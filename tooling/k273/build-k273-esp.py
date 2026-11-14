@@ -22,6 +22,13 @@ payload file and the line must be the base's, byte for byte, and no entry may us
 opens a store without native-ufs-root-part names linux_rootfs by default). The record (OUT/NAME.json) is a build-esp.py-style
 record whose seed and store are the 27.3 store's: maint-session.py checks the store on that partition at that LBA (bound to it,
 of that seed) before it writes the ESP, and rootfs-clear accepts only an ESP of such a record on the tablet.
+
+A base entry whose line is already split (piano-boot-args=SET, k27 0066: its piano-* arguments live in the base ADT's
+/chosen/piano-boot-args-SET) is reassembled before anything else: the whole arguments are the base's line without the selector plus
+that tail, the tail taken from the base record's boot_args_split or read out of the base image's ADT (both must agree when both
+exist; a loud refusal when the tail is in neither -- never a selector left pointing at a tail a fresh --adt does not carry, which
+would drop every piano-* argument without a word). The reassembled line takes the edits and is split again; each argument name is
+given at most once over --arg/--seed/--root-part (twice is refused, not silently duplicated).
 """
 import argparse
 import hashlib
@@ -183,11 +190,50 @@ def main():
         if common.adt_addon_slot(adt):
             raise SystemExit(f'{a.entry}\'s ADT has the GpuAddon slot of a RAM test image')
         seed = common.seed_info(seed_file)
+
+        # -- a base entry already split (k27 0066): reassemble the whole arguments before any edit --------------------------------
+        # the base's line ends piano-boot-args=SET with the piano-* arguments in the base ADT: an edit of one of them (or a fresh
+        # --adt that does not carry the tail) would otherwise leave a selector pointing nowhere and drop them without a word (v6)
+        base_split = None
+        sel = boot_args.selector(line.split())
+        if sel is not None and sel != '0':
+            prop = boot_args.prop_name(sel)
+            recorded = base.get('boot_args_split')
+            recorded = recorded if isinstance(recorded, dict) and recorded.get('set') == sel else None
+            in_adt = boot_args.sets(files[payload['adt']]).get(prop)
+            if recorded and recorded.get('tail') is not None and in_adt is not None and recorded['tail'] != in_adt:
+                raise SystemExit(f'{base_json.name}: its boot_args_split tail is not the /chosen/{prop} of {a.entry}\'s ADT in '
+                                 f'{base_img.name} (a stale record or a stale image): refused')
+            tail = recorded['tail'] if recorded and recorded.get('tail') is not None else (in_adt or '')
+            tail_args = tail.split()
+            if not tail_args:
+                raise SystemExit(f'{base_img}: {a.entry}\'s line carries piano-boot-args={sel} but its tail is in neither '
+                                 f'{base_json.name} (boot_args_split) nor the base ADT\'s /chosen/{prop}: refused rather than drop '
+                                 'its piano-* arguments')
+            if any(name_of(x) == 'piano-boot-args' for x in tail_args):
+                raise SystemExit(f'{base_img}: /chosen/{prop} itself carries piano-boot-args=: refused')
+            whole = [x for x in line.split() if name_of(x) != 'piano-boot-args'] + tail_args
+            names = [name_of(x) for x in whole]
+            if len(set(names)) != len(names):
+                dup = sorted({n for n in names if names.count(n) > 1})
+                raise SystemExit(f'{base_img}: {a.entry}\'s line and its ADT\'s /chosen/{prop} both carry {dup}: refused rather '
+                                 'than quietly let the later one win')
+            base_split = {'set': sel, 'property': prop, 'line_bytes': len(line), 'tail_bytes': len(tail),
+                          'full_bytes': len(' '.join(whole)), 'from': 'the base line + the base ADT tail, reassembled'}
+            line = ' '.join(whole)
+
         edits = list(a.arg) + ([f'data-store-lba={common.k273_store_first(seed)}'] if a.seed else [])
         if a.root_part:
             if a.root_part not in ('linux_data', 'linux_rootfs'):
                 raise SystemExit('--root-part: linux_data or linux_rootfs')
             edits += [f'native-ufs-root-part={a.root_part}'] + (['data-store-part=linux_data'] if a.root_part != 'linux_data' else [])
+        edit_names = [name_of(x) for x in edits]
+        if any(not n for n in edit_names):
+            raise SystemExit(f'--arg {edits[edit_names.index("")]!r}: an argument is NAME=VALUE')
+        if len(set(edit_names)) != len(edit_names):
+            dup = sorted({n for n in edit_names if edit_names.count(n) > 1})
+            raise SystemExit(f'{dup} given more than once over --arg/--seed/--root-part: one value per name (the base\'s '
+                             'occurrence is replaced in place by name); two would put both on the line')
         if edits or a.drop_arg:
             names = {name_of(x) for x in edits} | set(a.drop_arg)
             line = ' '.join([x for x in line.split() if name_of(x) not in names] + edits)
@@ -214,7 +260,7 @@ def main():
 
         # -- the arguments past DarwinBoot's line: the ADT's /chosen/piano-boot-args-macos (k27 0066) -----------------------------
         split = None
-        if len(line) >= LINE_MAX or a.split:
+        if len(line) >= LINE_MAX or a.split or base_split:   # a reassembled (split) base is split again
             if b'piano-boot-args: /chosen/' not in kc.read_bytes():
                 raise SystemExit(f'{a.entry}: a {len(line)}-byte line needs the ADT tail, and this collection\'s kernel lacks k27 0066')
             kept, tail = boot_args.fit(line.split(), 'macos', force=True)
@@ -346,6 +392,7 @@ def main():
         # the payload as it is on the base ESP (IMAGE:PATH; tooling/persist/base-seed.py and common.installed_trust read real files only)
         'inputs': {role: {'path': f'{a.name}.img:{path}', 'sha256': h(staged[role])} for role, path in payload.items()},
         'overrides': overrides, 'arg_edits': {'add': edits, 'drop': list(a.drop_arg)}, 'boot_args_split': split,
+        'base_split_rebuilt': base_split,
         'firmware': {'files': [{'path': f'{firmware.ESP_DIR}/{pin["path"]}', 'bytes': pin['size'], 'private': pin['private'],
                                 'sha256': None if pin['private'] else pin['sha256'], 'placed': True, 'problem': None} for pin in fw]},
         'seed': seed,
@@ -363,8 +410,9 @@ def main():
     print(f'{image.name}: {record["bytes"]} bytes sha256 {record["sha256"]}; from {base["image"]}: {a.entry} ({len(line)} bytes, '
           f'byte for byte), payload {payload_dir.removeprefix(ROOT)}, store on {part} LBA {lba}-{store["last_lba"]} bound, seed '
           f'{seed["identity_sha256"][:16]}; entries {[e["id"] for e in entries]} + actions'
-          + ('' if diag_info['included'] else f'; no -diag entry ({diag_info["why"]})') +
-          f'; dropped {len(dropped)} files of the base (the other payloads)')
+          + ('' if diag_info['included'] else f'; no -diag entry ({diag_info["why"]})')
+          + ('' if not base_split else f'; the split base reassembled ({base_split["full_bytes"]} B) and split again')
+          + f'; dropped {len(dropped)} files of the base (the other payloads)')
 
 
 if __name__ == '__main__':

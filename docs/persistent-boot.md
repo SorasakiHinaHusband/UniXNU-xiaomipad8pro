@@ -834,7 +834,10 @@ neither partition is unused.
 
 Host tests (no tablet): `tooling/persist/test-k273-only.py` makes every fixture in a temporary directory (a dual ESP by mtools, a
 GPT, the fake tablet of `test-persist.py`) and covers the builder, `tablet.sh`'s guard, the gate, both rootfs steps with their
-refusals, a broken and a stopped transfer, a device that keeps data after a discard, and the rollbacks back to the first byte.
+refusals, a broken and a stopped transfer, a device that keeps data after a discard, and the rollbacks back to the first byte. `tooling/k273/test-esp-split.py` (the same
+fixtures) covers the builder on a base whose entry line is already split (k27 0066): reassembled from the base record's
+boot_args_split or the base ADT, edited, split again, and every refusal that keeps a selector from pointing at a tail that is
+not there.
 
 ### 13.8 The whole-disk layout: the root on linux_rootfs, the owner's Data grown over linux_data (2026-11-14)
 
