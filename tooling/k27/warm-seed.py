@@ -248,17 +248,23 @@ def cmd_inspect(a):
 def cmd_collect(a):
     a.out.mkdir(parents=True, exist_ok=True)
     pack = a.out / 'warm.tar.xz'
+    # stream into a .part next to it and rename only when the archive is whole: a failed ssh (2026-11-15 02:30, ufs5's
+    # ride-along: "Operation timed out") used to open the real pack for writing first and leave it truncated to 0
+    partial = a.out / 'warm.tar.xz.part'
+    partial.unlink(missing_ok=True)
     secret = Path(a.secret)
     if not secret.is_file():
         raise SystemExit(f'{secret}: missing (the debug account\'s password for sudo on the tablet)')
     remote = "sudo -S -p '' /bin/sh -c '" + tablet_script() + "'"
     ssh = [str(D / 'tooling/native/desk-ssh.sh')] + (['-a', a.ssh_address] if a.ssh_address else []) + [remote]
-    with secret.open('rb') as stdin, pack.open('wb') as stdout:
+    with secret.open('rb') as stdin, partial.open('wb') as stdout:
         r = subprocess.run(ssh, stdin=stdin, stdout=stdout)
     # bsdtar answers 1 for warnings (a socket skipped, a file that changed while read): the archive is still whole
-    if r.returncode not in (0, 1) or pack.stat().st_size < 1024:
-        raise SystemExit(f'collect: ssh/tar answered {r.returncode}, {pack.stat().st_size} bytes: nothing usable (USB network up? '
-                         'logged in? tooling/native/desk-ssh.sh true)')
+    if r.returncode not in (0, 1) or partial.stat().st_size < 1024:
+        partial.unlink(missing_ok=True)
+        raise SystemExit(f'collect: ssh/tar answered {r.returncode}, {partial.stat().st_size if partial.exists() else 0} bytes: '
+                         'nothing usable (USB network up? logged in? tooling/native/desk-ssh.sh true); any earlier pack is untouched')
+    os.replace(partial, pack)
     members = listing(pack)
     record = {'pack': pack.name, 'pack_sha256': sha(pack), 'pack_bytes': pack.stat().st_size, 'members': len(members),
               'content_bytes': sum(s for _, s in members), 'collected': COLLECT,
