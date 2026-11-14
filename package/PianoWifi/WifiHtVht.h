@@ -7,8 +7,8 @@
 // capabilities. The rules are 802.11's (the capability and operation elements) and the firmware's own (the facts of its peer
 // association command, read from the Ubuntu tree's behaviour: docs/drivers/wifi.md section 3); no code of that tree is here.
 //
-// What is left for later: the receive block-ack agreements (the access point's ADDBA requests are counted, not answered: its
-// A-MPDUs need a reorder window of more than one frame), HE, 160 MHz.
+// The receive block-ack agreements these associations need are WifiBa.h's (boot 10s; 10r without them: 4.3 Mbit/s). What is
+// left for later: HE, 160 MHz.
 #pragma once
 #include <stdint.h>
 #include "WifiHw.h"
