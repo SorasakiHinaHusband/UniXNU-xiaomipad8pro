@@ -770,7 +770,11 @@ constexpr uint32_t kRxBufferBytes = 2048, kRxRadios = 2;
 constexpr uint32_t kWmiEvtUpdateStats = 0x1d004;
 constexpr uint32_t kWmiCmdRequestStats = 0x16001;
 constexpr uint32_t kWmiTagChanInfoEvent = 0x026, kWmiTagRequestStatsCmd = 0x08f, kWmiTagStatsEvent = 0x046;
-constexpr uint32_t kWmiStatsPdev = 1u << 2;
+constexpr uint32_t kWmiStatsPdev = 1u << 2, kWmiStatsVdev = 1u << 3;
+// A device record (level 8, boot 10q), 41 words: the device, the beacons' and the data's SNR, frames sent per access category
+// (4), frames received, retries per category (4), failures per category (4), RTS failures and successes, receive errors,
+// receive discards, frames not acknowledged, the last ten transmit rates and the last ten beacon RSSIs.
+constexpr uint32_t kWmiVdevStatsWords = 41;
 // The stats event: its fixed structure (stats kind, then how many radio, device, peer, beacon-filter, channel, MIB records,
 // the radio, beacon and two extended peer counts) and a byte array of records. A radio record is 44 words: 7 of its own (noise
 // floor, transmitting, receiving, busy and all cycles, PHY errors, power), 23 of transmission, 14 of reception (mid-PPDU route
@@ -852,7 +856,7 @@ constexpr uint32_t kWmiVdevUpWords = 8, kWmiVdevStartRespWords = 6;
 // A device parameter (WMI_VDEV_SET_PARAM): device, parameter, value. The one this level sets is the stream count.
 constexpr uint32_t kWmiVdevParamNss = 0x22;
 // The station's power save (WMI_STA_POWERSAVE_MODE): device, mode (0 off). Off at this level: the radio stays awake.
-constexpr uint32_t kWmiStaPsOff = 0;
+constexpr uint32_t kWmiStaPsOff = 0, kWmiStaPsOn = 1;
 // A peer (WMI_PEER_CREATE): device, the peer's address (two words), its type (0 default); then an array holding one
 // multi-link parameter structure (its header and a flags word, zero: not a multi-link peer), which this firmware's own host
 // always sends. Delete: device and address. A peer parameter (WMI_PEER_SET_PARAM): device, address, parameter, value.
@@ -924,6 +928,8 @@ constexpr uint32_t kWmiVdevParamTxEncapType = 0x30, kWmiVdevParamRxDecapType = 0
 constexpr uint32_t kWmiTxRxRaw = 0, kWmiTxRxNativeWifi = 1, kWmiTxRxEthernet = 2;
 constexpr uint32_t kWmiCmdStaPowersaveParam = 0x09002, kWmiTagStaPowersaveParamCmd = 0x06d;
 constexpr uint32_t kWmiStaPsParamRxWakePolicy = 0, kWmiStaPsParamTxWakeThreshold = 1, kWmiStaPsParamPspollCount = 2;
+// level 8's power save (boot 10q): the time without traffic after which the station dozes (milliseconds)
+constexpr uint32_t kWmiStaPsParamInactivityTime = 3;
 constexpr uint32_t kWmiStaPsRxWakePolicyWake = 0, kWmiStaPsTxWakeThresholdAlways = 1, kWmiStaPsPspollCountNoMax = 0;
 // The radio's transmit power limits (WMI_PDEV_SET_PARAM 3 and 4, 2.4 and 5 GHz), which this chip's host sends right after a
 // virtual device: the value in half-dB (7:0) and a reason (15:8). For WCN7860 that host sends its platform limit, 30 (15 dBm),

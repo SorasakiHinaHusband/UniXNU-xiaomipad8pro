@@ -129,7 +129,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
-  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0;
+  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats;
 };
 Args gArgs;
 
@@ -300,6 +300,14 @@ void readArgs()
   // piano-wifi-en0 (default 1 at level 8 since boot 10o-en0, 0 below): the station takes PianoNullEthernet's address and
   // PianoWifiEthernet its en0 (the null stands down); 0 keeps Wi-Fi a second interface of its own address (en2).
   gArgs.en0 = bootArg("piano-wifi-en0", gArgs.level >= 8 ? 1 : 0);
+  // For daily use on battery (boot 10q): piano-wifi-ps=1 turns the station's power save on once the port is open (it dozes
+  // between beacons after piano-wifi-psidle=MS without traffic, default 200); the root-only sysctl machdep.piano_wifi_ps
+  // turns it on (1) or off (0) at run time, each change logged. piano-wifi-l8stats=0: no firmware device counters with the
+  // status lines (by default they are asked for at each one, and the rates over its interval are printed with them).
+  gArgs.ps = bootArg("piano-wifi-ps", 0) ? 1 : 0;
+  gArgs.psIdleMs = bootArg("piano-wifi-psidle", 200);
+  if (!gArgs.psIdleMs || gArgs.psIdleMs > 10000) gArgs.psIdleMs = 200;
+  gArgs.l8stats = bootArg("piano-wifi-l8stats", 1);
   if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
 
@@ -3252,11 +3260,48 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 // (the same pattern as PianoPolicy's).
 struct sysctl_oid gOidJoin;
 
+extern volatile uint32_t gPsWanted;   // (level 8's, below)
+// machdep.piano_wifi_ps (boot 10q): the station's power save at run time, 0 off or 1 on; read by anyone, written by root. The
+// ladder's thread tells the firmware at its next turn while the port is open (psTurn), and logs the change.
+int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(__atomic_load_n(&gPsWanted, __ATOMIC_ACQUIRE));
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming != 0 && incoming != 1) return EINVAL;
+  __atomic_store_n(&gPsWanted, uint32_t(incoming), __ATOMIC_RELEASE);
+  IOLog("PianoWifi: machdep.piano_wifi_ps=%d: power save %s at the ladder's next turn while the port is open\n", incoming,
+        incoming ? "on" : "off");
+  return 0;
+}
+struct sysctl_oid gOidPs;
+
 }  // namespace
 
 SYSCTL_DECL(_machdep);
 
 namespace {
+void registerPsSysctl()
+{
+  __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
+  gOidPs.oid_parent = &sysctl__machdep_children;
+  gOidPs.oid_number = OID_AUTO;
+  gOidPs.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidPs.oid_arg1 = nullptr;
+  gOidPs.oid_arg2 = 0;
+  gOidPs.oid_name = "piano_wifi_ps";
+  gOidPs.oid_handler = sysctlPs;
+  gOidPs.oid_fmt = "I";
+  gOidPs.oid_descr = "PianoWifi's station power save: 0 off, 1 on (root writes; the change is logged)";
+  gOidPs.oid_version = SYSCTL_OID_VERSION;
+  gOidPs.oid_refcnt = 0;
+  sysctl_register_oid(&gOidPs);
+}
+
 void registerJoinSysctl()
 {
   gProfileLock = IOLockAlloc();
@@ -3597,6 +3642,26 @@ struct Level8 {
 };
 Level8 gL8;
 uint8_t gL8Out[kStaOutBytes + 64];   // a command of level 8's own (a key is 25 words and its bytes)
+// Boot 10q: the station's power save (wanted: the boot argument, then the sysctl; applied: what the firmware was told for the
+// association of `generation`), the firmware's device counters (the last answer) and the rates over a status interval.
+volatile uint32_t gPsWanted;
+struct PsState {
+  uint32_t applied = 0, generation = 0, step = 0, changes = 0;
+};
+PsState gPs;
+struct VdevCounters {
+  bool seen = false;
+  uint32_t recordBytes = 0, answers = 0, asked = 0;
+  uint32_t beaconSnr = 0, dataSnr = 0, txFrames = 0, rxFrames = 0, retries = 0, failures = 0, rxErrors = 0, rxDiscards = 0,
+           notAcked = 0, rtsFail = 0, rtsOk = 0, txRate = 0;
+  int32_t beaconRssi = 0;
+};
+VdevCounters gVdevCounters;
+struct RateWindow {
+  uint64_t at = 0;
+  uint32_t rxBytes = 0, txBytes = 0, rxFrames = 0, txFrames = 0, txAcked = 0, txNotAcked = 0;
+};
+RateWindow gRates;
 
 void portEnqueue(const uint8_t *message, uint32_t length)
 {
@@ -3905,6 +3970,129 @@ void level8Releases(const char *why, bool records)
   }
 }
 
+// Boot 10q: the rates over the interval since the last status (this host's own counts of the data path) and the firmware's device
+// counters of its last answer, with the power save's state. Not inlined into level8Status.
+__attribute__((noinline)) void level8Rates(uint64_t now, const char *why)
+{
+  const DpStats &st = gDp.st;
+  // (a counter below its last value: the data path began again, a new association or a restart's pass: the window too)
+  const bool reset = st.rxBytes < gRates.rxBytes || st.txBytes < gRates.txBytes || st.rxFrames < gRates.rxFrames;
+  const uint64_t ms = !reset && gRates.at && now > gRates.at ? now - gRates.at : 0;
+  auto kbps = [ms](uint32_t bytes) -> uint32_t { return ms ? uint32_t(uint64_t(bytes) * 8 / ms) : 0; };
+  if (ms)
+    note("level 8 %s: over the last %llu ms: in %u kbit/s (%u frames), out %u kbit/s (%u frames, %u acked, %u not); power "
+         "save %s (%u change(s))",
+         why, (unsigned long long)ms, kbps(st.rxBytes - gRates.rxBytes), st.rxFrames - gRates.rxFrames,
+         kbps(st.txBytes - gRates.txBytes), st.txFrames - gRates.txFrames, st.txAcked - gRates.txAcked,
+         st.txNotAcked - gRates.txNotAcked, gPs.applied ? "on" : "off", gPs.changes);
+  gRates.at = now;
+  gRates.rxBytes = st.rxBytes;
+  gRates.txBytes = st.txBytes;
+  gRates.rxFrames = st.rxFrames;
+  gRates.txFrames = st.txFrames;
+  gRates.txAcked = st.txAcked;
+  gRates.txNotAcked = st.txNotAcked;
+  const VdevCounters &v = gVdevCounters;
+  if (v.seen)
+    note("level 8 %s: the firmware's device counters (answer %u of %u, a record of %u bytes): SNR beacons %u data %u, out %u "
+         "(retries %u, failures %u, not acked %u, RTS %u/%u failed), in %u (errors %u, discarded %u), the last rate %u, the "
+         "last beacon %d",
+         why, v.answers, v.asked, v.recordBytes, v.beaconSnr, v.dataSnr, v.txFrames, v.retries, v.failures, v.notAcked,
+         v.rtsFail, v.rtsFail + v.rtsOk, v.rxFrames, v.rxErrors, v.rxDiscards, v.txRate, int(v.beaconRssi));
+  else if (gArgs.l8stats)
+    note("level 8 %s: the firmware's device counters: no answer yet (%u asked for)", why, v.asked);
+}
+
+// The firmware's device counters asked for (WMI_REQUEST_STATS, the device's kind) on the transport level 8 shares.
+__attribute__((noinline)) void level8AskCounters()
+{
+  WmiWriter w;
+  wmiBegin(w, gL8Out, sizeof gL8Out, kWmiCmdRequestStats);
+  uint8_t *cmd = wmiStruct(w, kWmiTagRequestStatsCmd, 5);
+  if (cmd) {
+    wmiPut(cmd, 0, kWmiStatsVdev);
+    wmiPut(cmd, 1, gLink.options.vdevId);
+    wmiPut(cmd, 4, kWmiPdevIdSoc);
+  }
+  const uint32_t n = wmiEnd(w);
+  if (n && linkSendWmi(gLink, gL8Out, n) == 1) ++gVdevCounters.asked;
+}
+
+// Their answer: the fixed structure's counts, then the byte array's records (the radio's first, then the devices'); ours by its
+// identifier. The record's size is measured (the bytes after the radio's records over their count) and printed, so that a
+// layout other than the 41 words this host reads shows in the log.
+bool level8Counters(uint32_t id, const uint8_t *payload, uint32_t length)
+{
+  if (id != uint32_t(kWmiEvtUpdateStats)) return false;
+  uint32_t size = 0, dataSize = 0;
+  const uint8_t *fixed = wmiFind(payload, length, kWmiTagStatsEvent, &size);
+  const uint8_t *data = wmiFind(payload, length, kWmiTagArrayByte, &dataSize);
+  if (!fixed || size < 9 * 4 || !data) return false;
+  const uint32_t pdevs = wmiGet(fixed, 1), vdevs = wmiGet(fixed, 2);
+  if (!vdevs) return false;   // a radio-only answer is level 6's
+  const uint32_t skip = pdevs * kWmiPdevStatsWords * 4;
+  if (dataSize < skip) return true;
+  VdevCounters &v = gVdevCounters;
+  ++v.answers;
+  v.recordBytes = (dataSize - skip) / vdevs;
+  if (v.recordBytes < kWmiVdevStatsWords * 4) return true;
+  for (uint32_t i = 0; i < vdevs; ++i) {
+    const uint8_t *r = data + skip + i * v.recordBytes;
+    if (wmiGet(r, 0) != gLink.options.vdevId) continue;
+    v.seen = true;
+    v.beaconSnr = wmiGet(r, 1);
+    v.dataSnr = wmiGet(r, 2);
+    v.txFrames = wmiGet(r, 3) + wmiGet(r, 4) + wmiGet(r, 5) + wmiGet(r, 6);
+    v.rxFrames = wmiGet(r, 7);
+    v.retries = wmiGet(r, 8) + wmiGet(r, 9) + wmiGet(r, 10) + wmiGet(r, 11);
+    v.failures = wmiGet(r, 12) + wmiGet(r, 13) + wmiGet(r, 14) + wmiGet(r, 15);
+    v.rtsFail = wmiGet(r, 16);
+    v.rtsOk = wmiGet(r, 17);
+    v.rxErrors = wmiGet(r, 18);
+    v.rxDiscards = wmiGet(r, 19);
+    v.notAcked = wmiGet(r, 20);
+    v.txRate = wmiGet(r, 21);
+    v.beaconRssi = int32_t(wmiGet(r, 31));
+  }
+  return true;
+}
+
+// The station's power save (boot 10q): once the port is open, the firmware is told what is wanted (the boot argument, then the
+// sysctl), each change logged; level 7 turns it off at every join, so a new association starts from off. One command per turn.
+__attribute__((noinline)) void psTurn()
+{
+  if (gPs.generation != gNetLink.generation) {
+    gPs.generation = gNetLink.generation;
+    gPs.applied = 0;
+    gPs.step = 0;
+  }
+  const uint32_t want = __atomic_load_n(&gPsWanted, __ATOMIC_ACQUIRE) ? 1u : 0u;
+  if (want == gPs.applied && gPs.step == 0) return;
+  WmiWriter w;
+  uint32_t n = 0;
+  if (want && gPs.step == 0)
+    n = assocBuildStaPsParam(w, gL8Out, sizeof gL8Out, gLink.options.vdevId, kWmiStaPsParamInactivityTime, gArgs.psIdleMs);
+  else
+    n = assocBuildPowersaveMode(w, gL8Out, sizeof gL8Out, gLink.options.vdevId, want ? kWmiStaPsOn : kWmiStaPsOff);
+  const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+  if (rc == 0) return;   // the transport is busy: the next turn
+  if (rc < 0) {
+    note("level 8: power save %s: the command could not be sent (it stays %s)", want ? "on" : "off", gPs.applied ? "on" : "off");
+    gPs.step = 0;
+    gPs.applied = want;   // not tried again until the next change
+    return;
+  }
+  if (want && gPs.step == 0) {
+    gPs.step = 1;   // the inactivity time first, then the mode
+    return;
+  }
+  gPs.step = 0;
+  gPs.applied = want;
+  ++gPs.changes;
+  note("level 8: power save %s (the station's mode %u%s), association generation %u, change %u (machdep.piano_wifi_ps)",
+       want ? "on" : "off", want, want ? ", dozing after the inactivity time" : "", gPs.generation, gPs.changes);
+}
+
 // The counters, in lines short enough for the console (boot 10e: the console and the kernel log cut a line at about 250
 // bytes, and the release, exception and refill counts of the old two-line form never came out).
 void level8Status(uint64_t now, const char *why)
@@ -3945,6 +4133,7 @@ void level8Status(uint64_t now, const char *why)
        "refused, %u unanswered",
        why, unit ? "a client" : "no client", connects, bad, gL8.portOut, gL8.portOutFailed, gL8.keyCommands, gKeys.installed,
        gKeys.refused, gL8.keyTimeouts);
+  level8Rates(now, why);
 }
 
 // Where every ring's two sides stand (after boot 10e, whose firmware died 236 ms after the association with nothing in our
@@ -4315,9 +4504,11 @@ void level8Turn(uint64_t now)
     gL8.nextPointers = now - gL8.associatedAt < 1000 ? now + 50 : now - gL8.associatedAt < 10000 ? now + 1000 : 0;
   }
   if (gL8.live && !gRelRecordsLogged && gDp.st.relRecorded >= kDpRelRecords) level8Releases("after 16 releases", true);
+  if (gL8.live && gSta.authorized) psTurn();
   if (gArgs.l8status && gL8.live && now >= gL8.lastStatus + gArgs.l8status) {
     gL8.lastStatus = now;
     level8Status(now, "while associated");
+    if (gArgs.l8stats) level8AskCounters();   // printed with the next status
   }
 }
 
@@ -4359,6 +4550,7 @@ void level8End(IOService *owner, uint64_t now)
 // The firmware's answer to a key (the only event level 8 reads itself).
 bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length)
 {
+  if (gL8.on && level8Counters(id, payload, length)) return true;
   if (!gL8.on || id != uint32_t(kWmiEvtVdevInstallKeyComplete)) return false;
   KeyComplete k;
   if (!assocParseKeyComplete(k, payload, length)) return false;
@@ -4536,6 +4728,8 @@ __attribute__((noinline)) void ladderReset()
   gStaPlanned = false;
   gL7EndedOnRequest = false;
   renew(gL8);
+  renew(gRates);
+  renew(gVdevCounters);
   gSyncAfterLevel5 = 0;   // levels 4 and 5 hold their lines again (piano-wifi-defer=3), as at the boot
 }
 
@@ -4964,6 +5158,7 @@ bool PianoWifi::start(IOService *provider)
   // en0's way in (PianoWifiNet.h) exists whenever PianoWifiEthernet may attach; the 802.1X port only with level 8.
   if (gArgs.level >= 6) netRegister();
   if (gArgs.level >= 8) portRegister();
+  if (gArgs.level >= 8) registerPsSysctl();
   // From level 2 on something is powered, so the driver joins the power tree: its kOff stops the radio (the power contract,
   // package/include/PianoPowerContract.h). Below level 2 nothing of the chip is on and there is nothing to do.
   if (gArgs.level >= 2) {

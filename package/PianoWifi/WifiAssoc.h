@@ -408,16 +408,21 @@ inline uint32_t assocBuildVdevSetParam(WmiWriter &w, uint8_t *buffer, uint32_t c
   return wmiEnd(w);
 }
 
-// The station's power save, off: nothing of this level may let the radio sleep between the handshake's frames.
-inline uint32_t assocBuildPowersaveOff(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId)
+// The station's power save: the device, the mode (level 7 sends it off: nothing of the join may let the radio sleep between the
+// handshake's frames; level 8 may turn it on once the port is open, piano-wifi-ps).
+inline uint32_t assocBuildPowersaveMode(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId, uint32_t mode)
 {
   wmiBegin(w, buffer, capacity, kWmiCmdStaPowersaveMode);
   uint8_t *cmd = wmiStruct(w, kWmiTagStaPowersaveModeCmd, 2);
   if (cmd) {
     wmiPut(cmd, 0, vdevId);
-    wmiPut(cmd, 1, kWmiStaPsOff);
+    wmiPut(cmd, 1, mode);
   }
   return wmiEnd(w);
+}
+inline uint32_t assocBuildPowersaveOff(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId)
+{
+  return assocBuildPowersaveMode(w, buffer, capacity, vdevId, kWmiStaPsOff);
 }
 
 // One of the station's power-save parameters: the device, the parameter, the value.
