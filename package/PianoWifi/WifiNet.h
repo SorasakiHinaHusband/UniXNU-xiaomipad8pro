@@ -242,8 +242,9 @@ inline const char *netEapolMessageName(uint32_t message)
 
 // ---------------------------------------------------------------------------------------------- the frame queue
 // Frames handed in by other threads (en0's output, the 802.1X port's EAPOL_TX) for the ladder's thread to send; a fixed ring
-// of copies. EAPOL frames may go out before the port is open; the others only after.
-constexpr uint32_t kNetQueueSlots = 32;
+// of copies. EAPOL frames may go out before the port is open; the others only after. (Boot 10s: 128 slots, 32 up to 10r; boot
+// 10r's uploads filled 32 at once: 3627 frames refused.)
+constexpr uint32_t kNetQueueSlots = 128;
 struct NetFrame {
   uint16_t length = 0;
   bool eapol = false;

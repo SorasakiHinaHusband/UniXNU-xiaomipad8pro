@@ -57,6 +57,11 @@ class PianoWifiEthernet : public IOEthernetController {
   IOEthernetInterface *fInterface = nullptr;
   IONetworkMedium *fMedium = nullptr;
   bool fTakeEn0 = false;   // piano-wifi-en0=1: take over PianoNullEthernet's built-in en0 (its address, primary)
+  // piano-wifi-txerr (boot 10s, default 1): an output refused returns its errno (ENOBUFS when PianoWifi's queue is full,
+  // ENETDOWN, EMSGSIZE). With no output queue the family's if_output returns outputPacket's value to the stack as an errno:
+  // kIOReturnOutputDropped is 2, ENOENT, which TCP does not take for a full queue and hands to the writer (boots 10q and 10r:
+  // every upload's nc ended after 0.1-0.6 s, when the queue first filled); TCP takes ENOBUFS as a full queue and goes on.
+  bool fTxErrno = true;
   bool takeOverEn0();
   // A work loop of its own (PianoUsbNet's pattern). Boot 10g: without one the controller had its provider's (IOResources,
   // none), the family's command gate never ran, and en0 was UP and RUNNING in ifconfig while enable() was never called and
@@ -227,7 +232,7 @@ UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
     else if (rc == EMSGSIZE) ++fTxSize;
     else ++fTxRefused;
     fLastRefusal = rc;
-    return kIOReturnOutputDropped;
+    return fTxErrno ? UInt32(rc) : kIOReturnOutputDropped;
   }
   ++fTxFrames;
   if ((fTxFrames & 255) == 0) counters("every 256 frames out");
@@ -368,6 +373,9 @@ bool PianoWifiEthernet::start(IOService *provider)
   if (!PE_parse_boot_argn("piano-wifi", &level, sizeof level)) level = 0;
   if (!PE_parse_boot_argn("piano-wifi-en0", &takeEn0, sizeof takeEn0)) takeEn0 = level >= 8 ? 1 : 0;
   fTakeEn0 = takeEn0 != 0;
+  uint32_t txErrno = 1;
+  if (!PE_parse_boot_argn("piano-wifi-txerr", &txErrno, sizeof txErrno)) txErrno = 1;
+  fTxErrno = txErrno != 0;
   // PianoWifi is the service that published the resource this driver matched: its properties are the scan's.
   OSDictionary *matching = IOService::serviceMatching("PianoWifi");
   IOService *wifi = matching ? IOService::waitForMatchingService(matching, kWaitNs) : nullptr;
