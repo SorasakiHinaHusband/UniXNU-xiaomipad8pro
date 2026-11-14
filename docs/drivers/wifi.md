@@ -332,6 +332,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-ps=1`, `piano-wifi-psidle=MS` | 0, 200 | the station's power save once the port is open: the firmware dozes between beacons after MS without traffic (`WMI_STA_POWERSAVE_MODE` on after the inactivity time `WMI_STA_PS_PARAM_INACTIVITY_TIME`, the way the chip's own host turns it on). At run time: `sudo sysctl machdep.piano_wifi_ps=1` (or `=0`); every change is logged (`level 8: power save on (...)`), and level 7 turns it off at each join, so a new association starts from off and is told again |
 | `piano-wifi-l8stats=0` | 1 | no firmware device counters with the status lines. By default each status asks for them (`WMI_REQUEST_STATS` of the device's kind; printed with the next status: SNR of the beacons and the data, frames out with their retries, failures and frames not acknowledged, RTS, frames in with errors and discards, the last transmit rate and beacon RSSI as the firmware gives them, and the record's measured size), and the rates in and out over the interval come from this host's own counts |
 | `piano-wifi-bgscan=S` | 120 with `piano-wifi-apple80211=1`, else 0 | a background scan every S s (at least 30) while associated, its list published for the Wi-Fi menu's snapshot; 0: only a fast pass's one. A list is published only from a scan that ran to its end, and on a fast pass only when it grew past the seeded entry: a refusal, a timeout or a stop keeps the list published before (`... not published: the list published before stays`) |
+| `piano-wifi-phy=N` | 0 | the most wanted PHY of a join (`package/PianoWifi/WifiHtVht.h`, host-tested in `phy_host`): 0 legacy (every level up to 10q: TCP about 24 Mbit/s, the 54 Mbit/s rate's ceiling), 1 HT, 2 HT and VHT. HT needs the network's HT capability and operation elements and WMM (QoS); VHT 5 GHz and its VHT elements; 40 MHz the HT operation's secondary channel, 80 MHz the VHT operation's width 1 and centre segment. The association request then carries this station's HT (LDPC, both short guard intervals, 20/40 MHz, SM power save off, MCS 0-15) and VHT (MCS 0-9 on two streams, 80 MHz short guard interval) capability elements and WMM's information element; the peer's association its flags, HT capabilities and rates, VHT capabilities and maps; the started channel its mode, centre and allowances. Each join logs `level 7: the PHY: ...`. At run time `sudo sysctl machdep.piano_wifi_phy=N`: the station leaves (our deauthentication) and joins again with it. Not yet: the receive block-ack agreements (the access point's requests are counted, `block-ack requests from the access point N`), HE |
 | `piano-wifi-crashtest=S` | 0 | a test: S s after the port first opens on a pass a restart began, the chip is asked once for its crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one unattended boot shows the restart after a crash |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
@@ -1456,6 +1457,33 @@ a 10 s receive), then the test sleep.
 | the three phases | PianoPower's `[Ns] charging: ... system ~W W` lines in each 150 s idle (the phases' uptimes in the script's log); the ping statistics (min/avg/max) and the 10 s receive per phase | ps=1: lower system watts or battery drain at idle, higher ping latency, the receive about the same |
 | `=0` | `level 8: power save off (the station's mode 0), ...` | — |
 | the test sleep (960 s) | the wake's fast restart (`(the wake from a system sleep): Wi-Fi is back ...`), then `level 7: a background scan beside the association (...): N channel(s), asked for` and `level 7: the background scan ended after N ms: K network(s) in the list, published` (or `ran out of time`: the firmware refused or ignored a scan while associated), and `piano-wifi-scan-summary` with K networks | K > 1 |
+
+**10q ran on 2026-11-14 22:33-22:51 (`private/host-checks/20261114-10q`):** the power save works (`power save on (the station's
+mode 1 ...)`; the ping to the router 4.0 ms on average off, 9.3 ms on; a 10 s receive 24-25 Mbit/s either way; the watts per
+phase in `10q-power.txt`); the background scan works beside the association (`ended after 3359 ms: 20 network(s) ...
+published`, and after the wake's fast restart); the wake's restart 2812 ms. Found: `kern.bootargs` carries 1 of the image's 6
+`piano-wifi` arguments (the ADT tail's are not in it: the airportd kick's gate now reads `machdep.piano_wifi_apple80211`, the
+argument as PianoWifi read it); the throughput 22.8-25 Mbit/s in, the transmit test cut after 0.6 s (now the tablet connects to
+the Mac); the device counters' SNR words are signed and each request is answered by two events. **Where the throughput is
+limited:** every association so far was legacy (`WifiAssoc.h`: "no HT, VHT or HE at this level"): 802.11a's 54 Mbit/s rate,
+whose TCP ceiling is about 25 Mbit/s — what 10q measured. 10r adds HT and VHT (`piano-wifi-phy`).
+
+**Boot 10r: HT and VHT, the A/B on one boot** (built 2026-11-14 from branch commit `0b71568` (main `a13dc09` merged), the 0070
+kernel, collection `6d6fe7d1...`, the v6 recipe (the line of `out/persistent/esp-k273-v6.json`, its tail, `data-persist=0`,
+`piano-wifi-l8status=5000`, the v2 seed, the v6b layer's trust cache), 237281280 bytes, `verify-ram-images.py` PASS:
+`out/ram-k273-wifi-10r` sha256 `97f4f73a37059ab54ed6d36b7f96acbc28167ef5cddb2ce212c3eb64a854fadd`). Arguments added: `piano-wifi-bgscan=900`, `piano-reset-after=1500`. The PHY is switched at
+run time by the Mac-side script (`q10r-tests.sh`): legacy as joined, then VHT, HT, VHT; each switch makes the station join again.
+
+| When | Line / command | Expected |
+|---|---|---|
+| the start | `sysctl machdep.piano_wifi_apple80211` | `0` (the kick's gate; `1` only with the argument) |
+| the first join | `level 7: the PHY: legacy (wanted legacy), mode 0, 20 MHz ...` | as 10q |
+| legacy | `tput rx` / `tput tx` 20 s each, the ping | rx about 24 Mbit/s; tx about the same (10q's tx test was broken) |
+| `machdep.piano_wifi_phy=2` | `machdep.piano_wifi_phy=2 (VHT): the station joins again with it`, `level 7: machdep.piano_wifi_phy=2 (VHT): the station leaves ...`, then the rejoin: `level 7: the PHY: VHT (wanted VHT), mode 10, 80 MHz (centre N MHz), 2 stream(s), 16 HT rate(s), peer flags ..., rate caps ...` and `the PHY's peer: HT caps ..., VHT caps ..., A-MPDU up to ... bytes, ...`; `the association answer: status 0`, the handshake, `the port is open`; DHCP | the association accepted as VHT (status 0); no `crash:` |
+| VHT | the throughput, the ping | well above legacy (inferred: without receive aggregation perhaps 60-150 Mbit/s in; transmit, which the firmware aggregates by itself, more) |
+| `=1` (HT) | as above with `HT`, mode 6 (40 MHz) or 4 | between legacy and VHT |
+| the counters | `the firmware's device counters (N event(s) for M request(s) ...): beacons -D dB, data ...`, `... the last transmit rate R ...; block-ack requests from the access point K` | signed values; K > 0 likely (the receive agreements are the next piece) |
+| if a switch fails | `level 7: join N ended (the join failed: ...)` or a `crash:` line | the script sets `=0` again |
 
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
