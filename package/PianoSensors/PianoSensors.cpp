@@ -496,7 +496,7 @@ void loadPack()
 SsrCore *gCore;
 PianoAdspChannel *gChannel;
 IOMemoryMap *gArenaMap;
-uint8_t *gArena, *gBounce;
+uint8_t *gArena, *gBounce, *gShadow;   // gShadow: the DSP's calls served in normal memory (SensorsRpc.h, SSR_SHADOW_BYTES)
 volatile uint32_t gChannelUp, gChannelUps;
 char gArenaText[200] = "none (piano-sensors-rpc-pa=0)";
 
@@ -552,7 +552,9 @@ int opTellable(void *)
 const SsrOps kRpcOps = {nullptr, opNow, opSend, opWait, opTrace, opPublish, opPrepare, opPackSize, opPackRead, opAlloc, opAdmit,
                         opTellable};
 
-// The arena: checked against the known owners of low DRAM and XNU's window, mapped write-combined, zeroed with 8-byte stores.
+// The arena: checked against the known owners of low DRAM and XNU's window, mapped write-combined, zeroed with 8-byte stores. The mapping
+// takes an alignment fault for an unaligned access on the tablet (s1b, 2026-11-14), as device memory does: SensorsRpc.c touches it only
+// through SensorsArena.h's aligned or byte accesses and serves the DSP's calls in normal memory (gShadow).
 bool mapArena()
 {
   const uint64_t pa = gArgs.rpcPa, bytes = SSR_ARENA_BYTES;
@@ -573,7 +575,8 @@ bool mapArena()
   gArenaMap = m ? m->map(kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
   if (m) m->release();
   gBounce = static_cast<uint8_t *>(IOMallocData(SSR_BOUNCE));
-  if (!gArenaMap || !gBounce) {
+  gShadow = static_cast<uint8_t *>(IOMallocData(SSR_SHADOW_BYTES));
+  if (!gArenaMap || !gBounce || !gShadow) {
     snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx: cannot map", (unsigned long long)pa, (unsigned long long)bytes);
     return false;
   }
@@ -871,7 +874,7 @@ bool PianoSensors::start(IOService *provider)
   // answered at the registration, and its state must find the core ready.
   const bool arena = mapArena();
   const SsrConfig cfg = {gArena, gArgs.rpcPa, SSR_ARENA_BYTES, gBounce, 1 /* Linux's first client id */, gArgs.bank, gArgs.log,
-                         gArgs.rpcFrame ? gArgs.rpcFrame : SSR_FRAME_PAG, gArgs.rpcLadder ? 0u : 1u, gArgs.rpcDeadline * 1000u};
+                         gArgs.rpcFrame ? gArgs.rpcFrame : SSR_FRAME_PAG, gArgs.rpcLadder ? 0u : 1u, gArgs.rpcDeadline * 1000u, gShadow};
   ssr_core_init(gCore, &kRpcOps, &cfg);
   if (gArgs.channel || gArgs.level >= 2) {
     static const PianoAdspClient client = {channelState, channelReceive};
