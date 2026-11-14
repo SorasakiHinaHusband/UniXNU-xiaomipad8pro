@@ -86,6 +86,7 @@
 #include <sys/kpi_mbuf.h>
 #include "PianoWifiNet.h"
 #include "SmmuStream.h"
+#include "WifiBa.h"
 #include "WifiBringup.h"
 #include "WifiChannels.h"
 #include "WifiDp.h"
@@ -130,6 +131,7 @@ struct Args {
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
   uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS, phy, apple80211;
+  uint32_t rxba, reoPool;
 };
 Args gArgs;
 
@@ -313,6 +315,13 @@ void readArgs()
   // machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
   gArgs.phy = bootArg("piano-wifi-phy", 0);
   if (gArgs.phy > 2) gArgs.phy = 0;
+  // piano-wifi-rxba=N (boot 10s, WifiBa.h): the access point's block-ack requests (it asks for them on an HT or VHT association,
+  // none on a legacy one): 0 not answered (boot 10r), 1 accepted without A-MSDUs (the default), 2 declined, 3 accepted with
+  // A-MSDUs as asked; machdep.piano_wifi_rxba changes it at run time (the station joins again). piano-wifi-reopool=0: every
+  // join's reorder queues alternate between two blocks of the window as up to 10r, rather than fresh memory of the pool.
+  gArgs.rxba = bootArg("piano-wifi-rxba", kBaModeAccept);
+  if (gArgs.rxba > kBaModeAcceptAmsdu) gArgs.rxba = kBaModeAccept;
+  gArgs.reoPool = bootArg("piano-wifi-reopool", 1) ? 1 : 0;
   // piano-wifi-bgscan=S (review of ee9980a, #3): a background scan every S s while associated, its list published for the
   // menu's snapshot; by default 120 with the menu binding on (piano-wifi-apple80211=1), 0 (only a fast pass's one) without.
   gArgs.apple80211 = bootArg("piano-wifi-apple80211", 0);
@@ -3278,6 +3287,7 @@ struct sysctl_oid gOidJoin;
 
 extern volatile uint32_t gPsWanted;   // (level 8's, below)
 volatile uint32_t gPhyWanted, gPhyRejoinAsked;   // boot 10r: machdep.piano_wifi_phy (read at each join)
+volatile uint32_t gRxbaWanted, gRxbaRejoinAsked; // boot 10s: machdep.piano_wifi_rxba (read at each request)
 // machdep.piano_wifi_ps (boot 10q): the station's power save at run time, 0 off or 1 on; read by anyone, written by root. The
 // ladder's thread tells the firmware at its next turn while the port is open (psTurn), and logs the change.
 int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
@@ -3317,6 +3327,27 @@ int sysctlPhy(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 struct sysctl_oid gOidPhy;
 
+// machdep.piano_wifi_rxba (boot 10s): what the access point's block-ack requests get (WifiBa.h BaMode: 0 nothing, 1 accepted,
+// 2 declined, 3 accepted with A-MSDUs); a change makes the associated station leave and join again, so that the access point asks
+// again under it.
+int sysctlRxba(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(__atomic_load_n(&gRxbaWanted, __ATOMIC_ACQUIRE));
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming < 0 || incoming > int(kBaModeAcceptAmsdu)) return EINVAL;
+  const uint32_t before = __atomic_exchange_n(&gRxbaWanted, uint32_t(incoming), __ATOMIC_ACQ_REL);
+  if (before != uint32_t(incoming)) __atomic_store_n(&gRxbaRejoinAsked, 1u, __ATOMIC_RELEASE);
+  IOLog("PianoWifi: machdep.piano_wifi_rxba=%d (block-ack requests %s)%s\n", incoming, baModeName(uint32_t(incoming)),
+        before != uint32_t(incoming) ? ": the station joins again with it" : ": as it was");
+  return 0;
+}
+struct sysctl_oid gOidRxba;
+
 // machdep.piano_wifi_apple80211 (boot 10r, read only): the kernel argument piano-wifi-apple80211 as the kexts read it (an
 // argument of the ADT's tail is not in kern.bootargs: boot 10q), for the airportd kick's gate.
 int sysctlApple80211(struct sysctl_oid *, void *, int, struct sysctl_req *req)
@@ -3343,6 +3374,16 @@ void registerPhySysctls()
   gOidPhy.oid_descr = "PianoWifi's most wanted PHY: 0 legacy, 1 HT, 2 VHT (root writes; the station joins again)";
   gOidPhy.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gOidPhy);
+  __atomic_store_n(&gRxbaWanted, gArgs.rxba, __ATOMIC_RELEASE);
+  gOidRxba.oid_parent = &sysctl__machdep_children;
+  gOidRxba.oid_number = OID_AUTO;
+  gOidRxba.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidRxba.oid_name = "piano_wifi_rxba";
+  gOidRxba.oid_handler = sysctlRxba;
+  gOidRxba.oid_fmt = "I";
+  gOidRxba.oid_descr = "PianoWifi's block-ack requests: 0 not answered, 1 accepted, 2 declined, 3 accepted with A-MSDUs (root writes)";
+  gOidRxba.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidRxba);
   gOidApple80211.oid_parent = &sysctl__machdep_children;
   gOidApple80211.oid_number = OID_AUTO;
   gOidApple80211.oid_kind = int(CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
@@ -3397,6 +3438,10 @@ void registerJoinSysctl()
 Sta gSta;
 StaDma gStaFrames[kAssocFrameBuffers];
 StaDma gStaReoq, gStaReoq2;      // the second for the rejoin: the queues of two peers in a row never share memory
+// Boot 10s (WifiBa.h): the reorder queues' pool, every join's 17 queues and every block-ack agreement's queue fresh memory while
+// the chip stays powered (piano-wifi-reopool=1); gStaReoq and gStaReoq2 are its fallback.
+StaDma gReoPoolMem;
+ReoPool gReoPool;
 bool gL7EndedOnRequest;
 bool gStaPlanned;
 uint32_t gRestarts, gRestartRun, gRestartsWake, gRestartsCrash, gRestartsFail;   // gRestartRun: in a row, without a port open
@@ -3554,34 +3599,96 @@ bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
   return true;
 }
 
-// Boot 10r: the access point's block-ack action frames (category 3: an ADDBA request asks for a receive agreement on a TID)
-// counted and the first ones logged; not answered yet (receive aggregation needs a reorder window per TID: the next piece).
-uint32_t gAddbaRequests, gBaOther;
-void baCount(uint32_t id, const uint8_t *payload, uint32_t length)
+// Boot 10r counted the access point's block-ack action frames (category 3); boot 10s answers them (WifiBa.h, piano-wifi-rxba):
+// an ADDBA request is kept for its TID here, and the ladder's turn (baTurn) sets up the TID's queue for the window and sends our
+// response; a DELBA of the access point's sets the TID back to a window of one. The completions of our responses are taken here.
+uint32_t gAddbaRequests, gBaOther;   // since the boot (the counters' line)
+struct BaTidState {
+  bool pending = false, delba = false, active = false, descTaken = false, queueSent = false;
+  BaRequest req;
+  BaAnswer ans;
+  uint16_t delbaReason = 0;
+  uint8_t *qva = nullptr;
+  uint64_t qbus = 0;
+  uint32_t descId = 0, window = 0;
+  uint64_t sentAt = 0;
+};
+struct BaState {
+  uint64_t join = 0;                    // the join (its machine's start time) these agreements belong to
+  BaTidState tid[kBaTids];
+  uint32_t requests = 0, accepted = 0, declined = 0, ended = 0, acked = 0, notAcked = 0, failed = 0, responses = 0;
+  uint32_t noted = 0, next = 0;
+  uint32_t total = 0, totalAccepted = 0, totalDeclined = 0, totalEnded = 0;   // since the boot
+};
+BaState gBa;
+
+bool baEvent(uint32_t id, const uint8_t *payload, uint32_t length)
 {
-  if (id != uint32_t(kWmiEvtMgmtRx)) return;
+  if (id == uint32_t(kWmiEvtMgmtTxCompletion)) {
+    MgmtTxComplete c;
+    if (!assocParseMgmtTxComplete(c, payload, length) || (c.descId & 0xfff00000u) != kBaDescBase) return false;
+    const bool ok = c.status == kWmiMgmtTxStatusOk;
+    ok ? ++gBa.acked : ++gBa.notAcked;
+    for (uint32_t t = 0; t < kBaTids; ++t)
+      if (gBa.tid[t].descId == c.descId) {
+        if (gBa.acked + gBa.notAcked <= 12 || !ok)
+          note("level 8: our ADDBA response %u (TID %u): %s (completion status %u)", c.descId & 0xfffffu, t,
+               ok ? "acknowledged" : "not acknowledged", c.status);
+        gBa.tid[t].descId = 0;
+      }
+    return true;
+  }
+  if (id != uint32_t(kWmiEvtMgmtRx)) return false;
   WmiMgmtRx rx;
-  if (!wmiParseMgmtRx(rx, payload, length) || rx.bytes < kDot11HeaderBytes + 2) return;
-  if ((rx.frame[0] & 0xfc) != 0xd0 || rx.frame[kDot11HeaderBytes] != 3) return;   // an action frame of the block-ack category
+  if (!wmiParseMgmtRx(rx, payload, length) || rx.bytes < kDot11HeaderBytes + 2) return false;
+  if ((rx.frame[0] & 0xfc) != kDot11Action || rx.frame[kDot11HeaderBytes] != kBaCategory) return false;
   const uint8_t action = rx.frame[kDot11HeaderBytes + 1];
-  if (action != 0) {
-    ++gBaOther;
-    return;
+  action == kBaAddbaRequest ? ++gAddbaRequests : ++gBaOther;
+  if (!gSta.choice.found || !gSta.vdevUp || gSta.disconnect) return true;
+  BaRequest r;
+  BaDelbaInfo d;
+  const uint8_t what = baParse(rx.frame, rx.bytes, gSta.env.ownMac, gSta.bssid, r, d);
+  if (what == kBaAddbaRequest) {
+    ++gBa.requests;
+    const uint32_t mode = __atomic_load_n(&gRxbaWanted, __ATOMIC_ACQUIRE);
+    const BaAnswer a = baDecide(r, mode);
+    if (gBa.noted < 8) {
+      ++gBa.noted;
+      note("level 8: the access point asks for a block-ack agreement (request %u of this association): TID %u, window %u, "
+           "A-MSDU %u, %s, timeout %u TU, starting sequence %u: %s%s%s%s",
+           gBa.requests, r.tid, r.window, r.amsdu ? 1u : 0u, r.immediate ? "immediate" : "delayed", r.timeout, r.ssn,
+           !a.answer ? "not answered" : a.accept ? "accepted" : "declined", a.why[0] ? " (" : "", a.why, a.why[0] ? ")" : "");
+    }
+    if (!a.answer || r.tid >= kBaTids) {
+      if (a.answer && r.tid >= kBaTids) ++gBa.failed;
+      return true;
+    }
+    BaTidState &t = gBa.tid[r.tid];
+    t.pending = true;   // the latest request of the TID wins (a retry of the same one, or a new one; over a DELBA's reset too)
+    t.delba = false;
+    t.req = r;
+    t.ans = a;
+    t.descTaken = false;
+    t.queueSent = false;
+    return true;
   }
-  ++gAddbaRequests;
-  if (gAddbaRequests <= 4 && rx.bytes >= kDot11HeaderBytes + 9) {
-    const uint8_t *b = rx.frame + kDot11HeaderBytes;
-    const uint32_t params = uint32_t(b[3] | b[4] << 8);
-    note("level 7: the access point asks for a block-ack agreement (request %u): TID %u, window %u, A-MSDU %u; not answered "
-         "(receive aggregation is the next piece)",
-         gAddbaRequests, (params >> 2) & 0xf, (params >> 6) & 0x3ff, params & 1);
+  if (what == kBaDelba && d.tid < kBaTids) {
+    note("level 8: a DELBA of the access point's: TID %u, %s, reason %u", d.tid, d.initiator ? "its own agreement (it sends)"
+                                                                                            : "the one where it receives", d.reason);
+    if (d.initiator && (gBa.tid[d.tid].active || gBa.tid[d.tid].pending)) {
+      gBa.tid[d.tid].pending = false;
+      gBa.tid[d.tid].delba = true;
+      gBa.tid[d.tid].delbaReason = d.reason;
+      gBa.tid[d.tid].descTaken = false;
+    }
   }
+  return true;
 }
 
 bool staHook(void *, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t now)
 {
   if (level8Event(id, payload, length)) return true;
-  baCount(id, payload, length);
+  if (baEvent(id, payload, length)) return true;
   if (bgScanEvent(id, payload, length)) return true;
   return staOnEvent(gSta, id, payload, length, now);
 }
@@ -4099,6 +4206,11 @@ __attribute__((noinline)) void level8Rates(uint64_t now, const char *why)
     note("level 8 %s: the firmware's device counters: RTS %u failed of %u, the last transmit rate %u, the last beacon %d; "
          "block-ack requests from the access point %u (other block-ack frames %u); the PHY %s",
          why, v.rtsFail, v.rtsFail + v.rtsOk, v.txRate, int(v.beaconRssi), gAddbaRequests, gBaOther, phyKindName(gSta.phy.kind));
+    note("level 8 %s: block-ack agreements (piano-wifi-rxba=%u): this association %u request(s), %u accepted, %u declined, %u "
+         "ended by the access point, %u response(s) acknowledged, %u not, %u failed; since the boot %u accepted of %u; the "
+         "queue pool %u take(s), %u wrap(s)",
+         why, __atomic_load_n(&gRxbaWanted, __ATOMIC_ACQUIRE), gBa.requests, gBa.accepted, gBa.declined, gBa.ended, gBa.acked,
+         gBa.notAcked, gBa.failed, gBa.totalAccepted, gBa.total, gReoPool.takes, gReoPool.wraps);
   } else if (gArgs.l8stats)
     note("level 8 %s: the firmware's device counters: no answer yet (%u asked for)", why, v.asked);
 }
@@ -4804,12 +4916,143 @@ __attribute__((noinline)) void phyTurn(uint64_t now, bool stopping)
       note("level 7: the PHY's peer: HT caps %#x, VHT caps %#x, A-MPDU up to %u bytes, spacing %u us, VHT maps rx %#x tx %#x",
            c.htCaps, c.vhtCaps, c.maxMpdu, c.mpduDensity, c.vhtRxMcs, c.vhtTxMcs);
   }
+  if (__atomic_load_n(&gRxbaRejoinAsked, __ATOMIC_ACQUIRE) && !stopping && gSta.step == kStaAssociated) {
+    __atomic_store_n(&gRxbaRejoinAsked, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gPhyRejoinAsked, 0u, __ATOMIC_RELEASE);   // one rejoin serves both
+    note("level 7: machdep.piano_wifi_rxba=%u (block-ack requests %s): the station leaves its association (our "
+         "deauthentication) and joins again with it",
+         __atomic_load_n(&gRxbaWanted, __ATOMIC_ACQUIRE), baModeName(__atomic_load_n(&gRxbaWanted, __ATOMIC_ACQUIRE)));
+    staStop(gSta, now);
+    return;
+  }
   if (__atomic_load_n(&gPhyRejoinAsked, __ATOMIC_ACQUIRE) && !stopping && gSta.step == kStaAssociated) {
     __atomic_store_n(&gPhyRejoinAsked, 0u, __ATOMIC_RELEASE);
     note("level 7: machdep.piano_wifi_phy=%u (%s): the station leaves its association (our deauthentication) and joins again "
          "with it",
          __atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE), phyKindName(__atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE)));
     staStop(gSta, now);
+  }
+}
+
+// Boot 10s: one block-ack step per turn while associated and the join's own outbox is empty (WifiBa.h). A request accepted: a
+// fresh queue descriptor of the pool with the window and the request's starting sequence, the firmware's reorder-queue command
+// with the window, then our ADDBA response (in the fourth frame buffer, one 128-byte slot per TID). Declined: the response alone.
+// A DELBA of the access point's: a fresh descriptor with the window of one and the command. A command the transport cannot take
+// now is tried at the next turn.
+__attribute__((noinline)) void baTurn(uint64_t now, bool stopping)
+{
+  if (gBa.join != gSta.began) {
+    const uint32_t total = gBa.total, acc = gBa.totalAccepted, dec = gBa.totalDeclined, end = gBa.totalEnded;
+    renew(gBa);
+    gBa.join = gSta.began;
+    gBa.total = total;
+    gBa.totalAccepted = acc;
+    gBa.totalDeclined = dec;
+    gBa.totalEnded = end;
+    return;
+  }
+  if (stopping || gSta.step != kStaAssociated || !gSta.vdevUp || gSta.disconnect || gSta.outLength) return;
+  const StaDma &slots = gStaFrames[kAssocFrameBuffers - 1];
+  for (uint32_t k = 0; k < kBaTids; ++k) {
+    const uint32_t tid = (gBa.next + k) % kBaTids;
+    BaTidState &t = gBa.tid[tid];
+    if (!t.pending && !t.delba) continue;
+    gBa.next = (tid + 1) % kBaTids;
+    const bool accept = t.pending && t.ans.accept;
+    if ((accept || t.delba) && !t.queueSent) {
+      if (!t.descTaken) {
+        bool wrapped = false;
+        if (!reoPoolTake(gReoPool, kReoQueueQosBytes, &t.qva, &t.qbus, &wrapped)) {
+          note("level 8: block ack, TID %u: no queue memory (the pool is not set up): %s", tid,
+               t.delba ? "the window stays" : "the request is not answered");
+          ++gBa.failed;
+          t.pending = t.delba = false;
+          return;
+        }
+        if (wrapped) note("level 8: the reorder queues' pool started again from its beginning (wrap %u)", gReoPool.wraps);
+        t.descTaken = true;
+        reoQueueInit(t.qva, tid, t.delba ? 1u : t.ans.window, t.delba ? 0u : t.req.ssn);
+      }
+      const uint32_t window = t.delba ? 1u : t.ans.window;
+      WmiWriter w;
+      const uint32_t n = assocBuildReorderQueueSetup(w, gL8Out, sizeof gL8Out, gSta.options.vdevId, gSta.bssid, tid, t.qbus,
+                                                     window);
+      const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+      if (rc == 0) return;
+      if (rc < 0) {
+        note("level 8: block ack, TID %u: the reorder-queue command could not be sent", tid);
+        ++gBa.failed;
+        t.pending = t.delba = false;
+        return;
+      }
+      t.queueSent = true;
+      if (t.delba) {
+        t.delba = false;
+        t.active = false;
+        t.window = 1;
+        ++gBa.ended;
+        ++gBa.totalEnded;
+        note("level 8: block ack, TID %u: the access point ended its agreement (reason %u): the queue is back to a window of one",
+             tid, t.delbaReason);
+        t.queueSent = false;
+        t.descTaken = false;
+      }
+      return;   // the response at the next turn
+    }
+    if (!t.pending) continue;
+    // the response (a response of this TID still in flight for less than 500 ms keeps the slot: the firmware reads it by DMA)
+    if (t.descId && now < t.sentAt + 500) return;
+    if (!slots.va || slots.bytes < kBaTids * kBaFrameSlot) {
+      t.pending = false;
+      ++gBa.failed;
+      return;
+    }
+    uint8_t *f = slots.va + tid * kBaFrameSlot;
+    const uint32_t length = baBuildResponse(f, kBaFrameSlot, gSta.env.ownMac, gSta.bssid, ++gSta.seq, t.req, t.ans);
+    MgmtTx tx;
+    tx.vdevId = gSta.options.vdevId;
+    tx.descId = kBaDescBase | ((++gBa.responses & 0xfffffu));
+    tx.freq = 0;
+    tx.bus = slots.bus + tid * kBaFrameSlot;
+    tx.frame = f;
+    tx.bytes = length;
+    WmiWriter w;
+    const uint32_t n = length ? assocBuildMgmtTx(w, gL8Out, sizeof gL8Out, tx) : 0;
+    const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+    if (rc == 0) {
+      --gBa.responses;
+      --gSta.seq;
+      return;
+    }
+    t.pending = false;
+    t.queueSent = false;
+    t.descTaken = false;
+    if (rc < 0) {
+      note("level 8: block ack, TID %u: our response could not be sent", tid);
+      ++gBa.failed;
+      return;
+    }
+    t.descId = tx.descId;
+    t.sentAt = now;
+    ++gBa.total;
+    if (t.ans.accept) {
+      t.active = true;
+      t.window = t.ans.window;
+      ++gBa.accepted;
+      ++gBa.totalAccepted;
+      if (gBa.accepted <= 8)
+        note("level 8: block-ack agreement on TID %u: window %u (asked %u), A-MSDU %u (asked %u), timeout %u TU, starting "
+             "sequence %u; its queue fresh memory of the pool (take %u), the firmware told, our response %u sent",
+             tid, t.ans.window, t.req.window, t.ans.amsdu ? 1u : 0u, t.req.amsdu ? 1u : 0u, t.req.timeout, t.req.ssn,
+             gReoPool.takes, tx.descId & 0xfffffu);
+    } else {
+      ++gBa.declined;
+      ++gBa.totalDeclined;
+      if (gBa.declined <= 4)
+        note("level 8: block-ack request on TID %u declined (status %u, %s): our response %u sent", tid, t.ans.status, t.ans.why,
+             tx.descId & 0xfffffu);
+    }
+    return;
   }
 }
 
@@ -4865,6 +5108,16 @@ __attribute__((noinline)) void ladderReset()
   for (StaDma &f : gStaFrames) renew(f);
   renew(gStaReoq);
   renew(gStaReoq2);
+  renew(gReoPoolMem);
+  renew(gReoPool);
+  {
+    const uint32_t total = gBa.total, acc = gBa.totalAccepted, dec = gBa.totalDeclined, end = gBa.totalEnded;
+    renew(gBa);
+    gBa.total = total;
+    gBa.totalAccepted = acc;
+    gBa.totalDeclined = dec;
+    gBa.totalEnded = end;
+  }
   gStaPlanned = false;
   gL7EndedOnRequest = false;
   renew(gL8);
@@ -4912,6 +5165,15 @@ int level7(IOService *owner)
       gStaReoq.va = arenaAlloc(gArena, kStaReoqBytes, &gStaReoq.bus);
       gStaReoq.bytes = kStaReoqBytes;
       ok = gStaReoq.va != nullptr;
+    }
+    if (ok && gArgs.reoPool && !gReoPoolMem.va) {
+      gReoPoolMem.va = arenaAlloc(gArena, kReoPoolBytes, &gReoPoolMem.bus);
+      gReoPoolMem.bytes = gReoPoolMem.va ? kReoPoolBytes : 0;
+      if (gReoPoolMem.va) reoPoolInit(gReoPool, gReoPoolMem.va, gReoPoolMem.bus, gReoPoolMem.bytes);
+      note("level 7: the reorder queues' pool: %s (%u KiB; each join's queues and each block-ack agreement's queue fresh "
+           "memory until the chip is powered down)",
+           gReoPoolMem.va ? "planned" : "NOT planned (no room in the window): the queues alternate between two blocks",
+           kReoPoolBytes >> 10);
     }
     gStaPlanned = ok;
   }
@@ -4983,13 +5245,29 @@ int level7(IOService *owner)
   }
   for (;;) {
   ++joins;
-  if (joins > 1) {
+  bool poolQueues = false;
+  if (gReoPool.va) {
+    // boot 10s: the queues of this join fresh memory (boot 10r's joins 4-7 reused an earlier QoS peer's and never got their
+    // first frames)
+    StaDma q;
+    bool wrapped = false;
+    if (reoPoolTake(gReoPool, kStaReoqBytes, &q.va, &q.bus, &wrapped)) {
+      q.bytes = kStaReoqBytes;
+      env.reoq = q;
+      poolQueues = true;
+      if (wrapped) note("level 7: the reorder queues' pool started again from its beginning (wrap %u)", gReoPool.wraps);
+    }
+  }
+  if (!poolQueues && joins > 1) {
     if (!gStaReoq2.va) {
       gStaReoq2.va = arenaAlloc(gArena, kStaReoqBytes, &gStaReoq2.bus);
       gStaReoq2.bytes = kStaReoqBytes;
     }
     env.reoq = (joins % 2 == 0 && gStaReoq2.va) ? gStaReoq2 : gStaReoq;
   }
+  if (joins > 1 || poolQueues)
+    note("level 7: join %u's reorder queues: %s", joins,
+         poolQueues ? "fresh memory of the pool" : (joins % 2 == 0 ? "the second block" : "the first block"));
   profileBeforeJoin(joins == 1 ? "at the join's start" : "before the rejoin");
   o.phy = __atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE);
   staBeginOnce(o, env, nowMs());
@@ -5017,6 +5295,7 @@ int level7(IOService *owner)
       bgScanTurn(owner, now, firstOpenAt, stopping);
     }
     phyTurn(now, stopping);
+    baTurn(now, stopping);
     if (gArgs.dropTest && !gDropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
         gSta.step == kStaAssociated) {
       gDropDone = true;   // once a boot (a restart's pass does not drop again)
