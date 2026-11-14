@@ -183,6 +183,7 @@ struct StaOptions {
   uint32_t maxCandidates = 4;          // how many access points of the name are tried, one after another (bit 10)
   uint32_t paceMs = 20;                // between the many small commands of 704 and 707
   int32_t minRssi5 = -82;              // a 5 GHz access point weaker than this loses to a stronger 2.4 GHz one
+  uint32_t phy = 0;                    // boot 10r: the most wanted (WifiHtVht.h kPhyLegacy, kPhyHt, kPhyVht)
 };
 
 struct StaDma {
@@ -219,6 +220,7 @@ constexpr unsigned kStaFrameAuth = 0, kStaFrameAssoc = 1, kStaFrameDeauth = 2;
 
 struct Sta {
   StaOptions options;
+  PhyChoice phy;                       // boot 10r: this candidate's HT/VHT (postVdevStart)
   StaEnv env;
   int step = kStaIdle, error = kStaErrNone, failedStep = 0;
   uint64_t began = 0, deadline = 0, pace = 0, sentAt = 0, stepAt = 0;
@@ -556,12 +558,16 @@ inline bool postAssoc(Sta &s)
   // the supported channels of the spectrum-management pair: the 5 GHz sub-band the network is in, four channels of 20 MHz
   r.firstChannel = uint8_t(s.choice.channel >= 149 ? 149 : s.choice.channel >= 100 ? 100 : s.choice.channel >= 52 ? 52 : 36);
   r.channelCount = uint8_t(s.choice.channel >= 149 ? 5 : s.choice.channel >= 100 ? 12 : 4);
+  r.ht = s.phy.kind != kPhyLegacy;
+  r.vht = s.phy.kind == kPhyVht;
+  r.wmm = s.phy.qos;
   const uint32_t length = dot11BuildAssocRequest(d.va, d.bytes, r);
   return length && postFrame(s, kStaFrameAssoc, length, kDot11AssocRequest);
 }
 
 inline uint32_t phyMode(const Sta &s)
 {
+  if (s.phy.kind != kPhyLegacy) return s.phy.phyMode;   // boot 10r: HT or VHT (WifiHtVht.h)
   if (s.choice.band5) return kWmiModeLegacy5;
   for (uint32_t i = 0; i < s.choice.net.rateCount; ++i)
     if (dot11RateIsOfdm(s.choice.net.rates[i])) return kWmiModeLegacy24;
@@ -587,7 +593,23 @@ inline bool postPeerAssoc(Sta &s)
   for (uint32_t i = 0; i < count && i < sizeof a.legacyRates; ++i) a.legacyRates[i] = dot11RateForFirmware(offered[i]);
   a.legacyRateCount = count;
   a.phyMode = phyMode(s);
-  a.qos = false;
+  a.qos = s.phy.qos;
+  if (s.phy.kind != kPhyLegacy) {
+    a.htFlags = s.phy.peerFlags;
+    a.htCaps = s.phy.htCaps;
+    a.maxMpdu = s.phy.maxMpdu;
+    a.mpduDensity = s.phy.mpduDensity;
+    a.rateCaps = s.phy.rateCaps;
+    a.nss = s.phy.nss;
+    a.vhtCaps = s.phy.vhtCaps;
+    for (uint32_t i = 0; i < s.phy.htRateCount && i < sizeof a.htRates; ++i) a.htRates[i] = s.phy.htRates[i];
+    a.htRateCount = s.phy.htRateCount;
+    a.vht = s.phy.kind == kPhyVht;
+    a.vhtRxMaxRate = s.phy.vhtRxMaxRate;
+    a.vhtRxMcs = s.phy.vhtRxMcs;
+    a.vhtTxMaxRate = s.phy.vhtTxMaxRate;
+    a.vhtTxMcs = s.phy.vhtTxMcs;
+  }
   a.needPtk4Way = s.rsn;
   a.needGtk2Way = false;
   a.pmf = false;
@@ -597,10 +619,16 @@ inline bool postPeerAssoc(Sta &s)
 
 inline bool postVdevStart(Sta &s)
 {
+  // boot 10r: the candidate's HT/VHT choice, made here (its first use) and kept for the association and the peer's
+  s.phy = phyChoose(s.choice.net, s.options.phy, s.options.chains, s.choice.band5, s.choice.freq);
   VdevStart v;
   v.vdevId = s.options.vdevId;
   v.freq = s.choice.freq;
   v.mode = phyMode(s);
+  v.centerFreq = s.phy.centerFreq;
+  v.allowHt = s.phy.kind != kPhyLegacy;
+  v.allowVht = s.phy.kind == kPhyVht;
+  v.ht40Above = s.phy.ht40Above;
   v.beaconIntervalTu = s.choice.net.beaconInterval ? s.choice.net.beaconInterval : 100;
   v.dtimPeriod = s.choice.net.dtimPeriod ? s.choice.net.dtimPeriod : 1;
   v.txStreams = s.options.chains ? s.options.chains : 1;

@@ -129,7 +129,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
-  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS;
+  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS, phy, apple80211;
 };
 Args gArgs;
 
@@ -308,9 +308,15 @@ void readArgs()
   gArgs.psIdleMs = bootArg("piano-wifi-psidle", 200);
   if (!gArgs.psIdleMs || gArgs.psIdleMs > 10000) gArgs.psIdleMs = 200;
   gArgs.l8stats = bootArg("piano-wifi-l8stats", 1);
+  // piano-wifi-phy=N (boot 10r): the most wanted PHY of a join: 0 legacy (every level up to 10q: TCP about 24 Mbit/s, the 54 Mbit/s
+  // rate's ceiling), 1 HT, 2 HT and VHT; what the network offers decides the rest (WifiHtVht.h). The root-only sysctl
+  // machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
+  gArgs.phy = bootArg("piano-wifi-phy", 0);
+  if (gArgs.phy > 2) gArgs.phy = 0;
   // piano-wifi-bgscan=S (review of ee9980a, #3): a background scan every S s while associated, its list published for the
   // menu's snapshot; by default 120 with the menu binding on (piano-wifi-apple80211=1), 0 (only a fast pass's one) without.
-  gArgs.bgScanS = bootArg("piano-wifi-bgscan", bootArg("piano-wifi-apple80211", 0) ? 120 : 0);
+  gArgs.apple80211 = bootArg("piano-wifi-apple80211", 0);
+  gArgs.bgScanS = bootArg("piano-wifi-bgscan", gArgs.apple80211 ? 120 : 0);
   if (gArgs.bgScanS && gArgs.bgScanS < 30) gArgs.bgScanS = 30;
   if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
@@ -3271,6 +3277,7 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 struct sysctl_oid gOidJoin;
 
 extern volatile uint32_t gPsWanted;   // (level 8's, below)
+volatile uint32_t gPhyWanted, gPhyRejoinAsked;   // boot 10r: machdep.piano_wifi_phy (read at each join)
 // machdep.piano_wifi_ps (boot 10q): the station's power save at run time, 0 off or 1 on; read by anyone, written by root. The
 // ladder's thread tells the firmware at its next turn while the port is open (psTurn), and logs the change.
 int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
@@ -3290,11 +3297,63 @@ int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 struct sysctl_oid gOidPs;
 
+// machdep.piano_wifi_phy (boot 10r): the most wanted PHY of a join (0 legacy, 1 HT, 2 VHT); a change makes the associated
+// station leave and join again with it (level 7).
+int sysctlPhy(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(__atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE));
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming < 0 || incoming > 2) return EINVAL;
+  const uint32_t before = __atomic_exchange_n(&gPhyWanted, uint32_t(incoming), __ATOMIC_ACQ_REL);
+  if (before != uint32_t(incoming)) __atomic_store_n(&gPhyRejoinAsked, 1u, __ATOMIC_RELEASE);
+  IOLog("PianoWifi: machdep.piano_wifi_phy=%d (%s)%s\n", incoming, phyKindName(uint32_t(incoming)),
+        before != uint32_t(incoming) ? ": the station joins again with it" : ": as it was");
+  return 0;
+}
+struct sysctl_oid gOidPhy;
+
+// machdep.piano_wifi_apple80211 (boot 10r, read only): the kernel argument piano-wifi-apple80211 as the kexts read it (an
+// argument of the ADT's tail is not in kern.bootargs: boot 10q), for the airportd kick's gate.
+int sysctlApple80211(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(gArgs.apple80211);
+  return SYSCTL_OUT(req, &value, sizeof value);
+}
+struct sysctl_oid gOidApple80211;
+
 }  // namespace
 
 SYSCTL_DECL(_machdep);
 
 namespace {
+void registerPhySysctls()
+{
+  __atomic_store_n(&gPhyWanted, gArgs.phy, __ATOMIC_RELEASE);
+  gOidPhy.oid_parent = &sysctl__machdep_children;
+  gOidPhy.oid_number = OID_AUTO;
+  gOidPhy.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidPhy.oid_name = "piano_wifi_phy";
+  gOidPhy.oid_handler = sysctlPhy;
+  gOidPhy.oid_fmt = "I";
+  gOidPhy.oid_descr = "PianoWifi's most wanted PHY: 0 legacy, 1 HT, 2 VHT (root writes; the station joins again)";
+  gOidPhy.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidPhy);
+  gOidApple80211.oid_parent = &sysctl__machdep_children;
+  gOidApple80211.oid_number = OID_AUTO;
+  gOidApple80211.oid_kind = int(CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidApple80211.oid_name = "piano_wifi_apple80211";
+  gOidApple80211.oid_handler = sysctlApple80211;
+  gOidApple80211.oid_fmt = "I";
+  gOidApple80211.oid_descr = "the kernel argument piano-wifi-apple80211 as PianoWifi read it";
+  gOidApple80211.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidApple80211);
+}
+
 void registerPsSysctl()
 {
   __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
@@ -3495,9 +3554,34 @@ bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
   return true;
 }
 
+// Boot 10r: the access point's block-ack action frames (category 3: an ADDBA request asks for a receive agreement on a TID)
+// counted and the first ones logged; not answered yet (receive aggregation needs a reorder window per TID: the next piece).
+uint32_t gAddbaRequests, gBaOther;
+void baCount(uint32_t id, const uint8_t *payload, uint32_t length)
+{
+  if (id != uint32_t(kWmiEvtMgmtRx)) return;
+  WmiMgmtRx rx;
+  if (!wmiParseMgmtRx(rx, payload, length) || rx.bytes < kDot11HeaderBytes + 2) return;
+  if ((rx.frame[0] & 0xfc) != 0xd0 || rx.frame[kDot11HeaderBytes] != 3) return;   // an action frame of the block-ack category
+  const uint8_t action = rx.frame[kDot11HeaderBytes + 1];
+  if (action != 0) {
+    ++gBaOther;
+    return;
+  }
+  ++gAddbaRequests;
+  if (gAddbaRequests <= 4 && rx.bytes >= kDot11HeaderBytes + 9) {
+    const uint8_t *b = rx.frame + kDot11HeaderBytes;
+    const uint32_t params = uint32_t(b[3] | b[4] << 8);
+    note("level 7: the access point asks for a block-ack agreement (request %u): TID %u, window %u, A-MSDU %u; not answered "
+         "(receive aggregation is the next piece)",
+         gAddbaRequests, (params >> 2) & 0xf, (params >> 6) & 0x3ff, params & 1);
+  }
+}
+
 bool staHook(void *, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t now)
 {
   if (level8Event(id, payload, length)) return true;
+  baCount(id, payload, length);
   if (bgScanEvent(id, payload, length)) return true;
   return staOnEvent(gSta, id, payload, length, now);
 }
@@ -4006,13 +4090,16 @@ __attribute__((noinline)) void level8Rates(uint64_t now, const char *why)
   gRates.txAcked = st.txAcked;
   gRates.txNotAcked = st.txNotAcked;
   const VdevCounters &v = gVdevCounters;
-  if (v.seen)
-    note("level 8 %s: the firmware's device counters (answer %u of %u, a record of %u bytes): SNR beacons %u data %u, out %u "
-         "(retries %u, failures %u, not acked %u, RTS %u/%u failed), in %u (errors %u, discarded %u), the last rate %u, the "
-         "last beacon %d",
-         why, v.answers, v.asked, v.recordBytes, v.beaconSnr, v.dataSnr, v.txFrames, v.retries, v.failures, v.notAcked,
-         v.rtsFail, v.rtsFail + v.rtsOk, v.rxFrames, v.rxErrors, v.rxDiscards, v.txRate, int(v.beaconRssi));
-  else if (gArgs.l8stats)
+  if (v.seen) {
+    // (boot 10q: the SNR words are signed, "4294967257" was -39; the firmware answers each request with two events)
+    note("level 8 %s: the firmware's device counters (%u event(s) for %u request(s), records of %u bytes): beacons %d dB, data "
+         "%d dB, out %u (retries %u, failures %u, not acked %u), in %u (errors %u, discarded %u)",
+         why, v.answers, v.asked, v.recordBytes, int32_t(v.beaconSnr), int32_t(v.dataSnr), v.txFrames, v.retries, v.failures,
+         v.notAcked, v.rxFrames, v.rxErrors, v.rxDiscards);
+    note("level 8 %s: the firmware's device counters: RTS %u failed of %u, the last transmit rate %u, the last beacon %d; "
+         "block-ack requests from the access point %u (other block-ack frames %u); the PHY %s",
+         why, v.rtsFail, v.rtsFail + v.rtsOk, v.txRate, int(v.beaconRssi), gAddbaRequests, gBaOther, phyKindName(gSta.phy.kind));
+  } else if (gArgs.l8stats)
     note("level 8 %s: the firmware's device counters: no answer yet (%u asked for)", why, v.asked);
 }
 
@@ -4700,6 +4787,32 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
   }
 }
 
+// Boot 10r: the join's HT/VHT choice logged once its device is started, and a change of machdep.piano_wifi_phy turned into a
+// leave (our deauthentication) that the rejoin follows with the new wish.
+uint64_t gPhyNotedJoin;   // the join (its machine's start time) whose choice was logged
+__attribute__((noinline)) void phyTurn(uint64_t now, bool stopping)
+{
+  if (gSta.vdevStartSent && gPhyNotedJoin != gSta.began) {
+    gPhyNotedJoin = gSta.began;
+    const PhyChoice &c = gSta.phy;
+    note("level 7: the PHY: %s (wanted %s%s%s), mode %u, %s (centre %u MHz), %u stream(s), %u HT rate(s), peer flags %#x, rate "
+         "caps %#x",
+         phyKindName(c.kind), phyKindName(gSta.options.phy), c.why[0] ? ": " : "", c.why, c.phyMode,
+         c.bw80 ? "80 MHz" : c.bw40 ? (c.ht40Above ? "40 MHz above" : "40 MHz below") : "20 MHz",
+         c.centerFreq ? c.centerFreq : gSta.choice.freq, c.nss, c.htRateCount, c.peerFlags, c.rateCaps);
+    if (c.kind != kPhyLegacy)
+      note("level 7: the PHY's peer: HT caps %#x, VHT caps %#x, A-MPDU up to %u bytes, spacing %u us, VHT maps rx %#x tx %#x",
+           c.htCaps, c.vhtCaps, c.maxMpdu, c.mpduDensity, c.vhtRxMcs, c.vhtTxMcs);
+  }
+  if (__atomic_load_n(&gPhyRejoinAsked, __ATOMIC_ACQUIRE) && !stopping && gSta.step == kStaAssociated) {
+    __atomic_store_n(&gPhyRejoinAsked, 0u, __ATOMIC_RELEASE);
+    note("level 7: machdep.piano_wifi_phy=%u (%s): the station leaves its association (our deauthentication) and joins again "
+         "with it",
+         __atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE), phyKindName(__atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE)));
+    staStop(gSta, now);
+  }
+}
+
 // The radio powered down between two passes (level 8's restart): WLAN_EN low and PERST# asserted, the PCIe NoC's vote and the
 // rails' owner bit given back while this driver holds them, and the link's state renewed (stopRadio's teardown looks at it:
 // nothing may reach the endpoint's registers any more).
@@ -4878,6 +4991,7 @@ int level7(IOService *owner)
     env.reoq = (joins % 2 == 0 && gStaReoq2.va) ? gStaReoq2 : gStaReoq;
   }
   profileBeforeJoin(joins == 1 ? "at the join's start" : "before the rejoin");
+  o.phy = __atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE);
   staBeginOnce(o, env, nowMs());
   gLink.hook = staHook;
   uint32_t generation = 0;
@@ -4902,6 +5016,7 @@ int level7(IOService *owner)
       restartTurn(owner, now, firstOpenAt, stopping);
       bgScanTurn(owner, now, firstOpenAt, stopping);
     }
+    phyTurn(now, stopping);
     if (gArgs.dropTest && !gDropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
         gSta.step == kStaAssociated) {
       gDropDone = true;   // once a boot (a restart's pass does not drop again)
@@ -5188,6 +5303,7 @@ bool PianoWifi::start(IOService *provider)
   if (gArgs.level >= 6) netRegister();
   if (gArgs.level >= 8) portRegister();
   if (gArgs.level >= 8) registerPsSysctl();
+  if (gArgs.level >= 6) registerPhySysctls();
   // From level 2 on something is powered, so the driver joins the power tree: its kOff stops the radio (the power contract,
   // package/include/PianoPowerContract.h). Below level 2 nothing of the chip is on and there is nothing to do.
   if (gArgs.level >= 2) {

@@ -829,6 +829,25 @@ constexpr uint32_t kWmiChanListAppend = 1u << 0;
 constexpr unsigned kWmiChanListMax = 58;          // channels per command, as this firmware's own host sends them
 // Radio modes of the channel and the peer: legacy only at this level (no HT, VHT or HE element goes out in the association).
 constexpr uint32_t kWmiModeLegacy5 = 0, kWmiModeLegacy24 = 1, kWmiModeLegacy24Cck = 2;
+// HT and VHT (level 7's piano-wifi-phy, boot 10r; 10q's legacy association capped TCP at about 24 Mbit/s, the 54 Mbit/s
+// rate's): the firmware's modes for them (its list counts on from the legacy ones), its peer flags, the rate-control
+// capabilities of a peer, the channel's HT40-above bit, and 802.11's elements and fields.
+constexpr uint32_t kWmiModeHt20 = 4, kWmiModeHt20G = 5, kWmiModeHt40 = 6, kWmiModeHt40G = 7, kWmiModeVht20 = 8,
+                   kWmiModeVht40 = 9, kWmiModeVht80 = 10;
+constexpr uint32_t kWmiPeerFlagHt = 0x1000, kWmiPeerFlag40 = 0x2000, kWmiPeerFlagStbc = 0x8000, kWmiPeerFlagLdpc = 0x10000,
+                   kWmiPeerFlagDynMimoPs = 0x20000, kWmiPeerFlagStaticMimoPs = 0x40000, kWmiPeerFlagSpatialMux = 0x200000,
+                   kWmiPeerFlagVht = 0x02000000, kWmiPeerFlag80 = 0x04000000;
+constexpr uint32_t kWmiRcDs = 0x01, kWmiRcCw40 = 0x02, kWmiRcSgi = 0x04, kWmiRcHt = 0x08, kWmiRcTxStbc = 0x20,
+                   kWmiRcRxStbcShift = 6, kWmiRcTs = 0x200;
+constexpr uint32_t kWmiChanInfoHt40Plus = 1u << 6;
+constexpr uint32_t kDot11ElementVhtCap = 191, kDot11ElementVhtOperation = 192;
+constexpr uint32_t kDot11HtCapBytes = 26, kDot11VhtCapBytes = 12;
+constexpr uint16_t kDot11HtCapLdpc = 0x0001, kDot11HtCap40 = 0x0002, kDot11HtCapSmPsMask = 0x000c, kDot11HtCapSmPsDisabled = 0x000c,
+                   kDot11HtCapSmPsStatic = 0x0000, kDot11HtCapSmPsDynamic = 0x0004, kDot11HtCapSgi20 = 0x0020,
+                   kDot11HtCapSgi40 = 0x0040, kDot11HtCapTxStbc = 0x0080, kDot11HtCapRxStbcMask = 0x0300;
+constexpr uint32_t kDot11HtCapRxStbcShift = 8;
+constexpr uint32_t kDot11VhtCapRxLdpc = 0x10, kDot11VhtCapSgi80 = 0x20, kDot11VhtCapTxStbc = 0x80, kDot11VhtCapRxStbc1 = 0x100,
+                   kDot11VhtCapAmpduShift = 23, kDot11VhtCapAmpduMask = 7u << 23;
 // The channels level 7 may put in that list, as centre frequencies: the 2.4 GHz band's 13 and the 5 GHz band's 25 (36-64,
 // 100-144, 149-165); the regulatory event's rules decide which go out and which are passive or radar channels.
 constexpr uint32_t kAssocChannels24[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472};

@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "WifiHw.h"
 #include "WifiWmi.h"
+#include "WifiHtVht.h"
 
 namespace pianowifi {
 
@@ -112,6 +113,8 @@ struct AssocRequest {
   // the spectrum-management pair (5 GHz, when the network sets capability bit 8): our power range and the channels we have
   int8_t minPowerDbm = 0, maxPowerDbm = 20;
   uint8_t firstChannel = 36, channelCount = 0;
+  // boot 10r: this station's HT and VHT capability elements and WMM's information element (what WifiHtVht.h chose)
+  bool ht = false, vht = false, wmm = false;
 };
 
 // The capability field a station sends: an ESS station, privacy when the network has it, short preamble and short slot time
@@ -136,7 +139,8 @@ inline uint32_t dot11BuildAssocRequest(uint8_t *f, uint32_t capacity, const Asso
   const uint32_t supported = rateCount > 8 ? 8 : rateCount, extended = rateCount - supported;
   const bool spectrum = r.band5 && (r.net->capability & kDot11CapSpectrumMgmt) && r.channelCount;
   uint32_t bytes = kDot11HeaderBytes + 4 + 2 + r.ssidLength + 2 + supported + (extended ? 2 + extended : 0) +
-                   (r.rsn ? 2 + 20 : 0) + (spectrum ? 4 + 4 : 0);
+                   (r.rsn ? 2 + 20 : 0) + (spectrum ? 4 + 4 : 0) + (r.ht ? 2 + kDot11HtCapBytes : 0) +
+                   (r.vht ? 2 + kDot11VhtCapBytes : 0) + (r.wmm ? 2 + 7 : 0);
   if (capacity < bytes) return 0;
   header(f, kDot11AssocRequest, r.bssid, r.own, r.bssid, r.seq);
   uint32_t at = kDot11HeaderBytes;
@@ -186,6 +190,35 @@ inline uint32_t dot11BuildAssocRequest(uint8_t *f, uint32_t capacity, const Asso
     suite(r.akm);
     put16(f + at, 0);
     at += 2;
+  }
+  // HT's capability (after RSN, in the standard's order), then VHT's, then WMM's information element (a vendor element, last)
+  if (r.ht) {
+    f[at++] = kDot11ElementHtCap;
+    f[at++] = kDot11HtCapBytes;
+    uint8_t *body = f + at;
+    for (uint32_t i = 0; i < kDot11HtCapBytes; ++i) body[i] = 0;
+    put16(body, kOwnHtCap);
+    body[2] = kOwnAmpduParams;
+    body[3] = 0xff;                      // receive MCS 0-7
+    body[4] = 0xff;                      // and 8-15
+    body[3 + 12] = 0x01;                 // the transmit MCS set is defined (and the same)
+    at += kDot11HtCapBytes;
+  }
+  if (r.vht) {
+    f[at++] = kDot11ElementVhtCap;
+    f[at++] = kDot11VhtCapBytes;
+    uint8_t *body = f + at;
+    put16(body, uint16_t(kOwnVhtCap & 0xffff));
+    put16(body + 2, uint16_t(kOwnVhtCap >> 16));
+    put16(body + 4, kOwnVhtMcsMap);      // receive MCS map, the highest rate left to the map
+    put16(body + 6, 0);
+    put16(body + 8, kOwnVhtMcsMap);      // transmit
+    put16(body + 10, 0);
+    at += kDot11VhtCapBytes;
+  }
+  if (r.wmm) {
+    const uint8_t wmm[9] = {uint8_t(kDot11ElementVendor), 7, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00};   // version 1, no U-APSD
+    for (uint8_t b : wmm) f[at++] = b;
   }
   return at;
 }

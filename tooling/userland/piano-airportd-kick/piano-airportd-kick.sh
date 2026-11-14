@@ -11,9 +11,10 @@ say() {
   echo "piano-airportd-kick: $*" > /dev/console 2> /dev/null
 }
 # Without the kernel argument the job ends at once (review of today's merges, #7: the 300 s wait walked the registry once a
-# second through every default boot's busiest minutes, for nothing).
-case " $(/usr/sbin/sysctl -n kern.bootargs 2> /dev/null) " in
-*" piano-wifi-apple80211="[1-9]*) ;;
+# second through every default boot's busiest minutes, for nothing). The argument as PianoWifi read it: its sysctl
+# machdep.piano_wifi_apple80211 (boot 10q: an argument of the ADT's tail is not in kern.bootargs, which carried 1 of 6).
+case "$(/usr/sbin/sysctl -n machdep.piano_wifi_apple80211 2> /dev/null)" in
+[1-9]*) ;;
 *) exit 0 ;;
 esac
 i=0

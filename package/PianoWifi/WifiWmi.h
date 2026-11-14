@@ -469,6 +469,10 @@ struct ScanEntry {
   ScanSecurity security;
   uint8_t rsnElement[64] = {};      // the RSN element whole (identifier, length, body) for level 8's 802.1X port; 0 bytes when
   uint8_t rsnElementLength = 0;     // there is none or it is longer than this (the handshake's check then has nothing to compare)
+  // HT, VHT and WMM (level 7's piano-wifi-phy, boot 10r): the elements' bodies as the frame carried them (the HT operation's
+  // first two bytes, the VHT operation's first three), and whether the network speaks WMM (QoS: HT needs it)
+  uint8_t htCap[26] = {}, htOp[2] = {}, vhtCap[12] = {}, vhtOp[3] = {};
+  bool htCapSeen = false, htOpSeen = false, vhtCapSeen = false, vhtOpSeen = false, wmm = false;
 };
 
 struct ScanList {
@@ -608,11 +612,29 @@ inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length
       }
     } else if (id == kDot11ElementHtCap) {
       out.ht = true;
+      if (bytes >= kDot11HtCapBytes) {
+        for (uint32_t i = 0; i < kDot11HtCapBytes; ++i) out.htCap[i] = body[i];
+        out.htCapSeen = true;
+      }
     } else if (id == kDot11ElementHtOperation && bytes >= 1) {
       out.htPrimary = body[0];
+      if (bytes >= 2) {
+        out.htOp[0] = body[0];
+        out.htOp[1] = body[1];
+        out.htOpSeen = true;
+      }
+    } else if (id == kDot11ElementVhtCap && bytes >= kDot11VhtCapBytes) {
+      for (uint32_t i = 0; i < kDot11VhtCapBytes; ++i) out.vhtCap[i] = body[i];
+      out.vhtCapSeen = true;
+    } else if (id == kDot11ElementVhtOperation && bytes >= 3) {
+      for (uint32_t i = 0; i < 3; ++i) out.vhtOp[i] = body[i];
+      out.vhtOpSeen = true;
     } else if (id == kDot11ElementVendor && bytes >= 4 && body[0] == 0x00 && body[1] == 0x50 && body[2] == 0xf2 &&
                body[3] == 0x01) {
       out.security.wpa1 = true;
+    } else if (id == kDot11ElementVendor && bytes >= 5 && body[0] == 0x00 && body[1] == 0x50 && body[2] == 0xf2 &&
+               body[3] == 0x02 && body[4] <= 1) {
+      out.wmm = true;   // WMM's information (0) or parameter (1) element
     }
     at += 2 + bytes;
   }
@@ -680,6 +702,24 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
       have.rsnElementLength = found.rsnElementLength;
       for (unsigned k = 0; k < sizeof have.rsnElement; ++k) have.rsnElement[k] = found.rsnElement[k];
     }
+    if (found.htCapSeen) {
+      for (unsigned k = 0; k < sizeof have.htCap; ++k) have.htCap[k] = found.htCap[k];
+      have.htCapSeen = true;
+    }
+    if (found.htOpSeen) {
+      have.htOp[0] = found.htOp[0];
+      have.htOp[1] = found.htOp[1];
+      have.htOpSeen = true;
+    }
+    if (found.vhtCapSeen) {
+      for (unsigned k = 0; k < sizeof have.vhtCap; ++k) have.vhtCap[k] = found.vhtCap[k];
+      have.vhtCapSeen = true;
+    }
+    if (found.vhtOpSeen) {
+      for (unsigned k = 0; k < sizeof have.vhtOp; ++k) have.vhtOp[k] = found.vhtOp[k];
+      have.vhtOpSeen = true;
+    }
+    have.wmm = have.wmm || found.wmm;
     if (isProbe) ++have.probes;
     else ++have.beacons;
     return &have;

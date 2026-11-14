@@ -306,6 +306,8 @@ inline void chanListFallback(ChanList &list, bool with5GHz)
 // --------------------------------------------------------------------------------------------- 704: the station started
 struct VdevStart {
   uint32_t vdevId = 0, freq = 0, mode = kWmiModeLegacy5;
+  uint32_t centerFreq = 0;                 // boot 10r: the operating width's centre (0: the channel's own)
+  bool allowHt = false, allowVht = false, ht40Above = false;
   uint32_t beaconIntervalTu = 100, dtimPeriod = 1;
   uint32_t txStreams = 1, rxStreams = 1;
   int32_t maxPowerDbm = 20;
@@ -335,9 +337,12 @@ inline uint32_t assocBuildVdevStart(WmiWriter &w, uint8_t *buffer, uint32_t capa
     uint32_t info = start.mode & kWmiChanInfoModeMask;
     if (start.passive) info |= kWmiChanInfoPassive;
     if (start.radar) info |= kWmiChanInfoDfs;
+    if (start.allowHt) info |= kWmiChanInfoAllowHt;
+    if (start.allowVht) info |= kWmiChanInfoAllowVht;
+    if (start.ht40Above && (start.mode == kWmiModeHt40 || start.mode == kWmiModeHt40G)) info |= kWmiChanInfoHt40Plus;
     const uint32_t power = uint32_t(uint8_t(start.maxPowerDbm));
     wmiPut(channel, 0, start.freq);
-    wmiPut(channel, 1, start.freq);
+    wmiPut(channel, 1, start.centerFreq ? start.centerFreq : start.freq);
     wmiPut(channel, 2, 0);
     wmiPut(channel, 3, info);
     wmiPut(channel, 4, power << 8 | power << 16);   // a started device's powers are whole dBm
@@ -544,6 +549,12 @@ struct PeerAssoc {
   uint32_t legacyRateCount = 0;
   uint32_t phyMode = kWmiModeLegacy5;
   bool qos = false, needPtk4Way = true, needGtk2Way = false, pmf = false, newAssoc = true;
+  // boot 10r: HT and VHT (WifiHtVht.h's choice; all zero for a legacy peer)
+  uint32_t htFlags = 0, htCaps = 0, maxMpdu = 0, mpduDensity = 0, rateCaps = 0, nss = 1, vhtCaps = 0;
+  uint8_t htRates[16] = {};
+  uint32_t htRateCount = 0;
+  bool vht = false;
+  uint32_t vhtRxMaxRate = 0, vhtRxMcs = 0, vhtTxMaxRate = 0, vhtTxMcs = 0;
 };
 
 // The command: the fixed structure, the legacy rates as bytes, an empty HT rate array, the VHT rate set structure (all zero
@@ -565,20 +576,36 @@ inline uint32_t assocBuildPeerAssoc(WmiWriter &w, uint8_t *buffer, uint32_t capa
     else flags |= kWmiPeerFlagAuth;      // an open network has nothing to wait for
     if (assoc.needGtk2Way) flags |= kWmiPeerFlagNeedGtk2Way;
     if (assoc.pmf) flags |= kWmiPeerFlagPmf;
+    // the HT and VHT flags only with QoS (the firmware's own host sets them only for a WMM peer), and HT only with rates (an
+    // HT peer without them makes the firmware assert)
+    if (assoc.qos && assoc.htRateCount) flags |= assoc.htFlags;
     wmiPut(cmd, 5, flags);
     wmiPut(cmd, 6, assoc.capability);
     wmiPut(cmd, 7, assoc.listenInterval);
-    wmiPut(cmd, 12, 1);                  // one spatial stream
+    wmiPut(cmd, 8, assoc.htCaps);
+    wmiPut(cmd, 9, assoc.maxMpdu);
+    wmiPut(cmd, 10, assoc.mpduDensity);
+    wmiPut(cmd, 11, assoc.rateCaps);
+    wmiPut(cmd, 12, assoc.nss ? assoc.nss : 1);
+    wmiPut(cmd, 13, assoc.vhtCaps);
     wmiPut(cmd, 14, assoc.phyMode);
     wmiPut(cmd, 17, assoc.legacyRateCount);
-    wmiPut(cmd, 18, 0);                  // no HT rates: a legacy peer
+    wmiPut(cmd, 18, assoc.htRateCount);
   }
   const uint32_t padded = (assoc.legacyRateCount + 3u) & ~3u;
   uint8_t *rates = wmiTlv(w, kWmiTagArrayByte, padded);
   if (rates)
     for (uint32_t i = 0; i < assoc.legacyRateCount && i < sizeof assoc.legacyRates; ++i) rates[i] = assoc.legacyRates[i];
-  (void)wmiTlv(w, kWmiTagArrayByte, 0);                              // no HT rates
-  (void)wmiStruct(w, kWmiTagVhtRateSet, kWmiVhtRateSetWords);        // zeroed: no VHT
+  uint8_t *htRates = wmiTlv(w, kWmiTagArrayByte, (assoc.htRateCount + 3u) & ~3u);
+  if (htRates)
+    for (uint32_t i = 0; i < assoc.htRateCount && i < sizeof assoc.htRates; ++i) htRates[i] = assoc.htRates[i];
+  uint8_t *vht = wmiStruct(w, kWmiTagVhtRateSet, kWmiVhtRateSetWords);   // zeroed for a peer without VHT
+  if (vht && assoc.vht) {
+    wmiPut(vht, 0, assoc.vhtRxMaxRate);
+    wmiPut(vht, 1, assoc.vhtRxMcs);
+    wmiPut(vht, 2, assoc.vhtTxMaxRate);
+    wmiPut(vht, 3, assoc.vhtTxMcs);
+  }
   (void)wmiTlv(w, kWmiTagArrayStruct, 0);                            // no HE rate sets
   (void)wmiTlv(w, kWmiTagArrayStruct, 0);                            // no multi-link parameters
   (void)wmiTlv(w, kWmiTagArrayStruct, 0);                            // no EHT rate sets
