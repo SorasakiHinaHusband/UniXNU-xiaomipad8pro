@@ -329,6 +329,9 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-restarts=N` | 6 | at most N restarts in a row without the port opening in between; then the radio stays down until the next wake |
 | `piano-wifi-fastrestart=0` | 1 | every restart scans as the boot does (level 6's two passive scans, about 5 s). By default a restart at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and channel, the join's own copy; its name is never logged); a fast join that does not open the port ends the pass, and the next restart scans. 10 s after a fast join's port opens, one passive background scan of every channel runs beside the association and its list is published (`piano-wifi-scan`, the Wi-Fi menu's and every registry reader's source), so a fast pass never leaves the boot's list in place |
 | `piano-wifi-haltwatch=1` | 0 (since 10p; 1 in 10n-10p) | a probe of the shutdown: from this driver's shutdown notice a helper thread names at +8 s and +20 s the services whose shutdown is not acknowledged (the power manager's `PMShutdown` property) and the power-plane services with a power change in progress (`MachineState`). Boot 10o answered it (0 and 0 of 15): it is off by default, so that a default boot does not walk the registry during its halt; a later shutdown notice arms it again once a watch has ended |
+| `piano-wifi-ps=1`, `piano-wifi-psidle=MS` | 0, 200 | the station's power save once the port is open: the firmware dozes between beacons after MS without traffic (`WMI_STA_POWERSAVE_MODE` on after the inactivity time `WMI_STA_PS_PARAM_INACTIVITY_TIME`, the way the chip's own host turns it on). At run time: `sudo sysctl machdep.piano_wifi_ps=1` (or `=0`); every change is logged (`level 8: power save on (...)`), and level 7 turns it off at each join, so a new association starts from off and is told again |
+| `piano-wifi-l8stats=0` | 1 | no firmware device counters with the status lines. By default each status asks for them (`WMI_REQUEST_STATS` of the device's kind; printed with the next status: SNR of the beacons and the data, frames out with their retries, failures and frames not acknowledged, RTS, frames in with errors and discards, the last transmit rate and beacon RSSI as the firmware gives them, and the record's measured size), and the rates in and out over the interval come from this host's own counts |
+| `piano-wifi-bgscan=S` | 120 with `piano-wifi-apple80211=1`, else 0 | a background scan every S s (at least 30) while associated, its list published for the Wi-Fi menu's snapshot; 0: only a fast pass's one. A list is published only from a scan that ran to its end, and on a fast pass only when it grew past the seeded entry: a refusal, a timeout or a stop keeps the list published before (`... not published: the list published before stays`) |
 | `piano-wifi-crashtest=S` | 0 | a test: S s after the port first opens on a pass a restart began, the chip is asked once for its crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one unattended boot shows the restart after a crash |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
@@ -1431,6 +1434,28 @@ profile's source (§13.2); #7, the airportd kick ends at once without `piano-wif
 ladder that never leaves its teardown at a shutdown leaves the radio powered into the restart (inferred: the restart's reset of
 the pins takes WLAN_EN low; the next boot's level 2 powers it up from scratch either way) — accepted, as stopRadio must not
 write under the ladder's registers.
+
+**10p scored on 2026-11-14 (`private/host-checks/20261114-10p/SCORE.md`): everything that ran passed** (en0 Wi-Fi's by default,
+the fast restarts, the review fixes); merged into main as `28d4591`.
+
+**Boot 10q: daily use on battery** (built 2026-11-14 from branch commit `a003ea4` (main `28d4591` merged), the 0067 kernel, collection
+`fdb88631...`, the v5 recipe, 237281280 bytes, `verify-ram-images.py` PASS: `out/ram-k273-wifi-10q` sha256 `5bcca0163e105d11b7f1e3fb14af33332385a279564fbe4ae109b5d7cc62ef3b`). Arguments: the v5 line's
+(`piano-wifi-l8status=5000` for a probe), `piano-sleep=1 piano-sleep-test=960 piano-sleep-max=60 piano-wifi-bgscan=900`, `piano-reset-after=1500`;
+the power save is flipped at run time (`machdep.piano_wifi_ps`). The Mac-side steps are a script (`q10q-tests.sh`, kept with the
+run-books): throughput both ways with the tablet's own `nc` listening and the Mac connecting to the tablet's Wi-Fi address (the
+route's interface printed, never an address), then the power save's A/B (off, on, off: 150 s idle each, 30 pings to the router,
+a 10 s receive), then the test sleep.
+
+| When | Line / command | Expected |
+|---|---|---|
+| port open + 10 s (`piano-wifi-bgscan=900`) | `level 7: a background scan beside the association (...): N channel(s), asked for`, then `level 7: the background scan ended after N ms: K network(s) in the list (L before it), published` | answers whether the firmware scans while associated (K at least L; `was refused at its start` or `ran out of time` if not, the list kept) |
+| the user space's boot arguments | the script's `kern.bootargs carries N piano-wifi argument(s)` | N as the image's (the airportd kick's gate reads them) |
+| the throughput | the Mac's `tput rx` / `tput tx` lines (Mbit/s, the Mac's interface); the status lines `level 8 while associated: over the last N ms: in X kbit/s (F frames), out Y kbit/s (...)` during them | the rates; no `crash:` |
+| the counters | `level 8 while associated: the firmware's device counters (answer N of M, a record of B bytes): SNR beacons ... data ..., out ... (retries ..., failures ..., not acked ..., RTS ...), in ... (errors ..., discarded ...), the last rate R, the last beacon S` | B = 164 (41 words); if not, the layout differs and the values are not to be read |
+| `sysctl machdep.piano_wifi_ps=1` | `PianoWifi: machdep.piano_wifi_ps=1: power save on at the ladder's next turn ...`, then `level 8: power save on (the station's mode 1, dozing after the inactivity time), association generation G, change 1` | within a second |
+| the three phases | PianoPower's `[Ns] charging: ... system ~W W` lines in each 150 s idle (the phases' uptimes in the script's log); the ping statistics (min/avg/max) and the 10 s receive per phase | ps=1: lower system watts or battery drain at idle, higher ping latency, the receive about the same |
+| `=0` | `level 8: power save off (the station's mode 0), ...` | — |
+| the test sleep (960 s) | the wake's fast restart (`(the wake from a system sleep): Wi-Fi is back ...`), then `level 7: a background scan beside the association (...): N channel(s), asked for` and `level 7: the background scan ended after N ms: K network(s) in the list, published` (or `ran out of time`: the firmware refused or ignored a scan while associated), and `piano-wifi-scan-summary` with K networks | K > 1 |
 
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
