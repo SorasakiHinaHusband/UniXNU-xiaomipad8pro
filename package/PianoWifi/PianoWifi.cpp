@@ -129,7 +129,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
-  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats;
+  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS;
 };
 Args gArgs;
 
@@ -308,6 +308,10 @@ void readArgs()
   gArgs.psIdleMs = bootArg("piano-wifi-psidle", 200);
   if (!gArgs.psIdleMs || gArgs.psIdleMs > 10000) gArgs.psIdleMs = 200;
   gArgs.l8stats = bootArg("piano-wifi-l8stats", 1);
+  // piano-wifi-bgscan=S (review of ee9980a, #3): a background scan every S s while associated, its list published for the
+  // menu's snapshot; by default 120 with the menu binding on (piano-wifi-apple80211=1), 0 (only a fast pass's one) without.
+  gArgs.bgScanS = bootArg("piano-wifi-bgscan", bootArg("piano-wifi-apple80211", 0) ? 120 : 0);
+  if (gArgs.bgScanS && gArgs.bgScanS < 30) gArgs.bgScanS = 30;
   if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
 
@@ -3164,8 +3168,8 @@ void stopRadio(const char *why)
 
 // A system sleep with piano-wifi-sleepoff=2: the ladder's thread is asked to stop (every level's waits end, level 7 tears its
 // join down with 300 ms per answer), powers the radio down and parks; this waits for that (3.5 s at most, inside the power
-// hook's 4 s) and, should it not come, puts WLAN_EN low and PERST# asserted itself. The join profile is kept: the wake's
-// restart joins again from it.
+// hook's 4 s); should it not come, the radio is left to the ladder (which parks it when it runs again: nothing is written under
+// its register writes). The join profile is kept: the wake's restart joins again from it.
 volatile uint32_t gParked;
 // The number of the last system sleep the ladder parked the radio for: it only ever grows, so the hook below cannot miss it the
 // way it could miss gParked's short 1 (review of 2026-11-14, F1: a park and a wake in the same turn of the ladder's loop).
@@ -3247,6 +3251,12 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   gProfileFromFile = false;   // the sysctl's (the next look at the file compares it with this one)
   const uint32_t generation = ++gProfileGeneration;
   IOLockUnlock(gProfileLock);
+  // (review of ee9980a, #2) a file already read would otherwise not be looked at again until its stamp changes, and this
+  // profile would stand against the supplicant's key from the file: the next look reads the file whatever its stamp
+  gProfileStampValid = false;
+  if (gArgs.l7file)
+    note("join profile set through the sysctl: when the root-only file exists, it is read at the next look and, if it "
+         "differs, replaces this one (the file is the profile's source: the supplicant derives the key from it)");
   note("join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s, the station's address %s "
        "(none of it is logged)",
        generation, unsigned(incoming.ssid_len), piano_wifi_security_name(incoming.security),
@@ -3470,14 +3480,17 @@ bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length);
 // beside the association (the firmware leaves the channel between its beacons), its frames fill the link's list as level 6's
 // do, and the list is published at its end.
 enum : uint32_t { kBgScanNone = 0, kBgScanArmed, kBgScanSent, kBgScanOver };
-uint32_t gBgScan;
-bool gBgScanDone;
-uint64_t gBgScanAt;
+uint32_t gBgScan, gBgScanIdNow, gBgScanSeed, gBgScanCount;
+bool gBgScanDone, gBgScanRefused;
+uint64_t gBgScanAt, gBgScanNext;
 bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
 {
-  if (id != uint32_t(kWmiEvtScan) || gBgScan != kBgScanSent) return false;
+  if (id != uint32_t(kWmiEvtScan)) return false;
   WmiScanEvent ev;
-  if (!wmiParseScanEvent(ev, payload, length) || ev.scanId != kBgScanId) return false;
+  // both background ids are taken (a late event of a scan an earlier pass left behind ends nothing of this one: review #5)
+  if (!wmiParseScanEvent(ev, payload, length) || (ev.scanId != kBgScanId && ev.scanId != kBgScanId + 1)) return false;
+  if (gBgScan != kBgScanSent || ev.scanId != gBgScanIdNow) return true;
+  if (ev.type & kWmiScanEvStartFailed) gBgScanRefused = true;
   if (ev.type & (kWmiScanEvCompleted | kWmiScanEvDequeued | kWmiScanEvStartFailed)) gBgScanDone = true;
   return true;
 }
@@ -4643,10 +4656,14 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
 
 __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64_t openedAt, bool stopping)
 {
+  // (review of ee9980a, #3) with the menu binding on (piano-wifi-apple80211), a scan again every piano-wifi-bgscan s while
+  // associated, so that the menu's snapshot follows the networks around; without it only the fast pass's one
+  if (gBgScan == kBgScanOver && gArgs.bgScanS && gBgScanNext && now >= gBgScanNext && !stopping) gBgScan = kBgScanArmed;
   if (gBgScan == kBgScanArmed && !stopping && gSta.step == kStaAssociated && now >= openedAt + 10000) {
     static WmiScanRequest request;   // a few hundred bytes: not on the ladder's stack
     request = gLink.request;         // level 6's channels (the regulatory list's), its dwell times
-    request.scanId = kBgScanId;
+    gBgScanIdNow = kBgScanId + (gBgScanCount & 1u);   // the two ids in turn: a late event of the last one ends nothing
+    request.scanId = gBgScanIdNow;
     request.vdevId = gLink.options.vdevId;
     request.passive = true;
     request.ssidLength = 0;
@@ -4657,19 +4674,29 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     const uint32_t n = wmiBuildStartScan(w, gL8Out, sizeof gL8Out, request);
     const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
     if (rc == 0) return;   // the transport is busy: the next turn
-    gBgScanDone = false;
+    gBgScanDone = gBgScanRefused = false;
     gBgScanAt = now;
+    gBgScanSeed = gLink.scan.count;
+    ++gBgScanCount;
     gBgScan = rc == 1 ? kBgScanSent : kBgScanOver;
+    gBgScanNext = gArgs.bgScanS ? now + uint64_t(gArgs.bgScanS) * 1000 : 0;
     note("level 7: a background scan beside the association (the fast restart published no list): %u channel(s), %s",
          request.channelCount, rc == 1 ? "asked for" : "NOT sent (the command could not be built or was refused)");
     return;
   }
   if (gBgScan == kBgScanSent && (gBgScanDone || now > gBgScanAt + gArgs.scanWaitMs + 3000 || stopping)) {
     gBgScan = kBgScanOver;
-    note("level 7: the background scan %s after %llu ms: %u network(s) in the list, published",
-         gBgScanDone ? "ended" : stopping ? "was cut short by the stop" : "ran out of time",
-         (unsigned long long)(now - gBgScanAt), gLink.scan.count);
-    publishScan(owner, gLink.scan, gArgs.bssid != 0);
+    // (review of ee9980a, #1 and #6) a list is published only from a scan that ran to its end and found more than it began
+    // with; a refusal, a timeout or a stop keeps the list published before (a fast pass's one seeded entry must never replace
+    // the boot's whole list)
+    // (a list that began with more than the fast pass's one seeded entry is published refreshed even when it did not grow: its
+    // entries' signals and ages are the scan's)
+    const bool publish = gBgScanDone && !gBgScanRefused && (gLink.scan.count > gBgScanSeed || gBgScanSeed > 1);
+    note("level 7: the background scan %s after %llu ms: %u network(s) in the list (%u before it), %s",
+         gBgScanRefused ? "was refused at its start" : gBgScanDone ? "ended" : stopping ? "was cut short by the stop" : "ran out of time",
+         (unsigned long long)(now - gBgScanAt), gLink.scan.count, gBgScanSeed,
+         publish ? "published" : "not published: the list published before stays");
+    if (publish) publishScan(owner, gLink.scan, gArgs.bssid != 0);
   }
 }
 
@@ -4830,7 +4857,9 @@ int level7(IOService *owner)
   uint64_t firstOpenAt = 0;
   const char *why = nullptr;
   uint32_t sendWaits = 0;
-  gBgScan = gPass.fast ? kBgScanArmed : kBgScanNone;   // a fast pass scans beside its association (bgScanTurn)
+  // a fast pass scans beside its association (bgScanTurn); with the menu binding on, every pass does, and again periodically
+  gBgScan = gPass.fast || gArgs.bgScanS ? kBgScanArmed : kBgScanNone;
+  gBgScanNext = 0;
   if (!gPass.level7At) gPass.level7At = nowMs();
   if (gPass.fast && gLastNetValid) {
     // the fast restart: the last network as the only entry of the list (level 6 did not scan)
@@ -4905,8 +4934,8 @@ int level7(IOService *owner)
       break;
     }
     if (gArgs.level >= 8) level8Turn(now);
-    // The root-only profile file, read by the kext itself while the join waits (a RAM probe's Data may have no helper); the
-    // sysctl stays the other way in, and whichever comes first is taken.
+    // The root-only profile file, read by the kext itself while the join waits (a RAM probe's Data may have no helper): when
+    // there is one, it is the profile's source (§13.2); the sysctl is the way in without one.
     if (!gSta.profileSet && gArgs.l7file && gSta.step == kStaProfileWait && now >= nextFileTry && gProfileLock) {
       nextFileTry = now + 2000;
       profileFileCheck("while the join waits");
