@@ -74,6 +74,13 @@ Offline design started 2026-11-11: B1a (DPU survey + design), B3 (sensors design
 design), B10 (video design + survey), B11 (camera design), B12 (torch, built), B9 (Bluetooth design + level 1). Each item's page
 lives in `docs/drivers/`; this table is updated when an item moves.
 
+**Last item (owner, 2026-11-15): drop the macOS-DroidVM build dependency**, after every hardware item above. Today the 27.3
+kernel tree is a clone of macOS-DroidVM's k27 tree (github.com/Droid-VM/macOS-DroidVM `11ac316`, via `PIANO_K27_TREE` and
+`tooling/k273/prepare-k27-tree.sh`) with this repository's kernel patches, its KC builder builds the collection, and
+`tooling/k27/UPSTREAM` lists the kext build glue taken from it. The work: an own XNU build environment and KC builder (or
+vendored pieces under their licences), then the `PIANO_K27_TREE` reference gone. The copyright lines of the kexts derived
+from it (NativeGopDisplay, NativeSoftGpu, NativeSoftMetal) stay as long as derived code remains.
+
 ## 4. Owner decisions (open ones: nothing proceeds on these without his word)
 
 | Item | Question | Default meanwhile |
