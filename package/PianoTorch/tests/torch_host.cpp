@@ -293,6 +293,20 @@ static void testOnOff()
   const StepResult spareOff = c.off(0x0c);
   CHECK(spareOff.ok && a.flash(kRegChanEn) == 0 && a.flash(kRegItarget0 + 2) == 0);
   CHECK(onlyFlash(a));
+  // The optional T4 diagnostic pulse uses FLASH's 12.5 mA resolution and a
+  // bounded safety timer, then the ordinary off sequence restores a safe state.
+  a.writes.clear();
+  const StepResult pulse = c.flashPulse(3, 8);
+  CHECK(pulse.ok && pulse.writes == 11 && pulse.readbacks == 11);
+  CHECK((a.flash(kRegIres) & kPianoChannelMask) == 0 && a.flash(kRegTimer0) == (kTimerEnable | 8) &&
+        a.flash(kRegTimer0 + 1) == (kTimerEnable | 8));
+  CHECK((a.flash(kRegItarget0) & kItargetMask) == 3 && (a.flash(kRegStrobe0) & kStrobeMask) == kStrobeSoftwareLevelHigh &&
+        (a.flash(kRegChanEn) & kPianoChannelMask) == kPianoChannelMask && (a.flash(kRegModuleEn) & kModuleEnBit) == kModuleEnBit);
+  const StepResult pulseOff = c.off();
+  CHECK(pulseOff.ok && a.flash(kRegChanEn) == 0 && (a.flash(kRegModuleEn) & kModuleEnBit) == 0);
+  a.writes.clear();
+  CHECK(!c.flashPulse(3, 0).ok && a.writes.empty());
+  CHECK(!c.flashPulse(3, 0x80).ok && a.writes.empty());
   // a mask above the four channels is refused before any write
   a.writes.clear();
   const StepResult wild = c.on(4, 9, 0x10);

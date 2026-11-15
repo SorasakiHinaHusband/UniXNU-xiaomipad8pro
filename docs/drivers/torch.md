@@ -6,8 +6,9 @@ instrument. Level 1 is a read-only survey, level 2 is torch control. Backlog ite
 
 ## 1. Purpose and gate
 
-A flashlight, as Ubuntu v1.1.1 has ("rear torch control, with a check tool that verifies readback and restores the previous
-setting"; Ubuntu's own status: partial, torch only, camera flash left to applications). No login milestone depends on it; it is a
+A flashlight, as the Ubuntu port has ("rear torch control, with a check tool that verifies readback and restores the previous
+setting"). Its v1.4.0 release notes also describe a timed FLASH pulse for photos and a shared green privacy LED. The port documents
+that a live V4L2 flash owner can leave torch mode on after close, so every diagnostic path has an explicit off. No login milestone depends on it; it is a
 small daily-use item and the first native driver that writes a PMIC register on purpose, so it also proves the owner-channel write
 path the later PMIC work (B4 charging policies, B6 thermistors, B7's repeater) needs.
 
@@ -105,7 +106,9 @@ tool is user-space work for later.
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
 | `piano-torch-delay` | 0 | wait first (s) |
-| `piano-torch-probe` | 0 | 1: replace the boot test with the two-window probe (below): the factory pair then the spare pair, each `piano-torch-test` s at `piano-torch-ma`, status polls every 500 ms while lit, full dumps before/after and diffs between |
+| `piano-torch-probe` | 0 | 1: replace the boot test with the T4 probe: one factory-pair window at `piano-torch-test` s, STATUS1/INT_RT_STS polls every 500 ms before/during/after, full dumps before/after and diffs |
+| `piano-torch-probe-spare` | 0 | 1: add the spare-pair mapping window from the original T4 checklist |
+| `piano-torch-flash` | 0 | 1: add one bounded 80 ms FLASH pulse after the torch window, then explicit off |
 
 ## 7. Kernel collection
 
@@ -161,13 +164,13 @@ ignored bit 2n+1), INT_RT_STS 0x10 (the fault bit whose factory meaning is open/
 five surveyed ranges, and any window on channels 3/4. Also open: the current itself — the factory drives this lamp at up to
 400 mA **a channel**; 10-25 mA a channel behind a diffuser may simply be invisible in a lit room.
 
-**T4, the probe** (next boot; `piano-torch=2 piano-torch-ma=100 piano-torch-test=8 piano-torch-probe=1 piano-torch-delay=S`, owner
-watching the rear LED in a dim room): two windows — A on channels 1+2 (the factory's pair, the real control path), B on channels
-3+4 (the spare pair, the controller directly) — each with `probe lit ...: status .. .. .. rt .. enables .. ..` logged every
-500 ms while lit, a full dump before/after, diffs between. What each line answers:
-- `probe lit A ... OPEN` or `rt 01` in window A only → the channels are open (no LED / no anode supply on ch1+2) and, if window B
-  shows the same, the whole module has no load or no supply: wiring/supply, not the driver;
-- window B lights (owner sees it) → the lamp is on channels 3+4 and the factory/Ubuntu mapping is wrong for this board;
+**T4, the probe** (next boot; `piano-torch=2 piano-torch-ma=100 piano-torch-test=15 piano-torch-probe=1 piano-torch-flash=1
+piano-torch-delay=S`, owner watching the rear LED in a dim room): window A on channels 1+2 (the factory's pair, the real control
+path) has STATUS1's open and short bits plus INT_RT_STS `0x10` logged every 500 ms before, during and after; the full 256-byte
+page is dumped before and after. `piano-torch-probe-spare=1` adds the original B channels 3+4 mapping window. What each line answers:
+- `probe during ... STATUS1=.. ch0[short=0 open=1] ... INT_RT_STS(0x10)=01` in window A → the channels are open (no LED / no anode
+  supply on ch1+2) and, if the optional window B shows the same, the whole module has no load or no supply: wiring/supply, not the driver;
+- the optional window B lights (owner sees it) → the lamp is on channels 3+4 and the factory/Ubuntu mapping is wrong for this board;
 - neither window lights, no fault bit anywhere, diffs show only the registers we wrote → the state is not the issue: next suspects
   are the current (2 × 50 mA too dim: an owner decision whether to raise the cap toward the factory's 400 mA a channel) and the
   LED's supply rail outside this peripheral;

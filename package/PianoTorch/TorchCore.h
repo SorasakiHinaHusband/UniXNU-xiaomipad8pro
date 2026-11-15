@@ -256,6 +256,33 @@ class Controller {
     return r;
   }
 
+  // A bounded diagnostic FLASH pulse for T4.  FLASH uses the module's 12.5 mA
+  // resolution (IRESOLUTION cleared) and its safety timer; it is deliberately
+  // separate from the ordinary torch path so a probe can prove the timed mode
+  // without leaving a level-triggered torch behind.  The caller always follows
+  // this with off(), even though the module's timer should have disabled it.
+  StepResult flashPulse(uint8_t itarget, uint8_t timerTicks, uint8_t mask = kPianoChannelMask)
+  {
+    StepResult r;
+    if (itarget > kHardMaxItarget) itarget = kHardMaxItarget;
+    if (!timerTicks || timerTicks > kTimerValueMask || !mask || mask & 0xf0) {
+      ++r.refused;
+      fail(r, kRegTimer0, timerTicks, 0, "the FLASH pulse arguments are outside the bounded diagnostic range");
+      return r;
+    }
+    bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegItarget0 + ch, kItargetMask, itarget);
+    // Clear IRESOLUTION for the selected channels: the flash path is 12.5 mA steps.
+    ok = ok && put(r, kRegIres, mask, 0);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegTimer0 + ch, 0xff, uint8_t(kTimerEnable | timerTicks));
+    ok = ok && put(r, kRegModuleEn, kModuleEnBit, kModuleEnBit) && put(r, kRegChanEn, mask, mask);
+    return r;
+  }
+
   // Torch off: channels, module, current to the lowest step. Every step is tried even after a failure.
   StepResult off(uint8_t mask = kPianoChannelMask)
   {

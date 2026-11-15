@@ -1,7 +1,8 @@
 # PianoTorch
 
 Piano's rear torch for native macOS 27: the PM8550 flash LED module (`led-controller@ee00`, SID 1, PPID 0x1ee) with its two
-factory-wired channels driven together, as Ubuntu v1.1.1 does. Backlog B12.
+factory-wired channels driven together, as the Ubuntu port does. Backlog B12. Its v1.4.0 release notes also describe a timed
+FLASH pulse for photos and a shared green privacy LED; those are provenance facts for the optional T4 pulse, not copied code.
 
 - `piano-torch=1`: a read-only survey over the SPMI observer channel: the flash APID and its owner EE, the module's identity,
   enables, per-channel current/strobe/timer, clamp, thermal thresholds, status bytes and raw bytes. The only store is the
@@ -11,6 +12,9 @@ factory-wired channels driven together, as Ubuntu v1.1.1 does. Backlog B12.
   on the module's own fault/over-temperature bits, at SoC >= `piano-torch-soc-max` (85 C, PianoThermal) or battery >=
   `piano-torch-batt-max` (45 C, PianoPower), when the enables read off, on system sleep and on shutdown. 50 mA by default
   (`piano-torch-ma`), never more than Ubuntu's 100 mA. `piano-torch-test=S` lights it once at boot for S seconds.
+  `piano-torch-probe=1` runs the T4 survey: a 15-second factory-pair window with STATUS1/INT_RT_STS polls every 500 ms before,
+  during and after plus full-page dumps; `piano-torch-probe-spare=1` adds the spare-pair mapping window and `piano-torch-flash=1`
+  adds one bounded timed FLASH pulse afterward.
 
 Control from macOS: `sudo piano-torch on|off|toggle|status` (`tooling/native/piano-torch`, an IORegistry property the kext
 accepts from an administrator only); from other drivers: `PianoTorchSet` / `PianoTorchToggle` / `PianoTorchStatus`

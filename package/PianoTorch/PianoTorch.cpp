@@ -12,7 +12,8 @@
 // Without piano-torch the driver declines in probe() and maps nothing.
 // Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own), piano-torch-max-ma (default and hard
 // cap 100, Ubuntu's led-max-microamp), piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85),
-// piano-torch-batt-max=C (default 45), piano-torch-delay=S (default 0).
+// piano-torch-batt-max=C (default 45), piano-torch-delay=S (default 0), piano-torch-probe-spare=1 to add the old channel-B
+// mapping window, and piano-torch-flash=1 for one bounded timed FLASH pulse after the torch window.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -39,7 +40,7 @@ volatile int32_t piano_torch_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax, probe;
+  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax, probe, probeSpare, flash;
 };
 Args gArgs;
 
@@ -62,6 +63,8 @@ void readArgs()
   gArgs.socMax = clampArg(bootArg("piano-torch-soc-max", 85), 40, 105);
   gArgs.battMax = clampArg(bootArg("piano-torch-batt-max", 45), 30, 60);
   gArgs.probe = clampArg(bootArg("piano-torch-probe", 0), 0, 1);
+  gArgs.probeSpare = clampArg(bootArg("piano-torch-probe-spare", 0), 0, 1);
+  gArgs.flash = clampArg(bootArg("piano-torch-flash", 0), 0, 1);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -266,6 +269,23 @@ void probeSnapDiff(const char *label)
   gProbeLast = now;
 }
 
+void formatStatus1Channels(uint8_t status1, uint8_t mask, char *out, unsigned size)
+{
+  unsigned at = 0;
+  for (unsigned ch = 0; ch < kChannels4ch; ++ch) {
+    if (!(mask & (1u << ch))) continue;
+    const bool shorted = status1 & (1u << (2 * ch));
+    const bool open = status1 & (1u << (2 * ch + 1));
+    if (at) at += unsigned(snprintf(out + at, at < size ? size - at : 0, " "));
+    at += unsigned(snprintf(out + at, at < size ? size - at : 0, "ch%u[short=%u open=%u]", ch, shorted, open));
+    if (at >= size) {
+      out[size - 1] = 0;
+      return;
+    }
+  }
+  if (!at) snprintf(out, size, "none");
+}
+
 void summary(const Survey &s, const char *refusal, char *out, unsigned size)
 {
   if (!s.flash) {
@@ -333,6 +353,8 @@ class PianoTorch : public IOService {
   void serve();
   void probe();
   void probeWindow(uint8_t mask, const char *label);
+  Reason probePollPhase(uint8_t mask, const char *phase, unsigned durationMs, bool enforceGuard);
+  void probeFlashPulse();
   void offNow(Reason why, const char *what);
   static void thread(void *self, wait_result_t);
 
@@ -358,9 +380,9 @@ IOService *PianoTorch::probe(IOService *provider, SInt32 *score)
 bool PianoTorch::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u probe=%u (PM8550 SID %u flash %#x, PPID %#x)",
-       gArgs.level, gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.test, gArgs.socMax, gArgs.battMax, gArgs.delay, gArgs.probe, kSid, kBase,
-       kPpid);
+  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u probe=%u spare=%u flash=%u (PM8550 SID %u flash %#x, PPID %#x)",
+       gArgs.level, gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.test, gArgs.socMax, gArgs.battMax, gArgs.delay, gArgs.probe,
+       gArgs.probeSpare, gArgs.flash, kSid, kBase, kPpid);
   if (gArgs.level > 2) {
     note("piano-torch=%u: only levels 1 and 2 exist (docs/drivers/torch.md section 8); running 2", gArgs.level);
     gArgs.level = 2;
@@ -479,21 +501,23 @@ void PianoTorch::run()
   serve();
 }
 
-// The no-light probe (piano-torch-probe=1 with piano-torch-test=S): two lit windows at boot — channels 1+2 (the factory's own
-// torch pair) then 3+4 (the spare pair, the channel-mapping question settled in one boot) — each piano-torch-test seconds at
-// piano-torch-ma, with STATUS1/2/3 and the real-time fault byte polled and logged every 500 ms while lit (the open bit and the
-// "vreg not ready" fault appear after the enable, not before it), a full 256-byte dump before and after, and diffs between.
-// The owner watches the rear LED during both windows (docs/drivers/torch.md section 8, T4).
+// The T4 probe (piano-torch-probe=1 with piano-torch-test=S): one 15-second lit window by default — channels 1+2 (the factory's
+// own torch pair) at piano-torch-ma — with STATUS1's per-channel short/open bits and INT_RT_STS (0x10) polled every 500 ms
+// before, during and after it, and a full 256-byte register dump before and after. The old spare-pair mapping window remains
+// available with piano-torch-probe-spare=1. A bounded timed FLASH pulse can follow the torch window with piano-torch-flash=1.
 void PianoTorch::probe()
 {
-  note("probe: piano-torch-probe=1: two windows at %u mA for %u s, full dumps and diffs, status polls while lit", gArgs.ma,
-       gArgs.test);
-  probeSnapFull("1: before any window");
+  note("probe: piano-torch-probe=1: %u mA (Ubuntu 2 x 50 mA cap) for %u s, status1/INT_RT_STS polls every 500 ms before/during/after",
+       gArgs.ma, gArgs.test);
+  probeSnapFull("1: before torch window");
   probeWindow(kPianoChannelMask, "A: channels 1+2 (the factory's torch pair)");
-  probeSnapDiff("2: after window A");
-  probeWindow(kOtherChannelMask, "B: channels 3+4 (the spare pair)");
-  probeSnapDiff("3: after window B");
-  probeSnapFull("4: after both windows");
+  probeSnapDiff("2: after torch window A");
+  if (gArgs.probeSpare) {
+    probeWindow(kOtherChannelMask, "B: channels 3+4 (the spare pair)");
+    probeSnapDiff("3: after spare window B");
+  }
+  if (gArgs.flash) probeFlashPulse();
+  probeSnapFull(gArgs.probeSpare ? "4: after all windows" : "3: after torch window");
 }
 
 void PianoTorch::probeWindow(uint8_t mask, const char *label)
@@ -502,10 +526,10 @@ void PianoTorch::probeWindow(uint8_t mask, const char *label)
   const uint8_t itarget = itargetForMa(ma);
   note("probe window %s: on at %u mA (itarget %u, clamp %u) for %u s", label, ma, itarget, clampForMa(gArgs.maxMa), gArgs.test);
   const uint64_t start = nowMs();
-  unsigned unreadable = 0;
   Reason bad = Reason::none;
   StepResult steps;
   const Temperatures t0 = readTemperatures(start);
+  probePollPhase(mask, "before", 1000, false);
   IOLockLock(gLock);
   if (mask == kPianoChannelMask) {   // the real control path, exactly as a user's on
     const Torch::Outcome o = gTorch.request(start, ma, gArgs.test, t0);
@@ -532,39 +556,15 @@ void PianoTorch::probeWindow(uint8_t mask, const char *label)
       IOLockUnlock(gLock);
       note("probe window %s: off after the refusal; %u writes, %u read back", label, undo.writes, undo.readbacks);
     }
+    probePollPhase(mask, "after", 1000, false);
     publishState(this);
     return;
   }
 
   // While lit: the module's own words for why a lit register state makes no light (open channel, vreg not ready), which only
   // appear once the channels are on — sampled twice a second, logged every sample.
-  bool mid = false;
-  const uint64_t end = start + uint64_t(gArgs.test) * 1000;
-  for (uint64_t now = start; now < end;) {
-    IOSleep(500);
-    now = nowMs();
-    const Temperatures t = readTemperatures(now);
-    IOLockLock(gLock);
-    const Controller::Live l = gTorch.controller().live();
-    const Reason verdict = judge(l, unreadable, t, gTorch.config(), mask);
-    IOLockUnlock(gLock);
-    char faults[80];
-    formatFaults(decodeFaults(l.status1, l.status2, l.status3, mask), faults, sizeof faults);
-    if (!l.ok)
-      note("probe lit %s: t+%llu ms: STATUS UNREADABLE (%s of two)", label, (unsigned long long)(now - start),
-           unreadable >= 2 ? "two" : "one");
-    else
-      note("probe lit %s: t+%llu ms: status %02x %02x %02x rt %02x enables %02x %02x: %s", label, (unsigned long long)(now - start),
-           l.status1, l.status2, l.status3, l.rt, l.moduleEn, l.chanEn, faults);
-    if (verdict != Reason::none) {
-      bad = verdict;
-      break;
-    }
-    if (!mid && now >= start + uint64_t(gArgs.test) * 1000 / 3) {
-      mid = true;
-      probeSnapDiff(label);   // any register the module itself changed while lit shows here
-    }
-  }
+  bad = probePollPhase(mask, "during", gArgs.test * 1000, true);
+  probeSnapDiff(label);   // any register the module itself changed while lit shows here
   IOLockLock(gLock);
   if (mask == kPianoChannelMask) {
     const Torch::Outcome o = gTorch.turnOff(nowMs(), Reason::test);
@@ -577,8 +577,64 @@ void PianoTorch::probeWindow(uint8_t mask, const char *label)
     IOLockUnlock(gLock);
     note("probe window %s: off (the probe); %u writes, %u read back", label, r.writes, r.readbacks);
   }
+  const Reason after = probePollPhase(mask, "after", 1000, false);
+  if (bad == Reason::none) bad = after;
   if (bad != Reason::none) note("probe window %s: ENDED EARLY by the guard: %s", label, reasonName(bad));
   publishState(this);
+}
+
+Reason PianoTorch::probePollPhase(uint8_t mask, const char *phase, unsigned durationMs, bool enforceGuard)
+{
+  unsigned unreadable = 0;
+  Reason bad = Reason::none;
+  const uint64_t phaseStart = nowMs();
+  for (unsigned elapsed = 0; elapsed <= durationMs; elapsed += 500) {
+    if (elapsed) IOSleep(500);
+    const uint64_t now = nowMs();
+    const Temperatures t = readTemperatures(now);
+    IOLockLock(gLock);
+    const Controller::Live l = gTorch.controller().live();
+    const Reason verdict = enforceGuard ? judge(l, unreadable, t, gTorch.config(), mask) : Reason::none;
+    IOLockUnlock(gLock);
+    char faults[80];
+    char channels[128];
+    formatFaults(decodeFaults(l.status1, l.status2, l.status3, mask), faults, sizeof faults);
+    formatStatus1Channels(l.status1, mask, channels, sizeof channels);
+    if (!l.ok) {
+      ++unreadable;
+      note("probe %s: t+%llu ms: STATUS1/INT_RT_STS 0x10 UNREADABLE (%u consecutive): %s", phase,
+           (unsigned long long)(now - phaseStart), unreadable, channels);
+    } else {
+      unreadable = 0;
+      note("probe %s: t+%llu ms: STATUS1=%02x %s INT_RT_STS(0x10)=%02x status2=%02x status3=%02x enables=%02x/%02x faults=%s",
+           phase, (unsigned long long)(now - phaseStart), l.status1, channels, l.rt, l.status2, l.status3, l.moduleEn, l.chanEn, faults);
+    }
+    if (verdict != Reason::none) {
+      bad = verdict;
+      break;
+    }
+  }
+  return bad;
+}
+
+void PianoTorch::probeFlashPulse()
+{
+  // 50 mA total (2 x 25 mA, 12.5 mA FLASH steps) for 80 ms. The safety timer
+  // is the visibility-friendly part of Ubuntu's photo path; off() still runs
+  // afterward to cover a timer or V4L2-owner edge case.
+  constexpr uint8_t kFlashItarget = 1;
+  constexpr uint8_t kFlashTimerTicks = 8;
+  note("probe FLASH pulse: timed 80 ms at 50 mA total (2 x 25 mA, 12.5 mA steps); V4L2 close trap covered by explicit off");
+  IOLockLock(gLock);
+  const StepResult pulse = gTorch.controller().flashPulse(kFlashItarget, kFlashTimerTicks, kPianoChannelMask);
+  IOLockUnlock(gLock);
+  note("probe FLASH pulse: on; %u writes, %u read back%s", pulse.writes, pulse.readbacks, pulse.ok ? "" : "; A STEP FAILED");
+  IOSleep(120);
+  IOLockLock(gLock);
+  const StepResult off = gTorch.controller().off(kPianoChannelMask);
+  IOLockUnlock(gLock);
+  note("probe FLASH pulse: explicit off after timer; %u writes, %u read back%s", off.writes, off.readbacks,
+       off.ok ? "" : "; A STEP FAILED");
 }
 
 // The control loop: requests as they come; while lit, a poll every second (the time limit, the guard).

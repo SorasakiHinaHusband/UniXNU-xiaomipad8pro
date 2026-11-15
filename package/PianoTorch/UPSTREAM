@@ -32,5 +32,7 @@ Specifications only (no code, comment or table copied):
   the Ubuntu device repository (yzddmr6/xiaomipad-8pro-mainline, v1.2.0 7fe59cc; MIT): tools/check-piano-flash.py (sha256
     de2f7286217719f4a2f52b68691dac800846b707b70676db985505126eb9dc20, "write and read back a torch setting, then restore it") and
     device/camera/piano-camera-light-off (sha256 278c85b166b35252f83905acd709b037eb5501cbf5f29e4d110acc9c3121d987, "closing V4L2
-    does not turn torch mode off"): behaviour only.
+    does not turn torch mode off"): behaviour only. Its v1.4.0 release-note facts used by T4 (timed FLASH photo pulse and the
+    shared green privacy LED) are calibration/behaviour data only; no Ubuntu source was copied. The V4L2 close behaviour remains a
+    required explicit-off guard.
 Not read and not used for anything: any Qualcomm or Xiaomi binary, any Apple binary.
