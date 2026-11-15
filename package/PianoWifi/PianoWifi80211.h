@@ -1257,7 +1257,8 @@ void PianoWifi80211::setShengMode(uint32_t mode, const char *why)
   }
   note80211("%s: sheng mode %#x (was %#x, %s): 0x1 the 802.11 medium selected, 0x2 SSID/BSSID events beside link ones, 0x4 card "
             "caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 NativeSandboxGrantProcess, 0x20 SIOCGIFMEDIA "
-            "in the filter, 0x40 interface identity, 0x80 interface user client, 0x100 association state; every request kind is logged again from here",
+            "in the filter, 0x40 interface identity, 0x80 interface user client, 0x100 association state, 0x200 preassigned BSD/unit "
+            "identity; every request kind is logged again from here",
             fIfName, unsigned(masked), unsigned(was), why);
 }
 

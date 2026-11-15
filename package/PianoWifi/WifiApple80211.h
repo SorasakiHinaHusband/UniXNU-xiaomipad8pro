@@ -364,9 +364,10 @@ enum : uint32_t {
   kShengInterfaceBinding = 0x40, // interface primary/class/name/grant plus controller discovery identity A/B
   kShengInterfaceUc = 0x80,     // interface-side IOUserClientClass / open path
   kShengAssocState = 0x100,      // supplicant association state, request answers and transition kevs
+  kShengInterfaceName = 0x200,   // publish the BSD name/unit and registry identity before InterfaceNamer waits for IOKit quiet
 };
 constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter |
-                                kShengInterfaceBinding | kShengInterfaceUc | kShengAssocState;
+                                kShengInterfaceBinding | kShengInterfaceUc | kShengAssocState | kShengInterfaceName;
 
 struct Association {
   bool associated = false;

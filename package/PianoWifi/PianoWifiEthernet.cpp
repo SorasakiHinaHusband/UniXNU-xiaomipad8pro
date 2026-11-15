@@ -443,6 +443,30 @@ bool PianoWifiEthernet::start(IOService *provider)
   // PianoNullEthernet keeps the primary built-in en0 (TimeSync), unless this interface takes it over (piano-wifi-en0=1).
   const bool en0Free = fTakeEn0 && takeOverEn0();
   fInterface->setProperty(kIOPrimaryInterface, en0Free);
+  // InterfaceNamer normally assigns a missing interface only after the registry becomes quiet.  The
+  // IO80211Interface identity A/B makes that wait observable because its namer path opens IONetworkStack
+  // and waits for the interface identity before declaring quiet.  The sheng port's verified path avoids
+  // the cycle by publishing the complete en0 identity before registration.  Keep this behind its own bit:
+  // it is only valid for the Wi-Fi en0 hand-over, and leaves the family naming path unchanged otherwise.
+  const bool preassigned = en0Free && (sheng & pianowifi::a80211::kShengInterfaceName);
+  if (preassigned) {
+    OSString *name = OSString::withCString("en0");
+    OSNumber *unit = OSNumber::withNumber(0ULL, 32);
+    if (name && unit) {
+      fInterface->setProperty(kIOBSDNameKey, name);
+      fInterface->setProperty("BSD Name", name);
+      fInterface->setProperty("IOInterfaceName", name);
+      fInterface->setProperty("IOInterfaceNamePrefix", "en");
+      fInterface->setProperty("IOInterfaceUnit", unit);
+      fInterface->setProperty(kIOBuiltin, true);
+      fInterface->setProperty(kIOPrimaryInterface, true);
+      note("en0: preassigned BSD/IOKit identity before registration (unit 0, prefix en, built-in primary)");
+    } else {
+      note("en0: cannot preassign BSD/IOKit identity (no property object)");
+    }
+    OSSafeReleaseNULL(name);
+    OSSafeReleaseNULL(unit);
+  }
   fInterface->registerService(kIOServiceSynchronous);
   // PianoWifi's network boundary: from here its thread may hand frames and the link's state to this driver.
   piano_wifi_net_client client;
@@ -453,8 +477,8 @@ bool PianoWifiEthernet::start(IOService *provider)
   client.link = &PianoWifiEthernet::netLink;
   const int rc = piano_wifi_net_attach(&client);
   fAttached = rc == 0;
-  // The BSD name comes later, from configd (the counters' lines carry it): getUnitNumber() is 0 until then, which is why boot
-  // 10a's "en0 published" was taken for the BSD name it never had.
+  // Without the preassignment bit the BSD name comes later, from configd (the counters' lines carry it): getUnitNumber() is 0
+  // until then, which is why boot 10a's "en0 published" was taken for the BSD name it never had.
   note("the interface is published (MAC %02x:%02x:%02x:..:%02x, built in, %s, link down until the station's port is "
        "authorized, its own work loop %s; macOS names it); PianoWifi's data path %s; the scan list is the property "
        "piano-wifi-scan",
