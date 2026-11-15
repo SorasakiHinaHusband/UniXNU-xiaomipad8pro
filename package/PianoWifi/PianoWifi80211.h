@@ -485,9 +485,9 @@ void PianoWifi80211::filterDetached(void *cookie, ifnet_t)
 // kernel memory — and the sheng snapshot taken before the request, so ucIn/ucOut can fall back to memcpy for a copy whose
 // address lies inside one of them (WifiApple80211.h shengKernelBuffer; their macOS-27.3 EFAULT fix).
 struct UcIo {
-  const uint8_t *inBase = nullptr;
+  uint8_t *inBase = nullptr;    // the client's structure buffers: kernel memory, written by the memcpy fallback
   uint32_t inBytes = 0;
-  const uint8_t *outBase = nullptr;
+  uint8_t *outBase = nullptr;
   uint32_t outBytes = 0;
   uint32_t sheng = 0;
 };
@@ -514,7 +514,7 @@ int PianoWifi80211::ucOut(void *ctx, const void *from, uint64_t to, uint32_t len
     return 0;
   }
   if (pianowifi::a80211::shengKernelBuffer(to, length, uc->inBase, uc->inBytes, offset)) {
-    memcpy(const_cast<uint8_t *>(uc->inBase) + offset, from, length);
+    memcpy(uc->inBase + offset, from, length);
     return 0;
   }
   return e;
@@ -938,9 +938,9 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   // kext holds, where copyin/copyout fault (their macOS-27.3 EFAULT fix is memcpy); ucIn/ucOut fall back to that only for a
   // copy whose address lies inside one of the two structure buffers, and only while the bit is on.
   UcIo ucio;
-  ucio.inBase = in;
+  ucio.inBase = const_cast<uint8_t *>(in);   // the memcpy fallback writes into it (the kext owns the copy)
   ucio.inBytes = args->structureInputSize;
-  ucio.outBase = static_cast<const uint8_t *>(args->structureOutput);
+  ucio.outBase = static_cast<uint8_t *>(args->structureOutput);
   ucio.outBytes = args->structureOutputSize;
   ucio.sheng = shengMode();
   const UserIo uio = {&ucio, &PianoWifi80211::ucIn, &PianoWifi80211::ucOut};

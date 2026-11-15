@@ -95,7 +95,7 @@ class PianoWifiEthernet : public IOEthernetController {
   IONetworkMedium *fMedium11 = nullptr;
   bool fMedium11On = false, fLinkUp = false;
 
- private:
+ protected:   // PianoWifi80211's free() reaches the chain (the medium members above too: applyMedium re-selects them)
   bool createWorkLoop() override
   {
     fWorkLoop = IOWorkLoop::workLoop();
