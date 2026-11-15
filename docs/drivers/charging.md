@@ -380,6 +380,19 @@ is 1 in every native image). So a low battery gives macOS's notices but no sleep
 the console line marks a clamped value `(floor)`. The tablet itself still cuts off at the real empty point: watch the
 `battery:` line, not the menu bar, in long sessions.
 
+**powerd's percentage anchor (2026-11-15, CHGUI).** On one installed boot `pmset` showed 12 % for the whole boot while this node
+tracked 95 → 90 % and powerd's own charging flag, adapter fields and time estimate followed it; the next boot showed the correct
+percent. Inferred: powerd anchors the displayed percentage on what the node carried around discovery and never re-derives it, so
+a garbage first reading poisons the whole boot (a misread FullChargeCapacity makes `socPct = remaining/full` ≈ 12 %; `gauge.ok`
+did not check `fullMah`). Since then a reading with implausible capacities (full < 2000 or > 20000 mAh, remaining above full + 5 %)
+publishes nothing — the first publish waits for a sane cycle — and the node carries the keys a Mac's own node has next to these
+(`UpdateTime`, `built-in`, `AppleRawExternalConnected`, `AppleRawAdapterDetails`, `IsWireless`, `AdapterID`); `AdapterDetails` is the
+firmware's live contract at level 2 (bus voltage, the fixed PDO the bus sits on / the input limit), the Rp current otherwise, and
+the `ps:` line says which (`adapter PD contract` / `adapter Rp`). One line per charger generation logs the source's PDO list
+(`mca: the source's PDOs (N): …`, read-only): on the wall PD charger the firmware contracts at 5 V by itself (`type PD`, PD state 2
+SNK_Ready) and higher fixed PDOs wait for the host's 0x21018 request (`piano-power-hv=1`); mid-session that contract dropped
+(PD state 1, type SDP) as the Rp ramp passed ~2 A at 5 V. Evidence and the fix: `private/host-checks/20261115-chgui/FIX.md` (local).
+
 **Test image** (owner present or the installed config; in the main checkout):
 
 ```sh
