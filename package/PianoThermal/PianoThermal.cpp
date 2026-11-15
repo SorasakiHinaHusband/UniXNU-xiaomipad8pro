@@ -1048,9 +1048,10 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   }
   const PowerSource power = profilePower(power_, Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE)));
   // The boost's own thermal back-off (2026-11-15, ufs5r3): one decision per poll on the hottest CPU reading, before the
-  // domains (a step lowers every domain's boost cap level at once; the heat end shortens the boost so each domain's boostStep
-  // takes its over transition on this same poll). The cap only steps down: a cooler spell must not raise it again.
-  if (boostEndNs_ && !boostBackoff_.ended) {
+  // domains and only while the boost is live (a step lowers every domain's boost cap level at once; the heat end shortens the
+  // boost so each domain's boostStep takes its over transition on this same poll). The cap only steps down: a cooler spell
+  // must not raise it again; past the boost's seconds there is nothing left to step or end.
+  if (boostEndNs_ && !boostBackoff_.ended && now < boostEndNs_) {
     int32_t hotDeci = -32768;
     if (cpuHottest(m, hotDeci)) {
       const BoostBackoffEvent backoff = boostBackoff(boostBackoff_, hotDeci, now / 1000000ull);
