@@ -34,6 +34,8 @@
 #include <IOKit/network/IOOutputQueue.h>   // kIOReturnOutputDropped
 #pragma clang diagnostic pop
 #include "PianoWifiNet.h"
+#include "WifiApple80211.h"   // kSheng*: the UniXNU-sheng binding bits, read where the medium is chosen (below; the class
+                              // that acts on them is included at the end of this file)
 
 namespace {
 constexpr UInt64 kLinkSpeed = 150 * 1000000ULL;      // what a 2.4 GHz link of this chip reaches; macOS shows it, nothing more
@@ -55,7 +57,6 @@ class PianoWifiEthernet : public IOEthernetController {
   OSDeclareDefaultStructors(PianoWifiEthernet)
 
   IOEthernetInterface *fInterface = nullptr;
-  IONetworkMedium *fMedium = nullptr;
   bool fTakeEn0 = false;   // piano-wifi-en0=1: take over PianoNullEthernet's built-in en0 (its address, primary)
   // piano-wifi-txerr (boot 10s, default 1): an output refused returns its errno (ENOBUFS when PianoWifi's queue is full,
   // ENETDOWN, EMSGSIZE). With no output queue the family's if_output returns outputPacket's value to the stack as an errno:
@@ -71,7 +72,7 @@ class PianoWifiEthernet : public IOEthernetController {
   // firmware reports none; never PianoNullEthernet's 0x01 (boot 10h: an interface with en0's address got no name of its own).
   // PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
   IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x04}};
-  bool fAttached = false, fLinkUp = false;
+  bool fAttached = false;
   UInt64 fTxFrames = 0, fTxDrops = 0, fRxFrames = 0, fRxDrops = 0, fLinkChanges = 0;
   // after boot 10f-c (the port open, en0 "link up", and not one frame of en0's ever handed to PianoWifi): why each output was
   // dropped, whether the stack brought the interface up at all, and the first frames each way (length, type, group bit)
@@ -86,6 +87,15 @@ class PianoWifiEthernet : public IOEthernetController {
   static void netLink(void *ctx, int up, const uint8_t *mac);
 
  protected:
+  // The link's medium, for PianoWifi80211 (the subclass included at the end of this file): the Ethernet one is always there,
+  // the IEEE 802.11 one (piano-wifi-sheng bit 0x1, the UniXNU-sheng macOS fact: "the framework lists wireless interfaces by
+  // this media type" — their en0's SIOCGIFMEDIA answer, ShengEthernet.cpp:271-277) beside it while the apple80211 front end
+  // runs, and which of the two is the selected medium is a run-time switch (machdep.piano_wifi_sheng re-selects).
+  IONetworkMedium *fMedium = nullptr;
+  IONetworkMedium *fMedium11 = nullptr;
+  bool fMedium11On = false, fLinkUp = false;
+
+ private:
   bool createWorkLoop() override
   {
     fWorkLoop = IOWorkLoop::workLoop();
@@ -205,7 +215,8 @@ void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
   if (now == self->fLinkUp) return;
   self->fLinkUp = now;
   ++self->fLinkChanges;
-  self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, self->fMedium,
+  IONetworkMedium *medium = (self->fMedium11On && self->fMedium11) ? self->fMedium11 : self->fMedium;
+  self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, medium,
                       now ? kLinkSpeed : 0);
   note("the link is %s (PianoWifi's port %s)", now ? "up" : "down", now ? "is authorized" : "closed: the association ended");
   self->counters(now ? "at the link's up" : "at the link's down");
@@ -383,20 +394,41 @@ bool PianoWifiEthernet::start(IOService *provider)
   takeScanList(wifi);
   OSSafeReleaseNULL(wifi);
 
-  OSDictionary *media = OSDictionary::withCapacity(1);
+  // The medium: Ethernet auto full duplex (what the interface has been until now), and — while the apple80211 front end runs
+  // — an IEEE 802.11 auto one beside it, the UniXNU-sheng macOS-verified form (their en0's SIOCGIFMEDIA answer; the family
+  // answers that ioctl from this dictionary, ShengEthernet.cpp:271-277). piano-wifi-sheng bit 0x1 selects the 802.11 one from
+  // the start; both stay published either way, so the run-time switch (machdep.piano_wifi_sheng, PianoWifi80211::applyMedium)
+  // only re-selects, never re-publishes.
+  uint32_t apple80211On = 0, sheng = 0;
+  PE_parse_boot_argn("piano-wifi-apple80211", &apple80211On, sizeof apple80211On);
+  PE_parse_boot_argn("piano-wifi-sheng", &sheng, sizeof sheng);
+  OSDictionary *media = OSDictionary::withCapacity(2);
   IONetworkMedium *medium = IONetworkMedium::medium(IOMediumType(kIOMediumEthernetAuto) | IOMediumType(kIOMediumOptionFullDuplex),
                                                     kLinkSpeed);
+  if (apple80211On) {
+    if (IONetworkMedium *medium11 = IONetworkMedium::medium(IOMediumType(kIOMediumIEEE80211Auto), kLinkSpeed)) {
+      if (IONetworkMedium::addMedium(media, medium11)) fMedium11 = medium11;
+      else medium11->release();
+    }
+  }
   if (!media || !medium || !IONetworkMedium::addMedium(media, medium) || !publishMediumDictionary(media)) {
     OSSafeReleaseNULL(media);
     OSSafeReleaseNULL(medium);
+    OSSafeReleaseNULL(fMedium11);
     note("cannot publish the medium");
     return false;
   }
   media->release();
-  setSelectedMedium(medium);
   fMedium = medium;   // kept for the link's changes (released in stop)
+  fMedium11On = apple80211On != 0 && (sheng & pianowifi::a80211::kShengMedium) != 0 && fMedium11 != nullptr;
+  IONetworkMedium *selected = fMedium11On ? fMedium11 : medium;
+  setSelectedMedium(selected);
   // The interface exists and is valid, but there is no link until PianoWifi's port is authorized.
-  setLinkStatus(kIONetworkLinkValid, medium, 0);
+  setLinkStatus(kIONetworkLinkValid, selected, 0);
+  if (fMedium11)
+    note("the medium dictionary carries an IEEE 802.11 auto medium beside the Ethernet one (piano-wifi-apple80211): %s is "
+         "selected (piano-wifi-sheng bit 0x1, machdep.piano_wifi_sheng re-selects at run time)",
+         fMedium11On ? "the 802.11 one" : "the Ethernet one");
   if (!attachInterface(reinterpret_cast<IONetworkInterface **>(&fInterface), false)) {
     note("cannot attach the interface");
     return false;
@@ -436,6 +468,7 @@ void PianoWifiEthernet::stop(IOService *provider)
     OSSafeReleaseNULL(fInterface);
   }
   OSSafeReleaseNULL(fMedium);
+  OSSafeReleaseNULL(fMedium11);
   IOEthernetController::stop(provider);
 }
 

@@ -336,6 +336,26 @@ enum : uint32_t {
 };
 constexpr uint32_t kAcceptDefault = kAcceptInfraEnumerated;
 
+// The UniXNU-sheng binding bits (`piano-wifi-sheng=MASK` at boot, `machdep.piano_wifi_sheng` at run time; each bit its own
+// A/B, docs/drivers/wifi-menu.md section 9): what their macOS-27.3 en0 binding — hardware-verified on our exact OS build
+// 26C5035r — does that ours does not (private/host-checks/20261115-unixnu-sheng/STUDY.md section 1). Their WifiNet.cpp /
+// ShengEthernet.cpp are BSD-2-Clause-Patent prior art; nothing of their code is used here, the values and layouts are
+// calibration data. The kext implements 0x1/0x2/0x8/0x10/0x20 around this header; 0x4 is answered here (CARD_CAPABILITIES).
+enum : uint32_t {
+  kShengMedium = 0x1,    // SIOCGIFMEDIA answers IEEE 802.11 auto ("the framework lists wireless interfaces by this media
+                         // type"): the medium dictionary carries kIOMediumIEEE80211Auto and it is the selected medium
+  kShengEvents = 0x2,    // the event set: SSID_CHANGED and BSSID_CHANGED posted with every LINK_CHANGED (their post_link_down)
+  kShengCaps46 = 0x4,    // CARD_CAPABILITIES bit 46: "the framework's scan waits for the scan-done event, up to 20 s, only
+                         // with this bit; without it the results are read the moment the request returns"
+  kShengUcKernel = 0x8,  // a user-client request's data rides inside the structure itself (a kernel buffer): byte replies
+                         // are memcpy'd, not copyout'd (their macOS-27.3 EFAULT fix)
+  kShengGrant = 0x10,    // NativeSandboxGrantProcess = "airportd" (their "airportd,sharingd,wifivelocityd" cannot match:
+                         // our kernel's native_sandbox_grant compares the whole property with one process name)
+  kShengMediaFilter = 0x20,  // SIOCGIFMEDIA answered in the interface filter outright (their non-macOS if_ioctl form), for
+                             // the case the family's answer lags the selected medium
+};
+constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter;
+
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
@@ -348,6 +368,7 @@ struct State {
   uint32_t scanRequests = 0, resultsServed = 0, listEnds = 0, powerSets = 0;
   uint32_t accept = kAcceptDefault;   // kAccept*: how requests without a layout of ours are answered (a runtime switch, M1b)
   uint32_t acceptedUnknown = 0;   // requests answered only because of `accept`
+  uint32_t sheng = 0;             // kSheng*: the UniXNU-sheng binding bits above (a runtime switch)
 };
 
 // A state as a fresh interface has it, in place (the kext's is a zeroed data allocation, too large for a temporary on the stack).
@@ -359,6 +380,7 @@ inline void reset(State &s)
   s.country[0] = 'X';
   s.country[1] = 'X';
   s.accept = kAcceptDefault;
+  s.sheng = 0;
 }
 
 // The identity strings (the kext's; the host test passes its own).
@@ -554,6 +576,11 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
   }
   case kCardCapabilities: {
     for (uint8_t b : kCapBits) scratch[b / 8] |= uint8_t(1u << (b % 8));
+    // sheng bit 0x4: their bitmap adds 46 — "the end of a scan is reported by the scan-done event. The framework's scan
+    // (IO80211 26C5035r, Apple80211Scan) waits for that event, up to 20 s, only with this bit; without it the results are
+    // read the moment the request returns, before the radio scanned" (WifiNet.cpp:646-651). Our scan-done is posted after
+    // kScanDoneMs whether or not the bit is set; the bit only changes what the framework waits for.
+    if (s.sheng & kShengCaps46) scratch[46 / 8] |= uint8_t(1u << (46 % 8));
     a.error = bytes(rq, io, scratch, kCapBytes, a);
     return a;
   }
@@ -662,6 +689,20 @@ inline uint32_t scanReqSsidLength(const Req &rq, const UserIo &io)
   const uint32_t n = uint32_t(head[kScanReqSsidLengthAt]) | uint32_t(head[kScanReqSsidLengthAt + 1]) << 8 |
                      uint32_t(head[kScanReqSsidLengthAt + 2]) << 16 | uint32_t(head[kScanReqSsidLengthAt + 3]) << 24;
   return n <= kSsidMax ? n : 0;
+}
+
+// The user client's request data may ride inside the structure the client passed — kernel memory the kext holds — instead of
+// at a user address; their macOS-27.3 finding is that copyout of it faults (their EFAULT fix: memcpy). True, and the offset
+// within [base, base+bytes), when the whole of [at, at+n) lies there; the checks are overflow-safe (an at below base or an
+// end above bytes cannot wrap into a match).
+inline bool shengKernelBuffer(uint64_t at, uint32_t n, const void *base, uint32_t bytes, uint32_t &offset)
+{
+  const uint64_t b = reinterpret_cast<uintptr_t>(base);
+  if (at < b) return false;
+  const uint64_t into = at - b;
+  if (into > bytes || n > bytes - into) return false;
+  offset = uint32_t(into);
+  return true;
 }
 
 // ------------------------------------------------------------------------------------------- the log: one line per kind

@@ -30,10 +30,12 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/copyio.h>   // copyin / copyout of the requesting task's buffers
+#include <net/if_media.h>     // IFM_IEEE80211 / IFM_AUTO: the SIOCGIFMEDIA answer of sheng bit 0x20
 #include <net/kpi_interfacefilter.h>
 #include <IOKit/IOUserClient.h>
 #include <sys/kern_event.h>
 #include <sys/proc.h>     // proc_selfname, proc_selfpid: who asked for a scan
+#include <sys/sockio.h>   // SIOCGIFMEDIA
 #include <sys/sysctl.h>
 #include "WifiApple80211.h"
 
@@ -98,9 +100,14 @@ class PianoWifi80211 : public IO80211Controller {
   static void reportTick(thread_call_param_t self, thread_call_param_t);
   static int userIn(void *, uint64_t from, void *to, uint32_t length) { return copyin(from, to, length); }
   static int userOut(void *, const void *from, uint64_t to, uint32_t length) { return copyout(from, to, length); }
+  // The user client's copies (sheng bit 0x8): the data of a client's request may ride inside the structure itself — kernel
+  // memory — where copyout faults (their macOS-27.3 EFAULT fix); a copy that faults and whose target lies inside the
+  // structure is answered with memcpy. The context is a UcIo (below), its `sheng` a snapshot taken before the request's lock.
+  static int ucIn(void *ctx, uint64_t from, void *to, uint32_t length);
+  static int ucOut(void *ctx, const void *from, uint64_t to, uint32_t length);
 
   void attachStep();
-  errno_t apple80211(bool set, pianowifi::a80211::Req &rq);
+  errno_t apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *io = nullptr);
   void refreshScanLocked();
   void postEvent(uint32_t code, const void *payload = nullptr, uint32_t length = 0);
   void scanStarted();
@@ -109,6 +116,9 @@ class PianoWifi80211 : public IO80211Controller {
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
   void noteIdentity(const char *why);
   void setOverride(bool on, bool onInterface);
+  errno_t mediaIoctl(struct ifmediareq *m);
+  void applyMedium();
+  void applyGrant(bool on);
 
   // Armed only while the driver runs, and counted: stop() waits for every call to be out of its callback (review F4).
   void arm(thread_call_t call, unsigned ms)
@@ -139,8 +149,11 @@ class PianoWifi80211 : public IO80211Controller {
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   uint32_t acceptMode();
+  uint32_t shengMode();
   static int sysctlAccept(struct sysctl_oid *, void *, int, struct sysctl_req *req);
+  static int sysctlSheng(struct sysctl_oid *, void *, int, struct sysctl_req *req);
   void setAcceptMode(uint32_t mode, const char *why);
+  void setShengMode(uint32_t mode, const char *why);
   bool start(IOService *provider) override;
   void stop(IOService *provider) override;
   // the user client's side (PianoWifi80211Uc.h)
@@ -182,7 +195,7 @@ void note80211(const char *fmt, ...)
 IOSimpleLock *gA80211Gate;             // guards the two words below
 PianoWifi80211 *gA80211;               // retained while set
 unsigned gA80211Busy;                  // handlers inside the gate
-struct sysctl_oid gA80211Oid, gA80211UcOid;
+struct sysctl_oid gA80211Oid, gA80211UcOid, gA80211ShengOid;
 
 // The driver for a sysctl handler, retained for the call (nullptr once the unregister has closed the gate).
 PianoWifi80211 *a80211Enter()
@@ -253,6 +266,16 @@ bool registerAcceptSysctl(PianoWifi80211 *self)
   gA80211UcOid.oid_descr = "PianoWifi80211's user-client switches (docs/drivers/wifi-menu.md section 7)";
   gA80211UcOid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gA80211UcOid);
+  bzero(&gA80211ShengOid, sizeof gA80211ShengOid);
+  gA80211ShengOid.oid_parent = &sysctl__machdep_children;
+  gA80211ShengOid.oid_number = OID_AUTO;
+  gA80211ShengOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gA80211ShengOid.oid_name = "piano_wifi_sheng";
+  gA80211ShengOid.oid_handler = PianoWifi80211::sysctlSheng;
+  gA80211ShengOid.oid_fmt = "I";
+  gA80211ShengOid.oid_descr = "PianoWifi80211's UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9)";
+  gA80211ShengOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gA80211ShengOid);
   return true;
 }
 // The gate closed, every handler inside it waited for, then the retain given back: after this the driver may be freed.
@@ -260,6 +283,7 @@ void unregisterAcceptSysctl()
 {
   sysctl_unregister_oid(&gA80211Oid);
   sysctl_unregister_oid(&gA80211UcOid);
+  sysctl_unregister_oid(&gA80211ShengOid);
   if (!gA80211Gate) return;
   const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
   PianoWifi80211 *self = gA80211;
@@ -319,6 +343,11 @@ bool PianoWifi80211::start(IOService *provider)
   reset(*fState);
   uint32_t accept = 0;
   if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
+  // The UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9): what their hardware-verified macOS-27.3 en0 binding
+  // does that ours does not, each its own A/B on this one front end. The medium bit was already applied where the dictionary
+  // is published (PianoWifiEthernet::start read the same argument); the grant rides on the filter's attach below.
+  uint32_t sheng = 0;
+  if (PE_parse_boot_argn("piano-wifi-sheng", &sheng, sizeof sheng)) fState->sheng = sheng & pianowifi::a80211::kShengAll;
   // The production form of ADOPTION.md P0, confirmed on the tablet (wm3b, 2026-11-14: with the override airportd created its
   // CWFApple80211 and its SystemConfiguration objects for en2; without it, "Did NOT find matching WiFi interface"): the override
   // on the controller by default, set in configureInterface before the interface registers. piano-wifi-apple80211-uc=0 is the
