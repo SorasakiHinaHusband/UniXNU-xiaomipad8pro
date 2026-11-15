@@ -65,6 +65,7 @@ class PianoWifi80211 : public IO80211Controller {
   static constexpr unsigned kScanDoneMs = 2000;   // a scan answered from the list completes after a short scan's time (sheng:
                                                   // answered at once, the daemon asks again straight away)
   static constexpr unsigned kReportMs = 60000;
+  static constexpr unsigned kAssociationTickMs = 250;
   static constexpr uint32_t kScanLinesMax = 400;   // two lines a scan: about 200 scans, the first half hour of a boot
 
   IOLock *fLock = nullptr;
@@ -75,7 +76,7 @@ class PianoWifi80211 : public IO80211Controller {
   IOService *fWifi = nullptr;             // PianoWifi, whose registry property piano-wifi-scan is the scan list
   interface_filter_t fFilter = nullptr;
   volatile bool fFilterGone = false, fStopping = false;
-  thread_call_t fAttachCall = nullptr, fScanDoneCall = nullptr, fReportCall = nullptr;
+  thread_call_t fAttachCall = nullptr, fScanDoneCall = nullptr, fReportCall = nullptr, fAssociationCall = nullptr;
   char fIfName[16] = {};
   unsigned fAttachTries = 0;
   bool fSubtypeTaken = false, fRegistered = false, fSysctl = false;
@@ -100,6 +101,7 @@ class PianoWifi80211 : public IO80211Controller {
   static void attachTick(thread_call_param_t self, thread_call_param_t);
   static void scanDoneTick(thread_call_param_t self, thread_call_param_t);
   static void reportTick(thread_call_param_t self, thread_call_param_t);
+  static void associationTick(thread_call_param_t self, thread_call_param_t);
   static int userIn(void *, uint64_t from, void *to, uint32_t length) { return copyin(from, to, length); }
   static int userOut(void *, const void *from, uint64_t to, uint32_t length) { return copyout(from, to, length); }
   // The user client's copies (sheng bit 0x8): the data of a client's request may ride inside the structure itself — kernel
@@ -115,6 +117,7 @@ class PianoWifi80211 : public IO80211Controller {
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
+  void syncAssociation(bool emit = true);
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
   void noteIdentity(const char *why);
   void setOverride(bool on, bool onInterface);
@@ -345,7 +348,8 @@ bool PianoWifi80211::start(IOService *provider)
   fAttachCall = thread_call_allocate(&PianoWifi80211::attachTick, this);
   fScanDoneCall = thread_call_allocate(&PianoWifi80211::scanDoneTick, this);
   fReportCall = thread_call_allocate(&PianoWifi80211::reportTick, this);
-  if (!fLock || !fState || !fScratch || !fSeen || !fAttachCall || !fScanDoneCall || !fReportCall) {
+  fAssociationCall = thread_call_allocate(&PianoWifi80211::associationTick, this);
+  if (!fLock || !fState || !fScratch || !fSeen || !fAttachCall || !fScanDoneCall || !fReportCall || !fAssociationCall) {
     note80211("no memory for the apple80211 state: not started");
     return false;
   }
@@ -366,7 +370,7 @@ bool PianoWifi80211::start(IOService *provider)
   // The next binding A/B routes discovery through the controller service, the only service we can offer a tested client
   // from without inventing an IOEthernetInterface subclass/vtable.  Interface registry facts are installed before its
   // synchronous registration in PianoWifiEthernet::start.
-  if (fState->sheng & kShengInterfaceBinding) uc |= kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf;
+  if (fState->sheng & (kShengInterfaceBinding | kShengInterfaceUc)) uc |= kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf;
   fUcMode = uc;
   if (!IO80211Controller::start(provider)) return false;   // PianoWifiEthernet: the interface, its data path, the link down
   IOEthernetAddress mac = {};
@@ -393,6 +397,7 @@ bool PianoWifi80211::start(IOService *provider)
             "0x8 kernel-buffer user-client copies, 0x10 grant, 0x20 filter media, 0x40 interface binding/user-client A/B)",
             unsigned(fState->sheng));
   arm(fAttachCall, kAttachTickMs);
+  arm(fAssociationCall, kAssociationTickMs);
   return true;
 }
 
@@ -550,6 +555,7 @@ int PianoWifi80211::ucOut(void *ctx, const void *from, uint64_t to, uint32_t len
 errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *ioOverride)
 {
   using namespace pianowifi::a80211;
+  syncAssociation(false);
   const int32_t type = rq.type, value = rq.value;
   const uint32_t length = rq.length;
   const UserIo plain = {nullptr, &PianoWifi80211::userIn, &PianoWifi80211::userOut};
@@ -845,7 +851,8 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
 {
   if (on) {
     setProperty(kIOBuiltin, true);
-    setProperty("IOUserClientClass", "PianoWifi80211Uc");
+    if (shengMode() & pianowifi::a80211::kShengInterfaceUc)
+      setProperty("IOUserClientClass", "PianoWifi80211Uc");
     setProperty("IO80211InterfaceRole", "Infrastructure");
     if (fIfName[0]) setProperty("IOInterfaceName", fIfName);
     setProperty("IOInterfaceNamePrefix", "en");
@@ -856,6 +863,8 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
       fNetif->setProperty("IOInterfaceNamePrefix", "en");
       fNetif->setProperty("IOClassNameOverride", "IO80211Interface");
       fNetif->setProperty("NativeSandboxGrantProcess", "airportd");
+      if (shengMode() & pianowifi::a80211::kShengInterfaceUc)
+        fNetif->setProperty("IOUserClientClass", "PianoWifi80211Uc");
     }
   } else {
     removeProperty("IOUserClientClass");
@@ -864,6 +873,7 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
     if (fNetif) {
       fNetif->setProperty(kIOPrimaryInterface, false);
       if (!(fUcMode & pianowifi::a80211::kUcOverrideIf)) fNetif->removeProperty("IOClassNameOverride");
+      fNetif->removeProperty("IOUserClientClass");
       if (!(shengMode() & pianowifi::a80211::kShengGrant)) fNetif->removeProperty("NativeSandboxGrantProcess");
     }
   }
@@ -878,6 +888,10 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
 // Ethernet personality.
 void PianoWifi80211::linkChanged(bool up)
 {
+  if (shengMode() & pianowifi::a80211::kShengAssocState) {
+    syncAssociation(true);
+    return;
+  }
   if (!(shengMode() & pianowifi::a80211::kShengEvents)) return;
   pianowifi::a80211::LinkEvent event = {};
   event.down = up ? 0 : 1;
@@ -890,6 +904,79 @@ void PianoWifi80211::linkChanged(bool up)
     postEvent(pianowifi::a80211::kEvSsidChanged);
     postEvent(pianowifi::a80211::kEvBssidChanged);
   }
+}
+
+// Pull the supplicant's stable snapshot and turn changes into the kev stream
+// airportd consumes.  This is deliberately polled: the station and the
+// Ethernet personality live in a separate kext and have no callback ABI to
+// the apple80211 front end.  Polling also covers roam/rejoin and a firmware
+// initiated leave uniformly.
+void PianoWifi80211::syncAssociation(bool emit)
+{
+  using namespace pianowifi::a80211;
+  if (!(shengMode() & kShengAssocState) || !fState) return;
+  struct piano_wifi_assoc_snapshot raw = {};
+  if (piano_wifi_assoc_snapshot(&raw) != 0) return;
+  Association next = {};
+  next.associated = raw.associated != 0;
+  next.authorized = raw.authorized != 0;
+  next.ssidLength = raw.ssid_length <= pianowifi::kSsidMax ? raw.ssid_length : pianowifi::kSsidMax;
+  memcpy(next.ssid, raw.ssid, next.ssidLength);
+  memcpy(next.bssid, raw.bssid, sizeof next.bssid);
+  next.channel = raw.channel;
+  next.frequency = raw.frequency_mhz;
+  next.rssi = raw.rssi_dbm;
+  next.noise = raw.noise_dbm;
+  next.rate = raw.rate_mbps;
+  next.authType = raw.auth_type;
+  next.cipher = raw.cipher;
+  next.opMode = raw.op_mode ? raw.op_mode : kOpModeStation;
+  next.result = raw.associate_result;
+  next.state = raw.state;
+  Association old = {};
+  bool changed = false, associatedChanged = false, bssidChanged = false, ssidChanged = false;
+  IOLockLock(fLock);
+  old = fState->association;
+  fState->power = raw.power != 0;
+  fState->association = next;
+  associatedChanged = old.associated != next.associated;
+  for (unsigned i = 0; i < 6; ++i) bssidChanged = bssidChanged || old.bssid[i] != next.bssid[i];
+  ssidChanged = old.ssidLength != next.ssidLength || memcmp(old.ssid, next.ssid, pianowifi::kSsidMax) != 0;
+  changed = associatedChanged || bssidChanged || ssidChanged || old.channel != next.channel || old.rssi != next.rssi;
+  IOLockUnlock(fLock);
+  if (!emit || !changed) return;
+  const bool joinedOrRoamed = next.associated && (associatedChanged || bssidChanged || ssidChanged);
+  if (associatedChanged || joinedOrRoamed) {
+    LinkEvent link = {};
+    link.down = next.associated ? 0 : 1;
+    link.rssi = next.rssi;
+    link.noise = uint16_t(next.noise);
+    if (next.associated) {
+      if (ssidChanged) postEvent(kEvSsidChanged);
+      if (bssidChanged) postEvent(kEvBssidChanged);
+      postEvent(kEvLinkChanged, &link, sizeof link);
+      const uint32_t result = 0;  // ASSOC_DONE's event result is success; GET 21 carries pending/success.
+      postEvent(kEvAssocDone, &result, sizeof result);
+    } else {
+      postEvent(kEvLinkChanged, &link, sizeof link);
+      postEvent(kEvSsidChanged);
+      postEvent(kEvBssidChanged);
+    }
+  } else {
+    if (ssidChanged) postEvent(kEvSsidChanged);
+    if (bssidChanged) postEvent(kEvBssidChanged);
+  }
+  note80211("%s: association state %s (channel %u, rssi %d, rate %u; events emitted)", fIfName,
+            next.associated ? "associated" : "idle", unsigned(next.channel), int(next.rssi), unsigned(next.rate));
+}
+
+void PianoWifi80211::associationTick(thread_call_param_t p, thread_call_param_t)
+{
+  auto *self = static_cast<PianoWifi80211 *>(p);
+  Tick tick(self);
+  if (!tick.run) return;
+  self->syncAssociation(true);
+  self->arm(self->fAssociationCall, kAssociationTickMs);
 }
 
 // sheng bit 0x20's answer, their if_ioctl form word for word (WifiNet.cpp:712-719): "the framework lists wireless interfaces
@@ -1162,14 +1249,15 @@ void PianoWifi80211::setShengMode(uint32_t mode, const char *why)
   IOLockUnlock(fLock);
   if (((masked ^ was) & kShengMedium) && fMedium11) applyMedium();
   if ((masked ^ was) & kShengGrant) applyGrant((masked & kShengGrant) != 0);
-  if ((masked ^ was) & kShengInterfaceBinding) {
+  if ((masked ^ was) & (kShengInterfaceBinding | kShengInterfaceUc)) {
     const bool on = (masked & kShengInterfaceBinding) != 0;
     applyInterfaceBinding(on);
-    if (on) setUcMode(ucMode() | kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf, "sheng interface binding");
+    if (masked & kShengInterfaceUc)
+      setUcMode(ucMode() | kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf, "sheng interface user client");
   }
   note80211("%s: sheng mode %#x (was %#x, %s): 0x1 the 802.11 medium selected, 0x2 SSID/BSSID events beside link ones, 0x4 card "
             "caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 NativeSandboxGrantProcess, 0x20 SIOCGIFMEDIA "
-            "in the filter, 0x40 interface binding/user-client A/B; every request kind is logged again from here",
+            "in the filter, 0x40 interface identity, 0x80 interface user client, 0x100 association state; every request kind is logged again from here",
             fIfName, unsigned(masked), unsigned(was), why);
 }
 
@@ -1245,11 +1333,13 @@ void PianoWifi80211::quiesceCalls()
   if (fAttachCall) thread_call_cancel_wait(fAttachCall);
   if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
   if (fReportCall) thread_call_cancel_wait(fReportCall);
+  if (fAssociationCall) thread_call_cancel_wait(fAssociationCall);
   for (unsigned waited = 0; waited < 500; ++waited) {
     if (!__atomic_load_n(&fCallsArmed, __ATOMIC_ACQUIRE) && !__atomic_load_n(&fCallsInside, __ATOMIC_ACQUIRE)) return;
     if (fAttachCall) thread_call_cancel_wait(fAttachCall);
     if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
     if (fReportCall) thread_call_cancel_wait(fReportCall);
+    if (fAssociationCall) thread_call_cancel_wait(fAssociationCall);
     IOSleep(10);
   }
   note80211("a thread call was still armed or running after 5 s at the stop");
@@ -1280,7 +1370,8 @@ void PianoWifi80211::free()
   if (fAttachCall) thread_call_free(fAttachCall);
   if (fScanDoneCall) thread_call_free(fScanDoneCall);
   if (fReportCall) thread_call_free(fReportCall);
-  fAttachCall = fScanDoneCall = fReportCall = nullptr;
+  if (fAssociationCall) thread_call_free(fAssociationCall);
+  fAttachCall = fScanDoneCall = fReportCall = fAssociationCall = nullptr;
   if (fState) IOFreeData(fState, sizeof(State));
   if (fScratch) IOFreeData(fScratch, pianowifi::a80211::kScratchBytes);
   if (fSeen) IOFreeData(fSeen, sizeof(Seen));

@@ -30,4 +30,4 @@ KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
   --library-prefix __ZN19IOEthernetInterface --library-prefix __ZNK18IONetworkInterface \
   --library-prefix __ZNK19IOEthernetInterface --library-prefix __ZTV18IONetworkInterface \
   --library-prefix __ZTV19IOEthernetInterface --library-prefix __ZTV19IONetworkController \
-  --library-prefix __ZTV20IOEthernetController --library-prefix _piano_wifi_net_ | cut -c1-160 >&2
+  --library-prefix __ZTV20IOEthernetController --library-prefix _piano_wifi_net_ --library-prefix _piano_wifi_assoc_ | cut -c1-160 >&2

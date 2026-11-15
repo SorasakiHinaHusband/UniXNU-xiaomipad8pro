@@ -70,8 +70,11 @@ class PianoWifi80211Uc : public IOUserClient {
   uint32_t fType = 0;
   uint64_t fCalls = 0;
   uint32_t fSeen = 0;   // bit per selector below kUcSelMax, for one line each
+  bool fOwnerRetained = false;
 
  public:
+  bool initWithTask(task_t owningTask, void *security, UInt32 type) override;
+  bool start(IOService *provider) override;
   bool initWithOwner(PianoWifi80211 *owner, task_t task, uint32_t type);
   IOReturn clientClose() override;
   void free() override;
@@ -87,9 +90,35 @@ bool PianoWifi80211Uc::initWithOwner(PianoWifi80211 *owner, task_t task, uint32_
   if (!owner || !IOUserClient::init()) return false;
   owner->retain();
   fOwner = owner;
+  fOwnerRetained = true;
   fTask = task;
   fType = type;
   return true;
+}
+
+// IOService's property-driven factory uses the standard initWithTask/start
+// pair.  The interface child does not own the controller, so discover it from
+// the provider chain and share the same request/event implementation.
+bool PianoWifi80211Uc::initWithTask(task_t task, void *security, UInt32 type)
+{
+  if (!IOUserClient::initWithTask(task, security, type)) return false;
+  fTask = task;
+  fType = type;
+  return true;
+}
+
+bool PianoWifi80211Uc::start(IOService *provider)
+{
+  if (!fOwner) {
+    IOService *p = provider;
+    for (unsigned depth = 0; p && depth < 4 && !fOwner; ++depth, p = p->getProvider()) {
+      fOwner = OSDynamicCast(PianoWifi80211, p);
+    }
+    if (!fOwner) return false;
+    fOwner->retain();
+    fOwnerRetained = true;
+  }
+  return IOUserClient::start(provider);
 }
 
 IOReturn PianoWifi80211Uc::clientClose()
@@ -101,7 +130,8 @@ IOReturn PianoWifi80211Uc::clientClose()
 
 void PianoWifi80211Uc::free()
 {
-  OSSafeReleaseNULL(fOwner);
+  if (fOwnerRetained) OSSafeReleaseNULL(fOwner);
+  else fOwner = nullptr;
   IOUserClient::free();
 }
 

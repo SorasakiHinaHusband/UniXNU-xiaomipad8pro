@@ -12,6 +12,7 @@
 #pragma once
 #include <stdint.h>
 #include "WifiHw.h"   // kScanEntriesMax, kSsidMax
+#include "WifiAssocSnapshot.h"
 
 namespace pianowifi {
 namespace a80211 {
@@ -147,6 +148,11 @@ constexpr int kErrInval = 22, kErrFault = 14;
 struct Channel {
   uint32_t version, channel, flags;
 };
+struct ChannelAnswer {
+  uint32_t version;
+  Channel channel;
+};
+static_assert(sizeof(ChannelAnswer) == 16, "channel answer");
 static_assert(sizeof(Channel) == 12, "channel");
 
 // {version, count, channels}: 4824 bytes on 27.3 (count at 4, entries from 8, stride 12; user space does not bound the count:
@@ -355,15 +361,36 @@ enum : uint32_t {
                          // our kernel's native_sandbox_grant compares the whole property with one process name)
   kShengMediaFilter = 0x20,  // SIOCGIFMEDIA answered in the interface filter outright (their non-macOS if_ioctl form), for
                              // the case the family's answer lags the selected medium
-  kShengInterfaceBinding = 0x40, // interface primary/class/name/grant plus controller-client discovery A/B
+  kShengInterfaceBinding = 0x40, // interface primary/class/name/grant plus controller discovery identity A/B
+  kShengInterfaceUc = 0x80,     // interface-side IOUserClientClass / open path
+  kShengAssocState = 0x100,      // supplicant association state, request answers and transition kevs
 };
 constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter |
-                                kShengInterfaceBinding;
+                                kShengInterfaceBinding | kShengInterfaceUc | kShengAssocState;
+
+struct Association {
+  bool associated = false;
+  bool authorized = false;
+  uint8_t ssid[kSsidMax] = {};
+  uint8_t ssidLength = 0;
+  uint8_t bssid[6] = {};
+  uint16_t channel = 0;
+  uint32_t frequency = 0;
+  int32_t rssi = -95;
+  int32_t noise = -95;
+  uint32_t rate = 0;
+  uint8_t authType = 1;
+  uint8_t cipher = 0;
+  uint8_t opMode = kOpModeStation;
+  uint32_t result = 0;
+  uint32_t state = kStateInit;
+};
 
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
   bool power = true;              // POWER: the radio as airportd sees it (M1: off only stops the scans; the chip stays up)
+  Association association;        // the supplicant's current link, when the association bit is enabled
   uint32_t cursor = 0;            // the next SCAN_RESULT
   bool cacheCleared = false;      // SCANCACHE_CLEAR since the last SCAN_REQ: no result until the next scan
   ScanSnapshot scan;              // the scan list as of the last refresh
@@ -548,7 +575,10 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     case kCipherKey:
     case kAuthType:
     case kRsnIe:
-      a.error = kErrUnsupported;   // the join's sets: M2, never accepted by a mode
+      // The native supplicant owns the join.  airportd may still issue these
+      // legacy commands while binding; accept them as an idempotent request
+      // and report the real link through the following gets/events.
+      a.error = 0;
       return a;
     case kInfraEnumerated:
       if (s.accept & kAcceptInfraEnumerated) {
@@ -597,16 +627,16 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     return a;
   }
   case kState:
-    a.error = value(rq, io, kStateInit, a);   // never associated in M1 (on or off: INIT)
+    a.error = value(rq, io, s.association.state, a);
     return a;
   case kOpMode:
-    a.error = value(rq, io, kOpModeStation, a);
+    a.error = value(rq, io, s.association.opMode, a);
     return a;
   case kPhyMode: {
     PhyMode *p = reinterpret_cast<PhyMode *>(scratch);
     p->version = 1;
     p->supported = kPhySupported;
-    p->active = 0;   // no association
+    p->active = s.association.associated ? kPhy11n : 0;
     a.error = copyOut(rq, io, p, sizeof *p, a);
     return a;
   }
@@ -614,21 +644,53 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     Rssi *r = reinterpret_cast<Rssi *>(scratch);
     r->version = 1;
     r->radios = 1;
-    for (int i = 0; i < 4; ++i) r->chain[i] = r->extChain[i] = -95;
-    r->aggregate = r->extAggregate = -95;
+    for (int i = 0; i < 4; ++i) r->chain[i] = r->extChain[i] = s.association.noise;
+    r->aggregate = r->extAggregate = s.association.noise;
     a.error = copyOut(rq, io, r, sizeof *r, a);
     return a;
   }
   case kRssi:
+    if (!s.association.associated) { a.error = kErrNotAssociated; return a; }
+    { Rssi *r = reinterpret_cast<Rssi *>(scratch); r->version = 1; r->radios = 1; r->unit = 0;
+      for (int i = 0; i < 4; ++i) r->chain[i] = r->extChain[i] = s.association.rssi;
+      r->aggregate = r->extAggregate = s.association.rssi;
+      a.error = copyOut(rq, io, r, sizeof *r, a); }
+    return a;
   case kChannel:
-  case kSsid:
-  case kBssid:
-  case kCurrentNetwork:
+    if (!s.association.associated) { a.error = kErrNotAssociated; return a; }
+    if (rq.length == 0 || !rq.data) a.error = value(rq, io, s.association.channel, a);
+    else { ChannelAnswer *c = reinterpret_cast<ChannelAnswer *>(scratch); c->version = 1;
+      fillChannel(c->channel, s.association.frequency, s.association.channel);
+      a.error = copyOut(rq, io, c, sizeof *c, a); }
+    return a;
   case kRate:
-    a.error = kErrNotAssociated;   // what needs an association (M2)
+    a.error = s.association.associated ? value(rq, io, s.association.rate, a) : kErrNotAssociated;
+    return a;
+  case kSsid:
+    if (!s.association.associated) { a.error = kErrNotAssociated; return a; }
+    a.error = bytes(rq, io, s.association.ssid, s.association.ssidLength, a);
+    return a;
+  case kBssid:
+    a.error = s.association.associated ? bytes(rq, io, s.association.bssid, sizeof s.association.bssid, a) : kErrNotAssociated;
+    return a;
+  case kCurrentNetwork:
+    if (!s.association.associated) { a.error = kErrNotAssociated; return a; }
+    { Bss b = {}; for (unsigned i = 0; i < 6; ++i) b.bssid[i] = s.association.bssid[i];
+      b.ssidLength = s.association.ssidLength; for (unsigned i = 0; i < b.ssidLength; ++i) b.ssid[i] = s.association.ssid[i];
+      b.channel = s.association.channel; b.freq = s.association.frequency; b.rssi = s.association.rssi;
+      b.rateCount = 1; b.rates[0] = uint8_t(s.association.rate > 127 ? 127 : s.association.rate * 2);
+      ScanResult *r = reinterpret_cast<ScanResult *>(scratch); fillScanResult(*r, b);
+      a.error = copyOut(rq, io, r, resultBytes(*r), a); }
+    return a;
+  case kAuthType:
+    w[0] = 1; w[1] = 1; w[2] = s.association.authType == 2 ? 0x10 : 0; w[3] = 0;
+    a.error = copyOut(rq, io, w, 16, a);
+    return a;
+  case kRsnIe:
+    a.error = s.association.associated ? kErrUnsupported : kErrNotAssociated;
     return a;
   case kAssociateResult:
-    a.error = value(rq, io, 0, a);   // pending: nothing was asked
+    a.error = value(rq, io, s.association.result, a);
     return a;
   case kVirtualIfRole:   // an answer may make airportd take the interface for a virtual one: refused unless kAcceptVirtualRole
     if (s.accept & kAcceptVirtualRole) {
@@ -638,11 +700,6 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       return a;
     }
     a.error = kErrUnsupported;
-    return a;
-  case kAuthType:
-    w[0] = 1;
-    w[1] = 1;   // open system
-    a.error = copyOut(rq, io, w, 16, a);
     return a;
   case kCountryCode:
     a.error = bytes(rq, io, s.country, 3, a);

@@ -184,11 +184,50 @@ int main()
     CHECK(r.ask(false, kVirtualIfRole, 0, false).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
     Answer e = r.ask(true, kInfraEnumerated, 1);                               // accepted by default (kAcceptInfraEnumerated)
     CHECK(e.error == 0 && e.accepted && r.st.acceptedUnknown == 1);
-    CHECK(r.ask(true, kAssociate, 656).error == kErrUnsupported);
-    CHECK(r.ask(true, kCipherKey, 148).error == kErrUnsupported);
+    CHECK(r.ask(true, kAssociate, 656).error == 0);
+    CHECK(r.ask(true, kCipherKey, 148).error == 0);
     CHECK(r.ask(false, 9999, 16).error == kErrUnsupported);
     // accepted sets that change nothing
     CHECK(r.ask(true, kCountryCode, 8).error == 0 && r.ask(true, kPowerSave, 8).error == 0);
+  }
+
+  // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered
+  // ---- an established supplicant link: the state requests expose the same BSS and telemetry airportd uses
+  {
+    Rig r;
+    r.st.association.associated = true;
+    r.st.association.authorized = true;
+    r.st.association.ssidLength = 4;
+    std::memcpy(r.st.association.ssid, "test", 4);
+    const uint8_t bssid[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+    std::memcpy(r.st.association.bssid, bssid, 6);
+    r.st.association.channel = 36;
+    r.st.association.frequency = 5180;
+    r.st.association.rssi = -47;
+    r.st.association.noise = -95;
+    r.st.association.rate = 433;
+    r.st.association.authType = 2;
+    r.st.association.cipher = 4;
+    r.st.association.state = kStateRun;
+    r.st.association.result = 1;
+    CHECK(r.ask(false, kState, 0, false).error == 0 && r.rq.value == int32_t(kStateRun));
+    CHECK(r.ask(false, kState, 8).error == 0 && r.u32(4) == kStateRun);
+    CHECK(r.ask(false, kSsid, 32).error == 0 && r.rq.length == 4 && std::memcmp(r.at(0), "test", 4) == 0);
+    CHECK(r.ask(false, kBssid, 6).error == 0 && std::memcmp(r.at(0), bssid, 6) == 0);
+    CHECK(r.ask(false, kChannel, 0, false).error == 0 && r.rq.value == 36);
+    CHECK(r.ask(false, kRate, 0, false).error == 0 && r.rq.value == 433);
+    CHECK(r.ask(false, kRssi, 52).error == 0 && int32_t(r.u32(28)) == -47);
+    CHECK(r.ask(false, kAuthType, 16).error == 0 && r.u32(4) == 1 && r.u32(8) == 0x10);
+    CHECK(r.ask(false, kNoise, 52).error == 0 && int32_t(r.u32(28)) == -95);
+    CHECK(r.ask(false, kAssociateResult, 0, false).error == 0 && r.rq.value == 1);
+    CHECK(r.ask(false, kChannel, 16).error == 0 && r.u32(0) == 1 && r.u32(4) == 1 && r.u32(8) == 36 &&
+          r.u32(12) == (kChan20MHz | kChan5GHz));
+    Answer a = r.ask(false, kCurrentNetwork, kScanResultBytes27);
+    CHECK(a.error == 0 && a.wrote >= offsetof(ScanResult, elements) && r.u32(8) == 36);
+    ScanResult joined;
+    std::memcpy(&joined, r.at(0), sizeof joined);
+    CHECK(joined.ssidLength == 4 && std::memcmp(joined.ssid, "test", 4) == 0 && joined.bssid[5] == 0x55);
+    CHECK(r.ask(true, kAssociate, 656).error == 0 && r.ask(true, kDisassociate, 0).error == 0);
   }
 
   // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered
@@ -211,9 +250,9 @@ int main()
     a = r.ask(false, kVirtualIfRole, 0, false);
     CHECK(a.error == 0 && a.accepted && r.rq.value == 0);
     // the handlers of ours and the join's sets (M2) are not changed by any mode
-    CHECK(r.ask(false, kRssi, 52).error == kErrNotAssociated && r.ask(true, kAssociate, 656).error == kErrUnsupported);
+    CHECK(r.ask(false, kRssi, 52).error == kErrNotAssociated && r.ask(true, kAssociate, 656).error == 0);
     r.st.accept = 0;
-    CHECK(r.ask(true, kInfraEnumerated, 1).error == kErrUnsupported && r.ask(true, kAssociate, 656).error == kErrUnsupported);
+    CHECK(r.ask(true, kInfraEnumerated, 1).error == kErrUnsupported && r.ask(true, kAssociate, 656).error == 0);
     Seen seen;
     CHECK(seen.first(85, true, 2068, 0) && !seen.first(85, true, 2068, 0));
     seen.clear();

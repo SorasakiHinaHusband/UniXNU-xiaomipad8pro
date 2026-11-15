@@ -99,6 +99,7 @@
 #include "WifiRddm.h"
 #include "WifiSmmuWindow.h"
 #include "WifiSta.h"
+#include "WifiAssocSnapshot.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
 #define PIANO_WCN_RAILS_KERNEL
@@ -3846,6 +3847,40 @@ struct Level8 {
 };
 Level8 gL8;
 uint8_t gL8Out[kStaOutBytes + 64];   // a command of level 8's own (a key is 25 words and its bytes)
+
+// The apple80211 personality consumes the station's state through this fixed
+// snapshot instead of reaching into the supplicant's mutable objects.  It is
+// intentionally a read-only, best-effort view: the front end polls it and
+// emits kev transitions when the association generation changes.
+extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
+{
+  if (!out) return EINVAL;
+  bzero(out, sizeof *out);
+  out->version = PIANO_WIFI_ASSOC_SNAPSHOT_VERSION;
+  out->power = (gArgs.level >= 2 && !gChipDead) ? 1 : 0;
+  out->op_mode = 1;
+  out->state = 0;
+  out->noise_dbm = -95;
+  out->associate_result = (gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess) ? 0u : uint32_t(gSta.assocStatus);
+  const bool live = gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
+                    (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||
+                     gSta.step == kStaAssociated);
+  out->associated = live && gSta.vdevUp;
+  out->authorized = out->associated && gSta.authorized;
+  out->state = out->associated ? (out->authorized ? 4 : 3) : 0;
+  if (!out->associated) return 0;
+  out->ssid_length = gSta.choice.net.ssidLength <= PIANO_WIFI_ASSOC_SSID_MAX ? gSta.choice.net.ssidLength : PIANO_WIFI_ASSOC_SSID_MAX;
+  for (uint32_t i = 0; i < out->ssid_length; ++i) out->ssid[i] = gSta.choice.net.ssidRaw[i];
+  for (unsigned i = 0; i < 6; ++i) out->bssid[i] = gSta.bssid[i];
+  out->channel = uint16_t(gSta.choice.channel ? gSta.choice.channel : gSta.choice.net.channel);
+  out->frequency_mhz = gSta.choice.freq ? gSta.choice.freq : gSta.choice.net.freq;
+  out->rssi_dbm = gSta.choice.rssi ? gSta.choice.rssi : gSta.choice.net.rssi;
+  out->rate_mbps = gSta.choice.net.rateCount ? uint32_t(gSta.choice.net.rates[gSta.choice.net.rateCount - 1] & 0x7f) / 2u : 6u;
+  out->auth_type = gSta.rsn ? 2 : 1;
+  out->cipher = gSta.rsn ? (gSta.pairwise ? uint8_t(gSta.pairwise) : 4) : 0;
+  out->associate_result = out->associated ? 1u : out->associate_result;
+  return 0;
+}
 // Boot 10q: the station's power save (wanted: the boot argument, then the sysctl; applied: what the firmware was told for the
 // association of `generation`), the firmware's device counters (the last answer) and the rates over a status interval.
 volatile uint32_t gPsWanted;
