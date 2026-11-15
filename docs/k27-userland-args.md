@@ -18,6 +18,10 @@ renaming one means changing the kernel (`patches/k27` or the baseline series) an
 
 ## The k27 kernel's arguments
 
+Userland readers of the piano arguments go through `package/include/PianoBootArgs.h` (`kern.piano_bootargs`, k27 0071: the whole
+merged line, `kern.bootargs` only as an older kernel's `ENOENT` fallback; [bringup-debugging.md](bringup-debugging.md) §5.2), so an
+argument that lives in the ADT tail past `kern.bootargs`' 1023-byte clip still switches its feature.
+
 `offline-apfs-load`, `owner-staged-apps`, `union-hide-lower`, `malloc-ranges-off`, `mac-amfi-launch-permissive`, `rootauth=0`,
 `exec-env`, `kt_fixed_zones`, `tlto_us`, `-no_slto_panic`, `vm_compression_limit`, `arm64_maxoffset`: read by the k27 kernel
 (the baseline series). They make the macOS 27.3 userland run on a machine that is not a Mac; their names and origin are from the

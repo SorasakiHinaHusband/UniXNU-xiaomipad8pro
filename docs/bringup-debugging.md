@@ -167,8 +167,20 @@ to a copy of the line, right after the device tree is set up and before any tuna
 bytes), so every `PE_parse_boot_argn()` / `bootArg()` sees both with no change in the kexts; without the property and the selector
 nothing changes. One console line says what happened: `piano-boot-args: /chosen/piano-boot-args-ram (P bytes): T bytes appended,
 boot-args M bytes (line L)` (or why nothing was appended: no such set, a byte outside printable ASCII, too long for 4095).
-`kern.bootargs` keeps its 1024-byte answer, cut after the last whole argument; the USB console's `args` prints the whole line.
-static-if keys (`validation_disables`, `serverperfmode`, `lcks`, `wdt`) must stay on the line (read before the device tree).
+`kern.bootargs` keeps its 1024-byte answer, cut after the last whole argument (Apple's and third-party fixed-size readers depend
+on it); the USB console's `args` prints the whole line. static-if keys (`validation_disables`, `serverperfmode`, `lcks`, `wdt`)
+must stay on the line (read before the device tree).
+
+**kern.piano_bootargs (k27 0071, 2026-11-15): the whole merged line for our own readers.** The clip above hid every argument past
+byte 1023 from userland: `piano-usb-shell` in the ADT tail silently left the root shell down, and the rotation and Metal debug keys
+fell to their defaults. The read-only `kern.piano_bootargs` answers exactly `PE_boot_args()` (the line plus the tail, at most 4095
+text bytes; `sysctl_io_string` with trunc 0, so a too-small buffer gets `ENOMEM`, never a prefix). The repository's readers go
+through `package/include/PianoBootArgs.h`: a 4096-byte buffer, falling back to `kern.bootargs` only on `ENOENT` (an older kernel --
+its answer is still the clipped line); any other failure reads nothing and the caller's defaults apply, as before. The eight
+readers moved in the same change: `pianousb-shell`, `piano-usbnet-address`, `piano-camera-grab --boot`, `piano-rotated`,
+`NativeSoftMetal`, Turnip's abort reporter and the frontend/Mesa `piano-metal-barriers` / `piano-tu-debug` hunks.
+`tooling/native/sysctl-test-shim.c` fakes both sysctls for their host tests (the shim emulates the kernel's string semantics,
+including the `ENOMEM`).
 
 The tools split only a line that would reach the budget (`PIANO_BOOT_ARGS_SPLIT=1` forces it): every `piano-*` argument moves to the
 ADT except `piano-reset-after`, `piano-reset-to` and `piano-boot-guard*` (the way back to fastboot even under a kernel without 0066);
