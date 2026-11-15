@@ -650,3 +650,30 @@ en2 at boot, with no kickstart. Its checklist is §7.4's with stage 0 now meanin
 | 2 min after the registration, no kickstart | A (the `[iflist] Successfully created CWFApple80211 (en2)` / `WiFi network interface added (en2)` lines from airportd's first pid), W, I, a scan step | adoption at the first start |
 | the control on the same boot | `sudo sysctl machdep.piano_wifi_a80211_uc=0`, kickstart -k, 60 s, A, W | `Did NOT find matching WiFi interface` again (the override is what adopts) |
 | the end | console `reset fastboot` | — |
+
+## 9. wm4: the UniXNU-sheng binding bits (2026-11-15; `piano-wifi-sheng=MASK`, default 0)
+
+The 17:40 runs settled that airportd's name-less lookup **does** match en0 (`Matched cached interface name=en0` in every stage
+of wm2a/wm2b) and wdutil still prints `(null)` with every CoreWLAN scan at 0 networks: the gap is **after** the lookup — what
+airportd/CoreWiFi then read from the matched en0 (the vif list `-3903`, the media type, card caps, the scan-done event). The
+UniXNU sheng port ran this same step on our exact OS build (26C5035r, macOS 27.3) with airportd scans, association, DHCP and
+traffic over en0 (`private/host-checks/20261115-unixnu-sheng/STUDY.md` §1); this milestone takes the Apple-side facts their run
+verified, each behind its own bit so one boot A/Bs them (their WifiNet.cpp / ShengEthernet.cpp are BSD-2-Clause-Patent prior
+art; values and layouts only, no code):
+
+| Bit | What it does | Their evidence |
+|---|---|---|
+| `0x1` medium | `kIOMediumIEEE80211Auto` published beside the Ethernet medium and **selected** while on; the family answers `SIOCGIFMEDIA` from the selection | "the framework lists wireless interfaces by this media type" (their en0's answer) |
+| `0x2` events | `SSID_CHANGED` and `BSSID_CHANGED` posted beside every `LINK_CHANGED` (code 2 and 3 after 4) | their `post_link_down` |
+| `0x4` caps 46 | `CARD_CAPABILITIES` bit 46 | "the framework's scan (IO80211 26C5035r, Apple80211Scan) waits for the scan-done event, up to 20 s, only with this bit; without it the results are read the moment the request returns, before the radio scanned" |
+| `0x8` uc kernel buffers | a user-client request whose data rides inside the client's structure (kernel memory) is answered by memcpy when the copyout faults inside it | their macOS-27.3 EFAULT fix (byte replies: country, SSID, BSSID) |
+| `0x10` sandbox grant | `NativeSandboxGrantProcess = "airportd"` on the controller and the interface; the kernel's `native_sandbox_grant` (the k27 IOUserClient patch) then stands in for the sandbox's verdict at the open | theirs is on the interface; our hook compares the whole property with **one** process name, so their comma list would never match here |
+| `0x20` media in the filter | `SIOCGIFMEDIA` answered in the interface filter outright (`ifm_current`/`ifm_active` = `IFM_IEEE80211|IFM_AUTO`, `IFM_AVALID` [+ `IFM_ACTIVE` when the link is up], count 1) | their `if_ioctl` form, word for word |
+
+Not behind a bit (always on): every scan is answered at once from the snapshot **and** completes with one scan-done kev 2 s
+later (their cached and joined scan paths in one: "answered at once, the daemon asks again straight away"), and the scan type
+at offset 0x34 of SCAN_REQ (3 = the held results) is logged per scan, so one boot shows which type CoreWLAN sends.
+
+Switches: `piano-wifi-sheng=MASK` at boot, `machdep.piano_wifi_sheng` at run time (re-selects the medium, sets/removes the
+grant, clears the request-kind table so every kind is logged again). Host tests: `tests/apple80211_host.cpp` (caps bit 46,
+`shengKernelBuffer`, the scan-type reader). The boot that tries them: `private/host-checks/20261115-awdl/SHENG-MEDIA.md`.
