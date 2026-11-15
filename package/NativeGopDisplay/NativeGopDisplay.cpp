@@ -44,14 +44,60 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <pexpert/device_tree.h>
+#include <sys/sysctl.h>
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
+#include "CopyRows.h"
 
 using gopcompose::Job;
 using gopcompose::Rect;
 
 extern "C" task_t kernel_task;
+
+SYSCTL_DECL(_machdep);
+static volatile uint32_t gCopyThreads = 4;
+static struct sysctl_oid gCopyThreadsOid;
+static bool gCopyThreadsRegistered = false;
+
+static int nativeGopCopyThreadsSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    int value = static_cast<int>(__atomic_load_n(&gCopyThreads, __ATOMIC_ACQUIRE));
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr)
+        return err;
+    if (value < 1)
+        value = 1;
+    if (value > 6)
+        value = 6;
+    __atomic_store_n(&gCopyThreads, static_cast<uint32_t>(value), __ATOMIC_RELEASE);
+    return 0;
+}
+
+static void registerNativeGopCopyThreadsSysctl()
+{
+    if (gCopyThreadsRegistered)
+        return;
+    bzero(&gCopyThreadsOid, sizeof gCopyThreadsOid);
+    gCopyThreadsOid.oid_parent = &sysctl__machdep_children;
+    gCopyThreadsOid.oid_number = OID_AUTO;
+    gCopyThreadsOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gCopyThreadsOid.oid_name = "native_gop_display_copy_threads";
+    gCopyThreadsOid.oid_handler = nativeGopCopyThreadsSysctl;
+    gCopyThreadsOid.oid_fmt = "I";
+    gCopyThreadsOid.oid_descr = "NativeGopDisplay parallel row-copy workers (1..6)";
+    gCopyThreadsOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gCopyThreadsOid);
+    gCopyThreadsRegistered = true;
+}
+
+static void unregisterNativeGopCopyThreadsSysctl()
+{
+    if (!gCopyThreadsRegistered)
+        return;
+    sysctl_unregister_oid(&gCopyThreadsOid);
+    gCopyThreadsRegistered = false;
+}
 
 // Every line of an instance names it: "NativeGopDisplay: " (the panel), "NativeGopDisplay-ext: " (D6's second display).
 #define GOPLOG(fmt, ...) IOLog("NativeGopDisplay%s: " fmt, logTag(), ##__VA_ARGS__)
@@ -256,6 +302,11 @@ private:
     void logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
+    struct BandResult;
+    struct BandWork;
+    static void copyBandThreadMain(void *, wait_result_t);
+    void composeBand(const gopcompose::RowSource &, const gopcompose::RowSource &, bool, bool, const gopcompose::Overlay &,
+                     const Rect &, const Rect &, const Job &, BandResult *, IOLock *, uint32_t *);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *, bool *cached);
     void releaseSurfaceMaps();
     void stopCopies();
@@ -314,6 +365,12 @@ private:
     struct FrameStats {
         uint64_t samples, lit, raw, red, green, blue;
         uint32_t centre;
+    };
+    struct BandResult {
+        FrameStats stats = {};
+        uint64_t readNs = 0, convertNs = 0, writeNs = 0;
+        bool sample = false, thumb = false;
+        bool aborted = false;
     };
     uint64_t fLastLitPerMille, fLastMean, fLastCenter;
     // The boot-time timeline (docs/boot-time.md section 10): the uptime of WindowServer's first frame and of the first frame copied
@@ -477,6 +534,8 @@ private:
     //          before the read, so the read streams through the cache instead of single uncached loads
     static constexpr uint32_t kCopyFencedRefresh = 1, kCopyCachedRead = 2;
     uint32_t fCopyMode;
+    uint32_t fCopyThreads = 4;
+    bool fCopyThreadsSysctl = false;
     // native-gop-display-copy-ab=1 (2026-11-14, one-boot A/B of copy mode bit 1): every report period the work loop asks for the
     // other read mode (fCopyModeWanted), the copy thread takes it before its next job (its surface maps let go, so the next jobs map
     // them again the new way), and each whole-frame copy's read time is counted by the mode it really used (fAbReads/fAbReadNs:
@@ -695,6 +754,15 @@ bool NativeGopDisplay::start(IOService *provider)
     fGpuFences = gpuFence != 0;
     fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
     PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
+    fCopyThreads = 4;
+    PE_parse_boot_argn("native-gop-display-copy-threads", &fCopyThreads, sizeof(fCopyThreads));
+    if (fCopyThreads < 1 || fCopyThreads > 6)
+        fCopyThreads = 4;
+    if (!fExternal) {
+        __atomic_store_n(&gCopyThreads, fCopyThreads, __ATOMIC_RELEASE);
+        registerNativeGopCopyThreadsSysctl();
+        fCopyThreadsSysctl = true;
+    }
     unsigned copyAB = 0;
     PE_parse_boot_argn("native-gop-display-copy-ab", &copyAB, sizeof(copyAB));
     fCopyAB = copyAB != 0;
@@ -757,6 +825,8 @@ bool NativeGopDisplay::start(IOService *provider)
         GOPLOG("copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the frame (and the last one)" : "",
               fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
+    GOPLOG("parallel row copy: %u workers (native-gop-display-copy-threads), runtime sysctl machdep.native_gop_display_copy_threads (1..6)\n",
+           fCopyThreads);
     // Flip mode is on by default where PianoDpu serves flips (piano-dpu=2 with piano-dpu-flip=4 or more, 2026-11-12): the ladder's
     // last step needs no argument of this driver; native-gop-display-flip=0 keeps the copy, =1 asks PianoDpu whatever its level.
     unsigned dpuLevel = 0, dpuFlip = 1;
@@ -888,6 +958,10 @@ bool NativeGopDisplay::start(IOService *provider)
 void NativeGopDisplay::stop(IOService *provider)
 {
     GOPLOG("stop\n");
+    if (fCopyThreadsSysctl) {
+        unregisterNativeGopCopyThreadsSysctl();
+        fCopyThreadsSysctl = false;
+    }
     IOMobileFramebufferLegacy::stop(provider);
     stopCopies();
     releaseSurfaceMaps();
@@ -2109,6 +2183,86 @@ bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *sou
     return true;
 }
 
+struct NativeGopDisplay::BandWork {
+    NativeGopDisplay *owner;
+    const gopcompose::RowSource *base;
+    const gopcompose::RowSource *cursor;
+    bool haveBase, haveCursor, sample, thumb, halfFloat;
+    gopcompose::Overlay overlay;
+    Rect onPanel, rect;
+    Job job;
+    BandResult *result;
+    IOLock *doneLock;
+    uint32_t *pending;
+};
+
+// Compose one row band. Each worker has private scratch buffers and writes only
+// its own destination rows; the source mappings, conversion tables and cursor
+// description are immutable for the duration of the job.
+void NativeGopDisplay::composeBand(const gopcompose::RowSource &base, const gopcompose::RowSource &cursor, bool haveBase,
+                                   bool haveCursor, const gopcompose::Overlay &o, const Rect &onPanel, const Rect &r,
+                                   const Job &job, BandResult *result, IOLock *, uint32_t *)
+{
+    const uint64_t lineBytes = uint64_t(fVideo.v_width) * 4;
+    const uint64_t scratchBytes = uint64_t(fVideo.v_width) * 8;
+    uint32_t *line = static_cast<uint32_t *>(IOMalloc(lineBytes));
+    uint8_t *scratch = static_cast<uint8_t *>(IOMalloc(scratchBytes));
+    uint32_t *overlayScratch = static_cast<uint32_t *>(IOMalloc(uint64_t(fVideo.v_width) * 4));
+    if (!line || !scratch || !overlayScratch) {
+        if (line) IOFree(line, lineBytes);
+        if (scratch) IOFree(scratch, scratchBytes);
+        if (overlayScratch) IOFree(overlayScratch, uint64_t(fVideo.v_width) * 4);
+        result->aborted = true;
+        return;
+    }
+    uint64_t mark = mach_absolute_time();
+    for (int32_t y = r.y; y < r.bottom(); y++) {
+        if (r.empty()) break;
+        if (job.refresh && __atomic_load_n(&fAbortSerial, __ATOMIC_ACQUIRE) == job.serial) {
+            result->aborted = true;
+            break;
+        }
+        const uint32_t count = gopcompose::readBaseSpan(line, scratch, y, r.x, static_cast<int32_t>(r.right()),
+                                                        haveBase ? &base : nullptr);
+        uint64_t now = mach_absolute_time(), ns = 0;
+        absolutetime_to_nanoseconds(now - mark, &ns);
+        result->readNs += ns;
+        mark = now;
+        gopcompose::convertBaseSpan(line, scratch, r.x, static_cast<int32_t>(r.right()), count, haveBase ? &base : nullptr, *fTables);
+        if (haveCursor)
+            gopcompose::blendOverlayRow(line, overlayScratch, y, r.x, static_cast<int32_t>(r.right()), &cursor, o, onPanel);
+        if (result->sample && y % static_cast<int32_t>(kSampleStep) == 0)
+            sampleRow(line, haveBase && base.format == gopcompose::kFormatRGhA ? scratch : nullptr,
+                      haveBase && base.format == gopcompose::kFormatRGhA ? 8 : 4, static_cast<uint64_t>(y), fVideo.v_width,
+                      fVideo.v_height, result->stats, result->thumb);
+        now = mach_absolute_time();
+        absolutetime_to_nanoseconds(now - mark, &ns);
+        result->convertNs += ns;
+        mark = now;
+        memcpy(fScanout + uint64_t(y) * fVideo.v_rowBytes + uint64_t(r.x) * 4, line + r.x, static_cast<size_t>(r.w) * 4);
+        now = mach_absolute_time();
+        absolutetime_to_nanoseconds(now - mark, &ns);
+        result->writeNs += ns;
+        mark = now;
+    }
+    IOFree(line, lineBytes);
+    IOFree(scratch, scratchBytes);
+    IOFree(overlayScratch, uint64_t(fVideo.v_width) * 4);
+}
+
+void NativeGopDisplay::copyBandThreadMain(void *arg, wait_result_t)
+{
+    BandWork *w = static_cast<BandWork *>(arg);
+    w->owner->composeBand(*w->base, *w->cursor, w->haveBase, w->haveCursor, w->overlay, w->onPanel, w->rect, w->job,
+                          w->result, w->doneLock, w->pending);
+    IOLockLock(w->doneLock);
+    if (*w->pending)
+        --*w->pending;
+    IOLockWakeup(w->doneLock, w->pending, true);
+    IOLockUnlock(w->doneLock);
+    thread_terminate(current_thread());
+}
+
 // A plan's rectangles into the boot framebuffer (the copy thread): per row, layer 0's part read in one run and converted (black where
 // it has no pixel), layer 1's glyph blended over it, the row written at once (the framebuffer is write-combined). A plan for the whole
 // panel is a frame: its time, statistics and thumbnail are the periodic line's; a cursor plan redraws the cursor's old and new
@@ -2179,26 +2333,80 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
     const uint64_t width = fVideo.v_width, height = fVideo.v_height;
     const bool halfFloat = haveBase && baseRows.format == gopcompose::kFormatRGhA;
     bool aborted = false;
-    for (unsigned i = 0; i < plan.count && !aborted; i++) {
+    unsigned workerCount = __atomic_load_n(&gCopyThreads, __ATOMIC_ACQUIRE);
+    if (workerCount < 1 || workerCount > 6)
+        workerCount = 4;
+    BandWork works[16] = {};
+    BandResult results[16] = {};
+    unsigned bandCount = 0;
+    for (unsigned i = 0; i < plan.count && bandCount < 16; i++) {
         const Rect &r = plan.rect[i];
-        const int32_t x0 = r.x, x1 = static_cast<int32_t>(r.right());
-        for (int32_t y = r.y; y < r.bottom(); y++) {
-            if (refresh && __atomic_load_n(&fAbortSerial, __ATOMIC_ACQUIRE) == job.serial) {
-                aborted = true;
-                break;
-            }
-            const uint32_t count = gopcompose::readBaseSpan(fLine, fRow, y, x0, x1, haveBase ? &baseRows : nullptr);
-            lap(readNs);
-            gopcompose::convertBaseSpan(fLine, fRow, x0, x1, count, haveBase ? &baseRows : nullptr, *fTables);
-            if (haveCursor)
-                gopcompose::blendOverlayRow(fLine, fOverlayRow, y, x0, x1, &cursorRows, o, onPanel);
-            if (sample && y % kSampleStep == 0)
-                sampleRow(fLine, halfFloat ? fRow : nullptr, halfFloat ? 8 : 4, static_cast<uint64_t>(y), width, height, stats, thumb);
-            lap(convertNs);
-            memcpy(fScanout + static_cast<uint64_t>(y) * fVideo.v_rowBytes + static_cast<uint64_t>(x0) * 4, fLine + x0,
-                   static_cast<size_t>(x1 - x0) * 4);
-            lap(writeNs);
+        const unsigned count = gopcopy::sliceCount(r.y, static_cast<int32_t>(r.bottom()), workerCount);
+        for (unsigned j = 0; j < count && bandCount < 16; j++) {
+            const gopcopy::RowSlice slice = gopcopy::sliceAt(r.y, static_cast<int32_t>(r.bottom()), workerCount, j);
+            works[bandCount].owner = this;
+            works[bandCount].base = &baseRows;
+            works[bandCount].cursor = &cursorRows;
+            works[bandCount].haveBase = haveBase;
+            works[bandCount].haveCursor = haveCursor;
+            works[bandCount].sample = sample;
+            works[bandCount].thumb = thumb;
+            works[bandCount].halfFloat = halfFloat;
+            works[bandCount].overlay = o;
+            works[bandCount].onPanel = onPanel;
+            works[bandCount].rect = {r.x, slice.y0, r.w, slice.y1 - slice.y0};
+            works[bandCount].job = job;
+            works[bandCount].result = &results[bandCount];
+            ++bandCount;
         }
+    }
+    IOLock *bandLock = bandCount > 1 ? IOLockAlloc() : nullptr;
+    uint32_t pending = 0;
+    for (unsigned i = 1; i < bandCount; i++) {
+        works[i].doneLock = bandLock;
+        works[i].pending = &pending;
+        thread_t thread = nullptr;
+        bool started = false;
+        if (bandLock) {
+            IOLockLock(bandLock);
+            ++pending;
+            started = kernel_thread_start(copyBandThreadMain, &works[i], &thread) == KERN_SUCCESS;
+            if (!started)
+                --pending;
+            IOLockUnlock(bandLock);
+        }
+        if (started) {
+            thread_deallocate(thread);
+        } else {
+            composeBand(baseRows, cursorRows, haveBase, haveCursor, o, onPanel, works[i].rect, job, &results[i], bandLock, &pending);
+        }
+    }
+    if (bandCount) {
+        works[0].sample = sample;
+        works[0].thumb = thumb;
+        composeBand(baseRows, cursorRows, haveBase, haveCursor, o, onPanel, works[0].rect, job, &results[0], bandLock, &pending);
+    }
+    if (bandLock) {
+        IOLockLock(bandLock);
+        while (pending)
+            IOLockSleep(bandLock, &pending, THREAD_UNINT);
+        IOLockUnlock(bandLock);
+        IOLockFree(bandLock);
+    }
+    for (unsigned i = 0; i < bandCount; i++) {
+        const BandResult &result = results[i];
+        readNs += result.readNs;
+        convertNs += result.convertNs;
+        writeNs += result.writeNs;
+        stats.samples += result.stats.samples;
+        stats.lit += result.stats.lit;
+        stats.raw += result.stats.raw;
+        stats.red += result.stats.red;
+        stats.green += result.stats.green;
+        stats.blue += result.stats.blue;
+        if (result.stats.centre || (stats.centre == 0 && result.stats.samples))
+            stats.centre = result.stats.centre;
+        aborted |= result.aborted;
     }
     if (plan.damage && !refresh && !aborted && haveBase)   // a frame from its region: what it left out must still be on the panel
         auditDamage(plan, baseRows, baseMap.cached, onPanel);
