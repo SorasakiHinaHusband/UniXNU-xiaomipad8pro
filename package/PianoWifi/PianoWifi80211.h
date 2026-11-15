@@ -822,8 +822,18 @@ void PianoWifi80211::setOverride(bool on, bool onInterface)
   if (on) setProperty("IOClassNameOverride", "IO80211Controller");
   else removeProperty("IOClassNameOverride");
   if (fNetif) {
-    if (onInterface) fNetif->setProperty("IOClassNameOverride", "IO80211Controller");
-    else fNetif->removeProperty("IOClassNameOverride");
+    // The controller override is the cache-adoption A/B.  When the sheng interface-binding
+    // A/B is enabled, keep the child typed as an IO80211Interface: configureInterface()
+    // installs that property before this helper runs, and replacing it with the controller
+    // class makes CoreWiFi log "not a valid 80211 interface" even though en0 is matched.
+    if (onInterface) {
+      if (shengMode() & pianowifi::a80211::kShengInterfaceBinding)
+        fNetif->setProperty("IOClassNameOverride", "IO80211Interface");
+      else
+        fNetif->setProperty("IOClassNameOverride", "IO80211Controller");
+    } else if (!(shengMode() & pianowifi::a80211::kShengInterfaceBinding)) {
+      fNetif->removeProperty("IOClassNameOverride");
+    }
   }
 }
 
