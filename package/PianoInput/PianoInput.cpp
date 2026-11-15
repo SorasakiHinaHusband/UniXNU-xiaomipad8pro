@@ -341,6 +341,7 @@ bool PianoInput::probeKeys()
   note("keys now: power %s, vol- %s, vol+ %s (PON [10] %02x bits 7/6, GPIO6 [10] %02x bit 0 active low)%s",
        keys & kKeyPower ? "DOWN" : "up", keys & kKeyVolumeDown ? "DOWN" : "up", keys & kKeyVolumeUp ? "DOWN" : "up", fPon, fGpio,
        keys ? "; a key down now is reported only after it has been up once" : "");
+  note("power key source: PMK8550 pon_pwrkey IRQ_TYPE_EDGE_BOTH, PON INT_RT_STS bit 7 (KPDPWR, active high); polling the same level");
   return true;
 }
 

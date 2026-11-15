@@ -23,9 +23,10 @@
 //                (Wn8030Piano.h PollPlan; one wait function, waitForEdge, for a later GPIO interrupt).
 // The I2C bus is driven in software (BitI2c.h); the QUP engine is not touched.
 //
-// The hall sensor: the folio's lid switch on TLMM gpio80 (boot DT gpio-keys switch-lid, SW_LID, active low: low = cover closed),
-// separate from the MCU's attach bit. Read only (its CTL is never written): logged at start and on each change ("hall: cover
-// closed/open"), two equal 500 ms samples make a change. macOS is told nothing unless piano-keyboard-lid=1.
+// The hall sensor: Ubuntu's gpio-keys switch-lid on TLMM gpio80 (GPIO_ACTIVE_LOW: low = cover closed), separate from the MCU's
+// connected bit. Keep the DT's pull and polarity, but make the pin a both-edge, raw-status latch with the apps target disabled;
+// the serving loop consumes that latch and the level, so a close/open shorter than the 500 ms poll cannot disappear. macOS is told
+// nothing unless piano-keyboard-lid=1.
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-keyboard=1            steps 1-6; every report is logged raw ("frame"/"key"/"touch" lines), nothing goes to macOS
@@ -523,10 +524,11 @@ class PianoKeyboard : public IOService {
   uint32_t fConsecutiveErrors = 0, fRawLogged = 0, fEmptyLogged = 0, fLevelReads = 0, fIrqHigh = 0, fPolls = 0;
   uint32_t fAcks = 0, fStates = 0, fPointerSent = 0, fSumBad = 0;
   bool fIrqWasLow = false;   // gpio97 low at the last wakeup
-  // the hall sensor (gpio80): the accepted level (1 open, 0 closed; -1 not read), the last sample, changes, the next sample time
+  // the hall sensor (gpio80): the accepted level (1 open, 0 closed; -1 not read), the last sample, changes, edge latches, next sample
   int fHall = -1, fHallSample = -1;
-  uint32_t fHallChanges = 0;
+  uint32_t fHallChanges = 0, fHallEdges = 0;
   uint64_t fHallNextMs = 0;
+  bool fHallEdge = false;
   bool fLidSetup = false;
   // the LED request from IOHIDFamily's side
   volatile uint32_t fLedRequests = 0, fLedWanted = 0;
@@ -567,6 +569,7 @@ class PianoKeyboard : public IOService {
   void published(const char *what);
   bool waitForEdge(uint32_t ms);
   void surveyHall();
+  void armHallEdge();
   void pollHall(uint64_t now);
   void hallOnly();
   void lidNotify(bool closed);
@@ -687,10 +690,12 @@ void PianoKeyboard::run()
                       step(6, "serving: gpio97 edges latched and polled, frames read from register 0x4c");
   setProperty("piano-keyboard-stage", uint64_t(uint32_t(piano_keyboard_stage)), 32);
   if (!served) {
+    armHallEdge();
     hallOnly();
     return;
   }
   armIrq();
+  armHallEdge();
   if (gArgs.level >= 2 && !publish()) {
     hallOnly();
     return;
@@ -754,19 +759,48 @@ void PianoKeyboard::surveyHall()
   p.io = rd32(p.page.va + kIo);
   p.intrCfg = rd32(p.page.va + kIntrCfg);
   fHall = fHallSample = int(p.io & 1);
-  note("hall: gpio80 CTL %08x (function %u, pull %u, %s) IO %08x INTR_CFG %08x: cover %s at start (level %u; the DT's switch-lid "
-       "is active low: low = closed)%s",
+  note("hall: gpio80 CTL %08x (function %u, pull %u, %s) IO %08x INTR_CFG %08x: cover %s at start (level %u; Ubuntu DT switch-lid "
+       "is GPIO_ACTIVE_LOW: low = closed; edge latch pending)%s",
        p.ctl, (p.ctl >> 2) & 15, p.ctl & 3, p.ctl & kOe ? "output" : "input", p.io, p.intrCfg, fHall ? "open" : "closed", p.io & 1,
        gArgs.lid ? "" : "; macOS is not told (piano-keyboard-lid=0)");
   setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
 }
 
-// Every 500 ms (the poll plan's hallMs): a level that two samples in a row agree on and differs from the accepted one is a change.
+// Ubuntu's gpio-keys switch-lid is an EDGE interrupt on gpio80. Keep the DT's pull and active-low level, but consume both edges
+// through TLMM's raw status latch. The apps target is disabled: this is edge-latched polling, not a second unowned GIC handler.
+void PianoKeyboard::armHallEdge()
+{
+  if (!gArgs.hall || !gHall.page.va) return;
+  constexpr uint32_t kEnable = 1u << 0, kPolarity = 1u << 1, kDetect = 3u << 2, kRaw = 1u << 4;
+  const uint32_t found = gHall.intrCfg;
+  const uint32_t cfg = (found & ~(kEnable | kPolarity | kDetect | kRaw)) | kDetect | kPolarity | kRaw;
+  wr32(gHall.page.va + kIntrStatus, 0);
+  wr32(gHall.page.va + kIntrCfg, cfg);
+  fHallEdge = true;
+  note("hall: gpio80 INTR_CFG %08x -> %08x (both edges, raw status latch, interrupt disabled; pull %u preserved, GPIO_ACTIVE_LOW)",
+       found, rd32(gHall.page.va + kIntrCfg), gHall.ctl & 3);
+}
+
+// Every 500 ms (the poll plan's hallMs), or immediately when the raw edge latch is set, accept the gpio80 level. The edge path
+// removes the old sampling blind spot while retaining a level read as the authoritative open/closed state.
 void PianoKeyboard::pollHall(uint64_t now)
 {
-  if (fHall < 0 || now < fHallNextMs) return;
+  bool edge = false;
+  if (fHallEdge) {
+    edge = (rd32(gHall.page.va + kIntrStatus) & 1u) != 0;
+    if (edge) {
+      wr32(gHall.page.va + kIntrStatus, 0);
+      ++fHallEdges;
+    }
+  }
+  if (fHall < 0 || (!edge && now < fHallNextMs)) return;
   fHallNextMs = now + fPoll.config().hallMs;
   const int sample = int(rd32(gHall.page.va + kIo) & 1);
+  if (edge && sample != fHall) {
+    acceptHall(sample, now, " (gpio80 edge)");
+    fHallSample = sample;
+    return;
+  }
   const bool agreed = sample == fHallSample;
   fHallSample = sample;
   if (!agreed || sample == fHall) return;
@@ -1227,7 +1261,6 @@ void PianoKeyboard::dispatch(const Report &r)
   switch (r.id) {
   case kIdKeyboard: {
     ++fKeys;
-    if (!fAttached) coverAttached(true, "a key report without an attach message");
     if (!fGate.pass()) return;   // the cover closed (piano-keyboard-lid-drop=1)
     uint8_t out[kKeyboardBytes];
     const uint32_t rollovers = fKeyFilter.rollovers();
@@ -1311,9 +1344,11 @@ void PianoKeyboard::dispatch(const Report &r)
   const Vendor v = vendorKind(r, &attached);
   ++fVendor;
   if (v == Vendor::attach) {
-    note("attach message: state byte %#04x (bit 0 %u, bit 1 %u)%s: %s", r.bytes[9], r.bytes[9] & 1, (r.bytes[9] >> 1) & 1,
-         fAttached && attached == 1 ? ", already attached" : "", hex(r.bytes, r.length < 16 ? r.length : 16, line, sizeof line));
-    coverAttached(attached == 1, "attach message");
+    const bool connected = connectedBit(r.bytes[9]);
+    note("attach message: MCU connected byte %#04x (connected bit %u; SW_TABLET_MODE %u; bit 1 %u)%s: %s", r.bytes[9], connected ? 1 : 0,
+         tabletMode(r.bytes[9]) ? 1 : 0, (r.bytes[9] >> 1) & 1, fAttached == connected ? ", state unchanged" : "",
+         hex(r.bytes, r.length < 16 ? r.length : 16, line, sizeof line));
+    coverAttached(connected, "MCU connected bit (a2)");
   } else if (v == Vendor::accel) {
     if (++fAccel <= 3 || fAccel % 500 == 0) note("accelerometer %u: %s", fAccel, hex(r.bytes, 16, line, sizeof line));
   } else if (v == Vendor::authRequest || v == Vendor::authInit || v == Vendor::authChallenge) {
@@ -1668,6 +1703,8 @@ void PianoKeyboard::describe(uint64_t seconds)
        seconds, fKeys, fKeyFilter.rollovers(), fConsumer, fTouch, fPointer.gestures(), fPointer.taps(),
        fPointer.vetoes(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches, fCommands, fCommandErrors,
        fSent, fSendErrors, unsigned(__atomic_load_n(&fLedRequests, __ATOMIC_ACQUIRE)));
+  if (fHallEdge)
+    note("hall: gpio80 edge-latched polls %u (both edges, GPIO_ACTIVE_LOW; %u accepted level changes)", fHallEdges, fHallChanges);
   if (fGate.enabled() || fCover.enabled() || fSleeps)
     note("power at %llu s: input %s (%u reports dropped while closed); MCU %s (%u blanks, %u unblanks, %u early wakes, %u timed out); "
          "%u system sleeps", seconds, fGate.closed() ? "DROPPED (cover closed)" : "passed", fGate.dropped(),

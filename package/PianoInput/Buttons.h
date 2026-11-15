@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // piano's three physical keys, read from the PMICs (the local bring-up notes, touch-native-plan.md section 3; the same registers
 // as piano-uefi's KeypadDeviceLib, on which the UniXNU menu runs at EL1 on this tablet):
-//   power  PMK8550 PON, SID 0 base 0x1300 (PPID 0x013), INT_RT_STS 0x10 bit 7 (KPDPWR), active high
+//   power  PMK8550 PON, SID 0 base 0x1300 (PPID 0x013), INT_RT_STS 0x10 bit 7 (KPDPWR), active high; Ubuntu's pon_pwrkey
+//          DT route is IRQ_TYPE_EDGE_BOTH, so this read observes the same press/release state without changing the PMIC latch.
 //   vol-   the same register, bit 6 (RESIN), active high
 //   vol+   PM8550 GPIO6, SID 1 base 0x8D00 (PPID 0x18D), INT_RT_STS 0x10 bit 0, active low
 // Polled and debounced here; no interrupt is configured and no PMIC register is written. The polling adapts (docs/power-irq.md):

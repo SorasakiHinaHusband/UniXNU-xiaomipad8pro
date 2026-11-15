@@ -250,14 +250,17 @@ inline const char *vendorName(Vendor v)
   return "?";
 }
 // A vendor message (IDs 0x22, 0x23, 0x24, 0x26): its kind and, for an attach message, the state (1 on, 0 off). Under 12 bytes or
-// without the 0x38 0x80 route it is "other" (Linux ignores those).
+// without the 0x38 0x80 route it is "other" (Linux ignores those). Ubuntu's WN8030 driver calls byte 9 bit 0 the MCU connected
+// bit; SW_TABLET_MODE is its inverse.
+inline bool connectedBit(uint8_t state) { return (state & 1u) != 0; }
+inline bool tabletMode(uint8_t state) { return !connectedBit(state); }
 inline Vendor vendorKind(const Report &r, int *attached)
 {
   *attached = -1;
   if (r.id != 0x22 && r.id != 0x23 && r.id != 0x24 && r.id != 0x26) return Vendor::none;
   if (r.length < 12 || r.bytes[2] != 0x38 || r.bytes[3] != 0x80) return Vendor::other;
   switch (r.bytes[4]) {
-  case 0xa2: *attached = r.bytes[9] & 1; return Vendor::attach;
+  case 0xa2: *attached = connectedBit(r.bytes[9]) ? 1 : 0; return Vendor::attach;
   case 0x64: return Vendor::accel;
   case 0x24: return Vendor::authRequest;
   case 0x31: return Vendor::authInit;
