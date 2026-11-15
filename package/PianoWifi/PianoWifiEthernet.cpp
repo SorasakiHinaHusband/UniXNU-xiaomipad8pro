@@ -87,6 +87,11 @@ class PianoWifiEthernet : public IOEthernetController {
   static void netLink(void *ctx, int up, const uint8_t *mac);
 
  protected:
+  // Called after the link state and selected medium are updated. The plain
+  // Ethernet personality has no additional event work; PianoWifi80211 uses
+  // the hook for the sheng event pair.
+  virtual void linkChanged(bool) {}
+
   // The link's medium, for PianoWifi80211 (the subclass included at the end of this file): the Ethernet one is always there,
   // the IEEE 802.11 one (piano-wifi-sheng bit 0x1, the UniXNU-sheng macOS fact: "the framework lists wireless interfaces by
   // this media type" — their en0's SIOCGIFMEDIA answer, ShengEthernet.cpp:271-277) beside it while the apple80211 front end
@@ -218,6 +223,7 @@ void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
   IONetworkMedium *medium = (self->fMedium11On && self->fMedium11) ? self->fMedium11 : self->fMedium;
   self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, medium,
                       now ? kLinkSpeed : 0);
+  self->linkChanged(now);
   note("the link is %s (PianoWifi's port %s)", now ? "up" : "down", now ? "is authorized" : "closed: the association ended");
   self->counters(now ? "at the link's up" : "at the link's down");
 }

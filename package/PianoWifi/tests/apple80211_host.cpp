@@ -370,6 +370,7 @@ int main()
     CHECK(!shengKernelBuffer(base - 0x100000000ull, uint32_t(0x100000000ull + 64), buf, sizeof buf, offset));   // no wraparound
     CHECK(shengKernelBuffer(base + 64, 0, buf, sizeof buf, offset) && offset == 64);     // an empty copy at the end is inside
     CHECK(!shengKernelBuffer(base + 64, 0, buf, 0, offset));                             // an empty range matches nothing
+    CHECK(!shengKernelBuffer(0, 0, nullptr, 0, offset));                                  // null is never a kernel buffer
   }
 
   if (failures) {

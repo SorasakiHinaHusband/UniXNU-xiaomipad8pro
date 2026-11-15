@@ -705,6 +705,9 @@ inline void scanReqInfo(const Req &rq, const UserIo &io, uint32_t &ssidLength, u
 // end above bytes cannot wrap into a match).
 inline bool shengKernelBuffer(uint64_t at, uint32_t n, const void *base, uint32_t bytes, uint32_t &offset)
 {
+  // A null/empty descriptor is not a kernel buffer.  Do not turn (nullptr, 0)
+  // into a successful match that would call memcpy with a null destination.
+  if (!base || !bytes) return false;
   const uint64_t b = reinterpret_cast<uintptr_t>(base);
   if (at < b) return false;
   const uint64_t into = at - b;

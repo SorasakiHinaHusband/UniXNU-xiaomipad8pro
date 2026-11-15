@@ -90,6 +90,8 @@ class PianoWifi80211 : public IO80211Controller {
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   uint64_t fScanSerial = 0;  // every SCAN_REQ gets one (ADOPTION.md 6.1 item 3): the 15 ms CoreWLAN scan is found by it
   uint32_t fScanRecords = 0; // records served since the serial's scan; printed at its list end
+  uint32_t fScanDonePending = 0; // one completion is required for every accepted scan request
+  bool fScanDoneArmed = false;   // guarded by fLock; the delayed callback drains fScanDonePending
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
 
@@ -116,6 +118,7 @@ class PianoWifi80211 : public IO80211Controller {
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
   void noteIdentity(const char *why);
   void setOverride(bool on, bool onInterface);
+  void linkChanged(bool up) override;
   errno_t mediaIoctl(struct ifmediareq *m);
   void applyMedium();
   void applyGrant(bool on);
@@ -318,6 +321,10 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
   fNetif = netif;
   fSubtypeTaken = piano_netif_set_subtype(netif, 3 /* IFNET_SUBFAMILY_WIFI */);
   netif->setProperty("IO80211InterfaceRole", "Infrastructure");
+  // PianoWifiEthernet registers the interface before PianoWifi80211::start
+  // can return. Install the grant while the interface is still configured so
+  // an immediate airportd open sees it.
+  if (fState && (fState->sheng & pianowifi::a80211::kShengGrant)) applyGrant(true);
   // The production form of ADOPTION.md P0: the override is on both services before this interface registers, so CoreWiFi cannot
   // see the child before the controller's identity is there (the sysctl's late set is the A/B of the same thing).
   if (fUcMode & pianowifi::a80211::kUcOverride) setOverride(true, (fUcMode & pianowifi::a80211::kUcOverrideIf) != 0);
@@ -367,9 +374,6 @@ bool PianoWifi80211::start(IOService *provider)
   refreshScanLocked();
   const uint32_t networks = fState->scan.count;
   IOLockUnlock(fLock);
-  // The grant must be on the services before airportd first opens the controller (attachStep registers it): the kernel's
-  // native_sandbox_grant reads the property at the open (sheng bit 0x10).
-  if (fState->sheng & pianowifi::a80211::kShengGrant) applyGrant(true);
   setProperty("piano-wifi-apple80211", true);
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
@@ -490,14 +494,19 @@ struct UcIo {
   uint8_t *outBase = nullptr;
   uint32_t outBytes = 0;
   uint32_t sheng = 0;
+  bool inlineData = false;       // the sheng user-client request carries its data in the input structure
 };
 
 int PianoWifi80211::ucIn(void *ctx, uint64_t from, void *to, uint32_t length)
 {
   auto *uc = static_cast<UcIo *>(ctx);
+  uint32_t offset = 0;
+  if (uc->inlineData && pianowifi::a80211::shengKernelBuffer(from, length, uc->inBase, uc->inBytes, offset)) {
+    memcpy(to, uc->inBase + offset, length);
+    return 0;
+  }
   const int e = copyin(from, to, length);
   if (!e || !(uc->sheng & pianowifi::a80211::kShengUcKernel)) return e;
-  uint32_t offset = 0;
   if (!pianowifi::a80211::shengKernelBuffer(from, length, uc->inBase, uc->inBytes, offset)) return e;
   memcpy(to, uc->inBase + offset, length);
   return 0;
@@ -506,9 +515,13 @@ int PianoWifi80211::ucIn(void *ctx, uint64_t from, void *to, uint32_t length)
 int PianoWifi80211::ucOut(void *ctx, const void *from, uint64_t to, uint32_t length)
 {
   auto *uc = static_cast<UcIo *>(ctx);
+  uint32_t offset = 0;
+  if (uc->inlineData && pianowifi::a80211::shengKernelBuffer(to, length, uc->inBase, uc->inBytes, offset)) {
+    memcpy(uc->inBase + offset, from, length);
+    return 0;
+  }
   const int e = copyout(from, to, length);
   if (!e || !(uc->sheng & pianowifi::a80211::kShengUcKernel)) return e;
-  uint32_t offset = 0;
   if (pianowifi::a80211::shengKernelBuffer(to, length, uc->outBase, uc->outBytes, offset)) {
     memcpy(uc->outBase + offset, from, length);
     return 0;
@@ -718,18 +731,29 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
 // that had not started; one that runs posts its own), this one's after kScanDoneMs.
 void PianoWifi80211::scanStarted()
 {
-  if (thread_call_cancel(fScanDoneCall)) {   // it had not started: this one's completion stands for both
-    __atomic_fetch_sub(&fCallsArmed, 1u, __ATOMIC_ACQ_REL);
-    postEvent(pianowifi::a80211::kEvScanDone);
+  bool schedule = false;
+  IOLockLock(fLock);
+  ++fScanDonePending;
+  if (!fScanDoneArmed) {
+    fScanDoneArmed = true;
+    schedule = true;
   }
-  arm(fScanDoneCall, kScanDoneMs);
+  IOLockUnlock(fLock);
+  if (schedule) arm(fScanDoneCall, kScanDoneMs);
 }
 
 void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
 {
   auto *self = static_cast<PianoWifi80211 *>(p);
   Tick tick(self);
-  if (tick.run) self->postEvent(pianowifi::a80211::kEvScanDone);
+  if (!tick.run) return;
+  uint32_t pending = 0;
+  IOLockLock(self->fLock);
+  pending = self->fScanDonePending;
+  self->fScanDonePending = 0;
+  self->fScanDoneArmed = false;
+  IOLockUnlock(self->fLock);
+  while (pending--) self->postEvent(pianowifi::a80211::kEvScanDone);
 }
 
 void PianoWifi80211::noteOtherIoctl(unsigned long cmd)
@@ -793,6 +817,26 @@ void PianoWifi80211::setOverride(bool on, bool onInterface)
   if (fNetif) {
     if (onInterface) fNetif->setProperty("IOClassNameOverride", "IO80211Controller");
     else fNetif->removeProperty("IOClassNameOverride");
+  }
+}
+
+// The sheng path posts the link event together with the SSID/BSSID state
+// events whenever the association changes.  The initial attach has its own
+// down event above; this hook covers later link callbacks from PianoWifi's
+// Ethernet personality.
+void PianoWifi80211::linkChanged(bool up)
+{
+  if (!(shengMode() & pianowifi::a80211::kShengEvents)) return;
+  pianowifi::a80211::LinkEvent event = {};
+  event.down = up ? 0 : 1;
+  if (up) {
+    postEvent(pianowifi::a80211::kEvSsidChanged);
+    postEvent(pianowifi::a80211::kEvBssidChanged);
+    postEvent(pianowifi::a80211::kEvLinkChanged, &event, sizeof event);
+  } else {
+    postEvent(pianowifi::a80211::kEvLinkChanged, &event, sizeof event);
+    postEvent(pianowifi::a80211::kEvSsidChanged);
+    postEvent(pianowifi::a80211::kEvBssidChanged);
   }
 }
 
@@ -943,6 +987,15 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   ucio.outBase = static_cast<uint8_t *>(args->structureOutput);
   ucio.outBytes = args->structureOutputSize;
   ucio.sheng = shengMode();
+  if ((ucio.sheng & kShengUcKernel) && args->structureInputSize > kUcDataAt) {
+    // Sheng's interface client marks this condition in apple80211req and
+    // points req_data at its inline data area. Use the same explicit kernel
+    // buffer path here instead of probing copyout and guessing from EFAULT.
+    ucio.inlineData = true;
+    ucio.inBase = const_cast<uint8_t *>(in + kUcDataAt);
+    ucio.inBytes = args->structureInputSize - kUcDataAt;
+    rq.data = reinterpret_cast<uint64_t>(ucio.inBase);
+  }
   const UserIo uio = {&ucio, &PianoWifi80211::ucIn, &PianoWifi80211::ucOut};
   const errno_t e = apple80211(cmd == kUcSetCmd, rq, &uio);
   // The answer's own length and value go back to the caller, as the ioctl's struct would carry them.
