@@ -88,7 +88,7 @@ class AppleSmartBattery : public IOPMPowerSource {
       if (v.adapter) {
         OSNumber *family = OSNumber::withNumber(v.adapterFamily, 32), *w = OSNumber::withNumber(v.adapterWatts, 32),
                  *mv = OSNumber::withNumber(v.adapterMv, 32), *ma = OSNumber::withNumber(v.adapterMa, 32),
-                 *id = OSNumber::withNumber(0u, 32);
+                 *id = OSNumber::withNumber((unsigned long long)0, 32);
         if (family) {adapter->setObject(kIOPMPSAdapterDetailsFamilyKey, family); family->release();}
         if (w) {adapter->setObject(kIOPMPSAdapterDetailsWattsKey, w); w->release();}
         if (mv) {adapter->setObject(kIOPMPSAdapterDetailsVoltage, mv); mv->release();}
