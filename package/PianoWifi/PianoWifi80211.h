@@ -367,6 +367,9 @@ bool PianoWifi80211::start(IOService *provider)
   refreshScanLocked();
   const uint32_t networks = fState->scan.count;
   IOLockUnlock(fLock);
+  // The grant must be on the services before airportd first opens the controller (attachStep registers it): the kernel's
+  // native_sandbox_grant reads the property at the open (sheng bit 0x10).
+  if (fState->sheng & pianowifi::a80211::kShengGrant) applyGrant(true);
   setProperty("piano-wifi-apple80211", true);
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
@@ -376,6 +379,9 @@ bool PianoWifi80211::start(IOService *provider)
             "pipe)", unsigned(fUcMode));
   note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
             "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
+  note80211("sheng mode %#x (machdep.piano_wifi_sheng changes it at run time: 0x1 the 802.11 medium selected, 0x2 SSID/BSSID "
+            "events beside link ones, 0x4 card caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 "
+            "NativeSandboxGrantProcess=airportd, 0x20 SIOCGIFMEDIA answered in the filter)", unsigned(fState->sheng));
   arm(fAttachCall, kAttachTickMs);
   return true;
 }
@@ -419,6 +425,12 @@ void PianoWifi80211::attachStep()
   pianowifi::a80211::LinkEvent down = {};
   down.down = 1;
   postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
+  // sheng bit 0x2: their post_link_down sends SSID_CHANGED and BSSID_CHANGED beside every LINK_CHANGED (WifiNet.cpp:195-197) —
+  // the two codes the framework's state machine waits for beside the link's own.
+  if (shengMode() & pianowifi::a80211::kShengEvents) {
+    postEvent(pianowifi::a80211::kEvSsidChanged);
+    postEvent(pianowifi::a80211::kEvBssidChanged);
+  }
   if (fUcMode & pianowifi::a80211::kUcControllerName) {
     // The lookup user space makes by IOInterfaceName takes any class: with these the controller can be what it finds and opens.
     setProperty("IOInterfaceName", fIfName);
@@ -448,6 +460,14 @@ errno_t PianoWifi80211::filterIoctl(void *cookie, ifnet_t, protocol_family_t, un
   if (!self || !arg) return EOPNOTSUPP;
   if (cmd == pianowifi::a80211::kSiocSA80211 || cmd == pianowifi::a80211::kSiocGA80211)
     return self->apple80211(cmd == pianowifi::a80211::kSiocSA80211, *static_cast<pianowifi::a80211::Req *>(arg));
+  // sheng bit 0x20: SIOCGIFMEDIA answered in the filter outright, their if_ioctl form (WifiNet.cpp:712-719), for the case the
+  // family's own answer (bit 0x1's selected medium) lags or never carries the 802.11 type.
+  if (cmd == SIOCGIFMEDIA && (self->shengMode() & pianowifi::a80211::kShengMediaFilter)) {
+    const errno_t e = self->mediaIoctl(static_cast<struct ifmediareq *>(arg));
+    static unsigned said;
+    if (said++ < 8) note80211("%s: SIOCGIFMEDIA answered in the filter (%d): IEEE 802.11 auto (sheng 0x20)", self->fIfName, e);
+    return e ? e : EJUSTRETURN;
+  }
   self->noteOtherIoctl(cmd);
   return EOPNOTSUPP;   // not ours: the protocol and the interface handle it as before
 }
@@ -461,17 +481,59 @@ void PianoWifi80211::filterDetached(void *cookie, ifnet_t)
   self->release();
 }
 
-// One request, in the requesting thread (airportd's ioctl): the answer under the lock, its log line and its effects after.
+// The user client's copy pair's context (sheng bit 0x8, ucRequest below): the two structure buffers the client call carries —
+// kernel memory — and the sheng snapshot taken before the request, so ucIn/ucOut can fall back to memcpy for a copy whose
+// address lies inside one of them (WifiApple80211.h shengKernelBuffer; their macOS-27.3 EFAULT fix).
+struct UcIo {
+  const uint8_t *inBase = nullptr;
+  uint32_t inBytes = 0;
+  const uint8_t *outBase = nullptr;
+  uint32_t outBytes = 0;
+  uint32_t sheng = 0;
+};
+
+int PianoWifi80211::ucIn(void *ctx, uint64_t from, void *to, uint32_t length)
+{
+  auto *uc = static_cast<UcIo *>(ctx);
+  const int e = copyin(from, to, length);
+  if (!e || !(uc->sheng & pianowifi::a80211::kShengUcKernel)) return e;
+  uint32_t offset = 0;
+  if (!pianowifi::a80211::shengKernelBuffer(from, length, uc->inBase, uc->inBytes, offset)) return e;
+  memcpy(to, uc->inBase + offset, length);
+  return 0;
+}
+
+int PianoWifi80211::ucOut(void *ctx, const void *from, uint64_t to, uint32_t length)
+{
+  auto *uc = static_cast<UcIo *>(ctx);
+  const int e = copyout(from, to, length);
+  if (!e || !(uc->sheng & pianowifi::a80211::kShengUcKernel)) return e;
+  uint32_t offset = 0;
+  if (pianowifi::a80211::shengKernelBuffer(to, length, uc->outBase, uc->outBytes, offset)) {
+    memcpy(uc->outBase + offset, from, length);
+    return 0;
+  }
+  if (pianowifi::a80211::shengKernelBuffer(to, length, uc->inBase, uc->inBytes, offset)) {
+    memcpy(const_cast<uint8_t *>(uc->inBase) + offset, from, length);
+    return 0;
+  }
+  return e;
+}
+
+// One request, in the requesting thread (airportd's ioctl, or the user client's selector 0 through ucRequest): the answer under
+// the lock, its log line and its effects after. `ioOverride` is the user client's copy pair (a request whose data rides inside
+// the client's own structure); without it the plain copyin/copyout of the ioctl path.
 // F3 (review 2026-11-14, accepted): the user copies happen under fLock, because the state and the one scratch buffer are shared.
 // A paged-out user buffer therefore stalls other apple80211 requests, the summary line and the accept sysctl — never the data
 // path, the link or PianoWifi's ladder, which share no lock with this. The buffers are airportd's own, small and touched again
 // and again; a separate per-request buffer would be the fix if that ever shows up on the tablet.
-errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
+errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *ioOverride)
 {
   using namespace pianowifi::a80211;
   const int32_t type = rq.type, value = rq.value;
   const uint32_t length = rq.length;
-  const UserIo io = {nullptr, &PianoWifi80211::userIn, &PianoWifi80211::userOut};
+  const UserIo plain = {nullptr, &PianoWifi80211::userIn, &PianoWifi80211::userOut};
+  const UserIo &io = ioOverride ? *ioOverride : plain;
   // F6 (review 2026-11-14): the request carries the interface's name; one naming another interface is refused, even though the
   // BSD layer routed it to this ifnet (the filter sees whatever the caller sent).
   if (rq.name[0] && strncmp(rq.name, fIfName, sizeof rq.name) != 0) {
@@ -482,11 +544,11 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
     return ENXIO;
   }
   const bool scanSet = set && (type == kScanReq || type == kScanReqMultiple);
-  uint32_t directed = 0;
+  uint32_t directed = 0, scanType = 0xffffffffu;
   IOLockLock(fLock);
   if (scanSet) {
     refreshScanLocked();
-    if (type == kScanReq) directed = scanReqSsidLength(rq, io);
+    if (type == kScanReq) scanReqInfo(rq, io, directed, scanType);
   }
   const Answer a = handle(*fState, kIdentity, set, rq, io, fScratch);
   const bool first = fSeen->first(type, set, length, a.error);
@@ -532,9 +594,10 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
       char proc[32] = "?";
       proc_selfname(proc, sizeof proc);
       if (scanSet)
-        note80211("%s: scan %llu asked by %s[%d]: %s len %u -> %d (%u network(s) in the list%s)", fIfName, serial, proc,
-                  proc_selfpid(), requestName(type), unsigned(length), a.error, unsigned(networks),
-                  directed ? ", a directed scan" : "");
+        note80211("%s: scan %llu asked by %s[%d]: %s len %u -> %d, scan type %s (%u network(s) in the list%s)", fIfName, serial,
+                  proc, proc_selfpid(), requestName(type), unsigned(length), a.error,
+                  scanType == 0xffffffffu ? "?" : (scanType == kScanTypeCached ? "3 (the held results)" : "other"),
+                  unsigned(networks), directed ? ", a directed scan" : "");
       else
         note80211("%s: scan %llu read to its end by %s[%d]: %u record(s) served, the list end answered %d", fIfName, serial, proc,
                   proc_selfpid(), unsigned(records), a.error);
@@ -733,6 +796,53 @@ void PianoWifi80211::setOverride(bool on, bool onInterface)
   }
 }
 
+// sheng bit 0x20's answer, their if_ioctl form word for word (WifiNet.cpp:712-719): "the framework lists wireless interfaces
+// by this media type". ifm_name is the caller's; the five answer words are ours. ifm_count 1 with no list written is their
+// answer too (the reader takes the current word, not the list).
+errno_t PianoWifi80211::mediaIoctl(struct ifmediareq *m)
+{
+  if (!m) return EINVAL;
+  m->ifm_current = IFM_IEEE80211 | IFM_AUTO;
+  m->ifm_mask = 0;
+  m->ifm_status = IFM_AVALID | (fLinkUp ? IFM_ACTIVE : 0);
+  m->ifm_active = IFM_IEEE80211 | IFM_AUTO;
+  m->ifm_count = 1;
+  return 0;
+}
+
+// sheng bit 0x1: the 802.11 medium is selected while the bit is on, the Ethernet one otherwise (both stay published — the
+// dictionary was built with them in PianoWifiEthernet::start). The family answers SIOCGIFMEDIA from the selection, so the
+// re-select announces the link status again with the chosen medium, as a link change does.
+void PianoWifi80211::applyMedium()
+{
+  const bool on11 = (shengMode() & pianowifi::a80211::kShengMedium) != 0 && fMedium11 != nullptr;
+  IONetworkMedium *chosen = on11 ? fMedium11 : fMedium;
+  if (!chosen || !fMedium11 || on11 == fMedium11On) return;
+  fMedium11On = on11;
+  setSelectedMedium(chosen);
+  setLinkStatus(fLinkUp ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, chosen, fLinkUp ? kLinkSpeed : 0);
+  note80211("%s: the selected medium is %s (the family's SIOCGIFMEDIA answer follows it)", fIfName,
+            on11 ? "IEEE 802.11 auto" : "Ethernet auto full duplex");
+}
+
+// sheng bit 0x10: their NativeSandboxGrantProcess on the interface (ShengEthernet.cpp:283), the kernel-side grant that stands
+// in for the sandbox's verdict when the named process opens the service's user client. Ours is exactly "airportd": our kernel's
+// native_sandbox_grant (the k27 IOUserClient patch) compares the whole property with one process name, so their
+// "airportd,sharingd,wifivelocityd" would never match here. The controller carries it too — it is the service our user client is
+// offered on, and what a lookup by IOInterfaceName (user-client mode 0x2) finds.
+void PianoWifi80211::applyGrant(bool on)
+{
+  if (on) {
+    setProperty("NativeSandboxGrantProcess", "airportd");
+    if (fNetif) fNetif->setProperty("NativeSandboxGrantProcess", "airportd");
+  } else {
+    removeProperty("NativeSandboxGrantProcess");
+    if (fNetif) fNetif->removeProperty("NativeSandboxGrantProcess");
+  }
+  note80211("%s: NativeSandboxGrantProcess %s (the kernel's native_sandbox_grant stands in for the sandbox verdict at the open)",
+            fIfName, on ? "= airportd" : "removed");
+}
+
 void PianoWifi80211::setUcMode(uint32_t mode, const char *why)
 {
   IOLockLock(fLock);
@@ -824,7 +934,17 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   rq.value = val;
   rq.length = length;
   rq.data = data;
-  const errno_t e = apple80211(cmd == kUcSetCmd, rq);
+  // The client's copies (sheng bit 0x8): the request's data may ride inside the structure the client passed, kernel memory the
+  // kext holds, where copyin/copyout fault (their macOS-27.3 EFAULT fix is memcpy); ucIn/ucOut fall back to that only for a
+  // copy whose address lies inside one of the two structure buffers, and only while the bit is on.
+  UcIo ucio;
+  ucio.inBase = in;
+  ucio.inBytes = args->structureInputSize;
+  ucio.outBase = static_cast<const uint8_t *>(args->structureOutput);
+  ucio.outBytes = args->structureOutputSize;
+  ucio.sheng = shengMode();
+  const UserIo uio = {&ucio, &PianoWifi80211::ucIn, &PianoWifi80211::ucOut};
+  const errno_t e = apple80211(cmd == kUcSetCmd, rq, &uio);
   // The answer's own length and value go back to the caller, as the ioctl's struct would carry them.
   uint8_t *out = static_cast<uint8_t *>(args->structureOutput);
   if (out && args->structureOutputSize >= want) {
@@ -907,6 +1027,55 @@ void PianoWifi80211::setAcceptMode(uint32_t mode, const char *why)
   IOLockUnlock(fLock);
   note80211("%s: accept mode %#x (was %#x, %s): every request kind is logged again from here", fIfName, unsigned(mode & 0xf),
             unsigned(was), why);
+}
+
+uint32_t PianoWifi80211::shengMode()
+{
+  IOLockLock(fLock);
+  const uint32_t mode = fState->sheng;
+  IOLockUnlock(fLock);
+  return mode;
+}
+
+// A new set of the UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9): each bit its own A/B, the ones with a state
+// beyond the answers applied at once — the medium re-selected (0x1), the grant property set or removed (0x10). The kind table
+// starts again so every request is re-logged with the new answers (bit 0x4 changes CARD_CAPABILITIES).
+void PianoWifi80211::setShengMode(uint32_t mode, const char *why)
+{
+  using namespace pianowifi::a80211;
+  const uint32_t masked = mode & kShengAll;
+  IOLockLock(fLock);
+  const uint32_t was = fState->sheng;
+  fState->sheng = masked;
+  fSeen->clear();
+  IOLockUnlock(fLock);
+  if (((masked ^ was) & kShengMedium) && fMedium11) applyMedium();
+  if ((masked ^ was) & kShengGrant) applyGrant((masked & kShengGrant) != 0);
+  note80211("%s: sheng mode %#x (was %#x, %s): 0x1 the 802.11 medium selected, 0x2 SSID/BSSID events beside link ones, 0x4 card "
+            "caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 NativeSandboxGrantProcess, 0x20 SIOCGIFMEDIA "
+            "in the filter; every request kind is logged again from here",
+            fIfName, unsigned(masked), unsigned(was), why);
+}
+
+int PianoWifi80211::sysctlSheng(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  PianoWifi80211 *self = a80211Enter();
+  struct Leave {
+    PianoWifi80211 *held;
+    ~Leave()
+    {
+      if (held) a80211Leave();
+    }
+  } leave{self};
+  int value = self ? int(self->shengMode()) : -1;
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (!self) return ENODEV;
+  self->setShengMode(uint32_t(incoming), "machdep.piano_wifi_sheng");
+  return 0;
 }
 
 void PianoWifi80211::report(const char *why)

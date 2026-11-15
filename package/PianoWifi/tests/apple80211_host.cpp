@@ -113,8 +113,18 @@ int main()
     CHECK(a.error == 0 && a.wrote == 23 && r.rq.length == 23 && r.at(23)[0] == 0xa5);
     for (uint8_t b : kCapBits) CHECK(r.at(0)[b / 8] & (1u << (b % 8)));
     CHECK((r.at(0)[0] & 0x1) == 0);                          // no WEP
-    CHECK((r.at(0)[46 / 8] & (1u << (46 % 8))) == 0);        // no wait for a scan-done event
+    CHECK((r.at(0)[46 / 8] & (1u << (46 % 8))) == 0);        // no wait for a scan-done event (sheng bit 0x4 adds it)
     CHECK((r.at(0)[73 / 8] & (1u << (73 % 8))) == 0);        // directed scans as SCAN_REQ
+    // sheng bit 0x4: their bitmap adds 46 — "the framework's scan waits for the scan-done event only with this bit"
+    r.st.sheng = kShengCaps46;
+    std::memset(r.user.mem.data(), 0xa5, 64);
+    a = r.ask(false, kCardCapabilities, 23);
+    CHECK(a.error == 0 && (r.at(0)[46 / 8] & (1u << (46 % 8))) != 0);
+    CHECK((r.at(0)[45 / 8] & (1u << (45 % 8))) == 0 && (r.at(0)[47 / 8] & (1u << (47 % 8))) == 0);   // bit 46 alone
+    r.st.sheng = kShengCaps46 | kShengMedium;   // no other bit leaks into the bitmap
+    std::memset(r.user.mem.data(), 0xa5, 64);
+    a = r.ask(false, kCardCapabilities, 23);
+    CHECK((r.at(0)[45 / 8] & (1u << (45 % 8))) == 0 && (r.at(0)[73 / 8] & (1u << (73 % 8))) == 0);
     a = r.ask(false, kStatusDevName, 1028);
     CHECK(a.error == 0 && std::strcmp(reinterpret_cast<const char *>(r.at(0)), "PianoWifi") == 0);
     // a get without a buffer is refused (the bind always gives one)
@@ -231,11 +241,20 @@ int main()
     std::memset(r.user.mem.data(), 0, 0x80);
     r.put32(kScanReqSsidLengthAt, 4);
     std::memcpy(r.user.mem.data() + kScanReqSsidAt, "cafe", 4);
+    r.put32(kScanReqTypeAt, kScanTypeCached);   // type 3 at 0x34: the held results (sheng's kScanTypeCached)
     r.rq = {};
     r.rq.type = kScanReq;
     r.rq.length = 0x80;
     r.rq.data = User::kBase;
-    CHECK(scanReqSsidLength(r.rq, r.io) == 4);
+    uint32_t ssidLength = 99, scanType = 0;
+    scanReqInfo(r.rq, r.io, ssidLength, scanType);
+    CHECK(ssidLength == 4 && scanType == kScanTypeCached);
+    r.put32(kScanReqTypeAt, 1);
+    scanReqInfo(r.rq, r.io, ssidLength, scanType);
+    CHECK(scanType == 1);
+    r.rq.length = 0x20;   // a buffer too short for the type: not read (SCAN_REQ_MULTIPLE has no type field either)
+    scanReqInfo(r.rq, r.io, ssidLength, scanType);
+    CHECK(scanType == 0xffffffffu && ssidLength == 4);
     Answer a = r.ask(true, kScanReq, 5528);
     CHECK(a.error == 0 && (a.effects & kDoScanStarted) && r.st.scanRequests == 1);
     // 27.3's 2280-byte record: the head and the elements written, its tail (a request identifier user space put at 0x88c) kept
@@ -336,6 +355,21 @@ int main()
     big.st.accept = kAcceptUnknownGets;
     Answer a = big.ask(false, 9999, 0x7fffffff);
     CHECK(a.error == 0 && a.wrote == 64 * 1024 && big.rq.length == 64 * 1024);
+  }
+
+  // ---- the user client's kernel-buffer test (sheng bit 0x8): a range knows what lies inside it, exactly and without wrapping
+  {
+    uint8_t buf[64];
+    const uintptr_t base = reinterpret_cast<uintptr_t>(buf);
+    uint32_t offset = 999;
+    CHECK(shengKernelBuffer(base + 8, 16, buf, sizeof buf, offset) && offset == 8);
+    CHECK(shengKernelBuffer(base, 64, buf, sizeof buf, offset) && offset == 0);
+    CHECK(shengKernelBuffer(base + 63, 1, buf, sizeof buf, offset) && offset == 63);
+    CHECK(!shengKernelBuffer(base + 63, 2, buf, sizeof buf, offset));                    // past the end
+    CHECK(!shengKernelBuffer(base - 1, 1, buf, sizeof buf, offset));                     // before the start
+    CHECK(!shengKernelBuffer(base - 0x100000000ull, uint32_t(0x100000000ull + 64), buf, sizeof buf, offset));   // no wraparound
+    CHECK(shengKernelBuffer(base + 64, 0, buf, sizeof buf, offset) && offset == 64);     // an empty copy at the end is inside
+    CHECK(!shengKernelBuffer(base + 64, 0, buf, 0, offset));                             // an empty range matches nothing
   }
 
   if (failures) {

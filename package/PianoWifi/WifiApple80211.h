@@ -213,8 +213,10 @@ constexpr uint32_t kVersionBytes = 384;
 // COUNTRY_CODE: 3 bytes, a C string (27.3, as sheng's).
 
 // SCAN_REQ (the parts read; 5528 bytes on 27.3, SCAN_REQ_MULTIPLE 5352): version, BSS type, BSSID, the SSID's length at 16 and
-// its bytes at 20 (27.3, as sheng's).
-constexpr uint32_t kScanReqSsidLengthAt = 16, kScanReqSsidAt = 20;
+// its bytes at 20, the scan type at 0x34 (27.3, as sheng's). Type 3 asks for the results already held: sheng answers it at once
+// from those, without a scan (kScanTypeCached); the type is read for the log, so one boot shows which type CoreWLAN sends.
+constexpr uint32_t kScanReqSsidLengthAt = 16, kScanReqSsidAt = 20, kScanReqTypeAt = 0x34;
+constexpr uint32_t kScanTypeCached = 3;
 
 // ------------------------------------------------------------------------------------------------- our scan list, compact
 // One network of PianoWifi's scan list (the registry property piano-wifi-scan, published by level 6: PianoWifi.cpp publishScan).
@@ -681,14 +683,20 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
   }
 }
 
-// The SSID length a SCAN_REQ names (0: all networks), for the log; reads the request's buffer through `io`.
-inline uint32_t scanReqSsidLength(const Req &rq, const UserIo &io)
+// The SSID length a SCAN_REQ names (0: all networks) and its scan type (0xffffffff: not read — a short buffer or a
+// SCAN_REQ_MULTIPLE, which has no type field), both for the log; reads the request's buffer through `io`.
+inline void scanReqInfo(const Req &rq, const UserIo &io, uint32_t &ssidLength, uint32_t &scanType)
 {
-  uint8_t head[kScanReqSsidAt];
-  if (rq.length < kScanReqSsidAt || detail::copyIn(rq, io, head, sizeof head)) return 0;
-  const uint32_t n = uint32_t(head[kScanReqSsidLengthAt]) | uint32_t(head[kScanReqSsidLengthAt + 1]) << 8 |
-                     uint32_t(head[kScanReqSsidLengthAt + 2]) << 16 | uint32_t(head[kScanReqSsidLengthAt + 3]) << 24;
-  return n <= kSsidMax ? n : 0;
+  ssidLength = 0;
+  scanType = 0xffffffffu;
+  uint8_t head[kScanReqTypeAt + 4];
+  if (rq.length < kScanReqSsidAt || detail::copyIn(rq, io, head, sizeof head)) return;
+  auto word = [&head](uint32_t at) {
+    return uint32_t(head[at]) | uint32_t(head[at + 1]) << 8 | uint32_t(head[at + 2]) << 16 | uint32_t(head[at + 3]) << 24;
+  };
+  ssidLength = word(kScanReqSsidLengthAt);
+  if (ssidLength > kSsidMax) ssidLength = 0;
+  if (rq.length >= kScanReqTypeAt + 4) scanType = word(kScanReqTypeAt);
 }
 
 // The user client's request data may ride inside the structure the client passed — kernel memory the kext holds — instead of
