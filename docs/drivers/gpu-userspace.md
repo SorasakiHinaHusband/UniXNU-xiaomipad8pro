@@ -39,7 +39,7 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   8192x8192 RGBA8 texture are refused by the frontend without a kernel call (`check-turnip-a830-host.py`, plugin_host section 5).
   Since 2026-11-12 piano's kernel answers the connection's GPU window there (0008 and
   [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12)).
-- `0005-turnip-darwin-tu-debug-boot-arg.patch`: `piano-tu-debug=<flags>` on the boot line (read through `kern.bootargs`) stands in for
+- `0005-turnip-darwin-tu-debug-boot-arg.patch`: `piano-tu-debug=<flags>` on the boot line (read through `kern.piano_bootargs`, the whole merged line, k27 0071: the key is seen from the ADT tail too) stands in for
   `TU_DEBUG` and wins over the seed's `tu-debug` file; `piano-tu-debug=none` means none at all (Turnip picks GMEM or sysmem per
   render pass). WindowServer says which: `TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug` or `... from boot
   argument piano-tu-debug`. The sysmem/GMEM A/B is two boot lines over one seed (below).
@@ -491,7 +491,7 @@ tooling/native/native-loop.sh out/ram-sysmem/boot-piano-macos-ram-A-bundled.img 
 
 `piano-tu-debug=gmem` instead of `none` forces GMEM on every pass (a stress run once `none` is clean). First check that the mode took:
 WindowServer's `TU: info: TU_DEBUG=... from boot argument piano-tu-debug` (or `... (none: Turnip picks GMEM or sysmem per render
-pass)`); a sandboxed client that cannot read `kern.bootargs` falls back to the seed's file, i.e. sysmem, so only WindowServer's line
+pass)`); a sandboxed client that cannot read `kern.piano_bootargs` falls back to the seed's file, i.e. sysmem, so only WindowServer's line
 is proof. What GMEM trouble looks like here: GMEM is the GPU address window at 64 MiB (`A830_GMEM_BASE`, 0x4000000..0x4c00000 for
 12 MiB; Query's `gmem_base`/`gmem_bytes`, which Turnip takes as they are), so a `gpu page fault at 0x04xxxxxx` names a GMEM address
 gone to the SMMU (a wrong base or size); a `gpu recovery` whose `hang snapshot 3/3` has a non-zero BR `prot` word (a protected

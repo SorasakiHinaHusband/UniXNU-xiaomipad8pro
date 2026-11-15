@@ -79,7 +79,7 @@ Reading of that run:
   for a minute; the `CAEnableDeepFramebuffer` preference is set false for the process. Every debug option that is on is listed once.
   Checked on the build Mac with `CA_FORCE_FP16_FRAMEBUFFER=1` in the environment: option 124 found and cleared.
 
-Boot arguments (read through `kern.bootargs`, so none of them needs a restaging):
+Boot arguments (read through `kern.piano_bootargs`, the whole merged line, k27 0071; `kern.bootargs` on an older kernel; none of them needs a restaging):
 
 | Argument | Default | Effect |
 |---|---|---|
