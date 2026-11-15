@@ -212,7 +212,31 @@ def main():
         config = files.get('EFI/UniXNU/unixnu.toml', (0, None, None))[2]
         check(config is not None, 'EFI/UniXNU/unixnu.toml present')
         if config:
-            print('  unixnu.toml:\n' + '\n'.join('    | ' + line[:150] for line in config.splitlines()))
+            print('  unixnu.toml:\n' + '\n'.join('    | ' + line for line in config.splitlines()))
+            # The whole boot-args, not the entry line cut at 150 columns: grading 2026-11-15 could not read an image's
+            # native-ufs-root-part from this print. With k27 0066 the kernel's boot-args are the entry line plus the
+            # payload ADT's piano-boot-args set (tooling/adt/boot_args.py), so the merge is shown here too.
+            spec = importlib.util.spec_from_file_location('piano_boot_args',
+                                                         Path(__file__).resolve().parents[2] / 'tooling/adt/boot_args.py')
+            ba = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(ba)
+            raw_adt = (fat_file(ramdisk, 'EFI/UniXNU/Payloads/kernel.macho.adt')
+                       if 'EFI/UniXNU/Payloads/kernel.macho.adt' in files else None)
+            for line in config.splitlines():
+                if not line.startswith('args = '):
+                    continue
+                line_args = line.split('=', 1)[1].strip().strip('"')
+                merged, status = ba.merged(line_args, raw_adt) if raw_adt else (line_args, 'no adt')
+                print(f'    boot-args ({status}): {merged}')
+                # The 2026-11-14 layout moved the 27.3 root image to linux_rootfs and the Data store spans linux_data
+                # (first LBA 71859642): a RAM image whose entry still names linux_data as the root partition maps its
+                # OS/SystemOS windows over that store, so the root volume never mounts (nx_mount: failed to find valid
+                # checkpoint), no BSD root is set, /sbin/launchd never execs and userland stays absent the whole boot
+                # (ram-chgui f0ea3d15..., tablet 2026-11-15 15:50 and 16:19). docs/k273-line.md §4: the K273_ROOT
+                # defaults are the first-line build record; do not use them against the current layout.
+                if 'native-ufs-root-part=linux_data' in merged:
+                    print('  warn  native-ufs-root-part=linux_data: the 27.3 root image has been on linux_rootfs since'
+                          ' 2026-11-14; this image would read its root windows over the Data store (docs/k273-line.md §4)')
         rest = data[end:]
         if rest.strip(b'\0'):
             if a.avbtool and a.pubkey:
