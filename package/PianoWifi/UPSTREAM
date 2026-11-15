@@ -283,5 +283,13 @@ a4738ae766ded21d5a89a891c26f9a5604da37f8162ff24acc4d035776221cae; BSD-2-Clause-P
   kev_post_msg symbol, and its link-event payload; the scan's completion posted a short while after an answer from the cache;
   EIO after the last scan record. Not taken: its own ifnet and registry stand-ins (piano uses IONetworkingFamily's interface and
   an interface filter), its association, keys and data path.
+  The wm4 binding bits (docs/drivers/wifi-menu.md section 9, piano-wifi-sheng; read at the 2026-11-15 clone e578007, the study
+  private/host-checks/20261115-unixnu-sheng): the SIOCGIFMEDIA answer words (IFM_IEEE80211|IFM_AUTO, IFM_AVALID, count 1), their
+  if_ioctl form re-expressed in this repository's interface filter; card capability bit 46 and what it makes the framework's scan
+  wait for; the scan request's type field at 0x34 (3: the held results); SSID_CHANGED and BSSID_CHANGED beside every
+  LINK_CHANGED; and, from package/ShengEthernet.cpp (same licence, same clone), NativeSandboxGrantProcess on the interface — here
+  the single name "airportd", because this kernel's native_sandbox_grant compares the whole property. Their macOS-27.3 finding
+  that a user-client request's byte replies must be memcpy'd, not copyout'd, is the shape of the kext's fallback (shengKernelBuffer),
+  with this repository's own bounds logic; their comma-separated grant list cannot match this kernel and is not used.
 OpenIntelWireless (itlwm / AirportItlwm, GPL) was not read for this code; its facts reached the design only through the W0
 report's notes (private/host-checks/20261114-io80211), and none of its text is here.
