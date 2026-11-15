@@ -961,6 +961,12 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   const uint32_t offset = large ? kUcLargeBytes - kUcSmallBytes : 0;
   const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
   if (!in || args->structureInputSize < want) return kIOReturnBadArgument;
+  // Keep the field reads below inside the structure supplied by IOUserClient.
+  // The selector-6 size/offset pair is a host-derived ABI fact and must not be
+  // trusted until the 40-byte request fits; a stale large-layout constant must
+  // fail closed instead of becoming an out-of-bounds kernel read.
+  if (offset > args->structureInputSize || kUcNameAt > args->structureInputSize - offset ||
+      sizeof(Req) > args->structureInputSize - offset - kUcNameAt) return kIOReturnBadArgument;
   uint32_t cmd = 0, length = 0, type = 0;
   int32_t val = 0;
   uint64_t data = 0;
