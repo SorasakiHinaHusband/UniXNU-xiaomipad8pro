@@ -120,9 +120,12 @@ int main()
     const PackReading p = combinePacks(g, 2);
     const BatteryValues v = mapBattery(g, 2, p, nullptr, 0);
     CHECK(!v.known && v.implausible && !v.adapter);
+    const BatteryValues control = mapBattery(g, 2, p, nullptr, 0, nullptr, 0, false);
+    CHECK(control.known && control.percent == 12);                                               // control reproduces the 12 % poison
     const GaugeReading zero[2] = {pack(4379, 0, 0, 95, 8186, 0, 5000, 305, 0, 113), pack(4380, 0, 0, 95, 8187, 0, 5000, 312, 0, 114)};
     const PackReading pz = combinePacks(zero, 2);
     CHECK(!mapBattery(zero, 2, pz, nullptr, 0).known);                                        // full = 0: nothing to show
+    CHECK(mapBattery(zero, 2, pz, nullptr, 0, nullptr, 0, false).known);                         // control: guard disabled publishes the poison
     GaugeReading over[2] = {pack(4379, 0, 0, 95, 12000, 8634, 5000, 305, 0, 113),
                             pack(4380, 0, 0, 95, 12000, 8634, 5000, 312, 0, 114)};            // remaining above full + 5 %
     const PackReading po = combinePacks(over, 2);

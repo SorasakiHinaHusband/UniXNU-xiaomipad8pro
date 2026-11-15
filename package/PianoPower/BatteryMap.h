@@ -63,7 +63,7 @@ inline unsigned minutes(long mah, long ma)
 // floorPct: piano-power-ps-floor; real: the charger firmware's view of the source (null at level 1); nowSec: the reading's
 // calendar time (0: unknown).
 inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const PackReading &pack, const PortState *port,
-                                unsigned floorPct, const AdapterReal *real = nullptr, uint32_t nowSec = 0)
+                                unsigned floorPct, const AdapterReal *real = nullptr, uint32_t nowSec = 0, bool guard = true)
 {
   BatteryValues v;
   if (!pack.ok) return v;
@@ -71,8 +71,8 @@ inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const Pac
   // shows on the values it sees first (2026-11-15: pmset said 12 % for a whole boot while the registry tracked 95 -> 90 %),
   // so a garbage FullChargeCapacity must never reach the registry. Both packs together: 2 x bq27z561, design 9200 mAh.
   // A negative remaining would show as 0 % (macOS's low-battery notices), so it is held out too.
-  if (pack.fullMah < 2000 || pack.fullMah > 20000 || pack.remainingMah < 0 ||
-      pack.remainingMah > pack.fullMah + pack.fullMah / 20) {
+  if (guard && (pack.fullMah < 2000 || pack.fullMah > 20000 || pack.remainingMah <= 0 ||
+                pack.remainingMah > pack.fullMah + pack.fullMah / 20)) {
     v.implausible = true;
     return v;
   }

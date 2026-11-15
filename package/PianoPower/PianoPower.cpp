@@ -95,7 +95,8 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
+  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, psInject, board, ucsi;
+  bool psGuard;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
   uint32_t wdog, chgen, chgfix, chgwatch;
@@ -126,6 +127,8 @@ void readArgs()
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
+  gArgs.psInject = bootArg("piano-power-ps-inject", 0); // deterministic bad first publisher cycles for CHGUI A/B
+  gArgs.psGuard = bootArg("piano-power-ps-guard", 1) != 0; // keep the plausibility gate on unless explicitly testing the bug
   gArgs.policy = bootArg("piano-power-policy", 0);          // ChargePolicy instead of the built-in policy (level 2, ChargeLink.h)
   gArgs.rp = bootArg("piano-power-rp", 0);                  // with it: the Type-C Rp current as the 5 V input limit (<= 1600 mA)
   gArgs.health = bootArg("piano-power-health", 0);          // with it: stop charging at 80 %, resume at 75 %
@@ -401,6 +404,7 @@ class PianoPower : public IOService {
   bool fPolicyOn = false, fPolicyEnded = false;
   ChargeLink fLink;
   uint64_t fPackMs = 0;                       // when the packs were last read (the decisions take them for 3 periods)
+  uint32_t fPsPublishCycles = 0;              // publisher cycles, including deterministic ps-inject A/B cycles
   IOService *fThermal = nullptr;              // PianoThermal, for its board temperatures (looked up every 10 s until found)
   uint64_t fThermalLookupMs = 0;
   bool fThermalNoted = false;
@@ -493,8 +497,12 @@ bool PianoPower::start(IOService *provider)
   }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
-         "Type-C state, refreshed every %u s%s%s", gArgs.period, gArgs.psFloor ? "; the percentage shown on battery stays at least " : "",
-         gArgs.psFloor ? "the floor (piano-power-ps-floor)" : "");
+         "Type-C state, refreshed every %u s%s%s%s", gArgs.period, gArgs.psFloor ? "; the percentage shown on battery stays at least " : "",
+         gArgs.psFloor ? "the floor (piano-power-ps-floor)" : "",
+         gArgs.psInject ? (gArgs.psGuard ? "; ps-inject is guarded" : "; ps-inject guard DISABLED (bug reproduction)") : "");
+  if (gArgs.psInject)
+    note("piano-power-ps-inject=%u: first cycle gets garbage FullChargeCapacity, second gets zero remaining capacity; later cycles are real",
+         gArgs.psInject);
   setProperty("piano-power", gArgs.level, 32);
   fRingLock = IOSimpleLockAlloc();
   thread_t t = nullptr;
@@ -1118,6 +1126,23 @@ void PianoPower::diagLine(char *line, size_t size)
 // The adapter shown to macOS is the firmware's own contract when it has answered (level 2), the Rp current otherwise.
 void PianoPower::publishBattery(uint64_t t, const PortState *port)
 {
+  PackReading published = fBattery;
+  const uint32_t cycle = fPsPublishCycles;
+  if (fBattery.ok) ++fPsPublishCycles;
+  if (gArgs.psInject && fBattery.ok && cycle < gArgs.psInject) {
+    if (cycle == 0) {
+      // The 12 % incident: a first-cycle FullChargeCapacity read of ~68 Ah made 8.2 Ah look like 12 %.
+      published.fullMah = 68220;
+      published.socPct = int((long(published.remainingMah) * 100 + published.fullMah / 2) / published.fullMah);
+      note("[%llus] ps-inject: cycle %u garbage FullChargeCapacity %d mAh -> %d %% before the plausibility guard", t, cycle + 1,
+           published.fullMah, published.socPct);
+    } else {
+      // A second first-window failure: a zero remaining-capacity sample must not become a low-battery publication.
+      published.remainingMah = 0;
+      published.socPct = 0;
+      note("[%llus] ps-inject: cycle %u zero remaining capacity -> 0 %% before the plausibility guard", t, cycle + 1);
+    }
+  }
   AdapterReal real;
   if (gArgs.level >= 2 && piano_mca_has(&fMca, McaBusVoltage)) {
     real.ok = true;
@@ -1136,9 +1161,9 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
   clock_usec_t usec = 0;
   clock_get_calendar_microtime(&sec, &usec);
   const uint32_t nowSec = sec > 1600000000 ? uint32_t(sec) : 0;   // before 2020: the calendar is not up yet
-  const BatteryValues v = mapBattery(fPack, 2, fBattery, port, gArgs.psFloor, &real, nowSec);
+  const BatteryValues v = mapBattery(fPack, 2, published, port, gArgs.psFloor, &real, nowSec, gArgs.psGuard);
   if (v.implausible) {
-    note("[%llus] ps: implausible pack reading (%d/%d mAh): the power source is %s", t, fBattery.remainingMah, fBattery.fullMah,
+    note("[%llus] ps: implausible pack reading (%d/%d mAh): the power source is %s", t, published.remainingMah, published.fullMah,
          pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
     return;
   }

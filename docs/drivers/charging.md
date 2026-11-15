@@ -384,7 +384,7 @@ the console line marks a clamped value `(floor)`. The tablet itself still cuts o
 tracked 95 → 90 % and powerd's own charging flag, adapter fields and time estimate followed it; the next boot showed the correct
 percent. Inferred: powerd anchors the displayed percentage on what the node carried around discovery and never re-derives it, so
 a garbage first reading poisons the whole boot (a misread FullChargeCapacity makes `socPct = remaining/full` ≈ 12 %; `gauge.ok`
-did not check `fullMah`). Since then a reading with implausible capacities (full < 2000 or > 20000 mAh, remaining above full + 5 %)
+did not check `fullMah`). Since then a reading with implausible capacities (full < 2000 or > 20000 mAh, remaining <= 0, or remaining above full + 5 %)
 publishes nothing — the first publish waits for a sane cycle — and the node carries the keys a Mac's own node has next to these
 (`UpdateTime`, `built-in`, `AppleRawExternalConnected`, `AppleRawAdapterDetails`, `IsWireless`, `AdapterID`); `AdapterDetails` is the
 firmware's live contract at level 2 (bus voltage, the fixed PDO the bus sits on / the input limit), the Rp current otherwise, and
@@ -416,6 +416,18 @@ Control Centre's Battery entry); unplugged, the percentage with "Power Source: B
 steady. `ioreg -rn AppleSmartBattery` (if a shell is available) lists the properties above. Built 2026-11-11 on main 7c04081:
 KC `dba24c1a1e8d814a…` (`11 native kexts linked, none from outside this repository`, PianoPower 719 pointers), image verify PASS (its own hash
 changes with every build: it carries the build time as `droidvm-utc`). Not booted.
+
+**Deterministic CHGUI reproduction.** `piano-power-ps-inject=N` injects the root-cause shapes into the first publisher cycles:
+cycle 1 has a garbage 68,220 mAh `FullChargeCapacity` (about 12 %), cycle 2 has zero remaining capacity, and later cycles are real.
+The plausibility guard is on by default and can be selected explicitly with `piano-power-ps-guard=1`; those cycles log
+`ps: implausible pack reading` and do not touch the registry. `piano-power-ps-guard=0` is a control that publishes the poisoned first
+cycle so powerd can be observed freezing the wrong percentage. Use the desktop-profile builder so the image carries the tested GPU/USB
+stack and the 27.3 KC:
+
+```sh
+DESK_EXTRA="piano-power-ps=1 piano-power-period=30 piano-power-ps-inject=2 piano-power-ps-guard=1" \
+  tooling/k27/build-desktop-images.sh chgui6
+```
 
 ## 5e. What the Ubuntu history adds (images I and G2, 2026-11-11)
 

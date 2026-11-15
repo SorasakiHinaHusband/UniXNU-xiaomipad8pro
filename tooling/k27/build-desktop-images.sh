@@ -132,7 +132,9 @@ DENY_DESK=/usr/libexec/watchdogd,/usr/libexec/PerfPowerServices
 # The cover (0x504b = 20555) and PianoDwc3's keyboard (0x5055 = 20565), vendor 0x1af4 = 6900: "product-vendor-0" => type.
 KEYBOARDS="defaults write /Library/Preferences/com.apple.keyboardtype keyboardtype -dict-add 20555-6900-0 -int $KBTYPE 20565-6900-0 -int $KBTYPE"
 ORDER="desk"
-ALL="desk quiet plain diag desk-dev"
+# chgui6 and chgui6-control are the deterministic charging A/B profiles; they use the same desktop seed and checks,
+# with their guard/injection switches supplied through DESK_EXTRA.
+ALL="desk quiet plain diag desk-dev chgui6 chgui6-control"
 
 stage() {   # stage NAME [stage-boot-run.py arguments]: out/desk-stage/NAME from the input seed
   local name=$1
@@ -164,7 +166,7 @@ for n in $NAMES; do
       if [ "$n" = quiet ]; then X+=(--disable-job com.apple.audiomxd); DENY=$DENY,/usr/libexec/audiomxd; fi
       stage "$n" "${X[@]}" ;;
     plain) ;;
-    desk-dev)
+    desk-dev|chgui6|chgui6-control)
       # the userland stage first (pianousb-shell and its trust cache entry), then desk's additions and the ways in
       python3 tooling/userland/stage.py --seed "$SEED_IN" --trust "$TRUST_IN" --out out/desk-stage/desk-dev-userland \
         --off piano-pmset-defaults > out/desk-stage/desk-dev-userland.log 2>&1 || { tail -5 out/desk-stage/desk-dev-userland.log >&2; exit 1; }
@@ -181,9 +183,9 @@ for n in $NAMES; do
       for j in $LOOPS; do X+=(--disable-job "$j"); done
       DENY=$DENY_DESK
       python3 tooling/k27/stage-boot-run.py --seed out/desk-stage/desk-dev-userland/scratch-data.img \
-        --trust out/desk-stage/desk-dev-userland/kernel.macho.trustcache --out out/desk-stage/desk-dev "${X[@]}" \
-        > out/desk-stage/desk-dev.log 2>&1 || { tail -5 out/desk-stage/desk-dev.log >&2; exit 1; }
-      tail -1 out/desk-stage/desk-dev.log
+        --trust out/desk-stage/desk-dev-userland/kernel.macho.trustcache --out "out/desk-stage/$n" "${X[@]}" \
+        > "out/desk-stage/$n.log" 2>&1 || { tail -5 "out/desk-stage/$n.log" >&2; exit 1; }
+      tail -1 "out/desk-stage/$n.log"
       A="piano-usb-shell=1 piano-usb-net=1" ;;
     diag)
       stage diag ${WALL[@]+"${WALL[@]}"} --file tooling/k27/desk-reports.sh:private/var/piano/desk-reports.sh \
