@@ -575,7 +575,8 @@ class Flipper {
     }
     state = State::ready;
     hw.note("B1b: serving flips (NativeGopDisplay with native-gop-display-flip=1): %u windows, clean %u, latch timeout %u ms, watch %u s, "
-            "vsync %s", smmu::kSlots, cfg.clean, cfg.latchMs, cfg.watchS, hw.irqLive() ? "interrupt" : "polled");
+            "vsync %s; a window's surface is prepared with its own direction (read-only only when refused)", smmu::kSlots, cfg.clean,
+            cfg.latchMs, cfg.watchS, hw.irqLive() ? "interrupt" : "polled");
     return true;
   }
 

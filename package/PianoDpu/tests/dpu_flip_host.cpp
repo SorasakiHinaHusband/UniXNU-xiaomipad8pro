@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 #include "DpuFlip.h"
+#include "prepare_model.h"
 
 using namespace pianodpu;
 using namespace pianodpu::flip;
@@ -357,6 +358,7 @@ struct FakeSurface {
   int refs = 0;
   bool cleanable = true, mapFails = false;
   unsigned cleans = 0;
+  PrepareModel md;   // its memory descriptor's prepares (XNU's read-only rule)
   // 16 KiB pages from base, every fourth 16 KiB page skipped (not contiguous)
   FakeSurface(uint64_t base, uint64_t bytes)
   {
@@ -371,6 +373,7 @@ struct FakeSurface {
 };
 struct Cookie {
   FakeSurface *s;
+  bool prepared;
 };
 
 // ---------------------------------------------------------------------------------------------------------- the Hw model
@@ -386,6 +389,7 @@ struct HostHw {
   bool verbose = false, allocFails = false;
   FakeSurface testBuf{0x900000000ull, 2136ull * 12800};
   int liveCookies = 0;
+  unsigned readOnlyPrepares = 0;
   HostHw(DpuModel &d, SmmuModel &s, Ram &r) : dpu(d), smmu(s), ram(r) {}
 
   uint32_t rd(uint64_t pa) { return dpu.rd(pa); }
@@ -473,9 +477,15 @@ struct HostHw {
       *why = "the model refuses";
       return false;
     }
+    const PianoPrepared how = f->md.prepareShared();   // as DpuFlip.cpp's KernelHw::surfaceMap
+    if (how == pianoPrepareNone) {
+      *why = "prepare failed";
+      return false;
+    }
+    if (how == pianoPrepareReadOnly) ++readOnlyPrepares;
     for (size_t i = 0; i < f->pages.size(); ++i) pages[i] = f->pages[i];
     *count = unsigned(f->pages.size());
-    *cookie = new Cookie{f};
+    *cookie = new Cookie{f, true};
     ++f->refs;
     ++liveCookies;
     return true;
@@ -489,6 +499,7 @@ struct HostHw {
   void surfaceRelease(void *cookie)
   {
     Cookie *c = static_cast<Cookie *>(cookie);
+    if (c->prepared) c->s->md.complete();
     --c->s->refs;
     --liveCookies;
     delete c;
@@ -498,7 +509,7 @@ struct HostHw {
     if (testBuf.pages.size() > max) return false;
     for (size_t i = 0; i < testBuf.pages.size(); ++i) pages[i] = testBuf.pages[i];
     *count = unsigned(testBuf.pages.size());
-    *cookie = new Cookie{&testBuf};
+    *cookie = new Cookie{&testBuf, false};
     ++testBuf.refs;
     ++liveCookies;
     return true;
@@ -1199,6 +1210,68 @@ static void testIrq()
   CHECK(r.f.request(q) == kPianoDpuFlipShown);
 }
 
+// 2026-11-15 (zcflip1, zcflip-nc1): WindowServer's three frames got windows 0/1/2 at the first flips and kept them (a window is kept
+// for the next flip of its surface, also once the boot framebuffer is back). Prepared kIODirectionOut, each was "prepared read only"
+// for as long, and NativeGopDisplay's copy of it (a prepare with the memory's own direction) was refused: every copied frame black.
+// Now a window prepares with the memory's own direction and only falls back to read-only, so a copy of any flipped surface prepares.
+static void testSharedPrepare()
+{
+  {   // the model: the tablet's failure, and the rule's way out of it
+    PrepareModel m;
+    CHECK(m.prepare(true) && m.readOnly);           // the old window prepare: read-only first
+    CHECK(!m.prepare(false) && m.refusals == 1);    // the copy: refused ("prepared read only")
+    CHECK(m.prepareShared() == pianoPrepareReadOnly && m.wired == 2);   // the rule: read-only as a fallback
+    m.complete();
+    m.complete();
+    CHECK(m.wired == 0 && !m.readOnly && m.prepare(false) && !m.readOnly);   // the last complete clears the mark
+    m.complete();
+    PrepareModel locked;
+    locked.writable = false;
+    CHECK(locked.prepareShared() == pianoPrepareReadOnly && locked.readOnly);   // cannot be written: read-only is all there is
+    PrepareModel broken;
+    broken.broken = true;
+    CHECK(broken.prepareShared() == pianoPrepareNone && broken.wired == 0);   // refused both ways: nothing to complete
+  }
+  Rig r;
+  CHECK(r.ready());
+  CHECK(r.hw.said("prepared with its own direction"));
+  FakeSurface a(0x8d0000000ull, 2136ull * 12800), b(0x8e0000000ull, 2136ull * 12800), c(0x8f0000000ull, 2136ull * 12800);
+  for (FakeSurface *s : {&a, &b, &c, &a, &b, &c}) {   // the boot's first frames: each takes a window once, then is shown again
+    PianoDpuFlipRequest q = req(s);
+    CHECK(r.f.request(q) == kPianoDpuFlipShown);
+    r.hw.advance(9000);
+  }
+  CHECK(r.f.st.maps == 3 && a.md.wired == 1 && b.md.wired == 1 && c.md.wired == 1);
+  CHECK(!a.md.readOnly && !b.md.readOnly && !c.md.readOnly && r.hw.readOnlyPrepares == 0);
+  PianoDpuFlipRequest back = req(nullptr);   // a cursor shows: the frame is copied into the boot framebuffer, that goes back on the panel
+  CHECK(r.f.request(back) == kPianoDpuFlipShown && r.f.slots.shown == -1);
+  CHECK(a.refs == 1 && b.refs == 1 && c.refs == 1);   // the windows keep their surfaces (and their prepares) for the next flips
+  for (FakeSurface *s : {&a, &b, &c}) {   // the copy thread's map of each: prepared with the memory's own direction, no refusal
+    CHECK(s->md.prepareShared() == pianoPrepareShared && s->md.refusals == 0);
+    s->md.complete();
+  }
+  // The copy had a surface first (its kept map), then the flip: both shared, the copy's map stays good.
+  FakeSurface d(0x900000000ull + 0x4000000, 2136ull * 12800);
+  CHECK(d.md.prepareShared() == pianoPrepareShared);
+  PianoDpuFlipRequest q = req(&d);
+  CHECK(r.f.request(q) == kPianoDpuFlipShown && d.md.wired == 2 && !d.md.readOnly && r.hw.readOnlyPrepares == 0);
+  d.md.complete();
+  // Someone else prepared a surface read-only first: the window falls back to read-only (counted), the flip is shown.
+  FakeSurface e(0x910000000ull, 2136ull * 12800);
+  CHECK(e.md.prepare(true));
+  q = req(&e);
+  CHECK(r.f.request(q) == kPianoDpuFlipShown && r.hw.readOnlyPrepares == 1 && e.md.wired == 2 && e.md.refusals == 1);
+  // A surface whose memory cannot be prepared at all: refused as memory, nothing held.
+  FakeSurface g(0x920000000ull, 2136ull * 12800);
+  g.md.broken = true;
+  q = req(&g);
+  CHECK(r.f.request(q) == kPianoDpuFlipMemory && g.refs == 0 && g.md.wired == 0 && r.hw.said("not mapped: prepare failed"));
+  // An evicted window completed its prepare: each surface is held once per window it has (e also by its other holder).
+  CHECK(r.f.st.evictions >= 1);
+  for (FakeSurface *s : {&a, &b, &c, &d}) CHECK(s->md.wired == unsigned(s->refs));
+  CHECK(e.md.wired == unsigned(e.refs) + 1 && e.refs == 1);
+}
+
 static void testCheckSurface()
 {
   PianoDpuFlipRequest q = req(nullptr);
@@ -1256,6 +1329,7 @@ int main(int argc, char **argv)
   testVariants();
   testSafety();
   testIrq();
+  testSharedPrepare();
   testCheckSurface();
   if (failures) {
     std::printf("%d failures\n", failures);

@@ -132,6 +132,7 @@ class KernelHw {
   uint32_t bankOff = 0;
   uint64_t stores = 0, smmuStores = 0, refusedStores = 0;
   uint32_t cleanPolicy = 1;   // piano-dpu-clean
+  uint64_t readOnlyPrepares = 0;   // surfaces prepared kIODirectionOut because their own direction was refused
   // The vsync interrupt.
   pianoirq::SpiLine line{};
   pianoirq::Waiter waiter{};
@@ -264,17 +265,25 @@ class KernelHw {
       *why = "not an IOMemoryDescriptor";
       return false;
     }
-    if (md->prepare(kIODirectionOut) != kIOReturnSuccess) {
+    // The memory's own direction, read-only only when that is refused (PianoDpuFlipClient.h, pianoPrepareSurface): a first prepare of
+    // kIODirectionOut would mark WindowServer's frame "prepared read only" while its window keeps it, and NativeGopDisplay's copy of
+    // it could not be prepared any more (2026-11-15: black copies for the rest of the boot after the first flips).
+    const PianoPrepared how = pianoPrepareSurface(
+        [md](bool readOnly) { return md->prepare(readOnly ? kIODirectionOut : kIODirectionNone) == kIOReturnSuccess; });
+    if (how == pianoPrepareNone) {
       *why = "prepare failed";
       return false;
     }
+    if (how == pianoPrepareReadOnly && readOnlyPrepares++ < 4)
+      note("flip: a %llux%llu surface's memory could not be prepared with its own direction (prepared read-only elsewhere?): prepared "
+           "read-only (%llu so far)", (unsigned long long)r.width, (unsigned long long)r.height, (unsigned long long)readOnlyPrepares);
     if (!listPages(md, pages, max, count, why)) {
-      md->complete(kIODirectionOut);
+      md->complete();
       return false;
     }
     Cookie *c = static_cast<Cookie *>(IOMallocZero(sizeof(Cookie)));
     if (!c) {
-      md->complete(kIODirectionOut);
+      md->complete();
       *why = "no memory";
       return false;
     }
@@ -307,7 +316,7 @@ class KernelHw {
     Cookie *c = static_cast<Cookie *>(cookie);
     if (!c) return;
     if (c->alias) c->alias->release();
-    if (c->prepared) c->memory->complete(kIODirectionOut);
+    if (c->prepared) c->memory->complete();   // a complete's direction only carries its error/valid flags: none here
     c->memory->release();
     c->surface->release();
     IOFree(c, sizeof(Cookie));

@@ -19,6 +19,8 @@
 //   - the panel before the first frame (startPlan): the rule's table, XNU's console choice, and a model of the text console's painting
 //     rules over twenty screens of log: the framebuffer kept under -v is exactly the console's text; the old fill (#203050) stays
 //     behind the text with black stroke lines through it (the bluish background of 2026-11-12, reproduced).
+//   - the copy's prepare of a surface PianoDpu's window also holds (pianoPrepareSurface against XNU's read-only rule): never refused,
+//     whichever came first and however the other prepared it (the black copies after the first flips of 2026-11-15, reproduced).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. gop_host.cpp -o /tmp/gop_host && /tmp/gop_host
 #include <cmath>
 #include <cstdio>
@@ -31,6 +33,8 @@
 #include <vector>
 #include "../CopyRows.h"
 #include "GopCompose.h"
+#include "../PianoDpu/PianoDpuFlipClient.h"           // pianoPrepareSurface: how the copy's kept maps prepare a surface
+#include "../../PianoDpu/tests/prepare_model.h"       // XNU's read-only prepare rule, modelled
 
 using namespace gopcompose;
 static int failures, checks;
@@ -1834,6 +1838,41 @@ static void testStartFill()
   }
 }
 
+// 2026-11-15 (zcflip1, zcflip-nc1): after the first flips every copied frame was black, with one "IOMemoryDescriptor ... prepared read
+// only" report per frame from this driver and "cannot map a 3200x2136 surface": PianoDpu's windows had prepared WindowServer's three
+// frames read-only first and kept them; the copy's prepare (the memory's own direction) was refused for as long. The copy now prepares
+// by pianoPrepareSurface: its own direction first, read-only when that is refused.
+static void testSharedPrepare()
+{
+  // the tablet's sequence with the old window (read-only first): the old copy's prepare was refused, the rule reads read-only
+  for (int frame = 0; frame < 3; ++frame) {
+    PrepareModel md;
+    CHECK(md.prepare(true));                                   // the window (old PianoDpu)
+    CHECK(!md.prepare(false) && md.refusals == 1);             // the old copy: refused, black
+    CHECK(md.prepareShared() == pianoPrepareReadOnly);         // the copy now: read through a read-only prepare
+    md.complete();                                             // the copy's map dropped (evicted from its 8 slots)
+    CHECK(md.wired == 1 && md.readOnly);                       // the window still holds it read-only
+    CHECK(md.prepareShared() == pianoPrepareReadOnly && md.refusals == 3);   // mapped again: read (one refused try per map)
+    md.complete();
+    md.complete();                                             // the window let go
+    CHECK(md.wired == 0 && !md.readOnly);
+  }
+  // the fixed window (shared) and the copy, in either order: never refused, never read-only
+  PrepareModel flippedFirst, copiedFirst;
+  CHECK(flippedFirst.prepareShared() == pianoPrepareShared && copiedFirst.prepareShared() == pianoPrepareShared);
+  CHECK(flippedFirst.prepareShared() == pianoPrepareShared && copiedFirst.prepareShared() == pianoPrepareShared);
+  CHECK(!flippedFirst.readOnly && !copiedFirst.readOnly && flippedFirst.refusals + copiedFirst.refusals == 0);
+  // a copy first, then (with the old window) the read-only prepare: allowed and no mark (the copy held it): why copies were right on
+  // boots whose first frames were copied (zcflip-off1, zcflip-key1)
+  PrepareModel offBoot;
+  CHECK(offBoot.prepareShared() == pianoPrepareShared && offBoot.prepare(true) && !offBoot.readOnly);
+  CHECK(offBoot.prepareShared() == pianoPrepareShared && offBoot.refusals == 0);
+  // memory that cannot be prepared at all: none (the copy draws black, counted as a map failure)
+  PrepareModel broken;
+  broken.broken = true;
+  CHECK(broken.prepareShared() == pianoPrepareNone && broken.wired == 0);
+}
+
 int main()
 {
   testGeometry();
@@ -1849,6 +1888,7 @@ int main()
   testDamage();
   testSimulation();
   testStartFill();
+  testSharedPrepare();
   std::printf("%s: %d checks, %d failures\n", failures ? "FAIL" : "ok", checks, failures);
   return failures ? 1 : 0;
 }

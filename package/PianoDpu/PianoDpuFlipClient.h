@@ -65,4 +65,21 @@ inline const char *pianoDpuFlipResultName(uint32_t r)
   return r < kPianoDpuFlipResults ? names[r] : "?";
 }
 
+// How a surface's memory is prepared (wired) by a driver that is not its only holder: PianoDpu for a window, NativeGopDisplay's copy
+// for its kept map. XNU's IOGeneralMemoryDescriptor remembers a FIRST prepare of kIODirectionOut as "prepared read only" until the last
+// complete, and refuses every later prepare that may write (kIODirectionNone: the memory's own direction, InOut for an IOSurface) with
+// kIOReturnNotWritable and an "IOMemoryDescriptor ... prepared read only" report. So a read-only first holder locks the others out:
+// 2026-11-15 (zcflip1, zcflip-nc1) PianoDpu's windows prepared WindowServer's three frames kIODirectionOut at the first flips, kept
+// them for reuse, and every later copy of a frame failed to map (black for the rest of the boot). The rule: prepare with the memory's
+// own direction; read-only only when that is refused (someone else made it read-only, or it cannot be written). prepare(readOnly)
+// returns true on success. pianoPrepareNone: not prepared (nothing to complete).
+enum PianoPrepared : uint8_t { pianoPrepareNone = 0, pianoPrepareShared, pianoPrepareReadOnly };
+template <class Prepare>
+inline PianoPrepared pianoPrepareSurface(Prepare prepare)
+{
+  if (prepare(false)) return pianoPrepareShared;
+  if (prepare(true)) return pianoPrepareReadOnly;
+  return pianoPrepareNone;
+}
+
 #endif

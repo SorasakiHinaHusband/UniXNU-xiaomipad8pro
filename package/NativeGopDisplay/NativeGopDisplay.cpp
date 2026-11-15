@@ -549,6 +549,9 @@ private:
     volatile uint32_t fCopyModeWanted = 0;
     uint64_t fAbReads[2] = {}, fAbReadNs[2] = {}, fAbCopyNs[2] = {}, fAbSwitches = 0;
     bool fCachedMapRefused;
+    // Surface maps (surfaceBytes, all boot): prepared read-only because their own direction was refused; not prepared or not mapped
+    // (each such frame reads black: its "cannot map" line).
+    uint64_t fReadOnlyPrepares = 0, fMapFailures = 0;
     uint64_t fRefreshSkipped, fInvalidateNs, fInvalidates;
     bool gpuFence(uint32_t *fence);
     bool waitGpuFence(uint32_t fence, bool *answered);
@@ -1294,7 +1297,8 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         GOPLOG("at most %llu frames in a second\n", fPeakFps);
         if (fFlipMode)
             GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies; %llu '&BGA' plane 0), %llu copied (PianoDpu refused "
-                  "them, is not serving, or a cursor was on the panel: %llu)\n", fFlips, fLosslessFlips, fFlipCopies, fCursorForced);
+                  "them, is not serving, or a cursor was on the panel: %llu); surface maps: %llu prepared read-only, %llu failed\n",
+                  fFlips, fLosslessFlips, fFlipCopies, fCursorForced, fReadOnlyPrepares, fMapFailures);
         if (fCursorJobs)
             GOPLOG("cursor: %llu updates of its old and new rectangles, mean %llu us max %llu us, last at (%d, %d)\n", fCursorJobs,
                   fCursorNs / fCursorJobs / 1000, fCursorMaxNs / 1000, fCursorX, fCursorY);
@@ -2084,8 +2088,17 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
     }
     if (slot->surface)
         dropSurfaceMap(*slot);
-    if (memory->prepare() != kIOReturnSuccess)
+    // The memory's own direction, read-only only when that is refused (PianoDpuFlipClient.h, pianoPrepareSurface): another holder
+    // that prepared it read-only first (PianoDpu's window before 2026-11-15) makes XNU refuse a prepare that may write.
+    const PianoPrepared how = pianoPrepareSurface(
+        [memory](bool readOnly) { return memory->prepare(readOnly ? kIODirectionOut : kIODirectionNone) == kIOReturnSuccess; });
+    if (how == pianoPrepareNone) {
+        fMapFailures++;
         return nullptr;
+    }
+    if (how == pianoPrepareReadOnly && fReadOnlyPrepares++ < 4)
+        GOPLOG("a %llux%llu surface's memory is prepared read-only by another holder: read through a read-only prepare (%llu so far)\n",
+              ioSurfaceWidth(surface), ioSurfaceHeight(surface), fReadOnlyPrepares);
     IOMemoryMap *map = nullptr;
     if (fCopyMode & kCopyCachedRead) {   // native-gop-display-copy bit 1: cacheable, invalidated before each read (compose)
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
@@ -2099,6 +2112,7 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
     if (!map) {
         memory->complete();
+        fMapFailures++;
         return nullptr;
     }
     reinterpret_cast<OSObject *>(surface)->retain();
