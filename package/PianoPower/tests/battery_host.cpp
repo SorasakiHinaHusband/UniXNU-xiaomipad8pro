@@ -127,9 +127,10 @@ int main()
                             pack(4380, 0, 0, 95, 12000, 8634, 5000, 312, 0, 114)};            // remaining above full + 5 %
     const PackReading po = combinePacks(over, 2);
     CHECK(!mapBattery(over, 2, po, nullptr, 0).known);
-    GaugeReading neg[2] = {pack(4379, 0, 0, 95, -100, 8634, 5000, 305, 0, 113),
-                           pack(4380, 0, 0, 95, 8187, 8634, 5000, 312, 0, 114)};              // a negative remaining
-    const PackReading pn = combinePacks(neg, 2);
+    GaugeReading neg[2] = {pack(4379, 0, 0, 95, 4000, 8634, 5000, 305, 0, 113),
+                           pack(4380, 0, 0, 95, 4187, 8634, 5000, 312, 0, 114)};
+    PackReading pn = combinePacks(neg, 2);   // a negative combined remaining cannot come from the gauges (u16 each): built by hand
+    pn.remainingMah = -813;
     CHECK(!mapBattery(neg, 2, pn, nullptr, 0).known);
     // A plausible reading right after a bad one still publishes (the bad one changed nothing).
     const GaugeReading good[2] = {pack(4379, 0, 0, 95, 8186, 8634, 5000, 305, 0, 113),
