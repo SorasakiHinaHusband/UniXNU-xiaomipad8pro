@@ -610,7 +610,8 @@ static void testGovernor()
 // PianoPolicy's profile (docs/policy.md 5.2): what the governor is handed as its power source, and so its ceiling; the fixed level
 // ignores it. The sleep plan: what kOff and kOn do, once each.
 // piano-cpufreq-boost (2026-11-14): the sustained level in every mode until the end, the thermal limit on top, a cap if given; the
-// step machine boosts until endMs, ends once, then nothing; 0 = off.
+// step machine boosts until endMs, ends once, then nothing; 0 = off. Its own thermal back-off (2026-11-15, ufs5r3): the hottest
+// CPU reading steps a sticky cap one level down at 88 C, ends the boost at 90 C, and never raises the cap again this boot.
 static void testBoost()
 {
   GovernorConfig gc;
@@ -634,6 +635,58 @@ static void testBoost()
   CHECK(boostStep(500, 60000, false) == BoostStep::boost && boostStep(59999, 60000, false) == BoostStep::boost);
   CHECK(boostStep(60000, 60000, false) == BoostStep::end && boostStep(90000, 60000, false) == BoostStep::end);
   CHECK(boostStep(60000, 60000, true) == BoostStep::none && boostStep(100, 60000, true) == BoostStep::none);   // ended: never again
+
+  // the boost's own thermal back-off (2026-11-15, ufs5r3: the ufs5 rerun's 120-s boost peaked at 97.3 C against the 92 C line):
+  // the hottest CPU reading steps the boost's cap one level down per stepMs at 88 C, ends it at 90 C, and no reading touches it
+  BoostBackoff bb;                                          // 88.0 / 90.0 C, one step per 10 ms
+  uint64_t bt = 100000;
+  CHECK(boostBackoff(bb, 500, bt) == BoostBackoffEvent::none);       // 50 C: nothing
+  CHECK(boostBackoff(bb, -1, bt) == BoostBackoffEvent::none);        // no reading: nothing
+  CHECK(boostBackoff(bb, 879, bt) == BoostBackoffEvent::none);       // just under the step
+  CHECK(boostBackoff(bb, 880, bt) == BoostBackoffEvent::step);       // at the step: one level down
+  CHECK(boostBackoff(bb, 884, bt + 5) == BoostBackoffEvent::none);   // 5 ms later: not yet
+  CHECK(boostBackoff(bb, 884, bt + 10) == BoostBackoffEvent::step);  // one per stepMs, as the cluster limit steps
+  CHECK(boostBackoff(bb, 700, bt + 20) == BoostBackoffEvent::none);  // cooler: held (the caller's cap only steps down)
+  CHECK(boostBackoff(bb, 899, bt + 30) == BoostBackoffEvent::step);  // still under the end: still stepping
+  CHECK(!bb.ended);
+  CHECK(boostBackoff(bb, 900, bt + 40) == BoostBackoffEvent::end && bb.ended && bb.endedDeci == 900);
+  CHECK(boostBackoff(bb, 950, bt + 50) == BoostBackoffEvent::none);  // ended: never again this boot
+  CHECK(boostBackoff(bb, 500, bt + 60) == BoostBackoffEvent::none);
+  BoostBackoff b0;
+  b0.stepDeci = 0;                                         // stepping off: the end alone
+  CHECK(boostBackoff(b0, 850, 100) == BoostBackoffEvent::none);
+  CHECK(boostBackoff(b0, 900, 110) == BoostBackoffEvent::end);
+  // the cap those events step (boostLevel's maxLevel): under the sustained level and the -cap, still under the thermal limit,
+  // and sticky — the cluster limit releases under hot - 5, the boost cap must not follow it up again
+  Governor cg;
+  cg.init(CpuMode::report, GovernorConfig{}, kNcc1, 16, 14, 0);
+  CHECK(cg.boostLevel(0) == cg.boostLevel(0, 15) && cg.boostLevel(0, 10) == 10);   // no cap given: the same; else the cap's level
+  CHECK(cg.boostLevel(capKhz(3000), 20) == 9 && cg.boostLevel(capKhz(3000), 5) == 5);   // the tighter of -cap and the cap
+  cg.thermal(hot(), 1000);
+  for (int i = 0; i < 9; ++i) cg.thermal(hot(), 1020 + i * 20);
+  CHECK(cg.limit() == 5 && cg.boostLevel(0, 10) == 5);       // the thermal limit below the cap still wins
+  uint64_t ct = 100000;
+  cg.thermal(cool(), ct);
+  cg.thermal(cool(), ct + 1000);
+  cg.thermal(cool(), ct + 2000);
+  CHECK(cg.limit() > 5 && cg.boostLevel(0, 6) == 6);         // the limit released; the sticky cap holds the boost at 6
+  // cpuHottest (Cluster.h): the CPU zones of BOTH clusters, never the GPU/NSP ones; false when none is usable
+  TsensModel model;
+  model.all(400);                                           // 40 C everywhere
+  model.status[2][5] = statusWord(950, true);               // a GPU sensor at 95 C: not a CPU zone
+  model.status[0][7] = statusWord(872, true);               // cpu-0-3-0 at 87.2 C
+  model.status[1][3] = statusWord(886, true);               // cpu-1-1-1 at 88.6 C: the hottest CPU zone
+  Monitor mon;
+  mon.poll(model.io());
+  int32_t hd = -32768;
+  CHECK(cpuHottest(mon, hd) && hd == 886);
+  TsensModel cold;
+  for (unsigned mc = 0; mc < kControllers; ++mc)
+    for (unsigned ms = 0; ms < kMaxSensors; ++ms) cold.status[mc][ms] = statusWord(0, false);   // nothing VALID
+  Monitor m2;
+  m2.poll(cold.io());
+  int32_t h2 = -32768;
+  CHECK(!cpuHottest(m2, h2) && h2 == -32768);               // no usable reading: false, deci untouched
 }
 
 static void testProfileAndSleep()

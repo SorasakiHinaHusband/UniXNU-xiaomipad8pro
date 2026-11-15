@@ -25,6 +25,9 @@
 //                    holding the per-core clock measurement makes no decision.
 //   piano-cpufreq-boost=S  (2026-11-14) the boot boost: every cluster at its sustained level until S s of uptime, the thermal limit
 //                    on top, then the mode's own level (implies piano-cpufreq=1: then back to the boot stages' level); -cap=<MHz>.
+//                    Its own thermal back-off (2026-11-15, ufs5r3): the hottest CPU sensor at -step C (88) steps the boost one
+//                    level down every piano-thermal-fast-ms — never up again in this boot — and at -end C (90) the boost is over
+//                    at once (Governor.h BoostBackoff; the ufs5 rerun peaked at 97.3 C against the 92 C line without it).
 // The thermal limit of modes 2 and 3 (Cluster.h) works on a hard ceiling since 2026-11-12: one level down per 10 ms while any cpu-*
 // sensor of the cluster is at piano-cpufreq-hot (default 90 C, never above the zone's stock passive trip; 0 = the stock trips),
 // whatever piano-thermal says.
@@ -94,7 +97,8 @@ constexpr uint32_t kA830Valid = 1u << 0, kA830Limiting = 1u << 1, kA830Emergency
 constexpr int kRbHalt = 0x08;                                                                   // bsd/sys/reboot.h RB_HALT
 
 struct Args {
-  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask, boostS, boostCap;
+  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask, boostS, boostCap, boostStepC,
+      boostEndC;
   uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, fastTempC, clockMs, gpuMhz, hotC,
       releaseC, cutC;
   bool capGiven[2];
@@ -124,6 +128,10 @@ void readArgs()
   // about 1.0 GHz). piano-cpufreq-boost-cap=<MHz>: no faster than that. 0 (the default): nothing changes.
   gArgs.boostS = clampU(bootArg("piano-cpufreq-boost", 0), 0, 3600);
   gArgs.boostCap = bootArg("piano-cpufreq-boost-cap", 0);
+  // the boost's own thermal back-off (2026-11-15, ufs5r3): the hottest CPU sensor at boostStepC steps the boost one level down
+  // (never up again in this boot), at boostEndC the boost is over at once; the ufs5 rerun's boost peaked at 97.3 C (92 C line)
+  gArgs.boostStepC = clampU(bootArg("piano-cpufreq-boost-step", 88), 0, 110);
+  gArgs.boostEndC = clampU(bootArg("piano-cpufreq-boost-end", 90), 0, 110);
   if (gArgs.boostS && !gArgs.cpufreq) gArgs.cpufreq = 1;
   if (gArgs.level > 2) gArgs.level = 2;
   if (gArgs.cpufreq && !gArgs.level) gArgs.level = 1;
@@ -554,6 +562,11 @@ class PianoThermal : public IOService {
   bool cpuOk_ = false;
   // piano-cpufreq-boost: its end (uptime ns, 0 off) and, per domain, whether it has ended / its level was reached (one line each)
   uint64_t boostEndNs_ = 0;
+  // the boost's own thermal back-off (Governor.h BoostBackoff): its state, the heat end (uptime ns, 0 = not by heat; the
+  // per-domain boost-over path sees it as the boost's end), and the boost's sticky cap level per domain (only steps down)
+  BoostBackoff boostBackoff_{};
+  uint64_t boostHotEndNs_ = 0;
+  unsigned boostCapLevel_[kDomains] = {};
   bool boostEnded_[kDomains] = {}, boostNoted_[kDomains] = {};
   // PianoPolicy's profile (any thread writes it; the governor reads it each tick) and what the 30 s report last named
   volatile uint32_t profile_ = 0;
@@ -971,11 +984,24 @@ void PianoThermal::cpuStart()
   if (mode >= CpuMode::fixed) note("cpufreq: power source: %s", powerName(power_));
   if (gArgs.boostS && cpuOk_) {
     boostEndNs_ = uint64_t(gArgs.boostS) * 1000000000ull;
+    boostHotEndNs_ = 0;
+    boostBackoff_ = BoostBackoff{};
+    boostBackoff_.stepDeci = int32_t(gArgs.boostStepC) * 10;
+    boostBackoff_.endDeci = int32_t(gArgs.boostEndC) * 10;
+    boostBackoff_.stepMs = gArgs.fastMs;
+    for (unsigned d = 0; d < kDomains; ++d) boostCapLevel_[d] = governor_[d].boostLevel(capKhz(gArgs.boostCap));
     char cap[48] = "";
     if (gArgs.boostCap) snprintf(cap, sizeof cap, " (no faster than %u MHz)", gArgs.boostCap);
     note("cpufreq: boot boost: every cluster that allows LEVEL_SET at its sustained level%s until %u s of uptime (piano-cpufreq-boost), "
          "the thermal limit on top (%s); then %s", cap, gArgs.boostS, tripsText(),
          mode == CpuMode::report ? "back to the level the boot stages left" : mode == CpuMode::fixed ? "the fixed level" : "the governor");
+    if (gArgs.boostStepC)
+      note("cpufreq: boot boost back-off: the hottest CPU sensor at %u.%u C steps the boost one level down every %u ms (never up "
+           "again this boot), at %u.%u C the boost is over (piano-cpufreq-boost-step / -end)", gArgs.boostStepC / 10,
+           gArgs.boostStepC % 10, gArgs.fastMs, gArgs.boostEndC / 10, gArgs.boostEndC % 10);
+    else
+      note("cpufreq: boot boost back-off: no stepping (piano-cpufreq-boost-step=0); at %u.%u C the boost is over "
+           "(piano-cpufreq-boost-end)", gArgs.boostEndC / 10, gArgs.boostEndC % 10);
   }
 }
 
@@ -1021,6 +1047,28 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     powerAtNs_ = now;
   }
   const PowerSource power = profilePower(power_, Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE)));
+  // The boost's own thermal back-off (2026-11-15, ufs5r3): one decision per poll on the hottest CPU reading, before the
+  // domains (a step lowers every domain's boost cap level at once; the heat end shortens the boost so each domain's boostStep
+  // takes its over transition on this same poll). The cap only steps down: a cooler spell must not raise it again.
+  if (boostEndNs_ && !boostBackoff_.ended) {
+    int32_t hotDeci = -32768;
+    if (cpuHottest(m, hotDeci)) {
+      const BoostBackoffEvent backoff = boostBackoff(boostBackoff_, hotDeci, now / 1000000ull);
+      if (backoff == BoostBackoffEvent::step) {
+        for (unsigned d = 0; d < kDomains; ++d) {
+          if (!domainOk_[d] || !domain_[d].canSet || !boostCapLevel_[d]) continue;
+          --boostCapLevel_[d];
+          note("[%us] cpufreq: domain %u: boost: capped at %u.%u C: %u MHz", upS(), d, uint32_t(hotDeci) / 10,
+               uint32_t(hotDeci) % 10,
+               domain_[d].levels[governor_[d].boostLevel(capKhz(gArgs.boostCap), boostCapLevel_[d])].khz / 1000);
+        }
+      } else if (backoff == BoostBackoffEvent::end) {
+        boostHotEndNs_ = now;
+        note("[%us] cpufreq: boost: %u.%u C ends the boot boost (the thermal back-off, at or above %u C)", upS(),
+             uint32_t(hotDeci) / 10, uint32_t(hotDeci) % 10, gArgs.boostEndC);
+      }
+    }
+  }
   int32_t busy[kDomains] = {-1, -1};
   if (loadTick) domainBusy(busy);
   // A load decision needs a busy figure: none on the first reading (it only starts the window), after the clock measurement, or
@@ -1029,12 +1077,15 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   for (unsigned d = 0; d < kDomains; ++d) {
     if (!domainOk_[d]) continue;
     Governor &g = governor_[d];
-    // piano-cpufreq-boost: the sustained level (the thermal limit on top, in every mode) until its end, then once the mode's own
-    const BoostStep step = domain_[d].canSet ? boostStep(now / 1000000ull, boostEndNs_ / 1000000ull, boostEnded_[d]) : BoostStep::none;
+    // piano-cpufreq-boost: the sustained level (the thermal limit and the boost's own sticky thermal cap on top, in every mode)
+    // until its end — its seconds, or the back-off's heat end, whichever is first — then once the mode's own
+    const BoostStep step = domain_[d].canSet
+        ? boostStep(now / 1000000ull, (boostHotEndNs_ ? boostHotEndNs_ : boostEndNs_) / 1000000ull, boostEnded_[d])
+        : BoostStep::none;
     if (step != BoostStep::none) {
       g.thermal(clusterThermal(m, d, gTrips, critical), now / 1000000ull);
       if (step == BoostStep::boost) {
-        const unsigned want = g.boostLevel(capKhz(gArgs.boostCap));
+        const unsigned want = g.boostLevel(capKhz(gArgs.boostCap), boostCapLevel_[d]);
         cpuApply(d, want, now);
         if (!boostNoted_[d] && set_[d] == want) {
           boostNoted_[d] = true;
@@ -1044,15 +1095,26 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
         continue;
       }
       boostEnded_[d] = true;
+      const bool byTime = now >= boostEndNs_;   // else the back-off ended it below its seconds
       if (g.mode() == CpuMode::report) {
         cpuApply(d, unsigned(boot_[d]), now);
-        note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: back to the boot stages' %u MHz", upS(), d, gArgs.boostS,
-             domain_[d].levels[set_[d]].khz / 1000);
+        if (byTime)
+          note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: back to the boot stages' %u MHz", upS(), d, gArgs.boostS,
+               domain_[d].levels[set_[d]].khz / 1000);
+        else
+          note("[%us] cpufreq: domain %u: boot boost over at %u.%u C (the thermal back-off): back to the boot stages' %u MHz",
+               upS(), d, uint32_t(boostBackoff_.endedDeci) / 10, uint32_t(boostBackoff_.endedDeci) % 10,
+               domain_[d].levels[set_[d]].khz / 1000);
         continue;
       }
       g.setLevel(set_[d]);
-      note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: %s from %u MHz", upS(), d, gArgs.boostS,
-           g.mode() == CpuMode::fixed ? "the fixed level" : "the governor", domain_[d].levels[set_[d]].khz / 1000);
+      if (byTime)
+        note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: %s from %u MHz", upS(), d, gArgs.boostS,
+             g.mode() == CpuMode::fixed ? "the fixed level" : "the governor", domain_[d].levels[set_[d]].khz / 1000);
+      else
+        note("[%us] cpufreq: domain %u: boot boost over at %u.%u C (the thermal back-off): %s from %u MHz", upS(), d,
+             uint32_t(boostBackoff_.endedDeci) / 10, uint32_t(boostBackoff_.endedDeci) % 10,
+             g.mode() == CpuMode::fixed ? "the fixed level" : "the governor", domain_[d].levels[set_[d]].khz / 1000);
     }
     if (g.mode() == CpuMode::report) {
       if (!slow) continue;

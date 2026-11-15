@@ -62,6 +62,26 @@ inline ThermalInput clusterThermal(const Monitor &m, unsigned cluster, const Clu
   return in;
 }
 
+// The hottest usable sensor of the CPU zones of BOTH clusters (the same sensor sets clusterThermal walks: cpu-0-*/cpu-1-*),
+// for the boot boost's thermal back-off (Governor.h BoostBackoff): one CPU-wide reading, absolute deci-C, so both clusters'
+// boost steps and ends together (the heat is shared die heat; the GPU, modem, NSP zones are not CPU zones and stay out).
+// false when neither cluster has a usable reading; deci is untouched then.
+inline bool cpuHottest(const Monitor &m, int32_t &deci)
+{
+  bool any = false;
+  for (unsigned c = 0; c < 2 && c < kControllers; ++c) {
+    const Controller &k = kMap[c];
+    if (!k.cpuLast) continue;
+    for (unsigned s = k.cpuFirst; s <= k.cpuLast && s < k.count; ++s) {
+      if (!m.usable(c, s)) continue;
+      const int32_t d = m.deci(c, s);
+      if (!any || d > deci) deci = d;
+      any = true;
+    }
+  }
+  return any;
+}
+
 // Any usable sensor of the SoC within kNearDeci of its policy passive threshold (Tsens.h passiveOf), or of the cluster ceiling.
 inline bool nearTrip(const Monitor &m, const ClusterTrips &t)
 {

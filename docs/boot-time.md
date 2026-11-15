@@ -500,7 +500,11 @@ userland. Sources: ufs4a's console (`private/host-checks/20261114-ufs1/ufs4a-con
    the samples idle: CPU-bound on slow cores, not waiting on the disk (NativeUfs busy 5-30 % of each second after 15 s, queue depth
    0.0-0.3, ~150 us a command). Fix: **`piano-cpufreq-boost=S`** (PianoThermal, 2026-11-14, default 0): every cluster at its
    sustained level until S s of uptime, PianoThermal's 90 C cluster ceiling on top in every mode, then the profile's own level
-   (without `piano-cpufreq`: the boot stages' level again). Host-tested (`thermal_host` testBoost). Probe ufs5.
+   (without `piano-cpufreq`: the boot stages' level again). Host-tested (`thermal_host` testBoost). Probe ufs5. Measured (ufs5,
+   2026-11-15): the clocks were the lever — Installer Progress 22.4 s [33.5], Finder 59.8 s [85.8] — but the 120-s boost peaked
+   at **97.3 C against the 92 C line** (`private/host-checks/UFS5-HEAT-WHY.md`), so since 2026-11-15 the boost carries its own
+   thermal back-off: the hottest CPU sensor steps it one level down at 88 C (never up again in that boot) and ends it at 90 C
+   (`piano-cpufreq-boost-step` / `-end`, `thermal_host` testBoost; probe ufs5r3).
 2. **The LaunchServices database, on RAM boots only (confirmed timing, inferred cause).** In ufs3, lsd runs at one full core from
    44 to 66 s (pc-sample) and Installer Progress opens the GPU at 69 s, ~31 s after its launch; ufs4a the same 30 s (3 -> 33 s); on
    the installed boots 7.7 s. A RAM test boot starts from the seed's Data volume, which has no LaunchServices database (and no

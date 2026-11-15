@@ -229,16 +229,19 @@ class Governor {
   }
   unsigned floorLevel() const { return config_.floorKhz ? slowestAtLeast(config_.floorKhz) : 0; }
   // piano-cpufreq-boost=S (2026-11-14, boot time): the level while the boot boost lasts, in every mode (report included): the
-  // sustained level, or the fastest at or under capKhz when one is given (piano-cpufreq-boost-cap), never above the thermal limit.
-  unsigned boostLevel(uint32_t capKhz) const
+  // sustained level, or the fastest at or under capKhz when one is given (piano-cpufreq-boost-cap), never above the thermal limit
+  // nor the boost's own sticky thermal cap maxLevel (the back-off below; count() - 1 = none).
+  unsigned boostLevel(uint32_t capKhz, unsigned maxLevel) const
   {
     unsigned top = sustained_;
     if (capKhz) {
       const unsigned l = fastestAtMost(capKhz);
       if (l < top) top = l;
     }
+    if (maxLevel < top) top = maxLevel;
     return limit_ < top ? limit_ : top;
   }
+  unsigned boostLevel(uint32_t capKhz) const { return boostLevel(capKhz, count_ - 1u); }
   unsigned sustained() const { return sustained_; }
   unsigned level() const { return level_; }
   unsigned limit() const { return limit_; }
@@ -284,6 +287,36 @@ inline BoostStep boostStep(uint64_t nowMs, uint64_t endMs, bool ended)
 {
   if (!endMs || ended) return BoostStep::none;
   return nowMs < endMs ? BoostStep::boost : BoostStep::end;
+}
+
+// The boot boost's own thermal back-off (2026-11-15, ufs5r3: the ufs5 rerun's 120-s boost peaked at 97.3 C against the 92 C
+// line while the cluster limit's ladder traded levels against an all-core ramp and its release let the peaks re-climb). One
+// decision per sensor poll on the hottest CPU reading (Cluster.h cpuHottest, both clusters' cpu-* zones), absolute degrees:
+// at or above stepDeci the boost's own cap (a level per domain, boostLevel's maxLevel) steps one level down per stepMs and
+// never rises again in this boot — the cluster limit releases under hot - 5, this cap does not; at or above endDeci the boost
+// is over at once (as if its seconds had passed: every domain takes its boost-over path on the next poll). hottestDeci < 0
+// (no reading) touches nothing; stepDeci 0 disables the stepping, not the end; endDeci <= stepDeci leaves only the end.
+struct BoostBackoff {
+  int32_t stepDeci = 880, endDeci = 900;   // piano-cpufreq-boost-step / -end (88 / 90 C)
+  uint32_t stepMs = 10;                    // one level per step, as the cluster limit steps (piano-thermal-fast-ms)
+  uint64_t lastStepMs = 0;
+  bool ended = false;
+  int32_t endedDeci = 0;                   // the reading that ended it (the log line names it)
+};
+enum class BoostBackoffEvent : uint8_t { none, step, end };
+inline BoostBackoffEvent boostBackoff(BoostBackoff &b, int32_t hottestDeci, uint64_t nowMs)
+{
+  if (b.ended || hottestDeci < 0) return BoostBackoffEvent::none;
+  if (hottestDeci >= b.endDeci) {
+    b.ended = true;
+    b.endedDeci = hottestDeci;
+    return BoostBackoffEvent::end;
+  }
+  if (b.stepDeci > 0 && hottestDeci >= b.stepDeci && (!b.lastStepMs || nowMs - b.lastStepMs >= b.stepMs)) {
+    b.lastStepMs = nowMs;
+    return BoostBackoffEvent::step;
+  }
+  return BoostBackoffEvent::none;
 }
 
 // Per mille busy of one core over a window: wall time minus its idle time and minus the time PianoThermal's own thread ran on that
