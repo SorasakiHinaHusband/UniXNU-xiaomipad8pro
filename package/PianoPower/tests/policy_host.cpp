@@ -154,6 +154,7 @@ struct Sim {
       if (w.value) sawZero = false;
       break;
     case PIANO_CHG_PD_FIXED: busMv = w.value == 9000 && follows9v && offers9v() ? 9000 : 5000; break;
+    case PIANO_CHG_QC_VOLT: busMv = w.value == 9000 && follows9v ? 9000 : 5000; break;
     case PIANO_CHG_PPS: busMv = follows9v && offers9v() ? int((w.value >> 16) * 20) : 5000; break;
     default: ret = 1;
     }
@@ -240,14 +241,16 @@ static void testTables()
   // at 9 V
   CHECK(piano_charge_icl_9v(PIANO_CHG_C_PD, 2000) == 1600 && piano_charge_icl_9v(PIANO_CHG_C_PD, 1000) == 1000);
   CHECK(piano_charge_icl_9v(PIANO_CHG_C_PD_PPS, 3000) == 2500 && piano_charge_icl_9v(PIANO_CHG_C_DCP, 3000) == 0);
+  CHECK(piano_charge_icl_qc3_9v(2000) == 1600 && piano_charge_icl_qc3_9v(1000) == 1000 && piano_charge_is_qc3(6) &&
+        piano_charge_is_qc3(7) && piano_charge_is_qc3(8) && !piano_charge_is_qc3(5));
   CHECK(piano_charge_fcc_full(PIANO_CHG_C_PD, 1) == 3000 && piano_charge_fcc_full(PIANO_CHG_C_PD_PPS, 1) == 3500);
 
-  // temperature: 500 below 15, full to 38, -300 per degree above, 500 at least
+  // temperature: 500 below 15, full to 48, -300 per degree above, 500 at least
   CHECK(piano_charge_fcc_thermal(2000, 0, 30) == 500);
   CHECK(piano_charge_fcc_thermal(2000, 1, 14) == 500 && piano_charge_fcc_thermal(2000, 1, 15) == 2000);
-  CHECK(piano_charge_fcc_thermal(2000, 1, 38) == 2000 && piano_charge_fcc_thermal(2000, 1, 39) == 1700);
-  CHECK(piano_charge_fcc_thermal(2000, 1, 42) == 800 && piano_charge_fcc_thermal(2000, 1, 43) == 500);
-  CHECK(piano_charge_fcc_thermal(2000, 1, 60) == 500 && piano_charge_fcc_thermal(3500, 1, 45) == 1400);
+  CHECK(piano_charge_fcc_thermal(2000, 1, 48) == 2000 && piano_charge_fcc_thermal(2000, 1, 49) == 1700);
+  CHECK(piano_charge_fcc_thermal(2000, 1, 52) == 800 && piano_charge_fcc_thermal(2000, 1, 53) == 500);
+  CHECK(piano_charge_fcc_thermal(2000, 1, 60) == 500 && piano_charge_fcc_thermal(3500, 1, 49) == 3200);
   CHECK(piano_charge_fcc_thermal(500, 1, 50) == 500 && piano_charge_fcc_thermal(0, 1, 30) == 0);
   CHECK(piano_charge_fcc_thermal(2000, 1, -5) == 500);
 
@@ -302,12 +305,14 @@ static void testTables()
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_FCC, 1500, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_FCC, 1501, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4400, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4480, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 5000, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 9000, 4));
+  CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_QC_VOLT, 9000, 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 3000), 4));
   CHECK(!piano_charge_write_allowed(&cfg, 0x2019, 0, 1) && !piano_charge_write_allowed(&cfg, 0x201a, 0, 16));
-  cfg.full_charge = 1; cfg.hv = 2; cfg.icl_cap_ma = 2500; cfg.fcc_cap_ma = 3500;
+  cfg.full_charge = 1; cfg.hv = 2; cfg.qc3 = 1; cfg.icl_cap_ma = 2500; cfg.fcc_cap_ma = 3500;
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4480, 4) && piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4060, 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4540, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4500, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 9000, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 12000, 4));
+  CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_QC_VOLT, 9000, 4) && piano_charge_write_allowed(&cfg, PIANO_CHG_QC_VOLT, 5000, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 3000), 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 3050), 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(8000, 3000), 4));
@@ -458,10 +463,10 @@ static void testThermal()
 {
   Sim s;
   s.cfg.icl_cap_ma = 2500; s.cfg.fcc_cap_ma = 3500;
-  s.temp(40);
+  s.temp(50);
   s.step();
   CHECK(s.wrote(PIANO_CHG_FCC, 1400));   // 2000 - 2 x 300
-  s.temp(44);
+  s.temp(54);
   s.step();
   CHECK(s.wrote(PIANO_CHG_FCC, 500));    // down at once
   s.temp(30);
@@ -475,7 +480,7 @@ static void testThermal()
   CHECK(s.wrote(PIANO_CHG_FCC, 1100));
   for (int i = 0; i < 10; ++i) s.step(30000);
   CHECK(s.fcc == 2000);
-  s.temp(39);                            // a degree to spare going up: 39 gives 1700 at once going down
+  s.temp(49);                            // a degree to spare going up: 49 gives 1700 at once going down
   s.step();
   CHECK(s.wrote(PIANO_CHG_FCC, 1700));
   s.temp(10);
@@ -488,12 +493,12 @@ static void testThermal()
   t.tbatC = 200;   // implausible: ignored
   t.step();
   CHECK(t.wrote(PIANO_CHG_FCC, 500));
-  // the warmer reading counts: the firmware 30, a pack 41
+  // the warmer reading counts: the firmware 30, a pack 49
   Sim u;
   u.cfg.icl_cap_ma = 2500; u.cfg.fcc_cap_ma = 3500;
-  u.tbatC = 30; u.tWarmDc = 415; u.tCoolDc = 300;
+  u.tbatC = 30; u.tWarmDc = 495; u.tCoolDc = 300;
   u.step();
-  CHECK(u.wrote(PIANO_CHG_FCC, 1100));
+  CHECK(u.wrote(PIANO_CHG_FCC, 1700));
 
   // the float voltage (opt-in), read back from 0x2007
   Sim f;
@@ -629,9 +634,9 @@ static void testNineVolt()
     t.step();
     CHECK(t.wrote(PIANO_CHG_ICL, 2500) && t.wrote(PIANO_CHG_FCC, 3500));
     // thermal derating applies at 9 V too
-    t.temp(41);
+    t.temp(49);
     t.step();
-    CHECK(t.wrote(PIANO_CHG_FCC, 2600));
+    CHECK(t.wrote(PIANO_CHG_FCC, 3200));
   }
   // hv off at 9 V without a request of ours (a wake without a handover): taken as on when allowed
   {
@@ -641,6 +646,16 @@ static void testNineVolt()
     s.busMv = 9000;
     s.step();
     CHECK((s.plan.events & PIANO_CHG_EV_HV_ON) && s.wrote(PIANO_CHG_ICL, 1600));
+  }
+  // B4 opt-in QC3: HVDCP3 uses the ADSP's QC voltage property, never a PD/PPS property.
+  {
+    Sim s;
+    s.cfg.hv = 2; s.cfg.qc3 = 1; s.cfg.icl_cap_ma = 2500;
+    s.type = PIANO_CHG_T_HVDCP3;
+    for (int i = 0; i < 4; ++i) s.step();
+    CHECK(s.wrote(PIANO_CHG_QC_VOLT, 9000) && !s.wrote(PIANO_CHG_PD_FIXED, 9000) && !s.wrote(PIANO_CHG_PPS));
+    s.step();
+    CHECK(s.busMv == 9000 && s.wrote(PIANO_CHG_ICL, 1600));
   }
 }
 
@@ -1040,12 +1055,12 @@ static void testRpAndBoard()
     Sim s;
     s.cfg.icl_cap_ma = 2500; s.cfg.fcc_cap_ma = 3500;
     s.boardValid = PIANO_CHG_IN_NTC;
-    s.ntcDc = 405;   // 40.5 degC against packs at 30
+    s.ntcDc = 405;   // 40.5 degC against packs at 30: below the 48 C warm boundary
     s.step();
-    CHECK(s.wrote(PIANO_CHG_FCC, 1400) && !(s.plan.events & PIANO_CHG_EV_NTC_APART));
+    CHECK(s.wrote(PIANO_CHG_FCC, 2000) && !(s.plan.events & PIANO_CHG_EV_NTC_APART));
     s.ntcDc = 455;
     s.step();
-    CHECK((s.plan.events & PIANO_CHG_EV_NTC_APART) && s.wrote(PIANO_CHG_FCC, 500));
+    CHECK((s.plan.events & PIANO_CHG_EV_NTC_APART) && !s.wrote(PIANO_CHG_FCC));
     s.step();
     CHECK(!(s.plan.events & PIANO_CHG_EV_NTC_APART));
     // an implausible thermistor reading is not a temperature

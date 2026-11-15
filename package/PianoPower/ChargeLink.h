@@ -32,6 +32,7 @@ namespace pianopower {
 struct LinkOptions {
   bool writes = true;              // piano-power-write
   unsigned hv = 0;                 // piano-power-hv: 0, 1 fixed 9 V PDO, 2 also a PPS APDO
+  bool qc3 = false;                // piano-power-b4pd: HVDCP3 9 V request (0x2011)
   bool rp = false;                 // piano-power-rp: the Type-C Rp current as the 5 V limit of a source without PD
   bool ramp = true;                // piano-power-ramp: that limit in steps from the row (ChargePolicy cfg.ramp, docs §15)
   unsigned rpMax = 0;              // piano-power-rp-max: the stepped limit's ceiling, mA (0: the 1600 mA cap; at most 3000)
@@ -108,6 +109,7 @@ class ChargeLink {
     piano_charge_config_default(&cfg);
     cfg.writes = o.writes && m.policy ? 1 : 0;
     cfg.hv = uint8_t(o.hv > 2 ? 2 : o.hv);
+    cfg.qc3 = o.qc3 ? 1 : 0;
     cfg.rp = o.rp ? 1 : 0;
     cfg.ramp = o.rp && o.ramp ? 1 : 0;
     cfg.rp_cap_ma = uint16_t(cfg.ramp && o.rpMax ? (o.rpMax > PIANO_CHG_RP_ABS_MAX ? PIANO_CHG_RP_ABS_MAX : o.rpMax) : 0);
@@ -115,7 +117,7 @@ class ChargeLink {
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
     // 0x2003 = 0 through the codec only for battery health's stop and the charging restart's
-    piano_mca_use_external_policy(&m, cfg.limit || cfg.kick, cfg.hv >= 2);
+    piano_mca_use_external_policy(&m, cfg.limit || cfg.kick, cfg.hv >= 2, cfg.qc3);
     piano_mca_allow_icl(&m, piano_charge_icl_max(&cfg));   // the codec's bound follows the policy's (1600 unless stepped higher)
   }
 

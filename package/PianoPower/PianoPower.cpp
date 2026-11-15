@@ -11,8 +11,8 @@
 //                  pins' TLMM configuration (taken as GPIOs for the read, then given back).
 //   piano-power=2  the same, and the charger: the DSP is started (its images from modem_a, PAS) with GLINK and the IPC router's service
 //                  locator, then the charger properties are read every 5 s and the conservative policy of PianoMca.c is applied: input
-//                  current limit by charger type (at most 1.5 A at 5 V), charge current 1.0 A between 15 and 38 degC (0.5 A outside or
-//                  without a temperature), the charger's enable bit set if it is clear, back to the firmware's own 100 mA / 500 mA on
+//                  current limit by charger type (at most 1.5 A at 5 V), charge current 1.0 A through 48 degC then -0.3 A/degC from
+//                  49 degC (0.5 A floor, or without a temperature), the charger's enable bit set if it is clear, back to the firmware's own 100 mA / 500 mA on
 //                  detach. USB-C port notifications are acknowledged (and handed, read only, to the port-event clients:
 //                  PortEvents.c, PianoDp). Nothing else is written.
 // The charger watchdog (ChargerWdog.h, docs/drivers/charging-policy.md §18), at both levels: the boot stages leave the charger PMIC's
@@ -36,6 +36,8 @@
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
 // DIR/adsp_dtb.mbn instead of modem_a). Every step logs "PianoPower: ...".
+// piano-power-b4pd=1 is the attended, opt-in first B4 step: it selects ChargePolicy, enables fixed-PDO/PPS requests and permits the
+// HVDCP3 0x2011=9000 request. It never changes the ADSP lifecycle; level 2's existing start/ready path remains the sole owner.
 // At both levels the PMIC RTC is read with every report from the first one after IOBSD is published (RtcReadout.h,
 // docs/drivers/rtc.md): its count, enable bit and the date with the offset of piano-rtc-offset=N or else the SDAM cell. Read only;
 // the kernel's calendar from it is k27 0060 (piano-rtc=1).
@@ -95,7 +97,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, psInject, board, ucsi;
+  uint32_t level, period, gauge, write, hv, b4pd, unsuspend, ps, psFloor, psInject, board, ucsi;
   bool psGuard;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
@@ -121,6 +123,9 @@ void readArgs()
   gArgs.gauge = bootArg("piano-power-gauge", 1);
   gArgs.write = bootArg("piano-power-write", 1);
   gArgs.hv = bootArg("piano-power-hv", 0);
+  gArgs.b4pd = bootArg("piano-power-b4pd", 0);
+  gArgs.policy = bootArg("piano-power-policy", 0);
+  if (gArgs.b4pd) { gArgs.policy = 1; gArgs.hv = 2; }
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
   gArgs.board = bootArg("piano-power-board", 1);   // the stock board configuration at level 2 with writes (PianoMca.h)
   gArgs.ucsi = bootArg("piano-power-ucsi", 1);     // one read of the UCSI owner's buffer per charger generation (PianoMca.h)
@@ -129,7 +134,6 @@ void readArgs()
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
   gArgs.psInject = bootArg("piano-power-ps-inject", 0); // deterministic bad first publisher cycles for CHGUI A/B
   gArgs.psGuard = bootArg("piano-power-ps-guard", 1) != 0; // keep the plausibility gate on unless explicitly testing the bug
-  gArgs.policy = bootArg("piano-power-policy", 0);          // ChargePolicy instead of the built-in policy (level 2, ChargeLink.h)
   gArgs.rp = bootArg("piano-power-rp", 0);                  // with it: the Type-C Rp current as the 5 V input limit (<= 1600 mA)
   gArgs.health = bootArg("piano-power-health", 0);          // with it: stop charging at 80 %, resume at 75 %
   gArgs.healthStop = bootArg("piano-power-health-stop", 80);
@@ -458,7 +462,7 @@ bool PianoPower::start(IOService *provider)
                                                     : "level 1: read only (no PMIC register written, the DSP is not started)");
   fPolicyOn = gArgs.level >= 2 && gArgs.policy != 0;
   if (gArgs.level >= 2 && !fPolicyOn)
-    note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-38 C"
+    note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-48 C"
                                              : "no charger writes (piano-power-write=0): the DSP keeps its own 100 mA input limit",
          gArgs.write && gArgs.hv ? ", 9 V from a PD source's fixed PDO (piano-power-hv=1, then <= 1.6 A)" : "");
   if (gArgs.level >= 2 && gArgs.write && gArgs.unsuspend && !fPolicyOn)
@@ -466,9 +470,11 @@ bool PianoPower::start(IOService *provider)
   if (fPolicyOn) {
     note("piano-power-policy=1: ChargePolicy decides the charger writes%s, after msm/adsp/charger_pd is up and the board "
          "configuration is through: input limit by class (SDP 500, CDP 900, DCP 1500, PD its 5 V offer <= 1500 mA), charge current "
-         "by class (<= 1500 mA) derated -300 mA/C above 38 C (500 mA below 15 C or without a temperature), a connector at 60 C -> "
+         "by class (<= 1500 mA) derated -300 mA/C above 48 C (500 mA below 15 C or without a temperature), a connector at 60 C -> "
          "100 mA input, the charger at 85 C -> 500 mA; re-sent on a new charger generation and after a wake",
          gArgs.write ? "" : " for the log only (piano-power-write=0: nothing is sent)");
+    if (gArgs.b4pd)
+      note("piano-power-b4pd=1: fixed PD 0x21018=9000, PPS 0x21017=(9000/20)<<16|(mA/50), and QC3 0x2011=9000 are opt-in; QC3 input <=1600 mA; warm-cell FCC derating starts at 48 C");
     if (gArgs.rp && gArgs.ramp)
       note("piano-power-rp=1 piano-power-ramp=1: a source without PD that advertises 1.5 or 3.0 A on its Rp is stepped from its class "
            "row to that current, at most %u mA (piano-power-rp-max): 1500, 2000, 2500, 3000, each held 10 s with the bus at 4.65 V or "
@@ -1337,6 +1343,7 @@ void PianoPower::startCharger()
     LinkOptions o;
     o.writes = gArgs.write != 0;
     o.hv = gArgs.hv;
+    o.qc3 = gArgs.b4pd != 0;
     o.rp = gArgs.rp != 0;
     o.ramp = gArgs.ramp != 0;
     o.rpMax = gArgs.rpMax;

@@ -10,7 +10,7 @@
  * The values are Ubuntu's (docs/ubuntu-history/device.md §2.5, kernel.md §2.5); the GPL xiaomi_mca driver was read as a
  * specification only (behaviour and numbers), nothing of it is copied. What the policy covers:
  *   - the input limit and charge current by source type at 5 V, 9 V from a fixed PDO (opt-in), 9 V from a PPS APDO (opt-in), the
- *     charge current derated by temperature (500 mA below 15 degC, -300 mA per degC above 38 degC, raised one step per 30 s);
+ *     charge current derated by temperature (500 mA below 15 degC, -300 mA per degC from 49 degC, raised one step per 30 s);
  *   - the float voltage (opt-in): 4480 mV, 4060 mV from 48 degC until below 46 degC, read back from 0x2007 (2 mV - 3600);
  *   - Preserve Battery Health (opt-in): stop at 80 %, resume at 75 % (the higher pack's charge), the charging-hold assertion while
  *     protected charging runs below the limit, the stop read back (0x2003, and the gauges' current);
@@ -49,6 +49,10 @@ extern "C" {
 #define PIANO_CHG_ICL 0x2008u        /* input current limit, mA (reads back the requested value, not the one in force) */
 #define PIANO_CHG_PPS 0x21017u       /* PPS APDO request: (mV / 20) << 16 | mA / 50 */
 #define PIANO_CHG_PD_FIXED 0x21018u  /* fixed PDO request, mV */
+#define PIANO_CHG_QC_VOLT 0x2011u    /* HVDCP/QC voltage request, mV */
+#define PIANO_CHG_QC_PULSE 0x201du  /* QC3 pulse: 0x20 up, 0x10 down (pump regulation only) */
+#define PIANO_CHG_QC_UP 0x20u
+#define PIANO_CHG_QC_DOWN 0x10u
 
 /* Charger types as the firmware reports them (0x2000c; xiaomi_mca's enum, kernel.md §2.5). */
 enum {
@@ -86,6 +90,7 @@ enum {
 typedef struct {
     uint8_t writes;        /* 0: plan nothing (piano-power-write=0); the 5 V decisions are still made, for the log (9 V never) */
     uint8_t hv;            /* 0 5 V only; 1 also a fixed 9 V PDO; 2 also a PPS APDO covering 9 V (piano-power-hv) */
+    uint8_t qc3;           /* opt-in HVDCP3 request: 0x2011 = 9000 for types 6/7/8 */
     uint8_t full_charge;   /* the float voltage of the stock tables (piano-power-fv) */
     uint8_t limit;         /* Preserve Battery Health (piano-power-limit, IORegistry) */
     uint8_t stop_pct, resume_pct;
@@ -184,7 +189,7 @@ typedef struct {
     uint32_t fcc_full;
     uint64_t fcc_raise_ms;
     /* 9 V */
-    uint8_t hv, hv_pps, hv_renegs, hv_checks;
+    uint8_t hv, hv_pps, hv_qc, hv_renegs, hv_checks;
     uint32_t hv_ma;
     uint64_t hv_asked_ms, hv_retry_ms;
     /* Preserve Battery Health */
@@ -330,6 +335,7 @@ uint32_t piano_charge_ramp_back(uint32_t from_ma, uint32_t row_ma);
 /* The input limit's ceiling of the allowlist: icl_cap_ma, or with rp and ramp the larger rp_cap_ma. */
 uint32_t piano_charge_icl_max(const PianoChargeConfig *c);
 uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma);   /* 0: no 9 V row for the class */
+uint32_t piano_charge_icl_qc3_9v(uint32_t source_ma);        /* HVDCP3 input row, capped at 1600 mA */
 uint32_t piano_charge_fcc_full(int cls, int hv_on);
 uint32_t piano_charge_fcc_thermal(uint32_t full, int t_valid, int32_t t_c);
 /* The lowest current among the PDOs and APDOs whose range covers 5 V, 0 when none. */
@@ -338,6 +344,7 @@ uint32_t piano_charge_pdo_5v_ma(const uint32_t pdo[][3], unsigned n);
  * *pps = 1; 0 when the source offers no 9 V. */
 uint32_t piano_charge_pdo_9v_ma(const uint32_t pdo[][3], unsigned n, int allow_pps, int *pps);
 uint32_t piano_charge_pps_word(uint32_t mv, uint32_t ma);
+int piano_charge_is_qc3(int32_t type);
 /* The float voltage target; *term_hot is the hysteresis (no temperature counts as hot). */
 uint32_t piano_charge_fv_target(uint8_t *term_hot, int t_valid, int32_t t_warm_c);
 static inline int32_t piano_charge_fv_raw(uint32_t mv) {return 2 * (int32_t)mv - 3600;}

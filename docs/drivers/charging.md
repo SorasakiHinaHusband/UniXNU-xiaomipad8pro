@@ -28,7 +28,7 @@ Status 2026-11-11: `package/PianoPower` built and linked into a test KC (host te
   module parameters `hv_charge`, `charge_current`, `full_charge`, `mipps_auth`, `cp_charge`, `pmic_glink_altmode.pan_ack` and last
   `charge_policy` to 1; stop sets `charge_policy=0`. The driver then talks to the DSP: input limit by charger type (CDP 900 mA,
   DCP/QC/PD at 5 V 1500 mA, 9 V PD 1600 mA, 9 V PPS/verified 2500 mA, 100 mA on detach), charge current by type with thermal
-  derating (500 mA below 15 °C, -300 mA/°C above 38 °C), 9 V from a fixed PDO after a 15 s wait, the SC8541 pump from PPS
+  derating (500 mA below 15 °C, full current through 48 °C, then -300 mA/°C to the 500 mA floor), 9 V from a fixed PDO after a 15 s wait, the SC8541 pump from PPS
   sources, and acknowledges the DSP's USB-C port notifications. The DSP itself keeps a 4400 mV float voltage (0x2007 reads
   2·mV − 3600, so 5200; stock full is 4480 mV, 4060 mV from 48 °C) and a 0–55 °C JEITA window (`docs/ubuntu-history/device.md`
   §2.5). Measured: 8.8 V / 1.59 A in, +1.2–1.34 A per cell at light load (`streamC-charging-report.md`).
@@ -56,7 +56,7 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
 | SMEM / SMP2P / IPCC | SMEM 0x81d00000 + 2 MiB, TCSR mutex 3; items 443/429, pid 2; IPCC 0x406000 (LPASS 3: GLINK 0, SMP2P 2; AOP 0) | live DT | verified |
 | AOSS / RSC / cmd-db | QMP RAM 0xc300000 + 0x400; apps RSC drv-2 0x16520000, TCS +0xd00, active TCS 0–2; cmd-db 0x81c60000 | live DT | verified |
 | Charger protocol | `PMIC_RTR_ADSP_APPS`, owner 0x800a: request {owner, type 1, op 1 read/2 write, property, seq, data[256]}, response adds retcode; type 2 = notification; USB-C port owner 0x800c (enable 0x10, ack 0x11 per notification 0x16) | SunUEFI `piano_mca.c` (spec only) | verified (source); 0x800c from Linux's header, needs-boot |
-| Properties | ICL 0x2008 mA, FCC 0x2005 mA (its read is a no-op), charge enable 0x2003 (1 byte), Tbat 0x202a °C, bus V/I 0x20002/0x20004 (µV/µA), real type 0x2000c, PDOs 0x21011, fixed PDO request 0x21018 (OS3 numbering) | same | verified (source) |
+| Properties | ICL 0x2008 mA, FCC 0x2005 mA (its read is a no-op), charge enable 0x2003 (1 byte), Tbat 0x202a °C, bus V/I 0x20002/0x20004 (µV/µA), real type 0x2000c, PDOs 0x21011, fixed PDO 0x21018, PPS 0x21017, QC voltage 0x2011 (OS3 numbering) | same | verified (source) |
 | DSP needs | the AP's QRTR service locator for its charger domain, else the properties never answer | same, `qcom_pd_mapper` note | verified (source) |
 
 ## 3. Design: PianoPower
@@ -84,15 +84,16 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   | Write | When | Value |
   |---|---|---|
   | ICL 0x2008 | attached and read back > 50 mA off | SDP 500, CDP 900, DCP/HVDCP 1500, PD min(5 V PDO, 1500) or 900 without PDOs, else 500; 9 V on: min(9 V PDO, 1600); detach: 100 |
-  | FCC 0x2005 | wanted value changed | 1000 mA at 15–38 °C (1500 at 9 V), 500 outside or without a temperature (DSP's, else the gauges'); detach: 500 |
+  | FCC 0x2005 | wanted value changed | 1000 mA at 15–48 °C (1500 at 9 V), -300 mA/°C from 49 °C to the 500 mA floor, 500 below 15 °C or without a temperature; detach: 500 |
   | charge enable 0x2003 | reads 0 | 1, at most 3 times per attach, never 0 |
   | fixed PDO 0x21018 | only `piano-power-hv=1`, PD source with a fixed 9 V PDO, 3 cycles after attach, no authentication running | 9000; back to 5000 if the bus is not at 8.0–9.6 V within 3 cycles |
+  | PPS 0x21017 / QC3 0x2011 | only `piano-power-b4pd=1`; PPS APDO covering 9 V or HVDCP3 type | `(9000/20)<<16 | mA/50` (500–3000 mA), or QC3 `9000`; restore 5000 on failure/detach |
 
   Refused limit writes are tried 3 times in a row, then left until the next attach. USB-C port notifications are acknowledged.
   If no input limit write has taken 3 minutes after the DSP start, a WARNING line says the input may be held at 100 mA.
   **With `piano-power-policy=1`** ChargePolicy replaces this table ([charging-policy.md](charging-policy.md) §8): after charger_pd is
   up and the board configuration is through, the class rows (CDP 900 mA, DCP 1500, PD its 5 V offer), the charge current by class
-  with −300 mA/°C above 38 °C, PianoThermal's board thermistors, re-sent on a new generation and after a wake, the sleep and
+  with full current through 48 °C then −300 mA/°C, PianoThermal's board thermistors, re-sent on a new generation and after a wake, the sleep and
   shutdown handovers; `piano-power-rp=1` the Type-C Rp current, in steps up to 3 A while the bus holds since 2026-11-12
   ([charging-policy.md](charging-policy.md) §15; `piano-power-ramp=0`: at once, ≤ 1600 mA), `piano-power-health=1` stop at 80 %,
   resume at 75 %. A write's answer is awaited 3 s (`piano-power-write-ms`), a late one still taken. Since 2026-11-12 afternoon
@@ -103,7 +104,7 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   re-sends it to stop a DSP crash on dock unplug), float voltage/termination, sleep notifications.
 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
-`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`,
+`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-b4pd=1` (attended first step: policy + fixed-PDO/PPS/QC3 requests), `piano-power-fw=DIR`,
 `piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-ramp=0|1`, `piano-power-rp-max=MA`, `piano-power-write-ms=MS`,
 `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`, `piano-power-kick=0|1`: charging-policy.md §8, §15, §17),
 `piano-power-wdog=0|1|2` (the charger watchdog: read only, pet, pet and clear the bite's charging stop (default); §18), and for the DSP
@@ -546,7 +547,7 @@ is not sinking; all normal with the gauges still negative → image I (the board
   on; `usb-host.md`'s H3 step relies on it): with an OTG adapter or a bus-powered device on the port, image I powers it.
 - **UCSI read (both images):** a read of the PPM's buffer, no UCSI command; a firmware that starts its UCSI machine on the first
   read would then send notifications nobody answers (logged, the first 8).
-- **Thermal:** nothing beyond the DSP's JEITA window and the 500 mA floor at ≥ 38 °C; no charge-pump or fast charging.
+- **Thermal:** the first-step FCC rule stays conservative: full current through 48 °C, then −300 mA/°C to a 500 mA floor; the DSP's JEITA window remains authoritative.
 
 ## 7. Open questions
 

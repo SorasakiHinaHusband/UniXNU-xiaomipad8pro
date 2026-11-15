@@ -89,6 +89,7 @@ extern "C" {
 #define PIANO_MCA_PDOS 0x21011u           /* up to 7 x {min mV, max mV, max mA} */
 #define PIANO_MCA_PPS 0x21017u            /* ask a PPS source for an APDO voltage: (mV / 20) << 16 | mA / 50 (external policy, hv 2) */
 #define PIANO_MCA_PD_FIXED 0x21018u       /* ask the source for a fixed PDO, mV */
+#define PIANO_MCA_QC_VOLT 0x2011u         /* HVDCP/QC voltage request, mV (external policy, b4pd) */
 
 enum {
     PIANO_MCA_TYPE_UNKNOWN = 0, PIANO_MCA_TYPE_SDP = 1, PIANO_MCA_TYPE_CDP = 2, PIANO_MCA_TYPE_DCP = 3, PIANO_MCA_TYPE_FLOAT = 4,
@@ -105,7 +106,7 @@ enum {
 #define PIANO_MCA_FCC_5V 1000u
 #define PIANO_MCA_FCC_9V 1500u
 #define PIANO_MCA_TBAT_LOW 15         /* below: the floor */
-#define PIANO_MCA_TBAT_HIGH 38        /* from: the floor (the firmware's own JEITA window, 0-55 degC, still applies) */
+#define PIANO_MCA_TBAT_HIGH 48        /* full FCC through here; derating starts at 49; the firmware's 0-55 degC JEITA still applies */
 
 /* The fields one cycle reads, in order. */
 enum {
@@ -145,7 +146,7 @@ typedef struct {
     /* external: ChargePolicy decides (piano-power-policy=1): the built-in policy is left out, the board configuration stays, the owner
      * queues through piano_mca_queue; stop_allowed admits 0x2003 = 0 (battery health on, or the charging restart: ChargePolicy
      * cfg.kick), pps_allowed the 9 V APDO request (hv 2) */
-    uint8_t external, stop_allowed, pps_allowed;
+    uint8_t external, stop_allowed, pps_allowed, qc3_allowed;
     uint32_t icl_max;                /* external: the input limit admitted up to this (the stepped Rp limit, <= 3000; 0: 1600) */
     /* the last write the owner's timer gave up on: its answer may still come (the firmware answered limit writes after the window
      * on 2026-11-12 and applied them; McaLateWritten) */
@@ -204,7 +205,7 @@ void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 /* ChargePolicy decides instead of the built-in policy (docs/drivers/charging-policy.md §8): the cycle, the board configuration, the port
  * notifications and the UCSI probe stay; stop: battery health or the charging restart is on (0x2003 = 0 admitted); pps: hv 2
  * (0x21017's 9 V word admitted). Without the policy (piano-power-write=0) the codec stays read only: piano_mca_queue refuses everything. */
-void piano_mca_use_external_policy(PianoMca *m, int stop, int pps);
+void piano_mca_use_external_policy(PianoMca *m, int stop, int pps, int qc3);
 /* With the external policy: the input limit admitted up to max_ma (1600..3000; the stepped Type-C current, ChargePolicy's
  * cfg.rp_cap_ma); 0 or less keeps the 1600 mA bound. */
 void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma);
@@ -215,7 +216,8 @@ int piano_mca_queue(PianoMca *m, uint32_t property, uint32_t value, uint8_t byte
 /* The board configuration of this link is through (taken, given up after five cycles, or not allowed): the policy may write. */
 int piano_mca_board_settled(const PianoMca *m);
 /* The allowlist as this codec applies it: piano_mca_write_allowed, and with the external policy 0x2003 = 0 only when stop_allowed,
- * 0x21017 only as the 9 V word (500..3000 mA) when pps_allowed, 0x21018 = 9000 only when hv_allowed. */
+ * 0x21017 only as the 9 V word (500..3000 mA) when pps_allowed, 0x21018 = 9000 only when hv_allowed, and 0x2011 = 5000/9000
+ * only for qc3_allowed. */
 int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes);
 uint32_t piano_mca_take_events(PianoMca *m);
 /* The link's charger generation is configured: a whole cycle ended with no write due or in flight (so the board configuration and the

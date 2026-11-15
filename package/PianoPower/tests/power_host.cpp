@@ -1617,7 +1617,7 @@ static void testMcaPolicy()
   CHECK(piano_mca_icl_for(PIANO_MCA_TYPE_PD, 0) == 900 && piano_mca_icl_for(PIANO_MCA_TYPE_PD, 1200) == 1200);
   CHECK(piano_mca_icl_for(PIANO_MCA_TYPE_FLOAT, 0) == 500 && piano_mca_icl_for(PIANO_MCA_TYPE_UNKNOWN, 0) == 500);
   CHECK(piano_mca_fcc_for(1, 30, 0) == 1000 && piano_mca_fcc_for(1, 30, 1) == 1500 && piano_mca_fcc_for(0, 30, 0) == 500);
-  CHECK(piano_mca_fcc_for(1, 10, 0) == 500 && piano_mca_fcc_for(1, 38, 0) == 500 && piano_mca_fcc_for(1, 37, 0) == 1000);
+  CHECK(piano_mca_fcc_for(1, 10, 0) == 500 && piano_mca_fcc_for(1, 48, 0) == 1000 && piano_mca_fcc_for(1, 49, 0) == 700);
 
   // The suspended input: written to 0 only with piano-power-unsuspend, at most three times, and never to 1.
   {
@@ -1680,7 +1680,7 @@ static void testMcaPolicy()
   cycle(m, d);
   CHECK(d.writes.size() == settled);   // read back as set: nothing more
   // Warm: the charge current drops to the floor, the input limit stays.
-  d.props[PIANO_MCA_TBAT] = 40;
+  d.props[PIANO_MCA_TBAT] = 50;
   cycle(m, d);
   CHECK(d.last(PIANO_MCA_FCC) == 500 && d.count(PIANO_MCA_ICL) == 1);
   // No firmware temperature (out of range): the gauges' is used.
@@ -2198,7 +2198,7 @@ static void testMcaLate()
 {
   PianoMca m;
   piano_mca_init(&m, 1, 0);
-  piano_mca_use_external_policy(&m, 0, 0);
+  piano_mca_use_external_policy(&m, 0, 0, 0);
   piano_mca_link(&m, 1);
   CHECK(piano_mca_queue(&m, PIANO_MCA_ICL, 1700, 4) == -1);            // above 1600 only with allow_icl
   piano_mca_allow_icl(&m, 2500);
@@ -2718,10 +2718,10 @@ static void testLinkThermal()
   r.temps(30, 74, 40, 40);
   r.period();
   CHECK((r.take() & PIANO_CHG_EV_CHGR_COOL) && r.d.last(PIANO_MCA_ICL) == 1600);
-  // the battery thermistor at 45 C with the packs at 29: the charge current derated at once (900 - 7 x 300 -> the 500 floor), noted
+  // the battery thermistor at 45 C with the packs at 29: it is noted as apart, but stays above the 48 C warm-cell derating boundary
   r.temps(45, 33, 31, 30);
   r.period();
-  CHECK((r.take() & PIANO_CHG_EV_NTC_APART) && r.d.last(PIANO_MCA_FCC) == 500);
+  CHECK((r.take() & PIANO_CHG_EV_NTC_APART) && r.d.last(PIANO_MCA_FCC) == 900);
   // PianoThermal gone quiet (no valid bits): the firmware's and the gauges' temperatures still count, back up one step per 30 s
   r.board.valid = 0;
   for (int i = 0; i < 14; ++i) r.period();

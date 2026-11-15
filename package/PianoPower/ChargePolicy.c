@@ -18,7 +18,7 @@
 #define HV_PPS_MIN_MA 500u
 #define HV_PPS_MAX_MA 3000u
 #define FCC_TBAT_MIN 15
-#define FCC_DERATE_FROM 38
+#define FCC_DERATE_FROM 48
 #define FCC_DERATE_STEP 300u
 #define FCC_RAISE_MS 30000u
 #define TERM_HOT_C 48
@@ -189,6 +189,16 @@ uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma)
     return ceiling && source_ma ? clampu(source_ma, PIANO_CHG_ICL_DEFAULT, ceiling) : 0;
 }
 
+uint32_t piano_charge_icl_qc3_9v(uint32_t source_ma)
+{
+    return source_ma ? clampu(source_ma, PIANO_CHG_ICL_DEFAULT, 1600u) : 0;
+}
+
+int piano_charge_is_qc3(int32_t type)
+{
+    return type == PIANO_CHG_T_HVDCP3 || type == PIANO_CHG_T_HVDCP3_B || type == PIANO_CHG_T_HVDCP3P5;
+}
+
 uint32_t piano_charge_fcc_full(int cls, int hv_on)
 {
     switch (cls) {
@@ -294,6 +304,7 @@ int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, ui
     case PIANO_CHG_FV:
         return bytes == 4 && (value == PIANO_CHG_FV_DEFAULT || (c->full_charge && (value == PIANO_CHG_FV_FULL || value == PIANO_CHG_FV_HOT)));
     case PIANO_CHG_PD_FIXED: return bytes == 4 && (value == 5000 || (c->hv && value == HV_MV));
+    case PIANO_CHG_QC_VOLT: return bytes == 4 && c->qc3 && (value == 5000 || value == HV_MV);
     case PIANO_CHG_PPS: {
         const uint32_t mv = (value >> 16) * 20, ma = (value & 0xffffu) * 50;
         return bytes == 4 && c->hv >= 2 && mv == HV_MV && ma >= HV_PPS_MIN_MA && ma <= HV_PPS_MAX_MA;
@@ -362,6 +373,7 @@ static void forget(PianoChargeState *s, uint64_t now)
     reset_tries(s);
     s->fcc_full = 0;
     s->hv = PIANO_CHG_HV_OFF;
+    s->hv_qc = 0;
     s->hv_renegs = s->hv_checks = 0;
     if (s->hv_retry_ms < now + HV_WAIT_MS) s->hv_retry_ms = now + HV_WAIT_MS;
     s->attached = 0;
@@ -446,8 +458,10 @@ static int still_taken(PianoChargeState *s, PianoChargePlan *p, int slot, int re
 
 static int volt_raised(const PianoChargeState *s)
 {
-    const int want = s->volt_want_prop && !(s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000);
-    const int set = s->volt_set_prop && !(s->volt_set_prop == PIANO_CHG_PD_FIXED && s->volt_set_value == 5000);
+    const int want = s->volt_want_prop && !((s->volt_want_prop == PIANO_CHG_PD_FIXED || s->volt_want_prop == PIANO_CHG_QC_VOLT) &&
+                                            s->volt_want_value == 5000);
+    const int set = s->volt_set_prop && !((s->volt_set_prop == PIANO_CHG_PD_FIXED || s->volt_set_prop == PIANO_CHG_QC_VOLT) &&
+                                           s->volt_set_value == 5000);
     return want || set || s->hv == PIANO_CHG_HV_ASKED || s->hv == PIANO_CHG_HV_ON;
 }
 
@@ -459,7 +473,7 @@ static void want_volt(PianoChargeState *s, uint32_t property, uint32_t value)
 
 static void want_5v(PianoChargeState *s)
 {
-    if (volt_raised(s)) want_volt(s, PIANO_CHG_PD_FIXED, 5000);
+    if (volt_raised(s)) want_volt(s, s->hv_qc ? PIANO_CHG_QC_VOLT : PIANO_CHG_PD_FIXED, 5000);
     s->hv = s->hv == PIANO_CHG_HV_BLOCKED ? PIANO_CHG_HV_BLOCKED : PIANO_CHG_HV_OFF;
 }
 
@@ -682,13 +696,15 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
 {
     const int32_t bus = in->bus_mv;
     const int at_9v = bus >= HV_MIN_MV && bus <= HV_MAX_MV;
+    const int qc = c->qc3 && piano_charge_is_qc3(s->type);
     int pps = 0;
     uint32_t ma = 0;
     if (is_pd(cls) && (in->valid & PIANO_CHG_IN_PDOS)) ma = piano_charge_pdo_9v_ma(in->pdo, in->pdos, c->hv >= 2, &pps);
     else if (is_pd(cls) && (s->hv == PIANO_CHG_HV_ASKED || s->hv == PIANO_CHG_HV_ON)) {ma = s->hv_ma; pps = s->hv_pps;}   /* a failed
                                                                                           * PDO read is no change of offer */
+    else if (qc) {ma = 1600; pps = 0;}
     /* the source has to keep offering 9 V the way it was asked for */
-    if (s->hv != PIANO_CHG_HV_OFF && s->hv != PIANO_CHG_HV_BLOCKED && pps != s->hv_pps) ma = 0;
+    if (s->hv != PIANO_CHG_HV_OFF && s->hv != PIANO_CHG_HV_BLOCKED && (pps != s->hv_pps || qc != s->hv_qc)) ma = 0;
     if (!c->writes) return 0;   /* nothing is sent: the machine stays at 5 V rather than log requests that never go out */
     if (!c->hv || !charge_ok) {
         if (volt_raised(s)) want_5v(s);
@@ -701,6 +717,7 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
             /* already at 9 V without a request of ours (a wake without a handover): take it as asked */
             s->hv = PIANO_CHG_HV_ON;
             s->hv_pps = (uint8_t)pps;
+            s->hv_qc = (uint8_t)qc;
             s->hv_ma = ma;
             p->events |= PIANO_CHG_EV_HV_ON;
             return ma;
@@ -709,10 +726,12 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
         if (!(in->valid & PIANO_CHG_IN_VERIFY) || in->verify) return 0;   /* never in the middle of an authentication (#20) */
         s->hv = PIANO_CHG_HV_ASKED;
         s->hv_pps = (uint8_t)pps;
+        s->hv_qc = (uint8_t)qc;
         s->hv_ma = ma;
         s->hv_checks = 0;
         s->hv_asked_ms = now;
-        want_volt(s, pps ? PIANO_CHG_PPS : PIANO_CHG_PD_FIXED, pps ? piano_charge_pps_word(HV_MV, ma) : HV_MV);
+        want_volt(s, qc ? PIANO_CHG_QC_VOLT : pps ? PIANO_CHG_PPS : PIANO_CHG_PD_FIXED,
+                  qc || !pps ? HV_MV : piano_charge_pps_word(HV_MV, ma));
         p->events |= PIANO_CHG_EV_HV_ASKED;
         return 0;
     case PIANO_CHG_HV_ASKED:
@@ -730,6 +749,7 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
             /* back at 5 V by itself (a Xiaomi charger does after its authentication): asked again after a pause */
             s->hv_renegs++;
             s->hv = PIANO_CHG_HV_OFF;
+            s->hv_qc = 0;
             s->volt_want_prop = s->volt_want_value = 0;
             s->volt_set_prop = s->volt_set_value = 0;
             s->hv_retry_ms = now + HV_RENEG_MS;
@@ -741,7 +761,7 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
         return 0;
     }
     /* not reached, dropped or refused: 5 V until the source is detached */
-    want_volt(s, PIANO_CHG_PD_FIXED, 5000);
+    want_volt(s, s->hv_qc ? PIANO_CHG_QC_VOLT : PIANO_CHG_PD_FIXED, 5000);
     s->hv = PIANO_CHG_HV_BLOCKED;
     p->events |= PIANO_CHG_EV_HV_BLOCKED;
     return 0;
@@ -894,6 +914,7 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     s->attached = 0;
     s->type = -1;
     s->hv = PIANO_CHG_HV_OFF;
+    s->hv_qc = 0;
     s->hv_renegs = 0;
     s->volt_set_prop = s->volt_set_value = s->volt_want_prop = s->volt_want_value = 0;   /* the next source starts at 5 V */
     s->fcc_full = 0;
@@ -1075,6 +1096,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         s->attach_ms = now;
         s->type = -1;
         s->hv = PIANO_CHG_HV_OFF;
+        s->hv_qc = 0;
         s->hv_renegs = s->hv_checks = 0;
         s->fcc_full = 0;
         s->stop_noted = s->fw_noted = 0;
@@ -1116,7 +1138,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     p->hv = s->hv;
     uint32_t icl;
     if (hv_on) {
-        icl = umin(piano_charge_icl_9v(cls, hv_ma), icl_cap(c));
+        icl = umin(s->hv_qc ? piano_charge_icl_qc3_9v(hv_ma) : piano_charge_icl_9v(cls, hv_ma), icl_cap(c));
         p->icl_why = PIANO_CHG_ICL_9V;
         p->rp_ma = 0;
     } else {

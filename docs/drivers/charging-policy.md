@@ -51,11 +51,11 @@ numbers only: nothing copied); xnu `iokit/IOKit/pwr_mgt/IOPM.h`, `RootDomain.h`,
 
 ## 1. Input limit and charge current by source (0x2000c)
 
-| Type | Class | Input limit (0x2008) | Charge current (0x2005), 15–38 °C | Note |
+| Type | Class | Input limit (0x2008) | Charge current (0x2005), 15–48 °C | Note |
 |---|---|---:|---:|---|
 | 1 SDP | SDP | 500 | 500 | |
 | 2 CDP | CDP | 900 | 900 | Ubuntu has no computer-port result |
-| 3 DCP, 5–8 QC (HVDCP 2/3/3B/3.5) | DCP | 1500 | 2000 | QC held at 5 V, as stock |
+| 3 DCP, 5–8 QC (HVDCP 2/3/3B/3.5) | DCP | 1500 | 2000 | QC held at 5 V unless `piano-power-b4pd=1` (HVDCP3 request) |
 | 4 float, 15 OCP | float | 500 | 1000 | xiaomi_mca's table gives 15 1000/1000; the history's 500 is kept |
 | 9 Type-C (Rp only) | Type-C | 500 | 500 | |
 | 10 PD, 11 PD verified, 12 PPS, at 5 V | PD / PD PPS | min(5 V offer, 1500); 500 without PDOs | 2000 | the 5 V offer: the lowest current of the PDOs/APDOs covering 5 V |
@@ -70,7 +70,7 @@ configured.
 **Thermal derating** (charge current only; the input limit never follows the temperature, so a warm battery is not left to carry
 the system). t = the warmest of the firmware's 0x202a (if −20..80 °C) and the two packs (whole °C, rounded down); none: 500.
 
-| t (°C) | < 15 | 15–38 | 39 | 40 | 41 | 42 | … | floor |
+| t (°C) | < 15 | 15–48 | 49 | 50 | 51 | 52 | … | floor |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | charge current | 500 | full | full − 300 | full − 600 | full − 900 | full − 1200 | −300/°C | 500 |
 
@@ -110,6 +110,11 @@ above it only with one below 50 °C; the sag, the quick detach and a refusal eac
 A detach while asked (a hard reset in answer looks like one) holds the next request off for 60 s. A failed PDO read changes
 nothing. 5 V is always requested as the fixed 5 V PDO, also of a PPS source (stock). The battery-health stop, the sleep and the
 shutdown go back to 5 V.
+
+With `piano-power-b4pd=1`, HVDCP3/HVDCP3_B/HVDCP3P5 types use the ADSP's QC voltage property `0x2011 = 9000` after the same
+15 s/three-decision guard and use an input ceiling of 1600 mA. A failed request is restored with `0x2011 = 5000`. The QC3 pulse
+property `0x201d` has values `0x20` (up) and `0x10` (down), but is reserved for the later SC8541 pump regulation loop and is not
+sent by this first step.
 
 ## 3. PPS with the original adapter: the direct-charging curve (specification)
 
@@ -197,14 +202,16 @@ PianoPower's contract (power.md §4): `setPowerState(off)` loops decide/send/ack
 | 0x2007 float voltage | 4 (mV) | 4400; 4480, 4060 with `full_charge` | float option | 0x2007 = 2 × mV − 3600 every cycle |
 | 0x21018 fixed PDO | 4 | 5000; 9000 with `hv` | §2 | bus 8.0–9.6 V within 15 s / 3 decisions, else 5 V and blocked |
 | 0x21017 PPS APDO | 4 | `450 << 16 \| mA/50`, 500..3000 mA, `hv` = 2 | §2 | the same |
+| 0x2011 QC voltage | 4 | 5000; 9000 with `piano-power-b4pd=1` and HVDCP3 | §2 | bus 8.0–9.6 V within 15 s / 3 decisions, else 5 V and blocked |
 
 **The codec's allowlist with the policy** (`piano_mca_write_allowed_for`, checked by `piano_mca_queue` before a write is queued
 and again by `piano_mca_next` before it is built; the policy's own `piano_charge_write_allowed` is checked first): PianoMca's
 (0x2008 100–1600, up to `piano-power-rp-max` (≤ 3000) only with the stepped Type-C current (`piano_mca_allow_icl`, set from the
 policy's `piano_charge_icl_max`), 0x2005 100–1500, 0x2003 = 1, 0x21018 = 5000, the three board values), plus 0x2003 = 0 **only with battery health
-or the charging restart on** (§17), 0x21018 = 9000 only with `piano-power-hv` ≥ 1, 0x21017 only as the 9 V word (500–3000 mA) with `piano-power-hv=2`. Not
+or the charging restart on** (§17), 0x21018 = 9000 only with `piano-power-hv` ≥ 1, 0x21017 only as the 9 V word (500–3000 mA) with `piano-power-hv=2`, and 0x2011 = 9000/5000 only with `piano-power-b4pd=1` on HVDCP3. Not
 admitted: 0x2007 (the float option is not offered: `piano-power-fv` does not exist yet), 0x2019 (the built-in policy's opt-in
-un-suspend; it read 0 on 2026-11-11), stage B ceilings (not offered). A write the codec refuses goes back to the policy as refused
+  un-suspend; it read 0 on 2026-11-11), stage B ceilings (not offered). `0x2011 = 9000` is admitted only with `piano-power-b4pd=1` and
+  an HVDCP3 type. A write the codec refuses goes back to the policy as refused
 (three: given up until the next attach). Never written: 0x2012 AICL, 0x21002 verify (nothing here authenticates), 0x2100c data
 role, the MiPPS VDMs 0x21003–0x2100a. Order inside a plan: stop,
 charge current, input limit, bus voltage, resume, float; since 2026-11-12 an input limit that **rises** goes before the charge
@@ -262,14 +269,15 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
 7. **Boot arguments**: `piano-power-policy=1`; `piano-power-rp=1` (§13) with `piano-power-ramp=0|1` (1, the default: the steps of
    §15) and `piano-power-rp-max=MA` (1500..3000, default 3000); `piano-power-write-ms=MS` (1000..5000, default 3000: how long a write's
    answer is awaited, §15.3); `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`
-   (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-kick=0|1` (1, the default: the charging restart, §17);
+   (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-b4pd=1` (attended first step: fixed-PDO/PPS/QC3 requests);
+   `piano-power-kick=0|1` (1, the default: the charging restart, §17);
    `piano-power-write=0` decides for the log only (nothing is sent). Not offered yet:
    `piano-power-fv`, the stage B ceilings, `sleep_charge`, the `setProperties()` switch. `piano-power-unsuspend` stays the built-in
    policy's.
 
 ## 9. Deliberate differences
 
-From PianoMca.c's policy today: charge current by type with −300 mA/°C (was 1000 mA, 1500 at 9 V, 500 from 38 °C); type 15 on the
+From PianoMca.c's policy today: charge current by type with −300 mA/°C from 49 °C (was 1000 mA, 1500 at 9 V, 500 from 38 °C); type 15 on the
 float row (was DCP); PD without PDOs 500 (was 900); unknown types no write (was 500); 0x2003 = 1 only to lift our own 0 (was:
 whenever it reads 0, 3 times per attach); timers in ms plus decision counts (were cycles). From Ubuntu: no charge reading → charging
 on after 5 min (Ubuntu stops); a stop lifted on detach; demand sleep stops a protected charge instead of refusing the sleep; no

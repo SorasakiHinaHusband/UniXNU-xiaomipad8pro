@@ -145,6 +145,7 @@ int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t v
                value <= (m->icl_max > PIANO_MCA_ICL_MAX_9V ? m->icl_max : PIANO_MCA_ICL_MAX_9V);
     case PIANO_MCA_CHARGE_ENABLE: return bytes == 1 && (value == 1 || (value == 0 && m->stop_allowed));
     case PIANO_MCA_PD_FIXED: return bytes == 4 && (value == 5000 || (value == 9000 && m->hv_allowed));
+    case PIANO_MCA_QC_VOLT: return bytes == 4 && m->qc3_allowed && (value == 5000 || value == 9000);
     case PIANO_MCA_PPS: {
         const uint32_t mv = (value >> 16) * 20, ma = (value & 0xffffu) * 50;
         return bytes == 4 && m->pps_allowed && mv == 9000 && ma >= 500 && ma <= 3000;
@@ -250,8 +251,12 @@ uint32_t piano_mca_icl_for(int type, uint32_t pdo5v_ma)
 
 uint32_t piano_mca_fcc_for(int tbat_valid, int32_t tbat_c, int hv)
 {
-    if (!tbat_valid || tbat_c < PIANO_MCA_TBAT_LOW || tbat_c >= PIANO_MCA_TBAT_HIGH) return PIANO_MCA_FCC_FLOOR;
-    return hv ? PIANO_MCA_FCC_9V : PIANO_MCA_FCC_5V;
+    const uint32_t full = hv ? PIANO_MCA_FCC_9V : PIANO_MCA_FCC_5V;
+    if (!tbat_valid || tbat_c < PIANO_MCA_TBAT_LOW) return PIANO_MCA_FCC_FLOOR;
+    if (tbat_c <= PIANO_MCA_TBAT_HIGH || full <= PIANO_MCA_FCC_FLOOR) return full;
+    const uint32_t degrees = (uint32_t)(tbat_c - PIANO_MCA_TBAT_HIGH);
+    const uint32_t derate = degrees * 300u;
+    return derate < full - PIANO_MCA_FCC_FLOOR ? full - derate : PIANO_MCA_FCC_FLOOR;
 }
 
 uint32_t piano_mca_pdo_fixed(const PianoMca *m, uint32_t mv)
@@ -280,11 +285,12 @@ static void queue_write(PianoMca *m, uint32_t property, uint32_t value, uint8_t 
     (void)queue_into(m, property, value, bytes, BUILTIN_QUEUE);
 }
 
-void piano_mca_use_external_policy(PianoMca *m, int stop, int pps)
+void piano_mca_use_external_policy(PianoMca *m, int stop, int pps, int qc3)
 {
     m->external = 1;
     m->stop_allowed = m->policy && stop;
     m->pps_allowed = m->policy && pps;
+    m->qc3_allowed = m->policy && qc3;
 }
 
 void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma)
@@ -633,6 +639,7 @@ const char *piano_mca_property_name(uint32_t property)
     case PIANO_MCA_CHARGE_ENABLE: return "charge enable";
     case PIANO_MCA_PD_FIXED: return "PD fixed request";
     case PIANO_MCA_PPS: return "PPS request";
+    case PIANO_MCA_QC_VOLT: return "QC voltage request";
     case PIANO_MCA_INPUT_SUSPEND: return "input suspend";
     case PIANO_MCA_CP_STATE: return "CP state";
     case PIANO_MCA_OTG_CFG: return "OTG configuration";
