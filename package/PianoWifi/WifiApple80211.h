@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The apple80211 requests (docs/drivers/wifi-menu.md section 5, milestone M1): the BSD ioctls SIOCSA80211 / SIOCGA80211 that
+// The apple80211 requests (docs/drivers/wifi-menu.md section 5, milestones M1/M2): the BSD ioctls SIOCSA80211 / SIOCGA80211 that
 // airportd and IO80211.framework send to a Wi-Fi interface (private/host-checks/20261114-io80211/REPORT.md section 2: the 40-byte
-// request, the 27.3 request numbers), their answers' layouts and the handler that answers M1's set from PianoWifi's own state:
-// the identity, the power, the channels, the scan from level 6/7's scan list, and a consistent "not associated" for everything
-// a join would fill. Portable: no kernel header; the kext (PianoWifi80211.h) gives it copyin/copyout, a scratch buffer and its
+// request, the 27.3 request numbers), their answers' layouts and the handler that answers from PianoWifi's own state: the
+// identity, power, channels, scan list, and (when sheng bit 0x100 is enabled) the supplicant association snapshot. Portable:
+// no kernel header; the kext (PianoWifi80211.h) gives it copyin/copyout, a scratch buffer and its
 // lock, and does what the answer asks for (events, the scan's completion). Host tests: tests/apple80211_host.cpp.
 //
 // Prior art: UniXNU-sheng package/WifiNet.cpp (our own organisation's, BSD-2-Clause-Patent, UPSTREAM), a raw SIOC[SG]A80211

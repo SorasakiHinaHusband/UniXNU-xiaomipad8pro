@@ -16,7 +16,7 @@
 //   - the apple80211 requests: an interface filter (iflt_attach, the BSD interface-filter KPI) whose ioctl callback answers
 //     SIOCSA80211 / SIOCGA80211 before the interface's own handler (WifiApple80211.h); every other ioctl passes on, its first
 //     occurrence logged;
-//   - the apple80211 kernel events (power changed, scan done, link down) with kev_post_msg, as UniXNU-sheng's WifiNet.cpp does;
+//   - the apple80211 kernel events (power, scan, link and association transitions) with kev_post_msg, as UniXNU-sheng's WifiNet.cpp does;
 //   - the controller registered (registerService) once the filter answers, so that launchd's IOKit match for airportd
 //     (IOProviderClass IO80211Controller) can fire only when the requests are answered.
 // One log line per distinct request (number, direction, length, result), a summary every 60 s while anything changed. Never a
