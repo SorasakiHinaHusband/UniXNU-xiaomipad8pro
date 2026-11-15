@@ -352,7 +352,7 @@ bool PianoWifi80211::start(IOService *provider)
   if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
   // The UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9): what their hardware-verified macOS-27.3 en0 binding
   // does that ours does not, each its own A/B on this one front end. The medium bit was already applied where the dictionary
-  // is published (PianoWifiEthernet::start read the same argument); the grant rides on the filter's attach below.
+  // is published (PianoWifiEthernet::start read the same argument); the grant is installed during interface configuration.
   uint32_t sheng = 0;
   if (PE_parse_boot_argn("piano-wifi-sheng", &sheng, sizeof sheng)) fState->sheng = sheng & pianowifi::a80211::kShengAll;
   // The production form of ADOPTION.md P0, confirmed on the tablet (wm3b, 2026-11-14: with the override airportd created its
