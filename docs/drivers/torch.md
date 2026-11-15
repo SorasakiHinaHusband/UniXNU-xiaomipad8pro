@@ -59,7 +59,8 @@ no channel outside the driver's set on (else "someone else drives this module").
   allowlisted **for the probe only** (`piano-torch-probe`, the one-boot test of which pair the LED really sits on); a normal boot
   never writes them. `Controller::put` refuses anything else. Every write reads first (on a failed read: the last known value),
   merges under the mask, writes, reads back and compares; a mismatch aborts the on and runs the off (which tries every step).
-- **Current**: `piano-torch-ma` 50 (2 × 25 mA, ITARGET 4) unless a request names one; `piano-torch-max-ma` 100 = the hard cap
+- **Current**: `piano-torch-ma` 50 (2 × 25 mA, ITARGET 4) unless a request names one; the default `piano-torch-max-ma` is 100,
+  while the factory-safe range reaches 400 mA total (2 × 200 mA) only when that existing cap argument opts in.
   (Ubuntu's DT limit, ITARGET 9, clamp 9). 5 mA a channel steps, rounded down.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
   1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, STATUS1 short **or open** (the open bit is the
@@ -101,7 +102,7 @@ tool is user-space work for later.
 |---|---|---|
 | `piano-torch` | 0 | 1 survey (read only); 2 survey + control |
 | `piano-torch-ma` | 50 | lamp current of an on without its own (10..max, 5 mA a channel steps) |
-| `piano-torch-max-ma` | 100 | the limit (10..100; 100 is the hard cap) |
+| `piano-torch-max-ma` | 100 | the limit (10..400; 100 is the default, 400 is the factory cap) |
 | `piano-torch-timeout` | 300 | auto-off of a request without its own time (10..1800 s) |
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
@@ -109,6 +110,7 @@ tool is user-space work for later.
 | `piano-torch-probe` | 0 | 1: replace the boot test with the T4 probe: one factory-pair window at `piano-torch-test` s, STATUS1/INT_RT_STS polls every 500 ms before/during/after, full dumps before/after and diffs |
 | `piano-torch-probe-spare` | 0 | 1: add the spare-pair mapping window from the original T4 checklist |
 | `piano-torch-flash` | 0 | 1: add one bounded 80 ms FLASH pulse after the torch window, then explicit off |
+| `piano-torch-ladder` | 0 | 1: guarded 100/200/300/400 mA total ladder; each level is 10 s lit, 10 s dark, with 500 ms status/fault and flash/SoC/battery temperature polls; any fault or existing guard stops it |
 
 ## 7. Kernel collection
 

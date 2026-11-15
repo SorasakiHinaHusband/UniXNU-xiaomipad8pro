@@ -159,10 +159,11 @@ static bool onlyFlash(const Arbiter &a)
 static void testConstants()
 {
   CHECK(kPpid == 0x1ee);
-  CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
+  CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(400) == 39 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
-  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(200, 500) == 100);
-  CHECK(clampForMa(100) == 9 && clampForMa(60) == 5);
+  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(200, 500) == 200 &&
+        clampMa(500, 500) == 400);
+  CHECK(clampForMa(100) == 9 && clampForMa(60) == 5 && clampForMa(400) == 39);
   CHECK(!writable(kRegThermThrsh1, 0x07) && !writable(kRegThermThrsh2, 0x07) && !writable(0xd0, 0xff) && !writable(0x3d, 0xff));
   CHECK(!writable(kRegChanEn, 0x10) && !writable(kRegIres, 0x10) && !writable(kRegModuleEn, 0x7f) && !writable(kRegChanEn, 0));
   // the spare channels are writable too (the probe's one-boot channel test), never a bit above the four channels
@@ -275,11 +276,17 @@ static void testOnOff()
   Torch low(p.bus, g, 60);
   o = low.request(4000, 100, 10, temps);
   CHECK(o.lit && low.ma() == 60 && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
+  low.request(4500, 0, 0, temps);
   Torch silly(p.bus, g, 5000);
-  CHECK(silly.maxMa() == 100);
+  CHECK(silly.maxMa() == 400);
+  Torch factory(p.bus, g, 400);
+  o = factory.request(5000, 400, 10, temps);
+  CHECK(o.lit && factory.ma() == 400 && factory.itarget() == 39 && (a.flash(kRegItarget0) & kItargetMask) == 39 && a.flash(kRegItarget0 + 1) == 39 &&
+        a.flash(kRegTorchClamp) == 39);
+  factory.request(6000, 0, 0, temps);
   Controller c(p.bus);
   const StepResult capped = c.on(77, 77);
-  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
   c.off();
 
   // the probe's spare-pair window: channels 3+4 through the same sequence, their registers only, the piano pair's kept

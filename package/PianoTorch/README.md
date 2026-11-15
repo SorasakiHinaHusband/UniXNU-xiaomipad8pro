@@ -11,7 +11,9 @@ FLASH pulse for photos and a shared green privacy LED; those are provenance fact
   `TorchCore.h`'s allowlist, each read-modify-write under its mask and read back. Off after `piano-torch-timeout` (300 s),
   on the module's own fault/over-temperature bits, at SoC >= `piano-torch-soc-max` (85 C, PianoThermal) or battery >=
   `piano-torch-batt-max` (45 C, PianoPower), when the enables read off, on system sleep and on shutdown. 50 mA by default
-  (`piano-torch-ma`), never more than Ubuntu's 100 mA. `piano-torch-test=S` lights it once at boot for S seconds.
+  (`piano-torch-ma`), 100 mA by default and up to the factory's 400 mA total only when `piano-torch-max-ma` opts in.
+  `piano-torch-test=S` lights it once at boot for S seconds. `piano-torch-ladder=1` runs the guarded 100/200/300/400 mA ladder
+  with 10-second dark intervals and 500 ms status/temperature samples.
   `piano-torch-probe=1` runs the T4 survey: a 15-second factory-pair window with STATUS1/INT_RT_STS polls every 500 ms before,
   during and after plus full-page dumps; `piano-torch-probe-spare=1` adds the spare-pair mapping window and `piano-torch-flash=1`
   adds one bounded timed FLASH pulse afterward.

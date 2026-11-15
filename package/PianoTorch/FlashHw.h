@@ -112,6 +112,7 @@ constexpr uint8_t clampForMa(unsigned totalMa)
 static_assert(kPpid == 0x1ee, "PM8550 flash PPID");
 static_assert(itargetForMa(50) == 4 && maForItarget(4) == 50, "50 mA = 2 x 25 mA");
 static_assert(itargetForMa(100) == 9 && maForItarget(9) == 100, "Ubuntu's 100 mA = 2 x 50 mA");
+static_assert(itargetForMa(400) == 39 && maForItarget(39) == 400, "factory 400 mA = 2 x 200 mA");
 static_assert(itargetForMa(10) == 0 && maForItarget(0) == 10, "one step a channel");
 static_assert(clampForMa(kUbuntuTorchMaxMa) == 9, "Linux's clamp for piano");
 

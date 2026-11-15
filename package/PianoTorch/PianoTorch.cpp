@@ -10,10 +10,11 @@
 //                  an administrator's IORegistry property (tooling/native/piano-torch) or another driver's callPlatformFunction
 //                  (PianoTorchClient.h); piano-torch-test=S lights it once for S seconds at boot (the attended first test).
 // Without piano-torch the driver declines in probe() and maps nothing.
-// Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own), piano-torch-max-ma (default and hard
-// cap 100, Ubuntu's led-max-microamp), piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85),
+// Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own), piano-torch-max-ma (default 100,
+// hard cap 400; the factory range is opt-in), piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85),
 // piano-torch-batt-max=C (default 45), piano-torch-delay=S (default 0), piano-torch-probe-spare=1 to add the old channel-B
-// mapping window, and piano-torch-flash=1 for one bounded timed FLASH pulse after the torch window.
+// mapping window, piano-torch-flash=1 for one bounded timed FLASH pulse after the torch window, and piano-torch-ladder=1 for
+// the guarded 100/200/300/400 mA ten-second ladder.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -40,7 +41,7 @@ volatile int32_t piano_torch_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax, probe, probeSpare, flash;
+  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax, probe, probeSpare, flash, ladder;
 };
 Args gArgs;
 
@@ -55,7 +56,7 @@ uint32_t clampArg(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : v
 void readArgs()
 {
   gArgs.level = bootArg("piano-torch", 0);
-  gArgs.maxMa = clampArg(bootArg("piano-torch-max-ma", kHardMaxMa), kTorchMinMa, kHardMaxMa);
+  gArgs.maxMa = clampArg(bootArg("piano-torch-max-ma", kUbuntuTorchMaxMa), kTorchMinMa, kHardMaxMa);
   gArgs.ma = clampArg(bootArg("piano-torch-ma", 50), kTorchMinMa, gArgs.maxMa);
   gArgs.timeout = clampArg(bootArg("piano-torch-timeout", 300), 10, 1800);
   gArgs.test = clampArg(bootArg("piano-torch-test", 0), 0, 60);
@@ -65,6 +66,7 @@ void readArgs()
   gArgs.probe = clampArg(bootArg("piano-torch-probe", 0), 0, 1);
   gArgs.probeSpare = clampArg(bootArg("piano-torch-probe-spare", 0), 0, 1);
   gArgs.flash = clampArg(bootArg("piano-torch-flash", 0), 0, 1);
+  gArgs.ladder = clampArg(bootArg("piano-torch-ladder", 0), 0, 1);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -187,6 +189,15 @@ Temperatures readTemperatures(uint64_t now)
       }
     }
     OSSafeReleaseNULL(o);
+    // B6's PMIC ADC publishes the flash thermistor separately from the TSENS hottest-per-controller map.
+    o = gThermal->copyProperty("BoardTemperaturesDeciC");
+    if (OSDictionary *d = OSDynamicCast(OSDictionary, o)) {
+      if (OSNumber *n = OSDynamicCast(OSNumber, d->getObject("flash"))) {
+        t.flashDeci = int32_t(n->unsigned32BitValue());
+        t.flashValid = true;
+      }
+    }
+    OSSafeReleaseNULL(o);
   }
   if (gBattery) {
     OSObject *o = gBattery->copyProperty("Temperature");
@@ -197,6 +208,16 @@ Temperatures readTemperatures(uint64_t now)
     OSSafeReleaseNULL(o);
   }
   return t;
+}
+
+void temperatureText(const Temperatures &t, char *flash, char *soc, char *battery, unsigned size)
+{
+  if (t.flashValid) snprintf(flash, size, "%d.%dC", t.flashDeci / 10, t.flashDeci % 10);
+  else strlcpy(flash, "none", size);
+  if (t.socValid) snprintf(soc, size, "%d.%dC", t.socDeci / 10, t.socDeci % 10);
+  else strlcpy(soc, "none", size);
+  if (t.batteryValid) snprintf(battery, size, "%d.%02dC", t.batteryCenti / 100, t.batteryCenti % 100);
+  else strlcpy(battery, "none", size);
 }
 
 // ------------------------------------------------------------------------------------------------------------ the report
@@ -351,6 +372,7 @@ class PianoTorch : public IOService {
   OSDeclareDefaultStructors(PianoTorch)
   void run();
   void serve();
+  void ladder();
   void probe();
   void probeWindow(uint8_t mask, const char *label);
   Reason probePollPhase(uint8_t mask, const char *phase, unsigned durationMs, bool enforceGuard);
@@ -380,9 +402,9 @@ IOService *PianoTorch::probe(IOService *provider, SInt32 *score)
 bool PianoTorch::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u probe=%u spare=%u flash=%u (PM8550 SID %u flash %#x, PPID %#x)",
+  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u probe=%u spare=%u flash=%u ladder=%u (PM8550 SID %u flash %#x, PPID %#x)",
        gArgs.level, gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.test, gArgs.socMax, gArgs.battMax, gArgs.delay, gArgs.probe,
-       gArgs.probeSpare, gArgs.flash, kSid, kBase, kPpid);
+       gArgs.probeSpare, gArgs.flash, gArgs.ladder, kSid, kBase, kPpid);
   if (gArgs.level > 2) {
     note("piano-torch=%u: only levels 1 and 2 exist (docs/drivers/torch.md section 8); running 2", gArgs.level);
     gArgs.level = 2;
@@ -492,7 +514,9 @@ void PianoTorch::run()
        gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.socMax, gArgs.battMax, kPpid, unsigned(sizeof kWritable / sizeof kWritable[0]));
   if (foundLit) logOutcome("it was lit when the driver started", o, 0);
   publishState(this);
-  if (gArgs.probe && gArgs.test) {
+  if (gArgs.ladder) {
+    ladder();
+  } else if (gArgs.probe && gArgs.test) {
     probe();   // replaces the single boot test: two windows (the factory's pair and the spare pair), dumps and polls
   } else if (gArgs.test) {
     note("test: on at %u mA for %u s (piano-torch-test)", gArgs.ma, gArgs.test);
@@ -635,6 +659,98 @@ void PianoTorch::probeFlashPulse()
   IOLockUnlock(gLock);
   note("probe FLASH pulse: explicit off after timer; %u writes, %u read back%s", off.writes, off.readbacks,
        off.ok ? "" : "; A STEP FAILED");
+}
+
+// Torch5: one guarded boot answers the useful-current question without four reboots. Each level is lit for ten seconds and
+// followed by ten seconds dark. The PMIC status/RT byte and all three temperatures are sampled every 500 ms. A fault, an
+// unreadable status, or an existing SoC/battery guard ends the ladder and leaves the module explicitly off.
+void PianoTorch::ladder()
+{
+  static const unsigned levels[] = {100, 200, 300, 400};
+  note("ladder: 100/200/300/400 mA total (2 channels), 10 s lit + 10 s dark, status/fault and temperatures every 500 ms; cap %u mA",
+       gArgs.maxMa);
+  for (unsigned step = 0; step < sizeof(levels) / sizeof(levels[0]); ++step) {
+    const unsigned ma = levels[step];
+    const uint64_t start = nowMs();
+    const Temperatures t0 = readTemperatures(start);
+    IOLockLock(gLock);
+    Torch::Outcome on = gTorch.request(start, ma, 10, t0);
+    gTorch.setTestMode(false);
+    gTorch.describe(start, gState, sizeof gState);
+    IOLockUnlock(gLock);
+    note("ladder step %u: request %u mA (2 x %u mA)", step + 1, ma, ma / 2);
+    logOutcome("ladder lit", on, ma);
+    publishState(this);
+    if (!on.lit) {
+      note("ladder stopped at %u mA: %s", ma, reasonName(on.reason));
+      return;
+    }
+
+    for (unsigned elapsed = 0; elapsed < 10000; elapsed += 500) {
+      if (elapsed) IOSleep(500);
+      const uint64_t now = nowMs();
+      const Temperatures t = readTemperatures(now);
+      IOLockLock(gLock);
+      const Torch::Outcome poll = gTorch.poll(now, t);
+      const Controller::Live live = poll.live;
+      gTorch.describe(now, gState, sizeof gState);
+      IOLockUnlock(gLock);
+      char faults[80], channels[128];
+      char flashTemp[24], socTemp[24], batteryTemp[24];
+      formatFaults(decodeFaults(live.status1, live.status2, live.status3, kPianoChannelMask), faults, sizeof faults);
+      formatStatus1Channels(live.status1, kPianoChannelMask, channels, sizeof channels);
+      temperatureText(t, flashTemp, socTemp, batteryTemp, sizeof flashTemp);
+      note("ladder poll: step=%u ma=%u phase=lit t+%u ms STATUS1=%02x %s INT_RT_STS(0x10)=%02x status2=%02x status3=%02x enables=%02x/%02x faults=%s temp flash=%s SoC=%s battery=%s",
+           step + 1, ma, elapsed, live.status1, channels, live.rt, live.status2, live.status3, live.moduleEn, live.chanEn, faults,
+           flashTemp, socTemp, batteryTemp);
+      if (!poll.lit) {
+        note("ladder stopped at %u mA lit window: %s", ma, reasonName(poll.reason));
+        return;
+      }
+    }
+
+    IOLockLock(gLock);
+    const Torch::Outcome off = gTorch.turnOff(nowMs(), Reason::test);
+    gTorch.describe(nowMs(), gState, sizeof gState);
+    IOLockUnlock(gLock);
+    note("ladder step %u: dark; %u writes, %u read back%s", step + 1, off.steps.writes, off.steps.readbacks,
+         off.steps.ok ? "" : "; A STEP FAILED");
+    publishState(this);
+    if (!off.steps.ok) {
+      note("ladder stopped after %u mA: off write failed", ma);
+      return;
+    }
+
+    unsigned darkUnreadable = 0;
+    for (unsigned elapsed = 0; elapsed < 10000; elapsed += 500) {
+      if (elapsed) IOSleep(500);
+      const uint64_t now = nowMs();
+      const Temperatures t = readTemperatures(now);
+      IOLockLock(gLock);
+      const Controller::Live live = gTorch.controller().live();
+      IOLockUnlock(gLock);
+      if (!live.ok) ++darkUnreadable;
+      else darkUnreadable = 0;
+      char faults[80], channels[128];
+      char flashTemp[24], socTemp[24], batteryTemp[24];
+      formatFaults(decodeFaults(live.status1, live.status2, live.status3, kPianoChannelMask), faults, sizeof faults);
+      formatStatus1Channels(live.status1, kPianoChannelMask, channels, sizeof channels);
+      temperatureText(t, flashTemp, socTemp, batteryTemp, sizeof flashTemp);
+      note("ladder poll: step=%u ma=%u phase=dark t+%u ms STATUS1=%02x %s INT_RT_STS(0x10)=%02x status2=%02x status3=%02x enables=%02x/%02x faults=%s temp flash=%s SoC=%s battery=%s",
+           step + 1, ma, elapsed, live.status1, channels, live.rt, live.status2, live.status3, live.moduleEn, live.chanEn, faults,
+           flashTemp, socTemp, batteryTemp);
+      const Faults f = decodeFaults(live.status1, live.status2, live.status3, kPianoChannelMask);
+      const bool hot = (t.socValid && t.socDeci >= gTorch.config().socMaxDeci) ||
+                       (t.batteryValid && t.batteryCenti >= gTorch.config().batteryMaxCenti);
+      if (f.any() || darkUnreadable >= 2 || hot) {
+        note("ladder stopped during dark after %u mA: %s%s%s", ma, f.any() ? "fault" : "", darkUnreadable >= 2 ? " unreadable" : "",
+             hot ? " temperature guard" : "");
+        return;
+      }
+    }
+    note("ladder step %u complete: %u mA lit 10 s, dark 10 s", step + 1, ma);
+  }
+  note("ladder complete: all four levels passed without a fault or guard");
 }
 
 // The control loop: requests as they come; while lit, a poll every second (the time limit, the guard).

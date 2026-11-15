@@ -175,8 +175,10 @@ inline void formatFaults(const Faults &f, char *out, unsigned size)
   out[size - 1] = 0;
 }
 
-// The hard limits, whatever the boot arguments say: never more than Ubuntu's 100 mA lamp current (2 x 50 mA, ITARGET 9).
-constexpr unsigned kHardMaxMa = kUbuntuTorchMaxMa;
+// The normal default remains Ubuntu's 100 mA total. The factory hardware permits 400 mA total (2 x 200 mA); the
+// higher limit is opt-in through piano-torch-max-ma and is used only for short guarded probes such as torch5.
+constexpr unsigned kFactoryTorchMaxMa = 400;
+constexpr unsigned kHardMaxMa = kFactoryTorchMaxMa;
 constexpr uint8_t kHardMaxItarget = itargetForMa(kHardMaxMa);
 inline unsigned clampMa(unsigned ma, unsigned maxMa)
 {
@@ -378,8 +380,8 @@ struct GuardConfig {
 // The temperatures other drivers publish (absent when that driver is not running: the time limit and the module's own bits
 // still apply).
 struct Temperatures {
-  bool socValid = false, batteryValid = false;
-  int32_t socDeci = 0, batteryCenti = 0;
+  bool socValid = false, batteryValid = false, flashValid = false;
+  int32_t socDeci = 0, batteryCenti = 0, flashDeci = 0;
 };
 
 // The decision on one poll of a lit torch. mask: the channels it is lit on.
