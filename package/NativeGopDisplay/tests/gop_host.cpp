@@ -29,6 +29,7 @@
 #include <queue>
 #include <random>
 #include <vector>
+#include "../CopyRows.h"
 #include "GopCompose.h"
 
 using namespace gopcompose;
@@ -214,6 +215,76 @@ struct TestSurface {
   uint32_t *word(uint32_t x, uint32_t y) {return reinterpret_cast<uint32_t *>(bytes.data() + y * rowBytes + uint64_t(x) * 4);}
   uint64_t *dword(uint32_t x, uint32_t y) {return reinterpret_cast<uint64_t *>(bytes.data() + y * rowBytes + uint64_t(x) * 8);}
 };
+
+
+// ---------------------------------------------------------------------------------------------------------------- parallel copy rows
+static void testParallelRows()
+{
+  // The kernel compositor uses the same half-open slices.  Check every
+  // worker count used by the boot A/B (including the invalid/zero setting),
+  // that slices are balanced, contiguous and cover each requested rectangle.
+  const int32_t y0 = 3, y1 = 40;
+  for (unsigned workers : {0u, 1u, 2u, 4u, 6u, 64u}) {
+    const unsigned n = gopcopy::sliceCount(y0, y1, workers);
+    CHECK(n == (workers ? (workers < unsigned(y1 - y0) ? workers : unsigned(y1 - y0)) : 1u));
+    int32_t cursor = y0;
+    for (unsigned i = 0; i < n; i++) {
+      const gopcopy::RowSlice slice = gopcopy::sliceAt(y0, y1, workers, i);
+      CHECK(slice.y0 == cursor && slice.y1 > slice.y0 && slice.y1 <= y1);
+      cursor = slice.y1;
+    }
+    CHECK(cursor == y1);
+    const gopcopy::RowSlice invalid = gopcopy::sliceAt(y0, y1, workers, n);
+    CHECK(invalid.y0 == y1 && invalid.y1 == y1);
+  }
+  CHECK(gopcopy::sliceCount(8, 8, 4) == 0 && gopcopy::sliceAt(8, 8, 4, 0).y0 == 8);
+
+  // Compose one frame serially and by row slices.  Each slice has private
+  // scratch/line storage, as the worker path does; the resulting panel must
+  // be byte-for-byte identical, including conversion and cursor blending.
+  constexpr uint32_t width = 53, height = 37;
+  TestSurface base, cursorSurface;
+  base.make(width, height, kFormatBGRA, 16);
+  cursorSurface.make(13, 11, kFormatBGRA, 8);
+  std::mt19937 rng(0x51ce);
+  for (uint32_t y = 0; y < height; y++)
+    for (uint32_t x = 0; x < width; x++)
+      *base.word(x, y) = 0xff000000u | (rng() & 0xffffffu);
+  for (uint32_t y = 0; y < cursorSurface.height; y++)
+    for (uint32_t x = 0; x < cursorSurface.width; x++) {
+      const uint32_t a = (x + 3 * y) % 5 == 0 ? 0 : (rng() % 256);
+      *cursorSurface.word(x, y) = (a << 24) | ((a * 3 / 4) << 16) | ((a * 2 / 3) << 8) | (a / 2);
+    }
+  Overlay overlay;
+  overlay.visible = true;
+  overlay.x = -4;
+  overlay.y = 15;
+  overlay.glyph = {0, 0, int32_t(cursorSurface.width), int32_t(cursorSurface.height)};
+  const Rect whole = panelRect(width, height), on = overlayOnPanel(overlay, width, height);
+  const RowSource baseRows = base.source(), cursorRows = cursorSurface.source();
+  static Tables tables;
+  tables.init();
+  std::vector<uint32_t> serial(size_t(width) * height), sliced(serial.size());
+  std::vector<uint8_t> scratch(width * 8);
+  for (uint32_t y = 0; y < height; y++)
+    composeRow(serial.data() + size_t(y) * width, scratch.data(), int32_t(y), 0, int32_t(width), &baseRows, &cursorRows, overlay, on,
+               tables);
+  for (unsigned workers : {1u, 2u, 4u, 6u}) {
+    std::fill(sliced.begin(), sliced.end(), 0xdeadbeefu);
+    const unsigned n = gopcopy::sliceCount(whole.y, whole.bottom(), workers);
+    for (unsigned i = 0; i < n; i++) {
+      const gopcopy::RowSlice s = gopcopy::sliceAt(whole.y, whole.bottom(), workers, i);
+      std::vector<uint32_t> line(width);
+      std::vector<uint8_t> workerScratch(width * 8);
+      for (int32_t y = s.y0; y < s.y1; y++) {
+        composeRow(line.data(), workerScratch.data(), int32_t(y), 0, int32_t(width), &baseRows, &cursorRows, overlay, on, tables);
+        memcpy(sliced.data() + size_t(y) * width, line.data(), width * sizeof(uint32_t));
+      }
+    }
+    CHECK(sliced == serial);
+  }
+}
+
 // The reference: pixel by pixel from the definitions (base converted, black outside it, the glyph blended where it lies).
 static uint32_t referencePixel(int32_t x, int32_t y, TestSurface *base, TestSurface *cursor, const Overlay &o, const Tables &t)
 {
@@ -1738,6 +1809,7 @@ static void testStartFill()
 int main()
 {
   testGeometry();
+  testParallelRows();
   testPixels();
   testOverlay();
   testCompose();
