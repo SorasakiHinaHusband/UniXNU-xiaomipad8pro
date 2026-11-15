@@ -17,8 +17,22 @@
 //   - drivers/spmi/spmi-pmic-arb.c (same tree, specification only): v7 writes go through the owner EE's channel at chnls +
 //     0x1000 * APID (command +0x00, status +0x08, write data +0x10), opcode 0 = extended register write long, and Linux refuses
 //     a write to an APID whose owner (cnfg + 4 * APID, bits 2:0) is not its own EE.
+//   - the factory's own device tree (vendor board.dtb, and the copy inside the Ubuntu live tree's piano-live.dtb, read
+//     2026-11-15 for the T2 no-light failure): qcom,flash_led@ee00 under pmic@1 carries torch_0/torch_1 (qcom,id 0 and 1),
+//     flash_0/flash_1 (qcom,id 0 and 1) and switch_2 (qcom,led-mask 0x0f, symmetry; switch_0 mask 0x09 and switch_1 mask
+//     0x06 disabled); the rear camera flash node qcom,camera-flash0 wires torch-source = torch_0+torch_1,
+//     flash-source = flash_0+flash_1, switch-source = switch_2 — piano's lamp on channels 1 and 2, the factory's own choice;
+//     each torch/flash child allows qcom,max-current-ma 400 a channel (the lamp is built for hundreds of mA a channel).
+//   - Xiaomi's vendor flash LED driver for piano (MiCode piano-w-oss drivers/leds/leds-qti-flash.c, GPL-2.0, specification
+//     only, nothing copied): STATUS1 = a channel open bit and a short bit; INT_RT_STS 0x10 bit 0 = "open/short/vreg not
+//     ready"; its torch path writes the same registers Linux's does (IRESOLUTION bit + ITARGET, MODULE_EN, CHAN_EN), its
+//     probe clears every channel's safety-timer enable bit and writes STROBE bits 6:4 and 2 = 0 (software, level); its
+//     "switch" LED is a grouping over the same CHAN_EN bits, not another register; MITIGATION 0x65 it sets only for a
+//     flash of 1 A or more; it never writes TORCH_CLAMP (the reset value, 200 mA a channel, stands).
 // Not known from any source (needs-boot, logged by level 1): the reset values, the owner EE of the flash APID (Ubuntu's writes
-// succeed, so it is inferred to be EE 0), the second STATUS1 bit of each channel, what the module does with a clamp below ITARGET.
+// succeed, so it is inferred to be EE 0), whether this unit's STATUS1 open bit is live or latched and when it appears, what the
+// module does with a clamp below ITARGET, what registers 0x20-0x37, 0x50-0x77 and 0x80-0xe7 hold (the survey now reads them
+// all; 0x4f read 0x02 at reset on the tablet and 0xe8-0xeb hold 80 c0 20 32, none identified in any source read).
 #ifndef PIANO_TORCH_FLASH_HW_H
 #define PIANO_TORCH_FLASH_HW_H
 #include <stdint.h>
@@ -40,9 +54,13 @@ constexpr uint8_t kTypeFlash = 0x18;
 constexpr uint8_t kSubtype4ch = 0x07, kSubtype3chPm8150 = 0x04, kSubtype3chPmi8998 = 0x03;
 
 // ----------------------------------------------------------------------------------- the four-channel layout (PM8550)
-constexpr uint8_t kRegStatus1 = 0x06;     // per channel two bits from 2 * channel; the first is a short circuit
+constexpr uint8_t kRegStatus1 = 0x06;     // per channel two bits from 2 * channel: first short circuit, second open
 constexpr uint8_t kRegStatus2 = 0x07;     // module faults, bits below
 constexpr uint8_t kRegStatus3 = 0x09;     // per channel: bit 2 * channel = the safety timer expired
+constexpr uint8_t kRegIntRtSts = 0x10;    // real-time interrupt status (read only): fault, ramps
+constexpr uint8_t kRtFault = 0x01;        // LED fault: open / short / vreg not ready (the factory's words)
+constexpr uint8_t kRtRampDownDone = 0x08, kRtRampUpDone = 0x10;
+constexpr uint8_t kRegMitigation = 0x65;  // LMH mitigation (bit 0); the factory sets it only for a flash >= 1 A
 constexpr uint8_t kRegTimer0 = 0x3e;      // + channel: bit 7 enable, bits 6:0 time in 10 ms steps
 constexpr uint8_t kRegItarget0 = 0x42;    // + channel: bits 6:0, current = (ITARGET + 1) * step
 constexpr uint8_t kRegModuleEn = 0x46;    // bit 7
@@ -128,8 +146,8 @@ inline const char *strobeName(uint8_t strobe)
 
 // What a set of STATUS bytes means, in words (a static string per class; the raw bytes are logged next to it).
 struct Faults {
-  bool shortCircuit = false, timeout = false, thermal = false, current = false, voltage = false;
-  bool any() const { return shortCircuit || timeout || thermal || current || voltage; }
+  bool shortCircuit = false, open = false, timeout = false, thermal = false, current = false, voltage = false;
+  bool any() const { return shortCircuit || open || timeout || thermal || current || voltage; }
 };
 inline Faults decodeFaults(uint8_t status1, uint8_t status2, uint8_t status3, uint8_t channelMask)
 {
@@ -137,6 +155,7 @@ inline Faults decodeFaults(uint8_t status1, uint8_t status2, uint8_t status3, ui
   for (unsigned ch = 0; ch < kChannels4ch; ++ch) {
     if (!(channelMask & (1u << ch))) continue;
     f.shortCircuit = f.shortCircuit || (status1 & (1u << (2 * ch)));
+    f.open = f.open || (status1 & (1u << (2 * ch + 1)));
     f.timeout = f.timeout || (status3 & (1u << (2 * ch)));
   }
   f.thermal = status2 & kSts2Thermal;

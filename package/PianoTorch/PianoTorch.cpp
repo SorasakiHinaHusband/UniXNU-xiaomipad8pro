@@ -39,7 +39,7 @@ volatile int32_t piano_torch_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax;
+  uint32_t level, ma, maxMa, timeout, test, delay, socMax, battMax, probe;
 };
 Args gArgs;
 
@@ -61,6 +61,7 @@ void readArgs()
   gArgs.delay = clampArg(bootArg("piano-torch-delay", 0), 0, 600);
   gArgs.socMax = clampArg(bootArg("piano-torch-soc-max", 85), 40, 105);
   gArgs.battMax = clampArg(bootArg("piano-torch-batt-max", 45), 30, 60);
+  gArgs.probe = clampArg(bootArg("piano-torch-probe", 0), 0, 1);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -202,10 +203,10 @@ void reportSurvey(const Survey &s)
        !s.flash ? "NOT a flash LED module (type 0x18 expected); nothing more read" : subtypeName(s.subtype),
        s.flash && !s.fourChannel ? " (not decoded: this driver knows the four-channel layout only)" : "");
   if (!s.flash) return;
-  for (const Range &r : kSurveyRanges) {
-    char line[100];   // "raw xx:" and up to 24 bytes of " xx"
-    int at = snprintf(line, sizeof line, "raw %02x:", r.start);
-    for (unsigned i = r.start; i < unsigned(r.start) + r.bytes && at < int(sizeof line) - 4; ++i)
+  for (unsigned row = 0; row < 256; row += 16) {
+    char line[64];   // "raw xx:" and 16 bytes of " xx"
+    int at = snprintf(line, sizeof line, "raw %02x:", row);
+    for (unsigned i = row; i < row + 16; ++i)
       at += s.valid[i] ? snprintf(line + at, sizeof line - at, " %02x", s.reg[i]) : snprintf(line + at, sizeof line - at, " --");
     note("%s", line);
   }
@@ -223,9 +224,46 @@ void reportSurvey(const Survey &s)
          (v.timer & kTimerEnable) ? "safety timer on" : "safety timer off", v.on ? ", ON" : "");
   }
   const Faults f = s.faults();
-  note("flash status1 %02x status2 %02x status3 %02x: %s%s%s%s%s%s", s.reg[kRegStatus1], s.reg[kRegStatus2], s.reg[kRegStatus3],
-       f.any() ? "" : "no fault on piano's channels", f.shortCircuit ? "SHORT " : "", f.timeout ? "TIMER-EXPIRED " : "",
-       f.thermal ? "OVER-TEMPERATURE " : "", f.current ? "CURRENT-LIMIT " : "", f.voltage ? "LOW-SUPPLY" : "");
+  note("flash status1 %02x status2 %02x status3 %02x rt %02x: %s%s%s%s%s%s%s", s.reg[kRegStatus1], s.reg[kRegStatus2],
+       s.reg[kRegStatus3], s.reg[kRegIntRtSts], f.any() ? "" : "no fault on piano's channels", f.shortCircuit ? "SHORT " : "",
+       f.open ? "OPEN " : "", f.timeout ? "TIMER-EXPIRED " : "", f.thermal ? "OVER-TEMPERATURE " : "",
+       f.current ? "CURRENT-LIMIT " : "", f.voltage ? "LOW-SUPPLY" : "");
+}
+
+// The probe of a no-light failure (piano-torch-probe=1): a full dump before the first window and after the last, and between
+// them only the registers that changed (a diff against the previous dump), so the log stays readable. The probe runs once on
+// this driver's own thread; gProbeLast is its private state.
+Survey gProbeLast;
+void probeSnapFull(const char *when)
+{
+  gProbeLast = survey(portBus(gPort));
+  note("probe dump %s (full):", when);
+  reportSurvey(gProbeLast);
+}
+void probeSnapDiff(const char *label)
+{
+  const Survey now = survey(portBus(gPort));
+  unsigned changed = 0;
+  for (unsigned i = 0; i < 256; ++i)
+    if (now.valid[i] && gProbeLast.valid[i] && now.reg[i] != gProbeLast.reg[i]) ++changed;
+  if (!changed)
+    note("probe diff %s: no register changed", label);
+  else {
+    char line[230];
+    int at = snprintf(line, sizeof line, "probe diff %s: %u changed:", label, changed);
+    unsigned printed = 0;
+    for (unsigned i = 0; i < 256; ++i) {
+      if (!now.valid[i] || !gProbeLast.valid[i] || now.reg[i] == gProbeLast.reg[i]) continue;
+      if (at >= int(sizeof line) - 14) {
+        at += snprintf(line + at, sizeof line - at, " +%u more", changed - printed);
+        break;
+      }
+      at += snprintf(line + at, sizeof line - at, " %02x:%02x->%02x", uint8_t(i), gProbeLast.reg[i], now.reg[i]);
+      ++printed;
+    }
+    note("%s", line);
+  }
+  gProbeLast = now;
 }
 
 void summary(const Survey &s, const char *refusal, char *out, unsigned size)
@@ -249,9 +287,9 @@ void logOutcome(const char *what, const Torch::Outcome &o, unsigned askedMa)
     return;
   }
   if (o.lit) {
-    note("on: %u mA (2 x %u mA, itarget %u, clamp %u) for %s; %u writes, %u read back; status %02x %02x %02x, enables %02x %02x",
+    note("on: %u mA (2 x %u mA, itarget %u, clamp %u) for %s; %u writes, %u read back; status %02x %02x %02x rt %02x, enables %02x %02x",
          gTorch.ma(), gTorch.ma() / 2, gTorch.itarget(), clampForMa(gTorch.maxMa()), what, r.writes, r.readbacks, o.live.status1,
-         o.live.status2, o.live.status3, o.live.moduleEn, o.live.chanEn);
+         o.live.status2, o.live.status3, o.live.rt, o.live.moduleEn, o.live.chanEn);
     if (askedMa && askedMa != gTorch.ma()) note("on: %u mA asked, %u mA set (the limit is %u mA, 5 mA steps a channel)", askedMa, gTorch.ma(), gTorch.maxMa());
     return;
   }
@@ -293,6 +331,8 @@ class PianoTorch : public IOService {
   OSDeclareDefaultStructors(PianoTorch)
   void run();
   void serve();
+  void probe();
+  void probeWindow(uint8_t mask, const char *label);
   void offNow(Reason why, const char *what);
   static void thread(void *self, wait_result_t);
 
@@ -318,8 +358,9 @@ IOService *PianoTorch::probe(IOService *provider, SInt32 *score)
 bool PianoTorch::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u (PM8550 SID %u flash %#x, PPID %#x)",
-       gArgs.level, gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.test, gArgs.socMax, gArgs.battMax, gArgs.delay, kSid, kBase, kPpid);
+  note("start: piano-torch=%u ma=%u max=%u timeout=%u s test=%u s soc-max=%u C batt-max=%u C delay=%u probe=%u (PM8550 SID %u flash %#x, PPID %#x)",
+       gArgs.level, gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.test, gArgs.socMax, gArgs.battMax, gArgs.delay, gArgs.probe, kSid, kBase,
+       kPpid);
   if (gArgs.level > 2) {
     note("piano-torch=%u: only levels 1 and 2 exist (docs/drivers/torch.md section 8); running 2", gArgs.level);
     gArgs.level = 2;
@@ -429,11 +470,115 @@ void PianoTorch::run()
        gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.socMax, gArgs.battMax, kPpid, unsigned(sizeof kWritable / sizeof kWritable[0]));
   if (foundLit) logOutcome("it was lit when the driver started", o, 0);
   publishState(this);
-  if (gArgs.test) {
+  if (gArgs.probe && gArgs.test) {
+    probe();   // replaces the single boot test: two windows (the factory's pair and the spare pair), dumps and polls
+  } else if (gArgs.test) {
     note("test: on at %u mA for %u s (piano-torch-test)", gArgs.ma, gArgs.test);
     queue(gArgs.ma, gArgs.test, "the boot test");
   }
   serve();
+}
+
+// The no-light probe (piano-torch-probe=1 with piano-torch-test=S): two lit windows at boot — channels 1+2 (the factory's own
+// torch pair) then 3+4 (the spare pair, the channel-mapping question settled in one boot) — each piano-torch-test seconds at
+// piano-torch-ma, with STATUS1/2/3 and the real-time fault byte polled and logged every 500 ms while lit (the open bit and the
+// "vreg not ready" fault appear after the enable, not before it), a full 256-byte dump before and after, and diffs between.
+// The owner watches the rear LED during both windows (docs/drivers/torch.md section 8, T4).
+void PianoTorch::probe()
+{
+  note("probe: piano-torch-probe=1: two windows at %u mA for %u s, full dumps and diffs, status polls while lit", gArgs.ma,
+       gArgs.test);
+  probeSnapFull("1: before any window");
+  probeWindow(kPianoChannelMask, "A: channels 1+2 (the factory's torch pair)");
+  probeSnapDiff("2: after window A");
+  probeWindow(kOtherChannelMask, "B: channels 3+4 (the spare pair)");
+  probeSnapDiff("3: after window B");
+  probeSnapFull("4: after both windows");
+}
+
+void PianoTorch::probeWindow(uint8_t mask, const char *label)
+{
+  const unsigned ma = clampMa(gArgs.ma, gArgs.maxMa);
+  const uint8_t itarget = itargetForMa(ma);
+  note("probe window %s: on at %u mA (itarget %u, clamp %u) for %u s", label, ma, itarget, clampForMa(gArgs.maxMa), gArgs.test);
+  const uint64_t start = nowMs();
+  unsigned unreadable = 0;
+  Reason bad = Reason::none;
+  StepResult steps;
+  const Temperatures t0 = readTemperatures(start);
+  IOLockLock(gLock);
+  if (mask == kPianoChannelMask) {   // the real control path, exactly as a user's on
+    const Torch::Outcome o = gTorch.request(start, ma, gArgs.test, t0);
+    steps = o.steps;
+    bad = o.reason;
+    if (o.lit) gTorch.setTestMode(true);
+    gTorch.describe(start, gState, sizeof gState);
+  } else {                           // the spare pair: the controller directly, this boot's diagnostic
+    steps = gTorch.controller().on(itarget, clampForMa(gArgs.maxMa), mask);
+    if (!steps.ok) bad = Reason::writeFailed;
+    snprintf(gState, sizeof gState, "probe window B %s", steps.ok ? "on" : "off (a write failed)");
+  }
+  IOLockUnlock(gLock);
+  note("probe window %s: %s; %u writes, %u read back%s", label, bad == Reason::none ? "on" : reasonName(bad), steps.writes,
+       steps.readbacks, steps.ok ? "" : "; A STEP FAILED");
+  if (!steps.ok) {
+    if (!steps.why) note("probe window %s: no step detail (refused %u)", label, steps.refused);
+    else note("failed step: register %#04x wanted %02x read %02x: %s", steps.failedReg, steps.failedWant, steps.failedGot, steps.why);
+  }
+  if (bad != Reason::none) {   // request() ran its own off; a raw window's remains
+    if (mask != kPianoChannelMask) {
+      IOLockLock(gLock);
+      const StepResult undo = gTorch.controller().off(mask);
+      IOLockUnlock(gLock);
+      note("probe window %s: off after the refusal; %u writes, %u read back", label, undo.writes, undo.readbacks);
+    }
+    publishState(this);
+    return;
+  }
+
+  // While lit: the module's own words for why a lit register state makes no light (open channel, vreg not ready), which only
+  // appear once the channels are on — sampled twice a second, logged every sample.
+  bool mid = false;
+  const uint64_t end = start + uint64_t(gArgs.test) * 1000;
+  for (uint64_t now = start; now < end;) {
+    IOSleep(500);
+    now = nowMs();
+    const Temperatures t = readTemperatures(now);
+    IOLockLock(gLock);
+    const Controller::Live l = gTorch.controller().live();
+    const Reason verdict = judge(l, unreadable, t, gTorch.config(), mask);
+    IOLockUnlock(gLock);
+    char faults[80];
+    formatFaults(decodeFaults(l.status1, l.status2, l.status3, mask), faults, sizeof faults);
+    if (!l.ok)
+      note("probe lit %s: t+%llu ms: STATUS UNREADABLE (%s of two)", label, (unsigned long long)(now - start),
+           unreadable >= 2 ? "two" : "one");
+    else
+      note("probe lit %s: t+%llu ms: status %02x %02x %02x rt %02x enables %02x %02x: %s", label, (unsigned long long)(now - start),
+           l.status1, l.status2, l.status3, l.rt, l.moduleEn, l.chanEn, faults);
+    if (verdict != Reason::none) {
+      bad = verdict;
+      break;
+    }
+    if (!mid && now >= start + uint64_t(gArgs.test) * 1000 / 3) {
+      mid = true;
+      probeSnapDiff(label);   // any register the module itself changed while lit shows here
+    }
+  }
+  IOLockLock(gLock);
+  if (mask == kPianoChannelMask) {
+    const Torch::Outcome o = gTorch.turnOff(nowMs(), Reason::test);
+    gTorch.describe(nowMs(), gState, sizeof gState);
+    IOLockUnlock(gLock);
+    note("probe window %s: off (%s); %u writes, %u read back", label, reasonName(o.reason), o.steps.writes, o.steps.readbacks);
+  } else {
+    const StepResult r = gTorch.controller().off(mask);
+    snprintf(gState, sizeof gState, "off (the probe)");
+    IOLockUnlock(gLock);
+    note("probe window %s: off (the probe); %u writes, %u read back", label, r.writes, r.readbacks);
+  }
+  if (bad != Reason::none) note("probe window %s: ENDED EARLY by the guard: %s", label, reasonName(bad));
+  publishState(this);
 }
 
 // The control loop: requests as they come; while lit, a poll every second (the time limit, the guard).
@@ -487,8 +632,8 @@ void PianoTorch::serve()
         logOutcome("guard", o, 0);
       } else if (now - lastLogMs >= 30000 || o.live.status1 != lastStatus[0] || o.live.status2 != lastStatus[1] ||
                  o.live.status3 != lastStatus[2]) {
-        note("lit: %s; status %02x %02x %02x enables %02x %02x; SoC %d.%d C battery %d.%02d C", gState, o.live.status1,
-             o.live.status2, o.live.status3, o.live.moduleEn, o.live.chanEn, t.socValid ? t.socDeci / 10 : 0,
+        note("lit: %s; status %02x %02x %02x rt %02x enables %02x %02x; SoC %d.%d C battery %d.%02d C", gState, o.live.status1,
+             o.live.status2, o.live.status3, o.live.rt, o.live.moduleEn, o.live.chanEn, t.socValid ? t.socDeci / 10 : 0,
              t.socValid ? t.socDeci % 10 : 0, t.batteryValid ? t.batteryCenti / 100 : 0, t.batteryValid ? t.batteryCenti % 100 : 0);
         lastLogMs = now;
         lastStatus[0] = o.live.status1;

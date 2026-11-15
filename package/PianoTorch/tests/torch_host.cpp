@@ -163,13 +163,22 @@ static void testConstants()
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
   CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(200, 500) == 100);
   CHECK(clampForMa(100) == 9 && clampForMa(60) == 5);
-  CHECK(!writable(kRegThermThrsh1, 0x07) && !writable(kRegThermThrsh2, 0x07) && !writable(0xd0, 0xff) && !writable(0x40, 0xff));
-  CHECK(!writable(kRegChanEn, 0x0c) && !writable(kRegIres, 0x04) && !writable(kRegModuleEn, 0x7f) && !writable(kRegItarget0 + 2, 0x7f));
-  CHECK(writable(kRegChanEn, 0x03) && writable(kRegModuleEn, 0x80) && writable(kRegTorchClamp, 0x7f) && !writable(kRegChanEn, 0));
+  CHECK(!writable(kRegThermThrsh1, 0x07) && !writable(kRegThermThrsh2, 0x07) && !writable(0xd0, 0xff) && !writable(0x3d, 0xff));
+  CHECK(!writable(kRegChanEn, 0x10) && !writable(kRegIres, 0x10) && !writable(kRegModuleEn, 0x7f) && !writable(kRegChanEn, 0));
+  // the spare channels are writable too (the probe's one-boot channel test), never a bit above the four channels
+  CHECK(writable(kRegChanEn, 0x0c) && writable(kRegIres, 0x04) && writable(kRegItarget0 + 2, 0x7f) && writable(kRegStrobe0 + 3, 0x7f));
+  CHECK(writable(kRegTimer0 + 3, 0xff) && writable(kRegChanEn, 0x03) && writable(kRegModuleEn, 0x80) && writable(kRegTorchClamp, 0x7f));
   const Faults f = decodeFaults(0x04, 0x20, 0x00, kPianoChannelMask);
-  CHECK(f.shortCircuit && f.thermal && !f.current && !f.voltage && !f.timeout);
+  CHECK(f.shortCircuit && f.thermal && !f.current && !f.voltage && !f.timeout && !f.open);
+  const Faults o = decodeFaults(0x02, 0, 0, kPianoChannelMask);
+  CHECK(o.open && !o.shortCircuit && o.any());   // channel 0's open bit (the no-light signature)
   CHECK(!decodeFaults(0x10, 0, 0x10, kPianoChannelMask).any());   // channel 2's bits are not piano's
   CHECK(std::strcmp(strobeName(0x01), "software, level, active high") == 0);
+  char faults[80];
+  formatFaults(decodeFaults(0x06, 0x01, 0, kPianoChannelMask), faults, sizeof faults);
+  CHECK(std::strcmp(faults, "SHORT OPEN LOW-SUPPLY") == 0);
+  formatFaults(Faults(), faults, sizeof faults);
+  CHECK(std::strcmp(faults, "none") == 0);
 }
 
 static void testSurvey()
@@ -206,6 +215,7 @@ static void testSurvey()
   a.r(kPpid, kRegChanEn) = 0x04;
   Port q4(false);
   CHECK(writeRefusal(survey(q4.bus), 2, 0) != nullptr);
+  CHECK(writeRefusal(survey(q4.bus), 2, 0, 0x0c) == nullptr);   // the probe's spare pair includes it
   // a read that fails: incomplete, refused
   piano(a);
   Port q5(false);
@@ -271,6 +281,22 @@ static void testOnOff()
   const StepResult capped = c.on(77, 77);
   CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
   c.off();
+
+  // the probe's spare-pair window: channels 3+4 through the same sequence, their registers only, the piano pair's kept
+  a.writes.clear();
+  a.r(kPpid, kRegIres) = 0x03;      // the piano pair's bits stand
+  const StepResult spare = c.on(4, 9, 0x0c);
+  CHECK(spare.ok && spare.writes == 12 && spare.readbacks == 12);
+  CHECK(a.flash(kRegChanEn) == 0x0c && a.flash(kRegIres) == 0x0f);
+  CHECK(a.flash(kRegItarget0 + 2) == 4 && a.flash(kRegItarget0 + 3) == 4 && (a.flash(kRegItarget0) & 0x7f) == 0);
+  CHECK(a.flash(kRegStrobe0 + 2) == 0x01 && a.flash(kRegStrobe0 + 3) == 0x01 && a.flash(kRegTimer0 + 2) == 0);
+  const StepResult spareOff = c.off(0x0c);
+  CHECK(spareOff.ok && a.flash(kRegChanEn) == 0 && a.flash(kRegItarget0 + 2) == 0);
+  CHECK(onlyFlash(a));
+  // a mask above the four channels is refused before any write
+  a.writes.clear();
+  const StepResult wild = c.on(4, 9, 0x10);
+  CHECK(!wild.ok && wild.refused == 1 && a.writes.empty());
 }
 
 static void testFailures()
@@ -372,6 +398,15 @@ static void testGuard()
   CHECK(t.request(500000, 50, 0, temps).lit);
   o = t.turnOff(500500, Reason::sleep);
   CHECK(!o.lit && t.lastReason() == Reason::sleep && a.flash(kRegModuleEn) == 0);
+  // the open bit: register-perfect but no light — the guard reports it instead of calling the torch fine
+  CHECK(t.request(600000, 50, 0, temps).lit);
+  a.r(kPpid, kRegStatus1) = 0x20;   // channel 3's (index 2's) open bit is not piano's; nothing happens
+  CHECK(t.poll(601000, temps).lit);
+  a.r(kPpid, kRegStatus1) = 0x02;   // channel 0 open
+  o = t.poll(602000, temps);
+  CHECK(!o.lit && o.reason == Reason::channelOpen && a.flash(kRegChanEn) == 0);
+  CHECK(!t.request(610000, 50, 0, temps).lit);   // it cools down like a fault
+  a.r(kPpid, kRegStatus1) = 0;
   CHECK(onlyFlash(a));
 }
 

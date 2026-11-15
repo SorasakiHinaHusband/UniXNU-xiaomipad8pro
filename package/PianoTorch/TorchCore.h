@@ -47,12 +47,15 @@ struct Bus {
 };
 
 // ------------------------------------------------------------------------------------------------------- level 1: survey
-// The byte ranges level 1 reads (8 bytes a read): identity and status, the interrupt block, the channel registers, the thermal
-// thresholds, the clamp's neighbourhood. Nothing outside the peripheral's 256 bytes.
+// The byte ranges level 1 reads (8 bytes a read): the peripheral's whole 256 bytes. The first T2 boots read only the ranges the
+// sources name; the rest (0x20-0x37, 0x50-0x77, 0x80-0xe7) had never been read when the torch lit no light with every named
+// register correct, so the survey now covers everything the peripheral decodes (a 256-byte region; reads only).
 struct Range {
   uint8_t start, bytes;
 };
-constexpr Range kSurveyRanges[] = {{0x00, 16}, {0x10, 16}, {0x38, 24}, {0x78, 8}, {0xe8, 8}};
+constexpr Range kSurveyRanges[] = {
+    {0x00, 32}, {0x20, 32}, {0x40, 32}, {0x60, 32}, {0x80, 32}, {0xa0, 32}, {0xc0, 32}, {0xe0, 32},
+};
 
 struct Survey {
   bool identity = false;     // TYPE/SUBTYPE/REVISION answered
@@ -117,7 +120,8 @@ inline Survey survey(const Bus &bus)
 }
 
 // Why level 2 must not write, or nullptr. ownerEe: the owner of the flash APID (cnfg); the arbiter drops another EE's writes.
-inline const char *writeRefusal(const Survey &s, int apid, uint32_t ownerEe)
+// channels: the channels this driver drives (kPianoChannelMask normally; the probe may name another pair).
+inline const char *writeRefusal(const Survey &s, int apid, uint32_t ownerEe, uint8_t channels = kPianoChannelMask)
 {
   if (apid < 0) return "the flash module's PPID 0x1ee is not in the SPMI arbiter's APID map";
   if (ownerEe != 0) return "the flash APID belongs to another execution environment (owner EE is not 0): the arbiter refuses our writes";
@@ -125,19 +129,24 @@ inline const char *writeRefusal(const Survey &s, int apid, uint32_t ownerEe)
   if (!s.flash) return "TYPE is not 0x18: not a flash LED module";
   if (!s.fourChannel) return "SUBTYPE is not 0x07: not the four-channel layout this driver knows";
   if (!s.complete) return "part of the survey did not read: the state is not known";
-  if (s.chanEn() & kOtherChannelMask) return "channel 3 or 4 is enabled: someone else drives this module";
+  if (s.chanEn() & uint8_t(~channels) & 0x0f) return "a channel outside this driver's set is enabled: someone else drives this module";
   return nullptr;
 }
 
 // ----------------------------------------------------------------------------------------------- level 2: the writes
 // Every register level 2 may write and the bits it may change in it. Nothing else is ever written (Controller::put refuses).
+// Channels 3 and 4 (bits 2 and 3) are the factory's spare channels, not wired to piano's lamp on this board per the factory
+// tree; their registers are in the allowlist only so the probe (piano-torch-probe) can drive them once, to settle which
+// channels the rear LED really sits on — a boot with the probe off never writes them.
 struct Writable {
   uint8_t reg, mask;
 };
 constexpr Writable kWritable[] = {
-    {kRegTimer0 + 0, 0xff},  {kRegTimer0 + 1, 0xff},   {kRegItarget0 + 0, kItargetMask}, {kRegItarget0 + 1, kItargetMask},
-    {kRegModuleEn, kModuleEnBit}, {kRegIres, kPianoChannelMask}, {kRegStrobe0 + 0, kStrobeMask}, {kRegStrobe0 + 1, kStrobeMask},
-    {kRegChanEn, kPianoChannelMask}, {kRegTorchClamp, kClampMask},
+    {kRegTimer0 + 0, 0xff},  {kRegTimer0 + 1, 0xff},  {kRegTimer0 + 2, 0xff},  {kRegTimer0 + 3, 0xff},
+    {kRegItarget0 + 0, kItargetMask}, {kRegItarget0 + 1, kItargetMask}, {kRegItarget0 + 2, kItargetMask},
+    {kRegItarget0 + 3, kItargetMask}, {kRegModuleEn, kModuleEnBit}, {kRegIres, 0x0f},
+    {kRegStrobe0 + 0, kStrobeMask}, {kRegStrobe0 + 1, kStrobeMask}, {kRegStrobe0 + 2, kStrobeMask},
+    {kRegStrobe0 + 3, kStrobeMask}, {kRegChanEn, 0x0f}, {kRegTorchClamp, kClampMask},
 };
 inline bool writable(uint8_t reg, uint8_t mask)
 {
@@ -145,6 +154,25 @@ inline bool writable(uint8_t reg, uint8_t mask)
   for (const Writable &w : kWritable)
     if (w.reg == reg) return (mask & ~w.mask) == 0;
   return false;
+}
+
+// The faults as one word list for a log line ("none" when there is none).
+inline void formatFaults(const Faults &f, char *out, unsigned size)
+{
+  if (!f.any()) {
+    snprintf(out, size, "none");
+    return;
+  }
+  unsigned at = 0;
+  const char *parts[] = {"SHORT", "OPEN", "TIMER-EXPIRED", "OVER-TEMPERATURE", "CURRENT-LIMIT", "LOW-SUPPLY"};
+  const bool have[] = {f.shortCircuit, f.open, f.timeout, f.thermal, f.current, f.voltage};
+  for (unsigned i = 0; i < 6; ++i) {
+    if (!have[i] || at + 1 >= size) continue;
+    if (at) out[at++] = ' ';
+    at += unsigned(snprintf(out + at, size - at, "%s", parts[i]));
+    if (at >= size) at = size - 1;
+  }
+  out[size - 1] = 0;
 }
 
 // The hard limits, whatever the boot arguments say: never more than Ubuntu's 100 mA lamp current (2 x 50 mA, ITARGET 9).
@@ -203,47 +231,59 @@ class Controller {
     return true;
   }
 
-  // Torch on at itarget on both channels (piano's lamp), with Linux's torch settings: software strobe, 5 mA steps, no safety
-  // timer, the clamp set for maxMa. Stops at the first failure; the caller then runs off().
-  StepResult on(uint8_t itarget, uint8_t clamp)
+  // Torch on at itarget over the channels of mask (one bit a channel, piano's pair by default), with Linux's torch settings:
+  // software strobe, 5 mA steps, no safety timer, the clamp set for maxMa. Stops at the first failure; the caller runs off().
+  StepResult on(uint8_t itarget, uint8_t clamp, uint8_t mask = kPianoChannelMask)
   {
     StepResult r;
     if (itarget > kHardMaxItarget) itarget = kHardMaxItarget;
     if (clamp > kHardMaxItarget) clamp = kHardMaxItarget;
-    put(r, kRegChanEn, kPianoChannelMask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0) &&
-        put(r, kRegStrobe0 + 0, kStrobeMask, kStrobeSoftwareLevelHigh) && put(r, kRegStrobe0 + 1, kStrobeMask, kStrobeSoftwareLevelHigh) &&
-        put(r, kRegTorchClamp, kClampMask, clamp) && put(r, kRegItarget0 + 0, kItargetMask, itarget) &&
-        put(r, kRegItarget0 + 1, kItargetMask, itarget) && put(r, kRegIres, kPianoChannelMask, kPianoChannelMask) &&
-        put(r, kRegTimer0 + 0, 0xff, 0) && put(r, kRegTimer0 + 1, 0xff, 0) && put(r, kRegModuleEn, kModuleEnBit, kModuleEnBit) &&
-        put(r, kRegChanEn, kPianoChannelMask, kPianoChannelMask);
+    if (!mask || mask & 0xf0) {
+      ++r.refused;
+      fail(r, kRegChanEn, mask, 0, "the channel mask is not one to four of the module's channels");
+      return r;
+    }
+    bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
+    ok = ok && put(r, kRegTorchClamp, kClampMask, clamp);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegItarget0 + ch, kItargetMask, itarget);
+    ok = ok && put(r, kRegIres, mask, mask);
+    for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) ok = put(r, kRegTimer0 + ch, 0xff, 0);
+    ok = ok && put(r, kRegModuleEn, kModuleEnBit, kModuleEnBit) && put(r, kRegChanEn, mask, mask);
     return r;
   }
 
   // Torch off: channels, module, current to the lowest step. Every step is tried even after a failure.
-  StepResult off()
+  StepResult off(uint8_t mask = kPianoChannelMask)
   {
     StepResult r;
-    put(r, kRegChanEn, kPianoChannelMask, 0);
+    put(r, kRegChanEn, mask, 0);
     put(r, kRegModuleEn, kModuleEnBit, 0);
-    put(r, kRegItarget0 + 0, kItargetMask, 0);
-    put(r, kRegItarget0 + 1, kItargetMask, 0);
+    for (unsigned ch = 0; ch < kChannels4ch; ++ch)
+      if (mask & (1u << ch)) put(r, kRegItarget0 + ch, kItargetMask, 0);
     return r;
   }
 
-  // The live state while on: status bytes and the enables, over the observer channel.
+  // The live state while on: the three status bytes, the real-time fault byte, the enables, over the observer channel.
   struct Live {
     bool ok = false;
-    uint8_t status1 = 0, status2 = 0, status3 = 0, moduleEn = 0, chanEn = 0;
-    bool lit() const { return (moduleEn & kModuleEnBit) && (chanEn & kPianoChannelMask) == kPianoChannelMask; }
+    uint8_t status1 = 0, status2 = 0, status3 = 0, rt = 0, moduleEn = 0, chanEn = 0;
+    bool lit() const { return (moduleEn & kModuleEnBit) && chanEn; }
+    bool lit(uint8_t mask) const { return (moduleEn & kModuleEnBit) && (chanEn & mask) == mask; }
   };
   Live live() const
   {
     Live l;
-    uint8_t st[4] = {}, en = 0, ch = 0;   // 0x06..0x09: STATUS1, STATUS2, (0x08), STATUS3
-    l.ok = bus_.read(bus_.ctx, kRegStatus1, st, 4) && bus_.read(bus_.ctx, kRegModuleEn, &en, 1) && bus_.read(bus_.ctx, kRegChanEn, &ch, 1);
+    uint8_t st[4] = {}, rt = 0, en = 0, ch = 0;   // 0x06..0x09: STATUS1, STATUS2, (0x08), STATUS3
+    l.ok = bus_.read(bus_.ctx, kRegStatus1, st, 4) && bus_.read(bus_.ctx, kRegIntRtSts, &rt, 1) &&
+           bus_.read(bus_.ctx, kRegModuleEn, &en, 1) && bus_.read(bus_.ctx, kRegChanEn, &ch, 1);
     l.status1 = st[0];
     l.status2 = st[1];
     l.status3 = st[3];
+    l.rt = rt;
     l.moduleEn = en;
     l.chanEn = ch;
     return l;
@@ -273,7 +313,7 @@ class Controller {
 
 // ----------------------------------------------------------------------------------------------------------- the guard
 enum class Reason : uint8_t {
-  none, user, timeout, test, bootFoundOn, pmicThermal, pmicCurrent, pmicVoltage, shortCircuit, socHot, batteryHot,
+  none, user, timeout, test, bootFoundOn, pmicThermal, pmicCurrent, pmicVoltage, shortCircuit, channelOpen, socHot, batteryHot,
   statusUnreadable, lostState, writeFailed, sleep, shutdown
 };
 inline const char *reasonName(Reason r)
@@ -288,6 +328,7 @@ inline const char *reasonName(Reason r)
     case Reason::pmicCurrent: return "the module's current-limit bits";
     case Reason::pmicVoltage: return "the module's low-supply bit";
     case Reason::shortCircuit: return "a channel's short-circuit bit";
+    case Reason::channelOpen: return "a channel's open-circuit bit (the LED, its supply, or the wiring is absent: register-perfect but no light)";
     case Reason::socHot: return "the SoC temperature (PianoThermal)";
     case Reason::batteryHot: return "the battery temperature (PianoPower)";
     case Reason::statusUnreadable: return "the status could not be read twice in a row";
@@ -314,19 +355,21 @@ struct Temperatures {
   int32_t socDeci = 0, batteryCenti = 0;
 };
 
-// The decision on one poll of a lit torch.
-inline Reason judge(const Controller::Live &l, unsigned &unreadable, const Temperatures &t, const GuardConfig &c)
+// The decision on one poll of a lit torch. mask: the channels it is lit on.
+inline Reason judge(const Controller::Live &l, unsigned &unreadable, const Temperatures &t, const GuardConfig &c,
+                    uint8_t mask = kPianoChannelMask)
 {
   if (!l.ok) return ++unreadable >= 2 ? Reason::statusUnreadable : Reason::none;
   unreadable = 0;
-  const Faults f = decodeFaults(l.status1, l.status2, l.status3, kPianoChannelMask);
+  const Faults f = decodeFaults(l.status1, l.status2, l.status3, mask);
   if (f.thermal) return Reason::pmicThermal;
   if (f.shortCircuit) return Reason::shortCircuit;
+  if (f.open) return Reason::channelOpen;
   if (f.current) return Reason::pmicCurrent;
   if (f.voltage) return Reason::pmicVoltage;
   // f.timeout (STATUS3) is not a reason of its own: a torch runs with the safety timer off, and a timer that did fire turned the
   // channel off, which the enables show (lostState).
-  if (!l.lit()) return Reason::lostState;
+  if (!l.lit(mask)) return Reason::lostState;
   if (t.socValid && t.socDeci >= c.socMaxDeci) return Reason::socHot;
   if (t.batteryValid && t.batteryCenti >= c.batteryMaxCenti) return Reason::batteryHot;
   return Reason::none;
@@ -342,7 +385,7 @@ inline Reason refuseOn(const Temperatures &t, const GuardConfig &c)
 inline bool coolsDown(Reason r)
 {
   return r == Reason::pmicThermal || r == Reason::pmicCurrent || r == Reason::pmicVoltage || r == Reason::shortCircuit ||
-         r == Reason::socHot || r == Reason::batteryHot || r == Reason::writeFailed;
+         r == Reason::channelOpen || r == Reason::socHot || r == Reason::batteryHot || r == Reason::writeFailed;
 }
 
 // ------------------------------------------------------------------------------------------------- the torch's state
