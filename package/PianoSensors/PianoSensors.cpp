@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // PianoSensors: the ADSP sensor hub of piano (SSC in msm/adsp/sensor_pd) for macOS 27, native at EL1, as a client of PianoPower's
 // running DSP through package/include/PianoAdspContract.h (charging.md §9). Design, facts, ladder: docs/drivers/sensors.md. Never
 // starts, stops or restarts the DSP, never votes a rail; everything stops on the guard's first strike (SensorsGuard.h, sensors.md §7).

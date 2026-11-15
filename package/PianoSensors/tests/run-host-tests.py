@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Host tests of PianoSensors, all with -Wall -Wextra -Werror and ASan/UBSan (cc from the environment's CC, default cc):
 
   wire     PaganiSensors' protobuf and SNS vectors (unchanged test), vector 4 framed by PianoPower's own QcomQrtr.c

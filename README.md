@@ -114,6 +114,7 @@ enforces it on every build, before and after the link: no descriptor from elsewh
 
 ## Licence and contents
 
-Code here is BSD-2-Clause-Patent unless a package's `LICENSE`, a file's SPDX header or an `UPSTREAM` file says otherwise.
+Code here is BSD-2-Clause-Patent, Copyright (c) 2026 Leo Zhang, unless a package's `LICENSE`, a file's SPDX header or an
+`UPSTREAM` file says otherwise (third-party parts keep their own holders and licences).
 Vendor firmware, partition images and Apple payloads (kernel collections, trust caches, IPSW-derived files) are never in this
 repository; neither are secrets, keys, per-unit calibration, local network or storage details, or machine names.

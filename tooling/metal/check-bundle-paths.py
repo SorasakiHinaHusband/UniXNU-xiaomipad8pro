@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Is a built Metal plugin bundle independent of the checkout it was built in? (tooling/metal/build-turnip-a830.sh step 7,
 docs/data-store.md section 9.)
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Included by auto_host.c:
 //   stream   AutoStream.c: one request outstanding, no nested close, the first event never dropped (also before the enable's answer),
 //            readings resume after every off/on (Ubuntu v1.1.1's bug, 20 cycles), re-arm on a missing first event, timeouts and late

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """The sensor pack as a RAM test image carries it (docs/drivers/sensors.md section 5b): one entry, sensors/piano-sensors.pack, in
 UniXNU's boot addon container (scripts/make-gpu-addon.py's layout, which DarwinBoot hands the kernel as /chosen/memory-map "GpuAddon"
 when the payload has Payloads/kernel.macho.gpuaddon and the ADT has that slot). PianoSensors (SensorsAddon.h) takes the pack from it

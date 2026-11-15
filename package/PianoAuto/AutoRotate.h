@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The display rotation agent's policy (piano-rotated, docs/drivers/sensors.md section 5a): the rotation WindowServer should show and
  * the one PianoTouch is told, from the panel edge PianoSensors reports up, the keyboard cover (PianoKeyboard's piano-keyboard-attached),
  * the user's rotation lock and what WindowServer really shows (CGDisplayRotation, read back). SensorsPolicy's ps_rotation_step keeps the

@@ -1,6 +1,6 @@
 Copyright (c) 2026, UniXNU contributors (the files derived from UniXNU-Pagani_SM8750 and macOS-DroidVM: board/PianoA830Board.cpp,
 board/PianoA830.cpp; UPSTREAM).
-Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+Copyright (c) 2026, Leo Zhang. All rights reserved.
 
 This license covers package/PianoA830/board. adreno830/ (the Adreno830 driver), kits/ArmSmmu4K and kits/AdrenoPM4 are MIT, each
 with its own LICENSE file kept in its directory (adreno830/LICENSE, kits/ArmSmmu4K/LICENSE, kits/AdrenoPM4/LICENSE).

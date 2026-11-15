@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Host tests of level 4 (SensorsStream.c over PianoAuto's AutoStream.c and AutoLight.c, docs/drivers/sensors.md section 5c) against a
 // simulated hub that reads every request as the hub would (QMI 0x20, TLV 0x01, sns_client_request_msg) and answers with the message
 // shapes of the sensor client service (libqmi's SSC description, libssc's and Android's sns_client / sns_std_sensor messages, facts

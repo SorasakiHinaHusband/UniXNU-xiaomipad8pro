@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 # install-piano-rotated.sh [DIR]: on the tablet, as root (the USB root shell, or the Data seed's boot job through
 # tooling/k27/stage-soft-metal.py --boot-run). Puts the agent from DIR (default /private/var/piano/rotated, where stage-soft-metal.py
 # --file stages it) at /usr/local/libexec/piano-rotated and its launchd job in /Library/LaunchAgents, both owned by root (launchd

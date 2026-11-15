@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """The userland of native macOS on piano, staged in one reproducible step (docs/userland.md): configs/userland.toml's files built
 (xcrun clang, arm64/arm64e, ad hoc signed by the linker) or copied, put into a copy of the Data seed under the manifest's staging
 directory with the on-tablet installer (tooling/userland/install.sh), the seed's boot job told to run it, the Mach-Os' CDHashes added

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* Piano's sensor policies: see SensorsPolicy.h. */
 #include "SensorsPolicy.h"
 

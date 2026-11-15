@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // wire.c's vector 4 (a QRTR data packet around an SNS request) built by the router piano really uses: PianoPower's QcomQrtr.c
 // (UniXNU-sheng's, compiled in from ../../PianoPower, read only), instead of PaganiAdsp's qcom_qrtr_frame. Same signature.
 #ifndef SENSORS_TEST_QRTR_FRAME_H

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The touch screen's coordinates under a display rotation: what PianoTouch applies to each contact before its HID report
  * (docs/drivers/sensors.md section 5a). Header only, C and C++, integer only, no C library (kernel code, -mgeneral-regs-only).
  *

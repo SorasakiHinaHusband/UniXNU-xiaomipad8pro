@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Host tests of AmbientBacklight.h (PianoBacklight's automatic mode, docs/drivers/sensors.md section 5a), synthetic inputs only:
 //   ladder   its shift is PianoBacklight's own step ladder (Ktz8866.h's Steps, included read only from package/PianoBacklight): linear and
 //            exponential mapping, the floor

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* PianoPower's health report (PianoAdspContract.h, charging.md §9) as the guard's observation (SensorsGuard.h). The strike rules read
  * it exactly so: a fatal bit now or any fatal report since the start, a crash reason, the charger domain not up or in a new generation,
  * a new link generation, the DSP not up after we started; quiet holds our traffic. A report of another contract version than the one

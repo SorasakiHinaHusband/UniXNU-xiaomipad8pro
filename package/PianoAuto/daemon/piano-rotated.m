@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // piano-rotated: automatic display rotation on native macOS for piano (docs/drivers/sensors.md section 5a). A launchd agent
 // (com.unixnu.piano-rotated.plist: the login window's session and each user's, so it acts at the login window too) that
 //   reads    PianoSensors' "piano-sensors-edge" (its level 4: "top", "left", "bottom", "right", "none"; a number 0..3 is taken

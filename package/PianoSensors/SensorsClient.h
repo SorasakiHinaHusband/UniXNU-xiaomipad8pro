@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* Level 3's client of the hub's sensor client service (QMI service 400, SensorsSsc.h) on one QRTR port of PianoPower's router: the
  * SUID lookup of each data type piano has (default sensor only, with updates: the hub reports late sensors), then the attributes of
  * every sensor found (name, vendor, rates, ...). No stream: the list is what level 3 publishes. Portable C, single threaded (the

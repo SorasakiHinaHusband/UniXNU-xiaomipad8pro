@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // PianoBacklight's automatic mode, for PianoBacklight's owner to take in (docs/drivers/sensors.md section 5a, "PianoBacklight").
 // Header only, portable C++ as Ktz8866.h (no kernel header, no allocation, integer only); host-tested against PianoBacklight's own
 // step ladder (tests/ambient_host.cpp). Nothing here touches an IC: it only says which 11-bit code the backlight should have.

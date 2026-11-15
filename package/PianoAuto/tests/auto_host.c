@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Host tests of PianoAuto's portable C (docs/drivers/sensors.md section 5a), synthetic inputs only, ASan/UBSan:
 //   touch    TouchRotation.h: the four rotations against CGDisplayRotation's definition (corners), round trips, clamping, the HID scale,
 //            the latch at touch-down

@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 # piano-pmset-defaults: the recommended power timers (docs/policy.md section 7) set once, for each power source, unless the owner
 # already set that source's timers. Installed as /usr/local/libexec/piano-pmset-defaults and run by the one-shot LaunchDaemon
 # com.unixnu.piano-pmset-defaults (RunAtLoad, LaunchOnlyOnce: once per boot, and it does nothing once both sources are settled).

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The safety governor of piano's sensors (docs/drivers/sensors.md section 7). The audio DSP that hosts the sensor protection domain also
  * runs the charger firmware (charging.md); natively nothing restarts that DSP (no subsystem restart), so one DSP crash ends charging until
  * the next boot, and Ubuntu's issue #3 showed the sensor PD's watchdog taking the whole DSP down (device.md section 2.14). The sensors are

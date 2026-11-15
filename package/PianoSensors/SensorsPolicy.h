@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* Piano's sensor facts and the macOS-side policies over the hub's samples (docs/drivers/sensors.md sections 2 and 5): which data types
  * and DSP resources, the accelerometer's axes in the panel's frame, the ambient light curve PianoBacklight is fed, and the display
  * rotation with the keyboard cover's lock. Portable C, integer only (kernel code builds with -mgeneral-regs-only), no C library;

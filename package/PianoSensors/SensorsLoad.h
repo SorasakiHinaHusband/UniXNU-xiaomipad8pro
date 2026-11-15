@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The sensor pack on the ESP (docs/drivers/sensors.md section 5): found by its path on the FAT volume, read whole into memory and
  * checked (header, table, names, every file inside the pack) before the file service may attach, so that no DSP file call ever waits
  * for UFS. The ESP is only read. Portable C over FatVolume.h; host-tested against an mtools FAT32 image (tests/piano.c). */

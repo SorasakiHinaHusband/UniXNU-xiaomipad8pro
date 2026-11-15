@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # Copyright (c) 2026, UniXNU contributors. All rights reserved.
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Packs what the ADSP's sensor protection domain reads into the one read-only file PianoSensors serves it from (SensorsPack.h), out of
 this tablet's own files (docs/drivers/sensors.md section 5b). PaganiSensors' scripts/make-sensor-pack.py (UPSTREAM) with piano's inputs:
 the owner's registry backup, the stock ROM's sensor configuration with its manifest, the ODM tree, a soc0 allowlist, and an output that

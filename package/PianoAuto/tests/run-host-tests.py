@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Host tests of PianoAuto, the macOS-side consumers of PianoSensors (docs/drivers/sensors.md section 5a), all with -Wall -Wextra
 -Werror and ASan/UBSan (compilers from the environment's CC and CXX, default cc and c++):
 

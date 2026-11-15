@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The ambient light chain of PianoSensors' kext (level S4, docs/drivers/sensors.md section 5a): the hub's ambient_light stream
  * (AutoStream.h: wanted while the consumer is on, the display is on and the cover's lid is open), SensorsPolicy's curve with its
  * smoothing and hysteresis (ps_als_step, unchanged), and the targets for PianoBacklight's automatic mode (the platform function

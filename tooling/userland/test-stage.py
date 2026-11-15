@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Host tests of the userland pipeline (docs/userland.md section 8); no tablet, nothing outside a temporary directory is written
 (the repository's out/ gets the build outputs of the real units in part 7):
 

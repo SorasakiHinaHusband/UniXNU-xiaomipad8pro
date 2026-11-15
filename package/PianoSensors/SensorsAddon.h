@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* The sensor pack carried by a RAM test image (docs/drivers/sensors.md section 5b, build-ram-images.py's PIANO_SENSOR_PACK), so that a
  * RAM boot needs no pack on the installed ESP. DarwinBoot hands the kernel one file of the boot payload besides the ramdisk and the
  * trust cache: Payloads/kernel.macho.gpuaddon, copied into the kernel's memory and named by the ADT's /chosen/memory-map "GpuAddon"

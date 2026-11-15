@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Host tests of PianoSensors' own parts and independent cross-checks of the imported codecs (docs/drivers/sensors.md section 4):
 //   guard     SensorsGuard.c: wait for the charger, settle, tokens, backoff, strikes, one-strike rules, the file-loop detector
 //   policy    SensorsPolicy.c: the light curve, smoothing and hysteresis; SSC accelerometer floats -> panel edge (Ubuntu's mount matrix

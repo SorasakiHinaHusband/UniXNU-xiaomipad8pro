@@ -1,7 +1,7 @@
 Copyright (c) 2026, UniXNU contributors (the files taken from UniXNU-sheng: Qcom*.c/h, FatVolume.c/h, and PianoAdsp.cpp,
 PianoAdspFirmware.c, PianoQrtr.c and PianoAdsp.h, which are derived from sheng's AdspProbe.cpp, AdspFirmware.c, ShengQrtr.c and
 ShengAdsp.h; UPSTREAM).
-Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+Copyright (c) 2026, Leo Zhang. All rights reserved.
 
 SPDX-License-Identifier: BSD-2-Clause-Patent
 

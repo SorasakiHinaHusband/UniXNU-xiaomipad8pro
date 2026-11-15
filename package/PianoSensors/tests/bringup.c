@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // Host tests of the file service's bring-up after the tablet's first S2 (batch-2 adsp run, 2026-11-14): attach, remotectl open, register
 // and close were answered 0, adsp_listener init2 (handle 3, method 3, no buffers) was answered AEE EBADPARM 0x8000040e, the service
 // stopped, and 59 s after the attach the sensor PD's watchdog took the whole ADSP (sns_watchdog.c:84, qsh_process).

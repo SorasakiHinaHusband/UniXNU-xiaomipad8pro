@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* One sensor stream of the hub, switched on and off as its consumer's conditions change (the ambient light with the display and the
  * cover's lid, the accelerometer with the cover): PianoSensors' kext (level S4, docs/drivers/sensors.md section 5a) keeps one of these
  * per sensor, next to that sensor's QMI client of service 400. It decides which request goes out when; the kext sends it (enable =

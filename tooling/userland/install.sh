@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+# Copyright (c) 2026, Leo Zhang. All rights reserved.
 # piano-userland install.sh: puts the userland staged next to it (manifest.tsv, files/) in place on the tablet's macOS, as root
 # (docs/userland.md section 5). tooling/userland/stage.py copies it into the Data seed with the files and adds
 #   sh /private/var/piano/userland/install.sh --boot

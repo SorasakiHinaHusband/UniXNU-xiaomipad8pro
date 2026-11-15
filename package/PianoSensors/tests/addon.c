@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // SensorsAddon.c and SensorsLoad.c's sl_check on the addon a RAM test image carries (tools/sensor_addon.py, the same as
 // build-ram-images.py's PIANO_SENSOR_PACK writes), inflated with zlib as the kext does with libkern's: the pack comes out byte for
 // byte and checks; then the container's refusals (every field of the header and the entry, a second entry before ours, nothing

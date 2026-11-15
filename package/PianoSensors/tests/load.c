@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
+// Copyright (c) 2026, Leo Zhang. All rights reserved.
 // SensorsLoad.c over FatVolume.c on a FAT32 image made by mtools as build-esp.py makes the ESP (4096-byte sectors, one per cluster),
 // holding a pack from tools/make-sensor-pack.py at SL_PATH, a damaged copy, a directory and a file too big:
 //   load IMAGE

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Copyright (c) 2026, UniXNU-piano contributors. All rights reserved. */
+/* Copyright (c) 2026, Leo Zhang. All rights reserved. */
 /* Level 4 of PianoSensors (docs/drivers/sensors.md section 5c): the two streams macOS's consumers need, each on a QMI client of its own
  * (its own QRTR port: libssc and Android's sensors HAL keep one client per sensor) of the hub's sensor client service 400:
  *
