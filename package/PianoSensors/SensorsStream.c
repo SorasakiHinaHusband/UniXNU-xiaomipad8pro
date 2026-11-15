@@ -13,6 +13,11 @@ static uint64_t now(const SsEngine *e) {return e->ops->now_ms(e->ops->context);}
 static PasStream *stream_of(SsEngine *e, int i) {return i == SS_LIGHT ? &e->light.stream : &e->accel;}
 static const PasStream *cstream_of(const SsEngine *e, int i) {return i == SS_LIGHT ? &e->light.stream : &e->accel;}
 
+int ss_accel_wanted(const SsConditions *c)
+{
+    return c && c->accel_consumer && c->display != 0 && c->attached != 1;
+}
+
 void ss_defaults(SsConfig *c)
 {
     SfxAxes gyro, mag;
@@ -116,7 +121,7 @@ static void apply(SsEngine *e, uint64_t at)
     pal_conditions(&e->light, light, c->display != 0, c->lid, at);
     e->ch[SS_LIGHT].why = held ? held : !c->light_consumer ? "no consumer" : c->display == 0 ? "display off"
                         : c->lid == 0 ? "lid closed" : 0;
-    const int accel = !held && c->accel_consumer && c->display != 0 && c->attached != 1;
+    const int accel = !held && ss_accel_wanted(c);
     pas_want(&e->accel, accel, at);
     e->ch[SS_ACCEL].why = held ? held : !c->accel_consumer ? "no consumer" : c->display == 0 ? "display off"
                         : c->attached == 1 ? "cover attached" : 0;

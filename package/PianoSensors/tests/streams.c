@@ -362,6 +362,16 @@ static void conditions(int light, int accel, int display, int lid, int attached)
     ss_conditions(&eng, &cond);
 }
 
+static void test_accel_gate_contract(void)
+{
+    SsConditions c = {1, 1, 1, 1, 0};
+    CHECK(ss_accel_wanted(&c));
+    c.attached = 1; CHECK(!ss_accel_wanted(&c));
+    c.attached = 0; c.display = 0; CHECK(!ss_accel_wanted(&c));
+    c.display = 1; c.accel_consumer = 0; CHECK(!ss_accel_wanted(&c));
+    CHECK(!ss_accel_wanted(NULL));
+}
+
 static void fresh(const SsConfig *cfg)
 {
     memset(hub, 0, sizeof hub);
@@ -1040,6 +1050,7 @@ int main(int argc, char **argv)
     test_inert();
     test_light();
     test_light_cycles();
+    test_accel_gate_contract();
     test_accel();
     test_guard();
     test_sleep();

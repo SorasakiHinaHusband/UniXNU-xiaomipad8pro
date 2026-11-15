@@ -535,6 +535,7 @@ PianoBacklight told to leave automatic mode: 0x0`, `light: QRTR port 24 closed`.
 | `piano-sensors-delay=S`, `-log=0..2` | 0, 1 | wait first; log volume (2: every SNS line) |
 | `piano-sensors-als=0\|1\|2` (level 4) | 1 | the light stream: 1 while PianoBacklight's automatic mode takes targets (`piano-backlight=2 piano-backlight-auto=1`, not manual by the user's choice); 2 always (lux without a consumer: S4); 0 never |
 | `piano-sensors-rotate=0\|1\|2` (level 4) | 1 | the accelerometer stream: 1 while piano-rotated reads the edge (`piano-rotate>=1`, not `piano-rotate-test=1`); 2 always (S4); 0 never |
+| `piano-sensors-condition-trace=1` | 0 | log each change seen from NativeGopDisplay/PianoKeyboard and the resulting accelerometer gate (`wanted` or its reason) |
 | `piano-sensors-accel-hz=N` (level 4) | 10 | the rate asked (1..100 Hz); the driver runs its nearest at or above (logged) |
 | `piano-sensors-accel-batch=MS` (level 4) | 0 | the hub may hold accelerometer samples this long (`batch_period`; 0: none, as libssc; at most 1000) |
 | `piano-sensors-axes=a..` (level 4) | `a+y+x+z` | the accelerometer map (SensorsFixed text), for the four-edge test; a text that is not a map: the default, logged |

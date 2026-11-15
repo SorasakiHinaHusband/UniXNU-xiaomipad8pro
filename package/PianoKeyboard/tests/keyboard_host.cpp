@@ -441,6 +441,8 @@ static void testCaptured()
 // Attach and detach: the attach bit (byte 9 bit 0, as v1.1.0 reads it), and the commands that follow.
 static void testAttach()
 {
+  CHECK(hallOpenFromRaw(1, true) && !hallOpenFromRaw(0, true));
+  CHECK(!hallOpenFromRaw(1, false) && hallOpenFromRaw(0, false));
   // Ubuntu's input device exposes SW_TABLET_MODE as the inverse of this bit.
   CHECK(connectedBit(0x23) && !tabletMode(0x23));
   CHECK(!connectedBit(0x22) && tabletMode(0x22));

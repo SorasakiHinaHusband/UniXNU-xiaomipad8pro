@@ -73,7 +73,7 @@ struct Args {
   uint64_t rpcPa;
   uint32_t rpcFrame, rpcLadder, rpcDeadline;   // the file service's framing, its ladder, the attach -> listening deadline (s)
   // level 4 (sensors.md §5c), and the consumers' own arguments it follows
-  uint32_t als, rotate, accelHz, accelBatch;
+  uint32_t als, rotate, accelHz, accelBatch, conditionTrace;
   uint32_t backlight, backlightAuto, rotateAgent, rotateTest;
   char axesText[32];
   SfxAxes axes;
@@ -116,6 +116,7 @@ void readArgs()
   if (gArgs.accelHz < 1 || gArgs.accelHz > 100) gArgs.accelHz = SS_ACCEL_HZ;
   gArgs.accelBatch = bootArg("piano-sensors-accel-batch", 0);
   if (gArgs.accelBatch > 1000) gArgs.accelBatch = 1000;
+  gArgs.conditionTrace = bootArg("piano-sensors-condition-trace", 0);
   gArgs.backlight = bootArg("piano-backlight", 0);         // PianoBacklight's level: its automatic mode needs 2
   gArgs.backlightAuto = bootArg("piano-backlight-auto", 0);
   gArgs.rotateAgent = bootArg("piano-rotate", 0);          // piano-rotated exits at 0
@@ -765,6 +766,13 @@ SsConditions readConditions(uint64_t now)
   c.accel_consumer = gArgs.rotate >= 2 || (gArgs.rotate == 1 && gArgs.rotateAgent >= 1 && gArgs.rotateTest != 1);
   gAccelWhy = gArgs.rotate == 0 ? "piano-sensors-rotate=0" : gArgs.rotate >= 2 ? "piano-sensors-rotate=2"
               : c.accel_consumer ? "piano-rotated" : "no rotation agent (piano-rotate=0 or piano-rotate-test=1)";
+  static int lastDisplay = -2, lastLid = -2, lastAttached = -2, lastWanted = -1;
+  const int wanted = c.accel_consumer && c.display != 0 && c.attached != 1;
+  if (gArgs.conditionTrace && (c.display != lastDisplay || c.lid != lastLid || c.attached != lastAttached || wanted != lastWanted)) {
+    note("conditions: display=%d lid=%d attached=%d consumer=%d accel=%s (%s)", c.display, c.lid, c.attached, c.accel_consumer,
+         wanted ? "wanted" : "off", wanted ? "cover detached/display on" : gAccelWhy);
+    lastDisplay = c.display; lastLid = c.lid; lastAttached = c.attached; lastWanted = wanted;
+  }
   return c;
 }
 

@@ -133,6 +133,7 @@ namespace {
 
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
+  uint32_t hallPull, hallActiveLow, hallTrace;
   uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll, irq;
   uint32_t blank, lidDrop, resting, tapMs, tapTravel, tapVeto;
 };
@@ -169,6 +170,10 @@ void readArgs()
   gArgs.fnrow = bootArg("piano-keyboard-fnrow", 0);
   gArgs.hall = bootArg("piano-keyboard-hall", 1);
   gArgs.lid = bootArg("piano-keyboard-lid", 0);
+  gArgs.hallPull = bootArg("piano-keyboard-hall-pull", 0);
+  if (gArgs.hallPull != 1 && gArgs.hallPull != 3) gArgs.hallPull = 0; // 0: preserve DT, 1: down, 3: up
+  gArgs.hallActiveLow = bootArg("piano-keyboard-hall-active-low", 1) ? 1 : 0;
+  gArgs.hallTrace = bootArg("piano-keyboard-hall-trace", 0);
   gArgs.dpi = touchpadDpi(bootArg("piano-keyboard-dpi", kTouchpadDpi));
   gArgs.scrollRes = touchpadScrollResolution(bootArg("piano-keyboard-scroll-res", kTouchpadScrollResolution));
   gArgs.scroll = clampArg(bootArg("piano-keyboard-scroll", 5), 1, 200);
@@ -606,9 +611,10 @@ bool PianoKeyboard::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-keyboard=%u (%s), stop %u, I2C half-bit %u us, poll %u ms, rails %u, touchpad cmd %u, backlight %u, auth %u, "
-       "raw %u, fnrow %u, hall %u, lid %u, firmware %llu bytes",
+       "raw %u, fnrow %u, hall %u (pull %u, %s, trace %u), lid %u, firmware %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID devices for macOS" : "raw reports logged, nothing for macOS", gArgs.stop, gArgs.halfUs,
-       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw, gArgs.fnrow, gArgs.hall, gArgs.lid,
+       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw, gArgs.fnrow, gArgs.hall, gArgs.hallPull,
+       gArgs.hallActiveLow ? "active-low" : "active-high", gArgs.hallTrace, gArgs.lid,
        (unsigned long long)piano_keyboard_firmware_size);
   setProperty("piano-keyboard", gArgs.level, 32);
   PointerConfig pc;
@@ -758,11 +764,21 @@ void PianoKeyboard::surveyHall()
   p.ctl = rd32(p.page.va + kCtl);
   p.io = rd32(p.page.va + kIo);
   p.intrCfg = rd32(p.page.va + kIntrCfg);
-  fHall = fHallSample = int(p.io & 1);
-  note("hall: gpio80 CTL %08x (function %u, pull %u, %s) IO %08x INTR_CFG %08x: cover %s at start (level %u; Ubuntu DT switch-lid "
+  if (gArgs.hallPull) {
+    const uint32_t before = p.ctl;
+    const uint32_t after = (before & ~0x3u) | gArgs.hallPull;
+    if (after != before) {
+      wr32(p.page.va + kCtl, after);
+      p.ctl = rd32(p.page.va + kCtl);
+      p.io = rd32(p.page.va + kIo);
+      note("hall: gpio80 pull override %u: CTL %08x -> %08x (DT pull was %u)", gArgs.hallPull, before, p.ctl, before & 3);
+    }
+  }
+  fHall = fHallSample = int(hallOpenFromRaw(p.io & 1u, gArgs.hallActiveLow));
+  note("hall: gpio80 CTL %08x (function %u, pull %u, %s) IO %08x INTR_CFG %08x: raw %u, cover %s at start (level %u; Ubuntu DT switch-lid "
        "is GPIO_ACTIVE_LOW: low = closed; edge latch pending)%s",
-       p.ctl, (p.ctl >> 2) & 15, p.ctl & 3, p.ctl & kOe ? "output" : "input", p.io, p.intrCfg, fHall ? "open" : "closed", p.io & 1,
-       gArgs.lid ? "" : "; macOS is not told (piano-keyboard-lid=0)");
+       p.ctl, (p.ctl >> 2) & 15, p.ctl & 3, p.ctl & kOe ? "output" : "input", p.io, p.intrCfg, p.io & 1,
+       fHall ? "open" : "closed", fHall, gArgs.lid ? "" : "; macOS is not told (piano-keyboard-lid=0)");
   setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
 }
 
@@ -795,7 +811,11 @@ void PianoKeyboard::pollHall(uint64_t now)
   }
   if (fHall < 0 || (!edge && now < fHallNextMs)) return;
   fHallNextMs = now + fPoll.config().hallMs;
-  const int sample = int(rd32(gHall.page.va + kIo) & 1);
+  const uint32_t raw = rd32(gHall.page.va + kIo) & 1u;
+  const int sample = int(hallOpenFromRaw(raw, gArgs.hallActiveLow));
+  if (gArgs.hallTrace)
+    note("hall: gpio80 poll raw %u -> %s (edge %u, accepted %s, sample %s)", raw, sample ? "open" : "closed", edge ? 1 : 0,
+         fHall ? "open" : "closed", sample ? "open" : "closed");
   if (edge && sample != fHall) {
     acceptHall(sample, now, " (gpio80 edge)");
     fHallSample = sample;

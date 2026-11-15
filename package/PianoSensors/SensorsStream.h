@@ -147,6 +147,8 @@ void ss_sensor(SsEngine *e, int stream, int found, const SscSuid *suid, int64_t 
 void ss_from_list(SsEngine *e, const ScClient *list);
 /* The consumers' and the hardware's state (repeating it is harmless). */
 void ss_conditions(SsEngine *e, const SsConditions *c);
+/* The level-4 accelerometer gate: consumer, display on, and MCU cover detached. */
+int ss_accel_wanted(const SsConditions *c);
 /* A system sleep begins (1: every stream is disabled) or ended (0). */
 void ss_sleep(SsEngine *e, int asleep);
 /* One QMI message the stream's port received. */

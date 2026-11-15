@@ -254,6 +254,10 @@ inline const char *vendorName(Vendor v)
 // bit; SW_TABLET_MODE is its inverse.
 inline bool connectedBit(uint8_t state) { return (state & 1u) != 0; }
 inline bool tabletMode(uint8_t state) { return !connectedBit(state); }
+// The Ubuntu DT describes the folio switch as GPIO_ACTIVE_LOW: the idle/open level is high.
+// Keep this conversion in the portable header so the host tests cover the polarity used by the
+// MMIO driver as well as the WN8030 report decoder.
+inline bool hallOpenFromRaw(uint32_t raw, bool activeLow) { return activeLow ? (raw & 1u) != 0 : (raw & 1u) == 0; }
 inline Vendor vendorKind(const Report &r, int *attached)
 {
   *attached = -1;

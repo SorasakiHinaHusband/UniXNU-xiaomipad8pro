@@ -73,6 +73,9 @@ which are unchanged.
 | `piano-keyboard-auth=1` | 0 | answer the authentication as Linux with its helper (init, s3t1); UID and challenge never logged |
 | `piano-keyboard-fnrow=1` | 0 | Right Ctrl + 1..0 - = are F1..F12 |
 | `piano-keyboard-hall=0` | 1 | do not read gpio80 |
+| `piano-keyboard-hall-pull=1\|3` | 0 | opt-in TLMM pull override for gpio80 (1 down, 3 up); 0 preserves the DT value (the cover3 probe uses 3) |
+| `piano-keyboard-hall-active-low=0` | 1 | Ubuntu DT polarity: 1 means raw low is closed and high is open; 0 inverts it |
+| `piano-keyboard-hall-trace=1` | 0 | log every gpio80 poll as raw level, logical level, edge-latch state and accepted state |
 | `piano-keyboard-lid=1` / `2` | 0 | tell IOPMrootDomain the hall state as a clamshell: 1 with clamshell sleep disabled first, 2 with it allowed |
 | `piano-keyboard-touchpad=V` | 1 | touchpad command value on attach (2: not sent) |
 | `piano-keyboard-dpi=N` | 400 | pointer resolution declared to macOS (120..4000); lower = faster |
