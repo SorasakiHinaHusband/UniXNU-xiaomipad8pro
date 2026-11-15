@@ -23,6 +23,7 @@ constexpr unsigned kTimeUnknown = 65535;
 
 struct BatteryValues {
   bool known = false;          // a reading to show (until the first one, nothing is published)
+  bool implausible = false;    // a reading was there but its capacities are not believable: not published either
   bool installed = false, external = false, chargeCapable = false, charging = false, full = false;
   bool clamped = false;        // the percentage shown was raised to the floor
   unsigned percent = 0, maxCapacity = 100;
@@ -32,13 +33,24 @@ struct BatteryValues {
   int temperatureCenti = 0;    // 0.01 degC
   bool temperatureValid = false;
   unsigned timeRemaining = kTimeUnknown, timeToEmpty = kTimeUnknown, timeToFull = kTimeUnknown;  // minutes
-  // the adapter, when a source is seen on the Type-C port (its Rp current, ChargerPmic.h)
+  uint32_t updateSec = 0;      // the calendar time of this reading (0: unknown, not published; "UpdateTime" on a Mac)
+  // the adapter, when a source is seen on the Type-C port (its Rp current, ChargerPmic.h; the firmware's contract at level 2)
   bool adapter = false;
+  bool adapterPd = false;      // the numbers come from a PD contract, not just a Type-C Rp
   unsigned adapterMv = 0, adapterMa = 0, adapterWatts = 0;
   uint32_t adapterFamily = 0;  // kIOPSFamilyCode value: 0xe0004009 USB Type-C (UniXNU-sheng ShengBattmgr.c's table)
 };
 
 constexpr uint32_t kFamilyTypeC = 0xe0004009u;
+
+// The charger firmware's own view of the source (level 2, PianoMca's McaBusVoltage/McaType/ICL and the PDO list); null at level 1
+// and whenever the firmware has not answered yet. What macOS shows as the adapter comes from here when it is available.
+struct AdapterReal {
+  bool ok = false;      // a reading this cycle
+  bool pd = false;      // the firmware's type is a PD one (a contract, not just a Type-C Rp)
+  int32_t mv = 0;       // the bus voltage the firmware reports
+  int32_t ma = 0;       // the offer in force: the matching fixed PDO's mA, else the input limit asked
+};
 
 inline unsigned minutes(long mah, long ma)
 {
@@ -48,14 +60,23 @@ inline unsigned minutes(long mah, long ma)
 }
 
 // packs: the two readings (either may be missing); pack: their combination; port: null when the Type-C block is not readable;
-// floorPct: piano-power-ps-floor.
+// floorPct: piano-power-ps-floor; real: the charger firmware's view of the source (null at level 1); nowSec: the reading's
+// calendar time (0: unknown).
 inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const PackReading &pack, const PortState *port,
-                                unsigned floorPct)
+                                unsigned floorPct, const AdapterReal *real = nullptr, uint32_t nowSec = 0)
 {
   BatteryValues v;
   if (!pack.ok) return v;
+  // A reading with implausible capacities is not published at all, not even as an update: powerd anchors the percentage it
+  // shows on the values it sees first (2026-11-15: pmset said 12 % for a whole boot while the registry tracked 95 -> 90 %),
+  // so a garbage FullChargeCapacity must never reach the registry. Both packs together: 2 x bq27z561, design 9200 mAh.
+  if (pack.fullMah < 2000 || pack.fullMah > 20000 || pack.remainingMah > pack.fullMah + pack.fullMah / 20) {
+    v.implausible = true;
+    return v;
+  }
   v.known = true;
   v.installed = true;
+  v.updateSec = nowSec;
   // On external power: a source's Rp on the Type-C port, else (no port view) a battery that takes charge.
   v.external = port && port->ok ? port->sourceSeen : pack.charging;
   v.chargeCapable = v.external;
@@ -89,8 +110,16 @@ inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const Pac
   if (v.external && port && port->ok) {
     v.adapter = true;
     v.adapterFamily = kFamilyTypeC;
-    v.adapterMv = 5000;
-    v.adapterMa = rpMilliamps(port->rpBits);
+    if (real && real->ok && real->mv >= 4000 && real->mv <= 22000 && real->ma > 0) {
+      // The firmware's own numbers: the bus it reports (a PD contract at its settled voltage, or 5 V) and the offer in force
+      v.adapterMv = unsigned(real->mv);
+      v.adapterMa = unsigned(real->ma > 5000 ? 5000 : real->ma);
+      v.adapterPd = real->pd;
+    } else {
+      v.adapterMv = 5000;
+      v.adapterMa = rpMilliamps(port->rpBits);
+      v.adapterPd = false;
+    }
     v.adapterWatts = (v.adapterMv * v.adapterMa + 500000) / 1000000;
   }
   return v;

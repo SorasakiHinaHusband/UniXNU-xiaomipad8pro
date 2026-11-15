@@ -74,22 +74,34 @@ class AppleSmartBattery : public IOPMPowerSource {
     number("NominalChargeCapacity", v.fullMah);
     number("AvgTimeToEmpty", v.timeToEmpty);
     number("AvgTimeToFull", v.timeToFull);
+    // What a Mac's AppleSmartBattery publishes next to these (this Mac's own node is the reference): the update stamp, the
+    // built-in mark and the raw duplicates. powerd tracks the battery through these keys (2026-11-15 CHGUI: it showed 12 % all
+    // boot while the registry tracked 95 -> 90 %, so the shape it expects matters as much as the values).
+    if (v.updateSec) number("UpdateTime", v.updateSec);
+    flag("built-in", true);
+    flag("AppleRawExternalConnected", v.external);
     if (v.temperatureValid) number("Temperature", v.temperatureCenti);
     text("DeviceName", "bq27z561 x2");
     text("Manufacturer", "Texas Instruments");
-    OSDictionary *adapter = OSDictionary::withCapacity(4);
+    OSDictionary *adapter = OSDictionary::withCapacity(6);
     if (adapter) {
       if (v.adapter) {
         OSNumber *family = OSNumber::withNumber(v.adapterFamily, 32), *w = OSNumber::withNumber(v.adapterWatts, 32),
-                 *mv = OSNumber::withNumber(v.adapterMv, 32), *ma = OSNumber::withNumber(v.adapterMa, 32);
+                 *mv = OSNumber::withNumber(v.adapterMv, 32), *ma = OSNumber::withNumber(v.adapterMa, 32),
+                 *id = OSNumber::withNumber(0u, 32);
         if (family) {adapter->setObject(kIOPMPSAdapterDetailsFamilyKey, family); family->release();}
         if (w) {adapter->setObject(kIOPMPSAdapterDetailsWattsKey, w); w->release();}
         if (mv) {adapter->setObject(kIOPMPSAdapterDetailsVoltage, mv); mv->release();}
         if (ma) {adapter->setObject(kIOPMPSAdapterDetailsAmperageKey, ma); ma->release();}
+        if (id) {adapter->setObject(kIOPMPSAdapterDetailsIDKey, id); id->release();}
+        adapter->setObject("IsWireless", kOSBooleanFalse);   // the key a Mac's dict carries; no constant in this xnu's IOPM.h
       }
       const OSSymbol *key = OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
       if (key) setPSProperty(key, adapter);
       OSSafeReleaseNULL(key);
+      const OSSymbol *rawKey = OSSymbol::withCString("AppleRawAdapterDetails");
+      if (rawKey) setPSProperty(rawKey, adapter);
+      OSSafeReleaseNULL(rawKey);
       adapter->release();
     }
   }

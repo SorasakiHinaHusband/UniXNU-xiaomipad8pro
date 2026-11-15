@@ -112,6 +112,43 @@ int main()
     p.tempDeciC = 950;
     CHECK(!mapBattery(&copy, 1, p, nullptr, 0).temperatureValid);
   }
+  // Implausible capacities are not published at all (CHGUI 2026-11-15: powerd anchors its percentage on what it sees first,
+  // so a garbage FullChargeCapacity must never reach the registry; a single early bad reading is held out, not shown).
+  {
+    GaugeReading g[2] = {pack(4379, -177, -177, 95, 8186, 68217, 5000, 305, kGaugeDsg, 113),
+                         pack(4380, -178, -178, 95, 8187, 68220, 5000, 312, kGaugeDsg, 114)};   // full misread (garbage)
+    const PackReading p = combinePacks(g, 2);
+    const BatteryValues v = mapBattery(g, 2, p, nullptr, 0);
+    CHECK(!v.known && v.implausible && !v.adapter);
+    const GaugeReading zero[2] = {pack(4379, 0, 0, 95, 8186, 0, 5000, 305, 0, 113), pack(4380, 0, 0, 95, 8187, 0, 5000, 312, 0, 114)};
+    const PackReading pz = combinePacks(zero, 2);
+    CHECK(!mapBattery(zero, 2, pz, nullptr, 0).known);                                        // full = 0: nothing to show
+    GaugeReading over[2] = {pack(4379, 0, 0, 95, 12000, 8634, 5000, 305, 0, 113),
+                            pack(4380, 0, 0, 95, 12000, 8634, 5000, 312, 0, 114)};            // remaining above full + 5 %
+    const PackReading po = combinePacks(over, 2);
+    CHECK(!mapBattery(over, 2, po, nullptr, 0).known);
+    // A plausible reading right after a bad one still publishes (the bad one changed nothing).
+    const GaugeReading good[2] = {pack(4379, 0, 0, 95, 8186, 8634, 5000, 305, 0, 113),
+                                  pack(4380, 0, 0, 95, 8187, 8634, 5000, 312, 0, 114)};
+    const PackReading pg = combinePacks(good, 2);
+    CHECK(mapBattery(good, 2, pg, nullptr, 0).known);
+  }
+  // The adapter from the firmware's PD contract (level 2): the bus voltage it reports and the offer in force, not a fixed 5 V.
+  {
+    const GaugeReading g[2] = {pack(4339, 579, 563, 90, 3890, 4317, 4600, 413, 0, 115), pack(4340, 581, 565, 90, 3896, 4317, 4600, 405, 0, 115)};
+    const PackReading p = combinePacks(g, 2);
+    const PortState port = source(0x2);
+    const AdapterReal pd = [] {AdapterReal r; r.ok = true; r.pd = true; r.mv = 4976; r.ma = 1500; return r;}();
+    const BatteryValues v = mapBattery(g, 2, p, &port, 0, &pd, 1731660000u);
+    CHECK(v.adapter && v.adapterPd && v.adapterMv == 4976 && v.adapterMa == 1500 && v.adapterWatts == 7);
+    CHECK(v.updateSec == 1731660000u);
+    const AdapterReal stale = [] {AdapterReal r; r.ok = true; r.pd = false; r.mv = 0; r.ma = 0; return r;}();   // not answered: Rp
+    const BatteryValues w = mapBattery(g, 2, p, &port, 0, &stale, 0);
+    CHECK(w.adapter && !w.adapterPd && w.adapterMv == 5000 && w.adapterMa == 3000 && w.adapterWatts == 15 && w.updateSec == 0);
+    const AdapterReal wild = [] {AdapterReal r; r.ok = true; r.pd = true; r.mv = 90000; r.ma = 9000; return r;}();  // out of range: Rp
+    const BatteryValues x = mapBattery(g, 2, p, &port, 0, &wild, 0);
+    CHECK(x.adapterMv == 5000 && x.adapterMa == 3000 && !x.adapterPd);
+  }
   if (gFailures) {
     std::fprintf(stderr, "battery_host: %d failure(s)\n", gFailures);
     return 1;

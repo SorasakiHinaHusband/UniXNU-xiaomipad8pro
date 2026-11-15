@@ -324,6 +324,7 @@ class PianoPower : public IOService {
   ChargerEnable fChgEn;   // the charging enable command (ChargerEnable.h)
   RtcReading fRtc;
   bool fRtcProbed = false;
+  bool fPdosLine = false;   // the PD source's PDO list has been logged this charger generation (logMcaEvents)
   // gauges
   bool fGauges = false;
   GaugeReading fPack[2];
@@ -1114,19 +1115,44 @@ void PianoPower::diagLine(char *line, size_t size)
 }
 
 // piano-power-ps=1: the battery for macOS (PianoBattery.cpp), from this cycle's gauge and port readings; one line per cycle.
+// The adapter shown to macOS is the firmware's own contract when it has answered (level 2), the Rp current otherwise.
 void PianoPower::publishBattery(uint64_t t, const PortState *port)
 {
-  const BatteryValues v = mapBattery(fPack, 2, fBattery, port, gArgs.psFloor);
+  AdapterReal real;
+  if (gArgs.level >= 2 && piano_mca_has(&fMca, McaBusVoltage)) {
+    real.ok = true;
+    real.mv = fMca.value[McaBusVoltage] / 1000;
+    real.pd = piano_mca_has(&fMca, McaType) &&
+              (fMca.value[McaType] == PIANO_MCA_TYPE_PD || fMca.value[McaType] == PIANO_MCA_TYPE_PD_VERIFY ||
+               fMca.value[McaType] == PIANO_MCA_TYPE_PD_PPS);
+    // The offer in force: the fixed PDO the bus sits on when there is one, else the input limit asked
+    real.ma = 0;
+    for (unsigned i = 0; i < fMca.pdos && i < 7; ++i)
+      if (fMca.pdo[i][2] > 0 && real.mv >= int32_t(fMca.pdo[i][0]) && real.mv <= int32_t(fMca.pdo[i][1]))
+        real.ma = int32_t(fMca.pdo[i][2]);
+    if (!real.ma && piano_mca_has(&fMca, McaIcl) && fMca.value[McaIcl] > 0) real.ma = fMca.value[McaIcl];
+  }
+  clock_sec_t sec = 0;
+  clock_usec_t usec = 0;
+  clock_get_calendar_microtime(&sec, &usec);
+  const uint32_t nowSec = sec > 1600000000 ? uint32_t(sec) : 0;   // before 2020: the calendar is not up yet
+  const BatteryValues v = mapBattery(fPack, 2, fBattery, port, gArgs.psFloor, &real, nowSec);
+  if (v.implausible) {
+    note("[%llus] ps: implausible pack reading (%d/%d mAh): the power source is %s", t, fBattery.remainingMah, fBattery.fullMah,
+         pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
+    return;
+  }
   if (!v.known) {
     note("[%llus] ps: no gauge reading: the power source is %s", t, pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
     return;
   }
   pianoBatteryUpdate(this, v);
-  note("[%llus] ps: %u %%%s, %s, %u mV, %d mA (instant %d), %u/%u mAh (design %u), %u cycles, time remaining %u min%s", t,
+  note("[%llus] ps: %u %%%s, %s, %u mV, %d mA (instant %d), %u/%u mAh (design %u), %u cycles, time remaining %u min%s%s", t,
        v.percent, v.clamped ? " (floor)" : "",
        v.external ? (v.charging ? "on power, charging" : v.full ? "on power, full" : "on power, not charging") : "on battery",
        v.voltageMv, v.amperageMa, v.instantMa, v.rawMah, v.fullMah, v.designMah, v.cycles, v.timeRemaining,
-       v.timeRemaining == kTimeUnknown ? " (unknown)" : "");
+       v.timeRemaining == kTimeUnknown ? " (unknown)" : "",
+       v.adapter ? (v.adapterPd ? " | adapter PD contract" : " | adapter Rp") : "");
 }
 
 void PianoPower::report()
@@ -1314,11 +1340,26 @@ void PianoPower::startCharger()
 void PianoPower::logMcaEvents()
 {
   const uint32_t e = piano_mca_take_events(&fMca);
-  if (!e) return;
+  if (!e && fPdosLine) return;
   const PianoMca &m = fMca;
   if (e & McaEvAttach)
     note("mca: a source is attached: %d mV, type %s", m.value[McaBusVoltage] / 1000,
          piano_mca_has(&m, McaType) ? piano_mca_type_name(m.value[McaType]) : "?");
+  if (e & McaEvAttach) fPdosLine = false;   // a new source: its PDO list is logged once it has been read
+  // The PD source's offers, logged once per charger generation (0x21011, read only): what a 9 V request (piano-power-hv) has to pick
+  if (!fPdosLine && piano_mca_has(&m, McaPdos) && m.pdos) {
+    char line[160];
+    unsigned at = 0;
+    for (unsigned i = 0; i < m.pdos && i < 7; ++i) {
+      const int n = snprintf(line + at, sizeof line - at, "%s%u.%u-%u V %u mA", i ? ", " : "", m.pdo[i][0] / 1000,
+                             (m.pdo[i][0] % 1000) / 100, m.pdo[i][1] / 1000, m.pdo[i][2]);
+      if (n <= 0 || unsigned(n) >= sizeof line - at) break;
+      at += unsigned(n);
+    }
+    note("mca: the source's PDOs (%u): %s", m.pdos, line);
+    fPdosLine = true;
+  }
+  if (!e) return;
   if (e & McaEvDetach) note("mca: the source is gone: input limit and charge current back to the firmware's own values");
   if (e & McaEvHvAsked) note("mca: asking the PD source for its fixed 9 V PDO");
   if (e & McaEvHvOn) note("mca: the bus is at %d mV: 9 V on", m.value[McaBusVoltage] / 1000);
