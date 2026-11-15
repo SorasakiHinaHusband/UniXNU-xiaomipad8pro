@@ -355,8 +355,10 @@ enum : uint32_t {
                          // our kernel's native_sandbox_grant compares the whole property with one process name)
   kShengMediaFilter = 0x20,  // SIOCGIFMEDIA answered in the interface filter outright (their non-macOS if_ioctl form), for
                              // the case the family's answer lags the selected medium
+  kShengInterfaceBinding = 0x40, // interface primary/class/name/grant plus controller-client discovery A/B
 };
-constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter;
+constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter |
+                                kShengInterfaceBinding;
 
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.

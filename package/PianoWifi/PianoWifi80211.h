@@ -118,6 +118,7 @@ class PianoWifi80211 : public IO80211Controller {
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
   void noteIdentity(const char *why);
   void setOverride(bool on, bool onInterface);
+  void applyInterfaceBinding(bool on);
   void linkChanged(bool up) override;
   errno_t mediaIoctl(struct ifmediareq *m);
   void applyMedium();
@@ -325,6 +326,7 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
   // can return. Install the grant while the interface is still configured so
   // an immediate airportd open sees it.
   if (fState && (fState->sheng & pianowifi::a80211::kShengGrant)) applyGrant(true);
+  if (fState && (fState->sheng & pianowifi::a80211::kShengInterfaceBinding)) applyInterfaceBinding(true);
   // The production form of ADOPTION.md P0: the override is on both services before this interface registers, so CoreWiFi cannot
   // see the child before the controller's identity is there (the sysctl's late set is the A/B of the same thing).
   if (fUcMode & pianowifi::a80211::kUcOverride) setOverride(true, (fUcMode & pianowifi::a80211::kUcOverrideIf) != 0);
@@ -361,6 +363,10 @@ bool PianoWifi80211::start(IOService *provider)
   // control without it.
   uint32_t uc = pianowifi::a80211::kUcOverride;
   if (PE_parse_boot_argn("piano-wifi-apple80211-uc", &uc, sizeof uc)) uc &= 0x3f;
+  // The next binding A/B routes discovery through the controller service, the only service we can offer a tested client
+  // from without inventing an IOEthernetInterface subclass/vtable.  Interface registry facts are installed before its
+  // synchronous registration in PianoWifiEthernet::start.
+  if (fState->sheng & kShengInterfaceBinding) uc |= kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf;
   fUcMode = uc;
   if (!IO80211Controller::start(provider)) return false;   // PianoWifiEthernet: the interface, its data path, the link down
   IOEthernetAddress mac = {};
@@ -383,9 +389,9 @@ bool PianoWifi80211::start(IOService *provider)
             "pipe)", unsigned(fUcMode));
   note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
             "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
-  note80211("sheng mode %#x (machdep.piano_wifi_sheng changes it at run time: 0x1 the 802.11 medium selected, 0x2 SSID/BSSID "
-            "events beside link ones, 0x4 card caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 "
-            "NativeSandboxGrantProcess=airportd, 0x20 SIOCGIFMEDIA answered in the filter)", unsigned(fState->sheng));
+  note80211("sheng mode %#x (machdep.piano_wifi_sheng changes it at run time: 0x1 medium, 0x2 SSID/BSSID events, 0x4 caps 46, "
+            "0x8 kernel-buffer user-client copies, 0x10 grant, 0x20 filter media, 0x40 interface binding/user-client A/B)",
+            unsigned(fState->sheng));
   arm(fAttachCall, kAttachTickMs);
   return true;
 }
@@ -442,6 +448,7 @@ void PianoWifi80211::attachStep()
     setProperty("IOInterfaceNamePrefix", "en");
     note80211("%s: the controller carries IOInterfaceName and the Infrastructure role too (user-client mode 0x2)", fIfName);
   }
+  if (shengMode() & pianowifi::a80211::kShengInterfaceBinding) applyInterfaceBinding(true);
   setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   noteIdentity("at the filter's attach");
   registerService();
@@ -820,6 +827,41 @@ void PianoWifi80211::setOverride(bool on, bool onInterface)
   }
 }
 
+// The clean negative creates CWFApple80211 but then rejects en0 as a non-802.11 interface and cannot find its network service.
+// Public sheng facts put the primary flag, interface identity and grant on the interface before registration.  This switch
+// applies those facts and makes the controller's already-tested user client discoverable; it does not invent virtual-interface
+// wire layouts or claim an IOEthernetInterface subclass.
+void PianoWifi80211::applyInterfaceBinding(bool on)
+{
+  if (on) {
+    setProperty(kIOBuiltin, true);
+    setProperty("IOUserClientClass", "PianoWifi80211Uc");
+    setProperty("IO80211InterfaceRole", "Infrastructure");
+    if (fIfName[0]) setProperty("IOInterfaceName", fIfName);
+    setProperty("IOInterfaceNamePrefix", "en");
+    setProperty("NativeSandboxGrantProcess", "airportd");
+    if (fNetif) {
+      fNetif->setProperty(kIOPrimaryInterface, true);
+      fNetif->setProperty("IO80211InterfaceRole", "Infrastructure");
+      fNetif->setProperty("IOInterfaceNamePrefix", "en");
+      fNetif->setProperty("IOClassNameOverride", "IO80211Interface");
+      fNetif->setProperty("NativeSandboxGrantProcess", "airportd");
+    }
+  } else {
+    removeProperty("IOUserClientClass");
+    if (!(fUcMode & pianowifi::a80211::kUcControllerName)) removeProperty("IOInterfaceName");
+    if (!(shengMode() & pianowifi::a80211::kShengGrant)) removeProperty("NativeSandboxGrantProcess");
+    if (fNetif) {
+      fNetif->setProperty(kIOPrimaryInterface, false);
+      if (!(fUcMode & pianowifi::a80211::kUcOverrideIf)) fNetif->removeProperty("IOClassNameOverride");
+      if (!(shengMode() & pianowifi::a80211::kShengGrant)) fNetif->removeProperty("NativeSandboxGrantProcess");
+    }
+  }
+  note80211("%s: interface binding %s (primary=%s, interface IOClassNameOverride=%s, controller user client %s)", fIfName,
+            on ? "enabled" : "disabled", on ? "true" : "false", on ? "IO80211Interface" : "absent",
+            on ? "offered" : "unchanged");
+}
+
 // The sheng path posts the link event together with the SSID/BSSID state
 // events whenever the association changes.  The initial attach has its own
 // down event above; this hook covers later link callbacks from PianoWifi's
@@ -1110,9 +1152,14 @@ void PianoWifi80211::setShengMode(uint32_t mode, const char *why)
   IOLockUnlock(fLock);
   if (((masked ^ was) & kShengMedium) && fMedium11) applyMedium();
   if ((masked ^ was) & kShengGrant) applyGrant((masked & kShengGrant) != 0);
+  if ((masked ^ was) & kShengInterfaceBinding) {
+    const bool on = (masked & kShengInterfaceBinding) != 0;
+    applyInterfaceBinding(on);
+    if (on) setUcMode(ucMode() | kUcOffer | kUcControllerName | kUcOverride | kUcOverrideIf, "sheng interface binding");
+  }
   note80211("%s: sheng mode %#x (was %#x, %s): 0x1 the 802.11 medium selected, 0x2 SSID/BSSID events beside link ones, 0x4 card "
             "caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 NativeSandboxGrantProcess, 0x20 SIOCGIFMEDIA "
-            "in the filter; every request kind is logged again from here",
+            "in the filter, 0x40 interface binding/user-client A/B; every request kind is logged again from here",
             fIfName, unsigned(masked), unsigned(was), why);
 }
 
