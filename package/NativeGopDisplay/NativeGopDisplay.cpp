@@ -511,7 +511,8 @@ private:
     uint64_t fFlips, fFlipCopies;
     // native-gop-display-flip-lossless=1 (default 0): an '&BGA' frame (WindowServer's framebuffers on 27.3) is offered to PianoDpu as
     // plain 'BGRA' at its plane 0 (gopcompose::flipLayout); off, PianoDpu refuses it by format and it is copied as before.
-    bool fFlipLossless, fLosslessLayoutLogged;
+    // The switch is also machdep.native_gop_flip_lossless (root writes 0/1, flip mode only): one boot compares copied and flipped frames.
+    bool fLosslessLayoutLogged;
     uint64_t fLosslessFlips;
     bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
     // The PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), each off without its boot argument (and then nothing of this runs):
@@ -573,6 +574,48 @@ private:
 };
 
 OSDefineMetaClassAndStructors(NativeGopDisplay, IOMobileFramebufferLegacy)
+
+// machdep.native_gop_flip_lossless: the '&BGA' plane-0 flip switch at run time (seeded from native-gop-display-flip-lossless,
+// registered once, in flip mode only; by hand: sudo sysctl machdep.native_gop_flip_lossless=0|1). Filled in at run time like
+// PianoPolicy's: an OID's parent and handler are signed pointers on arm64e.
+namespace {
+volatile uint32_t gFlipLossless;
+struct sysctl_oid gOidFlipLossless;
+bool gOidFlipLosslessRegistered;
+
+int sysctlFlipLossless(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    int v = int(__atomic_load_n(&gFlipLossless, __ATOMIC_ACQUIRE));
+    const int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr)
+        return err;
+    __atomic_store_n(&gFlipLossless, v ? 1u : 0u, __ATOMIC_RELEASE);
+    IOLog("NativeGopDisplay: flip mode: '&BGA' plane-0 flips %s (machdep.native_gop_flip_lossless=%d)\n", v ? "on" : "off", v ? 1 : 0);
+    return 0;
+}
+}  // namespace
+
+SYSCTL_DECL(_machdep);
+
+static void registerFlipLosslessSysctl()
+{
+    if (gOidFlipLosslessRegistered)
+        return;
+    gOidFlipLosslessRegistered = true;
+    struct sysctl_oid &o = gOidFlipLossless;
+    o.oid_parent = &sysctl__machdep_children;
+    o.oid_number = OID_AUTO;
+    o.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+    o.oid_arg1 = nullptr;
+    o.oid_arg2 = 0;
+    o.oid_name = "native_gop_flip_lossless";
+    o.oid_handler = sysctlFlipLossless;
+    o.oid_fmt = "I";
+    o.oid_descr = "NativeGopDisplay: '&BGA' frames flipped from plane 0 (1) or copied (0)";
+    o.oid_version = SYSCTL_OID_VERSION;
+    o.oid_refcnt = 0;
+    sysctl_register_oid(&o);
+}
 
 static IOPMPowerState gPowerStates[2] = {   // AppleParavirtDisplay's gPowerState
     {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -847,10 +890,14 @@ bool NativeGopDisplay::start(IOService *provider)
               "piano-dpu-flip=4), copied when refused or while a cursor is on the panel; a swap completes once on the panel\n");
         unsigned lossless = 0;
         PE_parse_boot_argn("native-gop-display-flip-lossless", &lossless, sizeof(lossless));
-        fFlipLossless = lossless != 0;
-        if (fFlipLossless)
+        __atomic_store_n(&gFlipLossless, lossless ? 1u : 0u, __ATOMIC_RELEASE);
+        if (lossless)
             GOPLOG("flip mode: '&BGA' plane-0 flips enabled (native-gop-display-flip-lossless=1): plane 0's offset and row bytes are "
                   "offered as linear 'BGRA'; other layouts are copied\n");
+        if (fFlipMode) {
+            registerFlipLosslessSysctl();
+            GOPLOG("flip mode: machdep.native_gop_flip_lossless=%u (root writes 0/1: copied or flipped '&BGA' frames)\n", lossless ? 1u : 0u);
+        }
     }
     static const char *const deferNames[3] = {"at once (native-gop-display-defer=0)",
                                               "at once unless the copy thread reads a surface it takes off the screen",
@@ -1615,7 +1662,8 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
         const bool planar = format == gopcompose::kFormatBGRALossless && planes >= 1;
         const gopcompose::FlipLayout layout = gopcompose::flipLayout(
             format, planes, ioSurfaceBaseOffset(surface), ioSurfaceBytesPerRow(surface), planar ? ioSurfacePlaneOffset(surface, 0) : 0,
-            planar ? ioSurfacePlaneBytesPerRow(surface, 0) : 0, planar ? ioSurfacePlaneBytesPerElement(surface, 0) : 0, fFlipLossless);
+            planar ? ioSurfacePlaneBytesPerRow(surface, 0) : 0, planar ? ioSurfacePlaneBytesPerElement(surface, 0) : 0,
+            __atomic_load_n(&gFlipLossless, __ATOMIC_ACQUIRE) != 0);
         normalized = format == gopcompose::kFormatBGRALossless && layout.format == gopcompose::kFormatBGRA;
         request->surface = surface;
         request->memory = ioSurfaceMemory(surface);
