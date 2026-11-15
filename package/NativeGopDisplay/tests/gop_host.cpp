@@ -140,6 +140,34 @@ static void testPixels()
   CHECK(bytesPerPixel(kFormatRGhA) == 8 && bytesPerPixel(kFormatBGRA) == 4 && bytesPerPixel(kFormatB3A8) == 4);
 }
 
+// native-gop-display-flip-lossless: which layout a flip offers PianoDpu (flip4 2026-11-15: '&BGA' frames, top-level row 3200)
+static void testFlipLayout()
+{
+  // enabled, '&BGA' with one plane of 4-byte elements: plane 0's offset and rows, as 'BGRA'
+  FlipLayout l = flipLayout(kFormatBGRALossless, 1, 0, 3200, 0, 12800, 4, true);
+  CHECK(l.format == kFormatBGRA && l.offset == 0 && l.rowBytes == 12800);
+  l = flipLayout(kFormatBGRALossless, 1, 64, 3200, 4096, 12864, 4, true);
+  CHECK(l.format == kFormatBGRA && l.offset == 4096 && l.rowBytes == 12864);
+  // disabled: the original layout and format (PianoDpu refuses it by format, the frame is copied)
+  l = flipLayout(kFormatBGRALossless, 1, 0, 3200, 0, 12800, 4, false);
+  CHECK(l.format == kFormatBGRALossless && l.offset == 0 && l.rowBytes == 3200);
+  // no plane, two planes, other element sizes: unchanged
+  l = flipLayout(kFormatBGRALossless, 0, 0, 3200, 0, 0, 0, true);
+  CHECK(l.format == kFormatBGRALossless && l.rowBytes == 3200);
+  l = flipLayout(kFormatBGRALossless, 2, 0, 3200, 0, 12800, 4, true);
+  CHECK(l.format == kFormatBGRALossless && l.rowBytes == 3200);
+  l = flipLayout(kFormatBGRALossless, 1, 0, 3200, 0, 25600, 8, true);
+  CHECK(l.format == kFormatBGRALossless && l.rowBytes == 3200);
+  // plain 'BGRA' keeps its top-level layout whatever the switch and the plane values
+  l = flipLayout(kFormatBGRA, 1, 128, 12800, 4096, 99, 4, true);
+  CHECK(l.format == kFormatBGRA && l.offset == 128 && l.rowBytes == 12800);
+  l = flipLayout(kFormatBGRA, 0, 0, 12800, 0, 0, 0, false);
+  CHECK(l.format == kFormatBGRA && l.offset == 0 && l.rowBytes == 12800);
+  // other formats are never renamed
+  l = flipLayout(kFormatRGhA, 1, 0, 25600, 0, 25600, 4, true);
+  CHECK(l.format == kFormatRGhA && l.rowBytes == 25600);
+}
+
 // --------------------------------------------------------------------------------------------------------------------- overlay
 static void testOverlay()
 {
@@ -1811,6 +1839,7 @@ int main()
   testGeometry();
   testParallelRows();
   testPixels();
+  testFlipLayout();
   testOverlay();
   testCompose();
   testLayers();

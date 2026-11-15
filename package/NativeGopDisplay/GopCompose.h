@@ -34,6 +34,23 @@ static constexpr uint32_t kFormatBGRA = 'BGRA', kFormatRGhA = 'RGhA', kFormatB3A
 // Nothing here compresses: the Metal plugin's frontend renders a planar surface at its plane's address and rows, so plane 0 holds
 // plain BGRA rows (NativeGopDisplay::openSource reads it as such).
 static constexpr uint32_t kFormatBGRALossless = '&BGA';
+
+// The layout a zero-copy flip offers PianoDpu (native-gop-display-flip-lossless=1, docs/drivers/dpu.md §4.1): an '&BGA' surface with
+// one plane of 4-byte elements is offered as plain 'BGRA' at plane 0's offset and rows (the top-level row of such a surface is not its
+// pixel pitch: flip4 logged "row 3200" for a 3200-wide frame); every other surface keeps its top-level layout and format, which
+// PianoDpu refuses or takes exactly as before. Nothing is read or decoded here; PianoDpu's checks stay the bounds authority.
+struct FlipLayout {
+    uint64_t offset, rowBytes;
+    uint32_t format;
+};
+
+inline FlipLayout flipLayout(uint32_t format, uint32_t planes, uint64_t baseOffset, uint64_t baseRowBytes, uint64_t planeOffset,
+                             uint64_t planeRowBytes, uint64_t planeBytesPerElement, bool losslessEnabled)
+{
+    if (losslessEnabled && format == kFormatBGRALossless && planes == 1 && planeBytesPerElement == 4)
+        return {planeOffset, planeRowBytes, kFormatBGRA};
+    return {baseOffset, baseRowBytes, format};
+}
 static constexpr uint32_t kBlack = 0xff000000u;
 static constexpr unsigned kLayers = 4;         // the family's layers in a swap (IOMFBSwapIORequest: surfaces at 2944 + 8 * i)
 static constexpr unsigned kRefreshTicks = 30;  // refresh copies on ticks 1, 2, 4, 8, 16 and 30 after a frame

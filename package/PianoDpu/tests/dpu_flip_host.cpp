@@ -1207,6 +1207,18 @@ static void testCheckSurface()
   CHECK(checkSurface(q).result == kPianoDpuFlipShown);
   q.rowBytes = 0xffc0;
   CHECK(checkSurface(q).result == kPianoDpuFlipSize);
+  // a raw '&BGA' request (its producer did not normalize it) is still refused by format, so it is copied
+  q = req(nullptr);
+  q.format = 0x26424741u;
+  CHECK(checkSurface(q).result == kPianoDpuFlipFormat);
+  // the normalized one ('BGRA' at plane 0's rows, one plane) passes exactly as a plain 'BGRA' frame
+  q.format = kFourccBgra;
+  q.planes = 1;
+  q.rowBytes = 12800;
+  CHECK(checkSurface(q).result == kPianoDpuFlipShown);
+  q.rowBytes = 3200;   // the top-level row flip4 logged for '&BGA': not a pixel pitch, refused as a stride
+  CHECK(checkSurface(q).result == kPianoDpuFlipStride);
+  q = req(nullptr);
   q.size = 8;
   CHECK(checkSurface(q).result == kPianoDpuFlipVersionMismatch);
   CHECK(std::strcmp(pianoDpuFlipResultName(kPianoDpuFlipUnderrun), "underrun") == 0 && std::strcmp(pianoDpuFlipResultName(99), "?") == 0);

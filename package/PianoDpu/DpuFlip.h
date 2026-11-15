@@ -145,7 +145,9 @@ inline bool sameTarget(const Target &a, const Target &b) { return a.base == b.ba
 
 // The surface rules (the 'BGRA' requests NativeGopDisplay sends). Rows and offsets in multiples of 64 bytes is this driver's policy,
 // not a measured DPU limit: the boot framebuffer's 12800 and msm's buffers on this DPU (32-pixel aligned pitch, 128 bytes) satisfy
-// it, an odd surface is copied instead.
+// it, an odd surface is copied instead. Only plain 'BGRA' is taken: an '&BGA' frame (27.3's WindowServer framebuffers) arrives here
+// already normalized by its producer (NativeGopDisplay, native-gop-display-flip-lossless=1: plane 0's offset and rows as 'BGRA'),
+// since this driver has no plane accessors to repair a top-level layout itself.
 struct Need {
   uint32_t result = kPianoDpuFlipShown;
   uint64_t bytes = 0;         // from the offset: the last row's end

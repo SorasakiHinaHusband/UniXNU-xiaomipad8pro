@@ -509,6 +509,10 @@ private:
     const OSSymbol *fDpuFlipSymbol;
     uint64_t fDpuLookupNext;          // mach time of the next lookup while none was found
     uint64_t fFlips, fFlipCopies;
+    // native-gop-display-flip-lossless=1 (default 0): an '&BGA' frame (WindowServer's framebuffers on 27.3) is offered to PianoDpu as
+    // plain 'BGRA' at its plane 0 (gopcompose::flipLayout); off, PianoDpu refuses it by format and it is copied as before.
+    bool fFlipLossless, fLosslessLayoutLogged;
+    uint64_t fLosslessFlips;
     bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
     // The PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), each off without its boot argument (and then nothing of this runs):
     //   piano-dpu-pcc=1|2       swap_set_color_matrix / set_gamma_table: logged (their raw bytes, B1d-0) and handed to PianoDpu's
@@ -841,6 +845,12 @@ bool NativeGopDisplay::start(IOService *provider)
         fDefer = gopcompose::kDeferAlways;
         GOPLOG("flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 "
               "piano-dpu-flip=4), copied when refused or while a cursor is on the panel; a swap completes once on the panel\n");
+        unsigned lossless = 0;
+        PE_parse_boot_argn("native-gop-display-flip-lossless", &lossless, sizeof(lossless));
+        fFlipLossless = lossless != 0;
+        if (fFlipLossless)
+            GOPLOG("flip mode: '&BGA' plane-0 flips enabled (native-gop-display-flip-lossless=1): plane 0's offset and row bytes are "
+                  "offered as linear 'BGRA'; other layouts are copied\n");
     }
     static const char *const deferNames[3] = {"at once (native-gop-display-defer=0)",
                                               "at once unless the copy thread reads a surface it takes off the screen",
@@ -1236,8 +1246,8 @@ IOReturn NativeGopDisplay::swap_begin_gated()
             GOPLOG("%llu copies skipped for newer ones\n", fCopiesSkipped);
         GOPLOG("at most %llu frames in a second\n", fPeakFps);
         if (fFlipMode)
-            GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them, is not serving, "
-                  "or a cursor was on the panel: %llu)\n", fFlips, fFlipCopies, fCursorForced);
+            GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies; %llu '&BGA' plane 0), %llu copied (PianoDpu refused "
+                  "them, is not serving, or a cursor was on the panel: %llu)\n", fFlips, fLosslessFlips, fFlipCopies, fCursorForced);
         if (fCursorJobs)
             GOPLOG("cursor: %llu updates of its old and new rectangles, mean %llu us max %llu us, last at (%d, %d)\n", fCursorJobs,
                   fCursorNs / fCursorJobs / 1000, fCursorMaxNs / 1000, fCursorX, fCursorY);
@@ -1598,23 +1608,38 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
     *request = {};
     request->size = sizeof(*request);
     request->version = kPianoDpuFlipVersion;
+    bool normalized = false;
     if (surface) {
+        const uint32_t format = ioSurfacePixelFormat(surface), planes = ioSurfacePlaneCount(surface);
+        // plane 0 is read only for an '&BGA' surface that has one (no plane accessor with a plane count of 0)
+        const bool planar = format == gopcompose::kFormatBGRALossless && planes >= 1;
+        const gopcompose::FlipLayout layout = gopcompose::flipLayout(
+            format, planes, ioSurfaceBaseOffset(surface), ioSurfaceBytesPerRow(surface), planar ? ioSurfacePlaneOffset(surface, 0) : 0,
+            planar ? ioSurfacePlaneBytesPerRow(surface, 0) : 0, planar ? ioSurfacePlaneBytesPerElement(surface, 0) : 0, fFlipLossless);
+        normalized = format == gopcompose::kFormatBGRALossless && layout.format == gopcompose::kFormatBGRA;
         request->surface = surface;
         request->memory = ioSurfaceMemory(surface);
-        request->offset = ioSurfaceBaseOffset(surface);
-        request->rowBytes = ioSurfaceBytesPerRow(surface);
+        request->offset = layout.offset;
+        request->rowBytes = layout.rowBytes;
         request->width = ioSurfaceWidth(surface);
         request->height = ioSurfaceHeight(surface);
-        request->format = ioSurfacePixelFormat(surface);
-        request->planes = ioSurfacePlaneCount(surface);
+        request->format = layout.format;
+        request->planes = planes;
         request->copyUs = fCopies ? static_cast<uint32_t>(fCopyNs / fCopies / 1000) : 0;
+        if (normalized && !fLosslessLayoutLogged) {
+            fLosslessLayoutLogged = true;
+            GOPLOG("flip '&BGA': plane 0 offset %llu row %llu, 4-byte pixels -> 'BGRA' request (linear; no decode, no copy)\n",
+                  request->offset, request->rowBytes);
+        }
     }
     if (fDpu->callPlatformFunction(fDpuFlipSymbol, false, request, nullptr, nullptr, nullptr) != kIOReturnSuccess)
         return false;
     static unsigned refusals;
     if (surface && request->result != kPianoDpuFlipShown && refusals++ < 8)
-        GOPLOG("flip refused (%s): %llux%llu row %llu format %#x; copied\n", pianoDpuFlipResultName(request->result),
-              request->width, request->height, request->rowBytes, request->format);
+        GOPLOG("flip refused (%s): %llux%llu row %llu format %#x%s; copied\n", pianoDpuFlipResultName(request->result),
+              request->width, request->height, request->rowBytes, request->format, normalized ? " (from '&BGA' plane 0)" : "");
+    if (normalized && request->result == kPianoDpuFlipShown)
+        fLosslessFlips++;
     return request->result == kPianoDpuFlipShown;
 }
 
