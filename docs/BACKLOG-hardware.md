@@ -74,6 +74,20 @@ Offline design started 2026-11-11: B1a (DPU survey + design), B3 (sensors design
 design), B10 (video design + survey), B11 (camera design), B12 (torch, built), B9 (Bluetooth design + level 1). Each item's page
 lives in `docs/drivers/`; this table is updated when an item moves.
 
+**Facts adopted from the Ubuntu port (github.com/yzddmr6/xiaomipad-8pro-mainline, v1.3.1 and v1.4.0, read 2026-11-15)**, each
+feeding an open item (reuse rule: that project's own code with its notice and provenance; upstream GPL kernel code only as
+calibration data):
+- B4 charging: charging and PD above 5 V are executed by the ADSP charger firmware (the kernel only carries MCA/GLINK messages);
+  fixed 9 V PDO on suspend; warm-cell protection from 48 C (our 38 C derating rows are too conservative); v1.4.0 adds MiPPS / PPS /
+  QC3 / QC3.5 / fixed 9 V with current set by source, cell temperature and voltage, and a net-power + protocol charging indicator
+  (our AdapterDetails).
+- B2 keyboard cover: two signals — the keyboard MCU's connected bit (attach/detach) and the folio hall on gpio80 as an edge
+  interrupt (close/open); hands1 polled gpio80's level and saw no change.
+- B12 torch: the LED lights under Linux as a timed flash pulse for photos plus a shared green privacy LED; a V4L2 flash owner
+  leaves the torch on after close.
+- Wi-Fi: WCN7860 calibration at cold boot before a 22 dBm board TX-power cap.
+- GPU: the Adreno GMU keep-alive register fix for the fault interrupt.
+
 **Last item (owner, 2026-11-15): drop the macOS-DroidVM build dependency**, after every hardware item above. Today the 27.3
 kernel tree is a clone of macOS-DroidVM's k27 tree (github.com/Droid-VM/macOS-DroidVM `11ac316`, via `PIANO_K27_TREE` and
 `tooling/k273/prepare-k27-tree.sh`) with this repository's kernel patches, its KC builder builds the collection, and
