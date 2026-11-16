@@ -487,8 +487,13 @@ struct KernelHw {
   // The secure calls (each logged before and after).
   void scmHold(bool take)
   {
-    if (take) piano_scm_kernel_take(&gScmShared);
-    else piano_scm_kernel_give(&gScmShared);
+    if (take) {
+      const int result = piano_scm_kernel_take(&gScmShared);
+      if (result == PianoScmLockTakenOver)
+        ::note("secure-call lock: TAKEN OVER before the PAS 9 sequence (the previous holder exceeded its bound)");
+    } else {
+      piano_scm_kernel_give(&gScmShared);
+    }
   }
   int scmPasInit(uint64_t metaPhys)
   {

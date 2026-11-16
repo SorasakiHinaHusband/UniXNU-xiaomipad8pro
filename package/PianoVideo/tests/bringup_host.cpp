@@ -1256,6 +1256,8 @@ static void testNoCmdDb()
 // ======================================================================================================================== V2
 static void testV2()
 {
+  CHECK(kPasId == 9 && kPasId != 1 && kPasId != 13 && kPasId != 36);
+  CHECK(kCarveout == 0x9c300000 && kCarveoutBytes == 0x800000);
   Run x(3);
   x.o.cycles = 3;
   const int rc = x.go();

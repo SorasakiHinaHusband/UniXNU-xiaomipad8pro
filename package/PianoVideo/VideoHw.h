@@ -21,6 +21,10 @@ constexpr uint64_t kSmmu = 0x15000000, kSmmuBytes = 0x100000;   // apps SMMU (qc
 // The firmware carveout: DT reserved-memory video@9c300000, 8 MiB, no-map; the node's memory-region. Outside XNU's DRAM window
 // (0x8c0000000..0xc00000000, dts/piano.dts): XNU never allocates it.
 constexpr uint64_t kCarveout = 0x9c300000, kCarveoutBytes = 0x800000;
+// This range is the DT's video@9c300000 reservation.  Keep the owner and extent
+// explicit: it is adjacent to camera-2 below and cvp above, and neither belongs
+// to the ADSP or to XNU's allocator.
+static_assert(kCarveout == 0x9c300000 && kCarveoutBytes == 0x800000, "video carveout contract changed");
 
 // The video core's SMMU streams: DT iommus = <&apps_smmu 0x1940 0>, <&apps_smmu 0x1947 0> (one Linux domain for both). The survey
 // lists every stream-match group covering 0x1940..0x194f, to see what else the boot stages or the hypervisor keep there.
@@ -101,6 +105,10 @@ constexpr uint32_t kAonVideoCtlNocLpiCtl = 0xe002c, kAonVideoCtlNocLpiStatus = 0
 // docs/scm-lock.md, tag PianoScmTagVideo): around each request through the Sm8750Scm ops, and once from init_image through
 // auth_and_reset and MP_VIDEO_VAR. PianoVideo.json names PianoA830 (the word's owner) as a library from then on.
 constexpr uint32_t kPasId = 9;
+// PAS 1/36 are PianoPower's ADSP images and PAS 13 is PianoA830's GPU ZAP.
+// Keep this guard next to the only video PAS constant so a copy/paste cannot
+// silently start or stop another subsystem.
+static_assert(kPasId == 9 && kPasId != 1 && kPasId != 13 && kPasId != 36, "PianoVideo must use PAS 9 only");
 constexpr uint32_t kCpStart = 0, kCpSize = 0x25800000, kCpNonPixelStart = 0x01000000, kCpNonPixelSize = 0x24800000;
 constexpr uint32_t kScmMpVideoVar = 0x42000c08;
 // The device address limit (iris_platform_vpu3x.c sm8750_data.dma_mask = 0xe0000000 - 1): every IOVA the core is given lies below.
