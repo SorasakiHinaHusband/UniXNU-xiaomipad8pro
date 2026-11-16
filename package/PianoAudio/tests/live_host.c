@@ -895,7 +895,7 @@ int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
     CHECK(preset_bytes > 100);
-    CHECK(audio_volume_q15(100) == AUDIO_Q15_ONE && audio_volume_q15(0) == 0 && audio_volume_q15(98) == 29204);
+    CHECK(audio_volume_q15(100) == AUDIO_Q15_ONE && audio_volume_q15(0) == 0 && audio_volume_q15(98) == 32713);
     CHECK(audio_ceiling_db(1) == AUDIO_CEILING_MAX && audio_ceiling_db(20) == 3277 && audio_ceiling_db(0) == AUDIO_CEILING_TEST);
     CHECK(audio_ceiling_db(6) == 16422 && audio_ceiling_db(41) == AUDIO_CEILING_TEST);
     testLevel8(AudioPortsUbuntu);

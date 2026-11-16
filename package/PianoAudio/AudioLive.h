@@ -73,7 +73,7 @@ void audio_live_shared_init(AudioLiveShared *sh, int16_t *out_storage, int16_t *
 void audio_live_running(AudioLiveShared *sh, int output, int input);
 uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t frames, uint32_t now_ms, int *wake);
 uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames);
-/* Level 9: the master volume in percent (0 silent, 100 unity, -0.5 dB a step below) and the mute; out of range: unchanged. */
+/* Level 9: the master volume in percent (0 silent, 100 unity, the shared -36 dB squared curve) and the mute; out of range: unchanged. */
 void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */

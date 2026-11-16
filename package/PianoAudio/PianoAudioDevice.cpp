@@ -66,10 +66,11 @@ enum : uint32_t {
     TerminalSpeaker = 0x73706b72, TerminalMicrophone = 0x6d696372,   // 'spkr', 'micr'
     StatusType = 0, StreamMemory = 0x10000000,
     ControlVolume = 1, ControlMute = 2,
-    ControlClass = 0x6163746c,       // 'actl'
-    LevelClass = 0x6c65766c,         // 'levl'
-    MuteClass = 0x6d757465,          // 'mute'
-    OutputScope = 0x6f757470,        // 'outp'
+    LevelBaseClass = PIANO_AUDIO_CONTROL_BASE_LEVEL,
+    LevelClass = PIANO_AUDIO_CONTROL_CLASS_VOLUME,
+    MuteBaseClass = PIANO_AUDIO_CONTROL_BASE_TOGGLE,
+    MuteClass = PIANO_AUDIO_CONTROL_CLASS_MUTE,
+    OutputScope = PIANO_AUDIO_CONTROL_SCOPE_OUTPUT,
 };
 struct EngineStatus { volatile uint64_t sampleTime, hostTime, seed, reserved, writeEnd; };
 static_assert(sizeof(EngineStatus) >= 0x28, "the HAL refuses a smaller engine status");
@@ -192,14 +193,14 @@ OSArray *controlSelectors() {
     if (OSNumber *n = OSNumber::withNumber(0x63726e67, 32)) { a->setObject(n); n->release(); } // 'crng'
     return a;
 }
-OSDictionary *makeControl(uint32_t id, uint32_t cls, uint32_t value, bool mute) {
+OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_t value, bool mute) {
     OSDictionary *d = OSDictionary::withCapacity(32);
     if (!d) return nullptr;
     setNumber(d, "control ID", id);
     setNumber(d, "UsageCase", mute ? 2 : 1);
     setNumber(d, "SampleRate", uint64_t(fixed64(Rate)), 64);
     setNumber(d, "IOAudioEngineDescription", 0);
-    setNumber(d, "base class", ControlClass);
+    setNumber(d, "base class", baseClass);
     setNumber(d, "class", cls);
     setNumber(d, "scope", OutputScope);
     setNumber(d, "element", 0);
@@ -216,17 +217,20 @@ OSDictionary *makeControl(uint32_t id, uint32_t cls, uint32_t value, bool mute) 
         setNumber(d, "left channel", 1);
         setNumber(d, "right channel", 2);
     } else {
-        /* The kernel's ramp is 0..100% in 0.5 dB steps. The board's -1 dBFS
-         * ceiling is applied before this control, so 0..100 is safe and gives
-         * 37.5 dB between the 25% and 100% test points. */
+        /* The DSP applies the shared -36 dB squared curve before the board's
+         * -1 dBFS ceiling; 0..100 therefore covers the full safe user range. */
         setNumber(d, "minimum value", 0);
         setNumber(d, "maximum value", 100);
         setBool(d, "range map", true);
         setNumber(d, "transfer function", 0);
         setNumber(d, "start int value", 0);
-        setSignedNumber(d, "start db value", -50, 64);
+        /* The level control's range is the same -36..0 dB squared curve used
+         * by the DSP gain.  A -50 dB floor makes normal positions too quiet
+         * (the Pad 6 Pro HEAD records that failure); -36 dB is the observed
+         * working range and still gives a >10 dB 25%-to-100% separation. */
+        setSignedNumber(d, "start db value", PIANO_AUDIO_VOLUME_MIN_DB, 64);
         setNumber(d, "integer steps", 100);
-        setNumber(d, "db per step", 1); // metadata is integral; transport stays 0.5 dB/percent
+        setNumber(d, "db per step", 1); // HAL's metadata is integral; range-map carries the curve
         setNumber(d, "left value", value);
         setNumber(d, "center value", value);
         setNumber(d, "right value", value);
@@ -293,6 +297,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     if (OSArray *a = streams(StreamID, channels(), isInput ? TerminalMicrophone : TerminalSpeaker)) { e->setProperty(key, a); a->release(); }
     if (OSArray *a = controls()) { e->setProperty("controls", a); a->release(); }
     e->setProperty("piano-audio-transport", gTransport->name);
+    e->setProperty("piano-audio-control-contract", "levl/vlme");
     if (!isInput) {
         setNumber(e, "piano-audio-volume", volumePercent);
         e->setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse);
@@ -302,8 +307,8 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
 OSArray *PianoAudioDevice::controls() const {
     OSArray *a = OSArray::withCapacity(isInput ? 1 : 2);
     if (!a || isInput) return a;
-    OSDictionary *level = makeControl(ControlVolume, LevelClass, volumePercent, false);
-    OSDictionary *mute = makeControl(ControlMute, MuteClass, masterMute ? 1 : 0, true);
+    OSDictionary *level = makeControl(ControlVolume, LevelBaseClass, LevelClass, volumePercent, false);
+    OSDictionary *mute = makeControl(ControlMute, MuteBaseClass, MuteClass, masterMute ? 1 : 0, true);
     if (level) { a->setObject(level); level->release(); }
     if (mute) { a->setObject(mute); mute->release(); }
     return a;

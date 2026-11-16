@@ -10,7 +10,19 @@ static int load(const int *p) {return __atomic_load_n(p, __ATOMIC_ACQUIRE);}
 static void store(int *p, int v) {__atomic_store_n(p, v, __ATOMIC_RELEASE);}
 
 /* ------------------------------------------------------------------------------------------------ levels in dB, as Q15 */
-/* 32767 * 10^(-0.5 n / 20) for n = 0..100: the master volume's steps of -0.5 dB (percent 100 - n). */
+/* The IOAudio2 volume control and the DSP use the same scalar curve: -36 dB
+ * at zero, 0 dB at unity, with dB proportional to (1-scalar)^2.  This keeps
+ * selector-2 scalar and decibel writes on the same speaker gain path while
+ * avoiding the -50 dB floor that made ordinary slider positions too quiet. */
+static const int16_t kVolumeQ15[101] = {
+    0, 564, 612, 663, 719, 778, 841, 909, 982, 1059, 1141, 1229, 1323, 1422, 1528, 1640, 1759, 1885, 2019, 2160,
+    2309, 2466, 2632, 2807, 2991, 3184, 3387, 3599, 3822, 4056, 4300, 4555, 4821, 5098, 5387, 5688, 6000, 6324, 6661, 7009,
+    7369, 7742, 8127, 8523, 8932, 9353, 9785, 10229, 10684, 11150, 11626, 12113, 12610, 13116, 13632, 14156, 14688, 15227, 15773, 16325,
+    16882, 17444, 18010, 18579, 19149, 19721, 20293, 20865, 21435, 22002, 22565, 23124, 23676, 24222, 24760, 25289, 25808, 26316, 26811, 27293,
+    27761, 28213, 28649, 29068, 29468, 29849, 30210, 30550, 30869, 31164, 31437, 31685, 31909, 32108, 32282, 32429, 32550, 32645, 32713, 32753, 32767};
+
+/* The safety-chain ceiling remains a conventional half-dB table, independent
+ * of the user-volume curve above. */
 static const int16_t kHalfDb[101] = {
     32767, 30934, 29204, 27570, 26028, 24572, 23197, 21900, 20675, 19518, 18426, 17395, 16422, 15504, 14636, 13818, 13045, 12315,
     11626, 10976, 10362, 9782, 9235, 8718, 8231, 7770, 7336, 6925, 6538, 6172, 5827, 5501, 5193, 4903, 4628, 4370, 4125, 3894, 3677,
@@ -22,7 +34,7 @@ int32_t audio_volume_q15(int percent)
 {
     if (percent <= 0) return 0;
     if (percent >= 100) return AUDIO_Q15_ONE;
-    return kHalfDb[100 - percent];
+    return kVolumeQ15[percent];
 }
 
 int32_t audio_ceiling_db(unsigned db)
