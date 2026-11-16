@@ -6,6 +6,7 @@
 // request, the scan list's address parse and the rebuilt elements, and the log's one-line-per-kind table.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. apple80211_host.cpp -o /tmp/apple80211_host && /tmp/apple80211_host
 #include "WifiApple80211.h"
+#include "PianoWifiUcTransport.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -33,6 +34,29 @@ static int userOut(void *ctx, const void *from, uint64_t to, uint32_t n)
   User &u = *static_cast<User *>(ctx);
   if (!u.inside(to, n)) return 14;
   std::memcpy(u.mem.data() + (to - User::kBase), from, n);
+  return 0;
+}
+
+// The IOUserClient SET path owns the staged descriptor in kernel memory.  Its
+// copy pair deliberately uses the real address of that allocation, matching
+// PianoWifi80211::ucIn's memcpy fallback rather than the fake user address.
+struct KernelBuffer {
+  std::vector<uint8_t> mem = std::vector<uint8_t>(0x3c30, 0);
+  uint64_t base() const { return reinterpret_cast<uint64_t>(mem.data()); }
+  bool inside(uint64_t at, uint32_t n) const { return at >= base() && at - base() <= mem.size() && uint64_t(n) <= mem.size() - (at - base()); }
+};
+static int kernelIn(void *ctx, uint64_t from, void *to, uint32_t n)
+{
+  KernelBuffer &b = *static_cast<KernelBuffer *>(ctx);
+  if (!b.inside(from, n)) return 14;
+  std::memcpy(to, b.mem.data() + (from - b.base()), n);
+  return 0;
+}
+static int kernelOut(void *ctx, const void *from, uint64_t to, uint32_t n)
+{
+  KernelBuffer &b = *static_cast<KernelBuffer *>(ctx);
+  if (!b.inside(to, n)) return 14;
+  std::memcpy(b.mem.data() + (to - b.base()), from, n);
   return 0;
 }
 
@@ -281,6 +305,28 @@ int main()
     r.put32(0, 0);                       // wrapper variant: selector word at 0x08 remains one
     a = r.ask(true, kAssociate, sizeof(AssociateRequest27));
     CHECK(a.error == 0 && a.associationProfile && a.associationProfileData.psk_len == 13);
+
+    // Fetch provenance: ioctl uses the caller's user pointer directly, while
+    // selector 0 supplies the same request inline at input+0x08 in a kernel
+    // buffer.  The latter must not interpret its first eight payload bytes as
+    // a second pointer (the tablet's PAC-looking h00/h04 came from that bug).
+    (void)r.associate(sizeof(AssociateRequest27), 10, 13);
+    KernelBuffer kb;
+    constexpr uint32_t ucDataAt = 8;
+    std::memcpy(kb.mem.data() + ucDataAt, r.user.mem.data(), sizeof(AssociateRequest27));
+    uint64_t inlineData = 0;
+    CHECK(ucInlineSetPayload(kb.mem.data(), uint32_t(kb.mem.size()), ucDataAt, sizeof(AssociateRequest27), inlineData));
+    Req uc = {};
+    std::strcpy(uc.name, "en2");
+    uc.type = kAssociate;
+    uc.length = sizeof(AssociateRequest27);
+    uc.data = inlineData;
+    UserIo kernelIo{&kb, kernelIn, kernelOut};
+    std::vector<uint8_t> kernelScratch(kScratchBytes);
+    Answer fromKernel = handle(r.st, kId, true, uc, kernelIo, kernelScratch.data());
+    CHECK(fromKernel.error == 0 && fromKernel.associationProfile && fromKernel.associationLayout == sizeof(AssociateRequest27) &&
+          fromKernel.associationHeader0 == 1 && fromKernel.associationCredentialLength == 13 &&
+          fromKernel.associationCredentialCipher == 10);
   }
 
   // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered

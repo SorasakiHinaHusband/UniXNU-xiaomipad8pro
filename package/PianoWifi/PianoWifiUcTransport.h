@@ -21,6 +21,19 @@ inline bool ucCommandAccepted(uint32_t command)
   return command == kUcGetCmd || command == kUcSetCmd;
 }
 
+// Apple80211IOCTLSetWrapper copies a SET payload into the IOUserClient's
+// kernel input structure immediately after the command/length words.  The
+// selector's `data` word at offset 0x08 is therefore the first eight payload
+// bytes on this path, not a second user pointer.  Keep the range check here so
+// both the real descriptor path and the host fake-buffer test use the same
+// fetch rule.
+inline bool ucInlineSetPayload(const uint8_t *base, uint32_t bytes, uint32_t offset, uint32_t length, uint64_t &address)
+{
+  if (!base || offset > bytes || uint64_t(length) > uint64_t(bytes - offset)) return false;
+  address = reinterpret_cast<uint64_t>(base + offset);
+  return true;
+}
+
 // IOUserClient's OOL descriptors refer to pageable memory in the calling task.
 // The caller must wire them before readBytes/writeBytes and complete them on
 // every exit path.  This small guard is also used by the host fake descriptor,

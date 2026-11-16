@@ -1358,8 +1358,21 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
     ucio.directOut = static_cast<uint8_t *>(args->structureOutput);
     ucio.directOutBytes = args->structureOutputSize;
   }
+  // Apple80211IOCTLSetWrapper copies a SET payload into the kernel input
+  // structure at offset 0x08 before IOConnectCallStructMethod.  With an OOL
+  // input descriptor (the normal 0x3c30-byte selector-0 call), the word we
+  // decoded as `data` is consequently the payload's first eight bytes.  Point
+  // the common handler at that kernel buffer so SET 20 parses the request,
+  // rather than treating those bytes as a user virtual address.  The same
+  // helper also covers the inline structure form used by the host fixture.
+  uint64_t inlineSetData = 0;
+  if (cmd == kUcSetCmd &&
+      pianowifi::a80211::ucInlineSetPayload(in, inputBytes, kUcDataAt, length, inlineSetData)) {
+    ucio.inlineData = true;
+    rq.data = inlineSetData;
+  }
   uint32_t inlineOffset = 0;
-  if (!inputDescriptor && cmd == kUcSetCmd && shengKernelBuffer(data, length, in, inputBytes, inlineOffset)) {
+  if (!ucio.inlineData && !inputDescriptor && cmd == kUcSetCmd && shengKernelBuffer(data, length, in, inputBytes, inlineOffset)) {
     // Raw sets carry their payload inline in the selector input when the wrapper has no
     // user pointer to copy from.  Accept that layout independently of the sheng A/B bit.
     ucio.inlineData = true;
