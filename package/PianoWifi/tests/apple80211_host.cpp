@@ -86,9 +86,16 @@ static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, 
 
 int main()
 {
+  // D.1 keeps one explicit boot-argument A/B: omitted/zero is the new asynchronous path;
+  // one selects the legacy preassigned/synchronous path.
+  CHECK(!useIfnet2Old(0));
+  CHECK(!useIfnet2Old(2));
+  CHECK(useIfnet2Old(kIfnet2Old));
+
   // ---- the layouts: the request and the answers' fixed sizes and offsets
   CHECK(sizeof(Req) == 40);
-  CHECK(sizeof(ScanResult) == 1164 && offsetof(ScanResult, elements) == 0x8c && offsetof(ScanResult, elementsLength) == 0x8a);
+  CHECK(sizeof(ScanResult) == 1164 && kScanResultBytes27 == 2280 && offsetof(ScanResult, elements) == 0x8c &&
+        offsetof(ScanResult, elementsLength) == 0x8a);
   CHECK(offsetof(ScanResult, channel) == 4 && offsetof(ScanResult, ssid) == 0x61 && offsetof(ScanResult, capability) == 0x1a);
   CHECK(sizeof(Power) == 24 && sizeof(Rssi) == 52 && sizeof(LinkEvent) == 32 && sizeof(Channel) == 12);
   CHECK(kChannelsInfoBytes == 0x2720 && kChannelsInfoCountAt == 0x0c && kChannelsInfoChannelAt == 0x32e &&
@@ -308,11 +315,13 @@ int main()
     CHECK(scanType == 0xffffffffu && ssidLength == 4);
     Answer a = r.ask(true, kScanReq, 5528);
     CHECK(a.error == 0 && (a.effects & kDoScanStarted) && r.st.scanRequests == 1);
-    // 27.3's 2280-byte record: the head and the elements written, its tail (a request identifier user space put at 0x88c) kept
+    // The user-client/raw-get loop returns 0 for each complete record, then exactly 5 at the list end.  The tail after the
+    // information elements is zeroed even though the caller prefilled it with a marker.
     std::memset(r.user.mem.data(), 0, kScanResultBytes27);
     std::memcpy(r.user.mem.data() + 0x88c, "request-7", 10);
     a = r.ask(false, kScanResult, kScanResultBytes27);
-    CHECK(a.error == 0 && a.wrote == 0x8c + 47 && std::memcmp(r.at(0x88c), "request-7", 10) == 0);
+    CHECK(a.error == 0 && a.wrote == kScanResultBytes27);
+    for (uint32_t i = 0x8c + 47; i < kScanResultBytes27; ++i) CHECK(r.at(i)[0] == 0);
     ScanResult got;
     std::memcpy(&got, r.at(0), sizeof got);
     CHECK(got.version == 1 && got.channel.channel == 36 && (got.channel.flags & kChan5GHz) && got.rssi == -48 && got.noise == -95);
@@ -325,31 +334,31 @@ int main()
     CHECK(e[19] == 50 && e[20] == 4 && e[21] == 0x30);
     CHECK(e[25] == 48 && e[26] == 20 && e[27] == 1);
     CHECK(got.elementsLength == 25 + 22);
-    a = r.ask(false, kScanResult, sizeof(ScanResult));
+    a = r.ask(false, kScanResult, kScanResultBytes27);
     std::memcpy(&got, r.at(0), sizeof got);
     CHECK(a.error == 0 && got.channel.channel == 6 && (got.channel.flags & kChan2GHz) && got.capability == 0x1);
     // 2.4 GHz: the DS parameter set (channel 6) after the rates
     CHECK(got.elements[0] == 0 && got.elements[6] == 1 && got.elements[16] == 3 && got.elements[17] == 1 && got.elements[18] == 6);
     CHECK(got.elementsLength == 6 + 10 + 3 + 6);
-    a = r.ask(false, kScanResult, sizeof(ScanResult));
+    a = r.ask(false, kScanResult, kScanResultBytes27);
     CHECK(a.error == kErrEndOfResults && r.st.cursor == 0 && r.st.listEnds == 1);
     // and again from the first
-    a = r.ask(false, kScanResult, sizeof(ScanResult));
+    a = r.ask(false, kScanResult, kScanResultBytes27);
     std::memcpy(&got, r.at(0), sizeof got);
     CHECK(a.error == 0 && got.bssid[5] == 1);
     // a short buffer: the head of the record
     a = r.ask(false, kScanResult, 0x8c);
     CHECK(a.error == 0 && a.wrote == 0x8c);
-    CHECK(resultBytes(got) == 0x8c + got.elementsLength);
+    CHECK(resultBytes(got) == kScanResultBytes27);
     // SCANCACHE_CLEAR: nothing until the next scan; then the list again
     CHECK(r.ask(true, kScanCacheClear, 0, false).error == 0);
-    CHECK(r.ask(false, kScanResult, sizeof(ScanResult)).error == kErrEndOfResults);
+    CHECK(r.ask(false, kScanResult, kScanResultBytes27).error == kErrEndOfResults);
     r.st.scan.count = 2;   // (the kext refreshes the snapshot before a SCAN_REQ)
     CHECK(r.ask(true, kScanReqMultiple, 0x400).error == 0);
-    CHECK(r.ask(false, kScanResult, sizeof(ScanResult)).error == 0);
+    CHECK(r.ask(false, kScanResult, kScanResultBytes27).error == 0);
     // an empty list: the end at once
     Rig e2;
-    CHECK(e2.ask(true, kScanReq, 0x80).error == 0 && e2.ask(false, kScanResult, 1164).error == kErrEndOfResults);
+    CHECK(e2.ask(true, kScanReq, 0x80).error == 0 && e2.ask(false, kScanResult, kScanResultBytes27).error == kErrEndOfResults);
   }
 
   // ---- the registry's address form; what is not a whole address is refused
