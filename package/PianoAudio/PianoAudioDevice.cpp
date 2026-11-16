@@ -655,6 +655,7 @@ struct PianoAudio2NotificationMessage {
     uint32_t scope;
     uint32_t element;
     uint32_t controlID;
+    uint64_t reserved;
 };
 
 void PianoAudioUserClient::sendControlNotification(uint32_t controlID) {
