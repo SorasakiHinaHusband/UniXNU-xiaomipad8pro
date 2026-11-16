@@ -106,7 +106,11 @@ class Bringup {
     if (o.level < 2 || o.level > 4) return kErrArgument;   // inert below piano-video=2: nothing is read or written
     power.stopAt = o.stop;
     firmware.stopAt = o.stop;
-    votes.floorVlvl = o.mmcxFloor;
+    // The boot framebuffer owns the display rail until a native display voter exists.  Keep
+    // the guard in the portable bring-up too, so a caller cannot bypass the boot-arg clamp.
+    votes.floorVlvl = o.mmcxFloor < kMmcxDisplayFloor ? kMmcxDisplayFloor : o.mmcxFloor;
+    if (votes.floorVlvl != o.mmcxFloor)
+      hw.note("rpmh: MMCX floor %#x raised to display floor %#x (boot-display guard)", o.mmcxFloor, votes.floorVlvl);
     idle.delayMs = o.idleMs;
     uint32_t bytes = 0;
     const uint8_t *db = hw.cmdDb(&bytes);

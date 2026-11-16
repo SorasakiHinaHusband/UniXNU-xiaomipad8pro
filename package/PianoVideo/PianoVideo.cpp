@@ -99,7 +99,9 @@ void readArgs()
   gArgs.resumes = clampArg("piano-video-resumes", 0, 1000);
   gArgs.unload = bootArg("piano-video-unload", 0) ? 1 : 0;
   gArgs.stop = clampArg("piano-video-stop", 0, kStepDone);
-  gArgs.mmcxFloor = clampArg("piano-video-mmcx-floor", kMmcxDisplayFloor, 0x1000);
+  const uint32_t requestedFloor = clampArg("piano-video-mmcx-floor", kMmcxDisplayFloor, 0x1000);
+  // Until a native display voter exists, V1 must not lower the boot framebuffer's MMCX rail.
+  gArgs.mmcxFloor = requestedFloor < kMmcxDisplayFloor ? kMmcxDisplayFloor : requestedFloor;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

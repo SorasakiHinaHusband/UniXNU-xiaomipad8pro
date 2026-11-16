@@ -1167,7 +1167,9 @@ static void testMmcxFloor()
   x.o.mmcxFloor = 0;
   x.m->allowMmcxDrop = true;
   CHECK(x.go() == kOk);
-  CHECK(x.m->count("vote mmcx 4") == 1 && x.m->count("vote mmcx 0") == 1);   // floor 0: the video's own need, then off
+  CHECK(x.m->count("vote mmcx 8") == 1 && x.m->count("vote mmcx 4") == 0 && x.m->count("vote mmcx 0") == 0);
+  CHECK(x.b->votes.floorVlvl == kMmcxDisplayFloor);
+  CHECK(x.m->logged("boot-display guard"));
   quiet(*x.m, "V1 floor 0");
 }
 
