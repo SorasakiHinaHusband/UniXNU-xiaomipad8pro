@@ -24,6 +24,9 @@ int main(void)
     CHECK(piano_audio_control_percent(100) == 100);
     CHECK(piano_audio_control_percent(f.u) == 25);
     CHECK(piano_audio_control_percent(d.u) == 60);
+    /* The selector reply must preserve these raw scalar encodings; turning
+     * them into 25/60 is the regression that made set volume read back zero. */
+    CHECK(f.u != 25u && d.u != 60u);
     CHECK(piano_audio_control_percent((uint64_t)25) == 25);
     CHECK(piano_audio_control_percent((uint64_t)60) == 60);
     CHECK(piano_audio_control_percent((uint64_t)100) == 100);

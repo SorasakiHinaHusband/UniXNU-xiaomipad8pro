@@ -151,8 +151,8 @@ void setNumber(OSDictionary *d, const char *key, uint64_t value, unsigned bits =
 void setNumber(IORegistryEntry *e, const char *key, uint64_t value, unsigned bits = 32) {
     if (OSNumber *n = OSNumber::withNumber(value, bits)) { e->setProperty(key, n); n->release(); }
 }
-void setSignedNumber(OSDictionary *d, const char *key, int64_t value, unsigned bits = 32) {
-    if (OSNumber *n = OSNumber::withNumber(value, bits)) { d->setObject(key, n); n->release(); }
+void setFloat(OSDictionary *d, const char *key, float value) {
+    if (OSNumber *n = OSNumber::withFloat(value)) { d->setObject(key, n); n->release(); }
 }
 void setBool(OSDictionary *d, const char *key, bool value) { d->setObject(key, value ? kOSBooleanTrue : kOSBooleanFalse); }
 OSDictionary *format(uint32_t channels) {
@@ -228,7 +228,11 @@ OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_
          * by the DSP gain.  A -50 dB floor makes normal positions too quiet
          * (the Pad 6 Pro HEAD records that failure); -36 dB is the observed
          * working range and still gives a >10 dB 25%-to-100% separation. */
-        setSignedNumber(d, "start db value", PIANO_AUDIO_VOLUME_MIN_DB, 64);
+        /* CoreAudio's decoded Level_Control parser asks for a Float32 dB
+         * seed. An OSNumber containing the signed integer -36 is displayed
+         * as an unsigned 64-bit value by ioreg and is rejected as a dB seed,
+         * leaving the HAL's virtual master at zero. */
+        setFloat(d, "start db value", float(PIANO_AUDIO_VOLUME_MIN_DB));
         setNumber(d, "integer steps", 100);
         setNumber(d, "db per step", 1); // HAL's metadata is integral; range-map carries the curve
         setNumber(d, "left value", value);
@@ -501,7 +505,11 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
         if (result == kIOReturnSuccess) result = device->apply(d, this);
         d->release();
         if (!result && a->scalarOutputCount >= 1) {
-            a->scalarOutput[0] = (id == ControlMute) ? (device->masterMute ? 1 : 0) : device->volumePercent;
+            /* Selector 2 returns the scalar representation that HAL passed
+             * in. Returning our percent integer changes a Float32/Float64
+             * scalar into a different value, so the HAL immediately reads
+             * the control back as zero and the next write does not stick. */
+            a->scalarOutput[0] = (id == ControlMute) ? (device->masterMute ? 1 : 0) : raw;
             a->scalarOutputCount = 1;
         }
         return result;
