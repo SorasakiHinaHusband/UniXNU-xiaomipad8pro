@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include "WifiHw.h"   // kScanEntriesMax, kSsidMax
 #include "WifiAssocSnapshot.h"
+#include "WifiProfile.h"
 
 namespace pianowifi {
 namespace a80211 {
@@ -129,6 +130,70 @@ struct LinkEvent {
   uint8_t unused3[4];
 };
 static_assert(sizeof(LinkEvent) == 32, "link event layout");
+
+// SET 20 carries one of two fixed association records.  The field meanings and offsets are
+// confirmed by the 27.3 Apple80211Associate2 parser and by the Pad 6 Pro binding (PAD6P0125;
+// SHENG-JOIN): the modern record has 32-bit authentication/key fields and moves the network
+// prefix from 0x0c to 0x10.  The trailing bytes are opaque to us and are deliberately zeroed.
+struct AssociateParameters {
+  uint32_t ssid_length;
+  uint8_t ssid[32];
+  uint8_t bssid[6], unused[2];
+  uint32_t key_version, key_length, key_cipher;
+  uint16_t key_flags, key_index;
+  uint8_t key[64];
+};
+struct AssociateRequestLegacy {
+  uint32_t version;
+  uint16_t mode, auth_lower, auth_upper, unused;
+  AssociateParameters network;
+  uint8_t rest[0x250 - 0x88];
+};
+struct AssociateRequest27 {
+  uint32_t version;
+  uint16_t mode, unused;
+  uint32_t auth_lower, auth_upper;
+  AssociateParameters network;
+  uint8_t rest[0x290 - 0x8c];
+};
+static_assert(sizeof(AssociateParameters) == 0x7c && offsetof(AssociateParameters, key) == 0x3c,
+              "association network prefix");
+static_assert(sizeof(AssociateRequestLegacy) == 592 && offsetof(AssociateRequestLegacy, network) == 0x0c,
+              "legacy association layout");
+static_assert(sizeof(AssociateRequest27) == 656 && offsetof(AssociateRequest27, network) == 0x10,
+              "modern association layout");
+
+// Modern Apple80211Associate2 completion.  The 27.3 event consumer accepts this 540-byte
+// record; the first attempt slot carries the BSSID, result at 0x214 and validity at 0x218.
+struct AssociateEvent27 {
+  uint8_t attempts[10][52];
+  uint32_t reserved[2], reason, result, has_result;
+};
+static_assert(sizeof(AssociateEvent27) == 540 && offsetof(AssociateEvent27, result) == 0x214 &&
+              offsetof(AssociateEvent27, has_result) == 0x218, "modern association event");
+
+enum : uint32_t {
+  kAssociateProblemNone = 0,
+  kAssociateProblemLayout,
+  kAssociateProblemVersion,
+  kAssociateProblemSsid,
+  kAssociateProblemKeyLength,
+  kAssociateProblemCipher,
+  kAssociateProblemProfile,
+};
+
+inline const char *associateProblemName(uint32_t problem)
+{
+  switch (problem) {
+  case kAssociateProblemLayout: return "unsupported association layout";
+  case kAssociateProblemVersion: return "association version is not 1";
+  case kAssociateProblemSsid: return "network name length is not 1 to 32 bytes";
+  case kAssociateProblemKeyLength: return "credential length is out of range";
+  case kAssociateProblemCipher: return "credential cipher/length is not supported";
+  case kAssociateProblemProfile: return "the association did not form a usable join profile";
+  default: return "unknown association refusal";
+  }
+}
 
 // ------------------------------------------------------------------------------------------------------------- the values
 enum : uint32_t { kStateInit = 0, kStateScan = 1, kStateAuth = 2, kStateAssoc = 3, kStateRun = 4 };
@@ -422,6 +487,7 @@ constexpr bool useIfnet2Old(uint32_t mode) { return (mode & kIfnet2Old) != 0; }
 struct Association {
   bool associated = false;
   bool authorized = false;
+  bool modern = false;             // the accepted SET 20 used the 656-byte request
   uint8_t ssid[kSsidMax] = {};
   uint8_t ssidLength = 0;
   uint8_t bssid[6] = {};
@@ -486,6 +552,10 @@ struct Answer {
   uint32_t effects = 0;    // kDo*
   uint32_t wrote = 0;      // bytes copied out (the log line's "wrote")
   bool accepted = false;   // answered by an accept mode, not by a handler of ours
+  bool associationProfile = false;  // SET 20 parsed into associationProfileData below
+  uint32_t associationProblem = kAssociateProblemNone;
+  uint32_t associationLayout = 0;
+  piano_wifi_profile associationProfileData = {};
 };
 
 // The user-space copies (copyin/copyout in the kext, memcpy in the host test); each returns 0 or an errno.
@@ -566,6 +636,92 @@ inline uint32_t strLen(const char *s, uint32_t max)
   while (s && n < max && s[n]) ++n;
   return n;
 }
+
+inline void associateProblem(Answer &a, uint32_t problem, uint32_t layout)
+{
+  a.associationProblem = problem;
+  a.associationLayout = layout;
+  a.error = kErrInval;
+}
+
+// Convert airportd's association request into the profile consumed by level 7 and the
+// 802.1X client.  Cipher 10 is the passphrase form; cipher 6 is the 32-byte PMK form
+// and is represented as the profile's accepted 64 hexadecimal characters.  No input
+// bytes are logged; the caller reports only the refusal class or length metadata.
+inline bool parseAssociate(const Req &rq, const UserIo &io, Answer &a)
+{
+  const uint32_t layout = rq.length;
+  if (layout != sizeof(AssociateRequestLegacy) && layout != sizeof(AssociateRequest27)) {
+    associateProblem(a, kAssociateProblemLayout, layout);
+    return false;
+  }
+  union {
+    AssociateRequestLegacy legacy;
+    AssociateRequest27 modern;
+  } wire = {};
+  if (copyIn(rq, io, &wire, sizeof wire)) {
+    associateProblem(a, kAssociateProblemLayout, layout);
+    return false;
+  }
+  const uint32_t version = layout == sizeof(AssociateRequest27) ? wire.modern.version : wire.legacy.version;
+  const AssociateParameters *network = layout == sizeof(AssociateRequest27) ? &wire.modern.network : &wire.legacy.network;
+  if (version != 1) {
+    associateProblem(a, kAssociateProblemVersion, layout);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  if (network->ssid_length < 1 || network->ssid_length > kSsidMax) {
+    associateProblem(a, kAssociateProblemSsid, layout);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  if (network->key_length > sizeof network->key) {
+    associateProblem(a, kAssociateProblemKeyLength, layout);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  if (network->key_length && !((network->key_cipher == 6 && network->key_length == 32) ||
+                               (network->key_cipher == 10 && network->key_length >= 8 && network->key_length <= 63))) {
+    associateProblem(a, kAssociateProblemCipher, layout);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  piano_wifi_profile &p = a.associationProfileData;
+  p.magic = PIANO_WIFI_PROFILE_MAGIC;
+  p.version = PIANO_WIFI_PROFILE_VERSION;
+  p.security = network->key_length ? PianoWifiSecWpa2Psk : PianoWifiSecOpen;
+  p.ssid_len = uint8_t(network->ssid_length);
+  for (uint32_t i = 0; i < network->ssid_length; ++i) p.ssid[i] = network->ssid[i];
+  bool bssid = false;
+  for (unsigned i = 0; i < sizeof p.bssid; ++i) {
+    p.bssid[i] = network->bssid[i];
+    bssid = bssid || network->bssid[i] != 0;
+  }
+  if (bssid) p.flags |= PianoWifiProfileBssid;
+  if (network->key_cipher == 6 && network->key_length == 32) {
+    static const char hex[] = "0123456789abcdef";
+    p.psk_len = 64;
+    for (uint32_t i = 0; i < 32; ++i) {
+      p.psk[2 * i] = uint8_t(hex[network->key[i] >> 4]);
+      p.psk[2 * i + 1] = uint8_t(hex[network->key[i] & 0xf]);
+    }
+  } else if (network->key_length) {
+    p.psk_len = uint8_t(network->key_length);
+    for (uint32_t i = 0; i < network->key_length; ++i) p.psk[i] = network->key[i];
+  }
+  const char *problem = piano_wifi_profile_problem(&p, sizeof p);
+  if (problem) {
+    associateProblem(a, kAssociateProblemProfile, layout);
+    piano_wifi_profile_wipe(&p);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  a.associationProfile = true;
+  a.associationProblem = kAssociateProblemNone;
+  a.associationLayout = layout;
+  zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+  return true;
+}
 }  // namespace detail
 
 // The channels this station scans (level 6's list: WifiLink.h, 2.4 GHz 1-13 and the 5 GHz non-radar ones).
@@ -641,6 +797,17 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     case kPowerSave:
       return a;   // accepted, nothing to change in M1
     case kAssociate:
+      // Parse the complete request before acknowledging it.  The front end hands the
+      // resulting profile to PianoWifi's level-7 machine after this lock is released.
+      a.associationProfile = false;
+      a.associationProblem = kAssociateProblemNone;
+      a.associationLayout = rq.length;
+      (void)parseAssociate(rq, io, a);
+      if (a.associationProfile) {
+        s.association.modern = rq.length == sizeof(AssociateRequest27);
+        a.error = 0;
+      }
+      return a;
     case kDisassociate:
     case kDeauth:
     case kCipherKey:

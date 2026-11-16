@@ -626,13 +626,26 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
     refreshScanLocked();
     if (type == kScanReq) scanReqInfo(rq, io, directed, scanType);
   }
-  const Answer a = handle(*fState, kIdentity, set, rq, io, fScratch);
+  Answer a = handle(*fState, kIdentity, set, rq, io, fScratch);
   const bool first = fSeen->first(type, set, length, a.error);
   ++fRequests;
   if (a.error == kErrUnsupported) ++fUnknown;
   const uint32_t networks = fState->scan.count, cursor = fState->cursor;
   const bool power = fState->power;
   IOLockUnlock(fLock);
+  if (set && type == kAssociate) {
+    if (a.associationProfile) {
+      const int e = piano_wifi_menu_join_profile(&a.associationProfileData);
+      piano_wifi_profile_wipe(&a.associationProfileData);
+      if (e) {
+        a.error = e;
+        note80211("%s: ASSOCIATE refused: the validated profile could not be handed to level 7 (errno %d)", fIfName, e);
+      }
+    } else if (a.error) {
+      note80211("%s: ASSOCIATE refused: %s (layout %u; no profile kept)", fIfName,
+                associateProblemName(a.associationProblem), unsigned(a.associationLayout));
+    }
+  }
   if (first) {
     char extra[64] = "";
     if (scanSet) snprintf(extra, sizeof extra, "; %u network(s)%s", unsigned(networks), directed ? ", a directed scan" : "");

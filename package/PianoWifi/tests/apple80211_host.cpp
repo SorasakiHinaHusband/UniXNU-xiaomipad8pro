@@ -61,6 +61,20 @@ struct Rig {
   }
   const uint8_t *at(uint32_t off) const { return user.mem.data() + off; }
   void put32(uint32_t off, uint32_t v) { std::memcpy(user.mem.data() + off, &v, 4); }
+  Answer associate(uint32_t layout = sizeof(AssociateRequest27), uint32_t cipher = 10, uint32_t keyLength = 13)
+  {
+    std::memset(user.mem.data(), 0, layout);
+    const uint32_t network = layout == sizeof(AssociateRequest27) ? 0x10 : 0x0c;
+    put32(0, 1);                         // request version
+    put32(network, 4);                   // SSID length (the bytes are test-only)
+    std::memcpy(user.mem.data() + network + 4, "test", 4);
+    if (keyLength) {
+      put32(network + 0x30, keyLength);
+      put32(network + 0x34, cipher);
+      for (uint32_t i = 0; i < keyLength; ++i) user.mem[network + 0x3c + i] = uint8_t('a' + (i % 20));
+    }
+    return ask(true, kAssociate, layout);
+  }
 };
 
 static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, bool rsn)
@@ -225,11 +239,33 @@ int main()
     CHECK(r.ask(false, kVirtualIfRole, 0, false).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
     Answer e = r.ask(true, kInfraEnumerated, 1);                               // accepted by default (kAcceptInfraEnumerated)
     CHECK(e.error == 0 && e.accepted && r.st.acceptedUnknown == 1);
-    CHECK(r.ask(true, kAssociate, 656).error == 0);
+    CHECK(r.associate().error == 0);
     CHECK(r.ask(true, kCipherKey, 148).error == 0);
     CHECK(r.ask(false, 9999, 16).error == kErrUnsupported);
     // accepted sets that change nothing
     CHECK(r.ask(true, kCountryCode, 8).error == 0 && r.ask(true, kPowerSave, 8).error == 0);
+  }
+
+  // ---- SET 20: both wire layouts become a level-7 profile; malformed requests are refused with a reason
+  {
+    Rig r;
+    Answer a = r.associate(sizeof(AssociateRequest27), 10, 13);
+    CHECK(a.error == 0 && a.associationProfile && a.associationLayout == 656);
+    CHECK(a.associationProfileData.security == PianoWifiSecWpa2Psk && a.associationProfileData.ssid_len == 4 &&
+          a.associationProfileData.psk_len == 13 && std::memcmp(a.associationProfileData.ssid, "test", 4) == 0);
+    a = r.associate(sizeof(AssociateRequestLegacy), 10, 8);
+    CHECK(a.error == 0 && a.associationProfile && a.associationLayout == 592 && a.associationProfileData.psk_len == 8);
+    a = r.associate(sizeof(AssociateRequest27), 6, 32);
+    CHECK(a.error == 0 && a.associationProfile && a.associationProfileData.psk_len == 64 &&
+          a.associationProfileData.psk[0] == '6' && a.associationProfileData.psk[1] == '1');
+    a = r.associate(sizeof(AssociateRequest27), 7, 8);
+    CHECK(a.error == kErrInval && !a.associationProfile && a.associationProblem == kAssociateProblemCipher);
+    a = r.ask(true, kAssociate, 600);
+    CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemLayout);
+    std::memset(r.user.mem.data(), 0, 656);
+    r.put32(0, 2);
+    a = r.ask(true, kAssociate, 656);
+    CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemVersion);
   }
 
   // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered
@@ -268,7 +304,7 @@ int main()
     ScanResult joined;
     std::memcpy(&joined, r.at(0), sizeof joined);
     CHECK(joined.ssidLength == 4 && std::memcmp(joined.ssid, "test", 4) == 0 && joined.bssid[5] == 0x55);
-    CHECK(r.ask(true, kAssociate, 656).error == 0 && r.ask(true, kDisassociate, 0).error == 0);
+    CHECK(r.associate().error == 0 && r.ask(true, kDisassociate, 0).error == 0);
   }
 
   // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered
@@ -291,9 +327,9 @@ int main()
     a = r.ask(false, kVirtualIfRole, 0, false);
     CHECK(a.error == 0 && a.accepted && r.rq.value == 0);
     // the handlers of ours and the join's sets (M2) are not changed by any mode
-    CHECK(r.ask(false, kRssi, 52).error == kErrNotAssociated && r.ask(true, kAssociate, 656).error == 0);
+    CHECK(r.ask(false, kRssi, 52).error == kErrNotAssociated && r.associate().error == 0);
     r.st.accept = 0;
-    CHECK(r.ask(true, kInfraEnumerated, 1).error == kErrUnsupported && r.ask(true, kAssociate, 656).error == 0);
+    CHECK(r.ask(true, kInfraEnumerated, 1).error == kErrUnsupported && r.associate().error == 0);
     Seen seen;
     CHECK(seen.first(85, true, 2068, 0) && !seen.first(85, true, 2068, 0));
     seen.clear();

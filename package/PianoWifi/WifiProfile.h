@@ -33,6 +33,17 @@ struct piano_wifi_profile {
   uint8_t psk[64];
 };
 
+// Apple80211 SET 20 uses this kernel boundary to hand a validated, ephemeral
+// profile to the level-7 ladder.  It copies the bytes into the driver's locked
+// profile store; callers wipe their temporary copy immediately afterwards.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int piano_wifi_menu_join_profile(const struct piano_wifi_profile *profile);
+#ifdef __cplusplus
+}
+#endif
+
 // The profile file's stamp (the kext's reader, WifiProfileFile.c): the file is read again whenever it differs from the last
 // read's. The change time is in it so that a chmod (a file first refused for its mode) is seen as well.
 struct piano_wifi_profile_stamp {
