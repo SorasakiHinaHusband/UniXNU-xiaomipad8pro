@@ -49,6 +49,21 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoVideo "$P/PianoVideo.cpp" "$D
   "$P/FatVolume.c" "$P/QcomMdt.c" "$P/Sm8750Scm.c" "$P/vt/PianoVideoVTParavirt.cpp" "$P/vt/PianoVideoVTHost.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" \
   "$D/package/common/PianoFirmwareZlib.c" "$O/gen/PianoVideoFirmware.c" -I "$P" -I "$D/package/common" -I "$O/gen" \
   --obj "${K27_OBJ:-k27-native-obj}"
+# PianoVideoVTParavirt owns two Apple-named IOService classes.  As with the audited accelerator, move its
+# compiler-generated class initializer out of __mod_init_func and export it for preModLoad/postModLoad.
+VT_OBJ=$O/PianoVideoVTParavirt.o; VT_LATE=$O/PianoVideoVTParavirt.late.o
+LLVM_OBJCOPY=$(command -v llvm-objcopy || true)
+[ -n "$LLVM_OBJCOPY" ] || LLVM_OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
+[ -x "$LLVM_OBJCOPY" ] || { echo "Error: llvm-objcopy is required to stage PianoVideoVTParavirt" >&2; exit 1; }
+"$LLVM_OBJCOPY" --remove-section=__DATA,__mod_init_func \
+  --globalize-symbol=__GLOBAL__sub_I_PianoVideoVTParavirt.cpp "$VT_OBJ" "$VT_LATE"
+python3 - "$O/objects.json" "$VT_OBJ" "$VT_LATE" <<'PY'
+import json, sys
+path, old, new = sys.argv[1:]
+items = json.loads(open(path).read())
+items = [new if item == old else item for item in items]
+open(path, 'w').write(json.dumps(items, indent=1) + '\n')
+PY
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words (DRV-2, the secure-call lock, the shared multimedia votes' lock and state) and NativeUfs's partition reader (the firmware loader's ESP source) come from
 # those kexts (libraries in PianoVideo.json, both linked before PianoVideo in configs/k27-native-kexts.txt), resolved by the KC link.

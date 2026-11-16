@@ -17,7 +17,7 @@ Changes for native PianoVideo V0b:
     internal ABI names only;
   * changed boot control to piano-video-vt=1 and console prefixes to PianoVideo;
   * changed advertised implementation identifiers/descriptions to PianoVideo;
-  * added the service properties used by the VideoToolbox support probe;
+  * added the Apple user-client property and a diagnostic property recording the confirmed class/open guest gate;
   * added the capability-only stub backend and no encode device.
 
 License: BSD-2-Clause-Patent.  See LICENSE in this directory.

@@ -69,7 +69,7 @@ struct Args {
   uint32_t cycles, holdMs, idleMs, resumes, unload, stop, mmcxFloor;
 };
 Args gArgs;
-extern "C" int droidvm_vt_paravirt_attach(void);
+extern "C" int piano_video_vt_attach(void);
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -616,7 +616,7 @@ bool PianoVideo::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   if (bootArg("piano-video-vt", 0)) {
-    const int vt = droidvm_vt_paravirt_attach();
+    const int vt = piano_video_vt_attach();
     note("vt attach: piano-video-vt=1 result=%d", vt);
   }
   note("start: piano-video=%u cc=%u smmu=%u carveout=%u delay=%u repeat=%u samples=%u (Iris %#llx, VIDEO_CC %#llx, SPI %u, streams "

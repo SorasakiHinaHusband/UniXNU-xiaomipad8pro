@@ -82,7 +82,7 @@ interconnect `sm8750.c`; the firmware pin (`xiaomipad-8pro-mainline/firmware/pia
 
 | Piece | Base (licence) | Use |
 |---|---|---|
-| VideoToolbox side | the VM-era VideoToolbox paravirtual files, source UniXNU-droidvm `706338e`: `package/DroidVMVTParavirt.cpp` (the service), `DroidVMVTHost.cpp` (the host), `DroidVMVTWire.h` (the wire format) + its patch series 0001–0017 (BSD-2-Clause-Patent) | vendored unchanged as `package/PianoVideo/vt/` with UPSTREAM (level 6) |
+| VideoToolbox side | the VM-era VideoToolbox paravirtual files, source UniXNU-droidvm `706338e`: `package/DroidVMVTParavirt.cpp` (the service), `DroidVMVTHost.cpp` (the host), `DroidVMVTWire.h` (the wire format) + its patch series 0001–0017 (BSD-2-Clause-Patent) | vendored as `package/PianoVideo/vt/`; native renames, boot control and the V0b stub are listed in UPSTREAM (level 6) |
 | Its transport | its virtio-media transport file | **replaced** by PianoVideo's Iris backend, the same 14 functions |
 | PAS, MDT, firmware file | PianoPower `Sm8750Scm.c` (MIT, copied; MP_VIDEO_VAR and PAS shutdown through its generic call), `QcomMdt.c`, `FatVolume.c` (copied); the shared run-time firmware loader (`package/common`, [kc-space.md](../kc-space.md) §6: a pin in the kext, the file from a RAM image's addon or the ESP) | level 3: built (`VideoFirmware.h`, §12.2) |
 | Rails, bandwidth | PianoA830 `Sm8750Rpmh` (MIT): its cmd-db layout, corner rule and TCS protocol re-expressed in `VideoRpmh.h` under its DRV-2 owner word: `mxc.lvl`, `mmcx.lvl`, MM1 (not SH0/MC0/ACV: §12.1) | level 2: built (§12.1) |
@@ -109,8 +109,11 @@ payloads in the 64-bit Linux layouts it already builds. Natively the page lists 
 copies each decoded frame into the player's IOSurface as in the VM, or decodes in place (its direct mode).
 Rejected: an AppleAVD-compatible service (AVD's userspace drives Apple's own hardware), a private VideoToolbox decoder plug-in (its
 method tables would need Apple binary reverse engineering), MediaExtension decoders (public, but for formats the system lacks, in
-apps that opt in; inferred from Apple's documentation). The one open risk is VideoToolbox's "running in a guest" decision with the
-truthful `vmm-present = 0` (open question 1): level V0b answers it in one boot, before any HFI work.
+apps that opt in; inferred from Apple's documentation). The 27.3 guest gate is established from code: `VTParavirtualizationIsRunningInGuest`
+dispatches once to `VTParavirtualizationGuestSupportSetUpWithHandlers`; the support framework matches the registry class
+`AppleVideoToolboxParavirtualizationDriver`, then opens its `IOUserClientClass` `AppleVideoToolboxParavirtualizationUserClient`
+with `IOServiceOpen` type 0. This path does not read `kern.hv_vmm_present` or a guest boolean property, so a kext can satisfy it
+truthfully while leaving `kern.hv_vmm_present=0`.
 
 **4.2 Memory: a translating bank of our own.** The core addresses 32 bits below 0xe0000000, and every XNU page is above 4 GiB
 (0x8c0000000..0xc00000000), so bypass cannot work: the streams need a stage-1 bank with XNU's tables. It is the same root problem as
@@ -261,8 +264,11 @@ events (software again) and powers the core off. A hang or reset returns to the 
 
 ## 10. Open questions
 
-1. **Guest gate:** 27.3 `VTParavirtualizationIsRunningInGuest` dispatches once to `VTParavirtualizationGuestSupportSetUpWithHandlers`; the support framework matches `AppleVideoToolboxParavirtualizationDriver` and opens its user client. V0b tests this with `kern.hv_vmm_present=0`; setting the sysctl is not part of the implementation because it changes other subsystems and costs the
-   'RGhA' framebuffer (`soft-metal.md`); no other route is open within the rules.
+1. **Guest gate (resolved in V0b analysis):** 27.3 dispatches once to `VTParavirtualizationGuestSupportSetUpWithHandlers`; the
+   support framework calls `IOServiceMatching("AppleVideoToolboxParavirtualizationDriver")`, `IOServiceGetMatchingService`, and
+   `IOServiceOpen(type=0)`, using the service's `IOUserClientClass` `AppleVideoToolboxParavirtualizationUserClient`. It does not
+   read `kern.hv_vmm_present` or a guest boolean property. V0b tests this with `kern.hv_vmm_present=0`; setting that sysctl remains
+   out of scope because it changes other subsystems and costs the 'RGhA' framebuffer (`soft-metal.md`).
 2. The state at XNU time (GCC video AHB, GDSCs, PLL0) and whether VIDEO_CC is readable at the boot rail levels → V0.
 3. SMMU: entries for 0x1940..0x194f, free groups and banks, CTTW → V0; a fresh bank accepted under Gunyah → V3.
 4. PAS 9 from XNU with the owner's file, under the secure-call lock (`../scm-lock.md`, built 2026-11-11) → V2 (built: §12.2;

@@ -113,9 +113,11 @@ public:
     bool start(IOService *provider) override {
         if (!IOService::start(provider)) return false;
         setProperty("IOUserClientClass", "AppleVideoToolboxParavirtualizationUserClient");
-        setProperty("VTIORegistryCapabilitiesKey", "vtpv");
-        setProperty("piano-video-vt-guest", true);
-        IOLog("PianoVideo: vt guest property published: VTIORegistryCapabilitiesKey=vtpv\n");
+        // The 27.3 support framework's guest gate matches this IOClass and then calls IOServiceOpen(type 0).
+        // It does not read kern.hv_vmm_present or a guest boolean property.  Keep a diagnostic property so the
+        // registry records exactly what this service implements; IOUserClientClass is consumed by IOServiceOpen.
+        setProperty("piano-video-vt-guest-gate", "IOServiceMatching(AppleVideoToolboxParavirtualizationDriver)+IOServiceOpen(type=0)");
+        IOLog("PianoVideo: vt guest property published: gate=IOServiceMatching(AppleVideoToolboxParavirtualizationDriver)+IOServiceOpen(type=0), kern.hv_vmm_present untouched\n");
         // Synchronously: a process that writes kern.piano_video_vt finds the service as soon as the write returns.
         registerService(kIOServiceSynchronous);
         IOLog("PianoVideo: vt service started: AppleVideoToolboxParavirtualizationDriver user-client AppleVideoToolboxParavirtualizationUserClient\n");
@@ -317,8 +319,8 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort
     return result;
 }
 
-#define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
-DROIDVM_LATE_INIT(DroidVMVTParavirt)
+#define PIANO_VIDEO_LATE_INIT(file) extern "C" void piano_video_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
+PIANO_VIDEO_LATE_INIT(PianoVideoVTParavirt)
 
 // Publishes the service on IOResources, once.
 static int publish(void) {
@@ -369,7 +371,7 @@ int piano_video_vt_attach(void) {
     if (droidvm_vtpv_stage) return -1;
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) return -1;
-    droidvm_late_init_DroidVMVTParavirt();
+    piano_video_late_init_PianoVideoVTParavirt();
     if (OSMetaClass::postModLoad(module)) return -1;
     droidvm_vtpv_stage = 1;
     if (!(publishLock = IOLockAlloc())) return -1;
