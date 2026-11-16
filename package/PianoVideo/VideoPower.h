@@ -66,11 +66,32 @@ class Power {
   bool requestedOn(uint32_t gdscr) { return ccReadable() && !(ops.rd(kVideoCc + gdscr) & kGdscCollapse); }
   bool codecReadable() const { return controllerReadable() && st.codecGdsc && st.axi0 && st.codecFreerun && st.codecClk; }
 
+  // Power::on() unwinds immediately on an error.  Capture the registers while the rails and
+  // clocks are still readable; the bring-up layer adds SMMU/firmware details for later stages.
+  void failureRaw(int stepNo, int rc)
+  {
+    ops.hw.note("failure raw: stage %d rc %d", stepNo, rc);
+    if (ccReadable())
+      ops.hw.note("failure raw: gcc ahb %08x axi0 %08x axi1 %08x; videocc mvs0c-gdsc %08x mvs0-gdsc %08x mvs0c %08x mvs0c-fr %08x mvs0 %08x mvs0-fr %08x",
+                  ops.rd(kGcc + kGccVideoAhb), ops.rd(kGcc + kGccVideoAxi0), ops.rd(kGcc + kGccVideoAxi1),
+                  ops.rd(kVideoCc + kCcMvs0cGdsc), ops.rd(kVideoCc + kCcMvs0Gdsc), ops.rd(kVideoCc + kCcMvs0cClk),
+                  ops.rd(kVideoCc + kCcMvs0cFreerun), ops.rd(kVideoCc + kCcMvs0Clk), ops.rd(kVideoCc + kCcMvs0Freerun));
+    if (controllerReadable())
+      ops.hw.note("failure raw: iris ctrl-status %08x core-power %08x core-clock %08x cpu-lpi %08x video-lpi %08x",
+                  ops.rd(kIris + kCtrlStatus), ops.rd(kIris + kCorePowerStatus), ops.rd(kIris + kCoreClockConfig),
+                  ops.rd(kIris + kCpuNocLpiStatus), ops.rd(kIris + kAonVideoCtlNocLpiStatus));
+    if (codecReadable())
+      ops.hw.note("failure raw: iris codec-power %08x tz-cpu %08x idle0 %08x idle1 %08x idle2 %08x idle3 %08x",
+                  ops.rd(kIris + kCorePowerStatus), ops.rd(kIris + kTzCpuStatus), ops.rd(kIris + kVcodecIdleStatus),
+                  ops.rd(kIris + kVcodecIdleStatus + 4), ops.rd(kIris + kVcodecIdleStatus + 8), ops.rd(kIris + kVcodecIdleStatus + 12));
+  }
+
   // ----------------------------------------------------------------------------------------------------------------- on
   int on()
   {
     int rc = onSteps();
     if (rc) {
+      failureRaw(st.failedStep, rc);
       ops.hw.note("power: %s at step %d (last value %08x): powering everything down", errorName(rc), st.failedStep, st.failedValue);
       off();
       st.error = rc;
