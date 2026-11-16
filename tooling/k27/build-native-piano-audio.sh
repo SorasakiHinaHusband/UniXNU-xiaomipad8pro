@@ -13,7 +13,8 @@
 #   failure path; keep: the hardware handed to levels 8-10), tests/live_host.c (levels 8-10 after the real session handed over, against
 #   the DSP and amplifier models and both macOS devices' engines: the plans in order, one command at a time over both, speaker safety
 #   at every amplifier write and every buffer played, start at the first sound and down after silence, the clocks' drift, the master
-#   volume's ramp, every fault and plan failure, the Mic's capture plan with the VA macro's DMIC path), tests/va_host.c (the VA
+#   volume's ramp, every fault and plan failure, the Mic's capture plan with the VA macro's DMIC path), tests/control_host.c (the IOAudio2
+#   selector-2 scalar mappings), tests/va_host.c (the VA
 #   macro's DMIC path against a register model: values, order, waits), tests/preset_host.c (the preset loader on an mtools FAT32
 #   image as build-esp.py makes the ESP; skipped without mtools)
 # The copies stay byte for byte their originals but for their provenance lines (FatVolume from PianoPower, SmmuStream from PianoDwc3,
@@ -46,6 +47,7 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/fs19xx_host.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -o "$T/fs19xx_host"
 "${C[@]}" "$P/tests/amps_host.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -o "$T/amps_host"
 "${C[@]}" "$P/tests/pcm_host.c" "$P/AudioSafety.c" -lm -o "$T/pcm_host"
+"${C[@]}" "$P/tests/control_host.c" -o "$T/control_host"
 "${C[@]}" "$P/tests/dsplink_host.c" "$P/AudioDspLink.c" "$P/PianoGpr.c" -o "$T/dsplink_host"
 "${C[@]}" "$P/tests/session_host.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -o "$T/session_host"
@@ -53,7 +55,7 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/live_host.c" "$P/AudioLive.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/live_host"
 "${C[@]}" "$P/tests/va_host.c" "$P/AudioVa.c" -o "$T/va_host"
-for t in gpr_host audioreach_host sequence_host fs19xx_host amps_host pcm_host dsplink_host session_host live_host va_host; do
+for t in gpr_host audioreach_host sequence_host fs19xx_host amps_host pcm_host control_host dsplink_host session_host live_host va_host; do
   "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }
 done
 # The preset loader on a FAT32 image with 4096-byte sectors, one per cluster, as build-esp.py makes the ESP (mtools).

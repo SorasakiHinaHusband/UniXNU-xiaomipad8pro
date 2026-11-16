@@ -43,6 +43,7 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include "AudioPcm.h"
+#include "AudioControl.h"
 
 extern "C" {
 // Post-mortem and the summary line: the engines' state and their counters.
@@ -64,6 +65,11 @@ enum : uint32_t {
     FlagsS16 = 0x4 | 0x8,                                 // signed integer, packed (little endian)
     TerminalSpeaker = 0x73706b72, TerminalMicrophone = 0x6d696372,   // 'spkr', 'micr'
     StatusType = 0, StreamMemory = 0x10000000,
+    ControlVolume = 1, ControlMute = 2,
+    ControlClass = 0x6163746c,       // 'actl'
+    LevelClass = 0x6c65766c,         // 'levl'
+    MuteClass = 0x6d757465,          // 'mute'
+    OutputScope = 0x6f757470,        // 'outp'
 };
 struct EngineStatus { volatile uint64_t sampleTime, hostTime, seed, reserved, writeEnd; };
 static_assert(sizeof(EngineStatus) >= 0x28, "the HAL refuses a smaller engine status");
@@ -99,6 +105,8 @@ public:
     uint64_t startTime;
     uint32_t seed;
     int32_t hogOwner = -1;
+    uint32_t volumePercent = 100;
+    bool masterMute = false;
 
     bool initRole(bool input, const char *deviceUID);
     void free() override;
@@ -109,6 +117,7 @@ public:
     IOReturn startIO();
     IOReturn stopIO();
     void publish(IORegistryEntry *entry);
+    OSArray *controls() const;
     IOReturn setProperties(OSObject *properties) override;
     IOReturn apply(OSObject *properties, IORegistryEntry *client);
     static void engineMain(void *, wait_result_t);
@@ -141,6 +150,10 @@ void setNumber(OSDictionary *d, const char *key, uint64_t value, unsigned bits =
 void setNumber(IORegistryEntry *e, const char *key, uint64_t value, unsigned bits = 32) {
     if (OSNumber *n = OSNumber::withNumber(value, bits)) { e->setProperty(key, n); n->release(); }
 }
+void setSignedNumber(OSDictionary *d, const char *key, int64_t value, unsigned bits = 32) {
+    if (OSNumber *n = OSNumber::withNumber(value, bits)) { d->setObject(key, n); n->release(); }
+}
+void setBool(OSDictionary *d, const char *key, bool value) { d->setObject(key, value ? kOSBooleanTrue : kOSBooleanFalse); }
 OSDictionary *format(uint32_t channels) {
     OSDictionary *f = OSDictionary::withCapacity(8);
     if (!f) return nullptr;
@@ -171,6 +184,59 @@ OSArray *streams(uint32_t id, uint32_t channels, uint32_t terminal) {
     }
     OSSafeReleaseNULL(stream); OSSafeReleaseNULL(current); OSSafeReleaseNULL(range); OSSafeReleaseNULL(available);
     return list;
+}
+OSArray *controlSelectors() {
+    OSArray *a = OSArray::withCapacity(2);
+    if (!a) return nullptr;
+    if (OSNumber *n = OSNumber::withNumber(0x6376616c, 32)) { a->setObject(n); n->release(); } // 'cval'
+    if (OSNumber *n = OSNumber::withNumber(0x63726e67, 32)) { a->setObject(n); n->release(); } // 'crng'
+    return a;
+}
+OSDictionary *makeControl(uint32_t id, uint32_t cls, uint32_t value, bool mute) {
+    OSDictionary *d = OSDictionary::withCapacity(32);
+    if (!d) return nullptr;
+    setNumber(d, "control ID", id);
+    setNumber(d, "UsageCase", mute ? 2 : 1);
+    setNumber(d, "SampleRate", uint64_t(fixed64(Rate)), 64);
+    setNumber(d, "IOAudioEngineDescription", 0);
+    setNumber(d, "base class", ControlClass);
+    setNumber(d, "class", cls);
+    setNumber(d, "scope", OutputScope);
+    setNumber(d, "element", 0);
+    setBool(d, "read only", false);
+    setNumber(d, "value", value);
+    if (OSArray *a = controlSelectors()) { d->setObject("property selectors", a); a->release(); }
+    if (mute) {
+        setNumber(d, "minimum value", 0);
+        setNumber(d, "maximum value", 1);
+        setNumber(d, "integer steps", 1);
+        setNumber(d, "left value", value);
+        setNumber(d, "center value", value);
+        setNumber(d, "right value", value);
+        setNumber(d, "left channel", 1);
+        setNumber(d, "right channel", 2);
+    } else {
+        /* The kernel's ramp is 0..100% in 0.5 dB steps. The board's -1 dBFS
+         * ceiling is applied before this control, so 0..100 is safe and gives
+         * 37.5 dB between the 25% and 100% test points. */
+        setNumber(d, "minimum value", 0);
+        setNumber(d, "maximum value", 100);
+        setBool(d, "range map", true);
+        setNumber(d, "transfer function", 0);
+        setNumber(d, "start int value", 0);
+        setSignedNumber(d, "start db value", -50, 64);
+        setNumber(d, "integer steps", 100);
+        setNumber(d, "db per step", 1); // metadata is integral; transport stays 0.5 dB/percent
+        setNumber(d, "left value", value);
+        setNumber(d, "center value", value);
+        setNumber(d, "right value", value);
+        setNumber(d, "left channel", 1);
+        setNumber(d, "right channel", 2);
+    }
+    setNumber(d, "selectors", 0);
+    setNumber(d, "mapping options", 0);
+    setNumber(d, "descriptor", 0);
+    return d;
 }
 uint64_t absolute(uint64_t frames) { uint64_t t; nanoseconds_to_absolutetime(frames * 1000000000ULL / Rate, &t); return t; }
 }  // namespace
@@ -217,11 +283,30 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("supports client description", kOSBooleanFalse);
     e->setProperty("wants output trap", kOSBooleanFalse);
     e->setProperty("wants input trap", kOSBooleanFalse);
+    /* HALS_Device::CanBeDefaultDevice asks these through the IOAudio2
+     * property path. Keep the direction-specific answers explicit. */
+    e->setProperty("can be system default", kOSBooleanTrue);
+    e->setProperty("can be content default", kOSBooleanTrue);
+    e->setProperty("can be default", kOSBooleanTrue);
     // One direction each: the speaker device has an output stream, the mic device an input stream.
     const char *key = isInput ? "input streams" : "output streams";
     if (OSArray *a = streams(StreamID, channels(), isInput ? TerminalMicrophone : TerminalSpeaker)) { e->setProperty(key, a); a->release(); }
-    if (OSArray *a = OSArray::withCapacity(1)) { e->setProperty("controls", a); a->release(); }
+    if (OSArray *a = controls()) { e->setProperty("controls", a); a->release(); }
     e->setProperty("piano-audio-transport", gTransport->name);
+    if (!isInput) {
+        setNumber(e, "piano-audio-volume", volumePercent);
+        e->setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse);
+    }
+}
+
+OSArray *PianoAudioDevice::controls() const {
+    OSArray *a = OSArray::withCapacity(isInput ? 1 : 2);
+    if (!a || isInput) return a;
+    OSDictionary *level = makeControl(ControlVolume, LevelClass, volumePercent, false);
+    OSDictionary *mute = makeControl(ControlMute, MuteClass, masterMute ? 1 : 0, true);
+    if (level) { a->setObject(level); level->release(); }
+    if (mute) { a->setObject(mute); mute->release(); }
+    return a;
 }
 
 bool PianoAudioDevice::start(IOService *provider) {
@@ -240,15 +325,16 @@ bool PianoAudioDevice::start(IOService *provider) {
 IOReturn PianoAudioDevice::apply(OSObject *properties, IORegistryEntry *client) {
     OSDictionary *d = OSDynamicCast(OSDictionary, properties);
     if (!d) return kIOReturnBadArgument;
-    if (!isInput && gTransport->control) {
+    bool controlsChanged = false;
+    if (!isInput) {
         OSNumber *volume = OSDynamicCast(OSNumber, d->getObject("piano-audio-volume"));
         OSBoolean *mute = OSDynamicCast(OSBoolean, d->getObject("piano-audio-mute"));
         const int v = volume && volume->unsigned32BitValue() <= 100 ? int(volume->unsigned32BitValue()) : -1;
         const int m = mute ? (mute->isTrue() ? 1 : 0) : -1;
         if (v >= 0 || m >= 0) {
-            gTransport->control(gTransport->context, v, m);
-            if (v >= 0) setNumber(this, "piano-audio-volume", uint32_t(v));
-            if (m >= 0) setProperty("piano-audio-mute", m ? kOSBooleanTrue : kOSBooleanFalse);
+            if (gTransport->control) gTransport->control(gTransport->context, v, m);
+            if (v >= 0) { volumePercent = uint32_t(v); setNumber(this, "piano-audio-volume", volumePercent); controlsChanged = true; }
+            if (m >= 0) { masterMute = m != 0; setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse); controlsChanged = true; }
         }
     }
     if (OSNumber *owner = OSDynamicCast(OSNumber, d->getObject("exclusive access owner"))) {
@@ -258,6 +344,12 @@ IOReturn PianoAudioDevice::apply(OSObject *properties, IORegistryEntry *client) 
         setNumber(this, "exclusive access owner", uint32_t(hogOwner));
         if (client) setNumber(client, "exclusive access owner", uint32_t(hogOwner));
         piano_audio_dev_hog_owner = hogOwner;
+    }
+    if (controlsChanged) {
+        /* setProperty emits the IORegistry change; rebuilding the dictionary
+         * makes the new scalar/mute values visible to HAL property reads. */
+        publish(this);
+        if (client) publish(client);
     }
     return kIOReturnSuccess;
 }
@@ -382,8 +474,33 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
     case 1: case 11:                                       // StopIO, StopIOWithFlags
         startedIO = false;
         return device->stopIO();
-    case 2:                                                // SetControlValue: no controls are published
-        return kIOReturnBadArgument;
+    case 2: {                                              // SetControlValue: control ID, scalar value
+        if (!device || a->scalarInputCount < 2 || device->isInput) return kIOReturnBadArgument;
+        const uint32_t id = uint32_t(a->scalarInput[0]);
+        const uint64_t raw = a->scalarInput[1];
+        OSDictionary *d = OSDictionary::withCapacity(1);
+        if (!d) return kIOReturnNoMemory;
+        IOReturn result = kIOReturnSuccess;
+        if (id == ControlVolume) {
+            const int p = piano_audio_control_percent(raw);
+            if (p < 0 || p > 100) result = kIOReturnBadArgument;
+            else if (OSNumber *n = OSNumber::withNumber(uint32_t(p), 32)) { d->setObject("piano-audio-volume", n); n->release(); }
+            else result = kIOReturnNoMemory;
+        } else if (id == ControlMute) {
+            const int m = piano_audio_control_bool(raw);
+            if (m < 0) result = kIOReturnBadArgument;
+            else d->setObject("piano-audio-mute", m ? kOSBooleanTrue : kOSBooleanFalse);
+        } else {
+            result = kIOReturnBadArgument;
+        }
+        if (result == kIOReturnSuccess) result = device->apply(d, this);
+        d->release();
+        if (!result && a->scalarOutputCount >= 1) {
+            a->scalarOutput[0] = (id == ControlMute) ? (device->masterMute ? 1 : 0) : device->volumePercent;
+            a->scalarOutputCount = 1;
+        }
+        return result;
+    }
     case 3:                                                // PerformConfigChange: none is ever requested
         return kIOReturnSuccess;
     case 4: {                                              // SetNominalSampleRate: the one rate there is
