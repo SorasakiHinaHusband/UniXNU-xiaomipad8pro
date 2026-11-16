@@ -41,6 +41,7 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/OSKextLib.h>
 #include <kern/clock.h>
+#include <kern/ipc_mig.h>
 #include <kern/thread.h>
 #include <sys/sysctl.h>
 #include "AudioPcm.h"
@@ -189,8 +190,11 @@ class PianoAudioUserClient : public IOUserClient {
     typedef IOUserClient super;
     PianoAudioDevice *device;
     bool startedIO;
+    mach_port_t notificationPort = MACH_PORT_NULL;
+    io_user_reference_t notificationRefCon = 0;
 public:
     bool start(IOService *provider) override;
+    void free() override;
     IOReturn clientClose() override;
     void stop(IOService *provider) override;
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
@@ -198,6 +202,7 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
     IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) override;
     IOReturn setProperties(OSObject *properties) override;
+    void sendControlNotification(uint32_t controlID);
 };
 
 OSDefineMetaClassAndStructors(PianoAudioDevice, IOService)
@@ -285,13 +290,15 @@ OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_
         setNumber(d, "start int value", 0);
         /* The level control's range is the same -36..0 dB squared curve used
          * by the DSP gain.  A -50 dB floor makes normal positions too quiet
-         * (the Pad 6 Pro HEAD records that failure); -36 dB is the observed
-         * working range and still gives a >10 dB 25%-to-100% separation. */
+         * (the Pad 6 Pro HEAD records that failure); the range-map remains
+         * -36..0 dB even though the initial unity seed below is 0 dB. */
         /* CoreAudio's decoded Level_Control parser asks for a Float32 dB
          * seed. An OSNumber containing the signed integer -36 is displayed
          * as an unsigned 64-bit value by ioreg and is rejected as a dB seed,
          * leaving the HAL's virtual master at zero. */
-        setFloat(d, "start db value", float(PIANO_AUDIO_VOLUME_MIN_DB));
+        /* The current integer value 100 is unity.  A zero dB seed makes the
+         * current value map to 0 dB instead of seeding the HAL at the floor. */
+        setFloat(d, "start db value", 0.0f);
         setNumber(d, "integer steps", 100);
         setNumber(d, "db per step", 1); // HAL's metadata is integral; range-map carries the curve
         setNumber(d, "left value", value);
@@ -367,6 +374,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     if (OSArray *a = controls()) { e->setProperty("controls", a); a->release(); }
     e->setProperty("piano-audio-transport", gTransport->name);
     e->setProperty("piano-audio-control-contract", "levl/vlme");
+    e->setProperty("piano-audio-notification-contract", "type0-control-property");
     e->setProperty("piano-audio-timing-contract", tp.contract);
     if (!isInput) {
         setNumber(e, "piano-audio-volume", volumePercent);
@@ -544,6 +552,15 @@ void PianoAudioUserClient::stop(IOService *provider) {
     super::stop(provider);
 }
 
+void PianoAudioUserClient::free() {
+    if (notificationPort != MACH_PORT_NULL) {
+        IOUserClient::releaseNotificationPort(notificationPort);
+        notificationPort = MACH_PORT_NULL;
+    }
+    notificationRefCon = 0;
+    super::free();
+}
+
 IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
                                               OSObject *, void *) {
     piano_audio_dev_last_selector = selector;
@@ -579,6 +596,9 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
         }
         if (result == kIOReturnSuccess) result = device->apply(d, this);
         d->release();
+        if (!result) {
+            sendControlNotification(id);
+        }
         if (!result && a->scalarOutputCount >= 1) {
             /* Selector 2 returns the scalar representation that HAL passed
              * in. Returning our percent integer changes a Float32/Float64
@@ -625,8 +645,50 @@ IOReturn PianoAudioUserClient::setProperties(OSObject *properties) {
     return device ? device->apply(properties, this) : kIOReturnNotReady;
 }
 
-// The HAL registers for IOAudio2Notification config-change requests; this device never asks for one.
-IOReturn PianoAudioUserClient::registerNotificationPort(mach_port_t, UInt32, io_user_reference_t) {
+/* The type-0 IOAudio2 notification is a property-address update.  CoreAudio
+ * reads the body as {type, selector, scope, element, control ID}; its
+ * notification handler then refreshes the control value through selector 2. */
+struct PianoAudio2NotificationMessage {
+    mach_msg_header_t header;
+    uint32_t type;
+    uint32_t selector;
+    uint32_t scope;
+    uint32_t element;
+    uint32_t controlID;
+};
+
+void PianoAudioUserClient::sendControlNotification(uint32_t controlID) {
+    mach_port_t port = notificationPort;
+    if (port == MACH_PORT_NULL) return;
+    PianoAudio2NotificationMessage message = {};
+    message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    message.header.msgh_size = sizeof message;
+    message.header.msgh_remote_port = port;
+    message.header.msgh_local_port = MACH_PORT_NULL;
+    message.header.msgh_reserved = 0;
+    message.header.msgh_id = 0;
+    message.type = 0;
+    message.selector = 0x6376616c;  // 'cval'
+    message.scope = OutputScope;
+    message.element = PIANO_AUDIO_CONTROL_ELEMENT_MAIN;
+    message.controlID = controlID;
+    (void)mach_msg_send_from_kernel(&message.header, message.header.msgh_size);
+}
+
+IOReturn PianoAudioUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) {
+    if (type != 0) return kIOReturnBadArgument;
+    if (port != MACH_PORT_NULL) {
+        if (notificationPort != MACH_PORT_NULL) IOUserClient::releaseNotificationPort(notificationPort);
+        notificationRefCon = refCon;
+        __sync_synchronize();
+        notificationPort = port;
+    } else {
+        mach_port_t old = notificationPort;
+        notificationRefCon = 0;
+        __sync_synchronize();
+        notificationPort = MACH_PORT_NULL;
+        if (old != MACH_PORT_NULL) IOUserClient::releaseNotificationPort(old);
+    }
     return kIOReturnSuccess;
 }
 

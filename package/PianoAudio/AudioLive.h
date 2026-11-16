@@ -60,6 +60,7 @@ typedef struct {
     int sound;                           /* a period with a non-zero sample came while the speaker path was down */
     uint32_t sound_at;                   /* the time of the last such period (ms) */
     int have_sound;
+    uint32_t producer_period_frames;      /* last output IO period: 240 legacy, 480 lead */
     int32_t volume_q15;                  /* level 9: the master volume (0..32767), from the device's property or the boot argument */
     int muted;                           /* level 9: the master mute */
     uint64_t offered, taken, dropped, captured, controls;
