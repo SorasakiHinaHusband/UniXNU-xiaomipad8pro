@@ -91,6 +91,7 @@ class PianoWifi80211 : public IO80211Controller {
   uint32_t fUcClients = 0;         // clients alive now
   uint32_t fUcScanRecords = 0;     // records in the current selector-0 scan
   bool fUcScanActive = false;
+  uint32_t fUcFailureLogs = 0;     // rate limit for raw user-client failure diagnostics
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   uint64_t fScanSerial = 0;  // every SCAN_REQ gets one (ADOPTION.md 6.1 item 3): the 15 ms CoreWLAN scan is found by it
   uint32_t fScanRecords = 0; // records served since the serial's scan; printed at its list end
@@ -174,6 +175,8 @@ class PianoWifi80211 : public IO80211Controller {
   void noteSelector(uint32_t selector, uint32_t inBytes, uint32_t inDescriptorBytes, uint32_t outBytes,
                     uint32_t outDescriptorBytes, uint32_t scalarIn, uint32_t scalarOut, uint32_t requestType, uint32_t answered,
                     IOReturn result, uint64_t calls);
+  void noteUcFailure(const char *reason, const IOExternalMethodArguments *args, uint32_t cmd, uint32_t length, uint64_t data,
+                     uint32_t type, int32_t value, const uint8_t *raw, uint32_t rawBytes, IOReturn result);
   static int sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req);
   static int sysctlGaps(struct sysctl_oid *, void *, int, struct sysctl_req *req);
   void setUcMode(uint32_t mode, const char *why);
@@ -1144,12 +1147,16 @@ IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32
                                        IOUserClient **handler)
 {
   const uint32_t mode = ucMode();
-  if (!handler) return kIOReturnBadArgument;
+  if (!handler) {
+    noteUcFailure("newUserClient handler pointer is null", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnBadArgument);
+    return kIOReturnBadArgument;
+  }
   if (!(mode & pianowifi::a80211::kUcOffer)) {
     IOLockLock(fLock);
     ++fUcRefused;
     IOLockUnlock(fLock);
     noteUserClient("refused (no client offered: mode 0x1 is off)", owningTask, uint32_t(type), 0);
+    noteUcFailure("newUserClient offer is disabled", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnUnsupported);
     return IO80211Controller::newUserClient(owningTask, security, type, properties, handler);
   }
   if (type != 0) {
@@ -1157,6 +1164,7 @@ IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32
     ++fUcRefused;
     IOLockUnlock(fLock);
     noteUserClient("refused (only IOServiceOpen type 0 is supported)", owningTask, uint32_t(type), 0);
+    noteUcFailure("newUserClient type is not zero", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnUnsupported);
     return kIOReturnUnsupported;
   }
   PianoWifi80211Uc *client = OSTypeAlloc(PianoWifi80211Uc);
@@ -1166,6 +1174,7 @@ IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32
     ++fUcRefused;
     IOLockUnlock(fLock);
     noteUserClient("refused (no memory)", owningTask, uint32_t(type), 0);
+    noteUcFailure("newUserClient allocation or init failed", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnNoMemory);
     return kIOReturnNoMemory;
   }
   if (!client->attach(this) || !client->start(this)) {
@@ -1175,6 +1184,7 @@ IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32
     ++fUcRefused;
     IOLockUnlock(fLock);
     noteUserClient("refused (the client did not start)", owningTask, uint32_t(type), 0);
+    noteUcFailure("newUserClient start failed", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnError);
     return kIOReturnError;
   }
   IOLockLock(fLock);
@@ -1192,56 +1202,65 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
 {
   using namespace pianowifi::a80211;
   requestType = ~0u;
+  uint32_t cmd = ~0u, length = ~0u, type = ~0u;
+  int32_t val = 0;
+  uint64_t data = 0;
+  uint8_t rawSnapshot[32] = {};
+  uint32_t rawSnapshotBytes = 0;
+  uint8_t *stagedInput = nullptr;
+  const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
+  uint32_t inputBytes = args->structureInputSize;
+  auto snapshot = [&]() {
+    rawSnapshotBytes = inputBytes < sizeof rawSnapshot ? inputBytes : uint32_t(sizeof rawSnapshot);
+    if (in && rawSnapshotBytes) memcpy(rawSnapshot, in, rawSnapshotBytes);
+  };
+  auto fail = [&](const char *reason, IOReturn result) -> IOReturn {
+    noteUcFailure(reason, args, cmd, length, data, type, val, rawSnapshot, rawSnapshotBytes, result);
+    if (stagedInput) IOFreeData(stagedInput, large ? kUcLargeBytes : kUcSmallBytes);
+    stagedInput = nullptr;
+    return result;
+  };
   const uint32_t want = large ? kUcLargeBytes : kUcSmallBytes;
   const uint32_t offset = large ? kUcLargeBytes - kUcSmallBytes : 0;
   IOMemoryDescriptor *inputDescriptor = args->structureInputDescriptor;
   const IOByteCount inputDescriptorLength = inputDescriptor ? inputDescriptor->getLength() : 0;
-  if (inputDescriptor && (inputDescriptorLength < want || inputDescriptorLength > UINT32_MAX)) return kIOReturnBadArgument;
+  if (inputDescriptor && (inputDescriptorLength < want || inputDescriptorLength > UINT32_MAX))
+    return fail("input descriptor length is shorter than the selected structure", kIOReturnBadArgument);
   // IOUserClient creates structureInputDescriptor with kIODirectionOut: the
   // caller wrote it and this kext reads it.  Wiring is deliberately outside
   // apple80211(), before that routine takes fLock; the guard completes it on
   // every return path, including allocation, short-request, and driver-error paths.
   pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> inputPreparation(inputDescriptor, kIODirectionOut);
   if (!inputPreparation.ok()) {
-    note80211("%s: IOUC descriptor prepare failed for input", fIfName);
-    return kIOReturnBadArgument;
+    return fail("input descriptor prepare refused", kIOReturnBadArgument);
   }
-  uint8_t *stagedInput = nullptr;
-  const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
-  uint32_t inputBytes = args->structureInputSize;
   if (inputDescriptor) {
     stagedInput = static_cast<uint8_t *>(IOMallocData(want));
     if (!stagedInput || !pianowifi::a80211::readDescriptor(inputDescriptor, inputDescriptorLength, stagedInput, want)) {
-      if (stagedInput) IOFreeData(stagedInput, want);
-      return kIOReturnBadArgument;
+      return fail("input descriptor allocation or read failed", kIOReturnBadArgument);
     }
     in = stagedInput;
     inputBytes = want;
   }
   if (!in || inputBytes < want) {
-    if (stagedInput) IOFreeData(stagedInput, want);
-    return kIOReturnBadArgument;
+    return fail("inline input structure is shorter than the selected structure", kIOReturnBadArgument);
   }
+  snapshot();
   // Keep the field reads below inside the structure supplied by IOUserClient.
   // The selector-6 size/offset pair is a host-derived ABI fact and must not be
   // trusted until the 40-byte request fits; a stale large-layout constant must
   // fail closed instead of becoming an out-of-bounds kernel read.
   if (offset > inputBytes || kUcNameAt > inputBytes - offset || sizeof(Req) > inputBytes - offset - kUcNameAt) {
-    if (stagedInput) IOFreeData(stagedInput, want);
-    return kIOReturnBadArgument;
+    return fail("request fields do not fit the selected structure", kIOReturnBadArgument);
   }
-  uint32_t cmd = 0, length = 0, type = 0;
-  int32_t val = 0;
-  uint64_t data = 0;
   memcpy(&cmd, in + kUcCmdAt, 4);
   memcpy(&length, in + kUcLenAt, 4);
   memcpy(&data, in + kUcDataAt, 8);
   memcpy(&type, in + offset + kUcTypeAt, 4);
   memcpy(&val, in + offset + kUcValAt, 4);
   requestType = type;
-  if (cmd != kUcGetCmd && cmd != kUcSetCmd) {
-    if (stagedInput) IOFreeData(stagedInput, want);
-    return kIOReturnBadArgument;
+  if (!ucCommandAccepted(cmd)) {
+    return fail("request command is neither full SIOCGA80211 nor SIOCSA80211", kIOReturnBadArgument);
   }
   Req rq;
   bzero(&rq, sizeof rq);
@@ -1265,8 +1284,7 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   uint32_t outputBytes = args->structureOutputSize;
   if (outputDescriptor) {
     if (outputDescriptorLength > UINT32_MAX) {
-      if (stagedInput) IOFreeData(stagedInput, want);
-      return kIOReturnBadArgument;
+      return fail("output descriptor length does not fit 32 bits", kIOReturnBadArgument);
     }
     outputBytes = uint32_t(outputDescriptorLength);
     if (args->structureOutputDescriptorSize && args->structureOutputDescriptorSize < outputBytes)
@@ -1277,9 +1295,7 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   // call ucOut(), and completed by scope exit after all descriptor writes.
   pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> outputPreparation(outputDescriptor, kIODirectionIn);
   if (!outputPreparation.ok()) {
-    note80211("%s: IOUC descriptor prepare failed for output", fIfName);
-    if (stagedInput) IOFreeData(stagedInput, want);
-    return kIOReturnBadArgument;
+    return fail("output descriptor prepare refused", kIOReturnBadArgument);
   }
   if (cmd == kUcGetCmd && outputDescriptor && outputBytes) {
     // OOL output has no inline pointer. A private token lets the common
@@ -1329,8 +1345,7 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   } else if (cmd == kUcSetCmd && outputDescriptor && outputBytes >= 8) {
     uint32_t resultPair[2] = {rq.length, uint32_t(rq.value)};
     if (!pianowifi::a80211::writeDescriptor(outputDescriptor, outputBytes, 0, resultPair, sizeof resultPair)) {
-      if (stagedInput) IOFreeData(stagedInput, want);
-      return kIOReturnBadArgument;
+      return fail("set result pair does not fit the output descriptor", kIOReturnBadArgument);
     }
     answered = sizeof resultPair;
     args->structureOutputDescriptorSize = answered;
@@ -1361,7 +1376,10 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
     IOLockUnlock(fLock);
     note80211("%s: %u records served through the user client, list end 5", fIfName, unsigned(records));
   }
-  return e > 0 ? IOReturn(e) : kIOReturnError;
+  const IOReturn result = e > 0 ? IOReturn(e) : kIOReturnError;
+  if (!(cmd == kUcGetCmd && type == kScanResult && e == kErrEndOfResults))
+    noteUcFailure("apple80211 returned an unhandled error", args, cmd, length, data, type, val, rawSnapshot, rawSnapshotBytes, result);
+  return result;
 }
 
 void PianoWifi80211::noteUserClient(const char *what, task_t task, uint32_t type, uint64_t calls)
@@ -1391,6 +1409,34 @@ void PianoWifi80211::noteSelector(uint32_t selector, uint32_t inBytes, uint32_t 
     note80211("%s: selector %u type %u -> %#x; struct in %u (descriptor %u) out %u (descriptor %u), scalars in %u out %u, wrote %u, call %llu",
               fIfName, unsigned(selector), unsigned(requestType), unsigned(result), unsigned(inBytes), unsigned(inDescriptorBytes),
               unsigned(outBytes), unsigned(outDescriptorBytes), unsigned(scalarIn), unsigned(scalarOut), unsigned(answered), calls);
+}
+
+void PianoWifi80211::noteUcFailure(const char *reason, const IOExternalMethodArguments *args, uint32_t cmd, uint32_t length,
+                                   uint64_t data, uint32_t type, int32_t value, const uint8_t *raw, uint32_t rawBytes,
+                                   IOReturn result)
+{
+  // A malformed caller can hit this path repeatedly while CoreWLAN retries. Keep enough evidence for the next boot without
+  // turning a retry loop into a console flood.
+  const uint32_t serial = __atomic_fetch_add(&fUcFailureLogs, 1u, __ATOMIC_RELAXED);
+  if (serial >= 32) return;
+  auto contains = [](uint64_t pointer, const void *base, uint32_t bytes) {
+    if (!base || !bytes) return false;
+    const uint64_t begin = reinterpret_cast<uint64_t>(base);
+    return pointer >= begin && pointer - begin < bytes;
+  };
+  const char *where = data == 0 ? "null" : "user address";
+  if (args && contains(data, args->structureInput, args->structureInputSize)) where = "inside input";
+  else if (args && contains(data, args->structureOutput, args->structureOutputSize)) where = "inside output";
+  char bytes[65] = {};
+  const char *hex = "0123456789abcdef";
+  const uint32_t count = rawBytes < 32 ? rawBytes : 32;
+  for (uint32_t i = 0; i < count; ++i) {
+    bytes[i * 2] = hex[raw[i] >> 4];
+    bytes[i * 2 + 1] = hex[raw[i] & 0xf];
+  }
+  note80211("%s: IOUC failure (%s) result %#x cmd %#x len %u data %s type %#x val %d request[0..31]=%s", fIfName, reason,
+            unsigned(result), unsigned(cmd), unsigned(length), where, unsigned(type), int(value),
+            count ? bytes : "(unavailable)");
 }
 
 int PianoWifi80211::sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req)

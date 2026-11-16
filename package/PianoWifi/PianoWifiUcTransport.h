@@ -8,6 +8,19 @@
 namespace pianowifi {
 namespace a80211 {
 
+// 27.3 IO80211 builds the complete BSD ioctl word.  The get wrapper's
+// immediate is 0xc02869c9 (Apple80211RawGet 0x1c4643e40-0x1c4643e48 and
+// BindToInterfaceWithService 0x1c465fac8-0x1c465fad4); set is 0x802869c8.
+// Comparing only the low 16 bits rejects the bind sanity request after it has
+// already been decoded.
+constexpr uint32_t kUcGetCmd = 0xc02869c9u;
+constexpr uint32_t kUcSetCmd = 0x802869c8u;
+
+inline bool ucCommandAccepted(uint32_t command)
+{
+  return command == kUcGetCmd || command == kUcSetCmd;
+}
+
 // IOUserClient's OOL descriptors refer to pageable memory in the calling task.
 // The caller must wire them before readBytes/writeBytes and complete them on
 // every exit path.  This small guard is also used by the host fake descriptor,

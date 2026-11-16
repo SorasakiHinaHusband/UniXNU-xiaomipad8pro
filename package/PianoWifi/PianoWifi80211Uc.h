@@ -16,6 +16,7 @@
 // 7 DriverKit support, 5 "use the event pipe", 6 the same as 0 with a 0x3c030-byte structure. No Apple code is used: the request
 // numbers and the two field offsets are data, and the answers are our own (WifiApple80211.h).
 #pragma once
+#include "PianoWifiUcTransport.h"
 
 // The structure selector 0 carries: the ioctl's number, the length and the user pointer at its head, then the 40-byte
 // apple80211 request's name, type and value near its end. Only these five fields are read or written; the rest is the caller's.
@@ -24,13 +25,12 @@ namespace a80211 {
 
 constexpr uint32_t kUcSmallBytes = 0x3c30;    // selector 0's structure
 constexpr uint32_t kUcLargeBytes = 0x3c030;   // selector 6's structure (the same fields, 0x3c000 further on)
-constexpr uint32_t kUcCmdAt = 0x0;            // the ioctl number (0x69c9 get / 0x69c8 set, the low 16 bits of SIOC[SG]A80211)
+constexpr uint32_t kUcCmdAt = 0x0;            // the complete 32-bit BSD ioctl word (SIOCGA80211/SIOCSA80211)
 constexpr uint32_t kUcLenAt = 0x4;            // the request's length
 constexpr uint32_t kUcDataAt = 0x8;           // the user pointer of the request's buffer
 constexpr uint32_t kUcNameAt = 0x3c08;        // the interface's name (16 bytes)
 constexpr uint32_t kUcTypeAt = 0x3c18;        // the request number
 constexpr uint32_t kUcValAt = 0x3c1c;         // req_val
-constexpr uint32_t kUcGetCmd = 0x69c9, kUcSetCmd = 0x69c8;
 
 // The selectors of 27.3's user-space IO80211, as the host analysis names them.
 enum : uint32_t {
@@ -140,14 +140,21 @@ void PianoWifi80211Uc::free()
 IOReturn PianoWifi80211Uc::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
 {
   if (fOwner) fOwner->noteUserClient("asked for a notification port", fTask, uint32_t(type), fCalls);
-  return IOUserClient::registerNotificationPort(port, type, refCon);
+  const IOReturn result = IOUserClient::registerNotificationPort(port, type, refCon);
+  if (fOwner && result != kIOReturnSuccess)
+    fOwner->noteUcFailure("notification port registration failed", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, result);
+  return result;
 }
 
 IOReturn PianoWifi80211Uc::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
                                           OSObject *, void *)
 {
   using namespace pianowifi::a80211;
-  if (!fOwner || !args) return kIOReturnNotReady;
+  if (!fOwner) return kIOReturnNotReady;
+  if (!args) {
+    fOwner->noteUcFailure("externalMethod arguments are null", nullptr, ~0u, 0, 0, ~0u, 0, nullptr, 0, kIOReturnNotReady);
+    return kIOReturnNotReady;
+  }
   ++fCalls;
   const uint32_t inBytes = args->structureInputSize;
   const uint32_t inDescriptorBytes = args->structureInputDescriptor
@@ -189,10 +196,12 @@ IOReturn PianoWifi80211Uc::externalMethod(uint32_t selector, IOExternalMethodArg
       result = kIOReturnSuccess;
     } else {
       result = kIOReturnBadArgument;
+      fOwner->noteUcFailure("selector byte output is missing", args, ~0u, 0, 0, requestType, 0, nullptr, 0, result);
     }
     break;
   }
   default:
+    fOwner->noteUcFailure("unsupported user-client selector", args, ~0u, 0, 0, requestType, 0, nullptr, 0, result);
     break;
   }
   const bool first = selector < kUcSelMax && !(fSeen & (1u << selector));

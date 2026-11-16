@@ -5,6 +5,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. iouc_host.cpp -o /tmp/iouc_host && /tmp/iouc_host
 #include "PianoWifiUcTransport.h"
 #include <cassert>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -60,10 +61,28 @@ struct FakeArguments {
 int main()
 {
   using pianowifi::a80211::DescriptorPreparation;
+  using pianowifi::a80211::kUcGetCmd;
+  using pianowifi::a80211::kUcSetCmd;
   using pianowifi::a80211::readDescriptor;
+  using pianowifi::a80211::ucCommandAccepted;
   using pianowifi::a80211::writeDescriptor;
   constexpr uint32_t requestBytes = 0x3c30;
   constexpr uint32_t replyBytes = 0x2720;
+
+  // Match the exact 40-byte request header that 27.3's IO80211 wrapper puts
+  // in the selector-0 structure.  The upper direction/size bits are part of
+  // the command and must survive the user-client decode.
+  std::vector<uint8_t> request(requestBytes, 0);
+  const uint32_t builtGet = kUcGetCmd;
+  std::memcpy(request.data(), &builtGet, sizeof builtGet);
+  uint32_t decodedGet = 0;
+  std::memcpy(&decodedGet, request.data(), sizeof decodedGet);
+  assert(decodedGet == 0xc02869c9u && decodedGet == kUcGetCmd);
+  assert(ucCommandAccepted(decodedGet));
+  assert(!ucCommandAccepted(0x000069c9u));
+  const uint32_t builtSet = kUcSetCmd;
+  assert(builtSet == 0x802869c8u);
+
   FakeDescriptor input{std::vector<uint8_t>(requestBytes, 0x5a)};
   FakeArguments args;
   args.structureInputDescriptor = &input;
