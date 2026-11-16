@@ -44,6 +44,7 @@ static_assert(sizeof(piano_wifi_8021x_eapol) == 12, "the EAPOL part's size is pa
 static_assert(sizeof(piano_wifi_8021x_key) == 48, "the key message's size is part of the boundary");
 static_assert(sizeof(piano_wifi_8021x_request) == 8, "the request's size is part of the boundary");
 static_assert(sizeof(piano_wifi_8021x_result) == 12, "the result's size is part of the boundary");
+static_assert(sizeof(piano_wifi_8021x_profile) == 108, "the profile message's size is part of the boundary");
 
 // ---------------------------------------------------------------------------------------------- the client's requests
 enum NetRequestKind : uint32_t { kNetReqNone = 0, kNetReqEapol, kNetReqKey, kNetReqAuthorize, kNetReqLinkQuery, kNetReqLeave };
@@ -135,6 +136,15 @@ inline uint32_t netBuildLink(uint8_t *m, uint32_t capacity, uint32_t seq, const 
   if (!m || capacity < length) return 0;
   netHeader(m, PIANO_WIFI_8021X_LINK, length, seq);
   netdetail::copy(m + kNetHdrBytes, reinterpret_cast<const uint8_t *>(&link), sizeof link);
+  return length;
+}
+
+inline uint32_t netBuildProfile(uint8_t *m, uint32_t capacity, uint32_t seq, const piano_wifi_8021x_profile &profile)
+{
+  const uint32_t length = kNetHdrBytes + sizeof profile;
+  if (!m || capacity < length) return 0;
+  netHeader(m, PIANO_WIFI_8021X_PROFILE, length, seq);
+  netdetail::copy(m + kNetHdrBytes, reinterpret_cast<const uint8_t *>(&profile), sizeof profile);
   return length;
 }
 

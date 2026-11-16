@@ -96,6 +96,7 @@ enum {
   PIANO_WIFI_8021X_LINK = 1,        /* struct piano_wifi_8021x_link */
   PIANO_WIFI_8021X_EAPOL_RX = 2,    /* struct piano_wifi_8021x_eapol, then the PDU */
   PIANO_WIFI_8021X_RESULT = 3,      /* struct piano_wifi_8021x_result */
+  PIANO_WIFI_8021X_PROFILE = 4,     /* struct piano_wifi_8021x_profile; ephemeral menu credential */
   /* client -> kext */
   PIANO_WIFI_8021X_EAPOL_TX = 16,   /* struct piano_wifi_8021x_eapol (src ignored), then the PDU */
   PIANO_WIFI_8021X_KEY = 17,        /* struct piano_wifi_8021x_key */
@@ -104,6 +105,21 @@ enum {
   PIANO_WIFI_8021X_LEAVE = 20       /* struct piano_wifi_8021x_request: the client gives up (a wrong passphrase, say): the
                                        kext deauthenticates and the association ends (the LINK message says so) */
 };
+
+/* A menu SET 20 has no root-only file for the supplicant to read.  The kext sends
+ * this short-lived profile over the privileged control socket before LINK/EAPOL;
+ * it is never logged or written to disk. */
+struct piano_wifi_8021x_profile {
+  uint32_t version;
+  uint32_t generation;
+  uint8_t security;                /* 0 open, 1 WPA2-PSK */
+  uint8_t ssid_len;
+  uint8_t psk_len;                 /* 0, 8..63 passphrase, or 64 hex PMK */
+  uint8_t reserved;
+  uint8_t ssid[32];
+  uint8_t psk[64];
+} __attribute__((packed));
+static const uint32_t PIANO_WIFI_8021X_PROFILE_VERSION = 1u;
 
 enum {
   PIANO_WIFI_8021X_STATE_IDLE = 0,        /* no association (yet, or any more) */

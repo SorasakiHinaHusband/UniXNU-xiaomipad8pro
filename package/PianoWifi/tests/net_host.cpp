@@ -157,8 +157,22 @@ int main()
     std::memcpy(&back, m + 8, sizeof back);
     CHECK(back.state == 1 && back.generation == 4 && back.aid == 20 && back.freq == 5200 && std::memcmp(back.bssid, kAp, 6) == 0);
     CHECK(netBuildLink(m, 100, 11, l) == 0);
+    piano_wifi_8021x_profile profile = {};
+    profile.version = PIANO_WIFI_8021X_PROFILE_VERSION;
+    profile.generation = 4;
+    profile.security = 1;
+    profile.ssid_len = 4;
+    profile.psk_len = 64;
+    std::memcpy(profile.ssid, "test", 4);
+    std::memset(profile.psk, 'a', profile.psk_len);
+    const uint32_t pn = netBuildProfile(m, sizeof m, 12, profile);
+    CHECK(pn == 8 + sizeof profile && *reinterpret_cast<uint16_t *>(m) == PIANO_WIFI_8021X_PROFILE &&
+          *reinterpret_cast<uint16_t *>(m + 2) == pn);
+    piano_wifi_8021x_profile profileBack;
+    std::memcpy(&profileBack, m + 8, sizeof profileBack);
+    CHECK(profileBack.generation == 4 && profileBack.psk_len == 64 && std::memcmp(profileBack.ssid, "test", 4) == 0);
     std::vector<uint8_t> pdu = keyPdu(0x008a);
-    const uint32_t e = netBuildEapolRx(m, sizeof m, 12, 4, kAp, pdu.data(), uint32_t(pdu.size()));
+    const uint32_t e = netBuildEapolRx(m, sizeof m, 13, 4, kAp, pdu.data(), uint32_t(pdu.size()));
     CHECK(e == 8 + 12 + pdu.size());
     piano_wifi_8021x_eapol eb;
     std::memcpy(&eb, m + 8, sizeof eb);

@@ -39,7 +39,7 @@ struct piano_wifi_profile {
 #ifdef __cplusplus
 extern "C" {
 #endif
-int piano_wifi_menu_join_profile(const struct piano_wifi_profile *profile);
+int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile *profile);
 #ifdef __cplusplus
 }
 #endif

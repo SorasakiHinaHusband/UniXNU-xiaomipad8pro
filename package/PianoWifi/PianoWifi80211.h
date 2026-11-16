@@ -635,7 +635,7 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
   IOLockUnlock(fLock);
   if (set && type == kAssociate) {
     if (a.associationProfile) {
-      const int e = piano_wifi_menu_join_profile(&a.associationProfileData);
+      const int e = piano_wifi_net_menu_join_profile(&a.associationProfileData);
       piano_wifi_profile_wipe(&a.associationProfileData);
       if (e) {
         a.error = e;
@@ -961,22 +961,11 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
 // Ethernet personality.
 void PianoWifi80211::linkChanged(bool up)
 {
-  if (shengMode() & pianowifi::a80211::kShengAssocState) {
-    syncAssociation(true);
-    return;
-  }
-  if (!(shengMode() & pianowifi::a80211::kShengEvents)) return;
-  pianowifi::a80211::LinkEvent event = {};
-  event.down = up ? 0 : 1;
-  if (up) {
-    postEvent(pianowifi::a80211::kEvSsidChanged);
-    postEvent(pianowifi::a80211::kEvBssidChanged);
-    postEvent(pianowifi::a80211::kEvLinkChanged, &event, sizeof event);
-  } else {
-    postEvent(pianowifi::a80211::kEvLinkChanged, &event, sizeof event);
-    postEvent(pianowifi::a80211::kEvSsidChanged);
-    postEvent(pianowifi::a80211::kEvBssidChanged);
-  }
+  // Association state is part of the normal menu contract; the sheng A/B bit
+  // only controls the extra interface-binding probes, not whether GET 13/21
+  // and completion events are kept coherent.
+  (void)up;
+  syncAssociation(true);
 }
 
 // Pull the supplicant's stable snapshot and turn changes into the kev stream
@@ -987,7 +976,7 @@ void PianoWifi80211::linkChanged(bool up)
 void PianoWifi80211::syncAssociation(bool emit)
 {
   using namespace pianowifi::a80211;
-  if (!(shengMode() & kShengAssocState) || !fState) return;
+  if (!fState) return;
   struct piano_wifi_assoc_snapshot raw = {};
   if (piano_wifi_assoc_snapshot(&raw) != 0) return;
   Association next = {};
@@ -1007,40 +996,65 @@ void PianoWifi80211::syncAssociation(bool emit)
   next.result = raw.associate_result;
   next.state = raw.state;
   Association old = {};
-  bool changed = false, associatedChanged = false, bssidChanged = false, ssidChanged = false;
+  bool changed = false, associatedChanged = false, authorizedChanged = false, resultChanged = false, bssidChanged = false,
+       ssidChanged = false, stateChanged = false;
   IOLockLock(fLock);
   old = fState->association;
+  next.modern = old.modern;
   fState->power = raw.power != 0;
   fState->association = next;
   associatedChanged = old.associated != next.associated;
+  authorizedChanged = old.authorized != next.authorized;
+  resultChanged = old.result != next.result;
+  stateChanged = old.state != next.state;
   for (unsigned i = 0; i < 6; ++i) bssidChanged = bssidChanged || old.bssid[i] != next.bssid[i];
   ssidChanged = old.ssidLength != next.ssidLength || memcmp(old.ssid, next.ssid, pianowifi::kSsidMax) != 0;
-  changed = associatedChanged || bssidChanged || ssidChanged || old.channel != next.channel || old.rssi != next.rssi;
+  changed = associatedChanged || authorizedChanged || resultChanged || stateChanged || bssidChanged || ssidChanged ||
+            old.channel != next.channel || old.rssi != next.rssi;
   IOLockUnlock(fLock);
   if (!emit || !changed) return;
-  const bool joinedOrRoamed = next.associated && (associatedChanged || bssidChanged || ssidChanged);
-  if (associatedChanged || joinedOrRoamed) {
+  const bool oldPublic = old.associated && (old.authType != 2 || old.authorized);
+  const bool nextPublic = next.associated && (next.authType != 2 || next.authorized);
+  const bool joinedOrRoamed = nextPublic && (associatedChanged || authorizedChanged || bssidChanged || ssidChanged);
+  auto assocDone = [&](const Association &a) {
+    if (a.modern) {
+      // Reuse the controller's scratch allocation so the ioctl caller's
+      // kernel stack does not carry the 540-byte modern completion record.
+      AssociateEvent27 *event = reinterpret_cast<AssociateEvent27 *>(fScratch);
+      bzero(event, sizeof *event);
+      for (unsigned i = 0; i < 6; ++i) event->attempts[0][i] = a.bssid[i];
+      event->result = a.result;
+      event->has_result = 1;
+      postEvent(kEvAssocDone, event, sizeof *event);
+    } else {
+      const uint32_t result = a.result;
+      postEvent(kEvAssocDone, &result, sizeof result);
+    }
+  };
+  if (nextPublic && (joinedOrRoamed || !oldPublic)) {
     LinkEvent link = {};
-    link.down = next.associated ? 0 : 1;
+    link.down = 0;
     link.rssi = next.rssi;
     link.noise = uint16_t(next.noise);
-    if (next.associated) {
-      if (ssidChanged) postEvent(kEvSsidChanged);
-      if (bssidChanged) postEvent(kEvBssidChanged);
-      postEvent(kEvLinkChanged, &link, sizeof link);
-      const uint32_t result = 0;  // ASSOC_DONE's event result is success; GET 21 carries pending/success.
-      postEvent(kEvAssocDone, &result, sizeof result);
-    } else {
-      postEvent(kEvLinkChanged, &link, sizeof link);
-      postEvent(kEvSsidChanged);
-      postEvent(kEvBssidChanged);
-    }
-  } else {
     if (ssidChanged) postEvent(kEvSsidChanged);
     if (bssidChanged) postEvent(kEvBssidChanged);
+    postEvent(kEvLinkChanged, &link, sizeof link);
+    assocDone(next);
+  } else if (!next.associated && (old.associated || resultChanged)) {
+    LinkEvent link = {};
+    link.down = 1;
+    link.rssi = next.rssi;
+    link.noise = uint16_t(next.noise);
+    postEvent(kEvLinkChanged, &link, sizeof link);
+    if (next.result) assocDone(next);
+    postEvent(kEvSsidChanged);
+    postEvent(kEvBssidChanged);
+  } else if (nextPublic && resultChanged) {
+    assocDone(next);
   }
   note80211("%s: association state %s (channel %u, rssi %d, rate %u; events emitted)", fIfName,
-            next.associated ? "associated" : "idle", unsigned(next.channel), int(next.rssi), unsigned(next.rate));
+            next.associated ? (next.authorized ? "authorized" : "associated") : "idle", unsigned(next.channel), int(next.rssi),
+            unsigned(next.rate));
 }
 
 void PianoWifi80211::associationTick(thread_call_param_t p, thread_call_param_t)

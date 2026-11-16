@@ -3225,7 +3225,8 @@ piano_wifi_profile gProfile;
 uint32_t gProfileGeneration;   // under gProfileLock
 bool gProfileSet;
 piano_wifi_profile_stamp gProfileStamp;   // the file's at the last read (profileFileCheck)
-bool gProfileStampValid, gProfileFromFile, gProfileReadOnce;
+bool gProfileStampValid, gProfileFromFile, gProfileFromMenu, gProfileReadOnce;
+volatile uint32_t gMenuJoinRequested;
 
 void profileClear()
 {
@@ -3233,6 +3234,7 @@ void profileClear()
   IOLockLock(gProfileLock);
   piano_wifi_profile_wipe(&gProfile);
   gProfileSet = false;
+  gProfileFromMenu = false;
   IOLockUnlock(gProfileLock);
 }
 
@@ -3266,7 +3268,8 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   IOLockLock(gProfileLock);
   gProfile = incoming;
   gProfileSet = true;
-  gProfileFromFile = false;   // the sysctl's (the next look at the file compares it with this one)
+  gProfileFromFile = false;
+  gProfileFromMenu = false;   // the sysctl's profile is replaced by a file only when the file changes
   const uint32_t generation = ++gProfileGeneration;
   IOLockUnlock(gProfileLock);
   // (review of ee9980a, #2) a file already read would otherwise not be looked at again until its stamp changes, and this
@@ -3361,6 +3364,32 @@ int sysctlApple80211(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 struct sysctl_oid gOidApple80211;
 
 }  // namespace
+
+// The Apple80211 front end lives in PianoWifiEthernet.cpp.  SET 20 is parsed there
+// under its own lock and calls this narrow C boundary after releasing that lock; the
+// profile is copied into the level-7 store and the caller wipes its temporary bytes.
+extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile *incoming)
+{
+  if (!incoming || !gProfileLock) return ENODEV;
+  const char *problem = piano_wifi_profile_problem(incoming, sizeof *incoming);
+  if (problem) {
+    note("menu join profile refused: %s (nothing of it kept)", problem);
+    return EINVAL;
+  }
+  IOLockLock(gProfileLock);
+  gProfile = *incoming;
+  gProfileSet = true;
+  gProfileFromFile = false;
+  gProfileFromMenu = true;
+  const uint32_t generation = ++gProfileGeneration;
+  IOLockUnlock(gProfileLock);
+  gProfileStampValid = false;
+  __atomic_store_n(&gMenuJoinRequested, 1u, __ATOMIC_RELEASE);
+  note("menu join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s (none of it is logged)",
+       generation, unsigned(incoming->ssid_len), piano_wifi_security_name(incoming->security),
+       incoming->psk_len ? " with a passphrase" : "", (incoming->flags & PianoWifiProfileBssid) ? "given" : "not given");
+  return 0;
+}
 
 SYSCTL_DECL(_machdep);
 
@@ -3490,6 +3519,10 @@ __attribute__((noinline)) bool profileFileCheck(const char *when)
 {
   static const char *lastProblem;
   if (!gArgs.l7file || !gProfileLock) return false;
+  IOLockLock(gProfileLock);
+  const bool menuOwnsProfile = gProfileFromMenu;
+  IOLockUnlock(gProfileLock);
+  if (menuOwnsProfile) return false;
   piano_wifi_profile_stamp stamp = {};
   const int rc = piano_wifi_profile_file_stamp(&stamp);
   if (rc == ENOENT) {
@@ -3863,7 +3896,19 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   out->op_mode = 1;
   out->state = 0;
   out->noise_dbm = -95;
-  out->associate_result = (gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess) ? 0u : uint32_t(gSta.assocStatus);
+  // ASSOCIATE_RESULT is a public progress/result code: 0 while the station or
+  // its WPA2 port is still running, 1 only after authorization, 9 for a
+  // timeout/no-answer, and 2 for every other completed failure.
+  if (!gSta.assocAnswered)
+    out->associate_result = 0;
+  else if (gSta.assocStatus != kDot11StatusSuccess)
+    out->associate_result = (gSta.error == kStaErrTimeout || gSta.error == kStaErrNoAnswer) ? 9u : 2u;
+  else if (gSta.rsn && !gSta.authorized)
+    out->associate_result = 0;
+  else if (gSta.disconnect || !gSta.vdevUp)
+    out->associate_result = 2u;
+  else
+    out->associate_result = 1u;
   const bool live = gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
                     (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||
                      gSta.step == kStaAssociated);
@@ -3880,7 +3925,6 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   out->rate_mbps = gSta.choice.net.rateCount ? uint32_t(gSta.choice.net.rates[gSta.choice.net.rateCount - 1] & 0x7f) / 2u : 6u;
   out->auth_type = gSta.rsn ? 2 : 1;
   out->cipher = gSta.rsn ? (gSta.pairwise ? uint8_t(gSta.pairwise) : 4) : 0;
-  out->associate_result = out->associated ? 1u : out->associate_result;
   return 0;
 }
 // Boot 10q: the station's power save (wanted: the boot argument, then the sysctl; applied: what the firmware was told for the
@@ -4151,6 +4195,33 @@ void netRegister()
 
 // ---- the ladder's side ----
 // The LINK message of the moment.
+void portSendProfile(uint32_t generation)
+{
+  if (!gProfileLock) return;
+  piano_wifi_8021x_profile p;
+  bzero(&p, sizeof p);
+  IOLockLock(gProfileLock);
+  if (!gProfileSet) {
+    IOLockUnlock(gProfileLock);
+    return;
+  }
+  p.version = PIANO_WIFI_8021X_PROFILE_VERSION;
+  p.generation = generation;
+  p.security = gProfile.security;
+  p.ssid_len = gProfile.ssid_len;
+  p.psk_len = gProfile.psk_len;
+  for (unsigned i = 0; i < sizeof p.ssid; ++i) p.ssid[i] = gProfile.ssid[i];
+  for (unsigned i = 0; i < sizeof p.psk; ++i) p.psk[i] = gProfile.psk[i];
+  IOLockUnlock(gProfileLock);
+  uint8_t m[kNetHdrBytes + sizeof p];
+  const uint32_t n = netBuildProfile(m, sizeof m, ++gL8.portSeq, p);
+  if (n) portEnqueue(m, n);
+  for (volatile uint8_t *at = reinterpret_cast<volatile uint8_t *>(&p);
+       at < reinterpret_cast<volatile uint8_t *>(&p) + sizeof p; ++at)
+    *at = 0;
+  for (unsigned i = 0; i < sizeof m; ++i) m[i] = 0;
+}
+
 void portSendLink(uint32_t state)
 {
   piano_wifi_8021x_link l;
@@ -4177,6 +4248,7 @@ void portSendLink(uint32_t state)
     for (uint32_t i = 0; i < l.ap_rsn_len; ++i) l.ap_rsn[i] = net.rsnElement[i];
     l.own_rsn_len = uint8_t(netRsnElement(l.own_rsn, sizeof l.own_rsn, gSta.groupCipher, gSta.pairwise, gSta.akm));
   }
+  if (state == PIANO_WIFI_8021X_STATE_ASSOCIATED) portSendProfile(l.generation);
   uint8_t m[kNetHdrBytes + sizeof l];
   const uint32_t n = netBuildLink(m, sizeof m, ++gL8.portSeq, l);
   if (n) portEnqueue(m, n);
@@ -5385,6 +5457,16 @@ int level7(IOService *owner)
            "(none of it is logged)",
            (unsigned long long)(now - started), unsigned(gSta.ssidLength), piano_wifi_security_name(gSta.security),
            gSta.bssidGiven ? "given" : "not given");
+    }
+    if (!stopping && __atomic_exchange_n(&gMenuJoinRequested, 0u, __ATOMIC_ACQ_REL) && gSta.profileSet && gProfileLock) {
+      IOLockLock(gProfileLock);
+      const uint32_t requestedGeneration = gProfileGeneration;
+      IOLockUnlock(gProfileLock);
+      if (requestedGeneration != gStaProfileGeneration) {
+        note("level 7: menu association replaced the active join profile (generation %u): the station leaves and joins the new request",
+             requestedGeneration);
+        staStop(gSta, now);
+      }
     }
     staRunOnce(now);
     if (gSta.outLength) {

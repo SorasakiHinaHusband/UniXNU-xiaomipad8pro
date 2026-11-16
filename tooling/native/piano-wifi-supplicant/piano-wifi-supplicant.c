@@ -404,6 +404,37 @@ static bool load_pmk(const char *path, struct pmk_state *ps)
   return true;
 }
 
+// A menu association has no profile file.  The kext sends the validated
+// credential over the privileged 802.1X socket; keep it in this process only,
+// with the same length-only logging as the file path.
+static bool profile_from_wire(const struct piano_wifi_8021x_profile *wire, struct profile *out)
+{
+  if (!wire || wire->version != PIANO_WIFI_8021X_PROFILE_VERSION || wire->ssid_len < 1 || wire->ssid_len > 32 ||
+      wire->psk_len > 64 || (wire->security != 0 && wire->security != 1))
+    return false;
+  if (wire->security == 1 && wire->psk_len != 64 && (wire->psk_len < 8 || wire->psk_len > 63)) return false;
+  if (wire->security == 0 && wire->psk_len != 0) return false;
+  memset(out, 0, sizeof *out);
+  out->ssid_len = wire->ssid_len;
+  memcpy(out->ssid, wire->ssid, out->ssid_len);
+  out->wpa2 = wire->security == 1;
+  if (wire->psk_len) memcpy(out->psk, wire->psk, wire->psk_len);
+  out->psk[wire->psk_len] = 0;
+  return true;
+}
+
+static bool set_pmk_profile(const struct profile *prof, struct pmk_state *ps)
+{
+  wipe(ps->pmk, sizeof ps->pmk);
+  ps->have = false;
+  if (!prof || !prof->wpa2 || pmk_of_profile(prof, ps->pmk) != 0) return false;
+  ps->have = true;
+  ps->ino = 0;
+  ps->size = 0;
+  memset(&ps->mtime, 0, sizeof ps->mtime);
+  return true;
+}
+
 // --------------------------------------------------------------------------------------------------------- the socket
 static int gSock = -1;
 static uint32_t gSeq;
@@ -447,6 +478,9 @@ static int run(const char *profile_path, bool once)
   say("connected to the 802.1X port");
   sock_send(NULL, PIANO_WIFI_8021X_LINK_QUERY, &(struct piano_wifi_8021x_request){0}, sizeof(struct piano_wifi_8021x_request), NULL, 0);
   struct handshake h = {0};
+  struct profile menu_profile = {0};
+  bool menu_profile_valid = false;
+  uint32_t menu_profile_generation = 0;
   struct timeval tv = { .tv_sec = 1 };
   setsockopt(gSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   time_t associated_at = 0;
@@ -469,7 +503,21 @@ static int run(const char *profile_path, bool once)
     memcpy(&hd, msg, sizeof hd);
     const uint8_t *body = msg + sizeof hd;
     size_t body_len = (size_t)n - sizeof hd;
-    if (hd.type == PIANO_WIFI_8021X_LINK && body_len >= sizeof(struct piano_wifi_8021x_link)) {
+    if (hd.type == PIANO_WIFI_8021X_PROFILE && body_len == sizeof(struct piano_wifi_8021x_profile)) {
+      struct piano_wifi_8021x_profile wire;
+      memcpy(&wire, body, sizeof wire);
+      if (profile_from_wire(&wire, &menu_profile)) {
+        menu_profile_valid = true;
+        menu_profile_generation = wire.generation;
+        if (menu_profile_generation == h.generation && menu_profile.wpa2 && !set_pmk_profile(&menu_profile, &ps)) {
+          menu_profile_valid = false;
+          say("the menu join profile's key could not be derived (generation %u)", wire.generation);
+        }
+      } else {
+        say("the menu join profile message was refused (invalid lengths or security kind)");
+      }
+      wipe(&wire, sizeof wire);
+    } else if (hd.type == PIANO_WIFI_8021X_LINK && body_len >= sizeof(struct piano_wifi_8021x_link)) {
       struct piano_wifi_8021x_link l;
       memcpy(&l, body, sizeof l);
       if (l.state == PIANO_WIFI_8021X_STATE_ASSOCIATED && l.generation != h.generation) {
@@ -485,7 +533,14 @@ static int run(const char *profile_path, bool once)
         associated_at = time(NULL);
         say("associated (generation %u, AID %u, %u MHz, pairwise %u, group %u, AKM %u): the four-way handshake's turn",
             l.generation, l.aid, l.freq, l.pairwise, l.group, l.akm);
-        if (!load_pmk(profile_path, &ps)) say("no usable join profile: the four-way handshake cannot run (generation %u)", l.generation);
+        if (menu_profile_valid && menu_profile_generation == l.generation && menu_profile.wpa2) {
+          if (!set_pmk_profile(&menu_profile, &ps)) {
+            menu_profile_valid = false;
+            say("the menu join profile's key could not be derived (generation %u)", l.generation);
+          }
+        } else if (!load_pmk(profile_path, &ps)) {
+          say("no usable join profile: the four-way handshake cannot run (generation %u)", l.generation);
+        }
       } else if (l.state == PIANO_WIFI_8021X_STATE_AUTHORIZED) {
         say("the port is open (generation %u)", l.generation);
       } else if (l.state == PIANO_WIFI_8021X_STATE_IDLE) {
@@ -498,6 +553,7 @@ static int run(const char *profile_path, bool once)
       struct piano_wifi_8021x_eapol e;
       memcpy(&e, body, sizeof e);
       if (e.generation != h.generation || sizeof e + e.pdu_len > body_len) continue;
+      if (!ps.have && menu_profile_valid && menu_profile_generation == h.generation) set_pmk_profile(&menu_profile, &ps);
       if (!ps.have && !load_pmk(profile_path, &ps)) {   // the profile may have come after the association
         if (nopmk_generation != h.generation) {
           say("an EAPOL frame came, but there is no usable join profile: dropped (generation %u)", h.generation);
