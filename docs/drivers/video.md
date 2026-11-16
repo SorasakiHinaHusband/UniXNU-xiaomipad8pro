@@ -240,7 +240,7 @@ SMMU (`piano-video-smmu=0`; PianoDpu and PianoWifi read the same pages). A `core
 | Level | Arguments | Step | Pass | Effort |
 |---|---|---|---|---|
 | V0 | `piano-video=1` | survey (built) | the lines above, no hang, `0 stores` | done offline; 1 boot |
-| V0b | a test image | the vendored transport + VTHost with a stub backend listing H.264/HEVC and refusing `dsta` | with `vmm-present = 0`: a process opens the service and a `decs` arrives (the transport's open and message counters, logged to the USB console), playback falls back to software cleanly | 1–2 days; 1 boot |
+| V0b | `piano-video-vt=1` | the vendored VT frontend + VTHost with a capability-only stub backend listing H.264/HEVC and refusing `dsta` | **built, not yet run**; with `kern.hv_vmm_present=0`, the support probe should open `AppleVideoToolboxParavirtualizationDriver` / `AppleVideoToolboxParavirtualizationUserClient`, report guest=true, emit `decs`, then refuse stream start without affecting the desktop | 1 boot |
 | V1 | `=2` | power (built offline, §12.1): MXC svs + MMCX at the display floor + BCM MM1, GCC AXI0/1, PLL0 720 MHz, MVS0C then MVS0 GDSC + clocks at 240 MHz; the survey's core readout with the gate open; off in Linux's order | CORE_POWER_STATUS bit 1, sane words, CTRL_STATUS 0; GDSCs off again; 20 cycles; the panel unaffected (§12.8 T1, T2) | 1–2 boots |
 | V2 | `=3` | firmware (built offline, §12.2): the pinned file (the RAM image's addon, else the ESP), MDT, PAS 9 init/mem_setup/segments/auth_and_reset, MP_VIDEO_VAR under one hold of the secure-call lock; PAS shutdown | every SMC `ok`, no stall, 3 repeats (§12.8 T3) | 1–2 boots |
 | V3 | `=4` | SMMU groups + bank, UC region, boot words, CTRL_INIT; INIT + IMAGE_VERSION; PC prep, collapse, resume (built offline, §12.3) | init without error, INIT answered with success, the version string, FSR 0; 10 collapse/resume cycles (§12.8 T4, T5) | 2–4 boots |
@@ -255,13 +255,13 @@ Total about 10–16 weeks attended; H.264 in VideoToolbox (the first battery pay
 
 ## 9. Fallback
 
-Without `piano-video` nothing is mapped and VideoToolbox keeps Apple's software decoders. From level 6, a format the core cannot
+Without `piano-video` and `piano-video-vt` nothing is mapped and VideoToolbox keeps Apple's software decoders. `piano-video-vt=1` publishes only the V0b service; the stub advertises H.264/HEVC and refuses stream start, so no Iris register or HFI work occurs. From level 6, a format the core cannot
 take is refused at `dsta` (VideoToolbox then decodes in software); a session error or a core watchdog ends the sessions with ERROR
 events (software again) and powers the core off. A hang or reset returns to the previous system (RAM boots, `piano-reset-after`).
 
 ## 10. Open questions
 
-1. Does VideoToolbox use the paravirtual service natively with `vmm-present = 0`? → V0b. If not: `vmm-present = 1` costs the
+1. **Guest gate:** 27.3 `VTParavirtualizationIsRunningInGuest` dispatches once to `VTParavirtualizationGuestSupportSetUpWithHandlers`; the support framework matches `AppleVideoToolboxParavirtualizationDriver` and opens its user client. V0b tests this with `kern.hv_vmm_present=0`; setting the sysctl is not part of the implementation because it changes other subsystems and costs the
    'RGhA' framebuffer (`soft-metal.md`); no other route is open within the rules.
 2. The state at XNU time (GCC video AHB, GDSCs, PLL0) and whether VIDEO_CC is readable at the boot rail levels → V0.
 3. SMMU: entries for 0x1940..0x194f, free groups and banks, CTTW → V0; a fresh bank accepted under Gunyah → V3.

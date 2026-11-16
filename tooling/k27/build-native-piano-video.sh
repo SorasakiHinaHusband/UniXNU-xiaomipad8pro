@@ -33,6 +33,8 @@ for f in Sm8750Scm.c Sm8750Scm.h; do
 done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/video_host.cpp" -o "$O/host-tests/video_host"
 "$O/host-tests/video_host" || { echo "Error: PianoVideo host tests failed (level 1)" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_host.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" -o "$O/host-tests/vt_host"
+"$O/host-tests/vt_host" || { echo "Error: PianoVideo VT host tests failed (V0b)" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomMdt.c" -o "$O/host-tests/QcomMdt.o"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/bringup_host.cpp" "$O/host-tests/QcomMdt.o" \
   -o "$O/host-tests/bringup_host"
@@ -44,7 +46,7 @@ VIDEO_HOST_FW=$([ -f "$FW" ] && echo "$FW" || true) "$O/host-tests/bringup_host"
 python3 "$D/tooling/persist/firmware.py" stage --kext PianoVideo --header "$O/gen/PianoVideoFirmwarePins.h" \
   --source "$O/gen/PianoVideoFirmware.c" "$FW=2409160:95c5882f9b66b93ad2635604b7db563cc310481e017fa6b82e0ce6cbb9eae01b"
 python3 "$D/tooling/k27/build-native-kext.py" PianoVideo "$P/PianoVideo.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/FatVolume.c" "$P/QcomMdt.c" "$P/Sm8750Scm.c" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" \
+  "$P/FatVolume.c" "$P/QcomMdt.c" "$P/Sm8750Scm.c" "$P/vt/PianoVideoVTParavirt.cpp" "$P/vt/PianoVideoVTHost.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" \
   "$D/package/common/PianoFirmwareZlib.c" "$O/gen/PianoVideoFirmware.c" -I "$P" -I "$D/package/common" -I "$O/gen" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}

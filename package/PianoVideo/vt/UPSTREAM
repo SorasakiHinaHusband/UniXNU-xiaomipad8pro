@@ -1,0 +1,23 @@
+PianoVideo/vt carries the VideoToolbox paravirtual frontend from the third-party
+repository UniXNU-droidvm-piano, commit 706338e309b410a1f04d87eb3ae009612577aedf.
+
+Source files brought in:
+  package/DroidVMVTParavirt.cpp -> PianoVideoVTParavirt.cpp
+  package/DroidVMVTHost.cpp     -> PianoVideoVTHost.cpp
+  package/DroidVMVTWire.h       -> PianoVideoVTWire.h
+
+The source history needed for this frontend is the channel and decoder series
+3df7c94, 1479852, 9d5a0ce, fab4fb1, and 706338e.  The virtio-media transport
+and all VM device code are intentionally excluded.  PianoVideoVTStubMedia.cpp
+supplies only the 14 transport entry points: it advertises H.264/HEVC decoder
+capability through the frontend and returns ENOTSUP for stream operations.
+
+Changes for native PianoVideo V0b:
+  * renamed files and include paths; retained upstream droidvm_* symbols as
+    internal ABI names only;
+  * changed boot control to piano-video-vt=1 and console prefixes to PianoVideo;
+  * changed advertised implementation identifiers/descriptions to PianoVideo;
+  * added the service properties used by the VideoToolbox support probe;
+  * added the capability-only stub backend and no encode device.
+
+License: BSD-2-Clause-Patent.  See LICENSE in this directory.
