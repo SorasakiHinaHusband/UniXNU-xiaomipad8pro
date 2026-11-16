@@ -60,15 +60,24 @@ struct Rig {
     return v;
   }
   const uint8_t *at(uint32_t off) const { return user.mem.data() + off; }
+  void put16(uint32_t off, uint16_t v) { std::memcpy(user.mem.data() + off, &v, 2); }
   void put32(uint32_t off, uint32_t v) { std::memcpy(user.mem.data() + off, &v, 4); }
   Answer associate(uint32_t layout = sizeof(AssociateRequest27), uint32_t cipher = 10, uint32_t keyLength = 13)
   {
     std::memset(user.mem.data(), 0, layout);
     const uint32_t network = layout == sizeof(AssociateRequest27) ? 0x10 : 0x0c;
-    put32(0, 1);                         // request version
+    put32(0, 1);                         // Associate2 record version
+    if (layout == sizeof(AssociateRequest27)) {
+      put16(4, 2);                       // mode
+      put32(8, 1);                       // authentication selector/version word
+      put32(0x0c, 0x40);                 // WPA2/RSN flags for this fixture
+    }
     put32(network, 4);                   // SSID length (the bytes are test-only)
     std::memcpy(user.mem.data() + network + 4, "test", 4);
+    const uint8_t bssid[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+    std::memcpy(user.mem.data() + network + 0x24, bssid, sizeof bssid);
     if (keyLength) {
+      put32(network + 0x2c, 1);          // credential version
       put32(network + 0x30, keyLength);
       put32(network + 0x34, cipher);
       for (uint32_t i = 0; i < keyLength; ++i) user.mem[network + 0x3c + i] = uint8_t('a' + (i % 20));
@@ -253,6 +262,8 @@ int main()
     CHECK(a.error == 0 && a.associationProfile && a.associationLayout == 656);
     CHECK(a.associationProfileData.security == PianoWifiSecWpa2Psk && a.associationProfileData.ssid_len == 4 &&
           a.associationProfileData.psk_len == 13 && std::memcmp(a.associationProfileData.ssid, "test", 4) == 0);
+    CHECK(a.associationHeaderValid && a.associationHeader0 == 1 && a.associationHeader8 == 1 &&
+          a.associationHeaderC == 0x40 && a.associationCredentialLength == 13 && a.associationCredentialCipher == 10);
     a = r.associate(sizeof(AssociateRequestLegacy), 10, 8);
     CHECK(a.error == 0 && a.associationProfile && a.associationLayout == 592 && a.associationProfileData.psk_len == 8);
     a = r.associate(sizeof(AssociateRequest27), 6, 32);
@@ -266,6 +277,10 @@ int main()
     r.put32(0, 2);
     a = r.ask(true, kAssociate, 656);
     CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemVersion);
+    a = r.associate(sizeof(AssociateRequest27), 10, 13);
+    r.put32(0, 0);                       // wrapper variant: selector word at 0x08 remains one
+    a = r.ask(true, kAssociate, sizeof(AssociateRequest27));
+    CHECK(a.error == 0 && a.associationProfile && a.associationProfileData.psk_len == 13);
   }
 
   // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered

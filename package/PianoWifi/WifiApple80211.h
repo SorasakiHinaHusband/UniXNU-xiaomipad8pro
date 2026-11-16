@@ -555,6 +555,13 @@ struct Answer {
   bool associationProfile = false;  // SET 20 parsed into associationProfileData below
   uint32_t associationProblem = kAssociateProblemNone;
   uint32_t associationLayout = 0;
+  uint32_t associationHeader0 = 0;
+  uint32_t associationHeader4 = 0;
+  uint32_t associationHeader8 = 0;
+  uint32_t associationHeaderC = 0;
+  uint32_t associationCredentialLength = 0;
+  uint32_t associationCredentialCipher = 0;
+  bool associationHeaderValid = false;
   piano_wifi_profile associationProfileData = {};
 };
 
@@ -663,9 +670,28 @@ inline bool parseAssociate(const Req &rq, const UserIo &io, Answer &a)
     associateProblem(a, kAssociateProblemLayout, layout);
     return false;
   }
+  const uint8_t *raw = reinterpret_cast<const uint8_t *>(&wire);
+  auto le32 = [&](uint32_t at) {
+    return uint32_t(raw[at]) | uint32_t(raw[at + 1]) << 8 | uint32_t(raw[at + 2]) << 16 |
+           uint32_t(raw[at + 3]) << 24;
+  };
+  a.associationHeader0 = le32(0);
+  a.associationHeader4 = le32(4);
+  a.associationHeader8 = le32(8);
+  a.associationHeaderC = le32(0x0c);
+  a.associationCredentialLength = le32(0x40);
+  a.associationCredentialCipher = le32(0x44);
+  a.associationHeaderValid = true;
   const uint32_t version = layout == sizeof(AssociateRequest27) ? wire.modern.version : wire.legacy.version;
   const AssociateParameters *network = layout == sizeof(AssociateRequest27) ? &wire.modern.network : &wire.legacy.network;
-  if (version != 1) {
+  // Associate2 emits two version-bearing words in the modern record: the record
+  // version at 0x00 and the authentication selector at 0x08 (both are one in
+  // the 27.3 request).  Keep the legacy check exact, while accepting a modern
+  // request whose wrapper preserved the selector word but did not preserve the
+  // first word; the rest of the fixed offsets are unchanged.
+  const bool modernVersion = layout == sizeof(AssociateRequest27) &&
+                             (version == 1 || (version == 0 && a.associationHeader8 == 1));
+  if (!modernVersion && version != 1) {
     associateProblem(a, kAssociateProblemVersion, layout);
     zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
     return false;

@@ -642,8 +642,16 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
         note80211("%s: ASSOCIATE refused: the validated profile could not be handed to level 7 (errno %d)", fIfName, e);
       }
     } else if (a.error) {
-      note80211("%s: ASSOCIATE refused: %s (layout %u; no profile kept)", fIfName,
-                associateProblemName(a.associationProblem), unsigned(a.associationLayout));
+      if (a.associationHeaderValid) {
+        note80211("%s: ASSOCIATE refused: %s (layout %u; h00 %08x h04 %08x h08 %08x h0c %08x; credential length %u cipher %u; no profile kept)",
+                  fIfName, associateProblemName(a.associationProblem), unsigned(a.associationLayout),
+                  unsigned(a.associationHeader0), unsigned(a.associationHeader4), unsigned(a.associationHeader8),
+                  unsigned(a.associationHeaderC), unsigned(a.associationCredentialLength),
+                  unsigned(a.associationCredentialCipher));
+      } else {
+        note80211("%s: ASSOCIATE refused: %s (layout %u; no profile kept)", fIfName,
+                  associateProblemName(a.associationProblem), unsigned(a.associationLayout));
+      }
     }
   }
   if (first) {
