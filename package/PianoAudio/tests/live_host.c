@@ -737,9 +737,11 @@ static void testLevel9(void)
         if (a > 1000 && b > 1000 && abs(a - b) > (int32_t)((int64_t)AUDIO_CEILING_MAX * AUDIO_VOLUME_STEP / AUDIO_Q15_ONE) + 200) big++;
     }
     CHECK(big == 0);
-    // half volume (-25 dB) reached: some period near 0.056 of the ceiling
+    // half slider volume follows the shared -36 dB squared curve: about 35.5%
+    // of the ceiling (the old -25 dB expectation belonged to the rejected
+    // -50 dB/half-dB curve).
     int seen = 0;
-    for (unsigned i = 0; i < w.nperiods; ++i) if (w.period_peak[i] > AUDIO_CEILING_MAX * 5 / 100 && w.period_peak[i] < AUDIO_CEILING_MAX * 7 / 100) seen = 1;
+    for (unsigned i = 0; i < w.nperiods; ++i) if (w.period_peak[i] > AUDIO_CEILING_MAX * 32 / 100 && w.period_peak[i] < AUDIO_CEILING_MAX * 38 / 100) seen = 1;
     CHECK(seen);
 }
 
