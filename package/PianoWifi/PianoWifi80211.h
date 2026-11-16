@@ -1202,7 +1202,10 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   // apple80211(), before that routine takes fLock; the guard completes it on
   // every return path, including allocation, short-request, and driver-error paths.
   pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> inputPreparation(inputDescriptor, kIODirectionOut);
-  if (!inputPreparation.ok()) return kIOReturnBadArgument;
+  if (!inputPreparation.ok()) {
+    note80211("%s: IOUC descriptor prepare failed for input", fIfName);
+    return kIOReturnBadArgument;
+  }
   uint8_t *stagedInput = nullptr;
   const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
   uint32_t inputBytes = args->structureInputSize;
@@ -1274,6 +1277,7 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   // call ucOut(), and completed by scope exit after all descriptor writes.
   pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> outputPreparation(outputDescriptor, kIODirectionIn);
   if (!outputPreparation.ok()) {
+    note80211("%s: IOUC descriptor prepare failed for output", fIfName);
     if (stagedInput) IOFreeData(stagedInput, want);
     return kIOReturnBadArgument;
   }
