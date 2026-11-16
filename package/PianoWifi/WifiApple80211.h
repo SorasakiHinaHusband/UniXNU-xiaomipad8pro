@@ -164,11 +164,29 @@ struct ChannelList {
 };
 static_assert(sizeof(ChannelList) == 8 + 12 * kChannelsMax, "channel list");
 
+// IO80211's CHANNELS_INFO reply is an out-of-line 0x2720-byte record on 27.3.
+// The parser consumes a 16-bit count at +0x0c, six byte arrays at the offsets
+// below (one 0x190-byte slot per channel), and one 32-bit bitmap array at +0x12d0.
+constexpr uint32_t kChannelsInfoBytes = 0x2720;
+constexpr uint32_t kChannelsInfoCountAt = 0x0c;
+constexpr uint32_t kChannelsInfoChannelAt = 0x32e;
+constexpr uint32_t kChannelsInfoIndoorAt = 0x4be;
+constexpr uint32_t kChannelsInfoDfsAt = 0x64e;
+constexpr uint32_t kChannelsInfoPassiveAt = 0x7de;
+constexpr uint32_t kChannelsInfo40At = 0x96e;
+constexpr uint32_t kChannelsInfo80At = 0xafe;
+constexpr uint32_t kChannelsInfoBitmapAt = 0x12d0;
+constexpr uint32_t kChannelsInfoStride = 0x190;
+
+constexpr uint16_t kChannelFreqs[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+                                      5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825};
+constexpr uint32_t kChannelCount = sizeof(kChannelFreqs) / sizeof(kChannelFreqs[0]);
+
 // A scan result's head: the fields to the elements are sheng's 24A446 layout, which 27.3 keeps (the element length at 0x8a, preset
 // by user space to its capacity, the elements at 0x8c). 27.3's record is 2280 bytes: 2048 bytes of elements, then fields from
 // 0x88c (a request identifier user space puts there itself, a timestamp, an RSN priority, the AP's PHY mode, MLO flags). The
-// answer writes the head and the elements it has, never the tail (resultBytes()); 1024 bytes of elements are more than the
-// rebuilt ones ever take.
+// The caller pre-fills the complete 27.3 record (including its tail) before each get.  Return the complete record so that stale
+// bytes from that prefill cannot be parsed as a second answer; fillScanResult() and the scratch buffer zero the unused tail.
 struct ScanResult {
   uint32_t version;              // 0x00
   Channel channel;               // 0x04
@@ -307,8 +325,9 @@ inline uint32_t buildElements(const Bss &b, uint8_t *out, uint32_t capacity)
   return n;
 }
 
-// The bytes of a filled result to copy out: the head and the elements it has (never 27.3's tail, from 0x88c).
-inline uint32_t resultBytes(const ScanResult &r) { return uint32_t(__builtin_offsetof(ScanResult, elements)) + r.elementsLength; }
+// The bytes of a filled result to copy out.  27.3's caller asks for 0x8e8 bytes and parses fields in the tail, so both ioctl and
+// user-client paths must return the full record even though our named struct contains only the common 1164-byte prefix.
+inline uint32_t resultBytes(const ScanResult &) { return kScanResultBytes27; }
 
 inline void fillScanResult(ScanResult &r, const Bss &b)
 {
@@ -342,6 +361,12 @@ enum : uint32_t {
   kAcceptUnknownGets = 0x4,       // any other get without a handler: a zeroed buffer of the asked length (0 in req_val without one)
   kAcceptVirtualRole = 0x8,       // VIRTUAL_IF_ROLE (96) get: 0 in req_val (else refused: an answer may make the interface virtual)
 };
+enum : uint32_t {
+  kGapChannelsInfo = 1u << 0,
+  kGapCountryCode = 1u << 1,
+  kGapAll = kGapChannelsInfo | kGapCountryCode,
+};
+constexpr uint32_t kGapDefault = kGapAll;
 constexpr uint32_t kAcceptDefault = kAcceptInfraEnumerated;
 
 // The UniXNU-sheng binding bits (`piano-wifi-sheng=MASK` at boot, `machdep.piano_wifi_sheng` at run time; each bit its own
@@ -364,10 +389,14 @@ enum : uint32_t {
   kShengInterfaceBinding = 0x40, // interface primary/class/name/grant plus controller discovery identity A/B
   kShengInterfaceUc = 0x80,     // interface-side IOUserClientClass / open path
   kShengAssocState = 0x100,      // supplicant association state, request answers and transition kevs
-  kShengInterfaceName = 0x200,   // publish the BSD name/unit and registry identity before InterfaceNamer waits for IOKit quiet
 };
 constexpr uint32_t kShengAll = kShengMedium | kShengEvents | kShengCaps46 | kShengUcKernel | kShengGrant | kShengMediaFilter |
-                                kShengInterfaceBinding | kShengInterfaceUc | kShengAssocState | kShengInterfaceName;
+                                kShengInterfaceBinding | kShengInterfaceUc | kShengAssocState;
+
+// piano-wifi-ifnet2-old=1 selects the pre-D.1 synchronous/preassigned path for one A/B boot.
+// The default (0, including an omitted argument) is D.1's asynchronous registration path.
+constexpr uint32_t kIfnet2Old = 1u;
+constexpr bool useIfnet2Old(uint32_t mode) { return (mode & kIfnet2Old) != 0; }
 
 struct Association {
   bool associated = false;
@@ -396,7 +425,8 @@ struct State {
   bool cacheCleared = false;      // SCANCACHE_CLEAR since the last SCAN_REQ: no result until the next scan
   ScanSnapshot scan;              // the scan list as of the last refresh
   uint8_t mac[6] = {};
-  char country[3] = {'X', 'X', 0};   // the world domain: the list keeps no Country element
+  char country[3] = {'X', 'X', 0};   // XX until PianoWifi publishes the firmware regulatory alpha2
+  uint32_t gaps = kGapDefault;       // A/B bits for this round's 207 and 51 responses
   uint32_t scanRequests = 0, resultsServed = 0, listEnds = 0, powerSets = 0;
   uint32_t accept = kAcceptDefault;   // kAccept*: how requests without a layout of ours are answered (a runtime switch, M1b)
   uint32_t acceptedUnknown = 0;   // requests answered only because of `accept`
@@ -411,6 +441,7 @@ inline void reset(State &s)
   s.power = true;
   s.country[0] = 'X';
   s.country[1] = 'X';
+  s.gaps = kGapDefault;
   s.accept = kAcceptDefault;
   s.sheng = 0;
 }
@@ -443,9 +474,9 @@ struct UserIo {
   int (*copyOut)(void *ctx, const void *from, uint64_t to, uint32_t length);
 };
 
-// The scratch buffer the kext gives the handler (never on the stack: the largest answer is the scan result, 1164 bytes, and the
-// channel list; the caller's kernel stack is the requesting thread's 16 KiB).
-constexpr uint32_t kScratchBytes = 2048;
+// The scratch buffer the kext gives the handler (never on the stack). It holds
+// the complete 27.3 scan record and the larger out-of-line CHANNELS_INFO reply.
+constexpr uint32_t kScratchBytes = kChannelsInfoBytes;
 static_assert(sizeof(ScanResult) <= kScratchBytes && sizeof(ChannelList) <= kScratchBytes && kVersionBytes <= kScratchBytes,
               "the scratch buffer holds every answer");
 
@@ -519,16 +550,34 @@ inline uint32_t strLen(const char *s, uint32_t max)
 // The channels this station scans (level 6's list: WifiLink.h, 2.4 GHz 1-13 and the 5 GHz non-radar ones).
 inline uint32_t fillChannelList(ChannelList &out)
 {
-  static const uint16_t kFreqs[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
-                                    5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825};
   detail::zero(reinterpret_cast<uint8_t *>(&out), sizeof out);
   out.version = 1;
-  for (uint16_t f : kFreqs) {
+  for (uint16_t f : kChannelFreqs) {
     fillChannel(out.list[out.count], f, 0);
     out.list[out.count].flags |= kChanActive;
     ++out.count;
   }
   return 8 + 12 * out.count;
+}
+
+// The 27.3 CHANNELS_INFO parser reads only the prefix selected by count. Keep
+// every reserved byte zero and advertise the same 22 active 20-MHz channels as
+// the supported-channel answer; no DFS/passive/wide-channel facts are claimed.
+inline uint32_t fillChannelsInfo(uint8_t *out, uint32_t capacity)
+{
+  if (!out || capacity < kChannelsInfoBytes) return 0;
+  detail::zero(out, kChannelsInfoBytes);
+  const uint16_t count = uint16_t(kChannelCount);
+  out[kChannelsInfoCountAt] = uint8_t(count);
+  out[kChannelsInfoCountAt + 1] = uint8_t(count >> 8);
+  for (uint32_t i = 0; i < kChannelCount; ++i) {
+    const uint8_t channel = uint8_t(channelOfFreq(kChannelFreqs[i]));
+    out[kChannelsInfoChannelAt + i * kChannelsInfoStride] = channel;
+    const uint32_t bitmap = i < 13 ? (kChan20MHz | kChan2GHz | kChanActive) : (kChan20MHz | kChan5GHz | kChanActive);
+    for (unsigned byte = 0; byte < sizeof bitmap; ++byte)
+      out[kChannelsInfoBitmapAt + i * sizeof(uint32_t) + byte] = uint8_t(bitmap >> (8 * byte));
+  }
+  return kChannelsInfoBytes;
 }
 
 // One request. `scratch` holds kScratchBytes. The kext refreshes s.scan first for a SCAN_REQ / SCAN_REQ_MULTIPLE set.
@@ -703,7 +752,18 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     a.error = kErrUnsupported;
     return a;
   case kCountryCode:
+    if (!(s.gaps & kGapCountryCode)) {
+      a.error = kErrUnsupported;
+      return a;
+    }
     a.error = bytes(rq, io, s.country, 3, a);
+    return a;
+  case kChannelsInfo:
+    if (!(s.gaps & kGapChannelsInfo)) {
+      a.error = kErrUnsupported;
+      return a;
+    }
+    a.error = copyOut(rq, io, scratch, fillChannelsInfo(scratch, kScratchBytes), a);
     return a;
   case kSupportedChannels:
   case kHwSupportedChannels: {

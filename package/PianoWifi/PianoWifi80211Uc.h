@@ -149,13 +149,27 @@ IOReturn PianoWifi80211Uc::externalMethod(uint32_t selector, IOExternalMethodArg
   using namespace pianowifi::a80211;
   if (!fOwner || !args) return kIOReturnNotReady;
   ++fCalls;
-  const uint32_t inBytes = args->structureInputSize, outBytes = args->structureOutputSize;
+  const uint32_t inBytes = args->structureInputSize;
+  const uint32_t inDescriptorBytes = args->structureInputDescriptor
+                                         ? (args->structureInputDescriptor->getLength() > UINT32_MAX
+                                                ? UINT32_MAX
+                                                : uint32_t(args->structureInputDescriptor->getLength()))
+                                         : 0;
+  const uint32_t outBytes = args->structureOutputSize;
+  const uint32_t outDescriptorBytes = args->structureOutputDescriptor
+                                          ? (args->structureOutputDescriptorSize
+                                                 ? args->structureOutputDescriptorSize
+                                                 : (args->structureOutputDescriptor->getLength() > UINT32_MAX
+                                                        ? UINT32_MAX
+                                                        : uint32_t(args->structureOutputDescriptor->getLength())))
+                                          : 0;
   IOReturn result = kIOReturnUnsupported;
   uint32_t answered = 0;   // bytes of the structure output written
+  uint32_t requestType = ~0u;
   switch (selector) {
   case kUcSelRequest:
   case kUcSelRequestBig:
-    result = fOwner->ucRequest(args, selector == kUcSelRequestBig, answered);
+    result = fOwner->ucRequest(args, selector == kUcSelRequestBig, answered, requestType);
     break;
   case kUcSelUseIouc:
   case kUcSelDkSupport:
@@ -180,6 +194,7 @@ IOReturn PianoWifi80211Uc::externalMethod(uint32_t selector, IOExternalMethodArg
   const bool first = selector < kUcSelMax && !(fSeen & (1u << selector));
   if (selector < kUcSelMax) fSeen |= 1u << selector;
   if (first || result != kIOReturnSuccess)
-    fOwner->noteSelector(selector, inBytes, outBytes, args->scalarInputCount, args->scalarOutputCount, answered, result, fCalls);
+    fOwner->noteSelector(selector, inBytes, inDescriptorBytes, outBytes, outDescriptorBytes, args->scalarInputCount,
+                         args->scalarOutputCount, requestType, answered, result, fCalls);
   return result;
 }

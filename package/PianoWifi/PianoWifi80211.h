@@ -38,6 +38,7 @@
 #include <sys/sockio.h>   // SIOCGIFMEDIA
 #include <sys/sysctl.h>
 #include "WifiApple80211.h"
+#include "PianoWifiUcTransport.h"
 
 // The KPI's private poster (Unsupported.exports): kev_msg_post refuses Apple's vendor code, which the apple80211 events carry.
 extern "C" int piano_kev_post_msg(struct kev_msg *) __asm__("_kev_post_msg");
@@ -88,6 +89,8 @@ class PianoWifi80211 : public IO80211Controller {
   uint32_t fUcMode = 0;            // kUc*: the user-client switches (docs/drivers/wifi-menu.md section 7)
   uint64_t fUcOpens = 0, fUcRefused = 0, fUcSelectors = 0;   // newUserClient calls answered / refused, selectors served
   uint32_t fUcClients = 0;         // clients alive now
+  uint32_t fUcScanRecords = 0;     // records in the current selector-0 scan
+  bool fUcScanActive = false;
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   uint64_t fScanSerial = 0;  // every SCAN_REQ gets one (ADOPTION.md 6.1 item 3): the 15 ms CoreWLAN scan is found by it
   uint32_t fScanRecords = 0; // records served since the serial's scan; printed at its list end
@@ -165,13 +168,18 @@ class PianoWifi80211 : public IO80211Controller {
   void stop(IOService *provider) override;
   // the user client's side (PianoWifi80211Uc.h)
   IOReturn newUserClient(task_t owningTask, void *security, UInt32 type, OSDictionary *properties, IOUserClient **handler) override;
-  IOReturn ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered);
+  IOReturn ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered, uint32_t &requestType);
   uint32_t ucMode();
   void noteUserClient(const char *what, task_t task, uint32_t type, uint64_t calls);
-  void noteSelector(uint32_t selector, uint32_t inBytes, uint32_t outBytes, uint32_t scalarIn, uint32_t scalarOut,
-                    uint32_t answered, IOReturn result, uint64_t calls);
+  void noteSelector(uint32_t selector, uint32_t inBytes, uint32_t inDescriptorBytes, uint32_t outBytes,
+                    uint32_t outDescriptorBytes, uint32_t scalarIn, uint32_t scalarOut, uint32_t requestType, uint32_t answered,
+                    IOReturn result, uint64_t calls);
   static int sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req);
+  static int sysctlGaps(struct sysctl_oid *, void *, int, struct sysctl_req *req);
   void setUcMode(uint32_t mode, const char *why);
+  uint32_t gapMode();
+  void setGapMode(uint32_t mode, const char *why);
+  void refreshRegulatoryCountry();
 };
 
 // (A subclass of IOEthernetInterface named IO80211Interface was tried for wm2-diag's Rank 2 and cannot be built: the 27.3
@@ -202,7 +210,7 @@ void note80211(const char *fmt, ...)
 IOSimpleLock *gA80211Gate;             // guards the two words below
 PianoWifi80211 *gA80211;               // retained while set
 unsigned gA80211Busy;                  // handlers inside the gate
-struct sysctl_oid gA80211Oid, gA80211UcOid, gA80211ShengOid;
+struct sysctl_oid gA80211Oid, gA80211UcOid, gA80211ShengOid, gA80211GapsOid;
 
 // The driver for a sysctl handler, retained for the call (nullptr once the unregister has closed the gate).
 PianoWifi80211 *a80211Enter()
@@ -283,6 +291,16 @@ bool registerAcceptSysctl(PianoWifi80211 *self)
   gA80211ShengOid.oid_descr = "PianoWifi80211's UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9)";
   gA80211ShengOid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gA80211ShengOid);
+  bzero(&gA80211GapsOid, sizeof gA80211GapsOid);
+  gA80211GapsOid.oid_parent = &sysctl__machdep_children;
+  gA80211GapsOid.oid_number = OID_AUTO;
+  gA80211GapsOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gA80211GapsOid.oid_name = "piano_wifi_a80211_gaps";
+  gA80211GapsOid.oid_handler = PianoWifi80211::sysctlGaps;
+  gA80211GapsOid.oid_fmt = "I";
+  gA80211GapsOid.oid_descr = "PianoWifi80211's 207/51 gap fixes (bit 0 CHANNELS_INFO, bit 1 COUNTRY_CODE)";
+  gA80211GapsOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gA80211GapsOid);
   return true;
 }
 // The gate closed, every handler inside it waited for, then the retain given back: after this the driver may be freed.
@@ -291,6 +309,7 @@ void unregisterAcceptSysctl()
   sysctl_unregister_oid(&gA80211Oid);
   sysctl_unregister_oid(&gA80211UcOid);
   sysctl_unregister_oid(&gA80211ShengOid);
+  sysctl_unregister_oid(&gA80211GapsOid);
   if (!gA80211Gate) return;
   const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
   PianoWifi80211 *self = gA80211;
@@ -329,7 +348,8 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
   // can return. Install the grant while the interface is still configured so
   // an immediate airportd open sees it.
   if (fState && (fState->sheng & pianowifi::a80211::kShengGrant)) applyGrant(true);
-  if (fState && (fState->sheng & pianowifi::a80211::kShengInterfaceBinding)) applyInterfaceBinding(true);
+  if (fUcMode & pianowifi::a80211::kUcOffer) applyInterfaceBinding(true);
+  else if (fState && (fState->sheng & pianowifi::a80211::kShengInterfaceBinding)) applyInterfaceBinding(true);
   // The production form of ADOPTION.md P0: the override is on both services before this interface registers, so CoreWiFi cannot
   // see the child before the controller's identity is there (the sysctl's late set is the A/B of the same thing).
   if (fUcMode & pianowifi::a80211::kUcOverride) setOverride(true, (fUcMode & pianowifi::a80211::kUcOverrideIf) != 0);
@@ -356,6 +376,8 @@ bool PianoWifi80211::start(IOService *provider)
   reset(*fState);
   uint32_t accept = 0;
   if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
+  uint32_t gaps = kGapDefault;
+  if (PE_parse_boot_argn("piano-wifi-apple80211-gaps", &gaps, sizeof gaps)) fState->gaps = gaps & kGapAll;
   // The UniXNU-sheng binding bits (docs/drivers/wifi-menu.md section 9): what their hardware-verified macOS-27.3 en0 binding
   // does that ours does not, each its own A/B on this one front end. The medium bit was already applied where the dictionary
   // is published (PianoWifiEthernet::start read the same argument); the grant is installed during interface configuration.
@@ -365,7 +387,10 @@ bool PianoWifi80211::start(IOService *provider)
   // CWFApple80211 and its SystemConfiguration objects for en2; without it, "Did NOT find matching WiFi interface"): the override
   // on the controller by default, set in configureInterface before the interface registers. piano-wifi-apple80211-uc=0 is the
   // control without it.
-  uint32_t uc = pianowifi::a80211::kUcOverride;
+  // The raw Apple80211 path is the normal binding when this front end is enabled.  The
+  // explicit boot argument remains an A/B override for older experiments.
+  uint32_t uc = pianowifi::a80211::kUcOffer | pianowifi::a80211::kUcControllerName |
+                pianowifi::a80211::kUcOverride | pianowifi::a80211::kUcOverrideIf;
   if (PE_parse_boot_argn("piano-wifi-apple80211-uc", &uc, sizeof uc)) uc &= 0x3f;
   // The next binding A/B routes discovery through the controller service, the only service we can offer a tested client
   // from without inventing an IOEthernetInterface subclass/vtable.  Interface registry facts are installed before its
@@ -393,6 +418,8 @@ bool PianoWifi80211::start(IOService *provider)
             "pipe)", unsigned(fUcMode));
   note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
             "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
+  note80211("gap switches %#x (machdep.piano_wifi_a80211_gaps changes it at run time: bit 0 CHANNELS_INFO, bit 1 COUNTRY_CODE)",
+            unsigned(fState->gaps));
   note80211("sheng mode %#x (machdep.piano_wifi_sheng changes it at run time: 0x1 medium, 0x2 SSID/BSSID events, 0x4 caps 46, "
             "0x8 kernel-buffer user-client copies, 0x10 grant, 0x20 filter media, 0x40 interface binding/user-client A/B)",
             unsigned(fState->sheng));
@@ -433,9 +460,10 @@ void PianoWifi80211::attachStep()
     note80211("%s: the interface filter was refused (%d): the apple80211 requests are not answered", fIfName, e);
     return;
   }
-  note80211("%s: apple80211 requests answered from now on (after %u ms); the BSD interface reads type %u, family %u, subfamily %u; "
-            "IOInterfaceName %s", fIfName, fAttachTries * kAttachTickMs, unsigned(ifnet_type(ifp)), unsigned(ifnet_family(ifp)),
-            unsigned(ifnet_subfamily(ifp)), named ? "the family's" : "set here");
+  note80211("%s: ifnet appeared (unit %u); apple80211 requests answered from now on (after %u ms); the BSD interface reads "
+            "type %u, family %u, subfamily %u; IOInterfaceName %s", fIfName, unsigned(ifnet_unit(ifp)),
+            fAttachTries * kAttachTickMs, unsigned(ifnet_type(ifp)), unsigned(ifnet_family(ifp)), unsigned(ifnet_subfamily(ifp)),
+            named ? "the family's" : "set here");
   postEvent(pianowifi::a80211::kEvPowerChanged);
   pianowifi::a80211::LinkEvent down = {};
   down.down = 1;
@@ -453,7 +481,8 @@ void PianoWifi80211::attachStep()
     setProperty("IOInterfaceNamePrefix", "en");
     note80211("%s: the controller carries IOInterfaceName and the Infrastructure role too (user-client mode 0x2)", fIfName);
   }
-  if (shengMode() & pianowifi::a80211::kShengInterfaceBinding) applyInterfaceBinding(true);
+  if (fUcMode & pianowifi::a80211::kUcOffer) applyInterfaceBinding(true);
+  else if (shengMode() & pianowifi::a80211::kShengInterfaceBinding) applyInterfaceBinding(true);
   setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   noteIdentity("at the filter's attach");
   registerService();
@@ -507,6 +536,10 @@ struct UcIo {
   uint32_t outBytes = 0;
   uint32_t sheng = 0;
   bool inlineData = false;       // the sheng user-client request carries its data in the input structure
+  uint8_t *directOut = nullptr;  // selector-0 get data can be the structure output buffer itself
+  uint32_t directOutBytes = 0;
+  IOMemoryDescriptor *directOutDescriptor = nullptr;  // large selector-0 get data (IOKit OOL output)
+  uint64_t directOutToken = 0;
 };
 
 int PianoWifi80211::ucIn(void *ctx, uint64_t from, void *to, uint32_t length)
@@ -528,6 +561,19 @@ int PianoWifi80211::ucOut(void *ctx, const void *from, uint64_t to, uint32_t len
 {
   auto *uc = static_cast<UcIo *>(ctx);
   uint32_t offset = 0;
+  if (uc->directOutDescriptor && to >= uc->directOutToken &&
+      to - uc->directOutToken <= uc->directOutBytes &&
+      length <= uc->directOutBytes - uint32_t(to - uc->directOutToken)) {
+    return pianowifi::a80211::writeDescriptor(uc->directOutDescriptor, uc->directOutBytes, to - uc->directOutToken, from, length)
+               ? 0
+               : EFAULT;
+  }
+  const uint64_t direct = reinterpret_cast<uint64_t>(uc->directOut);
+  if (uc->directOut && to >= direct && to - direct <= uc->directOutBytes &&
+      length <= uc->directOutBytes - uint32_t(to - direct)) {
+    memcpy(uc->directOut + (to - direct), from, length);
+    return 0;
+  }
   if (uc->inlineData && pianowifi::a80211::shengKernelBuffer(to, length, uc->inBase, uc->inBytes, offset)) {
     memcpy(uc->inBase + offset, from, length);
     return 0;
@@ -558,6 +604,7 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
   syncAssociation(false);
   const int32_t type = rq.type, value = rq.value;
   const uint32_t length = rq.length;
+  if (type == kCountryCode) refreshRegulatoryCountry();
   const UserIo plain = {nullptr, &PianoWifi80211::userIn, &PianoWifi80211::userOut};
   const UserIo &io = ioOverride ? *ioOverride : plain;
   // F6 (review 2026-11-14): the request carries the interface's name; one naming another interface is refused, even though the
@@ -851,7 +898,7 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
 {
   if (on) {
     setProperty(kIOBuiltin, true);
-    if (shengMode() & pianowifi::a80211::kShengInterfaceUc)
+    if (fUcMode & pianowifi::a80211::kUcOffer)
       setProperty("IOUserClientClass", "PianoWifi80211Uc");
     setProperty("IO80211InterfaceRole", "Infrastructure");
     if (fIfName[0]) setProperty("IOInterfaceName", fIfName);
@@ -863,7 +910,7 @@ void PianoWifi80211::applyInterfaceBinding(bool on)
       fNetif->setProperty("IOInterfaceNamePrefix", "en");
       fNetif->setProperty("IOClassNameOverride", "IO80211Interface");
       fNetif->setProperty("NativeSandboxGrantProcess", "airportd");
-      if (shengMode() & pianowifi::a80211::kShengInterfaceUc)
+      if (fUcMode & pianowifi::a80211::kUcOffer)
         fNetif->setProperty("IOUserClientClass", "PianoWifi80211Uc");
     }
   } else {
@@ -1052,17 +1099,65 @@ void PianoWifi80211::setUcMode(uint32_t mode, const char *why)
   noteIdentity(why);
 }
 
+uint32_t PianoWifi80211::gapMode()
+{
+  IOLockLock(fLock);
+  const uint32_t mode = fState->gaps;
+  IOLockUnlock(fLock);
+  return mode;
+}
+
+void PianoWifi80211::setGapMode(uint32_t mode, const char *why)
+{
+  using namespace pianowifi::a80211;
+  const uint32_t masked = mode & kGapAll;
+  IOLockLock(fLock);
+  const uint32_t was = fState->gaps;
+  fState->gaps = masked;
+  fSeen->clear();
+  IOLockUnlock(fLock);
+  note80211("%s: gap switches %#x (was %#x, %s): CHANNELS_INFO %s, COUNTRY_CODE %s",
+            fIfName, unsigned(masked), unsigned(was), why, (masked & kGapChannelsInfo) ? "on" : "off",
+            (masked & kGapCountryCode) ? "on" : "off");
+}
+
+// PianoWifi publishes the alpha2 from the firmware regulatory event on its
+// service. XX remains the explicit fallback until that event has appeared.
+void PianoWifi80211::refreshRegulatoryCountry()
+{
+  if (!fWifi) return;
+  OSString *country = OSDynamicCast(OSString, fWifi->copyProperty("piano-wifi-regulatory-country"));
+  if (!country) return;
+  const char *text = country->getCStringNoCopy();
+  if (text && country->getLength() >= 2 && text[0] >= 'A' && text[0] <= 'Z' && text[1] >= 'A' && text[1] <= 'Z') {
+    IOLockLock(fLock);
+    fState->country[0] = text[0];
+    fState->country[1] = text[1];
+    fState->country[2] = 0;
+    IOLockUnlock(fLock);
+  }
+  country->release();
+}
+
 // Every open logged, whoever asks and whatever it asks for: that is the question wm3 answers.
 IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32 type, OSDictionary *properties,
                                        IOUserClient **handler)
 {
   const uint32_t mode = ucMode();
+  if (!handler) return kIOReturnBadArgument;
   if (!(mode & pianowifi::a80211::kUcOffer)) {
     IOLockLock(fLock);
     ++fUcRefused;
     IOLockUnlock(fLock);
     noteUserClient("refused (no client offered: mode 0x1 is off)", owningTask, uint32_t(type), 0);
     return IO80211Controller::newUserClient(owningTask, security, type, properties, handler);
+  }
+  if (type != 0) {
+    IOLockLock(fLock);
+    ++fUcRefused;
+    IOLockUnlock(fLock);
+    noteUserClient("refused (only IOServiceOpen type 0 is supported)", owningTask, uint32_t(type), 0);
+    return kIOReturnUnsupported;
   }
   PianoWifi80211Uc *client = OSTypeAlloc(PianoWifi80211Uc);
   if (!client || !client->initWithOwner(this, owningTask, uint32_t(type))) {
@@ -1086,26 +1181,46 @@ IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32
   ++fUcOpens;
   ++fUcClients;
   IOLockUnlock(fLock);
-  noteUserClient("opened", owningTask, uint32_t(type), 0);
+  noteUserClient("accepted", owningTask, uint32_t(type), 0);
   *handler = client;
   return kIOReturnSuccess;
 }
 
 // An apple80211 request through the client: the five fields of the structure read, the request answered by the same handler the
-// ioctls use, and the request's own length and value written back into the caller's structure output.
-IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered)
+// ioctls use, and the driver's errno returned unchanged.  For a raw get, IO80211's variable structure output is the data buffer.
+IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered, uint32_t &requestType)
 {
   using namespace pianowifi::a80211;
+  requestType = ~0u;
   const uint32_t want = large ? kUcLargeBytes : kUcSmallBytes;
   const uint32_t offset = large ? kUcLargeBytes - kUcSmallBytes : 0;
+  IOMemoryDescriptor *inputDescriptor = args->structureInputDescriptor;
+  const IOByteCount inputDescriptorLength = inputDescriptor ? inputDescriptor->getLength() : 0;
+  if (inputDescriptor && (inputDescriptorLength < want || inputDescriptorLength > UINT32_MAX)) return kIOReturnBadArgument;
+  uint8_t *stagedInput = nullptr;
   const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
-  if (!in || args->structureInputSize < want) return kIOReturnBadArgument;
+  uint32_t inputBytes = args->structureInputSize;
+  if (inputDescriptor) {
+    stagedInput = static_cast<uint8_t *>(IOMallocData(want));
+    if (!stagedInput || !pianowifi::a80211::readDescriptor(inputDescriptor, inputDescriptorLength, stagedInput, want)) {
+      if (stagedInput) IOFreeData(stagedInput, want);
+      return kIOReturnBadArgument;
+    }
+    in = stagedInput;
+    inputBytes = want;
+  }
+  if (!in || inputBytes < want) {
+    if (stagedInput) IOFreeData(stagedInput, want);
+    return kIOReturnBadArgument;
+  }
   // Keep the field reads below inside the structure supplied by IOUserClient.
   // The selector-6 size/offset pair is a host-derived ABI fact and must not be
   // trusted until the 40-byte request fits; a stale large-layout constant must
   // fail closed instead of becoming an out-of-bounds kernel read.
-  if (offset > args->structureInputSize || kUcNameAt > args->structureInputSize - offset ||
-      sizeof(Req) > args->structureInputSize - offset - kUcNameAt) return kIOReturnBadArgument;
+  if (offset > inputBytes || kUcNameAt > inputBytes - offset || sizeof(Req) > inputBytes - offset - kUcNameAt) {
+    if (stagedInput) IOFreeData(stagedInput, want);
+    return kIOReturnBadArgument;
+  }
   uint32_t cmd = 0, length = 0, type = 0;
   int32_t val = 0;
   uint64_t data = 0;
@@ -1114,7 +1229,11 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   memcpy(&data, in + kUcDataAt, 8);
   memcpy(&type, in + offset + kUcTypeAt, 4);
   memcpy(&val, in + offset + kUcValAt, 4);
-  if (cmd != kUcGetCmd && cmd != kUcSetCmd) return kIOReturnBadArgument;
+  requestType = type;
+  if (cmd != kUcGetCmd && cmd != kUcSetCmd) {
+    if (stagedInput) IOFreeData(stagedInput, want);
+    return kIOReturnBadArgument;
+  }
   Req rq;
   bzero(&rq, sizeof rq);
   memcpy(rq.name, in + offset + kUcNameAt, sizeof rq.name);
@@ -1128,39 +1247,103 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   // copy whose address lies inside one of the two structure buffers, and only while the bit is on.
   UcIo ucio;
   ucio.inBase = const_cast<uint8_t *>(in);   // the memcpy fallback writes into it (the kext owns the copy)
-  ucio.inBytes = args->structureInputSize;
+  ucio.inBytes = inputBytes;
   ucio.outBase = static_cast<uint8_t *>(args->structureOutput);
   ucio.outBytes = args->structureOutputSize;
   ucio.sheng = shengMode();
-  if ((ucio.sheng & kShengUcKernel) && args->structureInputSize > kUcDataAt) {
+  IOMemoryDescriptor *outputDescriptor = args->structureOutputDescriptor;
+  const IOByteCount outputDescriptorLength = outputDescriptor ? outputDescriptor->getLength() : 0;
+  uint32_t outputBytes = args->structureOutputSize;
+  if (outputDescriptor) {
+    if (outputDescriptorLength > UINT32_MAX) {
+      if (stagedInput) IOFreeData(stagedInput, want);
+      return kIOReturnBadArgument;
+    }
+    outputBytes = uint32_t(outputDescriptorLength);
+    if (args->structureOutputDescriptorSize && args->structureOutputDescriptorSize < outputBytes)
+      outputBytes = args->structureOutputDescriptorSize;
+  }
+  if (cmd == kUcGetCmd && outputDescriptor && outputBytes) {
+    // OOL output has no inline pointer. A private token lets the common
+    // apple80211 copy routine address the descriptor without treating it as a
+    // user pointer; ucOut bounds every write before writeBytes().
+    ucio.directOutDescriptor = outputDescriptor;
+    ucio.directOutBytes = outputBytes;
+    ucio.directOutToken = 0xffffffffffff0000ull;
+    rq.data = ucio.directOutToken;
+    rq.length = outputBytes;
+  } else if (cmd == kUcGetCmd && args->structureOutput && args->structureOutputSize) {
+    // The bind sanity call (DRIVER_VERSION) also uses this form, with no request data pointer.
+    rq.data = reinterpret_cast<uint64_t>(args->structureOutput);
+    rq.length = args->structureOutputSize;
+    ucio.directOut = static_cast<uint8_t *>(args->structureOutput);
+    ucio.directOutBytes = args->structureOutputSize;
+  }
+  uint32_t inlineOffset = 0;
+  if (!inputDescriptor && cmd == kUcSetCmd && shengKernelBuffer(data, length, in, inputBytes, inlineOffset)) {
+    // Raw sets carry their payload inline in the selector input when the wrapper has no
+    // user pointer to copy from.  Accept that layout independently of the sheng A/B bit.
+    ucio.inlineData = true;
+    rq.data = reinterpret_cast<uint64_t>(in + inlineOffset);
+  } else if (!inputDescriptor && (ucio.sheng & kShengUcKernel) && inputBytes > kUcDataAt) {
     // Sheng's interface client marks this condition in apple80211req and
     // points req_data at its inline data area. Use the same explicit kernel
     // buffer path here instead of probing copyout and guessing from EFAULT.
     ucio.inlineData = true;
-    ucio.inBase = const_cast<uint8_t *>(in + kUcDataAt);
-    ucio.inBytes = args->structureInputSize - kUcDataAt;
+    ucio.inBase = const_cast<uint8_t *>(in);
+    ucio.inBytes = inputBytes;
     rq.data = reinterpret_cast<uint64_t>(ucio.inBase);
   }
   const UserIo uio = {&ucio, &PianoWifi80211::ucIn, &PianoWifi80211::ucOut};
   const errno_t e = apple80211(cmd == kUcSetCmd, rq, &uio);
-  // The answer's own length and value go back to the caller, as the ioctl's struct would carry them.
+  if (cmd == kUcGetCmd && (ucio.directOut || ucio.directOutDescriptor)) {
+    answered = rq.length < ucio.directOutBytes ? rq.length : ucio.directOutBytes;
+    if (ucio.directOutDescriptor) args->structureOutputDescriptorSize = answered;
+    else args->structureOutputSize = answered;
+  }
+  // A set has no variable output buffer; preserve its small length/value answer when a caller supplied a structure output.
   uint8_t *out = static_cast<uint8_t *>(args->structureOutput);
-  if (out && args->structureOutputSize >= want) {
-    memcpy(out, in, want);
-    memcpy(out + kUcLenAt, &rq.length, 4);
-    memcpy(out + offset + kUcValAt, &rq.value, 4);
-    answered = want;
-  } else if (out && args->structureOutputSize >= 8) {
+  if (cmd == kUcSetCmd && out && args->structureOutputSize >= 8) {
     memcpy(out, &rq.length, 4);
     memcpy(out + 4, &rq.value, 4);
     answered = 8;
+    args->structureOutputSize = answered;
+  } else if (cmd == kUcSetCmd && outputDescriptor && outputBytes >= 8) {
+    uint32_t resultPair[2] = {rq.length, uint32_t(rq.value)};
+    if (!pianowifi::a80211::writeDescriptor(outputDescriptor, outputBytes, 0, resultPair, sizeof resultPair)) {
+      if (stagedInput) IOFreeData(stagedInput, want);
+      return kIOReturnBadArgument;
+    }
+    answered = sizeof resultPair;
+    args->structureOutputDescriptorSize = answered;
   }
   IOLockLock(fLock);
   ++fUcSelectors;
   IOLockUnlock(fLock);
-  if (e == EJUSTRETURN || e == 0) return kIOReturnSuccess;
   // The driver's own errno reaches user space here (which the ioctl path cannot do): 5 ends a scan's result list.
-  return unsigned(e) & 0x3fff ? IOReturn(sub_iokit_common | (unsigned(e) & 0x3fff)) : kIOReturnError;
+  if (stagedInput) IOFreeData(stagedInput, want);
+  if (e == EJUSTRETURN || e == 0) {
+    if (cmd == kUcGetCmd && type == kScanResult) {
+      IOLockLock(fLock);
+      if (fUcScanActive) ++fUcScanRecords;
+      IOLockUnlock(fLock);
+    } else if (cmd == kUcSetCmd && (type == kScanReq || type == kScanReqMultiple)) {
+      IOLockLock(fLock);
+      fUcScanActive = true;
+      fUcScanRecords = 0;
+      IOLockUnlock(fLock);
+    }
+    return kIOReturnSuccess;
+  }
+  if (cmd == kUcGetCmd && type == kScanResult && e == kErrEndOfResults) {
+    uint32_t records = 0;
+    IOLockLock(fLock);
+    records = fUcScanRecords;
+    fUcScanActive = false;
+    IOLockUnlock(fLock);
+    note80211("%s: %u records served through the user client, list end 5", fIfName, unsigned(records));
+  }
+  return e > 0 ? IOReturn(e) : kIOReturnError;
 }
 
 void PianoWifi80211::noteUserClient(const char *what, task_t task, uint32_t type, uint64_t calls)
@@ -1174,16 +1357,22 @@ void PianoWifi80211::noteUserClient(const char *what, task_t task, uint32_t type
       proc_name(pid, name, sizeof name);
     }
   }
-  note80211("%s: a user client was %s: type %u, task %s[%d], %llu call(s) so far (opens %llu, refused %llu, alive %u)", fIfName,
-            what, unsigned(type), name, pid, calls, fUcOpens, fUcRefused, unsigned(fUcClients));
+  note80211("%s: open by %s[%d]: type %u %s, %llu call(s) so far (opens %llu, refused %llu, alive %u)", fIfName, name, pid,
+            unsigned(type), what, calls, fUcOpens, fUcRefused, unsigned(fUcClients));
 }
 
-void PianoWifi80211::noteSelector(uint32_t selector, uint32_t inBytes, uint32_t outBytes, uint32_t scalarIn, uint32_t scalarOut,
+void PianoWifi80211::noteSelector(uint32_t selector, uint32_t inBytes, uint32_t inDescriptorBytes, uint32_t outBytes,
+                                  uint32_t outDescriptorBytes, uint32_t scalarIn, uint32_t scalarOut, uint32_t requestType,
                                   uint32_t answered, IOReturn result, uint64_t calls)
 {
-  note80211("%s: selector %u: struct in %u out %u, scalars in %u out %u -> %#x (wrote %u), call %llu", fIfName,
-            unsigned(selector), unsigned(inBytes), unsigned(outBytes), unsigned(scalarIn), unsigned(scalarOut),
-            unsigned(answered), unsigned(result), calls);
+  if (requestType == ~0u)
+    note80211("%s: selector %u type ? -> %#x; struct in %u (descriptor %u) out %u (descriptor %u), scalars in %u out %u, wrote %u, call %llu",
+              fIfName, unsigned(selector), unsigned(result), unsigned(inBytes), unsigned(inDescriptorBytes), unsigned(outBytes),
+              unsigned(outDescriptorBytes), unsigned(scalarIn), unsigned(scalarOut), unsigned(answered), calls);
+  else
+    note80211("%s: selector %u type %u -> %#x; struct in %u (descriptor %u) out %u (descriptor %u), scalars in %u out %u, wrote %u, call %llu",
+              fIfName, unsigned(selector), unsigned(requestType), unsigned(result), unsigned(inBytes), unsigned(inDescriptorBytes),
+              unsigned(outBytes), unsigned(outDescriptorBytes), unsigned(scalarIn), unsigned(scalarOut), unsigned(answered), calls);
 }
 
 int PianoWifi80211::sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req)
@@ -1204,6 +1393,27 @@ int PianoWifi80211::sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req
   if (err) return err;
   if (!self) return ENODEV;
   self->setUcMode(uint32_t(incoming), "machdep.piano_wifi_a80211_uc");
+  return 0;
+}
+
+int PianoWifi80211::sysctlGaps(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  PianoWifi80211 *self = a80211Enter();
+  struct Leave {
+    PianoWifi80211 *held;
+    ~Leave()
+    {
+      if (held) a80211Leave();
+    }
+  } leave{self};
+  int value = self ? int(self->gapMode()) : -1;
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (!self) return ENODEV;
+  self->setGapMode(uint32_t(incoming), "machdep.piano_wifi_a80211_gaps");
   return 0;
 }
 
@@ -1257,8 +1467,8 @@ void PianoWifi80211::setShengMode(uint32_t mode, const char *why)
   }
   note80211("%s: sheng mode %#x (was %#x, %s): 0x1 the 802.11 medium selected, 0x2 SSID/BSSID events beside link ones, 0x4 card "
             "caps bit 46, 0x8 kernel-buffer copies for user-client requests, 0x10 NativeSandboxGrantProcess, 0x20 SIOCGIFMEDIA "
-            "in the filter, 0x40 interface identity, 0x80 interface user client, 0x100 association state, 0x200 preassigned BSD/unit "
-            "identity; every request kind is logged again from here",
+            "in the filter, 0x40 interface identity, 0x80 interface user client, 0x100 association state; every request kind is "
+            "logged again from here",
             fIfName, unsigned(masked), unsigned(was), why);
 }
 

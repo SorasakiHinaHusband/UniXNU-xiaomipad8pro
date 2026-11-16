@@ -3039,6 +3039,8 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
          gLink.reg.status, gLink.reg.numPhy, gLink.reg.minBw24, gLink.reg.maxBw24, gLink.reg.minBw5, gLink.reg.maxBw5,
          gLink.reg.rules24 + gLink.reg.rules5, gLink.reg.rules24, gLink.reg.rules5, gLink.reg.ruleCount,
          gLink.reg.rulesDropped, gLink.reg.extended ? " (the extended event)" : "");
+  if (gLink.reg.seen)
+    owner->setProperty("piano-wifi-regulatory-country", gLink.reg.alpha2);
   else
     note("level 6: the regulatory domain: the firmware sent no regulatory event%s",
          (gArgs.l6pre & kPreChanList) ? " (the channel list is this driver's own)" : "");

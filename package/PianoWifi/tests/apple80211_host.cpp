@@ -91,6 +91,8 @@ int main()
   CHECK(sizeof(ScanResult) == 1164 && offsetof(ScanResult, elements) == 0x8c && offsetof(ScanResult, elementsLength) == 0x8a);
   CHECK(offsetof(ScanResult, channel) == 4 && offsetof(ScanResult, ssid) == 0x61 && offsetof(ScanResult, capability) == 0x1a);
   CHECK(sizeof(Power) == 24 && sizeof(Rssi) == 52 && sizeof(LinkEvent) == 32 && sizeof(Channel) == 12);
+  CHECK(kChannelsInfoBytes == 0x2720 && kChannelsInfoCountAt == 0x0c && kChannelsInfoChannelAt == 0x32e &&
+        kChannelsInfoBitmapAt == 0x12d0 && kChannelCount == 22 && kGapDefault == kGapAll);
   CHECK(kSiocSA80211 == 0x802869c8UL && kSiocGA80211 == 0xc02869c9UL);
   // _IOW('i', 200, 40 bytes) and _IOWR('i', 201, 40 bytes)
   CHECK(((kSiocSA80211 >> 16) & 0x1fff) == 40 && (kSiocSA80211 & 0xff) == 200 && ((kSiocSA80211 >> 8) & 0xff) == 'i');
@@ -179,6 +181,16 @@ int main()
     CHECK(r.ask(false, kAssociateResult, 0, false).error == 0 && r.rq.value == 0);
     Answer a = r.ask(false, kCountryCode, 3);
     CHECK(a.error == 0 && std::memcmp(r.at(0), "XX", 3) == 0 && r.rq.length == 3);
+    r.user.mem.resize(kChannelsInfoBytes + 64, 0xa5);
+    a = r.ask(false, kChannelsInfo, kChannelsInfoBytes);
+    CHECK(a.error == 0 && a.wrote == kChannelsInfoBytes && r.u32(kChannelsInfoCountAt) == 22);
+    CHECK(r.at(kChannelsInfoChannelAt)[0] == 1 && r.at(kChannelsInfoChannelAt + 21 * kChannelsInfoStride)[0] == 165);
+    CHECK(r.u32(kChannelsInfoBitmapAt) == (kChan20MHz | kChan2GHz | kChanActive));
+    CHECK(r.u32(kChannelsInfoBitmapAt + 13 * sizeof(uint32_t)) == (kChan20MHz | kChan5GHz | kChanActive));
+    r.st.gaps = kGapCountryCode;
+    CHECK(r.ask(false, kChannelsInfo, kChannelsInfoBytes).error == kErrUnsupported);
+    r.st.gaps = kGapChannelsInfo;
+    CHECK(r.ask(false, kCountryCode, 3).error == kErrUnsupported);
     // unknown requests, both ways
     CHECK(r.ask(false, kInfraEnumerated, 16).error == kErrUnsupported);
     CHECK(r.ask(false, kVirtualIfRole, 0, false).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
