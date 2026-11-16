@@ -465,6 +465,10 @@ class Power {
         ops.wr(kIris + kCpuNocLpiCtl, kLpiReq, "CPU NoC LPI: power-down request");
         if (!ops.poll(kIris + kCpuNocLpiStatus, kLpiDone, kLpiDone, kLpiPollUs, kLpiStepUs)) {
           warn("the CPU NoC low-power ack did not come");
+          // The request register survives the controller GDSC collapse.  Linux's timeout path jumps straight to
+          // disable_power, but leaving the request asserted poisons the next power-up after a firmware run: clear it
+          // while the wrapper is still accessible before disabling the clocks and domain.
+          ops.wr(kIris + kCpuNocLpiCtl, 0, "CPU NoC LPI: request withdrawn after timeout (cycle-safe)");
           break;
         }
         ops.wr(kIris + kCpuNocLpiCtl, 0, "CPU NoC LPI: request withdrawn");

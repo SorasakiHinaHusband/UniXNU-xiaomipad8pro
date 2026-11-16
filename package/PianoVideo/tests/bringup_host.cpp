@@ -1280,6 +1280,19 @@ static void testV2()
   CHECK(std::strstr(x.b->rep.summary, "V2 ok: 3/3 cycles"));
 }
 
+static void testV2CpuLpiTimeoutCleanup()
+{
+  Run x(3);
+  x.o.cycles = 3;
+  x.m->f.cpuLpiStuck = true;
+  CHECK(x.go() == kOk);
+  quiet(*x.m, "V2 CPU NoC timeout cleanup");
+  CHECK(x.b->rep.cyclesOk == 3);
+  CHECK(x.m->count("lpi cpu") == 3);
+  CHECK((x.m->R(kIris + kCpuNocLpiCtl) & kLpiReq) == 0);
+  CHECK(x.m->logged("CPU NoC LPI: request withdrawn after timeout (cycle-safe)"));
+}
+
 static void testV2Refusals()
 {
   {   // the pin: another file is refused before any secure call
@@ -1696,6 +1709,7 @@ int main()
   testSharedVotes();
   testNoCmdDb();
   testV2();
+  testV2CpuLpiTimeoutCleanup();
   testV2Refusals();
   testV2ScmFailures();
   testV3();
