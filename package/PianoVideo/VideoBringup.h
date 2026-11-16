@@ -274,7 +274,10 @@ class Bringup {
     for (unsigned c = 1; c <= opt.cycles; ++c) {
       ++rep.cycles;
       int rc = on();
-      if (rc) return rc;
+      if (rc) {
+        failureRaw(pst.failedStep, rc);
+        return rc;
+      }
       rc = firmware.load();
       if (rc) {
         failureRaw(firmware.st.failedStep, rc);
