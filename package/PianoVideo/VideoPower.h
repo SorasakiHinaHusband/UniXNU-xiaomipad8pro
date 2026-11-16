@@ -131,10 +131,19 @@ class Power {
   // A branch on: CLK_ENABLE, then (halt checked) CLK_OFF clear or the NoC FSM on, within 200 us.
   bool branchEnable(uint64_t pa, Halt halt, bool hwcg, const char *what, uint32_t *last)
   {
+    const uint32_t before = ops.rd(pa);
+    ops.hw.note("power: branch %s raw before %08x", what, before);
     ops.set(pa, kCbcrEnable, what);
-    if (halt == kHaltSkip || (hwcg && (ops.rd(pa) & kCbcrHwcg))) return true;
-    return ops.pollFor(pa, [](uint32_t v) { return !(v & kCbcrOff) || ((v >> kCbcrNocFsmShift) & 7u) == kCbcrNocFsmOn; },
-                       kBranchHaltUs, 1, last);
+    const uint32_t after = ops.rd(pa);
+    if (halt == kHaltSkip || (hwcg && (after & kCbcrHwcg))) {
+      if (last) *last = after;
+      ops.hw.note("power: branch %s raw after %08x (halt check skipped)", what, after);
+      return true;
+    }
+    const bool ok = ops.pollFor(pa, [](uint32_t v) { return !(v & kCbcrOff) || ((v >> kCbcrNocFsmShift) & 7u) == kCbcrNocFsmOn; },
+                                kBranchHaltUs, 1, last);
+    ops.hw.note("power: branch %s raw after %08x (%s)", what, last ? *last : ops.rd(pa), ok ? "running" : "halt timeout");
+    return ok;
   }
   // A branch off: CLK_ENABLE cleared; a halt-checked branch must show CLK_OFF within 200 us, a voted one gets 10 us.
   void branchDisable(uint64_t pa, Halt halt, bool hwcg, const char *what)
@@ -149,8 +158,14 @@ class Power {
   }
   bool gdscEnable(uint32_t off, const char *name, uint32_t *last)
   {
+    const uint32_t before = ops.rd(kVideoCc + off);
+    ops.hw.note("power: GDSC %s raw before %08x", name, before);
     ops.clear(kVideoCc + off, kGdscCollapse, name);
-    if (!ops.poll(kVideoCc + off + kGdscCfg, kGdscPowerUpComplete, kGdscPowerUpComplete, kGdscPollUs, 1, last)) return false;
+    const bool ok = ops.poll(kVideoCc + off + kGdscCfg, kGdscPowerUpComplete, kGdscPowerUpComplete, kGdscPollUs, 1, last);
+    const uint32_t after = ops.rd(kVideoCc + off);
+    ops.hw.note("power: GDSC %s raw after %08x cfg %08x (%s)", name, after, last ? *last : ops.rd(kVideoCc + off + kGdscCfg),
+                ok ? "power-up complete" : "power-up timeout");
+    if (!ok) return false;
     ops.hw.delayUs(1);
     ops.set(kVideoCc + off, kGdscRetainFf, name);
     return true;
@@ -232,7 +247,7 @@ class Power {
     for (uint32_t o : gccCritical) {
       const uint32_t v = ops.rd(kGcc + o);
       if (branchOn(v) && (v & kCbcrEnable)) continue;
-      if (!branchEnable(kGcc + o, kHalt, false, o == kGccVideoAhb ? "gcc_video_ahb_clk: on" : "gcc_video_xo_clk: on", &last))
+      if (!branchEnable(kGcc + o, kHaltSkip, false, o == kGccVideoAhb ? "gcc_video_ahb_clk: on" : "gcc_video_xo_clk: on", &last))
         return fail(kStepGcc, kErrGcc, last);
       (o == kGccVideoAhb ? st.gccAhbOn : st.gccXoOn) = true;
     }

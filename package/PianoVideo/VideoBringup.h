@@ -175,6 +175,42 @@ class Bringup {
     if (us > rep.offUsMax) rep.offUsMax = us;
     return rc;
   }
+
+  // Keep a bounded, safe snapshot beside every V2/V3 failure.  The snapshot is taken before
+  // teardown while the domains that are readable are still clocked; early file/SMMU failures
+  // explicitly say that no core MMIO was read.
+  void failureRaw(int stepNo, int rc)
+  {
+    hw.note("failure raw: stage %d rc %d", stepNo, rc);
+    if (stepNo >= kStepSmmuPlan && stepNo <= kStepSmmuRoute)
+      hw.note("failure raw: smmu idr0 %08x idr1 %08x idr2 %08x scr0 %08x", plan.idr0, plan.idr1, plan.idr2, plan.scr0);
+    bool any = false;
+    if (power.ccReadable()) {
+      any = true;
+      hw.note("failure raw: gcc ahb %08x axi0 %08x axi1 %08x; videocc mvs0c-gdsc %08x mvs0-gdsc %08x mvs0c %08x mvs0c-fr %08x mvs0 %08x mvs0-fr %08x",
+              ops.rd(kGcc + kGccVideoAhb), ops.rd(kGcc + kGccVideoAxi0), ops.rd(kGcc + kGccVideoAxi1),
+              ops.rd(kVideoCc + kCcMvs0cGdsc), ops.rd(kVideoCc + kCcMvs0Gdsc), ops.rd(kVideoCc + kCcMvs0cClk),
+              ops.rd(kVideoCc + kCcMvs0cFreerun), ops.rd(kVideoCc + kCcMvs0Clk), ops.rd(kVideoCc + kCcMvs0Freerun));
+    }
+    if (power.controllerReadable()) {
+      any = true;
+      hw.note("failure raw: iris ctrl-init %08x ctrl-status %08x core-power %08x core-clock %08x cpu-lpi %08x video-lpi %08x",
+              ops.rd(kIris + kCtrlInit), ops.rd(kIris + kCtrlStatus), ops.rd(kIris + kCorePowerStatus), ops.rd(kIris + kCoreClockConfig),
+              ops.rd(kIris + kCpuNocLpiStatus), ops.rd(kIris + kAonVideoCtlNocLpiStatus));
+    }
+    if (power.codecReadable()) {
+      any = true;
+      hw.note("failure raw: iris codec-power %08x tz-cpu %08x idle0 %08x idle1 %08x idle2 %08x idle3 %08x",
+              ops.rd(kIris + kCorePowerStatus), ops.rd(kIris + kTzCpuStatus), ops.rd(kIris + kVcodecIdleStatus),
+              ops.rd(kIris + kVcodecIdleStatus + 4), ops.rd(kIris + kVcodecIdleStatus + 8), ops.rd(kIris + kVcodecIdleStatus + 12));
+    }
+    if (routed.bank) {
+      any = true;
+      const vsmmu::Fault f = vsmmu::fault(plan, ops);
+      hw.note("failure raw: smmu fsr %08x far %08x%08x fsynr0 %08x", f.fsr, f.farHi, f.farLo, f.fsynr0);
+    }
+    if (!any && stepNo < kStepSmmuPlan) hw.note("failure raw: no powered core MMIO was read at this stage");
+  }
   // The level 1 survey with the gate open; V1's verdict.
   const char *readout(bool firmwareExpected)
   {
@@ -199,7 +235,10 @@ class Bringup {
     for (unsigned c = 1; c <= opt.cycles; ++c) {
       ++rep.cycles;
       int rc = on();
-      if (rc) return rc;
+      if (rc) {
+        failureRaw(pst.failedStep, rc);
+        return rc;
+      }
       const char *bad = readout(false);
       if (opt.stop == kStepReadout) {
         off();
@@ -238,6 +277,7 @@ class Bringup {
       if (rc) return rc;
       rc = firmware.load();
       if (rc) {
+        failureRaw(firmware.st.failedStep, rc);
         off();
         return rc;
       }
@@ -245,9 +285,13 @@ class Bringup {
       hw.note("V2: cycle %u: the firmware is authenticated; CTRL_STATUS %08x (no HFI yet), tz cpu status %08x", c, status, tz);
       hw.sleepMs(opt.holdMs);
       const int un = firmware.unload();
+      if (un) failureRaw(kStepPasShutdown, un);
       const int offRc = off();
       if (un) return fail(kStepPasShutdown, un);
-      if (offRc) return fail(kStepOffCheck, offRc);
+      if (offRc) {
+        failureRaw(kStepOffCheck, offRc);
+        return fail(kStepOffCheck, offRc);
+      }
       ++rep.cyclesOk;
     }
     return kOk;
@@ -271,6 +315,7 @@ class Bringup {
   }
   int v3fail(int stepNo, int rc)
   {
+    failureRaw(stepNo, rc);
     char sfr[96];
     if (mem.uc && pst.on) {
       hfi::sfrText(mem, sfr, sizeof sfr);
@@ -285,6 +330,7 @@ class Bringup {
   int smmuFail(int stepNo, int rc)
   {
     rep.failedStep = stepNo;
+    failureRaw(stepNo, rc);
     return rc;
   }
   int smmuSetup()

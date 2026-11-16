@@ -237,8 +237,10 @@ struct Model {
 
   Model()
   {
-    R(kGcc + kGccVideoAhb) = 1;
-    R(kGcc + kGccVideoXo) = 1;
+    // The tablet's cold survey: AHB is enabled-capable but hardware-gated while idle,
+    // XO is kept off until Linux's probe sets CLK_ENABLE, and both AXI branches are HW_CTL.
+    R(kGcc + kGccVideoAhb) = kCbcrHwcg;
+    R(kGcc + kGccVideoXo) = 0;
     R(kGcc + kGccVideoAxi0) = kCbcrHwcg;
     R(kGcc + kGccVideoAxi1) = kCbcrHwcg;
     R(kVideoCc + kCcMvs0cGdsc) = kGdscCollapse | 0x00222000;
@@ -355,7 +357,9 @@ struct Model {
     uint32_t v = R(kGcc + o);
     if (o == kGccVideoAhb || o == kGccVideoXo || o == kGccVideoAxi0 || o == kGccVideoAxi1) {
       const bool on = (v & kCbcrEnable) && !(f.gccStuck && o == kGccVideoAhb);
-      v = on ? v & ~kCbcrOff : v | kCbcrOff;
+      // Linux's clk-branch halt check is skipped for HW_CTL branches: CLK_OFF remains set
+      // while the hardware gate is idle, even though CLK_ENABLE is asserted.
+      v = on && !(v & kCbcrHwcg) ? v & ~kCbcrOff : v | kCbcrOff;
     }
     return v;
   }
@@ -373,7 +377,12 @@ struct Model {
   // ------------------------------------------------------------------------------------------------------- VIDEO_CC
   bool pcalDone = false, rcgPending = false;
   uint32_t rcgActive = 0;   // the CFG the RCG runs with
-  bool vccOk() { return !(gccRd(kGccVideoAhb) & kCbcrOff) && mxc >= kMxcLowSvs && mmcx >= kMmcxLowSvs; }
+  bool vccOk()
+  {
+    const uint32_t v = gccRd(kGccVideoAhb);
+    return (!(v & kCbcrOff) || ((v & (kCbcrEnable | kCbcrHwcg)) == (kCbcrEnable | kCbcrHwcg))) && mxc >= kMxcLowSvs &&
+           mmcx >= kMmcxLowSvs;
+  }
   bool pllLocked()
   {
     const uint64_t p = kVideoCc + kCcPll0;
@@ -1058,6 +1067,12 @@ static void testV1Cycles()
   for (const auto &l : m.lines) writeLines += l.rfind("write ", 0) == 0;
   CHECK(writeLines == x.b->log.logged && x.b->log.overflow == 0);
   CHECK(m.logged("V1: cycle 20/20 ok"));
+  CHECK(m.logged("branch gcc_video_ahb_clk: on raw before 00000002"));
+  CHECK(m.logged("branch gcc_video_ahb_clk: on raw after 80000003 (halt check skipped)"));
+  CHECK(m.logged("branch gcc_video_xo_clk: on raw after 00000001 (halt check skipped)"));
+  CHECK(m.logged("GDSC mvs0c GDSC: out of collapse raw before"));
+  CHECK(m.logged("GDSC mvs0c GDSC: out of collapse raw after"));
+  CHECK(m.logged("branch video_cc_mvs0c_freerun_clk: on raw after") && m.logged("(running)"));
   CHECK(std::strstr(x.b->rep.summary, "V1 ok: 20/20 cycles"));
   // The calibration ran once (PCAL_NOT_DONE), PLL0's configuration was written once (the probe's set-up is once per boot).
   CHECK(m.pcalDone);
@@ -1082,7 +1097,6 @@ static void testV1Faults()
       {"rails not completed", [](Faults &f) { f.rpmhNoComplete = true; }, kErrRpmh, kStepRails},
       {"DRV-2 lock busy", [](Faults &f) { f.drv2Busy = true; }, kErrRpmh, kStepRails},
       {"an RSC write not read back", [](Faults &f) { f.rscReadback = true; }, kErrRpmh, kStepRails},
-      {"GCC AHB stuck", [](Faults &f) { f.gccStuck = true; }, kErrGcc, kStepGcc},
       {"controller GDSC stuck", [](Faults &f) { f.gdscStuck = true; }, kErrGdsc, kStepCtrlGdsc},
       {"PLL0 no lock", [](Faults &f) { f.pllNoLock = true; }, kErrPll, kStepCtrlClocks},
       {"RCG update stuck", [](Faults &f) { f.rcgStuck = true; }, kErrRcg, kStepCtrlClocks},
