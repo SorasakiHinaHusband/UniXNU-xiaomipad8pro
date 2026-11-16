@@ -18,7 +18,10 @@
 
 namespace pianovideo {
 
-inline bool branchOn(uint32_t cbcr) { return !(cbcr >> 31); }       // CBCR bit 31: CLK_OFF
+// A hardware-gated branch keeps CLK_OFF asserted while idle even after CLK_ENABLE is set.  Its
+// halt bit is meaningful only for a software-controlled branch; HW_CTL plus ENABLE is the
+// running/readable state for the former.
+inline bool branchOn(uint32_t cbcr) { return (cbcr & kCbcrEnable) && (!(cbcr & kCbcrOff) || (cbcr & kCbcrHwcg)); }
 inline bool gdscOn(uint32_t gdscr) { return (gdscr >> 31) & 1u; }   // GDSCR bit 31: PWR_ON
 
 // ------------------------------------------------------------------------------------------------------------- the clocks

@@ -1067,7 +1067,7 @@ static void testV1Cycles()
   for (const auto &l : m.lines) writeLines += l.rfind("write ", 0) == 0;
   CHECK(writeLines == x.b->log.logged && x.b->log.overflow == 0);
   CHECK(m.logged("V1: cycle 20/20 ok"));
-  CHECK(m.logged("branch gcc_video_ahb_clk: on raw before 00000002"));
+  CHECK(m.logged("branch gcc_video_ahb_clk: on raw before 80000002"));
   CHECK(m.logged("branch gcc_video_ahb_clk: on raw after 80000003 (halt check skipped)"));
   CHECK(m.logged("branch gcc_video_xo_clk: on raw after 00000001 (halt check skipped)"));
   CHECK(m.logged("GDSC mvs0c GDSC: out of collapse raw before"));
