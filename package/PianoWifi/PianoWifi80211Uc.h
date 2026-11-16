@@ -169,6 +169,10 @@ IOReturn PianoWifi80211Uc::externalMethod(uint32_t selector, IOExternalMethodArg
   switch (selector) {
   case kUcSelRequest:
   case kUcSelRequestBig:
+    // IOUserClient supplies OOL structures as caller-task descriptors.  The
+    // owner prepares input/output around the whole request before any
+    // readBytes/writeBytes (PianoWifi80211.h::ucRequest), then completes them
+    // on every return path; this dispatch itself only selects the request.
     result = fOwner->ucRequest(args, selector == kUcSelRequestBig, answered, requestType);
     break;
   case kUcSelUseIouc:
