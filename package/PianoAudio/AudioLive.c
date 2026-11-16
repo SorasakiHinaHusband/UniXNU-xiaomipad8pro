@@ -45,8 +45,8 @@ int32_t audio_ceiling_db(unsigned db)
 }
 
 /* ------------------------------------------------------------------------------------------------ the two clocks */
-/* The ring's fill, sampled once a period where its owner reads or writes it, is noisy by up to a device period (240 frames: where
- * the other side's last 5 ms landed) and biased by where in that cycle the sample falls; so its slow average (1/64 a period) is held
+/* The ring's fill, sampled once a period where its owner reads or writes it, is noisy by up to a device period (480 frames: where
+ * the other side's last 10 ms landed) and biased by where in that cycle the sample falls; so its slow average (1/64 a period) is held
  * at the level it settled at over the first 64 periods, give or take AUDIO_LIVE_SLIP_BAND: beyond, one frame slips a period
  * (+1: one too many, drop one; -1: one too few, repeat one). Only a drifting clock moves the average that far. */
 static void drift_reset(AudioLiveDrift *d) {d->avg = 0; d->setpoint = 0; d->samples = 0;}

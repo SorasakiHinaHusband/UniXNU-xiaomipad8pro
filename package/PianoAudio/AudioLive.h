@@ -26,27 +26,28 @@
 #ifndef PIANO_AUDIO_LIVE_H
 #define PIANO_AUDIO_LIVE_H
 #include <stdint.h>
+#include "AudioTiming.h"
 #include "AudioSession.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define AUDIO_LIVE_RING 4096u            /* the Speaker's stereo ring: 85 ms */
-#define AUDIO_LIVE_TARGET 960u           /* its fill while playing: 20 ms */
-#define AUDIO_LIVE_DEPTH 4u              /* speaker periods queued at the DSP while playing: 40 ms */
+#define AUDIO_LIVE_RING PIANO_AUDIO_RING_FRAMES /* the Speaker's stereo producer ring: 1.365 s */
+#define AUDIO_LIVE_TARGET PIANO_AUDIO_DSP_TARGET_FRAMES /* 260 ms before the DSP's four-period queue */
+#define AUDIO_LIVE_DEPTH PIANO_AUDIO_IN_FLIGHT /* speaker periods queued at the DSP while playing: 40 ms */
 #define AUDIO_LIVE_IDLE_MS 3000u         /* no sound (or no device) this long: the path goes down */
 #define AUDIO_LIVE_IDLE_MAX_MS 600000u
 #define AUDIO_LIVE_STATUS_MS 500u        /* the amplifiers' status while they play */
 #define AUDIO_LIVE_LATE_STOPS 3u         /* late stops of a path before it is off for the boot */
-#define AUDIO_LIVE_MIC_RING 4096u        /* the Mic's mono ring */
-#define AUDIO_LIVE_MIC_TARGET 960u
-#define AUDIO_LIVE_MIC_DEPTH 4u
+#define AUDIO_LIVE_MIC_RING PIANO_AUDIO_RING_FRAMES /* the Mic's mono producer ring */
+#define AUDIO_LIVE_MIC_TARGET PIANO_AUDIO_DSP_TARGET_FRAMES
+#define AUDIO_LIVE_MIC_DEPTH PIANO_AUDIO_IN_FLIGHT
 #define AUDIO_LIVE_MIC_SETTLE_MS 100u    /* the capture's first periods: zeros */
 #define AUDIO_LIVE_SLIP_BAND 240u        /* frames the smoothed fill may stray from where it settled before single frames slip */
 #define AUDIO_VOLUME_STEP 1024           /* Q15 per 10 ms period: the master volume's ramp (a full swing in 0.32 s) */
 #define AUDIO_LIVE_IDLE_TICK_MS 2000u    /* the tick with both paths down (the transport wakes the owner sooner) */
 /* The latency the transport adds, for the devices' registry (AudioPcm.h output_latency/input_latency). */
-#define AUDIO_LIVE_OUTPUT_LATENCY (AUDIO_LIVE_DEPTH * AUDIO_PERIOD_FRAMES + AUDIO_LIVE_TARGET)
+#define AUDIO_LIVE_OUTPUT_LATENCY (AUDIO_LIVE_DEPTH * AUDIO_PERIOD_FRAMES + AUDIO_LIVE_TARGET) /* 14400: >=300 ms */
 #define AUDIO_LIVE_INPUT_LATENCY (AUDIO_PERIOD_FRAMES + AUDIO_LIVE_MIC_TARGET)
 
 /* ---- what the devices' engine threads share with the owner's thread (single producer, single consumer per ring) */
