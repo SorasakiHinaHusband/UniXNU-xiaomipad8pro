@@ -816,7 +816,15 @@ void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
   self->fScanDonePending = 0;
   self->fScanDoneArmed = false;
   IOLockUnlock(self->fLock);
-  while (pending--) self->postEvent(pianowifi::a80211::kEvScanDone);
+  while (pending--) {
+    // Apple80211Scan consumes the synchronous records first.  The subset
+    // manager then waits for the separate cache transition (event 11) before
+    // replying to CoreWLAN; both notifications use the socket fallback in
+    // this profile because selector 5 reports no IOUC event pipe.
+    self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
+    self->note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
+    self->postEvent(pianowifi::a80211::kEvScanDone);
+  }
 }
 
 void PianoWifi80211::noteOtherIoctl(unsigned long cmd)

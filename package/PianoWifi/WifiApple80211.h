@@ -104,7 +104,19 @@ inline const char *requestName(int32_t type)
 // Vendor Apple, class KEV_IEEE80211_CLASS (6), subclass 1, the data: the interface's name (16 bytes) and then the payload.
 // The codes are sheng's and AirportItlwm's historical ones (REPORT.md section 4: "prior-art evidence to test", not re-decoded).
 constexpr uint32_t kEventClass = 6, kEventSubclass = 1;
-enum : uint32_t { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10 };
+// 27.3's IO80211 event vocabulary names the cache notification immediately
+// after SCAN_DONE.  Airportd's per-channel subset path waits for this cache
+// transition before completing its XPC request; the transport remains the
+// kernel-event socket while selector 5 (the IOUC event pipe) is zero.
+enum : uint32_t {
+  kEvPowerChanged = 1,
+  kEvSsidChanged = 2,
+  kEvBssidChanged = 3,
+  kEvLinkChanged = 4,
+  kEvAssocDone = 9,
+  kEvScanDone = 10,
+  kEvScanCacheUpdated = 11,
+};
 
 // The link-changed payload (sheng's 24A446 layout, 32 bytes; 27.3 not re-read).
 struct LinkEvent {

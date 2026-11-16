@@ -98,6 +98,7 @@ int main()
         offsetof(ScanResult, elementsLength) == 0x8a);
   CHECK(offsetof(ScanResult, channel) == 4 && offsetof(ScanResult, ssid) == 0x61 && offsetof(ScanResult, capability) == 0x1a);
   CHECK(sizeof(Power) == 24 && sizeof(Rssi) == 52 && sizeof(LinkEvent) == 32 && sizeof(Channel) == 12);
+  CHECK(kEvScanDone == 10 && kEvScanCacheUpdated == 11);
   CHECK(kChannelsInfoBytes == 0x2720 && kChannelsInfoCountAt == 0x0c && kChannelsInfoChannelAt == 0x32e &&
         kChannelsInfoBitmapAt == 0x12d0 && kChannelCount == 22 && kGapDefault == kGapAll);
   CHECK(kSiocSA80211 == 0x802869c8UL && kSiocGA80211 == 0xc02869c9UL);
