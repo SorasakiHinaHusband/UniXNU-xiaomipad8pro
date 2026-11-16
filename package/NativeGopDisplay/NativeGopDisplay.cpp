@@ -2318,10 +2318,9 @@ void NativeGopDisplay::composeBand(const gopcompose::RowSource &base, const gopc
         gopcompose::convertBaseSpan(line, scratch, r.x, static_cast<int32_t>(r.right()), count, haveBase ? &base : nullptr, *fTables);
         if (haveCursor)
             gopcompose::blendOverlayRow(line, overlayScratch, y, r.x, static_cast<int32_t>(r.right()), &cursor, o, onPanel);
-        if (result->sample && y % static_cast<int32_t>(kSampleStep) == 0)
-            sampleRow(line, haveBase && base.format == gopcompose::kFormatRGhA ? scratch : nullptr,
-                      haveBase && base.format == gopcompose::kFormatRGhA ? 8 : 4, static_cast<uint64_t>(y), fVideo.v_width,
-                      fVideo.v_height, result->stats, result->thumb);
+        // Sampling is done once the bands have joined, from the complete scanout row below.
+        // A worker's private line contains only its own rectangle; sampling the full panel here
+        // counted the untouched part as black (and raced on the shared thumbnail buffers).
         now = mach_absolute_time();
         absolutetime_to_nanoseconds(now - mark, &ns);
         result->convertNs += ns;
@@ -2494,6 +2493,16 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
         if (result.stats.centre || (stats.centre == 0 && result.stats.samples))
             stats.centre = result.stats.centre;
         aborted |= result.aborted;
+    }
+    if (sample && !aborted) {
+        // The workers have now written every row.  Read the completed panel rows so the
+        // statistic describes exactly what the framebuffer contains, independent of the
+        // row partition and without concurrent writes to fThumbLuma/fThumbCount.
+        __asm__ volatile("dsb sy" ::: "memory");
+        for (uint64_t y = 0; y < height; y += kSampleStep) {
+            const uint32_t *row = reinterpret_cast<const uint32_t *>(fScanout + y * fVideo.v_rowBytes);
+            sampleRow(row, nullptr, 4, y, width, height, stats, thumb);
+        }
     }
     if (plan.damage && !refresh && !aborted && haveBase)   // a frame from its region: what it left out must still be on the panel
         auditDamage(plan, baseRows, baseMap.cached, onPanel);

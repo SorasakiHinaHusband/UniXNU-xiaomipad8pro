@@ -315,6 +315,18 @@ static void testParallelRows()
     }
     CHECK(sliced == serial);
   }
+
+  // The production sampler runs after all row bands join and reads complete scanout rows.
+  // Sampling a worker's private line across the full panel would inspect unfilled columns;
+  // the joined scanout must retain the frame's lit-pixel statistic for six workers.
+  uint64_t joinedSamples = 0, joinedLit = 0;
+  for (uint32_t y = 0; y < height; y += 16)
+    for (uint32_t x = 0; x < width; x += 16) {
+      const uint32_t p = sliced[size_t(y) * width + x];
+      ++joinedSamples;
+      joinedLit += (p & 0x00ffffffu) != 0;
+    }
+  CHECK(joinedSamples != 0 && joinedLit * 2 >= joinedSamples);
 }
 
 // The reference: pixel by pixel from the definitions (base converted, black outside it, the glyph blended where it lies).
