@@ -4,8 +4,8 @@
 # objects in out/native-kexts/PianoWifiEthernet for tooling/k27/kext/PianoWifiEthernet.json. It has no hardware of its own and
 # matches the resource PianoWifiLink, which PianoWifi publishes only when level 6 came up, so it is inert without piano-wifi=6.
 # The same translation unit carries PianoWifi80211 (PianoWifi80211.h, docs/drivers/wifi-menu.md section 5: the controller as a
-# Wi-Fi interface for airportd, only with piano-wifi-apple80211=1): its host test (tests/apple80211_host.cpp: the apple80211
-# requests' layouts and answers) runs first, its kernel entries' stack is bounded after the compile, and the imports are checked
+# Wi-Fi interface for airportd, only with piano-wifi-apple80211=1): its host tests (the apple80211 request model and the
+# descriptor prepare/complete model) run first, its kernel entries' stack is bounded after the compile, and the imports are checked
 # against the kernel (IONetworkingFamily's and PianoWifi's are the KC link's to resolve).
 #   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes and the networking headers), K27_OBJ, CXX (host
 #                compiler for the test, default c++), K27_KERNEL (for the import check; skipped when absent)
@@ -16,6 +16,8 @@ P=$D/package/PianoWifi; O=$D/out/native-kexts/PianoWifiEthernet
 mkdir -p "$O/host-tests"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/apple80211_host.cpp" -o "$O/host-tests/apple80211_host"
 "$O/host-tests/apple80211_host" || { echo "Error: PianoWifiEthernet host tests failed (apple80211_host)" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/iouc_host.cpp" -o "$O/host-tests/iouc_host"
+"$O/host-tests/iouc_host" || { echo "Error: PianoWifiEthernet host tests failed (iouc_host)" >&2; exit 1; }
 python3 "$D/tooling/k27/build-native-kext.py" PianoWifiEthernet "$D/package/PianoWifi/PianoWifiEthernet.cpp" \
   "$D/tooling/k27/NativeKextGlue.cpp" -I "$K/out/x12377/inc-net-piano" --obj "${K27_OBJ:-k27-native-obj}"
 # PianoWifi80211's entries run on a requesting process's kernel stack (the ioctl, airportd's: 16 KiB with the syscall's and the

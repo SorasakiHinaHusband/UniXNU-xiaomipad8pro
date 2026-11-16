@@ -1197,6 +1197,12 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   IOMemoryDescriptor *inputDescriptor = args->structureInputDescriptor;
   const IOByteCount inputDescriptorLength = inputDescriptor ? inputDescriptor->getLength() : 0;
   if (inputDescriptor && (inputDescriptorLength < want || inputDescriptorLength > UINT32_MAX)) return kIOReturnBadArgument;
+  // IOUserClient creates structureInputDescriptor with kIODirectionOut: the
+  // caller wrote it and this kext reads it.  Wiring is deliberately outside
+  // apple80211(), before that routine takes fLock; the guard completes it on
+  // every return path, including allocation, short-request, and driver-error paths.
+  pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> inputPreparation(inputDescriptor, kIODirectionOut);
+  if (!inputPreparation.ok()) return kIOReturnBadArgument;
   uint8_t *stagedInput = nullptr;
   const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
   uint32_t inputBytes = args->structureInputSize;
@@ -1262,6 +1268,14 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
     outputBytes = uint32_t(outputDescriptorLength);
     if (args->structureOutputDescriptorSize && args->structureOutputDescriptorSize < outputBytes)
       outputBytes = args->structureOutputDescriptorSize;
+  }
+  // IOUserClient creates structureOutputDescriptor with kIODirectionIn: this
+  // kext writes the caller's output.  It is prepared before apple80211() can
+  // call ucOut(), and completed by scope exit after all descriptor writes.
+  pianowifi::a80211::DescriptorPreparation<IOMemoryDescriptor> outputPreparation(outputDescriptor, kIODirectionIn);
+  if (!outputPreparation.ok()) {
+    if (stagedInput) IOFreeData(stagedInput, want);
+    return kIOReturnBadArgument;
   }
   if (cmd == kUcGetCmd && outputDescriptor && outputBytes) {
     // OOL output has no inline pointer. A private token lets the common
