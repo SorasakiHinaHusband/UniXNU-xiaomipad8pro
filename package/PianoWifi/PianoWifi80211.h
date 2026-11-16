@@ -1368,6 +1368,8 @@ IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, 
   uint64_t inlineSetData = 0;
   if (cmd == kUcSetCmd &&
       pianowifi::a80211::ucInlineSetPayload(in, inputBytes, kUcDataAt, length, inlineSetData)) {
+    if (type == kAssociate)
+      note80211("%s: user-client SET payload fetched from kernel input+0x08 (PianoWifiUcInlinePayloadV1)", fIfName);
     ucio.inlineData = true;
     rq.data = inlineSetData;
   }
