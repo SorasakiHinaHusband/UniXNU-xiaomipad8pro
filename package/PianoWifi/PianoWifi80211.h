@@ -638,7 +638,7 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
     if (scanSet) snprintf(extra, sizeof extra, "; %u network(s)%s", unsigned(networks), directed ? ", a directed scan" : "");
     else if (type == kScanResult && !set) snprintf(extra, sizeof extra, "; cursor %u of %u", unsigned(cursor), unsigned(networks));
     if (type == kCardCapabilities && !set)
-      note80211("%s: Apple80211 capability profile advertises TKIP bit 1, WPA bit 13, WPA2 bit 14", fIfName);
+      note80211("%s: PianoWifiMixedSecurityCaps advertises TKIP bit 1, WPA bit 13, WPA2 bit 14", fIfName);
     note80211("%s: %s %d %s len %u val %d -> %d (wrote %u, len %u, val %d)%s%s", fIfName, set ? "set" : "get", int(type),
               requestName(type), unsigned(length), int(value), a.error, unsigned(a.wrote), unsigned(rq.length), int(rq.value), extra,
               a.accepted ? " [accept mode]" : "");
