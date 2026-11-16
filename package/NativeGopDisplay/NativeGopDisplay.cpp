@@ -56,7 +56,7 @@ using gopcompose::Rect;
 extern "C" task_t kernel_task;
 
 SYSCTL_DECL(_machdep);
-static volatile uint32_t gCopyThreads = 4;
+static volatile uint32_t gCopyThreads = 6;
 static struct sysctl_oid gCopyThreadsOid;
 static bool gCopyThreadsRegistered = false;
 
@@ -539,7 +539,7 @@ private:
     //          before the read, so the read streams through the cache instead of single uncached loads
     static constexpr uint32_t kCopyFencedRefresh = 1, kCopyCachedRead = 2;
     uint32_t fCopyMode;
-    uint32_t fCopyThreads = 4;
+    uint32_t fCopyThreads = 6;
     bool fCopyThreadsSysctl = false;
     // native-gop-display-copy-ab=1 (2026-11-14, one-boot A/B of copy mode bit 1): every report period the work loop asks for the
     // other read mode (fCopyModeWanted), the copy thread takes it before its next job (its surface maps let go, so the next jobs map
@@ -804,10 +804,10 @@ bool NativeGopDisplay::start(IOService *provider)
     fGpuFences = gpuFence != 0;
     fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
     PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
-    fCopyThreads = 4;
+    fCopyThreads = 6;
     PE_parse_boot_argn("native-gop-display-copy-threads", &fCopyThreads, sizeof(fCopyThreads));
     if (fCopyThreads < 1 || fCopyThreads > 6)
-        fCopyThreads = 4;
+        fCopyThreads = 6;
     if (!fExternal) {
         __atomic_store_n(&gCopyThreads, fCopyThreads, __ATOMIC_RELEASE);
         registerNativeGopCopyThreadsSysctl();
