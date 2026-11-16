@@ -822,7 +822,7 @@ void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
     // replying to CoreWLAN; both notifications use the socket fallback in
     // this profile because selector 5 reports no IOUC event pipe.
     self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
-    self->note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
+    note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
     self->postEvent(pianowifi::a80211::kEvScanDone);
   }
 }
