@@ -122,6 +122,9 @@ int main()
     a = r.ask(false, kCardCapabilities, 23);
     CHECK(a.error == 0 && a.wrote == 23 && r.rq.length == 23 && r.at(23)[0] == 0xa5);
     for (uint8_t b : kCapBits) CHECK(r.at(0)[b / 8] & (1u << (b % 8)));
+    CHECK(r.at(0)[kCapTkip / 8] & (1u << (kCapTkip % 8)));
+    CHECK(r.at(0)[kCapWpa / 8] & (1u << (kCapWpa % 8)));
+    CHECK(r.at(0)[kCapWpa2 / 8] & (1u << (kCapWpa2 % 8)));
     CHECK((r.at(0)[0] & 0x1) == 0);                          // no WEP
     CHECK((r.at(0)[46 / 8] & (1u << (46 % 8))) == 0);        // no wait for a scan-done event (sheng bit 0x4 adds it)
     CHECK((r.at(0)[73 / 8] & (1u << (73 % 8))) == 0);        // directed scans as SCAN_REQ
@@ -147,6 +150,24 @@ int main()
     r.rq.data = 0x1000;
     a = handle(r.st, kId, false, r.rq, r.io, r.scratch.data());
     CHECK(a.error == kErrFault);
+  }
+
+  // ---- a mixed WPA2 network: the scan record carries the AP's RSN IE byte-for-byte
+  // (group TKIP, pairwise CCMP, PSK).  Associate2 reads this group value as 2;
+  // CARD_CAPABILITIES bit 1 above is what lets that path continue to SET 20.
+  {
+    Bss b = network(9, "mixed", 5180, -42, true);
+    b.rsn[7] = 2;
+    ScanResult result = {};
+    fillScanResult(result, b);
+    const uint8_t want[] = {48, 20, 1, 0, 0x00, 0x0f, 0xac, 2, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0,
+                            0x00, 0x0f, 0xac, 2, 0, 0};
+    CHECK(result.elementsLength >= sizeof want);
+    bool found = false;
+    for (uint32_t at = 0; at + sizeof want <= result.elementsLength; ++at) {
+      if (std::memcmp(result.elements + at, want, sizeof want) == 0) { found = true; break; }
+    }
+    CHECK(found);
   }
 
   // ---- power: on by default; off answers EPWROFF to scans, on again restores them; each set asks for the event

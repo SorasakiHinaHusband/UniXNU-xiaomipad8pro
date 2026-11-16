@@ -144,7 +144,15 @@ enum : uint32_t { kChan20MHz = 0x2, kChan2GHz = 0x8, kChan5GHz = 0x10, kChanActi
 // 2026-11-14, docs/drivers/wifi-menu.md section 5.2): a raw 23-byte bitmap from offset 0, no version word, asked by
 // the bind (the only sanity request of the ioctl path: any error fails the bind); bit 46 would make airportd wait for a scan's
 // completion event and bit 73 choose SCAN_REQ_MULTIPLE for directed scans: neither is set.
-constexpr uint8_t kCapBits[] = {2, 3, 6, 9, 10, 14, 17, 19};
+// Apple80211Associate2 also consumes these bytes directly.  Its RSN/TKIP branch at
+// 0x1c4648bf8 tests handle[0x58] bit 1 and returns -3903 at 0x1c4648c00 when that
+// bit is absent.  The WPA fallback at 0x1c4647bec tests handle[0x59] bit 5; bit 6
+// of that byte is the existing WPA2 gate.  Keep all three advertised for the
+// mixed WPA/WPA2 networks accepted by the native supplicant.
+constexpr uint8_t kCapTkip = 1;  // RSN group cipher 2 (TKIP), confirmed in Associate2.
+constexpr uint8_t kCapWpa = 13;   // WPA fallback gate, inferred from handle+0x59 bit 5.
+constexpr uint8_t kCapWpa2 = 14;  // RSN/WPA2 gate, confirmed from handle+0x59 bit 6.
+constexpr uint8_t kCapBits[] = {kCapTkip, 2, 3, 6, 9, 10, kCapWpa, kCapWpa2, 17, 19};
 constexpr uint32_t kCapBytes = 23;
 constexpr int kErrPowerOff = 82;      // EPWROFF on Darwin: "device power is off"
 constexpr int kErrNotAssociated = 2;  // ENOENT (sheng's answer for what needs an association)
