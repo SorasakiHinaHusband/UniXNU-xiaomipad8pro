@@ -1021,9 +1021,7 @@ void PianoWifi80211::syncAssociation(bool emit)
             old.channel != next.channel || old.rssi != next.rssi;
   IOLockUnlock(fLock);
   if (!emit || !changed) return;
-  const bool oldPublic = old.associated && (old.authType != 2 || old.authorized);
-  const bool nextPublic = next.associated && (next.authType != 2 || next.authorized);
-  const bool joinedOrRoamed = nextPublic && (associatedChanged || authorizedChanged || bssidChanged || ssidChanged);
+  const auto transition = associationTransition(old, next);
   auto assocDone = [&](const Association &a) {
     if (a.modern) {
       // Reuse the controller's scratch allocation so the ioctl caller's
@@ -1039,7 +1037,11 @@ void PianoWifi80211::syncAssociation(bool emit)
       postEvent(kEvAssocDone, &result, sizeof result);
     }
   };
-  if (nextPublic && (joinedOrRoamed || !oldPublic)) {
+  // ASSOC_DONE is deliberately first: it is the airportd hand-off point and
+  // precedes the private supplicant's EAPOL exchange.  The public link events
+  // are emitted only after AUTHORIZE, so configd cannot start DHCP early.
+  if (transition.assocDone) assocDone(next);
+  if (transition.connected) {
     LinkEvent link = {};
     link.down = 0;
     link.rssi = next.rssi;
@@ -1047,17 +1049,16 @@ void PianoWifi80211::syncAssociation(bool emit)
     if (ssidChanged) postEvent(kEvSsidChanged);
     if (bssidChanged) postEvent(kEvBssidChanged);
     postEvent(kEvLinkChanged, &link, sizeof link);
-    assocDone(next);
-  } else if (!next.associated && (old.associated || resultChanged)) {
+  } else if (transition.disconnected || (!next.associated && resultChanged)) {
     LinkEvent link = {};
     link.down = 1;
     link.rssi = next.rssi;
     link.noise = uint16_t(next.noise);
     postEvent(kEvLinkChanged, &link, sizeof link);
-    if (next.result) assocDone(next);
+    if (next.result && !transition.assocDone) assocDone(next);
     postEvent(kEvSsidChanged);
     postEvent(kEvBssidChanged);
-  } else if (nextPublic && resultChanged) {
+  } else if (resultChanged && next.associated && !transition.assocDone) {
     assocDone(next);
   }
   note80211("%s: association state %s (channel %u, rssi %d, rate %u; events emitted)", fIfName,

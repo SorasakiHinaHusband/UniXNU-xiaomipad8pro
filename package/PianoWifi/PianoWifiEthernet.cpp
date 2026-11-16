@@ -223,6 +223,18 @@ void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
   IONetworkMedium *medium = (self->fMedium11On && self->fMedium11) ? self->fMedium11 : self->fMedium;
   self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, medium,
                       now ? kLinkSpeed : 0);
+  // IONetworkController's medium notification is what drives the family
+  // status, but configd's DHCP gate also reads the BSD running bit.  Set and
+  // read it explicitly at the same authorization edge and leave IFF_UP alone.
+  ifnet_t ifp = self->fInterface ? self->fInterface->getIfnet() : nullptr;
+  if (ifp) {
+    ifnet_set_flags(ifp, now ? IFF_RUNNING : 0, IFF_RUNNING);
+    const uint32_t flags = uint32_t(ifnet_flags(ifp));
+    note("the authorized link set IFF_RUNNING=%u (ifnet flags %#x; DHCP gate %s)", (flags & IFF_RUNNING) ? 1u : 0u, flags,
+         (flags & IFF_RUNNING) ? "open" : "closed");
+  } else {
+    note("the authorized link changed before the BSD ifnet existed (IFF_RUNNING deferred)");
+  }
   self->linkChanged(now);
   note("the link is %s (PianoWifi's port %s)", now ? "up" : "down", now ? "is authorized" : "closed: the association ended");
   self->counters(now ? "at the link's up" : "at the link's down");

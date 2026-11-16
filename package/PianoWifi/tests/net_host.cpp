@@ -47,6 +47,11 @@ static std::vector<uint8_t> keyPdu(uint16_t info, uint16_t data = 0)
 
 int main()
 {
+  CHECK(!piano_wifi_net_link_is_up(PIANO_WIFI_8021X_STATE_IDLE));
+  CHECK(!piano_wifi_net_link_is_up(PIANO_WIFI_8021X_STATE_ASSOCIATED));
+  CHECK(piano_wifi_net_link_is_up(PIANO_WIFI_8021X_STATE_AUTHORIZED));
+  CHECK(piano_wifi_post_join_disconnect_grace(1250, 1000));
+  CHECK(!piano_wifi_post_join_disconnect_grace(1500, 1000));
   // ---- EAPOL_TX: the PDU found, its generation read; a length that does not add up refused
   {
     piano_wifi_8021x_eapol e = {};

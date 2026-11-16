@@ -3871,7 +3871,9 @@ unsigned gPortResultHead, gPortResultTail;
 struct Level8 {
   bool on = false, selectionSent = false, live = false, txUp = false, linkUpTold = false;
   uint32_t selectionTries = 0, selections = 0;
-  uint64_t associatedAt = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0, nextPointers = 0;
+  uint64_t associatedAt = 0, authorizedAt = 0, disconnectGraceUntil = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0,
+           nextPointers = 0;
+  bool disconnectGraceLogged = false;
   uint32_t eapolLogged = 0, eapolToPort = 0, eapolDropped = 0, eapolNotFromAp = 0, eapolMsg[7] = {};
   uint32_t toEn0 = 0, en0Dropped = 0, keyCommands = 0, keyComplete = 0, keyTimeouts = 0;
   uint32_t portSeq = 0, portOut = 0, portOutFailed = 0;
@@ -4634,6 +4636,9 @@ void level8Follow(uint64_t now)
   }
   if (up && gSta.authorized && !gL8.linkUpTold) {
     gL8.linkUpTold = true;
+    gL8.authorizedAt = now;
+    gL8.disconnectGraceUntil = 0;
+    gL8.disconnectGraceLogged = false;
     netLinkSnapshot(PIANO_WIFI_8021X_STATE_AUTHORIZED, true, gDp.txReady);
     netTellLink(true);
     gL8.lastState = PIANO_WIFI_8021X_STATE_AUTHORIZED;
@@ -4642,6 +4647,27 @@ void level8Follow(uint64_t now)
     deferPhase();
   }
   if (gL8.live && !live) {
+    // A just-authorized port can receive the AP's teardown indication in the
+    // same scheduler turn as the final key completion.  Keep the public link
+    // stable for a short, bounded grace window so airportd/configd do not
+    // cancel DHCP on that transient edge; data TX is stopped immediately.
+    if (gL8.linkUpTold && !gL8.disconnectGraceUntil &&
+        piano_wifi_post_join_disconnect_grace(now, gL8.authorizedAt)) {
+      gL8.disconnectGraceUntil = now + PIANO_WIFI_POST_JOIN_DISCONNECT_GRACE_MS;
+      if (!gL8.disconnectGraceLogged) {
+        gL8.disconnectGraceLogged = true;
+        note("level 8: post-join disconnect grace %u ms (the port was authorized %llu ms ago); data TX stopped, link teardown deferred",
+             PIANO_WIFI_POST_JOIN_DISCONNECT_GRACE_MS,
+             (unsigned long long)(now - gL8.authorizedAt));
+      }
+      dpTxStop(gDp);
+      gL8.txUp = false;
+      IOLockLock(gTxLock);
+      netQueueClear(gTxQueue);
+      IOLockUnlock(gTxLock);
+      return;
+    }
+    if (gL8.disconnectGraceUntil && now < gL8.disconnectGraceUntil) return;
     gL8.live = false;
     gL8.txUp = false;
     gL8.linkUpTold = false;

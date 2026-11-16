@@ -84,6 +84,7 @@ int piano_wifi_net_send(const uint8_t *frame, uint32_t length);
 #define PIANO_WIFI_8021X_VERSION 1u
 #define PIANO_WIFI_8021X_MSG_MAX 2048u
 #define PIANO_WIFI_8021X_EAPOL_MAX 1500u   /* an EAPOL PDU, from its version byte on */
+#define PIANO_WIFI_POST_JOIN_DISCONNECT_GRACE_MS 500u
 
 struct piano_wifi_8021x_hdr {
   uint16_t type;     /* PIANO_WIFI_8021X_* below */
@@ -126,6 +127,19 @@ enum {
   PIANO_WIFI_8021X_STATE_ASSOCIATED = 1,  /* associated, the port closed: the handshake's turn */
   PIANO_WIFI_8021X_STATE_AUTHORIZED = 2   /* the port is open */
 };
+
+/* The BSD link is usable for DHCP only after the 802.1X port is authorized.
+ * Keep this predicate beside the wire contract so the Ethernet personality and
+ * host tests share the same gate. */
+static inline int piano_wifi_net_link_is_up(uint32_t state)
+{
+  return state == PIANO_WIFI_8021X_STATE_AUTHORIZED;
+}
+
+static inline int piano_wifi_post_join_disconnect_grace(uint64_t now_ms, uint64_t authorized_ms)
+{
+  return authorized_ms != 0 && now_ms < authorized_ms + PIANO_WIFI_POST_JOIN_DISCONNECT_GRACE_MS;
+}
 
 /* What the client needs of the association. ap_rsn / own_rsn are whole elements (identifier 48, length, body) as the access
  * point's beacon or probe response carried its own and as the association request carried ours; 0 bytes for an open network.

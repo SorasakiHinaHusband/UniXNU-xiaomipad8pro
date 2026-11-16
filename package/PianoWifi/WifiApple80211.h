@@ -176,6 +176,7 @@ enum : uint32_t {
   kAssociateProblemNone = 0,
   kAssociateProblemLayout,
   kAssociateProblemVersion,
+  kAssociateProblemAuth,
   kAssociateProblemSsid,
   kAssociateProblemKeyLength,
   kAssociateProblemCipher,
@@ -187,6 +188,7 @@ inline const char *associateProblemName(uint32_t problem)
   switch (problem) {
   case kAssociateProblemLayout: return "unsupported association layout";
   case kAssociateProblemVersion: return "association version is not 1";
+  case kAssociateProblemAuth: return "authentication selector/flags are inconsistent";
   case kAssociateProblemSsid: return "network name length is not 1 to 32 bytes";
   case kAssociateProblemKeyLength: return "credential length is out of range";
   case kAssociateProblemCipher: return "credential cipher/length is not supported";
@@ -503,6 +505,30 @@ struct Association {
   uint32_t state = kStateInit;
 };
 
+// Event ordering shared by the kernel front end and its host contract.  The
+// custom 802.1X path reports ASSOC_DONE as soon as 802.11 association is
+// complete, while SSID/BSSID/LINK-up wait for the private port's AUTHORIZE.
+// That lets airportd observe the 540-byte completion without advertising a
+// DHCP-capable link before the WPA2 keys are installed.
+struct AssociationTransition {
+  bool assocDone = false;
+  bool connected = false;
+  bool disconnected = false;
+};
+
+inline AssociationTransition associationTransition(const Association &old, const Association &next)
+{
+  AssociationTransition t;
+  bool bssidChanged = false, ssidChanged = old.ssidLength != next.ssidLength;
+  for (unsigned i = 0; i < sizeof old.bssid; ++i) bssidChanged = bssidChanged || old.bssid[i] != next.bssid[i];
+  for (unsigned i = 0; i < kSsidMax; ++i) ssidChanged = ssidChanged || old.ssid[i] != next.ssid[i];
+  t.assocDone = next.associated && (!old.associated || bssidChanged || ssidChanged);
+  t.connected = next.associated && next.authorized &&
+                (!old.associated || !old.authorized || bssidChanged || ssidChanged);
+  t.disconnected = !next.associated && (old.associated || old.authorized);
+  return t;
+}
+
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
@@ -693,6 +719,18 @@ inline bool parseAssociate(const Req &rq, const UserIo &io, Answer &a)
                              (version == 1 || (version == 0 && a.associationHeader8 == 1));
   if (!modernVersion && version != 1) {
     associateProblem(a, kAssociateProblemVersion, layout);
+    zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
+    return false;
+  }
+  // Associate2's selector is open-system (1); the upper word is the WPA2
+  // capability selected for a keyed request.  27.3 has emitted both 0x10
+  // (the public AUTH_TYPE spelling) and 0x40 (the Associate2 WPA2 flag), so
+  // accept those two encodings but reject an inconsistent selector/flag pair.
+  const uint32_t selector = layout == sizeof(AssociateRequest27) ? a.associationHeader8 : uint32_t(wire.legacy.auth_lower);
+  const uint32_t flags = layout == sizeof(AssociateRequest27) ? a.associationHeaderC : uint32_t(wire.legacy.auth_upper);
+  const bool wpa2Flags = flags == 0x10 || flags == 0x40;
+  if (selector != 1 || (network->key_length ? !wpa2Flags : flags != 0)) {
+    associateProblem(a, kAssociateProblemAuth, layout);
     zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
     return false;
   }

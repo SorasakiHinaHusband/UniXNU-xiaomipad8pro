@@ -95,6 +95,10 @@ struct Rig {
       put16(4, 2);                       // mode
       put32(8, 1);                       // authentication selector/version word
       put32(0x0c, 0x40);                 // WPA2/RSN flags for this fixture
+    } else {
+      put16(4, 2);                       // legacy mode
+      put16(6, 1);                       // open-system selector
+      put16(8, 0x10);                    // WPA2-Personal flag
     }
     put32(network, 4);                   // SSID length (the bytes are test-only)
     std::memcpy(user.mem.data() + network + 4, "test", 4);
@@ -138,6 +142,22 @@ int main()
   CHECK(!useIfnet2Old(0));
   CHECK(!useIfnet2Old(2));
   CHECK(useIfnet2Old(kIfnet2Old));
+
+  // The menu event contract: ASSOC_DONE is visible while WPA2 is still
+  // waiting for the private port, and the link/SSID/BSSID transition follows
+  // only after AUTHORIZE.  A disconnect emits one down transition.
+  {
+    Association old = {}, pending = {}, open = {};
+    pending.associated = true;
+    auto t = associationTransition(old, pending);
+    CHECK(t.assocDone && !t.connected && !t.disconnected);
+    open = pending;
+    open.authorized = true;
+    t = associationTransition(pending, open);
+    CHECK(!t.assocDone && t.connected && !t.disconnected);
+    t = associationTransition(open, Association{});
+    CHECK(!t.assocDone && !t.connected && t.disconnected);
+  }
 
   // ---- the layouts: the request and the answers' fixed sizes and offsets
   CHECK(sizeof(Req) == 40);
@@ -295,6 +315,14 @@ int main()
           a.associationProfileData.psk[0] == '6' && a.associationProfileData.psk[1] == '1');
     a = r.associate(sizeof(AssociateRequest27), 7, 8);
     CHECK(a.error == kErrInval && !a.associationProfile && a.associationProblem == kAssociateProblemCipher);
+    a = r.associate(sizeof(AssociateRequest27), 10, 13);
+    r.put32(8, 2);                       // a selector other than open-system
+    a = r.ask(true, kAssociate, sizeof(AssociateRequest27));
+    CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemAuth);
+    a = r.associate(sizeof(AssociateRequest27), 10, 13);
+    r.put32(0x0c, 0x80);                 // WPA flag without the WPA2 selector
+    a = r.ask(true, kAssociate, sizeof(AssociateRequest27));
+    CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemAuth);
     a = r.ask(true, kAssociate, 600);
     CHECK(a.error == kErrInval && a.associationProblem == kAssociateProblemLayout);
     std::memset(r.user.mem.data(), 0, 656);

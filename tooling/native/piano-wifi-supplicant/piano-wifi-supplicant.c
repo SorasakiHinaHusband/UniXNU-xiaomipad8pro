@@ -579,6 +579,7 @@ static int run(const char *profile_path, bool once)
     wipe(msg, sizeof msg);
   }
   wipe(ps.pmk, sizeof ps.pmk);
+  wipe(&menu_profile, sizeof menu_profile);
   wipe(&h, sizeof h);
   return 0;
 }
