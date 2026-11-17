@@ -7,7 +7,100 @@
 using namespace pianovideo;
 static int failures;
 #define CHECK(x) do { if(!(x)){std::printf("FAIL line %d: %s\n",__LINE__,#x); ++failures;} } while(0)
+// Our synthesized headers isolate each admission boundary; actual Apple wire
+// serialization and every compressed packet are also checked by video-v6 --self-test.
+struct BitWriter {
+  std::vector<uint8_t> raw; unsigned bit = 0;
+  void put(uint32_t value, unsigned n) {
+    for (unsigned i = n; i; --i) { if (!bit) raw.push_back(0); raw.back() |= ((value >> (i - 1)) & 1) << (7 - bit); bit = (bit + 1) % 8; }
+  }
+  void ue(uint32_t n) { ++n; unsigned bits = 0; for (auto v = n; v; v >>= 1) ++bits; put(0,bits-1); put(n,bits); }
+  void se(int n) { ue(n <= 0 ? uint32_t(-2*n) : uint32_t(2*n-1)); }
+  std::vector<uint8_t> nal(uint8_t header) {
+    put(1,1); while (bit) put(0,1);
+    std::vector<uint8_t> out{header}; unsigned zeros = 0;
+    for (auto b:raw) { if (zeros >= 2 && b <= 3) { out.push_back(3); zeros=0; } out.push_back(b); zeros=b?0:zeros+1; }
+    return out;
+  }
+};
+static std::vector<uint8_t> makeSps(unsigned profile=77,unsigned poc=0,unsigned refs=2,unsigned width=19,bool fields=false,bool crop=false,unsigned reorder=1) {
+  BitWriter b; b.put(profile,8);b.put(profile==66?0xc0:0x40,8);b.put(13,8);b.ue(0);b.ue(0);b.ue(poc);if(!poc)b.ue(1);
+  b.ue(refs);b.put(0,1);b.ue(width);b.ue(14);b.put(!fields,1);b.put(1,1);b.put(crop,1);
+  b.put(1,1);b.put(0,1);b.put(0,1);b.put(0,1);b.put(0,1);b.put(0,1);b.put(0,1);b.put(0,1);b.put(0,1);
+  b.put(1,1);b.put(1,1);b.ue(0);b.ue(0);b.ue(9);b.ue(9);b.ue(reorder);b.ue(refs);
+  return b.nal(0x67);
+}
+static std::vector<uint8_t> makePps(bool entropy=true,unsigned groups=0,bool redundant=false,unsigned sps=0) {
+  BitWriter b;b.ue(0);b.ue(sps);b.put(entropy,1);b.put(0,1);b.ue(groups);b.ue(1);b.ue(0);b.put(1,1);b.put(2,2);
+  b.se(-2);b.se(0);b.se(-2);b.put(1,1);b.put(0,1);b.put(redundant,1);return b.nal(0x68);
+}
+static std::vector<uint8_t> avcc(const std::vector<uint8_t> &s,const std::vector<uint8_t> &p) {
+  std::vector<uint8_t> out{1,s[1],s[2],s[3],0xff,0xe1,uint8_t(s.size()>>8),uint8_t(s.size())};
+  out.insert(out.end(),s.begin(),s.end());out.push_back(1);out.push_back(uint8_t(p.size()>>8));out.push_back(uint8_t(p.size()));out.insert(out.end(),p.begin(),p.end());return out;
+}
+static std::vector<uint8_t> picture(const avc::Config &c,unsigned type,unsigned frame,unsigned poc,unsigned firstMb=0,bool idr=false,bool reference=true,unsigned pps=0) {
+  BitWriter b;b.ue(firstMb);b.ue(type);b.ue(pps);b.put(frame,c.s.frameBits);if(idr)b.ue(0);if(!c.s.pocType)b.put(poc,c.s.pocBits);
+  return b.nal(uint8_t((reference?0x60:0)|(idr?5:1)));
+}
+static void appendNal(std::vector<uint8_t> &out,const std::vector<uint8_t> &nal) {
+  const auto at=out.size();out.resize(at+4);vtwire::put32(out.data()+at,uint32_t(nal.size()));out.insert(out.end(),nal.begin(),nal.end());
+}
+static void appendAtom(std::vector<uint8_t> &out,uint32_t kind,const void *p,uint32_t n) {
+  const auto at=out.size();out.resize(at+8+n);vtwire::put32(out.data()+at,8+n);vtwire::put32(out.data()+at+4,kind);if(n)memcpy(out.data()+at+8,p,n);
+}
+static std::vector<uint8_t> frameRequest(const std::vector<uint8_t> &sample,uint32_t flags=1,unsigned count=1,unsigned sizeDelta=0,unsigned timingBytes=72) {
+  using namespace vtwire;
+  uint8_t uuid[16]={},head[256]={};Writer w(head,sizeof head);w.header(cc("dfrm"),FlagRequest,uuid,23);w.s64(cc(",frm"),124);w.u32(cc(",dfl"),flags);
+  std::vector<uint8_t> body;uint32_t bytes=uint32_t(sample.size())+sizeDelta;uint8_t timing[80]={};
+  uint32_t scale=90000,valid=1;memcpy(timing+24+8,&scale,4);memcpy(timing+24+12,&valid,4);
+  appendAtom(body,cc("nsmp"),&count,4);appendAtom(body,cc("ssiz"),&bytes,4);appendAtom(body,cc("stia"),timing,timingBytes);appendAtom(body,cc("sdat"),sample.data(),uint32_t(sample.size()));
+  std::vector<uint8_t> sbuf;appendAtom(sbuf,cc("sbuf"),body.data(),uint32_t(body.size()));
+  std::vector<uint8_t> request(head,head+w.size());const auto at=request.size();request.resize(at+16+sbuf.size());
+  put32(request.data()+at,uint32_t(16+sbuf.size()));put32(request.data()+at+4,cc("para"));put32(request.data()+at+8,cc(",sbf"));put32(request.data()+at+12,cc("=sbf"));memcpy(request.data()+at+16,sbuf.data(),sbuf.size());return request;
+}
+static void streamTests() {
+  const auto s=makeSps(), p=makePps();auto conf=avcc(s,p);avc::Config c;
+  CHECK(avc::config(conf.data(),uint32_t(conf.size()),c));CHECK(c.valid()&&c.pocType==0&&c.hfiProfile()==1&&c.hfiLevel()==4&&c.s.maxReorder==1&&c.s.maxDpb==2);
+  CHECK(c.same(c));avc::Config different=c;different.pps[2]^=1;CHECK(!c.same(different));
+  CHECK(!avc::config(nullptr,0,different));
+  for(auto invalid:{makeSps(100),makeSps(77,1),makeSps(77,0,5),makeSps(77,0,2,20),makeSps(77,0,2,19,true),makeSps(77,0,2,19,false,true),makeSps(77,0,2,19,false,false,3)}){
+    auto bad=avcc(invalid,p);CHECK(!avc::config(bad.data(),uint32_t(bad.size()),different));
+  }
+  for(auto invalid:{makePps(true,1),makePps(true,0,true),makePps(true,0,false,1)}){
+    auto bad=avcc(s,invalid);CHECK(!avc::config(bad.data(),uint32_t(bad.size()),different));
+  }
+  for(unsigned i:{0u,1u,2u,3u,4u,5u}){auto bad=conf;bad[i]^=1;CHECK(!avc::config(bad.data(),uint32_t(bad.size()),different));}
+  for(unsigned n=0;n<conf.size();++n)CHECK(!avc::config(conf.data(),n,different));
+  std::vector<uint8_t> samples[4];
+  appendNal(samples[0],{0x09,0x10});appendNal(samples[0],{0x06,0x80});appendNal(samples[0],picture(c,2,0,0,0,true));
+  appendNal(samples[1],picture(c,0,1,6));appendNal(samples[2],picture(c,1,2,2,0,false,false));appendNal(samples[3],picture(c,1,2,4,0,false,false));
+  for(auto &sample:samples){
+    avc::Picture pic;CHECK(avc::accessUnit(sample.data(),uint32_t(sample.size()),c,&pic));
+    std::vector<uint8_t> normalized(sample.size()+c.parameterBytes());
+    auto bytes=vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),uint32_t(normalized.size()),c,true);
+    CHECK(bytes==normalized.size()&&avc::normalized(normalized.data(),bytes,c));
+    CHECK(!vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),bytes-1,c,true));
+    normalized[5]^=1;CHECK(!avc::normalized(normalized.data(),bytes,c));
+    vtcontract::InputReport report;
+    for(unsigned flags:{1u,3u,5u,9u,11u,15u}) {auto request=frameRequest(sample,flags);CHECK(vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&report.flags==flags&&report.hasToken&&report.token==124);}
+    for(unsigned flags:{0u,2u,8u,17u,0x80000001u}) {auto request=frameRequest(sample,flags);CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&report.transportReject);}
+    for(auto request:{frameRequest(sample,1,2),frameRequest(sample,1,1,1),frameRequest(sample,1,1,0,71),frameRequest(sample,1,1,0,80)})CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&!report.transportReject);
+    for(unsigned i=0;i<sample.size();++i)CHECK(!avc::accessUnit(sample.data(),i,c));
+  }
+  // Multiple slices must retain one picture, strictly increasing MB addresses.
+  auto multiple=samples[1];appendNal(multiple,picture(c,0,1,6,120));CHECK(avc::accessUnit(multiple.data(),uint32_t(multiple.size()),c));
+  for(auto nal:{picture(c,0,1,6,0),picture(c,0,1,6,300),picture(c,0,2,6,120),picture(c,0,1,8,120),picture(c,0,1,6,120,false,false),picture(c,0,1,6,120,false,true,1)}){
+    auto bad=samples[1];appendNal(bad,nal);CHECK(!avc::accessUnit(bad.data(),uint32_t(bad.size()),c));
+  }
+  auto changed=s;changed.back()^=1;for(auto nal:{changed,makePps(false),std::vector<uint8_t>{0x6c,0x80},std::vector<uint8_t>{0x05,0x80}}){auto bad=std::vector<uint8_t>{};appendNal(bad,nal);appendNal(bad,picture(c,2,0,0,0,true));CHECK(!avc::accessUnit(bad.data(),uint32_t(bad.size()),c));}
+  auto empty=std::vector<uint8_t>{};appendNal(empty,s);appendNal(empty,p);CHECK(!avc::accessUnit(empty.data(),uint32_t(empty.size()),c));
+  auto protectedHeader=samples[1];protectedHeader[4]|=0x80;CHECK(!avc::accessUnit(protectedHeader.data(),uint32_t(protectedHeader.size()),c));
+  auto badLength=samples[1];vtwire::put32(badLength.data(),uint32_t(badLength.size()));CHECK(!avc::accessUnit(badLength.data(),uint32_t(badLength.size()),c));
+  uint8_t forbidden[]={0x61,0,0,1};CHECK(!avc::ebsp(forbidden,sizeof forbidden));forbidden[3]=3;CHECK(!avc::ebsp(forbidden,sizeof forbidden));
+  uint8_t escaped[]={0x61,0,0,3,2};CHECK(avc::ebsp(escaped,sizeof escaped));escaped[4]=4;CHECK(!avc::ebsp(escaped,sizeof escaped));
+}
 int main() {
+  streamTests();
   uint8_t sample[252], au[287];
   vtwire::put32(sample,248); memcpy(sample+4,session::kAccessUnit+38,248);
   CHECK(vtcontract::sample(sample,sizeof sample));
@@ -123,5 +216,5 @@ int main() {
   uint8_t plist[48]={};memcpy(plist,"bplist00",8);plist[8]=0x5f;plist[9]=0x1f;plist[16]=8;
   plist[22]=1;plist[23]=1;vtwire::put64(plist+24,1);vtwire::put64(plist+32,0);vtwire::put64(plist+40,16);
   char name[96];CHECK(!vtwire::plistString(plist,sizeof plist,name,sizeof name));
-  if(failures)return 1;std::puts("PianoVideo V5a contract: sample/all-NAL/format/layout/overflow/cancel tests PASS");return 0;
+  if(failures)return 1;std::puts("PianoVideo V6 contract: AVC IP/IBP identity, SPS/PPS, wire flags/count/timing, layout and V5 regression PASS");return 0;
 }

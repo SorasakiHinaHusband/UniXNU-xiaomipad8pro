@@ -109,6 +109,7 @@ inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r, const avc
   if (!message(m,n) || !(r.hasToken = vtwire::paramS64(m,n,vtwire::cc(",frm"),r.token))) return false;
   vtwire::Param p; vtwire::Atom sbuf,sdat;
   if (cfg) {
+    if (!vtwire::param(m,n,vtwire::cc(",frm"),p) || p.type != vtwire::cc("=s64") || p.size != 8) { r.transportReject = true; return false; }
     r.decision = "decode-flags";
     if (!vtwire::param(m,n,vtwire::cc(",dfl"),p) || p.type != vtwire::cc("=u32") || p.size != 4) { r.transportReject = true; return false; }
     r.flags = vtwire::be32(p.value);
@@ -135,8 +136,14 @@ inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r, const avc
     if (!unique(sbuf.body,sbuf.size,vtwire::cc("nsmp"),number) || number.size != 4 || le32(number.body) != 1 ||
         !unique(sbuf.body,sbuf.size,vtwire::cc("ssiz"),sizes) || sizes.size != 4 || le32(sizes.body) != r.bytes ||
         !unique(sbuf.body,sbuf.size,vtwire::cc("stia"),timing) || timing.size != 72) return false;
+    auto finiteTime = [&](const uint8_t *q, bool required) {
+      const uint32_t scale = le32(q+8), flags = le32(q+12);
+      if (!required && flags == 0) return true; // explicitly invalid DTS is legal
+      return (flags & 1) && !(flags & ~3u) && scale && scale <= 0x7fffffffu;
+    };
+    if (!finiteTime(timing.body,false) || !finiteTime(timing.body+24,true) || !finiteTime(timing.body+48,false)) return false;
     if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) &&
-        (!unique(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) || outputPts.size != 24)) return false;
+        (!unique(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) || outputPts.size != 24 || !finiteTime(outputPts.body,true))) return false;
     if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("crpt"),protectedAtom) ||
         vtwire::find(sbuf.body,sbuf.size,vtwire::cc("kdcr"),protectedAtom)) return false;
     r.decision = "sample-not-qualified";
