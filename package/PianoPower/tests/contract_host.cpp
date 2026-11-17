@@ -45,7 +45,7 @@ struct Ppm {
     uint32_t pdos[7]={fixed(5000,3000),fixed(9000,2000),pps(3300,11000,3000),fixed(12000,1500),fixed(15000,1500),0,0};
     unsigned count=5;
     uint16_t version=0x110;
-    unsigned stage=0, reads=0, writes=0, acks=0, snapshots=0;
+    unsigned stage=0, reads=0, writes=0, acks=0, connectorAcks=0, snapshots=0;
     bool busy=false, shortStatus=false, changeOnVerify=false;
     bool transportError=false, ucsiError=false, wrongEcho=false, shortPayload=false, missingPdoFeature=false;
     unsigned cciConnector=0, connectorCount=1;
@@ -62,7 +62,7 @@ struct Ppm {
             control=uint64_t(piano_contract_u32(request+20)) | uint64_t(piano_contract_u32(request+24))<<32;
             unsigned cmd=control&255;
             assert(cmd==4 || cmd==6 || cmd==0x10 || cmd==0x12);
-            if(cmd==4) ++acks;
+            if(cmd==4) { ++acks; if(control & (uint64_t(1)<<16)) {++connectorAcks; cciConnector=0;} }
             else if(cmd==0x12) ++stage;
             uint8_t reply[16]={};
             piano_contract_put32(reply,PIANO_CONTRACT_OWNER); piano_contract_put32(reply+4,1); piano_contract_put32(reply+8,op);
@@ -138,8 +138,19 @@ static void invalidation() {
     Ppm p; p.complete(); auto gen=p.c.generation;
     uint8_t notify[24]={}; piano_contract_put32(notify,PIANO_CONTRACT_OWNER); piano_contract_put32(notify+4,2); piano_contract_put32(notify+8,PIANO_CONTRACT_NOTIFY);
     assert(piano_contract_receive(&p.c,p.now,notify,24)==1);
-    assert(!p.c.valid && !p.c.status_valid && p.c.generation==gen+1 && !p.c.pdos && !p.c.ma);
-    p.snapshots=0; p.complete(); assert(p.c.valid);
+    auto previousSeq=p.c.seq; auto previousUpdated=p.c.updated_ms; auto previousWrites=p.writes;
+    assert(p.c.valid && p.c.status_valid && p.c.notify_pending && p.c.generation==gen && p.c.pdos && p.c.ma);
+    assert(!piano_contract_fresh(&p.c,p.now));
+    assert(p.step()==2); // delayed final ACK_COMPLETE notification: CCI only, no new GET/ACK
+    assert(p.c.valid && !p.c.notify_pending && p.c.stage==PianoContractIdle);
+    assert(p.c.generation==gen && p.c.seq==previousSeq && p.c.updated_ms==previousUpdated && p.writes==previousWrites);
+    assert(piano_contract_fresh(&p.c,p.now));
+    assert(piano_contract_receive(&p.c,p.now,notify,24)==1);
+    p.cciConnector=1;
+    assert(p.step()==2);
+    assert(!p.c.valid && !p.c.status_valid && !p.c.notify_pending && p.c.generation==gen+1 && !p.c.pdos && !p.c.ma);
+    assert(p.c.stage==PianoContractStatus);
+    p.snapshots=0; p.complete(); assert(p.c.valid && p.connectorAcks==1);
     piano_contract_link(&p.c,0); assert(!p.c.valid && !p.c.status_valid && !p.c.pdos);
     uint8_t request[544]; assert(!piano_contract_next(&p.c,p.now,request));
     Ppm malformed; malformed.shortStatus=true; malformed.complete();
@@ -193,6 +204,26 @@ static void invalidation() {
     Ppm sourceChange; sourceChange.complete(); previousGeneration=sourceChange.c.generation;
     sourceChange.pdos[1]=fixed(9000,1800); piano_contract_refresh(&sourceChange.c); sourceChange.snapshots=0; sourceChange.complete();
     assert(sourceChange.c.valid && sourceChange.c.source_ma==1800 && sourceChange.c.generation==previousGeneration+1);
+    Ppm notifyError; notifyError.complete();
+    assert(piano_contract_receive(&notifyError.c,notifyError.now,notify,24)==1);
+    notifyError.ucsiError=true; assert(notifyError.step()==-1);
+    assert(!notifyError.c.valid && !notifyError.c.status_valid && !notifyError.c.notify_pending && notifyError.c.last_error==PIANO_CONTRACT_CCI);
+    Ppm notifyTimeout; notifyTimeout.complete(); previousGeneration=notifyTimeout.c.generation;
+    assert(piano_contract_receive(&notifyTimeout.c,notifyTimeout.now,notify,24)==1);
+    auto firstNotify=notifyTimeout.c.notify_ms;
+    notifyTimeout.now+=4000;
+    assert(piano_contract_receive(&notifyTimeout.c,notifyTimeout.now,notify,24)==1);
+    assert(notifyTimeout.c.notify_ms==firstNotify); // storms cannot extend unknown-state authorization suspension
+    assert(!piano_contract_next(&notifyTimeout.c,firstNotify+5000,request));
+    assert(!notifyTimeout.c.valid && !notifyTimeout.c.status_valid && notifyTimeout.c.quarantined &&
+           !notifyTimeout.c.notify_pending && notifyTimeout.c.last_error==PIANO_CONTRACT_TIMEOUT && notifyTimeout.c.generation==previousGeneration);
+    Ppm notifyBusy; notifyBusy.complete(); previousGeneration=notifyBusy.c.generation;
+    assert(piano_contract_receive(&notifyBusy.c,notifyBusy.now,notify,24)==1);
+    notifyBusy.busy=true; notifyBusy.cciConnector=127; notifyBusy.shortPayload=true; notifyBusy.ucsiError=true;
+    assert(notifyBusy.step()==1 && notifyBusy.c.notify_pending && notifyBusy.c.generation==previousGeneration);
+    assert(!piano_contract_fresh(&notifyBusy.c,notifyBusy.now)); // BUSY makes all remaining CCI fields non-authoritative
+    assert(!piano_contract_next(&notifyBusy.c,notifyBusy.c.notify_ms+5000,request));
+    assert(notifyBusy.c.last_error==PIANO_CONTRACT_TIMEOUT && !notifyBusy.c.valid);
     Ppm busy; busy.step(); busy.step(); busy.step(); busy.busy=true; busy.step();
     assert(busy.c.wire==2);
     assert(!piano_contract_next(&busy.c,busy.now+6000,request));

@@ -91,7 +91,7 @@ static inline int piano_contract_decode(const uint32_t *pdo, unsigned count, uin
 enum {
     PianoContractIdle = 0, PianoContractProbe, PianoContractCapability,
     PianoContractStatus, PianoContractPdos0, PianoContractPdos4,
-    PianoContractVerify, PianoContractAck, PianoContractCommit
+    PianoContractVerify, PianoContractAck, PianoContractCommit, PianoContractNotifyRead
 };
 typedef struct {
     /* Published snapshot. valid means PD sink + complete source list + decoded
@@ -105,11 +105,12 @@ typedef struct {
     int32_t last_error;
     /* Diagnostic transport state. in_flight is 0, READ=0x11, or WRITE=0x12. */
     uint8_t in_flight, linked, quarantined, stage, next_stage, wire, wanted, polls;
+    uint8_t notify_pending;          /* unknown notification; last snapshot cannot authorize more current */
     uint8_t connector_event, stage_connected, stage_sink, stage_pd, stage_pdos;
     uint16_t stage_change;
     uint32_t stage_flags, stage_rdo, stage_pdo[7];
     uint32_t notifies, failures, timeouts;
-    uint64_t command, sent_ms, command_ms, poll_ms;
+    uint64_t command, sent_ms, command_ms, poll_ms, notify_ms;
 } PianoChargeContract;
 
 static inline void piano_contract_zero(void *v, unsigned n) {
@@ -134,11 +135,11 @@ static inline void piano_contract_link(PianoChargeContract *c, int up) {
 }
 static inline void piano_contract_refresh(PianoChargeContract *c) { c->wanted = 1; }
 static inline int piano_contract_fresh(const PianoChargeContract *c, uint64_t now_ms) {
-    return c->valid && now_ms >= c->updated_ms && now_ms - c->updated_ms <= PIANO_CONTRACT_FRESH_MS;
+    return c->valid && !c->notify_pending && now_ms >= c->updated_ms && now_ms - c->updated_ms <= PIANO_CONTRACT_FRESH_MS;
 }
 static inline void piano_contract_fail(PianoChargeContract *c, int error, int quarantine) {
     piano_contract_invalidate(c, error, 0); ++c->failures;
-    c->in_flight = c->wire = c->wanted = 0; c->stage = PianoContractIdle;
+    c->in_flight = c->wire = c->wanted = c->notify_pending = 0; c->stage = PianoContractIdle;
     if (quarantine) c->quarantined = 1;
 }
 static inline void piano_contract_timeout(PianoChargeContract *c, uint64_t now_ms) {
@@ -166,6 +167,9 @@ static inline uint64_t piano_contract_stage_command(const PianoChargeContract *c
 static inline uint32_t piano_contract_next(PianoChargeContract *c, uint64_t now_ms, uint8_t out[PIANO_CONTRACT_REQUEST_MAX]) {
     unsigned bytes, i; uint32_t opcode, length;
     if (!c->linked || c->quarantined) return 0;
+    if (c->notify_pending && now_ms >= c->notify_ms && now_ms - c->notify_ms >= 5000) {
+        piano_contract_timeout(c, now_ms); return 0;
+    }
     if (c->in_flight) {
         if (now_ms >= c->sent_ms && now_ms - c->sent_ms >= 1500) piano_contract_timeout(c, now_ms);
         return 0;
@@ -180,7 +184,7 @@ static inline uint32_t piano_contract_next(PianoChargeContract *c, uint64_t now_
         c->stage_pdos = 0; c->wire = 0;
     }
     if (c->wire == 2 && now_ms < c->poll_ms) return 0;
-    opcode = c->stage == PianoContractProbe || c->wire == 2 ? PIANO_CONTRACT_READ : PIANO_CONTRACT_WRITE;
+    opcode = c->stage == PianoContractProbe || c->stage == PianoContractNotifyRead || c->wire == 2 ? PIANO_CONTRACT_READ : PIANO_CONTRACT_WRITE;
     bytes = opcode == PIANO_CONTRACT_READ ? 0 : piano_contract_buffer_size(c->version);
     if (opcode == PIANO_CONTRACT_WRITE && !bytes) { piano_contract_fail(c, PIANO_CONTRACT_VERSION, 0); return 0; }
     length = 12 + (bytes ? bytes + 4 : 0);
@@ -220,7 +224,7 @@ static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_m
     c->updated_ms = now_ms; ++c->seq; c->stage = PianoContractIdle; c->wire = 0;
 }
 /* Return 0 not this owner/unexpected late transport ACK; 1 consumed; 2 new
- * complete snapshot; -1 invalidated. Notify only schedules CCI reading: the
+ * complete snapshot or resolved idle notification; -1 invalidated. Notify only schedules CCI reading: the
  * notification also denotes command completion and is NOT itself a detach. */
 static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms, const uint8_t *data, uint32_t length) {
     uint32_t opcode, cci, result, payload, flags, rdo; uint16_t version;
@@ -231,8 +235,12 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (opcode == PIANO_CONTRACT_NOTIFY) {
         if (length != 24 || piano_contract_u32(data + 16) != 0) return 0;
         ++c->notifies;
-        if (c->stage == PianoContractIdle) {
-            piano_contract_invalidate(c, PIANO_CONTRACT_CHANGED, 1); c->wanted = 1;
+        if (c->stage == PianoContractIdle && c->linked && !c->quarantined) {
+            /* The same notification reports ACK_COMPLETE and connector change.
+             * Only CCI can distinguish them. Suspend authorization immediately,
+             * retain the last sample, and read CCI without issuing another GET. */
+            c->notify_pending = 1; c->notify_ms = c->command_ms = now_ms;
+            c->stage = PianoContractNotifyRead; c->wire = 0;
         }
         if (c->wire == 2 && !c->in_flight) c->poll_ms = now_ms;
         return 1;
@@ -253,6 +261,12 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     result = piano_contract_u32(data + 12 + bytes);
     if (result) { piano_contract_fail(c, PIANO_CONTRACT_RETURN, 0); return -1; }
     c->version = version; cci = piano_contract_u32(data + 16); c->cci = cci;
+    /* When BUSY, the other CCI fields are not authoritative (UCSI CCI
+     * semantics); in particular they must not invent a connector event. */
+    if (cci & (1u << 28)) {
+        if (c->stage == PianoContractProbe) { piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1; }
+        c->wire = 2; c->poll_ms = now_ms + 200; return 1;
+    }
     payload = (cci >> 8) & 255u;
     if (payload > (bytes == 48 ? 16u : 256u)) { piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1; }
     /* This tablet has one connector. Never acknowledge an event for a
@@ -263,15 +277,25 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (((cci >> 1) & 127u) && !c->connector_event) {
         c->connector_event = 1; piano_contract_invalidate(c, PIANO_CONTRACT_CHANGED, 1);
     }
+    if (c->stage == PianoContractNotifyRead) {
+        c->notify_pending = 0;
+        if (cci & ((1u << 25) | (1u << 26) | (1u << 27) | (1u << 30))) {
+            piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
+        }
+        if (cci & (1u << 31)) {
+            /* A command-complete indication left to drain. Connector change
+             * is acknowledged only after its own status has been queried. */
+            piano_contract_ack_stage(c, c->connector_event ? PianoContractStatus : PianoContractIdle, 0);
+        } else { c->stage = c->connector_event ? PianoContractStatus : PianoContractIdle; c->wire = 0; }
+        return 2;   /* authorization changed; no new sample or freshness timestamp */
+    }
     if (c->stage == PianoContractProbe) {
-        if (cci & (1u << 28)) { piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1; }
         if (cci & (1u << 31)) piano_contract_ack_stage(c, PianoContractCapability, c->connector_event);
         else { c->stage = PianoContractCapability; c->wire = 0; }
         return 1;
     }
     echo = (uint64_t)piano_contract_u32(data + 20) | (uint64_t)piano_contract_u32(data + 24) << 32;
     if (echo != c->command) { piano_contract_fail(c, PIANO_CONTRACT_CCI, 1); return -1; }
-    if (cci & (1u << 28)) { c->wire = 2; c->poll_ms = now_ms + 200; return 1; }
     if (cci & ((1u << 25) | (1u << 26) | (1u << 27) | (1u << 30))) {
         piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
     }
