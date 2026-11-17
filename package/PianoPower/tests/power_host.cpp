@@ -1210,6 +1210,10 @@ struct Gauge {
   uint8_t address = kGaugeAddress;
   bool present = true, stuckLow = false;
   std::map<uint8_t, uint16_t> regs;
+  std::map<uint8_t, std::vector<uint16_t>> replies;
+  std::map<uint8_t, unsigned> replyAt;
+  unsigned nackReadNumber = 0;
+  unsigned stretchReadNumber = 0;
   bool mSda = true, mScl = true, sSda = true, lastSda = true, lastScl = true;
   enum State { idle, address_, command, ignore, transmit } state = idle;
   int bits = 0;
@@ -1223,6 +1227,8 @@ struct Gauge {
   void driveBit(bool one) { sSda = one; }
   void startTx()
   {
+    if (!txIndex && replies.count(reg) && replyAt[reg] < replies[reg].size())
+      regs[reg] = replies[reg][replyAt[reg]++];
     const uint16_t v = regs.count(reg) ? regs[reg] : 0;
     txByte = uint8_t(txIndex == 0 ? v : v >> 8);
     txIndex++;
@@ -1270,7 +1276,8 @@ struct Gauge {
     if ((state == address_ || state == command || state == ignore) && bits == 8) {
       bits = 0;
       if (state == address_) {
-        if (present && (shift >> 1) == address) {
+        if (present && (shift >> 1) == address &&
+            !((shift & 1) && nackReadNumber && reads + 1 == nackReadNumber)) {
           reading = shift & 1;
           state = reading ? transmit : command;
           if (reading) {txIndex = 0; reads++;}
@@ -1309,7 +1316,10 @@ struct Gauge {
   static void setSda(void *ctx, bool release) { Gauge *g = static_cast<Gauge *>(ctx); g->mSda = release; g->update(); }
   static void setScl(void *ctx, bool release) { Gauge *g = static_cast<Gauge *>(ctx); g->mScl = release; g->update(); }
   static bool getSda(void *ctx) { return static_cast<Gauge *>(ctx)->sda(); }
-  static bool getScl(void *ctx) { return static_cast<Gauge *>(ctx)->scl(); }
+  static bool getScl(void *ctx) {
+    Gauge *g = static_cast<Gauge *>(ctx);
+    return g->scl() && !(g->stretchReadNumber && g->reads >= g->stretchReadNumber);
+  }
   static void delay(void *, unsigned) {}
   I2cIo io() { return I2cIo{this, setSda, setScl, getSda, getScl, delay}; }
 };
@@ -2182,6 +2192,99 @@ static void testGaugeAlertRestore()
   CHECK(!r.d.count(PIANO_MCA_PD_FIXED) && !r.d.count(PIANO_MCA_PPS) && r.allAllowed());
 }
 
+static void testGaugeReobserve()
+{
+  for (unsigned pack = 0; pack < 2; ++pack) for (unsigned field = 0; field < 2; ++field) {
+    const uint8_t reg = field ? 0x70 : 0x72;
+    const uint32_t bit = (field ? 4u : 2u) << (2 * pack);
+    for (uint16_t final : {0u, 1u, 3u, 255u}) {
+      Gauge g; g.replies[reg] = {255, final}; I2cBus bus(g.io()); GaugeAlerts a;
+      a.beginSample(); const auto reads = a.readPack(bus, pack); a.sampled(reads);
+      CHECK(g.reads == 3 && g.starts == 6 && g.stops == 3);
+      CHECK(a.retried == bit && a.retryValid == bit && a.rereads == 1);
+      CHECK((field ? a.firstSoa[pack] : a.firstIsc[pack]) == 255);
+      CHECK((field ? a.soa[pack] : a.isc[pack]) == final);
+      CHECK(a.active() == (field ? final != 0 : final == 3));
+      CHECK(bool(a.valid & bit) == (field || final <= 3));
+      a.beginSample(); CHECK(!a.retried && !a.retryValid && a.rereads == 1);
+    }
+    // A failed reread never converts the successful first255 into clear.
+    Gauge g; g.regs[reg] = 255; g.nackReadNumber = field + 2;
+    I2cBus bus(g.io()); GaugeAlerts a;
+    a.sampled(a.readPack(bus, pack));
+    CHECK(a.retried == bit && !a.retryValid && a.rereads == 1);
+    CHECK((field ? a.soa[pack] : a.isc[pack]) == 255);
+    CHECK(a.active() == bool(field));
+    Gauge stretched; stretched.regs[reg] = 255; stretched.stretchReadNumber = field + 2;
+    I2cBus slow(stretched.io()); GaugeAlerts timed;
+    timed.sampled(timed.readPack(slow, pack));
+    CHECK(timed.retried == bit && !timed.retryValid && timed.rereads == 1);
+    CHECK((field ? timed.soa[pack] : timed.isc[pack]) == 255);
+    CHECK(timed.active() == bool(field));
+    // Recognized alerts take the first read immediately, without debounce.
+    for (unsigned alarm : (field ? std::vector<unsigned>{1, 254} : std::vector<unsigned>{3})) {
+      Gauge b; b.regs[reg] = uint16_t(alarm); I2cBus bb(b.io()); GaugeAlerts v;
+      v.sampled(v.readPack(bb, pack));
+      CHECK(v.active() && !v.retried && b.reads == 2);
+      // Once confirmed, the alarm survives an unreadable next sample.
+      b.present = false; v.beginSample(); v.sampled(v.readPack(bb, pack));
+      CHECK(v.active() && !v.valid && !v.retried);
+    }
+  }
+
+  LinkOptions o; o.strictContract = o.health = o.rp = true; o.rpMax = 3000; o.kick = false;
+  LinkRig r(o); GaugeAlerts alerts; alerts.sampled(0x1e); r.alerts = &alerts;
+  r.haveBoard = true; r.pdUpMs = 1; r.soc(18);
+  r.d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_SDP;
+  r.d.props[PIANO_MCA_LPD_STATUS] = 0;
+  r.d.loadMa = 3100; r.d.ohms = 0.17;
+  for (auto &p : r.packs) {p.voltageMv = 3760; p.tempDeciC = 359; p.currentMa = 237;}
+  for (int i = 0; i < 35; ++i) r.period();
+  CHECK(r.link.st.fcc_set == 1500 && !r.link.st.pending);
+  const auto writes = r.d.writes.size();
+  // Saved buck5 Seq367..393: B ISC255, then B SOA255, then a second
+  // SOA255 window crossing an A ISC/SOA255 sample, then B ISC255.
+  // Feed the actual wire reader with one fresh clear read in this poll.
+  struct Sample {uint64_t ms; uint8_t ai, as, bi, bs;};
+  const Sample samples[] = {
+    {519151,0,0,0,0}, {523557,0,0,255,0}, {523648,0,0,0,0},
+    {533623,0,0,0,255}, {534202,0,0,0,0}, {538630,0,0,0,0},
+    {539175,0,0,0,255}, {539880,0,0,0,255}, {543565,255,255,0,0},
+    {543687,0,0,0,0}, {548568,0,0,255,0}, {548659,0,0,0,0}, {550505,0,0,0,0}
+  };
+  for (const auto &s : samples) {
+    Gauge buses[2]; const uint8_t raw[2][2] = {{s.ai,s.as},{s.bi,s.bs}};
+    alerts.beginSample(); uint32_t valid = 0;
+    for (unsigned p = 0; p < 2; ++p) {
+      buses[p].replies[0x72] = {raw[p][0],0}; buses[p].replies[0x70] = {raw[p][1],0};
+      I2cBus bus(buses[p].io()); valid |= alerts.readPack(bus, p);
+    }
+    alerts.sampled(valid); r.now = s.ms; r.link.requestDecision(); CHECK(r.stepOnce().decided);
+    std::printf("periodic replay t=%llu first=%u/%u/%u/%u final=%u/%u/%u/%u retry=%#x pending=%u FCC=%u/%u reason=%u\n",
+      (unsigned long long)r.now, s.ai,s.as,s.bi,s.bs, alerts.isc[0],alerts.soa[0],alerts.isc[1],alerts.soa[1],
+      alerts.retried, r.link.st.pending, r.link.plan.fcc_ma,r.link.st.fcc_set,r.link.plan.why_off);
+    CHECK(alerts.complete() && !alerts.active());
+    CHECK(r.link.plan.fcc_ma == 1500 && r.link.st.fcc_set == 1500 && !r.link.st.pending);
+    CHECK(r.link.plan.charge && r.m.value[McaChargeEnable] == 1);
+    r.settle(); CHECK(r.d.writes.size() == writes && !r.link.st.pending);
+  }
+  // Same source and temperature: persistent SOA255 must still stop and
+  // produce real enable/FCC writes, pending3, ACK and enable readback.
+  Gauge persistent; persistent.regs[0x70] = 255; I2cBus bus(persistent.io());
+  alerts.beginSample(); alerts.sampled(6 | alerts.readPack(bus, 1));
+  r.now += 60; r.link.requestDecision(); CHECK(r.stepOnce().decided);
+  CHECK(r.link.plan.why_off == PIANO_CHG_OFF_FAULT && r.link.st.pending == 3);
+  r.settle(); CHECK(r.link.st.fcc_set == 500 && !r.m.value[McaChargeEnable]);
+  // New successful clear, including a prior-alarm all-ones reread, is the
+  // only thing that permits the usual FCC then enable recovery.
+  persistent.regs[0x70] = 0; persistent.replies[0x70] = {255,0};
+  alerts.beginSample(); alerts.sampled(6 | alerts.readPack(bus, 1));
+  r.now += 1278; r.link.requestDecision(); CHECK(r.stepOnce().decided);
+  CHECK(r.link.st.pending == 3 && r.link.st.fcc_set == 500 && !r.m.value[McaChargeEnable]);
+  r.settle(); CHECK(r.link.st.fcc_set == 1500 && r.m.value[McaChargeEnable] == 1 && !r.link.st.pending);
+  CHECK(!r.d.count(PIANO_MCA_PD_FIXED) && !r.d.count(PIANO_MCA_PPS) && r.allAllowed());
+}
+
 static void testLinkCdp()
 {
   // That Mac port, the default options: the board configuration, then the CDP row (900 / 900) whatever the Rp says.
@@ -3046,6 +3149,7 @@ int main()
   testChgFix();
   testGauge();
   testGaugeAlertRestore();
+  testGaugeReobserve();
   testBuckQueueCancellation();
   testMcaCodec();
   testMcaPolicy();

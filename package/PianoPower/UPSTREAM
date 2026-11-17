@@ -145,3 +145,8 @@ BSD-2-Clause-Patent. Alert facts only from the same third-party Linux pin:
 xiaomi_mca_dtpt_poll tests ISC level equal to 3 and SOA nonzero. This project
 separates unrecognized ISC bytes from confirmed alarms and retains a confirmed
 vote until that field reads clear. No third-party implementation text copied.
+
+The same-poll all-ones reobservation (2026-11-17) and its GPIO-bus/charger
+replay tests are original project code, copyright Leo Zhang,
+BSD-2-Clause-Patent. The newer successful read supplies the current sample;
+persistent values and unsuccessful rereads keep the existing safety rules.
