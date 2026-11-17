@@ -728,3 +728,17 @@ only address/status. Our former parser used that extra field and rejected
 successful completions when it treated a timestamp as an out-of-range offset.
 The host suite checks exact request bytes, full response fields, truncated
 responses and short PCM delivery; hardware acoustic acceptance remains pending.
+
+
+### Capture FIFO startup and clock reconciliation
+
+A real level-10 tablet run confirmed two-decimator PCM, mono delivery, exact input
+mute zeros and clean capture release/restart. The startup-learned FIFO waterline
+could nevertheless cause continuous single-frame drops and missing samples when
+completion batching changed. The Mic now waits for a 960-frame reserve plus the
+first consumer batch, then corrects around a fixed 960-frame center. Startup waits
+are counted separately; subsequent missing frames remain failures. Bounded reports
+include primed state, smoothed fill and target. The DSP queue, mapped ring and
+speaker controller retain their existing geometry. Equal-clock and ±200 ppm host
+models cover batched completion delivery; hardware continuity and the complete
+acoustic timeline score still require the next tablet run.

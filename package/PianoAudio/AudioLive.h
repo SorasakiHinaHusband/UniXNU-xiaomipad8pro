@@ -58,6 +58,7 @@ typedef struct {
     AudioRing in;                        /* mono: the live thread writes, the Mic's engine reads */
     int want_out, want_in;               /* the devices run (the transport's running()) */
     int accepting;                       /* the speaker stream takes the ring now (else play() drops: nothing would read it) */
+    int input_primed;                    /* consumer owns; reserve reached after graph start */
     int capturing;                       /* the Mic's ring is fed now */
     int sound;                           /* a period with a non-zero sample came while the speaker path was down */
     uint32_t sound_at;                   /* the time of the last such period (ms) */

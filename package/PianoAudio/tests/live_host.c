@@ -116,6 +116,8 @@ static uint32_t g_t0;                // the live paths' start (ms)
 static double g_ppm;                 // the next run's device clock against the DSP's
 static const char *g_fail;           // the next run's failing live command (refused, or lost with g_drop)
 static int g_drop, g_queue_full;
+static int g_mic_clock;
+static uint64_t g_mic_missing;
 static unsigned g_wakes;
 static int g_mark;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
@@ -359,11 +361,11 @@ static void dsp_read(const GprPacket *p)
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = p->dst_port, .dst_port = p->src_port,
                    .token = p->token, .opcode = AR_OP_READ_DONE};
     const uint32_t short_bytes[] = {1920, 1916, 960, 0, 4, 576};
-    const uint32_t bytes = w.capture_short ? short_bytes[w.reads % 6] : AUDIO_MIC_PERIOD_BYTES;
+    const uint32_t bytes = g_mic_clock && w.reads == 1 ? 576 : w.capture_short ? short_bytes[w.reads % 6] : AUDIO_MIC_PERIOD_BYTES;
     const uint32_t words[14] = {0, le32(d), le32(d + 4), H_MIC, bytes,
                                 261034941u + 10000u * w.reads, 1, 0x80000000u, 1, 0, 0, 0, 0, 0};
     uint64_t at = w.cap_until_us > w.now_us ? w.cap_until_us : w.now_us;
-    at += dsp_period_us();
+    at += g_mic_clock && w.reads == 1 ? 30000 : dsp_period_us();
     w.cap_until_us = at;
     struct Answer *a = queue(at, &r, words, 14);
     a->read_slot = (int)slot;
@@ -549,6 +551,13 @@ struct Scenario {
 static void deliver(int to_live)
 {
     for (unsigned i = 0; i < w.nq;) {
+        /* Capture completions are drained by a polling host, not immediately
+         * at the DSP timestamp. Change poll phase after startup; equal sample
+         * clocks must not turn this into a permanent 100-frames/s drop. */
+        if (to_live && g_mic_clock && w.q[i].read_slot >= 0) {
+            const unsigned poll = now_ms() - g_t0 < 1500 ? 5000 : 25000;
+            if (now_ms() % (poll / 1000u)) {++i; continue;}
+        }
         if (w.q[i].due_us <= w.now_us) {
             struct Answer a = w.q[i];
             memmove(&w.q[i], &w.q[i + 1], (w.nq - i - 1) * sizeof w.q[0]);
@@ -1140,7 +1149,7 @@ static void testInputControlsAndWrap(void)
         audio_live_running(&state, 1, 1);
         CHECK(state.input_runs == 1);
         CHECK(audio_live_capture(&state, got, 64) == 0 && state.input_hal.startup == 64);
-        state.capturing = 1;
+        state.capturing = 1; state.input_primed = 1; /* controls test: already primed */
         const uint32_t count = callbacks[cb];
         for (uint32_t at = 0; at < 4 * PIANO_AUDIO_RING_FRAMES; at += count) {
             for (uint32_t i = 0; i < count; ++i) input[i] = (int16_t)((at + i) % 30001 - 15000);
@@ -1208,6 +1217,32 @@ static void testMicShortRestart(void)
     CHECK(logged("mic release: run 2 down 1 va 0"));
 }
 
+static void mic_clock(uint32_t t)
+{
+    if (t == 100) device(0, 1);
+    if (t == 4000) g_mic_missing = sh.in.underruns;
+    if (t == 59000 && w.in_running) {
+        fprintf(stderr, "mic clock: ppm=%+.0f missing=%llu->%llu drops=%u repeats=%u fill=%u avg=%d target=%d\n",
+                w.dsp_ppm, (unsigned long long)g_mic_missing, (unsigned long long)sh.in.underruns,
+                live.mic_drops, live.mic_repeats, audio_ring_fill(&sh.in), live.mic_drift.avg/64, live.mic_drift.setpoint/64);
+        CHECK(sh.in.underruns == g_mic_missing && !sh.in.overruns && !live.mic_full_frames);
+        device(0, 0);
+    }
+    w.dsp_ppm = g_ppm;
+}
+static void testMicClock(void)
+{
+    const struct Scenario sc = {10, 0, 0, 3000, 63000, AudioPortsUbuntu, 1, mic_clock};
+    g_mic_clock = 1;
+    const int ppms[] = {0, -200, 200};
+    for (unsigned i = 0; i < N(ppms); ++i) {
+        g_ppm = ppms[i];
+        run(&sc);
+        CHECK(!w.violations && live.mic_starts == 1 && live.cap.in_flight == 0 && live.cap.errors == 0);
+    }
+    g_ppm = 0; g_mic_clock = 0;
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1228,6 +1263,7 @@ int main(void)
     testDrift(-200);
     testFaults();
     testPlanFailures();
+    testMicClock();
     testMic();
     testInputControlsAndWrap();
     testMicShortRestart();

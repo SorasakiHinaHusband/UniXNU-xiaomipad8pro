@@ -100,6 +100,7 @@ void audio_live_running(AudioLiveShared *sh, int output, int input)
 {
     if (input && !load(&sh->want_in)) {
         zero(&sh->input_hal, sizeof sh->input_hal); /* engine stopped */
+        store(&sh->input_primed, 0);
         ++sh->input_runs;
     }
     if (output && !load(&sh->want_out)) {__atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE); store(&sh->sound, 0);}   /* a new run: only its own sound starts the path */
@@ -135,6 +136,16 @@ uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames)
     if (!load(&sh->capturing)) {
         if (load(&sh->input_fault)) h->unavailable += frames; else h->startup += frames;
         return 0;
+    }
+    /* A queued DSP request is not PCM already in this FIFO. Keep a real
+     * target reserve after the first consumer batch, accounting these zeros
+     * as startup rather than pretending capture was primed at graph START. */
+    if (!load(&sh->input_primed)) {
+        if (audio_ring_fill(&sh->in) < AUDIO_LIVE_MIC_TARGET + frames) {
+            h->startup += frames;
+            return 0;
+        }
+        store(&sh->input_primed, 1);
     }
     const uint32_t n = audio_ring_read(&sh->in, mono, frames);
     const int muted = load(&sh->input_muted);
@@ -692,11 +703,14 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->cap.token_base += l->sleep_generation << 16;
     l->sh->in.head = l->sh->in.tail = 0;   /* nobody reads it while capturing is 0 */
     drift_reset(&l->mic_drift);
+    store(&l->sh->input_primed, 0);
     store(&l->sh->capturing, !l->sleeping);
     store(&l->sh->input_fault, 0);
     l->mic_state = LiveRunning;
     LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mixed to mono; the first %u ms dropped",
         AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
+    LOG(l, "live: mic: mic-clock2:prime-target:fixed-center reserve %u band %u ring %u",
+        AUDIO_LIVE_MIC_TARGET, AUDIO_LIVE_SLIP_BAND, AUDIO_LIVE_MIC_RING);
     LOG(l, "live: mic: read-v2:56bytes:no-offset request %#x endpoint %#x port %#x base %#llx handle %#x period %u slots %u token %#x",
         AR_OP_READ, AR_IID_CAP_SHMEM, l->cap.port, (unsigned long long)l->cap.base, l->cap.handle,
         l->cap.period_bytes, l->cap.slots, l->cap.token_base);
@@ -729,7 +743,18 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
         if (load(&l->sh->want_in)) l->mic_full_frames += frames; else l->mic_tail_frames += frames;
         drift_reset(&l->mic_drift); return;
     }   /* not read: dropped */
-    const int slip = drift_update(&l->mic_drift, fill);
+    /* Empty-start calibration learns zero: later batched completions then
+     * look permanently overfull, dropping one frame on every READ even as
+     * the consumer underruns. Capture has a declared FIFO target; use that
+     * fixed center and do not learn a clock from startup/prefill or idle. */
+    int slip = 0;
+    if (load(&l->sh->want_in) && load(&l->sh->input_primed)) {
+        if (!l->mic_drift.samples) {
+            l->mic_drift.avg = l->mic_drift.setpoint = AUDIO_LIVE_MIC_TARGET * 64;
+            l->mic_drift.samples = 65;
+        }
+        slip = drift_update(&l->mic_drift, fill);
+    } else drift_reset(&l->mic_drift);
     if (frames && slip > 0) {
         frames--;   /* the Mic's engine runs slow: one frame less */
         l->mic_drops++;
@@ -751,11 +776,12 @@ void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now)
         l->mic_starts, event, now - l->mic_at, load(&l->sh->want_in), p->sent, p->returned, p->in_flight, p->errors, p->late,
         p->last_status, (unsigned long long)p->returned_bytes, p->min_bytes, p->max_bytes, p->min_offset, p->max_offset,
         p->short_returns, p->zero_returns, p->bad_alignment, p->bad_origin, p->bad_range);
-    LOG(l, "mic frames: run %u returned %llu settle %llu full-periods %u active-full %llu idle-tail %llu fifo-missing %llu fifo-overrun %llu drop %u repeat %u fill %u first-read-ms+1 %u first-pcm-ms+1 %u",
+    LOG(l, "mic frames: run %u returned %llu settle %llu full-periods %u active-full %llu idle-tail %llu fifo-missing %llu fifo-overrun %llu drop %u repeat %u fill %u first-read-ms+1 %u first-pcm-ms+1 %u primed %d drift-avg %d drift-target %d",
         l->mic_starts, (unsigned long long)l->mic_frames, (unsigned long long)l->mic_settle, l->mic_full - l->mic_full_base,
         (unsigned long long)l->mic_full_frames, (unsigned long long)l->mic_tail_frames,
         (unsigned long long)(l->sh->in.underruns - l->mic_underrun_base), (unsigned long long)(l->sh->in.overruns - l->mic_overrun_base),
-        l->mic_drops - l->mic_drop_base, l->mic_repeats - l->mic_repeat_base, audio_ring_fill(&l->sh->in), l->mic_first_read, l->mic_first_pcm);
+        l->mic_drops - l->mic_drop_base, l->mic_repeats - l->mic_repeat_base, audio_ring_fill(&l->sh->in), l->mic_first_read, l->mic_first_pcm,
+        load(&l->sh->input_primed), l->mic_drift.avg / 64, l->mic_drift.setpoint / 64);
     for (unsigned i = 0; i < 3; ++i) {
         const AudioCapturePcm *s = &l->mic_pcm[i];
         LOG(l, "mic PCM: run %u layer %s frames %llu nonzero %llu peak %u sum %lld squares %llu clipped %llu",
