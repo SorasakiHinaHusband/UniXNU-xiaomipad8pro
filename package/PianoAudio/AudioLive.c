@@ -937,7 +937,7 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
 void audio_live_sleep(AudioLive *l, uint32_t generation)
 {
     if (l->sleeping) return;
-    l->sleeping=1; l->sleep_generation=generation;
+    l->sleeping=1; l->sleep_quiet=0; l->sleep_generation=generation;
     store(&l->sh->accepting,0); store(&l->sh->capturing,0);
     /* Starting plans finish their existing command sequence; only then is the
      * ordinary stream fade/drain/undo used. Never abort a pending MEM_MAP. */

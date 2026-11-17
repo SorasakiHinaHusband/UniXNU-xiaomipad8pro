@@ -1013,7 +1013,7 @@ static void sleep_cycles(uint32_t t)
 {
     if (!w.out_running) device(1, 1);
     w.sound_on=1; w.amplitude=12000;
-    w.o.quiet=(t>=1500 && t<1700) ? 1 : 0;
+    w.o.quiet=((t>=1500 && t<1700) || (t>=4000 && t<4200) || (t>=6500 && t<6700)) ? 1 : 0;
     if (!pm_stage && t>=1500+pm_cycle*2500) {
         pm_command=w.ncmd; pm_stage=1;
         audio_live_control(&sh,60,0);
