@@ -10,7 +10,7 @@
  * g.lock guards the slot registry and the per-name rows. Fence waits
  * and the submit retry sleep with no lock held (ARCHITECTURE 4.13.3). This is not the Metal or Turnip ABI: it carries
  * NativeAdrenoABI.h unchanged. BO CPU mappings are physical-range views (non-cacheable unless the DeviceInfo is CachedCoherent)
- * matching the GPU's PTEs. The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the
+ * matching the GPU's PTEs, or retained VM-object views for the optional unmapped user fallback. The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the
  * processes that use Metal allow IOServiceOpen for that user-client class name, and nothing else in this system can create one
  * (the Apple AGX kext is never loaded without an Apple GPU), so the name only decides whether the Adreno Metal plugin may open
  * its own driver. */
@@ -823,7 +823,8 @@ IOReturn AGXDeviceUserClient::locked(uint32_t method,const void *input,size_t in
         {NativeAdrenoSubmitGuard guard(g.submit,NativeAdrenoSubmitLockMemory);
          free=NativeAdrenoMemory::poolFreeBytes();pool=NativeAdrenoMemory::poolBytes();}
         snprintf(failure,sizeof failure,"BoAlloc refused: n=%llu slot=%u stage=%s bytes=%llu status=%#x inner=%s",call,slot_,stage,
-            (unsigned long long)bytes,unsigned(status),strstr(stage,"create")?"not-exported":!strcmp(stage,"prepare")?"prepare-result":"driver-check");
+            (unsigned long long)bytes,unsigned(status),(!strcmp(stage,"mapped-descriptor-create") || !strcmp(stage,"vm-descriptor-create"))?"not-exported":
+            !strcmp(stage,"prepare")?"prepare-result":"driver-check");
         snprintf(totals,sizeof totals,"BoAlloc totals: n=%llu slot=%u pool=%llu/%llu free=%llu mapped=%llu unmapped=%llu",call,slot_,
             (unsigned long long)(pool-free),(unsigned long long)pool,(unsigned long long)free,
             (unsigned long long)t.mapped,(unsigned long long)t.unmapped);
