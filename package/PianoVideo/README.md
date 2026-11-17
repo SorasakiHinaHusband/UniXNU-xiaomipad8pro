@@ -3,7 +3,8 @@
 piano's video core for native macOS 27: the SM8750 Iris (VPU 3.5) that decodes H.264, HEVC and VP9 and encodes H.264 and HEVC in
 hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 INIT/version, ten collapse/resume cycles and legal teardown are tablet-confirmed** in `vid-v3b`.
 V4 is tablet-confirmed in `vid-v4a`: one real 320×240 AVC AU produces the exact active NV12 golden hash and safe teardown.
-V5a is a bounded native VT bridge; its IOSurface-backed callback is pending tablet qualification.
+V5b creates a hardware VT session and passes format queries on the tablet. V5c repairs rejected-frame completion and empty
+finish semantics; the bounded bridge's IOSurface-backed callback is still pending tablet qualification.
 `piano-video=6 piano-video-vt=1` publishes the restricted AVC qualification endpoint. Other levels do not publish a decoder inventory. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core

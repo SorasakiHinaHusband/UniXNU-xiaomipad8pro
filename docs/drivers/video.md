@@ -2,8 +2,8 @@
 
 Status, 2026-11-17: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
 our real 320×240 AVC AU and matched the exact active NV12 golden hash, with safe DMA teardown (§13).
-V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14). The tablet selected it,
-then session creation returned -12910 before input. V5b corrects the QuickTime extension terminator check; tablet acceptance is pending.
+V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14). V5b creates a hardware session
+and passes format queries on the tablet. A rejected sample lacks its completion; V5c repairs that lifecycle, pending tablet acceptance.
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
@@ -716,6 +716,15 @@ the old validator rejected that valid four-byte tail. V5b recognizes it only at 
 The exact CoreMedia tool descriptor and metadata-only query pass the shared dsta/dcan validator on the host; a Main-profile
 candidate and malformed/hidden/duplicate/protected extensions remain rejected. Every dcan request and answer records its
 format, session state, decision and transport result. The full VT-to-IOSurface decode still needs tablet qualification.
+
+The vid-v5b tablet run confirms hardware session creation and positive/negative dcan. Its first malformed six-byte sample
+reaches selector3 and is correctly refused before DMA, but the driver replies with an error without emitting that frame.
+The 27.3 PV codec and decompression duct do not synthesize a callback for that codec error; the public asynchronous wait
+then waits for the outstanding frame. The valid AU has not been submitted. V5c completes rejected tokens through the same
+worker-owned Demt/ack path, independently of the single accepted AU. An empty finish remains nonterminal because public
+WaitForAsynchronousFrames calls FinishDelayedFrames even after a rejection. Bounded rejection backpressure fails the transport,
+whose guest error path emits its original frame. Every shared-send event and outbound queue decision is logged. No firmware,
+pixel format, capability or native decode sequence changes; the same qualification tool and acceptance criteria remain.
 
 `piano-video=6 piano-video-vt=1` publishes version6 avc1 only, with the explicit qualification name
 `PianoVideo native AVC V5a qualification`. Apple's built-in ParavirtualizedVideoDecoder opens our type0 Apple-named

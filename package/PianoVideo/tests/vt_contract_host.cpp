@@ -36,7 +36,7 @@ int main() {
   locked[0x88+0x6c]=1;CHECK(!vtcontract::surfaceResult(locked,sizeof locked,27,parsed));locked[0x88+0x6c]=0;
   vtcontract::State st; CHECK(!st.accept());st.started=true;CHECK(st.accept());CHECK(!st.accept());CHECK(st.success());
   st.cancel();CHECK(!st.success());CHECK(st.complete());CHECK(!st.complete());CHECK(!st.accept());
-  vtcontract::State finished;finished.started=true;finished.finish();CHECK(!finished.accept());
+  vtcontract::State finished;finished.started=true;finished.finish();CHECK(!finished.terminal&&finished.accept());finished.finish();CHECK(finished.terminal&&!finished.accept());
   uint8_t ext[46]={};vtwire::put32(ext,46);vtwire::put32(ext+4,vtwire::cc("avcC"));
   const uint8_t prefix[]={1,66,0xc0,13,0xff,0xe1,0,22};memcpy(ext+8,prefix,8);memcpy(ext+16,session::kAccessUnit+4,22);
   ext[38]=1;ext[39]=0;ext[40]=5;memcpy(ext+41,session::kAccessUnit+30,5);
@@ -82,6 +82,44 @@ int main() {
   uint8_t wire[256]={},uuid[16]={};vtwire::Writer msg(wire,sizeof wire);msg.header(vtwire::cc("dfrm"),vtwire::FlagRequest,uuid,1);msg.s64(vtwire::cc(",frm"),0);
   CHECK(vtcontract::message(wire,msg.size()));msg.s64(vtwire::cc(",frm"),1);CHECK(!vtcontract::message(wire,msg.size()));
   CHECK(!vtcontract::message(wire,msg.size()-1));
+  // The decoded PV envelope: ,frm=s64, ,dfl=u32, ,sbf=sbf containing
+  // sbuf with sibling timing/format metadata and raw sdat. Never an HFI ring.
+  std::vector<uint8_t> frame(1024);vtwire::Writer fh(frame.data(),uint32_t(frame.size()));
+  fh.header(vtwire::cc("dfrm"),vtwire::FlagRequest,uuid,109);fh.s64(vtwire::cc(",frm"),0x123456789abcdefLL);fh.u32(vtwire::cc(",dfl"),1);
+  auto *fp=frame.data()+fh.size();const uint32_t sampleEnvelope=8+8+24+8+sizeof sample;
+  vtwire::put32(fp,16+sampleEnvelope);vtwire::put32(fp+4,vtwire::cc("para"));vtwire::put32(fp+8,vtwire::cc(",sbf"));vtwire::put32(fp+12,vtwire::cc("=sbf"));
+  auto *sb=fp+16;vtwire::put32(sb,sampleEnvelope);vtwire::put32(sb+4,vtwire::cc("sbuf"));
+  vtwire::put32(sb+8,32);vtwire::put32(sb+12,vtwire::cc("opts"));
+  auto *sd=sb+40;vtwire::put32(sd,8+sizeof sample);vtwire::put32(sd+4,vtwire::cc("sdat"));memcpy(sd+8,sample,sizeof sample);
+  const uint32_t fn=fh.size()+16+sampleEnvelope;vtcontract::InputReport input;
+  CHECK(vtcontract::inputRequest(frame.data(),fn,input)&&input.hasToken&&input.token==0x123456789abcdefLL&&input.bytes==252&&!memcmp(input.data,sample,252));
+  vtwire::put32(sd+8,512);CHECK(!vtcontract::inputRequest(frame.data(),fn,input)&&input.hasToken&&!strcmp(input.decision,"sample-not-qualified"));vtwire::put32(sd+8,248);
+  CHECK(!vtcontract::inputRequest(frame.data(),fn-1,input));
+  vtwire::put32(fp+12,vtwire::cc("=dat"));CHECK(!vtcontract::inputRequest(frame.data(),fn,input)&&input.hasToken&&!strcmp(input.decision,"sample-parameter"));vtwire::put32(fp+12,vtwire::cc("=sbf"));
+  vtwire::put32(sd+4,vtwire::cc("free"));CHECK(!vtcontract::inputRequest(frame.data(),fn,input)&&!strcmp(input.decision,"sdat-layout"));vtwire::put32(sd+4,vtwire::cc("sdat"));
+  vtwire::put32(frame.data()+vtwire::HeaderBytes+12,vtwire::cc("=u32"));
+  CHECK(!vtcontract::inputRequest(frame.data(),fn,input)&&!input.hasToken);vtwire::put32(frame.data()+vtwire::HeaderBytes+12,vtwire::cc("=s64"));
+  // Exactly the first tablet request's six bytes, not just a mutated valid AU.
+  const uint8_t badSample[]={0,0,2,0,0x65,0x88};
+  vtwire::put32(sd,14);memcpy(sd+8,badSample,sizeof badSample);vtwire::put32(sb,54);vtwire::put32(fp,70);
+  CHECK(!vtcontract::inputRequest(frame.data(),fh.size()+70,input)&&input.hasToken&&input.bytes==6&&!strcmp(input.decision,"sample-not-qualified"));
+  // Reproduce malformed -> Wait(empty finish) -> oversize -> Wait -> valid
+  // -> repeat -> terminal drain. Reject completions retain their own tokens
+  // and do not consume or overwrite the accepted AU's completion state.
+  vtcontract::State life;life.started=true;vtcontract::RejectedFrames rejects;vtcontract::RejectedFrame rejected;
+  CHECK(rejects.push(11,-12909));life.finish();CHECK(!life.terminal&&!life.accepted);
+  CHECK(rejects.pop(rejected)&&rejected.token==11&&rejected.error==-12909);CHECK(!rejects.pop(rejected));
+  CHECK(rejects.push(12,-12909));life.finish();CHECK(!life.terminal&&!life.accepted);
+  CHECK(rejects.pop(rejected)&&rejected.token==12);CHECK(life.accept());CHECK(life.success());
+  CHECK(!life.accept()&&rejects.push(14,-12903));CHECK(rejects.pop(rejected)&&rejected.token==14);CHECK(life.success());
+  CHECK(life.complete()&&!life.complete());life.finish();CHECK(life.terminal&&!life.accept());
+  for(unsigned i=0;i<vtcontract::RejectedFrames::Capacity;++i)CHECK(rejects.push(100+i,-12909));
+  CHECK(!rejects.push(999,-12909)); // fail transport, never silently discard
+  for(unsigned i=0;i<vtcontract::RejectedFrames::Capacity;++i)CHECK(rejects.pop(rejected)&&rejected.token==100+i);
+  CHECK(!rejects.pop(rejected)&&!rejects.push(1,0));
+  // Wraparound and cancellation settle each outstanding rejection separately.
+  CHECK(rejects.push(21,-12909)&&rejects.push(22,-12903));life.cancel();
+  CHECK(rejects.pop(rejected)&&rejected.token==21);CHECK(rejects.pop(rejected)&&rejected.token==22);CHECK(!rejects.pop(rejected));
   uint8_t plist[48]={};memcpy(plist,"bplist00",8);plist[8]=0x5f;plist[9]=0x1f;plist[16]=8;
   plist[22]=1;plist[23]=1;vtwire::put64(plist+24,1);vtwire::put64(plist+32,0);vtwire::put64(plist+40,16);
   char name[96];CHECK(!vtwire::plistString(plist,sizeof plist,name,sizeof name));

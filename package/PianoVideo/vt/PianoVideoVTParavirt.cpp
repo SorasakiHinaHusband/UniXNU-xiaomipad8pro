@@ -213,22 +213,30 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::buffers(uint64_t size, u
 // to the native frontend without waiting for any guest reply.
 IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length, const uint64_t *surfaces, unsigned count,
                                                                uint64_t *status) {
+    IOLog("PianoVideoVT V5c: send-event pid %d bytes %llu capacity %llu surfaces %u decision received\n",proc_selfpid(),length,capacity,count);
     if (!send || length < HeaderBytes || length > capacity || length > MaxSendBytes) {
         droidvm_vtpv_refused = droidvm_vtpv_refused + 1;
+        IOLog("PianoVideoVT V5c: send-event decision envelope-rejected status %08x\n",kIOReturnBadArgument);
         return kIOReturnBadArgument;
     }
     // The caller controls this shared mapping. Snapshot once and parse only the
     // private copy; a concurrent userspace mutation cannot change checked lengths.
     uint8_t *bytes = static_cast<uint8_t *>(IOMalloc(length));
-    if (!bytes) return kIOReturnNoMemory;
+    if (!bytes) { IOLog("PianoVideoVT V5c: send-event decision snapshot-no-memory status %08x\n",kIOReturnNoMemory);return kIOReturnNoMemory; }
     memcpy(bytes, send->getBytesNoCopy(), length);
     vtwire::Header checked;
-    if (!pianovideo::vtcontract::message(bytes, uint32_t(length)) || !vtwire::header(bytes, uint32_t(length), checked)) {
+    if (!vtwire::header(bytes, uint32_t(length), checked)) {
+        IOLog("PianoVideoVT V5c: send-event decision header-rejected status %08x\n",kIOReturnBadArgument);
+        IOFree(bytes, length); return kIOReturnBadArgument;
+    }
+    IOLog("PianoVideoVT V5c: send-event type %08x flags %u request %llu bytes %llu decision snapshot\n",checked.type,checked.flags,checked.request,length);
+    if (!pianovideo::vtcontract::message(bytes, uint32_t(length))) {
+        IOLog("PianoVideoVT V5c: send-event request %llu decision atom-layout-rejected status %08x\n",checked.request,kIOReturnBadArgument);
         IOFree(bytes, length); return kIOReturnBadArgument;
     }
     bool owned = checked.type == vtwire::cc("decs") || checked.type == vtwire::cc("encs");
     for (unsigned i = 0; i < uuidCount; ++i) if (!memcmp(uuids[i], checked.uuid, 16)) owned = true;
-    if (!owned) { IOFree(bytes, length); return kIOReturnNotPermitted; }
+    if (!owned) { IOLog("PianoVideoVT V5c: send-event request %llu decision uuid-rejected status %08x\n",checked.request,kIOReturnNotPermitted);IOFree(bytes, length); return kIOReturnNotPermitted; }
     const uint32_t seq = droidvm_vtpv_messages;
     droidvm_vtpv_record &r = droidvm_vtpv_log[seq % LogEntries];
     r.seq = seq;
@@ -248,6 +256,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length,
     uint32_t ids[MaxSurfaces];
     for (unsigned i = 0; i < r.surface_count; ++i) ids[i] = r.surfaces[i];
     const int rc = host ? droidvm_vthost_message(host, bytes, uint32_t(length), ids, r.surface_count) : -1;
+    IOLog("PianoVideoVT V5c: send-event request %llu flags %u decision %s status %d\n",checked.request,checked.flags,host?(rc?"host-transport-rejected":"host-dispatched"):"host-closed",rc);
     IOFree(bytes, length);
     *status = uint64_t(int64_t(rc));
     if (rc) droidvm_vtpv_refused = droidvm_vtpv_refused + 1;
@@ -261,6 +270,8 @@ bool AppleVideoToolboxParavirtualizationUserClient::sendToGuest(void *transport,
     IOLockLock(self->sendLock);
     const bool sent = self->queue && self->queue->enqueue(const_cast<uint8_t *>(bytes), size);
     IOLockUnlock(self->sendLock);
+    vtwire::Header h;const bool valid=vtwire::header(bytes,size,h);
+    IOLog("PianoVideoVT V5c: reply-queue type %08x flags %u request %llu bytes %u decision %s\n",valid?h.type:0,valid?h.flags:0,valid?h.request:0,size,sent?"enqueued":"dropped");
     if (sent) droidvm_vtpv_sent = droidvm_vtpv_sent + 1;
     else { droidvm_vtpv_dropped = droidvm_vtpv_dropped + 1; IOLog("PianoVideoVT V5a: transport DROP size %u\n", size); }
     return sent;
@@ -296,6 +307,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         break;
     case 3:
         if (a->scalarInputCount < 1 || a->scalarInputCount > 1 + MaxSurfaces || a->scalarOutputCount < 1) {
+            IOLog("PianoVideoVT V5c: send-event decision scalar-shape-rejected inputs %u outputs %u status %08x\n",a->scalarInputCount,a->scalarOutputCount,kIOReturnBadArgument);
             result = kIOReturnBadArgument;
             break;
         }
@@ -303,6 +315,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         if (!result) a->scalarOutputCount = 1;
         break;
     case 4:
+        IOLog("PianoVideoVT V5c: reply-queue event drained-ack status 0\n");
         result = kIOReturnSuccess;
         break;
     }

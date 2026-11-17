@@ -44,8 +44,8 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   test; opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
 - Hardware video decode (2026-11-17, RAM boots): Iris decoded our 320×240 H.264 AU into NV12 with the exact golden
   SHA-256 and safe DMA teardown (`vid-v4a`). A restricted native VideoToolbox bridge (`piano-video=6 piano-video-vt=1`)
-  and IOSurface callback qualification tool are implemented. VideoToolbox selected the bridge on the tablet;
-  its session-format rejection is corrected in host tests and awaits tablet acceptance
+  and IOSurface callback qualification tool are implemented. The tablet creates a hardware session and passes format queries;
+  the first rejected sample exposed a missing error callback. Its completion lifecycle is corrected and awaits tablet acceptance
   ([docs/drivers/video.md](docs/drivers/video.md)). Normal app playback still needs streaming support.
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;

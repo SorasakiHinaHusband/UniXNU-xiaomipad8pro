@@ -7,8 +7,8 @@
 #include "../VideoFixture.h"
 namespace pianovideo { namespace vtcontract {
 constexpr uint32_t kMaxAuBytes = 1u << 20;
-// Permit a bounded oversized-sample envelope so VT receives a synchronous
-// dfrm error and its send channel remains usable for the following valid AU.
+// Bound snapshots independently of the native AU limit. Rejected frames still
+// need completion; a dfrm error reply alone does not retire a VT frame.
 constexpr uint32_t kMaxMessageBytes = 4u << 20;
 constexpr uint32_t kMaxSurfaceBytes = 4u << 20; // bounded task wiring for the tiny qualification pool
 constexpr uint32_t kParameterBytes = 35; // start4+SPS22+start4+PPS5
@@ -90,6 +90,29 @@ inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t c
   memcpy(out + kParameterBytes + 4, p + 4, n - 4);
   const uint32_t bytes = n + kParameterBytes;
   return normalizedAu(out, bytes) ? bytes : 0;
+}
+struct InputReport {
+  int64_t token = 0;
+  bool hasToken = false;
+  uint32_t parameterType = 0, bytes = 0;
+  const uint8_t *data = nullptr;
+  const char *decision = "frame-parameter";
+};
+inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r) {
+  r = InputReport{};
+  if (!message(m,n) || !(r.hasToken = vtwire::paramS64(m,n,vtwire::cc(",frm"),r.token))) return false;
+  vtwire::Param p; vtwire::Atom sbuf,sdat;
+  r.decision = "sample-parameter";
+  if (!vtwire::param(m,n,vtwire::cc(",sbf"),p)) return false;
+  r.parameterType = p.type;
+  if (p.type != vtwire::cc("=sbf")) return false;
+  r.decision = "sbuf-layout";
+  if (!unique(p.value,p.size,vtwire::cc("sbuf"),sbuf)) return false;
+  r.decision = "sdat-layout";
+  if (!unique(sbuf.body,sbuf.size,vtwire::cc("sdat"),sdat)) return false;
+  r.data = sdat.body; r.bytes = sdat.size; r.decision = "sample-not-qualified";
+  if (!sample(r.data,r.bytes)) return false;
+  r.decision = "accept"; return true;
 }
 struct FormatReport {
   uint32_t parameterType = 0, bytes = 0, declared = 0, codec = 0, width = 0, height = 0;
@@ -197,12 +220,30 @@ inline bool surfaceResult(const uint8_t *b, uint32_t n, uint32_t id, Surface &v)
 }
 // All calls under the session lock. Invalid input does not consume the one-AU
 // budget. Cancellation suppresses success, settles an accepted frame once.
+struct RejectedFrame { int64_t token = 0; int error = 0; };
+// Independent of the single accepted AU. A full queue fails the transport, so
+// the guest's send-error path completes its frame without losing a token.
+struct RejectedFrames {
+  static constexpr unsigned Capacity = 8;
+  RejectedFrame frames[Capacity];
+  unsigned head = 0, count = 0;
+  bool push(int64_t token, int error) {
+    if (!error || count == Capacity) return false;
+    frames[(head + count) % Capacity] = {token,error}; ++count; return true;
+  }
+  bool pop(RejectedFrame &frame) {
+    if (!count) return false;
+    frame = frames[head]; head = (head + 1) % Capacity; --count; return true;
+  }
+};
 struct State {
   bool started = false, accepted = false, completed = false, terminal = false, cancelled = false;
   bool accept() { if (!started || accepted || terminal || cancelled) return false; accepted = true; return true; }
   bool complete() { if (!accepted || completed) return false; completed = true; return true; }
   bool success() const { return accepted && !completed && !cancelled; }
-  void finish() { terminal = true; }
+  // VT's WaitForAsynchronousFrames calls FinishDelayedFrames even after a
+  // rejected sample. No native input means nothing to drain or terminate.
+  void finish() { if (accepted) terminal = true; }
   void cancel() { cancelled = terminal = true; }
 };
 } }
