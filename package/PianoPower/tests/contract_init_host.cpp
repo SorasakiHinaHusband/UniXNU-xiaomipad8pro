@@ -3,6 +3,7 @@
 // A wire-level cold PPM, independent of the observer's stages. In notifications-
 // disabled state only RESET/ENABLE are processed (UCSI 1.2 section 4.3).
 #include "ChargeContract.h"
+#include "UsbcObservation.h"
 #include <cstdio>
 #include <vector>
 static unsigned checks, failures;
@@ -15,6 +16,8 @@ struct ColdPpm {
     unsigned droppedGets = 0, resets = 0, ackErrors = 0, snapshots = 0;
     unsigned attributes = 4, connectors = 1, features = 16, capLength = 16, statusLength = 9;
     bool pd = false;
+    uint32_t statusFlags = 1u<<19;
+    uint8_t orientationByte = 0;
     bool stuckReset = false, stuckEnable = false, stuckAck = false, dropRead = false, rejectEnable = false;
     bool stuckCapabilityAck = false;
     bool dirtyReset = false, alwaysDirtyReset = false, stuckClear = false, notify = false, oldNotifyOnReset = false;
@@ -53,7 +56,8 @@ struct ColdPpm {
             payload[12]=0; payload[13]=3; payload[14]=0x10; payload[15]=1;
         } else if (cmd == 0x12) {
             cci = 1u<<31 | statusLength<<8;
-            piano_contract_put32(payload, 1u<<19 | (pd?3u:1u)<<16);
+            piano_contract_put32(payload, statusFlags | (pd?3u:1u)<<16);
+            payload[10] = orientationByte;
             if (pd) piano_contract_put32(payload+4, 2u<<28 | 160u<<10 | 160u);
         } else if (cmd == 0x10) {
             const unsigned offset = unsigned(pending>>24)&255u;
@@ -163,7 +167,33 @@ static void capabilityVariants() {
     CHECK(unavailable.c.initialized && unavailable.c.status_valid && unavailable.c.pd && !unavailable.c.valid);
     CHECK(!unavailable.c.pdos && !unavailable.c.mv && !unavailable.c.ma && unavailable.resets==1 && !unavailable.ackErrors);
 }
+static void sharedObservation() {
+    for (unsigned version : {0x110u, 0x200u}) for (unsigned reverse : {0u, 1u}) {
+        ColdPpm p; p.version=version; p.statusLength=version>=0x200?11:9;
+        p.statusFlags=0x20280000; // connected DFP, USB capable, consumer
+        p.orientationByte=uint8_t(reverse<<6); p.run();
+        auto s=piano_usbc_observe(&p.c,1,1,p.now);
+        CHECK(piano_usbc_observation_fresh(&s,p.now));
+        CHECK(!p.c.valid && s.status_bytes==p.statusLength && s.seq==1);
+        CHECK(piano_contract_u32(s.status)==(p.statusFlags|1u<<16));
+        CHECK(s.ucsi_version==version && s.status[10]==(version>=0x200?reverse<<6:0));
+        CHECK(piano_usbc_observation_fresh(&s,s.expires_ms));
+        CHECK(!piano_usbc_observation_fresh(&s,s.expires_ms+1));
+        CHECK(!piano_usbc_observation_fresh(&s,s.updated_ms-1));
+        // Snapshot output is independent of the live ACK/capability scratch words.
+        p.c.message_in[0]=0xffffffff;
+        CHECK(piano_usbc_observe(&p.c,1,1,p.now).status[0]==s.status[0]);
+        CHECK(!piano_usbc_observe(&p.c,0,1,p.now).valid);
+        CHECK(!piano_usbc_observe(&p.c,1,0,p.now).valid);
+        p.c.notify_pending=1; CHECK(!piano_usbc_observe(&p.c,1,1,p.now).valid);
+        p.c.notify_pending=0; p.c.quarantined=1; CHECK(!piano_usbc_observe(&p.c,1,1,p.now).valid);
+        p.c.quarantined=0; piano_contract_link(&p.c,0);
+        CHECK(!piano_usbc_observe(&p.c,1,1,p.now).valid);
+        CHECK(piano_usbc_observe(&p.c,1,1,p.now).generation!=s.generation);
+    }
+}
 int main() {
+    sharedObservation();
     capabilityVariants();
     for (unsigned version : {0x100u,0x110u,0x120u,0x200u,0x210u}) {
         ColdPpm p; p.version=version; p.run();

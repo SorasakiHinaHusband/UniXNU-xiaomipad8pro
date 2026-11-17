@@ -76,3 +76,12 @@ no port event, or no further control-channel traffic. Normal role entry is
 suppressed in this diagnostic mode. Host uses the polled path, retaining the
 gadget's SPI handler. Tests: `tests/smmu_identity_host.cpp` covers hardware-shaped
 readback, ownership changes, rollback and bounded loan decisions.
+
+With `piano-power-policy=1`, PianoPower alone drives the UCSI mailbox.
+PianoUsbHost reads its locked connector snapshot through the USB-C relay;
+it never attaches a command client or sends reset/ACK/SET_UOR in this profile.
+The snapshot preserves the accepted status layout (including UCSI 2.x
+orientation) and expires independently of publisher progress. Pending
+notifications, link loss and observer failure revoke the role witness.
+The diagnostic loan waits for a fresh snapshot, but does not claim a VBUS
+source or request a role swap. The A2 class is checked before releasing CDC.

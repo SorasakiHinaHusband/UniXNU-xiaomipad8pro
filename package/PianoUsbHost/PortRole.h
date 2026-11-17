@@ -14,6 +14,7 @@
 #pragma once
 #include "UsbHostSurvey.h"
 #include "Ucsi.h"
+#include "../include/PianoUsbcContract.h"
 
 namespace pianousbhost {
 
@@ -27,6 +28,17 @@ struct PortWitnesses {
   bool typecValid = false;
   TypecView typec;
 };
+
+// Use only the owner's committed snapshot; expired/invalid data cannot leave
+// an old host-role witness armed. UCSI 1.x does not report orientation.
+inline bool observePort(PortWitnesses &w, const PianoUsbcObservation &s, uint64_t now)
+{
+  w.ucsiReady = piano_usbc_observation_fresh(&s, now);
+  w.ucsiVersion = s.ucsi_version;
+  w.ucsi = w.ucsiReady ? pianoucsi::decodeStatus(s.status, s.status_bytes, s.ucsi_version)
+                       : pianoucsi::ConnectorStatus();
+  return w.ucsiReady;
+}
 
 struct PortView {
   RoleDecision role;

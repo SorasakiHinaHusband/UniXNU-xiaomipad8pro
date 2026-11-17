@@ -1665,12 +1665,14 @@ bool liveDown(LiveHost &h)
 // ---- the published view
 const char *orientationWord(unsigned o) { return o == 1 ? "normal" : o == 2 ? "reverse" : "-"; }
 
-void publishPort(IOService *self, const pianoucsi::Client &c, bool ucsiOn, const PortWitnesses &w, const PortView &v,
+void publishPort(IOService *self, const pianoucsi::Client &c, bool ucsiOn, bool shared, const PortWitnesses &w, const PortView &v,
                  const RoleSwitch &rs, char *line, size_t size)
 {
   using namespace pianoucsi;
   char ucsi[200];
   if (!ucsiOn) snprintf(ucsi, sizeof ucsi, "off (level 3: port notifications only)");
+  else if (shared)
+    snprintf(ucsi, sizeof ucsi, "PianoPower read-only: %s [PianoUsbUcsiSharedA2c]", w.ucsiReady ? "fresh" : "waiting/stale");
   else if (c.phase == Phase::ready)
     snprintf(ucsi, sizeof ucsi, "ready: UCSI %x.%02x (%u-byte mailbox), %u connector(s), PD %x.%x, features %#x, notifications %#llx",
              c.version >> 8, c.version & 0xff, c.answerBytes, c.cap.connectors, c.cap.pdVersion >> 8, (c.cap.pdVersion >> 4) & 0xf,
@@ -1708,7 +1710,7 @@ void publishPort(IOService *self, const pianoucsi::Client &c, bool ucsiOn, const
              roleName(rs.current), rs.toHost, rs.toDevice, rs.failures);
   self->setProperty("piano-usbhost-handoff", hand);
   snprintf(line, size, "ucsi %s | port %s | orientation %s%s | vbus %s | role %s | hand-off %s",
-           !ucsiOn ? "off" : c.phase == Phase::ready ? "ready" : c.phase == Phase::failed ? "failed" : c.phase == Phase::init ? "starting" : "waiting",
+           !ucsiOn ? "off" : shared ? (w.ucsiReady ? "shared fresh" : "shared waiting/stale") : c.phase == Phase::ready ? "ready" : c.phase == Phase::failed ? "failed" : c.phase == Phase::init ? "starting" : "waiting",
            !v.known ? "?" : !v.connected ? "empty" : w.ucsiReady ? partnerTypeName(w.ucsi.partnerType) : "connected",
            orientationWord(v.orientation), v.orientationKnown && !v.agree ? " (DISAGREE)" : "",
            v.vbus == 1 ? "source" : v.vbus == 0 ? "sink" : "-", roleName(v.role.role), !rs.enabled ? "off" : roleName(rs.current));
@@ -1757,11 +1759,15 @@ void portManager(IOService *self)
 {
   using namespace pianoucsi;
   const bool ucsiOn = gArgs.level == 4;
+  const bool shared = ucsiOn && bootArg("piano-power", 0) >= 2 &&
+      (bootArg("piano-power-policy", 0) || bootArg("piano-power-b4pd", 0));
   stage(40, ucsiOn ? "port manager: the UCSI client over PianoPower's USB-C relay, the port notifications from its port events"
                    : "port manager: the port notifications from PianoPower's port events (no UCSI command)");
   gRx.lock = IOSimpleLockAlloc();
   static const PianoUsbcClient client = {relayState, relayUcsi};
-  const int attached = gRx.lock ? piano_usbc_attach(&client, nullptr) : -2;
+  // With charging policy, PianoPower is the ONLY command owner. Do not
+  // attach a second client, even while its first snapshot is still pending.
+  const int attached = !gRx.lock ? -2 : shared ? 0 : piano_usbc_attach(&client, nullptr);
   if (attached) {
     stage(-40, attached == -1 ? "the USB-C relay has another client" : "the USB-C relay refused the client");
     return;
@@ -1769,7 +1775,7 @@ void portManager(IOService *self)
   static const PianoPortClient portClient = {portEvent};
   const int portSlot = piano_port_events(&portClient, nullptr);
   note("port: attached to PianoPower's USB-C relay (%s) and its port events (%s, %u seen before); the role switch %s",
-       ucsiOn ? "the UCSI owner 0x800b" : "the ready state only: level 3 sends no UCSI command",
+       shared ? "read-only connector snapshots; PianoPower owns UCSI [PianoUsbUcsiSharedA2c]" : ucsiOn ? "the UCSI owner 0x800b" : "the ready state only: level 3 sends no UCSI command",
        portSlot >= 0 ? "slot taken" : "NO SLOT: no port notification will be seen", piano_port_seen(),
        gArgs.handoff ? (gArgs.handoff == 6 ? "is ON: host with Apple's xHCI on the nub (piano-usbhost-handoff=6)" : "is ON: host with our probe (piano-usbhost-handoff=5)")
                      : "is off (piano-usbhost-handoff=0: the decision is published, nothing is switched)");
@@ -1785,7 +1791,14 @@ void portManager(IOService *self)
   uint32_t generation = 0, moves = 0, panLogged = 0;
   uint8_t lastPan[3] = {0xff, 0xff, 0xff};
   char line[400], lastLine[400] = "";
-  if (gArgs.handoff == 6 && bootArg("piano-usbhost-test-loan", 0)) registerLoanSysctl();
+  if (gArgs.handoff == 6) {
+    // Resolve the real library closure while CDC still runs. A missing class
+    // must never consume a controller loan or erase its own failure evidence.
+    if (!controllerClassPresent()) { stage(-40, "A2 class unavailable before release"); return; }
+    if (bootArg("piano-usbhost-test-loan", 0)) registerLoanSysctl();
+  }
+  PianoUsbcObservation previous = {};
+  if (shared && gArgs.uor) note("ucsi: SET_UOR disabled: PianoPower owns the mailbox");
   stage(41, "port manager: running (event-driven)");
   bool first = true;   // the properties from the start ("waiting for PianoPower's DSP channel")
   for (;;) {
@@ -1795,7 +1808,7 @@ void portManager(IOService *self)
     first = false;
     // The relay's ready flag: start over on every new generation (the PPM is back on its defaults).
     const uint32_t m = __atomic_load_n(&gRx.stateMoves, __ATOMIC_ACQUIRE);
-    if (m != moves) {
+    if (!shared && m != moves) {
       moves = m;
       const bool r = __atomic_load_n(&gRx.ready, __ATOMIC_ACQUIRE) != 0;
       const uint32_t g = __atomic_load_n(&gRx.generation, __ATOMIC_ACQUIRE);
@@ -1839,7 +1852,20 @@ void portManager(IOService *self)
         lastPan[2] = uint8_t(p.svid);
       }
     }
-    if (ucsiOn) {
+    if (shared) {
+      PianoUsbcObservation observed = {};
+      piano_usbc_observation(&observed);
+      const bool fresh = observePort(w, observed, now);
+      if (fresh != ready || observed.generation != previous.generation || observed.seq != previous.seq) {
+        if (observed.generation != previous.generation) w.panSeen = false;
+        ready = fresh;
+        viewDirty = true;
+        note("usb-a2c UCSI shared fresh %u owned %u ready %u gen %u seq %u connector %u connected %u provider %u partner %u [PianoUsbUcsiSharedA2c]",
+             fresh, observed.owned, observed.ready, observed.generation, observed.seq, observed.connector,
+             w.ucsi.connected, w.ucsi.provider, w.ucsi.partnerType);
+      }
+      previous = observed;
+    } else if (ucsiOn) {
       c.tick(now);
       Request q;
       while (c.take(q, now)) {
@@ -1873,7 +1899,7 @@ void portManager(IOService *self)
         note("role: %s: %s%s", roleName(nv.role.role), nv.role.why,
              !rs.enabled && nv.role.role == Role::host ? " (would switch to host: piano-usbhost-handoff=0)" : "");
       v = nv;
-      publishPort(self, c, ucsiOn, w, v, rs, line, sizeof line);
+      publishPort(self, c, ucsiOn, shared, w, v, rs, line, sizeof line);
       if (strcmp(line, lastLine)) {
         note("port: %s", line);
         strlcpy(lastLine, line, sizeof lastLine);
@@ -1886,7 +1912,7 @@ void portManager(IOService *self)
     SwitchAction a = rs.step(hostWitness ? Role::host : Role::device, v.connected, now);
     if (!v.connected && !diagnostic) gLoan.disconnected();
     if (bootArg("piano-usbhost-test-loan", 0)) a = SwitchAction::none;
-    if (diagnostic && gLoan.phase == LoanPhase::idle && nowMs() >= __atomic_load_n(&gLoanRequestAt, __ATOMIC_ACQUIRE)) a = SwitchAction::toHost;
+    if (diagnostic && ready && w.ucsiReady && gLoan.phase == LoanPhase::idle && nowMs() >= __atomic_load_n(&gLoanRequestAt, __ATOMIC_ACQUIRE)) a = SwitchAction::toHost;
     bool present = false;
     if (gLive.active) {
       for (unsigned i = 1; i <= gLive.x.maxPorts; ++i) present |= (gHal.rd(portscAt(gLive.x, i)) & kPortCcs) != 0;
@@ -1930,7 +1956,7 @@ void portManager(IOService *self)
       gLive.nextPoll = nowMs() + gArgs.period;
     }
     // Sleep until woken or the next deadline (none: no timer at all).
-    uint64_t deadline = ucsiOn ? c.deadline() : 0;
+    uint64_t deadline = shared ? nowMs() + 1000 : ucsiOn ? c.deadline() : 0;
     const auto earliest = [&deadline](uint64_t t) { if (t && (!deadline || t < deadline)) deadline = t; };
     earliest(rs.deadline());
     if (gLive.active) { earliest(gLive.nextPoll); earliest(gLoan.deadline); }

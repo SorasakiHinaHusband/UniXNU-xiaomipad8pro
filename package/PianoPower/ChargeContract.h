@@ -106,6 +106,7 @@ typedef struct {
     uint16_t version, status_change;
     uint32_t cci, rdo, source_pdo[7], mv, ma, source_ma;
     uint32_t status_flags, capabilities;
+    uint8_t status_raw[16], status_bytes, stage_status_raw[16], stage_status_bytes;
     /* Last completed command's bounded MessageIn, before ACK clears it. These
      * are protocol data, never a contract until status/PDO/RDO agree. */
     uint32_t message_in[4];
@@ -268,6 +269,8 @@ static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_m
     c->status_valid = 1; c->valid = (uint8_t)valid;
     c->connected = c->stage_connected; c->sink = c->stage_sink; c->pd = c->stage_pd;
     c->status_flags = c->stage_flags; c->status_change = c->stage_change;
+    c->status_bytes = c->stage_status_bytes;
+    for (i = 0; i != 16; ++i) c->status_raw[i] = c->stage_status_raw[i];
     c->rdo = c->stage_rdo; c->pdos = c->stage_pdos;
     for (i = 0; i != 7; ++i) c->source_pdo[i] = c->stage_pdo[i];
     c->protocol = valid ? d.protocol : 0; c->object = valid ? d.object : 0;
@@ -435,6 +438,8 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
                 c->sink != !(flags & (1u << 20)) || c->pd != (((flags >> 16) & 7u) == 3u) || c->rdo != rdo))
                 piano_contract_invalidate(c, PIANO_CONTRACT_CHANGED, 1);
             c->stage_flags = flags; c->stage_change = (uint16_t)flags; c->stage_rdo = rdo;
+            c->stage_status_bytes = (uint8_t)(payload < 16 ? payload : 16);
+            for (i = 0; i != 16; ++i) c->stage_status_raw[i] = i < payload ? message[i] : 0;
             c->stage_connected = (uint8_t)((flags >> 19) & 1u); c->stage_sink = (uint8_t)(!(flags & (1u << 20)));
             c->stage_pd = (uint8_t)(((flags >> 16) & 7u) == 3u);
             c->stage_pdos = 0; piano_contract_zero(c->stage_pdo, (unsigned)sizeof(c->stage_pdo));

@@ -9,6 +9,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. ucsi_host.cpp -o /tmp/ucsi_host && /tmp/ucsi_host
 #include "UcsiClient.h"
 #include "PortRole.h"
+#include "ControllerLoan.h"
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -685,8 +686,50 @@ static void testEndToEnd()
   CHECK(s.step(v.role.role, v.connected, r.now) == SwitchAction::toDevice);
 }
 
+static void sharedConnector() {
+  PianoUsbcObservation s = {};
+  s.version=PIANO_USBC_OBSERVATION_VERSION; s.owned=s.ready=s.valid=1;
+  s.connector=1; s.seq=1; s.ucsi_version=0x110; s.status_bytes=9;
+  s.updated_ms=100; s.expires_ms=15100;
+  put32(s.status,0x202d5804); // a2b's confirmed non-PD DFP/sink status
+  PortWitnesses w;
+  CHECK(pianousbhost::observePort(w,s,100));
+  auto v=pianousbhost::portView(w);
+  CHECK(v.known && v.connected && v.vbus==0 && v.role.role==Role::device);
+  CHECK(!v.orientationKnown && w.ucsi.orientation==-1);
+  w.gpioRead=true; w.gpioHigh=false;
+  CHECK(pianousbhost::portView(w).orientation==1);
+  // UFP/provider is the normal automatic host witness; the diagnostic uses
+  // this same fresh snapshot without inventing a provider or role swap.
+  put32(s.status,1u<<19 | 1u<<20 | 2u<<29);
+  CHECK(pianousbhost::observePort(w,s,200));
+  v=pianousbhost::portView(w); CHECK(v.vbus==1 && v.role.role==Role::host);
+  pianousbhost::ControllerLoan loan;
+  CHECK(loan.begin(200,60000,true)); loan.started();
+  CHECK(loan.end(60199,false,false,false,false)==pianousbhost::LoanEnd::none);
+  CHECK(loan.end(60200,false,false,false,false)==pianousbhost::LoanEnd::timeout);
+  put32(s.status,0); CHECK(pianousbhost::observePort(w,s,300));
+  v=pianousbhost::portView(w); CHECK(v.known && !v.connected && !v.orientationKnown);
+  put32(s.status,0x202d5804); s.ucsi_version=0x200; s.status_bytes=11;
+  w.gpioRead=false;
+  for(unsigned reverse=0;reverse<2;++reverse) {
+    s.status[10]=uint8_t(reverse<<6);
+    CHECK(pianousbhost::observePort(w,s,400));
+    CHECK(pianousbhost::portView(w).orientation==reverse+1);
+  }
+  for(unsigned bad=0;bad<7;++bad) {
+    auto b=s;
+    switch(bad) {case 0:b.valid=0;break;case 1:b.ready=0;break;case 2:b.owned=0;break;
+      case 3:b.connector=2;break;case 4:b.status_bytes=8;break;
+      case 5:b.version=2;break;case 6:b.expires_ms=399;break;}
+    CHECK(!pianousbhost::observePort(w,b,400));
+    v=pianousbhost::portView(w);
+    CHECK(!v.known && v.role.role!=Role::host && !w.ucsi.valid);
+  }
+}
 int main()
 {
+  sharedConnector();
   testCodec();
   testInit();
   testChanges();

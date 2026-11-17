@@ -69,6 +69,25 @@ typedef struct {
 } PianoUsbcStatus;
 void piano_usbc_status(PianoUsbcStatus *out);
 
+/* Read-only alternative while PianoPower's charging policy owns the mailbox.
+ * No attach/send/reset/ACK is permitted by the consumer in that profile.
+ * Copied under the relay lock; the reader checks monotonic expiry even if
+ * the publishing worker stops. */
+#define PIANO_USBC_OBSERVATION_VERSION 1u
+typedef struct {
+    uint32_t version, owned, ready, valid, generation, seq;
+    uint64_t updated_ms, expires_ms;
+    uint16_t ucsi_version;
+    uint8_t connector, status_bytes, status[16];
+} PianoUsbcObservation;
+static inline int piano_usbc_observation_fresh(const PianoUsbcObservation *s, uint64_t now_ms)
+{
+    return s->version == PIANO_USBC_OBSERVATION_VERSION && s->owned && s->ready && s->valid &&
+           s->connector == 1 && s->status_bytes >= 9 && s->status_bytes <= 16 &&
+           now_ms >= s->updated_ms && now_ms <= s->expires_ms;
+}
+void piano_usbc_observation(PianoUsbcObservation *out);
+
 #ifdef __cplusplus
 }
 #endif

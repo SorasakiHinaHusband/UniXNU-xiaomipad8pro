@@ -14,6 +14,7 @@ extern "C" {
 
 namespace {
 UsbcRelay gRelay;                 // zero: no client (usbc_relay_attach sets what a client needs)
+PianoUsbcObservation gObservation;
 IOSimpleLock *volatile gLock;
 const void *volatile gWake;       // PianoPower's wait event (set by the first step)
 thread_t volatile gOwner;         // PianoPower's thread (set by the first step)
@@ -94,6 +95,20 @@ extern "C" void piano_usbc_status(PianoUsbcStatus *out)
   if (!out) return;
   Held h;
   usbc_relay_status(&gRelay, out);
+}
+
+extern "C" void piano_usbc_observation(PianoUsbcObservation *out)
+{
+  if (!out) return;
+  Held h;
+  if (h.l) *out = gObservation;
+  else memset(out, 0, sizeof *out);
+}
+
+extern "C" void piano_usbc_relay_observe(const PianoUsbcObservation *snapshot)
+{
+  Held h;
+  if (h.l && snapshot) gObservation = *snapshot;
 }
 
 // ---------------------------------------------------------------------------------------------------- PianoPower's hooks

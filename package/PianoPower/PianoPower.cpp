@@ -85,6 +85,7 @@ extern "C" {
 #include "AdspHealth.h"
 #include "PianoMca.h"
 #include "PortEvents.h"
+#include "UsbcObservation.h"
 #include "UsbcRelay.h"   // the USB-C owners for one client kext (package/include/PianoUsbcContract.h, PianoUsbcRelay.cpp)
 }
 #include "ChargeLink.h"
@@ -2281,6 +2282,9 @@ void PianoPower::run()
       if (fWatch.ticks != ticks || (fFix.nextDue() && now >= fFix.nextDue())) fixPoll(now);
     }
     serviceMca(now);
+    const PianoUsbcObservation observed = piano_usbc_observe(&fContract, fPolicyOn,
+        gArgs.ucsi && fWasUp && !fQuiet.raised, now);
+    piano_usbc_relay_observe(&observed);
     // The built-in contract observer exclusively owns UCSI while policy is on.
     // Otherwise the legacy relay is ready after link/quiet/probe completion.
     if (fChannel)

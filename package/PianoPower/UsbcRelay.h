@@ -60,6 +60,7 @@ void piano_usbc_relay_step(struct PianoAdspChannel *channel, int ready, uint32_t
 int piano_usbc_relay_receive(const uint8_t *data, uint32_t length);
 int piano_usbc_relay_pending(void);
 int piano_usbc_relay_attached(void);
+void piano_usbc_relay_observe(const PianoUsbcObservation *snapshot);
 
 #ifdef __cplusplus
 }
