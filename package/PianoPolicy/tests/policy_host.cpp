@@ -645,9 +645,30 @@ static void resolve()
   CHECK(view(c, in, true).close == Close::lock);
 }
 
+static void acDemandSleep()
+{
+  Config c = actLid(); c.profile = false; c.lidSleepAC = true;
+  for (Power power : {Power::unknown, Power::battery, Power::external})
+    for (bool on : {false, true}) for (bool wake : {false, true}) for (bool seen : {false, true}) {
+      Inputs in = base(); in.power = power; in.sleepOn = on; in.wakeMask = wake ? kWakeLid : 0;
+      CHECK((view(c, in, seen).close == Close::sleep) == (power != Power::unknown && on && wake && seen));
+    }
+  Engine e(c); Inputs in = base(); in.power = Power::external;
+  CHECK(run(e, in).find("kIOPMSleepNow") == std::string::npos);
+  in.lid = Lid::closed;
+  const auto close = run(e, in);
+  CHECK(close.find("kIOPMClamshellClosed") < close.find("kIOPMSleepNow"));
+  CHECK(run(e, in).empty());
+  in.lid = Lid::open; run(e, in); in.lid = Lid::closed;
+  CHECK(run(e, in).find("kIOPMSleepNow") != std::string::npos);
+  c.lidConflict = true; Engine conflict(c); in.lid = Lid::open; run(conflict, in); in.lid = Lid::closed;
+  CHECK(run(conflict, in).empty());
+}
+
 int main()
 {
   table();
+  acDemandSleep();
   coverOnBattery();
   bootClosed();
   noSleep();

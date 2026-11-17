@@ -813,7 +813,7 @@ void PianoKeyboard::pollHall(uint64_t now)
   fHallNextMs = now + fPoll.config().hallMs;
   const uint32_t raw = rd32(gHall.page.va + kIo) & 1u;
   const int sample = int(hallOpenFromRaw(raw, gArgs.hallActiveLow));
-  if (gArgs.hallTrace)
+  if (edge || gArgs.hallTrace)
     note("hall: gpio80 poll raw %u -> %s (edge %u, accepted %s, sample %s)", raw, sample ? "open" : "closed", edge ? 1 : 0,
          fHall ? "open" : "closed", sample ? "open" : "closed");
   if (edge && sample != fHall) {

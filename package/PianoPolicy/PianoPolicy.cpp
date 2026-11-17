@@ -88,7 +88,7 @@ namespace {
 
 struct Args {
   uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, lpm, displayTick, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal,
-      thermalGpuMhz, sleep, sleepWake;
+      thermalGpuMhz, sleep, sleepWake, lidSleepAC;
   bool gpuMaxGiven;
 };
 Args gArgs;
@@ -105,6 +105,7 @@ uint32_t clampArg(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : v
 void readArgs()
 {
   gArgs.level = clampArg(bootArg("piano-policy", 0), 0, 2);
+  gArgs.lidSleepAC = bootArg("piano-policy-lid-sleep-ac", 0);
   gArgs.lid = bootArg("piano-policy-lid", 0);
   gArgs.profile = bootArg("piano-policy-profile", 1);
   gArgs.gpuMhz = bootArg("piano-policy-gpu-mhz", 342);
@@ -308,6 +309,8 @@ bool PianoPolicy::start(IOService *provider)
   }
   fConfig.act = gArgs.level >= 2;
   fConfig.lid = gArgs.lid != 0;
+  fConfig.lidSleepAC = gArgs.lidSleepAC == 1;
+  note("sleep-contract1: AC lid demand-sleep %s (real AC preserved)", fConfig.lidSleepAC ? "opted in" : "off");
   fConfig.lidConflict = gArgs.keyboardLid != 0;
   fConfig.profile = gArgs.profile != 0;
   fConfig.gpuKhz = gArgs.gpuMhz * 1000u;

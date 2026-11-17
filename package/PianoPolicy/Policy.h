@@ -59,6 +59,7 @@ constexpr uint32_t kLongPressMs = 1500;
 struct Config {
   bool act = false;              // piano-policy=2 (1: decisions logged, nothing sent)
   bool lid = false;              // piano-policy-lid=1: act on the cover (only once the hall polarity is verified)
+  bool lidSleepAC = false;       // opted-in demand sleep on a real AC close; never falsify AC or clear powerd masks
   bool lidConflict = false;      // piano-keyboard-lid != 0: PianoKeyboard already tells IOPMrootDomain the clamshell
   bool profile = true;           // piano-policy-profile (0: no PianoThermal profile, no GPU ceiling)
   uint32_t gpuKhz = 342000;      // piano-policy-gpu-mhz: Power Saver's GPU ceiling (Ubuntu's Power Saver: 342 MHz); 0 none
@@ -106,14 +107,14 @@ inline View view(const Config &c, const Inputs &in, bool seenOpen)
     v.closeWhy = "no hall reading (PianoKeyboard absent or piano-keyboard-hall=0)";
   } else {
     v.close = Close::lock;
-    if (in.power == Power::external) v.closeWhy = "on external power: lock only";
+    if (in.power == Power::external && !c.lidSleepAC) v.closeWhy = "on external power: lock only";
     else if (in.power == Power::unknown) v.closeWhy = "power source unknown (piano-power-ps=1 publishes it): lock only";
     else if (!in.sleepOn) v.closeWhy = "no system sleep (k27 0062 with piano-sleep=1): lock only";
     else if (!(in.wakeMask & kWakeLid)) v.closeWhy = "the cover-open wake is not armed (piano-sleep-wake lacks 2): lock only";
     else if (!seenOpen) v.closeWhy = "the cover has not been seen open since boot: lock only";
     else {
       v.close = Close::sleep;
-      v.closeWhy = "on battery: sleep";
+      v.closeWhy = in.power == Power::external ? "AC lid demand-sleep opted in" : "on battery: sleep";
     }
   }
   if (in.lpm) {
@@ -203,6 +204,11 @@ class Engine {
         lid_ = closed;
       }
     }
+    // AC desktop/clamshell masks are owned by powerd. Use the explicit demand
+    // request once per eligible closed epoch, after mirroring the real lid/AC.
+    const bool demand = c_.lidSleepAC && v.close == Close::sleep && in.power == Power::external && in.lid == Lid::closed;
+    if (demand && !acDemand_) out.add(Kind::root, kSleepNow, "AC lid demand-sleep opted in");
+    acDemand_ = demand;
     if (c_.profile) {
       const uint32_t mode = in.lpm ? kThermalSaver : kThermalAuto;
       if (!profileUnsupported_ && mode != profileSent_)
@@ -320,6 +326,7 @@ class Engine {
   }
 
   Config c_;
+  bool acDemand_ = false;
   bool seenOpen_ = false;
   int ac_ = -1, clamshell_ = -1, lid_ = -1;    // what IOPMrootDomain was told (-1 nothing yet)
   uint32_t profileSent_ = kThermalAuto;         // PianoThermal starts by the power source
