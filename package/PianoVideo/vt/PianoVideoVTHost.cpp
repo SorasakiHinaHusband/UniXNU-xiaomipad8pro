@@ -470,10 +470,12 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
     }
     case cc("dfin"):{
       IOLockLock(s->lock);
-      const bool schedule=s->started&&s->workerRunning&&!s->stopping&&!s->finishWanted;
+      const auto decision=pianovideo::stream::finishDecision(s->started,s->invalidating,s->firstError!=0,
+        s->workerRunning,s->stopping,s->finishWanted);
+      const bool schedule=decision==pianovideo::stream::FinishDecision::Schedule;
       if(schedule){s->finishWanted=true;s->finishRequest=h.request;}
       IOLockUnlock(s->lock);
-      if(!schedule)status(c,h,kBadState);break;
+      if(!schedule)status(c,h,decision==pianovideo::stream::FinishDecision::Failed?kDecodeError:kBadState);break;
     }
     case cc("dinv"):teardown(s);status(c,h,s->closeError?kDecodeError:0);break;
     case cc("-dec"):c->session=nullptr;destroy(s);break;

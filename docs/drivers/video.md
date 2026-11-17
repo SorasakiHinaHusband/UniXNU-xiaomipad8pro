@@ -780,3 +780,10 @@ closed-GOP drain/resume, DoNotOutput on a reference, retained-surface rehash, ca
 is compared by token and OutputPTS with independent software hashes; callback order is not assumed to be display order.
 Performance is measured separately and is not called real-time playback merely because all pixels match. In-place DRC,
 synchronous flags0, HEVC, new geometries, protected content and QuickTime/Safari integration need separate qualification.
+
+The first V6 hardware session (`vid-v6a2`) passed INIT, persistent OPEN, first PSC and EBD, then returned RAW0 with the
+correct address, extent and token but picture flags `0x81`. Our streaming validator rejected ancillary bit `0x80` before
+output delivery. V6c follows the pinned Iris/sheng bitmask handling: require a known AVC kind and reject NOSHOW (`0x40`),
+while preserving address, extent, token and ownership validation. A failed session also keeps the same malfunction result
+for repeated finish requests until invalidation. Actual-parser replays and finish-state host regressions pass; V6c hardware
+qualification and the full continuous-frame matrix remain pending ([results](../results-2026-11-18.md)).

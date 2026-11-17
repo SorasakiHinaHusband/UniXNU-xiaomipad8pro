@@ -479,7 +479,10 @@ public:
     if (streaming) {
       if (cleanup) return; // cancellation never delivers a late success
       const uint64_t returnedToken = uint64_t(v[8]) | (uint64_t(v[9]) << 32);
-      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 15) || (picture & ~15u) ||
+      // Gen2 picture is a bitmask. Like the pinned Iris/sheng references,
+      // classify known kinds and test NOSHOW explicitly; ancillary bits such
+      // as the firmware's 0x80 do not invalidate an otherwise owned AVC frame.
+      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 15) || (picture & 0x40) ||
           outputCount == stream::Credits || !ledger.picture(returnedToken,b->index)) {
         fail(kErrHfi, Buffers, p[2], p[4], p[5], header); return;
       }

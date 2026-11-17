@@ -836,6 +836,7 @@ bool PianoVideo::start(IOService *provider)
     gNativeLock = IOLockAlloc();
     if (!gNativeLock) return false;
     note("V6 bounded AVC streaming ready level 6 exclusive credits8 inputs2 RAW-reuse descriptor-WC 1");
+    note("V6c completion disposition AVC-known NOSHOW40 ancillary-ignored finish-sticky");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();

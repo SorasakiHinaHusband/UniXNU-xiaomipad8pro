@@ -286,6 +286,45 @@ static void omittedPscTests() {
   CHECK(f.tx.psc.poc==0&&f.tx.psc.profile==2&&f.tx.psc.level==4);
   f.peer.output(97,8);f.pump();f.releaseAll();f.drain();f.close();
 }
+static void ancillaryPictureTests() {
+  // vid-v6a2 RX18: RAW0, 147456 bytes, token4, picture0x81, no error.
+  // The pinned gen2 and sheng references test known bits, not a closed enum.
+  for(uint32_t picture:{0x81u,0x82u,0x84u,0x88u}){
+    Fixture f;f.peer.n=9;f.start(4);f.pump();
+    CHECK(f.layout.find(Raw,0)->iova()==0x8252c000);
+    f.peer.output(4,picture);const int rc=f.tx.pump();
+    CHECK(rc==0&&f.tx.r.error==0&&f.tx.r.decoded==1&&f.tx.outputCount==1);
+    if(rc){f.tx.shutdown();continue;}
+    SelfTest<Peer>::OutputFrame out;CHECK(f.tx.popOutput(out)&&out.token==4&&out.index==0&&out.bytes==147456);
+    CHECK(f.tx.releaseOutput(out.index,out.token)==0&&f.tx.ledger.pending==0);
+    f.drain();f.close();
+  }
+  for(uint32_t picture:{0x80u,0x41u,0x82u}){
+    Fixture f;f.start(4);f.pump();
+    // Ancillary bits never authorize NOSHOW, a missing AVC kind, or a bad token.
+    f.peer.output(picture==0x82?5:4,picture);
+    CHECK(f.tx.pump()==kErrHfi&&f.tx.r.decoded==0&&f.tx.outputCount==0);
+    f.tx.shutdown();
+  }
+}
+static void finishDispositionTests() {
+  using D=stream::FinishDecision;
+  // Empty/repeated healthy barriers still run on the worker. An in-flight
+  // request may not be replaced by another request ID.
+  CHECK(stream::finishDecision(true,false,false,true,false,false)==D::Schedule);
+  CHECK(stream::finishDecision(true,false,false,true,false,true)==D::BadState);
+  CHECK(stream::finishDecision(true,false,false,true,false,false)==D::Schedule);
+  // Exact error lifetime: firstError is saved before stopping, remains during
+  // cleanup with an outstanding finish, then survives native/worker close.
+  CHECK(stream::finishDecision(true,false,true,true,false,false)==D::Failed);
+  CHECK(stream::finishDecision(true,false,true,true,true,true)==D::Failed);
+  CHECK(stream::finishDecision(true,false,true,false,true,false)==D::Failed);
+  CHECK(stream::finishDecision(true,false,true,false,true,false)==D::Failed);
+  // Explicit invalidation has precedence; a failed session is never revived.
+  CHECK(stream::finishDecision(true,true,true,false,true,false)==D::BadState);
+  CHECK(stream::finishDecision(false,false,true,false,true,false)==D::BadState);
+  CHECK(stream::finishDecision(true,false,false,false,true,false)==D::BadState);
+}
 static void delayedGuestTests() {
   Fixture f;f.start(101);f.peer.output(101,2);f.pump();
   SelfTest<Peer>::OutputFrame held;CHECK(f.tx.popOutput(held));
@@ -340,7 +379,7 @@ static void negativeTests(unsigned kind) {
     case 10:f.peer.ops.fault=true;break;
     case 11:f.peer.output(0x123456789ull,2,0x20000000);break; // PSC_LAST without supported DRC
     case 12:f.peer.output(0x123456789ull,0);break;
-    case 13:f.peer.output(0x123456789ull,0x40);break; // HEVC picture kind
+    case 13:f.peer.output(0x123456789ull,0x40);break; // NOSHOW is not a displayable picture
     case 14:{auto *b=f.layout.find(Raw,0);Words v={Raw,0,b->iova()+4096,0,0,b->size,0,kRawBytes,0x23456789,1,0,0,0,0,0,0};f.peer.reply({Peer::packet(Buffers,0,2,5,v),Peer::packet(0x03000162,0,2,1,{2})});break;}
     case 15:f.peer.output(0x123456789ull,2,0x10000000);break; // unsolicited LAST
   }
@@ -389,6 +428,8 @@ static void admissionPublication() {
   l.cancel();CHECK(l.pending==0&&!l.publish(0x5678));
 }
 int main() {
+  ancillaryPictureTests();
+  finishDispositionTests();
   admissionPublication();
   profileAbiTests();
   ledgerTests();guestTests();ownerTests();persistentTests();firstPscTests();omittedPscTests();delayedGuestTests();drainPictureTests();noOutputTests();capacityTests();

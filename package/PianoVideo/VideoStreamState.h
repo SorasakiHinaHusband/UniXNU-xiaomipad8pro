@@ -5,6 +5,14 @@
 #include <stdint.h>
 namespace pianovideo { namespace stream {
 constexpr unsigned Credits = 8, Inputs = 2, Raws = 64;
+enum class FinishDecision { Schedule, Failed, BadState };
+inline FinishDecision finishDecision(bool started, bool invalidating, bool failed, bool running, bool stopping, bool pending) {
+  // A decoder error ends native work, but the PV session still owns its error
+  // until explicit invalidation. Repeated finish must report that same error.
+  if(!started||invalidating)return FinishDecision::BadState;
+  if(failed)return FinishDecision::Failed;
+  return running&&!stopping&&!pending?FinishDecision::Schedule:FinishDecision::BadState;
+}
 enum class Phase : uint8_t { Free, Admitting, Queued, Submitted, Picture, Delivering, Emitted };
 struct Record {
   uint64_t token = 0, serial = 0;
