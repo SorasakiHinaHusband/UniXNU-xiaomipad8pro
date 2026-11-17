@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <atomic>
 #include "VideoFixture.h"
 
 namespace {
@@ -28,7 +29,7 @@ constexpr char kSampleSha[] = "07f70d032e843a48ce2560d7b8e886b41e83ba6b2c325393f
 constexpr char kNormalizedSha[] = "b3c7aab54e349a6e93254403bece100a3a219d32c7718adbe68302307b9c285b";
 constexpr int64_t kPtsValue = 6001;
 constexpr int32_t kPtsScale = 60000;
-int failures;
+std::atomic<int> failures{0};
 
 bool result(const char *stage, bool pass, OSStatus status = 0) {
     std::printf("video-v5a: %s %s status=%d\n", pass ? "PASS" : "FAIL", stage, int(status));
@@ -120,8 +121,8 @@ int selfTest() {
     char digest[65];
     result("active-rows-with-padding", activeDigest(y.data(), 384, uv.data(), 448, digest) && std::strcmp(digest, kGolden) == 0);
     result("short-plane-rejected", !activeDigest(y.data(), 319, uv.data(), 448, digest));
-    std::printf("video-v5a: %s self-test failures=%d\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 1 : 0;
+    std::printf("video-v5a: %s self-test failures=%d\n", failures.load() ? "FAIL" : "PASS", failures.load());
+    return failures.load() ? 1 : 0;
 }
 
 struct Frame {
@@ -311,8 +312,8 @@ int qualify() {
     if (changed) CFRelease(changed);
     CFRelease(format); CFRelease(specification);
     pthread_cond_destroy(&ctx.condition); pthread_mutex_destroy(&ctx.mutex);
-    std::printf("video-v5a: %s qualification failures=%d success-callbacks=%u error-callbacks=%u\n", failures ? "FAIL" : "PASS", failures, ctx.success, ctx.errors);
-    return failures ? 1 : 0;
+    std::printf("video-v5a: %s qualification failures=%d success-callbacks=%u error-callbacks=%u\n", failures.load() ? "FAIL" : "PASS", failures.load(), ctx.success, ctx.errors);
+    return failures.load() ? 1 : 0;
 }
 }
 int main(int argc, char **argv) {
