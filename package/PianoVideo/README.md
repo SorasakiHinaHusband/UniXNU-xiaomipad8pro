@@ -78,10 +78,14 @@ checks fixture and active-row hashing without querying VT; `--qualify` requires 
 checks dcan, exactly one IOSurface-backed 420v golden callback, unsupported input, terminal finish and safe invalidate.
 These host tests and implementation claims are not tablet acceptance or general AVC/HEVC playback support.
 
-V6 qualification: `bash tooling/native/build-video-v6.sh` compiles/signs the tool and runs the actual Apple CoreMedia/PV
-serialization of all 120 own-encoded IP/IBP samples through the production parser. Target use is
+V6 qualification: `bash tooling/native/build-video-v6.sh` compiles/signs the tool and audits both owned IP/IBP clips.
+Where private PV helpers are exported, it also runs actual Apple serialization of all 120 samples through the production
+parser. On 27.3 those helpers are local: the offline audit reports SKIP, and actual target serialization is exercised by
+public VT decode during qualification. `--self-test-public-only` tests the unavailable-export path without creating VT.
+Mandatory demux, manifest, packet timing/hash and public CoreMedia format checks always run. Target use is
 `video-v6 --qualify FIXTURE_DIR`, where the fixture directory is `tests/fixtures/v6` in this package. It requires hardware
 and PV, compares each callback token/OutputPTS/active NV12 hash to independent software truth, checks mid-GOP drain/resume,
 no-output reference decoding, cancel/recreate and retained surfaces. Seven producer credits leave one ACK-overlap credit.
+Named phases stop after the first failed phase and its cleanup; no later hardware phase is attempted.
 `tests/stream_host.cpp` exercises the real HFI parser, ownership ledger, guest deadlines and failure transitions with a
 scripted peer. Host results establish contracts; only tablet results can qualify continuous decode or performance.

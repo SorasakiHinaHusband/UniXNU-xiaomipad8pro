@@ -771,7 +771,10 @@ nonterminal. The next input resumes BITSTREAM and RAW with DRAIN cause. Seek qua
 IDR with a fresh native SID; no old output/reply may enter the next epoch. The V3/V4 PAS/routes/TLB retention contract is kept.
 
 The signed `video-v6` tool and owned fixtures live under `tooling/native/` and `package/PianoVideo/tests/fixtures/v6`.
-Its host self-test runs actual Apple serialization of all samples through the production contract parser. Its single target
+Its self-test checks both clips and, where private PV helpers are exported, actual Apple serialization through the production
+contract parser. The decoded 27.3 helpers are internal and absent from its export trie; an unavailable offline audit reports
+SKIP, while qualification exercises the actual serializer through public VT decode. A public-only self-test covers this
+preflight path without a VT session. Named phases stop after the first failed phase and cleanup. Its single target
 qualification run includes original golden/rejection regressions, 60-frame Main IBP with flags1 and flags9, the IP control,
 closed-GOP drain/resume, DoNotOutput on a reference, retained-surface rehash, cancel/recreate and clean close. Every callback
 is compared by token and OutputPTS with independent software hashes; callback order is not assumed to be display order.

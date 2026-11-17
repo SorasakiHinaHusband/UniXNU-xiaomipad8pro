@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
 // Bounded AVC streaming qualification, never a default decoder registration.
-// --self-test demuxes and audits actual CoreMedia serialization without VT create.
+// --self-test audits CoreMedia and, when exported, the private PV serializer.
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #include <CoreMedia/CMFormatDescriptionBridge.h>
@@ -24,6 +24,7 @@
 namespace {
 namespace contract = pianovideo::vtcontract;
 std::atomic<unsigned> failures{0};
+unsigned serializerAudits=0,serializerSkips=0;
 bool check(const char *stage, bool good, int status = 0) {
   std::printf("video-v6: %s %s status=%d\n",good?"PASS":"FAIL",stage,status);
   if (!good) ++failures;
@@ -135,21 +136,33 @@ std::vector<uint8_t> wire(uint32_t type,uint32_t key,uint32_t kind,const std::ve
   using namespace vtwire;std::vector<uint8_t> m(HeaderBytes+16+value.size());uint8_t uuid[16]={};Writer w(m.data(),uint32_t(m.size()));w.header(type,FlagRequest,uuid,103);
   uint8_t *p=m.data()+HeaderBytes;put32(p,uint32_t(16+value.size()));put32(p+4,cc("para"));put32(p+8,key);put32(p+12,kind);memcpy(p+16,value.data(),value.size());return m;
 }
-bool audit(Clip &clip) {
+bool audit(Clip &clip,bool publicOnly) {
   using namespace vtwire;
   auto fmt=formatWire(clip.format),m=wire(cc("dsta"),cc(",fds"),cc("=fds"),fmt);contract::FormatReport report;pianovideo::avc::Config config;
   if(!check("real-coremedia-format-contract",contract::formatRequest(m.data(),uint32_t(m.size()),report,&config)))return false;
-  // These exported PV entry points invoke Apple's private serializer. The
-  // request, sample timing, count, sizes and data are all Apple's own bytes.
+  // Some hosts export these private helpers; 27.3 keeps them local. Missing
+  // exports only prevent this offline audit. Public VT decode still calls the
+  // real serializer internally, and qualification must check its actual output.
   using Create=OSStatus(*)(uint32_t,uint32_t,const uint8_t*,uint64_t,CMBlockBufferRef*,CFTypeRef*);
   using Append=OSStatus(*)(CFTypeRef,uint32_t,uint32_t,uint32_t,CMSampleBufferRef,void*,CMBlockBufferRef*);
   using Int=OSStatus(*)(CFTypeRef,uint32_t,int64_t);
   using UInt=OSStatus(*)(CFTypeRef,uint32_t,uint32_t);
-  auto create=reinterpret_cast<Create>(dlsym(RTLD_DEFAULT,"VTParavirtualizationCreateMessageAndByteStream"));
-  auto append=reinterpret_cast<Append>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendCMSampleBufferWithLimitAndCopyRemainingData"));
-  auto integer=reinterpret_cast<Int>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendSInt64"));
-  auto flags=reinterpret_cast<UInt>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendUInt32"));
-  if(!check("real-sample-serializer",create&&append&&integer&&flags))return false;
+  auto symbol=[&](const char *name) {
+    void *p=publicOnly?nullptr:dlsym(RTLD_DEFAULT,name);
+    std::printf("video-v6: serializer-symbol clip=%s name=%s available=%u forced-public-only=%u\n",clip.name,name,unsigned(p!=nullptr),unsigned(publicOnly));
+    return p;
+  };
+  auto create=reinterpret_cast<Create>(symbol("VTParavirtualizationCreateMessageAndByteStream"));
+  auto append=reinterpret_cast<Append>(symbol("VTParavirtualizationMessageAppendCMSampleBufferWithLimitAndCopyRemainingData"));
+  auto integer=reinterpret_cast<Int>(symbol("VTParavirtualizationMessageAppendSInt64"));
+  auto flags=reinterpret_cast<UInt>(symbol("VTParavirtualizationMessageAppendUInt32"));
+  if(!create||!append||!integer||!flags) {
+    ++serializerSkips;
+    std::printf("video-v6: SKIP real-sample-serializer clip=%s reason=private-exports-unavailable actual-wire-audited=0 qualification-path=VTDecompressionSessionDecodeFrame\n",clip.name);
+    return true;
+  }
+  ++serializerAudits;
+  check("real-sample-serializer",true);
   bool ok=true;
   for(unsigned i=0;i<clip.samples.size();++i) {
     CMBlockBufferRef b=nullptr,remaining=nullptr;CFTypeRef stream=nullptr;uint8_t uuid[16]={};
@@ -160,7 +173,10 @@ bool audit(Clip &clip) {
     std::vector<uint8_t> request;
     if(!rc&&b&&!remaining){request.resize(CMBlockBufferGetDataLength(b));rc=CMBlockBufferCopyDataBytes(b,0,request.size(),request.data());}
     if(remaining)CFRelease(remaining);if(stream)CFRelease(stream);if(b)CFRelease(b);
-    if(rc||request.empty()){ok=false;continue;}
+    if(rc||request.empty()){
+      std::printf("video-v6: serializer-call-failed clip=%s sample=%u status=%d bytes=%zu\n",clip.name,i,int(rc),request.size());
+      ok=false;continue;
+    }
     contract::InputReport input;const bool accepted=contract::inputRequest(request.data(),uint32_t(request.size()),input,&config);
     if(!accepted)std::printf("video-v6: serializer rejection clip=%s sample=%u decision=%s bytes=%zu\n",clip.name,i,input.decision,request.size());
     ok &= accepted && input.hasToken && input.token==int64_t(0x56360000+i);
@@ -326,19 +342,40 @@ void cancel(Clip &clip,Clip &other,CFDictionaryRef spec) {
   std::printf("video-v6: cancel-joined epoch=20 callbacks=%u remaining-public-callbacks-not-required=%u\n",ctx.callbacks,ctx.inflight);
   stream(clip,other,spec,"recreate-at-idr",21,9,-1,30,60,false);
 }
-int run(NSString *folder,bool qualify) {
-  rejectionContractTest();
-  NSDictionary *m=manifest(folder);if(!m)return 1;Clip ip,ibp;if(!load(folder,m,"ip",ip)||!load(folder,m,"ibp",ibp))return 1;
-  // Qualification also checks its local files/serializer before opening VT.
-  if(!audit(ip)||!audit(ibp))return 1;
-  if(!qualify){std::printf("video-v6: %s self-test failures=%u no-vt-session=1\n",failures?"FAIL":"PASS",failures.load());return failures?1:0;}
-  CFDictionaryRef spec=specification();if(!spec)return 1;std::printf("video-v6: begin pid=%d stamp-us=%llu hardware-required=1 pv-required=1\n",getpid(),(unsigned long long)nowUs());
-  single(spec);stream(ibp,ip,spec,"ibp-async",1,1);stream(ip,ibp,spec,"ip-temporal",2,9);stream(ibp,ip,spec,"ibp-temporal",3,9);stream(ibp,ip,spec,"ibp-no-output",4,9,1);cancel(ibp,ip,spec);CFRelease(spec);
+template<class F> bool phase(const char *name,F action) {
+  std::printf("video-v6: phase-begin name=%s\n",name);
+  const unsigned before=failures.load();
+  if(!action()||failures.load()!=before) {
+    if(failures.load()==before)check("phase-result",false);
+    std::printf("video-v6: STOP first-failed-phase=%s failures=%u later-phases=not-run\n",name,failures.load());
+    return false;
+  }
+  std::printf("video-v6: phase-pass name=%s\n",name);return true;
+}
+int run(NSString *folder,bool qualify,bool publicOnly) {
+  std::printf("video-v6: begin pid=%d stamp-us=%llu hardware-required=%u pv-required=%u\n",getpid(),(unsigned long long)nowUs(),unsigned(qualify),unsigned(qualify));
+  if(!phase("rejection-contract",[]{rejectionContractTest();return true;}))return 1;
+  NSDictionary *m=nil;
+  if(!phase("manifest",[&]{m=manifest(folder);return m!=nil;}))return 1;
+  Clip ip,ibp;
+  if(!phase("demux-ip",[&]{return load(folder,m,"ip",ip);})||!phase("demux-ibp",[&]{return load(folder,m,"ibp",ibp);})||
+     !phase("audit-ip",[&]{return audit(ip,publicOnly);})||!phase("audit-ibp",[&]{return audit(ibp,publicOnly);}))return 1;
+  std::printf("video-v6: preflight-pass actual-wire-audits=%u unavailable-wire-audits=%u mandatory-public-checks=passed\n",serializerAudits,serializerSkips);
+  if(!qualify){std::printf("video-v6: PASS self-test failures=0 no-vt-session=1 actual-wire-audits=%u unavailable-wire-audits=%u\n",serializerAudits,serializerSkips);return 0;}
+  CFDictionaryRef spec=nullptr;
+  if(!phase("decoder-spec",[&]{spec=specification();return spec!=nullptr;}))return 1;
+  const bool ok=phase("single-regression",[&]{single(spec);return true;})&&
+    phase("ibp-async",[&]{return stream(ibp,ip,spec,"ibp-async",1,1);})&&
+    phase("ip-temporal",[&]{return stream(ip,ibp,spec,"ip-temporal",2,9);})&&
+    phase("ibp-temporal",[&]{return stream(ibp,ip,spec,"ibp-temporal",3,9);})&&
+    phase("ibp-no-output",[&]{return stream(ibp,ip,spec,"ibp-no-output",4,9,1);})&&
+    phase("cancel-recreate",[&]{cancel(ibp,ip,spec);return true;});
+  CFRelease(spec);if(!ok)return 1;
   std::printf("video-v6: %s qualification failures=%u bounded-stream-correctness-only=1\n",failures?"FAIL":"PASS",failures.load());return failures?1:0;
 }
 }
 int main(int argc,char **argv) {
   setvbuf(stdout,nullptr,_IOLBF,0);signal(SIGALRM,timeout);alarm(300);
-  if(argc!=3||(strcmp(argv[1],"--self-test")&&strcmp(argv[1],"--qualify"))){std::fprintf(stderr,"usage: video-v6 --self-test|--qualify FIXTURE_DIR\n");return 2;}
-  @autoreleasepool { return run([NSString stringWithUTF8String:argv[2]],!strcmp(argv[1],"--qualify")); }
+  if(argc!=3||(strcmp(argv[1],"--self-test")&&strcmp(argv[1],"--self-test-public-only")&&strcmp(argv[1],"--qualify"))){std::fprintf(stderr,"usage: video-v6 --self-test|--self-test-public-only|--qualify FIXTURE_DIR\n");return 2;}
+  @autoreleasepool { return run([NSString stringWithUTF8String:argv[2]],!strcmp(argv[1],"--qualify"),!strcmp(argv[1],"--self-test-public-only")); }
 }

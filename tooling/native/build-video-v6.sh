@@ -11,4 +11,5 @@ xcrun clang++ -std=c++17 -arch arm64 -mmacosx-version-min=15.0 -O2 -Wall -Wextra
   -framework VideoToolbox -framework IOSurface -o "$O"
 codesign -f -s - "$O"
 "$O" --self-test "$D/package/PianoVideo/tests/fixtures/v6"
+"$O" --self-test-public-only "$D/package/PianoVideo/tests/fixtures/v6"
 printf 'Built %s\n' "$O"
