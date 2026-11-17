@@ -138,12 +138,46 @@ static void close_reopen(void)
     CHECK(deliveries==before+2 && take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==1);
     qcom_glink_poll(&f.g);CHECK(deliveries==before+2 && take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==0);
 }
+static void shared_channel_returns(void)
+{
+    Fixture f;QcomGlinkChannel *channels[3];channels[0]=setup(&f,1,1);
+    const QcomGlinkClient client={NULL,receive};
+    const char *names[2]={"fastrpcglink-apps-dsp","adsp_apps"};
+    for(unsigned i=1;i<3;++i){
+        channels[i]=qcom_glink_channel(&f.g,names[i-1],16,1,f.storage+16*i,&client,NULL,1);
+        CHECK(channels[i]!=NULL);
+        channels[i]->open_sent=channels[i]->open_acked=channels[i]->remote_open=channels[i]->up=1;
+        channels[i]->rcid=(uint16_t)(7+i);channels[i]->local[0].advertised=1;
+    }
+    const unsigned before=deliveries;
+    f.th=sizeof f.tx-24;
+    uint8_t payload[12];put32(payload,4);put32(payload+4,0);memcpy(payload+8,"lux!",4);
+    for(unsigned i=0;i<3;++i)remote(&f,QCOM_GLINK_TX_DATA,channels[i]->rcid,1,payload,sizeof payload);
+    qcom_glink_poll(&f.g);
+    CHECK(deliveries==before+3 && f.g.done_deferred==3 && f.g.retry_pending);
+    for(unsigned i=0;i<3;++i)CHECK(channels[i]->local[0].done_due && channels[i]->local[0].busy);
+    f.tt=f.th;qcom_glink_poll(&f.g);
+    unsigned mask=0,done=0;
+    while(f.tt!=f.th){
+        uint8_t h[8];for(unsigned i=0;i<8;++i)h[i]=f.tx[(f.tt+i)%sizeof f.tx];
+        const uint16_t cid=(uint16_t)(h[2]|h[3]<<8);
+        unsigned slot=3;for(unsigned i=0;i<3;++i)if(channels[i]->lcid==cid)slot=i;
+        CHECK(h[0]==QCOM_GLINK_RX_DONE_W_REUSE && get32(h+4)==1 && slot<3);
+        if(slot<3){CHECK(!(mask&(1u<<slot)));mask|=1u<<slot;}
+        ++done;f.tt=(f.tt+8)%sizeof f.tx;
+    }
+    CHECK(done==3 && mask==7 && f.g.done_retried==3 && deliveries==before+3);
+    for(unsigned i=0;i<3;++i)CHECK(!channels[i]->local[0].done_due && !channels[i]->local[0].busy);
+    qcom_glink_poll(&f.g);
+    CHECK(!f.g.retry_pending && f.tt==f.th && deliveries==before+3);
+}
 int main(void)
 {
     for(int reuse=0;reuse<=1;++reuse)for(int frag=0;frag<=1;++frag)completion(reuse,frag,1);
     intent_grant();
     multiple_returns();
     close_reopen();
+    shared_channel_returns();
     printf("glink_return_host: %u checks, %u failures, %u delivered, %u kicks\n",checks,failures,deliveries,kicks);
     return failures?1:0;
 }
