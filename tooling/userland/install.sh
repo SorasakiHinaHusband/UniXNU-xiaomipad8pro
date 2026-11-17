@@ -178,6 +178,8 @@ while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
   if [ "$MODE" = --check ]; then
     if loaded "$d" "$label"; then say "$label: loaded in $d"
     elif [ "$on" = 1 ] && disabled "$d" "$label"; then say "$label: on in the manifest, turned off by the owner (launchctl disable)"
+    # launchd removes a LaunchOnlyOnce job after its one run of the boot (launchctl print then fails), so "not loaded" is its normal state
+    elif [ "$on" = 1 ] && [ "$(/usr/bin/plutil -extract LaunchOnlyOnce raw -o - "$R$dest" 2>/dev/null)" = true ]; then say "$label: a run-once job (LaunchOnlyOnce): launchd drops it after its run"
     elif [ "$on" = 1 ]; then say "$label: on in the manifest but not loaded in $d"; FAILED=1
     else say "$label: off (launchctl enable $d/$label turns it on)"; fi
     continue
