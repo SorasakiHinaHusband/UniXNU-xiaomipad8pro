@@ -39,6 +39,7 @@ static const struct {uint32_t property; uint8_t pd;} kFields[McaFields] = {
     [McaPdState] = {PIANO_MCA_PD_STATE, 0},
     [McaVerify] = {PIANO_MCA_VERIFY, 0},   /* always: a stuck adapter authentication holds the bus at 5 V (Ubuntu #20) */
     [McaPdos] = {PIANO_MCA_PDOS, 1},
+    [McaLpd] = {PIANO_MCA_LPD_STATUS, 0},
 };
 
 _Static_assert(McaFields <= 32, "PianoMca.valid has one bit per field");
@@ -98,7 +99,7 @@ void piano_mca_link(PianoMca *m, int up)
 
 static int wanted(const PianoMca *m, unsigned field)
 {
-    if (!kFields[field].pd) return 1;
+    if (!kFields[field].pd || m->external) return 1;
     return piano_mca_has(m, McaType) && is_pd(m->value[McaType]);
 }
 
@@ -557,7 +558,7 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         piano_mca_refresh(m);
         return McaNotified;
     }
-    if (type != PIANO_MCA_TYPE_REQUEST || length < 24) {m->ignored++; return McaIgnored;}
+    if (type != PIANO_MCA_TYPE_REQUEST || length != PIANO_MCA_RESPONSE_BYTES) {m->ignored++; return McaIgnored;}
     const uint32_t property = le32(data + 12), retcode = le32(data + 16), seq = le32(data + 20);
     /* the answer to a write the owner's timer gave up on: taken now (the request in flight, if any, has a later sequence) */
     if (m->late_pending && opcode == PIANO_MCA_OP_WRITE && seq == m->late_seq && property == m->late_property &&
@@ -601,14 +602,17 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         m->valid &= ~(1u << field);
     } else if (field == McaPdos) {
         m->pdos = 0;
-        for (unsigned i = 0; i < 7 && 12 * (i + 1) <= have; ++i) {
+        int good = have >= 7 * 12;
+        for (unsigned i = 0; good && i < 7; ++i) {
             const uint32_t lo = le32(payload + 12 * i), hi = le32(payload + 12 * i + 4), ma = le32(payload + 12 * i + 8);
-            if (!hi) break;
+            if (!lo && !hi && !ma) break;
+            if (lo < 3300 || hi < lo || hi > 21000 || !ma || ma > 5000) {good = 0; break;}
             m->pdo[m->pdos][0] = lo; m->pdo[m->pdos][1] = hi; m->pdo[m->pdos][2] = ma;
             m->pdos++;
         }
-        m->value[field] = m->pdos;
-        m->valid |= 1u << field;
+        m->value[field] = good ? m->pdos : 0;
+        if (good) m->valid |= 1u << field;
+        else {m->pdos = 0; m->valid &= ~(1u << field); m->errors++;}
     } else if (have >= (one_byte(field) ? 1u : 4u)) {
         m->value[field] = one_byte(field) ? payload[0] : (int32_t)le32(payload);
         m->valid |= 1u << field;
@@ -652,6 +656,6 @@ const char *piano_mca_property_name(uint32_t property)
 const char *piano_mca_type_name(int type)
 {
     static const char *const names[] = {"unknown", "SDP", "CDP", "DCP", "float", "HVDCP", "HVDCP3", "HVDCP3B", "HVDCP3.5", "Type-C",
-                                        "PD", "PD (verified)", "PD PPS", "13", "ACA", "DCP"};
+                                        "PD", "PD PPS", "PD (verified)", "13", "ACA", "DCP"};
     return type >= 0 && type < (int)(sizeof names / sizeof names[0]) ? names[type] : "other";
 }

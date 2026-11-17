@@ -86,6 +86,7 @@ extern "C" {
 #define PIANO_MCA_BUS_CURRENT 0x20004u    /* uA */
 #define PIANO_MCA_REAL_TYPE 0x2000cu      /* the charger type the firmware detected (PIANO_MCA_TYPE_*) */
 #define PIANO_MCA_VERIFY 0x21002u         /* non-zero while a charger authentication runs */
+#define PIANO_MCA_LPD_STATUS 0x2000au /* read-only u32: zero dry, nonzero wet */
 #define PIANO_MCA_PDOS 0x21011u           /* up to 7 x {min mV, max mV, max mA} */
 #define PIANO_MCA_PPS 0x21017u            /* ask a PPS source for an APDO voltage: (mV / 20) << 16 | mA / 50 (external policy, hv 2) */
 #define PIANO_MCA_PD_FIXED 0x21018u       /* ask the source for a fixed PDO, mV */
@@ -94,7 +95,7 @@ extern "C" {
 enum {
     PIANO_MCA_TYPE_UNKNOWN = 0, PIANO_MCA_TYPE_SDP = 1, PIANO_MCA_TYPE_CDP = 2, PIANO_MCA_TYPE_DCP = 3, PIANO_MCA_TYPE_FLOAT = 4,
     PIANO_MCA_TYPE_HVDCP = 5, PIANO_MCA_TYPE_HVDCP_3 = 6, PIANO_MCA_TYPE_HVDCP_3_B = 7, PIANO_MCA_TYPE_HVDCP_3P5 = 8,
-    PIANO_MCA_TYPE_C = 9, PIANO_MCA_TYPE_PD = 10, PIANO_MCA_TYPE_PD_VERIFY = 11, PIANO_MCA_TYPE_PD_PPS = 12, PIANO_MCA_TYPE_ACA = 14,
+    PIANO_MCA_TYPE_C = 9, PIANO_MCA_TYPE_PD = 10, PIANO_MCA_TYPE_PD_PPS = 11, PIANO_MCA_TYPE_PD_VERIFY = 12, PIANO_MCA_TYPE_ACA = 14,
     PIANO_MCA_TYPE_DCP_B = 15,
 };
 
@@ -112,7 +113,7 @@ enum {
 enum {
     McaBusVoltage, McaBusCurrent, McaType, McaIcl, McaTbat, McaChargeEnable, McaStatus, McaPackVoltage, McaPackCurrent,
     McaInputSuspend, McaAiclEnable, McaAiclStatus, McaOtgBoost, McaOtgGate, McaTypecMode, McaSnkSrc, McaUsbType, McaTermVolt,
-    McaCpState, McaOtgCfg, McaCidCfg, McaOtgPlugin, McaCcToggle, McaDataRole, McaPdState, McaVerify, McaPdos, McaFields
+    McaCpState, McaOtgCfg, McaCidCfg, McaOtgPlugin, McaCcToggle, McaDataRole, McaPdState, McaVerify, McaPdos, McaLpd, McaFields
 };
 
 /* receive results */

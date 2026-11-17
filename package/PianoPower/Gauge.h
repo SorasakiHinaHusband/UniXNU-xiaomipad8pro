@@ -76,10 +76,23 @@ class I2cBus {
     return r;
   }
 
+  // Read-only standard byte register (SC8541 CTRL2; bq27z561 SOA/ISC).
+  // The command pointer is the sole write, followed by one NACKed data byte.
+  I2cResult readRegisterByte(uint8_t address, uint8_t command, uint8_t *value)
+  {
+    if ((!io_.readSda(io_.ctx) || !io_.readScl(io_.ctx)) && !recover()) return I2cResult::busBusy;
+    uint16_t word = 0;
+    const I2cResult r = transfer(address, command, &word, true);
+    stop();
+    io_.delayUs(io_.ctx, kBusFreeUs);
+    if (r == I2cResult::ok) *value = uint8_t(word);
+    return r;
+  }
+
  private:
   const I2cIo io_;
 
-  I2cResult transfer(uint8_t address, uint8_t command, uint16_t *value)
+  I2cResult transfer(uint8_t address, uint8_t command, uint16_t *value, bool byteOnly = false)
   {
     I2cResult r = I2cResult::ok;
     uint8_t lo = 0, hi = 0;
@@ -88,7 +101,8 @@ class I2cBus {
     if (!writeByte(command, &r)) return r != I2cResult::ok ? r : I2cResult::nackData;
     if (!start()) return I2cResult::busBusy;   // repeated START
     if (!writeByte(uint8_t(address << 1 | 1), &r)) return r != I2cResult::ok ? r : I2cResult::nackAddress;
-    if (!readByte(&lo, true, &r) || !readByte(&hi, false, &r)) return r;
+    if (!readByte(&lo, !byteOnly, &r)) return r;
+    if (!byteOnly && !readByte(&hi, false, &r)) return r;
     *value = uint16_t(lo | hi << 8);
     return I2cResult::ok;
   }
