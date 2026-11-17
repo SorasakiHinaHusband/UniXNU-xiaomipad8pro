@@ -395,6 +395,24 @@ console) and one after, so a call that does not return is the last line.
 
 ### 12.3 V3: the streams' own SMMU bank and the HFI handshake (`piano-video=4`)
 
+**V3 evidence transaction (vid-v3a, awaiting tablet verification).** Level 4 keeps the `vid-v2c5` power/PAS contract, with ten
+resume/ping/collapse cycles and final unload by default; levels 2/3 retain their defaults. Explicit `piano-video-resumes=0
+piano-video-unload=0` keeps the earlier steady state. The transaction adds no IRQ handler or IRQ-clear writes. The plan is
+rechecked immediately before apply; a changed group, bank or competing SID route is refused before writing. This is a conflict
+check, not a cross-kext atomic reservation: combined images must still ensure other bank allocators have finished.
+
+The `V3 bank` lines record plan/apply/release routes and SCTLR/CBAR/CBA2R/TCR/TCR2/TTBR0/MAIR. `V3 memory` records physical page
+ends, the 1024-page software walk and scratch aliases; `V3 layout` records the table, all three queue headers and SFR bounds.
+`CTRL_STATUS sample/final` records actual reads and elapsed microseconds (at most 1001 reads / 100 ms of requested delay).
+`V3 TX/RX` records headers, packet fields and queue indices before parsing; `V3 doorbell` counts every event independently of
+the deduplicated MMIO log. `V3 wait`, `DBG summary`, core/fault/SFR snapshots distinguish INIT-only, missing version, malformed
+messages, command consumption, watchdog and translation faults. A missing response does not establish whether the CPU was released.
+
+`V3 first-HFI PASS` requires INIT success, version and consumed commands, with no bank fault or watchdog. Subsequent PC/WFI
+and every resume ping have their own result. `V3 teardown` reports PAS, power and SMMU outcomes; failed shutdown, power-off or
+TLB restoration cannot produce an unloaded/ok summary. Failed stages snapshot readable MMIO and shared memory before teardown.
+The traces are evidence hooks; only a tablet result can establish DMA reachability, HFI readiness or decoding support.
+
 **The bank.** Plan (reads only): stage 1 with 4 KiB AArch64 tables (IDR0/IDR2), no extended stream IDs (sCR0.EXIDENABLE), the
 geometry, an output size reaching XNU's RAM; refused if any valid group covers 0x1940 or 0x1947 (level 1 lists it: never
 replaced); the two highest free groups (other kexts take the lowest); the first bank from banks − 2 down that no valid group
@@ -414,7 +432,7 @@ write index and before the doorbell): the 456-byte queue table (version 0, size 
 `iris-hfi-queues`), three 1 MiB queues from +456 (headers: status 1, start IOVA, type q | 0x0101 << 16, size in words, variable
 packets, watermarks 1, rx_req 1 except the debug queue), the SFR at +0x301000 (its size word 4096). Boot words (Linux's order):
 UC_REGION_ADDR = QTBL_ADDR = 0x80000000, UC_REGION_SIZE 4 MiB, QTBL_INFO 1, SFR_ADDR = SFR + 1 (VIDEO_ARCH_LX), WRAPPER_SPARE_0 1,
-CTRL_INIT 1, SCIACMDARG3 1; CTRL_STATUS polled [1000 × 100 µs] until non-zero: init done without an error code, else refused
+CTRL_INIT 1, SCIACMDARG3 1; CTRL_STATUS polled [100 ms, 100 µs between reads] until non-zero: init done without an error code, else refused
 (0x4: the UC region); H2XSOFTINTEN 1, X2RPMH 0; MVS0 GDSC to hardware mode.
 
 **The handshake**: SYS_INIT (320 bytes: INIT with HFI_VIDEO_ARCH_LX and flags response | interrupt | non-discardable, then

@@ -1278,6 +1278,7 @@ static void testV2()
   CHECK(m.logged("the pinned vpu35_4v.mbn"));
   CHECK(m.logged("3 loadable, hash at 4, relocatable, span 0x101000 at 0xf500000"));
   CHECK(std::strstr(x.b->rep.summary, "V2 ok: 3/3 cycles"));
+  CHECK(!m.logged("V3 ") && m.dmaAllocs == 0 && m.fw.boots == 0);
 }
 
 static void testV2CpuLpiTimeoutCleanup()
@@ -1384,6 +1385,57 @@ static void testV3()
   CHECK(m.count("smr valid 6464") == 1 && m.count("smr valid 6471") == 1);
   CHECK(std::strstr(x.b->rep.summary, "V3 ok: firmware video-firmware.vpu35.model     x;"));
   CHECK(std::strstr(x.b->rep.summary, "collapse/resume 10/10"));
+  CHECK(m.logged("V3 memory: walk 1024/1024 ok"));
+  CHECK(m.logged("V3 first-HFI PASS: INIT success version received cmd-consumed 113 doorbells 3"));
+  CHECK(m.logged("V3 TX 1 packet 0 size 36 type 01000001 flags 00000007"));
+  CHECK(m.logged("V3 RX 1 packet 0 size 32 type 01000001 flags 00000001"));
+  CHECK(m.logged("V3 evidence complete: first-HFI PASS resumes 10/10 collapses 11 teardown 0 watchdog 0 fsr 00000000"));
+  CHECK(x.b->txEvents == x.b->doorbells && x.b->teardownRc == kOk);
+}
+
+static void testV3EvidenceFailures()
+{
+  // Do not turn INIT-only into "CPU never started", or discard the partial evidence on a version timeout.
+  {
+    Run x(4);
+    x.m->f.fwNoVersion = true;
+    CHECK(x.go() == kErrHfiTimeout);
+    CHECK(x.m->logged("V3 INIT success elapsed") && x.m->logged("init 1 init-failed 0 version 0"));
+    CHECK(x.m->logged("V3 version error -20 stage 48 received 0"));
+    CHECK(x.m->logged("V3 teardown result 0 PAS 0 power 0 smmu 1 dma-held 0"));
+    CHECK(!x.b->firstHfi);
+  }
+  // A failed final shutdown or TLB sync must not produce an unloaded/ok verdict.
+  for (unsigned kind = 0; kind < 3; ++kind) {
+    Run x(4);
+    uint32_t dbBytes = 0;
+    const uint8_t *db = x.m->cmdDb(&dbBytes);
+    x.b->res = rpmh::resources(db, dbBytes);
+    CHECK(x.b->smmuSetup() == kOk && x.b->on() == kOk && x.b->firmware.load() == kOk);
+    if (kind == 0) x.m->f.scmFail = "shutdown";
+    if (kind == 1) x.m->f.tlbStuck = true;
+    if (kind == 2) x.m->R(kIris + kWrapperIntrStatus) = 8;
+    CHECK(x.b->teardown() == (kind == 0 ? kErrScm : kind == 1 ? kErrSmmu : kErrWatchdog));
+    CHECK(x.m->dmaFrees == 1 && x.m->allOff());
+    quiet(*x.m, "V3 teardown evidence");
+  }
+  // An intervening group or bank owner is refused before apply's first MMIO write.
+  for (unsigned kind = 0; kind < 4; ++kind) {
+    Run x(4);
+    const vsmmu::Plan p = vsmmu::plan([&](uint32_t off) { return x.m->rd(kSmmu + off); });
+    CHECK(!p.error);
+    if (kind == 0) x.m->R(kSmmu + vsmmu::smrOffset(p.group[0])) = 0x80000abc;
+    if (kind == 1) x.m->R(kSmmu + p.cb() + vsmmu::kSctlr) = 1;
+    if (kind >= 2) {
+      x.m->R(kSmmu + vsmmu::smrOffset(50)) = kind == 2 ? 0x80000abc : 0x80001940;
+      x.m->R(kSmmu + vsmmu::s2crOffset(50)) = p.bank;
+    }
+    const auto before = x.m->snapshotSmmu();
+    vsmmu::Routed done;
+    CHECK(vsmmu::apply(p, 0x880000000ull, x.b->ops, done) != nullptr);
+    CHECK(!done.bank && !done.group[0] && !done.group[1] && x.m->writes == 0);
+    CHECK(x.m->snapshotSmmu() == before);
+  }
 }
 
 static void testV3SteadyState()
@@ -1717,6 +1769,7 @@ int main()
   testV2Refusals();
   testV2ScmFailures();
   testV3();
+  testV3EvidenceFailures();
   testV3SteadyState();
   testV3Failures();
   testV3SepFault();

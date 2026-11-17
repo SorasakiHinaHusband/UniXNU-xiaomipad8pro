@@ -1,7 +1,8 @@
 # PianoVideo
 
 piano's video core for native macOS 27: the SM8750 Iris (VPU 3.5) that decodes H.264, HEVC and VP9 and encodes H.264 and HEVC in
-hardware. **Levels 1-4** (the ladder's V0-V3 of `docs/drivers/video.md`), built and host-tested; none has run on the tablet yet. **V0b is built, not yet run:** `piano-video-vt=1` publishes the VideoToolbox paravirtual service with a capability-only stub backend. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
+hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 HFI remains unverified on the tablet**.
+`piano-video-vt=1` publishes the VideoToolbox paravirtual service with a capability-only stub backend. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core
   clock's RCG and dividers with the rate and the OPP it matches, both GDSCs, every branch); the core's controller registers
@@ -16,7 +17,10 @@ hardware. **Levels 1-4** (the ladder's V0-V3 of `docs/drivers/video.md`), built 
   hold of the kernel-wide secure-call lock, PAS shutdown before the power-off.
 - `piano-video=4` (V3): + the streams' own SMMU bank and the UC region, the boot words and the HFI handshake (SYS_INIT,
   IMAGE_VERSION, the version string), collapse 1.5 s after the last activity with the firmware kept, resume/collapse cycles
-  (`piano-video-resumes`), `piano-video-unload=1` to end with PAS shutdown and the bank released.
+  (`piano-video-resumes`, default 10), PAS shutdown and the bank released (`piano-video-unload`, default 1).
+  V3 records the bank's readbacks, all queue layouts, CTRL_STATUS samples and elapsed time, each TX/RX and doorbell, separate
+  INIT/version results, PC/resume cycles, faults/watchdog/SFR, and teardown results. `piano-video-resumes=0 piano-video-unload=0`
+  explicitly selects the earlier collapsed steady state. V2's defaults and power/PAS sequence are unchanged.
 
 Levels 2-4 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
 every wait is bounded, any failure powers everything down, and nothing is written below `piano-video=2`. Design, decisions, the

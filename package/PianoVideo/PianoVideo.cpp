@@ -96,8 +96,8 @@ void readArgs()
   if (!gArgs.cycles) gArgs.cycles = 1;
   gArgs.holdMs = clampArg("piano-video-hold-ms", 50, 60000);
   gArgs.idleMs = clampArg("piano-video-idle-ms", kIdleCollapseMs, 600000);
-  gArgs.resumes = clampArg("piano-video-resumes", 0, 1000);
-  gArgs.unload = bootArg("piano-video-unload", 0) ? 1 : 0;
+  gArgs.resumes = clampArg("piano-video-resumes", gArgs.level == 4 ? 10 : 0, 1000);
+  gArgs.unload = bootArg("piano-video-unload", gArgs.level == 4 ? 1 : 0) ? 1 : 0;
   gArgs.stop = clampArg("piano-video-stop", 0, kStepDone);
   const uint32_t requestedFloor = clampArg("piano-video-mmcx-floor", kMmcxDisplayFloor, 0x1000);
   // Until a native display voter exists, V1 must not lower the boot framebuffer's MMCX rail.

@@ -287,10 +287,11 @@ inline void sfrText(const Mem &m, char *line, uint32_t cap)
 
 // --------------------------------------------------------------------------------------------------------- the boot words
 // iris_vpu_setup_ucregion_memory_map + iris_vpu35_vpu4x_program_bootup_registers + iris_vpu_boot_firmware. 0, kErrBoot with
-// *status = CTRL_STATUS (an error code, or 0 after 1000 polls).
+// *status = CTRL_STATUS. Preserve the bounded poll and acceptance rule; report actual reads/time, including the first value.
 template <class O>
 int boot(O &ops, uint32_t iova, uint32_t *status)
 {
+  const uint64_t start = ops.hw.nowUs();
   ops.wr(kIris + kUcRegionAddr, iova, "UC_REGION_ADDR: the queue table");
   ops.wr(kIris + kUcRegionSize, kUcRegionBytes, "UC_REGION_SIZE: 4 MiB");
   ops.wr(kIris + kQtblAddr, iova, "QTBL_ADDR");
@@ -299,12 +300,28 @@ int boot(O &ops, uint32_t iova, uint32_t *status)
   ops.wr(kIris + kWrapperSpare0, 1, "WRAPPER_SPARE_0: 1 (VPU 3.5 boot)");
   ops.wr(kIris + kCtrlInit, 1, "CTRL_INIT: start the HFI");
   ops.wr(kIris + kSciaCmdArg3, 1, "SCIACMDARG3: 1");
+  ops.hw.note("hfi: boot readback uc %08x size %08x qtbl %08x info %08x sfr %08x spare0 %08x init %08x arg3 %08x",
+              ops.rd(kIris + kUcRegionAddr), ops.rd(kIris + kUcRegionSize), ops.rd(kIris + kQtblAddr), ops.rd(kIris + kQtblInfo),
+              ops.rd(kIris + kSfrAddr), ops.rd(kIris + kWrapperSpare0), ops.rd(kIris + kCtrlInit), ops.rd(kIris + kSciaCmdArg3));
   uint32_t v = 0;
-  const bool answered = ops.pollFor(kIris + kCtrlStatus, [](uint32_t s) { return s != 0; }, kBootPolls * kBootPollUs, kBootPollUs, &v);
+  unsigned reads = 0;
+  uint32_t previous = 0;
+  const uint64_t pollStart = ops.hw.nowUs();
+  const bool answered = ops.pollFor(kIris + kCtrlStatus, [&](uint32_t s) {
+    ++reads;
+    if (reads == 1 || s != previous)
+      ops.hw.note("hfi: CTRL_STATUS sample %u value %08x elapsed %llu us", reads, s, (unsigned long long)(ops.hw.nowUs() - pollStart));
+    previous = s;
+    return s != 0;
+  }, kBootPolls * kBootPollUs, kBootPollUs, &v);
   *status = v;
+  ops.hw.note("hfi: CTRL_STATUS final %08x answered %u init %u error %#x reads %u poll-us %llu boot-us %llu", v, unsigned(answered),
+              unsigned((v & kCtrlStatusInitDone) != 0), v & kCtrlStatusErrorMask, reads,
+              (unsigned long long)(ops.hw.nowUs() - pollStart), (unsigned long long)(ops.hw.nowUs() - start));
   if (!answered || (v & kCtrlStatusErrorMask) || !(v & kCtrlStatusInitDone)) return kErrBoot;
   ops.wr(kIris + kH2xSoftIntEn, kH2xEnable, "H2XSOFTINTEN: host-to-firmware interrupt on");
   ops.wr(kIris + kX2Rpmh, 0, "X2RPMH: unmasked");
+  ops.hw.note("hfi: doorbell enable readback h2x %08x x2rpmh %08x", ops.rd(kIris + kH2xSoftIntEn), ops.rd(kIris + kX2Rpmh));
   return kOk;
 }
 

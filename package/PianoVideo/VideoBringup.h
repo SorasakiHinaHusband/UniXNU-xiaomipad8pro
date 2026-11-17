@@ -96,6 +96,75 @@ class Bringup {
   IdleClock idle;
   Report rep;
   Options opt;
+  unsigned doorbells = 0, txEvents = 0, rxEvents = 0, dbgChecks = 0, dbgErrors = 0, msgDrops = 0, watchdogSamples = 0;
+  uint32_t watchdogSeen = 0;
+  int teardownRc = kOk;
+  bool firstHfi = false;
+
+  // V3 evidence is independent of the deduplicated MMIO write log. No IRQ-clear or new power/PAS sequence here.
+  void bankTrace(const char *when)
+  {
+    if (plan.error || plan.bank == ~0u) return;
+    const uint64_t cb = kSmmu + plan.cb();
+    for (unsigned k = 0; k < 2; ++k)
+      hw.note("V3 bank %s group %u sid %#x smr %08x s2cr %08x", when, plan.group[k], vsmmu::kStreams[k],
+              ops.rd(kSmmu + vsmmu::smrOffset(plan.group[k])), ops.rd(kSmmu + vsmmu::s2crOffset(plan.group[k])));
+    hw.note("V3 bank %s bank %u sctlr %08x cbar %08x cba2r %08x tcr %08x tcr2 %08x ttbr0 %08x%08x mair %08x/%08x", when,
+            plan.bank, ops.rd(cb + vsmmu::kSctlr), ops.rd(kSmmu + vsmmu::cbarOffset(plan.bank)),
+            ops.rd(kSmmu + vsmmu::cba2rOffset(plan.bank)), ops.rd(cb + vsmmu::kTcr), ops.rd(cb + vsmmu::kTcr2),
+            ops.rd(cb + vsmmu::kTtbr0Hi), ops.rd(cb + vsmmu::kTtbr0Lo), ops.rd(cb + vsmmu::kMair0), ops.rd(cb + vsmmu::kMair1));
+  }
+  void queueTrace(const char *when)
+  {
+    if (!mem.uc) return;
+    hw.barrier();
+    for (unsigned q = 0; q < hfi::kNumQ; ++q) {
+      const uint32_t h = hfi::qhdr(q);
+      hw.note("V3 queue %s q%u read %u write %u drop %u rxreq %u txreq %u", when, q, mem.ld(h + hfi::kQRead),
+              mem.ld(h + hfi::kQWrite), mem.ld(h + hfi::kQDrop), mem.ld(h + hfi::kQRxReq), mem.ld(h + hfi::kQTxReq));
+    }
+  }
+  void coreTrace(const char *when)
+  {
+    if (!power.controllerReadable()) {
+      hw.note("V3 core %s: MMIO skipped (controller not readable)", when);
+      return;
+    }
+    const uint32_t irq = ops.rd(kIris + kWrapperIntrStatus);
+    watchdogSeen |= irq & (1u << 3);
+    ++watchdogSamples;
+    hw.note("V3 core %s us %llu ctrl %08x tz %08x irq %08x mask %08x watchdog %u cpu-noc %08x/%08x video-noc %08x/%08x", when,
+            (unsigned long long)hw.nowUs(), ops.rd(kIris + kCtrlStatus), ops.rd(kIris + kTzCpuStatus), irq,
+            ops.rd(kIris + kWrapperIntrMask), unsigned(watchdogSeen != 0), ops.rd(kIris + kCpuNocLpiCtl),
+            ops.rd(kIris + kCpuNocLpiStatus), ops.rd(kIris + kAonVideoCtlNocLpiCtl), ops.rd(kIris + kAonVideoCtlNocLpiStatus));
+  }
+  void sfrTrace(const char *when)
+  {
+    if (!mem.uc) return;
+    char sfr[160];
+    hw.barrier();
+    hfi::sfrText(mem, sfr, sizeof sfr);
+    hw.note("V3 SFR %s size %u text [%s]", when, mem.ld(kSfrOffset), sfr);
+  }
+  // Bounds checked before indexing even for a malformed RX; called before the response parser.
+  void packetTrace(const char *direction, unsigned seq, const uint32_t *buf, uint32_t bytes)
+  {
+    if (bytes < kHfiHeaderBytes) {
+      hw.note("V3 %s %u short header bytes %u word0 %08x", direction, seq, bytes, bytes >= 4 ? buf[0] : 0);
+      return;
+    }
+    hw.note("V3 %s %u header bytes %u size %u session %u id %u reserved %08x/%08x/%08x/%08x packets %u", direction, seq, bytes,
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    uint32_t at = kHfiHeaderBytes;
+    for (unsigned p = 0; p < buf[7] && at <= bytes && bytes - at >= kHfiPacketBytes; ++p) {
+      const uint32_t *w = buf + at / 4, size = w[0];
+      const bool valid = size >= kHfiPacketBytes && !(size & 3) && size <= bytes - at;
+      hw.note("V3 %s %u packet %u size %u type %08x flags %08x payload %u port %u id %u reserved %08x/%08x valid %u payload0 %08x",
+              direction, seq, p, size, w[1], w[2], w[3], w[4], w[5], w[6], w[7], unsigned(valid), valid && size > kHfiPacketBytes ? w[8] : 0);
+      if (!valid) break;
+      at += size;
+    }
+  }
 
   // ------------------------------------------------------------------------------------------------------------------- run
   int run(const Options &o)
@@ -302,30 +371,51 @@ class Bringup {
 
   // ----------------------------------------------------------------------------------------------------------------- V3
   // Everything down: PAS shutdown while powered, the power-off, the bank and its memory.
-  void teardown()
+  int teardown()
   {
-    if ((fst.loaded || fst.initDone) && pst.on) firmware.unload();
-    else if (fst.loaded) hw.note("teardown: the core is collapsed: PAS 9 is left to the next boot (no shutdown without power)");
-    off();
+    coreTrace("before-teardown");
+    queueTrace("before-teardown");
+    sfrTrace("before-teardown");
+    int faultRc = routed.bank ? checkFault() : kOk;
+    int un = kOk;
+    if ((fst.loaded || fst.initDone) && pst.on) un = firmware.unload();
+    else if (fst.loaded || fst.initDone) {
+      hw.note("teardown: the core is collapsed: PAS 9 is left to the next boot (no shutdown without power)");
+      un = kErrScm;
+    }
+    hw.note("V3 teardown PAS result %d loaded %u init %u", un, unsigned(fst.loaded), unsigned(fst.initDone));
+    const int offRc = off();
+    hw.note("V3 teardown power result %d warnings %u rails %u bus %u controller %u codec %u", offRc, pst.offWarnings,
+            unsigned(pst.railsUp), unsigned(pst.busOn), unsigned(pst.ctrlGdsc), unsigned(pst.codecGdsc));
+    bool tlb = true;
     if (routed.bank || routed.group[0] || routed.group[1]) {
+      if (checkFault()) faultRc = kErrFault;
       hw.stage(kStepSmmuTeardown, "the video streams released, the bank back as found");
-      if (!vsmmu::teardown(plan, ops, routed)) hw.note("teardown: an SMMU TLB sync did not finish");
+      tlb = vsmmu::teardown(plan, ops, routed);
+      bankTrace("released");
     }
     if (dmaHeld) {
       hw.dmaFree(dma);
       dmaHeld = false;
+      mem.uc = nullptr;
     }
+    teardownRc = un ? un : offRc ? offRc : !tlb ? kErrSmmu : faultRc ? faultRc : watchdogSeen ? kErrWatchdog : kOk;
+    hw.note("V3 teardown result %d PAS %d power %d smmu %u dma-held %u watchdog %u samples %u", teardownRc, un, offRc,
+            unsigned(tlb), unsigned(dmaHeld), unsigned(watchdogSeen != 0), watchdogSamples);
+    return teardownRc;
   }
   int v3fail(int stepNo, int rc)
   {
     failureRaw(stepNo, rc);
-    char sfr[96];
-    if (mem.uc && pst.on) {
-      hfi::sfrText(mem, sfr, sizeof sfr);
-      if (sfr[0]) hw.note("hfi: SFR: %s", sfr);
-    }
+    coreTrace("failure");
+    queueTrace("failure");
+    bankTrace("failure");
+    sfrTrace("failure");
     if (routed.bank) checkFault();   // a fault on the video bank says why the firmware did not answer
     hw.note("V3: %s at step %d: powering everything down", errorName(rc), stepNo);
+    hw.note("V3 evidence: first-HFI %s version %u teardown pending; error %d step %d", firstHfi ? "passed" : "not passed",
+            unsigned(rep.version), rc, stepNo);
+    hw.note("V3 version error %d stage %d received %u (see CTRL/RX/SFR evidence)", rc, stepNo, unsigned(rep.version));
     teardown();
     return fail(stepNo, rc);
   }
@@ -344,6 +434,7 @@ class Bringup {
             plan.idr1, plan.idr2, plan.scr0, plan.groups, plan.freeGroups, plan.banks, int(plan.group[0]), int(plan.group[1]),
             int(plan.bank), plan.pasize, plan.error ? ": " : "", plan.error ? plan.error : "");
     if (plan.error) return smmuFail(kStepSmmuPlan, kErrSmmu);
+    bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
     if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
     dmaHeld = true;
@@ -363,26 +454,56 @@ class Bringup {
     }
     hw.note("smmu: table at %#llx maps IOVA %#x + %#x (%u pages of the UC region, the rest on scratch %#llx)",
             (unsigned long long)tables.pa, kIovaBase, kUcRegionBytes, vsmmu::kUcPages, (unsigned long long)dma.scratch);
+    hw.note("V3 memory: walk %u/%u ok UC physical first %#llx last %#llx table [%#llx,%#llx) scratch %#llx alias [%#x,%#x)",
+            vsmmu::kWindowPages, vsmmu::kWindowPages, (unsigned long long)dma.pages[0],
+            (unsigned long long)dma.pages[vsmmu::kUcPages - 1], (unsigned long long)tables.pa,
+            (unsigned long long)(tables.pa + vsmmu::kTablePages * 4096), (unsigned long long)dma.scratch,
+            kIovaBase + kUcBytes, kIovaBase + kUcRegionBytes);
     if (opt.stop == kStepSmmuTables) return smmuFail(kStepSmmuTables, kErrStopped);
     hw.stage(kStepSmmuRoute, "SMMU: the bank, then the two streams through it");
+    bankTrace("before-apply");
     if (const char *why = vsmmu::apply(plan, tables.pa, ops, routed)) {
       hw.note("smmu: %s", why);
       return smmuFail(kStepSmmuRoute, kErrSmmu);
     }
+    bankTrace("applied");
+    if (checkFault()) return smmuFail(kStepSmmuRoute, kErrFault);
     if (opt.stop == kStepSmmuRoute) return smmuFail(kStepSmmuRoute, kErrStopped);
     hw.stage(kStepQueues, "the queue table, three queues and the SFR");
     mem.uc = dma.uc;
     mem.iova = kIovaBase;
     hfi::initQueues(mem);
     hw.barrier();
+    hw.note("V3 layout: version %u table %u qhdr0 %u qhdr-size %u queues %u active %u cookie %08x%08x name iris-hfi-queues",
+            mem.ld(hfi::kTblVersion), mem.ld(hfi::kTblSize), mem.ld(hfi::kTblQhdr0Offset), mem.ld(hfi::kTblQhdrSize),
+            mem.ld(hfi::kTblNumQ), mem.ld(hfi::kTblNumActiveQ), mem.ld(hfi::kTblDeviceAddr + 4), mem.ld(hfi::kTblDeviceAddr));
+    for (unsigned q = 0; q < hfi::kNumQ; ++q) {
+      const uint32_t h = hfi::qhdr(q);
+      hw.note("V3 layout: q%u [%#x,%#x) status %u type %08x size-words %u packet %u drop %u wm %u/%u req %u/%u irq %u/%u read %u write %u",
+              q, mem.ld(h + hfi::kQStart), mem.ld(h + hfi::kQStart) + kHfiQueueBytes, mem.ld(h + hfi::kQStatus), mem.ld(h + hfi::kQType),
+              mem.ld(h + hfi::kQSize), mem.ld(h + hfi::kQPktSize), mem.ld(h + hfi::kQDrop), mem.ld(h + hfi::kQRxWm), mem.ld(h + hfi::kQTxWm),
+              mem.ld(h + hfi::kQRxReq), mem.ld(h + hfi::kQTxReq), mem.ld(h + hfi::kQRxIrq), mem.ld(h + hfi::kQTxIrq),
+              mem.ld(h + hfi::kQRead), mem.ld(h + hfi::kQWrite));
+    }
+    hw.note("V3 layout: SFR [%#x,%#x) size %u valid-pages %u padding-alias-pages %u", kIovaBase + kSfrOffset,
+            kIovaBase + kSfrOffset + kSfrBytes, mem.ld(kSfrOffset), vsmmu::kUcPages, vsmmu::kWindowPages - vsmmu::kUcPages);
     return kOk;
   }
 
-  void ring() { ops.wr(kIris + kCpuIcSoftInt, kSoftIntH2a, "IC_SOFTINT: doorbell"); }
+  void ring()
+  {
+    ops.wr(kIris + kCpuIcSoftInt, kSoftIntH2a, "IC_SOFTINT: doorbell");
+    hw.note("V3 doorbell %u tx %u cmd read %u write %u", ++doorbells, txEvents,
+            mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead), mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQWrite));
+  }
   int send(uint32_t bytes, const char *what)
   {
+    const unsigned seq = ++txEvents;
+    const uint32_t h = hfi::qhdr(hfi::kCmdq), beforeR = mem.ld(h + hfi::kQRead), beforeW = mem.ld(h + hfi::kQWrite);
+    packetTrace("TX", seq, tx, bytes);
     const int rc = hfi::write(mem, hfi::kCmdq, tx, bytes, [this] { hw.barrier(); });
     hw.note("hfi: %s: %u bytes, header %u, %u packet(s)%s", what, bytes, tx[2], tx[7], rc ? ": the command queue has no room" : "");
+    hw.note("V3 TX %u %s result %d cmd read %u->%u write %u->%u", seq, what, rc, beforeR, mem.ld(h + hfi::kQRead), beforeW, mem.ld(h + hfi::kQWrite));
     if (rc) return kErrHfi;
     ring();
     return kOk;
@@ -392,48 +513,79 @@ class Bringup {
     uint32_t bytes = 0;
     char line[120];
     for (unsigned n = 0; n < 64; ++n) {
+      ++dbgChecks;
       const int rc = hfi::read(mem, hfi::kDbgq, rx, sizeof rx, &bytes, [this] { hw.barrier(); });
       if (rc == 1) return;
-      if (rc || !hfi::debugText(rx, bytes, line, sizeof line)) continue;
+      hw.note("V3 DBG read result %d bytes %u size %u level %08x", rc, bytes, bytes >= 4 ? rx[0] : 0, bytes >= 8 ? rx[1] : 0);
+      if (rc || !hfi::debugText(rx, bytes, line, sizeof line)) { ++dbgErrors; continue; }
       ++rep.debugLines;
       if (rep.debugLines <= 32 || rep.debugLines % 64 == 0) hw.note("fw: %s", line);
     }
   }
-  // The message queue until what is wanted came, an error, or ms. kOk, kErrHfi, kErrSysError or kErrHfiTimeout.
+  // Keep partial INIT/version evidence even when the other answer never arrives.
   int waitFor(bool wantInit, bool wantVersion, hfi::Reply &r, uint32_t ms)
   {
     const uint64_t start = hw.nowUs();
+    const uint32_t target = mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQWrite);
+    unsigned checks = 0;
+    bool seenInit = false, seenVersion = false, seenReply = false;
+    int result = kErrHfiTimeout;
     for (;;) {
+      ++checks;
       uint32_t bytes = 0;
       for (unsigned n = 0; n < 64; ++n) {
+        const uint32_t h = hfi::qhdr(hfi::kMsgq), beforeR = mem.ld(h + hfi::kQRead), beforeW = mem.ld(h + hfi::kQWrite);
         const int rc = hfi::read(mem, hfi::kMsgq, rx, sizeof rx, &bytes, [this] { hw.barrier(); });
         if (rc == 1) break;
-        if (rc == -2) {
-          hw.note("hfi: an oversized message was dropped");
-          continue;
+        if (!seenReply) {
+          seenReply = true;
+          hw.note("V3 RX first elapsed %llu us", (unsigned long long)(hw.nowUs() - start));
         }
+        hw.note("V3 RX %u result %d bytes %u msg read %u->%u write %u->%u", ++rxEvents, rc, bytes, beforeR,
+                mem.ld(h + hfi::kQRead), beforeW, mem.ld(h + hfi::kQWrite));
+        if (rc == -2) { ++msgDrops; continue; }
+        if (!rc) packetTrace("RX", rxEvents, rx, bytes);
         if (rc || !hfi::parse(rx, bytes, r)) {
           hw.note("hfi: a malformed message (read %d, %u bytes, word 0 %08x)", rc, bytes, rx[0]);
-          return kErrHfi;
+          result = kErrHfi;
+          break;
+        }
+        if (r.initDone && !seenInit) {
+          seenInit = true;
+          hw.note("V3 INIT success elapsed %llu us", (unsigned long long)(hw.nowUs() - start));
+        }
+        if (r.version && !seenVersion) {
+          seenVersion = true;
+          hw.note("V3 version received elapsed %llu us", (unsigned long long)(hw.nowUs() - start));
+          noteVersion(r);
         }
       }
       drainDebug();
+      const uint32_t irq = ops.rd(kIris + kWrapperIntrStatus);
+      ++watchdogSamples;
+      watchdogSeen |= irq & (1u << 3);
+      if (watchdogSeen) { result = kErrWatchdog; break; }
+      if (result == kErrHfi) break;
       if (r.sysError) {
         hw.note("hfi: system error %08x (flags %08x)", r.errorType, r.errorFlags);
-        return kErrSysError;
+        result = kErrSysError;
+        break;
       }
-      if (r.initFailed) {
-        hw.note("hfi: the firmware answered INIT without success");
-        return kErrHfi;
-      }
-      if ((!wantInit || r.initDone) && (!wantVersion || r.version)) return kOk;
-      if (hw.nowUs() - start >= uint64_t(ms) * 1000) {
-        hw.note("hfi: no answer within %u ms (init %s, version %s; %u messages)", ms, r.initDone ? "done" : "not answered",
-                r.version ? "read" : "not read", r.headers);
-        return kErrHfiTimeout;
-      }
+      if (r.initFailed || r.malformed) { result = kErrHfi; break; }
+      const bool consumed = mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead) == target;
+      if ((!wantInit || r.initDone) && (!wantVersion || r.version) && consumed) { result = kOk; break; }
+      if (hw.nowUs() - start >= uint64_t(ms) * 1000) break;
       hw.sleepMs(1);
     }
+    hw.note("V3 wait result %d elapsed %llu us checks %u init %u init-failed %u version %u headers %u packets %u session %u malformed %u drops %u",
+            result, (unsigned long long)(hw.nowUs() - start), checks, unsigned(r.initDone), unsigned(r.initFailed), unsigned(r.version),
+            r.headers, r.packets, r.sessionHeaders, r.malformed, msgDrops);
+    hw.note("V3 DBG summary checks %u lines %u errors %u watchdog %u samples %u", dbgChecks, rep.debugLines, dbgErrors,
+            unsigned(watchdogSeen != 0), watchdogSamples);
+    queueTrace("after-wait");
+    coreTrace("after-wait");
+    sfrTrace("after-wait");
+    return result;
   }
   void noteVersion(const hfi::Reply &r)
   {
@@ -450,7 +602,8 @@ class Bringup {
   int checkFault()
   {
     const vsmmu::Fault f = vsmmu::fault(plan, ops);
-    rep.fsr = f.fsr;
+    rep.fsr |= f.fsr;
+    hw.note("V3 fault snapshot bank %u fsr %08x far %08x%08x fsynr0 %08x", plan.bank, f.fsr, f.farHi, f.farLo, f.fsynr0);
     if (!(f.fsr & vsmmu::kFsrFaults)) return kOk;
     hw.note("smmu: FAULT on the video bank: fsr %08x far %08x%08x fsynr0 %08x", f.fsr, f.farHi, f.farLo, f.fsynr0);
     return kErrFault;
@@ -459,6 +612,7 @@ class Bringup {
   int bootCore()
   {
     hw.stage(kStepBoot, "the boot words: UC region, queue table, SFR, SPARE_0, CTRL_INIT");
+    coreTrace("before-CTRL_INIT");
     uint32_t status = 0;
     const int rc = hfi::boot(ops, kIovaBase, &status);
     hw.stage(kStepCtrlStatus, "CTRL_STATUS");
@@ -466,11 +620,15 @@ class Bringup {
     hw.note("hfi: CTRL_STATUS %08x: %s", status,
             rc == kOk ? "init done"
             : (status & kCtrlStatusErrorMask) == kCtrlStatusErrorUcRegion ? "error 0x4: the UC region is refused"
-            : status ? "an error code" : "no answer after 1000 polls (100 ms)");
+            : status ? "nonzero status failed the init/error rule" : "no answer in the bounded 100 ms poll");
+    coreTrace("after-CTRL_STATUS");
     if (rc) return rc;
     hw.stage(kStepHwMode, "MVS0 GDSC to hardware mode");
     power.hardwareMode();
-    return kOk;
+    const uint32_t gdsc = ops.rd(kVideoCc + kCcMvs0Gdsc);
+    hw.note("V3 hardware-mode result %u mvs0-gdsc %08x", unsigned((gdsc & kGdscHwControl) != 0), gdsc);
+    if (!(gdsc & kGdscHwControl)) return kErrGdsc;
+    return checkFault();
   }
   // iris_vpu_prepare_pc + SET_REMOTE_STATE(0) + the power-off: the firmware stays.
   int collapse()
@@ -479,22 +637,32 @@ class Bringup {
     bool ready = false;
     for (unsigned attempt = 0; attempt < 10 && !ready; ++attempt) {
       const uint32_t s = ops.rd(kIris + kCtrlStatus);
+      const uint32_t wfi = ops.rd(kIris + kTzCpuStatus) & 1u;
+      hw.note("V3 PC attempt %u ctrl %08x PC_READY %u WFI %u", attempt + 1, s, unsigned((s & kCtrlStatusPcReady) != 0), wfi);
       if (s & kCtrlStatusPcReady) {
         ready = true;
         break;
       }
-      const uint32_t wfi = ops.rd(kIris + kTzCpuStatus) & 1u;
       if (!wfi || !(s & kCtrlStatusIdle)) {   // Linux: "skip power collapse" (-EAGAIN), tried again later
         hw.note("hfi: not idle yet (ctrl %08x, wfi %u): collapse tried again in 100 ms", s, wfi);
         hw.sleepMs(100);
         continue;
       }
       if (send(hfi::pcPrep(tx, ids), "SYS_PC_PREP")) return kErrHfi;
-      ready = ops.poll(kIris + kCtrlStatus, kCtrlStatusPcReady, kCtrlStatusPcReady, kPcPollUs, kPcStepUs) &&
-              ops.poll(kIris + kTzCpuStatus, 1, 1, kPcPollUs, kPcStepUs);
+      uint32_t ctrl = 0, tz = 0;
+      const uint64_t start = hw.nowUs();
+      const bool pc = ops.poll(kIris + kCtrlStatus, kCtrlStatusPcReady, kCtrlStatusPcReady, kPcPollUs, kPcStepUs, &ctrl);
+      const bool asleep = pc && ops.poll(kIris + kTzCpuStatus, 1, 1, kPcPollUs, kPcStepUs, &tz);
+      ready = pc && asleep;
+      hw.note("V3 PC poll result %u PC_READY %u WFI %u ctrl %08x tz %08x elapsed %llu us", unsigned(ready), unsigned(pc),
+              unsigned(asleep), ctrl, tz, (unsigned long long)(hw.nowUs() - start));
       if (!ready) break;
     }
     if (!ready) return kErrPc;
+    coreTrace("PC-ready");
+    queueTrace("PC-ready");
+    if (const int rc = checkFault()) return rc;
+    if (watchdogSeen) return kErrWatchdog;
     if (opt.stop == kStepPcPrep) return kErrStopped;
     hw.stage(kStepRemoteSuspend, "SET_REMOTE_STATE(0, 0)");
     if (hw.scmRemoteState(kRemoteStateSuspend)) return kErrScm;
@@ -503,11 +671,13 @@ class Bringup {
     if (rc) return rc;
     ++rep.collapses;
     hw.note("V3: collapsed after %u ms idle (collapse %u); the firmware kept", opt.idleMs, rep.collapses);
-    return kOk;
+    return checkFault();
   }
   // iris_hfi_pm_resume: on, SET_REMOTE_STATE(1), the boot words, hardware mode, interframe power collapse; then a version ping.
   int resume(bool ping)
   {
+    hw.note("V3 resume begin cycle %u ping %u", rep.resumesOk + 1, unsigned(ping));
+    queueTrace("before-resume");
     hw.stage(kStepResume, "resume: power on");
     int rc = on();
     if (rc) return rc;
@@ -521,7 +691,9 @@ class Bringup {
     if ((rc = send(hfi::imageVersion(tx, ids), "IMAGE_VERSION"))) return rc;
     hfi::Reply r;
     if ((rc = waitFor(false, true, r, kHfiResponseMs))) return rc;
-    return checkFault();
+    if ((rc = checkFault())) return rc;
+    hw.note("V3 resume ping PASS cycle %u version %u", rep.resumesOk + 1, unsigned(r.version));
+    return kOk;
   }
   void waitIdle()
   {
@@ -537,11 +709,14 @@ class Bringup {
   {
     hw.note("V3: SMMU bank + UC region, power on, PAS 9, HFI boot and handshake; collapse after %u ms idle; %u resume(s)%s", opt.idleMs,
             opt.resumes, opt.unload ? "; then unload" : "");
+    hw.note("V3 evidence contract vid-v3a: c5 power/PAS; bank/core/queues/version/teardown");
+    power.traceOff = true;
     ++rep.cycles;
     int rc = smmuSetup();
     if (rc) return v3fail(rep.failedStep, rc);
     if ((rc = on())) return v3fail(pst.failedStep, rc);
     if ((rc = firmware.load())) return v3fail(fst.failedStep, rc);
+    coreTrace("after-PAS");
     if ((rc = bootCore())) return v3fail(kStepCtrlStatus, rc);
     if (opt.stop == kStepHwMode) return v3fail(kStepHwMode, kErrStopped);
     hw.stage(kStepHfiSend, "SYS_INIT, IMAGE_VERSION, INTRA_FRAME_POWER_COLLAPSE");
@@ -555,9 +730,11 @@ class Bringup {
     rep.handshakeUs = hw.nowUs() - t0;
     hw.note("hfi: INIT answered with success after %llu us (%u messages, %u packets)", (unsigned long long)rep.handshakeUs, r.headers,
             r.packets);
-    noteVersion(r);
     if ((rc = checkFault())) return v3fail(kStepHfiWait, rc);
     if (opt.stop == kStepHfiWait) return v3fail(kStepHfiWait, kErrStopped);
+    firstHfi = true;
+    hw.note("V3 first-HFI PASS: INIT success version received cmd-consumed %u doorbells %u fsr %08x watchdog %u",
+            mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead), doorbells, rep.fsr, unsigned(watchdogSeen != 0));
     waitIdle();
     if ((rc = collapse())) return v3fail(kStepPcPrep, rc);
     for (unsigned i = 1; i <= opt.resumes; ++i) {
@@ -565,17 +742,19 @@ class Bringup {
       waitIdle();
       if ((rc = collapse())) return v3fail(kStepPcPrep, rc);
       ++rep.resumesOk;
-      if (i == 1 || i == opt.resumes || i % 5 == 0) hw.note("V3: collapse/resume %u/%u ok", i, opt.resumes);
+      hw.note("V3: collapse/resume %u/%u ok", i, opt.resumes);
     }
     if (opt.unload) {   // iris_core_deinit: resumed first, then PAS shutdown, then off
       hw.stage(kStepUnload, "unload: resume, PAS shutdown, power off, the bank released");
       if ((rc = resume(false))) return v3fail(kStepUnload, rc);
-      teardown();
+      if ((rc = teardown())) return fail(kStepUnload, rc);
       hw.note("V3: unloaded: PAS 9 shut down, the core off, the video streams released");
     } else {
       hw.note("V3: steady state: the core collapsed, the firmware in the carveout, the bank and the UC region kept");
     }
-    return kOk;
+    hw.note("V3 evidence complete: first-HFI PASS resumes %u/%u collapses %u teardown %d watchdog %u fsr %08x",
+            rep.resumesOk, opt.resumes, rep.collapses, teardownRc, unsigned(watchdogSeen != 0), rep.fsr);
+    return watchdogSeen ? kErrWatchdog : kOk;
   }
 };
 

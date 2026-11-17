@@ -52,7 +52,7 @@ struct Plan {
   uint32_t scr0 = 0, idr0 = 0, idr1 = 0, idr2 = 0;
   unsigned groups = 0, banks = 0, pages = 0, freeGroups = 0, pasize = 0;
   unsigned group[2] = {~0u, ~0u}, bank = ~0u;
-  uint32_t s2crFound[2] = {}, cbarFound = 0, cba2rFound = 0;
+  uint32_t smrFound[2] = {}, s2crFound[2] = {}, sctlrFound = 0, cbarFound = 0, cba2rFound = 0;
   const char *error = nullptr;
   uint32_t cb() const { return (pages + bank) * 4096; }
 };
@@ -127,7 +127,11 @@ Plan plan(Read rd)
     p.error = "no free context bank";
     return p;
   }
-  for (unsigned k = 0; k < 2; ++k) p.s2crFound[k] = rd(s2crOffset(p.group[k]));
+  for (unsigned k = 0; k < 2; ++k) {
+    p.smrFound[k] = rd(smrOffset(p.group[k]));
+    p.s2crFound[k] = rd(s2crOffset(p.group[k]));
+  }
+  p.sctlrFound = rd(p.cb() + kSctlr);
   p.cbarFound = rd(cbarOffset(p.bank));
   p.cba2rFound = rd(cba2rOffset(p.bank));
   return p;
@@ -186,14 +190,42 @@ bool tlbSync(O &ops, uint32_t cb)
 {
   ops.wr(kSmmu + cb + kTlbiAll, 0xffffffffu, "smmu bank TLBIALL");
   ops.wr(kSmmu + cb + kTlbSync, 0xffffffffu, "smmu bank TLBSYNC");
-  return ops.poll(kSmmu + cb + kTlbStatus, 1, 0, kSyncPolls, 1);
+  uint32_t last = 0;
+  const bool ok = ops.poll(kSmmu + cb + kTlbStatus, 1, 0, kSyncPolls, 1, &last);
+  ops.hw.note("smmu: bank sync cb %#x result %u status %08x", cb, unsigned(ok), last);
+  return ok;
 }
 template <class O>
 bool globalSync(O &ops)
 {
   ops.wr(kSmmu + kTlbiAllNsnh, 0xffffffffu, "smmu TLBIALLNSNH");
   ops.wr(kSmmu + kTlbGsync, 0xffffffffu, "smmu sTLBGSYNC");
-  return ops.poll(kSmmu + kTlbGstatus, 1, 0, kSyncPolls, 1);
+  uint32_t last = 0;
+  const bool ok = ops.poll(kSmmu + kTlbGstatus, 1, 0, kSyncPolls, 1, &last);
+  ops.hw.note("smmu: global sync result %u status %08x", unsigned(ok), last);
+  return ok;
+}
+
+// Recheck immediately before the first write. This detects stale plans, not an atomic reservation across kexts.
+template <class O>
+const char *available(const Plan &p, O &ops)
+{
+  auto rd = [&](uint32_t off) { return ops.rd(kSmmu + off); };
+  if (rd(kScr0) != p.scr0 || rd(kIdr0) != p.idr0 || rd(kIdr1) != p.idr1 || rd(kIdr2) != p.idr2)
+    return "SMMU geometry changed since plan";
+  for (unsigned k = 0; k < 2; ++k)
+    if (rd(smrOffset(p.group[k])) != p.smrFound[k] || rd(s2crOffset(p.group[k])) != p.s2crFound[k])
+      return "a selected stream group changed since plan";
+  if (rd(p.cb() + kSctlr) != p.sctlrFound || rd(cbarOffset(p.bank)) != p.cbarFound || rd(cba2rOffset(p.bank)) != p.cba2rFound)
+    return "the selected bank changed since plan";
+  for (unsigned g = 0; g < p.groups; ++g) {
+    const uint32_t smr = rd(smrOffset(g));
+    if (!(smr & 0x80000000u)) continue;
+    if (covers(smr, kStreamFirst) || covers(smr, kStreamSecond)) return "a video SID acquired a route since plan";
+    const uint32_t s2cr = rd(s2crOffset(g));
+    if ((s2cr & 0x300ffu) == p.bank) return "the selected bank acquired a stream since plan";
+  }
+  return nullptr;
 }
 
 struct Routed {
@@ -206,6 +238,9 @@ const char *apply(const Plan &p, uint64_t tablePa, O &ops, Routed &done)
 {
   if (p.error) return p.error;
   if (!tablePa || (tablePa & 0xfff)) return "the table is not page aligned";
+  const char *conflict = available(p, ops);
+  ops.hw.note("smmu: V3 recheck %s (no cross-kext reservation)", conflict ? conflict : "clear");
+  if (conflict) return conflict;
   const uint32_t cb = p.cb();
   done.bank = true;
   ops.wr(kSmmu + cb + kSctlr, 0, "smmu bank SCTLR: translation off while programmed");
@@ -227,7 +262,8 @@ const char *apply(const Plan &p, uint64_t tablePa, O &ops, Routed &done)
   ops.wr(kSmmu + cb + kSctlr, kSctlrVideo, "smmu bank SCTLR: M TRE AFE CFRE ASIDPNE");
   if ((ops.rd(kSmmu + cb + kSctlr) & kSctlrVideo) != kSctlrVideo || ops.rd(kSmmu + cba2rOffset(p.bank)) != kCba2rVa64 ||
       ops.rd(kSmmu + cbarOffset(p.bank)) != kCbarStage1 || ops.rd(kSmmu + cb + kTtbr0Lo) != uint32_t(tablePa) ||
-      ops.rd(kSmmu + cb + kTtbr0Hi) != uint32_t(tablePa >> 32))
+      ops.rd(kSmmu + cb + kTtbr0Hi) != uint32_t(tablePa >> 32) || ops.rd(kSmmu + cb + kTcr) != kTcrVideo ||
+      ops.rd(kSmmu + cb + kTcr2) != tcr2For(p.pasize) || ops.rd(kSmmu + cb + kMair0) != kMair0Video)
     return "the bank's registers do not read back";
   for (unsigned k = 0; k < 2; ++k) {
     const unsigned g = p.group[k];
@@ -250,14 +286,23 @@ bool teardown(const Plan &p, O &ops, Routed &done)
     if (!done.group[k]) continue;
     ops.wr(kSmmu + smrOffset(p.group[k]), 0, "smmu SMR: invalid (the video stream released)");
     ops.wr(kSmmu + s2crOffset(p.group[k]), p.s2crFound[k], "smmu S2CR: as found");
+    if (p.smrFound[k]) ops.wr(kSmmu + smrOffset(p.group[k]), p.smrFound[k], "smmu SMR: as found (invalid)");
+    const uint32_t smr = ops.rd(kSmmu + smrOffset(p.group[k])), s2cr = ops.rd(kSmmu + s2crOffset(p.group[k]));
+    const bool restored = smr == p.smrFound[k] && s2cr == p.s2crFound[k];
+    ops.hw.note("smmu: release group %u smr %08x s2cr %08x restored %u", p.group[k], smr, s2cr, unsigned(restored));
+    ok = restored && ok;
     done.group[k] = false;
   }
   if (done.bank) {
     const uint32_t cb = p.cb();
-    ops.wr(kSmmu + cb + kSctlr, 0, "smmu bank SCTLR: translation off");
+    ops.wr(kSmmu + cb + kSctlr, p.sctlrFound, "smmu bank SCTLR: as found (translation off)");
     ok = tlbSync(ops, cb) && ok;
     ops.wr(kSmmu + cbarOffset(p.bank), p.cbarFound, "smmu CBAR: as found");
     ops.wr(kSmmu + cba2rOffset(p.bank), p.cba2rFound, "smmu CBA2R: as found");
+    const uint32_t sctlr = ops.rd(kSmmu + cb + kSctlr), cbar = ops.rd(kSmmu + cbarOffset(p.bank)), cba2r = ops.rd(kSmmu + cba2rOffset(p.bank));
+    const bool restored = sctlr == p.sctlrFound && cbar == p.cbarFound && cba2r == p.cba2rFound;
+    ops.hw.note("smmu: release bank %u sctlr %08x cbar %08x cba2r %08x restored %u", p.bank, sctlr, cbar, cba2r, unsigned(restored));
+    ok = restored && ok;
     done.bank = false;
   }
   return globalSync(ops) && ok;
@@ -272,11 +317,9 @@ Fault fault(const Plan &p, O &ops)
   Fault f;
   const uint32_t cb = p.cb();
   f.fsr = ops.rd(kSmmu + cb + kFsr);
-  if (f.fsr & kFsrFaults) {
-    f.farLo = ops.rd(kSmmu + cb + kFarLo);
-    f.farHi = ops.rd(kSmmu + cb + kFarHi);
-    f.fsynr0 = ops.rd(kSmmu + cb + kFsynr0);
-  }
+  f.farLo = ops.rd(kSmmu + cb + kFarLo);
+  f.farHi = ops.rd(kSmmu + cb + kFarHi);
+  f.fsynr0 = ops.rd(kSmmu + cb + kFsynr0);
   return f;
 }
 

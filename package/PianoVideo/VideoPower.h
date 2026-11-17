@@ -58,6 +58,7 @@ class Power {
   rpmh::Votes &votes;
   PowerState &st;
   int stopAt = 0;   // piano-video-stop: power everything down after this step
+  bool traceOff = false;   // V3 only: raw observations, no change to the V2 power contract
 
   bool controllerReadable() const { return st.ctrlGdsc && st.axi1 && st.ctrlFreerun && st.ctrlClk; }
   // VIDEO_CC can be read (its rails voted, its probe-time set-up done: GCC's video AHB is on from step 12).
@@ -115,6 +116,7 @@ class Power {
     if (st.ccConfigured && st.railsUp && branchOn(ops.rd(kGcc + kGccVideoAhb))) {
       step(kStepOffCheck, "both GDSCs collapsed");
       const uint32_t c = ops.rd(kVideoCc + kCcMvs0cGdsc), d = ops.rd(kVideoCc + kCcMvs0Gdsc);
+      if (traceOff) ops.hw.note("V3 power-off GDSCs mvs0c %08x mvs0 %08x collapsed %u", c, d, unsigned(!gdscOn(c) && !gdscOn(d)));
       if (gdscOn(c) || gdscOn(d)) {
         ops.hw.note("power: a GDSC is still on after the power-off: mvs0c %08x mvs0 %08x", c, d);
         rc = kErrOffCheck;
@@ -496,6 +498,9 @@ class Power {
       } while (false);
     }
     // disable_power
+    if (traceOff && controllerReadable())
+      ops.hw.note("V3 power-off NoC cpu request %08x status %08x video request %08x status %08x", ops.rd(kIris + kCpuNocLpiCtl),
+                  ops.rd(kIris + kCpuNocLpiStatus), ops.rd(kIris + kAonVideoCtlNocLpiCtl), ops.rd(kIris + kAonVideoCtlNocLpiStatus));
     if (st.ctrlClk) {
       branchDisable(kVideoCc + kCcMvs0cClk, kHalt, false, "video_cc_mvs0c_clk: off");
       st.ctrlClk = false;

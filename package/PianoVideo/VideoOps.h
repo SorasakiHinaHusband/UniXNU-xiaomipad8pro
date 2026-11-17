@@ -137,7 +137,7 @@ enum Error : int {
   kOk = 0, kErrStopped = -1, kErrArgument = -2, kErrRpmh = -3, kErrGcc = -4, kErrPll = -5, kErrRcg = -6, kErrDivider = -7,
   kErrBranch = -8, kErrGdsc = -9, kErrReadout = -10, kErrOffCheck = -11, kErrFwFile = -12, kErrFwPin = -13, kErrFwImage = -14,
   kErrNoMemory = -15, kErrScm = -16, kErrSmmu = -17, kErrBoot = -18, kErrHfi = -19, kErrHfiTimeout = -20, kErrSysError = -21,
-  kErrPc = -22, kErrFault = -23,
+  kErrPc = -22, kErrFault = -23, kErrWatchdog = -24,
 };
 inline const char *errorName(int e)
 {
@@ -166,6 +166,7 @@ inline const char *errorName(int e)
   case kErrSysError: return "the firmware reported a system error";
   case kErrPc: return "the firmware did not get ready for power collapse";
   case kErrFault: return "an SMMU fault on the video streams";
+  case kErrWatchdog: return "the video firmware watchdog fired";
   }
   return "?";
 }
