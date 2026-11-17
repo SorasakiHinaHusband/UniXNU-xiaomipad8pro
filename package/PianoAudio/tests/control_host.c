@@ -1,37 +1,80 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Host tests for the IOAudio2 selector-2 scalar representations.
+// Copyright (c) 2026 Leo Zhang.
+// Integer selector-2 values and an independent IOAudio2 receiver wire decoder.
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "../AudioControl.h"
+#include "../AudioControlNotification.h"
 
 static unsigned checks;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); return 1; } ++checks; } while (0)
 
+static uint32_t word(const unsigned char *b, size_t offset)
+{
+    return (uint32_t)b[offset] | (uint32_t)b[offset+1] << 8 |
+           (uint32_t)b[offset+2] << 16 | (uint32_t)b[offset+3] << 24;
+}
+
+// Deliberately no sender struct/offsetof/constants: these are the observed
+// receiver's offsets (count at B+0x1c, records at B+0x20 with stride 32).
+static int receiver(const void *wire, size_t bytes, uint32_t id, int32_t value)
+{
+    const unsigned char *b = wire;
+    if (bytes != 64 || word(b, 4) != bytes || word(b, 0x18) != 0 || word(b, 0x1c) != 1) return 0;
+    const size_t entry = 0x20;
+    if (word(b, entry) != id || word(b, entry+4) != 0x6376616cU ||
+        (int32_t)word(b, entry+8) != value) return 0;
+    for (size_t i = entry+12; i < bytes; ++i) if (b[i]) return 0;
+    return 1;
+}
+
 int main(void)
 {
-    union { uint32_t u; float f; } f;
-    union { uint64_t u; double d; } d;
-    f.f = 0.25f; d.d = 0.60;
     CHECK(PIANO_AUDIO_CONTROL_BASE_LEVEL == 0x6c65766cU);
     CHECK(PIANO_AUDIO_CONTROL_CLASS_VOLUME == 0x766c6d65U);
     CHECK(PIANO_AUDIO_CONTROL_BASE_TOGGLE == 0x746f676cU);
     CHECK(PIANO_AUDIO_CONTROL_CLASS_MUTE == 0x6d757465U);
     CHECK(PIANO_AUDIO_CONTROL_SCOPE_OUTPUT == 0x6f757470U && PIANO_AUDIO_CONTROL_ELEMENT_MAIN == 0U);
     CHECK(PIANO_AUDIO_VOLUME_MIN_DB == -36);
-    CHECK(piano_audio_control_percent(0) == 0);
-    CHECK(piano_audio_control_percent(1) == 100);
-    CHECK(piano_audio_control_percent(25) == 25);
-    CHECK(piano_audio_control_percent(100) == 100);
-    CHECK(piano_audio_control_percent(f.u) == 25);
-    CHECK(piano_audio_control_percent(d.u) == 60);
-    /* The selector reply must preserve these raw scalar encodings; turning
-     * them into 25/60 is the regression that made set volume read back zero. */
-    CHECK(f.u != 25u && d.u != 60u);
-    CHECK(piano_audio_control_percent((uint64_t)25) == 25);
-    CHECK(piano_audio_control_percent((uint64_t)60) == 60);
-    CHECK(piano_audio_control_percent((uint64_t)100) == 100);
-    CHECK(piano_audio_control_bool(0) == 0 && piano_audio_control_bool(1) == 1);
-    CHECK(piano_audio_control_bool(f.u) == 1 && piano_audio_control_bool(0xdeadbeefULL) == -1);
-    printf("audio control host: %u checks\n", checks);
+    for (uint64_t raw = 0; raw <= 100; ++raw) {
+        const int applied = piano_audio_control_percent(raw);
+        CHECK(applied == (int)raw);
+        PianoAudio2NotificationMessage message;
+        memset(&message, 0xa5, sizeof message);
+        piano_audio_control_notification(&message, 123, 1, (uint32_t)applied);
+        CHECK(receiver(&message, sizeof message, 1, (int32_t)raw));
+        const unsigned char *b = (const unsigned char *)&message;
+        CHECK(word(b, 0) == 19 && word(b, 8) == 123);
+        CHECK(word(b, 12) == 0 && word(b, 16) == 0 && word(b, 20) == 0);
+        CHECK(!receiver(&message, sizeof message - 1, 1, (int32_t)raw));
+    }
+    const uint64_t bad[] = {101, 102, UINT32_MAX, 0x100000001ULL, UINT64_MAX,
+                           0x3e800000, 0x3f800000, 0x3fe3333333333333ULL};
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; ++i) {
+        CHECK(piano_audio_control_percent(bad[i]) == -1);
+        CHECK(piano_audio_control_bool(bad[i]) == -1);
+    }
+    CHECK(piano_audio_control_bool(2) == -1);
+    for (uint64_t raw = 0; raw <= 1; ++raw) {
+        const int applied = piano_audio_control_bool(raw);
+        CHECK(applied == (int)raw);
+        PianoAudio2NotificationMessage message;
+        memset(&message, 0xa5, sizeof message);
+        piano_audio_control_notification(&message, 123, 2, (uint32_t)applied);
+        CHECK(receiver(&message, sizeof message, 2, (int32_t)raw));
+    }
+    // Old property-address sender: 56 bytes, cval where count belongs.
+    uint32_t old[14] = {19, 56, 123, 0, 0, 0, 0, 0x6376616c, 0x6f757470, 0, 1};
+    CHECK(!receiver(old, sizeof old, 1, 50));
+    uint32_t corrupt[16] = {19, 64, 123, 0, 0, 0, 0, 1, 1, 0x6376616c, 50};
+    CHECK(receiver(corrupt, sizeof corrupt, 1, 50));
+    corrupt[7] = 0x6376616c;
+    CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
+    corrupt[7] = 1; corrupt[10] = 0x6f757470;
+    CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
+    corrupt[10] = 50; corrupt[15] = 1;
+    CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
+    printf("audio control host: %u checks (integer raw + independent counted-cval receiver)\n", checks);
     return 0;
 }

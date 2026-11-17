@@ -46,6 +46,7 @@
 #include <sys/sysctl.h>
 #include "AudioPcm.h"
 #include "AudioControl.h"
+#include "AudioControlNotification.h"
 #include "AudioLevelDictionary.h"
 #include "AudioTiming.h"
 
@@ -189,7 +190,8 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
     IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) override;
     IOReturn setProperties(OSObject *properties) override;
-    void sendControlNotification(uint32_t controlID);
+    uint32_t controlLogCount = 0;
+    mach_msg_return_t sendControlNotification(uint32_t controlID, uint32_t applied);
 };
 
 OSDefineMetaClassAndStructors(PianoAudioDevice, IOService)
@@ -338,7 +340,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("piano-audio-transport", gTransport->name);
     e->setProperty("piano-audio-control-contract", "levl/vlme");
     e->setProperty("piano-audio-level-map-contract", "range-array:raw0-100:db-fixed32.32:-36-0");
-    e->setProperty("piano-audio-notification-contract", "type0-control-property");
+    e->setProperty("piano-audio-notification-contract", "counted-cval64:raw-integer");
     e->setProperty("piano-audio-timing-contract", tp.contract);
     e->setProperty("piano-audio-ring-contract", PIANO_AUDIO_RING_CONTRACT);
     if (!isInput) {
@@ -557,8 +559,8 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
     case 1: case 11:                                       // StopIO, StopIOWithFlags
         startedIO = false;
         return device->stopIO();
-    case 2: {                                              // SetControlValue: control ID, scalar value
-        if (!device || a->scalarInputCount < 2 || device->isInput) return kIOReturnBadArgument;
+    case 2: {                                              // SetControlValue: control UCID, integer raw value
+        if (!device || a->scalarInputCount < 2 || a->scalarInput[0] > UINT32_MAX || device->isInput) return kIOReturnBadArgument;
         const uint32_t id = uint32_t(a->scalarInput[0]);
         const uint64_t raw = a->scalarInput[1];
         OSDictionary *d = OSDictionary::withCapacity(1);
@@ -579,15 +581,16 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
         if (result == kIOReturnSuccess) result = device->apply(d, this);
         d->release();
         if (!result) {
-            sendControlNotification(id);
-        }
-        if (!result && a->scalarOutputCount >= 1) {
-            /* Selector 2 returns the scalar representation that HAL passed
-             * in. Returning our percent integer changes a Float32/Float64
-             * scalar into a different value, so the HAL immediately reads
-             * the control back as zero and the next write does not stick. */
-            a->scalarOutput[0] = (id == ControlMute) ? (device->masterMute ? 1 : 0) : raw;
-            a->scalarOutputCount = 1;
+            const uint32_t applied = id == ControlMute ? (device->masterMute ? 1U : 0U) : device->volumePercent;
+            const mach_msg_return_t sent = sendControlNotification(id, applied);
+            // Bounded receipt/apply/send witness; no changes to transport timing.
+            if (__sync_fetch_and_add(&controlLogCount, 1) < 32)
+                IOLog("PianoAudio: counted-cval64:raw-integer UCID %u input %llu applied %u count 1 bytes 64 send 0x%x\n",
+                      id, (unsigned long long)raw, applied, unsigned(sent));
+            if (a->scalarOutputCount >= 1) {
+                a->scalarOutput[0] = applied;
+                a->scalarOutputCount = 1;
+            }
         }
         return result;
     }
@@ -627,35 +630,12 @@ IOReturn PianoAudioUserClient::setProperties(OSObject *properties) {
     return device ? device->apply(properties, this) : kIOReturnNotReady;
 }
 
-/* The type-0 IOAudio2 notification is a property-address update.  CoreAudio
- * reads the body as {type, selector, scope, element, control ID}; its
- * notification handler then refreshes the control value through selector 2. */
-struct PianoAudio2NotificationMessage {
-    mach_msg_header_t header;
-    uint32_t type;
-    uint32_t selector;
-    uint32_t scope;
-    uint32_t element;
-    uint32_t controlID;
-    uint64_t reserved;
-};
-
-void PianoAudioUserClient::sendControlNotification(uint32_t controlID) {
+mach_msg_return_t PianoAudioUserClient::sendControlNotification(uint32_t controlID, uint32_t applied) {
     mach_port_t port = notificationPort;
-    if (port == MACH_PORT_NULL) return;
-    PianoAudio2NotificationMessage message = {};
-    message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    message.header.msgh_size = sizeof message;
-    message.header.msgh_remote_port = port;
-    message.header.msgh_local_port = MACH_PORT_NULL;
-    message.header.msgh_reserved = 0;
-    message.header.msgh_id = 0;
-    message.type = 0;
-    message.selector = 0x6376616c;  // 'cval'
-    message.scope = OutputScope;
-    message.element = PIANO_AUDIO_CONTROL_ELEMENT_MAIN;
-    message.controlID = controlID;
-    (void)mach_msg_send_from_kernel(&message.header, message.header.msgh_size);
+    if (port == MACH_PORT_NULL) return MACH_SEND_INVALID_DEST;
+    PianoAudio2NotificationMessage message;
+    piano_audio_control_notification(&message, port, controlID, applied);
+    return mach_msg_send_from_kernel(&message.header, message.header.msgh_size);
 }
 
 IOReturn PianoAudioUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) {
