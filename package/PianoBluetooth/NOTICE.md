@@ -13,3 +13,8 @@ The address publication and domain-separated stable local address follow
 UniXNU-sheng, commit `0eea3a200aa426ab282b61a956c8013deb74b68a`,
 `package/BluetoothProbe.cpp` (<https://github.com/UniXNU/UniXNU-sheng>). The controller,
 firmware reader and hardware programming remain Piano's existing code.
+
+Shared firmware parser refresh: UniXNU-piano commit 8f4ce8914c0b,
+package/PianoPower/FatVolume.{c,h} (BSD-2-Clause-Patent), with synchronized
+integrity-checked copies in PianoWifi, PianoAudio, PianoSensors and PianoVideo.
+The bounded-prefix extension is new code by Leo Zhang.

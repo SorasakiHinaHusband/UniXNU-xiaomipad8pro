@@ -93,8 +93,8 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     checks and the stream-match decode, re-expressed read-only in surveySmmu (no plan, no write); and copied byte for byte as
     SmmuStream.h but for its first three lines (the namespace pianousb -> pianowifi and one provenance line), which level 3 uses for
     stream 0x1401. PianoDwc3 is not modified.
-  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
-    (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h: copied byte for byte but
+  package/PianoPower/FatVolume.c (sha256 a078920a1da5b073dad36817838cda66c7b1176399db48fb904776a5bd271932) and FatVolume.h
+    (sha256 7e4107f10c6a157ac167575a4ac7c02cfdfc678d8077717490e015fffa85bf45) -> FatVolume.c / FatVolume.h: copied byte for byte but
     for two added provenance lines each (the build script checks they have not drifted). PianoPower is not modified.
   package/PianoPower/PianoAdspFirmware.c (sha256 85dade1f9003e9acd80c1bfeb9799c57350f57b73df2267fe52d27fb38f78793): how the
     firmware partition is read (NativeUfs's GPT lookup, 4096-byte block reads, one block cached for the ends of a range, FatVolume
@@ -293,3 +293,8 @@ a4738ae766ded21d5a89a891c26f9a5604da37f8162ff24acc4d035776221cae; BSD-2-Clause-P
   with this repository's own bounds logic; their comma-separated grant list cannot match this kernel and is not used.
 OpenIntelWireless (itlwm / AirportItlwm, GPL) was not read for this code; its facts reached the design only through the W0
 report's notes (private/host-checks/20261114-io80211), and none of its text is here.
+
+Shared FAT refresh (2026-11-17): UniXNU-piano commit 8f4ce8914c0b,
+  package/PianoPower/FatVolume.{c,h}, BSD-2-Clause-Patent. The optional bounded
+  prefix API is used by Bluetooth only; default strict mounts are unchanged.
+  Local copies retain the existing byte-for-byte owner integrity checks.

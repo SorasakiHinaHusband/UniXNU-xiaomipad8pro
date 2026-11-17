@@ -48,8 +48,8 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
     SensorsHid.c, PaganiSensors*.cpp: iOS only.
 
 This repository's own packages, copied because their owners do not change them for this one:
-  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
-    (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h: byte for byte but for their
+  package/PianoPower/FatVolume.c (sha256 a078920a1da5b073dad36817838cda66c7b1176399db48fb904776a5bd271932) and FatVolume.h
+    (sha256 7e4107f10c6a157ac167575a4ac7c02cfdfc678d8077717490e015fffa85bf45) -> FatVolume.c / FatVolume.h: byte for byte but for their
     first lines (the SPDX line kept, a provenance comment added), as PianoWifi's copies; tooling/k27/build-native-piano-sensors.sh fails
     when they drift.
   package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3) -> SmmuStream.h: the namespace
@@ -78,3 +78,8 @@ SM8750 devicetree (GPL-2.0, the piano kernel tree v1.1.0); linux-msm/hexagonrpc 
 disable (10) requests, one QMI client per sensor; iio-sensor-proxy 3.9 (GPL-3.0); libqmi's SSC service description (LGPL-2.1); Android's
 sensor reporting modes (the light on change, the accelerometer continuous) and its sensors HAL's one client per sensor, as behaviour.
 qualcomm/fastrpc v1.0.7 (BSD-3-Clause) was read for its IDL's handle, method and argument numbers; no code was taken from it either.
+
+Shared FAT refresh (2026-11-17): UniXNU-piano commit 8f4ce8914c0b,
+  package/PianoPower/FatVolume.{c,h}, BSD-2-Clause-Patent. The optional bounded
+  prefix API is used by Bluetooth only; default strict mounts are unchanged.
+  Local copies retain the existing byte-for-byte owner integrity checks.

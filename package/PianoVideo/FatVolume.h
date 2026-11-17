@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/FatVolume.h of this repository, copied byte for byte but for this line (UPSTREAM has its sha256):
- * PianoPower is not modified, so the shared firmware loader's ESP source (level 3) has its own copy here. */
+ * Kept identical to the shared owner by the build guard; ordinary mounts remain strict. */
 /* A read-only FAT16/FAT32 volume over a byte read callback: enough to find a file by its long or short (8.3) name in a directory path and read
  * any range of it. Used to take the device's own firmware files from its firmware partition in place. No allocation: the one sector of
  * the allocation table in use is cached in the volume. The volume's metadata is untrusted: every cluster number and chain is bounds
@@ -45,6 +45,10 @@ typedef struct {
 } FatFile;
 
 int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context);
+/* Opt-in for a read-only populated prefix of a larger declared FAT volume.
+ * Metadata must fit; FAT type follows the BPB, reachable clusters and every
+ * byte read stay within size. Ordinary callers must use strict fat_mount. */
+int fat_mount_prefix(FatVolume *v, uint64_t size, FatRead read, void *context);
 /* path: names separated by '/', each matched in any case against the long name, else the 8.3 name ("image/adsp.b00"). */
 int fat_open(FatVolume *v, const char *path, FatFile *file);
 int fat_read(FatVolume *v, const FatFile *file, uint64_t offset, void *to, size_t length);

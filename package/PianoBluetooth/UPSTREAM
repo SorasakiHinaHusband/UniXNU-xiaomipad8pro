@@ -14,8 +14,8 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     piano-bt-hwcg. PianoWifi itself is not modified and not linked against.
   package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07): included, not
     copied (-I package/PianoPower): the arbiter, the APID of a PPID with its owner, the observer read.
-  package/PianoPower/FatVolume.c and FatVolume.h (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779,
-    a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7): compiled into this kext, not copied (level 4's FAT reader).
+  package/PianoPower/FatVolume.c and FatVolume.h (sha256 a078920a1da5b073dad36817838cda66c7b1176399db48fb904776a5bd271932,
+    7e4107f10c6a157ac167575a4ac7c02cfdfc678d8077717490e015fffa85bf45): compiled into this kext, not copied (level 4's FAT reader).
   package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716): included, not copied
     (-I package/PianoKeyboard): the cmd-db lookup and the RSC register layout.
   package/PianoWifi/PianoWifi.cpp at main 2026-11-11 (sha256 6ac47f0a6855ce7d69651446c74a194d88dfe6d2cfe6535c12b4af6ec0dad600) and
@@ -107,3 +107,8 @@ Bounded firmware-prefix correction (2026-11-17):
   partition. This is new UniXNU-piano code by Leo Zhang; no upstream source or
   firmware payload is imported. Geometry was measured from a saved partition;
   file identities checked against third-party xiaomipad-8pro-mainline a43f79c.
+
+Shared FAT refresh (2026-11-17): UniXNU-piano commit 8f4ce8914c0b,
+  package/PianoPower/FatVolume.{c,h}, BSD-2-Clause-Patent. The optional bounded
+  prefix API is used by Bluetooth only; default strict mounts are unchanged.
+  Local copies retain the existing byte-for-byte owner integrity checks.

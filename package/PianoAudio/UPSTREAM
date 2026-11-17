@@ -109,8 +109,8 @@ New code, from facts: AudioSession.{h,c} (the levels as one state machine), Audi
   tests/session_host.c, amps_host.c, preset_host.c, synthetic_fsm.h (a made-up container: no vendor data).
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent, copied byte for byte but for their provenance lines (the build script checks it):
-  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h (sha256
-    a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7): FatVolume.{c,h}.
+  package/PianoPower/FatVolume.c (sha256 a078920a1da5b073dad36817838cda66c7b1176399db48fb904776a5bd271932) and FatVolume.h (sha256
+    7e4107f10c6a157ac167575a4ac7c02cfdfc678d8077717490e015fffa85bf45): FatVolume.{c,h}.
   package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): SmmuStream.h, the
     namespace changed.
   package/PianoKeyboard/BitI2c.h (sha256 c63c87803997d89a4a09be877d7f04712e5d02e3d00bae30f41bb288beb76767): BitI2c.h, the namespace and
@@ -182,3 +182,8 @@ The piano boot DT (sha256 above): the VA macro's qcom,dmic-sample-rate (2.4 MHz)
   fallback to sm8650's table, the dmic01/dmic23 pin states (4 mA, the clock pins driven).
 hackios-redmi-k90-annibale docs/analysis/2026-11-02-audio-and-volume.md (local research notes, facts only): on the iOS-family stacks
   the system volume scales the samples in software when the device publishes none (audio.md 10.19).
+
+Shared FAT refresh (2026-11-17): UniXNU-piano commit 8f4ce8914c0b,
+  package/PianoPower/FatVolume.{c,h}, BSD-2-Clause-Patent. The optional bounded
+  prefix API is used by Bluetooth only; default strict mounts are unchanged.
+  Local copies retain the existing byte-for-byte owner integrity checks.
