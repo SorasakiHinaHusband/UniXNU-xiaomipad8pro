@@ -636,6 +636,8 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   const PianoChargePlan &p = fLink.plan;
   const PianoChargeInput &x = fLink.in;
   const PianoChargeContract &c = fContract;
+  const bool fvValid = (x.valid & PIANO_CHG_IN_FV) && x.fv_raw >= 3600 && x.fv_raw <= 6400;
+  const uint32_t fvMv = fvValid ? uint32_t(x.fv_raw + 3600) / 2 : 0;
   const bool enabledValid = piano_mca_has(&fMca, McaChargeEnable);
   const int32_t enabled = enabledValid ? fMca.value[McaChargeEnable] : -1;
   const bool applied = !s.pending && !fMca.queued && enabledValid && enabled == int(p.charge);
@@ -667,7 +669,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("DTPT", fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1]);
   n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
   n("RequestedICL", p.icl_ma); n("AppliedICL", s.icl_set); n("ICLReadback", uint32_t(x.icl_ma)); n("AICL", uint32_t(x.aicl_ma));
-  n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FV", 4400);
+  n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FVTarget", 4400); n("FVValid", fvValid); n("FVRaw", uint32_t(x.fv_raw)); n("FV", fvMv);
   n("HealthEnabled", fLink.cfg.limit); n("HealthStop", fLink.cfg.stop_pct); n("HealthResume", fLink.cfg.resume_pct);
   n("Mode", fLink.cfg.hv); n("HealthHold", s.hold); n("HealthDesired", p.charge); n("HealthPending", !applied);
   n("HealthApplied", applied); n("HealthReason", p.why_off); n("EnableReadback", uint32_t(enabled));
@@ -696,8 +698,8 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s", c.generation, c.seq, c.rdo, c.protocol,
        c.mv, c.ma, c.last_error, piano_contract_fresh(&c, now) ? "validated" : "no PD contract");
   for (unsigned i = 0; i < c.pdos && i < 7; ++i) note("buck-pdo: gen=%u index=%u raw=%#x", c.generation, i + 1, c.source_pdo[i]);
-  note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d", fStatusSeq, p.icl_ma, s.icl_set,
-       x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma);
+  note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d fv=%u/%d valid=%u", fStatusSeq, p.icl_ma, s.icl_set,
+       x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma, fvMv, x.fv_raw, fvValid);
   note("buck-health: seq=%u rev=%u enabled=%u stop=%u resume=%u hold=%u desired=%u pending=%u applied=%u reason=%u inhibit=%u",
        fStatusSeq, fConfigRevision, fLink.cfg.limit, fLink.cfg.stop_pct, fLink.cfg.resume_pct, s.hold, p.charge, !applied,
        applied, p.why_off, fInhibitUntil > now ? 1u : 0u);
