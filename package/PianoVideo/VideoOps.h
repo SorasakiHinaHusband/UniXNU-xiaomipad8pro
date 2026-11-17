@@ -64,7 +64,8 @@ class Ops {
   Ops(Hw &hw, WriteLog &log) : hw(hw), log(log) {}
   Hw &hw;
   WriteLog &log;
-  uint32_t reads = 0, polls = 0, timeouts = 0;
+  uint32_t reads = 0, polls = 0, timeouts = 0, smmuStores = 0;
+  bool traceSmmu = false;
 
   uint32_t rd(uint64_t pa)
   {
@@ -83,6 +84,8 @@ class Ops {
       ++log.repeats;
     }
     hw.wr(pa, v);
+    if (traceSmmu && pa >= kSmmu && pa < kSmmu + kSmmuBytes)
+      hw.note("smmu: store completed %u off %#x value %08x", ++smmuStores, uint32_t(pa - kSmmu), v);
   }
   // regmap_update_bits: (old & ~mask) | value, written only when it changes. Returns the value now there.
   uint32_t update(uint64_t pa, uint32_t mask, uint32_t value, const char *what)

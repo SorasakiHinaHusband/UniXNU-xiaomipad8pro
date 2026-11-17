@@ -184,8 +184,9 @@ class Firmware {
     int rc = held(bytes, size, phys);
     if (rc && st.initDone) {
       hw.note("firmware: %s at step %d: PAS shutdown(9) so the next load starts clean", errorName(rc), st.failedStep);
-      hw.scmPasShutdown();
-      st.initDone = st.loaded = false;
+      const int shutdown = hw.scmPasShutdown();
+      if (!shutdown) st.initDone = st.loaded = false;
+      else hw.note("firmware: cleanup PAS shutdown failed: ownership retained");
     }
     hw.scmHold(false);
     return rc;
@@ -237,7 +238,7 @@ class Firmware {
     if (!st.loaded && !st.initDone) return kOk;
     ops.hw.stage(kStepPasShutdown, "PAS shutdown(9)");
     const int rc = ops.hw.scmPasShutdown();
-    st.loaded = st.initDone = false;
+    if (!rc) st.loaded = st.initDone = false;
     return rc ? kErrScm : kOk;
   }
 };

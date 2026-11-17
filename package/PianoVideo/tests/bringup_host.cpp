@@ -162,7 +162,8 @@ struct Faults {
        branchStuck = false, wrongDivider = false, rpmhNoComplete = false, drv2Busy = false, rscReadback = false, lpiDeny = false,
        cpuLpiStuck = false, notIdle = false, noCmdDb = false, noFile = false, dmaFail = false, fwNoBoot = false, fwBadUc = false,
        fwNoReply = false, fwInitFail = false, fwSysError = false, fwNoVersion = false, fwNotIdle = false, smmuExisting = false,
-       smmuNoBank = false, tlbStuck = false, sepFaults = true;
+       smmuNoBank = false, tlbStuck = false, sepFaults = true, s1BadTcr = false, s1BadSctlr = false,
+       releaseSmrStuck = false, faultIgnored = false;
   std::string scmFail;   // the secure call to refuse ("init", "memsetup", "auth", "mpvideovar", "shutdown", "remote0", "remote1")
 };
 
@@ -517,7 +518,7 @@ struct Model {
     R(kSmmu + vsmmu::kIdr0) = 1u << 30 | 1u << 14 | 100;
     R(kSmmu + vsmmu::kIdr1) = 0x60000053;
     R(kSmmu + vsmmu::kIdr2) = 1u << 12 | 2u << 4;
-    for (unsigned g = 0; g < 100; ++g) R(kSmmu + vsmmu::s2crOffset(g)) = 2u << 16;   // free groups: fault
+    for (unsigned g = 0; g < 100; ++g) R(kSmmu + vsmmu::s2crOffset(g)) = 0x0300006e; // observed invalid free baseline
     R(kSmmu + vsmmu::smrOffset(0)) = 0x80000800;
     R(kSmmu + vsmmu::s2crOffset(0)) = 2;
     R(kSmmu + vsmmu::smrOffset(1)) = 0x80000060;
@@ -526,7 +527,13 @@ struct Model {
     R(kSmmu + vsmmu::s2crOffset(3)) = 2;
     R(kSmmu + (128 + 2) * 4096) = 1;    // bank 2 translates (someone's)
     R(kSmmu + (128 + 81) * 4096) = 1;   // bank 81 translates, no group yet (another kext's)
-    R(kSmmu + vsmmu::cbarOffset(80)) = 0x00020000;
+    R(kSmmu + vsmmu::cbarOffset(80)) = 0; // observed unsupported TYPE0, must never be restored
+    R(kSmmu + (128 + 80) * 4096 + vsmmu::kFsr) = 0x400; // Format=2, no valid fault
+    for (unsigned b : {2u, 81u}) {
+      R(kSmmu + vsmmu::cbarOffset(b)) = vsmmu::kCbarStage1;
+      R(kSmmu + (128 + b) * 4096 + vsmmu::kTtbr0Hi) = b << 16;
+      R(kSmmu + (128 + b) * 4096 + vsmmu::kTtbr1Hi) = b << 16;
+    }
     R(kSmmu + vsmmu::cba2rOffset(80)) = 0;
     groupsFound = snapshotSmmu();
   }
@@ -553,6 +560,25 @@ struct Model {
   }
   void smmuWr(uint32_t o, uint32_t v)
   {
+    if (!ctrlOn() || !codecOn() || mm1 != kBcmMm1On) violation("SMMU write/TLB without video power and NoC");
+    if (o >= 0x1000 && o < 0x1000 + 4 * 83 && ((v >> 16) & 3) != 1) violation("unsupported CBAR type restored");
+    if (o >= 0xc00 && o < 0xc00 + 4 * 100) {
+      if (!vsmmu::s2crRestorable(v, 83)) violation("illegal S2CR bank restored");
+      if (f.faultIgnored && v == vsmmu::kS2crFault) return; // trapped FAULT write leaves legal translate
+    }
+    if (o >= 0x800 && o < 0x800 + 4 * 100 && !(v & 0x80000000u)) {
+      event("smmu route-off");
+      if (f.releaseSmrStuck) return;
+    }
+    if (o == vsmmu::kTlbGsync) event("smmu global-sync");
+    if (o >= 128 * 4096 && (o & 0xfff) == vsmmu::kSctlr) {
+      if (v & 1) event("smmu bank-on");
+      v &= ~(1u << 12); // hardware keeps ASIDPNE at zero
+      if (f.s1BadSctlr) v &= ~4u;
+    }
+    if (o >= 128 * 4096 && (o & 0xfff) == vsmmu::kTcr2) v |= 0x60; // observed TBI0/1 readback
+    if (o >= 128 * 4096 && (o & 0xfff) == vsmmu::kTcr && f.s1BadTcr) v ^= 1;
+
     if (!v && (o == vsmmu::kTlbiAllNsnh || o == vsmmu::kTlbGsync || (o >= 128 * 4096 && ((o & 0xfff) == vsmmu::kTlbiAll ||
                                                                                          (o & 0xfff) == vsmmu::kTlbSync))))
       violation("an SMMU TLB register written with 0 (the trap path needs a non-zero value)");
@@ -646,6 +672,14 @@ struct Model {
   }
   void dmaFree(Dma &d)
   {
+    if (fw.authed) violation("DMA freed before PAS quiesce");
+    if (f.tlbStuck) violation("DMA freed after unconfirmed TLB sync");
+    for (unsigned g = 0; g < 100; ++g) {
+      const uint32_t smr = R(kSmmu + vsmmu::smrOffset(g));
+      if ((smr & 0x80000000u) && (vsmmu::covers(smr, kStreamFirst) || vsmmu::covers(smr, kStreamSecond)))
+        violation("DMA freed with a video stream still routed");
+    }
+    event("dma free");
     ++dmaFrees;
     phys.clear();
     d.uc = nullptr;
@@ -901,9 +935,9 @@ struct Model {
   int scmPasShutdown()
   {
     if (!codecOn()) violation("PAS shutdown with the core unpowered");
-    fw.authed = false;
-    fw.hfiUp = false;
-    return call("shutdown");
+    const int rc = call("shutdown");
+    if (!rc) { fw.authed = false; fw.hfiUp = false; }
+    return rc;
   }
   int scmRemoteState(uint32_t s)
   {
@@ -1356,6 +1390,22 @@ static void testV2ScmFailures()
 }
 
 // ======================================================================================================================== V3
+static void released(Model &m, const vsmmu::Plan &p)
+{
+  auto want = m.groupsFound;
+  for (unsigned g : p.group) {
+    CHECK(!(m.R(kSmmu + vsmmu::smrOffset(g)) & 0x80000000u));
+    const uint32_t found = want[vsmmu::s2crOffset(g)];
+    if (m.R(kSmmu + vsmmu::s2crOffset(g)) != found)
+      want[vsmmu::s2crOffset(g)] = vsmmu::s2crRestorable(found, p.banks) ? found : m.f.faultIgnored ? p.bank : vsmmu::kS2crFault;
+  }
+  if (!vsmmu::cbarRestorable(p.cbarFound, p.idr0) || p.cba2rFound != 1) {
+    want[vsmmu::cbarOffset(p.bank)] = vsmmu::kCbarStage1;
+    want[vsmmu::cba2rOffset(p.bank)] = 1;
+  }
+  CHECK(m.snapshotSmmu() == want);
+}
+
 static void testV3()
 {
   Run x(4);
@@ -1381,7 +1431,7 @@ static void testV3()
   CHECK(x.b->rep.fsr == 0 && x.b->rep.debugLines >= 1 && m.logged("fw: VIDEO: system init"));
   // Unloaded: PAS shut down, everything off, the SMMU exactly as found, the memory freed.
   CHECK(m.allOff() && !m.fw.authed && m.dmaFrees == 1 && m.dmaAllocs == 1);
-  CHECK(m.snapshotSmmu() == m.groupsFound);
+  released(m, x.b->plan);
   CHECK(m.count("smr valid 6464") == 1 && m.count("smr valid 6471") == 1);
   CHECK(std::strstr(x.b->rep.summary, "V3 ok: firmware video-firmware.vpu35.model     x;"));
   CHECK(std::strstr(x.b->rep.summary, "collapse/resume 10/10"));
@@ -1391,6 +1441,11 @@ static void testV3()
   CHECK(m.logged("V3 RX 1 packet 0 size 32 type 01000001 flags 00000001"));
   CHECK(m.logged("V3 evidence complete: first-HFI PASS resumes 10/10 collapses 11 teardown 0 watchdog 0 fsr 00000000"));
   CHECK(x.b->txEvents == x.b->doorbells && x.b->teardownRc == kOk);
+  CHECK(m.first("gdsc mvs0 on") < m.first("smmu bank-on"));
+  CHECK(m.last("scm shutdown") < m.first("smmu route-off"));
+  CHECK(m.last("smmu global-sync") < m.last("mm1 off") && m.last("mm1 off") < m.first("dma free"));
+  CHECK(m.logged("verify SCTLR want 00001027 got 00000027 mask 00000027 mismatch 00000000 PASS"));
+  CHECK(m.logged("TBI 60 tolerated 60") && m.logged("FSR raw 00000400 fault-bits 00000000 format 2 valid 0"));
 }
 
 static void testV3EvidenceFailures()
@@ -1411,12 +1466,14 @@ static void testV3EvidenceFailures()
     uint32_t dbBytes = 0;
     const uint8_t *db = x.m->cmdDb(&dbBytes);
     x.b->res = rpmh::resources(db, dbBytes);
-    CHECK(x.b->smmuSetup() == kOk && x.b->on() == kOk && x.b->firmware.load() == kOk);
+    CHECK(x.b->smmuSetup() == kOk && x.b->on() == kOk && x.b->smmuApply() == kOk && x.b->firmware.load() == kOk);
     if (kind == 0) x.m->f.scmFail = "shutdown";
     if (kind == 1) x.m->f.tlbStuck = true;
     if (kind == 2) x.m->R(kIris + kWrapperIntrStatus) = 8;
     CHECK(x.b->teardown() == (kind == 0 ? kErrScm : kind == 1 ? kErrSmmu : kErrWatchdog));
-    CHECK(x.m->dmaFrees == 1 && x.m->allOff());
+    CHECK(x.m->dmaFrees == (kind == 2 ? 1u : 0u));
+    CHECK(x.b->dmaHeld == (kind != 2));
+    CHECK(x.m->allOff() == (kind == 2));
     quiet(*x.m, "V3 teardown evidence");
   }
   // An intervening group or bank owner is refused before apply's first MMIO write.
@@ -1436,6 +1493,36 @@ static void testV3EvidenceFailures()
     CHECK(!done.bank && !done.group[0] && !done.group[1] && x.m->writes == 0);
     CHECK(x.m->snapshotSmmu() == before);
   }
+}
+
+static void testV3PlatformLifecycle()
+{
+  // An ignored FAULT write is acceptable only with both SMRs invalid, M clear, and completed TLB maintenance.
+  { Run x(4); x.o.unload = true; x.m->f.faultIgnored = true;
+    CHECK(x.go() == kOk); released(*x.m, x.b->plan); quiet(*x.m, "FAULT emulation"); }
+  // Real S1 mismatches still reject before PAS, but finish a legal partial release.
+  for (unsigned i = 0; i < 2; ++i) {
+    Run x(4); x.m->f.s1BadTcr = i == 0; x.m->f.s1BadSctlr = i == 1;
+    CHECK(x.go() == kErrSmmu && x.b->rep.failedStep == kStepSmmuRoute);
+    CHECK(x.m->count("scm init") == 0 && x.m->dmaFrees == 1 && x.m->allOff());
+    released(*x.m, x.b->plan); quiet(*x.m, "required S1 fields");
+  }
+  // Independently used ASID in TTBR0 OR TTBR1 refuses the transaction without touching that owner.
+  for (unsigned off : {vsmmu::kTtbr0Hi, vsmmu::kTtbr1Hi}) {
+    Run x(4); x.m->R(kSmmu + (128 + 2) * 4096 + off) = 80u << 16;
+    CHECK(x.go() == kErrSmmu && !x.b->routed.bank && x.m->count("scm init") == 0);
+    CHECK(x.m->R(kSmmu + (128 + 2) * 4096 + off) == 80u << 16 && x.m->dmaFrees == 1);
+    quiet(*x.m, "ASID collision");
+  }
+  // Failure to invalidate a match must retain tables, UC memory, bank ownership and power for safety.
+  { Run x(4); x.o.unload = true; x.m->f.releaseSmrStuck = true;
+    CHECK(x.go() == kErrSmmu && x.b->teardownRc == kErrSmmu);
+    CHECK(x.b->dmaHeld && x.b->routed.bank && x.m->dmaFrees == 0 && !x.m->allOff());
+    quiet(*x.m, "detach failure"); }
+  // Failure while already collapsed still powers/resumes before PAS shutdown, then releases while buses remain on.
+  { Run x(4); CHECK(x.go() == kOk && !x.b->pst.on);
+    CHECK(x.b->teardown() == kOk && !x.b->dmaHeld && x.m->allOff());
+    quiet(*x.m, "collapsed release"); }
 }
 
 static void testV3SteadyState()
@@ -1491,9 +1578,11 @@ static void testV3Failures()
       std::printf("  case %s: rc %d (%s) step %d\n", c.name, rc, errorName(rc), x.b->rep.failedStep);
     CHECK(rc == c.error && x.b->rep.failedStep == c.step);
     Model &m = *x.m;
-    CHECK(m.allOff() && !m.fw.authed);
-    CHECK(m.dmaFrees == m.dmaAllocs);
-    if (!m.f.tlbStuck) CHECK(m.snapshotSmmu() == m.groupsFound);
+    CHECK(m.allOff() == !m.f.tlbStuck && !m.fw.authed);
+    CHECK(m.dmaFrees == (m.f.tlbStuck ? 0u : m.dmaAllocs));
+    CHECK(x.b->dmaHeld == m.f.tlbStuck);
+    if (!m.f.tlbStuck && x.b->plan.bank != ~0u && m.dmaAllocs) released(m, x.b->plan);
+    else if (!m.f.tlbStuck) CHECK(m.snapshotSmmu() == m.groupsFound);
     if (c.step == kStepSmmuPlan) CHECK(m.writes == writesBefore);   // refused before any write
     if (c.step >= kStepCtrlStatus) CHECK(m.count("scm shutdown") == 1);
     if (c.step < kStepCtrlStatus) CHECK(m.count("scm init") == 0 || c.step == kStepPasAuth);
@@ -1649,7 +1738,7 @@ static void testSmmuPieces()
   auto rd = [&m](uint32_t off) { return m.R(kSmmu + off); };
   vsmmu::Plan p = vsmmu::plan(rd);
   CHECK(!p.error && p.group[0] == 99 && p.group[1] == 98 && p.bank == 80 && p.freeGroups == 97 && p.pasize == 2);
-  CHECK(p.s2crFound[0] == (2u << 16) && p.cbarFound == 0x00020000);
+  CHECK(p.s2crFound[0] == 0x0300006e && p.cbarFound == 0);
   m.R(kSmmu + vsmmu::kScr0) = vsmmu::kScr0ExidEnable;
   CHECK(vsmmu::plan(rd).error);
   m.R(kSmmu + vsmmu::kScr0) = 0;
@@ -1770,6 +1859,7 @@ int main()
   testV2ScmFailures();
   testV3();
   testV3EvidenceFailures();
+  testV3PlatformLifecycle();
   testV3SteadyState();
   testV3Failures();
   testV3SepFault();

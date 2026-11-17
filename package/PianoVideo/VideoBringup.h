@@ -10,8 +10,8 @@
 //                  SET_REMOTE_STATE(0), off; the firmware stays in the carveout); piano-video-resumes=N more resume (on,
 //                  SET_REMOTE_STATE(1), boot words, hardware mode, interframe power collapse, IMAGE_VERSION as a ping) / idle /
 //                  collapse cycles; piano-video-unload=1 ends with Linux's deinit (resume, PAS shutdown, off, the bank released).
-// Any failure powers everything down (PAS shutdown while the core is powered, the power-off, the votes, the bank and its memory)
-// before run() returns; piano-video-stop=STEP stops the same way after that step (the bisecting aid). Every register write is
+// V3 failures capture evidence, stop PAS, release the domain with power/NoC held, then off/free. An unconfirmed quiesce/detach/TLB
+// completion keeps DMA and available dependencies, and reports the cleanup failure. V1/V2 retain their power/PAS sequence; piano-video-stop=STEP stops the same way after that step (the bisecting aid). Every register write is
 // logged once (VideoOps.h); every wait is bounded.
 //
 // The Hw (a duck type: the kernel's in PianoVideo.cpp, the model in tests/bringup_host.cpp): VideoOps.h's rd/wr/delayUs/sleepMs/
@@ -100,6 +100,22 @@ class Bringup {
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
   bool firstHfi = false;
+  unsigned lifecycleEvent = 0;
+  void phase(const char *name, int rc) { hw.note("V3 lifecycle %u %s result %d", ++lifecycleEvent, name, rc); }
+  bool domainPowerReady() const { return pst.on && pst.railsUp && pst.busOn && pst.axi0 && power.codecReadable(); }
+  void powerTrace()
+  {
+    hw.note("V3 power ready %u rails %u bus %u controller %u codec %u AXI %u/%u PLL %u RCG %u", unsigned(domainPowerReady()),
+            unsigned(pst.railsUp), unsigned(pst.busOn), unsigned(power.controllerReadable()), unsigned(power.codecReadable()),
+            unsigned(pst.axi0), unsigned(pst.axi1), unsigned(pst.pll), unsigned(pst.rcg));
+    if (!domainPowerReady()) return;
+    hw.note("V3 power raw GCC ahb %08x axi0 %08x axi1 %08x PLL %08x RCG %08x", ops.rd(kGcc + kGccVideoAhb),
+            ops.rd(kGcc + kGccVideoAxi0), ops.rd(kGcc + kGccVideoAxi1), ops.rd(kVideoCc + kCcPll0),
+            ops.rd(kVideoCc + kCcMvs0Rcg));
+    hw.note("V3 power raw GDSC %08x/%08x branches ctrl %08x/%08x codec %08x/%08x (HWCG idle permitted)",
+            ops.rd(kVideoCc + kCcMvs0cGdsc), ops.rd(kVideoCc + kCcMvs0Gdsc), ops.rd(kVideoCc + kCcMvs0cClk),
+            ops.rd(kVideoCc + kCcMvs0cFreerun), ops.rd(kVideoCc + kCcMvs0Clk), ops.rd(kVideoCc + kCcMvs0Freerun));
+  }
 
   // V3 evidence is independent of the deduplicated MMIO write log. No IRQ-clear or new power/PAS sequence here.
   void bankTrace(const char *when)
@@ -109,10 +125,15 @@ class Bringup {
     for (unsigned k = 0; k < 2; ++k)
       hw.note("V3 bank %s group %u sid %#x smr %08x s2cr %08x", when, plan.group[k], vsmmu::kStreams[k],
               ops.rd(kSmmu + vsmmu::smrOffset(plan.group[k])), ops.rd(kSmmu + vsmmu::s2crOffset(plan.group[k])));
-    hw.note("V3 bank %s bank %u sctlr %08x cbar %08x cba2r %08x tcr %08x tcr2 %08x ttbr0 %08x%08x mair %08x/%08x", when,
+    hw.note("V3 bank %s bank %u sctlr %08x cbar %08x cba2r %08x tcr %08x tcr2 %08x", when,
             plan.bank, ops.rd(cb + vsmmu::kSctlr), ops.rd(kSmmu + vsmmu::cbarOffset(plan.bank)),
-            ops.rd(kSmmu + vsmmu::cba2rOffset(plan.bank)), ops.rd(cb + vsmmu::kTcr), ops.rd(cb + vsmmu::kTcr2),
-            ops.rd(cb + vsmmu::kTtbr0Hi), ops.rd(cb + vsmmu::kTtbr0Lo), ops.rd(cb + vsmmu::kMair0), ops.rd(cb + vsmmu::kMair1));
+            ops.rd(kSmmu + vsmmu::cba2rOffset(plan.bank)), ops.rd(cb + vsmmu::kTcr), ops.rd(cb + vsmmu::kTcr2));
+    hw.note("V3 bank %s TTBR0 %08x%08x TTBR1 %08x%08x ASID %u mair %08x/%08x", when,
+            ops.rd(cb + vsmmu::kTtbr0Hi), ops.rd(cb + vsmmu::kTtbr0Lo), ops.rd(cb + vsmmu::kTtbr1Hi),
+            ops.rd(cb + vsmmu::kTtbr1Lo), plan.asid, ops.rd(cb + vsmmu::kMair0), ops.rd(cb + vsmmu::kMair1));
+    const vsmmu::Fault f = vsmmu::fault(plan, ops);
+    hw.note("V3 bank %s FSR raw %08x fault-bits %08x format %u valid %u FAR %08x%08x FSYNR %08x (invalid is stale)", when,
+            f.fsr, f.fsr & vsmmu::kFsrFaults, (f.fsr >> 9) & 3, unsigned((f.fsr & vsmmu::kFsrFaults) != 0), f.farHi, f.farLo, f.fsynr0);
   }
   void queueTrace(const char *when)
   {
@@ -370,38 +391,55 @@ class Bringup {
   }
 
   // ----------------------------------------------------------------------------------------------------------------- V3
-  // Everything down: PAS shutdown while powered, the power-off, the bank and its memory.
+  // Domain lifetime: resume a collapsed firmware for PAS shutdown, stop DMA, detach with the c5 dependencies still held,
+  // synchronize, then drop power and free memory. A failure retains DMA (and any available dependencies), never reports unloaded.
   int teardown()
   {
+    phase("release-begin", kOk);
+    int un = kOk, faultRc = kOk, offRc = kOk;
+    const bool hadPas = fst.loaded || fst.initDone;
+    if (hadPas && !pst.on) {
+      // Do not repeat HFI/queue commands just to stop the processor. Power and secure resume suffice for PAS shutdown.
+      un = on();
+      if (!un) un = hw.scmRemoteState(kRemoteStateResume) ? kErrScm : kOk;
+      phase("release-resume", un);
+    }
     coreTrace("before-teardown");
     queueTrace("before-teardown");
     sfrTrace("before-teardown");
-    int faultRc = routed.bank ? checkFault() : kOk;
-    int un = kOk;
-    if ((fst.loaded || fst.initDone) && pst.on) un = firmware.unload();
-    else if (fst.loaded || fst.initDone) {
-      hw.note("teardown: the core is collapsed: PAS 9 is left to the next boot (no shutdown without power)");
-      un = kErrScm;
+    if (routed.bank) faultRc = checkFault();
+    if (!un && hadPas) {
+      if (domainPowerReady()) un = firmware.unload();
+      else un = kErrScm;
     }
-    hw.note("V3 teardown PAS result %d loaded %u init %u", un, unsigned(fst.loaded), unsigned(fst.initDone));
-    const int offRc = off();
-    hw.note("V3 teardown power result %d warnings %u rails %u bus %u controller %u codec %u", offRc, pst.offWarnings,
-            unsigned(pst.railsUp), unsigned(pst.busOn), unsigned(pst.ctrlGdsc), unsigned(pst.codecGdsc));
-    bool tlb = true;
-    if (routed.bank || routed.group[0] || routed.group[1]) {
-      if (checkFault()) faultRc = kErrFault;
-      hw.stage(kStepSmmuTeardown, "the video streams released, the bank back as found");
-      tlb = vsmmu::teardown(plan, ops, routed);
+    hw.note("V3 teardown PAS %s result %d loaded %u init %u", hadPas ? "performed" : "skipped-never-started", un,
+            unsigned(fst.loaded), unsigned(fst.initDone));
+    phase("device-quiesced", un);
+    const bool touched = routed.bank || routed.group[0] || routed.group[1];
+    bool detached = !touched;
+    if (!un && touched && domainPowerReady()) {
+      hw.stage(kStepSmmuTeardown, "video routes invalid, legal S1 release while power/NoC held");
+      detached = vsmmu::teardown(plan, ops, routed);
       bankTrace("released");
     }
-    if (dmaHeld) {
-      hw.dmaFree(dma);
-      dmaHeld = false;
-      mem.uc = nullptr;
-    }
-    teardownRc = un ? un : offRc ? offRc : !tlb ? kErrSmmu : faultRc ? faultRc : watchdogSeen ? kErrWatchdog : kOk;
+    phase("domain-release", detached ? kOk : kErrSmmu);
+    // No TLB operation after off(). Do not withdraw the buses after an unconfirmed detach or quiesce.
+    if (!un && detached) {
+      offRc = off();
+      phase("power-off", offRc);
+      hw.note("V3 teardown power result %d warnings %u rails %u bus %u controller %u codec %u", offRc, pst.offWarnings,
+              unsigned(pst.railsUp), unsigned(pst.busOn), unsigned(pst.ctrlGdsc), unsigned(pst.codecGdsc));
+      if (!offRc && dmaHeld) {
+        hw.dmaFree(dma);
+        dmaHeld = false;
+        mem.uc = nullptr;
+      }
+    } else hw.note("V3 teardown dependencies held: PAS %d detached %u power-ready %u", un, unsigned(detached), unsigned(domainPowerReady()));
+    phase(dmaHeld ? "DMA-held" : "DMA-freed", dmaHeld ? kErrSmmu : kOk);
+    teardownRc = un ? un : !detached ? kErrSmmu : offRc ? offRc : faultRc ? faultRc : watchdogSeen ? kErrWatchdog : kOk;
     hw.note("V3 teardown result %d PAS %d power %d smmu %u dma-held %u watchdog %u samples %u", teardownRc, un, offRc,
-            unsigned(tlb), unsigned(dmaHeld), unsigned(watchdogSeen != 0), watchdogSamples);
+            unsigned(detached), unsigned(dmaHeld), unsigned(watchdogSeen != 0), watchdogSamples);
+    phase("release-end", teardownRc);
     return teardownRc;
   }
   int v3fail(int stepNo, int rc)
@@ -417,6 +455,8 @@ class Bringup {
             unsigned(rep.version), rc, stepNo);
     hw.note("V3 version error %d stage %d received %u (see CTRL/RX/SFR evidence)", rc, stepNo, unsigned(rep.version));
     teardown();
+    hw.note("V3 outcome first-HFI %s first-error %d stage %d teardown %d dma-held %u", firstHfi ? "PASS" : "FAIL", rc, stepNo,
+            teardownRc, unsigned(dmaHeld));
     return fail(stepNo, rc);
   }
 
@@ -460,15 +500,6 @@ class Bringup {
             (unsigned long long)(tables.pa + vsmmu::kTablePages * 4096), (unsigned long long)dma.scratch,
             kIovaBase + kUcBytes, kIovaBase + kUcRegionBytes);
     if (opt.stop == kStepSmmuTables) return smmuFail(kStepSmmuTables, kErrStopped);
-    hw.stage(kStepSmmuRoute, "SMMU: the bank, then the two streams through it");
-    bankTrace("before-apply");
-    if (const char *why = vsmmu::apply(plan, tables.pa, ops, routed)) {
-      hw.note("smmu: %s", why);
-      return smmuFail(kStepSmmuRoute, kErrSmmu);
-    }
-    bankTrace("applied");
-    if (checkFault()) return smmuFail(kStepSmmuRoute, kErrFault);
-    if (opt.stop == kStepSmmuRoute) return smmuFail(kStepSmmuRoute, kErrStopped);
     hw.stage(kStepQueues, "the queue table, three queues and the SFR");
     mem.uc = dma.uc;
     mem.iova = kIovaBase;
@@ -487,6 +518,22 @@ class Bringup {
     }
     hw.note("V3 layout: SFR [%#x,%#x) size %u valid-pages %u padding-alias-pages %u", kIovaBase + kSfrOffset,
             kIovaBase + kSfrOffset + kSfrBytes, mem.ld(kSfrOffset), vsmmu::kUcPages, vsmmu::kWindowPages - vsmmu::kUcPages);
+    return kOk;
+  }
+
+  int smmuApply()
+  {
+    if (!domainPowerReady()) return smmuFail(kStepSmmuRoute, kErrSmmu);
+    hw.stage(kStepSmmuRoute, "SMMU: the bank, then the two streams through it");
+    bankTrace("before-apply");
+    if (const char *why = vsmmu::apply(plan, tables.pa, ops, routed)) {
+      hw.note("smmu: %s", why);
+      return smmuFail(kStepSmmuRoute, kErrSmmu);
+    }
+    bankTrace("applied");
+    if (checkFault()) return smmuFail(kStepSmmuRoute, kErrFault);
+    if (opt.stop == kStepSmmuRoute) return smmuFail(kStepSmmuRoute, kErrStopped);
+    phase("routes-effective", kOk);
     return kOk;
   }
 
@@ -602,8 +649,11 @@ class Bringup {
   int checkFault()
   {
     const vsmmu::Fault f = vsmmu::fault(plan, ops);
-    rep.fsr |= f.fsr;
-    hw.note("V3 fault snapshot bank %u fsr %08x far %08x%08x fsynr0 %08x", plan.bank, f.fsr, f.farHi, f.farLo, f.fsynr0);
+    rep.fsr |= f.fsr & vsmmu::kFsrFaults;
+    hw.note("V3 fault snapshot bank %u raw %08x fault-bits %08x format %u valid %u far %08x%08x fsynr0 %08x", plan.bank, f.fsr,
+            f.fsr & vsmmu::kFsrFaults, (f.fsr >> 9) & 3, unsigned((f.fsr & vsmmu::kFsrFaults) != 0), f.farHi, f.farLo, f.fsynr0);
+    hw.note("V3 fault syndrome %s CBFRSYNRA %08x SID %04x (FSYNR0 is not SID)", (f.fsr & vsmmu::kFsrFaults) ? "valid" : "stale",
+            f.cbfrsynra, f.cbfrsynra & 0xffffu);
     if (!(f.fsr & vsmmu::kFsrFaults)) return kOk;
     hw.note("smmu: FAULT on the video bank: fsr %08x far %08x%08x fsynr0 %08x", f.fsr, f.farHi, f.farLo, f.fsynr0);
     return kErrFault;
@@ -707,14 +757,23 @@ class Bringup {
 
   int v3()
   {
-    hw.note("V3: SMMU bank + UC region, power on, PAS 9, HFI boot and handshake; collapse after %u ms idle; %u resume(s)%s", opt.idleMs,
+    hw.note("V3: prepare UC, power on, SMMU bank/routes, PAS 9, HFI boot and handshake; collapse after %u ms idle; %u resume(s)%s", opt.idleMs,
             opt.resumes, opt.unload ? "; then unload" : "");
-    hw.note("V3 evidence contract vid-v3a: c5 power/PAS; bank/core/queues/version/teardown");
+    hw.note("V3 evidence contract vid-v3b: S1 lifecycle; c5 power/PAS and HFI unchanged");
     power.traceOff = true;
+    ops.traceSmmu = true;
     ++rep.cycles;
     int rc = smmuSetup();
+    phase("memory-prepared", rc);
     if (rc) return v3fail(rep.failedStep, rc);
-    if ((rc = on())) return v3fail(pst.failedStep, rc);
+    rc = on();
+    phase("power-on", rc);
+    powerTrace();
+    if (rc) return v3fail(pst.failedStep, rc);
+    coreTrace("after-power");
+    rc = smmuApply();
+    phase("S1-apply", rc);
+    if (rc) return v3fail(rep.failedStep, rc);
     if ((rc = firmware.load())) return v3fail(fst.failedStep, rc);
     coreTrace("after-PAS");
     if ((rc = bootCore())) return v3fail(kStepCtrlStatus, rc);
@@ -747,11 +806,15 @@ class Bringup {
     if (opt.unload) {   // iris_core_deinit: resumed first, then PAS shutdown, then off
       hw.stage(kStepUnload, "unload: resume, PAS shutdown, power off, the bank released");
       if ((rc = resume(false))) return v3fail(kStepUnload, rc);
-      if ((rc = teardown())) return fail(kStepUnload, rc);
+      if ((rc = teardown())) {
+        hw.note("V3 outcome first-HFI PASS first-error %d stage %d teardown %d dma-held %u", rc, kStepUnload, teardownRc, unsigned(dmaHeld));
+        return fail(kStepUnload, rc);
+      }
       hw.note("V3: unloaded: PAS 9 shut down, the core off, the video streams released");
     } else {
       hw.note("V3: steady state: the core collapsed, the firmware in the carveout, the bank and the UC region kept");
     }
+    hw.note("V3 outcome first-HFI PASS first-error 0 stage 0 teardown %d dma-held %u", teardownRc, unsigned(dmaHeld));
     hw.note("V3 evidence complete: first-HFI PASS resumes %u/%u collapses %u teardown %d watchdog %u fsr %08x",
             rep.resumesOk, opt.resumes, rep.collapses, teardownRc, unsigned(watchdogSeen != 0), rep.fsr);
     return watchdogSeen ? kErrWatchdog : kOk;

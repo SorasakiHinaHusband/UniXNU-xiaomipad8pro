@@ -395,13 +395,21 @@ console) and one after, so a call that does not return is the last line.
 
 ### 12.3 V3: the streams' own SMMU bank and the HFI handshake (`piano-video=4`)
 
-**V3 evidence transaction (vid-v3a, awaiting tablet verification).** Level 4 keeps the `vid-v2c5` power/PAS contract, with ten
+**V3 S1 lifecycle (vid-v3b, awaiting tablet verification).** The prior `vid-v3a` mailbox confirmed stage 42 rejected
+SCTLR `0x1027` reading `0x27`; teardown then ended at an unsupported as-found CBAR TYPE0 store (the inferred SError cause).
+FSR `0x400` has Format=2 and no valid fault bits. This revision uses the existing Wi-Fi and camera SMMU contracts.
+
+**Evidence transaction.** Level 4 keeps the `vid-v2c5` power/PAS contract, with ten
 resume/ping/collapse cycles and final unload by default; levels 2/3 retain their defaults. Explicit `piano-video-resumes=0
 piano-video-unload=0` keeps the earlier steady state. The transaction adds no IRQ handler or IRQ-clear writes. The plan is
 rechecked immediately before apply; a changed group, bank or competing SID route is refused before writing. This is a conflict
 check, not a cross-kext atomic reservation: combined images must still ensure other bank allocators have finished.
+A fingerprint of other routes and active S1 banks must remain stable through apply; both TTBR ASIDs are checked for conflicts.
+Level 4 defers the initial device survey. It prepares queues/tables in local memory, completes c5 power stages 10–18, then
+performs video bank/TLB operations and publishes both routes. `V3 lifecycle` records numbered phase results, `verify` records
+want/got/mask/mismatch, and `store completed` is emitted after each SMMU store returns.
 
-The `V3 bank` lines record plan/apply/release routes and SCTLR/CBAR/CBA2R/TCR/TCR2/TTBR0/MAIR. `V3 memory` records physical page
+The `V3 bank` lines record plan/apply/release routes and SCTLR/CBAR/CBA2R/TCR/TCR2/TTBR0/TTBR1/MAIR. `V3 memory` records physical page
 ends, the 1024-page software walk and scratch aliases; `V3 layout` records the table, all three queue headers and SFR bounds.
 `CTRL_STATUS sample/final` records actual reads and elapsed microseconds (at most 1001 reads / 100 ms of requested delay).
 `V3 TX/RX` records headers, packet fields and queue indices before parsing; `V3 doorbell` counts every event independently of
@@ -421,11 +429,20 @@ L3 tables mapping IOVA `[0x80000000, +4 MiB)`: the UC region's 770 pages (any XN
 rest of the window on one zeroed scratch page; everything else faults. Walks non-cacheable over tables cleaned to the PoC (whatever
 IDR0.CTTW says); the table is walked in software first (every page of the window must translate to its page). The bank: SCTLR 0,
 CBA2R VA64, CBAR stage 1 / stage 2 bypass (Linux's MemAttr WB, BPSHCFG NSH), TCR2 PASize + **SEP 7** (SEP 0 faults every IOVA with
-bit 31 set under this hypervisor family: dpu.md), TCR T0SZ 32, TTBR0 our table (ASID 0), TTBR1 0, MAIR0 0x44, bank TLBIALL +
-TLBSYNC, stale faults cleared, SCTLR M/TRE/AFE/CFRE/ASIDPNE (no CFIE: FSR is polled), read back; then per stream S2CR (translate,
-our bank) before SMR (valid, the stream, mask 0); global TLBIALLNSNH + sTLBGSYNC. TLB register stores are never 0. The teardown
-puts the groups back as found (SMR invalid first, then S2CR), the bank's translation off, CBAR/CBA2R as found, TLBs. The FSR is
-read after the handshake (must be 0) and after any failure.
+bit 31 set under this hypervisor family: dpu.md), TCR T0SZ 32, TTBR0 our table, TTBR1 disabled by EPD1; both TTBRs carry
+ASID=bank, preserving all PA high bits. MAIR0 is 0x44. Clear valid stale faults, bank TLBIALL + TLBSYNC, then SCTLR
+M/TRE/AFE/CFRE/ASIDPNE (no CFIE: FSR is polled). Require SCTLR bits `0x27`, allowing ASIDPNE to read zero; compare TCR2 fields
+with mask `0x3801f`, explicitly recording tolerated TBI bits `0x60`. Verify both S2CR TYPE/CBNDX values, record their attributes,
+then make both exact SMRs valid; global TLBIALLNSNH + sTLBGSYNC. TLB register stores are never 0.
+
+Release first stops PAS while powered, invalidates and verifies both SMRs, restores only legal S2CRs (an unsupported baseline
+such as `0x0300006e` is replaced with FAULT), clears SCTLR.M, and completes bank/global TLB maintenance before dropping the
+video power/NoC dependencies. If trapped FAULT keeps the already accepted translation, release requires SMR invalid plus M=0
+and completed TLBs. Unsupported CBAR TYPE0 is never restored on this S1-only SMMU; leave accepted CBAR `0x1f300`/CBA2R=1.
+Only a legal as-found VA64 context can be restored. Unknown quiesce, detach or TLB completion retains DMA and available power
+instead of reporting unloaded. FSR raw, Format and `FSR & 0xc00001fe` are recorded separately; only the masked bits are faults.
+`tooling/native/video-v3-verdict.py RUN_FOLDER` checks console evidence or the recovered mailbox when capture failed, and keeps
+the first firmware result (including its exact failing stage) separate from the lifecycle verdict.
 
 **The UC region** (0x302000 bytes, write-combined CPU view, non-cacheable device view: no cache maintenance; barriers before a
 write index and before the doorbell): the 456-byte queue table (version 0, size 456, qhdr0 288, qhdr size 56, three queues, name
@@ -447,15 +464,16 @@ cut) is logged; the debug queue's lines are logged (`fw: ...`, the first 32, the
 [2.5 ms] and WFI [2.5 ms]; not idle: tried again every 100 ms, ten times), SET_REMOTE_STATE(0, 0) alone, the power-off (the
 firmware stays in the carveout; MXC back to 0, MM1 off). Resume (`piano-video-resumes`): power on, SET_REMOTE_STATE(1, 0), the boot
 words again (no PAS), hardware mode, INTRA_FRAME_POWER_COLLAPSE, IMAGE_VERSION as a ping [1 s], FSR 0, then idle and collapse.
-`piano-video-unload=1` ends with Linux's deinit: resume, PAS shutdown, off, the bank and the UC region released. Without it the
+`piano-video-unload=1` ends with resume, PAS shutdown, bank/routes released while the buses remain on, power-off, then DMA free. Without it the
 steady state is: both GDSCs collapsed, the rails at the boot's levels, the firmware in the carveout under PAS 9, the bank and the
 3 MiB UC region kept for the next session (V5's).
 
 ### 12.4 Failures
 
-Any failure powers everything down before the level returns: PAS shutdown while the core is powered (a collapsed core is not
-touched: PAS 9 is then left to the next boot), the power-off in Linux's order, MM1 and MXC dropped, the SMMU groups and bank back
-as found, the memory freed; the SFR's text and the bank's FSR/FAR/FSYNR0 are logged when there is one. The stage word ends
+V1/V2 retain their established power/PAS cleanup. V3 captures readable core/queue/SFR/fault evidence, resumes a collapsed core
+before PAS shutdown, releases the S1 domain while dependencies remain on, then powers off and frees memory. A failed secure
+shutdown retains firmware ownership flags. An unconfirmed shutdown, detach, TLB sync or power-off retains DMA and reports a
+cleanup error alongside the original failure. The stage word ends
 negative at the failed step (`PianoVideo: FAILED at stage N: <reason>`), and `piano-video-bringup` says the same in one line.
 
 ### 12.5 What every level keeps

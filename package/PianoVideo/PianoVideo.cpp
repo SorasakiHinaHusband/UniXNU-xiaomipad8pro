@@ -658,6 +658,12 @@ void PianoVideo::run()
     note("waiting %u s", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
   }
+  if (gArgs.level == 4) {
+    note("V3 survey deferred: c5 power precedes Iris MMIO and video TLB maintenance");
+    bringup();
+    unmapAll();
+    return;
+  }
   unsigned loads = 0;
   Clocks c;
   stage(1, "GCC video branches (read only)");

@@ -18,7 +18,9 @@
 //     attribute 0 = 0x44), outer shareable, AF set, executable (as Linux's iommu_map without IOMMU_NOEXEC); the rest of the 4 MiB
 //     the firmware is told about maps one zeroed scratch page; everything else faults (terminated, CFCFG 0);
 //   - SCTLR = M | TRE | AFE | CFRE | ASIDPNE (Linux's stage-1 bits without CFIE: no fault interrupt is attached, FSR is polled);
-//   - the teardown puts the groups and the bank back as found: SMR invalid first, then S2CR, then translation off, TLB maintenance.
+//   - WifiSmmuWindow.h's required SCTLR bits and bank-number ASID; CameraSmmu.h's capability-checked restoration. Release
+//     invalidates SMRs before a legal S2CR, disables translation and synchronizes with the video buses still on. A failed release
+//     keeps the tables and UC memory. Unsupported reset words are never written back (docs/drivers/camera.md section 4.3).
 #pragma once
 #include <stdint.h>
 #include "VideoHw.h"
@@ -37,6 +39,10 @@ constexpr uint32_t kSctlr = 0x000, kResume = 0x008, kTcr2 = 0x010, kTtbr0Lo = 0x
                    kTtbr1Hi = 0x02c, kTcr = 0x030, kContextIdr = 0x034, kMair0 = 0x038, kMair1 = 0x03c, kFsr = 0x058, kFarLo = 0x060,
                    kFarHi = 0x064, kFsynr0 = 0x068, kTlbiAll = 0x618, kTlbSync = 0x7f0, kTlbStatus = 0x7f4;
 constexpr uint32_t kSctlrM = 1u << 0, kSctlrVideo = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12;   // M TRE AFE CFRE ASIDPNE
+constexpr uint32_t kSctlrRequired = kSctlrVideo & ~(1u << 12);
+constexpr uint32_t kTcr2Fields = 0x0003801fu, kTcr2Tbi = 0x60u;
+constexpr uint32_t kS2crFault = 2u << 16, kS2crFields = 0x300ffu, kS2crAttrs = 0x03000c00u;
+constexpr uint32_t ttbrHi(uint64_t pa, unsigned asid) { return uint32_t(pa >> 32) | (asid & 0xffu) << 16; }
 constexpr uint32_t kCbarStage1 = 1u << 16 | 0xfu << 12 | 3u << 8;   // stage 1, stage 2 bypass; MemAttr WB, BPSHCFG NSH (Linux)
 constexpr uint32_t kCba2rVa64 = 1;
 constexpr uint32_t kTcrVideo = 32u | 1u << 23;                      // T0SZ 32, IRGN0/ORGN0/SH0 0 (non-cacheable walks), TG0 4 KiB, EPD1
@@ -47,12 +53,15 @@ constexpr unsigned kPaBits[6] = {32, 36, 40, 42, 44, 48};
 constexpr uint16_t kStreams[2] = {kStreamFirst, kStreamSecond};
 constexpr unsigned kSyncPolls = 100000;                             // x 1 us
 
+constexpr uint32_t kBankWords[9] = {kTcr2, kTcr, kTtbr0Lo, kTtbr0Hi, kTtbr1Lo, kTtbr1Hi, kContextIdr, kMair0, kMair1};
+
 // ---------------------------------------------------------------------------------------------------------------- the plan
 struct Plan {
   uint32_t scr0 = 0, idr0 = 0, idr1 = 0, idr2 = 0;
   unsigned groups = 0, banks = 0, pages = 0, freeGroups = 0, pasize = 0;
-  unsigned group[2] = {~0u, ~0u}, bank = ~0u;
+  unsigned group[2] = {~0u, ~0u}, bank = ~0u, asid = 0;
   uint32_t smrFound[2] = {}, s2crFound[2] = {}, sctlrFound = 0, cbarFound = 0, cba2rFound = 0;
+  uint32_t bankFound[9] = {};
   const char *error = nullptr;
   uint32_t cb() const { return (pages + bank) * 4096; }
 };
@@ -131,9 +140,11 @@ Plan plan(Read rd)
     p.smrFound[k] = rd(smrOffset(p.group[k]));
     p.s2crFound[k] = rd(s2crOffset(p.group[k]));
   }
+  p.asid = p.bank;   // Same shared ASID namespace contract as PianoWifi.
   p.sctlrFound = rd(p.cb() + kSctlr);
   p.cbarFound = rd(cbarOffset(p.bank));
   p.cba2rFound = rd(cba2rOffset(p.bank));
+  for (unsigned i = 0; i < 9; ++i) p.bankFound[i] = rd(p.cb() + kBankWords[i]);
   return p;
 }
 
@@ -218,6 +229,8 @@ const char *available(const Plan &p, O &ops)
       return "a selected stream group changed since plan";
   if (rd(p.cb() + kSctlr) != p.sctlrFound || rd(cbarOffset(p.bank)) != p.cbarFound || rd(cba2rOffset(p.bank)) != p.cba2rFound)
     return "the selected bank changed since plan";
+  for (unsigned i = 0; i < 9; ++i)
+    if (rd(p.cb() + kBankWords[i]) != p.bankFound[i]) return "the selected S1 bank words changed since plan";
   for (unsigned g = 0; g < p.groups; ++g) {
     const uint32_t smr = rd(smrOffset(g));
     if (!(smr & 0x80000000u)) continue;
@@ -233,83 +246,203 @@ struct Routed {
   bool group[2] = {};          // the group's S2CR was written
 };
 
+// A stable fingerprint is a checkable no-competition precondition, not an atomic cross-kext lock. Check it again before
+// publishing either SID. Every active S1 bank's TTBR0 and TTBR1 shares the ASID namespace when ASIDPNE reads zero.
+template <class O>
+const char *owners(const Plan &p, O &ops, uint64_t &stamp)
+{
+  stamp = 1469598103934665603ull;
+  auto mix = [&](uint32_t v) { stamp = (stamp ^ v) * 1099511628211ull; };
+  for (unsigned g = 0; g < p.groups; ++g) {
+    if (g == p.group[0] || g == p.group[1]) continue;
+    mix(ops.rd(kSmmu + smrOffset(g)));
+    mix(ops.rd(kSmmu + s2crOffset(g)));
+  }
+  for (unsigned b = 0; b < p.banks; ++b) {
+    if (b == p.bank) continue;
+    const uint64_t cb = kSmmu + (p.pages + b) * 4096;
+    const uint32_t sctlr = ops.rd(cb + kSctlr);
+    mix(sctlr);
+    if (!(sctlr & kSctlrM)) continue;
+    const uint32_t cbar = ops.rd(kSmmu + cbarOffset(b));
+    mix(cbar);
+    if (((cbar >> 16) & 3u) == 0) continue;   // S2 has no S1 ASID.
+    const uint32_t t0 = ops.rd(cb + kTtbr0Hi), t1 = ops.rd(cb + kTtbr1Hi);
+    mix(t0); mix(t1);
+    if (((t0 >> 16) & 0xffffu) == p.asid || ((t1 >> 16) & 0xffffu) == p.asid) {
+      ops.hw.note("smmu: ASID conflict bank %u asid %u active-bank %u ttbr-hi %08x/%08x", p.bank, p.asid, b, t0, t1);
+      return "our ASID is held by an active S1 bank";
+    }
+  }
+  return nullptr;
+}
+
+template <class O>
+bool verify(O &ops, const char *word, uint64_t pa, uint32_t want, uint32_t mask)
+{
+  const uint32_t got = ops.rd(pa), mismatch = (want ^ got) & mask;
+  ops.hw.note("smmu: verify %s want %08x got %08x mask %08x mismatch %08x %s", word, want, got, mask, mismatch,
+              mismatch ? "FAIL" : "PASS");
+  return !mismatch;
+}
+
 template <class O>
 const char *apply(const Plan &p, uint64_t tablePa, O &ops, Routed &done)
 {
   if (p.error) return p.error;
-  if (!tablePa || (tablePa & 0xfff)) return "the table is not page aligned";
+  if (!tablePa || (tablePa & 0xfff) || (tablePa + kTablePages * 4096 - 1) >> kPaBits[p.pasize])
+    return "the table is not aligned or exceeds the output size";
   const char *conflict = available(p, ops);
-  ops.hw.note("smmu: V3 recheck %s (no cross-kext reservation)", conflict ? conflict : "clear");
+  uint64_t before = 0, after = 0;
+  if (!conflict) conflict = owners(p, ops, before);
+  ops.hw.note("smmu: V3 recheck %s bank %u ASID %u owners %016llx (no cross-kext lock)", conflict ? conflict : "clear", p.bank,
+              p.asid, (unsigned long long)before);
   if (conflict) return conflict;
   const uint32_t cb = p.cb();
   done.bank = true;
   ops.wr(kSmmu + cb + kSctlr, 0, "smmu bank SCTLR: translation off while programmed");
+  if (!verify(ops, "SCTLR-off", kSmmu + cb + kSctlr, 0, kSctlrM)) return "bank translation did not stop";
   ops.wr(kSmmu + cba2rOffset(p.bank), kCba2rVa64, "smmu CBA2R: VA64");
   ops.wr(kSmmu + cbarOffset(p.bank), kCbarStage1, "smmu CBAR: stage 1, stage 2 bypass");
   ops.wr(kSmmu + cb + kTcr2, tcr2For(p.pasize), "smmu bank TCR2: PASize, SEP upstream");
   ops.wr(kSmmu + cb + kTcr, kTcrVideo, "smmu bank TCR: T0SZ 32, 4 KiB, non-cacheable walks");
   ops.wr(kSmmu + cb + kTtbr0Lo, uint32_t(tablePa), "smmu bank TTBR0 low: our table");
-  ops.wr(kSmmu + cb + kTtbr0Hi, uint32_t(tablePa >> 32), "smmu bank TTBR0 high (ASID 0)");
+  ops.wr(kSmmu + cb + kTtbr0Hi, ttbrHi(tablePa, p.asid), "smmu bank TTBR0 high: PA and own ASID");
   ops.wr(kSmmu + cb + kTtbr1Lo, 0, "smmu bank TTBR1 low: none");
-  ops.wr(kSmmu + cb + kTtbr1Hi, 0, "smmu bank TTBR1 high: none");
+  ops.wr(kSmmu + cb + kTtbr1Hi, ttbrHi(0, p.asid), "smmu bank TTBR1 high: own ASID, EPD1");
   ops.wr(kSmmu + cb + kContextIdr, 0, "smmu bank CONTEXTIDR");
   ops.wr(kSmmu + cb + kMair0, kMair0Video, "smmu bank MAIR0: attribute 0 Normal non-cacheable");
   ops.wr(kSmmu + cb + kMair1, 0, "smmu bank MAIR1");
-  if (!tlbSync(ops, cb)) return "the bank's TLB sync did not finish";
   const uint32_t fsr = ops.rd(kSmmu + cb + kFsr);
+  ops.hw.note("smmu: stale FSR raw %08x fault-bits %08x format %u valid %u", fsr, fsr & kFsrFaults, (fsr >> 9) & 3,
+              unsigned((fsr & kFsrFaults) != 0));
   if (fsr & kFsrSs) ops.wr(kSmmu + cb + kResume, 1, "smmu bank RESUME: terminate a stalled transaction");
   if (fsr & kFsrFaults) ops.wr(kSmmu + cb + kFsr, fsr & kFsrFaults, "smmu bank FSR: stale faults cleared");
-  ops.wr(kSmmu + cb + kSctlr, kSctlrVideo, "smmu bank SCTLR: M TRE AFE CFRE ASIDPNE");
-  if ((ops.rd(kSmmu + cb + kSctlr) & kSctlrVideo) != kSctlrVideo || ops.rd(kSmmu + cba2rOffset(p.bank)) != kCba2rVa64 ||
-      ops.rd(kSmmu + cbarOffset(p.bank)) != kCbarStage1 || ops.rd(kSmmu + cb + kTtbr0Lo) != uint32_t(tablePa) ||
-      ops.rd(kSmmu + cb + kTtbr0Hi) != uint32_t(tablePa >> 32) || ops.rd(kSmmu + cb + kTcr) != kTcrVideo ||
-      ops.rd(kSmmu + cb + kTcr2) != tcr2For(p.pasize) || ops.rd(kSmmu + cb + kMair0) != kMair0Video)
-    return "the bank's registers do not read back";
+  if (!tlbSync(ops, cb)) return "the bank's TLB sync did not finish";
+  ops.wr(kSmmu + cb + kSctlr, kSctlrVideo, "smmu bank SCTLR: M TRE AFE CFRE, optional ASIDPNE");
+  bool ok = true;
+  auto check = [&](const char *word, uint32_t off, uint32_t want, uint32_t mask = 0xffffffffu) {
+    ok = verify(ops, word, kSmmu + off, want, mask) && ok;   // Do not short-circuit the evidence.
+  };
+  check("SCTLR", cb + kSctlr, kSctlrVideo, kSctlrRequired);
+  check("CBA2R", cba2rOffset(p.bank), kCba2rVa64);
+  check("CBAR", cbarOffset(p.bank), kCbarStage1);
+  check("TCR", cb + kTcr, kTcrVideo);
+  check("TCR2", cb + kTcr2, tcr2For(p.pasize), kTcr2Fields);
+  const uint32_t tcr2 = ops.rd(kSmmu + cb + kTcr2);
+  ops.hw.note("smmu: TCR2 fields PASize %u SEP %u AS %u TBI %02x tolerated %02x", tcr2 & 7, (tcr2 >> 15) & 7,
+              (tcr2 >> 4) & 1, tcr2 & kTcr2Tbi, kTcr2Tbi);
+  check("TTBR0-lo", cb + kTtbr0Lo, uint32_t(tablePa));
+  check("TTBR0-hi", cb + kTtbr0Hi, ttbrHi(tablePa, p.asid));
+  check("TTBR1-lo", cb + kTtbr1Lo, 0);
+  check("TTBR1-hi", cb + kTtbr1Hi, ttbrHi(0, p.asid));
+  check("MAIR0", cb + kMair0, kMair0Video);
+  check("MAIR1", cb + kMair1, 0);
+  if (!ok) return "the S1 bank fields do not read back (see verify FAIL)";
+  conflict = owners(p, ops, after);
+  ops.hw.note("smmu: owners before-routes %016llx->%016llx ASID %u result %u", (unsigned long long)before,
+              (unsigned long long)after, p.asid, unsigned(!conflict && before == after));
+  if (conflict || before != after) return conflict ? conflict : "other SMMU owners changed during bank apply";
+  // Recheck the selected groups immediately before publishing. Program and verify BOTH S2CRs before either SMR.
+  for (unsigned k = 0; k < 2; ++k) {
+    const unsigned g = p.group[k];
+    if (ops.rd(kSmmu + smrOffset(g)) != p.smrFound[k] || ops.rd(kSmmu + s2crOffset(g)) != p.s2crFound[k])
+      return "a selected group changed during bank apply";
+  }
   for (unsigned k = 0; k < 2; ++k) {
     const unsigned g = p.group[k];
     done.group[k] = true;
     ops.wr(kSmmu + s2crOffset(g), p.bank, "smmu S2CR: translate through our bank");
-    if ((ops.rd(kSmmu + s2crOffset(g)) & 0x300ffu) != p.bank) return "a stream's S2CR does not read back";
+    if (!verify(ops, "S2CR", kSmmu + s2crOffset(g), p.bank, kS2crFields))
+      return "a stream's S2CR type/bank do not read back";
+  }
+  for (unsigned k = 0; k < 2; ++k) {
+    const unsigned g = p.group[k];
+    ops.hw.note("smmu: S2CR group %u TYPE/bank verified attributes want 00000000 got %08x", g,
+                ops.rd(kSmmu + s2crOffset(g)) & kS2crAttrs);
     ops.wr(kSmmu + smrOffset(g), 0x80000000u | kStreams[k], "smmu SMR: valid, the video stream, mask 0");
-    if (ops.rd(kSmmu + smrOffset(g)) != (0x80000000u | kStreams[k])) return "a stream's SMR does not read back";
+    if (!verify(ops, "SMR", kSmmu + smrOffset(g), 0x80000000u | kStreams[k], 0xffffffffu))
+      return "a stream's SMR does not read back";
   }
   if (!globalSync(ops)) return "the global TLB sync did not finish";
   return nullptr;
 }
 
-// Back as found (only what apply wrote). True when the syncs finished.
+// Capability rules from this project's CameraSmmu.h. Never write an unsupported as-found word through trapped MMIO.
+inline bool s2crRestorable(uint32_t v, unsigned banks)
+{
+  const unsigned type = (v >> 16) & 3u;
+  return type == 1 || type == 2 || (type == 0 && (v & 0xffu) < banks);
+}
+inline bool cbarRestorable(uint32_t v, uint32_t idr0)
+{
+  const unsigned type = (v >> 16) & 3u;
+  if (type == 1) return (idr0 & kIdr0S1ts) != 0;
+  if (type == 3) return (idr0 & (1u << 28)) && (idr0 & kIdr0S1ts) && (idr0 & (1u << 29));
+  return (idr0 & (1u << 29)) != 0;
+}
+
+// Caller has confirmed PAS stopped (or never began), with c5 buses/NoC still held. On any unconfirmed detach keep ownership
+// flags set: no caller may free DMA or remove those dependencies. An invalid SMR plus M=0 is a legal free state.
 template <class O>
 bool teardown(const Plan &p, O &ops, Routed &done)
 {
-  bool ok = true;
+  if (!done.bank && !done.group[0] && !done.group[1]) return true;
   for (unsigned k = 0; k < 2; ++k) {
     if (!done.group[k]) continue;
-    ops.wr(kSmmu + smrOffset(p.group[k]), 0, "smmu SMR: invalid (the video stream released)");
-    ops.wr(kSmmu + s2crOffset(p.group[k]), p.s2crFound[k], "smmu S2CR: as found");
-    if (p.smrFound[k]) ops.wr(kSmmu + smrOffset(p.group[k]), p.smrFound[k], "smmu SMR: as found (invalid)");
-    const uint32_t smr = ops.rd(kSmmu + smrOffset(p.group[k])), s2cr = ops.rd(kSmmu + s2crOffset(p.group[k]));
-    const bool restored = smr == p.smrFound[k] && s2cr == p.s2crFound[k];
-    ops.hw.note("smmu: release group %u smr %08x s2cr %08x restored %u", p.group[k], smr, s2cr, unsigned(restored));
-    ok = restored && ok;
-    done.group[k] = false;
+    ops.wr(kSmmu + smrOffset(p.group[k]), p.smrFound[k] & ~0x80000000u, "smmu release SMR: invalid");
+    if (!verify(ops, "release-SMR", kSmmu + smrOffset(p.group[k]), p.smrFound[k] & ~0x80000000u, 0xffffffffu)) return false;
+  }
+  // Do not bypass/fault-probe a live route. Only after BOTH matches are confirmed invalid may the S2CR change.
+  for (unsigned k = 0; k < 2; ++k) {
+    if (!done.group[k]) continue;
+    const unsigned g = p.group[k];
+    const bool restore = s2crRestorable(p.s2crFound[k], p.banks);
+    const uint32_t want = restore ? p.s2crFound[k] : kS2crFault;
+    ops.wr(kSmmu + s2crOffset(g), want, restore ? "smmu release S2CR: legal as found" : "smmu release S2CR: fault, illegal baseline discarded");
+    const uint32_t got = ops.rd(kSmmu + s2crOffset(g));
+    // Known Qualcomm FAULT emulation may leave the already accepted translation. Never accept an arbitrary/illegal value.
+    const bool fallback = !restore && (got & (kS2crFields)) == p.bank;
+    ops.hw.note("smmu: release group %u smr %08x S2CR found %08x want %08x got %08x fallback %u result %u", g,
+                ops.rd(kSmmu + smrOffset(g)), p.s2crFound[k], want, got, unsigned(fallback), unsigned(got == want || fallback));
+    if (got != want && !fallback) return false;
+  }
+  // A newly acquired external reference is a conflict, never permission to disable its bank.
+  for (unsigned g = 0; g < p.groups; ++g) {
+    const uint32_t smr = ops.rd(kSmmu + smrOffset(g));
+    if ((smr & 0x80000000u) && (ops.rd(kSmmu + s2crOffset(g)) & kS2crFields) == p.bank) {
+      ops.hw.note("smmu: release conflict group %u still references bank %u: DMA held", g, p.bank);
+      return false;
+    }
   }
   if (done.bank) {
     const uint32_t cb = p.cb();
-    ops.wr(kSmmu + cb + kSctlr, p.sctlrFound, "smmu bank SCTLR: as found (translation off)");
-    ok = tlbSync(ops, cb) && ok;
-    ops.wr(kSmmu + cbarOffset(p.bank), p.cbarFound, "smmu CBAR: as found");
-    ops.wr(kSmmu + cba2rOffset(p.bank), p.cba2rFound, "smmu CBA2R: as found");
-    const uint32_t sctlr = ops.rd(kSmmu + cb + kSctlr), cbar = ops.rd(kSmmu + cbarOffset(p.bank)), cba2r = ops.rd(kSmmu + cba2rOffset(p.bank));
-    const bool restored = sctlr == p.sctlrFound && cbar == p.cbarFound && cba2r == p.cba2rFound;
-    ops.hw.note("smmu: release bank %u sctlr %08x cbar %08x cba2r %08x restored %u", p.bank, sctlr, cbar, cba2r, unsigned(restored));
-    ok = restored && ok;
-    done.bank = false;
+    ops.wr(kSmmu + cb + kSctlr, 0, "smmu release SCTLR: translation off");
+    if (!verify(ops, "release-SCTLR", kSmmu + cb + kSctlr, 0, kSctlrM)) return false;
+    if (!tlbSync(ops, cb)) return false;
+    const bool restore = cbarRestorable(p.cbarFound, p.idr0) && p.cba2rFound == kCba2rVa64;
+    if (restore) {
+      ops.wr(kSmmu + cbarOffset(p.bank), p.cbarFound, "smmu release CBAR: supported as found");
+      ops.wr(kSmmu + cba2rOffset(p.bank), p.cba2rFound, "smmu release CBA2R: legal VA64 as found");
+    }
+    // A partial apply must also have left a legal S1 pair before being called clean.
+    const uint32_t cbar = ops.rd(kSmmu + cbarOffset(p.bank)), cba2r = ops.rd(kSmmu + cba2rOffset(p.bank));
+    const bool legal = cbar == (restore ? p.cbarFound : kCbarStage1) && cba2r == (restore ? p.cba2rFound : kCba2rVa64);
+    ops.hw.note("smmu: release bank %u M0 1 CBAR %08x CBA2R %08x found %08x kept-S1 %u result %u", p.bank, cbar, cba2r,
+                p.cbarFound, unsigned(!restore), unsigned(legal));
+    if (!legal) return false;
   }
-  return globalSync(ops) && ok;
+  if (!globalSync(ops)) return false;
+  for (unsigned k = 0; k < 2; ++k)
+    if (done.group[k] && (ops.rd(kSmmu + smrOffset(p.group[k])) & 0x80000000u)) return false;
+  if (done.bank && (ops.rd(kSmmu + p.cb() + kSctlr) & kSctlrM)) return false;
+  done.bank = done.group[0] = done.group[1] = false;
+  ops.hw.note("smmu: release complete result 1 routes invalid bank M0 TLB complete");
+  return true;
 }
 
 struct Fault {
-  uint32_t fsr = 0, farLo = 0, farHi = 0, fsynr0 = 0;
+  uint32_t fsr = 0, farLo = 0, farHi = 0, fsynr0 = 0, cbfrsynra = 0;
 };
 template <class O>
 Fault fault(const Plan &p, O &ops)
@@ -320,6 +453,7 @@ Fault fault(const Plan &p, O &ops)
   f.farLo = ops.rd(kSmmu + cb + kFarLo);
   f.farHi = ops.rd(kSmmu + cb + kFarHi);
   f.fsynr0 = ops.rd(kSmmu + cb + kFsynr0);
+  f.cbfrsynra = ops.rd(kSmmu + 0x1400 + 4 * p.bank);
   return f;
 }
 

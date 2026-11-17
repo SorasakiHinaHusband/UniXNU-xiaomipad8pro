@@ -18,12 +18,15 @@ hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; *
 - `piano-video=4` (V3): + the streams' own SMMU bank and the UC region, the boot words and the HFI handshake (SYS_INIT,
   IMAGE_VERSION, the version string), collapse 1.5 s after the last activity with the firmware kept, resume/collapse cycles
   (`piano-video-resumes`, default 10), PAS shutdown and the bank released (`piano-video-unload`, default 1).
+  V3 prepares queues/tables before c5 power-on, then applies the S1 domain with its own ASID and publishes routes last.
+  Required SCTLR bits exclude optional ASIDPNE; TCR2 verification tolerates the observed TBI bits. Release keeps buses on until
+  PAS stops and routes/TLBs detach, never restores unsupported S2CR/CBAR words, and retains DMA on an unconfirmed cleanup.
   V3 records the bank's readbacks, all queue layouts, CTRL_STATUS samples and elapsed time, each TX/RX and doorbell, separate
   INIT/version results, PC/resume cycles, faults/watchdog/SFR, and teardown results. `piano-video-resumes=0 piano-video-unload=0`
   explicitly selects the earlier collapsed steady state. V2's defaults and power/PAS sequence are unchanged.
 
 Levels 2-4 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
-every wait is bounded, any failure powers everything down, and nothing is written below `piano-video=2`. Design, decisions, the
+every wait is bounded, V3 cleanup reports unsafe releases and keeps their DMA, and nothing is written below `piano-video=2`. Design, decisions, the
 batched tablet test list with its expected lines and the risks: `docs/drivers/video.md` (section 12 for levels 2-4).
 
 | File | What |
