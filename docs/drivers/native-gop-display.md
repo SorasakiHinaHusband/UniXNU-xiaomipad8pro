@@ -551,3 +551,11 @@ The VM-era display kext (`UPSTREAM`) and GopFramebuffer are BSD-2-Clause-Patent.
 code, and no Linux code, was read into this package. The IOMFB declarations are generated from the collection's symbols
 at build time, not copied. The composition (2026-11-12) is new code; the two layer-1 offsets and the extents getter were read
 from AppleParavirtDisplay's code in the collection the same way as the earlier offsets (§5a).
+
+### Single composed plane contract (pending tablet qualification)
+
+Each framebuffer publishes the top-level `IOMFBNumLayers` dictionary with a 32-bit `MaxNumLayers=1` before the family registers
+the service. Allocation or publication failure fails hardware start. This matches the existing CPU compositor: one composed
+desktop plane plus the existing cursor handling. Cursor capability properties remain unchanged. Ordinary desktop/video detachment
+must not move the composed frame to layer 1 or YUV video to ignored layer 2. Explicit forced-detach requests and capture results
+remain qualification questions; the property is not a new multi-plane renderer. Startup IOLog identifies `gpuoom-plane1`.

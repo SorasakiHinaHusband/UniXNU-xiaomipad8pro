@@ -317,6 +317,10 @@ void A830Fence::queuePass(uint64_t now)
     }
     /* (seen, done] is this pass's; a fence behind the accounted one (recovery's cleared memptrs) is nothing. */
     if(static_cast<int32_t>(done-seen)<=0) {__atomic_store_n(&q_seen_,seen,__ATOMIC_RELEASE);return;}
+    /* Single production writer of status.retired: hardware fence progress, not successful wait/query calls. The queue
+     * accountant owns (seen, done] once across IRQ/wait/DCVS callers; recovery's forced seqnos were skipped above. Count the
+     * whole wrap-safe delta, including completions too old for the latency stamp ring, without changing the status ABI. */
+    adreno830_status_add64(&adreno830_status.retired,uint32_t(done-seen));
     /* Only the newest A830FenceQueueStamps seqnos can still have their stamp. */
     uint32_t first=seen+1,missed=0;
     if(done-seen>A830FenceQueueStamps) {missed=done-seen-A830FenceQueueStamps;first=done-A830FenceQueueStamps+1;}

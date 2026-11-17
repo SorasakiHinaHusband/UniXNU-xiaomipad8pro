@@ -2709,7 +2709,7 @@ bool NativeGopDisplay::createDisplayAttributes()
     OSDictionary *attributes = OSDictionary::withCapacity(16), *product = OSDictionary::withCapacity(8);
     OSDictionary *chromaticity = OSDictionary::withCapacity(3), *whitePoint = point(20493, 21561);
     OSDictionary *transport = OSDictionary::withCapacity(2), *sourceLimits = OSDictionary::withCapacity(5);
-    OSDictionary *scalingLimits = OSDictionary::withCapacity(2);
+    OSDictionary *scalingLimits = OSDictionary::withCapacity(2), *numLayers = OSDictionary::withCapacity(1);
     OSArray *colors = OSArray::withCapacity(1), *timings = OSArray::withCapacity(1), *timingColors = OSArray::withCapacity(1);
     OSObject *color = ioavColorWithCapabilities(2, 8, 0, 0, 0, 16, false, nullptr, nullptr, nullptr, nullptr);
     // CVT reduced blanking as IOAVFamily's sCVTTimingData has it. Sync rates are 16.16 fixed point; the horizontal one is left 0.
@@ -2730,7 +2730,7 @@ bool NativeGopDisplay::createDisplayAttributes()
     at<uint32_t>(timingData, 68) = hTotal * vTotal * fRefreshHz;   // pixel clock in Hz
     OSObject *timing = ioavTimingWithData(timingData, 2, 4);
     do {
-        if (!attributes || !product || !chromaticity || !whitePoint || !transport || !sourceLimits || !scalingLimits || !colors ||
+        if (!attributes || !product || !chromaticity || !whitePoint || !transport || !sourceLimits || !scalingLimits || !numLayers || !colors ||
             !timings || !timingColors || !color || !timing)
             break;
         at<uint64_t>(color, kElementID) = kColorID;
@@ -2771,6 +2771,11 @@ bool NativeGopDisplay::createDisplayAttributes()
             break;
         if (!(appendNumber(scalingLimits, "RGBLayer_MinScaleFraction", 4) && appendNumber(scalingLimits, "RGBLayer_MaxScale", 4)))
             break;
+        // The CPU compositor consumes one composed desktop plane. Without this root property, CA may detach a fullscreen
+        // desktop/video onto slots reserved here for the cursor or ignored. start_hardware runs before the family registers us;
+        // failing this contract must fail start, never expose the permissive default. Cursor capability inputs stay unchanged.
+        if (!appendNumber(numLayers, "MaxNumLayers", 1, 32) || !setProperty("IOMFBNumLayers", numLayers))
+            break;
         setProperty("IOMFBUUID", fExternal ? pianodp::kFakeUuid : "4E474F50-4449-5350-0000-000000008750");
         // External, display index 0: the attributes macOS 27's WindowServer accepted on the VM-era display (UPSTREAM). D6's display:
         // external too, "primary" as piano-dp-fake-primary says (default 0, the panel's value; what WindowServer makes of it is D6's
@@ -2788,6 +2793,7 @@ bool NativeGopDisplay::createDisplayAttributes()
     OSSafeReleaseNULL(transport);
     OSSafeReleaseNULL(sourceLimits);
     OSSafeReleaseNULL(scalingLimits);
+    OSSafeReleaseNULL(numLayers);
     OSSafeReleaseNULL(colors);
     OSSafeReleaseNULL(timings);
     OSSafeReleaseNULL(timingColors);
@@ -2797,6 +2803,7 @@ bool NativeGopDisplay::createDisplayAttributes()
         GOPLOG("createDisplayAttributes failed (%s)\n", done ? "set_digital_out_mode" : "an element or a property");
         return false;
     }
+    GOPLOG("layer policy: IOMFBNumLayers MaxNumLayers=1 (32-bit); single composed plane; cursor inputs unchanged; gpuoom-plane1\n");
     return true;
 }
 

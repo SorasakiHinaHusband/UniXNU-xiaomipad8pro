@@ -233,6 +233,7 @@ struct Adreno830Status {
     uint32_t gmu_general11;         /* annibale: GENERAL_11 (0x3D7E72C) the last cold boot read before B6, 0 in RB mode (was
                                        reserved1, the padding before the 64-bit counters) */
     /* run-time counters (relaxed atomic adds from IRQ, submit and DCVS paths) */
+    /* retired: hardware seqnos observed by A830Fence's deduplicating queue accountant since start; excludes recovery skips. */
     uint64_t submits,retired,irqs,fence_irqs,waits,wait_timeouts,late_wakeups;
     uint32_t faults,smmu_faults,gmu_faults,hangs,recoveries,hfi_errors,wptr_retries,underruns;
     uint32_t mhz,busy_permille,gmu_level,bus_level,votes,vote_failures;
@@ -241,7 +242,7 @@ struct Adreno830Status {
 static_assert(offsetof(Adreno830Status,hfi_late)==20 && offsetof(Adreno830Status,reg)==24 &&
               offsetof(Adreno830Status,stage_us)==96 && offsetof(Adreno830Status,irq_off)==164 &&
               offsetof(Adreno830Status,qmp)==184 && offsetof(Adreno830Status,gmu_general11)==188 &&
-              offsetof(Adreno830Status,submits)==192 && offsetof(Adreno830Status,rows)==304 &&
+              offsetof(Adreno830Status,submits)==192 && offsetof(Adreno830Status,retired)==200 && offsetof(Adreno830Status,rows)==304 &&
               sizeof(Adreno830Status)==576,"Adreno830Status layout is read by the plugin and host tools");
 
 #ifdef __cplusplus

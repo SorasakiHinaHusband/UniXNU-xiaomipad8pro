@@ -465,3 +465,9 @@ allocation/free counters and mapped KVA accounting (pool included). Shared-range
 Host ASan/UBSan coverage exercises zero-fill, descriptor retention/cache choice, GPU maps, CPU leases, pending fences, free,
 double free, process-exit teardown, failure cleanup and quarantine. Actual VM/cache/DMA correctness and sustained desktop use
 remain tablet gates.
+
+The backing selection is announced on the direct startup IOLog channel, before the asynchronous GPU ring exists. The unchanged
+576-byte `Adreno830Status` ABI now counts `retired` at offset 200 from A830Fence's single queue accountant: the wrap-safe number
+of newly observed hardware fence seqnos, including completions whose latency stamps aged out, excluding recovery skips and forced
+completions. Repeated waits, display queries and IRQ/DCVS observations do not count a completion twice. This counter starts when
+the accountant starts and is separate from caller WaitFence timeouts (including polls) and display fence deadlines.

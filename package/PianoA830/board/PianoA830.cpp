@@ -1162,7 +1162,8 @@ bool PianoA830::start(IOService *provider)
     setProperty("IOPlatformSleepAction", kActionPriority, 32);
     setProperty("IOPlatformWakeAction", kActionPriority, 32);
   }
-  gpuLine("bo backing: user fallback=%s; kernel objects=mapped; pool=unchanged; gpuoom-vm1",
+  // The async line ring is not allocated yet: use the direct startup IOLog channel.
+  piano_a830_note("gpu bo backing: user fallback=%s; kernel objects=mapped; pool=unchanged; gpuoom-vm1",
           NativeAdrenoMemory::unmappedUser() ? "unmapped-vm" : "mapped-control");
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
   if (gTraceSync) {

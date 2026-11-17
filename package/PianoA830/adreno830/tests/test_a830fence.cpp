@@ -34,7 +34,7 @@ struct Rig {
 };
 
 Rig *previous;
-Rig *fresh(bool with_irq=true,uint32_t period_ms=0,uint32_t hang_ms=0,uint32_t slice_ms=0)
+Rig *fresh(bool with_irq=true,uint32_t period_ms=0,uint32_t hang_ms=0,uint32_t slice_ms=0,uint32_t initial_fence=0)
 {
     /* the previous case's ring may still look busy: its watchdog must not fire into this case */
     if(previous)previous->fence.stopWatchdog();
@@ -47,6 +47,7 @@ Rig *fresh(bool with_irq=true,uint32_t period_ms=0,uint32_t hang_ms=0,uint32_t s
     gGic.level=[rig](uint32_t) {return rig->gpu.asserted();};
     A830FenceConfig fc{};
     /* cases that do not test the watchdog get one that never fires on its own */
+    rig->memptrs[1]=initial_fence;
     fc.memptrs=rig->memptrs;fc.irq=with_irq?&rig->irq:nullptr;
     fc.watchdog_period_ms=period_ms?period_ms:3600000;fc.hang_ms=hang_ms?hang_ms:3600000;
     fc.slice_ms=slice_ms;
@@ -348,6 +349,7 @@ void queueMeter()
     f.takeQueueAt(&q,t0+31*ms);
     EXPECT(q.submitted==3 && q.completed==3 && q.missed==0 && q.depth==3 && q.slow==1 && !q.polled);
     EXPECT(q.avg_us==12333 && q.max_us==28000 && f.queueSeen()==3);
+    EXPECT(adreno830_status.retired==3);
     f.takeQueueAt(&q,t0+32*ms);        /* the next period starts empty */
     EXPECT(q.submitted==0 && q.completed==0 && q.depth==0 && q.slow==0 && q.max_us==0 && q.avg_us==0);
     ++queueCases;
@@ -376,6 +378,7 @@ void queueMeter()
     rig->memptrs[1]=108;f.queueCompleted(t0,false);
     f.takeQueueAt(&q,t0);
     EXPECT(q.completed==0 && q.missed==1 && q.submitted==0);
+    EXPECT(adreno830_status.retired==108); // includes hardware completions with overwritten/missing stamps
     ++queueCases;
     /* The recovery's forced fences: skipped (never backwards), not measured; a cleared memptrs fence measures nothing. */
     f.queueSubmitted(109,t0);f.queueSubmitted(110,t0);
@@ -389,7 +392,7 @@ void queueMeter()
     f.takeQueueAt(&q,t0+ms);
     EXPECT(q.submitted==3 && q.completed==0 && q.missed==0 && f.queueSeen()==111 && f.completed()==111);
     rig->memptrs[1]=0;f.queueCompleted(t0,false);
-    EXPECT(f.queueSeen()==111);
+    EXPECT(f.queueSeen()==111 && adreno830_status.retired==108);
     rig->memptrs[1]=111;
     ++queueCases;
     /* Real time: the ring's stamp hook, then the CP completes and interrupts: the top half measures. */
@@ -458,7 +461,27 @@ void queueRacing()
     const uint32_t seen=f.queueSeen();
     f.takeQueue(&q);submitted+=q.submitted;completed+=q.completed;missed+=q.missed;
     EXPECT(seen==n && submitted==n && completed+missed==n && f.queueSeen()==n);
+    EXPECT(adreno830_status.retired==n); // three concurrent callers, one count per hardware seqno
     ++queueCases;
+}
+
+/* Hardware retirement across UINT32_MAX, old observations, cancelled jobs and resumed work. */
+void retirementWrap()
+{
+    Rig *rig=fresh(false,0,0,0,0xfffffffdu);
+    A830Fence &f=rig->fence;
+    EXPECT(f.queueSeen()==0xfffffffdu && adreno830_status.retired==0);
+    rig->memptrs[1]=0xffffffffu;f.queueCompleted(a830Now(),true);
+    EXPECT(adreno830_status.retired==2);
+    rig->memptrs[1]=1;f.queueCompleted(a830Now(),true);
+    f.queueCompleted(a830Now(),false);
+    EXPECT(adreno830_status.retired==4);
+    rig->memptrs[1]=0xffffffffu;f.queueCompleted(a830Now(),false);
+    EXPECT(adreno830_status.retired==4);
+    f.forceComplete(3);f.queueCompleted(a830Now(),false);
+    EXPECT(adreno830_status.retired==4);
+    rig->memptrs[1]=5;f.queueCompleted(a830Now(),true);
+    EXPECT(adreno830_status.retired==6);
 }
 
 /* The accountant's second look: a completion that arrives in the middle of a pass (its interrupt on another CPU finds the accountant at
@@ -713,6 +736,7 @@ int main()
     retireKickWhileIrqOff();
     queueMeter();
     queueRacing();
+    retirementWrap();
     queueRecheck();
     queueAttribution();
     queueAttributionRacing();
