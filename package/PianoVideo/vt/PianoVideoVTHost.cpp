@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
-// Native V5a endpoint of the approved UniXNU VT frontend (vt/UPSTREAM).
-// This RAM qualification endpoint is one exclusive Baseline320x240 IDR AU,
-// terminal drain, no tile/encoder/HEVC/streaming capability. Selector3 only
-// copies/validates/enqueues. A serialized worker owns Iris and all guest waits.
+// Native V6 endpoint of the approved UniXNU VT frontend (vt/UPSTREAM).
+// One exclusive, bounded Baseline/Main320x240 AVC stream. Selector3 snapshots,
+// validates and enqueues. The worker pumps HFI during asynchronous guest waits;
+// output lookups/maps are scoped to a copy. No DRC, synchronous decode or HEVC.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -49,7 +49,7 @@ struct Session {
   unsigned surfaceOpens=0,surfaceCloses=0,maps=0;
   Frame frame;
   uint64_t currentToken=0;
-  bool current=false, currentAccepted=false;
+  bool current=false, currentAccepted=false, currentEmitted=false, currentImage=false;
   int currentError=0;
   unsigned guestHighWater=0;
 };
@@ -147,9 +147,9 @@ void emitFrame(Session *s,int error,const uint8_t *uuid=nullptr){
   w.header(cc("Demt"),FlagHostRequest,s->uuid,id);w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),error);
   // Asynchronous=1, FrameDropped=2. A NULL no-output completion has no Dbuf UUID.
   w.u32(cc(",inf"),uuid&&!error?1:3);if(uuid)w.uuid(cc(",uui"),uuid);
-  s->currentError=error;
+  s->currentError=error;s->currentImage=uuid&&!error;
   const bool sent=request(s,w,b,id,cc("Demt"));
-  IOLockLock(s->lock);if(sent&&s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f)f->phase=pianovideo::stream::Phase::Emitted;}IOLockUnlock(s->lock);
+  IOLockLock(s->lock);s->currentEmitted=sent;if(sent&&s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f)f->phase=pianovideo::stream::Phase::Emitted;}IOLockUnlock(s->lock);
   IOLog("PianoVideoVT V6: Demt session %u token %llu status %d image %u completed-once 1\n",s->native,s->currentToken,error,unsigned(uuid!=nullptr));
 }
 void settleCurrent(Session *s){
@@ -157,14 +157,14 @@ void settleCurrent(Session *s){
   if(s->currentAccepted && !s->frames.retire(s->currentToken) && !s->stopping){
     IOLockUnlock(s->lock);failure(s,73,kBadState);return;
   }
-  s->guest.clear();s->current=false;s->currentAccepted=false;
+  s->guest.clear();s->current=false;s->currentAccepted=false;s->currentEmitted=false;
   IOLockUnlock(s->lock);
 }
 void worker(void *arg,wait_result_t){
   Session *s=static_cast<Session *>(arg);thread_set_thread_name(current_thread(),"piano-video-v6");
   bool nativeStarted=false;
   for(;;){
-    IOLockLock(s->lock);const bool stopping=s->stopping;IOLockUnlock(s->lock);if(stopping)break;
+    IOLockLock(s->lock);const bool stopping=s->stopping||s->firstError;IOLockUnlock(s->lock);if(stopping)break;
     // This pump runs even while waiting for a guest surface or Demt ACK.
     if(nativeStarted){const int rc=piano_video_native_poll(s->native,&s->frame);if(rc<0){failure(s,70,rc);break;}}
     IOLockLock(s->lock);const uint32_t stage=s->guest.type;const bool replied=s->guest.replied;
@@ -175,17 +175,23 @@ void worker(void *arg,wait_result_t){
     if(timedOut){failure(s,30,kDecodeError);break;}
     if(stage&&replied){
       if(stage==cc("Dbuf")){
+        const uint64_t lookupStart=nowMs();
         contract::Surface v;bool ok=!replyError&&hasSurface&&lookupSurface(s,surfaceID,v);
+        const uint64_t lookupEnd=nowMs();
         IOLockLock(s->lock);const bool cancelled=s->stopping;IOLockUnlock(s->lock);
         ok=ok&&!cancelled&&copyFrame(s,s->frame,v);
+        const uint64_t copyEnd=nowMs();
         closeSurface(s); // lookup refs/task mappings are scoped to this copy
+        IOLog("PianoVideoVT V6: copy timing token %llu lookup-ms %llu map-copy-unmap-ms %llu close-ms %llu surface-open %u surface-close %u maps %u\n",s->frame.token,
+          lookupEnd-lookupStart,copyEnd-lookupEnd,nowMs()-copyEnd,s->surfaceOpens,s->surfaceCloses,s->maps);
         const int released=piano_video_native_frame_release(s->native,&s->frame);
         if(released){failure(s,74,released);break;}
         if(cancelled)break;
         emitFrame(s,ok?0:kDecodeError,hasSurface?uuid:nullptr);
       }else{
+        IOLog("PianoVideoVT V6: Demt ACK token %llu wait-ms %llu\n",s->currentToken,nowMs()-(s->guest.deadline-2000));
         if(replyError){failure(s,31,replyError);break;}
-        if(s->currentAccepted&&!s->currentError)droidvm_vthost_frames_out=droidvm_vthost_frames_out+1;
+        if(s->currentAccepted&&s->currentImage)droidvm_vthost_frames_out=droidvm_vthost_frames_out+1;
         settleCurrent(s);
       }
     }
@@ -219,7 +225,7 @@ void worker(void *arg,wait_result_t){
       if(rc<0){failure(s,70,rc);break;}
       if(!rc){
         nativeStarted=true;IOFree(in.bytes,contract::kMaxAuBytes);in={};
-        IOLockLock(s->lock);record.phase=pianovideo::stream::Phase::Submitted;IOLockUnlock(s->lock);
+        IOLockLock(s->lock);if(!s->stopping)record.phase=pianovideo::stream::Phase::Submitted;IOLockUnlock(s->lock);
       }
     }
     IOLockLock(s->lock);const bool finish=s->finishWanted;const bool rejectedPending=s->rejected.count!=0;IOLockUnlock(s->lock);
@@ -250,6 +256,17 @@ void worker(void *arg,wait_result_t){
   const bool finish=s->finishWanted;const uint64_t finishID=s->finishRequest;s->finishWanted=false;
   // Error dispositions are sent exactly once. Invalidation instead aborts the
   // old epoch and joins; it never sends a successful late frame.
+  if(!invalidated && s->current && !s->currentAccepted && !s->currentEmitted){
+    uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
+    w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
+    IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);
+  }
+  contract::RejectedFrame rejection;
+  while(s->rejected.pop(rejection))if(!invalidated){
+    uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
+    w.s64(cc(",frm"),rejection.token);w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
+    IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);
+  }
   if(!invalidated)for(auto &f:s->frames.frames)if(f.phase!=pianovideo::stream::Phase::Free && f.phase!=pianovideo::stream::Phase::Emitted){
     uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
     w.s64(cc(",frm"),int64_t(f.token));w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
@@ -262,8 +279,8 @@ void worker(void *arg,wait_result_t){
   for(auto &in:s->inputs)if(in.bytes){IOFree(in.bytes,contract::kMaxAuBytes);in={};}
   if(finish){Header h;h.type=cc("dfin");h.request=finishID;memcpy(h.uuid,s->uuid,16);status(s->client,h,kDecodeError);}
   s->closeError=piano_video_native_close(s->native);
-  IOLog("PianoVideoVT V6: worker close session %u status %d pending0 cancelled %u surface-open %u surface-close %u maps %u worker-joined-next 1\n",
-        s->native,s->closeError,s->frames.cancelled,s->surfaceOpens,s->surfaceCloses,s->maps);
+  IOLog("PianoVideoVT V6: worker close session %u status %d pending0 cancelled %u surface-open %u surface-close %u maps %u high-water %u worker-joined-next 1\n",
+        s->native,s->closeError,s->frames.cancelled,s->surfaceOpens,s->surfaceCloses,s->maps,s->frames.highWater);
   IOLockLock(s->lock);s->native=0;s->workerRunning=false;IOLockWakeup(s->lock,&s->workerRunning,false);IOLockUnlock(s->lock);
   thread_terminate(current_thread());
 }
@@ -367,7 +384,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
   Session *s=c->session;
   if(h.flags==FlagGuestReply){
     if(!s||memcmp(s->uuid,h.uuid,16))return -1;
-    IOLockLock(s->lock);const bool expected=s->guest.matches(h.request,h.type)&&!s->stopping;IOLockUnlock(s->lock);
+    IOLockLock(s->lock);const bool expected=s->guest.matches(h.request,h.type)&&!s->guest.expired(nowMs())&&!s->stopping;IOLockUnlock(s->lock);
     if(!expected)return -1;
     int32_t error=0;paramS32(m,n,cc(",err"),error);Param uuid;bool hasSurface=false;
     if(h.type==cc("Dbuf")&&!error){
@@ -375,7 +392,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
       if(!hasSurface)error=kDecodeError;
     }
     IOLockLock(s->lock);
-    if(s->guest.matches(h.request,h.type)&&!s->stopping){s->replyError=error;s->replyHasSurface=hasSurface;if(hasSurface){s->replySurfaceID=ids[0];memcpy(s->replyUuid,uuid.value,16);}s->guest.reply(h.request,h.type);}
+    if(s->guest.matches(h.request,h.type)&&!s->guest.expired(nowMs())&&!s->stopping){s->replyError=error;s->replyHasSurface=hasSurface;if(hasSurface){s->replySurfaceID=ids[0];memcpy(s->replyUuid,uuid.value,16);}s->guest.reply(h.request,h.type);}
     IOLockUnlock(s->lock);
     IOLog("PianoVideoVT V5a: guest reply %c%c%c%c request %llu status %d surface %u\n",int(h.type>>24),int((h.type>>16)&255),int((h.type>>8)&255),int(h.type&255),h.request,error,unsigned(hasSurface));return 0;
   }
@@ -437,7 +454,14 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
       if(error&&!scheduled){IOLockUnlock(c->lock);return error;}
       uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),error);w.u32(cc(",inf"),error?2:1);
       const bool sent=send(c,w,b);
-      IOLog("PianoVideoVT V5c: dfrm reply request %llu status %d info %u transport %u\n",h.request,error,error?2:1,unsigned(sent));break;
+      IOLog("PianoVideoVT V5c: dfrm reply request %llu status %d info %u transport %u\n",h.request,error,error?2:1,unsigned(sent));
+      if(!sent){
+        // PV's send-error path owns this frame disposition. Join/cancel the
+        // native epoch before any later successful delivery can escape.
+        IOLockLock(s->lock);auto *f=s->frames.find(uint64_t(r.token));if(f)f->phase=pianovideo::stream::Phase::Emitted;s->stopping=true;IOLockUnlock(s->lock);
+        IOLockUnlock(c->lock);return kDecodeError;
+      }
+      break;
     }
     case cc("dfin"):{
       IOLockLock(s->lock);
