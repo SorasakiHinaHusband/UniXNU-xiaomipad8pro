@@ -275,11 +275,13 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (opcode == PIANO_CONTRACT_NOTIFY) {
         if (length != 24 || piano_contract_u32(data + 16) != 0) return 0;
         ++c->notifies;
-        if (c->linked && !c->quarantined) {
+        if (c->linked && !c->quarantined && c->initialized) {
             /* The same notification reports command completion and connector
              * change. Suspend authorization until CCI distinguishes them, also
              * during a periodic GET. Preserve the active transaction and the
-             * first notification's deadline across a notification storm. */
+             * first notification's deadline across a notification storm.
+             * Before initialization there is no snapshot to suspend: a late
+             * pre-reset notification must not shorten RESET's own deadline. */
             if (!c->notify_pending) { c->notify_pending = 1; c->notify_ms = now_ms; }
             if (c->stage == PianoContractIdle) {
                 c->command_ms = now_ms; c->stage = PianoContractNotifyRead; c->wire = 0;

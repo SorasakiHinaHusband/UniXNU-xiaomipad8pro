@@ -14,7 +14,7 @@ struct ColdPpm {
     unsigned version = 0x110, resetDelay = 2, delay = 0, commandDelay = 1;
     unsigned droppedGets = 0, resets = 0, ackErrors = 0, snapshots = 0;
     bool stuckReset = false, stuckEnable = false, stuckAck = false, dropRead = false, rejectEnable = false;
-    bool dirtyReset = false, alwaysDirtyReset = false, stuckClear = false, notify = false;
+    bool dirtyReset = false, alwaysDirtyReset = false, stuckClear = false, notify = false, oldNotifyOnReset = false;
     uint8_t payload[16] = {};
     std::vector<uint64_t> commands;
     ColdPpm() { piano_contract_init(&c); piano_contract_link(&c, 1); }
@@ -69,6 +69,7 @@ struct ColdPpm {
                 pending=ctrl; delay=cmd==1 ? resetDelay : commandDelay;
             }
             piano_contract_receive(&c, now, out, 16);
+            if (cmd==1 && oldNotifyOnReset) indication(); // delayed notification from the previous OPM
         } else {
             CHECK(op==0x11 && n==12);
             if (dropRead) { now+=20; return; }
@@ -121,6 +122,7 @@ int main() {
     ColdPpm repeated; repeated.alwaysDirtyReset=true; repeated.run();
     CHECK(repeated.c.quarantined && repeated.c.last_error==PIANO_CONTRACT_TIMEOUT && repeated.resets>2 && repeated.now<11000);
     ColdPpm slow; slow.resetDelay=12; slow.run(); CHECK(slow.c.status_valid);
+    ColdPpm late; late.resetDelay=300; late.oldNotifyOnReset=true; late.run(); CHECK(late.c.status_valid);
     ColdPpm stuck; stuck.stuckReset=true; stuck.run();
     CHECK(stuck.c.quarantined && stuck.c.last_error==PIANO_CONTRACT_TIMEOUT && !stuck.c.status_valid);
     ColdPpm enable; enable.stuckEnable=true; enable.run();
