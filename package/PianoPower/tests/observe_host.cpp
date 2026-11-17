@@ -13,7 +13,7 @@ static std::string decode(QcomGlink &g,const uint8_t *p,unsigned n,unsigned tail
 }
 int main() {
     QcomGlink g={};auto &c=g.channel[0];c.used=1;c.lcid=3;c.rcid=7;c.up=1;c.remote[0].valid=1;c.remote[0].id=9;
-    strcpy(c.name,"adsp_apps");
+    strcpy(c.name,"fastrpcglink-apps-dsp");
     uint8_t packet[128]={};put(packet,9|(3u<<16));put(packet+4,9);put(packet+8,40);
     put(packet+16,1);put(packet+20,2);put(packet+24,0x1234);put(packet+32,4);put(packet+36,0x506);
     put(packet+40,0x9d200000);put(packet+44,3);put(packet+48,4096);
@@ -22,6 +22,16 @@ int main() {
     assert(s.find("frames=5 walked=88")!=std::string::npos);
     assert(s.find("fastrpc pid=1 tid=2 ctx=4660 handle=4 sc=0x506 addr=0x39d200000 size=4096")!=std::string::npos);
     assert(s.find("iid_valid=1")!=std::string::npos);
+    // adsp_apps is audio GPR, not FastRPC: a 72B GPR packet occupies the historical 88B GLINK interval.
+    uint8_t audio[88]={};strcpy(c.name,"adsp_apps");
+    put(audio,9|(3u<<16));put(audio+4,9);put(audio+8,72);
+    put(audio+16,(72u<<8)|(6u<<4));put(audio+20,2|(3u<<8));put(audio+24,2);put(audio+28,2);
+    put(audio+32,123);put(audio+36,0x0100100f);memcpy(audio+40,"PRIVATE-AUDIO-PAYLOAD",21);
+    s=decode(g,audio,sizeof audio,1672);assert(s.find("padded_end=1760 complete=1")!=std::string::npos);
+    assert(s.find("gpr version=0 header_bytes=24 size=72")!=std::string::npos && s.find("opcode=0x100100f valid=1")!=std::string::npos);
+    assert(s.find("fastrpc")==std::string::npos && s.find("PRIVATE")==std::string::npos);
+    put(audio+16,(100u<<8)|(6u<<4));s=decode(g,audio,sizeof audio);assert(s.find("valid=0")!=std::string::npos);
+    strcpy(c.name,"fastrpcglink-apps-dsp");
     // Wrapped pending bytes copy is decoded with original circular offsets, not linear indices.
     uint8_t ring[128]={},linear[88];for(unsigned i=0;i<88;++i)ring[(112+i)%128]=packet[i];
     for(unsigned i=0;i<88;++i)linear[i]=ring[(112+i)%128];

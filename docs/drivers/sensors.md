@@ -806,6 +806,7 @@ These are diagnostic interfaces, not a repair or evidence that sensors work on t
 With `piano-sensors=4`, `[sens-trace3]` logs every incoming GLINK RX_INTENT_REQ and INTENT_REQ_ACK, including channel, local/remote
 IDs, requested size, fixed receive size, grant/refusal and reason. Zero-inclusive summaries every 30 seconds include FIFO indices;
 per-channel counters retain request sizes (last/min/max/sum), grants/refusals and replies to our outgoing requests across reopen.
+Pending-frame diagnostics distinguish FastRPC on `fastrpcglink-apps-dsp` from the 24-byte audio GPR header on `adsp_apps`.
 The passive FIFO/owner exports also include intent counters. A grant counter records the host decision; an owed advertisement or
 ACK remains visible as reply debt until published. Console continuity and valid export headers must be checked before treating zero
 requests as evidence. The pending-frame decoder remains available to identify the bytes before the first light request.

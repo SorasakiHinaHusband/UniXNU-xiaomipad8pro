@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* Copyright (c) 2026 Leo Zhang. */
 /* Header-only observation of a copied owner state and a bounded copy of its pending TX FIFO.
- * DATA payloads are never dumped: only GLINK and identified FastRPC/QRTR/QMI/PMIC headers. */
+ * DATA payloads are never dumped: only GLINK and identified FastRPC/GPR/QRTR/QMI/PMIC headers. */
 #pragma once
 #include <PianoObserve.h>
 #include "QcomGlink.h"
@@ -51,10 +51,16 @@ inline void frames(Text &t, const QcomGlink &g, const uint8_t *bytes, unsigned n
             t.add("data iid=%u iid_valid=%u chunk=%u left=%u payload=omitted\n", value, iid, chunk, left);
             const uint8_t *d = p + 16;
             unsigned keep = 0;
-            if (cmd == 9 && named(c, "adsp_apps") && chunk >= 40) {
+            if (cmd == 9 && named(c, "fastrpcglink-apps-dsp") && chunk >= 40) {
                 keep = 40;
                 t.add("fastrpc pid=%u tid=%u ctx=%llu handle=%u sc=%#x addr=%#llx size=%llu\n", atr32(d), atr32(d+4),
                       (unsigned long long)le64(d+8), atr32(d+16), atr32(d+20), (unsigned long long)le64(d+24), (unsigned long long)le64(d+32));
+            } else if (cmd == 9 && named(c, "adsp_apps") && chunk >= 24) {
+                keep = 24;
+                const unsigned w0 = atr32(d), domains = atr32(d+4), header = ((w0 >> 4) & 15) * 4, size = w0 >> 8;
+                t.add("gpr version=%u header_bytes=%u size=%u src_domain=%u dst_domain=%u src_port=%#x dst_port=%#x token=%#x opcode=%#x valid=%u\n",
+                      w0 & 15, header, size, (domains >> 8) & 255, domains & 255, atr32(d+8), atr32(d+12), atr32(d+16), atr32(d+20),
+                      !(w0 & 15) && header >= 24 && size >= header && size <= chunk);
             } else if (cmd == 9 && named(c, "IPCRTR") && chunk >= 32) {
                 keep = 32;
                 const AdspTraceHeader h = atrHeader(d, chunk, true, false);
