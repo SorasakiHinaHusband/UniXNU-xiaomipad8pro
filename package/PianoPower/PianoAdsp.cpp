@@ -1267,8 +1267,7 @@ void adspThread(void *, wait_result_t) {
     for (;;) {
         bool pending = gGlinkStarted && gGlink.retry_pending;
         for (unsigned i = 0; i < gClientCount; ++i) pending |= gClients[i].count != 0;
-        service(waitEvents(pending ? 1000 : gTraceEnabled ? 1000 : 3600u * 1000u) | (pending ? kEvSend : 0));
-        intentSummary();
+        service(waitEvents(pending ? 1000 : 3600u * 1000u) | (pending ? kEvSend : 0));
     }
 }
 
