@@ -3925,16 +3925,7 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   // ASSOCIATE_RESULT is a public progress/result code: 0 while the station or
   // its WPA2 port is still running, 1 only after authorization, 9 for a
   // timeout/no-answer, and 2 for every other completed failure.
-  if (!gSta.assocAnswered)
-    out->associate_result = 0;
-  else if (gSta.assocStatus != kDot11StatusSuccess)
-    out->associate_result = (gSta.error == kStaErrTimeout || gSta.error == kStaErrNoAnswer) ? 9u : 2u;
-  else if (gSta.rsn && !gSta.authorized)
-    out->associate_result = 0;
-  else if (gSta.disconnect || !gSta.vdevUp)
-    out->associate_result = 2u;
-  else
-    out->associate_result = 1u;
+  out->associate_result = staAppleAssociateResult(gSta);
   const bool live = gUserControl.allowed(gUserControl.read()) &&
                     gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
                     (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||

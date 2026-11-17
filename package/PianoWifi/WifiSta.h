@@ -824,14 +824,28 @@ inline void staSent(Sta &s, uint64_t nowMs)
 inline void staStop(Sta &s, uint64_t nowMs, uint32_t answerWaitMs = 0)
 {
   if (answerWaitMs) s.options.stepMs = answerWaitMs;
-  if (s.step == kStaDone || s.step == kStaStopped || s.step == kStaTeardown) return;
+  if (s.step == kStaDone || s.step == kStaStopped) return;
   s.stopAsked = true;
+  // A failed candidate may already be draining. Keep its phase, but forbid
+  // advanceCandidate from starting another authentication after a user stop.
+  if (s.step == kStaTeardown) return;
   if (!s.error) s.error = kStaErrStopped;
   s.failedStep = s.step;
   stadetail::fail(s, s.error, nowMs);
 }
 
 inline bool staFinished(const Sta &s) { return s.step == kStaDone || s.step == kStaStopped; }
+
+// Apple80211 GET21: an explicit stop must not expose the previous join's
+// retained success flags before a replacement staBegin clears them.
+inline uint32_t staAppleAssociateResult(const Sta &s)
+{
+  if (s.stopAsked || !s.assocAnswered) return 0;
+  if (s.assocStatus != kDot11StatusSuccess)
+    return s.error == kStaErrTimeout || s.error == kStaErrNoAnswer ? 9u : 2u;
+  if (s.rsn && !s.authorized) return 0;
+  return s.disconnect || !s.vdevUp ? 2u : 1u;
+}
 
 // An event of the firmware's message interface: true when it was the join's (the owner then gives it to nobody else).
 // Management frames that are not the join's (beacons, other networks' frames) are left to the owner's scan list.

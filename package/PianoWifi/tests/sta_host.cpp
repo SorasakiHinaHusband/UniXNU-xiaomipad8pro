@@ -1144,10 +1144,12 @@ static void testUserStopCycles()
     m.begin(o, true, PianoWifiSecOpen);
     for (unsigned n = 0; n < 5000 && m.sta.step != kStaAssociated; ++n) m.turn();
     CHECK(m.sta.authorized && m.sta.vdevUp);
+    CHECK(staAppleAssociateResult(m.sta) == 1);
     const uint32_t stop = user.disconnect();
     CHECK(user.join() && !user.allowed(user.read()));
     staStop(m.sta, m.now, 300);
     CHECK(m.run() == kStaStopped);
+    CHECK(staAppleAssociateResult(m.sta) == 0); // retained flags cannot report old success after a new SET20
     CHECK(m.deauthFrame.size() == kDot11HeaderBytes + 2);
     CHECK(m.deauthFrame[kDot11HeaderBytes] == kDot11ReasonLeaving);
     CHECK(m.down && m.sta.peerDeleted && m.sta.vdevStopped);
@@ -1157,6 +1159,19 @@ static void testUserStopCycles()
     user.stopped(stop);
     CHECK(user.allowed(user.read()));
   }
+  // A user leave can arrive while a failed candidate is already tearing
+  // down. Preserve that teardown, but never authenticate the next candidate.
+  Model m;
+  m.networks(); m.answerAuth = false; m.begin(fastOptions());
+  for (unsigned n = 0; n < 15000 && m.sta.step != kStaTeardown; ++n) m.turn();
+  CHECK(m.sta.step == kStaTeardown && m.sta.nextCandidate);
+  const uint32_t phase = m.sta.tdPhase;
+  staStop(m.sta, m.now, 50);
+  CHECK(m.sta.stopAsked && m.sta.tdPhase == phase);
+  CHECK(m.run() == kStaStopped);
+  unsigned starts = 0;
+  for (uint32_t c : m.commands) starts += c == kWmiCmdVdevStart;
+  CHECK(starts == 1 && staAppleAssociateResult(m.sta) == 0);
 }
 
 int main()
