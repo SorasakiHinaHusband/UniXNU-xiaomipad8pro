@@ -86,6 +86,7 @@ struct Rig {
   const uint8_t *at(uint32_t off) const { return user.mem.data() + off; }
   void put16(uint32_t off, uint16_t v) { std::memcpy(user.mem.data() + off, &v, 2); }
   void put32(uint32_t off, uint32_t v) { std::memcpy(user.mem.data() + off, &v, 4); }
+  uint32_t wpaFlags = 0x08;   // the upper-auth word of a real 27.3 menu join (wifi-join8 console: "h0c 00000008")
   Answer associate(uint32_t layout = sizeof(AssociateRequest27), uint32_t cipher = 10, uint32_t keyLength = 13)
   {
     std::memset(user.mem.data(), 0, layout);
@@ -94,7 +95,7 @@ struct Rig {
     if (layout == sizeof(AssociateRequest27)) {
       put16(4, 2);                       // mode
       put32(8, 1);                       // authentication selector/version word
-      put32(0x0c, 0x40);                 // WPA2/RSN flags for this fixture
+      put32(0x0c, wpaFlags);             // WPA2/RSN flags for this fixture (0x08 = the captured 27.3 menu join, wifi-join8)
     } else {
       put16(4, 2);                       // legacy mode
       put16(6, 1);                       // open-system selector
@@ -307,7 +308,10 @@ int main()
     CHECK(a.associationProfileData.security == PianoWifiSecWpa2Psk && a.associationProfileData.ssid_len == 4 &&
           a.associationProfileData.psk_len == 13 && std::memcmp(a.associationProfileData.ssid, "test", 4) == 0);
     CHECK(a.associationHeaderValid && a.associationHeader0 == 1 && a.associationHeader8 == 1 &&
-          a.associationHeaderC == 0x40 && a.associationCredentialLength == 13 && a.associationCredentialCipher == 10);
+          a.associationHeaderC == 0x08 && a.associationCredentialLength == 13 && a.associationCredentialCipher == 10);
+    for (uint32_t f : {0x02u, 0x08u, 0x10u, 0x40u}) { r.wpaFlags = f; CHECK(r.associate().error == 0); }
+    r.wpaFlags = 0x00; CHECK(r.associate().error != 0);   // a keyed request without an upper-auth bit is refused
+    r.wpaFlags = 0x08;
     a = r.associate(sizeof(AssociateRequestLegacy), 10, 8);
     CHECK(a.error == 0 && a.associationProfile && a.associationLayout == 592 && a.associationProfileData.psk_len == 8);
     a = r.associate(sizeof(AssociateRequest27), 6, 32);

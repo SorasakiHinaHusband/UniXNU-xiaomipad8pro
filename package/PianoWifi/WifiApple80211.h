@@ -722,13 +722,14 @@ inline bool parseAssociate(const Req &rq, const UserIo &io, Answer &a)
     zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
     return false;
   }
-  // Associate2's selector is open-system (1); the upper word is the WPA2
-  // capability selected for a keyed request.  27.3 has emitted both 0x10
-  // (the public AUTH_TYPE spelling) and 0x40 (the Associate2 WPA2 flag), so
-  // accept those two encodings but reject an inconsistent selector/flag pair.
+  // Associate2's selector is open-system (1); the upper word is the upper
+  // authentication bit field of a keyed request: WPA_PSK 0x02, WPA2_PSK 0x08
+  // (the value a real 27.3 menu join sends: wifi-join8, "h0c 00000008"),
+  // and the 0x10 / 0x40 encodings of the host fixtures.  Reject a keyed
+  // request without one of them and an open request with any.
   const uint32_t selector = layout == sizeof(AssociateRequest27) ? a.associationHeader8 : uint32_t(wire.legacy.auth_lower);
   const uint32_t flags = layout == sizeof(AssociateRequest27) ? a.associationHeaderC : uint32_t(wire.legacy.auth_upper);
-  const bool wpa2Flags = flags == 0x10 || flags == 0x40;
+  const bool wpa2Flags = flags == 0x02 || flags == 0x08 || flags == 0x10 || flags == 0x40;
   if (selector != 1 || (network->key_length ? !wpa2Flags : flags != 0)) {
     associateProblem(a, kAssociateProblemAuth, layout);
     zero(reinterpret_cast<uint8_t *>(&wire), sizeof wire);
