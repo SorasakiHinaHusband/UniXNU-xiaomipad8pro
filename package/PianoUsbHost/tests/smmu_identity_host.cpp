@@ -95,5 +95,30 @@ int main(){
   {ControllerLoan l;l.begin(1,10000,false);l.started();CHECK(l.end(2,true,true,false,false)==LoanEnd::role);}
   {ControllerLoan l;l.begin(1,10000,true);l.started();CHECK(l.end(2,false,false,false,true)==LoanEnd::none);
     CHECK(l.end(3,false,false,false,false)==LoanEnd::unplug);l.returning();l.returned(false,true,true);CHECK(l.phase==LoanPhase::held);}
+  // A required field mismatch in any programmed word refuses routing.
+  for(unsigned field=0;field<12;++field) {
+    Model m;auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;
+    const uint32_t bad=identityWord(p,field);
+    bool enabled=false;auto wr0=m.wr();
+    auto wr=[&](uint32_t o,uint32_t v){wr0(o,v);if(o==p.cb()&&v==kSctlrIdentity)enabled=true;};
+    auto rd=[&](uint32_t o){uint32_t v=m.r[o];return enabled&&o==bad?v^1u:v;};
+    unsigned comparisons=0;
+    auto audit=[&](uint32_t,uint32_t,uint32_t,uint32_t){++comparisons;};
+    CHECK(applySmmuIdentity(p,0x40,table,rd,wr,never,tx,audit));
+    CHECK(!tx.route&&comparisons==12);
+  }
+  { // A group has a firmware reset S2CR pointing outside the bank geometry.
+    Model m;m.r[0x80c]=0x80000040;m.r[0xc0c]=0x0300006e;
+    auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;m.r[0x74]=1;
+    CHECK(applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),[]{return true;},tx,[](uint32_t,uint32_t,uint32_t,uint32_t){}));
+    m.r[0x74]=0;CHECK(unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx));
+    CHECK(!m.illegal&&!(m.r[0x80c]&0x80000000));
+  }
+  { // Only valid W1C bits are cleared, and an old stall is terminated.
+    Model m;auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;
+    m.r[p.cb()+kCbFsr]=0x400|0x40000002;
+    CHECK(!applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,[](uint32_t,uint32_t,uint32_t,uint32_t){}));
+    CHECK(m.r[p.cb()+kCbFsr]==0x400&&m.r[p.cb()+8]==1);
+  }
   std::printf("smmu_identity_host: %s\n",failures?"FAILED":"all passed (readback, unwind, ownership, bounded loan)");return failures?1:0;
 }

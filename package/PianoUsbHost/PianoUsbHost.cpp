@@ -91,6 +91,7 @@ struct Args {
   uint32_t handoff, debounce, uor;                                    // levels 3 and 4
 };
 Args gArgs;
+uint64_t gHostDeadline;
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -620,6 +621,10 @@ HostPolicy policy()
 
 bool hostSwitchLogged(SwitchResult &sw)
 {
+  if (!gHostDeadline || nowMs() >= gHostDeadline) {
+    stage(-10, "host switch refused without a live deadline");
+    return false;
+  }
   stage(10, "host switch: the device controller stopped, the glue (override off, UTMI as PIPE), soft reset, PRTCAPDIR host");
   sw = hostSwitch(gHal, policy());
   const CoreWords &f = sw.found, &n = sw.now;
@@ -1316,7 +1321,8 @@ void appleStack(const Xhci &x, uint32_t seconds)
 // Levels 5 and 6 after the survey: one host session; *line gets its one-line summary (the piano-usbhost-host property).
 void hostSession(char *line, size_t size)
 {
-  const uint32_t session = gArgs.back ? gArgs.back : gArgs.watch;
+  const uint32_t session = gArgs.back;
+  gHostDeadline = session ? nowMs() + uint64_t(session) * 1000 : 0;
   SwitchResult sw;
   if (!hostSwitchLogged(sw)) {
     snprintf(line, size, "switch FAILED (%s)", sw.why);
@@ -1531,6 +1537,7 @@ bool liveUp(LiveHost &h)
   gReturnSafe = true;
   if (!gLoan.deadline || nowMs() >= gLoan.deadline || (gArgs.handoff == 6 && (!sharedDomain(false) || !controllerClassPresent()))) return false;
   note("hand-off: host session %u: %s", h.sessions, gArgs.handoff == 6 ? "the switch, then Apple's xHCI on the nub" : "the switch, then our xHCI probe");
+  gHostDeadline = gLoan.deadline;
   if (!hostSwitchLogged(h.sw)) {
     if (h.sw.stores) gReturnSafe = hostEnd(nullptr, h.sw, true);
     return false;
