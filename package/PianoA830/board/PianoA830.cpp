@@ -63,7 +63,9 @@
 #include "PianoGpuIdle.h"
 
 extern "C" int adreno830_qual607_control(int);
-extern "C" void adreno830_qualification_note(const char *line) {piano_a830_note("%s",line);}
+// C5 records are bounded to960 bytes by the caller. Keep them intact: piano_a830_note's256-byte scratch
+// would drop the sticky/reason/freshness fields. IOLog's console printbuf flushes while formatting (IOLib.cpp).
+extern "C" void adreno830_qualification_note(const char *line) {IOLog("PianoA830: %s\n",line);}
 extern "C" void adreno830_qualification_unsafe() {
   // Native 0070 uses the SMC conduit (k27 0069). A graceful halt can wait on the very power mutex/HFI
   // whose deadline expired. Only this unconfirmed-GX emergency bypasses filesystem and IOKit shutdown.
