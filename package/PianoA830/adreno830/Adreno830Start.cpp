@@ -2176,8 +2176,12 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
         return scope.end(r);
     }
     g830.level=args->level;g830.bus=args->bus;
-    if(gQualificationEnabled)qualLog("R3a fresh-M9 ACK level=%u bus=%u header=%08x at-us=%llu elapsed-us=%llu",args->level,args->bus,
-        g830.hfi.header(A830HfiM9Vote),nowUs(),nowUs()-gQualification.failedAt()/1000);
+    if(gQualificationEnabled) {
+        uint64_t highAcks=0;
+        for(unsigned i=4;i<=Adreno830LevelMax;++i)highAcks+=g830.hfi.stats().level_acks[i];
+        qualLog("R3a fresh-M9 ACK level=%u bus=%u header=%08x at-us=%llu elapsed-us=%llu high-acks=%llu",args->level,args->bus,
+            g830.hfi.header(A830HfiM9Vote),nowUs(),nowUs()-gQualification.failedAt()/1000,highAcks);
+    }
     /* P2: with IFPC on (FEATURE_CTRL{IFPC,1,0x1680}) the GPU top half keeps GX up and polls the AHB fence (4.12.1, 4.17). */
     g830.irq.setIfpc(args->ifpc);
     return scope.end(kIOReturnSuccess);

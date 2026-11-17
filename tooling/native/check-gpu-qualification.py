@@ -59,11 +59,12 @@ def tables(text):
             expected.append(value)
         assert [int(w, 16) for w in words] == expected and int(wait, 16) == mask, f'DDR row {i}'
     assert 'C5-607-v1 full-table verified M1=49 GX12 CX3 M2=160' in text
+    return arcs
 
 
 def adjudicate(root):
     text = (root/'console-for-checks.txt').read_text(errors='replace')
-    tables(text)
+    arcs = tables(text)
     def records(kind):
         return [fields(l) for l in text.splitlines() if 'R3a '+kind+' ' in l]
     counters, temps, res, acks = (records(k) for k in ('COUNTERS', 'TEMP', 'RES', 'ACK'))
@@ -77,6 +78,7 @@ def adjudicate(root):
     assert 600_000_000 <= inj_at-opened <= 602_000_000, 'full 600-second soak, bounded injection tail'
     before = [c for c in counters if opened <= int(c['at-us']) < inj_at]
     assert len(before) >= 590, 'continuous normal counter capture'
+    assert all(1 <= int(c['level']) <= 7 for c in before), 'normal acknowledged level exceeds607'
     for key in ('failures', 'timeout', 'errors', 'stale', 'malformed', 'queuefull', 'forceoff', 'recover', 'recoverfail', 'gbif'):
         assert len({c[key] for c in before}) == 1, f'normal delta {key}'
     normal_temps = [t for t in temps if opened <= int(t['at-us']) < inj_at]
@@ -97,19 +99,24 @@ def adjudicate(root):
     assert any(int(r['l7']) > 0 for r in windows.values()), '607 residency'
     normal_acks = [a for a in acks if opened <= int(a['at-us']) < inj_at]
     assert normal_acks and any(int(a['l7']) > 0 for a in normal_acks), 'matching607 ACK'
+    assert all(all(int(a['l'+str(i)]) == 0 for i in range(8, 12)) for a in normal_acks), 'ACK above607 even if residency rounded to0'
     assert all(a['host-fail'] == '0' and a['ddr'] == '18597656' and int(a['gpu-peak']) < 700 for a in normal_acks), 'rail/BCM/peak bound'
+    assert all(int(a['mx']) == len(arcs['mx'])-1 and int(a['cx']) == len(arcs['cx'])-1 for a in normal_acks), 'host rails at top corners'
     post = [c for c in counters if int(c['at-us']) >= inj_at]
     assert post and int(post[-1]['at-us'])-inj_at >= 60_000_000, 'post-fallback load60s'
     first, last = before[-1], post[-1]
     for key in ('failures', 'timeout', 'forceoff', 'recover'):
         assert int(last[key])-int(first[key]) == 1, f'exactly one injection {key}'
     assert last['dropped'] == '1' and last['sticky'] == '1' and last['reason'] == '1'
-    low = re.search(r'R3a fresh-M9 ACK level=1 bus=2 header=[0-9a-f]+ at-us=(\d+)', text[inj.start():])
+    low = re.search(r'R3a fresh-M9 ACK level=1 bus=2 header=[0-9a-f]+ at-us=(\d+) elapsed-us=\d+ high-acks=(\d+)', text[inj.start():])
     assert low, 'fresh low M9'
     for c in post:
         if int(c['at-us']) < int(low[1]):
             continue
         assert int(c['level']) <= 3, 'post-injection high ACK'
+    for a in acks:
+        if int(a['at-us']) >= int(low[1]):
+            assert sum(int(a['l'+str(i)]) for i in range(4, 12)) == int(low[2]), 'post-M9 high ACK count grew'
     for marker in ('R3a strict-off result=0', 'R3a fresh-M9 ACK level=1 bus=2', 'R3a gate=0'):
         assert marker in text[inj.start():], marker
     progress = []
@@ -128,6 +135,11 @@ def adjudicate(root):
             values.append(m[1])
         assert len(values) >= 3 and len(set(values)) == 1, f'{key} changed'
     assert not re.search(r'R3a UNSAFE|GPU LOST', text), 'loss/escalation'
+    assert 'FIVE_APPS_OK' in (root/'apps.txt').read_text(), 'app readiness'
+    for phase in ('before', 'low', 'normal', 'post'):
+        assert 'GUI_SESSION_OK' in (root/f'session-{phase}.txt').read_text(), f'{phase} live GUI/console user'
+    for name, total in (('asset-hashes.txt', 14), ('load-hashes.txt', 5)):
+        assert (root/name).read_text().count(': OK') == total, 'payload hash positive count'
 
 
 if __name__ == '__main__':
