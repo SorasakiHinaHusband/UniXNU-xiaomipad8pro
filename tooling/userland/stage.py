@@ -75,6 +75,11 @@ DIRS = {'/Library/LaunchDaemons': 'daemon', '/Library/LaunchAgents': 'agent', '/
 # Contents/Info.plist, Contents/MacOS/<file>, Contents/Resources/<file>.
 GPU_BUNDLES = '/Library/GPUBundles'
 GPU_BUNDLE_FILE = re.compile(r'/Library/GPUBundles/[A-Za-z0-9_-]+\.bundle/Contents/(?:Info\.plist|(?:MacOS|Resources)/[A-Za-z0-9_+-][A-Za-z0-9._+-]*)')
+# Only the explicit external, version-locked Bluetooth runtime may use these Data
+# destinations. Apple bytes never enter this checkout, including its ignored out/.
+BT_ROOT = '/private/var/piano/bluetooth-path1'
+BT_DATA = frozenset(f'{BT_ROOT}/{name}' for name in ('bin/bluetoothd', 'bin/BlueTool',
+                    'bin/PianoBluetooth.runtime', 'lib/QcaBTType0.dylib', 'runtime.sha256'))
 SYSTEM_PROGRAMS = ('/bin/', '/usr/bin/', '/sbin/', '/usr/sbin/', '/usr/libexec/')
 WORD = re.compile(r'[A-Za-z0-9._+@/-]+')
 MODE = re.compile(r'0[0-7]{3}')
@@ -177,7 +182,7 @@ def dest_kind(dest):
     parent, _, base = dest.rpartition('/')
     if not WORD.fullmatch(dest) or not base or base.startswith('.') or '..' in dest.split('/'):
         return None
-    return DIRS.get(parent) or ('file' if GPU_BUNDLE_FILE.fullmatch(dest) else None)
+    return DIRS.get(parent) or ('file' if GPU_BUNDLE_FILE.fullmatch(dest) or dest in BT_DATA else None)
 
 
 def check_file(f, unit, problems):
@@ -258,6 +263,55 @@ def add_gpu_bundles(plan, bundles):
         plan['units'].append(unit)
     if problems:
         raise SystemExit('--gpu-bundle:\n  ' + '\n  '.join(problems))
+    return plan
+
+
+def add_bluetooth_runtime(plan):
+    """Opt-in external artifacts built from this committed checkout; no firmware or pairing data."""
+    supplied = os.environ.get('PIANO_BT_RUNTIME')
+    if not supplied:
+        return plan
+    root = Path(supplied).resolve(strict=True)
+    if root.is_relative_to(D) or any((p / '.git').exists() for p in (root, *root.parents)):
+        raise SystemExit('PIANO_BT_RUNTIME must be outside every Git checkout')
+    report = json.loads((root / 'report.json').read_text())
+    commit = sh(['git', '-C', str(D), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    if (report.get('format') != 1 or report.get('build') != '26C5035r' or report.get('source_commit') != commit or
+        report.get('native_input_sha256') != '82e244d5dcafbc150e820416ac7037debc9def106eae043ee51ed4e2c84e7721' or
+        report.get('native_uuid') != '01204E5C-F295-35D8-9ED6-62ECF79D62DF' or
+        report.get('native_entitlements_preserved') is not True):
+        raise SystemExit('Bluetooth runtime source/build/signature provenance differs; rebuild it from this commit')
+    inputs = report.get('inputs', {})
+    if not inputs:
+        raise SystemExit('Bluetooth runtime has no source input digests')
+    source = D / 'tooling/native/piano-bluetooth'
+    for name, digest in inputs.items():
+        path = (source / name).resolve()
+        if not path.is_relative_to(source) or not path.is_file() or sha(path.read_bytes()) != digest:
+            raise SystemExit(f'Bluetooth runtime source input differs: {name}')
+    destinations = {name: f'{BT_ROOT}/{name}' for name in ('bin/bluetoothd', 'bin/BlueTool',
+                    'bin/PianoBluetooth.runtime', 'lib/QcaBTType0.dylib', 'runtime.sha256')}
+    destinations.update({'helpers/piano-bt-runtime-mount': '/usr/local/libexec/piano-bt-runtime-mount',
+                         'helpers/piano-bt-probe': '/usr/local/libexec/piano-bt-probe',
+                         'scripts/piano-bluetooth-start': '/usr/local/libexec/piano-bluetooth-start',
+                         'launchd/com.unixnu.piano-bluetooth-path1.plist':
+                         '/Library/LaunchDaemons/com.unixnu.piano-bluetooth-path1.plist'})
+    unit = {'name': 'piano-bluetooth-path1', 'about': 'opt-in piano-bt=5 POSIX controller runtime',
+            'on': True, 'default_on': True, 'planned': False, 'files': []}
+    problems = []
+    existing = {f['dest'] for u in plan['units'] for f in u['files']}
+    for name, dest in destinations.items():
+        path = root / name
+        record = report.get('files', {}).get(name, {})
+        if path.is_symlink() or not path.is_file() or sha(path.read_bytes()) != record.get('sha256'):
+            raise SystemExit(f'Bluetooth runtime file missing or changed: {name}')
+        if dest in existing:
+            raise SystemExit(f'Bluetooth runtime destination already staged: {dest}')
+        mode = '0755' if name.startswith(('helpers/', 'scripts/')) or 'cdhash' in record else '0644'
+        unit['files'].append(check_file({'source': str(path), 'dest': dest, 'build': 'copy', 'mode': mode}, unit, problems))
+    if problems:
+        raise SystemExit('Bluetooth runtime:\n  ' + '\n  '.join(problems))
+    plan['units'].append(unit)
     return plan
 
 
@@ -719,7 +773,7 @@ def main():
     p.add_argument('--gpu-bundle', action='append', default=[], type=Path, metavar='BUNDLE',
                    help='a Metal plugin bundle as one more unit (/Library/GPUBundles/<name>.bundle), its Mach-Os trusted')
     a = p.parse_args()
-    plan = add_gpu_bundles(load_manifest(a.manifest, a.on, a.off), a.gpu_bundle)
+    plan = add_bluetooth_runtime(add_gpu_bundles(load_manifest(a.manifest, a.on, a.off), a.gpu_bundle))
     if a.plan:
         show_plan(plan)
     elif a.live:
