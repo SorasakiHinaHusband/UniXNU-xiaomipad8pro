@@ -15,26 +15,79 @@ SERIAL=${PIANO_SERIAL:?set PIANO_SERIAL in ~/.config/piano/env}
 export PATH=/opt/homebrew/share/android-commandlinetools/platform-tools:$PATH
 L=$D/logs/native-runs/$(date +%Y%m%d-%H%M%S)-loop; mkdir -p "$L"
 log() { echo "$(date +%T) $*" | tee -a "$L/loop.log"; }
-abl() { fastboot devices | grep -q "^$SERIAL"; }
-uefi() { fastboot devices | grep -q "^piano-uefi"; }
-wait_for() { local what=$1 secs=$2; for i in $(seq $((secs * 2))); do $what && return 0; sleep 0.5; done; return 1; }
+abl() { /tmp/tmo.sh 5 fastboot devices | grep -q "^$SERIAL[[:space:]]"; }
+uefi() { /tmp/tmo.sh 5 fastboot devices | grep -q "^piano-uefi[[:space:]]"; }
+wait_for() { local what=$1 deadline=$(( $(date +%s) + $2 ));
+  while :; do $what && return 0; [ "$(date +%s)" -lt "$deadline" ] || return 1; sleep 0.5; done; }
+abl_answers() { /tmp/tmo.sh 10 fastboot -s "$SERIAL" getvar product 2>&1 | grep -q '^product:'; }
+# Never apply a host timeout to an OUT download: killing it can strand ABL.
+boot_ram() { local rc=0 marker=${LOOP_STATUS_FILE:-$L/status}.boot-inflight
+  : > "$marker"
+  fastboot -s "$SERIAL" boot "$1" || rc=$?
+  rm -f "$marker"; return "$rc"; }
+[ ! -e /tmp/piano-tablet.recovery-required ] || { log "FATAL recovery required; no boot attempted"; exit 3; }
 RESET=$(strings "$IMG" | grep -o 'piano-reset-after=[0-9][0-9]*' | head -1 | cut -d= -f2 || true); RESET=${RESET:-45}
 log "image $(shasum -a 256 "$IMG" | cut -c1-16), reset after ${RESET} s; dump image $(shasum -a 256 "$DUMP" | cut -c1-16)"
 wait_for abl 240 || { log "no ABL fastboot (parked kernel? power + volume-down 15-20 s)"; exit 1; }
 t0=$(date +%s)
-fastboot -s "$SERIAL" boot "$IMG" > "$L/fastboot.log" 2>&1 || { cat "$L/fastboot.log"; exit 1; }
+boot_ram "$IMG" > "$L/fastboot.log" 2>&1 || { cat "$L/fastboot.log"; exit 1; }
 wait_for uefi 40 || { log "our UEFI did not appear"; exit 1; }
 wait_for "eval ! uefi" 40 || true
 log "XNU started after $(( $(date +%s) - t0 )) s"
 wait_for abl $((RESET + 150)) || { log "no ABL fastboot within $((RESET + 150)) s (parked? power + volume-down 15-20 s)"; exit 2; }
-log "back in ABL fastboot after $(( $(date +%s) - t0 )) s; dump boot"
-fastboot -s "$SERIAL" boot "$DUMP" >> "$L/fastboot.log" 2>&1 || { cat "$L/fastboot.log"; exit 1; }
-wait_for uefi 40 || { log "dump: our UEFI did not appear"; exit 1; }
-if fastboot -s piano-uefi oem dump 9cb00000 700000 > /dev/null 2>&1 && (cd "$L" && fastboot -s piano-uefi get_staged dump.bin > /dev/null 2>&1); then
+log "back in ABL fastboot after $(( $(date +%s) - t0 )) s; checking dump eligibility"
+abl_answers || { log "FATAL ABL enumerates but does not answer after the test; no dump attempted"; exit 3; }
+# Optional mailbox export must never trade away the only working recovery path.
+# 3750 mV is a conservative scheduling policy, NOT a measured PMIC cutoff.
+voltage=$(/tmp/tmo.sh 10 fastboot -s "$SERIAL" getvar battery-voltage 2>&1 || true)
+mv=$(printf '%s\n' "$voltage" | sed -nE 's/^(\(bootloader\) )?battery-voltage: ([0-9]+)[[:space:]]*$/\2/p' | head -1)
+case ${DUMP_MIN_MV:-3750} in ''|*[!0-9]*) log "FATAL invalid DUMP_MIN_MV"; exit 2;; esac
+case "$mv" in ''|*[!0-9]*) log "dump skipped: battery voltage unknown; ABL retained"; exit 0;; esac
+if [ "$mv" -lt "${DUMP_MIN_MV:-3750}" ]; then
+  log "dump skipped: battery ${mv} mV below ${DUMP_MIN_MV:-3750} mV policy; ABL retained"; exit 0
+fi
+# No current dump image has this qualification. Default: keep the live console,
+# skip the second boot. Main may supply a record ONLY after an independent reset
+# path (including the ABL-to-USB gap) has been forced to fail and returned to ABL.
+# A kernel piano-reset-after or an EFI timer that starts later does not qualify.
+if [ -z "${DUMP_GUARD_RECORD:-}" ]; then
+  log "dump skipped: no qualified pre-USB reset path; ABL retained"; exit 0
+fi
+if ! DUMP_RETURN_BOUND=$(python3 - "$DUMP" "$DUMP_GUARD_RECORD" <<'GUARD'
+import hashlib, json, pathlib, sys
+try:
+    image, record = map(pathlib.Path, sys.argv[1:])
+    p = json.loads(record.read_text())
+    digest = lambda f: hashlib.sha256(f.read_bytes()).hexdigest()
+    assert p['schema'] == 1 and p['image_sha256'] == digest(image)
+    assert p['pre_usb_reset_qualified'] is True and p['covers_abl_handoff'] is True
+    assert p['returns_to'] == 'abl-fastboot'
+    bound = p['return_bound_s']
+    assert type(bound) is int and 1 <= bound <= 120
+    evidence = pathlib.Path(p['evidence_path'])
+    assert evidence.is_absolute() and evidence.is_file()
+    assert p['evidence_sha256'] == digest(evidence)
+    print(bound)
+except Exception:
+    sys.exit(1)
+GUARD
+); then log "dump skipped: invalid/reset qualification does not match image; ABL retained"; exit 0; fi
+# A host wait cannot reset a device with no USB. This wait observes the qualified
+# independent reset path; failure is fatal and must interlock the queue.
+dump_t0=$(date +%s)
+dump_return() { local left=$(( DUMP_RETURN_BOUND - $(date +%s) + dump_t0 ));
+  [ "$left" -ge 0 ] || left=0
+  if wait_for abl "$left" && abl_answers; then log "dump: ABL answers again"; return 0; fi
+  log "FATAL dump left no verified ABL reset path; recovery required"; return 3; }
+log "dump: qualified boot, battery ${mv} mV; return bound ${DUMP_RETURN_BOUND} s"
+boot_ram "$DUMP" >> "$L/fastboot.log" 2>&1 || { cat "$L/fastboot.log"; dump_return || exit 3; exit 2; }
+wait_for uefi 40 || { log "dump: our UEFI did not appear"; dump_return || exit 3; exit 2; }
+dump_rc=0
+if /tmp/tmo.sh 15 fastboot -s piano-uefi oem dump 9cb00000 700000 > /dev/null 2>&1 && (cd "$L" && /tmp/tmo.sh 15 fastboot -s piano-uefi get_staged dump.bin > /dev/null 2>&1); then
   if python3 "$D/tooling/native/xnu-log.py" decode "$L/dump.bin" > "$L/xnu-console.txt" 2> "$L/reader.txt"; then
     log "log: $(cat "$L/reader.txt")"
-    LC_ALL=C tr -c '\11\12\15\40-\176' '?' < "$L/xnu-console.txt" | tail -4 | sed 's/^/    | /' | tee -a "$L/loop.log"
-  else log "$(cat "$L/reader.txt")"; fi
-else log "dump failed (UEFI gone before the dump?)"; fi
-wait_for "eval ! uefi" 40 || true
-wait_for abl 120 && log "parked in ABL fastboot after $(( $(date +%s) - t0 )) s" || log "not back in ABL fastboot within 120 s"
+  else log "dump decode failed; see reader.txt"; dump_rc=2; fi
+else log "dump failed or timed out; waiting only for the qualified reset path"; dump_rc=2; fi
+dump_return || exit 3
+log "parked in ABL fastboot after $(( $(date +%s) - t0 )) s"
+exit "$dump_rc"
