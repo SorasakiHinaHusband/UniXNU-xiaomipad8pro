@@ -70,7 +70,7 @@ enum {
     PIANO_CHG_C_FLOAT,      /* data lines floating, and OCP (type 15) */
     PIANO_CHG_C_TYPEC,      /* Type-C current (Rp) only */
     PIANO_CHG_C_PD,         /* USB PD */
-    PIANO_CHG_C_PD_PPS,     /* PD verified (11) or PPS (12): the stock "PD_PPS" row */
+    PIANO_CHG_C_PD_PPS,     /* PPS (11) or verified (12): the stock "PD_PPS" row */
     PIANO_CHG_C_REFUSED,    /* unknown or reserved (0, 13, 14, 16 and up): no write at all, the firmware's own values */
 };
 
@@ -89,7 +89,7 @@ enum {
 
 typedef struct {
     uint8_t writes;        /* 0: plan nothing (piano-power-write=0); the 5 V decisions are still made, for the log (9 V never) */
-    uint8_t hv;            /* 0 5 V only; 1 also a fixed 9 V PDO; 2 also a PPS APDO covering 9 V (piano-power-hv) */
+    uint8_t hv;            /* 0 5 V only; 1 fixed 9 V; 2 PPS preferred in strict mode (legacy: fixed, then PPS) */
     uint8_t qc3;           /* opt-in HVDCP3 request: 0x2011 = 9000 for types 6/7/8 */
     uint8_t full_charge;   /* the float voltage of the stock tables (piano-power-fv) */
     uint8_t limit;         /* Preserve Battery Health (piano-power-limit, IORegistry) */
@@ -341,7 +341,7 @@ void piano_charge_init(PianoChargeState *s);
 void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p);
 /* The firmware's answer to a planned write (retcode 0 = taken; the codec's -60 for no answer counts as a refusal). */
 void piano_charge_ack(PianoChargeState *s, uint32_t property, uint32_t value, int32_t retcode);
-/* The driver stops or the system shuts down: a stop of ours is lifted (0x2003 = 1) and the source put back at 5 V; the limits stay
+/* The driver stops or the system shuts down: a stop of ours is requested lifted (0x2003 = 1) and the source put back at 5 V; the limits stay
  * as they are (Ubuntu: handing back 100 mA drained a running tablet). Repeat until plan.sleep_ready, as for a sleep. */
 void piano_charge_shutdown(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p);
 int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, uint32_t value, uint8_t bytes);
