@@ -408,6 +408,50 @@ static void testCapturePump(void)
     CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.last_status == 7 && p.in_flight == 0);
 }
 
+/* Each malformed completion starts with a real outstanding request; bad
+ * origins cannot release it. Valid short/zero replies account actual bytes. */
+static void testCaptureValidation(void)
+{
+    const uint32_t sizes[] = {0, 4, 960, 1916, 1920};
+    for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; ++i) {
+        ArPump p; uint8_t packet[GPR_MAX_PACKET];
+        CHECK(!ar_pump_init_capture(&p, 0x19da10000ull, 0x99, AR_PORT_DATA, 8, 1920, 4, 250));
+        CHECK(ar_pump_write(&p, packet, sizeof packet, 10));
+        ArAnswer a = {.opcode=AR_OP_READ_DONE, .token=0x5000, .src_port=AR_IID_CAP_SHMEM, .dst_port=AR_PORT_DATA,
+                      .src_domain=GPR_DOMAIN_ADSP, .dst_domain=GPR_DOMAIN_APPS, .handle=0x99,
+                      .address=0x19da10000ull, .data_bytes=sizes[i], .offset=1920-sizes[i], .payload_bytes=24};
+        CHECK(ar_pump_done(&p, &a) == 1);
+        CHECK(p.returned == 1 && p.returned_bytes == sizes[i] && !p.in_flight);
+        CHECK(p.short_returns == (sizes[i] < 1920) && p.zero_returns == (sizes[i] == 0));
+        CHECK(ar_pump_done(&p, &a) == -1); /* duplicate */
+    }
+    for (unsigned bad = 0; bad < 12; ++bad) {
+        ArPump p; uint8_t packet[GPR_MAX_PACKET];
+        CHECK(!ar_pump_init_capture(&p, 0x19da10000ull, 0x99, AR_PORT_DATA, 8, 1920, 4, 250));
+        CHECK(ar_pump_write(&p, packet, sizeof packet, 10));
+        ArAnswer a = {.opcode=AR_OP_READ_DONE, .token=0x5000, .src_port=AR_IID_CAP_SHMEM, .dst_port=AR_PORT_DATA,
+                      .src_domain=GPR_DOMAIN_ADSP, .dst_domain=GPR_DOMAIN_APPS, .handle=0x99,
+                      .address=0x19da10000ull, .data_bytes=960, .offset=0, .payload_bytes=24};
+        switch (bad) {
+        case 0: a.src_domain=GPR_DOMAIN_APPS; break;
+        case 1: a.dst_domain=GPR_DOMAIN_ADSP; break;
+        case 2: a.src_port++; break;
+        case 3: a.data_bytes=959; break;
+        case 4: a.offset=2; break;
+        case 5: a.offset=964; break;
+        case 6: a.address += 1920ull << 32; break; /* truncated-slot alias */
+        case 7: a.address--; break;
+        case 8: a.handle++; break;
+        case 9: a.token++; break;
+        case 10: a.payload_bytes=20; break;
+        case 11: a.dst_port++; break;
+        }
+        CHECK(ar_pump_done(&p, &a) == -1 && p.errors == 1 && !p.returned && !p.returned_bytes);
+        if (bad < 3 || bad == 11) CHECK(p.bad_origin == 1 && p.in_flight == 1);
+        if (bad == 3 || bad == 4) CHECK(p.bad_alignment == 1);
+    }
+}
+
 // Level 10's capture plan: the fourteen commands with the VA macro's DMIC path between the prepares and the starts.
 static int va_log_on(void *owner) {(void)owner; snprintf(lg[lines++], sizeof lg[0], "VA ON"); return 0;}
 static int va_log_off(void *owner) {(void)owner; snprintf(lg[lines++], sizeof lg[0], "VA OFF"); return 0;}
@@ -580,6 +624,7 @@ int main(void)
     testClockPlans();
     testMicPlan();
     testCapturePump();
+    testCaptureValidation();
     testMicLivePlan();
     printf("PASS sequence: %u checks\n", checks);
     return 0;

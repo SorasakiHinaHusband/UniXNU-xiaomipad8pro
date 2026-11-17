@@ -64,6 +64,8 @@ struct World {
     unsigned stream_dones;
     uint8_t slot_copy[AUDIO_SPK_SLOTS][AUDIO_SPK_PERIOD_BYTES];
     int slot_busy[AUDIO_SPK_SLOTS];
+    int capture_short;
+    uint64_t cap_bytes;
     uint64_t cap_k;                   // the capture signal's sample counter
     // ---- what was played
     uint64_t played_periods, sound_periods, first_sound_played_us;
@@ -355,7 +357,10 @@ static void dsp_read(const GprPacket *p)
     }
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = p->dst_port, .dst_port = p->src_port,
                    .token = p->token, .opcode = AR_OP_READ_DONE};
-    const uint32_t words[6] = {0, le32(d), le32(d + 4), H_MIC, AUDIO_MIC_PERIOD_BYTES, 0};
+    const uint32_t short_bytes[] = {1920, 1916, 960, 0, 4};
+    const uint32_t bytes = w.capture_short ? short_bytes[w.reads % 5] : AUDIO_MIC_PERIOD_BYTES;
+    const uint32_t offset_bytes = w.capture_short ? 1920 - bytes : 0;
+    const uint32_t words[6] = {0, le32(d), le32(d + 4), H_MIC, bytes, offset_bytes};
     uint64_t at = w.cap_until_us > w.now_us ? w.cap_until_us : w.now_us;
     at += dsp_period_us();
     w.cap_until_us = at;
@@ -364,10 +369,13 @@ static void dsp_read(const GprPacket *p)
 }
 
 // The DSP's capture: a square wave of +-8000 on DEC0 and +-4000 on DEC1 (96 samples a cycle): the mono mix is +-6000.
-static void fill_capture(unsigned slot)
+static void fill_capture(unsigned slot, uint32_t bytes, uint32_t offset)
 {
-    int16_t *pcm = (int16_t *)(void *)(g_dma + AUDIO_DMA_MIC + slot * AUDIO_MIC_PERIOD_BYTES);
-    for (uint32_t i = 0; i < AUDIO_PERIOD_FRAMES; ++i, ++w.cap_k) {
+    uint8_t *base = g_dma + AUDIO_DMA_MIC + slot * AUDIO_MIC_PERIOD_BYTES;
+    memset(base, 0x55, AUDIO_MIC_PERIOD_BYTES); /* stale padding must not become PCM */
+    int16_t *pcm = (int16_t *)(void *)(base + offset);
+    w.cap_bytes += bytes;
+    for (uint32_t i = 0; i < bytes / 4; ++i, ++w.cap_k) {
         const int hi = w.cap_k % 96 < 48;
         pcm[2 * i] = (int16_t)(hi ? 8000 : -8000);
         pcm[2 * i + 1] = (int16_t)(hi ? 4000 : -4000);
@@ -547,7 +555,7 @@ static void deliver(int to_live)
             if (a.plan) w.outstanding = 0;
             if (a.n >= 24 && le32(a.b + 20) == AR_OP_WRITE_DONE) {w.write_dones++; if (w.str_started) w.stream_dones++;}
             if (a.read_slot <= -2) play_slot((unsigned)(-2 - a.read_slot));
-            if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot); w.read_dones++;}
+            if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot, le32(a.b + 40), le32(a.b + 44)); w.read_dones++;}
             if (to_live) audio_live_receive(&live, a.b, a.n, now_ms());
             else audio_session_receive(&session, a.b, a.n, now_ms());
             continue;
@@ -1117,6 +1125,88 @@ static void testLedgerOverflow(void)
     CHECK(audio_ledger_get(&l,l.written-1,b) && b[0]==l.written-1);
 }
 
+static void testInputControlsAndWrap(void)
+{
+    const uint32_t callbacks[] = {64, 128, 256, 512, 1024};
+    for (unsigned cb = 0; cb < N(callbacks); ++cb) {
+        AudioLiveShared state;
+        int16_t out[AUDIO_LIVE_RING * 2], fifo[AUDIO_LIVE_MIC_RING];
+        int16_t input[1024], got[1024], copied[1024], hal[PIANO_AUDIO_RING_FRAMES];
+        audio_live_shared_init(&state, out, fifo, 12345);
+        CHECK(state.input_q15 == 32767 && !state.input_muted);
+        audio_live_running(&state, 0, 1);
+        CHECK(state.input_runs == 1);
+        audio_live_running(&state, 1, 1);
+        CHECK(state.input_runs == 1);
+        CHECK(audio_live_capture(&state, got, 64) == 0 && state.input_hal.startup == 64);
+        state.capturing = 1;
+        const uint32_t count = callbacks[cb];
+        for (uint32_t at = 0; at < 4 * PIANO_AUDIO_RING_FRAMES; at += count) {
+            for (uint32_t i = 0; i < count; ++i) input[i] = (int16_t)((at + i) % 30001 - 15000);
+            CHECK(audio_ring_write(&state.in, input, count) == count);
+            CHECK(audio_live_capture(&state, got, count) == count);
+            piano_audio_copy_to_ring(hal, PIANO_AUDIO_RING_FRAMES, at, got, count, 1);
+            piano_audio_copy_from_ring(copied, hal, PIANO_AUDIO_RING_FRAMES, at, count, 1);
+            CHECK(!memcmp(input, copied, count * sizeof *input));
+        }
+        CHECK(!state.in.underruns && !state.in.overruns);
+        /* Level/mute take effect on data already queued, keep draining, and
+         * preserve speaker state. Zero level is real silence, not a default. */
+        const int levels[] = {100, 50, 0};
+        for (unsigned j = 0; j < N(levels); ++j) {
+            for (unsigned i = 0; i < 64; ++i) input[i] = i & 1 ? 32767 : -32768;
+            CHECK(audio_ring_write(&state.in, input, 64) == 64);
+            audio_live_input_control(&state, levels[j], 0);
+            CHECK(audio_live_capture(&state, got, 64) == 64);
+            for (unsigned i = 0; i < 64; ++i) CHECK(got[i] == (int16_t)((int32_t)input[i] * piano_audio_input_q15(levels[j]) / 32767));
+        }
+        CHECK(state.volume_q15 == 12345 && !state.muted);
+        audio_live_input_control(&state, 50, 1);
+        CHECK(audio_ring_write(&state.in, input, 64) == 64);
+        CHECK(audio_live_capture(&state, got, 64) == 64 && !audio_ring_fill(&state.in));
+        for (unsigned i = 0; i < 64; ++i) CHECK(!got[i]);
+        CHECK(state.input_hal.muted == 64 && !state.input_hal.mute_nonzero);
+        audio_live_input_control(&state, 101, 9);
+        CHECK(state.input_q15 == piano_audio_input_q15(50) && state.input_muted == 1);
+        audio_live_running(&state, 1, 0);
+        audio_live_running(&state, 1, 1);
+        CHECK(state.input_runs == 2 && state.input_q15 == piano_audio_input_q15(50) && state.input_muted == 1);
+        CHECK(!state.input_hal.requested && !state.input_hal.pcm.frames);
+        state.capturing = 0; state.input_fault = 1;
+        CHECK(!audio_live_capture(&state, got, 64) && state.input_hal.unavailable == 64 && !state.input_hal.startup);
+    }
+    for (int p = 1; p <= 100; ++p) {
+        const double db = 20 * log10(piano_audio_input_q15(p) / 32767.0);
+        CHECK(fabs(db - (-36 + .36 * p)) < .015);
+    }
+}
+static void short_mic(uint32_t t)
+{
+    w.capture_short = 1;
+    if (t == 100) device(0, 1);
+    if (t == 3100) device(0, 0);
+    /* Wait past idle and all release replies before a genuinely new plan. */
+    if (t == 7000 && !w.in_running) {
+        CHECK(live.mic_state == LiveDown && !w.va_on && !w.va_votes && !w.map_mic);
+        CHECK(live.cap.returned_bytes == live.mic_frames * 4 && live.cap.returned_bytes == w.cap_bytes);
+        CHECK(live.cap.short_returns && live.cap.zero_returns && !live.cap.errors);
+        CHECK(live.mic_pcm[0].peak == 8000 && live.mic_pcm[1].peak == 4000 && live.mic_pcm[2].peak == 6000);
+        CHECK(sh.input_hal.missing > 0); /* real short-period deficit is measured */
+        w.cap_bytes = 0;
+        device(0, 1);
+    }
+    if (t == 10000) device(0, 0);
+}
+static void testMicShortRestart(void)
+{
+    const struct Scenario sc = {10, 0, 0, 0, 14500, AudioPortsUbuntu, 1, short_mic};
+    run(&sc);
+    CHECK(!w.violations && live.mic_starts == 2 && sh.input_runs == 2 && w.mic_bad == 0);
+    CHECK(live.cap.returned_bytes == w.cap_bytes && live.cap.returned_bytes == live.mic_frames * 4);
+    CHECK(!live.cap.errors && count_cmd("VA ON", 0) == 2 && count_cmd("VA OFF", 0) == 2);
+    CHECK(logged("mic release: run 2 down 1 va 0"));
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1138,6 +1228,8 @@ int main(void)
     testFaults();
     testPlanFailures();
     testMic();
+    testInputControlsAndWrap();
+    testMicShortRestart();
     testQueueFull();
     testLoadedMonitor();
     testSleepCycles();

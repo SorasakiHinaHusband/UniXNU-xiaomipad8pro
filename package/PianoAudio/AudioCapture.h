@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 /* Input raw 0..100 follows the published linear -36..0 dB map. Mute is
- * separate; output keeps its proven curve and safety chain. */
+ * separate. Raw zero is exact silence (finite published dB floor -36);
+ * raw 1..100 uses the map below. Output keeps its proven safety chain. */
 static inline int32_t piano_audio_input_q15(int percent)
 {
     static const int16_t gain[101] = {
@@ -17,7 +18,7 @@ static inline int32_t piano_audio_input_q15(int percent)
         11626, 12118, 12631, 13165, 13723, 14303, 14909, 15539, 16197, 16882, 17597, 18342, 19118, 19927, 20770,
         21649, 22565, 23520, 24515, 25553, 26634, 27761, 28936, 30160, 31437, 32767
     };
-    return percent < 0 || percent > 100 ? -1 : gain[percent];
+    return percent < 0 || percent > 100 ? -1 : percent == 0 ? 0 : gain[percent];
 }
 
 typedef struct {
@@ -37,7 +38,7 @@ static inline void audio_capture_sample(AudioCapturePcm *s, int16_t v)
 }
 
 typedef struct {
-    uint64_t requested, delivered, startup, missing, muted, tail;
+    uint64_t requested, delivered, startup, missing, muted, unavailable;
     uint64_t first_delivery; /* HAL frame coordinate + 1, zero means absent */
     AudioCapturePcm pcm;    /* after digital level/mute, before HAL/codec */
     uint64_t mute_nonzero;

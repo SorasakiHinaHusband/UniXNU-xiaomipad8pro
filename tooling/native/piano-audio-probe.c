@@ -68,6 +68,7 @@ int main(int argc, char **argv)
     if (!st && bytes) st = AudioObjectGetPropertyData(dev, &a, 0, NULL, &bytes, ids);
     const UInt32 count = st ? 0 : bytes / sizeof *ids;
     printf("control_list_read phase=%s status=%d count=%u\n", phase, (int)st, (unsigned)count);
+    int wrote_level = 0, wrote_mute = 0, invalid = 0, has_level = 0, has_mute = 0;
     for (UInt32 i = 0; i < count; ++i) {
         UInt32 cls = 0, base = 0, scope = 0, element = 0;
         const OSStatus cs = u32(ids[i], kAudioObjectPropertyClass, &cls);
@@ -84,6 +85,7 @@ int main(int argc, char **argv)
                 cls == kAudioVolumeControlClassID ? (void *)&value : (void *)&muted);
             printf("control_write phase=%s id=%u status=%d level=%d mute=%d\n", phase, ids[i], (int)ws, level, mute);
             if (ws) {free(ids); return 3;}
+            if (cls == kAudioVolumeControlClassID) ++wrote_level; else ++wrote_mute;
         }
         Float32 scalar = 0, db = 0;
         UInt32 n = sizeof scalar;
@@ -94,12 +96,25 @@ int main(int argc, char **argv)
         const OSStatus ms = get(ids[i], kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0, &n, &muted);
         printf("control_state phase=%s id=%u mute_status=%d mute=%u finite_scalar=%d finite_db=%d\n", phase, ids[i], (int)ms, muted,
                !vs && isfinite(scalar), !dbs && isfinite(db));
+        if (!ss && scope == direction && !es && element == 0) {
+            if (cls == kAudioVolumeControlClassID) {
+                has_level = 1;
+                invalid |= vs || dbs || !isfinite(scalar) || !isfinite(db) ||
+                    (level >= 0 && (fabs(scalar - level / 100.0) > .011 || fabs(db - (-36 + .36 * level)) > .03));
+            }
+            if (cls == kAudioMuteControlClassID) {has_mute = 1; invalid |= ms || (mute >= 0 && muted != (UInt32)mute);}
+        }
         char c[5], b[5], sc[5]; fourcc(cls, c); fourcc(base, b); fourcc(scope, sc);
         printf("control phase=%s id=%u class=0x%08x(%s) base=0x%08x(%s) scope_status=%d scope=0x%08x(%s) element_status=%d element=%u class_status=%d base_status=%d scalar_status=%d scalar=%.9g db_status=%d db=%.9g\n",
                phase, (unsigned)ids[i], (unsigned)cls, c, (unsigned)base, b, (int)ss, (unsigned)scope, sc,
                (int)es, (unsigned)element, (int)cs, (int)bs, (int)vs, (double)scalar, (int)dbs, (double)db);
     }
     free(ids);
+    if ((level >= 0 && !wrote_level) || (mute >= 0 && !wrote_mute) || invalid || (input && (!has_level || !has_mute))) {
+        printf("control_validation phase=%s FAIL wrote_level=%d wrote_mute=%d invalid=%d\n", phase, wrote_level, wrote_mute, invalid);
+        return 4;
+    }
+    printf("control_validation phase=%s PASS wrote_level=%d wrote_mute=%d\n", phase, wrote_level, wrote_mute);
     for (UInt32 element = 0; element < 3; ++element) {
         Float32 v = 0; UInt32 n = sizeof v;
         st = get(dev, kAudioDevicePropertyVolumeScalar, direction, element, &n, &v);

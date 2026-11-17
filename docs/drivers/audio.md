@@ -683,3 +683,29 @@ engine headers (BSD-3-Clause / BSD-3-Clause-Clear) supply IDs and layouts with a
 reverse engineered. The DSP firmware, the amplifier preset and any topology or ACDB file are data read at run time from the
 owner's own tablet (or a staged copy under the ignored `out/`), never committed; the host tests use a synthetic preset container
 with made-up register data and models of the DSP and the amplifiers, no recorded vendor data.
+
+
+### Mic delivery controls (source and host validation, 2026-11-17)
+
+The existing level-10 path now publishes independent input/main level and mute
+controls (`inpt`, mono channel 1). Selector 2 preserves the caller's scalar
+representation and sends the input-scoped `cval` update. The input callback
+never changes speaker volume, the VA gain, graph, clocks or HAL ring geometry.
+Digital level/mute runs after the mono FIFO read and before the mapped input
+ring; muted capture continues draining. Raw 1..100 maps linearly from -35.64
+to 0 dB; raw 0 is exact silence (the finite advertised dB floor is -36 dB).
+At raw 50 the multiplier is 4125/32767, approximately -18 dB. Mute is exact zero.
+
+Capture completions check origin, slot/token/handle, bounds and stereo-frame
+alignment. Valid short and zero-byte replies are counted by actual returned
+size; padding is never treated as PCM. Bounded per-run diagnostics distinguish
+DEC0/DEC1/mono data, settle zeros, FIFO losses, active versus idle-tail drops,
+HAL delivery, requested mute and unavailable/fault silence. HAL and DSP runs
+have separate counters; stop/restart is covered by the host model.
+
+`tooling/native/piano-audio-probe.c PHASE input [LEVEL [MUTE]]` selects UID
+`Mic`, reads input controls/format/timing and optionally writes/reads back the
+input controls. Missing controls or failed writes fail the probe. With no
+`input` argument it retains the output snapshot behavior. These changes are
+host-verified; actual app recording, physical PCM and resource release still
+require the instrumented level-10 tablet acceptance.

@@ -47,6 +47,7 @@
 #include "AudioPcm.h"
 #include "AudioControl.h"
 #include "AudioControlNotification.h"
+#include "AudioCapture.h"
 #include "AudioLevelDictionary.h"
 #include "AudioTiming.h"
 #include "AudioPower.h"
@@ -389,7 +390,11 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("piano-audio-ring-contract", PIANO_AUDIO_RING_CONTRACT);
     setNumber(e, piano_audio_level_key(isInput), volumePercent);
     e->setProperty(piano_audio_mute_key(isInput), masterMute ? kOSBooleanTrue : kOSBooleanFalse);
-    if (isInput) e->setProperty("piano-audio-input-contract", "mic-delivery1:inpt/main:mono:db-linear:pre-HAL");
+    if (isInput) {
+        e->setProperty("piano-audio-input-contract", "mic-delivery1:inpt/main:mono:db-linear:pre-HAL");
+        setNumber(e, "piano-audio-input-gain-q15", masterMute ? 0 : piano_audio_input_q15(volumePercent));
+        e->setProperty("piano-audio-input-zero", "raw0=silence;finite-db-floor=-36;raw1-100=db-linear");
+    }
 }
 
 OSArray *PianoAudioDevice::controls() const {

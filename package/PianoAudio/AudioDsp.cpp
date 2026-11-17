@@ -188,11 +188,12 @@ uint32_t gMicHalReportAt, gMicHalControls;
 void micHalReport(const char *event)
 {
     const AudioCaptureHal &h = gShared->input_hal; // engine thread, or stopped
-    piano_audio_log("mic HAL: run %u event %s requested %llu delivered %llu startup %llu missing %llu muted %llu mute-nonzero %llu first-frame+1 %llu gain-q15 %d mute %d",
+    piano_audio_log("mic HAL: run %u event %s requested %llu delivered %llu startup %llu missing %llu muted %llu mute-nonzero %llu first-frame+1 %llu gain-q15 %d mute %d unavailable %llu fault %d",
         gShared->input_runs, event, (unsigned long long)h.requested, (unsigned long long)h.delivered,
         (unsigned long long)h.startup, (unsigned long long)h.missing, (unsigned long long)h.muted,
         (unsigned long long)h.mute_nonzero, (unsigned long long)h.first_delivery,
-        __atomic_load_n(&gShared->input_q15, __ATOMIC_ACQUIRE), __atomic_load_n(&gShared->input_muted, __ATOMIC_ACQUIRE));
+        __atomic_load_n(&gShared->input_q15, __ATOMIC_ACQUIRE), __atomic_load_n(&gShared->input_muted, __ATOMIC_ACQUIRE),
+        (unsigned long long)h.unavailable, __atomic_load_n(&gShared->input_fault, __ATOMIC_ACQUIRE));
     piano_audio_log("mic HAL PCM: run %u frames %llu nonzero %llu peak %u sum %lld squares %llu clipped %llu",
         gShared->input_runs, (unsigned long long)h.pcm.frames, (unsigned long long)h.pcm.nonzero, h.pcm.peak,
         (long long)h.pcm.sum, (unsigned long long)h.pcm.squares, (unsigned long long)h.pcm.clipped);
@@ -363,7 +364,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     PianoAdspHealth h;
     AdgObservation o;
     char line[300] = "", last[300] = "";
-    uint32_t lastWord = ~0u;
+    uint32_t lastWord = ~0u, registryAt = 0;
     while (!gLive->finished) {
         const uint32_t now = nowMs();
         bzero(&h,sizeof h); piano_adsp_health(&h); observe(o,h);
@@ -405,11 +406,12 @@ void liveRun(const PianoAudioLevelArgs *a)
         }
         const uint32_t word = liveWord(*gLive);
         piano_audio_live_word = word;
-        if (word != lastWord) {   // the registry follows the paths' states (not every period)
+        if (word != lastWord || (lc.mic && now - registryAt >= 1000)) {
             liveSummary(*gLive, line, sizeof line);
             if (strcmp(line, last)) piano_audio_set_property("piano-audio-live", line);
             strlcpy(last, line, sizeof last);
             lastWord = word;
+            registryAt = now;
         }
         if (!d) break;
         liveSleep(gLive->sleeping && d>5 ? 5 : d);

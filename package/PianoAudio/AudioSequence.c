@@ -368,8 +368,9 @@ uint32_t ar_pump_write(ArPump *p, uint8_t *out, uint32_t capacity, uint32_t now_
 
 int ar_pump_done(ArPump *p, const ArAnswer *a)
 {
-    if (a->opcode != (p->capture ? AR_OP_READ_DONE : AR_OP_WRITE_DONE) || a->dst_port != p->port) return 0;
-    if (p->capture && (a->src_domain != GPR_DOMAIN_ADSP || a->dst_domain != GPR_DOMAIN_APPS || a->src_port != AR_IID_CAP_SHMEM)) {
+    if (a->opcode != (p->capture ? AR_OP_READ_DONE : AR_OP_WRITE_DONE)) return 0;
+    if (!p->capture && a->dst_port != p->port) return 0;
+    if (p->capture && (a->dst_port != p->port || a->src_domain != GPR_DOMAIN_ADSP || a->dst_domain != GPR_DOMAIN_APPS || a->src_port != AR_IID_CAP_SHMEM)) {
         p->bad_origin++; p->errors++; return -1;
     }
     const uint64_t at = a->address - p->base;

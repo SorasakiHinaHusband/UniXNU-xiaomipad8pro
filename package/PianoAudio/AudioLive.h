@@ -66,6 +66,7 @@ typedef struct {
     int muted;                           /* level 9: the master mute */
     int32_t input_q15;
     int input_muted;
+    int input_fault;                      /* unavailable/fault zeros, distinct from requested mute */
     uint32_t input_controls, input_runs;
     AudioCaptureHal input_hal;            /* one HAL StartIO, single engine writer */
     uint64_t offered, taken, dropped, captured, controls;

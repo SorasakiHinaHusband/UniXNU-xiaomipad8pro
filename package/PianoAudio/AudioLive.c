@@ -132,7 +132,10 @@ uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames)
 {
     AudioCaptureHal *h = &sh->input_hal;
     h->requested += frames;
-    if (!load(&sh->capturing)) {h->startup += frames; return 0;}
+    if (!load(&sh->capturing)) {
+        if (load(&sh->input_fault)) h->unavailable += frames; else h->startup += frames;
+        return 0;
+    }
     const uint32_t n = audio_ring_read(&sh->in, mono, frames);
     const int muted = load(&sh->input_muted);
     const int32_t gain = __atomic_load_n(&sh->input_q15, __ATOMIC_ACQUIRE);
@@ -690,6 +693,7 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->sh->in.head = l->sh->in.tail = 0;   /* nobody reads it while capturing is 0 */
     drift_reset(&l->mic_drift);
     store(&l->sh->capturing, !l->sleeping);
+    store(&l->sh->input_fault, 0);
     l->mic_state = LiveRunning;
     LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mixed to mono; the first %u ms dropped",
         AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
@@ -759,6 +763,7 @@ void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now)
 
 static void mic_fault(AudioLive *l, int reason, uint32_t now)
 {
+    store(&l->sh->input_fault, 1);
     store(&l->sh->capturing, 0);
     audio_live_mic_report(l, "fault", now);
     l->mic_reason = reason;
@@ -824,6 +829,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
             ar_seq_step_name(&l->mplan.seq, l->mplan.seq.failed_step), l->mplan.seq.error_status);
         l->mplan.active = 0;
         l->mic_state = LiveOff;
+        store(&l->sh->input_fault, 1);
         return;
     }
     if (l->mic_state == LiveStopping) {
@@ -834,7 +840,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
         else if (reason && reason != AudioGuardLate && reason != AudioGuardQuiet) l->mic_state = LiveOff;
         else l->mic_state = LiveDown;
         LOG(l, "live: mic: %s", l->mic_state == LiveOff ? "the mic path is OFF for this boot" : "down");
-        LOG(l, "mic release: run %u down %d va %d handle %#x undo-errors %u", l->mic_starts, down, l->va_on,
+        LOG(l, "mic release: run %u down %d va %d retired-handle %#x undo-errors %u", l->mic_starts, down, l->va_on,
             l->mplan.seq.handle, l->mplan.seq.undo_errors);
     }
 }
@@ -862,6 +868,8 @@ static void finish(AudioLive *l, uint32_t now)
 /* PianoPower's health turned the guard off: no DSP command any more; the amplifiers down and held now. */
 static void go_off(AudioLive *l, uint32_t now)
 {
+    store(&l->sh->input_fault, 1);
+    if (l->mic_state == LiveRunning) audio_live_mic_report(l, "guard-off", now);
     l->off = 1;
     LOG(l, "live: dsp: guard OFF: %s: no DSP command goes out any more in this boot; the amplifiers muted, powered down and held in reset",
         adg_reason(l->guard ? l->guard->reason : AdgReasonOwner));
@@ -895,6 +903,7 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     l->ports = s->ports;
     l->amps = (AudioAmps *)&s->amps;
     l->sh = sh;
+    store(&sh->input_fault, !l->cfg.mic);
     return 0;
 }
 
