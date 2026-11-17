@@ -15,7 +15,8 @@
     "com.apple.driver.AppleARMPMU",
     "com.apple.driver.AppleEmbeddedTempSensor",
     "com.apple.driver.AppleOnboardSerial",
-    "com.apple.iokit.IOSlowAdaptiveClockingFamily"
+    "com.apple.iokit.IOSlowAdaptiveClockingFamily",
+    "com.apple.driver.usb.AppleUSBHostPlatformProperties"
   ],
   "libraries": {
     "com.apple.kpi.iokit": "18.0.0",

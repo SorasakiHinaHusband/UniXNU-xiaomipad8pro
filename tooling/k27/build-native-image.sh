@@ -37,7 +37,9 @@ if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
     LIST="$KEPT PianoUsbHostStack"
   fi
 fi
+BT_STACK_CHECK=0
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
+  [ "$k" != PianoBluetooth ] || BT_STACK_CHECK=1
   case $k in PianoUsbHostStack|PianoUsbHostStackA2) continue ;; esac   # codeless (a plist entry only): nothing to build
   case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; PianoXhciHost) b=piano-xhcihost ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
@@ -161,9 +163,9 @@ NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # The Bluetooth daemon requires the real consumer UC, while its hardware dependencies
 # must stay inert on this board. Check the linked metadata, not just the descriptor.
-case " $LIST " in *" PianoBluetooth "*)
-  python3 tooling/k27/check-bluetooth-stack.py out/k27/kc-k27-native.bin >&2 || exit 1 ;;
-esac
+if [ "$BT_STACK_CHECK" = 1 ]; then
+  python3 tooling/k27/check-bluetooth-stack.py out/k27/kc-k27-native.bin >&2 || exit 1
+fi
 # Apple's USB host stack (PIANO_USBHOST_STACK=1) must be inert without piano-usbhost=6: gated personalities only.
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   python3 tooling/k27/check-usbhost-stack.py out/k27/kc-k27-native.bin >&2 || { rm -f out/k27/kc-k27-native.bin; exit 1; }

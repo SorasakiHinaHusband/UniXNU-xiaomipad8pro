@@ -27,9 +27,13 @@ def main():
     entries = {row['CFBundleIdentifier']: row for row in metadata(sys.argv[1])}
     descriptor = json.loads((Path(__file__).parent / 'kext/PianoBluetooth.json').read_text())
     problems = []
+    for bundle, entry in entries.items():
+        absent = sorted(set(entry.get('OSBundleLibraries', {})) - set(entries))
+        if absent:
+            problems.append(f'{bundle}: unresolved library metadata {", ".join(absent)}')
     usb_profile = any(b in entries for b in ('com.unixnu.driver.PianoUsbHostStack',
                                            'com.unixnu.driver.PianoUsbHostStackA2'))
-    shim = json.loads((Path(__file__).parent / 'kext/PianoUsbHostStandIn.json').read_text())
+    shim = json.loads((Path(__file__).parent / 'kext/ARMPlatformStandIn.json').read_text())
     platform = entries.get('com.unixnu.driver.ARMPlatformStandIn', {})
     if not platform.get('_PrelinkExecutableLoadAddr'):
         problems.append('native platform stand-in executable absent')

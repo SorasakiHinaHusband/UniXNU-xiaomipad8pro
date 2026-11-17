@@ -115,14 +115,6 @@
         "IOProviderClass": "PianoBluetoothUnusedHardware"
       }
     },
-    "com.apple.driver.usb.AppleUSBHostPlatformProperties": {
-      "Mac Internal Hub Properties": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "Mac Internal Hub Properties 2": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
     "com.apple.iokit.IOAccessoryManager": {
       "Bulk Data": {
         "IOProviderClass": "PianoBluetoothUnusedHardware"
