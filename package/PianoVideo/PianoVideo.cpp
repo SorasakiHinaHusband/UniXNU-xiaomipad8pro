@@ -645,6 +645,7 @@ struct NativeOwner {
   Bringup<KernelHw> core;
   session::SelfTest<Bringup<KernelHw>> tx;
   IOMemoryDescriptor *loans[stream::Raws] = {};
+  avc::Config config;
   bool prepared = false, attempted = false;
   NativeOwner() : core(hw), tx(core, core.layout) {}
 };
@@ -680,17 +681,20 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
                                          const avc::Config *format)
 {
   // Validate again at the internal boundary before powering or using DMA.
-  if (!piano_video_native_ready() || !format || !avc::normalized(bytes,size,*format)) return -22;
+  avc::Picture picture;
+  if (!piano_video_native_ready() || !format || !avc::normalized(bytes,size,*format,&picture)) return -22;
   IOLockLock(gNativeLock);
   const bool ours=gNativeState.owns(sid);
   IOLockUnlock(gNativeLock);
   if(!ours)return -22;
   NativeOwner *owner=gNativeOwner;
+  if(owner&&!owner->config.same(*format))return -22;
   int rc=0;
   if(!owner){
+    if(!picture.idr)return -22;
     owner=new NativeOwner;
     if(!owner)return kErrNoMemory;
-    gNativeOwner=owner;
+    gNativeOwner=owner;owner->config=*format;
     Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
     rc=owner->core.run(options);owner->prepared=rc==0;
     if(!rc){
