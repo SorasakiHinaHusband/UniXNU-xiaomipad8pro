@@ -52,7 +52,10 @@ static void pureBoundaries() {
     CHECK(gOps.gates.back()==A830GateRecovering); // expired lease closes ring even without service
     bootB();openB();gEnv.now+=251000000;tickB();CHECK(qual.reason()==A830QualSensor && !qual.high());
     bootB();openB();gEnv.now+=251000000;CHECK(power.acquire()!=0);CHECK(recovery.pending());
-    bootB();tickB(850);CHECK(qual.reason()==A830QualGpuHot && recovery.pending());
+    bootB();raw=Sm8750TsensValidBit|850;qual.sample(gEnv.now,gpu());
+    CHECK(qual.reason()==A830QualGpuHot && recovery.pending() && power.qualificationBlocked());
+    CHECK(recovery.runPending()==0);const auto recoveries=recovery.stats().recoveries;
+    driveB(20,850);CHECK(recovery.stats().recoveries==recoveries && !recovery.lost() && dcvs.level()==1);
     bootB();openB();tickB(1050);CHECK(unsafe==1 && recovery.pending());
     CHECK(qual.deadlineMissed(gEnv.now+5000000000ull));
     tickB(1050,100000000);CHECK(unsafe>=2); // independent of HFI/deadline/recovery state

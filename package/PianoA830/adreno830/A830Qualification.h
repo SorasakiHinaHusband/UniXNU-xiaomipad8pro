@@ -93,7 +93,19 @@ public:
         if(r3b_ && openedAt() && (now<at || now-at>A830R3bThermal::Lease))power_->setQualificationCeiling(1,2);
     }
     void sample(uint64_t now,const Sm8750TsensSample &gpu) {
-        if(r3b_)return; // the sole 100 ms owner reads, filters and faults in tickR3b
+        if(r3b_) {
+            bool valid=gpu.valid==255,hot=false;
+            for(unsigned i=0;i<8;++i) {
+                if(gpu.deci[i]<-400 || gpu.deci[i]>1250)valid=false;
+                if(gpu.valid&(1u<<i)) {
+                    if(gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr);break;}
+                    if(gpu.deci[i]>=850)hot=true;
+                }
+            }
+            if(!reason() && hot)fault(A830QualGpuHot,now);
+            else if(high() && !valid)fault(A830QualSensor,now);
+            return; // no filter/cap update here: the sole 100 ms owner does that in tickR3b
+        }
         if(!openedAt())return;
         if(gpu.valid && gpu.max_deci>=700 && !power_->qualificationLatched())fault(A830QualGpuHot,now);
         else if(gpu.valid!=255 && !power_->qualificationLatched())fault(A830QualSensor,now);
@@ -117,7 +129,7 @@ private:
             (thermal_.entryRounds<2?A830QualNeedRounds:0u),__ATOMIC_RELEASE);
         const bool hardBoard=boardOk && board.valid==3 && board.state==PIANO_BOARD_TEMPS_RUNNING &&
             (board.milli_c[0]>=65000 || board.milli_c[1]>=40000);
-        if(high() || (gpuOk && thermal_.raw>=850) || hardBoard) {
+        if(high() || (!reason() && ((gpuOk && thermal_.raw>=850) || hardBoard))) {
             if(thermal_.raw>=850)fault(A830QualGpuHot,now);
             else if(board.milli_c[0]>=65000 || board.milli_c[1]>=40000)fault(A830QualBoardHot,now);
             else if(!thermal_.healthy)fault(A830QualSensor,now);

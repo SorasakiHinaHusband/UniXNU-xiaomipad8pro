@@ -2558,6 +2558,8 @@ void dcvsQueueRow(void *)
 void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
 {
     const auto &h=g830.hfi.failure();
+    // A last-moment R3b cap may have lowered the caller's cached target before enqueue.
+    if(gQualification.r3b()) {requested=uint8_t(g830.hfi.stats().last_level);bus=uint8_t(g830.hfi.stats().last_bw);}
     qualLog("R3a vote-unknown request=%08x seq=%u requested=%u/%u oldACK=%u/%u error=%x reason=%u at-us=%llu",
         h.hdr,A830_HFI_HDR_SEQ(h.hdr),requested,bus,g830.power_state.votedLevel(),g830.power_state.votedBus(),unsigned(error),h.reason,nowUs());
     gQualification.fault(A830QualVote,nowUs()*1000);
@@ -2569,8 +2571,7 @@ void qualificationThread(void *)
         const uint64_t now=nowUs()*1000;
         if(g830.power_state.qualificationLatched() && !gQualification.reason())gQualification.fault(A830QualVote,now);
         Sm8750TsensSample gpu={};Sm8750TsensReadGpu(&g830.tsens_io,&gpu);
-        if(gQualification.r3b())for(unsigned i=0;i<8;++i)
-            if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050)qualificationUnsafe(nullptr);
+        if(gQualification.r3b())gQualification.sample(now,gpu); // raw exit before board lookup, filtering, logging or HFI
         piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
         const bool ok=adreno830_qualification_board(&board);
         gQualification.tick(now,gpu,board,ok);
@@ -2605,7 +2606,8 @@ void qualificationService(void *,uint64_t now) {
     gQualification.checkLease(now);
     const uint64_t at=__atomic_load_n(&gQualificationInjectAt,__ATOMIC_ACQUIRE);
     if(at && now>=at && __atomic_exchange_n(&gQualificationInjectAt,0ull,__ATOMIC_ACQ_REL)) {
-        if(gQualification.high() && g830.power_state.votedLevel()>3 && g830.hfi.armDropAck()) {
+        if(gQualification.high() && g830.power_state.votedLevel()>3 &&
+           (!gQualification.r3b() || g830.power_state.qualificationEffectiveCap()>3) && g830.hfi.armDropAck()) {
             qualLog("R3a injection armed from ACK level=%u at-us=%llu",g830.power_state.votedLevel(),nowUs());
             g830.dcvs.forceQualificationVote();
         } else qualLog("R3a injection refused: high ACK/permit missing at deadline");
