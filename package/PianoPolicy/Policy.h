@@ -79,6 +79,7 @@ struct Inputs {
   Screen screen = Screen::unknown;   // NativeGopDisplay piano-display-power (always since 2026-11-11; before: piano-backlight=2)
   bool displayEvents = false;    // the display found messages each change of it (its piano-display-power-messages, or one seen)
   bool lpm = false;              // machdep.piano_policy_lpm
+  bool lidSleepArmed = true;    // explicit runtime safety gate while physical polarity awaits observation
   bool sleepOn = false;          // machdep.piano_sleep begins with "on" (k27 0062 and piano-sleep=1)
   uint32_t wakeMask = 0;         // its "wake mask"
   Thermal thermal = Thermal::unknown;   // PianoThermal's piano_thermal_state (with thermalOwnsGpu, only while the slot is shared)
@@ -109,6 +110,7 @@ inline View view(const Config &c, const Inputs &in, bool seenOpen)
     v.close = Close::lock;
     if (in.power == Power::external && !c.lidSleepAC) v.closeWhy = "on external power: lock only";
     else if (in.power == Power::unknown) v.closeWhy = "power source unknown (piano-power-ps=1 publishes it): lock only";
+    else if (!in.lidSleepArmed) v.closeWhy = "lid sleep not armed: physical observation pending";
     else if (!in.sleepOn) v.closeWhy = "no system sleep (k27 0062 with piano-sleep=1): lock only";
     else if (!(in.wakeMask & kWakeLid)) v.closeWhy = "the cover-open wake is not armed (piano-sleep-wake lacks 2): lock only";
     else if (!seenOpen) v.closeWhy = "the cover has not been seen open since boot: lock only";

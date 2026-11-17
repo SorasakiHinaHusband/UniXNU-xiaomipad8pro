@@ -171,6 +171,7 @@ int numberProperty(IOService *s, const char *key)
 }
 
 // ---------------------------------------------------------------------------------------------------------------- sysctls
+volatile uint32_t gLidArm;
 volatile uint32_t gLpm;                 // machdep.piano_policy_lpm
 IOLock *gStatusLock;
 char gStatus[640] = "starting\n";
@@ -195,9 +196,21 @@ int sysctlLpm(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
   return 0;
 }
 
+int sysctlLidArm(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+  int v=int(__atomic_load_n(&gLidArm,__ATOMIC_ACQUIRE));
+  const int err=sysctl_handle_int(oidp,&v,0,req);
+  if (err || !req->newptr) return err;
+  if (v!=0 && v!=1) return EINVAL;
+  __atomic_store_n(&gLidArm,uint32_t(v),__ATOMIC_RELEASE);
+  note("sleep-contract1: lid sleep %s by explicit runtime gate",v?"armed":"disarmed");
+  kickFromSysctl();
+  return 0;
+}
+
 // machdep.piano_policy (read only) and machdep.piano_policy_lpm (root writes), registered at start. Filled in at run time rather
 // than by SYSCTL_OID's static initializer: its parent and handler are signed pointers on arm64e.
-struct sysctl_oid gOidStatus, gOidLpm;
+struct sysctl_oid gOidStatus, gOidLpm, gOidLidArm;
 
 }  // namespace
 
@@ -307,6 +320,7 @@ bool PianoPolicy::start(IOService *provider)
     note("FAILED: no lock");
     return false;
   }
+  __atomic_store_n(&gLidArm,bootArg("piano-policy-lid-arm",1)?1u:0u,__ATOMIC_RELEASE);
   fConfig.act = gArgs.level >= 2;
   fConfig.lid = gArgs.lid != 0;
   fConfig.lidSleepAC = gArgs.lidSleepAC == 1;
@@ -369,6 +383,8 @@ bool PianoPolicy::start(IOService *provider)
           "PianoPolicy: inputs, decisions and counters");
   fillOid(gOidLpm, "piano_policy_lpm", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, sysctlLpm, "I",
           "PianoPolicy: macOS Low Power Mode (0/1), mirrored by the agent");
+  fillOid(gOidLidArm,"piano_policy_lid_arm",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED,sysctlLidArm,"I","Explicit lid sleep gate; physical polarity observation first");
+  sysctl_register_oid(&gOidLidArm);
   sysctl_register_oid(&gOidStatus);
   sysctl_register_oid(&gOidLpm);
   setProperty("piano-policy", gArgs.level, 32);
@@ -512,6 +528,7 @@ Inputs PianoPolicy::gather()
   Inputs in;
   IOService *kb = __atomic_load_n(&fKeyboard, __ATOMIC_ACQUIRE);
   const int hall = numberProperty(kb, "piano-keyboard-hall");
+  in.lidSleepArmed=__atomic_load_n(&gLidArm,__ATOMIC_ACQUIRE)!=0;
   in.lid = hall < 0 ? Lid::unknown : hall ? Lid::open : Lid::closed;
   in.attached = numberProperty(kb, "piano-keyboard-attached") == 1;
   IOService *ps = __atomic_load_n(&fPowerSource, __ATOMIC_ACQUIRE);

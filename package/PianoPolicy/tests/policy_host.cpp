@@ -654,6 +654,8 @@ static void acDemandSleep()
       CHECK((view(c, in, seen).close == Close::sleep) == (power != Power::unknown && on && wake && seen));
     }
   Engine e(c); Inputs in = base(); in.power = Power::external;
+  in.lidSleepArmed=false; CHECK(view(c,in,true).close==Close::lock);
+  in.lidSleepArmed=true;
   CHECK(run(e, in).find("kIOPMSleepNow") == std::string::npos);
   in.lid = Lid::closed;
   const auto close = run(e, in);

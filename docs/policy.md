@@ -353,5 +353,7 @@ Unknown power, absent sleep/lid-wake capability, a cover never seen open, and
 clamshell masks remain its own. Physical hall polarity and full tablet recovery
 are acceptance gates; `piano-keyboard-hall-active-low` defaults to 1 from the
 third-party Linux DT, and every raw edge is logged even with poll tracing off.
-The first unattended sleep test leaves acting lid off and uses the existing
-kernel maximum-duration wake timer. Real cover acceptance is attended.
+The first unattended sleep test uses `piano-policy-lid-arm=0`
+(`machdep.piano_policy_lid_arm`, root writes 0/1) to keep lid sleep disarmed and uses the existing
+kernel maximum-duration wake timer. Real cover acceptance is attended; it first observes a valid physical close/open,
+then arms the same image while open. Lid reporting keeps a single owner throughout.
