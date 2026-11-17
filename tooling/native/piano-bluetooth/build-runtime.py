@@ -91,8 +91,15 @@ def main():
     out = external_output(args.output)
     runtime = out / 'runtime'
     build = out / 'build'
-    for directory in (build, *(runtime / d for d in ('bin', 'lib', 'helpers', 'scripts', 'launchd'))):
+    for directory in (build, runtime, *(runtime / d for d in ('bin', 'lib', 'helpers', 'scripts', 'launchd'))):
+        if directory.is_symlink():
+            raise ValueError('Output directories must not be symlinks')
+        external_output(directory)
         directory.mkdir(parents=True, exist_ok=True)
+    if any(path.is_symlink() for path in runtime.rglob('*')):
+        raise ValueError('Existing runtime output contains a symlink')
+    if any(path.is_symlink() for path in build.rglob('*')):
+        raise ValueError('Existing build output contains a symlink')
     # A failed partial invocation must never leave an apparently usable report.
     (runtime / 'report.json').unlink(missing_ok=True)
     source = args.bluetoothd.expanduser().resolve(strict=True)

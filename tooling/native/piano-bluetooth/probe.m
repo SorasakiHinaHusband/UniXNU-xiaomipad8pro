@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreBluetooth/CoreBluetooth.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,8 +55,17 @@
 static void spin(double seconds)
 {
     NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
-    while ([until timeIntervalSinceNow] > 0)
+    while ([until timeIntervalSinceNow] > 0) {
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        [NSThread sleepForTimeInterval:0.01];
+    }
+}
+static void deadline(int signalNumber)
+{
+    (void)signalNumber;
+    static const char line[] = "piano-bt-path1 probe: client_ipc_deadline=1\n";
+    (void)write(STDERR_FILENO, line, sizeof(line) - 1);
+    _exit(6);
 }
 static int usage(void)
 {
@@ -71,8 +81,10 @@ int main(int argc, const char *argv[])
         long seconds = scan ? strtol(argv[2], &end, 10) : 0;
         if (scan && (!end || *end || seconds < 1 || seconds > 30)) return usage();
         /* Also bound any synchronous framework initialization waiting for daemon IPC. */
+        signal(SIGALRM, deadline);
         alarm((unsigned)(2 * seconds + 30));
         setvbuf(stdout, NULL, _IOLBF, 0);
+        printf("piano-bt-path1 probe: started=1 scan=%u\n", scan);
         IOBluetoothHostController *controller = [IOBluetoothHostController defaultController];
         NSInteger power = controller ? controller.powerState : -1;
         printf("piano-bt-path1 probe: default_object=%u power=%ld\n", controller != nil, (long)power);

@@ -19,6 +19,12 @@ while [ "$i" -lt 4 ]; do
 done
 [ "$ready" = 1 ] || { printf '%s\n' 'piano-bt-path1 runtime: transport_not_ready=1'; exit 1; }
 # The stock job definitions retain Apple's mach services and sandbox policy.
-/bin/launchctl kickstart -k system/com.apple.BlueTool
-/bin/launchctl kickstart -k system/com.apple.bluetoothd
+if ! /bin/launchctl kickstart -k system/com.apple.BlueTool; then
+    printf '%s\n' 'piano-bt-path1 runtime: service=BlueTool kickstart_failed=1'
+    exit 1
+fi
+if ! /bin/launchctl kickstart -k system/com.apple.bluetoothd; then
+    printf '%s\n' 'piano-bt-path1 runtime: service=bluetoothd kickstart_failed=1'
+    exit 1
+fi
 printf '%s\n' 'piano-bt-path1 runtime: stock services restarted on verified views'
