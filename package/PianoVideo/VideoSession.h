@@ -10,6 +10,7 @@
 #include "VideoBuffers.h"
 #include "VideoFixture.h"
 #include "VideoStreamState.h"
+#include "VideoDiagnostics.h"
 namespace pianovideo
 {
 namespace session
@@ -64,6 +65,41 @@ struct Result {
   uint32_t errorType = 0, errorFlags = 0, errorPort = 0, errorId = 0, errorHeader = 0;
   bool checksum = false, drainAck = false, last = false, stopRaw = false, stopInput = false, closed = false;
 };
+struct Observation {
+  Result r;
+  Psc psc;
+  stream::Ledger ledger;
+  uint32_t sid=0,flags=0,outputCount=0,queued=0,releasing=0,readonly=0;
+  uint64_t token=0,deadline=0;
+  int closeRc=0,teardownRc=0;
+  bool dmaHeld=false;
+  template<class Log> void print(Log &l,const char *which) const {
+    l.note("V6f session %s sid %08x phase %u failed %u error %d flags %08x token %llu deadline %llu ETB %u EBD %u PSC %u decoded %u",
+      which,sid,r.stage,r.failedStage,r.error,flags,(unsigned long long)token,(unsigned long long)deadline,r.etb,r.ebd,r.psc,r.decoded);
+    l.note("V6f state %s close-rc %d teardown %d dma-held %u STOP %u/%u CLOSE %u ACK %u LAST %u queued %u releasing %u readonly %u outputs %u",
+      which,closeRc,teardownRc,unsigned(dmaHeld),unsigned(r.stopRaw),unsigned(r.stopInput),unsigned(r.closed),unsigned(r.drainAck),unsigned(r.last),queued,releasing,readonly,outputCount);
+    l.note("V6f PSC %s returned %08x res %08x crop %08x/%08x depth %08x coded %u N %u POC %u profile %u level %u color %08x",
+      which,psc.returned,psc.resolution,psc.crop[0],psc.crop[1],psc.depth,psc.coded,psc.n,psc.poc,psc.profile,psc.level,psc.color);
+    l.note("V6f ledger %s pending %u accepted %llu retired %u cancelled %u high-water %u draining %u paused %u stopped %u",
+      which,ledger.pending,(unsigned long long)ledger.accepted,ledger.retired,ledger.cancelled,ledger.highWater,unsigned(ledger.draining),unsigned(ledger.paused),unsigned(ledger.stopped));
+    for(unsigned i=0;i<stream::Inputs;++i)l.note("V6f input %s index %u owned %u token %llu uses %u",which,i,unsigned(ledger.inputOwned[i]),(unsigned long long)ledger.inputToken[i],ledger.inputUses[i]);
+    for(unsigned i=0;i<stream::Credits;++i) {
+      const auto &f=ledger.frames[i];
+      l.note("V6f frame %s index %u phase %u token %llu serial %llu flags %08x",which,i,unsigned(f.phase),(unsigned long long)f.token,(unsigned long long)f.serial,f.flags);
+    }
+    unsigned held=0;for(unsigned i=0;i<stream::Raws;++i)if(ledger.rawHeld[i]) {
+      ++held;l.note("V6f RAW %s index %u token %llu uses %u",which,i,(unsigned long long)ledger.rawToken[i],ledger.rawUses[i]);
+    }
+    l.note("V6f RAW %s held %u",which,held);
+  }
+};
+template<class Log> void printTimeoutObservation(Log &log,const diagnostic::Hardware &hardware,
+    const Observation &previous,const Observation &current,const diagnostic::History &history) {
+  log.note("V6f snapshot begin version 1 error %d sid %08x before-cleanup 1",current.r.error,current.sid);
+  hardware.print(log);previous.print(log,"previous");current.print(log,"current");
+  history.commands.print(log,"TX");history.messages.print(log,"RX");
+  log.note("V6f snapshot end sid %08x before-cleanup 1",current.sid);
+}
 // Session has no resource destructor: only the V3 PAS/detach/TLB owner can free the arena.
 // Every RX is validated before a four-pass error/info/property/command dispatch. Single worker, no callback re-entry.
 template <class Owner> class SelfTest
@@ -88,7 +124,17 @@ public:
   struct OutputFrame { uint64_t token = 0; unsigned index = 0; uint32_t bytes = 0; };
   OutputFrame outputs[stream::Credits] = {};
   unsigned outputHead = 0, outputCount = 0;
+  diagnostic::History *history = nullptr; // storage belongs to the native owner, never the kernel stack
+  void (*timeoutObserver)(void *, const SelfTest &) = nullptr;
+  void *observerContext = nullptr;
   explicit SelfTest(Owner &owner, Layout &l) : o(owner), layout(l) {}
+  Observation observation() const {
+    Observation s; s.r=r;s.psc=psc;s.ledger=ledger;s.sid=sessionId;s.token=token;s.deadline=deadline;s.outputCount=outputCount;
+    s.flags=unsigned(openSent)|(unsigned(inputStarted)<<1)|(unsigned(rawStarted)<<2)|(unsigned(drainSent)<<3)|
+      (unsigned(closeSent)<<4)|(unsigned(cleanup)<<5);
+    for(unsigned i=0;i<layout.used;++i){const auto &b=layout.buf[i];s.queued+=b.queued;s.releasing+=b.pendingRelease;s.readonly+=b.readonly;}
+    return s;
+  }
   bool pscSupported() const {
     if (!streaming) return psc.supported();
     return psc.resolution == 0x014000f0 && !psc.crop[0] && !psc.crop[1] && psc.depth == 0x00080008 && psc.coded == 1 &&
@@ -120,6 +166,8 @@ public:
       r.errorPort = port;
       r.errorId = id;
       r.errorHeader = header;
+      if(code==kErrHfiTimeout && streaming && !cleanup && timeoutObserver)
+        timeoutObserver(observerContext,*this);
       o.hw.note("V4 first-error %d stage %u session %08x header %u type %08x flags %08x port %u packet %u", code, r.stage, sessionId,
                 header, type, flags, port, id);
     }
@@ -134,6 +182,7 @@ public:
     hfi::add(o.tx, type, flags, payload, data, words, o.ids, port);
     o.hw.note("V4 TX stage %u session %08x header %u packet %u type %08x port %u flags %08x payload %u words %u", r.stage, o.tx[1], o.tx[2],
               o.tx[13], type, port, flags, payload, words);
+    if(streaming&&history)history->commands.add(o.tx,o.tx[0],o.hw.nowUs());
     const int rc = o.send(o.tx[0], "V4-session");
     return rc ? fail(rc, type, flags, port) : 0;
   }
@@ -236,6 +285,7 @@ public:
   }
   int receive(const uint32_t *b, uint32_t bytes)
   {
+    if(streaming&&history)history->messages.add(b,bytes,o.hw.nowUs());
     const uint32_t before = errorSerial;
     if (!validate(b, bytes))
       return fail(kErrHfi);

@@ -646,12 +646,48 @@ struct NativeOwner {
   session::SelfTest<Bringup<KernelHw>> tx;
   IOMemoryDescriptor *loans[stream::Raws] = {};
   avc::Config config;
+  diagnostic::History history;
   bool prepared = false, attempted = false;
   NativeOwner() : core(hw), tx(core, core.layout) {}
 };
 IOLock *gNativeLock;
 stream::Owner gNativeState;
 NativeOwner *gNativeOwner;
+IOService *gVideoService;
+session::Observation gPreviousNative;
+bool gTimeoutCaptured=false;
+// Independent of NativeOwner lifetime: PAS teardown and owner deletion cannot
+// erase this evidence. IOLog is also collected by the existing event-window export.
+struct SnapshotText {
+  char text[32768]={};
+  unsigned used=0;
+  bool truncated=false;
+  void note(const char *fmt,...) __attribute__((format(printf,2,3))) {
+    char line[480];va_list ap;va_start(ap,fmt);vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
+    ::note("%s",line);
+    if(used>=sizeof text-1){truncated=true;return;}
+    const int n=snprintf(text+used,sizeof text-used,"PianoVideo: %s\n",line);
+    if(n<0||unsigned(n)>=sizeof text-used){truncated=true;used=sizeof text-1;}
+    else used+=unsigned(n);
+  }
+} gTimeoutText;
+diagnostic::Hardware gTimeoutHardware;
+session::Observation gTimeoutCurrent;
+void nativeTimeoutSnapshot(void *context,const session::SelfTest<Bringup<KernelHw>> &tx)
+{
+  if(gTimeoutCaptured)return;
+  gTimeoutCaptured=true;
+  auto &owner=*static_cast<NativeOwner *>(context);
+  // All sampling precedes formatting/logging and any worker error cleanup.
+  gTimeoutCurrent=tx.observation();
+  gTimeoutHardware.capture(owner.core);
+  auto &s=gTimeoutText;
+  s.note("V6f native owner prepared %u attempted %u phase %u serial %u previous-valid %u",
+    unsigned(owner.prepared),unsigned(owner.attempted),unsigned(gNativeState.phase),gNativeState.serial,unsigned(gPreviousNative.sid!=0));
+  session::printTimeoutObservation(s,gTimeoutHardware,gPreviousNative,gTimeoutCurrent,owner.history);
+  const bool exported=gVideoService&&gVideoService->setProperty("piano-video-first-error",s.text);
+  ::note("V6f snapshot exported IORegistry %u bytes %u truncated %u",unsigned(exported),s.used,unsigned(s.truncated));
+}
 
 void hashBytes(const uint8_t *bytes, uint32_t size, char text[65])
 {
@@ -695,6 +731,8 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
     owner=new NativeOwner;
     if(!owner)return kErrNoMemory;
     gNativeOwner=owner;owner->config=*format;
+    owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
+    owner->tx.history=&owner->history;
     Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
     rc=owner->core.run(options);owner->prepared=rc==0;
     if(!rc){
@@ -794,6 +832,8 @@ extern "C" int piano_video_native_close(uint32_t sid)
       if (!rc) rc = un;
     }
     held = owner->core.dmaHeld;
+    gPreviousNative=owner->tx.observation();gPreviousNative.closeRc=rc;
+    gPreviousNative.teardownRc=owner->core.teardownRc;gPreviousNative.dmaHeld=held;
     note("V6 native close session %08x result %d ETB %u EBD %u PSC %u decoded %u drain-ack %u LAST %u STOP %u/%u CLOSE %u "
          "teardown %d dma-held %u watchdog %u fault-bits %08x", sid, rc, owner->tx.r.etb, owner->tx.r.ebd, owner->tx.r.psc,
          owner->tx.r.decoded, unsigned(owner->tx.r.drainAck), unsigned(owner->tx.r.last), unsigned(owner->tx.r.stopRaw),
@@ -835,8 +875,10 @@ bool PianoVideo::start(IOService *provider)
   if (gArgs.level == 6) {
     gNativeLock = IOLockAlloc();
     if (!gNativeLock) return false;
+    gVideoService=this;
     note("V6 bounded AVC streaming ready level 6 exclusive credits8 inputs2 RAW-reuse descriptor-WC 1");
     note("V6c completion disposition AVC-known NOSHOW40 ancillary-ignored finish-sticky");
+    note("V6f first-timeout snapshot armed passive console IORegistry before-cleanup");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();

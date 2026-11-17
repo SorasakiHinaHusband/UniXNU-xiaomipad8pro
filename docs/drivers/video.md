@@ -786,4 +786,16 @@ correct address, extent and token but picture flags `0x81`. Our streaming valida
 output delivery. V6c follows the pinned Iris/sheng bitmask handling: require a known AVC kind and reject NOSHOW (`0x40`),
 while preserving address, extent, token and ownership validation. A failed session also keeps the same malfunction result
 for repeated finish requests until invalidation. Actual-parser replays and finish-state host regressions pass; V6c hardware
-qualification and the full continuous-frame matrix remain pending ([results](../results-2026-11-18.md)).
+qualification subsequently delivered the original golden frame; its second session stalled after PSC, before DPB/RAW
+submission ([results](../results-2026-11-18.md)). Continuous decoding remains unqualified.
+
+V6f adds passive first-timeout evidence to the native path. Before cleanup at the first `-20`, it samples the existing
+readable domains' core, clock, power and interrupt registers, queue indices and pending heads. It retains the last 40 TX
+packets and 16 RX packets (header fields and up to 16 payload words), the current session's PSC/ownership/ledger, and the
+previous session's final state. Sampling finishes before formatting; timestamps delimit the sequential sample. Registers
+with interrupt side effects are excluded. The snapshot changes no waits, timeouts, HFI bytes or cleanup decisions.
+
+`PianoVideo: V6f snapshot begin/end` bounds the console/IOLog record. `piano-video-first-error` on the PianoVideo IORegistry
+service preserves the same text independently of owner teardown; `V6f snapshot exported IORegistry 1` confirms publication.
+Absent domains are marked unreadable rather than read speculatively. The unchanged V6 tool and fixtures reproduce the
+original phase order. This is diagnostic instrumentation, not a firmware-stall fix or a continuous-decoding qualification.

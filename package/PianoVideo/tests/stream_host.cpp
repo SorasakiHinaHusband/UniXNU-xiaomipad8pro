@@ -427,7 +427,93 @@ static void admissionPublication() {
   CHECK(!l.publish(0x5678)&&!l.submit(0x5678,1));
   l.cancel();CHECK(l.pending==0&&!l.publish(0x5678));
 }
+// The stall is an explicit model input, not an explanation of firmware behavior.
+struct StalledPeer : Peer {
+  bool stalled=false;
+  int send(unsigned bytes,const char *what) {
+    if(stalled)return hfi::write(mem,hfi::kCmdq,tx,bytes,[]{});
+    const bool firstInput=tx[9]==Buffers&&tx[16]==Bitstream;
+    const int rc=Peer::send(bytes,what);if(firstInput)stalled=true;return rc;
+  }
+};
+struct TimeoutWitness {
+  unsigned calls=0;
+  session::Observation saved;
+  static void capture(void *context,const SelfTest<StalledPeer> &t) {
+    auto &s=*static_cast<TimeoutWitness *>(context);++s.calls;s.saved=t.observation();
+    CHECK(!t.cleanup&&!t.closeSent&&t.o.stops==0&&t.o.closes==0);
+    CHECK(t.o.hw.clock==1000000&&t.r.error==kErrHfiTimeout);
+    CHECK(t.o.mem.ld(hfi::qhdr(0)+hfi::kQRead)==739&&t.o.mem.ld(hfi::qhdr(0)+hfi::kQWrite)==1395);
+    CHECK(t.history&&t.history->commands.total==59&&t.history->messages.total>=10);
+    t.history->commands.print(t.o.hw,"TX");t.history->messages.print(t.o.hw,"RX");
+    s.saved.print(t.o.hw,"current");
+  }
+};
+static void firstTimeoutObservationTests() {
+  std::vector<uint32_t> referenceUc;
+  for(bool hooked:{false,true}) {
+    StalledPeer p;Layout l;CHECK(l.init());p.autoEbd=false;
+    p.ids.header=3;p.ids.packet=10;
+    p.mem.st(hfi::qhdr(0)+hfi::kQRead,113);p.mem.st(hfi::qhdr(0)+hfi::kQWrite,113);
+    SelfTest<StalledPeer> t(p,l);TimeoutWitness witness;diagnostic::History history;
+    t.streaming=true;t.checkGolden=false;t.expectedPoc=t.psc.poc=0;t.expectedProfile=t.psc.profile=2;t.expectedLevel=t.psc.level=4;
+    if(hooked){t.timeoutObserver=TimeoutWitness::capture;t.observerContext=&witness;t.history=&history;}
+    CHECK(t.nativeInput(0x56360002,kAccessUnit,sizeof kAccessUnit,1));
+    CHECK(t.transaction()==kErrHfiTimeout&&t.r.failedStage==Output&&p.hw.clock==1000000);
+    CHECK(t.r.etb==1&&!t.r.ebd&&t.r.psc==1&&!p.dpbs&&!p.ftbs);
+    if(!hooked)referenceUc=p.uc;else CHECK(p.uc==referenceUc); // identical HFI bytes/indices, including the failed wait
+    CHECK(witness.calls==unsigned(hooked));
+    t.fail(kErrHfiTimeout);CHECK(witness.calls==unsigned(hooked));
+    if(hooked) {
+      CHECK(witness.saved.sid==0x56360002&&witness.saved.ledger.inputOwned[0]&&witness.saved.ledger.pending==1);
+      CHECK(p.hw.log.find("V6f TX seq 59 ")!=std::string::npos);
+      CHECK(p.hw.log.find("V6f session current sid 56360002")!=std::string::npos);
+      CHECK(p.hw.log.find("V6f input current index 0 owned 1 token 1")!=std::string::npos);
+    }
+    const auto saved=witness.saved;t.shutdown();CHECK(witness.calls==unsigned(hooked));
+    CHECK(witness.saved.sid==saved.sid&&witness.saved.r.stage==saved.r.stage); // survives cleanup
+  }
+}
+static void passiveHardwareTests() {
+  struct Model {
+    Hardware hw;
+    struct Power {
+      bool on=false;
+      bool ccReadable()const{return on;}bool controllerReadable()const{return on;}bool codecReadable()const{return on;}
+    } power;
+    struct Reads {
+      unsigned count=0;
+      uint32_t rd(uint64_t pa){CHECK(pa!=kIris+kCpuCsA2hSoftIntClr&&pa!=kIris+kCpuIcSoftInt);++count;return uint32_t(pa);}
+    } ops;
+    hfi::Mem mem;
+  } m;
+  diagnostic::Hardware off;off.capture(m);CHECK(!off.cc&&!off.controller&&!off.codec&&!off.queues&&m.ops.count==0);
+  std::vector<uint32_t> uc(kUcBytes/4);m.mem.uc=uc.data();hfi::initQueues(m.mem);
+  const auto size=kHfiQueueBytes/4;
+  m.mem.st(hfi::qhdr(0)+hfi::kQRead,size-2);m.mem.st(hfi::qhdr(0)+hfi::kQWrite,3);
+  for(unsigned i=0;i<5;++i)m.mem.st(hfi::qbase(0)+4*((size-2+i)%size),100+i);
+  const auto before=uc;m.power.on=true;
+  diagnostic::Hardware s;s.capture(m);CHECK(uc==before&&m.ops.count==31);
+  CHECK(s.cc&&s.codec&&s.controller&&s.queues&&s.headWords[0]==5&&!s.headWords[1]);
+  CHECK(s.head[0][0]==100&&s.head[0][4]==104&&s.core[5]==kIris+kWrapperIntrStatus);
+  s.print(m.hw);CHECK(m.hw.log.find("V6f interrupt status ")!=std::string::npos);
+  // Use the same formatter as the native callback for spec-pattern rehearsal.
+  Observation previous,current;previous.sid=0x56360001;previous.r.closed=true;previous.r.decoded=1;
+  current.sid=0x56360002;current.r.error=kErrHfiTimeout;current.r.failedStage=Output;
+  current.r.etb=current.r.psc=1;diagnostic::History history;
+  uint32_t packet[24]={96,0x56360002,61,0,0,0,0,1,64,Start,3,0,2,68};
+  for(unsigned i=0;i<41;++i)history.commands.add(packet,sizeof packet,0);
+  history.messages.add(packet,sizeof packet,0);
+  printTimeoutObservation(m.hw,s,previous,current,history);
+  CHECK(m.hw.log.find("V6f snapshot begin version 1 error -20 sid 56360002 before-cleanup 1")!=std::string::npos);
+  CHECK(m.hw.log.find("V6f snapshot end sid 56360002 before-cleanup 1")!=std::string::npos);
+  CHECK(m.hw.log.find("V6f TX seq 1 ")==std::string::npos&&m.hw.log.find("V6f TX seq 41 ")!=std::string::npos);
+  CHECK(m.hw.log.size()<32768);
+  // Corrupt indices/size must never authorize an out-of-bounds pending-head read.
+  m.mem.st(hfi::qhdr(0)+hfi::kQRead,size);diagnostic::Hardware bad;bad.capture(m);CHECK(!bad.headWords[0]);
+}
 int main() {
+  firstTimeoutObservationTests();passiveHardwareTests();
   ancillaryPictureTests();
   finishDispositionTests();
   admissionPublication();
