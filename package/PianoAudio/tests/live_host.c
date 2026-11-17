@@ -105,6 +105,7 @@ static AudioLiveShared sh;
 static int16_t g_out_ring[AUDIO_LIVE_RING * 2], g_in_ring[AUDIO_LIVE_MIC_RING];
 static AudioSession session;
 static AudioLive live;
+static AudioLedger live_ledger;
 static AudioDspGuard guard;
 static uint8_t preset[4096];
 static uint8_t g_dma[AUDIO_DMA_BYTES];   // the audio slice the kernel maps
@@ -556,6 +557,7 @@ static void deliver(int to_live)
 }
 
 static void (*g_setup)(AudioLiveConfig *);
+static int pm_expect_unsafe;
 
 static void run(const struct Scenario *sc)
 {
@@ -609,6 +611,7 @@ static void run(const struct Scenario *sc)
     if (g_setup) g_setup(&lc);
     audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
     CHECK(audio_live_init(&live, &lc, &session, &sh) == 0);
+    memset(&live_ledger,0,sizeof live_ledger); live.ledger=&live_ledger;
     w.write_dones = w.stream_dones = 0;
     w.writes = 0;
     g_t0 = now_ms();
@@ -629,6 +632,13 @@ static void run(const struct Scenario *sc)
             next = w.now_us + (d ? d : 1) * 1000u;
         }
         w.now_us += 500;
+    }
+    if (pm_expect_unsafe) {
+        CHECK(live.sleep_failed && audio_live_parked(&live)==-1);
+        CHECK(audio_live_rearm(&live)==-1 && w.map_spk==1 && !live.finished);
+        CHECK(live.splan.in_flight && live.splan.seq.state==ArSeqWaiting);
+        CHECK(!w.violations && !any_powered());
+        return; // reset the host world between tests; production retains this backing
     }
     // ---- the owner's stop, then the end state
     if (!live.finished) {
@@ -998,6 +1008,90 @@ static void testLoadedMonitor(void)
     g_status_read_us = g_status_fail_at = g_loaded_reads = 0;
 }
 
+static unsigned pm_cycle, pm_stage, pm_command, pm_park_at;
+static void sleep_cycles(uint32_t t)
+{
+    if (!w.out_running) device(1, 1);
+    w.sound_on=1; w.amplitude=12000;
+    if (!pm_stage && t>=1500+pm_cycle*2500) {
+        pm_command=w.ncmd; pm_stage=1;
+        audio_live_control(&sh,60,0);
+        audio_live_sleep(&live,pm_cycle+1);
+        audio_live_sleep(&live,99); /* repeated off does not change generation */
+        CHECK(live.sleep_generation==pm_cycle+1);
+    }
+    if (pm_stage==1 && live.parked) {
+        CHECK(audio_live_parked(&live)==1);
+        CHECK(!w.clock_on && !w.map_spk && !w.map_mic && !w.va_on && !w.va_votes && !w.va_mclk);
+        CHECK(!any_powered() && !w.pins_on && !live.pump.in_flight && !live.cap.in_flight);
+        CHECK(sh.want_out && sh.want_in && sh.volume_q15==audio_volume_q15(60) && !sh.muted);
+        unsigned si=0,mi=0;
+        for (unsigned j=pm_command;j<w.ncmd;++j) {
+            if(si<N(kSpkDown) && !strcmp(w.cmd[j],kSpkDown[si])) ++si;
+            if(mi<N(kMicDown) && !strcmp(w.cmd[j],kMicDown[mi])) ++mi;
+        }
+        CHECK(si==N(kSpkDown) && mi==N(kMicDown));
+        pm_stage=2; pm_park_at=t;
+    }
+    if (pm_stage==2 && t-pm_park_at>=100) {
+        const unsigned sends=w.send_calls;
+        CHECK(audio_live_rearm(&live)==0);
+        CHECK(audio_live_rearm(&live)==-1);
+        CHECK(w.send_calls==sends && !audio_ring_fill(&sh.out) && !audio_ring_fill(&sh.in));
+        CHECK(!sh.have_sound && !sh.sound && sh.volume_q15==audio_volume_q15(60));
+        CHECK(!live.finished && !live.off);
+        pm_stage=3;
+    }
+    if (pm_stage==3 && live.spk_state==LiveRunning && live.mic_state==LiveRunning) {
+        ++pm_cycle; pm_stage=pm_cycle==3 ? 4 : 0;
+    }
+}
+static void testSleepCycles(void)
+{
+    pm_cycle=pm_stage=0;
+    const struct Scenario sc={10,160,6,0,10000,AudioPortsUbuntu,0,sleep_cycles};
+    run(&sc);
+    CHECK(pm_cycle==3 && !w.violations && !live.sleep_failed);
+    uint64_t words[AUDIO_LEDGER_WORDS], n=live.ledger->written;
+    CHECK(n>0);
+    CHECK(audio_ledger_get(live.ledger,n-1,words));
+    CHECK(!audio_ledger_get(live.ledger,n,words));
+}
+static int pm_map_seen;
+static void sleep_pending_map(uint32_t t)
+{
+    (void)t;
+    if (!w.out_running) device(1,0);
+    w.sound_on=1; w.amplitude=10000;
+    if (!pm_map_seen && live.splan.in_flight && live.splan.seq.pending_opcode==AR_OP_MEM_MAP) {
+        pm_map_seen=1;
+        CHECK(live.splan.seq.state==ArSeqWaiting && w.map_spk==1);
+        audio_live_sleep(&live,7);
+        CHECK(live.splan.seq.state==ArSeqWaiting); // pending MAP is NOT aborted
+        if (pm_expect_unsafe) w.nq=0; // DSP mapped; the answer is lost
+    }
+    if (live.parked) {
+        CHECK(pm_map_seen && live.splan.seq.handle==H_SPK && w.map_spk==0);
+        CHECK(count_cmd("UNMAP 0x55",live_from())==1);
+    }
+}
+static void testSleepPendingMap(void)
+{
+    const struct Scenario sc={9,160,6,0,5000,AudioPortsUbuntu,0,sleep_pending_map};
+    pm_map_seen=0; run(&sc); CHECK(pm_map_seen && live.parked);
+    pm_map_seen=0; pm_expect_unsafe=1; run(&sc);
+    CHECK(pm_map_seen && !count_cmd("UNMAP 0x55",live_from()));
+    pm_expect_unsafe=0;
+}
+static void testLedgerOverflow(void)
+{
+    AudioLedger l={0}; uint64_t a[AUDIO_LEDGER_WORDS]={0},b[AUDIO_LEDGER_WORDS];
+    for(unsigned n=0;n<AUDIO_LEDGER_CAP+7;++n) {a[0]=n; audio_ledger_put(&l,a);}
+    CHECK(l.written==AUDIO_LEDGER_CAP+7 && !audio_ledger_get(&l,0,b));
+    CHECK(audio_ledger_get(&l,7,b) && b[0]==7);
+    CHECK(audio_ledger_get(&l,l.written-1,b) && b[0]==l.written-1);
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1021,6 +1115,9 @@ int main(void)
     testMic();
     testQueueFull();
     testLoadedMonitor();
+    testSleepCycles();
+    testSleepPendingMap();
+    testLedgerOverflow();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }

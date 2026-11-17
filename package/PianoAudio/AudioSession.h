@@ -88,6 +88,7 @@ typedef struct {
      * DEC1 at 48 kHz from 2.4 MHz DMIC clocks; on 0: all of it undone), called only while the PRM votes and the VA mclk hold. 0 or an
      * error. May be null (the mic path then fails at that step). */
     int (*va_mic)(void *ctx, int on);
+    uint32_t (*clock_ms)(void *ctx);  /* optional diagnostic clock; same domain as tick */
 } AudioSessionOps;
 
 enum {AudioLevelNotRun = 0, AudioLevelPassed = 1, AudioLevelFailed = 2, AudioLevelSkipped = 3};

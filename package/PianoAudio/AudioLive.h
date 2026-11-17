@@ -27,6 +27,7 @@
 #define PIANO_AUDIO_LIVE_H
 #include <stdint.h>
 #include "AudioTiming.h"
+#include "AudioLedger.h"
 #include "AudioSession.h"
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,9 @@ typedef struct {
     int32_t volume_q15;                  /* level 9: the master volume (0..32767), from the device's property or the boot argument */
     int muted;                           /* level 9: the master mute */
     uint64_t offered, taken, dropped, captured, controls;
+    uint32_t producer_seq, epoch, boundary_ms, producer_ms, producer_frames, producer_late_us;
+    uint64_t hal_sample, hal_host, hal_write_end;
+
 } AudioLiveShared;
 /* The rings' storage: AUDIO_LIVE_RING_BYTES and AUDIO_LIVE_MIC_RING_BYTES (the owner's, kept as long as sh). */
 #define AUDIO_LIVE_RING_BYTES (AUDIO_LIVE_RING * 2u * 2u)
@@ -151,6 +155,11 @@ typedef struct {
     int va_on;
     /* ---- the exchange */
     uint32_t sends, queue_full, received, stray, timeouts;
+    int sleeping, parked, sleep_failed;
+    uint32_t sleep_generation, ledger_epoch, ledger_out, done_batch;
+    uint32_t monitor_start, monitor_end, monitor_field;
+    AudioLedger *ledger;   /* optional fixed allocation owned for the boot */
+
 } AudioLive;
 
 /* After audio_session_tick finished with the hardware kept (audio_session_kept): the session's amplifiers, ops, guard and ports.
@@ -165,6 +174,11 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
 /* The owner's stop: both paths down (hard: without DSP commands), the amplifiers held in reset, the TDM pins given back, then
  * finished. */
 void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms);
+/* Reversible PM path: no abort of a command in flight, no guard reset. The
+ * caller first parks both HAL readers; timeout cancels sleep, never forces unmap. */
+void audio_live_sleep(AudioLive *l, uint32_t generation);
+int audio_live_parked(AudioLive *l);  /* 1 safe, 0 draining, -1 unsafe */
+int audio_live_rearm(AudioLive *l);
 const char *audio_live_state(int state);
 
 #ifdef __cplusplus

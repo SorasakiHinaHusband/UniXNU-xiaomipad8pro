@@ -49,6 +49,7 @@
 #include "AudioControlNotification.h"
 #include "AudioLevelDictionary.h"
 #include "AudioTiming.h"
+#include "AudioPower.h"
 
 extern "C" {
 // Post-mortem and the summary line: the engines' state and their counters.
@@ -149,7 +150,7 @@ public:
     IOBufferMemoryDescriptor *statusMemory, *ring;
     IOLock *lock;
     thread_t engine;
-    bool running, stopping;
+    bool running, stopping, powerParked, reanchor;
     uint64_t startTime;
     uint32_t seed;
     int32_t hogOwner = -1;
@@ -172,6 +173,49 @@ public:
     static void engineMain(void *, wait_result_t);
     void run();
 };
+
+namespace {
+PianoAudioDevice *gPowerDevices[2];
+int gDeviceSleep;
+}
+
+extern "C" int piano_audio_devices_power(int sleep)
+{
+    if (sleep) __atomic_store_n(&gDeviceSleep,1,__ATOMIC_RELEASE);
+    for (unsigned i=0;i<2;++i) {
+        auto *d=__atomic_load_n(&gPowerDevices[i],__ATOMIC_ACQUIRE);
+        if (!d) continue;
+        IOLockLock(d->lock);
+        uint64_t deadline; clock_interval_to_deadline(250,kMillisecondScale,&deadline);
+        while (sleep && d->running && !d->powerParked) {
+            if (IOLockSleepDeadline(d->lock,&d->powerParked,deadline,THREAD_UNINT)==THREAD_TIMED_OUT) {
+                if (d->running && !d->powerParked) {IOLockUnlock(d->lock); return -1;}
+                break;
+            }
+        }
+        if (!sleep) {
+            bzero(d->ring->getBytesNoCopy(),PIANO_AUDIO_RING_FRAMES*2u*d->channels());
+            d->startTime=mach_absolute_time();
+            auto *s=d->status();
+            s->sampleTime=0; s->hostTime=d->startTime; s->writeEnd=0;
+            __asm__ volatile("dmb ish" ::: "memory");
+            s->seed=++d->seed;
+            d->reanchor=true;
+            IOLockWakeup(d->lock,&gDeviceSleep,false);
+            IOLog("PianoAudio: sleep-contract1: HAL reanchor %s seed %u intent %u\n",d->uid,d->seed,d->running?1:0);
+        }
+        IOLockUnlock(d->lock);
+    }
+    if (!sleep) {
+        __atomic_store_n(&gDeviceSleep,0,__ATOMIC_RELEASE);
+        for (unsigned i=0;i<2;++i) {
+            auto *d=__atomic_load_n(&gPowerDevices[i],__ATOMIC_ACQUIRE);
+            if (!d) continue;
+            IOLockLock(d->lock); IOLockWakeup(d->lock,&gDeviceSleep,false); IOLockUnlock(d->lock);
+        }
+    }
+    return 0;
+}
 
 class PianoAudioUserClient : public IOUserClient {
     OSDeclareDefaultStructors(PianoAudioUserClient)
@@ -364,6 +408,7 @@ bool PianoAudioDevice::start(IOService *provider) {
     publish(this);
     setProperty("IOUserClientClass", "PianoAudioUserClient");
     registerService();
+    __atomic_store_n(&gPowerDevices[isInput?1:0],this,__ATOMIC_RELEASE);
     return true;
 }
 
@@ -416,6 +461,7 @@ IOReturn PianoAudioDevice::startIO() {
     IOLockLock(lock);
     if (!running) {
         while (stopping) IOLockSleep(lock, &stopping, THREAD_UNINT);
+        reanchor=false; powerParked=false;
         /* Only kernel batching changes at StartIO. HAL has already cached the
          * fixed ring/safety/latency tuple before calling this selector. */
         timingMode = selectedTimingMode();
@@ -442,6 +488,7 @@ IOReturn PianoAudioDevice::stopIO() {
     IOLockLock(lock);
     if (running) {
         running = false; stopping = true;
+        IOLockWakeup(lock,&gDeviceSleep,false);
         while (stopping) IOLockSleep(lock, &stopping, THREAD_UNINT);   // the engine thread clears it as it leaves
         setProperty("is running", kOSBooleanFalse);
         transportSet(!isInput, false);
@@ -466,12 +513,21 @@ void PianoAudioDevice::run() {
     uint64_t done = 0, soundPeriods = 0, latePeriods = 0, maxLate = 0;
     for (;;) {
         IOLockLock(lock);
+        while (running && __atomic_load_n(&gDeviceSleep,__ATOMIC_ACQUIRE)) {
+            powerParked=true;
+            IOLockWakeup(lock,&powerParked,false);
+            IOLockSleep(lock,&gDeviceSleep,THREAD_UNINT);
+        }
+        powerParked=false;
+        if (reanchor) {done=0; reanchor=false;}
         const bool live = running;
         IOLockUnlock(lock);
         if (!live) break;
         const uint64_t deadline = startTime + absolute(done + tp.periodFrames);
         if (mach_absolute_time() > deadline + absolute(tp.periodFrames)) piano_audio_dev_late = piano_audio_dev_late + 1;
         else clock_delay_until(deadline);
+        IOLockLock(lock);
+        if (!running || __atomic_load_n(&gDeviceSleep,__ATOMIC_ACQUIRE)) {IOLockUnlock(lock); continue;}
         const uint64_t woke = mach_absolute_time();
         const uint64_t late = woke > deadline ? woke - deadline : 0;
         if (late > maxLate) maxLate = late;
@@ -500,7 +556,12 @@ void PianoAudioDevice::run() {
             s->sampleTime = anchor;
             __asm__ volatile("dmb ish" ::: "memory");
         }
+        if (!isInput) {
+            uint64_t ns; absolutetime_to_nanoseconds(late,&ns);
+            piano_audio_producer_trace(tp.periodFrames,uint32_t(ns/1000u),status()->sampleTime,status()->hostTime,status()->writeEnd);
+        }
         piano_audio_dev_periods = piano_audio_dev_periods + 1;
+        IOLockUnlock(lock);
     }
     IOLog("PianoAudio: HAL ring read: %s mode %u periods %llu with sound %llu frames %llu write-end %llu\n",
           isInput ? "input" : "output", timingMode, (unsigned long long)(done / tp.periodFrames),
@@ -511,6 +572,8 @@ void PianoAudioDevice::run() {
           (unsigned long long)latePeriods, (unsigned long long)(maxLateNs / 1000u));
     IOLockLock(lock);
     stopping = false;
+    powerParked=false;
+    IOLockWakeup(lock, &powerParked, false);
     IOLockWakeup(lock, &stopping, false);
     IOLockUnlock(lock);
     release();

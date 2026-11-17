@@ -9,6 +9,30 @@ static void zero(void *p, uint32_t n) {for (uint32_t i = 0; i < n; ++i) ((uint8_
 static int load(const int *p) {return __atomic_load_n(p, __ATOMIC_ACQUIRE);}
 static void store(int *p, int v) {__atomic_store_n(p, v, __ATOMIC_RELEASE);}
 
+static void ledger(AudioLive *l, unsigned event, uint32_t before, uint32_t after, uint32_t want, uint32_t got, int slip)
+{
+    if (!l->ledger) return;
+    const AudioLiveShared *s = l->sh;
+    uint64_t w[AUDIO_LEDGER_WORDS] = {0};
+    w[0]=event; w[1]=l->now; w[2]=__atomic_load_n(&s->epoch,__ATOMIC_ACQUIRE);
+    w[3]=l->spk_mode; w[4]=load(&s->want_out); w[5]=before; w[6]=after; w[7]=want; w[8]=got; w[9]=want-got;
+    const uint32_t producer_seq=__atomic_load_n(&s->producer_seq,__ATOMIC_SEQ_CST);
+    w[10]=__atomic_load_n(&s->producer_ms,__ATOMIC_ACQUIRE);
+    w[11]=__atomic_load_n(&s->producer_frames,__ATOMIC_ACQUIRE);
+    w[12]=__atomic_load_n(&s->producer_late_us,__ATOMIC_ACQUIRE);
+    w[13]=l->pump.sent; w[14]=l->pump.returned; w[15]=l->pump.in_flight; w[16]=l->done_batch;
+    w[17]=l->monitor_start; w[18]=l->monitor_end; w[19]=l->monitor_field;
+    w[20]=l->skipped; w[21]=l->drops; w[22]=l->repeats; w[23]=(uint64_t)(int64_t)slip;
+    w[24]=__atomic_load_n(&s->hal_sample,__ATOMIC_ACQUIRE); w[25]=__atomic_load_n(&s->hal_host,__ATOMIC_ACQUIRE);
+    w[26]=__atomic_load_n(&s->hal_write_end,__ATOMIC_ACQUIRE); w[27]=s->out.underruns;
+    if ((producer_seq&1u) || producer_seq!=__atomic_load_n(&s->producer_seq,__ATOMIC_SEQ_CST)) {
+        w[10]=w[11]=w[24]=w[25]=w[26]=0; w[12]=UINT32_MAX;
+    }
+    w[28]=__atomic_load_n(&s->boundary_ms,__ATOMIC_ACQUIRE); w[29]=l->sleep_generation;
+    w[30]=l->spk_state; w[31]=l->underruns;
+    audio_ledger_put(l->ledger,w);
+}
+
 /* ------------------------------------------------------------------------------------------------ levels in dB, as Q15 */
 /* The IOAudio2 volume control and the DSP use the same scalar curve: -36 dB
  * at zero, 0 dB at unity, with dB proportional to (1-scalar)^2.  This keeps
@@ -73,7 +97,7 @@ void audio_live_shared_init(AudioLiveShared *sh, int16_t *out_storage, int16_t *
 
 void audio_live_running(AudioLiveShared *sh, int output, int input)
 {
-    if (output && !load(&sh->want_out)) store(&sh->sound, 0);   /* a new run: only its own sound starts the path */
+    if (output && !load(&sh->want_out)) {__atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE); store(&sh->sound, 0);}   /* a new run: only its own sound starts the path */
     store(&sh->want_out, output ? 1 : 0);
     store(&sh->want_in, input ? 1 : 0);
 }
@@ -178,8 +202,9 @@ static int plan_settled(const AudioLivePlan *p)
  * PianoPower asks for quiet. */
 static void plan_send(AudioLive *l, AudioLivePlan *p, const AudioLivePlan *other, uint32_t now)
 {
-    if (!p->active || l->off) return;
+    if (!p->active || l->off || l->sleep_failed) return;
     if (p->in_flight && now - p->sent_at >= l->cfg.answer_ms) {
+        if (l->sleeping) {l->sleep_failed=1; return;} /* retain uncertain DMA ownership; cancel instead of abort */
         l->timeouts++;
         LOG(l, "live: dsp: no answer to %s%s within %u ms%s", p->pending_undo ? "the undo of " : "", ar_seq_step_name(&p->seq, p->pending_step),
             l->cfg.answer_ms, p->pending_undo ? " (counted; the undoing goes on)" : ": undoing what was done, that step too");
@@ -263,7 +288,7 @@ static int spk_active(const AudioLive *l, uint32_t now, int *silent)
     const int have = load(&sh->have_sound);
     const uint32_t at = __atomic_load_n(&sh->sound_at, __ATOMIC_ACQUIRE);
     *silent = !have || now - at >= l->cfg.idle_ms;
-    return load(&sh->want_out) && !(l->cfg.level >= 9 && load(&sh->muted)) && !*silent;
+    return !l->sleeping && load(&sh->want_out) && !(l->cfg.level >= 9 && load(&sh->muted)) && !*silent;
 }
 
 static void spk_begin(AudioLive *l, uint32_t now)
@@ -279,7 +304,7 @@ static void spk_begin(AudioLive *l, uint32_t now)
     const ArStep *steps = ar_speaker_steps(&count);
     l->spk_starts++;
     LOG(l, "live: speaker: sound from the Speaker device: the speaker plan (start %u)", l->spk_starts);
-    plan_start(l, &l->splan, "speaker", steps, count, 0x8000, &l->speaker);
+    plan_start(l, &l->splan, "speaker", steps, count, 0x8000 + (l->sleep_generation << 16), &l->speaker);
     l->spk_state = LiveStarting;
     (void)now;
 }
@@ -299,13 +324,14 @@ static void stream_begin(AudioLive *l, uint32_t now)
         LOG(l, "live: speaker: the period pump refused its geometry");
         l->dsp_error = 1;
     }
+    l->pump.token_base += l->sleep_generation << 16;
     (void)audio_chain_init(&l->chain, 4);
     (void)audio_chain_set_ceiling(&l->chain, l->cfg.ceiling);
     l->gain_now = l->cfg.level >= 9 ? __atomic_load_n(&l->sh->volume_q15, __ATOMIC_ACQUIRE) : AUDIO_Q15_ONE;
     audio_guard_start(&l->sguard, now, 0);   /* no time limit: the device's stream */
     audio_ring_reset(&l->sh->out);
     drift_reset(&l->spk_drift);
-    store(&l->sh->accepting, 1);
+    store(&l->sh->accepting, !l->sleeping);
     l->spk_state = LiveRunning;
     LOG(l, "live: speaker: stream up: 10 ms periods, %u in flight, the ring's target %u frames; ceiling %d, gain %u; %u silent periods "
         "first, the amplifiers muted", AUDIO_LIVE_DEPTH, AUDIO_LIVE_TARGET, l->chain.ceiling, l->amps->amp[0].gain, AUDIO_UNMUTE_PERIODS);
@@ -316,6 +342,7 @@ static void take_period(AudioLive *l)
 {
     AudioRing *r = &l->sh->out;
     uint32_t fill = audio_ring_fill(r);
+    const uint32_t before = fill, skipped = l->skipped;
     if (fill > AUDIO_LIVE_TARGET + 3u * AUDIO_PERIOD_FRAMES) {   /* a backlog (the device stalled, then caught up): skipped */
         audio_ring_skip(r, fill - AUDIO_LIVE_TARGET);
         l->skipped++;
@@ -337,6 +364,7 @@ static void take_period(AudioLive *l)
         l->stereo[2 * want + 1] = got ? l->stereo[2 * want - 1] : 0;
     }
     if (got < want) l->underruns++;
+    if (got < want || skipped != l->skipped || slip) ledger(l, AlRefill, before, audio_ring_fill(r), want, got, slip);
 }
 
 static void fill_period(AudioLive *l, uint32_t slot)
@@ -376,7 +404,10 @@ static void fill_period(AudioLive *l, uint32_t slot)
 static void status_sample(AudioLive *l)
 {
     ++l->status_slices;
+    l->monitor_start = l->ops.clock_ms ? l->ops.clock_ms(l->ops.ctx) : l->now;
+    l->monitor_field = l->status_poll.next;
     const int complete = audio_amps_poll(l->amps, &l->status_poll);
+    l->monitor_end = l->ops.clock_ms ? l->ops.clock_ms(l->ops.ctx) : l->now;
     if (complete < 0) {
         l->amp_bad |= l->status_poll.failed;
         LOG(l, "live: amp: a status read failed (slots %#x)", l->status_poll.failed);
@@ -430,6 +461,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
     const int late = ar_pump_check(&l->pump, now);
     int r = audio_guard_check(&l->sguard, now, l->dsp_error, late, l->amp_bad);
     if (!r && l->held) r = AudioGuardQuiet;
+    if (r && l->sleeping) {l->sleep_failed=1; (void)audio_amps_off(l->amps); return;}
     if (r) {stream_fault(l, r, now); return;}
     int silent = 0;
     const int active = spk_active(l, now, &silent);
@@ -446,7 +478,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
     case SpkQuiet:
         if (l->spk_mode == SpkQuiet && !active) {
             const uint32_t from = l->hold_from_sound ? __atomic_load_n(&l->sh->sound_at, __ATOMIC_ACQUIRE) : l->quiet_at;
-            if (now - from >= l->cfg.idle_ms || !load(&l->sh->have_sound)) l->spk_ending = 1;
+            if (l->sleeping || now - from >= l->cfg.idle_ms || !load(&l->sh->have_sound)) l->spk_ending = 1;
             break;
         }
         l->spk_ending = 0;
@@ -525,7 +557,7 @@ static void spk_tick(AudioLive *l, uint32_t now)
     case LiveDown: {
         /* held, muted or no device: the sound flag stays set, so play() wakes nobody until it is taken (the control, the device's
          * start and the end of quiet come with their own wake or the next tick) */
-        if (l->held || l->aborting || !load(&l->sh->want_out) || (l->cfg.level >= 9 && load(&l->sh->muted))) return;
+        if (l->sleeping || l->held || l->aborting || !load(&l->sh->want_out) || (l->cfg.level >= 9 && load(&l->sh->muted))) return;
         int silent = 0;
         const int active = spk_active(l, now, &silent);
         const int fresh = __atomic_exchange_n(&l->sh->sound, 0, __ATOMIC_ACQ_REL);
@@ -607,7 +639,7 @@ static void mic_begin(AudioLive *l)
     const ArStep *steps = ar_mic_live_steps(&count);
     l->mic_starts++;
     LOG(l, "live: mic: the Mic device runs: the capture plan (start %u)", l->mic_starts);
-    plan_start(l, &l->mplan, "microphone", steps, count, 0x9000, &l->micplan);
+    plan_start(l, &l->mplan, "microphone", steps, count, 0x9000 + (l->sleep_generation << 16), &l->micplan);
     l->mic_state = LiveStarting;
 }
 
@@ -622,9 +654,10 @@ static void capture_begin(AudioLive *l, uint32_t now)
     if (ar_pump_init_capture(&l->cap, base, l->mplan.seq.handle, l->ports->data, AUDIO_MIC_SLOTS, AUDIO_MIC_PERIOD_BYTES,
                              AUDIO_LIVE_MIC_DEPTH, AUDIO_LATE_MS))
         l->cap_error = 1;
+    l->cap.token_base += l->sleep_generation << 16;
     l->sh->in.head = l->sh->in.tail = 0;   /* nobody reads it while capturing is 0 */
     drift_reset(&l->mic_drift);
-    store(&l->sh->capturing, 1);
+    store(&l->sh->capturing, !l->sleeping);
     l->mic_state = LiveRunning;
     LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mixed to mono; the first %u ms dropped",
         AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
@@ -671,7 +704,9 @@ static void capture_tick(AudioLive *l, uint32_t now)
 {
     int r = l->cap_error ? AudioGuardDsp : ar_pump_check(&l->cap, now) ? AudioGuardLate : AudioGuardOk;
     if (!r && l->held) r = AudioGuardQuiet;
+    if (r && l->sleeping) {l->sleep_failed=1; return;}
     if (r) {mic_fault(l, r, now); return;}
+    if (l->sleeping) l->mic_ending = 1;
     if (load(&l->sh->want_in)) l->mic_idle_at = 0;
     else if (!l->mic_idle_at) l->mic_idle_at = now ? now : 1;
     if (l->mic_idle_at && now - l->mic_idle_at >= l->cfg.idle_ms) l->mic_ending = 1;
@@ -700,7 +735,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
     if (!l->cfg.mic) return;
     switch (l->mic_state) {
     case LiveDown:
-        if (l->held || l->aborting || !load(&l->sh->want_in)) return;
+        if (l->sleeping || l->held || l->aborting || !load(&l->sh->want_in)) return;
         mic_begin(l);
         break;
     case LiveRunning:
@@ -803,6 +838,11 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
             l->cfg.idle_ms, l->ports->name);
     }
     l->now = now_ms;
+    const uint32_t epoch = __atomic_load_n(&l->sh->epoch,__ATOMIC_ACQUIRE), out = load(&l->sh->want_out);
+    if (epoch != l->ledger_epoch || out != l->ledger_out) {
+        ledger(l, out ? AlStart : AlStop, audio_ring_fill(&l->sh->out), audio_ring_fill(&l->sh->out), 0, 0, 0);
+        l->ledger_epoch=epoch; l->ledger_out=out;
+    }
     const int g = o ? adg_observe(l->guard, o, now_ms) : l->guard->state;
     if (g == AdgOff) {go_off(l, now_ms); return 0;}
     l->held = g == AdgWait;
@@ -815,6 +855,8 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
         l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping)
         finish(l, now_ms);
     if (l->finished) return 0;
+    if (l->sleeping && !l->parked) (void)audio_live_parked(l);
+    l->done_batch = 0;
     if (l->spk_state == LiveRunning || l->mic_state == LiveRunning) return 5;   /* 40 ms queued at the DSP: a refill within 5 ms */
     if (l->spk_state == LiveStarting || l->spk_state == LiveStopping || l->mic_state == LiveStarting || l->mic_state == LiveStopping) return 2;
     return AUDIO_LIVE_IDLE_TICK_MS;
@@ -828,7 +870,7 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
     const int kind = ar_parse(packet, length, &a);
     if (kind == ArWriteDone && l->spk_state == LiveRunning) {
         const int r = ar_pump_done(&l->pump, &a);
-        if (r == 1) return;
+        if (r == 1) {++l->done_batch; return;}
         if (r == -1) {
             LOG(l, "live: dsp: WRITE_DONE refused: status %#x for %#llx (token %#x)", a.status, (unsigned long long)a.address, a.token);
             l->dsp_error = 1;
@@ -879,3 +921,52 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
     if (l->spk_state != LiveStopping && l->mic_state != LiveStopping) finish(l, now_ms);
 }
 
+
+void audio_live_sleep(AudioLive *l, uint32_t generation)
+{
+    if (l->sleeping) return;
+    l->sleeping=1; l->sleep_generation=generation;
+    store(&l->sh->accepting,0); store(&l->sh->capturing,0);
+    /* Starting plans finish their existing command sequence; only then is the
+     * ordinary stream fade/drain/undo used. Never abort a pending MEM_MAP. */
+}
+
+int audio_live_parked(AudioLive *l)
+{
+    if (!l->sleeping || l->sleep_failed || l->finished || l->off || l->spk_state==LiveOff || l->mic_state==LiveOff || l->timeouts ||
+        l->splan.seq.undo_errors || l->mplan.seq.undo_errors) return -1;
+    if (l->parked) return 1;
+    /* A prior quiet-stop may have already ACKed STOP/UNMAP. Its old pump
+     * bookkeeping is no longer ownership; never clear an active plan. */
+    if (l->spk_state==LiveDown && !l->splan.active && l->splan.seq.state==ArSeqDown) {
+        l->stream_unsent=0; l->pump.in_flight=0;
+    }
+    if (l->mic_state==LiveDown && !l->mplan.active && l->mplan.seq.state==ArSeqDown) {
+        l->cap_unsent=0; l->cap.in_flight=0;
+    }
+    if (l->spk_state!=LiveDown || l->mic_state!=LiveDown || l->splan.in_flight || l->mplan.in_flight ||
+        l->splan.unsent || l->mplan.unsent || l->stream_unsent || l->cap_unsent || l->pump.in_flight || l->cap.in_flight) return 0;
+    /* Graph stops, UNMAPs, and plan-owned TDM/VA releases have all ACKed.
+     * Preserve configured amps in powered-down mute, not terminal reset. */
+    if (audio_amps_off(l->amps) || l->amps->reset_errors || l->amps->off_errors) return -1;
+    dma_zero(l,0,AUDIO_DMA_BYTES);
+    if (l->ops.tdm_pins && l->ops.tdm_pins(l->ops.ctx,0)) return -1;
+    audio_ring_reset(&l->sh->out); audio_ring_reset(&l->sh->in);
+    l->parked=1;
+    ledger(l,AlPark,0,0,0,0,0);
+    return 1;
+}
+
+int audio_live_rearm(AudioLive *l)
+{
+    if (!l->parked || audio_live_parked(l)!=1) return -1;
+    if (l->ops.tdm_pins && l->ops.tdm_pins(l->ops.ctx,1)) return -1;
+    audio_ring_reset(&l->sh->out); audio_ring_reset(&l->sh->in);
+    store(&l->sh->sound,0); store(&l->sh->have_sound,0);
+    zero(&l->pump,sizeof l->pump); zero(&l->cap,sizeof l->cap);
+    drift_reset(&l->spk_drift); drift_reset(&l->mic_drift);
+    l->status_poll_active=0; l->stream_unsent=l->cap_unsent=0;
+    l->sleeping=l->parked=0;
+    ledger(l,AlRearm,0,0,0,0,0);
+    return 0;
+}

@@ -48,6 +48,8 @@
 #include "AudioSurvey.h"
 #include "AudioLog.h"
 #include "AudioPcm.h"
+#include "AudioPower.h"
+#include <PianoPowerContract.h>
 
 using namespace pianoaudio;
 
@@ -60,7 +62,7 @@ namespace {
 
 struct Args {
   uint32_t level, smmu, delay, repeat, samples, dsp, dspWait, settle, device, power, volume;
-  uint32_t ports, portsTry;
+  uint32_t ports, portsTry, sleep;
   PianoAudioLevelArgs levels;
 };
 Args gArgs;
@@ -74,6 +76,7 @@ uint32_t bootArg(const char *name, uint32_t fallback)
 
 void readArgs()
 {
+  gArgs.sleep = bootArg("piano-audio-sleep", 0);
   gArgs.level = bootArg("piano-audio", 0);
   gArgs.smmu = bootArg("piano-audio-smmu", 1);
   gArgs.delay = bootArg("piano-audio-delay", 0);
@@ -291,6 +294,14 @@ class PianoAudio : public IOService {
   void devices();
   static void thread(void *self, wait_result_t);
   static void devicesThread(void *self, wait_result_t);
+  static void powerThread(void *self, wait_result_t);
+  bool fSeenOn = false, fJoined = false, fSleepRequested = false;
+  unsigned long fRequested = pianopower::kOn;
+ public:
+  bool powerJoined() const {return fJoined;}
+  IOPMDriverAssertionID readyGate = kIOPMUndefinedDriverAssertionID;
+  IOReturn setPowerState(unsigned long state, IOService *) override;
+
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
@@ -323,6 +334,18 @@ bool PianoAudio::start(IOService *provider)
          gArgs.level >= 10 ? " and the Mic" : "", piano_audio_live_prepare(gArgs.volume) ? "no memory for the dsp transport: the devices stay silent" : "the dsp transport");
   setProperty("piano-audio", gArgs.level, 32);
   gService = this;
+  if (gArgs.sleep == 1 && gArgs.level >= 8) {
+    auto *root = getPMRootDomain();
+    if (root) readyGate = root->createPMAssertion(kIOPMDriverAssertionCPUBit, kIOPMDriverAssertionLevelOn, this,
+                                                 "com.unixnu.audio.sleep-not-ready");
+    if (!readyGate) {note("sleep-contract1: no CPU readiness assertion; refusing Audio start"); return false;}
+    fJoined = true;
+    if (pianopower::join(this) != kIOReturnSuccess) {
+      fJoined = false;
+      note("sleep-contract1: PM join failed; CPU readiness gate stays held");
+    }
+    note("sleep-contract1: Audio sole power-tree owner, bounded drain 8s; readiness gate held");
+  }
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoAudio::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -334,6 +357,51 @@ bool PianoAudio::start(IOService *provider)
     else note("devices: no thread");
   }
   return true;
+}
+
+extern "C" void piano_audio_power_ready(void)
+{
+  auto *driver = static_cast<PianoAudio *>(gService);
+  if (!driver || !driver->readyGate || !driver->powerJoined()) return;
+  const IOReturn cancel = pianopower::cancelSystemSleep("PianoAudio", "capability check outside sleep");
+  if (cancel == kIOReturnNotReady) {
+    if (IOService::getPMRootDomain()->setPMAssertionLevel(driver->readyGate, kIOPMDriverAssertionLevelOff)!=kIOReturnSuccess) {note("sleep-contract1: readiness gate release failed"); return;}
+    driver->setProperty("piano-audio-sleep-ready", true);
+    note("sleep-contract1: ready; 0064 cancellation confirmed enabled");
+  } else note("sleep-contract1: cancellation unavailable (%#x); CPU readiness gate held", cancel);
+}
+
+IOReturn PianoAudio::setPowerState(unsigned long state, IOService *)
+{
+  if (!fJoined) return kIOPMAckImplied;
+  if (state == pianopower::kOn && !fSeenOn) {fSeenOn=true; return kIOPMAckImplied;}
+  if (!fSeenOn) return kIOPMAckImplied;
+  const bool sleep=state==pianopower::kOff;
+  if (sleep==fSleepRequested) return kIOPMAckImplied;
+  fSleepRequested=sleep;
+  fRequested=state;
+  thread_t t=nullptr;
+  if (kernel_thread_start(powerThread,this,&t)==KERN_SUCCESS) {
+    thread_deallocate(t);
+    return 12000000; // includes reader barrier, 8s drain and cancellation; below PM watchdog
+  }
+  if (readyGate) getPMRootDomain()->setPMAssertionLevel(readyGate,kIOPMDriverAssertionLevelOn);
+  if (state==pianopower::kOff) (void)pianopower::cancelSystemSleep("PianoAudio","no PM worker");
+  note("sleep-contract1: no PM worker; readiness gate held");
+  return kIOPMAckImplied;
+}
+
+void PianoAudio::powerThread(void *self, wait_result_t)
+{
+  auto *d=static_cast<PianoAudio *>(self);
+  const bool sleep=d->fRequested==pianopower::kOff;
+  if (piano_audio_power_request(sleep)) {
+    getPMRootDomain()->setPMAssertionLevel(d->readyGate,kIOPMDriverAssertionLevelOn);
+    d->setProperty("piano-audio-sleep-ready",false);
+    const IOReturn cancel=sleep ? pianopower::cancelSystemSleep("PianoAudio","unsafe or timed-out Audio drain; DMA retained") : kIOReturnNotReady;
+    note("sleep-contract1: %s FAILED; cancel %#x; readiness gate held, no forced unmap or rearm",sleep?"off":"on",cancel);
+  }
+  d->acknowledgeSetPowerState();
 }
 
 void PianoAudio::devicesThread(void *self, wait_result_t)
