@@ -71,6 +71,13 @@ int audio_amps_configure(AudioAmps *g, const uint8_t *preset, uint32_t size, int
 /* The status of the amplifiers that answered (into g->status; the first reading after an unmute also into g->first). Returns the
  * slots whose reads failed. */
 unsigned audio_amps_read(AudioAmps *g);
+/* Private snapshot, one transaction per call (pins returned each time). 0: more,
+ * 1: complete and published, -1: read failure. Zero before starting/restarting. */
+typedef struct {
+    Fs19xxStatus status[AUDIO_AMPS];
+    unsigned next, failed;
+} AudioAmpsPoll;
+int audio_amps_poll(AudioAmps *g, AudioAmpsPoll *poll);
 /* After audio_amps_read: every configured amplifier powered down (PWDN set). */
 int audio_amps_all_down(const AudioAmps *g);
 /* Power all four configured amplifiers up, muted, at min(gain, AUDIO_AMPS_TEST_GAIN). 0; or all of them shut down again. */

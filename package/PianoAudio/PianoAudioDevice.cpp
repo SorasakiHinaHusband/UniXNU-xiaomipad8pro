@@ -461,7 +461,7 @@ void PianoAudioDevice::run() {
     const uint32_t ch = channels();
     const TimingProfile &tp = timingProfile(timingMode);
     int16_t period[PIANO_AUDIO_PERIOD_FRAMES * OutputChannels];
-    uint64_t done = 0, soundPeriods = 0;
+    uint64_t done = 0, soundPeriods = 0, latePeriods = 0, maxLate = 0;
     for (;;) {
         IOLockLock(lock);
         const bool live = running;
@@ -470,6 +470,10 @@ void PianoAudioDevice::run() {
         const uint64_t deadline = startTime + absolute(done + tp.periodFrames);
         if (mach_absolute_time() > deadline + absolute(tp.periodFrames)) piano_audio_dev_late = piano_audio_dev_late + 1;
         else clock_delay_until(deadline);
+        const uint64_t woke = mach_absolute_time();
+        const uint64_t late = woke > deadline ? woke - deadline : 0;
+        if (late > maxLate) maxLate = late;
+        if (late > absolute(tp.periodFrames)) ++latePeriods;
         if (isInput) {
             const uint32_t captured = gTransport->capture(gTransport->context, period, tp.periodFrames);
             if (captured < tp.periodFrames) bzero(period + captured * ch, (tp.periodFrames - captured) * 2 * ch);
@@ -499,6 +503,10 @@ void PianoAudioDevice::run() {
     IOLog("PianoAudio: HAL ring read: %s mode %u periods %llu with sound %llu frames %llu write-end %llu\n",
           isInput ? "input" : "output", timingMode, (unsigned long long)(done / tp.periodFrames),
           (unsigned long long)soundPeriods, (unsigned long long)done, (unsigned long long)status()->writeEnd);
+    uint64_t maxLateNs;
+    absolutetime_to_nanoseconds(maxLate, &maxLateNs);
+    IOLog("PianoAudio: HAL wake: %s mode %u late-periods %llu max-us %llu\n", isInput ? "input" : "output", timingMode,
+          (unsigned long long)latePeriods, (unsigned long long)(maxLateNs / 1000u));
     IOLockLock(lock);
     stopping = false;
     IOLockWakeup(lock, &stopping, false);

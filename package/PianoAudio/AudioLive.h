@@ -129,6 +129,9 @@ typedef struct {
     uint32_t stream_at, next_status, quiet_at, stream_len, mute_after;
     int32_t gain_now;                    /* the master gain as ramped */
     AudioLiveDrift spk_drift;
+    AudioAmpsPoll status_poll;
+    int status_poll_active;
+    uint32_t status_polls, status_slices;
     uint8_t spkt[GPR_MAX_PACKET];
     int16_t stereo[AUDIO_PERIOD_FRAMES * 2];
     int16_t quad[AUDIO_PERIOD_FRAMES * 4];

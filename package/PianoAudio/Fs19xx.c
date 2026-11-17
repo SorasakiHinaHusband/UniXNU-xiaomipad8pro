@@ -301,15 +301,23 @@ int fs19xx_mute(Fs19xx *a, int mute)
 }
 
 /* --------------------------------------------------------------------------------------------------------------- status */
+int fs19xx_read_status_field(Fs19xx *a, Fs19xxStatus *s, unsigned field)
+{
+    switch (field) {
+    case 0: return fs19xx_read(a, FS19XX_REG_STATUS, &s->status);
+    case 1: return fs19xx_read(a, FS19XX_REG_DIGSTAT, &s->digstat);
+    case 2: return fs19xx_read(a, FS19XX_REG_PWRCTRL, &s->pwrctrl);
+    case 3: return fs19xx_read(a, FS19XX_REG_SYSCTRL, &s->sysctrl);
+    case 4: return fs19xx_read(a, FS19XX_REG_VOLCTRL, &s->volctrl);
+    case 5: return fs19xx_read(a, FS19XX_REG_DACCTRL, &s->dacctrl);
+    default: return Fs19xxErrBus;
+    }
+}
+
 int fs19xx_read_status(Fs19xx *a, Fs19xxStatus *s)
 {
     int r = 0;
-    r |= fs19xx_read(a, FS19XX_REG_STATUS, &s->status);
-    r |= fs19xx_read(a, FS19XX_REG_DIGSTAT, &s->digstat);
-    r |= fs19xx_read(a, FS19XX_REG_PWRCTRL, &s->pwrctrl);
-    r |= fs19xx_read(a, FS19XX_REG_SYSCTRL, &s->sysctrl);
-    r |= fs19xx_read(a, FS19XX_REG_VOLCTRL, &s->volctrl);
-    r |= fs19xx_read(a, FS19XX_REG_DACCTRL, &s->dacctrl);
+    for (unsigned field = 0; field < FS19XX_STATUS_FIELDS; ++field) r |= fs19xx_read_status_field(a, s, field);
     s->ok = !r;
     return r ? Fs19xxErrBus : Fs19xxOk;
 }

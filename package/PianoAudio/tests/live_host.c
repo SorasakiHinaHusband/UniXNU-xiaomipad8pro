@@ -30,6 +30,9 @@
 
 static unsigned checks;
 static void dump(void);
+static void engine(void);
+static void deliver(int to_live);
+static unsigned g_status_read_us, g_status_fail_at, g_loaded_reads;
 #define CHECK(x) do {if (!(x)) {dump(); fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1);} ++checks;} while (0)
 static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
 
@@ -55,6 +58,7 @@ struct World {
     int write_error_at, drop_writes_from, drop_writes_until;   // WRITEs by count: refused with status 5; not answered in [from, until)
     double dsp_ppm;                   // the DSP's clock against the host's
     uint64_t play_until_us, cap_until_us;
+    unsigned queue_gaps, max_monitor_reads;
     int clock_on, va_votes, va_mclk, dev_started, str_started, mic_started, cap_started, mic_prepared, cap_prepared;
     int map_spk, map_mic;
     unsigned stream_dones;
@@ -184,6 +188,16 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
     (void)ctx;
     w.transfers++;
     w.now_us += 300;
+    if (g_status_read_us && in_len == 2 && live.spk_state == LiveRunning && live.unmuted) {
+        /* Engine and DSP clocks continue while the owner is on the bus. There
+         * is no refill here: completed periods stay free until tick returns. */
+        for (unsigned us = 0; us < g_status_read_us; us += 500) {
+            w.now_us += 500;
+            engine();
+            deliver(1);
+        }
+        if (++g_loaded_reads == g_status_fail_at) return -1;
+    }
     struct Amp *a = amp_at(address);
     if (!a) return -1;
     amp_derive(a);
@@ -288,6 +302,7 @@ static void dsp_write(const GprPacket *p)
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = p->dst_port, .dst_port = p->src_port,
                    .token = p->token, .opcode = AR_OP_WRITE_DONE};
     const uint32_t words[4] = {le32(d), le32(d + 4), le32(d + 8), k == w.write_error_at ? 5u : 0u};
+    if (g_status_read_us && live.unmuted && w.out_running && w.play_until_us < w.now_us) ++w.queue_gaps;
     uint64_t at = w.play_until_us > w.now_us ? w.play_until_us : w.now_us;
     at += dsp_period_us();
     w.play_until_us = at;
@@ -608,7 +623,9 @@ static void run(const struct Scenario *sc)
                     live.spk_drift.avg / 64, live.drops, live.repeats, (unsigned long long)w.played_periods);
         if (w.now_us >= next || w.wake) {
             w.wake = 0;
+            const unsigned reads = g_loaded_reads;
             const uint32_t d = audio_live_tick(&live, &w.o, now_ms());
+            if (g_loaded_reads - reads > w.max_monitor_reads) w.max_monitor_reads = g_loaded_reads - reads;
             next = w.now_us + (d ? d : 1) * 1000u;
         }
         w.now_us += 500;
@@ -960,6 +977,27 @@ static void testQueueFull(void)
     CHECK(!w.violations && live.queue_full > 0 && live.spk_starts == 1 && live.mic_starts == 1 && w.sound_periods > 300);
 }
 
+static void testLoadedMonitor(void)
+{
+    g_status_read_us = 4000;   /* explicit load, not an assumed hardware measurement */
+    g_loaded_reads = 0;
+    const struct Scenario sc = {9, 192, 1, 0, 6500, AudioPortsUbuntu, 1, burst};
+    run(&sc);
+    printf("loaded monitor: reads=%u polls=%u max-reads/tick=%u DSP-gaps=%u underruns=%u skips=%u\n",
+           g_loaded_reads, live.status_polls, w.max_monitor_reads, w.queue_gaps, live.underruns, live.skipped);
+    CHECK(!w.violations && live.status_polls >= 3 && w.max_monitor_reads == 1);
+    CHECK(w.queue_gaps == 0 && live.underruns == 0 && live.skipped == 0);
+    /* A partial group must not be published; bus errors still stop the path. */
+    g_loaded_reads = 0;
+    g_status_fail_at = 11;
+    struct Scenario fault = sc;
+    fault.strict = 0;   /* a safety fault mutes immediately, without waiting for the fade */
+    run(&fault);
+    CHECK(!w.violations && live.spk_state == LiveOff && live.status_poll.failed && live.status_polls == 0);
+    CHECK(logged("a status read failed") && logged("the speaker path is OFF for this boot"));
+    g_status_read_us = g_status_fail_at = g_loaded_reads = 0;
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -982,6 +1020,7 @@ int main(void)
     testPlanFailures();
     testMic();
     testQueueFull();
+    testLoadedMonitor();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }

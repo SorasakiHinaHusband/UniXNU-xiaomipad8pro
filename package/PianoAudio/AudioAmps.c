@@ -127,6 +127,27 @@ unsigned audio_amps_read(AudioAmps *g)
     return failed;
 }
 
+int audio_amps_poll(AudioAmps *g, AudioAmpsPoll *p)
+{
+    if (p->failed || p->next >= AUDIO_AMPS * FS19XX_STATUS_FIELDS) return -1;
+    const unsigned slot = p->next / FS19XX_STATUS_FIELDS;
+    const unsigned field = p->next % FS19XX_STATUS_FIELDS;
+    if (!(g->present >> slot & 1u) || fs19xx_read_status_field(&g->amp[slot], &p->status[slot], field)) {
+        p->failed |= 1u << slot;
+        done(g);
+        return -1;
+    }
+    done(g);
+    if (++p->next != AUDIO_AMPS * FS19XX_STATUS_FIELDS) return 0;
+    for (unsigned s = 0; s < AUDIO_AMPS; ++s) {
+        p->status[s].ok = 1;
+        g->status[s] = p->status[s];
+        if (g->started && !g->have_first) g->first[s] = p->status[s];
+    }
+    if (g->started) g->have_first = 1;
+    return 1;
+}
+
 int audio_amps_all_down(const AudioAmps *g)
 {
     if (!g->configured) return 0;

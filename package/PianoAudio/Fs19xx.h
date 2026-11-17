@@ -151,6 +151,10 @@ typedef struct {
     uint16_t status, digstat, pwrctrl, sysctrl, volctrl, dacctrl;
 } Fs19xxStatus;
 int fs19xx_read_status(Fs19xx *a, Fs19xxStatus *s);
+/* One of the six status registers, for a monitor that yields between bus transactions.
+ * The caller owns validity and publishes the snapshot only after all six succeed. */
+#define FS19XX_STATUS_FIELDS 6u
+int fs19xx_read_status_field(Fs19xx *a, Fs19xxStatus *s, unsigned field);
 /* Playing as Ubuntu's check judges it: PWDN clear, SYSCTRL 0x00ef, DACRUN set; down: PWDN set. */
 int fs19xx_status_running(const Fs19xxStatus *s);
 int fs19xx_status_down(const Fs19xxStatus *s);

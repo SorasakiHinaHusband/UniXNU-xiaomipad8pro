@@ -293,6 +293,7 @@ static void stream_begin(AudioLive *l, uint32_t now)
     l->amp_bad = 0;
     l->stream_at = l->next_status = now;
     l->spk_reason = 0;
+    l->status_poll_active = 0;
     if (ar_pump_init(&l->pump, base, l->splan.seq.handle, l->ports->data, AUDIO_SPK_SLOTS, AUDIO_SPK_PERIOD_BYTES, AUDIO_LIVE_DEPTH,
                      AUDIO_LATE_MS)) {
         LOG(l, "live: speaker: the period pump refused its geometry");
@@ -374,12 +375,16 @@ static void fill_period(AudioLive *l, uint32_t slot)
 
 static void status_sample(AudioLive *l)
 {
-    const unsigned failed = audio_amps_read(l->amps);
-    if (failed) {
-        l->amp_bad |= failed;
-        LOG(l, "live: amp: a status read failed (slots %#x)", failed);
+    ++l->status_slices;
+    const int complete = audio_amps_poll(l->amps, &l->status_poll);
+    if (complete < 0) {
+        l->amp_bad |= l->status_poll.failed;
+        LOG(l, "live: amp: a status read failed (slots %#x)", l->status_poll.failed);
         return;
     }
+    if (!complete) return;
+    l->status_poll_active = 0;
+    ++l->status_polls;
     const unsigned bad = audio_amps_check(l->amps);
     if (bad) {
         l->amp_bad |= bad;
@@ -426,11 +431,6 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
     int r = audio_guard_check(&l->sguard, now, l->dsp_error, late, l->amp_bad);
     if (!r && l->held) r = AudioGuardQuiet;
     if (r) {stream_fault(l, r, now); return;}
-    if (l->unmuted && (int32_t)(now - l->next_status) >= 0) {
-        l->next_status = now + l->cfg.status_ms;
-        status_sample(l);
-        if (l->amp_bad) {stream_fault(l, AudioGuardAmplifier, now); return;}
-    }
     int silent = 0;
     const int active = spk_active(l, now, &silent);
     switch (l->spk_mode) {
@@ -457,6 +457,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         }
         audio_chain_restart(&l->chain);
         l->unmuted = 1;
+        l->status_poll_active = 0;   /* discard a snapshot taken before this unmute */
         l->next_status = now + AUDIO_STATUS_MS;
         drift_reset(&l->spk_drift);
         l->spk_mode = SpkPlaying;
@@ -479,6 +480,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         if (l->pump.returned < l->mute_after) break;
         if (audio_amps_mute(l->amps)) {stream_fault(l, AudioGuardAmplifier, now); return;}
         l->unmuted = 0;
+        l->status_poll_active = 0;
         l->spk_mode = SpkQuiet;
         l->quiet_at = now;
         LOG(l, "live: speaker: %s: faded to silence, the amplifiers muted; down after %u ms more without sound", silent ? "silence" :
@@ -500,6 +502,21 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         l->sends++;
     }
     if (l->spk_ending && !l->stream_unsent && !l->pump.in_flight) stream_end(l, now);
+    /* Refill first. Twenty-four synchronous I2C reads here used to block the
+     * four-period queue, then trim its recovered FIFO backlog to two periods.
+     * Yield to completion handling between EVERY register, keeping the group
+     * snapshot private until all reads succeed. No second bus/DSP owner. */
+    if (l->spk_state == LiveRunning && l->unmuted && !l->spk_ending && !l->stream_unsent) {
+        if (!l->status_poll_active && (int32_t)(now - l->next_status) >= 0) {
+            zero(&l->status_poll, sizeof l->status_poll);
+            l->status_poll_active = 1;
+            l->next_status = now + l->cfg.status_ms;
+        }
+        if (l->status_poll_active) {
+            status_sample(l);
+            if (l->amp_bad) stream_fault(l, AudioGuardAmplifier, now);
+        }
+    }
 }
 
 static void spk_tick(AudioLive *l, uint32_t now)

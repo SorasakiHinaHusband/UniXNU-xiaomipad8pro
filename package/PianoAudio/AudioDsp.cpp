@@ -173,6 +173,17 @@ AudioLiveShared *gShared;
 AudioLive *gLive;
 IOLock *gWakeLock;
 bool gWake;
+uint32_t gIoSound, gIoUnderruns, gIoSkipped, gIoPolls;
+uint64_t gIoDropped;
+bool gIoWarm;
+uint32_t gTickMaxUs, gSliceMaxUs;
+
+uint32_t elapsedUs(uint64_t start)
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+    return uint32_t(ns / 1000u);
+}
 
 void liveWake()
 {
@@ -197,6 +208,22 @@ void liveSleep(uint32_t ms)
 
 void dspRunning(void *, int output, int input)
 {
+    const bool wasOutput = __atomic_load_n(&gShared->want_out, __ATOMIC_ACQUIRE) != 0;
+    if (gLive && output && !wasOutput) {
+        gIoSound = gLive->sound_periods;
+        gIoUnderruns = gLive->underruns;
+        gIoSkipped = gLive->skipped;
+        gIoPolls = gLive->status_polls;
+        gIoDropped = gShared->dropped;
+        gIoWarm = gLive->spk_state == LiveRunning && __atomic_load_n(&gShared->accepting, __ATOMIC_ACQUIRE);
+        gTickMaxUs = gSliceMaxUs = 0;
+        piano_audio_log("live: IO window start: warm %u; monitor-slice1:refill-first", unsigned(gIoWarm));
+    } else if (gLive && !output && wasOutput) {
+        piano_audio_log("live: IO window stop: warm %u sound %u underruns %u skips %u fifo-dropped %llu polls %u tick-max-us %u slice-tick-max-us %u",
+                        unsigned(gIoWarm), gLive->sound_periods - gIoSound, gLive->underruns - gIoUnderruns,
+                        gLive->skipped - gIoSkipped, (unsigned long long)(gShared->dropped - gIoDropped),
+                        gLive->status_polls - gIoPolls, gTickMaxUs, gSliceMaxUs);
+    }
     audio_live_running(gShared, output, input);
     liveWake();
 }
@@ -255,7 +282,13 @@ void liveRun(const PianoAudioLevelArgs *a)
         piano_adsp_health(&h);
         observe(o, h);
         for (uint32_t n; (n = audio_inbox_get(&gInbox, in, sizeof in)) != 0;) audio_live_receive(gLive, in, n, now);
+        const uint32_t slices = gLive->status_slices;
+        const bool playing = gLive->unmuted;
+        const uint64_t tickStart = mach_absolute_time();
         const uint32_t d = audio_live_tick(gLive, &o, now);
+        const uint32_t us = elapsedUs(tickStart);
+        if (playing && us > gTickMaxUs) gTickMaxUs = us;
+        if (slices != gLive->status_slices && us > gSliceMaxUs) gSliceMaxUs = us;
         const uint32_t word = liveWord(*gLive);
         piano_audio_live_word = word;
         if (word != lastWord) {   // the registry follows the paths' states (not every period)
