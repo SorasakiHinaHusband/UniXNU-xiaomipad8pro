@@ -4,7 +4,7 @@
  * the audio slice mapped: AudioSessionConfig.keep):
  *   8  the Speaker device's periods (AudioPcm.h's dsp transport: its engine thread writes them into the ring below) played through
  *      the speaker plan: brought up when the device runs with sound, the amplifiers started muted at the playing gain (at most 160
- *      at this level) and unmuted after four silent periods came back, every 10 ms DSP period taken from the ring through the
+ *      at this level) and unmuted after four silent periods came back AND the output epoch's PCM lead is primed, every 10 ms DSP period taken from the ring through the
  *      safety chain (the slots, the DC blocker, the master gain, the fades, the -20 dBFS ceiling of this level), the amplifiers'
  *      group check while they play; taken down (a fade to silence, the amplifiers muted, after idle_ms without sound their power,
  *      the plan undone) when the device stops, is muted or plays only silence
@@ -55,6 +55,7 @@ extern "C" {
 #define AUDIO_LIVE_IDLE_TICK_MS 2000u    /* the tick with both paths down (the transport wakes the owner sooner) */
 /* The latency the transport adds, for the devices' registry (AudioPcm.h output_latency/input_latency). */
 #define AUDIO_LIVE_OUTPUT_LATENCY (AUDIO_LIVE_DEPTH * AUDIO_PERIOD_FRAMES + AUDIO_LIVE_TARGET)
+#define AUDIO_LIVE_START_FRAMES AUDIO_LIVE_OUTPUT_LATENCY /* four-slot burst plus the 960-frame reserve */
 #define AUDIO_LIVE_INPUT_LATENCY (AUDIO_PERIOD_FRAMES + AUDIO_LIVE_MIC_TARGET)
 
 /* ---- what the devices' engine threads share with the owner's thread (single producer, single consumer per ring) */
@@ -68,6 +69,9 @@ typedef struct {
     int sound;                           /* a period with a non-zero sample came while the speaker path was down */
     uint32_t sound_at;                   /* the time of the last such period (ms) */
     int have_sound;
+    int have_pcm;                        /* nonzero PCM actually accepted in this output epoch */
+    uint32_t output_head;                /* StartIO's producer boundary; only the consumer discards older PCM */
+    uint32_t output_frames;              /* reader geometry; the 480-frame experiment retains its old trim policy */
     int32_t volume_q15;                  /* level 9: the master volume (0..32767), from the device's property or the boot argument */
     int muted;                           /* level 9: the master mute */
     int32_t input_q15;
@@ -142,6 +146,8 @@ typedef struct {
     AudioChain chain;
     AudioGuard sguard;
     int unmuted, dsp_error, stream_unsent, hold_from_sound;
+    int spk_primed;
+    uint32_t prime_left;                 /* exclude the first four PCM periods from drift calibration */
     unsigned amp_bad, late_stops;
     uint32_t stream_at, next_status, quiet_at, stream_len, mute_after;
     int32_t gain_now;                    /* the master gain as ramped */

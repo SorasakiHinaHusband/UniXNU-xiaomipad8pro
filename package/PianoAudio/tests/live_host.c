@@ -128,6 +128,13 @@ static void violate(const char *what)
 }
 static void dump(void)
 {
+    for (uint64_t n = live_ledger.written > AUDIO_LEDGER_CAP ? live_ledger.written - AUDIO_LEDGER_CAP : 0; n < live_ledger.written; ++n) {
+        uint64_t e[AUDIO_LEDGER_WORDS];
+        if (audio_ledger_get(&live_ledger, n, e))
+            fprintf(stderr, "  ledger %llu event %llu ms %llu epoch %llu mode %llu want-out %llu fill %llu->%llu want/got %llu/%llu skips %llu\n",
+                (unsigned long long)n, (unsigned long long)e[0], (unsigned long long)e[1], (unsigned long long)e[2], (unsigned long long)e[3],
+                (unsigned long long)e[4], (unsigned long long)e[5], (unsigned long long)e[6], (unsigned long long)e[7], (unsigned long long)e[8], (unsigned long long)e[20]);
+    }
     const unsigned from = w.nlines > 60 ? w.nlines - 60 : 0;
     for (unsigned i = from; i < w.nlines; ++i) fprintf(stderr, "  | %s\n", w.lines[i]);
     const unsigned c0 = w.ncmd > 60 ? w.ncmd - 60 : 0;
@@ -1015,7 +1022,18 @@ static void testLoadedMonitor(void)
     printf("loaded monitor: reads=%u polls=%u max-reads/tick=%u DSP-gaps=%u underruns=%u skips=%u\n",
            g_loaded_reads, live.status_polls, w.max_monitor_reads, w.queue_gaps, live.underruns, live.skipped);
     CHECK(!w.violations && live.status_polls >= 3 && w.max_monitor_reads == 1);
-    CHECK(w.queue_gaps == 0 && live.underruns == 0 && live.skipped == 0);
+    CHECK(w.queue_gaps == 0 && live.underruns == 0);
+    /* A deliberate backlog trim may now remove the larger startup lead when
+     * this load catches up. It must retain this whole burst plus the reserve. */
+    uint32_t skips = 0;
+    for (uint64_t n = 0; n < live_ledger.written; ++n) {
+        uint64_t e[AUDIO_LEDGER_WORDS];
+        CHECK(audio_ledger_get(&live_ledger, n, e));
+        if (e[20] == skips) continue;
+        CHECK(e[0] == AlRefill && e[20] == ++skips && e[7] == e[8]);
+        CHECK(e[6] >= AUDIO_LIVE_TARGET + (AUDIO_LIVE_DEPTH - e[15] - 1u) * AUDIO_PERIOD_FRAMES);
+    }
+    CHECK(skips == live.skipped);
     /* A partial group must not be published; bus errors still stop the path. */
     g_loaded_reads = 0;
     g_status_fail_at = 11;
@@ -1133,6 +1151,35 @@ static void testLedgerOverflow(void)
     CHECK(l.written==AUDIO_LEDGER_CAP+7 && !audio_ledger_get(&l,0,b));
     CHECK(audio_ledger_get(&l,7,b) && b[0]==7);
     CHECK(audio_ledger_get(&l,l.written-1,b) && b[0]==l.written-1);
+}
+
+static void epoch_starts(uint32_t t)
+{
+    w.hal_replay=1; w.hal_mode=0; w.hal_io=512; w.amplitude=16000;
+    if(t==100 || t==2200 || t==2250 || t==4510) device(1,0);
+    if(t==2000 || t==2230 || t==4500 || t==6500) device(0,0);
+    w.sound_on=(t>=100 && t<2000) || (t>=2250 && t<4500) || (t>=4630 && t<6500);
+    if(t==2225 || t==4625) CHECK(!live.unmuted); /* old sound/silent PCM cannot release the new epoch */
+}
+static void testEpochStarts(void)
+{
+    const struct Scenario sc={9,192,1,15000,7000,AudioPortsUbuntu,1,epoch_starts};
+    run(&sc);
+    CHECK(!w.violations && sh.epoch==4);
+    unsigned primed=0, tail=0;
+    for(uint64_t n=0;n<live_ledger.written;++n) {
+        uint64_t e[AUDIO_LEDGER_WORDS]; CHECK(audio_ledger_get(&live_ledger,n,e));
+        if(e[0]==AlPrime) {
+            CHECK(e[2]!=2 && e[5]>=2880 && e[6]>=2880);
+            ++primed;
+        }
+        if(e[0]==AlRefill && e[9]) {
+            CHECK(!e[4] && (e[3]==SpkFading || e[3]==SpkMuting));
+            ++tail;
+        }
+    }
+    CHECK(primed==3 && tail>0); /* original raw U remains visible after StopIO */
+    printf("PASS epoch starts: cold/warm/rapid restart, silent cancellation, active U=0; raw tail U=%u\n",tail);
 }
 
 static void testInputControlsAndWrap(void)
@@ -1273,6 +1320,7 @@ int main(void)
     testSleepPendingMap();
     testFailSafeMute();
     testLedgerOverflow();
+    testEpochStarts();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }

@@ -103,13 +103,23 @@ void audio_live_running(AudioLiveShared *sh, int output, int input)
         store(&sh->input_primed, 0);
         ++sh->input_runs;
     }
-    if (output && !load(&sh->want_out)) {__atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE); store(&sh->sound, 0);}   /* a new run: only its own sound starts the path */
+    if (output && !load(&sh->want_out)) {
+        /* The engine is stopped here. Publish the old/new PCM boundary, never
+         * reset its head from the consumer (a new reader may already be writing). */
+        __atomic_store_n(&sh->output_head, __atomic_load_n(&sh->out.head, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+        store(&sh->sound, 0);
+        store(&sh->have_sound, 0);
+        store(&sh->have_pcm, 0);
+        __atomic_store_n(&sh->sound_at, 0u, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE);
+    }
     store(&sh->want_out, output ? 1 : 0);
     store(&sh->want_in, input ? 1 : 0);
 }
 
 uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t frames, uint32_t now_ms, int *wake)
 {
+    __atomic_store_n(&sh->output_frames, frames, __ATOMIC_RELEASE);
     int any = 0;
     for (uint32_t i = 0; i < 2 * frames; ++i) any |= stereo[i];
     *wake = 0;
@@ -124,6 +134,11 @@ uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t fr
         return frames;
     }
     const uint32_t n = audio_ring_write(&sh->out, stereo, frames);
+    if (any && n) {
+        int accepted = n == frames ? any : 0;
+        if (n != frames) for (uint32_t i = 0; i < 2u * n; ++i) accepted |= stereo[i];
+        if (accepted) store(&sh->have_pcm, 1);
+    }
     sh->taken += n;
     sh->dropped += frames - n;
     return frames;
@@ -302,6 +317,10 @@ static void dma_zero(AudioLive *l, uint32_t offset, uint32_t bytes)
 
 /* ------------------------------------------------------------------------------------------------ the speaker path */
 static unsigned live_gain_cap(const AudioLive *l) {return l->cfg.level >= 9 ? FS19XX_GAIN_CAP : AUDIO_AMPS_TEST_GAIN;}
+static int spk_epoch_lead(const AudioLive *l) {return __atomic_load_n(&l->sh->output_frames, __ATOMIC_ACQUIRE) != 480u;}
+static uint32_t spk_prefill(const AudioLive *l) {return spk_epoch_lead(l) ? AUDIO_LIVE_START_FRAMES : AUDIO_LIVE_TARGET;}
+static int spk_same_epoch(const AudioLive *l) {return __atomic_load_n(&l->sh->epoch, __ATOMIC_ACQUIRE) == l->ledger_epoch;}
+static int spk_has_prefill(const AudioLive *l) {return spk_same_epoch(l) && load(&l->sh->have_pcm) && audio_ring_fill(&l->sh->out) >= spk_prefill(l);}
 
 static int live_amps_on(void *owner)
 {
@@ -354,6 +373,8 @@ static void stream_begin(AudioLive *l, uint32_t now)
     uint64_t base = 0;
     (void)ar_dsp_address(l->speaker.buffer_phys, l->speaker.stream_id, &base);
     l->spk_mode = SpkPriming;
+    l->spk_primed = 0;
+    l->prime_left = AUDIO_LIVE_DEPTH;
     l->spk_ending = l->unmuted = l->dsp_error = l->stream_unsent = 0;
     l->amp_bad = 0;
     l->stream_at = l->next_status = now;
@@ -370,6 +391,7 @@ static void stream_begin(AudioLive *l, uint32_t now)
     l->gain_now = l->cfg.level >= 9 ? __atomic_load_n(&l->sh->volume_q15, __ATOMIC_ACQUIRE) : AUDIO_Q15_ONE;
     audio_guard_start(&l->sguard, now, 0);   /* no time limit: the device's stream */
     audio_ring_reset(&l->sh->out);
+    store(&l->sh->have_pcm, 0);
     drift_reset(&l->spk_drift);
     store(&l->sh->accepting, !l->sleeping);
     l->spk_state = LiveRunning;
@@ -378,19 +400,25 @@ static void stream_begin(AudioLive *l, uint32_t now)
 }
 
 /* The ring's frames for one period: the drift held near the target by single frames, a stale backlog skipped. */
-static void take_period(AudioLive *l)
+static void take_period(AudioLive *l, uint32_t burst)
 {
     AudioRing *r = &l->sh->out;
     uint32_t fill = audio_ring_fill(r);
     const uint32_t before = fill, skipped = l->skipped;
-    if (fill > AUDIO_LIVE_TARGET + 3u * AUDIO_PERIOD_FRAMES) {   /* a backlog (the device stalled, then caught up): skipped */
-        audio_ring_skip(r, fill - AUDIO_LIVE_TARGET);
+    /* Keep this entire burst AND the reserve, including after startup. The
+     * former >2400 -> 960 trim destroyed cold-start PCM just before refill. */
+    const uint32_t pending = l->prime_left > burst ? l->prime_left : burst;
+    const uint32_t keep = AUDIO_LIVE_TARGET + (spk_epoch_lead(l) ? pending * AUDIO_PERIOD_FRAMES : 0u);
+    const uint32_t threshold = spk_epoch_lead(l) ? (keep > AUDIO_LIVE_START_FRAMES ? keep : AUDIO_LIVE_START_FRAMES) : AUDIO_LIVE_TARGET + 3u * AUDIO_PERIOD_FRAMES;
+    if (fill > threshold) {
+        audio_ring_skip(r, fill - keep);
         l->skipped++;
-        fill = AUDIO_LIVE_TARGET;
+        fill = keep;
         drift_reset(&l->spk_drift);
     }
     uint32_t want = AUDIO_PERIOD_FRAMES;
-    const int slip = drift_update(&l->spk_drift, fill);
+    const int slip = l->prime_left ? 0 : drift_update(&l->spk_drift, fill);
+    if (l->prime_left && !--l->prime_left) drift_reset(&l->spk_drift);
     if (slip > 0 && fill > AUDIO_PERIOD_FRAMES) {
         audio_ring_skip(r, 1);   /* the device runs fast: one frame less */
         l->drops++;
@@ -407,15 +435,16 @@ static void take_period(AudioLive *l)
     if (got < want || skipped != l->skipped || slip) ledger(l, AlRefill, before, audio_ring_fill(r), want, got, slip);
 }
 
-static void fill_period(AudioLive *l, uint32_t slot)
+static void fill_period(AudioLive *l, uint32_t slot, uint32_t burst)
 {
-    const int listening = l->spk_mode == SpkPlaying || l->spk_mode == SpkFading || l->spk_mode == SpkMuting;
+    const int listening = l->spk_primed && spk_same_epoch(l) && (l->spk_mode == SpkPlaying || l->spk_mode == SpkFading || l->spk_mode == SpkMuting);
     if (listening) {
-        take_period(l);
+        take_period(l, burst);
     } else {
         for (uint32_t i = 0; i < 2u * AUDIO_PERIOD_FRAMES; ++i) l->stereo[i] = 0;
         const uint32_t fill = audio_ring_fill(&l->sh->out);
-        if (fill > AUDIO_LIVE_TARGET) audio_ring_skip(&l->sh->out, fill - AUDIO_LIVE_TARGET);   /* keep the latency for the next sound */
+        const uint32_t keep = spk_prefill(l);
+        if (fill > keep) audio_ring_skip(&l->sh->out, fill - keep);
     }
     /* the master volume (level 9), ramped */
     const int32_t target = l->cfg.level >= 9 ? __atomic_load_n(&l->sh->volume_q15, __ATOMIC_ACQUIRE) : AUDIO_Q15_ONE;
@@ -517,41 +546,63 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         /* fallthrough: unmute */
     case SpkQuiet:
         if (l->spk_mode == SpkQuiet && !active) {
-            const uint32_t from = l->hold_from_sound ? __atomic_load_n(&l->sh->sound_at, __ATOMIC_ACQUIRE) : l->quiet_at;
-            if (l->sleeping || now - from >= l->cfg.idle_ms || !load(&l->sh->have_sound)) l->spk_ending = 1;
+            const uint32_t from = l->hold_from_sound && load(&l->sh->have_sound) ? __atomic_load_n(&l->sh->sound_at, __ATOMIC_ACQUIRE) : l->quiet_at;
+            if (l->sleeping || now - from >= l->cfg.idle_ms || (!load(&l->sh->want_out) && !load(&l->sh->have_sound))) l->spk_ending = 1;
             break;
         }
         l->spk_ending = 0;
+        /* Silent DONE proves only the transport. Both cold and warm starts
+         * need this epoch's accepted PCM and the worst four-slot burst budget. */
+        if (!spk_has_prefill(l)) break;
+        const uint32_t primed_fill = audio_ring_fill(&l->sh->out);
+        /* Still quiet: retain the same bounded prefill as silent refills do.
+         * Unmute may admit more PCM; take_period preserves the first burst. */
+        if (primed_fill > spk_prefill(l)) audio_ring_skip(&l->sh->out, primed_fill - spk_prefill(l));
         if (audio_amps_unmute(l->amps)) {
             LOG(l, "live: speaker: unmuting failed: the amplifiers muted and powered down");
             stream_fault(l, AudioGuardAmplifier, now);
             return;
+        }
+        /* StartIO/StopIO may race the synchronous bus writes. No PCM has
+         * been submitted here yet: a cancelled arm returns safely to quiet. */
+        if (!spk_same_epoch(l) || !load(&l->sh->want_out)) {
+            if (audio_amps_mute(l->amps)) {stream_fault(l, AudioGuardAmplifier, now); return;}
+            l->spk_mode = SpkQuiet;
+            l->spk_primed = l->unmuted = 0;
+            l->quiet_at = now;
+            break;
         }
         audio_chain_restart(&l->chain);
         l->unmuted = 1;
         l->status_poll_active = 0;   /* discard a snapshot taken before this unmute */
         l->next_status = now + AUDIO_STATUS_MS;
         drift_reset(&l->spk_drift);
+        l->spk_primed = 1;
+        l->prime_left = spk_epoch_lead(l) ? AUDIO_LIVE_DEPTH : 0;
         l->spk_mode = SpkPlaying;
+        ledger(l, AlPrime, primed_fill, audio_ring_fill(&l->sh->out), 0, 0, 0);
+        LOG(l, "speaker-prime1:epoch-pcm:burst-reserve epoch %u fill %u budget %u burst %u reserve %u",
+            l->ledger_epoch, primed_fill, spk_prefill(l), AUDIO_LIVE_DEPTH - l->pump.in_flight, AUDIO_LIVE_TARGET);
         LOG(l, "live: speaker: %u periods returned: the amplifiers unmuted, the sound fades in", l->pump.returned);
         break;
     case SpkPlaying:
-        if (active) break;
+        if (active && l->spk_primed && spk_same_epoch(l)) break;
         audio_chain_fade(&l->chain, -1);
         l->spk_mode = SpkFading;
         l->hold_from_sound = silent;
         break;
     case SpkFading:
-        if (active) {audio_chain_fade(&l->chain, +1); l->spk_mode = SpkPlaying; break;}
+        if (active && l->spk_primed && spk_same_epoch(l)) {audio_chain_fade(&l->chain, +1); l->spk_mode = SpkPlaying; break;}
         if (!audio_chain_silent(&l->chain)) break;
         l->mute_after = l->pump.sent;   /* the fade's last periods are still queued at the DSP: muted once they played */
         l->spk_mode = SpkMuting;
         break;
     case SpkMuting:
-        if (active) {audio_chain_restart(&l->chain); l->spk_mode = SpkPlaying; break;}
+        if (active && l->spk_primed && spk_same_epoch(l)) {audio_chain_restart(&l->chain); l->spk_mode = SpkPlaying; break;}
         if (l->pump.returned < l->mute_after) break;
         if (audio_amps_mute(l->amps)) {stream_fault(l, AudioGuardAmplifier, now); return;}
         l->unmuted = 0;
+        l->spk_primed = 0;
         l->status_poll_active = 0;
         l->spk_mode = SpkQuiet;
         l->quiet_at = now;
@@ -564,15 +615,21 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         l->stream_unsent = 0;
         l->sends++;
     }
+    uint32_t burst = AUDIO_LIVE_DEPTH - l->pump.in_flight;
+    const uint32_t lead_before = audio_ring_fill(&l->sh->out), prime_before = l->prime_left;
+    const uint32_t sent_before = l->pump.sent;
     while (!l->spk_ending) {
         const int slot = ar_pump_free_slot(&l->pump);
         if (slot < 0) break;
-        fill_period(l, (uint32_t)slot);
+        fill_period(l, (uint32_t)slot, burst);
+        if (burst) --burst;
         l->stream_len = ar_pump_write(&l->pump, l->spkt, sizeof l->spkt, now);
         if (!l->stream_len) {l->dsp_error = 1; break;}
         if (l->ops.send(l->ops.ctx, l->spkt, l->stream_len)) {l->stream_unsent = 1; l->queue_full++; break;}
         l->sends++;
     }
+    if (l->spk_primed && prime_before && l->pump.sent != sent_before)
+        ledger(l, AlLead, lead_before, audio_ring_fill(&l->sh->out), 0, 0, 0);
     if (l->spk_ending && !l->stream_unsent && !l->pump.in_flight) stream_end(l, now);
     /* Refill first. Twenty-four synchronous I2C reads here used to block the
      * four-period queue, then trim its recovered FIFO backlog to two periods.
@@ -956,6 +1013,16 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
     l->now = now_ms;
     const uint32_t epoch = __atomic_load_n(&l->sh->epoch,__ATOMIC_ACQUIRE), out = load(&l->sh->want_out);
     if (epoch != l->ledger_epoch || out != l->ledger_out) {
+        if (epoch != l->ledger_epoch) {
+            AudioRing *r = &l->sh->out;
+            const uint32_t old = __atomic_load_n(&l->sh->output_head, __ATOMIC_ACQUIRE) - r->tail;
+            if (old <= audio_ring_fill(r)) audio_ring_skip(r, old);
+            l->spk_primed = 0;
+            l->prime_left = AUDIO_LIVE_DEPTH;
+            l->quiet_at = now_ms;
+            l->spk_ending = 0;
+            drift_reset(&l->spk_drift);
+        }
         ledger(l, out ? AlStart : AlStop, audio_ring_fill(&l->sh->out), audio_ring_fill(&l->sh->out), 0, 0, 0);
         l->ledger_epoch=epoch; l->ledger_out=out;
     }

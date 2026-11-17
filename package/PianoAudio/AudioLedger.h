@@ -6,7 +6,7 @@
 #include <stdint.h>
 #define AUDIO_LEDGER_CAP 128u
 #define AUDIO_LEDGER_WORDS 32u
-enum {AlRefill=1, AlStart=2, AlStop=3, AlPark=4, AlRearm=5};
+enum {AlRefill=1, AlStart=2, AlStop=3, AlPark=4, AlRearm=5, AlPrime=6, AlLead=7};
 typedef struct {uint64_t seq, word[AUDIO_LEDGER_WORDS];} AudioLedgerSlot;
 typedef struct {uint64_t written; AudioLedgerSlot slot[AUDIO_LEDGER_CAP];} AudioLedger;
 static inline void audio_ledger_put(AudioLedger *l, const uint64_t *w)
