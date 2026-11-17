@@ -313,10 +313,10 @@ int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, ui
 {
     switch (property) {
     case PIANO_CHG_ENABLE: return bytes == 1 && value <= 1;
-    case PIANO_CHG_FCC: return bytes == 4 && value >= 100 && value <= fcc_cap(c);
+    case PIANO_CHG_FCC: return bytes == 4 && value >= 100 && value <= (c->strict_contract ? umin(fcc_cap(c),1500) : fcc_cap(c));
     case PIANO_CHG_ICL: return bytes == 4 && value >= PIANO_CHG_ICL_DEFAULT && value <= piano_charge_icl_max(c);
     case PIANO_CHG_FV:
-        return bytes == 4 && (value == PIANO_CHG_FV_DEFAULT || (c->full_charge && (value == PIANO_CHG_FV_FULL || value == PIANO_CHG_FV_HOT)));
+        return bytes == 4 && (value == PIANO_CHG_FV_DEFAULT || (c->full_charge && !c->strict_contract && (value == PIANO_CHG_FV_FULL || value == PIANO_CHG_FV_HOT)));
     case PIANO_CHG_PD_FIXED: return bytes == 4 && (value == 5000 || (c->hv && value == HV_MV));
     case PIANO_CHG_QC_VOLT: return bytes == 4 && c->qc3 && (value == 5000 || value == HV_MV);
     case PIANO_CHG_PPS: {
@@ -749,6 +749,7 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < HV_5V_MAX_MV;
     const int at9 = contract && in->contract_mv >= HV_MIN_MV && in->contract_mv <= HV_MAX_MV &&
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_MIN_MV && in->bus_mv <= HV_MAX_MV;
+    if (s->contract_generation && s->contract_generation != in->contract_generation) s->contract_recheck = 1;
     s->contract_generation = in->contract_generation;
     if (s->contract_mode != c->hv) {
         if (volt_raised(s) || at9 || s->contract_mode_change) s->contract_mode_change = 1;
@@ -777,7 +778,8 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
     }
     if ((in->safety & PIANO_CHG_SAFE_ALL) != PIANO_CHG_SAFE_ALL || in->faults ||
         t->cool < 15 || t->warm > 45 || s->conn_hot || s->chgr_hot ||
-        !(in->valid & PIANO_CHG_IN_VERIFY) || in->verify) {
+        !(in->valid & PIANO_CHG_IN_VERIFY) || in->verify ||
+        !(in->valid & PIANO_CHG_IN_FV) || in->fv_raw != piano_charge_fv_raw(PIANO_CHG_FV_DEFAULT)) {
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_SAFETY); return 0;
     }
     const int pps = c->hv == 2;
@@ -788,6 +790,12 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_SOURCE); return 0;
     }
     if (at9 && in->contract_protocol == (pps ? 2 : 1)) {
+        if (s->contract_recheck) {
+            s->contract_transition = 1;
+            s->transition_ma = umin(500, in->contract_ma);
+            if (!strict_barrier(in, s)) {p->fallback = PIANO_CHG_FALLBACK_READBACK; return 0;}
+            s->contract_recheck = 0;
+        }
         if (s->hv == PIANO_CHG_HV_ASKED && (s->pending & (1u << PIANO_CHG_S_VOLT))) return 0;
         s->contract_transition = 0;
         s->hv = PIANO_CHG_HV_ON;
@@ -944,7 +952,7 @@ static void plan_fv(const PianoChargeConfig *c, const PianoChargeInput *in, Pian
                     uint64_t now, const Temps *t)
 {
     uint32_t target = 0;
-    if (c->full_charge) target = piano_charge_fv_target(&s->term_hot, t->valid, t->warm);
+    if (c->full_charge && !c->strict_contract) target = piano_charge_fv_target(&s->term_hot, t->valid, t->warm);
     else if (s->touched & (1u << PIANO_CHG_S_FV)) target = PIANO_CHG_FV_DEFAULT;   /* the option went off: the firmware's own */
     p->fv_mv = target;
     if (!target) return;
@@ -966,7 +974,10 @@ static void plan_fv(const PianoChargeConfig *c, const PianoChargeInput *in, Pian
 static void expire_pending(PianoChargeState *s, uint64_t now)
 {
     for (unsigned i = 0; i < PIANO_CHG_SLOTS; ++i)
-        if ((s->pending & (1u << i)) && now >= s->pending_ms[i] + PENDING_MS) s->pending &= (uint8_t)~(1u << i);
+        if ((s->pending & (1u << i)) && now >= s->pending_ms[i] + PENDING_MS) {
+            s->pending &= (uint8_t)~(1u << i);
+            if (s->sleeping) s->handover_fault = 1;
+        }
 }
 
 static int limit_on(const PianoChargeConfig *c) {return c->limit && c->stop_pct < 100;}
@@ -1080,13 +1091,22 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     p->cls = (uint8_t)cls;
     if (c->writes && cls != PIANO_CHG_C_NONE && cls != PIANO_CHG_C_REFUSED) {
         /* the row, not the Rp current: nothing watches the bus while the system is suspended */
-        const uint32_t icl = board_cap(s, p, icl_at_5v(c, in, s, p, cls, 0));
+        uint32_t icl = board_cap(s, p, icl_at_5v(c, in, s, p, cls, 0));
         s->rp_taken_ms = 0;
-        const uint32_t fcc = piano_charge_fcc_thermal(umin(piano_charge_fcc_full(cls, 0), fcc_cap(c)), t->valid, t->warm);
-        const int stop = limit_on(c) && (s->hold || s->hot || s->cold || !c->sleep_charge);
+        uint32_t fcc = piano_charge_fcc_thermal(umin(piano_charge_fcc_full(cls, 0), fcc_cap(c)), t->valid, t->warm);
+        if (c->strict_contract && (volt_raised(s) || in->bus_mv >= HV_5V_MAX_MV)) {
+            s->contract_transition = 1;
+            s->transition_ma = strict_contract(in) ? umin(500, in->contract_ma) : PIANO_CHG_ICL_DEFAULT;
+            icl = umin(icl, s->transition_ma); fcc = umin(fcc, 500);
+        }
+        const int stop = s->hot || s->cold || c->admin_stop || in->faults || s->soc_failures >= SOC_FAILURES_STOP ||
+                         (c->strict_contract && s->fw_block) || (limit_on(c) && (s->hold || !c->sleep_charge));
         if (stop) {
-            p->why_off = s->hold ? PIANO_CHG_OFF_LIMIT : s->hot ? PIANO_CHG_OFF_HOT : s->cold ? PIANO_CHG_OFF_COLD : PIANO_CHG_OFF_SLEEP;
-            if (s->enable_set != 0) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 0, 1);
+            p->why_off = s->hold ? PIANO_CHG_OFF_LIMIT : s->hot ? PIANO_CHG_OFF_HOT : s->cold ? PIANO_CHG_OFF_COLD :
+                         c->admin_stop ? PIANO_CHG_OFF_ADMIN : in->faults ? PIANO_CHG_OFF_FAULT :
+                         s->soc_failures >= SOC_FAILURES_STOP ? PIANO_CHG_OFF_STALE :
+                         c->strict_contract && s->fw_block ? PIANO_CHG_OFF_FIRMWARE : PIANO_CHG_OFF_SLEEP;
+            if (s->enable_set != 0 && !(c->strict_contract && s->fw_block && !s->disabled)) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 0, 1);
         } else if (s->disabled) {
             /* a charging restart's stop (or one of battery health's being lifted): charging stays on for the sleep */
             plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
@@ -1095,14 +1115,20 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
         if ((s->touched & (1u << PIANO_CHG_S_FCC)) && s->fcc_set != fcc) plan_write(c, s, p, now, PIANO_CHG_S_FCC, PIANO_CHG_FCC, fcc, 4);
         if ((s->touched & (1u << PIANO_CHG_S_ICL)) && s->icl_set != icl) plan_write(c, s, p, now, PIANO_CHG_S_ICL, PIANO_CHG_ICL, icl, 4);
         want_5v(s);
-        plan_volt(c, s, p, now);
+        if (!c->strict_contract || !s->contract_transition || strict_barrier(in, s)) plan_volt(c, s, p, now);
         p->icl_ma = icl;
         p->fcc_ma = fcc;
         p->charge = (uint8_t)!stop;
         p->bus_mv = 5000;
     }
-    /* ready once nothing is left to send; a value refused three times is not waited for */
+    /* Hardware refusal or a lost completion remains a fault; elapsed time never proves a handover. */
     p->sleep_ready = p->writes == 0 && s->pending == 0 && !s->handover_fault;
+    if (c->strict_contract && p->sleep_ready && s->attached) {
+        const int stopped = !p->charge;
+        p->sleep_ready = (in->valid & PIANO_CHG_IN_ENABLE) && in->enable == (stopped ? 0 : 1) &&
+                         (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < HV_5V_MAX_MV &&
+                         (!is_pd(cls) || (strict_contract(in) && in->contract_mv < HV_5V_MAX_MV));
+    }
 }
 
 /* The float voltage in force: 0x2007 as read (2 mV - 3600), else the firmware's own 4400 mV. */
@@ -1232,12 +1258,22 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
             s->contract_transition = 1; s->transition_ma = PIANO_CHG_ICL_DEFAULT;
             want_5v(s); plan_icl(c, in, s, p, now, PIANO_CHG_ICL_DEFAULT);
             plan_fcc(c, s, p, now, PIANO_CHG_FCC_DEFAULT, PIANO_CHG_FCC_DEFAULT);
-            if (s->icl_set <= PIANO_CHG_ICL_DEFAULT && s->icl_set && s->fcc_set == PIANO_CHG_FCC_DEFAULT)
-                plan_volt(c, s, p, now);
+            if (strict_barrier(in, s)) plan_volt(c, s, p, now);
             p->fallback = PIANO_CHG_FALLBACK_READBACK; p->transition = 1;
         }
         return;
     }   /* no bus reading is neither a detach nor an attach: nothing changes */
+    if (in->bus_mv < ONLINE_MV && c->strict_contract &&
+        (((in->valid & PIANO_CHG_IN_TYPEC) && in->typec_source) || strict_contract(in))) {
+        /* A live connector with a missing bus reading is not a detach and cannot lift a safety stop. */
+        if (!charge_ok && p->why_off != PIANO_CHG_OFF_FIRMWARE) plan_enable(c, in, s, p, now, 0);
+        strict_fallback(in, s, p, PIANO_CHG_FALLBACK_READBACK);
+        s->transition_ma = PIANO_CHG_ICL_DEFAULT;
+        plan_icl(c, in, s, p, now, PIANO_CHG_ICL_DEFAULT);
+        plan_fcc(c, s, p, now, 500, 500);
+        if (strict_barrier(in, s)) plan_volt(c, s, p, now);
+        return;
+    }
     if (in->bus_mv < ONLINE_MV) {
         detached(c, in, s, p, now);
         s->hold_awake = p->hold_awake = 0;
@@ -1281,7 +1317,8 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         if (!charge_ok) plan_enable(c, in, s, p, now, 0);
         return;
     }
-    const int cls = piano_charge_class(s->type);
+    const int cls = c->strict_contract && strict_contract(in) ?
+                    (in->contract_protocol == 2 ? PIANO_CHG_C_PD_PPS : PIANO_CHG_C_PD) : piano_charge_class(s->type);
     p->cls = (uint8_t)cls;
     if (cls == PIANO_CHG_C_REFUSED && !c->strict_contract) {   /* classification never bypasses a known stop */
         if (!charge_ok) plan_enable(c, in, s, p, now, 0);
@@ -1399,8 +1436,20 @@ void piano_charge_shutdown(const PianoChargeConfig *c, const PianoChargeInput *i
     if (c->strict_contract) s->sleeping = 1;
     s->hold_awake = 0;
     if (s->disabled) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
-    if (s->attached && volt_raised(s)) {want_5v(s); plan_volt(c, s, p, now);}
+    if (s->attached && (volt_raised(s) || (c->strict_contract && in->bus_mv >= HV_5V_MAX_MV))) {
+        if (c->strict_contract) {
+            s->contract_transition = 1;
+            s->transition_ma = strict_contract(in) ? umin(500, in->contract_ma) : PIANO_CHG_ICL_DEFAULT;
+            plan_fcc(c, s, p, now, 500, 500);
+            plan_icl(c, in, s, p, now, s->transition_ma);
+            want_volt(s, PIANO_CHG_PD_FIXED, 5000);
+        } else want_5v(s);
+        if (!c->strict_contract || strict_barrier(in, s)) plan_volt(c, s, p, now);
+    }
     p->sleep_ready = p->writes == 0 && s->pending == 0 && !s->handover_fault;
+    if (c->strict_contract && p->sleep_ready && s->attached)
+        p->sleep_ready = (in->valid & PIANO_CHG_IN_ENABLE) && in->enable == 1 &&
+                         (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < HV_5V_MAX_MV;
 }
 
 /* --------------------------------------------------------------------------------------------------- the direct-charging curve */

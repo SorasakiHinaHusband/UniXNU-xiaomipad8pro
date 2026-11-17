@@ -212,7 +212,7 @@ typedef struct {
     uint8_t charge_ok;
     uint8_t soc_failures, fw_block;
     uint32_t contract_generation;
-    uint8_t contract_mode, contract_transition, contract_mode_change;
+    uint8_t contract_mode, contract_transition, contract_mode_change, contract_recheck;
     uint32_t transition_ma;
     uint8_t handover_fault;       /* refusal/timeout is not successful hardware handover */
     /* the float voltage */

@@ -1564,8 +1564,153 @@ static void testKick()
   }
 }
 
+// The production session supplements the firmware model with independent UCSI RDO readback. ACK and contract may disagree.
+struct StrictSim : Sim {
+  bool contractValid = true, sourceValid = true, contractFollows = true;
+  bool iclReadable = true, busReadable = true;
+  uint32_t contractGen = 1, contractLink = 1, contractMv = 5000, contractMa = 3000;
+  uint32_t fixed9 = 3000, pps9 = 3000, safe = PIANO_CHG_SAFE_ALL, faults = 0;
+  uint8_t protocol = 1;
+  StrictSim() {cfg.strict_contract = 1; cfg.limit = 1; cfg.hv = 1; pd(kPd5and9);}
+  void step(uint64_t dt = 5000)
+  {
+    now += dt; fill();
+    if (contractValid) in.valid |= PIANO_CHG_IN_CONTRACT;
+    if (sourceValid) in.valid |= PIANO_CHG_IN_SOURCE;
+    if (!iclReadable) in.valid &= ~PIANO_CHG_IN_ICL;
+    if (!busReadable) in.valid &= ~PIANO_CHG_IN_BUS;
+    in.contract_generation = contractGen;
+    in.contract_link_generation = contractLink;
+    in.contract_mv = contractMv; in.contract_ma = contractMa;
+    in.fixed9_ma = fixed9; in.pps9_ma = pps9; in.contract_protocol = protocol;
+    in.safety = safe; in.faults = faults;
+    piano_charge_decide(&cfg, &in, &st, &plan); check();
+    if (!ackWrites) return;
+    for (unsigned i = 0; i < plan.writes; ++i) {
+      const auto &w = plan.write[i];
+      // A request must only cross the voltage boundary behind both current ACKs and ICL readback.
+      if (w.property == PIANO_CHG_PD_FIXED || w.property == PIANO_CHG_PPS) {
+        CHECK(st.icl_set && st.icl_set <= st.transition_ma && st.fcc_set && st.fcc_set <= 500);
+        CHECK((in.valid & PIANO_CHG_IN_ICL) && uint32_t(in.icl_ma) <= st.transition_ma);
+        CHECK(!(st.pending & ((1u << PIANO_CHG_S_ICL) | (1u << PIANO_CHG_S_FCC))));
+      }
+      apply(w);
+      if (contractFollows) {
+        if (w.property == PIANO_CHG_PD_FIXED) {protocol = 1; contractMv = busMv;}
+        if (w.property == PIANO_CHG_PPS) {protocol = 2; contractMv = busMv;}
+      }
+    }
+  }
+  void run(unsigned n = 12) {while (n--) step();}
+};
+
+static void testContractSession()
+{
+  {
+    StrictSim s; s.run();
+    CHECK(s.st.hv == PIANO_CHG_HV_ON && s.busMv == 9000 && s.icl == 1600 && s.fcc <= 1500);
+    CHECK(s.st.contract_generation == s.contractGen);
+    s.contractMa = 1200; s.step();
+    CHECK(s.icl <= 1200);       // actual RDO current wins over the advertised 3A
+    s.contractGen++; s.step(); CHECK(s.icl <= 500 && s.plan.transition);
+    s.step(); CHECK(s.icl == 1200 && s.st.hv == PIANO_CHG_HV_ON); // current generation revalidated behind low-current barrier
+    s.contractMa = 100; s.step(); CHECK(s.icl <= 100);
+  }
+  {
+    StrictSim s; s.contractValid = false; s.run();
+    CHECK(s.busMv == 5000 && s.icl <= 100 && !s.wrote(PIANO_CHG_PD_FIXED,9000));
+    CHECK(s.plan.fallback == PIANO_CHG_FALLBACK_NO_CONTRACT);
+    s.contractValid = true; s.contractLink = 2; s.run();
+    CHECK(s.busMv == 5000 && s.icl <= 100);       // same-looking RDO from another firmware generation denied
+    s.contractLink = s.generation; s.contractGen++; s.run(); CHECK(s.busMv == 9000);
+    s.contractValid = false; s.step(); CHECK(s.icl <= 100 && !s.wrote(PIANO_CHG_PD_FIXED,5000));
+    s.step(); CHECK(s.busMv == 5000);             // new lower-current ACK+readback, then retract
+  }
+  {
+    StrictSim s; s.sourceValid = false; s.run(); CHECK(s.busMv == 5000);
+    s.sourceValid = true; s.safe &= ~PIANO_CHG_SAFE_CP_OFF; s.run(); CHECK(s.busMv == 5000);
+    s.safe |= PIANO_CHG_SAFE_CP_OFF; s.fv = 4480; s.run(); CHECK(s.busMv == 5000);
+    s.fv = 4400; s.run(); CHECK(s.busMv == 9000);
+    s.safe &= ~PIANO_CHG_SAFE_LPD_DRY; s.run(3); CHECK(s.busMv == 5000);
+  }
+  {
+    StrictSim s; s.iclReadable = false; s.run();
+    CHECK(s.busMv == 5000 && s.plan.transition && s.icl <= 500);  // ACK alone cannot cross the transition
+    s.iclReadable = true; s.contractFollows = false; s.run();
+    CHECK(s.busMv == 5000 || s.icl <= 500);       // voltage ACK / even measured9V without a matching RDO cannot raise ICL
+    CHECK(s.st.hv != PIANO_CHG_HV_ON);
+  }
+  {
+    StrictSim s; s.run();
+    CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,2,0) == 0);
+    s.step(); CHECK(s.icl <= 500 && !s.wrote(PIANO_CHG_PPS));
+    s.step(); CHECK(s.busMv == 5000 && s.protocol == 1);
+    for (int i = 0; i < 3; ++i) {s.step(); CHECK(!s.wrote(PIANO_CHG_PPS));}
+    s.run(); CHECK(s.protocol == 2 && s.busMv == 9000 && s.icl <= 1600);
+    CHECK(s.st.hv_pps && s.st.hv == PIANO_CHG_HV_ON);
+    CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,1,0) == 0);
+    s.run(); CHECK(s.protocol == 1 && s.busMv == 9000);
+  }
+  {
+    StrictSim s; s.cfg.rp = 1; s.cfg.ramp = 1; s.cfg.rp_cap_ma = 3000;
+    s.type = PIANO_CHG_T_SDP; s.contractValid = false; s.sourceValid = false; s.loadMa = 3000;
+    s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+    s.run(); CHECK(s.busMv == 5000 && s.icl > 1000 && s.icl <= 3000);
+    CHECK(s.plan.fallback == PIANO_CHG_FALLBACK_NO_CONTRACT); // explicit no-PD, existing SDP/Rp rule remains
+  }
+  {
+    StrictSim s; s.type = PIANO_CHG_T_UNKNOWN; s.run();
+    CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600);  // validated contract, not raw PD_STATE cache, sets effective class
+    s.contractValid = false; s.busReadable = false; s.cfg.admin_stop = 1;
+    s.step(); CHECK(s.wrote(PIANO_CHG_ENABLE,0) && !s.plan.charge);
+    CHECK(s.plan.why_off == PIANO_CHG_OFF_ADMIN);
+    s.busReadable = true; s.busMv = 0; s.step();
+    CHECK(s.enable == 0 && !s.wrote(PIANO_CHG_ENABLE,1)); // not a detach while PMIC still sees the source
+  }
+}
+
+static void testAtomicHealth()
+{
+  StrictSim s; s.cfg.hv = 0; s.soc = 79; s.run(2); CHECK(s.enable == 1 && !s.st.hold);
+  s.soc = 80; s.step(); CHECK(s.st.hold && s.wrote(PIANO_CHG_ENABLE,0));
+  s.soc = 76; s.step(); CHECK(s.st.hold && s.enable == 0);
+  auto before = s.cfg;
+  CHECK(piano_charge_config_transaction(&s.cfg,1,25,20,1,0) == -1);
+  CHECK(std::memcmp(&before,&s.cfg,sizeof before) == 0 && s.st.hold);
+  CHECK(piano_charge_config_transaction(&s.cfg,1,78,74,0,0) == 0);
+  s.step(); CHECK(s.st.hold && s.enable == 0);      // threshold update retains hysteresis, not a reset
+  s.soc = 74; s.step(); CHECK(!s.st.hold && s.wrote(PIANO_CHG_ENABLE,1));
+  CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,0,0) == 0);
+  s.soc = 80; s.step(); CHECK(s.st.hold); s.soc = 75; s.step(); CHECK(!s.st.hold && s.enable == 1);
+  s.soc = 25;
+  CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,0,1) == 0);
+  s.step(); CHECK(!s.plan.charge && s.plan.why_off == PIANO_CHG_OFF_ADMIN && s.enable == 0);
+  CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,0,0) == 0);
+  s.step(); CHECK(s.enable == 1 && s.plan.charge);    // same real actuator, no fake SOC or threshold relaxation
+  s.temp(55); s.step(); CHECK(s.enable == 0 && s.st.hot);
+  CHECK(piano_charge_config_transaction(&s.cfg,0,80,75,0,0) == 0);
+  s.step(); CHECK(s.enable == 0 && s.st.hot && s.plan.why_off == PIANO_CHG_OFF_HOT);
+  s.temp(30); s.step(); CHECK(s.enable == 1);
+  // Firmware-owned disable survives both mode toggles and a limit transaction.
+  StrictSim f; f.cfg.hv = 0; f.enable = 0; f.run(2);
+  CHECK(f.st.fw_block && f.enable == 0 && !f.st.disabled);
+  CHECK(piano_charge_config_transaction(&f.cfg,0,80,75,0,0) == 0);
+  f.run(2); CHECK(f.enable == 0 && !f.wrote(PIANO_CHG_ENABLE,1));
+  // Repeated lost gauges stop controlled charging and retract HV; no time passage releases known hold.
+  StrictSim g; g.run(); g.bothGauges = false; g.step(); CHECK(g.busMv == 9000 || g.icl <= 500);
+  g.step(); CHECK(g.enable == 0 && g.plan.why_off == PIANO_CHG_OFF_STALE);
+  g.step(360000); CHECK(g.enable == 0 && !g.wrote(PIANO_CHG_ENABLE,1));
+  g.bothGauges = true; g.step(); CHECK(g.enable == 1);
+  // A sleep handover cannot discard admin inhibit or declare success merely because there are no queued writes.
+  StrictSim h; h.cfg.hv = 0; h.run(2); h.cfg.admin_stop = 1; h.step();
+  h.sleep = PIANO_CHG_WILL_SLEEP; h.step(); CHECK(h.enable == 0 && !h.plan.charge);
+  h.enable = 1; h.step(); CHECK(!h.plan.sleep_ready);   // ACK cache disagrees with the actual enable readback
+}
+
 int main()
 {
+  testContractSession();
+  testAtomicHealth();
   testTables();
   testFiveVolt();
   testThermal();
