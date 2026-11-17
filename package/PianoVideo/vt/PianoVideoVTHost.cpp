@@ -333,7 +333,7 @@ int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   if(first&&!r.picture.idr){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);r.decision="first-picture-not-IDR";return kBadData;}
   const uint32_t normalized=contract::normalize(r.data,r.bytes,input,contract::kMaxAuBytes,s->config,first);
   if(!normalized){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);return kBadData;}
-  auto *record=s->frames.accept(uint64_t(r.token),r.flags);
+  auto *record=s->frames.accept(uint64_t(r.token),r.flags,false);
   if(!record){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);r.decision="credit-or-duplicate";return kBadState;}
   const unsigned index=unsigned(record-s->frames.frames);s->inputs[index]={input,normalized};
   const unsigned pending=s->frames.pending;
@@ -444,28 +444,26 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
     case cc("dsts"):case cc("dtil"):status(c,h,kUnsupported);IOLog("PianoVideoVT V5a: tiles rejected before-DMA 1\n");break;
     case cc("dfrm"):{
       contract::InputReport r;const int error=queue(s,m,n,r);
-      bool scheduled=false;
-      if(error){
-        IOLockLock(s->lock);
-        scheduled=r.hasToken&&!r.transportReject&&(r.flags&1)&&s->workerRunning&&!s->stopping&&!s->frames.find(uint64_t(r.token))&&s->rejected.push(r.token,error);
-        if(scheduled)IOLockWakeup(s->lock,&s->busy,false);
-        IOLockUnlock(s->lock);
-      }
-      IOLog("PianoVideoVT V5c: dfrm request %llu flags %u token-present %u token %llu sbf-type %08x sample-bytes %u decision %s status %d rejected-worker %u\n",
-        h.request,h.flags,unsigned(r.hasToken),uint64_t(r.token),r.parameterType,r.bytes,error?(scheduled?"reject-and-complete":"reject-via-transport"):"accepted-native-AU",error,unsigned(scheduled));
-      IOLog("PianoVideoVT V5c: dfrm validation request %llu decision %s\n",h.request,r.decision);
-      // A codec error reply does not emit on 27.3. If no worker can complete
-      // this token, fail the send itself: PV then emits its original frame.
-      if(error&&!scheduled){IOLockUnlock(c->lock);return error;}
+      // No work is visible to the worker until its dfrm reply is enqueued.
+      // Otherwise an enqueue failure could trigger PV's fallback emit after
+      // the worker has already emitted that same frame (especially rejects).
+      IOLockLock(s->lock);
+      const bool scheduled=error&&r.hasToken&&!r.transportReject&&(r.flags&1)&&s->workerRunning&&!s->stopping&&
+        !s->frames.find(uint64_t(r.token))&&s->rejected.count<contract::RejectedFrames::Capacity;
+      if(error&&!scheduled){IOLockUnlock(s->lock);IOLockUnlock(c->lock);return error;}
       uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),error);w.u32(cc(",inf"),error?2:1);
       const bool sent=send(c,w,b);
-      IOLog("PianoVideoVT V5c: dfrm reply request %llu status %d info %u transport %u\n",h.request,error,error?2:1,unsigned(sent));
-      if(!sent){
-        // PV's send-error path owns this frame disposition. Join/cancel the
-        // native epoch before any later successful delivery can escape.
-        IOLockLock(s->lock);auto *f=s->frames.find(uint64_t(r.token));if(f)f->phase=pianovideo::stream::Phase::Emitted;s->stopping=true;IOLockUnlock(s->lock);
-        IOLockUnlock(c->lock);return kDecodeError;
+      if(sent){
+        if(scheduled)s->rejected.push(r.token,error);
+        else if(!s->stopping)s->frames.publish(uint64_t(r.token));
+      }else{
+        auto *f=s->frames.find(uint64_t(r.token));if(f)f->phase=pianovideo::stream::Phase::Emitted;
+        s->stopping=true; // error-stop: settle all other tokens; fallback owns only this token
       }
+      IOLockUnlock(s->lock);
+      IOLog("PianoVideoVT V6: dfrm request %llu token %llu decision %s status %d reply-enqueued %u published %u\n",
+        h.request,uint64_t(r.token),r.decision,error,unsigned(sent),unsigned(sent&&!s->stopping));
+      if(!sent){IOLockUnlock(c->lock);return kDecodeError;}
       break;
     }
     case cc("dfin"):{

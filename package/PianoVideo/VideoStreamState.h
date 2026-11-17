@@ -5,7 +5,7 @@
 #include <stdint.h>
 namespace pianovideo { namespace stream {
 constexpr unsigned Credits = 8, Inputs = 2, Raws = 64;
-enum class Phase : uint8_t { Free, Queued, Submitted, Picture, Delivering, Emitted };
+enum class Phase : uint8_t { Free, Admitting, Queued, Submitted, Picture, Delivering, Emitted };
 struct Record {
   uint64_t token = 0, serial = 0;
   uint32_t flags = 0;
@@ -20,11 +20,12 @@ struct Ledger {
   uint64_t accepted = 0, barrier = 0;
   bool draining = false, ack = false, last = false, paused = false, stopped = false;
   Record *find(uint64_t t) { for(auto &f:frames) if(f.phase!=Phase::Free && f.token==t)return &f; return nullptr; }
-  Record *accept(uint64_t t, uint32_t flags = 1) {
+  Record *accept(uint64_t t, uint32_t flags = 1, bool published = true) {
     if(stopped || draining || pending==Credits || find(t))return nullptr;
-    for(auto &f:frames)if(f.phase==Phase::Free){f={t,++accepted,flags,Phase::Queued};++pending;if(pending>highWater)highWater=pending;return &f;}
+    for(auto &f:frames)if(f.phase==Phase::Free){f={t,++accepted,flags,published?Phase::Queued:Phase::Admitting};++pending;if(pending>highWater)highWater=pending;return &f;}
     return nullptr;
   }
+  bool publish(uint64_t t) {auto *f=find(t);if(!f||f->phase!=Phase::Admitting||stopped)return false;f->phase=Phase::Queued;return true;}
   int freeInput() const {for(unsigned i=0;i<Inputs;++i)if(!inputOwned[i])return int(i);return -1;}
   bool submit(uint64_t t,unsigned i) {
     Record *f=find(t);if(stopped||!f||f->phase!=Phase::Queued||i>=Inputs||inputOwned[i])return false;

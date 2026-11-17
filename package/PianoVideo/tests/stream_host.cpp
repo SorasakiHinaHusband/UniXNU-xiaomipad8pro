@@ -363,6 +363,18 @@ static void idleTests() {
   Fixture f;f.start(61);f.peer.output(61,1);f.pump();f.releaseAll();f.pump();
   CHECK(f.tx.deadline==UINT64_MAX);f.peer.hw.clock+=90000000;f.pump();CHECK(!f.tx.r.error);f.close();
 }
+static void admissionPublication() {
+  stream::Ledger l;
+  auto *f=l.accept(0x1234,1,false);
+  CHECK(f&&f->phase==stream::Phase::Admitting&&l.pending==1);
+  CHECK(!l.submit(0x1234,0)); // worker cannot DMA before the dfrm reply exists
+  CHECK(l.publish(0x1234)&&!l.publish(0x1234)&&l.submit(0x1234,0));
+  CHECK(!l.accept(0x1234,1,false));
+  auto *failed=l.accept(0x5678,1,false);CHECK(failed&&failed->phase==stream::Phase::Admitting);
+  failed->phase=stream::Phase::Emitted; // transport fallback owns this failed enqueue
+  CHECK(!l.publish(0x5678)&&!l.submit(0x5678,1));
+  l.cancel();CHECK(l.pending==0&&!l.publish(0x5678));
+}
 int main() {
   ledgerTests();guestTests();ownerTests();persistentTests();firstPscTests();omittedPscTests();delayedGuestTests();drainPictureTests();noOutputTests();capacityTests();
   for(unsigned i=0;i<16;++i)negativeTests(i);
