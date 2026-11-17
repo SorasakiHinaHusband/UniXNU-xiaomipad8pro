@@ -45,6 +45,26 @@ static void step(bool heartbeat=true) {
     gHw.busyTicks+=A830_XO_HZ*16/1000;dcvs.noteSubmit();dcvs.serviceTick(gEnv.now);
 }
 int main() {
+    // Recorded R3a2: valid TSENS, fresh/in-bound ADC, but max >=70C. This is not a5s cadence/lease failure.
+    boot();auto recorded=board(4);recorded.milli_c[0]=57753;recorded.milli_c[1]=33079;
+    recorded.sample_us[0]=15838780;recorded.sample_us[1]=15839480;
+    recorded.age_ms[0]=4096;recorded.age_ms[1]=4095;
+    raw=Sm8750TsensValidBit|706;qual.tick(19935078000ull,gpu(),recorded,true);
+    CHECK(!qual.ready() && !qual.reason() && !qual.arm() && !qual.high());
+    CHECK(qual.inhibit()==(A830QualGpuOver|A830QualNeedRounds));
+    recorded=board(41);recorded.milli_c[0]=64127;recorded.milli_c[1]=34481;
+    recorded.age_ms[0]=recorded.age_ms[1]=3341;raw=Sm8750TsensValidBit|741;
+    qual.tick(204251354000ull,gpu(),recorded,true);CHECK(!qual.ready() && !qual.reason());
+    CHECK(qual.inhibit() & A830QualGpuOver);
+    // Cool fresh samples with the real4.1s age are allowed, after two advancing rounds. Cached rounds still fail.
+    raw=Sm8750TsensValidBit|672;recorded=board(42);recorded.age_ms[0]=4096;recorded.age_ms[1]=4095;
+    qual.tick(209251354000ull,gpu(),recorded,true);CHECK(!qual.ready() && qual.inhibit()==A830QualNeedRounds);
+    qual.tick(209251354001ull,gpu(),recorded,true);CHECK(!qual.ready());
+    recorded=board(43);recorded.age_ms[0]=4096;recorded.age_ms[1]=4095;
+    qual.tick(214251354000ull,gpu(),recorded,true);CHECK(qual.ready() && !qual.inhibit() && !qual.reason());
+    recorded.age_ms[0]=10000;qual.tick(214251354001ull,gpu(),recorded,true);CHECK(qual.ready());
+    recorded.age_ms[0]=10001;qual.tick(214251354002ull,gpu(),recorded,true);
+    CHECK(!qual.ready() && (qual.inhibit() & A830QualBoardInvalid) && !qual.reason());
     boot();CHECK(dcvs.ceiling()==3);openPermit();
     qual.tick(gEnv.now+1,gpu(),board(3),true);qual.checkLease(gEnv.now);CHECK(!qual.reason());
     for(unsigned i=0;i<100;++i)step();CHECK(dcvs.level()==7);

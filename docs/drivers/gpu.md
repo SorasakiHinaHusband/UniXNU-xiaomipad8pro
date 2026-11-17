@@ -463,6 +463,13 @@ to request the permit; write 2 once while the acknowledged level exceeds 342 to 
 runtime id 30. Startup M9 and unrelated ACKs are never injected. The normal soak is 600 seconds, with at most 2 seconds for
 the final injection; this absolute permit cannot be renewed. A 2.5-second heartbeat lease also constrains votes and wakes.
 
+Before arming, a hot or invalid sample clears readiness without setting the armed-run fault reason. `R3a TEMP` separately
+reports `inhibit`: bit 0 invalid GPU, bit 1 invalid/stale board, bit 2 GPU at70 C, bit 3 board at its limit, bit 4 awaiting
+two advancing cool rounds. Board freshness allows at most10 seconds; it is independent of the2.5-second heartbeat lease.
+Complete qualification records are available through read-only `machdep.piano_gpu_qual607_log` (`C5LOG-v1`), allocated only
+for this mode. Its8192 bounded records include sequence/length framing and explicit overwrite/rejection information;
+an overwritten or incomplete capture cannot establish qualification. Console and unified-log delivery are supplementary.
+
 Any sampled GPU temperature at70 C, quiet at40 C, msm at65 C, invalid/stale sensor input, expired permit or runtime vote
 failure closes submission and latches a boot ceiling of 342. The driver stops the GMU, verifies CM3 reset, both GX-off/clock
 bits, CFG power-down and RSCC completion, restarts M9 at 160/bus2, and reopens only after CP/secure initialization succeeds.

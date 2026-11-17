@@ -10,10 +10,14 @@
 #include "../../include/PianoBoardTemps.h"
 
 enum A830QualReason : uint32_t {A830QualNone,A830QualVote,A830QualGpuHot,A830QualBoardHot,A830QualSensor,A830QualExpired};
+// Current pre-arm blockers, distinct from the first armed-run fault (reason). Diagnostic only.
+enum A830QualInhibit : uint32_t {A830QualGpuInvalid=1,A830QualBoardInvalid=2,A830QualGpuOver=4,
+    A830QualBoardOver=8,A830QualNeedRounds=16};
 class A830Qualification {
 public:
     void init(A830PowerState *power,A830Recovery *recovery) {power_=power;recovery_=recovery;power_->setQualificationCeiling(3,3);}
     bool ready() const {return __atomic_load_n(&ready_,__ATOMIC_ACQUIRE);}
+    uint32_t inhibit() const {return __atomic_load_n(&inhibit_,__ATOMIC_ACQUIRE);}
     bool high() const {return __atomic_load_n(&high_,__ATOMIC_ACQUIRE) && !power_->qualificationLatched();}
     bool arm() {
         if(!ready() || power_->qualificationLatched() || __atomic_exchange_n(&armed_,true,__ATOMIC_ACQ_REL))return false;
@@ -53,6 +57,8 @@ public:
                 lastRound_=board.rounds;lastSamples_[0]=board.sample_us[0];lastSamples_[1]=board.sample_us[1];
             }
         } else rounds_=0;
+        __atomic_store_n(&inhibit_,(!gpuOk?A830QualGpuInvalid:0u)|(!boardGood?A830QualBoardInvalid:0u)|
+            (gpuHot?A830QualGpuOver:0u)|(boardHot?A830QualBoardOver:0u)|(rounds_<2?A830QualNeedRounds:0u),__ATOMIC_RELEASE);
         __atomic_store_n(&ready_,gpuOk && boardGood && !gpuHot && !boardHot && rounds_>=2,__ATOMIC_RELEASE);
         if(high()) {
             if(gpuHot)fault(A830QualGpuHot,now);
@@ -88,7 +94,7 @@ private:
     A830PowerState *power_=nullptr;
     A830Recovery *recovery_=nullptr;
     bool ready_=false,high_=false,armed_=false;
-    uint32_t reason_=0,rounds_=0,lastRound_=0;
+    uint32_t reason_=0,rounds_=0,lastRound_=0,inhibit_=A830QualNeedRounds;
     uint64_t openedAt_=0,failedAt_=0,lastSamples_[2]={};
     uint64_t heartbeatAt_=0;
 };

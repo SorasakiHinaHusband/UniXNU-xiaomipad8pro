@@ -61,11 +61,21 @@
 #include "PianoLlccIsland.h"
 #include "PianoGpuCeiling.h"
 #include "PianoGpuIdle.h"
+#include "PianoGpuQualificationLog.h"
 
 extern "C" int adreno830_qual607_control(int);
-// C5 records are bounded to960 bytes by the caller. Keep them intact: piano_a830_note's256-byte scratch
-// would drop the sticky/reason/freshness fields. IOLog's console printbuf flushes while formatting (IOLib.cpp).
-extern "C" void adreno830_qualification_note(const char *line) {IOLog("PianoA830: %s\n",line);}
+using QualLog=pianogpu::QualificationLog<>;
+static QualLog *gQualLog;
+static IOSimpleLock *gQualLogLock;
+extern "C" bool adreno830_qualification_log_ready() {return gQualLog && gQualLogLock;}
+extern "C" void adreno830_qualification_note(const char *line) {
+  if(adreno830_qualification_log_ready()) {
+    const auto irq=IOSimpleLockLockDisableInterrupt(gQualLogLock);
+    gQualLog->push(line);
+    IOSimpleLockUnlockEnableInterrupt(gQualLogLock,irq);
+  }
+  IOLog("PianoA830: %s\n",line); // convenience only; qualification evidence comes from the read-only export
+}
 extern "C" void adreno830_qualification_unsafe() {
   // Native 0070 uses the SMC conduit (k27 0069). A graceful halt can wait on the very power mutex/HFI
   // whose deadline expired. Only this unconfirmed-GX emergency bypasses filesystem and IOKit shutdown.
@@ -83,6 +93,32 @@ extern "C" bool adreno830_qualification_board(piano_gpu_temps *out) {
 }
 SYSCTL_DECL(_machdep);
 static struct sysctl_oid gQual607Oid;
+static struct sysctl_oid gQualLogOid;
+static int qualLogSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+  if(req->newptr)return EPERM;
+  if(!adreno830_qualification_log_ready())return ENOMEM;
+  // sysctl first asks the required size. Reserve the maximum so concurrent new records cannot outgrow it.
+  if(!req->oldptr) {req->oldidx=QualLog::capacity*(QualLog::bytes+96)+256;return 0;}
+  auto irq=IOSimpleLockLockDisableInterrupt(gQualLogLock);
+  const auto bounds=gQualLog->bounds();
+  IOSimpleLockUnlockEnableInterrupt(gQualLogLock,irq);
+  char header[160];
+  int n=snprintf(header,sizeof header,"C5LOG-v1 first=%llu next=%llu rejected=%llu\n",bounds.first,bounds.next,bounds.rejected);
+  int err=SYSCTL_OUT(req,header,n);
+  QualLog::Record record;
+  for(uint64_t sequence=bounds.first;!err && sequence<bounds.next;++sequence) {
+    irq=IOSimpleLockLockDisableInterrupt(gQualLogLock);
+    const bool ok=gQualLog->copy(sequence,record);
+    IOSimpleLockUnlockEnableInterrupt(gQualLogLock,irq);
+    if(!ok)return EAGAIN; // snapshot overwritten while reading; never return a successful partial capture
+    n=snprintf(header,sizeof header,"C5REC seq=%llu bytes=%u\n",sequence,unsigned(record.length));
+    err=SYSCTL_OUT(req,header,n);
+    if(!err)err=SYSCTL_OUT(req,record.text,record.length);
+    if(!err)err=SYSCTL_OUT(req,"\n",1);
+  }
+  if(!err)err=SYSCTL_OUT(req,"C5END\n",7); // includes final NUL for CTLTYPE_STRING
+  return err;
+}
 static int qual607Sysctl(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
   int value=adreno830_qual607_control(0);
   const int err=sysctl_handle_int(oidp,&value,0,req);
@@ -90,13 +126,22 @@ static int qual607Sysctl(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
   if(value!=1 && value!=2)return EINVAL;
   return adreno830_qual607_control(value)<0?EAGAIN:0;
 }
-static void registerQual607() {
+static void registerQual607(bool record) {
   bzero(&gQual607Oid,sizeof gQual607Oid);
   gQual607Oid.oid_parent=&sysctl__machdep_children;gQual607Oid.oid_number=OID_AUTO;
   gQual607Oid.oid_kind=int(CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED|CTLFLAG_OID2);
   gQual607Oid.oid_name="piano_gpu_qual607";gQual607Oid.oid_handler=qual607Sysctl;gQual607Oid.oid_fmt="I";
   gQual607Oid.oid_descr="R3a qualification flags; write 1 permit, 2 one queued ACK loss";
   gQual607Oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQual607Oid);
+  if(record) {
+    gQualLog=static_cast<QualLog *>(IOMallocZero(sizeof(QualLog)));gQualLogLock=IOSimpleLockAlloc();
+  }
+  bzero(&gQualLogOid,sizeof gQualLogOid);
+  gQualLogOid.oid_parent=&sysctl__machdep_children;gQualLogOid.oid_number=OID_AUTO;
+  gQualLogOid.oid_kind=int(CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  gQualLogOid.oid_name="piano_gpu_qual607_log";gQualLogOid.oid_handler=qualLogSysctl;gQualLogOid.oid_fmt="A";
+  gQualLogOid.oid_descr="C5LOG-v1 bounded read-only qualification records";
+  gQualLogOid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQualLogOid);
 }
 #include <PianoDisplayFollow.h>
 
@@ -1179,7 +1224,8 @@ bool PianoA830::start(IOService *provider)
   static bool started;
   if (started) return true;
   started = true;
-  registerQual607();
+  // Board parsing happens later on the bring-up thread; allocate before its first qualification record.
+  registerQual607(bootArg("piano-gpu-maxlevel",0)==7 && bootArg("piano-gpu-dcvs-max",0)==607);
   if (gLevel > 2) {
     piano_a830_note("piano-gpu=%u: unknown level (1 survey, 2 bring-up); nothing done", gLevel);
     return true;

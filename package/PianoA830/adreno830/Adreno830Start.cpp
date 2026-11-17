@@ -47,6 +47,7 @@
 #endif
 
 extern "C" __attribute__((weak)) void adreno830_qualification_note(const char *) {}
+extern "C" bool adreno830_qualification_log_ready();
 extern "C" __attribute__((weak)) bool adreno830_qualification_board(piano_gpu_temps *) {return false;}
 extern "C" __attribute__((weak)) void adreno830_qualification_unsafe() {}
 
@@ -191,7 +192,8 @@ bool gQualificationInjectionScheduled=false;
 bool qualificationMode(const Adreno830Board *b) {return b && b->knobs.maxlevel==7 && b->knobs.dcvs_max_mhz==607;}
 void qualLog(const char *format,...) __attribute__((format(printf,1,2)));
 void qualLog(const char *format,...) {
-    char line[960];va_list ap;va_start(ap,format);vsnprintf(line,sizeof line,format,ap);va_end(ap);
+    char line[960];va_list ap;va_start(ap,format);const int n=vsnprintf(line,sizeof line,format,ap);va_end(ap);
+    if(n<0 || unsigned(n)>=sizeof line)line[0]=0; // the export counts a rejected record; never certify a truncated tail
     adreno830_qualification_note(line);
 }
 void qualificationUnsafe(void *) {adreno830_qualification_unsafe();} // no logger, allocation, power or HFI lock on the emergency path
@@ -2559,11 +2561,11 @@ void qualificationThread(void *)
         gQualification.tick(now,gpu,board,ok);
         if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr);
         const uint64_t age0=board.age_ms[0],age1=board.age_ms[1];
-        qualLog("R3a TEMP at-us=%llu gpu-valid=%02x gpu-max=%d gpu-raw=%x,%x,%x,%x,%x,%x,%x,%x board-ok=%u state=%u valid=%x disabled=%x rounds=%u period=%u msm=%d quiet=%d age-ms=%llu,%llu sample-us=%llu,%llu ready=%u high=%u sticky=%u reason=%u opened-us=%llu failed-us=%llu",
+        qualLog("R3a TEMP at-us=%llu gpu-valid=%02x gpu-max=%d gpu-raw=%x,%x,%x,%x,%x,%x,%x,%x board-ok=%u state=%u valid=%x disabled=%x rounds=%u period=%u msm=%d quiet=%d age-ms=%llu,%llu sample-us=%llu,%llu ready=%u high=%u sticky=%u reason=%u opened-us=%llu failed-us=%llu inhibit=%u",
             now/1000,gpu.valid,gpu.max_deci,gpu.raw[0],gpu.raw[1],gpu.raw[2],gpu.raw[3],gpu.raw[4],gpu.raw[5],gpu.raw[6],gpu.raw[7],
             ok,board.state,board.valid,board.disabled,board.rounds,board.period_ms,board.milli_c[0],board.milli_c[1],age0,age1,
             board.sample_us[0],board.sample_us[1],gQualification.ready(),gQualification.high(),g830.power_state.qualificationLatched(),
-            gQualification.reason(),gQualification.openedAt()/1000,gQualification.failedAt()/1000);
+            gQualification.reason(),gQualification.openedAt()/1000,gQualification.failedAt()/1000,gQualification.inhibit());
         os().sleep_us(1000000);
     }
 }
@@ -2626,6 +2628,9 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
 #endif
     d->tsens_io={nullptr,tsensRead};
     if(config.qualification607) {
+#if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
+        if(!adreno830_qualification_log_ready())return refuse(f,A830S10StepDcvs,A830ReasonNoMemory,0,0,0,kIOReturnNoMemory);
+#endif
         gQualificationEnabled=true;
         d->recovery.qualification(qualificationUnsafe,nullptr);
         gQualification.init(&d->power_state,&d->recovery);
