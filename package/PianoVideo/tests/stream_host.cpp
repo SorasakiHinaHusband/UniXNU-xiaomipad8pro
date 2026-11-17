@@ -55,6 +55,9 @@ struct Peer {
   unsigned n=4,etbs=0,ftbs=0,dpbs=0,opens=0,closes=0,stops=0,drains=0;
   unsigned settingsResume=0,drainInputResume=0,drainRawResume=0;
   uint32_t pscPoc=0,pscProfile=1,pscLevel=4;
+  uint32_t pscResolution=0x014000f0,pscDepth=0x00080008,pscCoded=1,pscCrop0=0,pscCrop1=0;
+  bool omitOptional=false;
+  unsigned decodeOrderProperties=0;
   bool autoEbd=true,autoDrainAck=true,autoDrainLast=true,dropStop=false,dropClose=false,lateClose=false;
   bool lastWithPicture=false;
   uint64_t finalToken=0;
@@ -69,10 +72,11 @@ struct Peer {
     CHECK(hfi::write(mem,hfi::kMsgq,b.data(),b[0],[]{})==0);
   }
   void psc() {
-    reply({packet(Settings,0,1,0),packet(0x03000103,0,1,1,{0x014000f0}),packet(0x03000105,0,1,13,{0,0}),
-      packet(0x0300010f,0,1,1,{0x00080008}),packet(0x03000120,0,1,1,{1}),packet(0x03000124,0,1,1,{n}),
-      packet(0x03000128,0,1,1,{pscPoc}),packet(0x03000107,0,1,1,{pscProfile}),packet(0x03000108,0,1,1,{pscLevel}),
-      packet(0x03000155,0,1,1,{0x14000003})});
+    std::vector<Words> parts={packet(Settings,0,1,0),packet(0x03000103,0,1,1,{pscResolution}),packet(0x03000105,0,1,13,{pscCrop0,pscCrop1}),
+      packet(0x0300010f,0,1,1,{pscDepth}),packet(0x03000120,0,1,1,{pscCoded}),packet(0x03000124,0,1,1,{n})};
+    if(!omitOptional){parts.push_back(packet(0x03000128,0,1,1,{pscPoc}));parts.push_back(packet(0x03000107,0,1,1,{pscProfile}));
+      parts.push_back(packet(0x03000108,0,1,1,{pscLevel}));}
+    parts.push_back(packet(0x03000155,0,1,1,{0x14000003}));reply(parts);
   }
   void ebd(unsigned index,bool duplicate=false) {
     CHECK(index<inputs.size()&&!inputs[index].empty());
@@ -140,6 +144,7 @@ struct Peer {
     if(type==Stop){CHECK(flags==7);++stops;if(!dropStop)reply({packet(Stop,1,port,0)});return 0;}
     if(type==Close){CHECK(flags==7&&port==0);++closes;if(!dropClose){reply({packet(Close,1,0,0)});if(lateClose)reply({packet(0x03000162,0,2,1,{2})});}return 0;}
     if(type==0x03000193)comvCounts.push_back(p[8]);
+    if(type==0x0300015b&&port==1){CHECK(p[8]==1&&payload==1&&etbs==0);++decodeOrderProperties;}
     if(type==Subscribe)CHECK(flags==3&&payload==11);
     else CHECK(type>0x03000000&&type<0x03ffffff&&flags==0);
     return 0;
@@ -149,7 +154,7 @@ struct Fixture {
   Peer peer;Layout layout;SelfTest<Peer> tx;
   uint32_t sid=0x56361234;
   Fixture():tx(peer,layout) {CHECK(layout.init());tx.streaming=true;tx.checkGolden=false;tx.expectedPoc=0;tx.expectedProfile=1;tx.expectedLevel=4;}
-  void start(uint64_t token=0x100000001ull) {CHECK(tx.nativeInput(sid,kAccessUnit,sizeof kAccessUnit,token));CHECK(tx.transaction()==0);CHECK(tx.r.psc==1&&peer.opens==1&&peer.drains==0);}
+  void start(uint64_t token=0x100000001ull) {CHECK(tx.nativeInput(sid,kAccessUnit,sizeof kAccessUnit,token));CHECK(tx.transaction()==0);CHECK(tx.r.psc==1&&peer.opens==1&&peer.drains==0&&peer.decodeOrderProperties==1);}
   void pump() {CHECK(tx.pump()==0);}
   void releaseAll() {SelfTest<Peer>::OutputFrame f;while(tx.popOutput(f))CHECK(tx.releaseOutput(f.index,f.token)==0);}
   void drain() {CHECK(tx.beginDrain()==0);pump();CHECK(tx.drainStatus()==1);}
@@ -221,6 +226,21 @@ static void persistentTests() {
   f.close();CHECK(f.peer.closes==1&&f.peer.drains==2);
   for(unsigned i=0;i<f.peer.headers.size();++i){CHECK(f.peer.headers[i]==i&&f.peer.packets[i]==i);}
 }
+static void firstPscTests() {
+  for(unsigned n:{1u,9u,64u}){
+    Fixture f;f.peer.n=n;f.start(77);f.peer.output(77,1);f.pump();f.releaseAll();f.drain();f.close();
+    CHECK(f.tx.psc.n==n&&f.peer.dpbs==n&&f.peer.comvCounts==std::vector<uint32_t>({4,n}));
+  }
+  for(unsigned kind=0;kind<9;++kind){
+    Fixture f;
+    switch(kind){case 0:f.peer.n=0;break;case 1:f.peer.n=65;break;case 2:f.peer.pscPoc=2;break;
+      case 3:f.peer.pscProfile=0;break;case 4:f.peer.pscLevel=5;break;case 5:f.peer.pscResolution=0x01400100;break;
+      case 6:f.peer.pscDepth=0x000a000a;break;case 7:f.peer.pscCoded=0;break;case 8:f.peer.pscCrop1=1;break;}
+    CHECK(f.tx.nativeInput(f.sid,kAccessUnit,sizeof kAccessUnit,78));CHECK(f.tx.transaction()!=0&&f.tx.r.error);
+    CHECK(!f.tx.rawStarted&&f.peer.dpbs==0&&f.peer.ftbs==0&&f.peer.drains==0);
+    CHECK(f.tx.shutdown()==0&&f.peer.stops==1&&f.peer.closes==1);
+  }
+}
 static void drainPictureTests() {
   Fixture f;f.start(91);f.peer.lastWithPicture=true;f.peer.finalToken=91;
   CHECK(f.tx.beginDrain()==0);f.pump();CHECK(f.tx.r.decoded==1&&f.tx.r.rawReturns==1&&f.tx.outputCount==1);
@@ -267,6 +287,13 @@ static void negativeTests(unsigned kind) {
   CHECK(f.tx.pump()!=0&&f.tx.r.error!=0&&f.peer.dma.arena==f.peer.arena.data());
   f.tx.shutdown();CHECK(f.peer.stops==2&&f.peer.closes==1);
 }
+static void staleRetiredTests() {
+  Fixture f;f.start(73);f.peer.output(73,2);f.pump();SelfTest<Peer>::OutputFrame out;CHECK(f.tx.popOutput(out));
+  CHECK(f.tx.releaseOutput(out.index,out.token)==0&&f.tx.ledger.pending==0);
+  // A requeued RAW index does not make a late token from its old generation
+  // valid; the frame ledger, not RAW FIFO order, controls identity.
+  f.peer.output(73,2,0,out.index);CHECK(f.tx.pump()!=0&&f.tx.r.error);f.tx.shutdown();
+}
 static void timeoutTests(bool ack) {
   Fixture f;f.start(71);f.peer.output(71,1);f.pump();f.releaseAll();
   f.peer.autoDrainAck=!ack;f.peer.autoDrainLast=ack;
@@ -288,8 +315,8 @@ static void idleTests() {
   CHECK(f.tx.deadline==UINT64_MAX);f.peer.hw.clock+=90000000;f.pump();CHECK(!f.tx.r.error);f.close();
 }
 int main() {
-  ledgerTests();ownerTests();persistentTests();drainPictureTests();noOutputTests();capacityTests();
+  ledgerTests();ownerTests();persistentTests();firstPscTests();drainPictureTests();noOutputTests();capacityTests();
   for(unsigned i=0;i<16;++i)negativeTests(i);
-  timeoutTests(true);timeoutTests(false);cancelTests();idleTests();
+  staleRetiredTests();timeoutTests(true);timeoutTests(false);cancelTests();idleTests();
   std::printf("V6 persistent host: %s (real HFI parser/ledger; scripted peer, never hardware evidence)\n",failures?"FAIL":"PASS");return failures?1:0;
 }
