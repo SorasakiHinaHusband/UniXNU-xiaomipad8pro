@@ -365,8 +365,6 @@ static int bt_tty_boot_sysctl SYSCTL_HANDLER_ARGS
     lck_mtx_unlock(&bt_tty_lock);
     return error?error:SYSCTL_OUT(req,&value,sizeof(value));
 }
-SYSCTL_PROC(_kern,OID_AUTO,qbt_boot,CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_LOCKED,NULL,0,bt_tty_boot_sysctl,"I","WCN7850 kernel bring-up result");
-SYSCTL_STRING(_kern,OID_AUTO,qbt_firmware,CTLFLAG_RD|CTLFLAG_LOCKED,bt_tty.firmware,sizeof(bt_tty.firmware),"WCN7850 firmware build label");
 
 /* A sandboxed client cannot write sysctls, so reading this value requests startup and waits for the worker's result. */
 static int bt_tty_power_on_sysctl SYSCTL_HANDLER_ARGS
@@ -379,7 +377,38 @@ static int bt_tty_power_on_sysctl SYSCTL_HANDLER_ARGS
     result=bt_tty_power_on();
     return SYSCTL_OUT(req,&result,sizeof(result));
 }
-SYSCTL_PROC(_kern,OID_AUTO,qbt_power_on,CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_LOCKED,NULL,0,bt_tty_power_on_sysctl,"I","WCN7850 startup request");
+/* XNU's node macros make permanent OIDs for kernel startup. Kexts register
+ * non-permanent, versioned OIDs at run time and unregister them on stop. */
+SYSCTL_DECL(_machdep);
+static struct sysctl_oid bt_boot_oid,bt_firmware_oid,bt_power_on_oid;
+static bool bt_sysctls_registered;
+static void bt_tty_register_oid(struct sysctl_oid *oid,const char *name,int type,
+                               sysctl_handler_t handler,const char *format,const char *description)
+{
+    bzero(oid,sizeof(*oid));
+    oid->oid_parent=&sysctl__machdep_children;
+    oid->oid_number=OID_AUTO;
+    oid->oid_kind=type|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2;
+    oid->oid_name=name;
+    oid->oid_handler=handler;
+    oid->oid_fmt=format;
+    oid->oid_descr=description;
+    oid->oid_version=SYSCTL_OID_VERSION;
+    if(type==CTLTYPE_STRING) {
+        oid->oid_arg1=bt_tty.firmware;
+        oid->oid_arg2=sizeof(bt_tty.firmware);
+    }
+    sysctl_register_oid(oid);
+}
+void qbt_transport_unregister_sysctls(void)
+{
+    if(!bt_sysctls_registered)return;
+    /* Unregistration waits for active handlers; do not hold bt_tty_lock. */
+    sysctl_unregister_oid(&bt_power_on_oid);
+    sysctl_unregister_oid(&bt_firmware_oid);
+    sysctl_unregister_oid(&bt_boot_oid);
+    bt_sysctls_registered=false;
+}
 
 int qbt_transport_init(const struct qbt_transport_ops *ops)
 {
@@ -389,11 +418,11 @@ int qbt_transport_init(const struct qbt_transport_ops *ops)
     bt_ops=*ops;
     bool start=!bt_tty.node_thread;bt_tty.node_thread=true;
     lck_mtx_unlock(&bt_tty_lock);
-    /* IOKit kext OIDs are not part of kernel startup registration. The native
-     * collection linker retains these structs, not a kernel sysctl linker set. */
-    sysctl_register_oid(&sysctl__kern_qbt_boot);
-    sysctl_register_oid(&sysctl__kern_qbt_firmware);
-    sysctl_register_oid(&sysctl__kern_qbt_power_on);
+    bt_tty_register_oid(&bt_boot_oid,"piano_bt_boot",CTLTYPE_INT,bt_tty_boot_sysctl,"I","WCN7860 kernel bring-up result");
+    bt_tty_register_oid(&bt_firmware_oid,"piano_bt_firmware",CTLTYPE_STRING,sysctl_handle_string,"A","WCN7860 firmware build label");
+    bt_tty_register_oid(&bt_power_on_oid,"piano_bt_power_on",CTLTYPE_INT,bt_tty_power_on_sysctl,"I","WCN7860 startup request");
+    bt_sysctls_registered=true;
+    printf("PianoBluetooth: bt-path2: runtime sysctls registered\n");
     if(start && !bt_tty_make_node()) {
         thread_t thread=THREAD_NULL;
         if(kernel_thread_start(bt_tty_node_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);

@@ -19,7 +19,7 @@ to the chip, BT_EN on GPIO 3 of the pm8550ve "f" PMIC (SPMI SID 5, PPID 0x58a), 
 - `piano-bt=5`: the level-4 controller at fixed 3.2 Mbit/s, IBS disabled, followed by a persistent byte-stream worker and
   `/dev/cu.BLTH` (root:wheel 0600, one open). The daemon's termios/IOSSIOSPEED calls record line settings; the worker owns the
   actual hardware configuration. RX backpressure retains bytes and leaves the hardware FIFO untouched when full. BlueTool's
-  `kern.qbt_power_on` read queues an acknowledgement on the same worker; it does not repeat firmware download on an already
+  `machdep.piano_bt_power_on` read queues an acknowledgement on the same worker; it does not repeat firmware download on an already
   initialized controller. Publishes `bluetooth` with OSData transport properties and the same valid address written to HCI,
   and releases the `PianoBluetoothStack` resource for the separately gated Apple consumer. Only level 5 derives a stable locally
   administered address from the chosen chip identifier when no private ADT address was supplied. Addresses are never logged.

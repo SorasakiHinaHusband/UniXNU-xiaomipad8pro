@@ -15,6 +15,7 @@ personalities for classes of its com.apple.* libraries.
 """
 import json
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -132,6 +133,9 @@ def main():
         return
     repo = Path(sys.argv[1]).resolve()
     args = sys.argv[2:]
+    # Static SYSCTL node macros panic when a kext registers them at run time.
+    # Scan every package, including headers and calls hidden behind helpers.
+    subprocess.run([sys.executable, str(Path(__file__).with_name('check-kext-sysctls.py')), str(repo)], check=True)
     try:
         if args[:1] == ['--kc-log']:
             linked = check_kc_log(Path(args[1]).read_text(errors='replace'))

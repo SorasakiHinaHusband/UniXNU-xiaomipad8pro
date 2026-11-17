@@ -950,6 +950,7 @@ class PianoBluetooth : public IOService {
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  void stop(IOService *provider) override;
   IOReturn setPowerState(unsigned long state, IOService *device) override;
   void systemWillShutdown(IOOptionBits specifier) override;
   void quiesce(const char *why);
@@ -1009,6 +1010,12 @@ bool PianoBluetooth::start(IOService *provider)
   }
   thread_deallocate(t);
   return true;
+}
+
+void PianoBluetooth::stop(IOService *provider)
+{
+  if (fTransport) qbt_transport_unregister_sysctls();
+  IOService::stop(provider);
 }
 
 void PianoBluetooth::thread(void *self, wait_result_t)

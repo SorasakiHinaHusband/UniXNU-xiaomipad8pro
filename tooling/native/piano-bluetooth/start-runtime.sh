@@ -23,7 +23,7 @@ done
 i=0
 ready=0
 while [ "$i" -lt 4 ]; do
-    boot=$(/usr/sbin/sysctl -n kern.qbt_boot 2>/dev/null || printf unavailable)
+    boot=$(/usr/sbin/sysctl -n machdep.piano_bt_boot 2>/dev/null || printf unavailable)
     if [ "$boot" = 0 ]; then ready=1; break; fi
     i=$((i + 1))
     /bin/sleep 1
