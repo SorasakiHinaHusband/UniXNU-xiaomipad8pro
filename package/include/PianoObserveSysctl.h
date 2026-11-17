@@ -12,6 +12,9 @@ template <class Fill> int readOnly(struct sysctl_req *req, Fill fill) {
     if (!kauth_cred_issuser(kauth_cred_get())) return EPERM;
     if (req->newptr) return EPERM;
     constexpr size_t capacity = 65536;
+    // sysctl(8) first asks for size, then allocates. Counters/text may grow between calls;
+    // reserve the bound without touching hardware on the size-only query.
+    if (!req->oldptr) return SYSCTL_OUT(req, nullptr, capacity);
     char *buffer = static_cast<char *>(IOMallocZeroData(capacity));
     if (!buffer) return ENOMEM;
     Text text = {buffer, capacity};
