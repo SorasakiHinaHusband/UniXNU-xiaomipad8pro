@@ -173,6 +173,14 @@ struct Frame {
   uint64_t token=0,submitUs=0;CMTime pts=kCMTimeInvalid,duration=kCMTimeInvalid;std::string gold;
   OSStatus submissionStatus=0;unsigned calls=0,images=0,errors=0;bool noOutput=false,reject=false,submitted=false;
 };
+bool rejectedDisposed(const Frame &f) { return f.images==0 && (f.submissionStatus!=0 || f.errors!=0); }
+void rejectionContractTest() {
+  Frame f;f.reject=true;
+  check("async-rejection-still-pending",!rejectedDisposed(f));
+  f.errors=1;check("async-rejection-callback-disposes",rejectedDisposed(f));
+  f.images=1;check("rejected-image-never-accepted",!rejectedDisposed(f));
+  f.images=f.errors=0;f.submissionStatus=-12909;check("sync-rejection-status-disposes",rejectedDisposed(f));
+}
 struct Held { CVPixelBufferRef image=nullptr;std::string sha; };
 struct Context {
   pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
@@ -257,7 +265,7 @@ bool drain(VTDecompressionSessionRef session,Context &ctx,const char *stage) {
 }
 void close(VTDecompressionSessionRef &session,Context &ctx) {
   if(!session)return;VTDecompressionSessionInvalidate(session);pthread_mutex_lock(&ctx.lock);ctx.invalidated=true;const unsigned calls=ctx.callbacks;releaseHeld(ctx);pthread_mutex_unlock(&ctx.lock);
-  CFRelease(session);session=nullptr;usleep(20000);check("no-callback-after-invalidate",ctx.callbacks==calls);
+  CFRelease(session);session=nullptr;usleep(20000);pthread_mutex_lock(&ctx.lock);const bool unchanged=ctx.callbacks==calls;pthread_mutex_unlock(&ctx.lock);check("no-callback-after-invalidate",unchanged);
 }
 CMVideoFormatDescriptionRef metadata(CMVideoFormatDescriptionRef format) {
   CFMutableDictionaryRef ext=CFDictionaryCreateMutableCopy(kCFAllocatorDefault,0,CMFormatDescriptionGetExtensions(format));
@@ -305,7 +313,7 @@ void single(CFDictionaryRef spec) {
   sb=make(format,large);if(sb){submit(session,sb,ctx,1,1,"",false,true);CFRelease(sb);drain(session,ctx,"oversize-empty-finish");}
   sb=make(format,bytes);if(sb){submit(session,sb,ctx,2,0,"",false,true);CFRelease(sb);drain(session,ctx,"flags-zero-empty-finish");}
   sb=make(format,bytes);if(sb){submit(session,sb,ctx,3,1,kGolden);CFRelease(sb);drain(session,ctx,"single-golden-drain");}
-  for(unsigned i=0;i<3;++i)check("reject-has-error-disposition",ctx.frames[i].images==0&&(ctx.frames[i].submissionStatus||ctx.frames[i].errors));
+  for(unsigned i=0;i<3;++i)check("reject-has-error-disposition",rejectedDisposed(ctx.frames[i]));
   check("original-one-golden-callback",ctx.frames[3].calls==1&&ctx.frames[3].images==1&&ctx.frames[3].errors==0&&ctx.images==1);
   close(session,ctx);CFRelease(format);
 }
@@ -319,6 +327,7 @@ void cancel(Clip &clip,Clip &other,CFDictionaryRef spec) {
   stream(clip,other,spec,"recreate-at-idr",21,9,-1,30,60,false);
 }
 int run(NSString *folder,bool qualify) {
+  rejectionContractTest();
   NSDictionary *m=manifest(folder);if(!m)return 1;Clip ip,ibp;if(!load(folder,m,"ip",ip)||!load(folder,m,"ibp",ibp))return 1;
   // Qualification also checks its local files/serializer before opening VT.
   if(!audit(ip)||!audit(ibp))return 1;
