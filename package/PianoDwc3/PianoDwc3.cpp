@@ -1195,6 +1195,7 @@ pianousbhost::IdentityPlan gIdentity;
 pianousbhost::IdentityTxn gIdentityTx;
 IOBufferMemoryDescriptor *gIdentityTable;
 uint64_t gIdentityPa;
+bool gIdentityQuiesced;
 volatile uint32_t gDomainConfigured, gDomainNet;
 void identityAudit(uint32_t off, uint32_t want, uint32_t got, uint32_t mask)
 {
@@ -1223,6 +1224,7 @@ bool identitySetup()
   unsigned waited = 0;
   while (!(rd32(gDwc.va + dwc3::DSTS) & dwc3::DSTS_DEVCTRLHLT) && waited++ < 1000) IODelay(100);
   if (!(rd32(gDwc.va + dwc3::DSTS) & dwc3::DSTS_DEVCTRLHLT)) { note("usb-a2b domain: device halt failed; no SMMU writes"); return fail(); }
+  gIdentityQuiesced = true;
   gIdentity = planSmmuIdentity(pianohw::kUsbStream, pianohw::kSmmuBytes, smmuRead);
   note("usb-a2b domain: owner PianoDwc3 idr %08x/%08x/%08x scr0 %08x slot %u bank %u ASID %u old %08x/%08x",
        gIdentity.idr0, gIdentity.idr1, gIdentity.idr2, gIdentity.scr0, gIdentity.slot, gIdentity.bank, gIdentity.asid, gIdentity.smr, gIdentity.s2cr);
@@ -1254,7 +1256,11 @@ bool identitySetup()
   const uint32_t fsr = smmuRead(gIdentity.cb() + kCbFsr);
   note("usb-a2b domain READY owner PianoDwc3 table %#llx ASID %u PASize 36 sync-us %llu fsr %08x fault_bits %08x",
        gIdentityPa, gIdentity.asid, (nowNs() - start) / 1000, fsr, fsr & kFsrFaults);
-  return identityVerify();
+  if (identityVerify()) return true;
+  const uint64_t end = nowNs() + 100000000ull;
+  const bool safe = unwindSmmuIdentity(gIdentity, smmuRead, wr, [end] { return nowNs() >= end; }, gIdentityTx);
+  note("usb-a2b domain post-commit validation failed unwind %u", safe);
+  return fail();
 }
 
 bool smmuSetup()
@@ -2192,6 +2198,12 @@ void usbThread(void *, wait_result_t)
     const bool moved = logPump();
     gGadget.pump();
     gGadget.tick();
+    const uint32_t configured = gGadget.configured() ? 1u : 0u;
+    const uint32_t net = gGadget.netLinkUp() ? 1u : 0u;
+    const uint32_t old = __atomic_exchange_n(&gDomainConfigured, configured, __ATOMIC_ACQ_REL);
+    const uint32_t oldNet = __atomic_exchange_n(&gDomainNet, net, __ATOMIC_ACQ_REL);
+    if (gArgs.smmu == 2 && (configured != old || net != oldNet))
+      note("usb-a2b gadget CDC configured %u network %u reclaim %u domain-valid %u", configured, net, gHandoffReclaims, identityVerify());
     const uint64_t ns = nowNs();
     if (ns - lastReport > 1000000000ull) {   // DSTS once a second while it changes (link state before the first reset)
       lastReport = ns;
@@ -2216,12 +2228,6 @@ void usbThread(void *, wait_result_t)
     if (gIrqMode && !gIrqLine.live()) irqOff("storm: the line stayed up with nothing to mask; disabled at the GIC");
     UsbActivity a{};
     a.configured = gGadget.configured();
-    const uint32_t configured = a.configured ? 1u : 0u;
-    const uint32_t net = gGadget.netLinkUp() ? 1u : 0u;
-    const uint32_t old = __atomic_exchange_n(&gDomainConfigured, configured, __ATOMIC_ACQ_REL);
-    const uint32_t oldNet = __atomic_exchange_n(&gDomainNet, net, __ATOMIC_ACQ_REL);
-    if (gArgs.smmu == 2 && (configured != old || net != oldNet))
-      note("usb-a2b gadget CDC configured %u network %u reclaim %u domain-valid %u", configured, net, gHandoffReclaims, identityVerify());
     a.netUp = gGadget.netLinkUp();
     a.ep0Active = gGadget.ep0Active();
     for (unsigned p = 0; p < gGadget.ports(); ++p)
@@ -2607,7 +2613,19 @@ bool PianoDwc3::start(IOService *provider)
   if (gArgs.smmu) {
     IOSleep(20);
     stage(6, gArgs.smmu == 2 ? "SMMU: shared SID 0x40 identity domain" : "SMMU: stream 0x40 bypass");
-    if (!(gArgs.smmu == 2 ? identitySetup() : smmuSetup())) { stage(-6, "SMMU: stream 0x40 bypass (piano-usb-smmu=0 skips it)"); return true; }
+    if (gArgs.smmu == 2) {
+      if (!identitySetup()) {
+        // Only this owner may use the known gadget bypass as a failed-prepare
+        // fallback, with DMA halted and the attempted S1 transaction unwound.
+        // Borrowers see failed/held forever and cannot enter host mode.
+        if (!gIdentityQuiesced || gIdentityTx.held || !smmuSetup()) {
+          stage(-6, "shared domain failed and gadget fallback unconfirmed; held for boot guard");
+          return true;
+        }
+        gArgs.smmu = 1;
+        note("usb-a2b domain unavailable: verified gadget bypass restored; host loan disabled");
+      }
+    } else if (!smmuSetup()) { stage(-6, "SMMU: stream 0x40 bypass (piano-usb-smmu=0 skips it)"); return true; }
   }
   if (!ringAlloc(gTx[0], 256 * 1024) || !ringAlloc(gTx[1], 64 * 1024) || !ringAlloc(gRx1, 64 * 1024)) { stage(-7, "ring buffers"); return true; }
   thread_t thread = nullptr;
