@@ -209,8 +209,8 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::buffers(uint64_t size, u
     return kIOReturnSuccess;
 }
 
-// Selector 3: a message of `length` bytes in the send buffer, with the IDs of the IOSurfaces that go with it. Recorded; the
-// the private snapshot is dispatched to the native bounded frontend.
+// Selector3 snapshots a bounded message and its IOSurface IDs, then dispatches
+// to the native frontend without waiting for any guest reply.
 IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length, const uint64_t *surfaces, unsigned count,
                                                                uint64_t *status) {
     if (!send || length < HeaderBytes || length > capacity || length > MaxSendBytes) {

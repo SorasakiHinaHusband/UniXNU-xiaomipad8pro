@@ -109,7 +109,7 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
 bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
-  if(!f.memory || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v)){failure(s,60,kBadData);return false;}
+  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v)){failure(s,60,kBadData);return false;}
   IOMemoryDescriptor *mem=IOMemoryDescriptor::withAddressRange(v.base,v.size,kIODirectionInOut,s->client->task);
   const IOReturn prepared=mem?mem->prepare():kIOReturnNoMemory;
   if(prepared){OSSafeReleaseNULL(mem);failure(s,61,int(prepared));return false;}
@@ -157,7 +157,8 @@ void completeFrame(Session *s,int error,const uint8_t *uuid=nullptr,bool wait=tr
   IOLog("PianoVideoVT V5a: Demt token %llu status %d transport %u completed-once 1\n",uint64_t(s->token),error,unsigned(delivered));
 }
 void frame(Session *s) {
-  Frame f;const int rc=piano_video_native_decode(s->native,s->input,s->inputBytes,uint64_t(s->token),&f);
+  Frame f;int rc=piano_video_native_decode(s->native,s->input,s->inputBytes,uint64_t(s->token),&f);
+  if(!rc && f.token!=uint64_t(s->token))rc=kBadData;
   IOFree(s->input,s->inputBytes);s->input=nullptr;s->inputBytes=0;
   IOLockLock(s->lock);bool cancelled=s->stopping;IOLockUnlock(s->lock);
   if(rc || cancelled){if(rc)failure(s,70,rc);completeFrame(s,rc?kDecodeError:kBadState,nullptr,!cancelled);}
