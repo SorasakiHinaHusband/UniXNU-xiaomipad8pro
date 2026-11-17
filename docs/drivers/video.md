@@ -792,7 +792,8 @@ submission ([results](../results-2026-11-18.md)). Continuous decoding remains un
 V6f adds passive first-timeout evidence to the native path. Before cleanup at the first `-20`, it samples the existing
 readable domains' core, clock, power and interrupt registers, queue indices and pending heads. It retains the last 40 TX
 packets and 16 RX packets (header fields and up to 16 payload words), the current session's PSC/ownership/ledger, and the
-previous session's final state. Sampling finishes before formatting; timestamps delimit the sequential sample. Registers
+previous session's final state. Codec idle words additionally require the live `CORE_POWER_STATUS` power bit, since firmware
+can collapse that domain while the host's provisioned-state flags remain set. Sampling finishes before formatting; timestamps delimit the sequential sample. Registers
 with interrupt side effects are excluded. The snapshot changes no waits, timeouts, HFI bytes or cleanup decisions.
 
 `PianoVideo: V6f snapshot begin/end` bounds the console/IOLog record. `piano-video-first-error` on the PianoVideo IORegistry

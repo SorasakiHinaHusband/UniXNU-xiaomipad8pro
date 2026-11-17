@@ -483,7 +483,8 @@ static void passiveHardwareTests() {
     } power;
     struct Reads {
       unsigned count=0;
-      uint32_t rd(uint64_t pa){CHECK(pa!=kIris+kCpuCsA2hSoftIntClr&&pa!=kIris+kCpuIcSoftInt);++count;return uint32_t(pa);}
+      bool powered=true;
+      uint32_t rd(uint64_t pa){CHECK(pa!=kIris+kCpuCsA2hSoftIntClr&&pa!=kIris+kCpuIcSoftInt);++count;return pa==kIris+kCorePowerStatus?(powered?kCorePowered:0):uint32_t(pa);}
     } ops;
     hfi::Mem mem;
   } m;
@@ -497,6 +498,9 @@ static void passiveHardwareTests() {
   CHECK(s.cc&&s.codec&&s.controller&&s.queues&&s.headWords[0]==5&&!s.headWords[1]);
   CHECK(s.head[0][0]==100&&s.head[0][4]==104&&s.core[5]==kIris+kWrapperIntrStatus);
   s.print(m.hw);CHECK(m.hw.log.find("V6f interrupt status ")!=std::string::npos);
+  m.ops.powered=false;const auto reads=m.ops.count;diagnostic::Hardware collapsed;collapsed.capture(m);
+  CHECK(!collapsed.codec&&collapsed.controller&&m.ops.count==reads+27);
+  collapsed.print(m.hw);CHECK(m.hw.log.find("V6f codec idle skipped not-powered-or-readable")!=std::string::npos);
   // Use the same formatter as the native callback for spec-pattern rehearsal.
   Observation previous,current;previous.sid=0x56360001;previous.r.closed=true;previous.r.decoded=1;
   current.sid=0x56360002;current.r.error=kErrHfiTimeout;current.r.failedStage=Output;

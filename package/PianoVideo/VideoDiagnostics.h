@@ -46,7 +46,7 @@ struct Hardware {
   // Never touch A2HSOFTINTCLR or CPU_IC_SOFTINT (both have side effects).
   template<class Owner> void capture(Owner &o) {
     startUs=o.hw.nowUs(); cc=o.power.ccReadable();
-    controller=o.power.controllerReadable();codec=o.power.codecReadable();queues=o.mem.uc!=nullptr;
+    controller=o.power.controllerReadable();queues=o.mem.uc!=nullptr;
     if(cc) {
       const uint32_t g[]={kGccVideoAhb,kGccVideoAxi0,kGccVideoAxi1};
       const uint32_t c[]={kCcPll0,kCcMvs0Rcg,kCcMvs0Rcg+4,kCcMvs0cGdsc,kCcMvs0cGdsc+4,kCcMvs0Gdsc,kCcMvs0Gdsc+4,
@@ -59,6 +59,9 @@ struct Hardware {
         kWrapperIntrMask,kH2xSoftIntEn,kCpuNocLpiCtl,kCpuNocLpiStatus,kAonVideoCtlNocLpiCtl,kAonVideoCtlNocLpiStatus};
       for(unsigned i=0;i<12;++i)core[i]=o.ops.rd(kIris+c[i]);
     }
+    // Firmware may collapse MVS0 while the host's provisioned-state flags stay
+    // set. Sample its live power bit before touching any codec-domain word.
+    codec=controller&&o.power.codecReadable()&&(core[2]&kCorePowered);
     if(codec)for(unsigned i=0;i<4;++i)idle[i]=o.ops.rd(kIris+kVcodecIdleStatus+4*i);
     if(queues) {
       o.hw.barrier();
@@ -88,6 +91,7 @@ struct Hardware {
         core[5],core[6],core[7],core[8],core[9],core[10],core[11]);
     }
     if(codec)l.note("V6f codec idle %08x/%08x/%08x/%08x",idle[0],idle[1],idle[2],idle[3]);
+    else l.note("V6f codec idle skipped not-powered-or-readable");
     if(queues)for(unsigned q=0;q<3;++q) {
       l.note("V6f queue q%u read %u write %u drop %u rxreq %u txreq %u size %u",q,queue[q][0],queue[q][1],queue[q][2],queue[q][3],queue[q][4],queue[q][5]);
       if(q<2) {
