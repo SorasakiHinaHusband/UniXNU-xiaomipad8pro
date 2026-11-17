@@ -3,8 +3,8 @@
 piano's video core for native macOS 27: the SM8750 Iris (VPU 3.5) that decodes H.264, HEVC and VP9 and encodes H.264 and HEVC in
 hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 INIT/version, ten collapse/resume cycles and legal teardown are tablet-confirmed** in `vid-v3b`.
 V4 is tablet-confirmed in `vid-v4a`: one real 320×240 AVC AU produces the exact active NV12 golden hash and safe teardown.
-V5b creates a hardware VT session and passes format queries on the tablet. V5c repairs rejected-frame completion and empty
-finish semantics; the bounded bridge's IOSurface-backed callback is still pending tablet qualification.
+V5c is tablet-confirmed: one actual caller AU traverses VT and Iris into an IOSurface-backed golden callback.
+V6 adds bounded persistent AVC streaming; continuous hardware results remain pending.
 `piano-video=6 piano-video-vt=1` publishes the restricted AVC qualification endpoint. Other levels do not publish a decoder inventory. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core
@@ -33,11 +33,13 @@ finish semantics; the bounded bridge's IOSurface-backed callback is still pendin
   DRAIN/LAST, both STOPs and CLOSE. Five-second transaction, bounded cleanup; unsafe quiesce/detach retains every DMA owner.
   It always tears down, uses no VT consumer and does not repeat the ten V3 resume cycles. No playback support is claimed.
 
-- `piano-video=6 piano-video-vt=1` (V5a): reserve one exclusive demand session, copy the actual caller's one Baseline AVC AU
-  through the proven V4 transaction, retain its descriptor/WC view, and copy active NV12 rows to the guest pool's IOSurface.
-  Only exact proven SPS/PPS, 320×240, 8-bit, progressive, no crop, one IDR are accepted. HEVC, tiles, changed format, P/B,
-  malformed/oversized input, multiple AUs and simultaneous sessions are rejected. Drain is terminal; invalidate joins the
-  worker before STOP/CLOSE/PAS/routes/TLB/free. No autonomous self-test runs in this mode.
+- `piano-video=6 piano-video-vt=1` (V6): one exclusive demand session for bounded 320×240 progressive 8-bit AVC
+  Baseline/Main IP/IBP. Parse actual avcC/SPS/PPS and complete one-picture samples, preserve opaque tokens, use two owned DMA
+  input slots with eight frame credits, and continuously pump HFI while guest replies are pending. RAW slots recycle after
+  checked active-row copies into scoped IOSurface clients; split DPB stays firmware-owned. Finish is a nonterminal
+  ACK+LAST barrier; later input resumes both ports. Invalidation cancels the old epoch and joins before bounded
+  STOP/CLOSE/PAS/routes/TLB teardown. Unsafe quiesce retains DMA and poisons future opens.
+  Synchronous flags0, in-place format changes, HEVC, tiles and default app playback remain unsupported.
 
 Levels 2-6 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
 every wait is bounded, V3 cleanup reports unsafe releases and keeps their DMA, and nothing is written below `piano-video=2`. Design, decisions, the
@@ -75,3 +77,11 @@ V5a tool: `bash tooling/native/build-video-v5a.sh` builds an ordinary signed arm
 checks fixture and active-row hashing without querying VT; `--qualify` requires hardware and paravirtual decoding and
 checks dcan, exactly one IOSurface-backed 420v golden callback, unsupported input, terminal finish and safe invalidate.
 These host tests and implementation claims are not tablet acceptance or general AVC/HEVC playback support.
+
+V6 qualification: `bash tooling/native/build-video-v6.sh` compiles/signs the tool and runs the actual Apple CoreMedia/PV
+serialization of all 120 own-encoded IP/IBP samples through the production parser. Target use is
+`video-v6 --qualify FIXTURE_DIR`, where the fixture directory is `tests/fixtures/v6` in this package. It requires hardware
+and PV, compares each callback token/OutputPTS/active NV12 hash to independent software truth, checks mid-GOP drain/resume,
+no-output reference decoding, cancel/recreate and retained surfaces. Seven producer credits leave one ACK-overlap credit.
+`tests/stream_host.cpp` exercises the real HFI parser, ownership ledger, guest deadlines and failure transitions with a
+scripted peer. Host results establish contracts; only tablet results can qualify continuous decode or performance.

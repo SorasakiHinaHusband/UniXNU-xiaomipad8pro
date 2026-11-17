@@ -2,14 +2,13 @@
 
 Status, 2026-11-17: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
 our real 320×240 AVC AU and matched the exact active NV12 golden hash, with safe DMA teardown (§13).
-V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14). V5b creates a hardware session
-and passes format queries on the tablet. A rejected sample lacks its completion; V5c repairs that lifecycle, pending tablet acceptance.
+V5c is tablet-confirmed: real caller input traverses VT and Iris into an IOSurface-backed callback with the original golden
+hash and safe teardown. V6 implements bounded persistent Baseline/Main AVC streaming; its continuous hardware qualification is pending (§15).
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
 
-Natively every video is decoded by the CPU today (VideoToolbox's software decoders: the machine has none of Apple's decoder
-hardware). The SoC's video core decodes H.264, HEVC and VP9 at its lowest clock for every common stream (§4.5), and encodes H.264
+Normal apps still use VideoToolbox software decoding; the native Iris bridge is an opt-in qualification endpoint. The SoC's video core decodes H.264, HEVC and VP9 at its lowest clock for every common stream (§4.5), and encodes H.264
 and HEVC. Gate: battery life (owner priority) and daily use (QuickTime, Safari, wallpapers, thumbnails);
 not a login gate. Ubuntu uses it: H.264/HEVC/VP9 decode and H.264/H.265 encode verified at 1080p and 4K, AV1 in software
 (`xiaomipad-8pro-mainline/docs/STATUS.md`, `README.en.md`; the core lists AV1, but a third-party piano report has AV1 decode failing
@@ -752,3 +751,29 @@ exactly-once cancellation, and failed-quiesce retention. `tooling/native/build-v
 its fresh hardware+PV-required session must return one IOSurface-backed420v callback with the §13 golden, reject unsupported
 inputs, and finish/invalidate safely. Selection, input/frame correlation and native completions are required alongside the
 hardware property. This endpoint is opt-in RAM qualification, not general AVC/HEVC, QuickTime, Safari or wallpaper rollout.
+
+## 15. Bounded persistent AVC qualification (V6; hardware result pending)
+
+The one-AU bridge is now a persistent exclusive session. The supported input is one complete picture per sample in a real
+avcC configuration: 320×240, 8-bit 4:2:0 progressive, no crop, Baseline/Main, POC0/2 and bounded references/reordering.
+Input remains in demux/DTS order. Firmware timestamps carry opaque frame identities, independent of PTS; callbacks recover
+Apple's original source reference and OutputPTS. Decode-order output is explicitly enabled. No default app rollout is implied.
+
+Eight frame credits and at most 8 MiB of software AU storage feed two independently owned 7,077,888-byte DMA inputs.
+The guarded 141-entry aperture is 56,623,104 bytes. EBD releases an input slot; only output/error/no-output/cancel retires a
+frame. First PSC supplies actual N for split DPB and COMV. RAW FBD holds a separate loan until the checked IOSurface copy
+finishes, then FTB recycles that slot. Each output opens and closes its own owner-task IOSurfaceRoot client and mapping.
+A guest Dbuf/Demt wait never stops HFI pumping. Unexpected internal returns, changed SPS/second PSC, unknown tokens,
+READONLY reuse, unsupported wire flags or unsafe quiesce fail closed.
+
+Finish submits one drain barrier after earlier queued AUs, requires ACK plus LAST and all prior dispositions, and remains
+nonterminal. The next input resumes BITSTREAM and RAW with DRAIN cause. Seek qualification invalidates and rebuilds from an
+IDR with a fresh native SID; no old output/reply may enter the next epoch. The V3/V4 PAS/routes/TLB retention contract is kept.
+
+The signed `video-v6` tool and owned fixtures live under `tooling/native/` and `package/PianoVideo/tests/fixtures/v6`.
+Its host self-test runs actual Apple serialization of all samples through the production contract parser. Its single target
+qualification run includes original golden/rejection regressions, 60-frame Main IBP with flags1 and flags9, the IP control,
+closed-GOP drain/resume, DoNotOutput on a reference, retained-surface rehash, cancel/recreate and clean close. Every callback
+is compared by token and OutputPTS with independent software hashes; callback order is not assumed to be display order.
+Performance is measured separately and is not called real-time playback merely because all pixels match. In-place DRC,
+synchronous flags0, HEVC, new geometries, protected content and QuickTime/Safari integration need separate qualification.
