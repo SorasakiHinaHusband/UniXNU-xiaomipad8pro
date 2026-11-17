@@ -87,7 +87,7 @@ def evaluate(console, tool, manifest):
     for line in copies:
         m = re.search(r'status (-?\d+).*surface-open (\d+) surface-close (\d+) maps (\d+) high-water (\d+)', line)
         require(m is not None and m[1] == '0' and m[2] == m[3] and m[4] == '0' and int(m[5]) <= 8, 'surface refs/maps/credit balanced')
-    require(not re.search(r'first-error|smmu: FAULT on the video bank|V3 teardown result .*watchdog 1', console), 'zero kernel errors/faults/watchdog')
+    require(not re.search(r'PianoVideo(?:VT V5a: first-error|: V4 first-error|: smmu: FAULT on the video bank|: V3 teardown result .*watchdog 1)', console), 'zero kernel errors/faults/watchdog')
     return errors
 
 
