@@ -820,12 +820,12 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
   const bool first = code < 32 && !(fEventCodesLogged & (1u << code));
   if (code < 32) fEventCodesLogged |= 1u << code;
   IOLockUnlock(fLock);
-  if (code == kEvLinkChanged && payload && length == sizeof(pianowifi::a80211::LinkEvent)) {
+  if (code == pianowifi::a80211::kEvLinkChanged && payload && length == sizeof(pianowifi::a80211::LinkEvent)) {
     const auto &link = *static_cast<const pianowifi::a80211::LinkEvent *>(payload);
     note80211("PianoWifiPowerLifecycleV1 event4 down %u voluntary %u reason %u bytes %u -> %d",
               unsigned(link.down), link.involuntary ? 0u : 1u, unsigned(link.reason), unsigned(length), e);
   }
-  if (code == kEvPowerChanged) note80211("PianoWifiPowerLifecycleV1 event1 power changed bytes %u -> %d", unsigned(length), e);
+  if (code == pianowifi::a80211::kEvPowerChanged) note80211("PianoWifiPowerLifecycleV1 event1 power changed bytes %u -> %d", unsigned(length), e);
   if (first || e) note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
 }
 

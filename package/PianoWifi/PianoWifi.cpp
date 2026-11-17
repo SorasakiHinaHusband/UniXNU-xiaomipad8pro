@@ -3379,8 +3379,11 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
     note("menu join profile refused: %s (nothing of it kept)", problem);
     return EINVAL;
   }
-  if (!gUserControl.join()) return EPWROFF;
+  // Release an idle worker only while holding the profile lock: its
+  // profileBeforeJoin/profileToSta must observe this generation, never the
+  // retained old profile in the gap between enabling joins and publishing it.
   IOLockLock(gProfileLock);
+  if (!gUserControl.join()) { IOLockUnlock(gProfileLock); return EPWROFF; }
   gProfile = *incoming;
   gProfileSet = true;
   gProfileFromFile = false;
