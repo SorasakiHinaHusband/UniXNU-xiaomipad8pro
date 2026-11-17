@@ -5,6 +5,7 @@
 #include "PianoVideoVTWire.h"
 #include "PianoVideoNative.h"
 #include "../VideoFixture.h"
+#include "PianoVideoAVC.h"
 namespace pianovideo { namespace vtcontract {
 constexpr uint32_t kMaxAuBytes = 1u << 20;
 // Bound snapshots independently of the native AU limit. Rejected frames still
@@ -91,17 +92,31 @@ inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t c
   const uint32_t bytes = n + kParameterBytes;
   return normalizedAu(out, bytes) ? bytes : 0;
 }
+inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t cap, const avc::Config &cfg, bool prepend) {
+  return avc::normalize(p,n,out,cap,cfg,prepend);
+}
 struct InputReport {
   int64_t token = 0;
-  bool hasToken = false;
+  bool hasToken = false, transportReject = false;
+  uint32_t flags = 0;
+  avc::Picture picture;
   uint32_t parameterType = 0, bytes = 0;
   const uint8_t *data = nullptr;
   const char *decision = "frame-parameter";
 };
-inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r) {
+inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r, const avc::Config *cfg = nullptr) {
   r = InputReport{};
   if (!message(m,n) || !(r.hasToken = vtwire::paramS64(m,n,vtwire::cc(",frm"),r.token))) return false;
   vtwire::Param p; vtwire::Atom sbuf,sdat;
+  if (cfg) {
+    r.decision = "decode-flags";
+    if (!vtwire::param(m,n,vtwire::cc(",dfl"),p) || p.type != vtwire::cc("=u32") || p.size != 4) { r.transportReject = true; return false; }
+    r.flags = vtwire::be32(p.value);
+    // A synchronous callback cannot wait for a guest reply through selector3.
+    if (!(r.flags & 1) || (r.flags & ~15u)) { r.transportReject = true; return false; }
+    r.decision = "unsupported-frame-options";
+    if (vtwire::param(m,n,vtwire::cc(",fop"),p)) { r.transportReject = true; return false; }
+  }
   r.decision = "sample-parameter";
   if (!vtwire::param(m,n,vtwire::cc(",sbf"),p)) return false;
   r.parameterType = p.type;
@@ -111,7 +126,22 @@ inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r) {
   r.decision = "sdat-layout";
   if (!unique(sbuf.body,sbuf.size,vtwire::cc("sdat"),sdat)) return false;
   r.data = sdat.body; r.bytes = sdat.size; r.decision = "sample-not-qualified";
-  if (!sample(r.data,r.bytes)) return false;
+  if (cfg) {
+    r.decision = "sample-metadata";
+    vtwire::Atom number, sizes, timing, outputPts, protectedAtom;
+    auto le32 = [](const uint8_t *q) { uint32_t v; memcpy(&v,q,4); return v; };
+    // Payloads here are memory blocks in the target serializer, unlike BE atoms
+    // and PV scalar parameters (decoded 27.3 AppendNumSamples/SizeArray).
+    if (!unique(sbuf.body,sbuf.size,vtwire::cc("nsmp"),number) || number.size != 4 || le32(number.body) != 1 ||
+        !unique(sbuf.body,sbuf.size,vtwire::cc("ssiz"),sizes) || sizes.size != 4 || le32(sizes.body) != r.bytes ||
+        !unique(sbuf.body,sbuf.size,vtwire::cc("stia"),timing) || timing.size != 72) return false;
+    if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) &&
+        (!unique(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) || outputPts.size != 24)) return false;
+    if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("crpt"),protectedAtom) ||
+        vtwire::find(sbuf.body,sbuf.size,vtwire::cc("kdcr"),protectedAtom)) return false;
+    r.decision = "sample-not-qualified";
+    if (!avc::accessUnit(r.data,r.bytes,*cfg,&r.picture)) return false;
+  } else if (!sample(r.data,r.bytes)) return false;
   r.decision = "accept"; return true;
 }
 struct FormatReport {
@@ -136,7 +166,7 @@ inline bool imageExtensions(const uint8_t *p, uint32_t n, uint32_t &atomBytes, b
   atomBytes = n;
   return true;
 }
-inline bool format(const vtwire::ImageDescription &d, FormatReport *report = nullptr) {
+inline bool format(const vtwire::ImageDescription &d, FormatReport *report = nullptr, avc::Config *config = nullptr) {
   using namespace vtwire;
   FormatReport local;
   FormatReport &r = report ? *report : local;
@@ -153,19 +183,17 @@ inline bool format(const vtwire::ImageDescription &d, FormatReport *report = nul
   if (!unique(d.extensions, r.atomBytes, cc("avcC"), avc)) return false;
   r.avcBytes = avc.size;
   r.decision = "avcC-configuration";
-  if (avc.size != 38) return false;
-  const uint8_t *p = avc.body;
-  // avcC version, Baseline compatibility/level, NAL length4, one SPS22 and PPS5.
-  if (p[0] != 1 || p[1] != 66 || p[2] != 0xc0 || p[3] != 13 || p[4] != 0xff || p[5] != 0xe1 || be16(p+6) != 22 ||
-      memcmp(p+8, session::kAccessUnit+4, 22) || p[30] != 1 || be16(p+31) != 5 || memcmp(p+33, session::kAccessUnit+30, 5)) return false;
+  avc::Config parsed;
+  if (!avc::config(avc.body,avc.size,parsed)) return false;
   Atom protectedAtom;
   r.decision = "protected-or-hevc";
   if (find(d.extensions, r.atomBytes, cc("sinf"), protectedAtom) || find(d.extensions, r.atomBytes, cc("hvcC"), protectedAtom)) return false;
+  if (config) *config = parsed;
   r.decision = "accept";
   return true;
 }
 // Shared by dsta/dcan and by the real CoreMedia serializer host test.
-inline bool formatRequest(const uint8_t *m, uint32_t n, FormatReport &r) {
+inline bool formatRequest(const uint8_t *m, uint32_t n, FormatReport &r, avc::Config *config = nullptr) {
   using namespace vtwire;
   r = FormatReport{};
   r.decision = "message-layout";
@@ -183,7 +211,7 @@ inline bool formatRequest(const uint8_t *m, uint32_t n, FormatReport &r) {
   r.codec = d.codec; r.width = d.width; r.height = d.height; r.extensionBytes = d.extensionsSize;
   r.decision = "declared-size";
   if (r.declared != p.size) return false;
-  return format(d, &r);
+  return format(d, &r, config);
 }
 inline bool extent(uint64_t offset, uint64_t stride, uint64_t rows, uint64_t width, uint64_t size) {
   return rows && width && stride >= width && offset <= size && width <= size-offset && rows-1 <= (size-offset-width)/stride;
