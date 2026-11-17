@@ -54,13 +54,15 @@ extern "C" {
 #define FS19XX_PLL2_6M144 0x0540u
 #define FS19XX_PLL3_6M144 0x0018u
 
-/* Gain: VOLCTRL bits 15:8, 0.375 dB per step, 255 = 0 dB. No speaker protection runs, so the cap is a compile-time constant:
- * 192 = -23.6 dB, Ubuntu's UCM speaker gain; never above 215 (-15 dB, Ubuntu's first kernel cap). Unattended tests use 160 (-35.6 dB). */
-#define FS19XX_GAIN_CAP 192u
+/* Gain: VOLCTRL bits 15:8, 0.375 dB per step, 255 = 0 dB. Third-party upstream xiaomipad-8pro-mainline a43f79c's UCM
+ * and its linux-sm8750-piano kernel pin 1c21cb9895d69c1c5e83ceae68952fedf522644a use 231 (-9 dB), encoded 0xe7c0
+ * for family 0x29. This is a policy limit, not a proven protection threshold: no VI speaker protection runs here.
+ * Unattended diagnostic tests retain 160 (-35.6 dB). Never permit a request above the pinned reference's 231. */
+#define FS19XX_GAIN_CAP 231u
 #define FS19XX_GAIN_TEST 160u
-#define FS19XX_GAIN_HARD_LIMIT 215u
-#if FS19XX_GAIN_CAP > FS19XX_GAIN_HARD_LIMIT
-#error "FS19XX_GAIN_CAP above 215: no speaker protection runs on piano"
+#define FS19XX_GAIN_HARD_LIMIT 231u
+#if FS19XX_GAIN_HARD_LIMIT > 231u || FS19XX_GAIN_CAP > FS19XX_GAIN_HARD_LIMIT
+#error "FS19XX gain above 231: no speaker protection runs on piano"
 #endif
 unsigned fs19xx_gain_clamp(unsigned requested);
 /* The gain in tenths of a dB (192: -236). */

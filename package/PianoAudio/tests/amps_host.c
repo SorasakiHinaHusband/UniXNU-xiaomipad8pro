@@ -19,6 +19,7 @@ static struct {
     unsigned events, dones;
     uint64_t now_us;
     int fail_after;   // transfers after this many fail (-1 none)
+    int fail_once;
     unsigned transfers;
 } m;
 
@@ -44,7 +45,10 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
     (void)ctx;
     const int s = slot_of(address);
     if (s < 0 || !m.amp[s].present || !m.amp[s].released) return -1;
-    if (m.fail_after >= 0 && m.transfers++ >= (unsigned)m.fail_after) return -1;
+    if (m.fail_after >= 0 && m.transfers++ >= (unsigned)m.fail_after) {
+        if (m.fail_once) m.fail_after = -1;
+        return -1;
+    }
     struct Amp *a = &m.amp[s];
     if (out_len == 3 && !in_len) {
         const uint16_t v = (uint16_t)(out[1] << 8 | out[2]);
@@ -166,14 +170,25 @@ int main(void)
     CHECK(audio_amps_start(&g, 160) == AudioAmpsErrStart && !g.started);
     m.fail_after = -1;
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE);
-    // levels 8-10: the playing gain at most the cap asked for and never above the core's 192; muted and unmuted while powered;
+    // levels 8-10: the playing gain at most the cap asked for and never above the core's 231; muted and unmuted while powered;
     // off and started again without a new configuration (the reset lines stay released)
     model();
     audio_amps_init(&g, &io);
     audio_amps_probe(&g);
     CHECK(audio_amps_configure(&g, fsm, fsm_bytes, 1) == AudioAmpsOk);
-    CHECK(audio_amps_start_capped(&g, 255, 215) == AudioAmpsOk);
+    CHECK(audio_amps_start_capped(&g, 255, UINT32_MAX) == AudioAmpsOk);
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == FS19XX_GAIN_CAP && m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE);
+    CHECK(audio_amps_unmute(&g) == AudioAmpsOk);
+    for (unsigned s = 0; s < 4; ++s) CHECK(audio_amps_gain_slot(&g, s, 192, 231) == AudioAmpsOk);
+    CHECK(audio_amps_read(&g) == 0 && audio_amps_check(&g) == 0);
+    for (unsigned s = 0; s < 4; ++s) {
+        CHECK(g.amp[s].gain == 192 && g.status[s].volctrl == 0xc0c0);
+        const unsigned writes = m.events;
+        CHECK(audio_amps_gain_slot(&g, s, UINT32_MAX, UINT32_MAX) == AudioAmpsOk);
+        CHECK(m.events == writes + 1 && g.amp[s].gain == 231 && m.amp[s].reg[FS19XX_REG_VOLCTRL] == 0xe7c0);
+    }
+    CHECK(audio_amps_read(&g) == 0 && audio_amps_check(&g) == 0);   // active 231 is healthy
+    CHECK(audio_amps_gain_slot(&g, 4, 231, 231) == AudioAmpsErrState);
     CHECK(audio_amps_unmute(&g) == AudioAmpsOk && audio_amps_mute(&g) == 0);
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE && !(m.amp[i].reg[FS19XX_REG_PWRCTRL] & 1));
     CHECK(!g.have_first && audio_amps_unmute(&g) == AudioAmpsOk && audio_amps_off(&g) == 0 && !g.started && g.configured == 0xf);
@@ -181,6 +196,20 @@ int main(void)
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == 176 && m.amp[i].released);
     CHECK(audio_amps_off(&g) == 0 && audio_amps_start_capped(&g, 176, 160) == AudioAmpsOk);
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == 160);
+    for (unsigned s = 0; s < 4; ++s) {
+        CHECK(audio_amps_gain_slot(&g, s, 231, 160) == AudioAmpsOk);
+        CHECK(g.amp[s].gain == 160);
+    }
+    // A single failed runtime write: all four DACs muted before any power-down, all four off.
+    CHECK(audio_amps_unmute(&g) == AudioAmpsOk);
+    const unsigned fail_at = m.events;
+    m.fail_after = 0; m.transfers = 0; m.fail_once = 1;
+    CHECK(audio_amps_gain_slot(&g, 2, 231, 231) == AudioAmpsErrBus && !g.started);
+    for (unsigned s = 0; s < 4; ++s) {
+        CHECK(m.ev[fail_at + s].slot == s && m.ev[fail_at + s].reg == FS19XX_REG_DACCTRL && m.ev[fail_at + s].value == FS19XX_DACCTRL_MUTE);
+        CHECK(m.amp[s].reg[FS19XX_REG_PWRCTRL] & FS19XX_PWRCTRL_PWDN);
+        CHECK(m.amp[s].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE && m.amp[s].reg[FS19XX_REG_SYSCTRL] == 0);
+    }
     audio_amps_hold(&g);
     CHECK(audio_amps_mute(&g) == 0 && audio_amps_start_capped(&g, 160, 160) == AudioAmpsErrState);
     printf("PASS amps: %u checks\n", checks);

@@ -23,7 +23,7 @@
 //   piano-audio=8  levels 4-6 (and 7 with piano-audio-tone=1), then for the rest of the boot the macOS Speaker on the DSP (AudioLive.h:
 //                  the dsp transport; the speaker plan comes up with the first sound and goes down after piano-audio-idle ms without
 //                  one): at this level gain 160 and full scale at -20 dBFS. Sound comes out of the speakers.
-//   piano-audio=9  also the daily level: piano-audio-gain=G (default 160, never above 192), piano-audio-ceiling=DB (full scale at -DB
+//   piano-audio=9  also the daily level: piano-audio-gain=G (default 231, never above 231), piano-audio-ceiling=DB (full scale at -DB
 //                  dBFS, 1..40, default 6), piano-audio-volume=P (the kernel's master volume, percent, default 100) and the Speaker
 //                  device's properties piano-audio-volume / piano-audio-mute.
 //   piano-audio=10 also the Mic: the capture plan with the VA macro's DMIC path (piano-audio-mic-gain=G, 0..124, default 124 = +40 dB).
@@ -109,7 +109,7 @@ void readArgs()
   l.i2cSwap = bootArg("piano-audio-i2c-swap", 2);
   l.i2cHalfUs = bootArg("piano-audio-i2c-half", 5);
   l.smmu = gArgs.smmu;
-  l.liveGain = bootArg("piano-audio-gain", 0);         // capped at 160 at level 8, 192 from level 9 (AudioLive.c)
+  l.liveGain = bootArg("piano-audio-gain", 0);         // capped at 160 at level 8, 231 from level 9 (AudioLive.c)
   l.liveCeilingDb = bootArg("piano-audio-ceiling", 0); // 1..40 dB below full scale, level 9 and up; 0: the level's own
   l.liveIdleMs = bootArg("piano-audio-idle", 0);
   l.micGain = bootArg("piano-audio-mic-gain", 0);

@@ -303,6 +303,27 @@ uint32_t liveWord(const AudioLive &l)
 }
 
 struct sysctl_oid gLedgerOid;
+struct sysctl_oid gGainOid;
+int gainControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || gLive->cfg.level < 9) return ENXIO;
+    int value = int(__atomic_load_n(&gShared->amp_gain_requested, __ATOMIC_ACQUIRE));
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (audio_live_gain_select(gShared, unsigned(value))) return EINVAL;
+    piano_audio_log("aud-gain231-v1: requested gain %d (worker applies; active readback follows)", value);
+    return 0;
+}
+void registerGain()
+{
+    bzero(&gGainOid, sizeof gGainOid);
+    gGainOid.oid_parent = &sysctl__machdep_children; gGainOid.oid_number = OID_AUTO;
+    gGainOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gGainOid.oid_name = "piano_audio_gain"; gGainOid.oid_handler = gainControl;
+    gGainOid.oid_fmt = "I"; gGainOid.oid_descr = "Daily FS19xx A/B request: 192 or 231; aud-gain231-v1";
+    gGainOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gGainOid);
+}
 int ledgerRead(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
     if (req->newptr) return EPERM;
@@ -358,6 +379,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     gLive->ledger=static_cast<AudioLedger *>(IOMallocData(sizeof(AudioLedger)));
     if (gLive->ledger) {bzero(gLive->ledger,sizeof(AudioLedger)); registerLedger();}
     else {piano_audio_log("sleep-contract1: ledger allocation failed; readiness gate held"); return;}
+    if (lc.level >= 9) registerGain();
     piano_audio_power_ready();
     uint32_t handled=0;
     uint8_t in[AUDIO_INBOX_BYTES];

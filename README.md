@@ -41,11 +41,13 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   DNS ([docs/results-2026-11-17.md](docs/results-2026-11-17.md)); the menu's own list/click proof and the installed system's update
   are next; user power/disconnect lifecycle is implemented with host coverage, awaiting its three-cycle tablet qualification ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md), [docs/drivers/wifi.md](docs/drivers/wifi.md)).
 - Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
-  test; opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
+  test; the reference-aligned gain cap (231) and runtime 192/231 A/B switch have host coverage and await acoustic tablet validation;
+  opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
 - Hardware video decode (2026-11-17, RAM boots): the opt-in native VideoToolbox bridge delivered our 320×240 H.264
   frame through Iris into an IOSurface-backed callback with the exact golden SHA-256 and safe teardown (`vid-v5c`).
   A bounded Baseline/Main streaming implementation and owned 60-frame IP/IBP qualification clips now have host coverage;
-  continuous hardware decoding awaits tablet qualification ([docs/drivers/video.md](docs/drivers/video.md)).
+  continuous hardware decoding awaits tablet qualification. The post-PSC stall has passive first-timeout diagnostics
+  for the next test ([docs/drivers/video.md](docs/drivers/video.md)).
   Normal app playback remains unqualified.
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
@@ -59,6 +61,9 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, hardware video playback in apps, and
   a clean restart — every reboot of the 27.3 line ends in IOPlatformExpert's panic 30 s after the halt begins
   (`Halt/Restart Timed Out`, console captures since 2026-11-13).
+- Safari's synchronous Apple Pay query can hang while native lacks the AppleKeyStore unlock contract. A reversible UID 501
+  `passd` policy is implemented with host rehearsal; cold Safari response and persistence await tablet qualification
+  ([userland policy](docs/userland.md#passd-policy-2026-11-18-tablet-qualification-pending)). Wallet and payment handoff are unavailable with this policy.
 - Latest results: [docs/results-2026-11-17.md](docs/results-2026-11-17.md) (Wi-Fi join through macOS, sound with volume control, the
   video firmware booting and talking HFI); before: [docs/results-2026-11-16.md](docs/results-2026-11-16.md) (macOS's Wi-Fi scan through our user client, the
   video firmware authenticated, macOS sound output, the boot-window analysis); earlier: [docs/results-2026-11-14.md](docs/results-2026-11-14.md)

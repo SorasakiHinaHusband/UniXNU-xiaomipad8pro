@@ -8,7 +8,7 @@
  *      safety chain (the slots, the DC blocker, the master gain, the fades, the -20 dBFS ceiling of this level), the amplifiers'
  *      group check while they play; taken down (a fade to silence, the amplifiers muted, after idle_ms without sound their power,
  *      the plan undone) when the device stops, is muted or plays only silence
- *   9  also the daily level: the playing gain up to the core's FS19XX_GAIN_CAP (192), the ceiling up to -1 dBFS, the kernel's own
+ *   9  also the daily level: the playing gain up to the core's FS19XX_GAIN_CAP (231), the ceiling up to -1 dBFS, the kernel's own
  *      master volume and mute (boot arguments, the Speaker device's properties) ramped without a click; the HAL's own volume works
  *      on the samples before they come here
  *   10 also the Mic device: the capture plan (the VA clocks, the mic graphs, the VA macro's DMIC path between their prepare and
@@ -74,6 +74,7 @@ typedef struct {
     uint32_t output_frames;              /* reader geometry; the 480-frame experiment retains its old trim policy */
     int32_t volume_q15;                  /* level 9: the master volume (0..32767), from the device's property or the boot argument */
     int muted;                           /* level 9: the master mute */
+    uint32_t amp_gain_requested;          /* sysctl -> worker; only the worker touches the amplifier bus */
     int32_t input_q15;
     int input_muted;
     int input_fault;                      /* unavailable/fault zeros, distinct from requested mute */
@@ -96,6 +97,8 @@ uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t fr
 uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames);
 /* Level 9: the master volume in percent (0 silent, 100 unity, the shared -36 dB squared curve) and the mute; out of range: unchanged. */
 void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
+/* A/B policy selector: only 192 or 231; invalid values leave the request unchanged. Level 8 still clamps to 160. */
+int audio_live_gain_select(AudioLiveShared *sh, unsigned gain);
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */
@@ -154,6 +157,9 @@ typedef struct {
     AudioLiveDrift spk_drift;
     AudioAmpsPoll status_poll;
     int status_poll_active;
+    unsigned gain_target, gain_slot;
+    int gain_changing, gain_witness;
+    unsigned gain_reports;               /* at most eight four-amplifier snapshots per boot */
     uint32_t status_polls, status_slices;
     uint8_t spkt[GPR_MAX_PACKET];
     int16_t stereo[AUDIO_PERIOD_FRAMES * 2];

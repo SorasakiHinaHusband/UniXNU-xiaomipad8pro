@@ -6,7 +6,7 @@
 //   - the commands of each plan in order, never two plan commands in flight at once (over both plans), from the port set's ports;
 //   - speaker safety at every amplifier write and every buffer the DSP plays: no amplifier powered up but while the bit clock and
 //     both speaker graphs run, none unmuted before four periods of the stream came back, no unmuted gain above the level's cap
-//     (160 at level 8, 192 at 9), no gain above 192 ever, no sample above the level's ceiling, no slot changed while the DSP has
+//     (160 at level 8, 231 at 9), no gain above 231 ever, no sample above the level's ceiling, no slot changed while the DSP has
 //     it, (in the clean runs) no sound played while an amplifier is muted (the fades come first), the amplifiers down before a
 //     speaker graph stops and held in reset at the end;
 //   - a device that plays only silence never brings anything up; sound brings the path up within a few hundred ms; silence, a
@@ -217,7 +217,7 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
         const uint8_t reg = out[0];
         const uint16_t v = (uint16_t)(out[1] << 8 | out[2]);
         const int unmuted = !(a->reg[FS19XX_REG_DACCTRL] & FS19XX_DACCTRL_MUTE_BIT);
-        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP) violate("an amplifier gain above 192");
+        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP) violate("an amplifier gain above 231");
         if (reg == FS19XX_REG_VOLCTRL && unmuted && (v >> 8) > w.gain_cap) violate("an unmuted amplifier's gain above the level's cap");
         if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT) && (a->reg[FS19XX_REG_VOLCTRL] >> 8) > w.gain_cap)
             violate("an amplifier unmuted at a gain above the level's cap");
@@ -868,9 +868,38 @@ static void testLevel9(void)
 // Level 8 never takes level 9's gain or ceiling, whatever is asked.
 static void testLevel8Caps(void)
 {
-    const struct Scenario sc = {8, 215, 1, 0, 5000, AudioPortsUbuntu, 1, burst};
+    const struct Scenario sc = {8, 231, 1, 0, 5000, AudioPortsUbuntu, 1, burst};
     run(&sc);
     CHECK(!w.violations && live.cfg.gain == AUDIO_AMPS_TEST_GAIN && live.cfg.ceiling == AUDIO_CEILING_TEST && w.peak <= AUDIO_CEILING_TEST);
+}
+
+static void steady(uint32_t t);
+static void gain_switch(uint32_t t)
+{
+    steady(t);
+    if (t == 2000 && !g_mark) {
+        g_mark = 1;
+        CHECK(live.unmuted && audio_live_gain_select(&sh, 192) == 0);
+        CHECK(audio_live_gain_select(&sh, 232) == -1 && audio_live_gain_select(&sh, 255) == -1 &&
+              audio_live_gain_select(&sh, UINT32_MAX) == -1 && sh.amp_gain_requested == 192);
+    }
+    if (t == 3000 && g_mark == 1) {
+        g_mark = 2;
+        CHECK(live.cfg.gain == 192 && !live.gain_changing && live.unmuted);
+        CHECK(audio_live_gain_select(&sh, 231) == 0);
+    }
+}
+
+static void testGainSwitch(void)
+{
+    g_mark = 0;
+    const struct Scenario sc = {9, 0, 1, 0, 7000, AudioPortsUbuntu, 1, gain_switch};
+    run(&sc);
+    CHECK(g_mark == 2 && !w.violations && live.cfg.gain == 231 && !live.gain_changing);
+    CHECK(live.spk_starts == 1 && live.underruns == 0 && live.amp_bad == 0);
+    CHECK(logged("applied gain 192 cap 231") && logged("applied gain 231 cap 231"));
+    CHECK(logged("requested 192 gain 192 VOLCTRL 0xc0c0") && logged("requested 231 gain 231 VOLCTRL 0xe7c0"));
+    CHECK(live.gain_reports > 0 && live.gain_reports <= 8);
 }
 
 // The clocks: the device 200 ppm fast, then slow, for 60 s of sound.
@@ -1306,6 +1335,7 @@ int main(void)
     testSilentDevice();
     testLevel9();
     testLevel8Caps();
+    testGainSwitch();
     testDrift(200);
     testDrift(-200);
     testFaults();

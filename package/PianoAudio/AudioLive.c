@@ -185,6 +185,13 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute)
     sh->controls++;
 }
 
+int audio_live_gain_select(AudioLiveShared *sh, unsigned gain)
+{
+    if (gain != 192u && gain != 231u) return -1;
+    __atomic_store_n(&sh->amp_gain_requested, gain, __ATOMIC_RELEASE);
+    return 0;
+}
+
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute)
 {
     const int32_t gain = piano_audio_input_q15(level_percent);
@@ -198,7 +205,7 @@ void audio_live_defaults(AudioLiveConfig *c, uint32_t level)
 {
     zero(c, sizeof *c);
     c->level = level < 8 ? 8 : level > 10 ? 10 : level;
-    c->gain = AUDIO_AMPS_TEST_GAIN;
+    c->gain = c->level >= 9 ? FS19XX_GAIN_CAP : AUDIO_AMPS_TEST_GAIN;
     c->ceiling = c->level >= 9 ? audio_ceiling_db(6) : AUDIO_CEILING_TEST;
     c->idle_ms = AUDIO_LIVE_IDLE_MS;
     c->status_ms = AUDIO_LIVE_STATUS_MS;
@@ -325,6 +332,9 @@ static int spk_has_prefill(const AudioLive *l) {return spk_same_epoch(l) && load
 static int live_amps_on(void *owner)
 {
     AudioLive *l = owner;
+    l->cfg.gain = __atomic_load_n(&l->sh->amp_gain_requested, __ATOMIC_ACQUIRE);
+    if (l->cfg.gain > live_gain_cap(l)) l->cfg.gain = live_gain_cap(l);
+    l->gain_changing = 0;
     const int r = audio_amps_start_capped(l->amps, l->cfg.gain, live_gain_cap(l));
     const int db10 = fs19xx_gain_db10(l->amps->amp[0].gain);
     if (r) LOG(l, "live: amplifiers on FAILED (%s): all four muted and powered down again", audio_amps_error(r));
@@ -486,6 +496,15 @@ static void status_sample(AudioLive *l)
     l->status_poll_active = 0;
     ++l->status_polls;
     const unsigned bad = audio_amps_check(l->amps);
+    if (!bad && l->gain_witness && l->gain_reports < 8) {
+        ++l->gain_reports;
+        l->gain_witness = 0;
+        for (unsigned i = 0; i < AUDIO_AMPS; ++i) {
+            const Fs19xxStatus *st = &l->amps->status[i];
+            LOG(l, "aud-gain231-v1: active snapshot %u slot %u requested %u gain %u VOLCTRL 0x%04x STATUS 0x%04x DIGSTAT 0x%04x DACCTRL 0x%04x bus-errors %u",
+                l->gain_reports, i, l->cfg.gain, st->volctrl >> 8, st->volctrl, st->status, st->digstat, st->dacctrl, l->amps->amp[i].bus_errors);
+        }
+    }
     if (bad) {
         l->amp_bad |= bad;
         for (unsigned i = 0; i < AUDIO_AMPS; ++i) {
@@ -574,6 +593,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         }
         audio_chain_restart(&l->chain);
         l->unmuted = 1;
+        l->gain_witness = 1;
         l->status_poll_active = 0;   /* discard a snapshot taken before this unmute */
         l->next_status = now + AUDIO_STATUS_MS;
         drift_reset(&l->spk_drift);
@@ -635,7 +655,30 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
      * four-period queue, then trim its recovered FIFO backlog to two periods.
      * Yield to completion handling between EVERY register, keeping the group
      * snapshot private until all reads succeed. No second bus/DSP owner. */
-    if (l->spk_state == LiveRunning && l->unmuted && !l->spk_ending && !l->stream_unsent) {
+    if (l->spk_state == LiveRunning && !l->spk_ending && !l->stream_unsent) {
+        unsigned requested = __atomic_load_n(&l->sh->amp_gain_requested, __ATOMIC_ACQUIRE);
+        if (requested > live_gain_cap(l)) requested = live_gain_cap(l);
+        if (!l->gain_changing && requested != l->cfg.gain) {
+            l->gain_target = requested;
+            l->gain_slot = 0;
+            l->gain_changing = 1;
+            l->status_poll_active = 0;   /* never publish a mixed-gain snapshot */
+        }
+        if (l->gain_changing) {
+            if (audio_amps_gain_slot(l->amps, l->gain_slot, l->gain_target, live_gain_cap(l))) {
+                stream_fault(l, AudioGuardAmplifier, now);
+                return;
+            }
+            if (++l->gain_slot == AUDIO_AMPS) {
+                l->cfg.gain = l->gain_target;
+                l->gain_changing = 0;
+                l->gain_witness = 1;
+                l->next_status = now;
+                LOG(l, "aud-gain231-v1: applied gain %u cap %u (four slots; refill first)", l->cfg.gain, live_gain_cap(l));
+            }
+            return;   /* yield to DSP completion handling after each I2C write */
+        }
+        if (!l->unmuted) return;
         if (!l->status_poll_active && (int32_t)(now - l->next_status) >= 0) {
             zero(&l->status_poll, sizeof l->status_poll);
             l->status_poll_active = 1;
@@ -995,6 +1038,7 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     l->ports = s->ports;
     l->amps = (AudioAmps *)&s->amps;
     l->sh = sh;
+    __atomic_store_n(&sh->amp_gain_requested, l->cfg.gain, __ATOMIC_RELEASE);
     store(&sh->input_fault, !l->cfg.mic);
     return 0;
 }

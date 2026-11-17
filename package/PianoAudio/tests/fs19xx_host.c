@@ -3,7 +3,7 @@
 //   - probe: the late first answer after a cold reset, an absent amplifier, a foreign device;
 //   - the preset container: a synthetic fs19xx.fsm (made-up register data, the documented structure: no vendor data in this file),
 //     every header and block error, block selection by address, the units (whole, field, delay, wait, unknown);
-//   - speaker safety: at no point does a write power an amplifier up, unmute it or set a gain above 192 except fs19xx_start (power,
+//   - speaker safety: at no point does a write power an amplifier up, unmute it or set a gain above 231 except fs19xx_start (power,
 //     capped gain) and fs19xx_mute(.., 0); a hostile preset is filtered; a failing start leaves it shut down;
 //   - the power sequences in order, the status reads and the group check that stops a stream.
 //   - the preset's identity: SHA-256 against the FIPS 180-4 vectors, the stock size and digest.
@@ -161,13 +161,13 @@ static void build_fsm(int hostile)
 static void testBasics(void)
 {
     CHECK(fsm_crc16((const uint8_t *)"123456789", 9) == 0xbb3d);   // CRC-16/ARC check value
-    CHECK(fs19xx_gain_clamp(255) == 192 && fs19xx_gain_clamp(193) == 192 && fs19xx_gain_clamp(192) == 192 && fs19xx_gain_clamp(160) == 160);
-    CHECK(fs19xx_gain_db10(192) == -236 && fs19xx_gain_db10(160) == -356 && fs19xx_gain_db10(255) == 0 && fs19xx_gain_db10(215) == -150);
+    CHECK(fs19xx_gain_clamp(255) == 231 && fs19xx_gain_clamp(232) == 231 && fs19xx_gain_clamp(UINT32_MAX) == 231 && fs19xx_gain_clamp(231) == 231 && fs19xx_gain_clamp(192) == 192 && fs19xx_gain_clamp(160) == 160);
+    CHECK(fs19xx_gain_db10(231) == -90 && fs19xx_gain_db10(192) == -236 && fs19xx_gain_db10(160) == -356 && fs19xx_gain_db10(255) == 0 && fs19xx_gain_db10(215) == -150);
     int changed;
     CHECK(fs19xx_filter(FS19XX_REG_PWRCTRL, 0, &changed) == 1 && changed);
     CHECK(fs19xx_filter(FS19XX_REG_PWRCTRL, 3, &changed) == 3 && !changed);
     CHECK(fs19xx_filter(FS19XX_REG_DACCTRL, 0x0210, &changed) == 0x0310 && changed);
-    CHECK(fs19xx_filter(FS19XX_REG_VOLCTRL, 0xffc0, &changed) == 0xc0c0 && changed);
+    CHECK(fs19xx_filter(FS19XX_REG_VOLCTRL, 0xffc0, &changed) == 0xe7c0 && changed);
     CHECK(fs19xx_filter(FS19XX_REG_VOLCTRL, 0xa0c0, &changed) == 0xa0c0 && !changed);
     CHECK(fs19xx_filter(0x1a, 0xffff, &changed) == 0xffff && !changed);
     char names[96];
@@ -280,6 +280,9 @@ static void testHostilePreset(void)
     for (int i = 0; i < 4; ++i) {
         CHECK(amps[i].filtered == 5 && amps[i].skipped == 1);   // PWRCTRL, DACCTRL, two VOLCTRL, the 60 s delay
         CHECK((m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8) <= FS19XX_GAIN_CAP && m.amp[i].reg[FS19XX_REG_PWRCTRL] & FS19XX_PWRCTRL_PWDN);
+        CHECK(fs19xx_unit(&amps[i], 0x7016, 0xffff) == 0);   // low byte only must not bypass the high-byte cap
+        CHECK(fs19xx_unit(&amps[i], 0x7816, 0x00ff) == 0);   // high byte only
+        CHECK((m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8) == 231);
     }
     CHECK(m.slept_us < 4 * 200000ull);   // the 60 s delay was capped (100 ms per amplifier, plus the sequences' own waits)
     // a wait that never matches is counted, not fatal
@@ -305,7 +308,7 @@ static void testStartStop(void)
     CHECK(m.violations == 0);
     for (int i = 0; i < 4; ++i) {
         const struct Amp *a = &m.amp[i];
-        CHECK(amps[i].gain == FS19XX_GAIN_CAP && a->reg[FS19XX_REG_VOLCTRL] == 0xc0c0);   // 255 asked, 192 written
+        CHECK(amps[i].gain == FS19XX_GAIN_CAP && a->reg[FS19XX_REG_VOLCTRL] == 0xe7c0);   // 255 asked, 231 written
         CHECK(a->reg[FS19XX_REG_I2SCTRL] == (0x9000 | 0x0800 | 0x0003));                    // 48 kHz, data out, other bits kept
         CHECK(a->reg[FS19XX_REG_PLLCTRL1] == 0x0260 && a->reg[FS19XX_REG_PLLCTRL2] == 0x0540 && a->reg[FS19XX_REG_PLLCTRL3] == 0x0018);
         CHECK(a->reg[FS19XX_REG_OTPACC] == 0 && a->reg[FS19XX_REG_TSCTRL] == FS19XX_TSCTRL_TSEN && a->reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_UNMUTE);
@@ -334,7 +337,7 @@ static void testStartStop(void)
     st[1].ok = 1;
     first[0].status = 0x0040;  // top left's own first reading differs from now
     CHECK(fs19xx_group_check(st, first, 4) == 0x1);
-    st[0].volctrl = 0xd0c0;    // a gain above the cap read back
+    st[0].volctrl = 0xe8c0;    // a gain above the cap read back
     CHECK(fs19xx_group_check(st, 0, 4) & 0x1);
 
     // shut down: mute, power down, 35 ms, blocks off; then the status says down
