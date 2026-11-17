@@ -47,6 +47,7 @@ struct Ppm {
     uint16_t version=0x110;
     unsigned stage=0, reads=0, writes=0, acks=0, snapshots=0;
     bool busy=false, shortStatus=false, changeOnVerify=false;
+    bool transportError=false, ucsiError=false, wrongEcho=false, shortPayload=false, missingPdoFeature=false;
     Ppm() { piano_contract_init(&c); piano_contract_link(&c,1); }
     int step() {
         uint8_t request[PIANO_CONTRACT_REQUEST_MAX];
@@ -64,13 +65,14 @@ struct Ppm {
             else if(cmd==0x12) ++stage;
             uint8_t reply[16]={};
             piano_contract_put32(reply,PIANO_CONTRACT_OWNER); piano_contract_put32(reply+4,1); piano_contract_put32(reply+8,op);
+            if(transportError) piano_contract_put32(reply+12,9);
             return piano_contract_receive(&c,now,reply,sizeof(reply));
         }
         assert(op==PIANO_CONTRACT_READ && n==12); ++reads;
         uint8_t response[544]={}; unsigned size=version<0x200 ? 64:544;
         piano_contract_put32(response,PIANO_CONTRACT_OWNER); piano_contract_put32(response+4,1); piano_contract_put32(response+8,op);
         response[12]=uint8_t(version); response[13]=uint8_t(version>>8);
-        piano_contract_put32(response+20,uint32_t(control)); piano_contract_put32(response+24,uint32_t(control>>32));
+        piano_contract_put32(response+20,uint32_t(control)+(wrongEcho?1u:0u)); piano_contract_put32(response+24,uint32_t(control>>32));
         uint8_t *msg=response+28;
         uint32_t cci=0;
         unsigned cmd=control&255;
@@ -79,7 +81,7 @@ struct Ppm {
             else if(cmd==4) cci=1u<<29;
             else {
                 cci=1u<<31;
-                if(cmd==6) { cci|=16u<<8; msg[0]=4; msg[4]=1; msg[5]=16; }
+                if(cmd==6) { cci|=16u<<8; msg[0]=4; msg[4]=1; msg[5]=missingPdoFeature?0:16; }
                 else if(cmd==0x12) {
                     cci|=(shortStatus?8u:9u)<<8;
                     piano_contract_put32(msg,status);
@@ -94,6 +96,8 @@ struct Ppm {
                 }
             }
         }
+        if(ucsiError && c.stage!=PianoContractProbe) cci|=1u<<30;
+        if(shortPayload && c.stage!=PianoContractProbe) cci=(cci&~0xff00u)|(17u<<8);
         piano_contract_put32(response+16,cci);
         auto result=piano_contract_receive(&c,now,response,size);
         if(result==2) ++snapshots;
@@ -159,6 +163,27 @@ static void invalidation() {
     assert(!truncated.c.valid && truncated.c.quarantined);
     Ppm wrongVersion; assert(piano_contract_next(&wrongVersion.c,10,request)==12); late[12]=0;late[13]=3;
     assert(piano_contract_receive(&wrongVersion.c,11,late,64)==-1 && wrongVersion.c.last_error==PIANO_CONTRACT_VERSION);
+    Ppm reject; reject.step(); reject.transportError=true; assert(reject.step()==-1);
+    assert(reject.c.last_error==PIANO_CONTRACT_RETURN && !reject.c.valid);
+    Ppm ppmError; ppmError.step(); ppmError.step(); ppmError.ucsiError=true; assert(ppmError.step()==-1);
+    assert(ppmError.c.last_error==PIANO_CONTRACT_CCI);
+    Ppm echo; echo.step(); echo.step(); echo.wrongEcho=true; assert(echo.step()==-1);
+    assert(echo.c.last_error==PIANO_CONTRACT_CCI && echo.c.quarantined);
+    Ppm payload; payload.step(); payload.step(); payload.shortPayload=true; assert(payload.step()==-1);
+    assert(payload.c.last_error==PIANO_CONTRACT_PAYLOAD);
+    Ppm feature; feature.missingPdoFeature=true; feature.complete();
+    assert(feature.c.last_error==PIANO_CONTRACT_CAPABILITY && !feature.c.status_valid);
+    Ppm notifyCommand; notifyCommand.step(); notifyCommand.step();
+    auto initialGeneration=notifyCommand.c.generation;
+    assert(piano_contract_receive(&notifyCommand.c,notifyCommand.now,notify,24)==1);
+    assert(notifyCommand.c.generation==initialGeneration); // command completion notify alone is not a detach
+    notifyCommand.complete(); assert(notifyCommand.c.valid && notifyCommand.c.generation==initialGeneration);
+    Ppm stale; stale.complete(); auto previousGeneration=stale.c.generation;
+    piano_contract_refresh(&stale.c); stale.snapshots=0; stale.shortStatus=true; stale.complete();
+    assert(!stale.c.valid && !stale.c.status_valid && !stale.c.pdos && !stale.c.ma && stale.c.generation==previousGeneration);
+    Ppm sourceChange; sourceChange.complete(); previousGeneration=sourceChange.c.generation;
+    sourceChange.pdos[1]=fixed(9000,1800); piano_contract_refresh(&sourceChange.c); sourceChange.snapshots=0; sourceChange.complete();
+    assert(sourceChange.c.valid && sourceChange.c.source_ma==1800 && sourceChange.c.generation==previousGeneration+1);
     Ppm busy; busy.step(); busy.step(); busy.step(); busy.busy=true; busy.step();
     assert(busy.c.wire==2);
     assert(!piano_contract_next(&busy.c,busy.now+6000,request));
