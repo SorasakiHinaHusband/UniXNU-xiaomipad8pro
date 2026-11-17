@@ -40,8 +40,14 @@ python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" --self-test >&2 || exit 
 # shellcheck disable=SC2086
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" $NATIVE >&2 || exit 2
 export KC_NATIVE_PLACEMENT=${KC_NATIVE_PLACEMENT:-best-fit}
+# The macOS 27.3 USB consumer interface has no fileset executable but carries an
+# INT64_MAX placeholder. Normalize its metadata in this task's output directory;
+# the pinned input and kernel tree stay untouched. The linker then retains the
+# actual codeless library, including the native descriptor's personality gates.
+KC_LINK_INPUT="$OUT.input.bin"
+python3 "$PIANO_REPO/tooling/k27/normalize-bluetooth-codeless.py" "$KC_BASE" "$KC_LINK_INPUT"
 # shellcheck disable=SC2046,SC2086
-python3 "${KC_BUILDER:-k27/kc-build27-piano.py}" "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
+python3 "${KC_BUILDER:-k27/kc-build27-piano.py}" "$KC_LINK_INPUT" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
   || { tail -20 "${OUT%.bin}.log"; exit 1; }
 grep -E "problem|wrote" "${OUT%.bin}.log" | cut -c1-120
 grep -q "^native placement ($KC_NATIVE_PLACEMENT)" "${OUT%.bin}.log" \
