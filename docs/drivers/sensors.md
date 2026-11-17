@@ -750,15 +750,17 @@ and `piano_qrtr_close` (§5c). Still open: NativeGopDisplay's transform (R2 only
 
 ### 10.3 Level 4's risks
 
-1. The light's consumer is read from PianoBacklight's boot arguments and properties: a level the user chose before the first target
-   looks like "no target yet" (its published `piano-backlight-auto` is false for both), so the light stream keeps running, its targets
-   refused, until PianoBacklight publishes its last target; bounded, and shown as the consumer in `piano-sensors-streams`.
+1. The light's consumer uses PianoBacklight's explicit automatic-mode request and control state. Its current-session validity is
+   separate from that request: waiting for the first sample must not look like a manual override, and an old target must not survive
+   display off/on as valid input. Both states are published for inspection.
 2. Without PianoKeyboard the cover reads detached and the lid open: the accelerometer streams whenever the agent runs and the display
    is on; the batched test links PianoKeyboard.
 3. Before NativeGopDisplay's first power change `piano-display-power` is absent and the display counts as on (as it is at boot).
 4. The sleep's fallback closes a port (DEL_CLIENT) when a disable is not answered within 800 ms; with PianoPower asking for quiet it
    does not, and the stream stays on through the sleep (logged): the hub's reports then wait in GLINK until the wake.
 5. The edge's axes and the light's placement are inferred (5a.9 risk 7); the rates the hub chooses are logged, not checked.
+6. A fatal-free DSP with an unchanged charger generation can still stop communicating. Check progress of GLINK receive counters
+   and fresh MCA answers alongside the sensor requests; sens-ab1 lost both while its cached health state remained unchanged.
 
 ## 11. Licence note
 
