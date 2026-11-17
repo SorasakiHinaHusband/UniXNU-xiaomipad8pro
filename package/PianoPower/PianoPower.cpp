@@ -74,6 +74,7 @@
 #include "ChargerEnable.h"
 #include "ChargerFix.h"
 #include "Gauge.h"
+#include "GaugeAlerts.h"
 #include "PianoBattery.h"
 #include "Servreg.h"
 #include "RtcReadout.h"
@@ -353,7 +354,8 @@ class PianoPower : public IOService {
   uint64_t fInhibitUntil = 0;
   int32_t fConfigError = 0;
   uint32_t fStatusSeq = 0;
-  uint8_t fCpCtrl = 0, fIsc[2] = {}, fSoa[2] = {};
+  uint8_t fCpCtrl = 0;
+  GaugeAlerts fAlerts;
   uint32_t fSafetyValid = 0;
   uint64_t fSafetyMs = 0;
   bool fHandoverFault = false;
@@ -537,7 +539,7 @@ bool PianoPower::start(IOService *provider)
   fRingLock = IOSimpleLockAlloc();
   fConfigLock = IOLockAlloc();
   setProperty("PianoChargeBuild", "PianoBuckContractV1");
-  note("buck: PianoBuckContractV1 status=PianoBuckStatusV2 HV_ICL=1600 FCC=1500 FV=4400 CP=read-only");
+  note("buck: PianoBuckContractV1 status=PianoBuckStatusV2 alerts=PianoBuckAlertsV5 HV_ICL=1600 FCC=1500 FV=4400 CP=read-only");
   thread_t t = nullptr;
   if (!fConfigLock || !fRingLock || kernel_thread_start(&PianoPower::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -625,10 +627,12 @@ void PianoPower::sampleSafety(uint64_t now)
     const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
     I2cBus bus(io);
     if (!i && bus.readRegisterByte(0x6a, 0x0f, &fCpCtrl) == I2cResult::ok) fSafetyValid |= 1;
-    if (bus.readRegisterByte(0x55, 0x72, &fIsc[i]) == I2cResult::ok) fSafetyValid |= 2u << (2 * i);
-    if (bus.readRegisterByte(0x55, 0x70, &fSoa[i]) == I2cResult::ok) fSafetyValid |= 4u << (2 * i);
+    if (bus.readRegisterByte(0x55, 0x72, &fAlerts.isc[i]) == I2cResult::ok) fSafetyValid |= 2u << (2 * i);
+    if (bus.readRegisterByte(0x55, 0x70, &fAlerts.soa[i]) == I2cResult::ok) fSafetyValid |= 4u << (2 * i);
     givePin(b.sda); givePin(b.scl);
   }
+  fAlerts.sampled(fSafetyValid);
+  fSafetyValid = (fSafetyValid & 1) | fAlerts.valid;
   fSafetyMs = now;
 }
 
@@ -677,7 +681,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
   n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
   n("CPControl", fCpCtrl); n("LPDValid", piano_mca_has(&fMca, McaLpd)); n("LPD", uint32_t(fMca.value[McaLpd]));
-  n("DTPT", fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1]);
+  n("DTPT", fAlerts.active()); n("SafetyAlarmMask", fAlerts.alarms);
   n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
   n("RequestedICL", p.icl_ma); n("AppliedICL", s.icl_set); n("ICLReadback", uint32_t(x.icl_ma)); n("AICL", uint32_t(x.aicl_ma));
   n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FVTarget", 4400); n("FVValid", fvValid); n("FVRaw", uint32_t(x.fv_raw)); n("FV", fvMv);
@@ -697,7 +701,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
 #define PACKNUM(name, value) snprintf(key, sizeof key, "Pack%u" name, i); n(key, uint32_t(value))
     PACKNUM("Valid", g.ok); PACKNUM("SOC", g.socPct); PACKNUM("MA", g.currentMa); PACKNUM("TempDC", g.tempDeciC);
     PACKNUM("MV", g.voltageMv); PACKNUM("Error", g.error); PACKNUM("FailedCommand", g.failedCommand);
-    PACKNUM("ISC", fIsc[i]); PACKNUM("SOA", fSoa[i]);
+    PACKNUM("ISC", fAlerts.isc[i]); PACKNUM("SOA", fAlerts.soa[i]);
 #undef PACKNUM
   }
   for (unsigned i = 0; i < PIANO_BOARD_TEMP_COUNT; ++i) {
@@ -720,12 +724,12 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
        applied, p.why_off, fInhibitUntil > now ? 1u : 0u);
   note("buck-safety: seq=%u valid=%#x cp=%#x lpd=%d dtpt=%u ack=%#x/%u/%d timeout=%u fallback=%u", fStatusSeq, fSafetyValid,
        fCpCtrl, piano_mca_has(&fMca, McaLpd) ? fMca.value[McaLpd] : -1,
-       fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1], fMca.last_property, fMca.last_value, fMca.last_result, fMca.timeouts, p.fallback);
+       fAlerts.active(), fMca.last_property, fMca.last_value, fMca.last_result, fMca.timeouts, p.fallback);
   note("buck-board: seq=%u valid=%#x age=%u/%u/%u/%u", fStatusSeq, board ? board->valid : 0,
        board ? board->age_ms[0] : ~0u, board ? board->age_ms[1] : ~0u,
        board ? board->age_ms[2] : ~0u, board ? board->age_ms[3] : ~0u);
   for (unsigned i = 0; i < 2; ++i) note("buck-pack: seq=%u pack=%u valid=%u soc=%d ma=%d temp=%d isc=%u soa=%u age=%llu mv=%d error=%u failed=%#x",
-       fStatusSeq, i, fPack[i].ok, fPack[i].socPct, fPack[i].currentMa, fPack[i].tempDeciC, fIsc[i], fSoa[i], now - fPackMs,
+       fStatusSeq, i, fPack[i].ok, fPack[i].socPct, fPack[i].currentMa, fPack[i].tempDeciC, fAlerts.isc[i], fAlerts.soa[i], now - fPackMs,
        fPack[i].voltageMv, unsigned(fPack[i].error), fPack[i].failedCommand);
 }
 
@@ -2195,8 +2199,8 @@ void PianoPower::stepPolicy(uint64_t now)
     if (!fHandover && !fShutdownSeen) sampleSafety(now);
     v.safetyFresh = fSafetyMs && now >= fSafetyMs && now - fSafetyMs <= 10000;
     v.cpOff = (fSafetyValid & 1) && !(fCpCtrl & 0x10);
-    v.dtptValid = (fSafetyValid & 0x1e) == 0x1e;
-    v.dtpt = fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1];
+    v.dtptValid = fAlerts.complete();
+    v.dtpt = fAlerts.active();
     // the port every decision (the Rp current, the #18 check), not only every report
     if (fSpmi && fCharger.found) {
       port = readPort(gIo, fCharger);

@@ -15,6 +15,7 @@
 #include "ChargerEnable.h"
 #include "ChargerFix.h"
 #include "Gauge.h"
+#include "GaugeAlerts.h"
 #include "RtcReadout.h"
 #include <algorithm>
 #include <ctime>
@@ -1968,6 +1969,7 @@ struct LinkRig {
   PortState port;
   piano_board_temps board{};
   bool havePort = true, haveBoard = false, pdUp = true, packsFresh = true, sleep = false, shutdown = false;
+  const GaugeAlerts *alerts = nullptr;
   uint32_t wakes = 0;
   uint64_t now = 0, pdUpMs = 0;       // pdUpMs: when charger_pd came up (LinkView.chargerPdUpMs)
   unsigned relinks = 0, handoverReady = 0, refused = 0, waitingPd = 0, waitingBoard = 0;
@@ -2034,6 +2036,11 @@ struct LinkRig {
     v.wakes = wakes;
     v.willSleep = sleep;
     v.shutdown = shutdown;
+    if (alerts) {
+      v.safetyFresh = v.cpOff = true;
+      v.dtptValid = alerts->complete();
+      v.dtpt = alerts->active();
+    }
     return v;
   }
   LinkOutcome stepOnce()
@@ -2084,6 +2091,96 @@ struct LinkRig {
     return true;
   }
 };
+
+static void testGaugeAlertRestore()
+{
+  // Decode actual one-byte bus replies, including an ACKed all-ones value.
+  // A transport ACK establishes delivery, not a recognized ISC level.
+  for (unsigned raw = 0; raw < 256; ++raw) {
+    Gauge busModel; busModel.regs[0x72] = uint16_t(raw);
+    I2cBus bus(busModel.io()); GaugeAlerts a;
+    CHECK(bus.readRegisterByte(kGaugeAddress, 0x72, &a.isc[1]) == I2cResult::ok);
+    a.sampled(0x1e);
+    CHECK(a.isc[1] == raw && a.complete() == (raw <= 3));
+    CHECK(a.active() == (raw == 3));
+  }
+  // A true alert is never suppressed by another unreadable field, and only
+  // a successful recognized clear can withdraw that field's alarm vote.
+  GaugeAlerts a; a.isc[0] = 3; a.sampled(2);
+  CHECK(a.active() && !a.complete() && a.alarms == 2);
+  a.isc[0] = 255; a.sampled(0x1e);
+  CHECK(a.active() && !a.complete() && a.alarms == 2);
+  a.isc[0] = 0; a.sampled(0);
+  CHECK(a.active() && !a.complete());
+  a.sampled(0x1e); CHECK(!a.active() && a.complete());
+  for (unsigned pack = 0; pack < 2; ++pack) {
+    for (unsigned soa : {1u, 255u}) {
+      GaugeAlerts s; s.soa[pack] = uint8_t(soa); s.sampled(4u << (2 * pack));
+      CHECK(s.active() && !s.complete());
+      s.soa[pack] = 0; s.sampled(0); CHECK(s.active());
+      s.sampled(0x1e); CHECK(!s.active() && s.complete());
+    }
+  }
+
+  LinkOptions o; o.strictContract = o.health = o.rp = true; o.rpMax = 3000; o.kick = false;
+  LinkRig r(o); GaugeAlerts alerts; alerts.sampled(0x1e); r.alerts = &alerts;
+  r.haveBoard = true; r.pdUpMs = 1; r.soc(20);
+  r.d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_SDP;
+  r.d.props[PIANO_MCA_LPD_STATUS] = 0;
+  r.d.loadMa = 3100; r.d.ohms = 0.17;
+  for (auto &p : r.packs) {p.voltageMv = 3754; p.tempDeciC = 373; p.currentMa = 125;}
+  for (int i = 0; i < 35; ++i) r.period();
+  CHECK(r.link.st.fcc_set == 1500 && r.link.st.icl_set == 3000 && !r.link.st.pending);
+  // The same real admin stop/resume path used at SOC20 in buck4; restore
+  // keeps real SOC and 80/75. No threshold, temperature or firmware bypass.
+  CHECK(!piano_charge_config_transaction(&r.link.cfg, 1, 80, 75, 1, 1));
+  r.link.requestDecision(); r.settle();
+  CHECK(!r.d.props[PIANO_MCA_CHARGE_ENABLE] && r.link.plan.why_off == PIANO_CHG_OFF_ADMIN);
+  CHECK(!piano_charge_config_transaction(&r.link.cfg, 1, 80, 75, 1, 0));
+  r.link.requestDecision(); r.settle();
+  CHECK(r.d.props[PIANO_MCA_CHARGE_ENABLE] == 1 && r.link.st.fcc_set == 1500 && !r.link.st.pending);
+  const auto oldStops = r.d.count(PIANO_MCA_CHARGE_ENABLE, 0);
+  // Saved buck4 Seq278..282: same fresh pair/SOC, no config change;
+  // B ISC 0 -> 255 -> 255 -> 0 -> 0 at the actual decision timestamps.
+  const uint64_t times[] = {393558, 393618, 394191, 394896, 395565};
+  const uint8_t raw[] = {0, 255, 255, 0, 0};
+  for (unsigned i = 0; i < 5; ++i) {
+    r.now = times[i]; alerts.isc[1] = raw[i]; alerts.sampled(0x1e);
+    r.link.requestDecision(); CHECK(r.stepOnce().decided);
+    std::printf("restore replay t=%llu ISC=%u valid=%#x alarm=%u charge=%u pending=%u FCC=%u/%u enable=%d\n",
+      (unsigned long long)r.now, raw[i], alerts.valid, alerts.active(), r.link.plan.charge, r.link.st.pending,
+      r.link.plan.fcc_ma, r.link.st.fcc_set, r.m.value[McaChargeEnable]);
+    CHECK(r.link.plan.charge && r.link.plan.why_off == PIANO_CHG_OFF_NONE);
+    CHECK(!(r.link.st.pending & (1u << PIANO_CHG_S_ENABLE)));
+    if (raw[i] == 255) CHECK(!(r.link.in.safety & PIANO_CHG_SAFE_DTPT) && r.link.plan.fcc_ma <= 500);
+    r.settle();
+    CHECK(r.d.props[PIANO_MCA_CHARGE_ENABLE] == 1 && !r.link.st.pending);
+    CHECK(r.link.st.fcc_set == (raw[i] == 255 ? 500u : 1500u));
+  }
+  CHECK(r.d.count(PIANO_MCA_CHARGE_ENABLE, 0) == oldStops);
+  // Genuine level3 still exercises exactly the old pending3/FCC500/enable0
+  // transaction, followed by the pending3 resume and independent readback.
+  alerts.isc[1] = 3; alerts.sampled(0x1e);
+  r.now += 60; r.link.requestDecision(); CHECK(r.stepOnce().decided);
+  CHECK(r.link.plan.why_off == PIANO_CHG_OFF_FAULT && r.link.st.pending == 3);
+  r.settle(); CHECK(r.link.st.fcc_set == 500 && !r.m.value[McaChargeEnable]);
+  alerts.isc[1] = 0; alerts.sampled(0x1e);
+  r.now += 1278; r.link.requestDecision(); CHECK(r.stepOnce().decided);
+  CHECK(r.link.st.pending == 3 && r.link.st.fcc_set == 500 && !r.m.value[McaChargeEnable]);
+  r.settle(); CHECK(r.link.st.fcc_set == 1500 && r.m.value[McaChargeEnable] == 1 && !r.link.st.pending);
+  // Unknown/missing cannot permit new high current; a confirmed alarm on
+  // the other pack must still stop, and persist through invalid readback.
+  alerts.sampled(0); r.period(); CHECK(r.link.plan.fcc_ma <= 500);
+  alerts.isc[0] = 3; alerts.sampled(2); r.period();
+  CHECK(r.link.plan.why_off == PIANO_CHG_OFF_FAULT && !r.m.value[McaChargeEnable]);
+  alerts.isc[0] = 255; alerts.sampled(0x1e); r.period();
+  CHECK(r.link.plan.why_off == PIANO_CHG_OFF_FAULT && !r.m.value[McaChargeEnable]);
+  alerts.isc[0] = 0; alerts.sampled(0x1e); r.period();
+  CHECK(r.link.plan.charge && r.m.value[McaChargeEnable] == 1 && r.link.st.fcc_set == 1500);
+  r.d.props[PIANO_MCA_LPD_STATUS] = 1; r.period();
+  CHECK(r.link.plan.why_off == PIANO_CHG_OFF_FAULT && !r.m.value[McaChargeEnable]);
+  CHECK(!r.d.count(PIANO_MCA_PD_FIXED) && !r.d.count(PIANO_MCA_PPS) && r.allAllowed());
+}
 
 static void testLinkCdp()
 {
@@ -2948,6 +3045,7 @@ int main()
   testChgEn();
   testChgFix();
   testGauge();
+  testGaugeAlertRestore();
   testBuckQueueCancellation();
   testMcaCodec();
   testMcaPolicy();

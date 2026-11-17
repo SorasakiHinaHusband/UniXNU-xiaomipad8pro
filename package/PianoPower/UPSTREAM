@@ -139,3 +139,9 @@ pin for wire facts only: the packed 16-byte capability, seven-bit connector
 count, optional PDO-query support, status bit offsets, and command ACK before
 local capability validation. Implementation and synthetic fixtures are original
 project code, copyright Leo Zhang, BSD-2-Clause-Patent.
+
+GaugeAlerts.h (2026-11-17) is original project code, copyright Leo Zhang,
+BSD-2-Clause-Patent. Alert facts only from the same third-party Linux pin:
+xiaomi_mca_dtpt_poll tests ISC level equal to 3 and SOA nonzero. This project
+separates unrecognized ISC bytes from confirmed alarms and retains a confirmed
+vote until that field reads clear. No third-party implementation text copied.

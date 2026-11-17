@@ -46,7 +46,7 @@ struct LinkOptions {
 // What the owner knows besides the codec, for one decision.
 struct LinkView {
   const PianoChargeContract *contract = nullptr;
-  bool safetyFresh = false, cpOff = false, dtptValid = false, dtpt = false;
+  bool safetyFresh = false, cpOff = false, dtptValid = false, dtpt = false; // dtpt: a confirmed alert, even if another field is missing
   uint64_t nowMs = 0;
   bool chargerPdUp = false;                   // msm/adsp/charger_pd reports up (PianoQrtr.c's servreg listener)
   uint64_t chargerPdUpMs = 0;                 // when it was seen coming up (nowMs's clock; each up again moves it)
@@ -198,7 +198,7 @@ class ChargeLink {
     if (has(McaLpd) && m.value[McaLpd] == 0) x.safety |= PIANO_CHG_SAFE_LPD_DRY;
     if (v.safetyFresh && v.dtptValid && !v.dtpt) x.safety |= PIANO_CHG_SAFE_DTPT;
     if (has(McaLpd) && m.value[McaLpd] != 0) x.faults |= 1;
-    if (v.safetyFresh && v.dtptValid && v.dtpt) x.faults |= 2;
+    if (v.safetyFresh && v.dtpt) x.faults |= 2;
     // the gauges only when both packs read (one charger feeds both)
     if (v.packs && v.packsFresh && v.packs[0].ok && v.packs[1].ok) {
       const GaugeReading &a = v.packs[0], &b = v.packs[1];

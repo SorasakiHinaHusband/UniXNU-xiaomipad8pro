@@ -81,7 +81,8 @@ notifications, old CONTROL, reconnect and bounded failure. `PianoUcsiMessageInV4
 identifies the initialization trace; `PianoCharge` also exposes initialization,
 enabled events, request/reply counts and the timeout layer. The tablet has
 confirmed RESET, basic notification enable, ACK and GET_CAPABILITY completion;
-the capability-to-status path still needs tablet qualification.
+the tablet has also confirmed fresh non-PD status and the real stop/resume
+actuator. PD/PPS charging still needs tablet qualification.
 
 COMMAND_COMPLETE with CCI `0x80001000` carries a successful 16-byte capability
 response. UCSI 1.1 MessageIn is at offset 16 in the 48-byte mailbox, or offset 28
@@ -92,3 +93,11 @@ Locally rejected capability data is acknowledged before quarantine, without
 restarting the PPM. The bounded `ucsi-message` trace and `UCSIMessageIn0..3`,
 `UCSIMessageLength`, `UCSIMessageCommand`, `UCSIAttributes`, `UCSIFeatures` and
 `UCSIConnectors` retain the evidence for the next status-path qualification.
+
+`PianoBuckAlertsV5` identifies the gauge alert decoder. ISC level 3 is an
+alarm; bytes outside 0..3 are unknown and clear that field's validity bit.
+Unknown safety inputs forbid new HV and cap FCC at 500 mA. They do not create
+a new stop vote. SOA nonzero remains an alarm, including an all-ones byte.
+A confirmed alarm survives unreadable samples until that field reads clear;
+another missing field cannot hide it. `SafetyValid`, raw `Pack0/1ISC` and
+`Pack0/1SOA`, `DTPT` and `SafetyAlarmMask` distinguish these states.

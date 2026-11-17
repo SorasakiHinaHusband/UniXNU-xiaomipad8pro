@@ -5,6 +5,7 @@
 // The source model answers queries; it never assigns contract-valid bits.
 #include "ChargeContract.h"
 #include "ChargeLink.h"
+#include "GaugeAlerts.h"
 #include <cassert>
 #include <cstdio>
 #include <vector>
@@ -28,12 +29,14 @@ struct Integration {
   unsigned voltageRequests=0;
   int32_t iclReadbackOverride=-1;
   bool pd=true;
+  GaugeAlerts alerts;
 
   Integration() {
     piano_contract_init(&contract); piano_contract_link(&contract,1);
     piano_mca_init(&m,1,1); m.links=1; m.board_allowed=1; m.board_done=7;
     LinkOptions o; o.strictContract=true; o.health=true; o.hv=1; o.kick=false;
     link.configure(m,o);
+    alerts.sampled(0x1e);
     board.version=PIANO_BOARD_TEMPS_VERSION; board.valid=15; board.state=PIANO_BOARD_TEMPS_RUNNING;
     for(unsigned i=0;i<4;++i) board.milli_c[i]=30000;
     for(auto &g:packs) {g.ok=true;g.socPct=25;g.tempDeciC=300;g.voltageMv=3900;g.currentMa=300;}
@@ -44,7 +47,7 @@ struct Integration {
     put(McaType,pd?PIANO_CHG_T_PD:PIANO_CHG_T_SDP);put(McaIcl,iclReadbackOverride<0?int32_t(icl):iclReadbackOverride);put(McaChargeEnable,int32_t(enable));
     put(McaTermVolt,5200);put(McaVerify,0);put(McaTbat,30);put(McaPdState,2);put(McaLpd,0);
     LinkView v;v.nowMs=now;v.chargerPdUp=true;v.chargerPdUpMs=1;
-    v.contract=&contract;v.safetyFresh=true;v.cpOff=true;v.dtptValid=true;
+    v.contract=&contract;v.safetyFresh=true;v.cpOff=true;v.dtptValid=alerts.complete();v.dtpt=alerts.active();
     v.packs=packs;v.packsFresh=true;v.packsMs=now;v.board=&board;
     ChargeLink::fill(link.in,m,v);
   }
@@ -121,6 +124,14 @@ struct Integration {
 };
 
 int main() {
+  Integration unknown; unknown.alerts.isc[1]=255;unknown.alerts.sampled(0x1e);
+  unknown.observe();unknown.decide();
+  for(unsigned i=0;i<12;++i)unknown.tick();
+  assert(!unknown.voltageRequests && unknown.fcc<=500 && unknown.bus==5000 && unknown.enable==1);
+  unknown.alerts.isc[0]=3;unknown.alerts.sampled(2);unknown.tick();
+  assert(!unknown.enable && unknown.link.plan.why_off==PIANO_CHG_OFF_FAULT && !unknown.voltageRequests);
+  unknown.alerts.isc[0]=255;unknown.alerts.sampled(0x1e);unknown.tick();
+  assert(!unknown.enable && unknown.alerts.active() && !unknown.voltageRequests);
   Integration sdp;sdp.pd=false;sdp.observe();sdp.decide();
   assert(sdp.contract.connected && sdp.contract.sink && !sdp.contract.pd && !sdp.contract.last_error);
   assert(sdp.link.in.valid & PIANO_CHG_IN_GAUGES);
