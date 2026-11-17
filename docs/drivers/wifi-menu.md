@@ -677,3 +677,21 @@ at offset 0x34 of SCAN_REQ (3 = the held results) is logged per scan, so one boo
 Switches: `piano-wifi-sheng=MASK` at boot, `machdep.piano_wifi_sheng` at run time (re-selects the medium, sets/removes the
 grant, clears the request-kind table so every kind is logged again). Host tests: `tests/apple80211_host.cpp` (caps bit 46,
 `shengKernelBuffer`, the scan-type reader). The boot that tries them: `private/host-checks/20261115-awdl/SHENG-MEDIA.md`.
+
+
+## 10. User disconnect and radio power (2026-11-17, tablet qualification pending)
+
+The native binding now connects power (IOC19), disassociate (IOC22), and deauth (IOC29) to the radio worker. A user leave
+suppresses retries until another SET20; power-off cancels scans, drains station teardown, disables DMA and parks WLAN_EN.
+Power-on reloads the firmware through the existing restart path and permits the retained profile to reconnect. A stop serial
+keeps quick off/on and leave/join requests from skipping teardown. Existing saved profiles are retained.
+
+The 27.3 ABI is power24 bytes, optional disassociate12 bytes and deauth16 bytes. The voluntary disconnect notification is
+LINK_CHANGED4 with exactly32 bytes (down at0, involuntary at0x10, reason at0x14, subreason at0x18), also returned by GET156.
+POWER_CHANGED1 follows coherent GET19; station mode remains1 while off. Current GET state and last-notified state are
+separate, so a poll cannot consume an event before it is posted. Association-event storage is separate from request scratch.
+
+Host coverage includes three station teardown cycles in firmware order, power/leave intent races, ABI validation and
+GET-before-notification ordering. This is source/model validation; real disconnect, physical off/on and automatic
+reconnection with DHCP/gateway/DNS still require the unattended wifi-power1 three-cycle RAM qualification. No result is
+claimed for the installed system by this change.

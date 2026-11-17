@@ -7,6 +7,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. sta_host.cpp -o /tmp/sta_host && /tmp/sta_host
 #include "WifiProfile.h"
 #include "WifiSta.h"
+#include "WifiUserControl.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -1131,8 +1132,36 @@ static void testFailures()
   }
 }
 
+// The actual station machine drains a user stop in firmware order before a
+// replacement join is allowed, for three cycles on the same control state.
+static void testUserStopCycles()
+{
+  WifiUserControl user;
+  for (unsigned i = 0; i < 3; ++i) {
+    Model m;
+    addToList(m.list, beacon(kAp24, kName, sizeof kName, false, false, kDot11CapEss), 2437, -45);
+    StaOptions o = fastOptions(); o.holdMs = 0;
+    m.begin(o, true, PianoWifiSecOpen);
+    for (unsigned n = 0; n < 5000 && m.sta.step != kStaAssociated; ++n) m.turn();
+    CHECK(m.sta.authorized && m.sta.vdevUp);
+    const uint32_t stop = user.disconnect();
+    CHECK(user.join() && !user.allowed(user.read()));
+    staStop(m.sta, m.now, 300);
+    CHECK(m.run() == kStaStopped);
+    CHECK(m.deauthFrame.size() == kDot11HeaderBytes + 2);
+    CHECK(m.deauthFrame[kDot11HeaderBytes] == kDot11ReasonLeaving);
+    CHECK(m.down && m.sta.peerDeleted && m.sta.vdevStopped);
+    const size_t n = m.commands.size();
+    CHECK(n >= 4 && m.commands[n-4] == kWmiCmdMgmtTxSend && m.commands[n-3] == kWmiCmdVdevDown &&
+          m.commands[n-2] == kWmiCmdPeerDelete && m.commands[n-1] == kWmiCmdVdevStop);
+    user.stopped(stop);
+    CHECK(user.allowed(user.read()));
+  }
+}
+
 int main()
 {
+  testUserStopCycles();
   testFrames();
   testAnswers();
   testRsn();

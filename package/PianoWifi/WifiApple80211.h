@@ -43,7 +43,7 @@ enum : int32_t {
   kScanResult = 11, kCardCapabilities = 12, kState = 13, kPhyMode = 14, kOpMode = 15, kRssi = 16, kNoise = 17, kPower = 19,
   kAssociate = 20, kAssociateResult = 21, kDisassociate = 22, kStatusDevName = 23, kSupportedChannels = 27, kLocale = 28,
   kDeauth = 29, kDriverVersion = 43, kHardwareVersion = 44, kRsnIe = 46, kCountryCode = 51, kRadioInfo = 54, kRsnConf = 77,
-  kPmkCache = 83, kScanReqMultiple = 86, kVirtualIfRole = 96, kScanCacheClear = 90, kCurrentNetwork = 103, kOffloadRsn = 177, kChannelsInfo = 207,
+  kPmkCache = 83, kScanReqMultiple = 86, kVirtualIfRole = 96, kScanCacheClear = 90, kCurrentNetwork = 103, kLinkChangedEventData = 156, kOffloadRsn = 177, kChannelsInfo = 207,
   kHwSupportedChannels = 254, kScanControl = 360, kCurPmk = 376, kRsnXe = 457, kInfraEnumerated = 512, kHeCapability = 570,
   kSuspendInterface = 606, kAggressiveEdca = 607,
 };
@@ -87,6 +87,7 @@ inline const char *requestName(int32_t type)
   case kScanCacheClear: return "SCANCACHE_CLEAR";
   case kVirtualIfRole: return "VIRTUAL_IF_ROLE";
   case kCurrentNetwork: return "CURRENT_NETWORK";
+  case kLinkChangedEventData: return "LINK_CHANGED_EVENT_DATA";
   case kOffloadRsn: return "OFFLOAD_RSN";
   case kChannelsInfo: return "CHANNELS_INFO";
   case kHwSupportedChannels: return "HW_SUPPORTED_CHANNELS";
@@ -119,7 +120,7 @@ enum : uint32_t {
   kEvScanCacheUpdated = 11,
 };
 
-// The link-changed payload (sheng's 24A446 layout, 32 bytes; 27.3 not re-read).
+// Link-changed event4 and GET156: 27.3 airportd/CoreWiFi consume the same 32 bytes.
 struct LinkEvent {
   uint8_t down, unused0[3];
   int32_t rssi;
@@ -129,7 +130,9 @@ struct LinkEvent {
   uint32_t reason, subreason;
   uint8_t unused3[4];
 };
-static_assert(sizeof(LinkEvent) == 32, "link event layout");
+static_assert(sizeof(LinkEvent) == 32 && __builtin_offsetof(LinkEvent, involuntary) == 0x10 &&
+              __builtin_offsetof(LinkEvent, reason) == 0x14 && __builtin_offsetof(LinkEvent, subreason) == 0x18,
+              "27.3 link event layout");
 
 // SET 20 carries one of two fixed association records.  The field meanings and offsets are
 // confirmed by the 27.3 Apple80211Associate2 parser and by the Pad 6 Pro binding (PAD6P0125;
@@ -532,8 +535,11 @@ inline AssociationTransition associationTransition(const Association &old, const
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
-  bool power = true;              // POWER: the radio as airportd sees it (M1: off only stops the scans; the chip stays up)
-  Association association;        // the supplicant's current link, when the association bit is enabled
+  bool power = true;              // requested power; the worker owns physical off/on
+  Association association;        // current GET state
+  Association eventAssociation;   // last notified state: GET polling never consumes an event
+  bool eventPower = true;
+  LinkEvent linkEvent = {};        // event4 and GET156 agree, including a voluntary leave
   uint32_t cursor = 0;            // the next SCAN_RESULT
   bool cacheCleared = false;      // SCANCACHE_CLEAR since the last SCAN_REQ: no result until the next scan
   ScanSnapshot scan;              // the scan list as of the last refresh
@@ -546,12 +552,24 @@ struct State {
   uint32_t sheng = 0;             // kSheng*: the UniXNU-sheng binding bits above (a runtime switch)
 };
 
+// Current GET state and last-notified state are separate: a GET arriving
+// before the periodic callback cannot swallow a pending link/power event.
+inline Association observeAssociation(State &s, const Association &next, bool power, bool emit)
+{
+  const Association old = s.eventAssociation;
+  s.association = next;
+  s.power = power;
+  if (emit) { s.eventAssociation = next; s.eventPower = power; }
+  return old;
+}
+
 // A state as a fresh interface has it, in place (the kext's is a zeroed data allocation, too large for a temporary on the stack).
 inline void reset(State &s)
 {
   uint8_t *raw = reinterpret_cast<uint8_t *>(&s);
   for (uint32_t i = 0; i < sizeof s; ++i) raw[i] = 0;
   s.power = true;
+  s.eventPower = true;
   s.country[0] = 'X';
   s.country[1] = 'X';
   s.gaps = kGapDefault;
@@ -570,6 +588,7 @@ struct Identity {
 enum : uint32_t {
   kDoPowerChanged = 0x1,   // post kEvPowerChanged
   kDoScanStarted = 0x2,    // arm the scan's completion (kEvScanDone after the time a short scan takes)
+  kDoDisassociate = 0x8,   // ask the radio worker to tear down and suppress retry
   kDoRefreshScan = 0x4,    // (asked before the handler runs for SCAN_REQ: the kext refreshes the snapshot first)
 };
 
@@ -833,7 +852,9 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     switch (rq.type) {
     case kPower: {
       Power p;
+      if (rq.length < sizeof p) { a.error = kErrInval; return a; }
       if ((a.error = copyIn(rq, io, &p, sizeof p))) return a;
+      if (p.version != 1 || p.radios != 1 || p.state[0] > 1) { a.error = kErrInval; return a; }
       s.power = p.state[0] != 0;
       ++s.powerSets;
       a.effects |= kDoPowerChanged;
@@ -862,6 +883,7 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     case kPowerSave:
       return a;   // accepted, nothing to change in M1
     case kAssociate:
+      if (!s.power) { a.error = kErrPowerOff; return a; }
       // Parse the complete request before acknowledging it.  The front end hands the
       // resulting profile to PianoWifi's level-7 machine after this lock is released.
       a.associationProfile = false;
@@ -875,6 +897,21 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       return a;
     case kDisassociate:
     case kDeauth:
+      // Disassociate accepts no data or the extended {version, reason, flush}
+      // record. Reason is an Apple policy value, not an IEEE reason to put on air.
+      if (rq.length) {
+        uint32_t leave[4];
+        const uint32_t bytes = rq.type == kDeauth ? 16u : 12u;
+        if (rq.length < bytes) { a.error = kErrInval; return a; }
+        if ((a.error = copyIn(rq, io, leave, bytes))) return a;
+        if (leave[0] != 1) { a.error = kErrInval; return a; }
+        if (rq.type == kDisassociate && leave[2]) {
+          s.scan.count = s.cursor = 0;
+          s.cacheCleared = true;
+        }
+      }
+      a.effects |= kDoDisassociate;
+      return a;
     case kCipherKey:
     case kAuthType:
     case kRsnIe:
@@ -929,6 +966,9 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     a.error = copyOut(rq, io, p, sizeof *p, a);
     return a;
   }
+  case kLinkChangedEventData:
+    a.error = copyOut(rq, io, &s.linkEvent, sizeof s.linkEvent, a);
+    return a;
   case kState:
     a.error = value(rq, io, s.association.state, a);
     return a;

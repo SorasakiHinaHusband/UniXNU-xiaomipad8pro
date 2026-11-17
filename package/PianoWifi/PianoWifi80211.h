@@ -70,6 +70,8 @@ class PianoWifi80211 : public IO80211Controller {
   static constexpr uint32_t kScanLinesMax = 400;   // two lines a scan: about 200 scans, the first half hour of a boot
 
   IOLock *fLock = nullptr;
+  IOLock *fSyncLock = nullptr;   // serialize snapshot/event delivery, separate from request scratch
+  pianowifi::a80211::AssociateEvent27 fAssocEvent = {};
   State *fState = nullptr;          // data allocations (no pointer in them): the state, the scratch buffer, the log's table
   uint8_t *fScratch = nullptr;
   Seen *fSeen = nullptr;
@@ -365,6 +367,7 @@ bool PianoWifi80211::start(IOService *provider)
 {
   using namespace pianowifi::a80211;
   fLock = IOLockAlloc();
+  fSyncLock = IOLockAlloc();
   fState = static_cast<State *>(IOMallocZeroData(sizeof(State)));
   fScratch = static_cast<uint8_t *>(IOMallocZeroData(kScratchBytes));
   fSeen = static_cast<Seen *>(IOMallocZeroData(sizeof(Seen)));
@@ -372,7 +375,7 @@ bool PianoWifi80211::start(IOService *provider)
   fScanDoneCall = thread_call_allocate(&PianoWifi80211::scanDoneTick, this);
   fReportCall = thread_call_allocate(&PianoWifi80211::reportTick, this);
   fAssociationCall = thread_call_allocate(&PianoWifi80211::associationTick, this);
-  if (!fLock || !fState || !fScratch || !fSeen || !fAttachCall || !fScanDoneCall || !fReportCall || !fAssociationCall) {
+  if (!fLock || !fSyncLock || !fState || !fScratch || !fSeen || !fAttachCall || !fScanDoneCall || !fReportCall || !fAssociationCall) {
     note80211("no memory for the apple80211 state: not started");
     return false;
   }
@@ -664,10 +667,12 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
               requestName(type), unsigned(length), int(value), a.error, unsigned(a.wrote), unsigned(rq.length), int(rq.value), extra,
               a.accepted ? " [accept mode]" : "");
   }
-  if (a.effects & kDoPowerChanged) {
-    note80211("%s: POWER set %s by airportd (M1: scans %s; the chip stays up)", fIfName, power ? "on" : "off",
-              power ? "answered again" : "refused with EPWROFF");
-    postEvent(kEvPowerChanged);
+  if (a.effects & (kDoPowerChanged | kDoDisassociate)) {
+    a.error = piano_wifi_user_control((a.effects & kDoDisassociate) ? PIANO_WIFI_USER_LEAVE :
+                                     power ? PIANO_WIFI_USER_ON : PIANO_WIFI_USER_OFF);
+    // The coherent GET view and event baseline come from the same owner.
+    // This also restores the old state if the owner refused the operation.
+    syncAssociation(true);
   }
   // Every scan request and every list end, with a serial and the asking process (ADOPTION.md 6.1 item 3): that is how a
   // client's scan through airportd — CoreWLAN's, which came back empty in 15 ms — is told from airportd's own scheduled ones.
@@ -759,7 +764,7 @@ void PianoWifi80211::eventPayload(uint32_t code, uint8_t *buffer, uint32_t capac
 {
   using namespace pianowifi::a80211;
   length = 0;
-  if (!(ucMode() & kUcEventPayloads) || !buffer) return;
+  if (!buffer) return;
   if (code == kEvPowerChanged && capacity >= sizeof(Power)) {
     Power p;
     bzero(&p, sizeof p);
@@ -770,7 +775,7 @@ void PianoWifi80211::eventPayload(uint32_t code, uint8_t *buffer, uint32_t capac
     IOLockUnlock(fLock);
     memcpy(buffer, &p, sizeof p);
     length = sizeof p;
-  } else if (code == kEvScanDone && capacity >= 8) {
+  } else if ((ucMode() & kUcEventPayloads) && code == kEvScanDone && capacity >= 8) {
     const uint32_t done[2] = {1, 0};   // {version, status 0: the scan finished}
     memcpy(buffer, done, sizeof done);
     length = sizeof done;
@@ -780,6 +785,11 @@ void PianoWifi80211::eventPayload(uint32_t code, uint8_t *buffer, uint32_t capac
 // Vendor Apple, class 6 (IEEE 802.11), subclass 1 (apple80211), the interface's name (16 bytes) and the payload.
 void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t length)
 {
+  if (code == pianowifi::a80211::kEvLinkChanged && payload && length == sizeof(pianowifi::a80211::LinkEvent)) {
+    IOLockLock(fLock);
+    fState->linkEvent = *static_cast<const pianowifi::a80211::LinkEvent *>(payload);
+    IOLockUnlock(fLock);
+  }
   char name[16] = {};
   memcpy(name, fIfName, sizeof name);
   uint8_t made[32];
@@ -810,6 +820,12 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
   const bool first = code < 32 && !(fEventCodesLogged & (1u << code));
   if (code < 32) fEventCodesLogged |= 1u << code;
   IOLockUnlock(fLock);
+  if (code == kEvLinkChanged && payload && length == sizeof(pianowifi::a80211::LinkEvent)) {
+    const auto &link = *static_cast<const pianowifi::a80211::LinkEvent *>(payload);
+    note80211("PianoWifiPowerLifecycleV1 event4 down %u voluntary %u reason %u bytes %u -> %d",
+              unsigned(link.down), link.involuntary ? 0u : 1u, unsigned(link.reason), unsigned(length), e);
+  }
+  if (code == kEvPowerChanged) note80211("PianoWifiPowerLifecycleV1 event1 power changed bytes %u -> %d", unsigned(length), e);
   if (first || e) note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
 }
 
@@ -835,6 +851,7 @@ void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
   if (!tick.run) return;
   uint32_t pending = 0;
   IOLockLock(self->fLock);
+  const bool power = self->fState->power;
   pending = self->fScanDonePending;
   self->fScanDonePending = 0;
   self->fScanDoneArmed = false;
@@ -844,8 +861,10 @@ void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
     // manager then waits for the separate cache transition (event 11) before
     // replying to CoreWLAN; both notifications use the socket fallback in
     // this profile because selector 5 reports no IOUC event pipe.
-    self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
-    note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
+    if (power) {
+      self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
+      note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
+    }
     self->postEvent(pianowifi::a80211::kEvScanDone);
   }
 }
@@ -984,9 +1003,10 @@ void PianoWifi80211::linkChanged(bool up)
 void PianoWifi80211::syncAssociation(bool emit)
 {
   using namespace pianowifi::a80211;
-  if (!fState) return;
+  if (!fState || !fSyncLock) return;
+  IOLockLock(fSyncLock);
   struct piano_wifi_assoc_snapshot raw = {};
-  if (piano_wifi_assoc_snapshot(&raw) != 0) return;
+  if (piano_wifi_assoc_snapshot(&raw) != 0) { IOLockUnlock(fSyncLock); return; }
   Association next = {};
   next.associated = raw.associated != 0;
   next.authorized = raw.authorized != 0;
@@ -1004,13 +1024,19 @@ void PianoWifi80211::syncAssociation(bool emit)
   next.result = raw.associate_result;
   next.state = raw.state;
   Association old = {};
+  bool powerChanged = false;
   bool changed = false, associatedChanged = false, authorizedChanged = false, resultChanged = false, bssidChanged = false,
        ssidChanged = false, stateChanged = false;
   IOLockLock(fLock);
-  old = fState->association;
-  next.modern = old.modern;
-  fState->power = raw.power != 0;
-  fState->association = next;
+  next.modern = fState->association.modern;
+  powerChanged = fState->eventPower != (raw.power != 0);
+  old = observeAssociation(*fState, next, raw.power != 0, emit);
+  LinkEvent link = {};
+  link.down = next.authorized ? 0 : 1;
+  link.rssi = next.rssi;
+  link.noise = uint16_t(next.noise);
+  link.involuntary = raw.user_stop ? 0 : 1;
+  link.reason = 0;   // local voluntary leave, as sheng; on-air IEEE reason3 is separate
   associatedChanged = old.associated != next.associated;
   authorizedChanged = old.authorized != next.authorized;
   resultChanged = old.result != next.result;
@@ -1020,13 +1046,15 @@ void PianoWifi80211::syncAssociation(bool emit)
   changed = associatedChanged || authorizedChanged || resultChanged || stateChanged || bssidChanged || ssidChanged ||
             old.channel != next.channel || old.rssi != next.rssi;
   IOLockUnlock(fLock);
-  if (!emit || !changed) return;
+  if (!emit) { IOLockUnlock(fSyncLock); return; }
+  if (powerChanged) postEvent(kEvPowerChanged);
+  if (!changed) { IOLockUnlock(fSyncLock); return; }
   const auto transition = associationTransition(old, next);
   auto assocDone = [&](const Association &a) {
     if (a.modern) {
-      // Reuse the controller's scratch allocation so the ioctl caller's
+      // A separate event record, serialized by fSyncLock, so the ioctl caller's
       // kernel stack does not carry the 540-byte modern completion record.
-      AssociateEvent27 *event = reinterpret_cast<AssociateEvent27 *>(fScratch);
+      AssociateEvent27 *event = &fAssocEvent;
       bzero(event, sizeof *event);
       for (unsigned i = 0; i < 6; ++i) event->attempts[0][i] = a.bssid[i];
       event->result = a.result;
@@ -1042,18 +1070,12 @@ void PianoWifi80211::syncAssociation(bool emit)
   // are emitted only after AUTHORIZE, so configd cannot start DHCP early.
   if (transition.assocDone) assocDone(next);
   if (transition.connected) {
-    LinkEvent link = {};
     link.down = 0;
-    link.rssi = next.rssi;
-    link.noise = uint16_t(next.noise);
     if (ssidChanged) postEvent(kEvSsidChanged);
     if (bssidChanged) postEvent(kEvBssidChanged);
     postEvent(kEvLinkChanged, &link, sizeof link);
   } else if (transition.disconnected || (!next.associated && resultChanged)) {
-    LinkEvent link = {};
     link.down = 1;
-    link.rssi = next.rssi;
-    link.noise = uint16_t(next.noise);
     postEvent(kEvLinkChanged, &link, sizeof link);
     if (next.result && !transition.assocDone) assocDone(next);
     postEvent(kEvSsidChanged);
@@ -1064,6 +1086,7 @@ void PianoWifi80211::syncAssociation(bool emit)
   note80211("%s: association state %s (channel %u, rssi %d, rate %u; events emitted)", fIfName,
             next.associated ? (next.authorized ? "authorized" : "associated") : "idle", unsigned(next.channel), int(next.rssi),
             unsigned(next.rate));
+  IOLockUnlock(fSyncLock);
 }
 
 void PianoWifi80211::associationTick(thread_call_param_t p, thread_call_param_t)
@@ -1714,6 +1737,8 @@ void PianoWifi80211::free()
   fState = nullptr;
   fScratch = nullptr;
   fSeen = nullptr;
+  if (fSyncLock) IOLockFree(fSyncLock);
+  fSyncLock = nullptr;
   if (fLock) IOLockFree(fLock);
   fLock = nullptr;
   IO80211Controller::free();

@@ -31,11 +31,16 @@ struct piano_wifi_assoc_snapshot {
   uint8_t op_mode;    // 1=station
   uint8_t reserved;
   uint32_t associate_result;
+  uint32_t user_stop;  // explicit user leave/off; link event is voluntary (the on-air deauth uses reason 3)
 };
 
 // Returns 0 and fills a version-1 snapshot.  The function is safe before the
 // station starts and reports power off/idle in that case.
 int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out);
+
+enum { PIANO_WIFI_USER_OFF = 0, PIANO_WIFI_USER_ON = 1, PIANO_WIFI_USER_LEAVE = 2 };
+// Nonblocking intent only. The radio worker owns WMI, DMA and physical power.
+int piano_wifi_user_control(uint32_t operation);
 
 #ifdef __cplusplus
 }

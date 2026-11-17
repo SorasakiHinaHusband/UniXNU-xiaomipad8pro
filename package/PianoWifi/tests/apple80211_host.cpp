@@ -266,6 +266,26 @@ int main()
     CHECK(a.error == 0 && a.wrote == 12);
   }
 
+  // Invalid power records and joins while off must not change the radio or
+  // hand credentials to the worker. Both leave APIs carry a real worker effect.
+  {
+    Rig r;
+    r.put32(0, 1); r.put32(4, 1); r.put32(8, 0);
+    CHECK(r.ask(true, kPower, 24).error == 0);
+    CHECK(r.associate().error == kErrPowerOff);
+    CHECK(!r.st.power);
+    r.put32(0, 2); r.put32(8, 1);
+    CHECK(r.ask(true, kPower, 24).error == kErrInval && !r.st.power);
+    CHECK(r.ask(true, kDisassociate, 0, false).effects & kDoDisassociate);
+    r.put32(0, 1); r.put32(4, 3); r.put32(8, 1);
+    CHECK(r.ask(true, kDisassociate, 12).effects & kDoDisassociate);
+    CHECK(r.ask(true, kDeauth, 16).effects & kDoDisassociate);
+    CHECK(r.ask(true, kDisassociate, 4).error == kErrInval);
+    r.st.linkEvent.down = 1; r.st.linkEvent.reason = 3;
+    CHECK(r.ask(false, kLinkChangedEventData, 32).wrote == 32);
+    CHECK(r.user.mem[0] == 1 && r.user.mem[0x10] == 0 && r.u32(0x14) == 3);
+  }
+
   // ---- the idle station: state, mode, PHY, noise, and the not-associated answers
   {
     Rig r;

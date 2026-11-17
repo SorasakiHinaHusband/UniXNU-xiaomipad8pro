@@ -100,12 +100,15 @@
 #include "WifiSmmuWindow.h"
 #include "WifiSta.h"
 #include "WifiAssocSnapshot.h"
+#include "WifiUserControl.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
 #define PIANO_WCN_RAILS_KERNEL
 #include <PianoWcnRails.h>   // the PMU's six rails, shared with PianoBluetooth (docs/drivers/bluetooth.md section 7)
 
 using namespace pianowifi;
+
+namespace { WifiUserControl gUserControl; }
 
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
@@ -542,7 +545,7 @@ bool levelLate()
 {
   // A stop asked for (a suspend, a shutdown) ends every wait of levels 4 to 6 as their hard deadline does: a restart's bring-up
   // that a system sleep interrupts gives the chip up at once (the power hook waits for the ladder to park the radio).
-  if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) return true;
+  if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) || gUserControl.radioStop()) return true;
   const uint64_t deadline = __atomic_load_n(&gLevelDeadline, __ATOMIC_ACQUIRE);
   return deadline && nowMs() > deadline;
 }
@@ -3376,6 +3379,7 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
     note("menu join profile refused: %s (nothing of it kept)", problem);
     return EINVAL;
   }
+  if (!gUserControl.join()) return EPWROFF;
   IOLockLock(gProfileLock);
   gProfile = *incoming;
   gProfileSet = true;
@@ -3388,6 +3392,20 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
   note("PianoWifiMenuJoinProfile: menu join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s (none of it is logged)",
        generation, unsigned(incoming->ssid_len), piano_wifi_security_name(incoming->security),
        incoming->psk_len ? " with a passphrase" : "", (incoming->flags & PianoWifiProfileBssid) ? "given" : "not given");
+  return 0;
+}
+
+extern "C" int piano_wifi_user_control(uint32_t operation)
+{
+  if (gArgs.level < 8 || !gArgs.restart) return ENOTSUP;
+  uint32_t w;
+  if (operation == PIANO_WIFI_USER_LEAVE) w = gUserControl.disconnect();
+  else if (operation <= PIANO_WIFI_USER_ON) w = gUserControl.setPower(operation == PIANO_WIFI_USER_ON);
+  else return EINVAL;
+  note("PianoWifiPowerLifecycleV1 request %s serial %u: power %u, join %u, cycle %u",
+       operation == PIANO_WIFI_USER_LEAVE ? "leave" : operation == PIANO_WIFI_USER_ON ? "on" : "off",
+       WifiUserControl::serial(w), WifiUserControl::power(w) ? 1u : 0u, (w & WifiUserControl::kJoin) ? 1u : 0u,
+       (w & WifiUserControl::kCycle) ? 1u : 0u);
   return 0;
 }
 
@@ -3894,10 +3912,13 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   if (!out) return EINVAL;
   bzero(out, sizeof *out);
   out->version = PIANO_WIFI_ASSOC_SNAPSHOT_VERSION;
-  out->power = (gArgs.level >= 2 && !gChipDead) ? 1 : 0;
+  const uint32_t user = gUserControl.read();
+  out->power = (gArgs.level >= 2 && WifiUserControl::power(user)) ? 1 : 0;
+  out->user_stop = !gUserControl.allowed(user);
   out->op_mode = 1;
   out->state = 0;
   out->noise_dbm = -95;
+  if (out->user_stop) return 0;
   // ASSOCIATE_RESULT is a public progress/result code: 0 while the station or
   // its WPA2 port is still running, 1 only after authorization, 9 for a
   // timeout/no-answer, and 2 for every other completed failure.
@@ -3911,7 +3932,8 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
     out->associate_result = 2u;
   else
     out->associate_result = 1u;
-  const bool live = gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
+  const bool live = gUserControl.allowed(gUserControl.read()) &&
+                    gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
                     (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||
                      gSta.step == kStaAssociated);
   out->associated = live && gSta.vdevUp;
@@ -4020,7 +4042,7 @@ errno_t portSend(kern_ctl_ref, u_int32_t unit, void *, mbuf_t m, int)
   IOLockLock(gNetLock);
   const NetLink link = gNetLink;
   IOLockUnlock(gNetLock);
-  const bool live = link.state != PIANO_WIFI_8021X_STATE_IDLE;
+  const bool live = gUserControl.allowed(gUserControl.read()) && link.state != PIANO_WIFI_8021X_STATE_IDLE;
   const bool stale = r.kind != kNetReqLinkQuery && r.generation != link.generation;
   int status = 0;
   bool answerNow = true;
@@ -4171,7 +4193,7 @@ extern "C" int piano_wifi_net_send(const uint8_t *frame, uint32_t length)
     __atomic_add_fetch(&gNetSendSize, 1u, __ATOMIC_RELAXED);
     return EMSGSIZE;
   }
-  if (!gNetLock || !gTxLock) return ENETDOWN;
+  if (!gUserControl.allowed(gUserControl.read()) || !gNetLock || !gTxLock) return ENETDOWN;
   IOLockLock(gNetLock);
   const bool open = gNetLink.txData;
   IOLockUnlock(gNetLock);
@@ -4597,7 +4619,8 @@ void level8Follow(uint64_t now)
   // Live from the association's answer on: the access point sends message 1 of the handshake right after it, before the
   // peer's association and the station's up have gone out, and the port must have the association's generation by then. The
   // transmit side waits for the station's up (a frame before it is the firmware's to drop): EAPOL_TX frames wait in the queue.
-  const bool live = gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
+  const bool live = gUserControl.allowed(gUserControl.read()) &&
+                    gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
                     (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||
                      gSta.step == kStaAssociated);
   const bool up = live && gSta.vdevUp;
@@ -4614,6 +4637,7 @@ void level8Follow(uint64_t now)
     IOLockUnlock(gNetLock);
     IOLockLock(gPortLock);
     netKeysReset(gKeys);
+    gPortAuthorizeWanted = gPortLeaveWanted = false;
     IOLockUnlock(gPortLock);
     netLinkSnapshot(PIANO_WIFI_8021X_STATE_ASSOCIATED, true, false);
     note("level 8: the association is live for the data path (generation %u, AID %u): %s", generation, gSta.aid,
@@ -4635,6 +4659,7 @@ void level8Follow(uint64_t now)
     deferPhase();
   }
   if (up && gSta.authorized && !gL8.linkUpTold) {
+    if (gBgScan == kBgScanNone && (gPass.fast || gArgs.bgScanS)) gBgScan = kBgScanArmed;
     gL8.linkUpTold = true;
     gL8.authorizedAt = now;
     gL8.disconnectGraceUntil = 0;
@@ -4651,7 +4676,7 @@ void level8Follow(uint64_t now)
     // same scheduler turn as the final key completion.  Keep the public link
     // stable for a short, bounded grace window so airportd/configd do not
     // cancel DHCP on that transient edge; data TX is stopped immediately.
-    if (gL8.linkUpTold && !gL8.disconnectGraceUntil &&
+    if (gUserControl.allowed(gUserControl.read()) && gL8.linkUpTold && !gL8.disconnectGraceUntil &&
         piano_wifi_post_join_disconnect_grace(now, gL8.authorizedAt)) {
       gL8.disconnectGraceUntil = now + PIANO_WIFI_POST_JOIN_DISCONNECT_GRACE_MS;
       if (!gL8.disconnectGraceLogged) {
@@ -4667,7 +4692,7 @@ void level8Follow(uint64_t now)
       IOLockUnlock(gTxLock);
       return;
     }
-    if (gL8.disconnectGraceUntil && now < gL8.disconnectGraceUntil) return;
+    if (gUserControl.allowed(gUserControl.read()) && gL8.disconnectGraceUntil && now < gL8.disconnectGraceUntil) return;
     gL8.live = false;
     gL8.txUp = false;
     gL8.linkUpTold = false;
@@ -4680,6 +4705,7 @@ void level8Follow(uint64_t now)
     IOLockUnlock(gTxLock);
     IOLockLock(gPortLock);
     netKeysReset(gKeys);
+    gPortAuthorizeWanted = gPortLeaveWanted = false;
     IOLockUnlock(gPortLock);
     gL8.lastState = PIANO_WIFI_8021X_STATE_IDLE;
     portSendLink(PIANO_WIFI_8021X_STATE_IDLE);
@@ -4709,7 +4735,7 @@ void level8Requests(uint64_t now)
   gPortLinkWanted = false;
   IOLockUnlock(gPortLock);
   if (linkWanted) portSendLink(gL8.lastState);
-  if (!gL8.txUp || gSta.outLength) return;   // keys and the authorization once the station is up; the join's own command first
+  if (!gUserControl.allowed(gUserControl.read()) || !gL8.txUp || gSta.outLength) return;   // keys and the authorization once the station is up; the join's own command first
   IOLockLock(gNetLock);
   const uint32_t generation = gNetLink.generation;
   IOLockUnlock(gNetLock);
@@ -4990,6 +5016,7 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
 
 __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64_t openedAt, bool stopping)
 {
+  if (!gUserControl.allowed(gUserControl.read())) return;
   // (review of ee9980a, #3) with the menu binding on (piano-wifi-apple80211), a scan again every piano-wifi-bgscan s while
   // associated, so that the menu's snapshot follows the networks around; without it only the fast pass's one
   if (gBgScan == kBgScanOver && gArgs.bgScanS && gBgScanNext && now >= gBgScanNext && !stopping) gBgScan = kBgScanArmed;
@@ -5272,6 +5299,7 @@ __attribute__((noinline)) const char *rejoinWait(uint32_t waitMs, bool &stoppedO
       stoppedOnRequest = true;
       return nullptr;
     }
+    if (!gUserControl.allowed(gUserControl.read())) return nullptr;
     linkRun(gLink, now);
     if (gLink.step == kLinkStopped) return linkErrorName(gLink.error);
     if (gArgs.level >= 8) level8Turn(now);
@@ -5282,6 +5310,31 @@ __attribute__((noinline)) const char *rejoinWait(uint32_t waitMs, bool &stoppedO
     IOSleep(20);
   }
   return nullptr;
+}
+
+__attribute__((noinline)) void userStopScans()
+{
+  const uint32_t ids[2] = {gBgScan == kBgScanSent ? gBgScanIdNow : 0u,
+                           gSta.scanAsked && !gSta.scanDone ? gSta.scanId : 0u};
+  for (uint32_t id : ids) {
+    if (!id) continue;
+    WmiScanRequest request;
+    request.scanId = id;
+    WmiWriter w;
+    uint8_t command[64];
+    const uint32_t n = wmiBuildStopScan(w, command, sizeof command, request);
+    int rc = 0;
+    const uint64_t until = nowMs() + 300;
+    do {
+      rc = n ? linkSendWmi(gLink, command, n) : -1;
+      if (rc) break;
+      linkRun(gLink, nowMs());
+      IOSleep(2);
+    } while (nowMs() < until);
+    note("PianoWifiPowerLifecycleV1 stop scan: %s", rc == 1 ? "sent" : "transport refused or timed out");
+  }
+  gBgScan = kBgScanNone;
+  gBgScanNext = 0;
 }
 
 int level7(IOService *owner)
@@ -5379,6 +5432,22 @@ int level7(IOService *owner)
          unsigned(gLastNet.channel));
   }
   for (;;) {
+  // A user leave is an idle station, not a failed join to retry from the
+  // retained profile. A subsequent SET20 releases this gate. No scan runs here.
+  while (!gUserControl.allowed(gUserControl.read())) {
+    const uint32_t user = gUserControl.read();
+    if (gUserControl.radioStop() || __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
+      stoppedOnRequest = true;
+      break;
+    }
+    gUserControl.stopped(user);  // no station exists between joins
+    const uint64_t now = nowMs();
+    linkRun(gLink, now);
+    if (gArgs.level >= 8) level8Turn(now);
+    if (gLink.step == kLinkStopped || mhiHealth(gMhiIo, gBoot.bhi).dead()) { why = "the idle firmware stopped"; break; }
+    IOSleep(20);
+  }
+  if (stoppedOnRequest || why) break;
   ++joins;
   bool poolQueues = false;
   if (gReoPool.va) {
@@ -5411,6 +5480,8 @@ int level7(IOService *owner)
   uint64_t nextFileTry = 0;
   bool stopping = false, profileNoted = false, dropThisJoin = false, clientWaitOver = false;
   uint64_t stopAt = 0, clientWaitFrom = 0;
+  uint32_t userStop = 0;
+  bool userStopped = false;
   why = nullptr;
   while (!staFinished(gSta)) {
     const uint64_t now = nowMs();
@@ -5428,6 +5499,17 @@ int level7(IOService *owner)
     if (firstOpenAt) {
       restartTurn(owner, now, firstOpenAt, stopping);
       bgScanTurn(owner, now, firstOpenAt, stopping);
+    }
+    const uint32_t user = gUserControl.read();
+    if (!stopping && (gUserControl.pending(user) || gUserControl.radioStop())) {
+      userStop = user;
+      userStopped = true;
+      userStopScans();
+      staStop(gSta, now, 300u);
+      stopping = true;
+      stopAt = now;
+      note("PianoWifiPowerLifecycleV1 teardown serial %u: deauth, vdev down, peer delete, vdev stop",
+           WifiUserControl::serial(user));
     }
     phyTurn(now, stopping);
     baTurn(now, stopping);
@@ -5513,6 +5595,17 @@ int level7(IOService *owner)
       break;
     }
     IOSleep(gSta.step == kStaProfileWait ? 20 : 2);
+  }
+  if (gArgs.level >= 8) level8Follow(nowMs());
+  if (userStopped) {
+    if (gUserControl.radioStop()) stoppedOnRequest = true;
+    // A power cycle is acknowledged only after physical power down. A
+    // station leave completes here, before any new profile is allowed to run.
+    if (!(userStop & WifiUserControl::kCycle)) gUserControl.stopped(userStop);
+    note("PianoWifiPowerLifecycleV1 station stopped serial %u: down %u, peer %u, stop %u",
+         WifiUserControl::serial(userStop), gSta.downSent ? 1u : 0u, gSta.peerDeleted ? 1u : 0u,
+         gSta.vdevStopped ? 1u : 0u);
+    if (!stoppedOnRequest) continue;
   }
   gLink.hook = nullptr;
   // ---- the rejoin's decision: only an association that ended or a join that failed, never a stop, a dead chip, a dead link
@@ -5972,13 +6065,14 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   };
   // A stop asked for (a system sleep at level 8) between two levels: the chip is given up before the next one begins.
   auto stopAsked = [&]() {
-    if (!__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) return false;
+    if (!__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST) && !gUserControl.radioStop()) return false;
     note("level %d: done, but a stop was asked for (%s): the next level does not begin", e.level, gStopWhy);
     safeOff(gHw, power, opt);
     chipPut();
     e.failed = true;
     return true;
   };
+  if (stopAsked()) return 0;
   reportStack("level 2 begins");
   note("level 2: the six PMU rails, PERST# low, WLAN_EN; the PHY's two LDOs are read only (one is the UFS PHY's PLL)");
   // The rails through the shared helper first (PianoBluetooth may hold them already: then only a read-back), then level 2's own
@@ -6253,12 +6347,33 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   // The wait. A system sleep parks the radio (powered down) and only its wake ends the wait; a back-off ends by itself.
   const bool untilWake = next != kNextFailure || capped;
   const uint64_t until = ended + waitMs;
-  bool parked = false, woke = false;
+  bool parked = false, woke = false, userParked = false, userRestart = false;
   for (;;) {
     if (gRadioStopped) {   // a shutdown: stopRadio powered the radio down, unless the ladder still had it (then here)
       if (__atomic_load_n(&gStopLeftToLadder, __ATOMIC_SEQ_CST) && gChipHeld) chipDown(power, opt);
       return false;
     }
+    const uint32_t idleUser = gUserControl.read();
+    if (gUserControl.pending(idleUser) && !(idleUser & WifiUserControl::kCycle))
+      gUserControl.stopped(idleUser);  // level7/its station have ended
+    if (gUserControl.radioStop()) {
+      if (chipOn) { chipDown(power, opt); chipOn = false; }
+      const uint32_t user = gUserControl.read();
+      gUserControl.radioOff(user);
+      if (!userParked) {
+        note("PianoWifiPowerLifecycleV1 radio off: WLAN_EN low, PERST asserted, scans stopped serial %u",
+             WifiUserControl::serial(user));
+        setProperty("piano-wifi-user-radio", "off: WLAN_EN low, scans stopped");
+      }
+      userParked = true;
+    }
+    if (userParked && WifiUserControl::power(gUserControl.read()) && !gUserControl.radioStop() &&
+        !__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
+      userRestart = true;
+      break;
+    }
+    if (userParked && !WifiUserControl::power(gUserControl.read()) &&
+        !__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) { IOSleep(20); continue; }
     if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
       if (!parked) {
         if (chipOn) {
@@ -6283,9 +6398,14 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
           parked = false;
           continue;
         }
+        if (!WifiUserControl::power(gUserControl.read())) { IOSleep(20); continue; }
         woke = true;
         break;
       }
+    } else if (gUserControl.allowed(gUserControl.read()) &&
+               __atomic_load_n(&gMenuJoinRequested, __ATOMIC_ACQUIRE)) {
+      userRestart = true;
+      break;
     } else if (!untilWake && nowMs() >= until) {
       break;
     }
@@ -6297,10 +6417,14 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   }
   // The restart.
   ++gRestarts;
-  if (woke) {
+  if (woke || userRestart) {
     ++gRestartsWake;
     gRestartRun = 0;   // a wake is a fresh start: the cap counts again from here
-    gRestartWhy = "the wake from a system sleep";
+    gRestartWhy = userRestart ? "Wi-Fi user power on" : "the wake from a system sleep";
+    if (userRestart) {
+      setProperty("piano-wifi-user-radio", "on: firmware restarting");
+      note("PianoWifiPowerLifecycleV1 radio on: clean firmware restart, retained profile available to auto-join");
+    }
   } else {
     ++gRestartRun;
     if (gChipDead) ++gRestartsCrash;
@@ -6309,7 +6433,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   }
   // A fast pass after a wake or the firmware's death, when a port has opened before and the pass that just ended was not a fast
   // one that failed to open it; a failed level, or that, restarts with the scans.
-  gFastNext = gArgs.fastRestart && gLastNetValid && (woke || gChipDead) && !(e.fast && !e.opened);
+  gFastNext = gArgs.fastRestart && gLastNetValid && (woke || userRestart || gChipDead) && !(e.fast && !e.opened);
   gRestartBegan = nowMs();
   char line[200];
   snprintf(line, sizeof line, "%u restart(s): %u at a wake, %u after the firmware died, %u after a failed level; the last: %s",

@@ -39,7 +39,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   on its own). Joining through macOS itself works since 2026-11-17 on RAM boots (run wifi-join9b): `networksetup` -> airportd ->
   IO80211's Apple80211Associate2 -> our driver -> WPA2 association, the four-way handshake by our supplicant, DHCP, gateway and
   DNS ([docs/results-2026-11-17.md](docs/results-2026-11-17.md)); the menu's own list/click proof and the installed system's update
-  are next ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md), [docs/drivers/wifi.md](docs/drivers/wifi.md)).
+  are next; user power/disconnect lifecycle is implemented with host coverage, awaiting its three-cycle tablet qualification ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md), [docs/drivers/wifi.md](docs/drivers/wifi.md)).
 - Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
   test; opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
 - Hardware video decode (2026-11-17, RAM boots): the video firmware loads, is authenticated, boots and answers the host interface
