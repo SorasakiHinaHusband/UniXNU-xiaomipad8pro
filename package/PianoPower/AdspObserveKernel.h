@@ -41,6 +41,9 @@ void observeGlink(pianoobserve::Text &t, bool fifo) {
     if(consistent) {
         const auto &g=copy->glink;
         t.add("fifo status=ok tx_length=%u rx_length=%u th=%u tt=%u rh=%u rt=%u pending=%u\n",g.tx.length,g.rx.length,th,tt,rh,rt,pending);
+        t.add("sens-trace3 requests=%u granted=%u refused=%u acks=%u ack_granted=%u ack_refused=%u grant_mode=%u dynamic_bytes=%u\n",
+              g.intents.requests,g.intents.granted,g.intents.refused,g.intents.acks,g.intents.ack_granted,g.intents.ack_refused,
+              g.dynamic_intents,g.dynamic_bytes);
         if(fifo)adspobserve::frames(t,g,copy->bytes,pending,tt,g.tx.length);
         else adspobserve::owner(t,g);
     } else t.add("status=unavailable-or-concurrent no_decode=1\n");

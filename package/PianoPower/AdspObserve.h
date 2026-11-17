@@ -79,13 +79,22 @@ inline void owner(Text &t, const QcomGlink &g) {
     t.add("owner broken=%u version=%u features=%#x retry_pending=%u reply_due=%u reply_cmd=%u reply_cid=%u reply_value=%u done_deferred=%u done_retired=%u reply_deferred=%u reply_retired=%u tx_blocked=%u rx_messages=%u tx_messages=%u\n",
           g.broken, g.version_agreed, g.features, g.retry_pending, g.reply_due, g.reply_cmd, g.reply_cid, g.reply_value,
           g.done_deferred, g.done_retried, g.reply_deferred, g.reply_retried, g.tx_blocked, g.rx_messages, g.tx_messages);
+    t.add("sens-trace3 intent_totals grant_mode=%u dynamic_bytes=%u max_intent=%u max_total=%u reply_offer=%u requests=%u granted=%u refused=%u last_size=%u min_size=%u max_size=%u size_sum=%llu requests_tx=%u acks=%u ack_granted=%u ack_refused=%u\n",
+          g.dynamic_intents, g.dynamic_bytes, QCOM_GLINK_DYNAMIC_INTENT_MAX, QCOM_GLINK_DYNAMIC_TOTAL_MAX, g.reply_offer,
+          g.intents.requests, g.intents.granted, g.intents.refused, g.intents.last_size, g.intents.min_size, g.intents.max_size,
+          (unsigned long long)g.intents.size_sum, g.intents.requests_tx, g.intents.acks, g.intents.ack_granted, g.intents.ack_refused);
     for (unsigned j = 0; j < QCOM_GLINK_MAX_CHANNELS; ++j) {
         const auto &c = g.channel[j];
         t.add("channel slot=%u name=%.*s used=%u lcid=%u rcid=%u up=%u open_sent=%u open_acked=%u remote_open=%u ack_due=%u intent_asked=%u size=%u count=%u\n",
               j, QCOM_GLINK_NAME, c.name, c.used, c.lcid, c.rcid, c.up, c.open_sent, c.open_acked, c.remote_open, c.ack_due, c.intent_asked, c.intent_size, c.intent_count);
+        const auto &s = c.intents;
+        t.add("intent_stats channel=%u requests=%u granted=%u refused=%u last_size=%u min_size=%u max_size=%u size_sum=%llu requests_tx=%u last_tx_size=%u acks=%u ack_granted=%u ack_refused=%u fixed_count=%u\n",
+              j, s.requests, s.granted, s.refused, s.last_size, s.min_size, s.max_size, (unsigned long long)s.size_sum,
+              s.requests_tx, s.last_tx_size, s.acks, s.ack_granted, s.ack_refused, c.fixed_intent_count);
         for (unsigned i = 0; i < QCOM_GLINK_MAX_LOCAL_INTENTS; ++i) {
             const auto &l = c.local[i];
-            t.add("local channel=%u index=%u configured=%u fill=%u advertised=%u busy=%u done_due=%u\n", j, i, i < c.intent_count, l.fill, l.advertised, l.busy, l.done_due);
+            t.add("local channel=%u index=%u configured=%u size=%u dynamic=%u fill=%u advertised=%u busy=%u done_due=%u\n",
+                  j, i, i < c.intent_count, l.size, i >= c.fixed_intent_count && i < c.intent_count, l.fill, l.advertised, l.busy, l.done_due);
         }
         for (unsigned i = 0; i < QCOM_GLINK_MAX_REMOTE_INTENTS; ++i) {
             const auto &r = c.remote[i];

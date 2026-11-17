@@ -800,3 +800,20 @@ never file data, SUID or calibration; crash text is separately limited to 80 byt
 IPCC reads only CONFIG; counters/last values observe existing receive/clear/send calls. Enable strobes are recorded requests,
 not mask readbacks; remote mask/pending/ACK and independent watchdog state remain unknown. No new doorbell or SMP2P ACK is issued.
 These are diagnostic interfaces, not a repair or evidence that sensors work on the tablet.
+
+### Intent-request diagnostics and bounded A/B
+
+With `piano-sensors=4`, `[sens-trace3]` logs every incoming GLINK RX_INTENT_REQ and INTENT_REQ_ACK, including channel, local/remote
+IDs, requested size, fixed receive size, grant/refusal and reason. Zero-inclusive summaries every 30 seconds include FIFO indices;
+per-channel counters retain request sizes (last/min/max/sum), grants/refusals and replies to our outgoing requests across reopen.
+The passive FIFO/owner exports also include intent counters. A grant counter records the host decision; an owed advertisement or
+ACK remains visible as reply debt until published. Console continuity and valid export headers must be checked before treating zero
+requests as evidence. The pending-frame decoder remains available to identify the bytes before the first light request.
+
+`piano-glink-intent-grant=1` enables an experimental requested-size allocation path; its default is off. Each remote request allocates
+a fresh intent of exactly the requested size, with limits of 64KiB per intent, 256KiB for the whole edge and 24 total receive slots per
+channel (including fixed buffers). Zero sizes, exhausted limits and failed allocations are explicitly refused. Advertisements precede
+grant ACKs; FIFO pressure retains both without duplicate allocation/counting. Receives use each slot's actual capacity, and remote
+close/reopen frees dynamic buffers. Linux's allocation behaviour was studied as a specification; no source text was copied.
+The diagnostic comparison keeps one committed KC and changes either this grant switch or `piano-audio=0`, independently.
+These controls have host validation only; their effect on the shared-edge stall needs tablet evidence.
