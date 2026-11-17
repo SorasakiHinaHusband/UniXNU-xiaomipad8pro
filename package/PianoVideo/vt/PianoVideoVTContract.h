@@ -122,6 +122,20 @@ inline bool surface(const Surface &s) {
     extent(s.plane[0].offset,s.plane[0].stride,240,320,s.size) && extent(s.plane[1].offset,s.plane[1].stride,120,320,s.size) &&
     s.plane[1].offset >= s.plane[0].offset + 239*s.plane[0].stride + 320;
 }
+// Native 27.3 IOSurface lookup lock result. Plane+0x6c is a byte:
+// IOSurfaceClientGetBytesPerRowOfPlane 0x1876b7978 uses ldrb, as does
+// GetBaseAddressOfPlane 0x1876b7c2c. Neighbouring bytes are not this flag.
+inline bool surfaceResult(const uint8_t *b, uint32_t n, uint32_t id, Surface &v) {
+  if (!b || n != 0xc68) return false;
+  auto u64 = [&](uint32_t at) { uint64_t x; memcpy(&x,b+at,8); return x; };
+  auto u32 = [&](uint32_t at) { uint32_t x; memcpy(&x,b+at,4); return x; };
+  v.base=u64(0); v.id=u32(0x18); v.size=u64(0x20); v.format=u32(0x48); v.planes=u32(0x58);
+  for (unsigned p=0;p<2;++p) {
+    const uint32_t at=0x88+p*0x98;
+    v.plane[p]={u64(at),u64(at+8),u64(at+0x18),u64(at+0x20),b[at+0x6c]};
+  }
+  return v.id==id && surface(v);
+}
 // All calls under the session lock. Invalid input does not consume the one-AU
 // budget. Cancellation suppresses success, settles an accepted frame once.
 struct State {

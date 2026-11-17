@@ -98,13 +98,7 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   const IOReturn rc=newClient?newClient->externalMethod(4,reinterpret_cast<IOExternalMethodArgumentsOpaque *>(&a)):
     s->surfaces->callExternalMethod(4,&a);
   bool ok=!rc && a.structureOutputSize==bytes;
-  if(ok){
-    auto u64=[&](uint32_t at){uint64_t x;memcpy(&x,result+at,8);return x;};
-    auto u32=[&](uint32_t at){uint32_t x;memcpy(&x,result+at,4);return x;};
-    v.base=u64(0);v.id=u32(0x18);v.size=u64(0x20);v.format=u32(0x48);v.planes=u32(0x58);
-    for(unsigned p=0;p<2;++p){const uint32_t at=0x88+p*0x98;v.plane[p]={u64(at),u64(at+8),u64(at+0x18),u64(at+0x20),u32(at+0x6c)};}
-    ok=v.id==id && contract::surface(v);
-  }
+  if(ok)ok=contract::surfaceResult(result,bytes,id,v);
   IOLog("PianoVideoVT V5a: surface lookup id %u status %08x result-bytes %u format %08x planes %u valid %u\n",id,rc,unsigned(a.structureOutputSize),v.format,v.planes,unsigned(ok));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }

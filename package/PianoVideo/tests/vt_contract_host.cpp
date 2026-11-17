@@ -26,6 +26,14 @@ int main() {
   const auto allocation=s.size;s.size=uint64_t(vtcontract::kMaxSurfaceBytes)+1;CHECK(!vtcontract::surface(s));s.size=allocation;
   s.plane[1].nonlinear=1;CHECK(!vtcontract::surface(s));s.plane[1].nonlinear=0;
   s.plane[1].offset=76801;CHECK(!vtcontract::surface(s));
+  uint8_t locked[0xc68]={};
+  auto put64=[&](unsigned at,uint64_t x){memcpy(locked+at,&x,8);};
+  auto put32=[&](unsigned at,uint32_t x){memcpy(locked+at,&x,4);};
+  put64(0,0x1000);put32(0x18,27);put64(0x20,115200);put32(0x48,vtwire::cc("420v"));put32(0x58,2);
+  for(unsigned p=0;p<2;++p){unsigned at=0x88+p*0x98;put64(at,p?160:320);put64(at+8,p?120:240);put64(at+0x18,p?76800:0);put64(at+0x20,320);locked[at+0x6d]=0xa5;}
+  vtcontract::Surface parsed;CHECK(vtcontract::surfaceResult(locked,sizeof locked,27,parsed));
+  CHECK(!vtcontract::surfaceResult(locked,sizeof locked-1,27,parsed));CHECK(!vtcontract::surfaceResult(locked,sizeof locked,28,parsed));
+  locked[0x88+0x6c]=1;CHECK(!vtcontract::surfaceResult(locked,sizeof locked,27,parsed));locked[0x88+0x6c]=0;
   vtcontract::State st; CHECK(!st.accept());st.started=true;CHECK(st.accept());CHECK(!st.accept());CHECK(st.success());
   st.cancel();CHECK(!st.success());CHECK(st.complete());CHECK(!st.complete());CHECK(!st.accept());
   vtcontract::State finished;finished.started=true;finished.finish();CHECK(!finished.accept());
