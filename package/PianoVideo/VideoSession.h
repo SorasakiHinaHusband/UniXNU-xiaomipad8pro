@@ -93,7 +93,7 @@ public:
     if (!streaming) return psc.supported();
     return psc.resolution == 0x014000f0 && !psc.crop[0] && !psc.crop[1] && psc.depth == 0x00080008 && psc.coded == 1 &&
       psc.n && psc.n <= kMaxN && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
-      (!(psc.returned & (1u << 7)) || psc.profile == expectedProfile) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
+      (!(psc.returned & (1u << 7)) || (expectedProfile == 0 ? psc.profile <= 1 : psc.profile == expectedProfile)) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
   }
   // Called only by the exclusive worker, before OPEN. Input validation is also
   // enforced at the native API boundary before the V3 DMA/power preparation.

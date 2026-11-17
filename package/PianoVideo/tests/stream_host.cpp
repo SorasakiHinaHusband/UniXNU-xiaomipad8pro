@@ -54,7 +54,7 @@ struct Peer {
   uint32_t sid=0;
   unsigned n=4,etbs=0,ftbs=0,dpbs=0,opens=0,closes=0,stops=0,drains=0;
   unsigned settingsResume=0,drainInputResume=0,drainRawResume=0;
-  uint32_t pscPoc=0,pscProfile=1,pscLevel=4;
+  uint32_t pscPoc=0,pscProfile=2,pscLevel=4;
   uint32_t pscResolution=0x014000f0,pscDepth=0x00080008,pscCoded=1,pscCrop0=0,pscCrop1=0;
   bool omitOptional=false;
   unsigned decodeOrderProperties=0;
@@ -153,7 +153,7 @@ struct Peer {
 struct Fixture {
   Peer peer;Layout layout;SelfTest<Peer> tx;
   uint32_t sid=0x56361234;
-  Fixture():tx(peer,layout) {CHECK(layout.init());tx.streaming=true;tx.checkGolden=false;tx.expectedPoc=0;tx.expectedProfile=1;tx.expectedLevel=4;}
+  Fixture():tx(peer,layout) {CHECK(layout.init());tx.streaming=true;tx.checkGolden=false;tx.expectedPoc=0;tx.expectedProfile=2;tx.expectedLevel=4;tx.psc.poc=0;tx.psc.profile=2;tx.psc.level=4;}
   void start(uint64_t token=0x100000001ull) {CHECK(tx.nativeInput(sid,kAccessUnit,sizeof kAccessUnit,token));CHECK(tx.transaction()==0);CHECK(tx.r.psc==1&&peer.opens==1&&peer.drains==0&&peer.decodeOrderProperties==1);}
   void pump() {CHECK(tx.pump()==0);}
   void releaseAll() {SelfTest<Peer>::OutputFrame f;while(tx.popOutput(f))CHECK(tx.releaseOutput(f.index,f.token)==0);}
@@ -268,11 +268,22 @@ static void firstPscTests() {
     CHECK(f.tx.shutdown()==0&&f.peer.stops==1&&f.peer.closes==1);
   }
 }
+static void profileAbiTests() {
+  // Pinned gen2/sheng ABI, independent of the AVC header's conversion helper.
+  Fixture main;CHECK(main.tx.expectedProfile==2&&main.peer.pscProfile==2);
+  main.peer.pscProfile=1;CHECK(main.tx.nativeInput(main.sid,kAccessUnit,sizeof kAccessUnit,98));
+  CHECK(main.tx.transaction()!=0&&!main.tx.rawStarted);CHECK(main.tx.shutdown()==0);
+  for(unsigned profile:{0u,1u}){
+    Fixture baseline;baseline.tx.expectedProfile=0;baseline.tx.expectedPoc=2;
+    baseline.tx.psc.profile=0;baseline.tx.psc.poc=2;baseline.peer.pscProfile=profile;baseline.peer.pscPoc=2;
+    baseline.start(99);baseline.peer.output(99,1);baseline.pump();baseline.releaseAll();baseline.drain();baseline.close();
+  }
+}
 static void omittedPscTests() {
   Fixture f;f.peer.omitOptional=true;
   f.tx.psc.poc=f.tx.expectedPoc;f.tx.psc.profile=f.tx.expectedProfile;f.tx.psc.level=f.tx.expectedLevel;
   f.start(97);CHECK(!(f.tx.psc.returned&((1u<<6)|(1u<<7)|(1u<<8))));
-  CHECK(f.tx.psc.poc==0&&f.tx.psc.profile==1&&f.tx.psc.level==4);
+  CHECK(f.tx.psc.poc==0&&f.tx.psc.profile==2&&f.tx.psc.level==4);
   f.peer.output(97,8);f.pump();f.releaseAll();f.drain();f.close();
 }
 static void delayedGuestTests() {
@@ -379,6 +390,7 @@ static void admissionPublication() {
 }
 int main() {
   admissionPublication();
+  profileAbiTests();
   ledgerTests();guestTests();ownerTests();persistentTests();firstPscTests();omittedPscTests();delayedGuestTests();drainPictureTests();noOutputTests();capacityTests();
   for(unsigned i=0;i<16;++i)negativeTests(i);
   staleRetiredTests();timeoutTests(true);timeoutTests(false);cancelTests();idleTests();

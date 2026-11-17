@@ -73,7 +73,7 @@ static std::vector<uint8_t> sampleFormatBody(const std::vector<uint8_t> &conf,bo
 }
 static void streamTests() {
   const auto s=makeSps(), p=makePps();auto conf=avcc(s,p);avc::Config c;
-  CHECK(avc::config(conf.data(),uint32_t(conf.size()),c));CHECK(c.valid()&&c.pocType==0&&c.hfiProfile()==1&&c.hfiLevel()==4&&c.s.maxReorder==1&&c.s.maxDpb==2);
+  CHECK(avc::config(conf.data(),uint32_t(conf.size()),c));CHECK(c.valid()&&c.pocType==0&&c.hfiProfile()==2&&c.hfiLevel()==4&&c.s.maxReorder==1&&c.s.maxDpb==2);
   auto formatBody=sampleFormatBody(conf);vtwire::Atom fdsc;fdsc.type=vtwire::cc("fdsc");fdsc.body=formatBody.data();fdsc.size=uint32_t(formatBody.size());
   CHECK(vtcontract::sampleFormat(fdsc,c));
   for(auto bad:{sampleFormatBody(conf,true),sampleFormatBody(conf,false,true),sampleFormatBody(avcc(makeSps(77,2),p))}){

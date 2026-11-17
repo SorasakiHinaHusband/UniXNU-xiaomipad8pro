@@ -101,7 +101,9 @@ struct Config {
   uint32_t spsBytes = 0, ppsBytes = 0;
   Sps s; Pps p;
   uint32_t pocType = 0;
-  uint32_t hfiProfile() const { return s.profile == 77 ? 1 : 0; }
+  // Gen2 uses the V4L2 enumeration: Baseline0, ConstrainedBaseline1,
+  // Main2 (UniXNU-sheng QcomIrisSession.h at the UPSTREAM reference pin).
+  uint32_t hfiProfile() const { return s.profile == 77 ? 2 : 0; }
   uint32_t hfiLevel() const {
     switch (s.level) { case 10: return 0; case 11: return (s.constraints & 0x10) ? 1 : 2; case 12: return 3; case 13: return 4;
       case 20: return 5; case 21: return 6; case 22: return 7; case 30: return 8; case 31: return 9; default: return UINT32_MAX; }
