@@ -40,6 +40,8 @@ P=$D/package/PianoAudio; O=$D/out/native-kexts/PianoAudio; T=$O/host-tests
 mkdir -p "$T"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/audio_host.cpp" -o "$T/audio_host"
 "$T/audio_host" || { echo "Error: PianoAudio host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror "$P/tests/level_dictionary_host.cpp" -framework CoreFoundation -o "$T/level_dictionary_host"
+"$T/level_dictionary_host"
 C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/gpr_host.c" "$P/PianoGpr.c" -o "$T/gpr_host"
 "${C[@]}" "$P/tests/audioreach_host.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/audioreach_host"

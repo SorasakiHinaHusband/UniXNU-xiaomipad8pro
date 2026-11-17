@@ -46,6 +46,7 @@
 #include <sys/sysctl.h>
 #include "AudioPcm.h"
 #include "AudioControl.h"
+#include "AudioLevelDictionary.h"
 #include "AudioTiming.h"
 
 extern "C" {
@@ -215,9 +216,6 @@ void setNumber(OSDictionary *d, const char *key, uint64_t value, unsigned bits =
 void setNumber(IORegistryEntry *e, const char *key, uint64_t value, unsigned bits = 32) {
     if (OSNumber *n = OSNumber::withNumber(value, bits)) { e->setProperty(key, n); n->release(); }
 }
-void setFloat(OSDictionary *d, const char *key, float value) {
-    if (OSNumber *n = OSNumber::withFloat(value)) { d->setObject(key, n); n->release(); }
-}
 void setBool(OSDictionary *d, const char *key, bool value) { d->setObject(key, value ? kOSBooleanTrue : kOSBooleanFalse); }
 OSDictionary *format(uint32_t channels) {
     OSDictionary *f = OSDictionary::withCapacity(8);
@@ -281,31 +279,11 @@ OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_
         setNumber(d, "left channel", 1);
         setNumber(d, "right channel", 2);
     } else {
-        /* The DSP applies the shared -36 dB squared curve before the board's
-         * -1 dBFS ceiling; 0..100 therefore covers the full safe user range. */
-        setNumber(d, "minimum value", 0);
-        setNumber(d, "maximum value", 100);
-        setBool(d, "range map", true);
-        setNumber(d, "transfer function", 0);
-        setNumber(d, "start int value", 0);
-        /* The level control's range is the same -36..0 dB squared curve used
-         * by the DSP gain.  A -50 dB floor makes normal positions too quiet
-         * (the Pad 6 Pro HEAD records that failure); the range-map remains
-         * -36..0 dB even though the initial unity seed below is 0 dB. */
-        /* CoreAudio's decoded Level_Control parser asks for a Float32 dB
-         * seed. An OSNumber containing the signed integer -36 is displayed
-         * as an unsigned 64-bit value by ioreg and is rejected as a dB seed,
-         * leaving the HAL's virtual master at zero. */
-        /* The current integer value 100 is unity.  A zero dB seed makes the
-         * current value map to 0 dB instead of seeding the HAL at the floor. */
-        setFloat(d, "start db value", 0.0f);
-        setNumber(d, "integer steps", 100);
-        setNumber(d, "db per step", 1); // HAL's metadata is integral; range-map carries the curve
-        setNumber(d, "left value", value);
-        setNumber(d, "center value", value);
-        setNumber(d, "right value", value);
-        setNumber(d, "left channel", 1);
-        setNumber(d, "right channel", 2);
+        if (!piano_audio_level_dictionary<OSDictionary, OSArray>(d, value,
+                [](OSDictionary *dict, const char *key, uint64_t v, unsigned bits) { setNumber(dict, key, v, bits); })) {
+            d->release();
+            return nullptr;
+        }
     }
     setNumber(d, "selectors", 0);
     setNumber(d, "mapping options", 0);
@@ -374,6 +352,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     if (OSArray *a = controls()) { e->setProperty("controls", a); a->release(); }
     e->setProperty("piano-audio-transport", gTransport->name);
     e->setProperty("piano-audio-control-contract", "levl/vlme");
+    e->setProperty("piano-audio-level-map-contract", "range-array:raw0-100:db-fixed32.32:-36-0");
     e->setProperty("piano-audio-notification-contract", "type0-control-property");
     e->setProperty("piano-audio-timing-contract", tp.contract);
     if (!isInput) {
