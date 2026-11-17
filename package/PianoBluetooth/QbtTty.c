@@ -389,6 +389,11 @@ int qbt_transport_init(const struct qbt_transport_ops *ops)
     bt_ops=*ops;
     bool start=!bt_tty.node_thread;bt_tty.node_thread=true;
     lck_mtx_unlock(&bt_tty_lock);
+    /* IOKit kext OIDs are not part of kernel startup registration. The native
+     * collection linker retains these structs, not a kernel sysctl linker set. */
+    sysctl_register_oid(&sysctl__kern_qbt_boot);
+    sysctl_register_oid(&sysctl__kern_qbt_firmware);
+    sysctl_register_oid(&sysctl__kern_qbt_power_on);
     if(start && !bt_tty_make_node()) {
         thread_t thread=THREAD_NULL;
         if(kernel_thread_start(bt_tty_node_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
