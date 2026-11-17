@@ -388,23 +388,23 @@ static void testCapturePump(void)
     ArAnswer a;
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = AR_IID_CAP_SHMEM, .dst_port = AR_PORT_DATA,
                    .token = 0x5001u, .opcode = AR_OP_READ_DONE};
-    uint32_t w[6] = {0, 0x9da10000u + 1920u, 1, 0x99, 1920, 0};
-    uint32_t m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    uint32_t w[14] = {0, 0x9da10000u + 1920u, 1, 0x99, 1920, 261063941, 0, 0x80000000u, 1};
+    uint32_t m = gpr_encode(rsp, sizeof rsp, &r, w, sizeof w);
     CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == 1 && p.last_slot == 1 && p.in_flight == 3);
-    // a WRITE_DONE is not this pump's; more bytes than the slot, an offset past it: refused
+    // A WRITE_DONE is not this pump's; more bytes than the slot are refused.
     r.opcode = AR_OP_WRITE_DONE;
     uint32_t wd[4] = {0x9da10000u, 1, 0x99, 0};
     m = gpr_encode(rsp, sizeof rsp, &r, wd, 16);
     CHECK(ar_parse(rsp, m, &a) == ArWriteDone && ar_pump_done(&p, &a) == 0);
     r.opcode = AR_OP_READ_DONE; r.token = 0x5002u; w[1] = 0x9da10000u + 3840u; w[4] = 1921;
-    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    m = gpr_encode(rsp, sizeof rsp, &r, w, sizeof w);
     CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.errors == 1);
-    r.token = 0x5003u; w[1] = 0x9da10000u + 5760u; w[4] = 960; w[5] = 1000;
-    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    r.token = 0x5003u; w[1] = 0x9da10000u + 5760u; w[4] = 1924; w[5] = 261073941;
+    m = gpr_encode(rsp, sizeof rsp, &r, w, sizeof w);
     CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.errors == 2);
     // a READ_DONE with an error status
     r.token = 0x5000u; w[0] = 7; w[1] = 0x9da10000u; w[4] = 1920; w[5] = 0;
-    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    m = gpr_encode(rsp, sizeof rsp, &r, w, sizeof w);
     CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.last_status == 7 && p.in_flight == 0);
 }
 
@@ -419,7 +419,7 @@ static void testCaptureValidation(void)
         CHECK(ar_pump_write(&p, packet, sizeof packet, 10));
         ArAnswer a = {.opcode=AR_OP_READ_DONE, .token=0x5000, .src_port=AR_IID_CAP_SHMEM, .dst_port=AR_PORT_DATA,
                       .src_domain=GPR_DOMAIN_ADSP, .dst_domain=GPR_DOMAIN_APPS, .handle=0x99,
-                      .address=0x19da10000ull, .data_bytes=sizes[i], .offset=1920-sizes[i], .payload_bytes=24};
+                      .address=0x19da10000ull, .data_bytes=sizes[i], .offset=0, .payload_bytes=AR_READ_DONE_BYTES};
         CHECK(ar_pump_done(&p, &a) == 1);
         CHECK(p.returned == 1 && p.returned_bytes == sizes[i] && !p.in_flight);
         CHECK(p.short_returns == (sizes[i] < 1920) && p.zero_returns == (sizes[i] == 0));
@@ -431,7 +431,7 @@ static void testCaptureValidation(void)
         CHECK(ar_pump_write(&p, packet, sizeof packet, 10));
         ArAnswer a = {.opcode=AR_OP_READ_DONE, .token=0x5000, .src_port=AR_IID_CAP_SHMEM, .dst_port=AR_PORT_DATA,
                       .src_domain=GPR_DOMAIN_ADSP, .dst_domain=GPR_DOMAIN_APPS, .handle=0x99,
-                      .address=0x19da10000ull, .data_bytes=960, .offset=0, .payload_bytes=24};
+                      .address=0x19da10000ull, .data_bytes=960, .offset=0, .payload_bytes=AR_READ_DONE_BYTES};
         switch (bad) {
         case 0: a.src_domain=GPR_DOMAIN_APPS; break;
         case 1: a.dst_domain=GPR_DOMAIN_ADSP; break;

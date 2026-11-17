@@ -385,7 +385,7 @@ int ar_pump_done(ArPump *p, const ArAnswer *a)
     }
     p->busy[slot] = 0; p->in_flight--;
     if (a->status) {p->errors++; p->last_status = a->status; return -1;}
-    if (p->capture && (a->payload_bytes < 24 || a->offset > p->period_bytes || a->data_bytes > p->period_bytes - a->offset)) {
+    if (p->capture && (a->payload_bytes < AR_READ_DONE_BYTES || a->offset > p->period_bytes || a->data_bytes > p->period_bytes - a->offset)) {
         p->bad_range++; p->errors++; return -1;
     }
     if (p->capture && ((a->offset | a->data_bytes) & 3u)) {p->bad_alignment++; p->errors++; return -1;}

@@ -185,6 +185,24 @@ int main(void)
     CHECK(le32(b + 24) == 0x9f000000 && le32(b + 28) == 1 && le32(b + 32) == 0x55 && le32(b + 36) == 3840);
     n = ar_read(b, sizeof b, AR_PORT_DATA, 19, 0x19f001000ull, 0x56, 1920);
     CHECK(n == 24 + 32 && gpr_decode(b, n, &p) == GprOk && p.dst_port == AR_IID_CAP_SHMEM);
+    /* Independent Linux q6apm_read field-order vector: address, map handle,
+     * 480 stereo S16 frames, then four zero metadata words. Saved run handle. */
+    const uint8_t read_wire[] = {
+        0x60,0x38,0,0, 2,3,0,0, 0,0,0,0x10, 0x24,0x60,0,0,
+        0,0x50,0,0, 0x0b,0x10,0,4,
+        0,0,0xa1,0x9d, 1,0,0,0, 0x78,0x37,2,0xa1, 0x80,7,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0
+    };
+    n = ar_read(b, sizeof b, AR_PORT_DATA, 0x5000, 0x19da10000ull, 0xa1023778, 1920);
+    CHECK(n == sizeof read_wire && !memcmp(b, read_wire, sizeof read_wire));
+    CHECK(ar_read(b, sizeof read_wire - 1, AR_PORT_DATA, 0x5000, 0x19da10000ull, 0xa1023778, 1920) == 0);
+    for (unsigned slot = 0; slot < 8; ++slot) {
+        const uint64_t address = 0x19da10000ull + 1920 * slot;
+        CHECK(!(address & 63) && address + 1920 <= 0x19da14000ull);
+        n = ar_read(b, sizeof b, AR_PORT_DATA, 0x5000 + slot, address, 0xa1023778, 1920);
+        CHECK(n == 56 && le32(b + 24) == (uint32_t)address && le32(b + 28) == 1);
+        for (unsigned at = 40; at < n; ++at) CHECK(b[at] == 0);
+    }
 
     /* ---- every builder refuses a buffer that is too small, and stays within one intent. */
     CHECK(ar_open_playback_stream(b, 100, 1, 1) == 0 && ar_open_capture_stream(b, 400, 1, 1) == 0 && ar_config_speaker_tdm(b, 60, 1, 1, &t, &slots) == 0);
@@ -194,7 +212,7 @@ int main(void)
 
     /* ---- answers. */
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = 1, .dst_port = 1, .token = 5, .opcode = GPR_OP_BASIC_RESULT};
-    uint32_t words[10] = {AR_OP_GRAPH_OPEN, 0};
+    uint32_t words[14] = {AR_OP_GRAPH_OPEN, 0};
     ArAnswer ans;
     n = gpr_encode(b, sizeof b, &r, words, 8);
     CHECK(ar_parse(b, n, &ans) == ArBasicResult && ans.result_opcode == AR_OP_GRAPH_OPEN && ans.status == 0 && ans.token == 5 &&
@@ -206,8 +224,35 @@ int main(void)
     n = gpr_encode(b, sizeof b, &r, words, 32);
     CHECK(ar_parse(b, n, &ans) == ArWriteDone && ans.address == 0x19f000000ull && ans.handle == 0x55 && ans.status == 0);
     r.opcode = AR_OP_READ_DONE; words[0] = 0; words[1] = 0xa000; words[2] = 0; words[3] = 0x56; words[4] = 1920;
-    n = gpr_encode(b, sizeof b, &r, words, 40);
+    n = gpr_encode(b, sizeof b, &r, words, sizeof words);
     CHECK(ar_parse(b, n, &ans) == ArReadDone && ans.address == 0xa000 && ans.data_bytes == 1920);
+    /* SPF V2 has 14 words, no offset. This first short return and timestamp
+     * reproduce the values that were wrongly rejected as range errors. */
+    const uint32_t sizes[] = {576, 1920, 1920};
+    const uint32_t times[] = {261034941, 261063941, 261073941};
+    for (unsigned i = 0; i < 3; ++i) {
+        words[1] = 0x9da10000u + 1920 * i; words[2] = 1; words[3] = 0xa1023778;
+        words[4] = sizes[i]; words[5] = times[i]; words[6] = 7;
+        words[7] = 0x80000000u; words[8] = 1; words[9] = 0;
+        words[10] = 0; words[11] = 0; words[12] = 0; words[13] = 0;
+        n = gpr_encode(b, sizeof b, &r, words, sizeof words);
+        CHECK(n == 80 && ar_parse(b, n, &ans) == ArReadDone);
+        CHECK(!ans.status && !ans.offset && ans.data_bytes == sizes[i]);
+        CHECK(ans.timestamp == ((uint64_t)7 << 32 | times[i]));
+        CHECK(ans.flags == 0x80000000u && ans.num_frames == 1 && !ans.md_status && !ans.md_bytes);
+    }
+    /* Every incomplete V2 tail is malformed; old opcode is not V2. */
+    for (unsigned bytes = 0; bytes < 56; ++bytes) {
+        n = gpr_encode(b, sizeof b, &r, words, bytes);
+        CHECK(ar_parse(b, n, &ans) == ArBad && ans.opcode == AR_OP_READ_DONE && ans.payload_bytes == bytes);
+    }
+    words[9] = 5; words[10] = 0x12345678; words[11] = 9; words[12] = 0xabcdef; words[13] = 16;
+    n = gpr_encode(b, sizeof b, &r, words, sizeof words);
+    CHECK(ar_parse(b, n, &ans) == ArReadDone && ans.md_status == 5 && ans.md_address == 0x912345678ull &&
+          ans.md_handle == 0xabcdef && ans.md_bytes == 16);
+    r.opcode = 0x05001002;
+    n = gpr_encode(b, sizeof b, &r, words, 40);
+    CHECK(ar_parse(b, n, &ans) == ArUnknown);
     CHECK(ar_parse(b, 10, &ans) == ArBad);
     r.opcode = GPR_OP_APM_SPF_STATE; words[0] = 1;
     n = gpr_encode(b, sizeof b, &r, words, 4);

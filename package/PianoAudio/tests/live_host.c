@@ -41,7 +41,7 @@ static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] <
 #define H_MIC 0x77u
 #define MAX_PERIODS 20000
 
-struct Answer {uint64_t due_us; uint32_t n; int read_slot, plan; uint8_t b[64];};
+struct Answer {uint64_t due_us; uint32_t n; int read_slot, plan; uint8_t b[96];};
 struct Amp {uint8_t address; int present, released; uint16_t reg[256]; uint16_t inject;};
 struct World {
     uint64_t now_us;
@@ -345,6 +345,7 @@ static void dsp_read(const GprPacket *p)
 {
     const uint8_t *d = p->payload;
     w.reads++;
+    if (p->payload_bytes != 32) violate("a READ with the wrong V2 payload size");
     if (p->src_port != session.ports->data || p->dst_port != AR_IID_CAP_SHMEM) violate("a READ from the wrong port");
     if (!w.mic_started || !w.cap_started || !w.va_mclk || w.va_votes != 2) violate("a READ without the running capture graphs");
     if (!w.va_on) violate("a READ without the VA macro's DMIC path");
@@ -357,14 +358,14 @@ static void dsp_read(const GprPacket *p)
     }
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = p->dst_port, .dst_port = p->src_port,
                    .token = p->token, .opcode = AR_OP_READ_DONE};
-    const uint32_t short_bytes[] = {1920, 1916, 960, 0, 4};
-    const uint32_t bytes = w.capture_short ? short_bytes[w.reads % 5] : AUDIO_MIC_PERIOD_BYTES;
-    const uint32_t offset_bytes = w.capture_short ? 1920 - bytes : 0;
-    const uint32_t words[6] = {0, le32(d), le32(d + 4), H_MIC, bytes, offset_bytes};
+    const uint32_t short_bytes[] = {1920, 1916, 960, 0, 4, 576};
+    const uint32_t bytes = w.capture_short ? short_bytes[w.reads % 6] : AUDIO_MIC_PERIOD_BYTES;
+    const uint32_t words[14] = {0, le32(d), le32(d + 4), H_MIC, bytes,
+                                261034941u + 10000u * w.reads, 1, 0x80000000u, 1, 0, 0, 0, 0, 0};
     uint64_t at = w.cap_until_us > w.now_us ? w.cap_until_us : w.now_us;
     at += dsp_period_us();
     w.cap_until_us = at;
-    struct Answer *a = queue(at, &r, words, 6);
+    struct Answer *a = queue(at, &r, words, 14);
     a->read_slot = (int)slot;
 }
 
@@ -555,7 +556,7 @@ static void deliver(int to_live)
             if (a.plan) w.outstanding = 0;
             if (a.n >= 24 && le32(a.b + 20) == AR_OP_WRITE_DONE) {w.write_dones++; if (w.str_started) w.stream_dones++;}
             if (a.read_slot <= -2) play_slot((unsigned)(-2 - a.read_slot));
-            if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot, le32(a.b + 40), le32(a.b + 44)); w.read_dones++;}
+            if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot, le32(a.b + 40), 0); w.read_dones++;}
             if (to_live) audio_live_receive(&live, a.b, a.n, now_ms());
             else audio_session_receive(&session, a.b, a.n, now_ms());
             continue;

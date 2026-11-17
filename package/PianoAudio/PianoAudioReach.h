@@ -30,6 +30,7 @@ extern "C" {
 #define AR_OP_WRITE_DONE 0x05001004u
 #define AR_OP_READ 0x0400100Bu                  /* DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2 */
 #define AR_OP_READ_DONE 0x05001005u
+#define AR_READ_DONE_BYTES 56u                 /* V2: 14 words, no data offset */
 #define AR_OP_EOS_RENDERED 0x05001001u
 
 /* GPR ports of the application side. Ubuntu on piano (Linux gpr/q6apm) sends APM commands from port 1 and PRM requests from port 2
@@ -166,7 +167,9 @@ typedef struct {
     uint32_t result_opcode, status;  /* basic result: the command and its status (0 success); framework state: 1 ready; PRM: status */
     uint32_t handle;                 /* AR_OP_MEM_MAP_DONE */
     uint64_t address;                /* write/read done: the buffer */
-    uint32_t data_bytes, offset;     /* read done: bytes filled, starting offset bytes into the buffer */
+    uint32_t data_bytes, offset;     /* V2 starts at the returned address; offset is always zero */
+    uint64_t timestamp, md_address;
+    uint32_t flags, num_frames, md_status, md_handle, md_bytes;
     uint32_t payload_bytes;
 } ArAnswer;
 enum {ArUnknown = 0, ArBasicResult = 1, ArMapped = 2, ArWriteDone = 3, ArReadDone = 4, ArFrameworkState = 5, ArPrmDone = 6, ArBad = -1};

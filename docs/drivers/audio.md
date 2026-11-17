@@ -709,3 +709,22 @@ input controls. Missing controls or failed writes fail the probe. With no
 `input` argument it retains the output snapshot behavior. These changes are
 host-verified; actual app recording, physical PCM and resource release still
 require the instrumented level-10 tablet acceptance.
+
+## Capture V2 completion layout
+
+`READ_V2` (`0x0400100b`) sends a 32-byte payload to capture endpoint
+`0x6024`: mapped address, handle, size and four zero metadata words. A 10 ms
+48 kHz stereo S16 period is 1920 bytes; each slot is 64-byte aligned.
+`READ_DONE_V2` (`0x05001005`) has a 56-byte payload. Its word at +20 is the
+session timestamp's low word; V2 has no data-offset word. PCM starts at the
+returned address. The parser requires the full response and retains timestamp,
+flags, frame count and metadata diagnostics while accepting bounded short reads.
+
+This follows the published AudioReach SPF `rd_sh_mem_ep_api.h` at
+`Audioreach/audioreach-engine` commit `d416046c2acc858400adcc605b86954c63c34cae`.
+The third-party Linux kernel pinned by `xiaomipad-8pro-mainline` at `a43f79c`
+declares an extra offset in its response struct, but its capture callback uses
+only address/status. Our former parser used that extra field and rejected
+successful completions when it treated a timestamp as an out-of-range offset.
+The host suite checks exact request bytes, full response fields, truncated
+responses and short PCM delivery; hardware acoustic acceptance remains pending.

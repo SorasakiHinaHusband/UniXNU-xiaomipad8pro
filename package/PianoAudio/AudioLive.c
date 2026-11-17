@@ -697,6 +697,9 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->mic_state = LiveRunning;
     LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mixed to mono; the first %u ms dropped",
         AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
+    LOG(l, "live: mic: read-v2:56bytes:no-offset request %#x endpoint %#x port %#x base %#llx handle %#x period %u slots %u token %#x",
+        AR_OP_READ, AR_IID_CAP_SHMEM, l->cap.port, (unsigned long long)l->cap.base, l->cap.handle,
+        l->cap.period_bytes, l->cap.slots, l->cap.token_base);
 }
 
 /* One returned capture period into the Mic's ring: two channels to mono, the drift held near the ring's target. */
@@ -964,7 +967,8 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
     const int kind = ar_parse(packet, length, &a);
     if (kind == ArBad && a.opcode == AR_OP_READ_DONE && a.dst_port == l->ports->data && l->mic_state == LiveRunning) {
         l->cap.bad_range++; l->cap.errors++; l->cap_error = 1;
-        LOG(l, "live: dsp: READ_DONE refused: malformed payload %u", a.payload_bytes);
+        LOG(l, "live: dsp: READ_DONE refused: opcode %#x malformed payload %u token %#x domains %u->%u ports %#x->%#x",
+            a.opcode, a.payload_bytes, a.token, a.src_domain, a.dst_domain, a.src_port, a.dst_port);
         return;
     }
     if (kind == ArWriteDone && l->spk_state == LiveRunning) {
@@ -978,6 +982,14 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
     }
     if (kind == ArReadDone && l->mic_state == LiveRunning) {
         const int r = ar_pump_done(&l->cap, &a);
+        if (r < 0 || (r == 1 && l->cap.returned <= 4)) {
+            LOG(l, "live: dsp: READ_DONE wire: opcode %#x status %#x payload %u token %#x domains %u->%u ports %#x->%#x address %#llx handle %#x bytes %u offset %u",
+                a.opcode, a.status, a.payload_bytes, a.token, a.src_domain, a.dst_domain, a.src_port, a.dst_port,
+                (unsigned long long)a.address, a.handle, a.data_bytes, a.offset);
+            LOG(l, "live: dsp: READ_DONE tail: timestamp %#llx flags %#x frames %u md-status %#x md-address %#llx md-handle %#x md-bytes %u result %d",
+                (unsigned long long)a.timestamp, a.flags, a.num_frames, a.md_status,
+                (unsigned long long)a.md_address, a.md_handle, a.md_bytes, r);
+        }
         if (r == 1) {capture_period(l, &a, now_ms); return;}
         if (r == -1) {
             LOG(l, "live: dsp: READ_DONE refused: status %#x for %#llx (token %#x, %u bytes at %u)", a.status, (unsigned long long)a.address,

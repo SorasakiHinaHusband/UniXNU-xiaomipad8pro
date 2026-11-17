@@ -449,9 +449,16 @@ int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a)
         a->address = le32(d) | (uint64_t)le32(d + 4) << 32; a->handle = le32(d + 8); a->status = le32(d + 12);
         return ArWriteDone;
     case AR_OP_READ_DONE:
-        if (p.payload_bytes < 20) return ArBad;
+        /* AudioReach SPF rd_sh_mem_ep_api V2 has no offset word: +20 is
+         * the session timestamp, not a byte offset (unlike the old layout
+         * declared in Linux audioreach.h and inherited through sheng). */
+        if (p.payload_bytes < AR_READ_DONE_BYTES) return ArBad;
         a->status = le32(d); a->address = le32(d + 4) | (uint64_t)le32(d + 8) << 32; a->handle = le32(d + 12); a->data_bytes = le32(d + 16);
-        a->offset = p.payload_bytes >= 24 ? le32(d + 20) : 0;   /* RD_SH_MEM_EP_DATA_BUFFER_DONE_V2: status, address, handle, size, offset */
+        a->offset = 0;
+        a->timestamp = le32(d + 20) | (uint64_t)le32(d + 24) << 32;
+        a->flags = le32(d + 28); a->num_frames = le32(d + 32); a->md_status = le32(d + 36);
+        a->md_address = le32(d + 40) | (uint64_t)le32(d + 44) << 32;
+        a->md_handle = le32(d + 48); a->md_bytes = le32(d + 52);
         return ArReadDone;
     default:
         return ArUnknown;
