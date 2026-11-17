@@ -42,10 +42,10 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   are next; user power/disconnect lifecycle is implemented with host coverage, awaiting its three-cycle tablet qualification ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md), [docs/drivers/wifi.md](docs/drivers/wifi.md)).
 - Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
   test; opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
-- Hardware video decode (2026-11-17, RAM boots): the video firmware loads, is authenticated, boots and answers the host interface
-  (HFI) with its version; power cycles repeat cleanly. Decoding a frame is next ([docs/drivers/video.md](docs/drivers/video.md)).
-  A bounded kernel H.264 single-frame self-test (`piano-video=5`) is implemented and host-checked; tablet frame verification is pending.
-  It does not enable a macOS video consumer.
+- Hardware video decode (2026-11-17, RAM boots): Iris decoded our 320×240 H.264 AU into NV12 with the exact golden
+  SHA-256 and safe DMA teardown (`vid-v4a`). A restricted native VideoToolbox bridge (`piano-video=6 piano-video-vt=1`)
+  and IOSurface callback qualification tool are implemented; their tablet acceptance is pending
+  ([docs/drivers/video.md](docs/drivers/video.md)). Normal app playback still needs streaming support.
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
   firmware initialization, the Bluetooth menu and discovery are not yet tablet-confirmed
@@ -55,7 +55,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
   pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;
   a parallel version stays the fallback); probes built, then into the installed ESP ([docs/boot-time.md](docs/boot-time.md) §9).
-- Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, hardware video decode, and
+- Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, hardware video playback in apps, and
   a clean restart — every reboot of the 27.3 line ends in IOPlatformExpert's panic 30 s after the halt begins
   (`Halt/Restart Timed Out`, console captures since 2026-11-13).
 - Latest results: [docs/results-2026-11-17.md](docs/results-2026-11-17.md) (Wi-Fi join through macOS, sound with volume control, the

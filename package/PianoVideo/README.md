@@ -2,8 +2,9 @@
 
 piano's video core for native macOS 27: the SM8750 Iris (VPU 3.5) that decodes H.264, HEVC and VP9 and encodes H.264 and HEVC in
 hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 INIT/version, ten collapse/resume cycles and legal teardown are tablet-confirmed** in `vid-v3b`.
-V4 is implemented as a kernel self-test; real frame decode is still awaiting tablet verification.
-`piano-video-vt=1` publishes the VideoToolbox paravirtual service with a capability-only stub backend. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
+V4 is tablet-confirmed in `vid-v4a`: one real 320×240 AVC AU produces the exact active NV12 golden hash and safe teardown.
+V5a is a bounded native VT bridge; its IOSurface-backed callback is pending tablet qualification.
+`piano-video=6 piano-video-vt=1` publishes the restricted AVC qualification endpoint. Other levels do not publish a decoder inventory. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core
   clock's RCG and dividers with the rate and the OPP it matches, both GDSCs, every branch); the core's controller registers
@@ -31,7 +32,13 @@ V4 is implemented as a kernel self-test; real frame decode is still awaiting tab
   DRAIN/LAST, both STOPs and CLOSE. Five-second transaction, bounded cleanup; unsafe quiesce/detach retains every DMA owner.
   It always tears down, uses no VT consumer and does not repeat the ten V3 resume cycles. No playback support is claimed.
 
-Levels 2-5 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
+- `piano-video=6 piano-video-vt=1` (V5a): reserve one exclusive demand session, copy the actual caller's one Baseline AVC AU
+  through the proven V4 transaction, retain its descriptor/WC view, and copy active NV12 rows to the guest pool's IOSurface.
+  Only exact proven SPS/PPS, 320×240, 8-bit, progressive, no crop, one IDR are accepted. HEVC, tiles, changed format, P/B,
+  malformed/oversized input, multiple AUs and simultaneous sessions are rejected. Drain is terminal; invalidate joins the
+  worker before STOP/CLOSE/PAS/routes/TLB/free. No autonomous self-test runs in this mode.
+
+Levels 2-6 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
 every wait is bounded, V3 cleanup reports unsafe releases and keeps their DMA, and nothing is written below `piano-video=2`. Design, decisions, the
 batched tablet test list with its expected lines and the risks: `docs/drivers/video.md` (section 12 for levels 2-4).
 
@@ -53,12 +60,17 @@ batched tablet test list with its expected lines and the risks: `docs/drivers/vi
 | `FatVolume.c/h`, `QcomMdt.c/h`, `Sm8750Scm.c/h` | copies of PianoPower's (the build checks them byte for byte; Sm8750Scm is MIT); FatVolume serves the shared loader's ESP source |
 | `tests/video_host.cpp` | level 1's host tests against register models (the gate, the allowlist of loads, decoders, verdicts, SMMU) |
 | `tests/bringup_host.cpp` | levels 2-4 against one SoC model (VIDEO_CC, the core, DRV-2, cmd-db, the secure world, the SMMU, a firmware reached through our table), every wait made to fail, every secure call refused, the stop argument at every step |
-| `vt/` | VideoToolbox paravirtual frontend and wire format from third-party UniXNU-droidvm commit 706338e; V0b stub lists H.264/HEVC and returns `ENOTSUP` when a stream is opened |
+| `vt/` | VideoToolbox paravirtual frontend and wire format from third-party UniXNU-droidvm commit 706338e; bounded native avc1 endpoint, descriptor/WC layout contract, IOSurfaceRoot lookup/copy and asynchronous guest completion |
 | `tests/vt_host.cpp` | wire atom round-trip and capability-only stub checks |
 
 Build: `tooling/k27/build-native-piano-video.sh` (the secure-call lock's tests, the shared firmware loader's tests, the copies'
 check, the two host tests, the pin, the objects with the loader's `package/common` files, the import check). PianoVideo is in
-`configs/k27-native-kexts.txt` after PianoA830 (its lock words) and NativeUfs (the loader's ESP source), and inert without `piano-video` or `piano-video-vt`; V0b uses the latter and does not power or read the Iris core. The firmware (`vpu35_4v.mbn`, the owner's copy, never committed) is pinned as `PianoVideo/vpu35_4v.mbn`
+`configs/k27-native-kexts.txt` after PianoA830 (its lock words) and NativeUfs (the loader's ESP source), and inert without `piano-video`; level 6 additionally requires `piano-video-vt=1` for the VT endpoint. The firmware (`vpu35_4v.mbn`, the owner's copy, never committed) is pinned as `PianoVideo/vpu35_4v.mbn`
 (docs/kc-space.md §6): the build stages it into the ignored `out/firmware/PianoVideo/`, `build-ram-images.py` puts it into a RAM
 image's addon and `build-esp.py` onto the ESP; level 3 loads it at run time. Sources and
 licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent; the MIT notice for Sm8750Scm).
+
+V5a tool: `bash tooling/native/build-video-v5a.sh` builds an ordinary signed arm64 executable. `video-v5a --self-test`
+checks fixture and active-row hashing without querying VT; `--qualify` requires hardware and paravirtual decoding and
+checks dcan, exactly one IOSurface-backed 420v golden callback, unsupported input, terminal finish and safe invalidate.
+These host tests and implementation claims are not tablet acceptance or general AVC/HEVC playback support.

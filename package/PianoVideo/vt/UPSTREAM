@@ -8,9 +8,9 @@ Source files brought in:
 
 The source history needed for this frontend is the channel and decoder series
 3df7c94, 1479852, 9d5a0ce, fab4fb1, and 706338e.  The virtio-media transport
-and all VM device code are intentionally excluded.  PianoVideoVTStubMedia.cpp
-supplies only the 14 transport entry points: it advertises H.264/HEVC decoder
-capability through the frontend and returns ENOTSUP for stream operations.
+and all VM device code are intentionally excluded. The former capability-only
+stub is removed in V5a. The native kernel boundary is PianoVideoNative.h;
+its retained descriptor and WC view replace physical-address MMAP assumptions.
 
 Changes for native PianoVideo V0b:
   * renamed files and include paths; retained upstream droidvm_* symbols as
@@ -21,3 +21,12 @@ Changes for native PianoVideo V0b:
   * added the capability-only stub backend and no encode device.
 
 License: BSD-2-Clause-Patent.  See LICENSE in this directory.
+
+Changes for native PianoVideo V5a (copyright Leo Zhang):
+  * one opt-in native AVC qualification inventory; no HEVC/encoder inventory;
+  * strict proven configuration, complete sample and single-AU ownership gates;
+  * native session/descriptor bridge, explicit active/padded linear NV12 layout;
+  * macOS IOSurfaceRoot validation, checked copy, async frame/error/cancel;
+  * dcan format query, terminal drain and joined invalidation;
+  * bounded shared-input snapshot and per-client UUID ownership.
+No Apple payload, firmware, VM transport or third-party Linux source is included.

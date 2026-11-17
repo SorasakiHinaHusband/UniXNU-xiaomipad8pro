@@ -1,10 +1,9 @@
 # Video: the Iris video core natively (PianoVideo) and VideoToolbox through the VM-era paravirtual decoder
 
-Status, 2026-11-11: **level 1 built and host-tested** (`package/PianoVideo`, `piano-video=1`, in the kext list, inert without the
-argument); **levels 2-4 built and host-tested offline**: the ladder's V1 power on/off at 240 MHz (`piano-video=2`), V2 the firmware
-through PAS 9 (`=3`), V3 the streams' own SMMU bank and the HFI handshake (`=4`), as built in §12, with the batched tablet test
-list in §12.8; nothing is written below `piano-video=2`. None of it has run on the tablet. Levels 5+ are design. Template:
-`README.md`. Backlog item B10 (`../BACKLOG-hardware.md`).
+Status, 2026-11-17: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
+our real 320×240 AVC AU and matched the exact active NV12 golden hash, with safe DMA teardown (§13).
+V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14); tablet acceptance is pending.
+The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
 
@@ -678,9 +677,9 @@ with `piano-video-stop=33` to separate the file from the calls. `FAILED at stage
    stage 30 reports `not found` on that system).
 
 
-## 13. V4 kernel single-frame self-test (implemented, tablet result pending)
+## 13. V4 kernel single-frame self-test (tablet-confirmed)
 
-`piano-video=5` adds one bounded session inside V3's verified lifecycle; it leaves the paravirtual backend stub in place.
+`piano-video=5` adds one bounded session inside V3's verified lifecycle; the autonomous self-test and native VT mode are mutually exclusive.
 The committed fixture is an own encode of constant Y/Cb/Cr=64/96/160 at 320×240: SPS/PPS/one Baseline IDR, 286 bytes,
 SHA-256 `ed63e8ee3deeb819b059f5c8346f66da0592b1922eec0198a47a6efa33f96923`. Host reproduction and independent software decode
 are checked by `package/PianoVideo/tests/fixture_host.py`; no external media or firmware is embedded.
@@ -705,5 +704,34 @@ budget and one-second command/cleanup waits preserve first-error evidence; uncon
 The host model covers counts 1/4/7/64, command-first PSC/FBD headers, delayed scratch release, malformed packets, incorrect pixels,
 addresses/timestamps, corruption, session/system errors, missing completions, READONLY and late replies. Expanded-arena lifetime
 checks exercise the real portable V3 teardown on a nonresponsive session, including PAS/TLB failures. These are host checks;
-only a future tablet run can confirm rel0039 session acceptance and pixel DMA. QuickTime, Safari, IOSurface and VT selection
-remain separate consumer work.
+the valid `vid-v4a` tablet capture confirms rel0039 session acceptance and pixel DMA with this exact golden.
+QuickTime, Safari, IOSurface and VT selection remain separate consumer work.
+
+## 14. V5a bounded native AVC VT bridge (tablet qualification pending)
+
+`piano-video=6 piano-video-vt=1` publishes version6 avc1 only, with the explicit qualification name
+`PianoVideo native AVC V5a qualification`. Apple's built-in ParavirtualizedVideoDecoder opens our type0 Apple-named
+user client. The frontend consumes the actual length-prefixed sample (252 bytes for the own fixture), prepends the exact
+proven SPS/PPS, and sends 287 caller bytes to Iris. Frontend/native input SHA-256 and the full caller frame token are logged;
+no embedded input is substituted by the native transaction. HFI timestamps retain both token words.
+
+A demand session reserves the exclusive core before firmware/DMA preparation. One worker drives V3 initialization and
+V4 first PSC, internal releases, DPB/RAW, EBD and FBD. Terminal DRAIN ACK and LAST release a delayed first picture; dfin
+completes that same terminal transaction and never restarts it. The returned retained arena subdescriptor names the same
+scatter-backed ledger entry as its WC view and IOVA. RAW is held until the IOSurface copy finishes, separately from firmware
+READONLY/internal references. Source layout is active320×240, stride384, scanlines256, UV98304, allocation147456.
+
+The guest Dpba/Dbuf pool supplies a 420v IOSurface. The frontend opens macOS IOSurfaceRoot for the decoder's task,
+checks the native lock result, exactly two uncompressed planes, dimensions, strides and allocation extents, maps that task's
+surface into the kernel, and copies only active rows. Demt success follows successful copy. Every accepted input completes
+once; request waits run on the worker so selector3 remains free to deliver replies. Invalidate cancels, joins the worker,
+settles pending work and releases surfaces before native close. Unconfirmed PAS/routes/TLB cleanup retains all DMA and
+fences subsequent sessions.
+
+Only the proven Baseline SPS/PPS, 320×240 progressive8-bit/no crop, one IDR are accepted. dcan returns true only for the
+same supported configuration; tiles, HEVC, changed format, P/B, malformed/oversized input, a second AU and concurrent native
+sessions are refused. Host checks cover external input/token correlation, descriptor lifetime, parser/layout overflow,
+exactly-once cancellation, and failed-quiesce retention. `tooling/native/build-video-v5a.sh` builds the ordinary VT tool;
+its fresh hardware+PV-required session must return one IOSurface-backed420v callback with the §13 golden, reject unsupported
+inputs, and finish/invalidate safely. Selection, input/frame correlation and native completions are required alongside the
+hardware property. This endpoint is opt-in RAM qualification, not general AVC/HEVC, QuickTime, Safari or wallpaper rollout.
