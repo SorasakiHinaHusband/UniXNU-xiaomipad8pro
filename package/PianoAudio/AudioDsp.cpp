@@ -334,7 +334,7 @@ void liveRun(const PianoAudioLevelArgs *a)
         if (request!=handled && !gLive->sleep_failed) {
             if (__atomic_load_n(&gPmSleep,__ATOMIC_ACQUIRE)) {
                 if (!gLive->sleeping) {
-                    if (piano_audio_devices_power(1)) gLive->sleep_failed=1;
+                    if (piano_audio_devices_power(1)) audio_live_sleep_fail(gLive);
                     else audio_live_sleep(gLive,++gPmGeneration);
                     piano_audio_log("sleep-contract1: drain gen %u periods %u U %u",gPmGeneration,gLive->periods,gLive->underruns);
                 }
@@ -355,9 +355,11 @@ void liveRun(const PianoAudioLevelArgs *a)
         const uint32_t us = elapsedUs(tickStart);
         if (playing && us > gTickMaxUs) gTickMaxUs = us;
         if (slices != gLive->status_slices && us > gSliceMaxUs) gSliceMaxUs = us;
+        if (gLive->sleep_failed) audio_live_sleep_fail(gLive);
         if (request!=handled && __atomic_load_n(&gPmSleep,__ATOMIC_ACQUIRE)) {
             const int parked=audio_live_parked(gLive);
             if (parked!=0) {
+                if (parked<0) audio_live_sleep_fail(gLive);
                 piano_audio_log("sleep-contract1: %s gen %u periods %u U %u",parked==1?"off-ready":"off-unsafe",gPmGeneration,gLive->periods,gLive->underruns);
                 __atomic_store_n(&gPmResult,parked==1?0:-1,__ATOMIC_RELEASE);
                 __atomic_store_n(&gPmAck,request,__ATOMIC_RELEASE); handled=request;

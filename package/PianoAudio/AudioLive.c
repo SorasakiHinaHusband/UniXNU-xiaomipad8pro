@@ -867,6 +867,7 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
         l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping)
         finish(l, now_ms);
     if (l->finished) return 0;
+    if (l->sleep_failed) audio_live_sleep_fail(l);
     if (l->sleeping && !l->parked) (void)audio_live_parked(l);
     l->done_batch = 0;
     if (l->spk_state == LiveRunning || l->mic_state == LiveRunning) return 5;   /* 40 ms queued at the DSP: a refill within 5 ms */
@@ -950,10 +951,10 @@ int audio_live_parked(AudioLive *l)
     if (l->parked) return 1;
     /* A prior quiet-stop may have already ACKed STOP/UNMAP. Its old pump
      * bookkeeping is no longer ownership; never clear an active plan. */
-    if (l->spk_state==LiveDown && !l->splan.active && l->splan.seq.state==ArSeqDown) {
+    if (l->spk_state==LiveDown && !l->splan.active && (l->splan.seq.state==ArSeqDown || l->splan.seq.state==ArSeqFailed) && !l->splan.in_flight && !l->splan.unsent) {
         l->stream_unsent=0; l->pump.in_flight=0;
     }
-    if (l->mic_state==LiveDown && !l->mplan.active && l->mplan.seq.state==ArSeqDown) {
+    if (l->mic_state==LiveDown && !l->mplan.active && (l->mplan.seq.state==ArSeqDown || l->mplan.seq.state==ArSeqFailed) && !l->mplan.in_flight && !l->mplan.unsent) {
         l->cap_unsent=0; l->cap.in_flight=0;
     }
     if (l->spk_state!=LiveDown || l->mic_state!=LiveDown || l->splan.in_flight || l->mplan.in_flight ||
@@ -981,4 +982,18 @@ int audio_live_rearm(AudioLive *l)
     l->sleeping=l->parked=0;
     ledger(l,AlRearm,0,0,0,0,0);
     return 0;
+}
+
+void audio_live_sleep_fail(AudioLive *l)
+{
+    l->sleeping=1; l->sleep_failed=1;
+    store(&l->sh->accepting,0); store(&l->sh->capturing,0);
+    if (!l->sleep_safe) {
+        l->sleep_safe=1;
+        if (audio_amps_off(l->amps)) audio_amps_hold(l->amps);
+        l->unmuted=0;
+        LOG(l,"sleep-contract1: owner fail-safe mute; uncertain DSP mappings/backing retained");
+    }
+    /* No DSP abort, unmap, DMA zero, VA access or new acquisition. CPU ready
+     * gate + cancellation keep the host alive; a health-fatal still wins. */
 }

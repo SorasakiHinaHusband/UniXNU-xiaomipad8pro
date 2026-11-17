@@ -633,6 +633,7 @@ static void run(const struct Scenario *sc)
         }
         w.now_us += 500;
     }
+    if (pm_expect_unsafe==2) {CHECK(live.sleep_safe && !any_powered() && w.map_spk==1); return;}
     if (pm_expect_unsafe) {
         CHECK(live.sleep_failed && audio_live_parked(&live)==-1);
         CHECK(audio_live_rearm(&live)==-1 && w.map_spk==1 && !live.finished);
@@ -1058,6 +1059,29 @@ static void testSleepCycles(void)
     CHECK(audio_ledger_get(live.ledger,n-1,words));
     CHECK(!audio_ledger_get(live.ledger,n,words));
 }
+static int pm_safe_seen;
+static void fail_active_sleep(uint32_t t)
+{
+    if (!w.out_running) device(1,0);
+    w.sound_on=1; w.amplitude=10000;
+    if (!pm_safe_seen && t>=1500 && live.unmuted) {
+        const unsigned commands=w.ncmd; const int map=w.map_spk;
+        audio_live_sleep_fail(&live);
+        audio_live_sleep_fail(&live);
+        CHECK(!sh.accepting && !sh.capturing && !live.unmuted && !any_powered());
+        CHECK(w.ncmd==commands && w.map_spk==map && map==1);
+        CHECK(audio_live_parked(&live)==-1 && audio_live_rearm(&live)==-1);
+        pm_safe_seen=1;
+        live.finished=1; // host-only fixture cleanup must not undo retained ownership
+    }
+}
+static void testFailSafeMute(void)
+{
+    const struct Scenario sc={9,160,6,0,2500,AudioPortsUbuntu,0,fail_active_sleep};
+    pm_safe_seen=0; pm_expect_unsafe=2; run(&sc); pm_expect_unsafe=0;
+    CHECK(pm_safe_seen);
+}
+
 static int pm_map_seen;
 static void sleep_pending_map(uint32_t t)
 {
@@ -1118,6 +1142,7 @@ int main(void)
     testLoadedMonitor();
     testSleepCycles();
     testSleepPendingMap();
+    testFailSafeMute();
     testLedgerOverflow();
     printf("PASS live: %u checks\n", checks);
     return 0;

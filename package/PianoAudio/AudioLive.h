@@ -155,7 +155,7 @@ typedef struct {
     int va_on;
     /* ---- the exchange */
     uint32_t sends, queue_full, received, stray, timeouts;
-    int sleeping, parked, sleep_failed, sleep_quiet;
+    int sleeping, parked, sleep_failed, sleep_quiet, sleep_safe;
     uint32_t sleep_generation, ledger_epoch, ledger_out, done_batch;
     uint32_t monitor_start, monitor_end, monitor_field;
     AudioLedger *ledger;   /* optional fixed allocation owned for the boot */
@@ -179,6 +179,7 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms);
 void audio_live_sleep(AudioLive *l, uint32_t generation);
 int audio_live_parked(AudioLive *l);  /* 1 safe, 0 draining, -1 unsafe */
 int audio_live_rearm(AudioLive *l);
+void audio_live_sleep_fail(AudioLive *l); /* owner-thread safe mute, retain all uncertain backing */
 const char *audio_live_state(int state);
 
 #ifdef __cplusplus
