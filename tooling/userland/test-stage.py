@@ -754,11 +754,12 @@ def live_tests(tmp):
         want = {'system/com.unixnu.pianousb-shell', 'system/com.unixnu.piano-policy-agent', 'system/com.unixnu.piano-pmset-defaults',
                 'system/com.unixnu.piano-still-wallpaper', 'system/com.unixnu.piano-wifi-join', 'system/com.unixnu.piano-camera-grab',
                 'system/com.unixnu.piano-wifi-supplicant', 'system/com.unixnu.piano-airportd-kick', 'system/com.unixnu.piano-usbnet-address',
-                f'gui/{rig.uid}/com.unixnu.piano-rotated', f'gui/{rig.uid}/com.unixnu.piano-login-front'}
+                f'gui/{rig.uid}/com.unixnu.piano-rotated', f'gui/{rig.uid}/com.unixnu.piano-login-front',
+                f'gui/{rig.uid}/com.unixnu.piano-passd-policy'}
         check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file() and
               rig.root('/usr/local/share/piano/wallpaper/still.png').read_bytes()[:8] == b'\x89PNG\r\n\x1a\n',
               f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): nine daemons (the '
-              'airportd-kick of 88f4171e counted) and the two agents loaded, piano-torch in /usr/local/bin, '
+              'airportd-kick of 88f4171e counted) and the three agents loaded, piano-torch in /usr/local/bin, '
               'the still picture in /usr/local/share/piano/wallpaper')
         code, out = rig.run('--check')
         check(code == 0, 'and --check passes on it')
