@@ -80,14 +80,19 @@ static void test_modes()
   a.configure(true, 128, false, 12);
   CHECK(a.target(500, 400) && a.code() == 1024 && a.step(-1) && a.code() == 813);
   a.manual();
-  CHECK(a.mode() == Mode::manual && !a.target(600, 600) && !a.step(1) && a.lastTarget() == 600);
-  CHECK(a.setAutomatic(true) && a.automatic() && a.code() == Ambient::shift(Ambient::codeForPermille(600, 128), -1, 128, false));
+  CHECK(a.mode() == Mode::manual && !a.target(600, 600) && !a.step(1) && a.lastTarget() == -1 && !a.requested());
+  CHECK(!a.setAutomatic(true) && a.requested() && !a.valid());
+  CHECK(a.target(600, 600) && a.automatic() && a.code() == Ambient::shift(Ambient::codeForPermille(600, 128), -1, 128, false));
   CHECK(!a.setAutomatic(false) && !a.target(700, 700) && a.mode() == Mode::manual);
-  CHECK(a.setAutomatic(true) && a.automatic());
+  CHECK(!a.setAutomatic(true) && a.requested() && !a.valid());
+  CHECK(a.target(700, 700) && a.automatic());
   // the sensor leaves (-1): manual with the code as it is; its next target returns to automatic
   CHECK(!a.target(-1, 0) && a.mode() == Mode::manual && a.lastTarget() == -1 && !a.step(1));
   CHECK(!a.setAutomatic(true) && a.mode() == Mode::manual);       // nothing to apply until a target comes
   CHECK(a.target(450, 500) && a.automatic());
+  a.invalidate(true);
+  CHECK(a.requested() && !a.valid() && a.faulted());
+  CHECK(!a.setAutomatic(true) && !a.target(900, 5000) && !a.automatic());
   // exponential mapping: 1/16 of the range per press
   a.configure(true, 128, true, 16);
   CHECK(a.target(500, 400) && a.step(1) && a.code() == 1024 + 120);

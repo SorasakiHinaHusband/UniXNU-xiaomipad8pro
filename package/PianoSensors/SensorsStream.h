@@ -38,7 +38,7 @@ extern "C" {
 #endif
 
 enum {SS_LIGHT = 0, SS_ACCEL = 1, SS_STREAMS = 2};
-enum {SS_OUT_LUX = 1, SS_OUT_TARGET = 2, SS_OUT_EDGE = 4};
+enum {SS_OUT_LUX = 1, SS_OUT_TARGET = 2, SS_OUT_EDGE = 4, SS_OUT_LIGHT_STATE = 8};
 #define SS_ACCEL_HZ 10u                  /* the rotation's rate (sensors.md 5a.5): the lowest that still turns within a second */
 #define SS_LUX_MS 250u                   /* the lux output moves at most this often between targets */
 #define SS_LOG_BURST 8u
@@ -50,6 +50,8 @@ typedef struct {
     int edge;                            /* piano-sensors-edge: PS_EDGE_* (ps_edge_name), PS_EDGE_NONE while the stream is off */
     uint64_t seq;                        /* piano-sensors-seq: moves with every change of the three */
     unsigned changed;                    /* SS_OUT_*: what moved in this publication */
+    int light_valid, light_fault;         /* target belongs to this live session; fault latches for the boot */
+    uint32_t light_session;
 } SsOutputs;
 
 typedef struct {
@@ -114,6 +116,7 @@ typedef struct {
     SsLog log;
     uint32_t requests, refused_port, responses, refused_hub, timeouts, reports, samples, unreliable, physical, errors;
     uint32_t malformed, unexpected, other, dropped, ignored, restarts, closes;
+    int64_t sample_status;               /* SNS accuracy, including 0 (unreliable); not a numeric validity test */
     char line[200];
 } SsChannel;
 

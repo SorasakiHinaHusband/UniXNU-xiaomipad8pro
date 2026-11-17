@@ -13,6 +13,9 @@ void pal_init(PalLight *l, const PasConfig *c)
     l->target = -1;
     l->lux = 0;
     l->samples = l->targets = l->restarts = 0;
+    l->raw_bits = l->invalid = 0;
+    l->sample_ms = l->valid_ms = 0;
+    l->sample_valid = 0;
 }
 
 int pal_settled(const PalLight *l)
@@ -41,8 +44,17 @@ void pal_conditions(PalLight *l, int enabled, int display_on, int lid, uint64_t 
     if (!want) l->tick_at = 0;
 }
 
+int pal_lux_valid(uint32_t bits)
+{
+    return (bits & 0x7f800000u) != 0x7f800000u && (!(bits >> 31) || !(bits & 0x7fffffffu));
+}
+
 int32_t pal_event(PalLight *l, uint32_t lux_bits, uint64_t now_ms)
 {
+    l->raw_bits = lux_bits;
+    l->sample_ms = now_ms;
+    l->sample_valid = pal_lux_valid(lux_bits);
+    if (!l->sample_valid) { ++l->invalid; return -1; }
     const int e = pas_event(&l->stream, now_ms);
     if (e == PAS_EV_DROP) return -1;
     if (e == PAS_EV_FIRST) {
@@ -50,8 +62,11 @@ int32_t pal_event(PalLight *l, uint32_t lux_bits, uint64_t now_ms)
         ps_als_init(&l->als);                     /* a new session: start from its first sample */
     }
     ++l->samples;
-    const int32_t milli = sfx_milli(lux_bits);
-    l->lux = milli <= 0 ? 0 : (uint32_t)((milli + 500) / 1000);
+    l->valid_ms = now_ms;
+    /* The curve ends at 10000 lux; saturate before conversion, and round in wide arithmetic. */
+    const uint32_t end = ps_als_curve[ps_als_curve_points - 1].lux;
+    const int32_t milli = (int32_t)sfx_scale(lux_bits, 1000, 1, 0, 0, (int64_t)end * 1000);
+    l->lux = (uint32_t)(((int64_t)milli + 500) / 1000);
     return took(l, ps_als_step(&l->als, 1, milli, now_ms), now_ms);
 }
 

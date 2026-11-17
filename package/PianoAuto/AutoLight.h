@@ -26,6 +26,9 @@ typedef struct {
     int32_t target;                  /* the last target handed out (permille), -1 none */
     uint32_t lux;                    /* the last sample's lux */
     uint32_t samples, targets, restarts;
+    uint32_t raw_bits, invalid;
+    uint64_t sample_ms, valid_ms;
+    int sample_valid;                /* last input's numeric validity; zero lux is valid */
 } PalLight;
 
 void pal_init(PalLight *l, const PasConfig *c);
@@ -34,6 +37,8 @@ void pal_init(PalLight *l, const PasConfig *c);
 void pal_conditions(PalLight *l, int enabled, int display_on, int lid, uint64_t now_ms);
 /* An ambient_light event of this stream: its first float (lux, IEEE-754 bits). The target permille to hand PianoBacklight now, or -1. */
 int32_t pal_event(PalLight *l, uint32_t lux_bits, uint64_t now_ms);
+/* Numeric validation before pas_event: invalid input must not consume the session's first-event gate. */
+int pal_lux_valid(uint32_t bits);
 /* The time passes (call at pal_deadline): the stream's timeouts and the smoothing. A target or -1. */
 int32_t pal_tick(PalLight *l, uint64_t now_ms);
 /* The next time pal_tick (or the stream's pas_action) has something to do, 0 for none. */

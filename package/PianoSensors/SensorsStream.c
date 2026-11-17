@@ -91,6 +91,11 @@ static void set_edge(SsEngine *e, int edge, uint64_t at)
 static void light_target(SsEngine *e, int32_t target, uint64_t at)
 {
     unsigned changed = 0;
+    if (target >= 0 && (!e->out.light_valid || e->out.light_session != e->light.stream.sessions)) {
+        e->out.light_valid = 1;
+        e->out.light_session = e->light.stream.sessions;
+        changed |= SS_OUT_LIGHT_STATE;
+    }
     if (target >= 0 && target != e->out.target) {
         e->out.target = target;
         changed |= SS_OUT_TARGET;
@@ -103,6 +108,16 @@ static void light_target(SsEngine *e, int32_t target, uint64_t at)
     }
     e->lux_pending = e->light.lux != e->out.lux;
     publish(e, changed);
+}
+
+static void light_invalid(SsEngine *e, int fault)
+{
+    const int changed = e->out.light_valid || (fault && !e->out.light_fault);
+    e->out.light_valid = 0;
+    if (fault) e->out.light_fault = 1;
+    e->lux_pending = 0;
+    e->light.tick_at = 0;
+    if (changed) publish(e, SS_OUT_LIGHT_STATE);
 }
 
 static void leave(SsEngine *e)
@@ -119,6 +134,7 @@ static void apply(SsEngine *e, uint64_t at)
     const char *held = e->off ? "the guard is off" : e->asleep ? "system sleep" : 0;
     const int light = !held && c->light_consumer;
     pal_conditions(&e->light, light, c->display != 0, c->lid, at);
+    if (!e->light.stream.want) light_invalid(e, e->off);
     e->ch[SS_LIGHT].why = held ? held : !c->light_consumer ? "no consumer" : c->display == 0 ? "display off"
                         : c->lid == 0 ? "lid closed" : 0;
     const int accel = !held && ss_accel_wanted(c);
@@ -132,6 +148,9 @@ static void restart(SsEngine *e, int i, uint64_t at)
 {
     SsChannel *ch = &e->ch[i];
     PasStream *s = stream_of(e, i);
+    /* FAILED is for this boot, even if a port/service/SUID is replaced. */
+    if (s->state == PAS_FAILED) return;
+    if (i == SS_LIGHT) light_invalid(e, 0);
     if (s->sessions || s->outstanding != PAS_ACT_NONE) ch->restarts++;
     pas_init(s, &e->cfg.stream);
     ch->timeouts_seen = 0;
@@ -311,6 +330,8 @@ static void observe(SsEngine *e, int i, uint64_t at)
     SsChannel *ch = &e->ch[i];
     PasStream *s = stream_of(e, i);
     SntText t;
+    if (i == SS_LIGHT && (s->state == PAS_FAILED || s->dirty ||
+        (s->state != PAS_ON && s->state != PAS_ENABLING))) light_invalid(e, s->state == PAS_FAILED);
     if (s->timeouts != ch->timeouts_seen) {
         ch->timeouts += s->timeouts - ch->timeouts_seen;
         ch->timeouts_seen = s->timeouts;
@@ -423,6 +444,7 @@ static void sample(SsEngine *e, int i, const SscSensorEvent *se, uint64_t at)
     SntText t;
     if (i == SS_LIGHT) {
         if (se->count < 1) {ch->malformed++; return;}
+        ch->sample_status = se->status;
         const uint32_t before = e->light.samples;
         const int32_t target = pal_event(&e->light, se->data[0], at);
         if (e->light.samples == before) {ch->dropped++; return;}

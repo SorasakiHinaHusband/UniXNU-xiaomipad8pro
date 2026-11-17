@@ -58,6 +58,7 @@
 #include <stdarg.h>
 #include "BitI2c.h"
 #include "Ktz8866.h"
+#include <IOKit/IOMessage.h>
 #include "PianoBacklightClient.h"
 #include <PianoPowerContract.h>
 
@@ -298,7 +299,8 @@ class PianoBacklight : public IOService {
   IOService *fDisplay = nullptr, *fKeyboard = nullptr, *fSensors = nullptr;   // fSensors: piano-backlight-auto=1 only
   uint64_t fSensorsSeq = ~0ull;   // PianoSensors' piano-sensors-seq as last taken
   int64_t fSensorsTarget = -2;    // its piano-sensors-light-target as last taken (-2: none yet)
-  int fAutoPublished = -1, fOffsetPublished = 0x7fffffff;
+  uint64_t fPublished[23] = {};
+  bool fHavePublished = false;
   uint64_t fNextLookupMs = 0;
   int fDisplayProperty = -1;   // NativeGopDisplay's piano-display-power as last read (-1: none yet)
   bool fDisplayKnown = false, fDisplayOn = true;
@@ -424,6 +426,7 @@ void PianoBacklight::run()
   note("step 2: control");
   if (!fCtl.start()) {
     piano_backlight_stage = -2;
+    publishState();
     return;
   }
   publishState();
@@ -459,15 +462,23 @@ void PianoBacklight::poll(uint64_t now, bool lidOnly)
   }
   // PianoSensors' light target (its level 4; the property is absent before): a new one when its sequence or the value moved.
   if (fSensors) {
-    OSNumber *target = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsTargetProperty));
-    OSNumber *seq = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsSeqProperty));
-    OSNumber *lux = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsLuxProperty));
+    OSObject *snapshot = fSensors->copyProperty("piano-sensors-light");
+    OSDictionary *d = OSDynamicCast(OSDictionary, snapshot);
+    OSNumber *target = d ? OSDynamicCast(OSNumber, d->getObject("target")) : nullptr;
+    OSNumber *seq = d ? OSDynamicCast(OSNumber, d->getObject("seq")) : nullptr;
+    OSNumber *lux = d ? OSDynamicCast(OSNumber, d->getObject("lux")) : nullptr;
+    OSBoolean *valid = d ? OSDynamicCast(OSBoolean, d->getObject("valid")) : nullptr;
+    OSBoolean *fault = d ? OSDynamicCast(OSBoolean, d->getObject("fault")) : nullptr;
     const uint64_t t = target ? target->unsigned64BitValue() : ~0ull, q = seq ? seq->unsigned64BitValue() : 0;
-    if (target && t <= 1000 && (int64_t(t) != fSensorsTarget || (seq && q != fSensorsSeq))) {
+    if (!valid || !valid->isTrue() || (fault && fault->isTrue())) {
+      fCtl.invalidateAmbient(fault && fault->isTrue());
+      fSensorsTarget = -2;
+    } else if (target && seq && t <= 1000 && (int64_t(t) != fSensorsTarget || q != fSensorsSeq)) {
       fSensorsTarget = int64_t(t);
       fSensorsSeq = q;
       fCtl.ambient(int32_t(t), lux ? lux->unsigned32BitValue() : 0, "PianoSensors");
     }
+    OSSafeReleaseNULL(snapshot);
   }
   if (lidOnly || !fDisplay) return;
   OSBoolean *power = OSDynamicCast(OSBoolean, fDisplay->getProperty(kDisplayPowerProperty));
@@ -505,8 +516,6 @@ void PianoBacklight::serve()
   gServing = true;
   IOLockUnlock(gLock);
   uint64_t nextPoll = 0, nextSlow = 0, nextAlive = nowMs() + 60000;
-  bool lastLit = fCtl.lit(0);
-  uint16_t lastCode = fCtl.code();
   for (;;) {
     Pending p;
     IOLockLock(gLock);
@@ -554,13 +563,7 @@ void PianoBacklight::serve()
       poll(now, !slow);
       if (slow) fCtl.retry();
     }
-    const pianoauto::Ambient &a = fCtl.ambientState();
-    if (fCtl.lit(0) != lastLit || fCtl.code() != lastCode ||
-        (gArgs.autoAllowed && (int(a.automatic()) != fAutoPublished || a.offset() != fOffsetPublished))) {
-      lastLit = fCtl.lit(0);
-      lastCode = fCtl.code();
-      publishState();
-    }
+    publishState();
     if (now >= nextAlive) {
       nextAlive = now + 600000;
       note("alive: %s, code %u (%u %%), %s; %u writes, %u failed accesses; calls: display %u, steps %u", fCtl.controlling() ? "controlling" : "NOT controlling",
@@ -572,19 +575,48 @@ void PianoBacklight::serve()
 
 void PianoBacklight::publishState()
 {
+  const pianoauto::Ambient &a = fCtl.ambientState();
+  const IcState &p = fCtl.ic(0), &q = fCtl.ic(1);
+  const uint64_t state[] = {fCtl.code(), fCtl.controlling(), fCtl.wantLit(), fCtl.autoActive(), fCtl.autoFault(),
+      a.requested(), a.valid(), uint64_t(uint32_t(a.lastTarget())), a.lastLux(), uint64_t(uint32_t(a.offset())), a.targets(),
+      p.code, q.code, p.lit, q.lit, p.codeReadbacks, q.codeReadbacks, p.enableReadbacks, q.enableReadbacks,
+      p.errors, q.errors, fCtl.errors(), fCtl.writes()};
+  static_assert(sizeof(state) == sizeof(fPublished), "backlight publication fields");
+  if (fHavePublished && !memcmp(state, fPublished, sizeof(state))) return;
+  memcpy(fPublished, state, sizeof(state));
+  fHavePublished = true;
   setProperty("piano-backlight-code", fCtl.code(), 32);
   setProperty("piano-backlight-percent", percentOf(fCtl.code()), 32);
   setProperty("piano-backlight-lit", fCtl.lit(0) && fCtl.lit(1));
+  setProperty("piano-backlight-control", fCtl.controlling());
+  setProperty("piano-backlight-want-lit", fCtl.wantLit());
+  setProperty("piano-backlight-errors", uint64_t(fCtl.errors()), 32);
+  setProperty("piano-backlight-writes", uint64_t(fCtl.writes()), 32);
+  setProperty("piano-backlight-primary-code", uint64_t(p.code), 32);
+  setProperty("piano-backlight-secondary-code", uint64_t(q.code), 32);
+  setProperty("piano-backlight-primary-lit", p.lit);
+  setProperty("piano-backlight-secondary-lit", q.lit);
+  setProperty("piano-backlight-primary-enable", uint64_t(p.reg[kRegEn]), 32);
+  setProperty("piano-backlight-secondary-enable", uint64_t(q.reg[kRegEn]), 32);
+  setProperty("piano-backlight-primary-readbacks", uint64_t(p.codeReadbacks), 32);
+  setProperty("piano-backlight-secondary-readbacks", uint64_t(q.codeReadbacks), 32);
+  setProperty("piano-backlight-primary-enable-readbacks", uint64_t(p.enableReadbacks), 32);
+  setProperty("piano-backlight-secondary-enable-readbacks", uint64_t(q.enableReadbacks), 32);
+  setProperty("piano-backlight-primary-errors", uint64_t(p.errors), 32);
+  setProperty("piano-backlight-secondary-errors", uint64_t(q.errors), 32);
   if (!gArgs.autoAllowed) return;
-  const pianoauto::Ambient &a = fCtl.ambientState();
-  fAutoPublished = a.automatic();
-  fOffsetPublished = a.offset();
-  setProperty(pianoauto::kPropertyAuto, a.automatic());
+  setProperty("piano-backlight-implementation", "sens-ab1:session-valid:dual-readback");
+  setProperty(pianoauto::kPropertyAuto, fCtl.autoActive());
+  setProperty(pianoauto::kPropertyRequested, a.requested());
+  setProperty(pianoauto::kPropertyValid, a.valid());
+  setProperty("piano-backlight-auto-active", fCtl.autoActive());
+  setProperty("piano-backlight-auto-fault", fCtl.autoFault());
   setProperty(pianoauto::kPropertyOffset, uint64_t(uint32_t(int32_t(a.offset()))), 32);   // signed 32-bit
+  setProperty(pianoauto::kPropertyTarget, uint64_t(uint32_t(a.lastTarget())), 32);
   if (a.lastTarget() >= 0) {
-    setProperty(pianoauto::kPropertyTarget, uint64_t(a.lastTarget()), 32);
     setProperty(pianoauto::kPropertyLux, uint64_t(a.lastLux()), 32);
   }
+  messageClients(kIOMessageServicePropertyChange);
 }
 
 IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)

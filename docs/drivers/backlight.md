@@ -92,7 +92,7 @@ A target (the light policy's curve, smoothed in the sensor kext: at most one per
 never under the floor. The brightness keys then shift the curve by this driver's own steps (x 2^(1/3) with the linear mapping, 1/16 of
 the range with the exponential one): the offset stays for the boot, so "a step darker than automatic" holds as the room changes, and a
 press is always a visible step unless the code is at an end. `piano-backlight-percent` switches to manual (targets recorded only);
-`piano-backlight-auto=1` as a property re-enters (the last target at once, the offset kept), `=0` leaves; a target of -1 (the sensor
+`piano-backlight-auto=1` as a property requests it again (a fresh session target, the offset kept), `=0` leaves; a target of -1 (the sensor
 gone) leaves with the code as it is. Writes happen only on a change and not while dark (the newest code lights the wake). The writes'
 own lines are folded into one per 10 s: `ambient: N targets in S s, lux A..B, target P..Q permille, offset K, code X -> Y (Z %)`; the
 first target says `automatic brightness: on (PianoSensors): ...`, a key `step +1 from ... in automatic mode: offset 0 -> 1, code ...`.
@@ -255,3 +255,13 @@ the display asleep).
 Linux's ktz8866 driver and Project-SunUEFI's patch to it (GPL-2.0) were read as the specification only; nothing of them is in this
 repository. Register facts come from the public KTZ8866 datasheet. PianoBacklight is BSD-2-Clause-Patent
 (`package/PianoBacklight/LICENSE`), its I2C engine PianoKeyboard's (same licence).
+
+### Automatic-light session and applied-state evidence
+
+The automatic-light loop rejects nonfinite and negative nonzero ALS values before the first-event gate; signed zero is valid darkness. Finite values above the curve endpoint saturate before milli conversion. The existing curve, smoothing, floor and key offset are retained.
+
+`piano-backlight-auto-requested` records user intent independently of `piano-backlight-ambient-valid` (a target in the current live sensor session). `piano-backlight-auto-active` and the legacy `piano-backlight-auto` are true only while both ICs have applied the target, control is enabled and the display/lid allow light. `piano-backlight-auto-fault` records a latched sensor/ADSP fault or stopped IC control. Setting auto to 1 cannot clear either fault. Manual mode, display off, sleep, lid close and sensor re-arm invalidate the cached target; resumption waits for the new session's first valid sample.
+
+PianoSensors publishes the immutable `piano-sensors-light` snapshot (target, lux, session, seq, valid, fault) for the backlight consumer, plus diagnostic numeric validity, raw IEEE bits, accuracy status, valid/invalid counts and sample timestamps. The consumer gate reads explicit requested/control properties rather than inferring intent from an old target.
+
+For each of `primary` and `secondary`, PianoBacklight publishes `piano-backlight-<ic>-code`, `-lit`, `-enable`, `-readbacks`, `-enable-readbacks` and `-errors`. Applied code moves only after both brightness registers read back correctly. Aggregate `-control`, `-errors` and `-writes` are also published, including after a one-sided retry or control failure. No additional register polling is introduced. These are implementation/host-test contracts; daily automatic brightness still requires real lux changes and same-boot tablet readbacks.

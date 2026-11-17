@@ -14,8 +14,8 @@
 //
 // Modes: off (piano-backlight-auto not 1: targets are refused, PianoBacklight behaves as today); manual (allowed, but no target yet,
 // the sensor left with -1, or the user chose a level: piano-backlight-percent, or piano-backlight-auto=0 as a property); automatic.
-// A target enters automatic mode unless the user chose manual; the property piano-backlight-auto=1 re-enters it (the last target
-// at once, the offset kept).
+// A target enters automatic mode unless the user chose manual; the property piano-backlight-auto=1 requests it again (a fresh session target,
+// the offset kept).
 //
 // Integration in Ktz8866.h's Controller (three calls, PianoBacklight's owner):
 //   pianoauto::Ambient ambient_;                         // start(): ambient_.configure(cfg_.autoAllowed, cfg_.floor, exponential_,
@@ -35,6 +35,8 @@ namespace pianoauto {
 constexpr const char *kFunctionAmbient = "PianoBacklightAmbient";   // p1 permille (intptr_t, -1 leaves), p2 source, p3 lux (uintptr_t)
 constexpr const char *kArgAuto = "piano-backlight-auto";            // boot argument (1: targets taken) and setProperties key (0/1)
 constexpr const char *kPropertyAuto = "piano-backlight-auto";       // published: automatic mode now (boolean)
+constexpr const char *kPropertyRequested = "piano-backlight-auto-requested";
+constexpr const char *kPropertyValid = "piano-backlight-ambient-valid";
 constexpr const char *kPropertyOffset = "piano-backlight-offset";   // published: the user's shift in steps (signed)
 constexpr const char *kPropertyTarget = "piano-backlight-ambient-permille";
 constexpr const char *kPropertyLux = "piano-backlight-ambient-lux";
@@ -54,12 +56,13 @@ class Ambient {
     mode_ = allowed ? Mode::manual : Mode::off;
     offset_ = 0;
     have_ = userManual_ = false;
+    fault_ = false;
   }
 
   // PianoBacklightAmbient. True when the code should be applied now (code()); -1 leaves automatic mode with the code as it is.
   bool target(int32_t permille, uint32_t lux)
   {
-    if (!allowed_) return false;
+    if (!allowed_ || fault_) return false;
     if (permille < 0) {
       have_ = false;
       mode_ = Mode::manual;
@@ -67,9 +70,9 @@ class Ambient {
     }
     permille_ = permille > 1000 ? 1000 : uint32_t(permille);
     lux_ = lux;
-    have_ = true;
     ++targets_;
     if (userManual_) return false;
+    have_ = true;
     mode_ = Mode::automatic;
     return true;
   }
@@ -91,16 +94,16 @@ class Ambient {
   {
     if (!allowed_) return;
     userManual_ = true;
-    mode_ = Mode::manual;
+    invalidate();
   }
 
-  // The property piano-backlight-auto: 0 leaves (manual), 1 re-enters. True when code() should be applied now.
+  // The property piano-backlight-auto: 0 leaves (manual), 1 requests it again. A manual transition invalidates cached targets.
   bool setAutomatic(bool on)
   {
     if (!allowed_) return false;
     userManual_ = !on;
     if (!on) {
-      mode_ = Mode::manual;
+      invalidate();
       return false;
     }
     if (!have_) return false;                // the next target enters it
@@ -109,6 +112,16 @@ class Ambient {
   }
 
   Mode mode() const { return mode_; }
+  bool requested() const { return allowed_ && !userManual_; }
+  bool valid() const { return have_; }
+  bool faulted() const { return fault_; }
+  // Session invalidation preserves the owner's request and offset. A stream/guard fault cannot be cleared by auto=1.
+  void invalidate(bool fault = false)
+  {
+    have_ = false;
+    fault_ = fault_ || fault;
+    mode_ = allowed_ ? Mode::manual : Mode::off;
+  }
   bool automatic() const { return mode_ == Mode::automatic; }
   int offset() const { return offset_; }
   int32_t lastTarget() const { return have_ ? int32_t(permille_) : -1; }
@@ -156,7 +169,7 @@ class Ambient {
     return false;
   }
 
-  bool allowed_ = false, exponential_ = false, have_ = false, userManual_ = false;
+  bool allowed_ = false, exponential_ = false, have_ = false, userManual_ = false, fault_ = false;
   Mode mode_ = Mode::off;
   uint16_t floor_ = 128;
   int maxOffset_ = 12, offset_ = 0;

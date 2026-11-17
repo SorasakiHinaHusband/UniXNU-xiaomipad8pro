@@ -546,7 +546,7 @@ static void test_light(void)
     conditions(1, 0, 1, -1, 0);                  // a consumer, the display on, the lid unknown (open)
     run(100);
     CHECK(hub[SS_LIGHT].enables == 1 && hub[SS_ACCEL].requests == 0);
-    CHECK(out.target == 370 && out.lux == 300 && out.seq == 1 && results_ok == 1);   // the first sample at once: 300 lux -> 370
+    CHECK(out.target == 370 && out.lux == 300 && out.seq == 1 && out.light_valid && !out.light_fault && results_ok == 1);   // the first sample at once: 300 lux -> 370
     // brighter: smoothed towards 574 (1000 lux) at most every 250 ms, rising
     set_lux(1000.0f);
     int32_t last = out.target;
@@ -600,7 +600,7 @@ static void test_light_cycles(void)
         run(10);
         hub_sample(SS_LIGHT);                    // a late sample of the old session: dropped
         run(200);
-        CHECK(!hub[SS_LIGHT].enabled);
+        CHECK(!hub[SS_LIGHT].enabled && !out.light_valid);
         hub_lux = rooms[cycle % 10];
         run(5000);                               // asleep: nothing
         const uint64_t seq = out.seq;
@@ -611,7 +611,7 @@ static void test_light_cycles(void)
         if (cycle % 4 == 3) {                    // the lid as well
             conditions(1, 0, 1, 0, 0);
             run(200);
-            CHECK(!hub[SS_LIGHT].enabled);
+            CHECK(!hub[SS_LIGHT].enabled && !out.light_valid);
             conditions(1, 0, 1, 1, 0);
             run(200);
             CHECK(hub[SS_LIGHT].enabled && out.target == (int32_t)ps_als_curve_permille(lux));
@@ -759,6 +759,11 @@ static void test_guard(void)
     CHECK(eng.light.stream.state == PAS_FAILED && leaves == 1 && hub[SS_LIGHT].enables == enables + 2 + 6);
     run(70000);
     CHECK(hub[SS_LIGHT].enables == enables + 8 && leaves == 1);
+    ss_service(&eng, SS_LIGHT, 1, 3);
+    conditions(0, 0, 0, 0, 0);
+    conditions(1, 0, 1, 1, 0);
+    run(1000);
+    CHECK(eng.light.stream.state == PAS_FAILED && out.light_fault && !out.light_valid && leaves == 1);
     // a strike: nothing more is sent, packets are ignored, the outputs at rest; the ports that carried a request are closed when the
     // glue says the DSP may still be told
     fresh(&cfg);
@@ -768,12 +773,12 @@ static void test_guard(void)
     CHECK(out.edge == PS_EDGE_LEFT && out.target == 370 && hub[0].enabled && hub[1].enabled);
     const uint32_t sent = hub[0].requests + hub[1].requests, s0 = out.seq;
     ss_off(&eng);
-    CHECK(out.edge == PS_EDGE_NONE && leaves == 1 && out.seq == s0 + 1);
+    CHECK(out.edge == PS_EDGE_NONE && leaves == 1 && out.seq == s0 + 2 && !out.light_valid && out.light_fault);
     run(10000);
     set_lux(5000.0f);
     conditions(1, 1, 0, 1, 1);
     run(1000);
-    CHECK(hub[0].requests + hub[1].requests == sent && out.seq == s0 + 1 && out.target == 370 && ss_deadline(&eng) == 0 && ss_idle(&eng));
+    CHECK(hub[0].requests + hub[1].requests == sent && out.seq == s0 + 2 && out.target == 370 && ss_deadline(&eng) == 0 && ss_idle(&eng));
     CHECK(eng.ch[SS_LIGHT].ignored > 0 && eng.ch[SS_ACCEL].ignored > 0);
     ss_close_all(&eng);
     CHECK(closes[SS_LIGHT] == 1 && closes[SS_ACCEL] == 1);

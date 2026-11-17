@@ -669,6 +669,21 @@ void ssPublish(void *, const SsOutputs *o)
   gSelf->setProperty("piano-sensors-lux", uint64_t(o->lux), 32);
   if (o->target >= 0) gSelf->setProperty("piano-sensors-light-target", uint64_t(o->target), 32);
   gSelf->setProperty("piano-sensors-edge", ps_edge_name(o->edge));
+  gSelf->setProperty("piano-sensors-light-valid", bool(o->light_valid));
+  gSelf->setProperty("piano-sensors-light-fault", bool(o->light_fault));
+  gSelf->setProperty("piano-sensors-light-session", uint64_t(o->light_session), 32);
+  // One immutable dictionary is the consumer transaction; separate diagnostic properties are not an atomic snapshot.
+  if (OSDictionary *d = OSDictionary::withCapacity(6)) {
+    const char *keys[] = {"target", "lux", "session", "seq"};
+    const uint64_t values[] = {uint64_t(uint32_t(o->target)), o->lux, o->light_session, o->seq};
+    for (unsigned i = 0; i < 4; ++i) {
+      if (OSNumber *n = OSNumber::withNumber(values[i], 64)) { d->setObject(keys[i], n); n->release(); }
+    }
+    d->setObject("valid", o->light_valid ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("fault", o->light_fault ? kOSBooleanTrue : kOSBooleanFalse);
+    gSelf->setProperty("piano-sensors-light", d);
+    d->release();
+  }
   gSelf->setProperty("piano-sensors-seq", o->seq, 64);
   if (o->changed & SS_OUT_EDGE) gSelf->messageClients(kIOMessageServicePropertyChange);   // piano-rotated's interest notification
 }
@@ -757,10 +772,9 @@ SsConditions readConditions(uint64_t now)
     c.light_consumer = 0;
     gLightWhy = "no automatic brightness (piano-backlight=2 piano-backlight-auto=1)";
   } else if (IOService *backlight = watched(gBacklight, now)) {
-    const bool manual = property(backlight, "piano-backlight-auto", -1) == 0 &&
-                        property(backlight, "piano-backlight-ambient-permille", -1) >= 0;
-    c.light_consumer = !manual;
-    gLightWhy = manual ? "PianoBacklight is in manual mode" : "PianoBacklight's automatic mode";
+    c.light_consumer = property(backlight, "piano-backlight-auto-requested", 0) == 1 &&
+                       property(backlight, "piano-backlight-control", 0) == 1;
+    gLightWhy = c.light_consumer ? "PianoBacklight requests automatic light" : "PianoBacklight manual or control fault";
   } else {
     c.light_consumer = 0;
     gLightWhy = "no PianoBacklight service";
@@ -955,6 +969,15 @@ void PianoSensors::publishStatus(const SgDsp &d, const PianoAdspHealth &h)
            s.refused, s.declined, (unsigned long long)s.bytes, s.note[0] ? " first missing " : "", s.note);
   setProperty("piano-sensors-rpc", rpc);
   if (gEngine) {
+    const PalLight &l = gEngine->light;
+    setProperty("piano-sensors-light-raw", uint64_t(l.raw_bits), 32);
+    setProperty("piano-sensors-light-sample-valid", bool(l.sample_valid));
+    setProperty("piano-sensors-light-status", uint64_t(gEngine->ch[SS_LIGHT].sample_status), 64);
+    setProperty("piano-sensors-light-valid-samples", uint64_t(l.samples), 32);
+    setProperty("piano-sensors-light-invalid-samples", uint64_t(l.invalid), 32);
+    setProperty("piano-sensors-light-sample-ms", l.sample_ms, 64);
+    setProperty("piano-sensors-light-valid-ms", l.valid_ms, 64);
+    setProperty("piano-sensors-light-consumer", bool(gEngine->cond.light_consumer));
     if (OSDictionary *streams = OSDictionary::withCapacity(SS_STREAMS)) {
       for (int i = 0; i < SS_STREAMS; ++i) {
         char text[320];

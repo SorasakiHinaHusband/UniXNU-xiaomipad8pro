@@ -736,9 +736,12 @@ static void testAmbient()
   // Dark (display asleep): a target is kept, nothing written; the wake lights the newest.
   c.display(false, 1, 0);
   const size_t before = m.writes().size();
-  CHECK(c.ambient(240, 100, "test light") && m.writes().size() == before && !m.lit(0));
+  CHECK(!c.ambient(240, 100, "test light") && m.writes().size() == before && !m.lit(0) &&
+        !c.ambientState().valid() && c.ambientState().requested());
   c.display(true, 1, 1);
-  CHECK(m.lit(0) && m.code(0) == Ambient::shift(Ambient::codeForPermille(240, 128), 1, 128, false));
+  CHECK(m.lit(0) && !c.autoActive());
+  CHECK(c.ambient(240, 100, "fresh wake sample") && c.autoActive() &&
+        m.code(0) == Ambient::shift(Ambient::codeForPermille(240, 128), 1, 128, false));
   // One summary line per 10 s while targets come (retry(), every second in the kext, flushes it).
   m.now += 11000;
   c.retry();
@@ -748,17 +751,49 @@ static void testAmbient()
   CHECK(!c.ambientState().automatic() && m.code(0) == codeForPercent(50, 128) &&
         m.logged("automatic brightness: off, a level was set by setProperties"));
   CHECK(c.ambient(800, 3000, "test light") && m.code(0) == codeForPercent(50, 128));
-  CHECK(c.automatic(true, "setProperties") && c.ambientState().automatic() &&
+  CHECK(c.automatic(true, "setProperties") && !c.ambientState().automatic() && c.ambientState().requested());
+  CHECK(c.ambient(800, 3000, "fresh auto sample") && c.autoActive() &&
         m.code(0) == Ambient::shift(Ambient::codeForPermille(800, 128), 1, 128, false));
   // -1: the sensor leaves, the code stays; the keys step the ladder again.
   const uint16_t kept = m.code(0);
-  CHECK(c.ambient(-1, 0, "test light") && !c.ambientState().automatic() && m.code(0) == kept &&
+  CHECK(c.ambient(-1, 0, "test light") && !c.ambientState().automatic() && c.autoFault() && c.ambientState().requested() && m.code(0) == kept &&
         m.logged("automatic brightness: off (test light left it)"));
   Steps ladder;
   ladder.build(128, false);
   c.step(1, "test keys");
   CHECK(m.code(0) == ladder.up(kept));
+  CHECK(c.automatic(true, "fault retry") && !c.autoActive());
+  c.ambient(900, 5000, "late fault sample");
+  CHECK(!c.autoActive() && c.autoFault());
   CHECK(!m.inBurst);
+  checkWhitelist(m, 128);
+}
+
+static void testAmbientReadbackFault()
+{
+  Model m;
+  Controller c(m);
+  Config cfg = config();
+  cfg.autoAllowed = true;
+  cfg.errorLimit = 3;
+  c.configure(cfg);
+  CHECK(c.survey() && c.start());
+  const uint16_t old = c.ic(1).code;
+  const uint32_t good = c.ic(1).codeReadbacks;
+  m.deaf[1] = true;
+  c.ambient(800, 3000, "fault test");
+  CHECK(c.ic(0).code == c.code() && c.ic(0).codeReadbacks > 0);
+  CHECK(c.ic(1).code == old && c.ic(1).codeReadbacks == good && c.ic(1).errors > 0);
+  CHECK(!c.autoActive() && c.controlling());
+  m.deaf[1] = false;
+  c.retry();
+  CHECK(c.autoActive() && c.ic(1).code == c.code() && c.ic(1).codeReadbacks == good + 1);
+  m.deaf[1] = true;
+  c.ambient(500, 400, "persistent fault");
+  c.retry();
+  c.retry();
+  CHECK(!c.controlling() && c.autoFault() && !c.autoActive());
+  CHECK(!c.automatic(true, "cannot restore control"));
   checkWhitelist(m, 128);
 }
 
@@ -775,6 +810,7 @@ int main()
   testStack();
   testKeys();
   testAmbient();
+  testAmbientReadbackFault();
   if (failures) {
     std::printf("backlight_host: %d FAILED\n", failures);
     return 1;

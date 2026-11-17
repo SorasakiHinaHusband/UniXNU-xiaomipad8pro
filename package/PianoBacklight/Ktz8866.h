@@ -182,6 +182,7 @@ struct IcState {
   uint16_t code = 0;                  // the code as last read or written
   uint16_t foundCode = 0;
   bool foundLit = false;
+  uint32_t codeReadbacks = 0, enableReadbacks = 0, errors = 0;
 };
 
 class Controller {
@@ -253,6 +254,7 @@ class Controller {
     if (!on && !armed_) return;
     if (on) armed_ = true;
     displayOn_ = on;
+    if (!on) ambient_.invalidate();
     apply();
   }
   // A system sleep (docs/power.md 4; setPowerState off / on): asleep -> BL_EN cleared on both ICs whatever the display says (the
@@ -261,6 +263,7 @@ class Controller {
   {
     if (asleep == asleep_) return;
     asleep_ = asleep;
+    if (asleep) ambient_.invalidate();
     note("system %s: %s", asleep ? "sleep" : "wake",
          asleep ? "the backlight off on both ICs (BL_EN cleared, the code kept; HWEN untouched)"
          : wantLit() ? "the backlight as before the sleep" : "the backlight stays off (the display or the lid wants it so)");
@@ -272,6 +275,7 @@ class Controller {
   {
     if (state == lid_) return;
     lid_ = state;
+    if (cfg_.lidWatch && state == 0) ambient_.invalidate();
     note("lid %s%s", state == 0 ? "closed" : state == 1 ? "open" : "unknown", cfg_.lidWatch ? "" : " (not acted on: piano-backlight-lid=0)");
     if (cfg_.lidWatch) apply();
   }
@@ -325,6 +329,8 @@ class Controller {
   {
     if (!control_ || !cfg_.autoAllowed) return false;
     const bool was = ambient_.automatic();
+    if (permille < 0) ambient_.invalidate(true);   // stream/ADSP fault, never a user request to disable auto
+    if (permille >= 0 && !wantLit()) return false;
     if (!ambient_.target(permille, lux)) {
       if (was && !ambient_.automatic()) note("automatic brightness: off (%s left it): the code stays %u", source, code_);
       return true;
@@ -355,7 +361,7 @@ class Controller {
     if (ics_.nowMs() - summary_.since >= kSummaryMs) summarize();
     return true;
   }
-  // piano-backlight-auto as a property: 0 leaves automatic mode, 1 enters it again (the last target at once, the offset kept).
+  // piano-backlight-auto as a property: 0 leaves automatic mode, 1 requests it again (a fresh target, the offset kept).
   bool automatic(bool on, const char *source)
   {
     if (!control_ || !cfg_.autoAllowed) return false;
@@ -368,6 +374,9 @@ class Controller {
     return true;
   }
   const pianoauto::Ambient &ambientState() const { return ambient_; }
+  void invalidateAmbient(bool fault) { ambient_.invalidate(fault); }
+  bool autoActive() const { return ambient_.automatic() && control_ && wantLit() && !pending(); }
+  bool autoFault() const { return ambient_.faulted() || !control_; }
 
   bool controlling() const { return control_; }
   bool wantLit() const { return displayOn_ && !asleep_ && !(cfg_.lidWatch && lid_ == 0); }
@@ -393,9 +402,9 @@ class Controller {
     s.reg[reg] = v;
     if (!s.have[reg]) s.answered = false;
   }
-  bool access(bool okay)
+  bool access(unsigned i, bool okay)
   {
-    if (!okay) ++errors_;
+    if (!okay) { ++errors_; ++ic_[i].errors; }
     return okay;
   }
   // The code into one IC: LSB, MSB (which makes it take effect), both read back.
@@ -407,34 +416,36 @@ class Controller {
     }
     const uint8_t lsb = uint8_t(code & 7), msb = uint8_t(code >> 3);
     uint8_t rl = 0, rm = 0;
-    const bool wrote = access(ics_.write(i, kRegBrtLsb, lsb)) && access(ics_.write(i, kRegBrtMsb, msb));
+    const bool wrote = access(i, ics_.write(i, kRegBrtLsb, lsb)) && access(i, ics_.write(i, kRegBrtMsb, msb));
     writes_ += wrote ? 2 : 1;
-    const bool readBack = wrote && access(ics_.read(i, kRegBrtLsb, &rl)) && access(ics_.read(i, kRegBrtMsb, &rm));
+    const bool readBack = wrote && access(i, ics_.read(i, kRegBrtLsb, &rl)) && access(i, ics_.read(i, kRegBrtMsb, &rm));
     const bool good = readBack && codeOf(rl, rm) == code;
     if (!quiet_ || !good) {   // an ambient change that took is in the summary line instead
       limited("write %s: BL_BRT_LSB 0x04 = 0x%02x, BL_BRT_MSB 0x05 = 0x%02x: code %u (%u %%), was %u; %s", kIcName[i], lsb, msb, code,
               percentOf(code), ic_[i].code, !wrote ? "WRITE FAILED" : !readBack ? "read back failed" : good ? "read back ok" : "READ BACK DIFFERS");
     }
-    if (readBack && !good) access(false);
+    if (readBack && !good) access(i, false);
+    if (good) ++ic_[i].codeReadbacks;
     return good;
   }
   // BL_EN's bit 6 in one IC: read, bits 5:0 kept, bit 7 never set, written only when it changes, read back.
   bool writeEnable(unsigned i, bool on)
   {
     uint8_t found = 0, back = 0;
-    if (!access(ics_.read(i, kRegEn, &found))) {
+    if (!access(i, ics_.read(i, kRegEn, &found))) {
       limited("read %s: BL_EN failed (backlight %s not written)", kIcName[i], on ? "on" : "off");
       return false;
     }
     const uint8_t value = enableValue(found, on);
-    if (value == found) return true;
-    const bool wrote = access(ics_.write(i, kRegEn, value));
+    if (value == found) { ic_[i].reg[kRegEn] = found; ++ic_[i].enableReadbacks; return true; }
+    const bool wrote = access(i, ics_.write(i, kRegEn, value));
     ++writes_;
-    const bool readBack = wrote && access(ics_.read(i, kRegEn, &back));
+    const bool readBack = wrote && access(i, ics_.read(i, kRegEn, &back));
     const bool good = readBack && (back & kEnBacklight) == (value & kEnBacklight);
     limited("write %s: BL_EN 0x08 = 0x%02x (was 0x%02x): backlight %s, sinks 0x%02x kept; %s", kIcName[i], value, found, on ? "ON" : "OFF",
             found & kEnSinks, !wrote ? "WRITE FAILED" : !readBack ? "read back failed" : good ? "read back ok" : "READ BACK DIFFERS");
-    if (readBack && !good) access(false);
+    if (readBack && !good) access(i, false);
+    if (good) { ic_[i].reg[kRegEn] = back; ++ic_[i].enableReadbacks; }
     return good;
   }
   // The ICs toward the wanted state: lit -> the code first, then BL_EN; dark -> BL_EN cleared (the code stays for the next on).

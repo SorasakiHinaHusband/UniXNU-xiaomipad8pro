@@ -114,7 +114,7 @@ static uint32_t distance(uint32_t a, uint32_t b) {return a > b ? a - b : b - a;}
 int32_t ps_als_step(PsAls *a, int have_sample, int32_t milli_lux, uint64_t now_ms)
 {
     if (have_sample) {
-        const uint32_t lux = milli_lux <= 0 ? 0 : (uint32_t)((milli_lux + 500) / 1000);
+        const uint32_t lux = milli_lux <= 0 ? 0 : (uint32_t)(((int64_t)milli_lux + 500) / 1000);
         const uint32_t target = ps_als_curve_permille(lux);
         if (!a->has) {
             a->has = 1;
