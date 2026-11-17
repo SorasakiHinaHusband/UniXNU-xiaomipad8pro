@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Copyright (c) 2026 Leo Zhang.
+// Integration: binary GLINK/UCSI replies -> decoded source/contract ->
+// ChargeLink snapshot -> production policy -> ACK plus independent readback.
+// The source model answers queries; it never assigns contract-valid bits.
+#include "ChargeContract.h"
+#include "ChargeLink.h"
+#include <cassert>
+#include <cstdio>
+#include <vector>
+using namespace pianopower;
+
+static uint32_t fixedPdo(unsigned mv,unsigned ma) {return mv/50<<10 | ma/10;}
+static uint32_t fixedRdo(unsigned object,unsigned ma) {return object<<28 | ma/10<<10 | ma/10;}
+static uint32_t ppsPdo() {return 3u<<30 | 110u<<17 | 33u<<8 | 60u;}
+static uint32_t ppsRdo() {return 3u<<28 | 450u<<9 | 60u;}
+
+struct Integration {
+  PianoChargeContract contract{};
+  PianoMca m{};
+  ChargeLink link;
+  GaugeReading packs[2]{};
+  piano_board_temps board{};
+  uint64_t now=1000, control=0;
+  uint32_t rdo=fixedRdo(1,3000), bus=5000, icl=100, fcc=500, enable=1;
+  uint32_t source[3]={fixedPdo(5000,3000),fixedPdo(9000,2000),ppsPdo()};
+  std::vector<PianoChargeWrite> writes;
+  unsigned voltageRequests=0;
+
+  Integration() {
+    piano_contract_init(&contract); piano_contract_link(&contract,1);
+    piano_mca_init(&m,1,1); m.links=1; m.board_allowed=1; m.board_done=7;
+    LinkOptions o; o.strictContract=true; o.health=true; o.hv=1; o.kick=false;
+    link.configure(m,o);
+    board.version=PIANO_BOARD_TEMPS_VERSION; board.valid=15; board.state=PIANO_BOARD_TEMPS_RUNNING;
+    for(unsigned i=0;i<4;++i) board.milli_c[i]=30000;
+    for(auto &g:packs) {g.ok=true;g.socPct=25;g.tempDeciC=300;g.voltageMv=3900;g.currentMa=300;}
+  }
+  void fill() {
+    auto put=[&](int field,int32_t value) {m.valid|=1u<<field;m.value[field]=value;};
+    put(McaBusVoltage,int32_t(bus*1000));put(McaBusCurrent,int32_t(icl*1000));
+    put(McaType,PIANO_CHG_T_PD);put(McaIcl,int32_t(icl));put(McaChargeEnable,int32_t(enable));
+    put(McaTermVolt,5200);put(McaVerify,0);put(McaTbat,30);put(McaPdState,2);put(McaLpd,0);
+    LinkView v;v.nowMs=now;v.chargerPdUp=true;v.chargerPdUpMs=1;
+    v.contract=&contract;v.safetyFresh=true;v.cpOff=true;v.dtptValid=true;
+    v.packs=packs;v.packsFresh=true;v.packsMs=now;v.board=&board;
+    ChargeLink::fill(link.in,m,v);
+  }
+  void decide() {
+    fill();piano_charge_decide(&link.cfg,&link.in,&link.st,&link.plan);
+    for(unsigned i=0;i<link.plan.writes;++i) {
+      const auto w=link.plan.write[i];
+      assert(piano_charge_write_allowed(&link.cfg,w.property,w.value,w.bytes));
+      if(w.property==PIANO_CHG_PD_FIXED || w.property==PIANO_CHG_PPS) {
+        if (!(link.st.icl_set && link.st.icl_set<=link.st.transition_ma)) std::fprintf(stderr,"barrier now=%llu prop=%x value=%u hv=%u set=%u transition=%u read=%u pending=%u valid=%u observing=%u bus=%u rdo=%x\n",(unsigned long long)now,w.property,w.value,link.st.hv,link.st.icl_set,link.st.transition_ma,icl,link.st.pending,contract.valid,contract.notify_pending,bus,rdo);
+        assert(link.st.icl_set && link.st.icl_set<=link.st.transition_ma);
+        assert(link.st.fcc_set && link.st.fcc_set<=500);
+        assert(icl<=link.st.transition_ma); // independent hardware readback, not the ACK cache
+        assert(!(link.st.pending & ((1u<<PIANO_CHG_S_ICL)|(1u<<PIANO_CHG_S_FCC))));
+        ++voltageRequests;
+      }
+      writes.push_back(w);
+      switch(w.property) {
+      case PIANO_CHG_ICL:icl=w.value;break;
+      case PIANO_CHG_FCC:fcc=w.value;break;
+      case PIANO_CHG_ENABLE:enable=w.value;for(auto &g:packs)g.currentMa=enable?300:0;break;
+      case PIANO_CHG_PD_FIXED:bus=w.value;rdo=fixedRdo(bus==9000?2:1,bus==9000?1600:3000);break;
+      case PIANO_CHG_PPS:bus=(w.value>>16)*20;rdo=ppsRdo();break;
+      default:assert(false);
+      }
+      piano_charge_ack(&link.st,w.property,w.value,0);
+    }
+    assert(fcc<=1500 && icl<=1600);
+  }
+  int wire() {
+    uint8_t request[PIANO_CONTRACT_REQUEST_MAX];auto n=piano_contract_next(&contract,now,request);
+    if(!n) {now+=200;return 0;}
+    const auto op=piano_contract_u32(request+8);uint8_t response[544]={};
+    piano_contract_put32(response,PIANO_CONTRACT_OWNER);piano_contract_put32(response+4,1);piano_contract_put32(response+8,op);
+    uint32_t length=16;
+    if(op==PIANO_CONTRACT_WRITE) {
+      assert(n==64);control=piano_contract_u32(request+20)|(uint64_t(piano_contract_u32(request+24))<<32);
+      assert((control&255)==4 || (control&255)==6 || (control&255)==0x10 || (control&255)==0x12);
+    } else {
+      assert(n==12 && op==PIANO_CONTRACT_READ);length=64;response[12]=0x10;response[13]=1;
+      piano_contract_put32(response+20,uint32_t(control));piano_contract_put32(response+24,uint32_t(control>>32));
+      uint32_t cci=0;uint8_t *msg=response+28;
+      if(contract.stage!=PianoContractProbe) {
+        const unsigned command=control&255;
+        cci=command==4?1u<<29:1u<<31;
+        if(command==6) {cci|=16u<<8;msg[0]=4;msg[4]=1;msg[5]=16;}
+        else if(command==0x12) {cci|=9u<<8;piano_contract_put32(msg,1u<<19|3u<<16);piano_contract_put32(msg+4,rdo);}
+        else if(command==0x10) {cci|=12u<<8;for(unsigned i=0;i<3;++i)piano_contract_put32(msg+4*i,source[i]);}
+      }
+      piano_contract_put32(response+16,cci);
+    }
+    now+=20;return piano_contract_receive(&contract,now,response,length);
+  }
+  void observe(bool duringGap=false) {
+    auto seq=contract.seq;piano_contract_refresh(&contract);
+    for(unsigned i=0;i<100 && contract.seq==seq;++i) {
+      assert(wire()>=0);
+      if(duringGap && !piano_contract_fresh(&contract,now)) {
+        const auto requests=voltageRequests;decide();
+        assert(icl<=100 && voltageRequests==requests); // no extra 9V or 5V request during bounded validation
+      }
+    }
+    assert(contract.seq==seq+1 && contract.valid);
+  }
+  void tick() {now+=5000;observe();decide();}
+  bool wrote5(size_t after) const {
+    for(size_t i=after;i<writes.size();++i)if(writes[i].property==PIANO_CHG_PD_FIXED&&writes[i].value==5000)return true;
+    return false;
+  }
+  void notify() {
+    uint8_t data[24]={};piano_contract_put32(data,PIANO_CONTRACT_OWNER);piano_contract_put32(data+4,2);
+    piano_contract_put32(data+8,PIANO_CONTRACT_NOTIFY);assert(piano_contract_receive(&contract,now,data,24)==1);
+  }
+};
+
+int main() {
+  Integration s;s.observe();s.fill();
+  assert(s.link.in.contract_mv==5000 && s.link.in.contract_ma==3000);
+  assert(s.link.in.fixed9_ma==2000 && s.link.in.pps9_ma==3000);
+  for(unsigned i=0;i<12 && s.bus!=9000;++i)s.tick();
+  assert(s.bus==9000 && s.link.st.hv==PIANO_CHG_HV_ASKED);
+  s.observe(true); // actual binary RDO changes to object2, with a partial-validation gap
+  assert(s.contract.mv==9000 && s.contract.ma==1600 && s.contract.protocol==PIANO_CONTRACT_FIXED);
+  for(unsigned i=0;i<6 && s.link.st.hv!=PIANO_CHG_HV_ON;++i)s.tick();
+  assert(s.link.st.hv==PIANO_CHG_HV_ON && s.icl==1600 && s.fcc<=1500);
+
+  for(unsigned active=0;active<2;++active) {
+    const auto gen=s.contract.generation, seq=s.contract.seq;const auto timestamp=s.contract.updated_ms;
+    if(active) {piano_contract_refresh(&s.contract);assert(s.wire()==1);}
+    const auto requests=s.voltageRequests;const auto start=s.writes.size();
+    s.notify();s.decide();assert(s.icl<=100 && s.voltageRequests==requests && !s.wrote5(start));
+    assert(s.wire()==2); // CCI says completion, not a connector event
+    assert(!s.contract.notify_pending && s.contract.generation==gen && s.contract.seq==seq && s.contract.updated_ms==timestamp);
+    if(active) {for(unsigned i=0;i<100 && s.contract.seq==seq;++i)assert(s.wire()>=0);}
+    s.decide();assert(!s.wrote5(start) && s.link.st.hv==PIANO_CHG_HV_ON && s.icl==1600);
+  }
+
+  const auto modeStart=s.writes.size();
+  assert(!piano_charge_config_transaction(&s.link.cfg,1,80,75,2,0));
+  s.decide();
+  for(unsigned i=0;i<18 && s.contract.protocol!=PIANO_CONTRACT_PPS;++i)s.tick();
+  assert(s.contract.protocol==PIANO_CONTRACT_PPS && s.contract.mv==9000 && s.wrote5(modeStart));
+  bool fiveBeforePps=false;
+  for(size_t i=modeStart;i<s.writes.size();++i) {
+    if(s.writes[i].property==PIANO_CHG_PD_FIXED && s.writes[i].value==5000)fiveBeforePps=true;
+    if(s.writes[i].property==PIANO_CHG_PPS)assert(fiveBeforePps);
+  }
+  assert(fiveBeforePps);
+  // The legal actuator test at SOC25 uses the bounded administrator inhibit;
+  // threshold validation remains 50/40 minimum and neither gauge is replaced.
+  assert(s.packs[0].socPct==25 && s.packs[1].socPct==25);
+  assert(piano_charge_config_transaction(&s.link.cfg,1,25,20,1,0)!=0);
+  assert(!piano_charge_config_transaction(&s.link.cfg,1,80,75,1,1));
+  for(unsigned i=0;i<4 && (s.enable || s.bus!=5000);++i) {s.decide();s.observe();}
+  assert(!s.enable && s.bus==5000 && s.packs[0].currentMa==0 && s.packs[1].currentMa==0);
+  assert(!piano_charge_config_transaction(&s.link.cfg,1,80,75,1,0));
+  for(unsigned i=0;i<5 && !s.enable;++i) {s.decide();s.observe();}
+  assert(s.enable && s.packs[0].socPct==25 && s.packs[1].socPct==25);
+  assert(s.link.cfg.limit && s.link.cfg.stop_pct==80 && s.link.cfg.resume_pct==75 && !s.link.cfg.admin_stop);
+  std::puts("charge integration: binary UCSI -> ChargeLink -> bounded buck, notification stability, mode transition, SOC25 stop/resume PASS");
+}
