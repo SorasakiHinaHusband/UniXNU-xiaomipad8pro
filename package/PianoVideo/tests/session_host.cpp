@@ -371,6 +371,7 @@ static void negative(unsigned kind)
   // Failure never frees a buffer/arena, even after an unacknowledged STOP/CLOSE. Only ownership flags change on RELEASE_DONE.
   CHECK(p.dma.arena == p.arena.data());
   CHECK(l.find(Bitstream, 0)->capacity == 7077888);
+  CHECK(p.hw.log.find("V4 PSC-raw resolution ") != std::string::npos);
   if (kind == 11)
     CHECK(s.r.errorType == 0x04000001);
   if (kind == 15)

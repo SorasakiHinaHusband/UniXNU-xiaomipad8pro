@@ -656,6 +656,10 @@ public:
   int run()
   {
     const int rc = transaction();
+    // Preserve all fields even when validation rejected PSC or an earlier stage failed (returned=0 means defaults).
+    o.hw.note("V4 PSC-raw resolution %08x crop %08x/%08x depth %08x coded %08x N %u POC %u profile %u level %u color %08x returned %08x",
+              psc.resolution, psc.crop[0], psc.crop[1], psc.depth, psc.coded, psc.n, psc.poc, psc.profile, psc.level, psc.color,
+              psc.returned);
     shutdown();
     return rc ? rc : r.error ? r.error : r.close;
   }
