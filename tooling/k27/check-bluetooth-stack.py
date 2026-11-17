@@ -27,6 +27,8 @@ def main():
     entries = {row['CFBundleIdentifier']: row for row in metadata(sys.argv[1])}
     descriptor = json.loads((Path(__file__).parent / 'kext/PianoBluetooth.json').read_text())
     problems = []
+    usb_profile = any(b in entries for b in ('com.unixnu.driver.PianoUsbHostStack',
+                                           'com.unixnu.driver.PianoUsbHostStackA2'))
     shim = json.loads((Path(__file__).parent / 'kext/PianoUsbHostStandIn.json').read_text())
     platform = entries.get('com.unixnu.driver.ARMPlatformStandIn', {})
     if not platform.get('_PrelinkExecutableLoadAddr'):
@@ -38,6 +40,8 @@ def main():
     # Every personality in each must be explicitly gated, including any unexpected
     # new personality in a future input KC (checking only the patched names misses it).
     for bundle, patches in descriptor['patch_personalities'].items():
+        if usb_profile and bundle != 'com.apple.iokit.IOBluetoothFamily':
+            continue  # the existing USB-profile checker owns these personalities
         entry = entries.get(bundle)
         if entry is None:
             problems.append(f'{bundle}: absent from collection')

@@ -143,6 +143,20 @@ fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
+# When an explicit USB host profile owns the shared consumer libraries, retain
+# its original personalities and gate checks. Bluetooth owns only its Family.
+if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
+  python3 - out/k27/kext/PianoBluetooth.json <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+if p.is_file():
+    d = json.loads(p.read_text())
+    d['patch_personalities'] = {k: v for k, v in d.get('patch_personalities', {}).items()
+                              if k == 'com.apple.iokit.IOBluetoothFamily'}
+    p.write_text(json.dumps(d, indent=2) + '\n')
+PY
+fi
 NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # The Bluetooth daemon requires the real consumer UC, while its hardware dependencies
