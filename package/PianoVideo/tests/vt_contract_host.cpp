@@ -42,6 +42,43 @@ int main() {
   ext[38]=1;ext[39]=0;ext[40]=5;memcpy(ext+41,session::kAccessUnit+30,5);
   vtwire::ImageDescription d;d.codec=vtwire::cc("avc1");d.width=320;d.height=240;d.extensions=ext;d.extensionsSize=46;
   CHECK(vtcontract::format(d));d.width=321;CHECK(!vtcontract::format(d));d.width=320;ext[9]=100;CHECK(!vtcontract::format(d));
+  ext[9]=66;
+  // QuickTime's zero-u32 is legal only at an extension boundary and at EOF.
+  std::vector<uint8_t> extensions(ext,ext+sizeof ext);extensions.resize(50);
+  d.extensions=extensions.data();d.extensionsSize=uint32_t(extensions.size());
+  vtcontract::FormatReport report;
+  CHECK(vtcontract::format(d,&report)&&report.terminalZero&&report.atomBytes==46&&report.avcBytes==38);
+  CHECK(!vtcontract::atoms(d.extensions,d.extensionsSize)); // not a global atoms relaxation
+  for(unsigned n=1;n<=8;++n){
+    extensions.resize(46+n);d.extensions=extensions.data();d.extensionsSize=uint32_t(extensions.size());
+    CHECK(vtcontract::format(d)==(n==4));
+  }
+  extensions.resize(50);extensions.back()=1;d.extensions=extensions.data();d.extensionsSize=50;CHECK(!vtcontract::format(d));
+  extensions.back()=0;
+  // Reject hidden atoms after a terminator, duplicate avcC, protection and HEVC.
+  extensions.insert(extensions.end(),ext,ext+46);d.extensions=extensions.data();d.extensionsSize=uint32_t(extensions.size());CHECK(!vtcontract::format(d));
+  extensions.assign(ext,ext+46);extensions.insert(extensions.end(),ext,ext+46);extensions.resize(96);
+  d.extensions=extensions.data();d.extensionsSize=96;CHECK(!vtcontract::format(d));
+  for(auto kind:{vtwire::cc("sinf"),vtwire::cc("hvcC")}){
+    extensions.assign(ext,ext+46);extensions.resize(58);vtwire::put32(extensions.data()+46,8);vtwire::put32(extensions.data()+50,kind);
+    d.extensions=extensions.data();d.extensionsSize=58;CHECK(!vtcontract::format(d));
+  }
+  // A valid atom body ending in zero4 is not mistaken for a terminator.
+  extensions.assign(ext,ext+46);extensions.resize(62);vtwire::put32(extensions.data()+46,16);vtwire::put32(extensions.data()+50,vtwire::cc("free"));
+  d.extensions=extensions.data();d.extensionsSize=62;CHECK(vtcontract::format(d,&report)&&!report.terminalZero&&report.atomBytes==62);
+  uint8_t request[256]={},requestUuid[16]={};vtwire::Writer requestHeader(request,sizeof request);
+  requestHeader.header(vtwire::cc("dsta"),vtwire::FlagRequest,requestUuid,103);
+  auto *p=request+vtwire::HeaderBytes;vtwire::put32(p,16+136);vtwire::put32(p+4,vtwire::cc("para"));
+  vtwire::put32(p+8,vtwire::cc(",fds"));vtwire::put32(p+12,vtwire::cc("=fds"));
+  auto *fds=p+16;vtwire::put32(fds,136);vtwire::put32(fds+4,vtwire::cc("avc1"));fds[32]=1;fds[33]=64;fds[35]=240;
+  memcpy(fds+86,ext,46);const uint32_t requestBytes=vtwire::HeaderBytes+16+136;
+  CHECK(vtcontract::formatRequest(request,requestBytes,report)&&report.terminalZero&&!strcmp(report.decision,"accept"));
+  vtwire::put32(request+8,vtwire::cc("dcan"));CHECK(vtcontract::formatRequest(request,requestBytes,report));
+  fds[33]=65;CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"dimensions"));fds[33]=64;
+  vtwire::put32(fds+4,vtwire::cc("hvc1"));CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"codec"));vtwire::put32(fds+4,vtwire::cc("avc1"));
+  vtwire::put32(fds,135);CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"declared-size"));vtwire::put32(fds,136);
+  vtwire::put32(p+12,vtwire::cc("=dat"));CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"fds-type"));vtwire::put32(p+12,vtwire::cc("=fds"));
+  CHECK(!vtcontract::formatRequest(request,requestBytes-1,report));
   uint8_t wire[256]={},uuid[16]={};vtwire::Writer msg(wire,sizeof wire);msg.header(vtwire::cc("dfrm"),vtwire::FlagRequest,uuid,1);msg.s64(vtwire::cc(",frm"),0);
   CHECK(vtcontract::message(wire,msg.size()));msg.s64(vtwire::cc(",frm"),1);CHECK(!vtcontract::message(wire,msg.size()));
   CHECK(!vtcontract::message(wire,msg.size()-1));

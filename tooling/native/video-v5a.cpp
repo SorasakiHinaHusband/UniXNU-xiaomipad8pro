@@ -23,6 +23,7 @@
 #include <atomic>
 #include "VideoFixture.h"
 #include "vt/PianoVideoVTWire.h"
+#include "vt/PianoVideoVTContract.h"
 
 namespace {
 using pianovideo::session::kAccessUnit;
@@ -114,12 +115,19 @@ bool activeDigest(const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uv
 }
 CMVideoFormatDescriptionRef avcFormat(const std::vector<Nal> &nals);
 bool formatQueries(CMVideoFormatDescriptionRef original, CMVideoFormatDescriptionRef &same, CMVideoFormatDescriptionRef &unsupported);
+bool formatContractTest(CMVideoFormatDescriptionRef format, const char *stage, bool wanted);
 int selfTest() {
     std::vector<Nal> nals;
     std::vector<uint8_t> sample;
     if (!fixtureTest(nals, sample)) return 1;
     CMVideoFormatDescriptionRef format = avcFormat(nals), same = nullptr, unsupported = nullptr;
-    if (format) formatQueries(format, same, unsupported);
+    if (format) {
+        formatContractTest(format, "kernel-format-original", true);
+        if (formatQueries(format, same, unsupported)) {
+            formatContractTest(same, "kernel-format-metadata", true);
+            formatContractTest(unsupported, "kernel-format-main-rejected", false);
+        }
+    }
     if (unsupported) CFRelease(unsupported);
     if (same) CFRelease(same);
     if (format) CFRelease(format);
@@ -219,6 +227,38 @@ bool imageDescription(CMVideoFormatDescriptionRef format, std::vector<uint8_t> &
     }
     if (block) CFRelease(block);
     return result("format-query-image-description", !status && bytes.size() >= 86, status);
+}
+// Exercise the exact dsta/dcan request validator with CoreMedia's full output,
+// not a hand-built avcC or a search that ignores trailing bytes. Host only.
+bool formatContractTest(CMVideoFormatDescriptionRef format, const char *stage, bool wanted) {
+    using namespace vtwire;
+    std::vector<uint8_t> bytes;
+    if (!imageDescription(format, bytes)) return false;
+    std::vector<uint8_t> request(HeaderBytes + 16 + bytes.size());
+    uint8_t uuid[16] = {};
+    Writer w(request.data(), uint32_t(request.size()));
+    w.header(cc("dsta"), FlagRequest, uuid, 103);
+    uint8_t *p = request.data() + HeaderBytes;
+    put32(p, uint32_t(16 + bytes.size())); put32(p + 4, cc("para"));
+    put32(p + 8, cc(",fds")); put32(p + 12, cc("=fds"));
+    std::memcpy(p + 16, bytes.data(), bytes.size());
+    pianovideo::vtcontract::FormatReport r;
+    const bool accepted = pianovideo::vtcontract::formatRequest(request.data(), uint32_t(request.size()), r);
+    std::printf("video-v5b: kernel-format bytes=%u codec=%08x size=%ux%u extensions=%u atoms=%u terminal-zero4=%u avcC=%u decision=%s\n",
+        r.bytes, r.codec, r.width, r.height, r.extensionBytes, r.atomBytes, unsigned(r.terminalZero), r.avcBytes, r.decision);
+    bool ok = result(stage, accepted == wanted && r.bytes == bytes.size() && r.declared == bytes.size() &&
+        r.codec == cc("avc1") && r.width == 320 && r.height == 240 && r.avcBytes == 38);
+    // The same bytes go through the same validator for a real dcan query.
+    put32(request.data() + 8, cc("dcan"));
+    ok = result("kernel-format-dcan-same-decision", pianovideo::vtcontract::formatRequest(request.data(), uint32_t(request.size()), r) == wanted) && ok;
+    // Mutation of an actually serialized complete descriptor: a nonzero final
+    // byte cannot be silently removed as padding/terminator.
+    if (r.terminalZero) {
+        request.back() = 1;
+        ok = result("kernel-format-bad-terminator-rejected", !pianovideo::vtcontract::formatRequest(request.data(), uint32_t(request.size()), r) &&
+            std::strcmp(r.decision, "extension-layout") == 0) && ok;
+    }
+    return ok;
 }
 bool queryCandidate(CMVideoFormatDescriptionRef original, CFDictionaryRef extensions, bool sameConfig,
                     CMVideoFormatDescriptionRef &candidate) {

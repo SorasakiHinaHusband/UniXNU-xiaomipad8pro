@@ -2,7 +2,8 @@
 
 Status, 2026-11-17: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
 our real 320×240 AVC AU and matched the exact active NV12 golden hash, with safe DMA teardown (§13).
-V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14); tablet acceptance is pending.
+V5a implements a restricted native VideoToolbox/IOSurface bridge and qualification tool (§14). The tablet selected it,
+then session creation returned -12910 before input. V5b corrects the QuickTime extension terminator check; tablet acceptance is pending.
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
@@ -708,6 +709,13 @@ the valid `vid-v4a` tablet capture confirms rel0039 session acceptance and pixel
 QuickTime, Safari, IOSurface and VT selection remain separate consumer work.
 
 ## 14. V5a bounded native AVC VT bridge (tablet qualification pending)
+
+The vid-v5a tablet run confirmed PV selection, client mappings and dsta delivery, then our driver returned -12910 before
+native session open. The 27.3 QuickTime ImageDescription serializer includes a zero-u32 after its extension atoms;
+the old validator rejected that valid four-byte tail. V5b recognizes it only at an atom boundary and at the exact end.
+The exact CoreMedia tool descriptor and metadata-only query pass the shared dsta/dcan validator on the host; a Main-profile
+candidate and malformed/hidden/duplicate/protected extensions remain rejected. Every dcan request and answer records its
+format, session state, decision and transport result. The full VT-to-IOSurface decode still needs tablet qualification.
 
 `piano-video=6 piano-video-vt=1` publishes version6 avc1 only, with the explicit qualification name
 `PianoVideo native AVC V5a qualification`. Apple's built-in ParavirtualizedVideoDecoder opens our type0 Apple-named

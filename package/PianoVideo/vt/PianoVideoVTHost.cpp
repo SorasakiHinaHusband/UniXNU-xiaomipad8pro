@@ -205,8 +205,12 @@ void teardown(Session *s) {
   IOLog("PianoVideoVT V5a: invalidate safe worker-joined 1 surfaces-released 1 close-status %d\n",s->closeError);
 }
 void destroy(Session *s){if(!s)return;teardown(s);IOLockFree(s->lock);delete s;}
-bool descriptor(const uint8_t *m,uint32_t n,ImageDescription &d) {
-  Param p;return param(m,n,cc(",fds"),p)&&p.type==cc("=fds")&&imageDescription(p.value,p.size,d)&&be32(p.value)==p.size&&contract::format(d);
+bool descriptor(Client *c,const Header &h,const uint8_t *m,uint32_t n,contract::FormatReport &r) {
+  const bool valid=contract::formatRequest(m,n,r);
+  IOLog("PianoVideoVT V5b: format %c%c%c%c request %llu pid %d fds-type %08x bytes %u declared %u codec %08x size %ux%u extensions %u atoms %u terminal-zero4 %u avcC %u decision %s\n",
+    int(h.type>>24),int((h.type>>16)&255),int((h.type>>8)&255),int(h.type&255),h.request,c->pid,
+    r.parameterType,r.bytes,r.declared,r.codec,r.width,r.height,r.extensionBytes,r.atomBytes,unsigned(r.terminalZero),r.avcBytes,r.decision);
+  return valid;
 }
 void attributes(Session *s) {
   Plist *p=new Plist();if(!p){failure(s,10,kNoMemory);return;}
@@ -216,8 +220,8 @@ void attributes(Session *s) {
   const int attrs=p->dict(keys,values,6);Writer w(b,sizeof b);w.header(cc("Dpba"),0,s->uuid,0);w.plist(cc(",pba"),*p,attrs);send(s->client,w,b);delete p;
   IOLog("PianoVideoVT V5a: Dpba active 320x240 420v IOSurface pool\n");
 }
-int start(Session *s,const uint8_t *m,uint32_t n) {
-  ImageDescription d;if(!descriptor(m,n,d))return kUnsupported;
+int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
+  contract::FormatReport r;if(!descriptor(s->client,h,m,n,r))return kUnsupported;
   IOLockLock(s->lock);const bool started=s->state.started||s->state.cancelled;IOLockUnlock(s->lock);if(started)return kBadState;
   const int rc=piano_video_native_open(&s->native);if(rc)return kDecodeError;
   s->state.started=true;s->workerRunning=true;thread_t t=nullptr;
@@ -276,7 +280,18 @@ void *droidvm_vthost_client_open(void *transport,bool (*sendFn)(void *,const uin
 }
 void droidvm_vthost_client_close(void *host){Client *c=static_cast<Client *>(host);if(!c)return;destroy(c->session);IOLockFree(c->lock);delete c;}
 int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t *ids,unsigned surfaces) {
-  Client *c=static_cast<Client *>(host);Header h;if(!c||!contract::message(m,n)||!header(m,n,h))return -1;
+  Client *c=static_cast<Client *>(host);Header h;if(!c||!m||n>contract::kMaxMessageBytes||!header(m,n,h))return -1;
+  if(h.type==cc("dcan")){
+    IOLog("PianoVideoVT V5b: dcan received request %llu pid %d bytes %u flags %u\n",h.request,c->pid,n,h.flags);
+    if(h.flags!=FlagRequest&&h.flags!=0){
+      IOLog("PianoVideoVT V5b: dcan request %llu pid %d decision message-flags status -1 transport-rejected 1 no-answer 1\n",h.request,c->pid);
+      return -1;
+    }
+  }
+  if(!contract::message(m,n)){
+    if(h.type==cc("dcan"))IOLog("PianoVideoVT V5b: dcan request %llu pid %d decision message-layout status -1 transport-rejected 1 no-answer 1\n",h.request,c->pid);
+    return -1;
+  }
   Session *s=c->session;
   if(h.flags==FlagGuestReply){
     if(!s||memcmp(s->uuid,h.uuid,16))return -1;
@@ -311,10 +326,20 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
         IOLog("PianoVideoVT V5a: +dec selected com.unixnu.pianovideo.decoder.avc pid %d\n",c->pid);
       }
     }
-  }else if(!owned){if(h.flags&FlagRequest)status(c,h,kBadState);}
+  }else if(!owned){
+    const bool sent=(h.flags&FlagRequest)?status(c,h,kBadState):false;
+    if(h.type==cc("dcan"))IOLog("PianoVideoVT V5b: dcan request %llu pid %d decision uuid-session status %d can-absent 1 transport %u\n",h.request,c->pid,kBadState,unsigned(sent));
+  }
   else switch(h.type){
-    case cc("dsta"):status(c,h,start(s,m,n));break;
-    case cc("dcan"):{ImageDescription d;IOLockLock(s->lock);const bool active=s->state.started&&!s->state.cancelled;IOLockUnlock(s->lock);const bool can=active&&descriptor(m,n,d);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);send(c,w,b);IOLog("PianoVideoVT V5a: dcan ,can %u side-effect-free 1\n",unsigned(can));break;}
+    case cc("dsta"):status(c,h,start(s,h,m,n));break;
+    case cc("dcan"):{
+      contract::FormatReport r;const bool valid=descriptor(c,h,m,n,r);
+      IOLockLock(s->lock);const bool active=s->state.started&&!s->state.cancelled;IOLockUnlock(s->lock);
+      const bool can=active&&valid;uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);
+      const bool sent=send(c,w,b);
+      IOLog("PianoVideoVT V5b: dcan request %llu pid %d active %u decision %s status 0 ,can %u transport %u side-effect-free 1\n",h.request,c->pid,unsigned(active),active?r.decision:"inactive-session",unsigned(can),unsigned(sent));
+      IOLog("PianoVideoVT V5a: dcan ,can %u side-effect-free 1\n",unsigned(can));break;
+    }
     case cc("dsts"):case cc("dtil"):status(c,h,kUnsupported);IOLog("PianoVideoVT V5a: tiles rejected before-DMA 1\n");break;
     case cc("dfrm"):{const int error=queue(s,m,n);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),error);w.u32(cc(",inf"),error?0:1);send(c,w,b);break;}
     case cc("dfin"):{IOLockLock(s->lock);const bool schedule=s->workerRunning&&!s->stopping&&!s->finishWanted&&!s->state.terminal;if(schedule){s->finishWanted=true;s->finishRequest=h.request;s->state.finish();IOLockWakeup(s->lock,&s->busy,false);}IOLockUnlock(s->lock);if(!schedule)status(c,h,s->state.terminal?0:kBadState);break;}

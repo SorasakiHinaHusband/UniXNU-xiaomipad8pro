@@ -91,17 +91,76 @@ inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t c
   const uint32_t bytes = n + kParameterBytes;
   return normalizedAu(out, bytes) ? bytes : 0;
 }
-inline bool format(const vtwire::ImageDescription &d) {
+struct FormatReport {
+  uint32_t parameterType = 0, bytes = 0, declared = 0, codec = 0, width = 0, height = 0;
+  uint32_t extensionBytes = 0, atomBytes = 0, avcBytes = 0;
+  bool terminalZero = false;
+  const char *decision = "missing-fds";
+};
+// QuickTime ImageDescription extensions alone may end in a zero u32. The
+// native CM bridge includes it in the declared size. Recognize it only at an
+// atom boundary and at the exact end; message/sample atoms remain strict.
+inline bool imageExtensions(const uint8_t *p, uint32_t n, uint32_t &atomBytes, bool &terminalZero) {
+  atomBytes = 0; terminalZero = false;
+  if (!p) return false;
+  const uint8_t *at = p, *end = p + n;
+  vtwire::Atom a;
+  unsigned count = 0;
+  while (at != end) {
+    if (end - at == 4 && !vtwire::be32(at)) { terminalZero = true; atomBytes = n - 4; return true; }
+    if (++count > 128 || !vtwire::next(at, end, a)) return false;
+  }
+  atomBytes = n;
+  return true;
+}
+inline bool format(const vtwire::ImageDescription &d, FormatReport *report = nullptr) {
   using namespace vtwire;
-  if (d.codec != cc("avc1") || d.width != 320 || d.height != 240 || !d.extensions || !atoms(d.extensions, d.extensionsSize)) return false;
+  FormatReport local;
+  FormatReport &r = report ? *report : local;
+  r.codec = d.codec; r.width = d.width; r.height = d.height; r.extensionBytes = d.extensionsSize;
+  r.avcBytes = 0;
+  r.decision = "extension-layout";
+  if (!imageExtensions(d.extensions, d.extensionsSize, r.atomBytes, r.terminalZero)) return false;
+  r.decision = "codec";
+  if (d.codec != cc("avc1")) return false;
+  r.decision = "dimensions";
+  if (d.width != 320 || d.height != 240) return false;
+  r.decision = "avcC-missing-or-duplicate";
   Atom avc;
-  if (!unique(d.extensions, d.extensionsSize, cc("avcC"), avc) || avc.size != 38) return false;
+  if (!unique(d.extensions, r.atomBytes, cc("avcC"), avc)) return false;
+  r.avcBytes = avc.size;
+  r.decision = "avcC-configuration";
+  if (avc.size != 38) return false;
   const uint8_t *p = avc.body;
   // avcC version, Baseline compatibility/level, NAL length4, one SPS22 and PPS5.
   if (p[0] != 1 || p[1] != 66 || p[2] != 0xc0 || p[3] != 13 || p[4] != 0xff || p[5] != 0xe1 || be16(p+6) != 22 ||
       memcmp(p+8, session::kAccessUnit+4, 22) || p[30] != 1 || be16(p+31) != 5 || memcmp(p+33, session::kAccessUnit+30, 5)) return false;
   Atom protectedAtom;
-  return !find(d.extensions, d.extensionsSize, cc("sinf"), protectedAtom) && !find(d.extensions, d.extensionsSize, cc("hvcC"), protectedAtom);
+  r.decision = "protected-or-hevc";
+  if (find(d.extensions, r.atomBytes, cc("sinf"), protectedAtom) || find(d.extensions, r.atomBytes, cc("hvcC"), protectedAtom)) return false;
+  r.decision = "accept";
+  return true;
+}
+// Shared by dsta/dcan and by the real CoreMedia serializer host test.
+inline bool formatRequest(const uint8_t *m, uint32_t n, FormatReport &r) {
+  using namespace vtwire;
+  r = FormatReport{};
+  r.decision = "message-layout";
+  if (!message(m, n)) return false;
+  Param p;
+  r.decision = "missing-fds";
+  if (!param(m, n, cc(",fds"), p)) return false;
+  r.parameterType = p.type; r.bytes = p.size;
+  if (p.size >= 4) r.declared = be32(p.value);
+  r.decision = "fds-type";
+  if (p.type != cc("=fds")) return false;
+  ImageDescription d;
+  r.decision = "image-description";
+  if (!imageDescription(p.value, p.size, d)) return false;
+  r.codec = d.codec; r.width = d.width; r.height = d.height; r.extensionBytes = d.extensionsSize;
+  r.decision = "declared-size";
+  if (r.declared != p.size) return false;
+  return format(d, &r);
 }
 inline bool extent(uint64_t offset, uint64_t stride, uint64_t rows, uint64_t width, uint64_t size) {
   return rows && width && stride >= width && offset <= size && width <= size-offset && rows-1 <= (size-offset-width)/stride;
