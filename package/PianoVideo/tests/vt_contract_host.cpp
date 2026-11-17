@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Copyright (c) 2026 Leo Zhang.
+#include "PianoVideoVTContract.h"
+#include <cstdio>
+#include <cstring>
+#include <vector>
+using namespace pianovideo;
+static int failures;
+#define CHECK(x) do { if(!(x)){std::printf("FAIL line %d: %s\n",__LINE__,#x); ++failures;} } while(0)
+int main() {
+  uint8_t sample[252], au[287];
+  vtwire::put32(sample,248); memcpy(sample+4,session::kAccessUnit+38,248);
+  CHECK(vtcontract::sample(sample,sizeof sample));
+  CHECK(vtcontract::normalize(sample,sizeof sample,au,sizeof au)==287);
+  CHECK(vtcontract::normalizedAu(au,sizeof au));
+  CHECK(!vtcontract::sample(sample,251));
+  sample[4]=0x61; CHECK(!vtcontract::sample(sample,252)); sample[4]=0x65;
+  au[4]^=1; CHECK(!vtcontract::normalizedAu(au,287)); au[4]^=1;
+  au[80]=0; au[81]=0; au[82]=1; CHECK(!vtcontract::normalizedAu(au,287));
+  std::vector<uint8_t> huge(vtcontract::kMaxAuBytes+1); CHECK(!vtcontract::normalizedAu(huge.data(),uint32_t(huge.size())));
+  native::Layout l; CHECK(vtcontract::layout(l,l.bytes)); l.uvOffset=92160; CHECK(!vtcontract::layout(l,l.bytes));
+  CHECK(vtcontract::extent(0,384,240,320,92160)); CHECK(!vtcontract::extent(UINT64_MAX,384,240,320,92160));
+  CHECK(!vtcontract::extent(0,UINT64_MAX,240,320,92160));
+  vtcontract::Surface s; s.base=0x1000;s.size=115200;s.id=1;s.format=vtwire::cc("420v");s.planes=2;
+  s.plane[0]={320,240,0,320,0};s.plane[1]={160,120,76800,320,0}; CHECK(vtcontract::surface(s));
+  s.plane[1].nonlinear=1;CHECK(!vtcontract::surface(s));s.plane[1].nonlinear=0;
+  s.plane[1].offset=76801;CHECK(!vtcontract::surface(s));
+  vtcontract::State st; CHECK(!st.accept());st.started=true;CHECK(st.accept());CHECK(!st.accept());CHECK(st.success());
+  st.cancel();CHECK(!st.success());CHECK(st.complete());CHECK(!st.complete());CHECK(!st.accept());
+  vtcontract::State finished;finished.started=true;finished.finish();CHECK(!finished.accept());
+  uint8_t ext[46]={};vtwire::put32(ext,46);vtwire::put32(ext+4,vtwire::cc("avcC"));
+  const uint8_t prefix[]={1,66,0xc0,13,0xff,0xe1,0,22};memcpy(ext+8,prefix,8);memcpy(ext+16,session::kAccessUnit+4,22);
+  ext[38]=1;ext[39]=0;ext[40]=5;memcpy(ext+41,session::kAccessUnit+30,5);
+  vtwire::ImageDescription d;d.codec=vtwire::cc("avc1");d.width=320;d.height=240;d.extensions=ext;d.extensionsSize=46;
+  CHECK(vtcontract::format(d));d.width=321;CHECK(!vtcontract::format(d));d.width=320;ext[9]=100;CHECK(!vtcontract::format(d));
+  if(failures)return 1;std::puts("PianoVideo V5a contract: sample/all-NAL/format/layout/overflow/cancel tests PASS");return 0;
+}
