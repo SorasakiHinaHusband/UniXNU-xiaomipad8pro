@@ -837,10 +837,13 @@ inline void staStop(Sta &s, uint64_t nowMs, uint32_t answerWaitMs = 0)
 inline bool staFinished(const Sta &s) { return s.step == kStaDone || s.step == kStaStopped; }
 
 // Apple80211 GET21: an explicit stop must not expose the previous join's
-// retained success flags before a replacement staBegin clears them.
-inline uint32_t staAppleAssociateResult(const Sta &s)
+// retained success flags. Cancellation is terminal2; a new accepted profile
+// generation overrides the old stop with pending0 before staBegin consumes it.
+inline uint32_t staAppleAssociateResult(const Sta &s, bool newRequest = false)
 {
-  if (s.stopAsked || !s.assocAnswered) return 0;
+  if (newRequest) return 0;
+  if (s.stopAsked) return 2;
+  if (!s.assocAnswered) return 0;
   if (s.assocStatus != kDot11StatusSuccess)
     return s.error == kStaErrTimeout || s.error == kStaErrNoAnswer ? 9u : 2u;
   if (s.rsn && !s.authorized) return 0;

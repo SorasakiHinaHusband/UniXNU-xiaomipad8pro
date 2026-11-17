@@ -3917,15 +3917,22 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   out->version = PIANO_WIFI_ASSOC_SNAPSHOT_VERSION;
   const uint32_t user = gUserControl.read();
   out->power = (gArgs.level >= 2 && WifiUserControl::power(user)) ? 1 : 0;
-  out->user_stop = !gUserControl.allowed(user);
+  bool newRequest = false;
+  if (gProfileLock) {
+    IOLockLock(gProfileLock);
+    newRequest = gProfileSet && gProfileGeneration != gStaProfileGeneration;
+    IOLockUnlock(gProfileLock);
+  }
+  out->user_stop = !gUserControl.allowed(user) || newRequest;
   out->op_mode = 1;
   out->state = 0;
   out->noise_dbm = -95;
+  const bool canceled = !WifiUserControl::power(user) || !(user & WifiUserControl::kJoin);
+  out->associate_result = canceled ? 2u : staAppleAssociateResult(gSta, newRequest);
   if (out->user_stop) return 0;
   // ASSOCIATE_RESULT is a public progress/result code: 0 while the station or
   // its WPA2 port is still running, 1 only after authorization, 9 for a
   // timeout/no-answer, and 2 for every other completed failure.
-  out->associate_result = staAppleAssociateResult(gSta);
   const bool live = gUserControl.allowed(gUserControl.read()) &&
                     gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
                     (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||

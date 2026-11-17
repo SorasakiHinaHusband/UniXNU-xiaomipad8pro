@@ -31,7 +31,7 @@ struct piano_wifi_assoc_snapshot {
   uint8_t op_mode;    // 1=station
   uint8_t reserved;
   uint32_t associate_result;
-  uint32_t user_stop;  // explicit user leave/off; link event is voluntary (the on-air deauth uses reason 3)
+  uint32_t user_stop;  // public link hidden during user stop/replacement; local leave is voluntary
 };
 
 // Returns 0 and fills a version-1 snapshot.  The function is safe before the

@@ -1149,7 +1149,8 @@ static void testUserStopCycles()
     CHECK(user.join() && !user.allowed(user.read()));
     staStop(m.sta, m.now, 300);
     CHECK(m.run() == kStaStopped);
-    CHECK(staAppleAssociateResult(m.sta) == 0); // retained flags cannot report old success after a new SET20
+    CHECK(staAppleAssociateResult(m.sta) == 2); // old synchronous join must terminate on cancel
+    CHECK(staAppleAssociateResult(m.sta, true) == 0); // a new accepted generation cannot inherit old success/failure
     CHECK(m.deauthFrame.size() == kDot11HeaderBytes + 2);
     CHECK(m.deauthFrame[kDot11HeaderBytes] == kDot11ReasonLeaving);
     CHECK(m.down && m.sta.peerDeleted && m.sta.vdevStopped);
@@ -1171,7 +1172,7 @@ static void testUserStopCycles()
   CHECK(m.run() == kStaStopped);
   unsigned starts = 0;
   for (uint32_t c : m.commands) starts += c == kWmiCmdVdevStart;
-  CHECK(starts == 1 && staAppleAssociateResult(m.sta) == 0);
+  CHECK(starts == 1 && staAppleAssociateResult(m.sta) == 2);
 }
 
 int main()
