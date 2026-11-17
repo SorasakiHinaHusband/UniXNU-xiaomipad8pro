@@ -5,6 +5,7 @@
 // the native V5a endpoint before this fresh process makes its first VT query.
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
+#include <CoreMedia/CMFormatDescriptionBridge.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <IOSurface/IOSurface.h>
@@ -21,6 +22,7 @@
 #include <vector>
 #include <atomic>
 #include "VideoFixture.h"
+#include "vt/PianoVideoVTWire.h"
 
 namespace {
 using pianovideo::session::kAccessUnit;
@@ -110,10 +112,17 @@ bool activeDigest(const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uv
     hexDigest(hash, digest);
     return true;
 }
+CMVideoFormatDescriptionRef avcFormat(const std::vector<Nal> &nals);
+bool formatQueries(CMVideoFormatDescriptionRef original, CMVideoFormatDescriptionRef &same, CMVideoFormatDescriptionRef &unsupported);
 int selfTest() {
     std::vector<Nal> nals;
     std::vector<uint8_t> sample;
-    fixtureTest(nals, sample);
+    if (!fixtureTest(nals, sample)) return 1;
+    CMVideoFormatDescriptionRef format = avcFormat(nals), same = nullptr, unsupported = nullptr;
+    if (format) formatQueries(format, same, unsupported);
+    if (unsupported) CFRelease(unsupported);
+    if (same) CFRelease(same);
+    if (format) CFRelease(format);
     std::vector<uint8_t> y(384 * 256, 0xa5), uv(448 * 128, 0x5a);
     for (unsigned r = 0; r < 240; ++r) std::memset(y.data() + r * 384, 64, 320);
     for (unsigned r = 0; r < 120; ++r)
@@ -194,6 +203,82 @@ CMVideoFormatDescriptionRef avcFormat(const std::vector<Nal> &nals) {
     result("format-avc", status == 0 && format, status);
     return format;
 }
+// The public CanAccept wrapper short-circuits CFEqual descriptions and rejects
+// different codec/dimensions before calling the decoder. Keep those checks, but
+// force two real dcan requests with unequal descriptions of the same codec/size.
+// FormatName is metadata in the QuickTime ImageDescription's compressor-name
+// field; the first candidate keeps exactly the supported avcC. The second uses
+// a self-consistent Main-profile avcC/SPS and is queried only, never decoded.
+bool imageDescription(CMVideoFormatDescriptionRef format, std::vector<uint8_t> &bytes) {
+    CMBlockBufferRef block = nullptr;
+    OSStatus status = CMVideoFormatDescriptionCopyAsBigEndianImageDescriptionBlockBuffer(kCFAllocatorDefault, format,
+        kCFStringEncodingUTF8, nullptr, &block);
+    if (!status && block) {
+        bytes.resize(CMBlockBufferGetDataLength(block));
+        status = CMBlockBufferCopyDataBytes(block, 0, bytes.size(), bytes.data());
+    }
+    if (block) CFRelease(block);
+    return result("format-query-image-description", !status && bytes.size() >= 86, status);
+}
+bool queryCandidate(CMVideoFormatDescriptionRef original, CFDictionaryRef extensions, bool sameConfig,
+                    CMVideoFormatDescriptionRef &candidate) {
+    const char *stage = sameConfig ? "make-dcan-wire-same" : "make-dcan-wire-unsupported";
+    OSStatus status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_H264, 320, 240, extensions, &candidate);
+    if (!result(stage, !status && candidate, status)) return false;
+    const CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(candidate);
+    const bool reachesDecoder = !CFEqual(original, candidate) && CMFormatDescriptionGetMediaSubType(candidate) == kCMVideoCodecType_H264 &&
+        d.width == 320 && d.height == 240;
+    std::vector<uint8_t> source, target;
+    bool serialized = imageDescription(original, source) && imageDescription(candidate, target);
+    vtwire::ImageDescription a, b;
+    vtwire::Atom sourceAvc, targetAvc;
+    serialized = serialized && source != target && vtwire::imageDescription(source.data(), uint32_t(source.size()), a) &&
+        vtwire::imageDescription(target.data(), uint32_t(target.size()), b) &&
+        vtwire::find(a.extensions, a.extensionsSize, vtwire::cc("avcC"), sourceAvc) &&
+        vtwire::find(b.extensions, b.extensionsSize, vtwire::cc("avcC"), targetAvc) && sourceAvc.size == 38 && targetAvc.size == 38;
+    bool config = false;
+    if (serialized) {
+        config = sameConfig ? std::memcmp(sourceAvc.body, targetAvc.body, sourceAvc.size) == 0 :
+            targetAvc.body[1] == 77 && targetAvc.body[9] == 77 && std::memcmp(sourceAvc.body, targetAvc.body, sourceAvc.size) != 0;
+        // A metadata-only name change must survive the public bridge, rather
+        // than relying on an extension the serializer silently drops.
+        if (sameConfig) config = config && std::memcmp(source.data() + 50, target.data() + 50, 32) != 0;
+    }
+    std::printf("video-v5a: format-query kind=%s unequal=%u codec=%08x width=%d height=%d serialized-different=%u avcC-%s=%u\n",
+        sameConfig ? "same" : "unsupported", unsigned(!CFEqual(original, candidate)), unsigned(CMFormatDescriptionGetMediaSubType(candidate)),
+        d.width, d.height, unsigned(serialized), sameConfig ? "same" : "changed", unsigned(config));
+    return result(sameConfig ? "dcan-wire-same-preconditions" : "dcan-wire-unsupported-preconditions", reachesDecoder && serialized && config);
+}
+bool formatQueries(CMVideoFormatDescriptionRef original, CMVideoFormatDescriptionRef &same, CMVideoFormatDescriptionRef &unsupported) {
+    CFDictionaryRef extensions = CMFormatDescriptionGetExtensions(original);
+    CFMutableDictionaryRef sameExtensions = extensions ? CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, extensions) : nullptr;
+    if (!result("format-query-extensions", sameExtensions != nullptr)) return false;
+    CFDictionarySetValue(sameExtensions, kCMFormatDescriptionExtension_FormatName, CFSTR("V5a qualification metadata"));
+    const bool sameOK = queryCandidate(original, sameExtensions, true, same);
+    CFRelease(sameExtensions);
+    CFTypeRef atomsValue = CFDictionaryGetValue(extensions, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    CFDictionaryRef atoms = atomsValue && CFGetTypeID(atomsValue) == CFDictionaryGetTypeID() ? static_cast<CFDictionaryRef>(atomsValue) : nullptr;
+    CFTypeRef avcValue = atoms ? CFDictionaryGetValue(atoms, CFSTR("avcC")) : nullptr;
+    CFDataRef avc = avcValue && CFGetTypeID(avcValue) == CFDataGetTypeID() ? static_cast<CFDataRef>(avcValue) : nullptr;
+    if (!result("format-query-avcC", avc && CFDataGetLength(avc) == 38)) return false;
+    CFMutableDictionaryRef changedExtensions = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, extensions);
+    CFMutableDictionaryRef changedAtoms = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, atoms);
+    CFMutableDataRef changedAvc = CFDataCreateMutableCopy(kCFAllocatorDefault, 0, avc);
+    if (!result("format-query-allocation", changedExtensions && changedAtoms && changedAvc)) {
+        if (changedExtensions) CFRelease(changedExtensions);
+        if (changedAtoms) CFRelease(changedAtoms);
+        if (changedAvc) CFRelease(changedAvc);
+        return false;
+    }
+    uint8_t *p = CFDataGetMutableBytePtr(changedAvc);
+    p[1] = 77; // AVCProfileIndication: Main rather than the qualified Baseline.
+    p[9] = 77; // Matching profile_idc in the SPS NAL held by avcC.
+    CFDictionarySetValue(changedAtoms, CFSTR("avcC"), changedAvc);
+    CFDictionarySetValue(changedExtensions, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, changedAtoms);
+    const bool unsupportedOK = queryCandidate(original, changedExtensions, false, unsupported);
+    CFRelease(changedAvc); CFRelease(changedAtoms); CFRelease(changedExtensions);
+    return sameOK && unsupportedOK;
+}
 CMSampleBufferRef makeSample(CMVideoFormatDescriptionRef format, const std::vector<uint8_t> &bytes) {
     CMBlockBufferRef block = nullptr;
     CMSampleBufferRef sample = nullptr;
@@ -269,6 +354,11 @@ int qualify() {
     result("using-hardware", !status && hardware && CFEqual(hardware, kCFBooleanTrue), status);
     if (hardware) CFRelease(hardware);
     result("dcan-same", VTDecompressionSessionCanAcceptFormatDescription(session, format));
+    CMVideoFormatDescriptionRef wireSame = nullptr, wireUnsupported = nullptr;
+    if (formatQueries(format, wireSame, wireUnsupported)) {
+        result("dcan-wire-same", VTDecompressionSessionCanAcceptFormatDescription(session, wireSame));
+        result("dcan-wire-unsupported", !VTDecompressionSessionCanAcceptFormatDescription(session, wireUnsupported));
+    }
     CMVideoFormatDescriptionRef changed = nullptr, hevc = nullptr;
     status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_H264, 640, 240,
         CMFormatDescriptionGetExtensions(format), &changed);
@@ -310,6 +400,8 @@ int qualify() {
     result("no-extra-success-callback", ctx.success == 1);
     if (hevc) CFRelease(hevc);
     if (changed) CFRelease(changed);
+    if (wireSame) CFRelease(wireSame);
+    if (wireUnsupported) CFRelease(wireUnsupported);
     CFRelease(format); CFRelease(specification);
     pthread_cond_destroy(&ctx.condition); pthread_mutex_destroy(&ctx.mutex);
     std::printf("video-v5a: %s qualification failures=%d success-callbacks=%u error-callbacks=%u\n", failures.load() ? "FAIL" : "PASS", failures.load(), ctx.success, ctx.errors);
