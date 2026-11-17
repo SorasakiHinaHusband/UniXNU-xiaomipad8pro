@@ -13,7 +13,8 @@
     "com.apple.kpi.private": "18.0.0",
     "com.apple.kpi.unsupported": "18.0.0",
     "com.unixnu.driver.NativeUfs": "1.0.0",
-    "com.unixnu.driver.PianoA830": "1.0.0"
+    "com.unixnu.driver.PianoA830": "1.0.0",
+    "com.apple.iokit.IOBluetoothFamily": "9.0.0"
   },
   "personalities": {
     "PianoBluetooth": {
@@ -22,6 +23,274 @@
       "IOProviderClass": "IOPlatformExpertDevice",
       "IOProbeScore": 100,
       "IOMatchCategory": "PianoBluetooth"
+    }
+  },
+  "patch_personalities": {
+    "com.apple.driver.AppleARMPMU": {
+      "AppleARMCharger": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleARMPassthroughPowerSource": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.AppleEmbeddedTempSensor": {
+      "AMCTempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleDieTempController": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "ApplePMGRTempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSCCTempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSocHot": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleT700XTempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleT8015TempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleT8020MTRTempSensor": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleVTempDispatcher": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.AppleOnboardSerial": {
+      "AppleOnboardSerialBSDClient": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.AppleSMC": {
+      "AppleSMCACAMDriver": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCAOP": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCCharger": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCChargerUtil": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCDockUSB_UFP": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCHighVoltageCharger": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCKeysEndpoint": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCPMU": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCPowerOut": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleSMCSensorDispatcher": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.AppleUSBHostMergeProperties": {
+      "AnkerUsbPowerSinkCapability-3000": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple 0x9226-7 Device": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple 0x9226-7 Interface": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple Acrylic Keyboard": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple LED Display Audio Device": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple Studio Display": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple WS Device": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Apple WS Interface": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-1000": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-1300": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-1500": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-2100": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-2400": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-3000": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-500": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-700": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUsbPowerSinkCapability-800": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "BelkinUsbPowerSinkCapability-1500": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "DisplayiSight - 0x219": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Lightning Digital AV Adapter": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Lightning VGA Adapter": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Linksys USB3GIGV1": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "LogitechUsbPowerSinkCapability-2400": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Moshi USB 10/100/1000 LAN": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "SIXAXIS controller": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "eLicenser Enable Data Toggle Reset": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "iPhoneUsbPowerSinkCapability-1000": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "iPhoneUsbPowerSinkCapability-2400": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "iPod": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.RTBuddy": {
+      "RTBuddy": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "RTBuddy64": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "RTBuddyARG": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "RTBuddyRouteOnly": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "RTBuddyService": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.driver.usb.AppleUSBHostPlatformProperties": {
+      "Mac Internal Hub Properties": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Mac Internal Hub Properties 2": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.iokit.IOAccessoryManager": {
+      "Bulk Data": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data EA": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data HID": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data HID Input": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data PD": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data Proxy PD": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data SNTP": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Bulk Data System States": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Dock 0-pin": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Dock 30-pin": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Dock USB UFP": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "HSAID Bulk Data": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "IAP ID Bus": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "IAP Serial Port": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "IOPort Auto Match": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "KeyboardA Property Merge": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "KeyboardB Property Merge": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "Power Source Detect": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "VADResourceArbiter": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.iokit.IOBluetoothFamily": {
+      "Bluetooth Entitlement": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "IOBluetoothHCIController": {
+        "IOResourceMatch": "PianoBluetoothStack"
+      },
+      "MacPro6_1 BRCM20702B0 Hub": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
+    },
+    "com.apple.iokit.IOUSBHostFamily": {
+      "AppleUSBHostResources": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      },
+      "AppleUSBHostResourcesTypeC": {
+        "IOProviderClass": "PianoBluetoothUnusedHardware"
+      }
     }
   }
 }

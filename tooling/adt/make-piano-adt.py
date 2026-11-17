@@ -22,6 +22,7 @@ Environment: UNIXNU_RESEARCH (default ~/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-re
 import argparse
 import contextlib
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -118,6 +119,11 @@ def main():
     address = None if a.no_bt_address else bt_address(a.bt_address_file or DEVICE / 'private/bluetooth-address', a.bt_address_file)
     if address:
         extra.append(devicetree.node('piano-bt', [('bt-address', address)]))
+    # macOS H4 metadata. The opt-in PianoBluetooth worker supplies the same private
+    # address to this node and its registered IOService; no Apple UART driver matches it.
+    extra.append(devicetree.node('bluetooth', [('device_type', b'bluetooth\0'),
+                                              ('transport-encoding', struct.pack('<I', 1)),
+                                              ('transport-speed', struct.pack('<I', 3200000))]))
     with arm_io_children(extra):
         tree = generate(dtb, config, unique_chip_id=a.unique_chip_id, data=a.data, trust=a.trust, addon=a.addon)
     a.output.parent.mkdir(parents=True, exist_ok=True)

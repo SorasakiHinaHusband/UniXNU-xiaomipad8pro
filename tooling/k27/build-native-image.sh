@@ -145,6 +145,9 @@ mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
 NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
+# The Bluetooth daemon requires the real consumer UC, while its hardware dependencies
+# must stay inert on this board. Check the linked metadata, not just the descriptor.
+python3 tooling/k27/check-bluetooth-stack.py out/k27/kc-k27-native.bin >&2 || exit 1
 # Apple's USB host stack (PIANO_USBHOST_STACK=1) must be inert without piano-usbhost=6: gated personalities only.
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   python3 tooling/k27/check-usbhost-stack.py out/k27/kc-k27-native.bin >&2 || { rm -f out/k27/kc-k27-native.bin; exit 1; }
