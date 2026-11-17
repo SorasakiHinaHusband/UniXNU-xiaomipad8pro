@@ -75,9 +75,27 @@ static void tx_write(QcomGlink *g, const uint8_t *header, uint32_t header_length
     g->kick_pending = 1;
 }
 
+/* The normal FIFO allowance leaves this notification's bytes untouched. The remote rings us after reading them. */
+static void notify_read(QcomGlink *g)
+{
+    const uint32_t head = *g->tx.head, tail = *g->tx.tail;
+    if (g->notify_sent || head >= g->tx.length || tail >= g->tx.length) return;
+    const uint32_t raw = tail <= head ? g->tx.length - head + tail : tail - head;
+    if (raw >= FULL_RESERVE + 8) {
+        const uint8_t m[8] = {QCOM_GLINK_READ_NOTIF, 0, 0, 0, 0, 0, 0, 0};
+        tx_write(g, m, 8, 0, 0);
+        g->notify_sent = 1;
+    }
+}
+
 static int tx(QcomGlink *g, const uint8_t *header, uint32_t header_length, const uint8_t *data, uint32_t data_length)
 {
-    if (align8(header_length + data_length) > qcom_glink_tx_avail(&g->tx)) return QcomGlinkAgain;
+    if (align8(header_length + data_length) > qcom_glink_tx_avail(&g->tx)) {
+        g->tx_blocked++;
+        g->retry_pending = 1;
+        notify_read(g);
+        return QcomGlinkAgain;
+    }
     tx_write(g, header, header_length, data, data_length);
     return QcomGlinkOk;
 }
@@ -184,13 +202,36 @@ static void reset_channel(QcomGlinkChannel *c)
 {
     c->open_acked = c->remote_open = c->up = c->intent_asked = c->ack_due = 0;
     c->open_sent = c->initiator ? 0 : 2;
-    for (unsigned i = 0; i < QCOM_GLINK_MAX_LOCAL_INTENTS; ++i) c->local[i].advertised = c->local[i].busy = 0, c->local[i].fill = 0;
+    for (unsigned i = 0; i < QCOM_GLINK_MAX_LOCAL_INTENTS; ++i) c->local[i].advertised = c->local[i].busy = c->local[i].done_due = 0, c->local[i].fill = 0;
     for (unsigned i = 0; i < QCOM_GLINK_MAX_REMOTE_INTENTS; ++i) c->remote[i].valid = 0;
 }
 
-/* Channel bring-up and our intents: whatever is due and fits in the FIFO now. */
+static int return_intent(QcomGlink *g, QcomGlinkChannel *c, unsigned index)
+{
+    const int reuse = (g->features & QCOM_GLINK_FEATURE_INTENT_REUSE) != 0;
+    if (command(g, reuse ? QCOM_GLINK_RX_DONE_W_REUSE : QCOM_GLINK_RX_DONE, c->lcid, index + 1)) return QcomGlinkAgain;
+    c->local[index].done_due = c->local[index].busy = 0;
+    if (!reuse) c->local[index].advertised = 0;
+    return QcomGlinkOk;
+}
+
+/* Ownership returns precede new offers/data. A completed callback is never run again just to retry its return. */
 static void progress(QcomGlink *g)
 {
+    if (g->reply_due) {
+        if (command(g, g->reply_cmd, g->reply_cid, g->reply_value)) return;
+        g->reply_due = 0;
+        g->reply_retried++;
+    }
+    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i) {
+        QcomGlinkChannel *c = &g->channel[i];
+        if (!c->used) continue;
+        for (unsigned k = 0; k < c->intent_count; ++k) {
+            if (!c->local[k].done_due) continue;
+            if (return_intent(g, c, k)) return;
+            g->done_retried++;
+        }
+    }
     if (!g->version_sent) {
         if (command(g, QCOM_GLINK_VERSION, GLINK_VERSION_1, g->features)) return;
         g->version_sent = 1;
@@ -242,12 +283,12 @@ static int handle_data(QcomGlink *g, uint16_t cmd, uint32_t rcid, uint32_t liid,
                 c->local[index].busy = 1;
                 g->rx_data++;
                 if (c->client.receive) c->client.receive(c->context, c, c->storage + (size_t)index * c->intent_size, fill);
-                c->local[index].busy = 0;
                 fill = 0;
-                /* The intent is ours again once the remote knows it is done; with reuse it stays advertised. */
-                const int reuse = (g->features & QCOM_GLINK_FEATURE_INTENT_REUSE) != 0;
-                if (command(g, reuse ? QCOM_GLINK_RX_DONE_W_REUSE : QCOM_GLINK_RX_DONE, c->lcid, liid) == QcomGlinkOk && !reuse)
-                    c->local[index].advertised = 0;
+                /* The remote still owns the intent until DONE actually fits in the shared FIFO. */
+                if (return_intent(g, c, index)) {
+                    c->local[index].done_due = 1;
+                    g->done_deferred++;
+                }
             }
         }
         c->local[index].fill = fill;
@@ -281,6 +322,7 @@ static void note_unknown(QcomGlink *g, const char *name)
 }
 static int receive_one(QcomGlink *g)
 {
+    if (g->reply_due) return 0;   /* one remembered side-effecting reply; do not overwrite it */
     const uint32_t avail = qcom_glink_rx_avail(&g->rx);
     uint8_t m[8];
     if (avail < 8) return 0;
@@ -411,7 +453,15 @@ static int receive_one(QcomGlink *g)
                     granted = 1;
                     break;
                 }
-        if (command(g, QCOM_GLINK_RX_INTENT_REQ_ACK, c ? c->lcid : param1, (uint32_t)granted)) return 0;
+        const uint16_t cid = c ? c->lcid : param1;
+        if (command(g, QCOM_GLINK_RX_INTENT_REQ_ACK, cid, (uint32_t)granted)) {
+            /* Advertising may already have succeeded: retain that grant instead of replaying it as a refusal. */
+            g->reply_due = 1;
+            g->reply_cmd = QCOM_GLINK_RX_INTENT_REQ_ACK;
+            g->reply_cid = cid;
+            g->reply_value = (uint32_t)granted;
+            g->reply_deferred++;
+        }
         break;
     }
     case QCOM_GLINK_RX_INTENT_REQ_ACK:
@@ -440,7 +490,7 @@ int qcom_glink_poll(QcomGlink *g)
 {
     if (g->broken) return QcomGlinkCorrupt;
     int handled = 0;
-    g->notify_sent = 0;
+    g->notify_sent = g->retry_pending = 0;
     progress(g);
     /* Bounded: at most one FIFO's worth of minimal messages per call. */
     for (uint32_t budget = g->rx.length / 8 + 1; g->rx.data && budget; --budget) {
@@ -475,13 +525,6 @@ int qcom_glink_send(QcomGlink *g, QcomGlinkChannel *c, const void *data, uint32_
     put32(h + 8, length);
     put32(h + 12, 0);
     if (tx(g, h, 16, (const uint8_t *)data, length)) {
-        /* Ask the remote to ring us once it has read, so the owner retries then. */
-        const uint32_t head = *g->tx.head, tail = *g->tx.tail;
-        if (!g->notify_sent && head < g->tx.length && tail < g->tx.length) {
-            uint8_t m[8] = {QCOM_GLINK_READ_NOTIF, 0, 0, 0, 0, 0, 0, 0};
-            const uint32_t raw = tail <= head ? g->tx.length - head + tail : tail - head;
-            if (raw >= FULL_RESERVE + 8) {tx_write(g, m, 8, 0, 0); g->notify_sent = 1;}
-        }
         if (g->kick_pending && g->kick) {g->kick_pending = 0; g->kick(g->kick_context);}
         return QcomGlinkAgain;
     }

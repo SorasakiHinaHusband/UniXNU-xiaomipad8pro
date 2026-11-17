@@ -701,7 +701,8 @@ void serviceSmp2p() {
 
 void applyClients();
 void pumpSends();
-uint32_t gUnknownSeen;
+uint32_t gUnknownSeen, gReturnsSeen, gReturnLogs;
+bool gReturnsLogged;
 void serviceGlink() {
     if (!gGlinkStarted) return;
     if (!gGlink.rx.data) {
@@ -719,6 +720,13 @@ void serviceGlink() {
         if (gGlink.broken) say("GLINK: the transport is broken (link generation %u)", gLinkTrack.generation);
     }
     pumpSends();
+    const uint32_t returns = gGlink.done_deferred + gGlink.reply_deferred;
+    if (!gReturnsLogged || (returns != gReturnsSeen && (gReturnLogs < 8 || !(returns & 63u)))) {
+        say("GLINK returns: done %u deferred/%u retired, replies %u/%u, tx-full %u, retry %u [sens-ab2:rx-return-debt]",
+            gGlink.done_deferred, gGlink.done_retried, gGlink.reply_deferred, gGlink.reply_retried, gGlink.tx_blocked,
+            gGlink.retry_pending);
+        gReturnsLogged = true; gReturnsSeen = returns; ++gReturnLogs;
+    }
     if (!agreed && gGlink.version_agreed) say("GLINK: version agreed (features %#x)", gGlink.features);
     if (gGlink.unknown_opens != gUnknownSeen) {
         gUnknownSeen = gGlink.unknown_opens;
@@ -1001,7 +1009,7 @@ void adspThread(void *, wait_result_t) {
     // From here on the thread only answers doorbells and client sends; while a send waits for an intent or FIFO room it looks again
     // every second.
     for (;;) {
-        bool pending = false;
+        bool pending = gGlinkStarted && gGlink.retry_pending;
         for (unsigned i = 0; i < gClientCount; ++i) pending |= gClients[i].count != 0;
         service(waitEvents(pending ? 1000 : 3600u * 1000u) | (pending ? kEvSend : 0));
     }

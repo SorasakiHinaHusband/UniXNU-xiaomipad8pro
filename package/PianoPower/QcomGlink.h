@@ -59,7 +59,7 @@ struct QcomGlinkChannel {
     /* Our receive intents: count buffers of size bytes in storage (count * size). */
     uint8_t *storage;
     uint32_t intent_size, intent_count;
-    struct {uint32_t fill; uint8_t advertised, busy;} local[QCOM_GLINK_MAX_LOCAL_INTENTS];
+    struct {uint32_t fill; uint8_t advertised, busy, done_due;} local[QCOM_GLINK_MAX_LOCAL_INTENTS];
     /* The remote's intents we may send into. */
     struct {uint32_t id, size; uint8_t valid, busy;} remote[QCOM_GLINK_MAX_REMOTE_INTENTS];
 };
@@ -80,6 +80,11 @@ typedef struct {
      * channel still gets it) or the remote closes it; late_opens counts the ones answered that way. */
     struct {uint16_t rcid; uint8_t used; char name[QCOM_GLINK_NAME];} pending[QCOM_GLINK_MAX_PENDING_OPENS];
     uint32_t late_opens;
+    /* Backpressure retains ownership returns after the payload callback; they never re-deliver that payload. */
+    uint8_t retry_pending, reply_due;
+    uint16_t reply_cmd, reply_cid;
+    uint32_t reply_value;
+    uint32_t done_deferred, done_retried, reply_deferred, reply_retried, tx_blocked;
 } QcomGlink;
 
 /* Sets up the link on its FIFOs (rx may have no data yet: the remote makes its FIFO later) and resets the indices we own. */
