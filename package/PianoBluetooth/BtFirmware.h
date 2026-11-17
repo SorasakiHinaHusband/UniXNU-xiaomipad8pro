@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* PianoBluetooth level 4: the controller's rampatch and NVM read in place from the tablet's own firmware partition, never from this
- * repository. `bluetooth_a` (else `bluetooth_b`) is a FAT volume read through NativeUfs, read only; the files are under `image/`
+ * repository. `bluetooth_a` (else `bluetooth_b`) is a populated FAT prefix read through NativeUfs, read only; the files are under `image/`
  * (gngbtfw20.mbn, gngbtnv20.bXX by board id, gngbtnv20.bin). The firmware is proprietary and must not be redistributed
  * (docs/drivers/bluetooth.md section 11); nothing of it is logged but names and sizes. */
 #ifndef PIANO_BT_FIRMWARE_H
@@ -21,6 +21,21 @@ enum {
     PianoBtFwNoMemory = -6,
     PianoBtFwRange = -7,
 };
+
+static inline const char *piano_bt_firmware_error(int rc)
+{
+    switch (rc) {
+    case PianoBtFwOk: return "ok";
+    case PianoBtFwNotReady: return "NativeUfs has not published bluetooth_a/bluetooth_b";
+    case PianoBtFwNoPartition: return "no mounted firmware partition";
+    case PianoBtFwNotFat: return "invalid FAT metadata or missing physical prefix";
+    case PianoBtFwNotFound: return "file not found";
+    case PianoBtFwReadError: return "firmware partition read failed";
+    case PianoBtFwNoMemory: return "firmware reader allocation failed";
+    case PianoBtFwRange: return "firmware range outside file";
+    default: return "unknown firmware error";
+    }
+}
 
 /* Mounts the firmware partition (idempotent). `partition` gets the name that worked (a static string). */
 int piano_bt_firmware_open(const char **partition);

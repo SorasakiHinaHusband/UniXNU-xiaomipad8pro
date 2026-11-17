@@ -21,6 +21,8 @@ for t in bt_host bt_bringup_host; do
   "${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror "${INC[@]}" -I "$D/package/include" "$P/tests/$t.cpp" -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoBluetooth host tests failed ($t)" >&2; exit 1; }
 done
+python3 "$P/tests/run-firmware-host.py"
+python3 "$D/tooling/native/piano-bluetooth/tests/test-start-runtime.py"
 # The level 1 survey headers stay store-free: no str instruction and no assignment through a volatile pointer (the kext's stores are
 # in PianoBluetooth.cpp; levels 2..4 write only through BtBringup.h's callbacks).
 if grep -nE '"str|volatile[^;]*\*[^;]*[^=!<>]=[^=]' "$P/GeniUart.h" "$P/BtHw.h"; then

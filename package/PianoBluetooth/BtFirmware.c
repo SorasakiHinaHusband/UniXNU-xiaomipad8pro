@@ -81,11 +81,16 @@ int piano_bt_firmware_open(const char **partition)
             continue;
         }
         p->cached = UINT64_MAX;
-        rc = fat_mount(v, blocks * 4096, partitionRead, p) ? PianoBtFwNotFat : PianoBtFwOk;
+        const int fat = fat_mount_prefix(v, blocks * 4096, partitionRead, p);
+        rc = fat == FatReadError ? PianoBtFwReadError : fat ? PianoBtFwNotFat : PianoBtFwOk;
+        IOLog("PianoBluetooth: bt-path3: firmware candidate %s (LUN %u, %llu blocks of 4 KiB): FAT status %d, result %d\n",
+              kPartitions[i], p->lun, (unsigned long long)blocks, fat, rc);
         if (!rc) {
             gPartitionName = kPartitions[i];
             IOLog("PianoBluetooth: firmware partition %s (LUN %u, %llu blocks of 4 KiB)\n", kPartitions[i], p->lun,
                   (unsigned long long)blocks);
+            IOLog("PianoBluetooth: bt-path3: bounded FAT%u prefix: sector %u, cluster %u, reachable clusters %u\n",
+                  v->fat32 ? 32 : 16, v->sector_bytes, v->cluster_bytes, v->clusters);
         }
     }
     if (rc) {

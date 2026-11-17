@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # Copyright (c) 2026 Leo Zhang. All rights reserved.
 set -eu
-# Match the parsed final value, rather than accepting an earlier duplicate arg.
-level=$(/usr/sbin/sysctl -n kern.bootargs | /usr/bin/awk '{for(i=1;i<=NF;i++)if($i~/^piano-bt=/){split($i,a,"=");level=a[2]}} END {print level}')
-[ "$level" = 5 ] || exit 0
+# The kernel registers this OID only for parsed piano-bt=5. kern.bootargs is
+# clipped at 1024 bytes and can omit the ADT tail the driver actually parsed.
+# -N checks the name without invoking the pending boot-result handler.
+/usr/sbin/sysctl -N machdep.piano_bt_boot >/dev/null 2>&1 || exit 0
+printf '%s\n' 'piano-bt-path3 runtime: kernel level5 endpoint present'
 # A stock process may already have mapped the lower executable while firmware was
 # loading. Stop just these jobs before making the new views visible: otherwise
 # the old daemon can issue Broadcom commands in the worker's ready/start interval.

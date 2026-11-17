@@ -43,6 +43,10 @@ typedef struct {
 } FatFile;
 
 int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context);
+/* Opt-in for a read-only populated prefix of a larger declared FAT volume.
+ * Metadata must fit; FAT type follows the BPB, reachable clusters and every
+ * byte read stay within size. Ordinary callers must use strict fat_mount. */
+int fat_mount_prefix(FatVolume *v, uint64_t size, FatRead read, void *context);
 /* path: names separated by '/', each matched in any case against the long name, else the 8.3 name ("image/adsp.b00"). */
 int fat_open(FatVolume *v, const char *path, FatFile *file);
 int fat_read(FatVolume *v, const FatFile *file, uint64_t offset, void *to, size_t length);

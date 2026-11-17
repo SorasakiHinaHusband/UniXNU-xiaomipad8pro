@@ -99,3 +99,11 @@ Level 5 transport addition (2026-11-17):
   No GPL core, firmware blob or Apple executable is part of this import.
   Stable address fallback follows UniXNU-sheng commit
   0eea3a200aa426ab282b61a956c8013deb74b68a, package/BluetoothProbe.cpp.
+
+Bounded firmware-prefix correction (2026-11-17):
+  The existing shared package/PianoPower/FatVolume.c remains the one FAT
+  implementation compiled into this kext. Its new opt-in prefix mount preserves
+  the declared FAT type while bounding metadata, clusters and reads to the GPT
+  partition. This is new UniXNU-piano code by Leo Zhang; no upstream source or
+  firmware payload is imported. Geometry was measured from a saved partition;
+  file identities checked against third-party xiaomipad-8pro-mainline a43f79c.

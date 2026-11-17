@@ -11,7 +11,7 @@ static int vread(FatVolume *v, uint64_t offset, void *to, size_t length)
     return v->read(v->context, offset, to, length) ? FatReadError : FatOk;
 }
 
-int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context)
+static int mount_volume(FatVolume *v, uint64_t size, FatRead read, void *context, int prefix)
 {
     uint8_t b[512];
     if (!v || !read) return FatReadError;
@@ -28,22 +28,42 @@ int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context)
         return FatNotFat;
     const uint64_t root_sectors = ((uint64_t)root * 32 + bps - 1) / bps;
     const uint64_t data_sector = reserved + (uint64_t)fats * fat_sectors + root_sectors;
-    if (total <= data_sector || (uint64_t)total * bps > size) return FatNotFat;
+    if (total <= data_sector || (!prefix && (uint64_t)total * bps > size)) return FatNotFat;
     const uint64_t clusters = (total - data_sector) / spc;
     if (clusters < 4085) return FatNotFat;  /* FAT12 */
     v->fat32 = clusters >= 65525;
     if (v->fat32 ? root != 0 : root == 0) return FatNotFat;
     /* the table must hold an entry for every cluster */
     if ((uint64_t)fat_sectors * bps / (v->fat32 ? 4 : 2) < clusters + 2 || clusters > 0x0ffffff0) return FatNotFat;
+    /* Some read-only firmware partitions contain the populated prefix of a
+     * larger FAT image. Keep its declared FAT type/table geometry, but never
+     * make the absent tail addressable. Metadata must fit before subtraction. */
+    uint64_t reachable = clusters;
+    if (prefix) {
+        if (data_sector * bps >= size) return FatNotFat;
+        const uint64_t physical = (size - data_sector * bps) / ((uint64_t)bps * spc);
+        if (!physical) return FatNotFat;
+        if (reachable > physical) reachable = physical;
+    }
     v->sector_bytes = bps;
     v->cluster_bytes = bps * spc;
-    v->clusters = (uint32_t)clusters;
+    v->clusters = (uint32_t)reachable;
     v->fat_offset = (uint64_t)reserved * bps;
     v->root_offset = (reserved + (uint64_t)fats * fat_sectors) * bps;
     v->data_offset = data_sector * bps;
     v->root_entries = root;
     v->root_cluster = v->fat32 ? le32(b + 44) & 0x0fffffff : 0;
     return FatOk;
+}
+
+int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context)
+{
+    return mount_volume(v, size, read, context, 0);
+}
+
+int fat_mount_prefix(FatVolume *v, uint64_t size, FatRead read, void *context)
+{
+    return mount_volume(v, size, read, context, 1);
 }
 
 static int valid(const FatVolume *v, uint32_t cluster) {return cluster >= 2 && cluster - 2 < v->clusters;}

@@ -1244,8 +1244,13 @@ void PianoBluetooth::levels()
       if (rc == PianoBtFwNotReady) IOSleep(1000);
     }
     if (rc) {
-      note("level 4 not run: no firmware partition (%d: %s); stopping at level 3", rc,
-           rc == PianoBtFwNotReady ? "NativeUfs has not published bluetooth_a/bluetooth_b" : "not a FAT volume, or no memory");
+      note("level 4 not run: no firmware partition (%d: %s); %s", rc, piano_bt_firmware_error(rc),
+           fTransport ? "level 5 refused before power/UART" : "continuing only to level 3");
+      if (fTransport) {
+        stage(-500, "bt-path3: firmware unavailable; no power/UART/controller attempted");
+        transportResult();
+        return;
+      }
       level = 3;
     }
   }
