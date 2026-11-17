@@ -746,12 +746,27 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|cache;
+        if(NativeAdrenoMemory *b=live_?box_->core.memoryForToken(type):nullptr)
+            if(b->unmapped())*options=kIOMapAnywhere|(b->writeCombined()?kIOMapWriteCombineCache:kIOMapDefaultCache);
         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
         IOLockUnlock(lock_);
         return kIOReturnSuccess;
     }
     NativeAdrenoMemory *backing=live_?box_->core.memoryForToken(type):nullptr;
-    if(backing) {
+    if(backing && backing->unmapped()) {
+        if(!v || v->descriptor)status=kIOReturnNoResources;
+        else {
+            IOMemoryDescriptor *descriptor=backing->retainVmCpuDescriptor();
+            if(!descriptor)status=kIOReturnNotReady;
+            else {
+                v->token=type;v->descriptor=descriptor;
+                descriptor->retain();*memory=descriptor;
+                *options=kIOMapAnywhere|(backing->writeCombined()?kIOMapWriteCombineCache:kIOMapDefaultCache);
+                native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
+                status=kIOReturnSuccess;
+            }
+        }
+    } else if(backing) {
         /* The BO's pages are mapped non-cacheable by the GPU, so the client needs a view of the same raw physical spans the SMMU maps
          * with the matching cache mode (a mapping of the buffer descriptor with another cache mode is not reliable). A BO's pages can
          * come scattered, one span per page: the descriptor takes them all, as many as the GPU's own table accepts. The descriptor
@@ -789,10 +804,40 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
 /* One core call under this connection's lock. */
 IOReturn AGXDeviceUserClient::locked(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
-    if(!lock_)return kIOReturnNotReady;
+    if(!lock_) {
+        if(method==NativeAdrenoMethodBoAlloc)
+            boot_progress_gpu_event("BoAlloc refused: stage=connection-lock bytes=0 status=not-ready inner=not-called pool=unavailable");
+        return kIOReturnNotReady;
+    }
     lockMetered(lock_,Adreno830WaitConnection);
     const IOReturn status=live_?box_->core.dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+#ifdef ADRENO830_MACOS
+    char failure[NativeAdrenoMapLineBytes]={},totals[NativeAdrenoMapLineBytes]={};
+    if(method==NativeAdrenoMethodBoAlloc && status) {
+        /* Per-call by-value snapshot BEFORE unlocking: a concurrent success cannot erase this refusal. */
+        static uint64_t refusalSequence;
+        const unsigned long long call=__atomic_add_fetch(&refusalSequence,1ull,__ATOMIC_RELAXED);
+        const NativeAdrenoAllocRefusal r=live_?box_->core.lastAllocRefusal():NativeAdrenoAllocRefusal{};
+        const char *stage=r.failure.status?r.failure.stage:
+            !live_?"not-open":r.why==NativeAdrenoAllocWhyObjects?"object-slots":
+            r.why==NativeAdrenoAllocWhyLimit?"object-limit":"request-dispatch";
+        const uint64_t bytes=input && input_size==sizeof(NativeAdrenoAbiBoAlloc)?
+            static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes:0;
+        const NativeAdrenoBackingTotals t=NativeAdrenoMemory::backingTotals();
+        uint64_t free=0,pool=0;
+        {NativeAdrenoSubmitGuard guard(g.submit,NativeAdrenoSubmitLockMemory);
+         free=NativeAdrenoMemory::poolFreeBytes();pool=NativeAdrenoMemory::poolBytes();}
+        snprintf(failure,sizeof failure,"BoAlloc refused: n=%llu slot=%u stage=%s bytes=%llu status=%#x inner=%s",call,slot_,stage,
+            (unsigned long long)bytes,unsigned(status),strstr(stage,"create")?"not-exported":"returned");
+        snprintf(totals,sizeof totals,"BoAlloc totals: n=%llu slot=%u pool=%llu/%llu free=%llu mapped=%llu unmapped=%llu",call,slot_,
+            (unsigned long long)(pool-free),(unsigned long long)pool,(unsigned long long)free,
+            (unsigned long long)t.mapped,(unsigned long long)t.unmapped);
+    }
+#endif
     IOLockUnlock(lock_);
+#ifdef ADRENO830_MACOS
+    if(failure[0]) {boot_progress_gpu_event(failure);boot_progress_gpu_event(totals);}
+#endif
     return status;
 }
 /* WaitFence (ARCHITECTURE 4.13.3): one zero-timeout core call under the connection lock validates the fence and reaps it when it already
@@ -1061,7 +1106,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
                 __atomic_store_n(&native_adreno_va_due,1u,__ATOMIC_RELEASE);
             }
             /* 2026-11-12: a BoAlloc's or BoImport's reason the same way (the per-object limit, the pool's room and XNU's answer). */
-            if((method==NativeAdrenoMethodBoAlloc || method==NativeAdrenoMethodBoImport) && box_) {
+            if(method==NativeAdrenoMethodBoImport && box_) {
                 char detail[NativeAdrenoMapLineBytes];
                 NativeAdrenoAllocRefusalLine(detail,sizeof detail,box_->core.lastAllocRefusal());
                 boot_progress_gpu_event(detail);
@@ -1622,17 +1667,24 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
         /* 2026-11-12: the address space (NativeAdrenoMapLines.h): the VM's records and ranges, the pool and what is outside it, then
          * every connection's mappings against its window. Every 30 s while it changes, and at the tick after a refused BoMap. */
         static uint32_t vaAt;
-        static uint64_t vaSignature;
-        uint64_t va=0;
-        for(unsigned i=0;i<listed;++i)va=va*1099511628211ull^(entries[i].map.spans+(entries[i].map.objects<<40)+entries[i].slot);
+
         const bool due=__atomic_exchange_n(&native_adreno_va_due,0u,__ATOMIC_ACQ_REL)!=0;
-        if(g.vm && listed && (due || (va!=vaSignature && (!vaAt || ticks-vaAt>=30)))) {
-            vaAt=ticks;vaSignature=va;
+        if(g.vm && listed && (due || (!vaAt || ticks-vaAt>=30))) {
+            vaAt=ticks;
             uint32_t pool_mib=0,used_mib=0;
             NativeAdrenoMemory::usage(&pool_mib,&used_mib,nullptr);
             char totals[NativeAdrenoMapLineBytes];
             NativeAdrenoVaTotalsLine(totals,sizeof totals,g.vm->objectCount(),NativeAdrenoVmMaxObjects,g.vm->spanCount(),
                 g.vm->spanCapacity(),g.vm->mappedBytes()>>20,used_mib,pool_mib,mib(fallback));
+            boot_progress_gpu_event(totals);
+            const NativeAdrenoBackingTotals bt=NativeAdrenoMemory::backingTotals();
+            snprintf(totals,sizeof totals,"bo memory: pool=%u/%uM owned-unmapped=%llu owned-mapped=%llu imports=%llu",used_mib,pool_mib,
+                (unsigned long long)bt.unmapped,(unsigned long long)bt.mapped,(unsigned long long)bt.imports);
+            boot_progress_gpu_event(totals);
+            snprintf(totals,sizeof totals,"bo lifetime: kva-current=%llu kva-peak=%llu allocs=%llu frees=%llu range-hole=unavailable",
+                (unsigned long long)(NativeAdrenoMemory::poolBytes()+bt.mapped),
+                (unsigned long long)(NativeAdrenoMemory::poolBytes()+bt.mapped_peak),
+                (unsigned long long)bt.allocs,(unsigned long long)bt.frees);
             boot_progress_gpu_event(totals);
             char vaLine[NativeAdrenoMapLineBytes];
             int at=snprintf(vaLine,sizeof vaLine,"va/map:");

@@ -17,6 +17,7 @@ constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
  kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8;
 using IODirection=unsigned;
 constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,kIOMemoryPersistent=0x10000;
+constexpr unsigned kIOMemoryPageable=0x100000,kIOMapWriteCombineCache=0x200000;
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */
@@ -57,7 +58,9 @@ public:
     size_t bytes=0;
     uint64_t mask=0;
     uint64_t physical_base=0;
-    bool contiguous=false;
+    bool contiguous=false,vm_object=false,write_combined=false;
+    unsigned references=1;
+    void retain() {++references;}
     static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(void *task,unsigned options,size_t bytes,uint64_t mask) {
         if(task!=kernel_task || !(options&kIOMemoryMapperNone))std::abort();
         if(fixture.allocation_hook)fixture.allocation_hook(options,bytes);
@@ -70,13 +73,20 @@ public:
         if(posix_memalign(&d->raw,4096,bytes+4096))std::abort();
         std::memset(d->raw,0xa5,bytes+4096);++fixture.created;fixture.live.push_back(d);return d;
     }
+    static IOBufferMemoryDescriptor *inTaskWithOptions(void *task,unsigned options,size_t bytes,size_t alignment) {
+        if(task || !(options&kIOMemoryPageable) || alignment!=4096)std::abort();
+        auto *d=inTaskWithPhysicalMask(kernel_task,options,bytes,UINT64_C(0xFFFFFFFFFFFFF000));
+        if(d) {d->vm_object=true;d->write_combined=options&kIOMapWriteCombineCache;std::memset(d->raw,0,bytes);}
+        return d;
+    }
     IOReturn prepare() {++fixture.prepared;return fixture.prepare_fail?kIOReturnIOError:kIOReturnSuccess;}
     IOReturn complete() {++fixture.completed;return fixture.complete_fail?kIOReturnIOError:kIOReturnSuccess;}
     void release() {
+        if(--references)return;
         ++fixture.released;auto at=std::find(fixture.live.begin(),fixture.live.end(),this);
         if(at==fixture.live.end())std::abort();fixture.live.erase(at);std::free(raw);delete this;
     }
-    void *getBytesNoCopy() {return fixture.null_mapping?nullptr:static_cast<char *>(raw)+(fixture.unaligned_mapping?8:0);}
+    void *getBytesNoCopy() {return vm_object || fixture.null_mapping?nullptr:static_cast<char *>(raw)+(fixture.unaligned_mapping?8:0);}
     size_t getLength() {return bytes+(fixture.wrong_length?4096:0);}
     uint64_t getPhysicalSegment(size_t offset,size_t *length,unsigned options) {
         if((offset&4095) || offset>=bytes || options!=kIOMemoryMapperNone)std::abort();

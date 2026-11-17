@@ -44,6 +44,7 @@
 #include "Adreno830Status.h"
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
+#include "NativeAdrenoMemory.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
@@ -1112,6 +1113,7 @@ OSDefineMetaClassAndStructors(PianoA830, IOService)
 IOService *PianoA830::probe(IOService *provider, SInt32 *score)
 {
   gLevel = bootArg("piano-gpu", 0);
+  NativeAdrenoMemory::setUnmappedUser(bootArg("piano-gpu-user-vm", 0) == 1);
   if (!gLevel || !OSDynamicCast(IOPlatformExpertDevice, provider)) return nullptr;
   return IOService::probe(provider, score);
 }
@@ -1160,6 +1162,8 @@ bool PianoA830::start(IOService *provider)
     setProperty("IOPlatformSleepAction", kActionPriority, 32);
     setProperty("IOPlatformWakeAction", kActionPriority, 32);
   }
+  gpuLine("bo backing: user fallback=%s; kernel objects=mapped; pool=unchanged; gpuoom-vm1",
+          NativeAdrenoMemory::unmappedUser() ? "unmapped-vm" : "mapped-control");
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
   if (gTraceSync) {
     gRing.stamp = static_cast<uint64_t *>(IOMallocZero(size_t(RingLines) * sizeof(uint64_t)));

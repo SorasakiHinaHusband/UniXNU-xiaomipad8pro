@@ -6,6 +6,9 @@
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
 class IOMemoryDescriptor;
+/* A factory returning null does not export its inner kern_return_t. Never invent one. */
+struct NativeAdrenoMemoryFailure {const char *stage="none";IOReturn status=0;};
+struct NativeAdrenoBackingTotals {uint64_t mapped,unmapped,imports,mapped_peak,allocs,frees;};
 struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
 struct NativeAdrenoCpuState {
     uint64_t tcr,ttbr0,ttbr1,sctlr;
@@ -86,6 +89,9 @@ class NativeAdrenoMemory final {
     IOBufferMemoryDescriptor *descriptor_=nullptr;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false,device_=false,live_import_=false;
+    bool unmapped_=false,accounted_=false;
+    NativeAdrenoMemoryFailure failure_{};
+    IOReturn allocateBacking(size_t,unsigned,bool,size_t,bool,bool,bool);
     void *mapping_=nullptr;
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
@@ -110,6 +116,16 @@ public:
      * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
      * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
     IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
+    /* Only the user BO fallback opts in; kernel objects and explicit contiguous requests keep allocate().
+     * Named VM object, no lifetime KVA, explicitly prepared until fences and CPU leases retire. */
+    IOReturn allocateUser(size_t bytes,unsigned bits,size_t budget,bool write_combined)
+    {return allocateBacking(bytes,bits,false,budget,false,true,write_combined);}
+    static void setUnmappedUser(bool enabled);
+    static bool unmappedUser();
+    static NativeAdrenoBackingTotals backingTotals();
+    NativeAdrenoMemoryFailure lastFailure() const {return failure_;}
+    bool unmapped() const {return unmapped_;}
+    IOBufferMemoryDescriptor *retainVmCpuDescriptor();
     /* allocate()'s pool step alone: the bytes from the BO pool, or kIOReturnNoResources without a pool or room in it (nothing else
      * is tried). The pool's free list and figures are shared: the caller holds the Memory lock (NativeAdrenoSubmitLockMemory). A BO
      * outside the pool (allocate with pooled false: the contiguous attempt, the scattered pages, makeWriteCombined, release) touches

@@ -462,8 +462,55 @@ static unsigned poolPieces()
     return controls;
 }
 #endif
+/* VM zero-fill and VM-owned cache are simulated; real cache/DMA is a tablet gate. */
+static void unmappedBacking()
+{
+    for(bool wc:{false,true}) {
+        reset();fixture.mode=Scattered;
+        NativeAdrenoMemory memory;
+        const auto before=NativeAdrenoMemory::backingTotals();
+        CHECK(memory.allocateUser(16384,36,16384,wc)==kIOReturnSuccess);
+        CHECK(memory.unmapped() && !memory.mapping() && memory.spanCount()==4);
+        CHECK(memory.writeCombined()==wc && fixture.prepared==1);
+        auto *view=memory.retainVmCpuDescriptor();
+        CHECK(view && view->vm_object && view->write_combined==wc && view->references==2);
+        for(size_t i=0;i<16384;++i)CHECK(static_cast<unsigned char *>(view->raw)[i]==0);
+        static_cast<unsigned char *>(view->raw)[4096]=0x5a;
+        CHECK(memory.holdForDevice()==kIOReturnSuccess && memory.release()==kIOReturnBusy);
+        CHECK(memory.publishForDevice(0,16384,true)==kIOReturnSuccess);
+        CHECK(memory.acquireDeviceWrites(0,16384)==kIOReturnSuccess);
+        CHECK(fixture.cache_calls==0); /* no mapping_ access, no physical-aperture stores */
+        CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess);
+        view->release();
+        CHECK(memory.release()==kIOReturnSuccess && memory.release()==kIOReturnSuccess);
+        CHECK(!memory.retainVmCpuDescriptor() && fixture.live.empty());
+        const auto after=NativeAdrenoMemory::backingTotals();
+        CHECK(after.unmapped==before.unmapped && after.mapped==before.mapped && after.allocs==before.allocs+1 && after.frees==before.frees+1);
+    }
+    for(unsigned fail=0;fail<5;++fail) {
+        reset();NativeAdrenoMemory memory;
+        if(fail==0)fixture.allocation_fail=true;
+        if(fail==1)fixture.prepare_fail=true;
+        if(fail==2)fixture.metadata_fail=true;
+        if(fail==3)fixture.mode=HighPhysical;
+        if(fail==4)fixture.wrong_length=true;
+        CHECK(memory.allocateUser(16384,32,16384,true)!=kIOReturnSuccess);
+        const auto failure=memory.lastFailure();
+        const char *stages[]={"vm-descriptor-create","prepare","span-metadata","physical-spans","layout"};
+        CHECK(!std::strcmp(failure.stage,stages[fail]) && failure.status);
+        CHECK(fixture.live.empty() && fixture.metadata.empty());
+    }
+    reset();NativeAdrenoMemory memory;
+    CHECK(memory.allocateUser(4096,36,4096,true)==kIOReturnSuccess);
+    fixture.complete_fail=true;
+    CHECK(memory.release()==kIOReturnIOError && memory.quarantined() && memory.backed());
+    CHECK(!memory.retainVmCpuDescriptor() && memory.release()==kIOReturnBusy);
+    discardFixtureAfterQuarantine();
+    std::puts("PASS: unmapped VM backing: zero fill, retained CPU view, cache policy, device lifetime, double release, five failure stages, quarantine");
+}
 int main()
 {
+    unmappedBacking();
     auto profiles=successes(),failure_controls=failures(),argument_controls=arguments();reset();
     const unsigned scanout=scanoutImports(),pool=bestEffortPool(),threaded=poolThreads(),extents=poolExtents(),runs=maintenanceRuns();
 #ifdef ADRENO830_MACOS

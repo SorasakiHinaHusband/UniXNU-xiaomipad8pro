@@ -346,6 +346,9 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
     NativeAdrenoAbiBoAllocReply *reply,const NativeAdrenoRingClock *clock)
 {
     const IOReturn status=allocBoInner(request,reply,clock);
+#ifdef ADRENO830_MACOS
+    if(status && !alloc_refusal_.why)refuseAlloc(NativeAdrenoAllocWhyRequest,NativeAdrenoMethodBoAlloc,status,request?request->bytes:0);
+#endif
     if(status && request) {
         volatile uint32_t *stats=clientStats(queue_base_,window_bytes_);
         stats[2]=stats[2]+1;stats[3]=(uint32_t)status;stats[4]=(uint32_t)request->bytes;
@@ -399,13 +402,17 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
         /* Every BO that comes here: most never make a contiguous attempt, and what they cost in spans shows nowhere else. */
         __atomic_fetch_add(&native_adreno_meter_contig[2],1u,__ATOMIC_RELAXED);
         status=kIOReturnUnsupported;
-        if(request->contiguous==0 && contiguousAllowed(request->bytes,clock)) {
+        if(!NativeAdrenoMemory::unmappedUser() && request->contiguous==0 && contiguousAllowed(request->bytes,clock)) {
             __atomic_fetch_add(&native_adreno_meter_contig[0],1u,__ATOMIC_RELAXED);
             status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
             if(status)contiguousFailed(request->bytes,clock);
             if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
         }
-        if(status)status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes);
+        if(status) {
+            if(NativeAdrenoMemory::unmappedUser() && !request->contiguous)
+                status=entry->memory.allocateUser((size_t)request->bytes,output_bits_,(size_t)request->bytes,native_adreno_wc_enabled);
+            else status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes);
+        }
     }
     /* A pooled BO's zero fill: its pages are nobody else's, so the zeros of a large BO hold up no other process's BoAlloc, BoImport or
      * BoFree (pagani-gpu-kopt bit 0; a failure releases it below, under the Memory lock). The BO is published only after this. */
@@ -419,6 +426,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
     if(status) {
 #ifdef ADRENO830_MACOS
+        const NativeAdrenoMemoryFailure failure=entry->memory.lastFailure();
         bool figures=false;uint64_t pool_free=0,pool_largest=0;   /* UniXNU-piano: the refusal's pool figures */
 #endif
         {
@@ -433,10 +441,12 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
 #endif
         }
 #ifdef ADRENO830_MACOS
-        if(backed)return refuseAlloc(NativeAdrenoAllocWhyWriteCombine,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status));
-        if(!figures)return refuseAllocMemory(request->bytes,status);   /* takes the Memory lock for them */
-        return refuseAlloc(NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status),pool_free,
-                           pool_largest,keep_pool_);
+        if(backed)refuseAlloc(NativeAdrenoAllocWhyWriteCombine,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status));
+        else if(!figures)refuseAllocMemory(request->bytes,status);
+        else refuseAlloc(NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status),pool_free,pool_largest,keep_pool_);
+        alloc_refusal_.failure=backed?NativeAdrenoMemoryFailure{"write-combine",status}:failure;
+        if(!alloc_refusal_.failure.status)alloc_refusal_.failure={"pool-zero-cache",status};
+        return status;
 #else
         return status;
 #endif
@@ -733,6 +743,10 @@ size_t NativeAdrenoUserClient::outputSize(uint32_t method)
 IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
     size_t input_size,void *output,size_t output_size,const NativeAdrenoRingClock *clock)
 {
+#ifdef ADRENO830_MACOS
+    if(method==NativeAdrenoMethodBoAlloc)alloc_refusal_={};
+#endif
+
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);
     if(expected_in==SIZE_MAX || expected_out==SIZE_MAX)return kIOReturnUnsupported;
     IOReturn status=kIOReturnSuccess;

@@ -84,7 +84,7 @@ enum NativeAdrenoAllocWhy : uint8_t {
     NativeAdrenoAllocWhyWriteCombine,  /* a bytes, b status: the pages' write-combined attribute */
     NativeAdrenoAllocWhyImport,        /* a bytes, b status, c the import's stage (native_adreno_import_stage), d the address */
 };
-struct NativeAdrenoAllocRefusal {uint8_t why;uint32_t method;uint64_t a,b,c,d,e;};
+struct NativeAdrenoAllocRefusal {uint8_t why;uint32_t method;uint64_t a,b,c,d,e;NativeAdrenoMemoryFailure failure{};};
 #endif
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};

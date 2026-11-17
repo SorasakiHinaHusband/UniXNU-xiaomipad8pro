@@ -449,3 +449,19 @@ replaced it.
 
 Adreno830, ArmSmmu4K, AdrenoPM4: MIT (their LICENSE files in `package/PianoA830`). Board glue and tooling: BSD-2-Clause-Patent
 (`package/PianoA830/LICENSE`). Linux/KGSL: specification only. Vendor firmware: never in this repository.
+
+### User BO fallback without a lifetime kernel mapping (experimental)
+
+`piano-gpu-user-vm=1` selects a prepared, wired named VM object for non-contiguous user BOs that cannot use the shared pool.
+Without it, the existing mapped fallback remains the control. Kernel ring, fence, firmware and SMMU objects, explicitly contiguous
+requests and the pool keep their existing backing. The new path selects the VM object's CPU cache mode before prepare, uses VM
+zero-fill and retains that descriptor for CPU views; CPU leases and GPU fences still block release. This removes fallback-sized
+kernel VA use, but still wires physical pages while the BO is live. It is not yet tablet-qualified.
+
+Every failed BoAlloc records its stage, byte request, returned status and pool/fallback totals under the connection lock, in both
+modes. A descriptor factory returning null cannot expose its inner XNU status: `inner=not-exported` must not be read as evidence of
+KERN_NO_SPACE. Periodic `gpu bo memory` and `gpu bo lifetime` lines separate mapped own bytes, unmapped own bytes and imports, with
+allocation/free counters and mapped KVA accounting (pool included). Shared-range occupancy/largest hole remain unavailable.
+Host ASan/UBSan coverage exercises zero-fill, descriptor retention/cache choice, GPU maps, CPU leases, pending fences, free,
+double free, process-exit teardown, failure cleanup and quarantine. Actual VM/cache/DMA correctness and sustained desktop use
+remain tablet gates.

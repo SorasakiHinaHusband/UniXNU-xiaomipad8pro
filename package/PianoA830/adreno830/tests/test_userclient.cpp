@@ -149,6 +149,36 @@ static unsigned macosChecks;   /* UniXNU-piano: the BoMap refusal records and th
 int main()
 {
     unsigned blocks=0,koptBlocks=0;
+    /* New backing goes through the real client, GPU map/job/fence and CPU leases. No pool exists yet. */
+    NativeAdrenoMemory::setUnmappedUser(true);
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        CHECK(!p.tables.unmapped() && p.tables.mapping()); /* kernel object unchanged */
+        const uint64_t handle=allocMapped(p.client,4096,Base);
+        NativeAdrenoAbiBoCpuMap cm{handle};NativeAdrenoAbiBoCpuMapReply cr{};
+        CHECK(p.client.cpuMap(&cm,&cr)==kIOReturnSuccess);
+        NativeAdrenoMemory *backing=p.client.memoryForToken(cr.token);
+        CHECK(backing && backing->unmapped() && !backing->mapping());
+        auto *view=backing->retainVmCpuDescriptor();CHECK(view && view->vm_object);
+        for(unsigned i=0;i<4096;++i)CHECK(static_cast<unsigned char *>(view->raw)[i]==0);
+        NativeAdrenoAbiSubmit job{};job.buffer_count=1;job.buffers[0]={handle,Base,4096};
+        NativeAdrenoAbiSubmitReply jr{};
+        CHECK(p.client.submit(&job,&jr,&ringclock)==kIOReturnSuccess);
+        NativeAdrenoAbiBoFree fr{handle};CHECK(p.client.freeBo(&fr)==kIOReturnBusy);
+        NativeAdrenoAbiBoCpuUnmap cu{handle,cr.token,0};
+        view->release();CHECK(p.client.cpuUnmap(&cu)==kIOReturnSuccess);
+        CHECK(p.client.freeBo(&fr)==kIOReturnBusy); /* job still in flight */
+        complete(uint32_t(jr.fence));
+        CHECK(p.client.freeBo(&fr)==kIOReturnSuccess && p.client.freeBo(&fr)==kIOReturnBadArgument);
+        /* Process exit: force-drop the retained view, then releaseAll clears leases and retires the GPU map. */
+        const uint64_t exitHandle=allocMapped(p.client,4096,Base);
+        NativeAdrenoAbiBoCpuMap exitMap{exitHandle};CHECK(p.client.cpuMap(&exitMap,&cr)==kIOReturnSuccess);
+        view=p.client.memoryForToken(cr.token)->retainVmCpuDescriptor();CHECK(view);view->release();
+        CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess && !p.client.liveObjects());
+        CHECK(p.tables.retireAfterQuiescence()==kIOReturnSuccess && p.tables.release()==kIOReturnSuccess);
+    }
+    NativeAdrenoMemory::setUnmappedUser(false);
+    std::puts("PASS: unmapped user BO: allocate, GPU map, CPU view/lease, pending fence, free, double free, process-exit teardown; kernel backing unchanged");
     /* Full client transaction: query (output bits as opened: IDR2.OAS 36), allocate, map, submit, wait, free, close. A submission's
      * wait_fence is only validated against the ring (ARCHITECTURE 4.13.3): no CPU wait, nothing written for a refused one. */
     {
