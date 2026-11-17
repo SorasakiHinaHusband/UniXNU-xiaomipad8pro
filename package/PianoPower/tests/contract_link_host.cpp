@@ -26,6 +26,7 @@ struct Integration {
   uint32_t source[3]={fixedPdo(5000,3000),fixedPdo(9000,2000),ppsPdo()};
   std::vector<PianoChargeWrite> writes;
   unsigned voltageRequests=0;
+  int32_t iclReadbackOverride=-1;
 
   Integration() {
     piano_contract_init(&contract); piano_contract_link(&contract,1);
@@ -39,7 +40,7 @@ struct Integration {
   void fill() {
     auto put=[&](int field,int32_t value) {m.valid|=1u<<field;m.value[field]=value;};
     put(McaBusVoltage,int32_t(bus*1000));put(McaBusCurrent,int32_t(icl*1000));
-    put(McaType,PIANO_CHG_T_PD);put(McaIcl,int32_t(icl));put(McaChargeEnable,int32_t(enable));
+    put(McaType,PIANO_CHG_T_PD);put(McaIcl,iclReadbackOverride<0?int32_t(icl):iclReadbackOverride);put(McaChargeEnable,int32_t(enable));
     put(McaTermVolt,5200);put(McaVerify,0);put(McaTbat,30);put(McaPdState,2);put(McaLpd,0);
     LinkView v;v.nowMs=now;v.chargerPdUp=true;v.chargerPdUpMs=1;
     v.contract=&contract;v.safetyFresh=true;v.cpOff=true;v.dtptValid=true;
@@ -55,7 +56,7 @@ struct Integration {
         if (!(link.st.icl_set && link.st.icl_set<=link.st.transition_ma)) std::fprintf(stderr,"barrier now=%llu prop=%x value=%u hv=%u set=%u transition=%u read=%u pending=%u valid=%u observing=%u bus=%u rdo=%x\n",(unsigned long long)now,w.property,w.value,link.st.hv,link.st.icl_set,link.st.transition_ma,icl,link.st.pending,contract.valid,contract.notify_pending,bus,rdo);
         assert(link.st.icl_set && link.st.icl_set<=link.st.transition_ma);
         assert(link.st.fcc_set && link.st.fcc_set<=500);
-        assert(icl<=link.st.transition_ma); // independent hardware readback, not the ACK cache
+        assert(link.in.icl_ma>=0 && uint32_t(link.in.icl_ma)<=link.st.transition_ma); // independent readback, not the ACK cache
         assert(!(link.st.pending & ((1u<<PIANO_CHG_S_ICL)|(1u<<PIANO_CHG_S_FCC))));
         ++voltageRequests;
       }
@@ -122,6 +123,11 @@ int main() {
   Integration s;s.observe();s.fill();
   assert(s.link.in.contract_mv==5000 && s.link.in.contract_ma==3000);
   assert(s.link.in.fixed9_ma==2000 && s.link.in.pps9_ma==3000);
+  s.decide();s.now+=20000;s.observe();s.iclReadbackOverride=1500;s.decide();
+  assert(s.icl<=500 && s.link.st.icl_set<=500 && s.fcc<=500 && !s.voltageRequests);
+  s.now+=100;s.decide(); // both current ACKs arrived, but the independent ICL readback disagrees
+  assert(s.link.in.icl_ma==1500 && s.bus==5000 && !s.voltageRequests);
+  s.iclReadbackOverride=-1;
   for(unsigned i=0;i<12 && s.bus!=9000;++i)s.tick();
   assert(s.bus==9000 && s.link.st.hv==PIANO_CHG_HV_ASKED);
   s.observe(true); // actual binary RDO changes to object2, with a partial-validation gap
