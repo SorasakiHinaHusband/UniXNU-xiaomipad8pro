@@ -75,7 +75,7 @@ static void tx_write(QcomGlink *g, const uint8_t *header, uint32_t header_length
     g->kick_pending = 1;
 }
 
-/* The normal FIFO allowance leaves this notification's bytes untouched. The remote rings us after reading them. */
+/* UniXNU-piano: the normal FIFO allowance leaves this notification's bytes untouched. The remote rings us after reading them. */
 static void notify_read(QcomGlink *g)
 {
     const uint32_t head = *g->tx.head, tail = *g->tx.tail;
@@ -215,7 +215,7 @@ static int return_intent(QcomGlink *g, QcomGlinkChannel *c, unsigned index)
     return QcomGlinkOk;
 }
 
-/* Ownership returns precede new offers/data. A completed callback is never run again just to retry its return. */
+/* UniXNU-piano: ownership returns precede new offers/data. A completed callback is never run again just to retry its return. */
 static void progress(QcomGlink *g)
 {
     if (g->reply_due) {

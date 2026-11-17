@@ -14,6 +14,10 @@ porting.toml), package/:
   Taken and extended (sha256 of the originals; the additions are marked "UniXNU-piano" in the files):
     QcomGlink.c  3d7e18c2cae2c6136b1b7bf43f8d69e49c99ed8e60d3ee7cd98c37891df9b1ba   QcomGlink.h  7e617c764e11ba7ca08e9976e39c35710515a16613ea66f3e845da538ad2df07
       + the remote's opens of channels nobody registered yet are kept (4) and answered when the channel is registered later.
+      + 2026-11-17: receive-intent completions and a partially issued intent grant survive shared TX FIFO pressure; control
+        refusals request READ_NOTIF and keep bounded retry work. New synthetic host tests cover ownership, fragments and channel
+        turnover. Implemented here; Linux qcom_glink_native.c (third-party piano kernel 1c21cb9895d69c1c5e83ceae68952fedf522644a)
+        was read for its queued receive-completion and FIFO-wait behavior only; no Linux code or source text was copied.
     QcomQrtr.c   d22ff8572b93424f1f03138204a44e10b444d0cb62b6be4f1c57b7d3b2ddbc74   QcomQrtr.h   3ead40f5f996497224ebef92e2e67820aa8372bab0a21646c15df954baba84f1
       + client ports that are never announced (qcom_qrtr_add_client), their removal and DEL_CLIENT (qcom_qrtr_remove_port,
         qcom_qrtr_del_client); 12 local ports, 64 remote services, data packets of up to 1024 bytes (was 480).
