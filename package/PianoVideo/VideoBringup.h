@@ -52,7 +52,7 @@ struct Dma {
   void *owner = nullptr;   // the Hw's bookkeeping
   bool session = false;
   volatile uint8_t *arena = nullptr;
-  uint64_t arenaPages[session::kArenaPages] = {};
+  uint64_t *arenaPages = nullptr; // CPU metadata owned with the prepared buffers, not KC static __DATA
 };
 
 // "Off 1.5 s after the last frame" (docs/drivers/video.md section 4.5): the collapse decision, from the last activity.
@@ -830,6 +830,7 @@ class Bringup {
     if (opt.level == 5) {
       session::SelfTest<Bringup<Hw>> test(*this, layout);
       rc = test.run();
+      int outerStep = 0;
       v4 = test.r;
       if (rc) {
         failureRaw(60 + int(v4.failedStage), rc);
@@ -837,17 +838,18 @@ class Bringup {
       } else {
         waitIdle();
         rc = collapse();
-        if (!rc) rc = resume(false);
+        if (rc) outerStep = kStepPcPrep;
+        else { rc = resume(false); if (rc) outerStep = kStepResume; }
       }
       const int un = teardown();
-      if (!rc) rc = un;
+      if (!rc && un) { rc = un; outerStep = kStepUnload; }
       hw.note("V4 outcome first-error %d stage %u decoded %u checksum %s close %d teardown %d dma-held %u",
-              rc, rc ? (v4.error ? v4.failedStage : 60u) : 0u, v4.decoded, v4.checksum ? "PASS" : "FAIL", v4.close,
+              rc, rc ? (v4.error ? v4.failedStage : unsigned(outerStep)) : 0u, v4.decoded, v4.checksum ? "PASS" : "FAIL", v4.close,
               teardownRc, unsigned(dmaHeld));
       hw.note("V4 complete ETB %u EBD %u PSC %u RELEASE_DONE %u drain-ack %u LAST %u STOP %u/%u CLOSE %u watchdog %u fault-bits %08x",
               v4.etb,v4.ebd,v4.psc,v4.releases,unsigned(v4.drainAck),unsigned(v4.last),unsigned(v4.stopRaw),unsigned(v4.stopInput),
               unsigned(v4.closed),unsigned(watchdogSeen != 0),rep.fsr);
-      return rc ? fail(60 + int(v4.error ? v4.failedStage : session::Finished), rc) : kOk;
+      return rc ? fail(v4.error ? 60 + int(v4.failedStage) : outerStep, rc) : kOk;
     }
     waitIdle();
     if ((rc = collapse())) return v3fail(kStepPcPrep, rc);

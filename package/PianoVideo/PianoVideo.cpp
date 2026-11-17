@@ -528,19 +528,21 @@ struct KernelHw {
   }
 
   // Prepared XNU owners; cached zero+clean precedes the sole NC/WC data view. No cached writes after mapping.
-  IOBufferMemoryDescriptor *ucMem = nullptr, *tableMem = nullptr, *arenaMem = nullptr;
+  IOBufferMemoryDescriptor *ucMem = nullptr, *tableMem = nullptr, *arenaMem = nullptr, *ledgerMem = nullptr;
   IOMemoryMap *ucMap = nullptr, *arenaMap = nullptr;
-  bool ucPrepared = false, tablePrepared = false, arenaPrepared = false;
-  uint64_t uniquePages[32768] = {};
+  bool ucPrepared = false, tablePrepared = false, arenaPrepared = false, ledgerPrepared = false;
+  uint64_t *uniquePages = nullptr;
+  unsigned uniqueCapacity = 0;
   bool rememberPage(uint64_t pa)
   {
     if ((pa & 4095) || pa < kXnuDramBase || pa >= kXnuDramEnd) return false;
     const uint64_t n = pa >> 12;
-    unsigned slot = unsigned(n ^ (n >> 15)) & 32767;
-    for (unsigned i = 0; i < 32768; ++i) {
+    const unsigned mask = uniqueCapacity - 1;
+    unsigned slot = unsigned(n ^ (n >> 15)) & mask;
+    for (unsigned i = 0; i < uniqueCapacity; ++i) {
       if (uniquePages[slot] == pa) return false;
       if (!uniquePages[slot]) { uniquePages[slot] = pa; return true; }
-      slot = (slot + 1) & 32767;
+      slot = (slot + 1) & mask;
     }
     return false;
   }
@@ -548,23 +550,33 @@ struct KernelHw {
   {
     const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
     const uint64_t tableBytes = ((d.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
+    // CPU-only metadata follows the same owner lifetime. Keeping 384 KiB in static __DATA exceeds the KC insertion gap.
+    uniqueCapacity = d.session ? 32768 : 2048;
+    const uint64_t ledgerBytes = uint64_t(uniqueCapacity + (d.session ? session::kArenaPages : 0)) * sizeof(uint64_t);
+    ledgerMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), ledgerBytes,
+                                                               0x0000000ffffff000ull);
     ucMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), bytes, 0x0000000ffffff000ull);
     tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), tableBytes, 0x0000000fffffc000ull);
     if (d.session) arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut), session::kArenaBytes, 0x0000000ffffff000ull);
-    if (!ucMem || !tableMem || (d.session && !arenaMem)) { dmaFree(d); return false; }
+    if (!ledgerMem || !ucMem || !tableMem || (d.session && !arenaMem)) { dmaFree(d); return false; }
+    ledgerPrepared = ledgerMem->prepare() == kIOReturnSuccess;
     ucPrepared = ucMem->prepare() == kIOReturnSuccess;
     tablePrepared = tableMem->prepare() == kIOReturnSuccess;
     if (d.session) arenaPrepared = arenaMem->prepare() == kIOReturnSuccess;
-    if (!ucPrepared || !tablePrepared || (d.session && !arenaPrepared)) { dmaFree(d); return false; }
+    if (!ledgerPrepared || !ucPrepared || !tablePrepared || (d.session && !arenaPrepared)) { dmaFree(d); return false; }
     uint8_t *cached = static_cast<uint8_t *>(ucMem->getBytesNoCopy());
     bzero(cached, bytes); ::cleanToPoc(cached, bytes);
     d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
     IOByteCount tableSegment = 0;
     d.tablesPa = tableMem->getPhysicalSegment(0, &tableSegment, kIOMemoryMapperNone);
     bool ok = d.tables && d.tablesPa && tableSegment >= tableBytes;
-    bzero(uniquePages, sizeof uniquePages);
+    uint64_t *ledger = static_cast<uint64_t *>(ledgerMem->getBytesNoCopy());
+    if (!ledger) { dmaFree(d); return false; }
+    bzero(ledger, ledgerBytes);
+    d.arenaPages = d.session ? ledger : nullptr;
+    uniquePages = ledger + (d.session ? session::kArenaPages : 0);
     for (unsigned i = 0; ok && i < vsmmu::kUcPages; ++i) {
       IOByteCount segment = 0;
       d.pages[i] = ucMem->getPhysicalSegment(4096ull * i, &segment, kIOMemoryMapperNone);
@@ -608,10 +620,12 @@ struct KernelHw {
     if (arenaMem) { if (arenaPrepared) arenaMem->complete(); arenaMem->release(); }
     if (ucMem) { if (ucPrepared) ucMem->complete(); ucMem->release(); }
     if (tableMem) { if (tablePrepared) tableMem->complete(); tableMem->release(); }
+    if (ledgerMem) { if (ledgerPrepared) ledgerMem->complete(); ledgerMem->release(); }
     arenaMap = ucMap = nullptr;
-    arenaMem = ucMem = tableMem = nullptr;
-    arenaPrepared = ucPrepared = tablePrepared = false;
-    d.arena = nullptr; d.uc = nullptr; d.tables = nullptr;
+    arenaMem = ucMem = tableMem = ledgerMem = nullptr;
+    arenaPrepared = ucPrepared = tablePrepared = ledgerPrepared = false;
+    uniquePages = nullptr; uniqueCapacity = 0;
+    d.arenaPages = nullptr; d.arena = nullptr; d.uc = nullptr; d.tables = nullptr;
   }
 
 };

@@ -637,7 +637,7 @@ struct Model {
   // ------------------------------------------------------------------------------------------ physical memory, DMA, the core's view
   std::map<uint64_t, uint8_t *> phys;   // 4 KiB page -> host bytes
   std::vector<uint8_t> uc, scratchPage, sessionArena;
-  std::vector<uint64_t> tableMem;
+  std::vector<uint64_t> tableMem, sessionPa;
   unsigned dmaAllocs = 0, dmaFrees = 0;
   uint8_t *physPtr(uint64_t pa)
   {
@@ -675,6 +675,8 @@ struct Model {
     for (unsigned i = 0; i < tablePages; ++i) phys[d.tablesPa + 4096 * i] = reinterpret_cast<uint8_t *>(tableMem.data()) + 4096 * i;
     d.tables = tableMem.data();
     if (d.session) {
+      sessionPa.assign(session::kArenaPages,0);
+      d.arenaPages = sessionPa.data();
       sessionArena.assign(session::kArenaBytes,0);
       d.arena = sessionArena.data();
       for (unsigned i=0; i<session::kArenaPages; ++i) {
@@ -699,6 +701,7 @@ struct Model {
     phys.clear();
     d.uc = nullptr;
     d.arena = nullptr;
+    d.arenaPages = nullptr;
     d.tables = nullptr;
   }
   bool dmaRd(uint16_t sid, uint32_t iova, uint32_t *v)

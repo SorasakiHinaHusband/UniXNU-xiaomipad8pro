@@ -175,6 +175,7 @@ struct Peer {
         CHECK(std::memcmp(arena.data() + b[2] - kArenaBase, kAccessUnit, sizeof kAccessUnit) == 0);
         ++inputCount;
         b[7] = 0;
+        b[8] = b[9] = 0; // input completion metadata is not an echoed-timestamp contract; RAW is correlated strictly
         reply({packet(type, 0, 1, 5, b)});
         if (!dropPsc)
           reply({packet(0x0100000c, 0, 1, 0), packet(0x03000103, 0, 1, 1, {badPsc ? 0x01400100u : 0x014000f0u}),

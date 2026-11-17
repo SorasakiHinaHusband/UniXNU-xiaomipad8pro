@@ -375,15 +375,16 @@ public:
   void completion(const uint32_t *p, uint32_t header)
   {
     const uint32_t *v = p + 8;
+    o.hw.note("V4 completion type %u index %u iova %08x size %u addr-offset %u data-offset %u data-size %u timestamp %08x%08x flags %08x "
+              "picture %08x error %u",
+              v[0], v[1], v[2], v[5], v[4], v[6], v[7], v[9], v[8], v[10], picture, unsigned(frameError));
     Buffer *b = layout.find(v[0], v[1]);
     if (!b || !b->queued || b->port != p[4] || v[2] != b->iova() || v[3] || v[4] || v[5] > b->size || v[6] > b->size ||
         v[7] > b->size - v[6]) {
       fail(kErrHfi, Buffers, p[2], p[4], p[5], header);
       return;
     }
-    o.hw.note("V4 completion type %u index %u iova %08x size %u addr-offset %u data-offset %u data-size %u timestamp %08x%08x flags %08x "
-              "picture %08x error %u",
-              v[0], v[1], v[2], v[5], v[4], v[6], v[7], v[9], v[8], v[10], picture, unsigned(frameError));
+
     if (b->pendingRelease) {
       if (!(v[10] & 1) || (v[10] & 0x10)) {
         fail(kErrHfi, Buffers);
@@ -403,7 +404,7 @@ public:
     }
     b->readonly = (v[10] & 0x10) != 0;
     if (b->type == Bitstream) {
-      if (v[8] != kTimestamp || v[9] || ++r.ebd != 1) {
+      if (++r.ebd != 1) {
         fail(kErrHfi, Buffers);
         return;
       }
