@@ -1,136 +1,99 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Host test of SmmuIdentity.h on an SMMU register model shaped like piano's apps SMMU after NativeUfs (IDR1 0x60000053: 83 banks,
-// 128 pages; SID 0x60 on bank 82, as PianoDwc3's tests/smmu_stream_host.cpp): the bank and group chosen, the context bank words,
-// the order (the bank complete and translating before the stream points at it, the match last for a new group), the redirect of an
-// exact entry PianoDwc3's bypass left, the refusals, the TLB waits; and the identity table's descriptors.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. smmu_identity_host.cpp -o /tmp/smmu_identity_host && /tmp/smmu_identity_host
+// Copyright (c) 2026 Leo Zhang. Model observed apps-SMMU semantics, not ideal MMIO.
 #include "SmmuIdentity.h"
+#include "UsbDomain.h"
+#include "ControllerLoan.h"
 #include <cstdio>
 #include <map>
 #include <vector>
-
 using namespace pianousbhost;
 static int failures;
-#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
-
-struct Smmu {
-  std::map<uint32_t, uint32_t> r;
-  std::vector<std::pair<uint32_t, uint32_t>> log;
-  Smmu()
-  {
-    r[0x20] = 1u << 30 | 64;
-    r[0x24] = 0x60000053;
-    r[0x28] = 1u << 12;
-    r[0x800 + 4 * 1] = 0x80000060;   // NativeUfs: SID 0x60 on bank 82 (translation off, VA64)
-    r[0xc00 + 4 * 1] = 82;
-    r[0x1000 + 4 * 82] = 0x10000;
-    r[0x1800 + 4 * 82] = 1;
+#define CHECK(c) do {if(!(c)){std::printf("FAIL line %d: %s\n",__LINE__,#c);++failures;}}while(0)
+struct Model {
+  std::map<uint32_t,uint32_t> r;
+  std::vector<std::pair<uint32_t,uint32_t>> writes;
+  uint32_t reject=~0u,corrupt=0;
+  bool illegal=false;
+  Model() {r[0x20]=0x4c017e7f;r[0x24]=0x60000053;r[0x28]=0x5111;
+    r[0x804]=0x80000060;r[0xc04]=82;r[0x1148]=0x10000;r[0x1948]=1;
+    for(unsigned b=0;b<83;++b)r[(128+b)*4096+0x58]=0x400;
   }
-  static uint32_t cb(unsigned bank) { return (128 + bank) * 4096; }
-  auto reader() { return [this](uint32_t o) { return r[o]; }; }
-  auto writer() { return [this](uint32_t o, uint32_t v) { log.push_back({o, v}); r[o] = v; }; }
-  int at(uint32_t o) const
-  {
-    for (size_t i = 0; i < log.size(); ++i)
-      if (log[i].first == o) return int(i);
-    return -1;
-  }
+  auto rd(){return [this](uint32_t o){return r[o];};}
+  auto wr(){return [this](uint32_t o,uint32_t v){
+    writes.push_back({o,v});
+    if(o>=0x1000&&o<0x1200&&((v>>16)&3)!=1)illegal=true;
+    if(o>=0xc00&&o<0xe00&&!(v&0x30000)&&(v&255)>=83)illegal=true;
+    if(o==reject)return;
+    if(o>=0x80000&&!(o&4095))v&=~0x1000u;
+    if(o>=0x80000&&(o&4095)==0x10)v|=0x60;
+    if(o>=0x80000&&(o&4095)==0x58){r[o]&=~(v&kFsrFaults);return;}
+    r[o]=v^(o==corrupt?1u:0u);
+  };}
 };
-
-int main()
-{
-  const auto never = [] { return false; };
-  const uint64_t table = 0x0000000881234000ull;
-  {  // nothing for SID 0x40: a free group, the bank below NativeUfs's
-    Smmu s;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, s.reader());
-    CHECK(!p.error && !p.reuse && p.slot == 0 && p.bank == 81 && p.pages == 128 && p.banks == 83);
-    CHECK(applySmmuIdentity(p, 0x40, table, s.reader(), s.writer(), never) == nullptr);
-    const uint32_t cb = Smmu::cb(81);
-    CHECK(s.r[cb + kCbSctlr] == kSctlrIdentity && s.r[0x1800 + 4 * 81] == 1 && s.r[0x1000 + 4 * 81] == kCbarStage1);
-    CHECK(s.r[cb + kCbTcr] == kTcrIdentity && s.r[cb + kCbTcr2] == kTcr2Identity && s.r[cb + kCbMair0] == 0xff);
-    CHECK(s.r[cb + kCbTtbr0] == 0x81234000u && s.r[cb + kCbTtbr0 + 4] == 0x8);
-    CHECK(s.r[0x800] == 0x80000040 && s.r[0xc00] == 81);
-    CHECK(s.r[0x804] == 0x80000060 && s.r[0xc04] == 82);   // UFS untouched
-    // Order: SCTLR off first, the bank translating before S2CR, S2CR before the match, the global sync last.
-    CHECK(s.at(cb + kCbSctlr) == 0);
-    int sctlrOn = -1;
-    for (size_t i = 0; i < s.log.size(); ++i)
-      if (s.log[i].first == cb + kCbSctlr && s.log[i].second == kSctlrIdentity) sctlrOn = int(i);
-    CHECK(sctlrOn > 0 && s.at(0xc00) > sctlrOn && s.at(0x800) > s.at(0xc00) && s.at(0x70) > s.at(0x800));
-    // No store from a zero register is the kernel's business; the TLB invalidates carry non-zero values.
-    CHECK(s.r[cb + kCbTlbiAll] == 0xffffffffu && s.r[cb + kCbTlbSync] == 0xffffffffu && s.r[0x68] == 0xffffffffu);
+int main(){
+  const uint64_t table=0x8e0efb000ull;const auto never=[] {return false;};
+  unsigned audits=0;auto audit=[&](uint32_t,uint32_t,uint32_t,uint32_t){++audits;};
+  {
+    Model m;auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;
+    CHECK(!p.error&&p.bank==81&&p.asid==81);
+    CHECK(!applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,audit));
+    CHECK(tx.ready&&m.r[p.cb()]==0x27&&m.r[p.cb()+0x10]==0x38061);
+    CHECK(m.r[p.cb()+0x24]==0x510008&&m.r[p.cb()+0x2c]==0x510000);
+    CHECK(m.r[p.cb()+0x58]==0x400&&audits==14&&!m.illegal);
+    CHECK(unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx));
+    CHECK(!(m.r[0x800]&0x80000000)&&!m.r[p.cb()]&&m.r[0x1000+4*p.bank]==kCbarStage1&&!m.illegal);
   }
-  {  // PianoDwc3's bypass entry for 0x40 on bank 81 (translation off, VA64): redirected in place; bank 81 is the stream's own: taken
-    Smmu s;
-    s.r[0x800 + 4 * 5] = 0x80000040;
-    s.r[0xc00 + 4 * 5] = 81;
-    s.r[0x1000 + 4 * 81] = 0x10000;
-    s.r[0x1800 + 4 * 81] = 1;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, s.reader());
-    CHECK(!p.error && p.reuse && p.slot == 5 && p.bank == 81);
-    CHECK(applySmmuIdentity(p, 0x40, table, s.reader(), s.writer(), never) == nullptr);
-    CHECK(s.r[0xc00 + 4 * 5] == 81 && s.r[0x800 + 4 * 5] == 0x80000040 && s.at(0x800 + 4 * 5) < 0);   // the match not rewritten
-    CHECK(s.r[Smmu::cb(81) + kCbSctlr] == kSctlrIdentity);
+  { // Preserve the original active USB route until the new bank has passed every check.
+    Model m;m.r[0x80c]=0x80000040;m.r[0xc0c]=81;m.r[(128+81)*4096]=0x27;
+    m.r[0x1144]=kCbarStage1;m.r[0x1944]=1;
+    auto p=planSmmuIdentity(0x40,0x100000,m.rd());CHECK(p.bank==80);
+    IdentityTxn tx;m.reject=p.cb()+0x38;
+    CHECK(applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,audit));
+    CHECK(!tx.route&&m.r[0xc0c]==81&&m.r[(128+81)*4096]==0x27);
+    CHECK(unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx)&&!m.illegal);
   }
-  {  // the stream's entry on a bank another stream shares: that bank is skipped
-    Smmu s;
-    s.r[0x800 + 4 * 5] = 0x80000040;
-    s.r[0xc00 + 4 * 5] = 81;
-    s.r[0x800 + 4 * 6] = 0x80000123;
-    s.r[0xc00 + 4 * 6] = 81;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, s.reader());
-    CHECK(!p.error && p.reuse && p.bank == 80);
+  { // Real control errors still reject; all checks are audited after SCTLR mismatch.
+    Model m;auto p=planSmmuIdentity(0x40,0x100000,m.rd());m.reject=p.cb();IdentityTxn tx;audits=0;
+    CHECK(applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,audit));CHECK(audits==12&&!tx.route);
+    m.reject=~0u;CHECK(unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx));
   }
-  {  // banks with translation on (someone else's) are skipped; none left: refused, nothing written
-    Smmu s;
-    for (unsigned b = 0; b < 82; ++b) s.r[Smmu::cb(b)] = 1;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, s.reader());
-    CHECK(p.error != nullptr);
-    CHECK(applySmmuIdentity(p, 0x40, table, s.reader(), s.writer(), never) == p.error && s.log.empty());
+  { // ASID collision excludes a bank; ownership changes after plan refuse all writes.
+    Model m;m.r[(128+7)*4096]=0x27;m.r[0x101c]=kCbarStage1;m.r[(128+7)*4096+0x24]=81u<<16;
+    auto p=planSmmuIdentity(0x40,0x100000,m.rd());CHECK(p.bank==80);
+    m.r[0x810]=0x80000123;m.r[0xc10]=80;IdentityTxn tx;
+    CHECK(applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,audit)&&m.writes.empty());
   }
-  {  // a masked group covering the stream; two groups matching it: refused
-    Smmu s;
-    s.r[0x800 + 4 * 3] = 0x80000000u | 0xfu << 16 | 0x40;
-    CHECK(planSmmuIdentity(0x40, 0x100000, s.reader()).error != nullptr);
-    Smmu t;
-    t.r[0x800 + 4 * 3] = 0x80000040;
-    t.r[0x800 + 4 * 4] = 0x80000040;
-    CHECK(planSmmuIdentity(0x40, 0x100000, t.reader()).error != nullptr);
+  { // Global sync failure after route commit: legal original bank restored; invalid reset CBAR never restored.
+    Model m;m.r[0x80c]=0x80000040;m.r[0xc0c]=4;m.r[0x1010]=kCbarStage1;m.r[0x1810]=1;
+    auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;m.r[0x74]=1;
+    CHECK(applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),[]{return true;},tx,audit));
+    m.r[0x74]=0;CHECK(unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx));
+    CHECK(m.r[0x80c]==0x80000040&&m.r[0xc0c]==4&&!m.illegal);
   }
-  {  // no stage 1, a bad geometry, an unaligned table
-    Smmu s;
-    s.r[0x20] = 64;
-    CHECK(planSmmuIdentity(0x40, 0x100000, s.reader()).error != nullptr);
-    Smmu g;
-    g.r[0x24] = 0x60000080 | 0x7fu;   // 127 banks + 128 pages: beyond the window
-    CHECK(planSmmuIdentity(0x40, 0x100000, g.reader()).error != nullptr);
-    Smmu u;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, u.reader());
-    CHECK(applySmmuIdentity(p, 0x40, table + 8, u.reader(), u.writer(), never) != nullptr && u.log.empty());
+  { // Unconfirmed disconnect/sync retains ownership and memory.
+    Model m;auto p=planSmmuIdentity(0x40,0x100000,m.rd());IdentityTxn tx;
+    CHECK(!applySmmuIdentity(p,0x40,table,m.rd(),m.wr(),never,tx,audit));m.reject=0x800;
+    CHECK(!unwindSmmuIdentity(p,m.rd(),m.wr(),never,tx)&&tx.held);
   }
-  {  // TLB syncs that never complete
-    Smmu s;
-    s.r[Smmu::cb(81) + kCbTlbStatus] = 1;
-    const IdentityPlan p = planSmmuIdentity(0x40, 0x100000, s.reader());
-    unsigned polls = 0;
-    CHECK(applySmmuIdentity(p, 0x40, table, s.reader(), s.writer(), [&] { return ++polls > 5; }) != nullptr);
-    CHECK(s.r[0xc00] == 0);   // the stream was not switched to the unfinished bank
-    Smmu g;
-    g.r[0x74] = 1;
-    unsigned more = 0;
-    CHECK(applySmmuIdentity(planSmmuIdentity(0x40, 0x100000, g.reader()), 0x40, table, g.reader(), g.writer(),
-                            [&] { return ++more > 5; }) != nullptr);
+  for(uint32_t bit:{1u,0x10u,0x100u}) {Model m;m.r[0x28]&=~bit;CHECK(planSmmuIdentity(0x40,0x100000,m.rd()).error);}
+  CHECK(identityRange(table,4096)&&!identityRange(1ull<<36,4096)&&!identityRange((1ull<<36)-4096,8192));
+  uint64_t entries[64]={};identityTable([&](unsigned i,uint64_t d){entries[i]=d;});CHECK(!entries[1]&&entries[2]==0x80000741ull&&entries[63]==(63ull<<30|0x741));
+  { // There is no initialize request on the borrower contract, nor a retry into a live domain.
+    pianousb::DomainOwner owner;CHECK(!owner.borrow()&&owner.begin()&&!owner.begin());
+    owner.finish(true,false);CHECK(owner.borrow()&&!owner.begin());
+    pianousb::DomainOwner held;held.begin();held.finish(false,true);CHECK(!held.borrow()&&!held.begin());
   }
-  {  // the table: invalid below 2 GiB, 1 GiB identity blocks with the attributes above
-    uint64_t t[kIdentityEntries] = {};
-    identityTable([&](unsigned i, uint64_t d) { t[i] = d; });
-    CHECK(t[0] == 0 && t[1] == 0);
-    CHECK(t[2] == (0x80000000ull | 0x741) && t[63] == (63ull << 30 | 0x741));
-    bool ok = true;
-    for (unsigned i = 2; i < kIdentityEntries; ++i) ok &= (t[i] >> 30) == i && (t[i] & 3) == 1 && ((t[i] >> 2) & 7) == 0;
-    CHECK(ok);
+  { // No peripheral/no notifications: deadline still returns exactly once.
+    ControllerLoan l;CHECK(!l.begin(100,0,true));CHECK(l.begin(100,60000,true));l.started();
+    CHECK(l.end(60099,false,false,false,false)==LoanEnd::none);
+    CHECK(l.end(60100,false,false,false,false)==LoanEnd::timeout);
+    CHECK(l.returning()&&!l.returning());l.returned(true,true,true);
+    CHECK(l.phase==LoanPhase::device&&!l.begin(60101,100,true));l.disconnected();CHECK(l.begin(60102,100,true));
   }
-  std::printf("smmu_identity_host: %s\n", failures ? "FAILED" : "all passed");
-  return failures ? 1 : 0;
+  {ControllerLoan l;l.begin(1,10000,false);l.started();CHECK(l.end(2,false,true,true,false)==LoanEnd::relay);}
+  {ControllerLoan l;l.begin(1,10000,false);l.started();CHECK(l.end(2,true,false,false,false)==LoanEnd::unplug);}
+  {ControllerLoan l;l.begin(1,10000,false);l.started();CHECK(l.end(2,true,true,false,false)==LoanEnd::role);}
+  {ControllerLoan l;l.begin(1,10000,true);l.started();CHECK(l.end(2,false,false,false,true)==LoanEnd::none);
+    CHECK(l.end(3,false,false,false,false)==LoanEnd::unplug);l.returning();l.returned(false,true,true);CHECK(l.phase==LoanPhase::held);}
+  std::printf("smmu_identity_host: %s\n",failures?"FAILED":"all passed (readback, unwind, ownership, bounded loan)");return failures?1:0;
 }

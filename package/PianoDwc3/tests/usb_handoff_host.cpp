@@ -53,7 +53,7 @@ int main()
   CHECK(handoffSettled(kAskReclaim, kHoDevice) && !handoffSettled(kAskReclaim, kHoReleased));
   CHECK(handoffCoreFree(false, kHoOff));                                     // no PianoDwc3: the core is ours
   CHECK(!handoffCoreFree(true, kHoOff) && !handoffCoreFree(true, kHoDevice) && !handoffCoreFree(true, kHoStarting));
-  CHECK(handoffCoreFree(true, kHoReleased) && handoffCoreFree(true, kHoFailed));
+  CHECK(handoffCoreFree(true, kHoReleased) && !handoffCoreFree(true, kHoFailed) && !handoffCoreFree(true, kHoUnsafe));
   // A round.
   Thread t;
   t.ask = kAskRelease;

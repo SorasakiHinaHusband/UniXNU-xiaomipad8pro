@@ -168,6 +168,11 @@ template <class Hal> SwitchResult hostSwitch(Hal &h, const HostPolicy &policy)
       r.devHalted = (rd(kDsts) & kDstsDevCtrlHlt) != 0;
     }
   }
+  if (mode != kPrtcapHost && !r.devHalted) {
+    r.why = "device halt unconfirmed: host switch refused";
+    r.now = readCoreWords(h);
+    return r;
+  }
   if ((r.found.qsHs & kOverrideHs) || (r.found.qsSs & kOverrideSs)) {
     if (!glueStore(h, kQsSsPhyCtrl, h.rd(kQscratch + kQsSsPhyCtrl) & ~kOverrideSs, r.stores, r.glueStores) ||
         !glueStore(h, kQsHsPhyCtrl, h.rd(kQscratch + kQsHsPhyCtrl) & ~kOverrideHs, r.stores, r.glueStores)) {

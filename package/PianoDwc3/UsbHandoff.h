@@ -24,6 +24,7 @@ enum HandoffState : uint32_t {
   kHoStarting = 1,   // before (or during) PianoDwc3's takeover: ask again later
   kHoDevice = 2,     // the device controller runs: PianoDwc3's
   kHoReleased = 3,   // stopped and parked: the core is free for PianoUsbHost
+  kHoUnsafe = 5,     // halt unconfirmed: never lend; only a device recovery is permitted
   kHoFailed = 4,     // a takeover failed (or a reclaim found the clocks off): the core is free, PianoDwc3 idle
 };
 inline const char *handoffStateName(uint32_t s)
@@ -33,6 +34,7 @@ inline const char *handoffStateName(uint32_t s)
     case kHoStarting: return "starting";
     case kHoDevice: return "device (PianoDwc3 runs the controller)";
     case kHoReleased: return "released";
+    case kHoUnsafe: return "unsafe (device halt unconfirmed)";
     case kHoFailed: return "failed (PianoDwc3 idle)";
     default: return "?";
   }
@@ -44,17 +46,17 @@ enum class HandoffDo : uint8_t { nothing, release, reclaim };
 inline HandoffDo handoffDecide(uint32_t state, uint32_t ask)
 {
   if (ask == kAskRelease && state == kHoDevice) return HandoffDo::release;
-  if (ask == kAskReclaim && (state == kHoReleased || state == kHoFailed)) return HandoffDo::reclaim;
+  if (ask == kAskReclaim && (state == kHoReleased || state == kHoFailed || state == kHoUnsafe)) return HandoffDo::reclaim;
   return HandoffDo::nothing;
 }
 // The state the caller waits for after an ask (the USB thread got to it): release -> released or failed, reclaim -> device or failed.
 inline bool handoffSettled(uint32_t ask, uint32_t state)
 {
-  if (ask == kAskRelease) return state == kHoReleased || state == kHoFailed || state == kHoOff;
-  if (ask == kAskReclaim) return state == kHoDevice || state == kHoFailed || state == kHoOff;
+  if (ask == kAskRelease) return state == kHoReleased || state == kHoFailed || state == kHoUnsafe || state == kHoOff;
+  if (ask == kAskReclaim) return state == kHoDevice || state == kHoFailed || state == kHoUnsafe || state == kHoOff;
   return true;
 }
 // The caller's view: may the core be switched to host now? (PianoDwc3 absent: yes; present: released or failed only.)
-inline bool handoffCoreFree(bool present, uint32_t state) { return !present || state == kHoReleased || state == kHoFailed; }
+inline bool handoffCoreFree(bool present, uint32_t state) { return !present || state == kHoReleased; }
 
 }  // namespace pianousb

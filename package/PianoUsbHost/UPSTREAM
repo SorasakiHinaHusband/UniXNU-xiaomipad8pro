@@ -70,3 +70,10 @@ supported-notifications rule, ucsi_partner_change's roles, ucsi_glink's 5 s answ
 1.2 specification (registers, TRBs, the programming model); the ARM SMMUv2 / MMU-500 programming model (context bank registers). Not
 read and not used for anything: any Apple binary beyond the kernel collection's kext names, class names, Info.plist matching
 dictionaries and the KC link report's symbol names (docs/drivers/usb-host.md section 5), any Qualcomm binary.
+
+USB A2b shared-domain transaction (2026-11-17), new code by Leo Zhang:
+  package/PianoVideo/VideoSmmu.h at UniXNU-piano 3cdda11e5f (BSD-2-Clause-Patent): studied the
+  verified apps-SMMU contract (required SCTLR bits, TCR2 field mask, bank-number ASID, valid
+  FSR bits and keeping legal S1 configuration on release); re-expressed in SmmuIdentity.h.
+  UsbDomain.h and ControllerLoan.h are new portable owner/borrower and bounded-loan models.
+  No third-party Linux source text or Apple binary payload was copied.

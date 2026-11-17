@@ -52,3 +52,27 @@ its descriptor names `com.unixnu.driver.PianoPower`) and inert without `piano-us
 `package/include/PianoUsbcContract.h` and `package/common/PianoIrq.h` (not copied). Apple's host stack for level 6: `PIANO_USBHOST_STACK=1 tooling/k27/build-native-image.sh`
 (`package/PianoUsbHostStandIn`, `tooling/k27/kext/PianoUsbHostStack.json`, `tooling/k27/check-usbhost-stack.py`). Sources and
 licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
+
+A2b uses `piano-usbhost=4 piano-usbhost-handoff=6 piano-usb-handoff=1
+piano-usbhost-smmu=2 piano-usb-smmu=2 piano-usbhost-back=60` with the A2 stack
+linked. PianoDwc3 is the only SID 0x40 initializer, before gadget DMA; it keeps
+the 36-bit WB identity table pinned across both roles. The borrower checks the
+route, ASID, bank and valid faults before lending. Required SCTLR bits are 0x27;
+ASIDPNE and observed TCR2 TBI readback are reported without false rejection.
+
+The loan budget starts before the host switch. Unplug, role loss, relay loss or
+deadline ends it; the same connection cannot re-enter after expiry. Device halt,
+Apple stop, xHCI reset, device role and gadget reclaim must each be confirmed.
+An unconfirmed stop pins DMA/controller ownership for the image's boot guard.
+The gadget then enumerates CDC and its network function afresh and replays its
+console. Their recovery is a tablet acceptance condition, not implied by host
+model tests.
+
+With the additional diagnostic-only `piano-usbhost-test-loan=1`, root writes
+`kern.piano_usbhost_loan=1` once after confirming console and ssh. This bypasses
+the partner/VBUS entry policy to test an empty root port; it does not assert VBUS
+negotiation or source power. The deadline still applies even with no partner,
+no port event, or no further control-channel traffic. Normal role entry is
+suppressed in this diagnostic mode. Host uses the polled path, retaining the
+gadget's SPI handler. Tests: `tests/smmu_identity_host.cpp` covers hardware-shaped
+readback, ownership changes, rollback and bounded loan decisions.

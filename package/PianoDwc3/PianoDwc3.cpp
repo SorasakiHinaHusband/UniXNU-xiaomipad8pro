@@ -71,6 +71,8 @@
 #include "PianoBacklightClient.h"   // package/PianoBacklight: brightness keys to the backlight (piano-backlight-keys=1)
 #include "UsbIdle.h"          // the USB thread's wait tiers
 #include "UsbSleep.h"         // a system sleep's steps and the QSCRATCH guard
+#include "UsbDomain.h"
+#include "../PianoUsbHost/SmmuIdentity.h"
 #include "UsbHandoff.h"       // the controller hand-off to PianoUsbHost (piano-usb-handoff=1)
 #include "UsbCold.h"          // the cold start (piano-usb-cold)
 #include "LogCursor.h"        // the console's reader of the kernel log ring
@@ -145,7 +147,8 @@ void readArgs()
 {
   gArgs.level = bootArg("piano-usb", 0);
   gArgs.phy = bootArg("piano-usb-phy", 0);
-  gArgs.smmu = bootArg("piano-usb-smmu", 1);
+  gArgs.smmu = bootArg("piano-usb-smmu",
+      bootArg("piano-usb-handoff", 0) && bootArg("piano-usbhost-handoff", 0) == 6 ? 2 : 1);
   gArgs.utmi = bootArg("piano-usb-utmi", 1);
   gArgs.delay = bootArg("piano-usb-delay", 0);
   gArgs.shell = bootArg("piano-usb-shell", 0);
@@ -1185,6 +1188,74 @@ SmmuPlan probeSmmu()
   return p;
 }
 
+// Only this kext initializes SID 0x40 when the shared-domain experiment is on.
+// Host borrowers cannot request initialization or a bypass replacement.
+pianousb::DomainOwner gDomain;
+pianousbhost::IdentityPlan gIdentity;
+pianousbhost::IdentityTxn gIdentityTx;
+IOBufferMemoryDescriptor *gIdentityTable;
+uint64_t gIdentityPa;
+volatile uint32_t gDomainConfigured, gDomainNet;
+void identityAudit(uint32_t off, uint32_t want, uint32_t got, uint32_t mask)
+{
+  note("usb-a2b S1 off %x want %08x got %08x mask %08x mismatch %08x", off, want, got, mask, (want ^ got) & mask);
+}
+bool identityVerify()
+{
+  using namespace pianousbhost;
+  if (!gDomain.borrow()) return false;
+  bool ok = verifySmmuIdentity(gIdentity, gIdentityPa, smmuRead, [](uint32_t, uint32_t, uint32_t, uint32_t) {});
+  ok &= smmuRead(0x800 + 4 * gIdentity.slot) == (0x80000000u | pianohw::kUsbStream);
+  ok &= (smmuRead(0xc00 + 4 * gIdentity.slot) & kS2crFields) == gIdentity.bank;
+  return ok && !(smmuRead(gIdentity.cb() + kCbFsr) & kFsrFaults);
+}
+bool identitySetup()
+{
+  using namespace pianousbhost;
+  if (!gDomain.begin()) return gDomain.borrow();
+  const auto fail = [] { gDomain.finish(false, gIdentityTx.held); return false; };
+  // CPU MMIO and TLB maintenance need the same powered bus window as takeover.
+  if (!gCoreClocked || !gDwc.va || !glueClocked() || !mapRegion(gSmmu, pianohw::kSmmu, pianohw::kSmmuBytes)) return fail();
+  if (((rd32(gDwc.va + dwc3::GCTL) >> 12) & 3) != 2) return fail();
+  wr32(gDwc.va + dwc3::DCTL, rd32(gDwc.va + dwc3::DCTL) & ~dwc3::DCTL_RUN_STOP);
+  dsb();
+  unsigned waited = 0;
+  while (!(rd32(gDwc.va + dwc3::DSTS) & dwc3::DSTS_DEVCTRLHLT) && waited++ < 1000) IODelay(100);
+  if (!(rd32(gDwc.va + dwc3::DSTS) & dwc3::DSTS_DEVCTRLHLT)) { note("usb-a2b domain: device halt failed; no SMMU writes"); return fail(); }
+  gIdentity = planSmmuIdentity(pianohw::kUsbStream, pianohw::kSmmuBytes, smmuRead);
+  note("usb-a2b domain: owner PianoDwc3 idr %08x/%08x/%08x scr0 %08x slot %u bank %u ASID %u old %08x/%08x",
+       gIdentity.idr0, gIdentity.idr1, gIdentity.idr2, gIdentity.scr0, gIdentity.slot, gIdentity.bank, gIdentity.asid, gIdentity.smr, gIdentity.s2cr);
+  if (gIdentity.error) { note("usb-a2b domain: %s", gIdentity.error); return fail(); }
+  for (unsigned i = 0; i < 12; ++i) note("usb-a2b baseline off %x value %08x", identityWord(gIdentity, i), gIdentity.baseline[i]);
+  gIdentityTable = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+      IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), 4096, 0x0000000ffffff000ull);
+  if (!gIdentityTable || gIdentityTable->prepare() != kIOReturnSuccess) return fail();
+  IOByteCount contiguous = 0;
+  gIdentityPa = gIdentityTable->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+  auto *table = static_cast<uint64_t *>(gIdentityTable->getBytesNoCopy());
+  if (!table || contiguous < 4096 || !identityRange(gIdentityPa, 4096) || (gIdentityPa & 4095)) return fail();
+  bzero(table, 4096);
+  identityTable([&](unsigned i, uint64_t d) { table[i] = d; });
+  for (unsigned off = 0; off < 4096; off += 64) __asm__ volatile("dc civac, %0" :: "r"(reinterpret_cast<uint8_t *>(table) + off) : "memory");
+  dsb();
+  const auto wr = [](uint32_t o, uint32_t v) { wr32(gSmmu.va + o, v); dsb(); };
+  const uint64_t start = nowNs();
+  const char *failure = applySmmuIdentity(gIdentity, pianohw::kUsbStream, gIdentityPa, smmuRead, wr,
+      [start] { return nowNs() - start >= 100000000ull; }, gIdentityTx, identityAudit);
+  if (failure) {
+    const uint64_t end = nowNs() + 100000000ull;
+    const bool safe = unwindSmmuIdentity(gIdentity, smmuRead, wr, [end] { return nowNs() >= end; }, gIdentityTx);
+    note("usb-a2b domain FAILED: %s unwind %u DMA pinned %u", failure, safe, gIdentityTx.held);
+    // Retain even an unused table until reboot: no DMA-after-free on uncertain teardown.
+    return fail();
+  }
+  gDomain.finish(true, false);
+  const uint32_t fsr = smmuRead(gIdentity.cb() + kCbFsr);
+  note("usb-a2b domain READY owner PianoDwc3 table %#llx ASID %u PASize 36 sync-us %llu fsr %08x fault_bits %08x",
+       gIdentityPa, gIdentity.asid, (nowNs() - start) / 1000, fsr, fsr & kFsrFaults);
+  return identityVerify();
+}
+
 bool smmuSetup()
 {
   const SmmuPlan p = probeSmmu();
@@ -1282,6 +1353,7 @@ bool dmaAlloc()
   gDmaPa = gDma->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
   uint8_t *cached = static_cast<uint8_t *>(gDma->getBytesNoCopy());
   if (!gDmaPa || (gDmaPa & 0xfff) || contiguous < Layout::kBytes || !cached) return false;
+  if (gArgs.smmu == 2 && (!identityVerify() || !pianousbhost::identityRange(gDmaPa, Layout::kBytes))) return false;
   bzero(cached, Layout::kBytes);
   // The core reaches this memory without cache coherence (SMMU bypass): the CPU uses a second, non-cacheable mapping only,
   // after the cacheable one is cleaned and dropped from the caches.
@@ -1918,11 +1990,22 @@ void handoffSet(uint32_t state)
 }
 uint32_t handoffTake() { return __atomic_exchange_n(&gHandoffAsk, uint32_t(kAskState), __ATOMIC_ACQ_REL); }
 
-void handoffRelease()
+bool handoffRelease()
 {
   using namespace dwc3;
   gRunning = false;
   const bool halted = gGadget.halt(100);
+  if (!halted) {
+    note("usb-a2b release REFUSED: device did not halt; host cannot borrow");
+    handoffSet(kHoUnsafe);
+    return false;
+  }
+  __atomic_store_n(&gDomainConfigured, 0u, __ATOMIC_RELEASE);
+  __atomic_store_n(&gDomainNet, 0u, __ATOMIC_RELEASE);
+  if (gLines[kPortConsole] & 1) consoleClosed();
+  IOLockLock(gLock);
+  for (uint16_t &line : gLines) line = 0;
+  IOLockUnlock(gLock);
   gHal.wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
   gHal.barrier();
   if (gIrqMode) irqOff("the controller is handed to PianoUsbHost");
@@ -1931,6 +2014,7 @@ void handoffRelease()
             gHal.rd(DCTL), gHal.rd(DSTS), halted ? "halted" : "NOT halted within 100 ms");
   __atomic_store_n(&gRoleSeen, 0xffu, __ATOMIC_RELAXED);   // PianoUsbHost changes the role: not known until GCTL is read again
   handoffSet(kHoReleased);
+  return true;
 }
 
 // Parked (released, or a takeover that failed): waits for a reclaim; returns once a takeover after one went through. gRunning is
@@ -1951,7 +2035,7 @@ void handoffPark()
       note("hand-off: reclaim %u: the core is back from PianoUsbHost: the takeover again", gHandoffReclaims);
       gCoreClocked = true;
       gWatch.disarm();   // the controller has two users now: no cold start behind PianoUsbHost's back
-      if (takeover(false)) {
+      if ((gArgs.smmu != 2 || identityVerify()) && takeover(false)) {
         gRunning = true;
         handoffSet(kHoDevice);
         return;
@@ -2094,7 +2178,7 @@ void usbThread(void *, wait_result_t)
     if (gArgs.handoff && __atomic_load_n(&gHandoffAsk, __ATOMIC_ACQUIRE) != kAskState) {
       const uint32_t ask = handoffTake();
       if (gSleep.state() == SleepState::awake && handoffDecide(__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE), ask) == HandoffDo::release) {
-        handoffRelease();
+        if (!handoffRelease()) { handoffPark(); continue; }
         handoffPark();
         gIrqMode = false;   // after a hand-off the thread polls (the line may be Apple's xHCI's by then)
         lastReport = nowNs();
@@ -2131,6 +2215,12 @@ void usbThread(void *, wait_result_t)
     if (gIrqMode && !gIrqLine.live()) irqOff("storm: the line stayed up with nothing to mask; disabled at the GIC");
     UsbActivity a{};
     a.configured = gGadget.configured();
+    const uint32_t configured = a.configured ? 1u : 0u;
+    const uint32_t net = gGadget.netLinkUp() ? 1u : 0u;
+    const uint32_t old = __atomic_exchange_n(&gDomainConfigured, configured, __ATOMIC_ACQ_REL);
+    const uint32_t oldNet = __atomic_exchange_n(&gDomainNet, net, __ATOMIC_ACQ_REL);
+    if (gArgs.smmu == 2 && (configured != old || net != oldNet))
+      note("usb-a2b gadget CDC configured %u network %u reclaim %u domain-valid %u", configured, net, gHandoffReclaims, identityVerify());
     a.netUp = gGadget.netLinkUp();
     a.ep0Active = gGadget.ep0Active();
     for (unsigned p = 0; p < gGadget.ports(); ++p)
@@ -2410,6 +2500,15 @@ OSDefineMetaClassAndStructors(PianoDwc3, IOService)
 IOReturn PianoDwc3::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
                                          void *param4)
 {
+  if (functionName && functionName->isEqualTo(kDomainFunction)) {
+    auto *info = static_cast<DomainInfo *>(param1);
+    if (!info || info->version != 1 || gArgs.smmu != 2) return kIOReturnUnsupported;
+    info->state = uint32_t(gDomain.state);
+    info->slot = gIdentity.slot; info->bank = gIdentity.bank; info->asid = gIdentity.asid; info->table = gIdentityPa;
+    info->configured = __atomic_load_n(&gDomainConfigured, __ATOMIC_ACQUIRE) != 0;
+    info->net = __atomic_load_n(&gDomainNet, __ATOMIC_ACQUIRE) != 0;
+    return identityVerify() ? kIOReturnSuccess : kIOReturnNotReady;
+  }
   if (!functionName || !functionName->isEqualTo(kHandoffFunction))
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
   uint32_t *state = static_cast<uint32_t *>(param2);
@@ -2504,8 +2603,8 @@ bool PianoDwc3::start(IOService *provider)
   // another thread (ShengUfs's note: the stream-match registers were not safe to touch later).
   if (gArgs.smmu) {
     IOSleep(20);
-    stage(6, "SMMU: stream 0x40 bypass");
-    if (!smmuSetup()) { stage(-6, "SMMU: stream 0x40 bypass (piano-usb-smmu=0 skips it)"); return true; }
+    stage(6, gArgs.smmu == 2 ? "SMMU: shared SID 0x40 identity domain" : "SMMU: stream 0x40 bypass");
+    if (!(gArgs.smmu == 2 ? identitySetup() : smmuSetup())) { stage(-6, "SMMU: stream 0x40 bypass (piano-usb-smmu=0 skips it)"); return true; }
   }
   if (!ringAlloc(gTx[0], 256 * 1024) || !ringAlloc(gTx[1], 64 * 1024) || !ringAlloc(gRx1, 64 * 1024)) { stage(-7, "ring buffers"); return true; }
   thread_t thread = nullptr;
