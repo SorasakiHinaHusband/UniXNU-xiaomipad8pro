@@ -22,6 +22,7 @@ Now there is one manifest, one staging tool, and one installer on the tablet.
 | `piano-still-wallpaper` | `/usr/local/libexec/piano-still-wallpaper` 0755 (`tooling/k27/still-wallpaper.sh`), its three files in `/usr/local/share/piano/wallpaper/` 0644 (`still.png`, `Metadata.plist`, `Index.plist`: `tooling/k27/still-wallpaper.py`), `/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist` 0644 (one run a boot) | on | nothing: once a boot it converts the system volume's stock `DefaultDesktop.heic` (one-colour fallback) for the login window and desktop; it writes absent choices and replaces only our earlier `UniXNU Still` or generated choices, never the user's (`drivers/gpu-userspace.md`, the test images' still wallpaper; added 2026-11-12 for the installed system, whose seed is never restaged) | none (a script and data) |
 | `piano-usbnet-address` | `/usr/local/libexec/piano-usbnet-address` 0755 (shell script), `/Library/LaunchDaemons/com.unixnu.piano-usbnet-address.plist` 0644 (once per boot) | on | `piano-usb-net=N` (exits 0 without; with it: the USB network's 169.254.80.2 set as the interface's SystemConfiguration service, Manual, and re-checked for 600 s: [drivers/usb-device-debug.md](drivers/usb-device-debug.md) §14.9) | — |
 | `piano-wifi` | `/usr/local/bin/piano-wifi` | planned | the CLI of `drivers/wifi.md` §13.1 (not written: `status = "planned"`, listed and skipped) | — |
+| `piano-passd-policy` | `/usr/local/libexec/piano-passd-policy` 0755, `/Library/LaunchAgents/com.unixnu.piano-passd-policy.plist` 0644 | on, UID 501 only | disables and unloads `com.apple.passd`; restores the original effective override on removal (below) | none (shell) |
 
 Two changes to existing pieces came with this. `pianousb-shell` now exits at once (status 0) on `/dev/pianousb` when the kernel
 argument `piano-usb-shell` is missing, and its job is `KeepAlive SuccessfulExit false`. Before, it retried the open every 2 s
@@ -31,6 +32,43 @@ read ([drivers/usb-device-debug.md](drivers/usb-device-debug.md) §6). Its host 
 `tooling/native/pianousb-shell/test_pianousb_shell.py`.
 
 ## 2. The manifest
+
+### passd policy (2026-11-18; tablet qualification pending)
+
+**Confirmed from the decoded 27.3 binaries and earlier tablet samples:** Safari's synchronous Apple Pay availability query can
+reach `passd` before its payment coordinator is initialized. Piano lacks the AppleKeyStore unlock contract needed by that
+initialization. The handler sends to the absent coordinator without invoking its reply block. Removing the loaded service
+released the sampled Safari wait. **Inferred:** persistently preventing that service from loading makes the client return false
+through its XPC connection failure path. A cold Safari timing test is still required; this policy does not implement Apple Pay.
+
+The installer runs `piano-passd-policy --install` synchronously. It prepares a private state directory owned by UID 501, then
+drops privileges to that account before using its state. With `gui/501` present it records `print-disabled`'s original true,
+false or absent state once, executes `launchctl disable gui/501/com.apple.passd`, verifies it, then bootouts the loaded service.
+With no GUI it records PENDING; the Aqua RunAtLoad agent does the same at first login. Other UIDs exit without changing services.
+Subsequent installs retain the original record. The supported launchctl override survives reboot; no Apple plist, binary,
+launchd database or system volume is edited. There is no respawn denial loop.
+
+`/private/var/db/piano-userland/passd-policy/status` must contain
+`PASS disabled=true loaded=false uid=501 policy=passd1` before testing Safari. `--check` verifies the live disabled/unloaded
+state. Removing the unit (including the empty-layer rollback), or turning it off in the manifest, restores the saved effective
+state. An absent or false original is restored with `launchctl enable`, then the original system LaunchAgent is bootstrapped;
+the absent override becomes explicit false, with the same effective enabled behavior. An originally disabled service stays
+disabled. If a recorded policy cannot be restored, including when GUI 501 is absent, removal fails and the installer keeps the
+whole unit and receipt for retry after login. It never reports a successful removal while leaving an untracked override.
+
+Disabling this Apple job also disables its Wallet card management, virtual-card services and remote iPhone/Watch payment
+handoff. Ordinary Safari password/address/credit-card AutoFill is a separate path and remains a tablet regression check;
+Wallet virtual cards are expected to be unavailable. The policy deliberately covers only UID 501.
+
+Host rehearsal: `python3 tooling/userland/test-passd-policy.py` exercises the real staged installer and receipt-based removal,
+GUI present/absent, loaded/unloaded service, original true/false/absent override, repeated installation, non-501 login, off
+profile, command failures, and deferred removal. `passd-probe.html` is a Safari test page: it requires a secure context and the
+real ApplePaySession API, measures three synchronous calls, and requires false in under 1000 ms for every call. A missing API
+or an exception is a failure. A separate HID click increments the page title after the calls; an outer SSH timeout and process
+sample detect a stuck page without relying on a timeout scheduled on its blocked JavaScript thread. If a local file does not
+expose that API, the result is an unqualified context, requiring a trusted local HTTPS fixture before the API gate can pass.
+
+### Manifest fields
 
 `configs/userland.toml` (format 1; its header documents every key):
 

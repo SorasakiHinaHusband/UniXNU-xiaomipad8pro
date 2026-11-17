@@ -45,6 +45,21 @@ LOG=
 FAILED=0
 CHANGED=' '
 PLIST_CHANGED=' '
+PASSD_KEEP=0
+PASSD=/usr/local/libexec/piano-passd-policy
+
+# The passd policy changes persistent launchd state as well as files. Revert it
+# BEFORE removing either of its files. A failed revert retains the whole unit
+# and its receipt, including when gui/501 is absent, for a safe retry at login.
+passd_revert() {
+  [ -f "$STATE/receipt.tsv" ] || return 0
+  want=$(awk -F '\t' -v p="$PASSD" '$9 == p {print $7}' "$STATE/receipt.tsv")
+  [ -n "$want" ] || return 0
+  if [ ! -f "$R$PASSD" ] || [ "$(sum "$R$PASSD")" != "$want" ]; then
+    say 'passd policy: rollback helper missing or changed; unit and receipt kept'; return 1
+  fi
+  sh "$R$PASSD" --remove
+}
 
 say() {
   echo "piano-userland: $*"
@@ -132,10 +147,30 @@ while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
   case "$kind" in daemon|agent) PLIST_CHANGED="$PLIST_CHANGED$unit " ;; esac
 done < "$S/manifest.tsv"
 
+# 1a. The policy's install/check hook is synchronous: an already logged-in
+# session must be protected before the installer reports success. At the login
+# window it prepares UID 501's state; the Aqua agent finishes at first login.
+passd_on=$(awk -F '\t' -v p="$PASSD" '$9 == p {print $3}' "$S/manifest.tsv")
+if [ -n "$passd_on" ]; then
+  passd_valid=1
+  while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
+    [ "$unit" = piano-passd-policy ] || continue
+    [ -f "$R$dest" ] && [ "$(sum "$R$dest")" = "$want" ] || passd_valid=0
+  done < "$S/manifest.tsv"
+  if [ "$passd_valid" != 1 ]; then say 'passd policy: incomplete unit; hook refused'; FAILED=1
+  elif [ "$passd_on" = 0 ]; then
+    if [ "$MODE" != --check ]; then sh "$R$PASSD" --remove || FAILED=1; fi
+  elif [ "$MODE" = --check ]; then sh "$R$PASSD" --check || FAILED=1
+  else sh "$R$PASSD" --install || FAILED=1; fi
+elif [ "$MODE" != --check ]; then
+  passd_revert || { FAILED=1; PASSD_KEEP=1; }
+fi
+
 # 2. Files of the previous receipt that the manifest no longer lists: removed when unchanged since, their jobs booted out first.
 if [ "$MODE" != --check ] && [ -f "$STATE/receipt.tsv" ]; then
   while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
     case "$unit" in ''|'#'*) continue ;; esac
+    [ "$unit" != piano-passd-policy ] || [ "$PASSD_KEEP" != 1 ] || continue
     cut -f9 "$S/manifest.tsv" | grep -qxF "$dest" && continue
     dst=$R$dest
     prev=$STATE/prev$dest
@@ -164,6 +199,9 @@ if [ "$MODE" != --check ]; then
     [ -f "$R$dest" ] && [ "$(sum "$R$dest")" = "$want" ] &&
       printf '%s\n' "$unit$TAB$kind$TAB$on$TAB$mode$TAB$owner$TAB$group$TAB$want$TAB$staged$TAB$dest$TAB$label" >> "$STATE/receipt.tsv.new"
   done < "$S/manifest.tsv"
+  if [ "$PASSD_KEEP" = 1 ] && [ -f "$STATE/receipt.tsv" ]; then
+    awk -F '\t' '$1 == "piano-passd-policy"' "$STATE/receipt.tsv" >> "$STATE/receipt.tsv.new"
+  fi
   mv -f "$STATE/receipt.tsv.new" "$STATE/receipt.tsv"
 fi
 

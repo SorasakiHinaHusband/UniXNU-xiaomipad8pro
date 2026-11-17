@@ -1,0 +1,40 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: BSD-2-Clause-Patent
+     Copyright (c) 2026, Leo Zhang. All rights reserved. -->
+<html lang="en"><meta charset="utf-8"><title>PASSD1 LOADING</title>
+<style>body{font:24px system-ui;margin:3rem}button{font:inherit;padding:1rem}pre{white-space:pre-wrap}</style>
+<h1>Apple Pay availability</h1>
+<button id="continue" autofocus>Continue (0)</button>
+<pre id="result">Waiting for the page to render.</pre>
+<script>
+"use strict";
+const output = document.getElementById("result");
+const button = document.getElementById("continue");
+let summary = "START", clicks = 0;
+function publish() {
+  document.title = "PASSD1 " + summary + " clicks=" + clicks;
+  output.textContent = document.title;
+}
+button.onclick = () => { clicks++; button.textContent = "Continue (" + clicks + ")"; publish(); };
+publish();
+requestAnimationFrame(() => setTimeout(() => {
+  if (!isSecureContext || typeof ApplePaySession === "undefined") {
+    summary = "FAIL context secure=" + isSecureContext + " api=" + typeof ApplePaySession;
+    publish();
+    return;
+  }
+  const samples = [];
+  try {
+    for (let i = 0; i < 3; i++) {
+      const start = performance.now();
+      const value = ApplePaySession.canMakePayments();
+      samples.push({value, ms: performance.now() - start});
+    }
+    const passed = samples.every(x => x.value === false && x.ms < 1000);
+    summary = (passed ? "PASS" : "FAIL") + " samples=" + JSON.stringify(samples);
+  } catch (e) {
+    summary = "FAIL exception=" + e.name;
+  }
+  publish();
+}, 100));
+</script></html>
