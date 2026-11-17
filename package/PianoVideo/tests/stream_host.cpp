@@ -183,6 +183,32 @@ static void ledgerTests() {
   // the consumer releases them or final quiesce fences the entire arena.
   CHECK(!l.loansEmpty()&&l.release(0,11)&&!l.release(0,11)&&l.loansEmpty());
 }
+static void guestTests() {
+  stream::Guest guest;
+  constexpr uint32_t dbuf=0x44627566,demt=0x44656d74;
+  CHECK(!guest.matches(100,dbuf)&&!guest.reply(100,dbuf)&&!guest.expired(999999));
+  CHECK(!guest.begin(0,dbuf,10)&&!guest.begin(100,0,10)&&guest.begin(100,dbuf,10));
+  CHECK(guest.deadline==2010&&guest.matches(100,dbuf)&&!guest.matches(99,dbuf)&&!guest.matches(100,demt));
+  CHECK(!guest.begin(101,demt,20)&&!guest.reply(99,dbuf)&&!guest.reply(100,demt));
+  CHECK(!guest.expired(2009)&&guest.expired(2010));
+  guest.clear();CHECK(!guest.type&&!guest.request&&!guest.expired(9000));
+  CHECK(guest.begin(101,dbuf,9000)&&guest.reply(101,dbuf)&&!guest.reply(101,dbuf)&&!guest.matches(101,dbuf));
+  CHECK(!guest.expired(999999));
+  // The next stage can replace a replied request, while stale/duplicate Dbuf
+  // replies cannot settle the Demt acknowledgement for the same frame.
+  CHECK(guest.begin(102,demt,9100)&&!guest.reply(101,dbuf)&&!guest.reply(102,dbuf)&&guest.reply(102,demt));
+  guest.clear();CHECK(guest.begin(103,dbuf,9200));guest.cancel();
+  CHECK(guest.stopped&&!guest.type&&!guest.reply(103,dbuf)&&!guest.begin(104,demt,9300));
+  // New native epoch uses a distinct Guest object. Cancelling its predecessor
+  // is irreversible, even if a new session starts its request sequence at100.
+  stream::Guest replacement;CHECK(replacement.begin(100,dbuf,9300));CHECK(!guest.reply(100,dbuf));
+  CHECK(replacement.reply(100,dbuf));replacement.clear();
+  // A send failure leaves an owned pending stage until its deadline/cancel;
+  // clearing it prematurely would make a late reply match a newer output.
+  CHECK(replacement.begin(101,demt,10000)&&!replacement.begin(102,dbuf,10001));
+  CHECK(!replacement.expired(11999)&&replacement.expired(12000));replacement.cancel();
+  CHECK(!replacement.reply(101,demt)&&!replacement.expired(12001));
+}
 static void ownerTests() {
   stream::Owner o;uint32_t a=0,b=0;
   CHECK(o.acquire(nullptr)==-22&&o.acquire(&a)==0&&o.owns(a));
@@ -240,6 +266,26 @@ static void firstPscTests() {
     CHECK(!f.tx.rawStarted&&f.peer.dpbs==0&&f.peer.ftbs==0&&f.peer.drains==0);
     CHECK(f.tx.shutdown()==0&&f.peer.stops==1&&f.peer.closes==1);
   }
+}
+static void omittedPscTests() {
+  Fixture f;f.peer.omitOptional=true;
+  f.tx.psc.poc=f.tx.expectedPoc;f.tx.psc.profile=f.tx.expectedProfile;f.tx.psc.level=f.tx.expectedLevel;
+  f.start(97);CHECK(!(f.tx.psc.returned&((1u<<6)|(1u<<7)|(1u<<8))));
+  CHECK(f.tx.psc.poc==0&&f.tx.psc.profile==1&&f.tx.psc.level==4);
+  f.peer.output(97,8);f.pump();f.releaseAll();f.drain();f.close();
+}
+static void delayedGuestTests() {
+  Fixture f;f.start(101);f.peer.output(101,2);f.pump();
+  SelfTest<Peer>::OutputFrame held;CHECK(f.tx.popOutput(held));
+  stream::Guest guest;CHECK(guest.begin(100,0x44627566,0));
+  const uint8_t au[]={0,0,0,1,0x41,0x9a,0x22};
+  for(unsigned i=102;i<108;++i){CHECK(f.tx.streamSubmit(au,sizeof au,i)==0);f.peer.output(i,4);f.pump();}
+  CHECK(f.tx.r.ebd==7&&f.tx.r.decoded==7&&f.tx.ledger.pending==7&&f.tx.ledger.rawHeld[held.index]);
+  // Guest has not replied, but HFI input ownership and output progress continue.
+  CHECK(guest.matches(100,0x44627566)&&!guest.expired(1999));
+  CHECK(guest.reply(100,0x44627566)&&guest.begin(101,0x44656d74,1999));
+  CHECK(f.tx.releaseOutput(held.index,held.token)==0);f.releaseAll();
+  CHECK(guest.reply(101,0x44656d74));guest.clear();f.drain();f.close();
 }
 static void drainPictureTests() {
   Fixture f;f.start(91);f.peer.lastWithPicture=true;f.peer.finalToken=91;
@@ -315,7 +361,7 @@ static void idleTests() {
   CHECK(f.tx.deadline==UINT64_MAX);f.peer.hw.clock+=90000000;f.pump();CHECK(!f.tx.r.error);f.close();
 }
 int main() {
-  ledgerTests();ownerTests();persistentTests();firstPscTests();drainPictureTests();noOutputTests();capacityTests();
+  ledgerTests();guestTests();ownerTests();persistentTests();firstPscTests();omittedPscTests();delayedGuestTests();drainPictureTests();noOutputTests();capacityTests();
   for(unsigned i=0;i<16;++i)negativeTests(i);
   staleRetiredTests();timeoutTests(true);timeoutTests(false);cancelTests();idleTests();
   std::printf("V6 persistent host: %s (real HFI parser/ledger; scripted peer, never hardware evidence)\n",failures?"FAIL":"PASS");return failures?1:0;
