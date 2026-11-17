@@ -756,7 +756,7 @@ void portWatch(Probe &pr, uint32_t seconds)
   const unsigned count = pr.x.maxPorts < 16 ? pr.x.maxPorts : 16;
   uint32_t last[16] = {};
   for (unsigned i = 1; i <= count; ++i) last[i - 1] = gHal.rd(portscAt(pr.x, i)) & ~kPortChangeBits;
-  const uint64_t start = nowMs(), end = start + uint64_t(seconds) * 1000;
+  const uint64_t start = nowMs(), end = gHostDeadline ? gHostDeadline : start + uint64_t(seconds) * 1000;
   unsigned changes = 0;
   while (nowMs() < end) {
     IOSleep(gArgs.period);
@@ -789,7 +789,9 @@ void portWatch(Probe &pr, uint32_t seconds)
 // The end of a host session: the controller halted and reset (it forgets the rings); with piano-usbhost-back, device mode.
 bool hostEnd(Probe *pr, const SwitchResult &sw, bool back)
 {
-  if (pr && pr->running) {
+  // A failed RUN acknowledgement can still leave RS=1. Stop every probed
+  // controller, including partial starts, before changing role.
+  if (pr && pr->x.sane) {
     const StopResult st = xhciStop(gHal, pr->x);
     note("xHCI stop: halted and reset: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
     if (!st.ok) { stage(-20, "xHCI stop unconfirmed: device reclaim forbidden"); return false; }
@@ -1311,7 +1313,7 @@ void appleStack(const Xhci &x, uint32_t seconds)
   appleUp();
   AppleWatch w;
   appleWatchBegin(x, w);
-  const uint64_t end = w.start + uint64_t(seconds) * 1000;
+  const uint64_t end = gHostDeadline ? gHostDeadline : w.start + uint64_t(seconds) * 1000;
   while (nowMs() < end) {
     IOSleep(gArgs.period);
     appleTick(x, w);
@@ -1559,7 +1561,7 @@ bool liveUp(LiveHost &h)
         pr.running = false;
       }
       if (!ok) {
-        gReturnSafe = hostEnd(nullptr, h.sw, true);
+        gReturnSafe = hostEnd(&pr, h.sw, true);
         return false;
       }
     }

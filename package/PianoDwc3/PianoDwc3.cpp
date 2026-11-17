@@ -1219,7 +1219,7 @@ bool identitySetup()
   // CPU MMIO and TLB maintenance need the same powered bus window as takeover.
   if (!gCoreClocked || !gDwc.va || !glueClocked() || !mapRegion(gSmmu, pianohw::kSmmu, pianohw::kSmmuBytes)) return fail();
   if (((rd32(gDwc.va + dwc3::GCTL) >> 12) & 3) != 2) return fail();
-  wr32(gDwc.va + dwc3::DCTL, rd32(gDwc.va + dwc3::DCTL) & ~dwc3::DCTL_RUN_STOP);
+  wr32(gDwc.va + dwc3::DCTL, rd32(gDwc.va + dwc3::DCTL) & ~(dwc3::DCTL_RUN_STOP | dwc3::DCTL_ULSTCHNGREQ_MASK));
   dsb();
   unsigned waited = 0;
   while (!(rd32(gDwc.va + dwc3::DSTS) & dwc3::DSTS_DEVCTRLHLT) && waited++ < 1000) IODelay(100);

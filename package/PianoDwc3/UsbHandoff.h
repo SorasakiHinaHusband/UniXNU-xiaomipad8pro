@@ -26,7 +26,7 @@ enum HandoffState : uint32_t {
   kHoReleased = 3,   // stopped and parked: the core is free for PianoUsbHost
   kHoReclaiming = 6, // request accepted; the USB thread owns recovery
   kHoUnsafe = 5,     // halt unconfirmed: never lend; only a device recovery is permitted
-  kHoFailed = 4,     // a takeover failed (or a reclaim found the clocks off): the core is free, PianoDwc3 idle
+  kHoFailed = 4,     // a takeover failed: idle; not permission for a host to borrow
 };
 inline const char *handoffStateName(uint32_t s)
 {
