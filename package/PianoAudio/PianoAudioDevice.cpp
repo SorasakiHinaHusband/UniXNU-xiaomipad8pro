@@ -72,7 +72,7 @@ static int pianoAudioTimingSysctl(struct sysctl_oid *oidp, void *, int, struct s
     if (value != int(PIANO_AUDIO_TIMING_LEGACY) && value != int(PIANO_AUDIO_TIMING_NEW)) return EINVAL;
     __atomic_store_n(&gTimingMode, uint32_t(value), __ATOMIC_RELEASE);
     IOLog("PianoAudio: machdep.piano_audio_timing=%d (%s; read at next StartIO)\n", value,
-          value ? "lead/ring" : "legacy");
+          value ? "10 ms batching" : "legacy");
     return 0;
 }
 
@@ -86,30 +86,16 @@ static void registerPianoAudioTimingSysctl()
     gTimingModeOid.oid_name = "piano_audio_timing";
     gTimingModeOid.oid_handler = pianoAudioTimingSysctl;
     gTimingModeOid.oid_fmt = "I";
-    gTimingModeOid.oid_descr = "PianoAudio timing at next StartIO: 0 legacy 5 ms/7680, 1 lead 10 ms/65536";
+    gTimingModeOid.oid_descr = "PianoAudio batching at next StartIO: 0 = 5 ms, 1 = 10 ms; fixed 7680-frame ring";
     gTimingModeOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gTimingModeOid);
     gTimingModeRegistered = true;
 }
 
-struct TimingProfile {
-    uint32_t ringFrames, periodFrames, zeroTimePeriod, ioBufferFrames, latency, safetyOffset;
-    const char *contract;
-};
-static const TimingProfile kLegacyTiming = {
-    PIANO_AUDIO_LEGACY_RING_FRAMES, PIANO_AUDIO_LEGACY_PERIOD_FRAMES, PIANO_AUDIO_LEGACY_RING_FRAMES,
-    PIANO_AUDIO_LEGACY_PERIOD_FRAMES, PIANO_AUDIO_LEGACY_PERIOD_FRAMES, 2u * PIANO_AUDIO_LEGACY_PERIOD_FRAMES,
-    "legacy-ring7680/period240/zero7680/iobuffer240",
-};
-static const TimingProfile kLeadTiming = {
-    PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_PERIOD_FRAMES, PIANO_AUDIO_ZERO_TIME_PERIOD,
-    PIANO_AUDIO_PERIOD_FRAMES, PIANO_AUDIO_ENGINE_LATENCY_FRAMES,
-    PIANO_AUDIO_LEAD_FRAMES + (PIANO_AUDIO_SAFETY_PERIODS + 1u) * PIANO_AUDIO_PERIOD_FRAMES,
-    "ring65536/period480/lead14400/zero65536/iobuffer480",
-};
+using TimingProfile = PianoAudioTiming;
 static const TimingProfile &timingProfile(uint32_t mode)
 {
-    return mode == PIANO_AUDIO_TIMING_NEW ? kLeadTiming : kLegacyTiming;
+    return *piano_audio_timing_profile(mode);
 }
 static uint32_t selectedTimingMode()
 {
@@ -134,7 +120,7 @@ enum : uint32_t {
 };
 struct EngineStatus { volatile uint64_t sampleTime, hostTime, seed, reserved, writeEnd; };
 static_assert(sizeof(EngineStatus) >= 0x28, "the HAL refuses a smaller engine status");
-static_assert((PIANO_AUDIO_RING_FRAMES & (PIANO_AUDIO_RING_FRAMES - 1u)) == 0, "the lead ring is power of two");
+static_assert(PIANO_AUDIO_RING_FRAMES % PIANO_AUDIO_PERIOD_FRAMES == 0, "both batching modes divide the ring");
 constexpr int64_t fixed64(uint32_t hz) { return int64_t(hz) << 32; }
 // Wired kernel memory a client maps: the engine status and the ring.
 const IOOptionBits Shared = IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared);
@@ -299,8 +285,7 @@ bool PianoAudioDevice::initRole(bool input, const char *deviceUID) {
     uid = deviceUID;
     lock = IOLockAlloc();
     statusMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, Shared, page_size, page_size);
-    /* Both profiles map the same maximum ring; the HAL cycle is selected
-     * separately at StartIO and published as `io buffer frame size`. */
+    /* Both batching modes share this fixed ring and the same HAL contract. */
     ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, Shared, PIANO_AUDIO_RING_FRAMES * 2 * channels(), page_size);
     if (!lock || !statusMemory || !ring) return false;
     bzero(statusMemory->getBytesNoCopy(), page_size);
@@ -331,7 +316,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     setNumber(e, "input latency", inLatency);
     setNumber(e, "output safety offset", tp.safetyOffset);
     setNumber(e, "input safety offset", tp.safetyOffset);
-    /* This is the HAL's IO cycle. The mapped zero-time ring is tp.ringFrames. */
+    /* HAL writes modulo this field, regardless of the mapped byte capacity. */
     setNumber(e, "io buffer frame size", tp.ioBufferFrames);
     setNumber(e, "sample rate", uint64_t(fixed64(Rate)), 64);
     setNumber(e, "exclusive access owner", uint32_t(hogOwner));
@@ -355,6 +340,7 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("piano-audio-level-map-contract", "range-array:raw0-100:db-fixed32.32:-36-0");
     e->setProperty("piano-audio-notification-contract", "type0-control-property");
     e->setProperty("piano-audio-timing-contract", tp.contract);
+    e->setProperty("piano-audio-ring-contract", PIANO_AUDIO_RING_CONTRACT);
     if (!isInput) {
         setNumber(e, "piano-audio-volume", volumePercent);
         e->setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse);
@@ -428,14 +414,17 @@ IOReturn PianoAudioDevice::startIO() {
     IOLockLock(lock);
     if (!running) {
         while (stopping) IOLockSleep(lock, &stopping, THREAD_UNINT);
-        /* Read the switch only at the stream boundary. A write while IO is
-         * running cannot change the HAL contract or the engine period. */
+        /* Only kernel batching changes at StartIO. HAL has already cached the
+         * fixed ring/safety/latency tuple before calling this selector. */
         timingMode = selectedTimingMode();
         const TimingProfile &tp = timingProfile(timingMode);
         bzero(ring->getBytesNoCopy(), tp.ringFrames * 2u * channels());
         EngineStatus *s = status();
         startTime = mach_absolute_time();
         s->sampleTime = 0; s->hostTime = startTime; s->seed = ++seed; s->writeEnd = 0;
+        IOLog("PianoAudio: HAL ring: %s mode %u ring %u io-ring %u period %u zero %u safety %u seed %u\n",
+              isInput ? "input" : "output", timingMode, tp.ringFrames, tp.ioBufferFrames,
+              tp.periodFrames, tp.zeroTimePeriod, tp.safetyOffset, seed);
         __asm__ volatile("dmb ish" ::: "memory");
         running = true;
         setProperty("is running", kOSBooleanTrue);
@@ -472,7 +461,7 @@ void PianoAudioDevice::run() {
     const uint32_t ch = channels();
     const TimingProfile &tp = timingProfile(timingMode);
     int16_t period[PIANO_AUDIO_PERIOD_FRAMES * OutputChannels];
-    uint64_t done = 0;
+    uint64_t done = 0, soundPeriods = 0;
     for (;;) {
         IOLockLock(lock);
         const bool live = running;
@@ -488,6 +477,9 @@ void PianoAudioDevice::run() {
             piano_audio_dev_captured = piano_audio_dev_captured + captured;
         } else {
             piano_audio_copy_from_ring(period, buffer, tp.ringFrames, uint32_t(done % tp.ringFrames), tp.periodFrames, ch);
+            int any = 0;
+            for (uint32_t i = 0; i < tp.periodFrames * ch; ++i) any |= period[i];
+            if (any) ++soundPeriods;
             const uint32_t played = gTransport->play(gTransport->context, period, tp.periodFrames);
             piano_audio_zero_ring(buffer, tp.ringFrames, uint32_t(done % tp.ringFrames), tp.periodFrames, ch);
             piano_audio_dev_played = piano_audio_dev_played + played;
@@ -504,6 +496,9 @@ void PianoAudioDevice::run() {
         }
         piano_audio_dev_periods = piano_audio_dev_periods + 1;
     }
+    IOLog("PianoAudio: HAL ring read: %s mode %u periods %llu with sound %llu frames %llu write-end %llu\n",
+          isInput ? "input" : "output", timingMode, (unsigned long long)(done / tp.periodFrames),
+          (unsigned long long)soundPeriods, (unsigned long long)done, (unsigned long long)status()->writeEnd);
     IOLockLock(lock);
     stopping = false;
     IOLockWakeup(lock, &stopping, false);

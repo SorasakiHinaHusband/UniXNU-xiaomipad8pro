@@ -1,47 +1,75 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Host checks for the runtime timing switch's two profiles and the lead-ring
- * wrap. The device's registry contract is checked here as frame relations:
- * the IO cycle is one period, while the zero-time ring is larger. */
+/* Replay HAL's independently cached modulo-write contract against the device
+ * reader, including the former small-prefix failure and both batching modes. */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "../AudioTiming.h"
 
 static unsigned checks;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "timing_host:%d: %s\n", __LINE__, #x); return 1; } ++checks; } while (0)
+static int16_t ring[65536u * 2u], src[1024u * 2u], dst[PIANO_AUDIO_PERIOD_FRAMES * 2u];
+static int16_t sample(uint32_t frame) { return (int16_t)(1u + frame % 30000u); }
 
-static int16_t ring[PIANO_AUDIO_RING_FRAMES * 2u];
-static int16_t src[PIANO_AUDIO_PERIOD_FRAMES * 2u];
-static int16_t dst[PIANO_AUDIO_PERIOD_FRAMES * 2u];
+static int replay(uint32_t mode, uint32_t halRing, uint32_t io, int good)
+{
+    const PianoAudioTiming *tp = piano_audio_timing_profile(mode);
+    const uint32_t readerRing = !good && mode == 1 ? 65536u : tp->ringFrames;
+    uint32_t matched = 0, nonzero = 0, read = 0;
+    memset(ring, 0, sizeof ring);
+    /* HAL output time is ahead of now by safety plus the selected callback.
+     * Only the advertised ring is used for its modulo, not the mapped size. */
+    const uint32_t lead = tp->safetyOffset + io;
+    for (uint32_t now = 0; now < 12u * PIANO_AUDIO_RATE; ++now) {
+        if (now % io == 0) {
+            const uint32_t first = now + lead;
+            for (uint32_t i = 0; i < io; ++i) {
+                src[2u*i] = sample(first + i);
+                src[2u*i+1u] = (int16_t)-src[2u*i];
+            }
+            /* Independent of the reader helpers, as in HAL's split memcpy. */
+            uint32_t at = first % halRing, n = io < halRing - at ? io : halRing - at;
+            memcpy(ring + 2u*at, src, n * 4u);
+            if (n < io) memcpy(ring, src + 2u*n, (io - n) * 4u);
+        }
+        if (now && now % tp->periodFrames == 0) {
+            const uint32_t first = now - tp->periodFrames;
+            piano_audio_copy_from_ring(dst, ring, readerRing, first, tp->periodFrames, 2);
+            piano_audio_zero_ring(ring, readerRing, first, tp->periodFrames, 2);
+            if (first >= lead) {
+                for (uint32_t i = 0; i < tp->periodFrames; ++i) {
+                    ++read;
+                    nonzero += dst[2u*i] != 0;
+                    matched += dst[2u*i] == sample(first+i) && dst[2u*i+1u] == -sample(first+i);
+                }
+            }
+        }
+    }
+    if (good) CHECK(matched == read && read > 500000u);
+    else CHECK(nonzero < read / 8u && matched < read / 8u);
+    printf("HAL replay: mode=%u published-ring=%u callback=%u reader-ring=%u matched=%u/%u nonzero=%u (%s)\n",
+           mode, halRing, io, readerRing, matched, read, nonzero, good ? "continuous" : "old failure rejected");
+    return 0;
+}
 
 int main(void)
 {
-    CHECK(PIANO_AUDIO_TIMING_LEGACY == 0u && PIANO_AUDIO_TIMING_NEW == 1u);
-    CHECK(PIANO_AUDIO_LEGACY_PERIOD_FRAMES == 240u);
-    CHECK(PIANO_AUDIO_LEGACY_RING_FRAMES == 7680u);
-    CHECK(PIANO_AUDIO_PERIOD_FRAMES == 480u);
-    CHECK(PIANO_AUDIO_RING_FRAMES == 65536u);
-    CHECK(PIANO_AUDIO_LEAD_FRAMES == 14400u);
-    CHECK(PIANO_AUDIO_DSP_TARGET_FRAMES == 12480u);
-    CHECK(PIANO_AUDIO_ZERO_TIME_PERIOD == PIANO_AUDIO_RING_FRAMES);
-    CHECK(PIANO_AUDIO_ZERO_TIME_PERIOD >
-          PIANO_AUDIO_LEAD_FRAMES + (PIANO_AUDIO_SAFETY_PERIODS + 1u) * PIANO_AUDIO_PERIOD_FRAMES);
-    CHECK(PIANO_AUDIO_LEGACY_RING_FRAMES >
-          2u * PIANO_AUDIO_LEGACY_PERIOD_FRAMES + PIANO_AUDIO_LEGACY_PERIOD_FRAMES);
-    CHECK(piano_audio_ring_segment(PIANO_AUDIO_RING_FRAMES - 200u, PIANO_AUDIO_PERIOD_FRAMES,
-                                   PIANO_AUDIO_RING_FRAMES) == 200u);
-
-    for (uint32_t i = 0; i < PIANO_AUDIO_PERIOD_FRAMES * 2u; ++i) src[i] = (int16_t)(i * 3u - 700);
-    piano_audio_copy_to_ring(ring, PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_RING_FRAMES - 200u,
-                             src, PIANO_AUDIO_PERIOD_FRAMES, 2u);
-    piano_audio_copy_from_ring(dst, ring, PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_RING_FRAMES - 200u,
-                               PIANO_AUDIO_PERIOD_FRAMES, 2u);
-    for (uint32_t i = 0; i < PIANO_AUDIO_PERIOD_FRAMES * 2u; ++i) CHECK(dst[i] == src[i]);
-    piano_audio_zero_ring(ring, PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_RING_FRAMES - 200u,
-                          PIANO_AUDIO_PERIOD_FRAMES, 2u);
-    piano_audio_copy_from_ring(dst, ring, PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_RING_FRAMES - 200u,
-                               PIANO_AUDIO_PERIOD_FRAMES, 2u);
-    for (uint32_t i = 0; i < PIANO_AUDIO_PERIOD_FRAMES * 2u; ++i) CHECK(dst[i] == 0);
-
-    printf("PianoAudio timing host: %u checks, legacy 240/7680 and lead 480/65536\n", checks);
+    const PianoAudioTiming *a = piano_audio_timing_profile(0), *b = piano_audio_timing_profile(1);
+    CHECK(a->ringFrames == 7680u && b->ringFrames == a->ringFrames);
+    CHECK(a->ioBufferFrames == a->ringFrames && b->ioBufferFrames == a->ioBufferFrames);
+    CHECK(a->zeroTimePeriod == a->ringFrames && b->zeroTimePeriod == a->zeroTimePeriod);
+    CHECK(a->safetyOffset == 480u && b->safetyOffset == a->safetyOffset);
+    CHECK(a->latency == 240u && b->latency == a->latency);
+    CHECK(a->periodFrames == 240u && b->periodFrames == 480u);
+    CHECK(a->ioBufferFrames * 3u / 8u >= 1024u); /* HAL's real maximum callback */
+    const uint32_t callbacks[] = {64, 128, 256, 512, 1024};
+    for (uint32_t mode = 0; mode < 2; ++mode)
+        for (unsigned i = 0; i < sizeof callbacks / sizeof callbacks[0]; ++i)
+            CHECK(replay(mode, piano_audio_timing_profile(mode)->ioBufferFrames, callbacks[i], 1) == 0);
+    CHECK(replay(0, 240, 64, 0) == 0);
+    CHECK(replay(1, 240, 64, 0) == 0);
+    /* Restart with the other cadence: a fresh origin and cleared ring. */
+    CHECK(replay(0, a->ioBufferFrames, 512, 1) == 0);
+    puts("PianoAudio HAL-ring contract and restart replay passed");
     return 0;
 }

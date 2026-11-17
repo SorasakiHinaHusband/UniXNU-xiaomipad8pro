@@ -75,6 +75,10 @@ struct World {
     int16_t amplitude;
     double phase, engine_ppm;
     double next_out_us, next_in_us;
+    int hal_replay;
+    uint32_t hal_mode, hal_io, hal_next, hal_read;
+    double hal_origin_us;
+    uint32_t steady_periods, steady_sound;
     uint64_t first_sound_offered_us;
     int wake;
     unsigned wakes;
@@ -92,6 +96,7 @@ struct World {
     unsigned nlines;
 };
 static struct World w;
+static int16_t hal_ring[PIANO_AUDIO_RING_FRAMES * 2u];
 static AudioLiveShared sh;
 static int16_t g_out_ring[AUDIO_LIVE_RING * 2], g_in_ring[AUDIO_LIVE_MIC_RING];
 static AudioSession session;
@@ -435,18 +440,38 @@ static int va_mic(void *ctx, int on)
 // ------------------------------------------------------------------------------------------------------ the engines
 static void engine(void)
 {
-    const double out_period = 5000.0 / (1.0 + w.engine_ppm * 1e-6);
+    const PianoAudioTiming *tp = piano_audio_timing_profile(w.hal_mode);
+    const uint32_t period = w.hal_replay ? tp->periodFrames : 240u;
+    const double out_period = (double)period * 1000000.0 / 48000.0 / (1.0 + w.engine_ppm * 1e-6);
+    if (w.hal_replay && w.out_running) {
+        const uint32_t now_frame = (uint32_t)((w.now_us - w.hal_origin_us) * 48000.0 / 1000000.0);
+        while (w.hal_next <= now_frame) {
+            const uint32_t first = w.hal_next + tp->safetyOffset + w.hal_io;
+            for (uint32_t i = 0; i < w.hal_io; ++i) {
+                const int16_t v = w.sound_on ? (int16_t)lrint(w.amplitude * sin(2 * M_PI * 1000.0 * (first+i) / 48000.0)) : 0;
+                const uint32_t at = (first + i) % tp->ioBufferFrames;
+                hal_ring[2u*at] = v;
+                hal_ring[2u*at+1u] = (int16_t)-v;
+            }
+            w.hal_next += w.hal_io;
+        }
+    }
     if (w.out_running && w.now_us >= (uint64_t)w.next_out_us) {
-        int16_t buf[240 * 2];
-        for (unsigned i = 0; i < 240; ++i) {
+        int16_t buf[PIANO_AUDIO_PERIOD_FRAMES * 2];
+        for (unsigned i = 0; i < period; ++i) {
             const int16_t v = w.sound_on ? (int16_t)lrint(w.amplitude * sin(w.phase)) : 0;
             w.phase += 2 * M_PI * 1000.0 / 48000.0;
             buf[2 * i] = v;
             buf[2 * i + 1] = (int16_t)-v;
         }
+        if (w.hal_replay) {
+            piano_audio_copy_from_ring(buf, hal_ring, tp->ringFrames, w.hal_read, period, 2);
+            piano_audio_zero_ring(hal_ring, tp->ringFrames, w.hal_read, period, 2);
+            w.hal_read += period;
+        }
         if (w.sound_on && w.amplitude && !w.first_sound_offered_us) w.first_sound_offered_us = w.now_us;
         int wake = 0;
-        CHECK(audio_live_play(&sh, buf, 240, now_ms(), &wake) == 240);
+        CHECK(audio_live_play(&sh, buf, period, now_ms(), &wake) == period);
         if (wake) {
             w.wake = 1;
             w.wakes++;
@@ -470,7 +495,15 @@ static void engine(void)
 }
 static void device(int out, int in)
 {
-    if (out && !w.out_running) w.next_out_us = (double)w.now_us;
+    if (out && !w.out_running) {
+        w.next_out_us = (double)w.now_us;
+        if (w.hal_replay) {
+            memset(hal_ring, 0, sizeof hal_ring);
+            w.hal_origin_us = (double)w.now_us;
+            w.hal_read = w.hal_next = 0;
+            w.next_out_us += piano_audio_timing_profile(w.hal_mode)->periodFrames * 1000000.0 / 48000.0;
+        }
+    }
     if (in && !w.in_running) w.next_in_us = (double)w.now_us;
     w.out_running = out;
     w.in_running = in;
@@ -631,6 +664,40 @@ static unsigned power_ups_after_session(void) {return w.power_ups;}   // the ses
 
 // ------------------------------------------------------------------------------------------------------------- the tests
 // A device that runs from 500 ms, sound (full scale) from 1000 to 3000 ms, stopped at 9000.
+static uint32_t replay_mode, replay_io;
+static uint32_t replay_begin_periods, replay_begin_sound;
+static void hal_burst(uint32_t t)
+{
+    if (t == 500) {
+        w.hal_replay = 1; w.hal_mode = replay_mode; w.hal_io = replay_io;
+        device(1, 0);
+    }
+    w.amplitude = 16000;
+    w.sound_on = t >= 500 && t < 5000;
+    if (t == 1500) { replay_begin_periods = (uint32_t)w.played_periods; replay_begin_sound = (uint32_t)w.sound_periods; }
+    if (t == 4500) {
+        w.steady_periods = (uint32_t)w.played_periods - replay_begin_periods;
+        w.steady_sound = (uint32_t)w.sound_periods - replay_begin_sound;
+    }
+    if (t == 5500 && w.out_running) device(0, 0);
+}
+static void hal_transport_replay(void)
+{
+    const uint32_t callbacks[] = {64, 128, 256, 512};
+    for (replay_mode = 0; replay_mode < 2; ++replay_mode) {
+        for (unsigned i = 0; i < sizeof callbacks / sizeof callbacks[0]; ++i) {
+            replay_io = callbacks[i];
+            const struct Scenario sc = {9, 192, 1, 0, 9500, AudioPortsUbuntu, 1, hal_burst};
+            run(&sc);
+            CHECK(!w.violations && w.steady_periods >= 298 && w.steady_periods <= 302);
+            CHECK(w.steady_sound == w.steady_periods);
+            CHECK(live.drops == 0 && live.repeats == 0);
+            printf("HAL -> AudioLive -> DSP replay: mode=%u callback=%u steady sound=%u/%u drops=%u repeats=%u\n",
+                   replay_mode, replay_io, w.steady_sound, w.steady_periods, live.drops, live.repeats);
+        }
+    }
+}
+
 static void burst(uint32_t t)
 {
     if (t == 500 && !w.out_running) device(1, 0);
@@ -897,6 +964,7 @@ int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
     CHECK(preset_bytes > 100);
+    hal_transport_replay();
     CHECK(audio_volume_q15(100) == AUDIO_Q15_ONE && audio_volume_q15(0) == 0 && audio_volume_q15(98) == 32713);
     CHECK(audio_ceiling_db(1) == AUDIO_CEILING_MAX && audio_ceiling_db(20) == 3277 && audio_ceiling_db(0) == AUDIO_CEILING_TEST);
     CHECK(audio_ceiling_db(6) == 16422 && audio_ceiling_db(41) == AUDIO_CEILING_TEST);

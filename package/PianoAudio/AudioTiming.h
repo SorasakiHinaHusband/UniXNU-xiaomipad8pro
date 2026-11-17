@@ -1,30 +1,41 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* The two IOAudio2 timing profiles used by PianoAudio.
- *
- * The legacy profile is the known-good 5 ms engine. The lead profile keeps a
- * 300 ms producer lead in a separate zero-time ring; its HAL IO cycle is one
- * 10 ms period. The registry's `io buffer frame size` is the cycle, never the
- * mapped ring capacity.
- */
+/* IOAudio2's `io buffer frame size` is the HAL ring modulus. It is
+ * independent of both the selected HAL callback size and our kernel batching.
+ * Keep the published geometry fixed across StartIO and control notifications;
+ * the runtime switch changes only the reader's 5/10 ms cadence. */
 #ifndef PIANO_AUDIO_TIMING_H
 #define PIANO_AUDIO_TIMING_H
 #include <stdint.h>
 
 #define PIANO_AUDIO_RATE 48000u
 #define PIANO_AUDIO_LEGACY_PERIOD_FRAMES 240u
-#define PIANO_AUDIO_LEGACY_RING_FRAMES (32u * PIANO_AUDIO_LEGACY_PERIOD_FRAMES)
-
 #define PIANO_AUDIO_PERIOD_FRAMES 480u
-#define PIANO_AUDIO_RING_FRAMES 65536u
-#define PIANO_AUDIO_IN_FLIGHT 4u
-#define PIANO_AUDIO_LEAD_FRAMES (30u * PIANO_AUDIO_PERIOD_FRAMES)
-#define PIANO_AUDIO_DSP_TARGET_FRAMES (PIANO_AUDIO_LEAD_FRAMES - PIANO_AUDIO_IN_FLIGHT * PIANO_AUDIO_PERIOD_FRAMES)
+#define PIANO_AUDIO_RING_FRAMES (32u * PIANO_AUDIO_LEGACY_PERIOD_FRAMES)
 #define PIANO_AUDIO_ZERO_TIME_PERIOD PIANO_AUDIO_RING_FRAMES
-#define PIANO_AUDIO_ENGINE_LATENCY_FRAMES PIANO_AUDIO_PERIOD_FRAMES
-#define PIANO_AUDIO_SAFETY_PERIODS 2u
-
+#define PIANO_AUDIO_ENGINE_LATENCY_FRAMES PIANO_AUDIO_LEGACY_PERIOD_FRAMES
+#define PIANO_AUDIO_SAFETY_FRAMES (2u * PIANO_AUDIO_LEGACY_PERIOD_FRAMES)
+#define PIANO_AUDIO_IN_FLIGHT 4u
 #define PIANO_AUDIO_TIMING_LEGACY 0u
 #define PIANO_AUDIO_TIMING_NEW 1u
+#define PIANO_AUDIO_RING_CONTRACT "fixed-ring7680:fifo4096:batch240-480"
+
+typedef struct {
+    uint32_t ringFrames, periodFrames, zeroTimePeriod, ioBufferFrames, latency, safetyOffset;
+    const char *contract;
+} PianoAudioTiming;
+
+static inline const PianoAudioTiming *piano_audio_timing_profile(uint32_t mode)
+{
+    static const PianoAudioTiming profiles[2] = {
+        {PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_LEGACY_PERIOD_FRAMES, PIANO_AUDIO_ZERO_TIME_PERIOD,
+         PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_ENGINE_LATENCY_FRAMES, PIANO_AUDIO_SAFETY_FRAMES,
+         "ring7680/period240/zero7680/ioring7680"},
+        {PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_PERIOD_FRAMES, PIANO_AUDIO_ZERO_TIME_PERIOD,
+         PIANO_AUDIO_RING_FRAMES, PIANO_AUDIO_ENGINE_LATENCY_FRAMES, PIANO_AUDIO_SAFETY_FRAMES,
+         "ring7680/period480/zero7680/ioring7680"},
+    };
+    return &profiles[mode == PIANO_AUDIO_TIMING_NEW ? 1 : 0];
+}
 
 static inline uint32_t piano_audio_ring_segment(uint32_t frame, uint32_t count, uint32_t ring_frames)
 {

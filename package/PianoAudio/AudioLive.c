@@ -83,11 +83,6 @@ uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t fr
     int any = 0;
     for (uint32_t i = 0; i < 2 * frames; ++i) any |= stereo[i];
     *wake = 0;
-    /* The lead IO profile feeds the DSP in the same 480-frame cadence as its
-     * pump.  Remember that exact-period contract so the generic drift
-     * compensator does not turn a one-to-one stream into artificial skips and
-     * single-frame drops.  Legacy remains on the clock-slip path below. */
-    __atomic_store_n(&sh->producer_period_frames, frames, __ATOMIC_RELEASE);
     sh->offered += frames;
     if (any) {
         __atomic_store_n(&sh->sound_at, now_ms, __ATOMIC_RELEASE);
@@ -319,24 +314,21 @@ static void stream_begin(AudioLive *l, uint32_t now)
 static void take_period(AudioLive *l)
 {
     AudioRing *r = &l->sh->out;
-    const int exact_lead_period = __atomic_load_n(&l->sh->producer_period_frames, __ATOMIC_ACQUIRE) == AUDIO_PERIOD_FRAMES;
     uint32_t fill = audio_ring_fill(r);
-    if (!exact_lead_period && fill > AUDIO_LIVE_TARGET + 3u * AUDIO_PERIOD_FRAMES) {   /* a backlog (the device stalled, then caught up): skipped */
+    if (fill > AUDIO_LIVE_TARGET + 3u * AUDIO_PERIOD_FRAMES) {   /* a backlog (the device stalled, then caught up): skipped */
         audio_ring_skip(r, fill - AUDIO_LIVE_TARGET);
         l->skipped++;
         fill = AUDIO_LIVE_TARGET;
         drift_reset(&l->spk_drift);
     }
     uint32_t want = AUDIO_PERIOD_FRAMES;
-    const int slip = exact_lead_period ? 0 : drift_update(&l->spk_drift, fill);
-    if (!exact_lead_period) {
-        if (slip > 0 && fill > AUDIO_PERIOD_FRAMES) {
-            audio_ring_skip(r, 1);   /* the device runs fast: one frame less */
-            l->drops++;
-        } else if (slip < 0 && fill >= AUDIO_PERIOD_FRAMES) {
-            want = AUDIO_PERIOD_FRAMES - 1u;   /* the DSP runs fast: one frame repeated */
-            l->repeats++;
-        }
+    const int slip = drift_update(&l->spk_drift, fill);
+    if (slip > 0 && fill > AUDIO_PERIOD_FRAMES) {
+        audio_ring_skip(r, 1);   /* the device runs fast: one frame less */
+        l->drops++;
+    } else if (slip < 0 && fill >= AUDIO_PERIOD_FRAMES) {
+        want = AUDIO_PERIOD_FRAMES - 1u;   /* the DSP runs fast: one frame repeated */
+        l->repeats++;
     }
     const uint32_t got = audio_ring_read(r, l->stereo, want);
     if (want < AUDIO_PERIOD_FRAMES) {
