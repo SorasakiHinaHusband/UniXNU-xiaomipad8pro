@@ -116,7 +116,14 @@ int main(void)
     CHECK(!strcmp(piano_audio_level_key(1), "piano-audio-input-level"));
     CHECK(!strcmp(piano_audio_mute_key(1), "piano-audio-input-mute"));
     CHECK(strcmp(piano_audio_mute_key(1), piano_audio_mute_key(0)));
+    for (unsigned raw = 0; raw <= 100; ++raw) CHECK(piano_audio_control_decode(1, 1, raw) == (int)raw);
     CHECK(piano_audio_control_decode(1, 1, 50) == 50);
+    f.f = 1.0f; CHECK(piano_audio_control_decode(1, 1, f.u) == 100);
+    d.d = 1.0; CHECK(piano_audio_control_decode(1, 1, d.u) == 100);
+    f.f = .01f; CHECK(piano_audio_control_decode(1, 1, f.u) == 1);
+    d.d = .01; CHECK(piano_audio_control_decode(1, 1, d.u) == 1);
+    f.f = 0.0f; CHECK(piano_audio_control_decode(1, 1, f.u) == 0);
+    d.d = 0.0; CHECK(piano_audio_control_decode(1, 1, d.u) == 0);
     CHECK(piano_audio_control_decode(1, 2, 1) == 1);
     CHECK(piano_audio_control_decode(1, 99, 50) == -1);
     CHECK(piano_audio_control_decode(1, 1, 101) == -1);

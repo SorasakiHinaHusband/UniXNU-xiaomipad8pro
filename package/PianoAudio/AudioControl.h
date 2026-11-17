@@ -37,7 +37,7 @@ static inline const char *piano_audio_mute_key(int input)
 { return input ? "piano-audio-input-mute" : "piano-audio-mute"; }
 static inline int piano_audio_input_percent(uint64_t raw)
 {
-    if (raw <= 100) return raw == 1 ? 100 : (int)raw;
+    if (raw <= 100) return (int)raw;
     if (raw >> 32) {
         union { uint64_t u; double d; } d = {raw};
         return d.d >= 0.0 && d.d <= 1.0 ? (int)(d.d * 100.0 + 0.5) : -1;
