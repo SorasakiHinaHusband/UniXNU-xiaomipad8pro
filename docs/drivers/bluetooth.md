@@ -1,6 +1,29 @@
 # Bluetooth: the WCN7860's Bluetooth over QUP2 SE6 ("UART14"): PianoBluetooth
 
-Status: levels 1–4 built, 2026-11-11 (backlog B9). `package/PianoBluetooth` is a native kext with level 1 (a read-only survey), level
+Status update, 2026-11-17 (B9): the original BT1 run confirmed levels 1–3, shared rails/Wi-Fi coexistence, EE0 BT_EN,
+SE6 UART protocol 2, 48/48 loopback and CTS low. A later same-name short run ended before the driver delay; its missing
+lines are a harness failure, not a hardware regression. Level 4 firmware initialization and the new level 5 host transport
+remain unconfirmed on the tablet.
+
+`piano-bt=5` now prepares one complete **macOS 27.3 POSIX** path: stable private identity, registered `bluetooth` service
+and ADT properties, `/dev/cu.BLTH`, a continuous H4 worker with backpressure, and the real IOBluetoothFamily singleton/user
+client. The collection retains the consumer dependencies but gates their hardware personalities; without level 5 the
+singleton resource is never published. This is not the iPadOS UART.SK transport. The daemon itself needs the Family user
+client and its memory mappings during startup, even though public ObjC power/discovery APIs use CoreBluetooth XPC.
+
+The matching runtime sources and build instructions are in
+[`tooling/native/piano-bluetooth`](../../tooling/native/piano-bluetooth/README.md). The original and patched Apple files
+stay outside Git checkouts. The signed library, daemon and BlueTool enter a volatile Data seed and its derived trust cache
+through `PIANO_BT_RUNTIME` with `PAD_USERLAND=1`. A helper verifies hashes, mounts read-only library/executable views at
+the stock paths and starts the original jobs. The exact-build patch includes type 0, third-party chipset, vendor/VM gates,
+truthful standard capabilities, random-address sequencing and the extended-advertising report event mask. Prepared code
+and valid patch guards do not establish a working controller or menu. `piano-bt-probe --scan 20` reports only bounded
+discovery counts; no pairing, connections or owner-key persistence are part of this test.
+
+The older level 1–4 design below is retained for hardware details. Its “not run”, A0-first, UART.SK, private-address-only
+and study-only licensing statements are superseded above and by the per-file NOTICE entries for the new BSD imports.
+
+Original design (2026-11-11): `package/PianoBluetooth` is a native kext with level 1 (a read-only survey), level
 2 (power: the PMU rails through the helper shared with PianoWifi, BT_EN over SPMI), level 3 (the GENI UART at 115200 with RTS/CTS)
 and level 4 (the controller set-up: rampatch and NVM from the tablet's own `bluetooth_a`, 3.2 Mbit/s, the unit's address), all
 **host-tested, linked into the native KC, not run**: inert without `piano-bt`, the radio powered only from `piano-bt=2`.

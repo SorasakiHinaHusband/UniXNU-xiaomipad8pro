@@ -18,7 +18,7 @@ INC=(-I "$P" -I "$D/package/PianoPower" -I "$D/package/PianoKeyboard")
 mkdir -p "$O/host-tests"
 "$D/package/include/tests/run.sh"   # PianoWcnRails.h: the rails both radios share (docs/drivers/bluetooth.md section 7.1)
 for t in bt_host bt_bringup_host; do
-  "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror "${INC[@]}" -I "$D/package/include" "$P/tests/$t.cpp" -o "$O/host-tests/$t"
+  "${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror "${INC[@]}" -I "$D/package/include" "$P/tests/$t.cpp" -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoBluetooth host tests failed ($t)" >&2; exit 1; }
 done
 # The level 1 survey headers stay store-free: no str instruction and no assignment through a volatile pointer (the kext's stores are

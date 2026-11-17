@@ -145,7 +145,13 @@ def main():
     probe = runtime / 'helpers/piano-bt-probe'
     compile_program('probe.m', probe, sdk=sdk,
                     extra=['-fobjc-arc', '-fblocks', '-framework', 'Foundation', '-framework', 'IOBluetooth', '-framework', 'CoreBluetooth'])
-    sign(probe, 'com.unixnu.piano.bluetooth.probe', own_entitlements)
+    # This boot's explicitly authorized scan must not wait for an unattended TCC
+    # dialog. Scope the grant to this signed discovery probe and the precise
+    # service requested by CBManager, without changing a user's TCC database.
+    probe_entitlements = build / 'probe-entitlements.plist'
+    probe_entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
+                                                  'com.apple.private.tcc.allow': ['kTCCServiceBluetoothAlways']}))
+    sign(probe, 'com.unixnu.piano.bluetooth.probe', probe_entitlements)
     for src, dest in (('start-runtime.sh', 'scripts/piano-bluetooth-start'),
                       ('com.unixnu.piano-bluetooth-path1.plist', 'launchd/com.unixnu.piano-bluetooth-path1.plist')):
         target = runtime / dest

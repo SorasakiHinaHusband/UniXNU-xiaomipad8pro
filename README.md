@@ -46,6 +46,10 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   (HFI) with its version; power cycles repeat cleanly. Decoding a frame is next ([docs/drivers/video.md](docs/drivers/video.md)).
   A bounded kernel H.264 single-frame self-test (`piano-video=5`) is implemented and host-checked; tablet frame verification is pending.
   It does not enable a macOS video consumer.
+- Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
+  An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
+  firmware initialization, the Bluetooth menu and discovery are not yet tablet-confirmed
+  ([Bluetooth](docs/drivers/bluetooth.md)).
 - Boot time is being worked on: most of launchd's 40 s is our 4 KiB code-signature pre-hash of the compressed dyld shared
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
   pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;
