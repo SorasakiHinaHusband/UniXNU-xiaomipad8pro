@@ -20,7 +20,7 @@
 //
 // Design (sheng's): one kernel thread owns every step and all protocol state. The thread waits on an event with a deadline for each
 // step (QMP 1 s per phase, RPMh 100 ms, DSP ready 5 s) and polls the doorbells every few milliseconds while it waits; afterwards it
-// sleeps between doorbells (polled every 20 ms) and client sends. No lock is held across a wait. Clients (PianoAdsp.h) register
+// sleeps between doorbells (20 ms idle, 1 ms for a bounded command reply wait) and client sends. No lock is held across a wait. Clients (PianoAdsp.h) register
 // channels and queue sends from any thread; their callbacks run on this thread. SMEM is read only inside the APPS partitions and the
 // global one (other partitions may be closed to the HLOS: a whole-SMEM read on the 13T faulted).
 //
@@ -73,6 +73,7 @@ constexpr unsigned kClients = PIANO_ADSP_CHANNELS, kQueue = 16;
 static_assert(kClients <= QCOM_GLINK_MAX_CHANNELS, "a GLINK channel per client slot");
 constexpr uint32_t kSlowCallbackMs = 20;
 constexpr uint32_t kBringUpSliceMs = 2, kSteadySliceMs = 20;
+constexpr uint32_t kReplySliceMs = 1, kReplyFastMs = 100, kReplyTrackMs = 2000, kReplyReportMs = 30000;
 
 struct Knobs {uint32_t delay, stop, qmp, rpmh, trace, map, loadFirst;};
 Knobs gKnobs = {30, 0, 1, 1, 1, 0, 0};
@@ -189,6 +190,90 @@ uint64_t nowMs() {
     absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
     return ns / 1000000;
 }
+
+// Only the DSP thread touches this bookkeeping. GPR's control commands (type 1) have replies; the continuously queued PCM
+// READ/WRITE commands (type 4) must not keep the shared GLINK poll fast. Wire facts: PianoAudio/PianoGpr.c and AudioSequence.c.
+// These records observe successful publishes and matching receives; they never change a packet or a client's timeout/decision.
+struct ReplyWait {PianoAdspChannel *channel; uint32_t token, port, opcode, answer; uint64_t sent;};
+ReplyWait gReplyWait[kQueue];
+uint32_t gReplyHistogram[kReplyTrackMs + 1], gReplyCount, gReplyMax, gReplyExpired, gReplyOverflow;
+uint64_t gReplyTotal, gReplyReportAt;
+uint32_t replyWord(const uint8_t *p) {
+    return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+}
+bool replyHeader(const uint8_t *data, uint32_t length, uint32_t &header, uint32_t &size) {
+    if (length < 24) return false;
+    const uint32_t w = replyWord(data);
+    header = ((w >> 4) & 15u) * 4; size = w >> 8;
+    return !(w & 15u) && header >= 24 && header <= size && size <= length;
+}
+void replySent(PianoAdspChannel *c, const uint8_t *data, uint32_t length) {
+    uint32_t header, size;
+    if (strcmp(c->name, "adsp_apps") || !replyHeader(data, length, header, size) ||
+        (replyWord(data + 4) & 0xffffu) != 0x0302u) return; // APPS -> ADSP
+    const uint32_t opcode = replyWord(data + 20), token = replyWord(data + 16), port = replyWord(data + 8);
+    if ((opcode >> 24) != 1) return;
+    ReplyWait *free = nullptr;
+    const uint64_t now = nowMs();
+    for (auto &r : gReplyWait) {
+        if (r.channel && now - r.sent >= kReplyTrackMs) {r.channel = nullptr; ++gReplyExpired;}
+        if (r.channel == c && r.token == token && r.port == port) return; // a retry cannot renew a lost reply's fast budget
+        if (!r.channel && !free) free = &r;
+    }
+    if (!free) {++gReplyOverflow; return;}
+    uint32_t answer = 0x02001005u; // BASIC_RESULT includes the original opcode
+    switch (opcode) {
+    case 0x0100100cu: answer = 0x02001001u; break; // MEM_MAP
+    case 0x0100100fu: answer = 0x02001002u; break; // PRM_REQUEST
+    case 0x01001010u: answer = 0x02001003u; break; // PRM_RELEASE
+    case 0x01001021u: answer = 0x02001007u; break; // GET_SPF_STATE
+    }
+    *free = {c, token, port, opcode, answer, now};
+}
+void replyReceived(PianoAdspChannel *c, const uint8_t *data, uint32_t length) {
+    uint32_t header, size;
+    if (strcmp(c->name, "adsp_apps") || !replyHeader(data, length, header, size) ||
+        (replyWord(data + 4) & 0xffffu) != 0x0203u) return; // ADSP -> APPS
+    const uint32_t opcode = replyWord(data + 20), token = replyWord(data + 16), port = replyWord(data + 12);
+    for (auto &r : gReplyWait) {
+        if (r.channel != c || r.token != token || r.port != port) continue;
+        if (opcode == 0x02001005u) {
+            if (size - header < 8 || replyWord(data + header) != r.opcode) continue;
+        } else if (opcode != r.answer || size - header < 4) continue;
+        const uint64_t elapsed = nowMs() - r.sent;
+        r.channel = nullptr;
+        if (elapsed >= kReplyTrackMs) {++gReplyExpired; return;}
+        const uint32_t ms = (uint32_t)elapsed;
+        ++gReplyHistogram[ms]; ++gReplyCount; ++gReplyTotal;
+        if (ms > gReplyMax) gReplyMax = ms;
+        return;
+    }
+}
+uint32_t replyPollSlice(uint64_t now) {
+    unsigned pending = 0;
+    bool fast = false;
+    for (auto &r : gReplyWait) {
+        if (!r.channel) continue;
+        const uint64_t elapsed = now - r.sent;
+        if (elapsed >= kReplyTrackMs) {r.channel = nullptr; ++gReplyExpired; continue;}
+        ++pending;
+        fast |= elapsed < kReplyFastMs;
+    }
+    if (now - gReplyReportAt >= kReplyReportMs) {
+        uint32_t median = 0, n = 0;
+        if (gReplyCount) for (; median < kReplyTrackMs; ++median) {
+            n += gReplyHistogram[median];
+            if (n > gReplyCount / 2) break; // upper median, exact integer-ms histogram
+        }
+        say("[aud-adsp1:pending-reply-1ms] replies %u total %llu median-ms %u max-ms %u pending %u expired %u overflow %u slice-ms %u bound-ms %u idle-ms %u",
+            gReplyCount, (unsigned long long)gReplyTotal, median, gReplyMax, pending, gReplyExpired, gReplyOverflow,
+            kReplySliceMs, kReplyFastMs, kSteadySliceMs);
+        bzero(gReplyHistogram, sizeof gReplyHistogram);
+        gReplyCount = gReplyMax = gReplyExpired = gReplyOverflow = 0;
+        gReplyReportAt = now;
+    }
+    return fast ? kReplySliceMs : kSteadySliceMs;
+}
 void linkChanged() {__atomic_store_n(&gLinkGeneration, gLinkTrack.generation, __ATOMIC_RELEASE);}
 
 void wake(uint32_t bits) {
@@ -221,7 +306,8 @@ uint32_t waitEvents(uint32_t ms) {
         uint32_t bits = __atomic_exchange_n(&gPending, 0, __ATOMIC_ACQ_REL) | pollHardware();
         if (bits) return bits;
         if (mach_absolute_time() >= deadline) return 0;
-        assert_wait_timeout((event_t)&gPending, THREAD_UNINT, gSliceMs < ms ? gSliceMs : ms, kMillisecondScale);
+        const uint32_t slice = gSliceMs == kSteadySliceMs ? replyPollSlice(nowMs()) : gSliceMs;
+        assert_wait_timeout((event_t)&gPending, THREAD_UNINT, slice < ms ? slice : ms, kMillisecondScale);
         bits = __atomic_exchange_n(&gPending, 0, __ATOMIC_ACQ_REL);
         if (bits) {clear_wait(current_thread(), THREAD_AWAKENED); return bits;}
         thread_block(THREAD_CONTINUE_NULL);
@@ -769,6 +855,7 @@ void timed(uint64_t since, const char *name) {
 }
 void clientState(void *context, QcomGlinkChannel *, int up) {
     PianoAdspChannel *c = static_cast<PianoAdspChannel *>(context);
+    if (!up) for (auto &r : gReplyWait) if (r.channel == c) r.channel = nullptr;
     adsp_link_channel(&gLinkTrack, (unsigned)(c - gClients), up);
     linkChanged();
     say("channel %s %s%s", c->name, up ? "up" : "down", up ? "" : " (link generation moves)");
@@ -780,6 +867,7 @@ void clientState(void *context, QcomGlinkChannel *, int up) {
 }
 void clientReceive(void *context, QcomGlinkChannel *, const uint8_t *data, uint32_t length) {
     PianoAdspChannel *c = static_cast<PianoAdspChannel *>(context);
+    replyReceived(c, data, length);
     if (c->client.receive) {
         const uint64_t t = nowMs();
         c->client.receive(c->context, data, length);
@@ -810,6 +898,7 @@ void pumpSends() {
             if (!m) continue;
             // Only this thread takes messages off the queue, so m stays valid while the lock is dropped for the send.
             if (qcom_glink_send(&gGlink, c.glink, m->data, m->length) != QcomGlinkOk) {blocked |= 1u << i; continue;}
+            replySent(&c, m->data, m->length);
             IOLockLock(gClientLock);
             c.head = (c.head + 1) % kQueue;
             c.count--;
