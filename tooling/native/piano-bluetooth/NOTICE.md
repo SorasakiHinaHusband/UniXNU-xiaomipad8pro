@@ -1,7 +1,7 @@
 # Source attribution
 
 The following source files are copied from
-[UniXNU-QcaBluetooth](https://github.com/UniXNU/UniXNU-QcaBluetooth), commit
+[QcaBluetooth](https://github.com/UniXNU/QcaBluetooth), commit
 `effe4ec5c57cd400a5f818b21c9903fef237edbc` (the component pinned by
 UniXNU-sheng at `0eea3a2`):
 
