@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent
  * Copyright (c) 2026 Leo Zhang.
- * Read-only CoreAudio output/control and timing snapshot. */
+ * CoreAudio input/output control and timing snapshot; optional explicit control write. */
 #include <CoreAudio/CoreAudio.h>
 #include <AudioToolbox/AudioHardwareService.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
 static OSStatus get(AudioObjectID id, AudioObjectPropertySelector key, AudioObjectPropertyScope scope,
                     AudioObjectPropertyElement element, UInt32 *size, void *out)
@@ -25,13 +27,39 @@ static void fourcc(UInt32 v, char out[5])
     }
     out[4] = 0;
 }
+static int named(AudioObjectID id, AudioObjectPropertySelector key, const char *want)
+{
+    CFStringRef str = NULL; UInt32 n = sizeof str;
+    if (get(id, key, kAudioObjectPropertyScopeGlobal, 0, &n, &str) || !str) return 0;
+    char buf[256] = "";
+    const int ok = CFStringGetCString(str, buf, sizeof buf, kCFStringEncodingUTF8) && !strcmp(buf, want);
+    CFRelease(str); return ok;
+}
+static AudioDeviceID mic(void)
+{
+    const AudioObjectPropertyAddress a = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, 0};
+    UInt32 n = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &n)) return 0;
+    AudioDeviceID *ids = calloc(1, n); AudioDeviceID found = 0;
+    if (ids && !AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &n, ids))
+        for (UInt32 i = 0; i < n / sizeof *ids; ++i)
+            if (named(ids[i], kAudioDevicePropertyDeviceUID, "Mic")) {found = ids[i]; break;}
+    free(ids); return found;
+}
 int main(int argc, char **argv)
 {
     const char *phase = argc > 1 ? argv[1] : "snapshot";
+    const int input = argc > 2 && !strcmp(argv[2], "input");
+    const AudioObjectPropertyScope direction = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput;
+    const int level = argc > 3 ? atoi(argv[3]) : -1, mute = argc > 4 ? atoi(argv[4]) : -1;
+    if (level < -1 || level > 100 || mute < -1 || mute > 1) return 2;
     AudioDeviceID dev = 0;
-    const OSStatus ds = u32(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice, &dev);
-    printf("default_output phase=%s status=%d device=%u\n", phase, (int)ds, (unsigned)dev);
+    const OSStatus ds = u32(kAudioObjectSystemObject, input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice, &dev);
+    printf("default_%s phase=%s status=%d device=%u\n", input ? "input" : "output", phase, (int)ds, (unsigned)dev);
+    if (input) dev = mic();
     if (ds || !dev) return 1;
+    printf("selected_device phase=%s direction=%s device=%u exact_mic_uid=%d\n", phase, input ? "input" : "output", dev,
+           named(dev, kAudioDevicePropertyDeviceUID, "Mic"));
     const AudioObjectPropertyAddress a = {kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal, 0};
     UInt32 bytes = 0;
     OSStatus st = AudioObjectGetPropertyDataSize(dev, &a, 0, NULL, &bytes);
@@ -46,11 +74,26 @@ int main(int argc, char **argv)
         const OSStatus bs = u32(ids[i], kAudioObjectPropertyBaseClass, &base);
         const OSStatus ss = u32(ids[i], kAudioControlPropertyScope, &scope);
         const OSStatus es = u32(ids[i], kAudioControlPropertyElement, &element);
+        if (!ss && scope == direction && !es && element == 0 &&
+            ((cls == kAudioVolumeControlClassID && level >= 0) || (cls == kAudioMuteControlClassID && mute >= 0))) {
+            const AudioObjectPropertyAddress write = {cls == kAudioVolumeControlClassID ? kAudioLevelControlPropertyScalarValue : kAudioBooleanControlPropertyValue,
+                                                       kAudioObjectPropertyScopeGlobal, 0};
+            Float32 value = (Float32)level / 100; UInt32 muted = (UInt32)mute;
+            const OSStatus ws = AudioObjectSetPropertyData(ids[i], &write, 0, NULL,
+                cls == kAudioVolumeControlClassID ? sizeof value : sizeof muted,
+                cls == kAudioVolumeControlClassID ? (void *)&value : (void *)&muted);
+            printf("control_write phase=%s id=%u status=%d level=%d mute=%d\n", phase, ids[i], (int)ws, level, mute);
+            if (ws) {free(ids); return 3;}
+        }
         Float32 scalar = 0, db = 0;
         UInt32 n = sizeof scalar;
         const OSStatus vs = get(ids[i], kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0, &n, &scalar);
         n = sizeof db;
         const OSStatus dbs = get(ids[i], kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0, &n, &db);
+        UInt32 muted = 0; n = sizeof muted;
+        const OSStatus ms = get(ids[i], kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0, &n, &muted);
+        printf("control_state phase=%s id=%u mute_status=%d mute=%u finite_scalar=%d finite_db=%d\n", phase, ids[i], (int)ms, muted,
+               !vs && isfinite(scalar), !dbs && isfinite(db));
         char c[5], b[5], sc[5]; fourcc(cls, c); fourcc(base, b); fourcc(scope, sc);
         printf("control phase=%s id=%u class=0x%08x(%s) base=0x%08x(%s) scope_status=%d scope=0x%08x(%s) element_status=%d element=%u class_status=%d base_status=%d scalar_status=%d scalar=%.9g db_status=%d db=%.9g\n",
                phase, (unsigned)ids[i], (unsigned)cls, c, (unsigned)base, b, (int)ss, (unsigned)scope, sc,
@@ -59,17 +102,24 @@ int main(int argc, char **argv)
     free(ids);
     for (UInt32 element = 0; element < 3; ++element) {
         Float32 v = 0; UInt32 n = sizeof v;
-        st = get(dev, kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput, element, &n, &v);
+        st = get(dev, kAudioDevicePropertyVolumeScalar, direction, element, &n, &v);
         printf("device_volume phase=%s element=%u status=%d size=%u scalar=%.9g\n", phase, (unsigned)element, (int)st, (unsigned)n, (double)v);
     }
     Float32 vm = 0; UInt32 n = sizeof vm;
-    const AudioObjectPropertyAddress va = {kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioObjectPropertyScopeOutput, 0};
-    st = AudioHardwareServiceGetPropertyData(dev, &va, 0, NULL, &n, &vm);
+    const AudioObjectPropertyAddress va = {kAudioHardwareServiceDeviceProperty_VirtualMainVolume, direction, 0};
+    st = AudioObjectGetPropertyData(dev, &va, 0, NULL, &n, &vm);
     printf("virtual_main phase=%s status=%d size=%u scalar=%.9g\n", phase, (int)st, (unsigned)n, (double)vm);
     UInt32 cycle = 0, safety = 0; n = sizeof cycle;
     const OSStatus fs = get(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, 0, &n, &cycle);
     n = sizeof safety;
-    const OSStatus so = get(dev, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, 0, &n, &safety);
+    const OSStatus so = get(dev, kAudioDevicePropertySafetyOffset, direction, 0, &n, &safety);
     printf("hal_timing phase=%s callback_status=%d callback_frames=%u safety_status=%d safety_frames=%u\n", phase, (int)fs, (unsigned)cycle, (int)so, (unsigned)safety);
+    UInt32 latency = 0; n = sizeof latency;
+    st = get(dev, kAudioDevicePropertyLatency, direction, 0, &n, &latency);
+    printf("hal_latency phase=%s status=%d frames=%u\n", phase, (int)st, latency);
+    AudioStreamBasicDescription fmt = {0}; n = sizeof fmt;
+    st = get(dev, kAudioDevicePropertyStreamFormat, direction, 0, &n, &fmt);
+    printf("stream_format phase=%s status=%d rate=%.0f channels=%u bits=%u bytes_per_frame=%u\n", phase, (int)st, fmt.mSampleRate,
+           (unsigned)fmt.mChannelsPerFrame, (unsigned)fmt.mBitsPerChannel, (unsigned)fmt.mBytesPerFrame);
     return 0;
 }

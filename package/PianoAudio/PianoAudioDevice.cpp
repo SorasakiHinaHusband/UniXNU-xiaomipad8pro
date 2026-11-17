@@ -287,7 +287,7 @@ OSArray *controlSelectors() {
     if (OSNumber *n = OSNumber::withNumber(0x63726e67, 32)) { a->setObject(n); n->release(); } // 'crng'
     return a;
 }
-OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_t value, bool mute) {
+OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_t value, bool mute, bool input) {
     OSDictionary *d = OSDictionary::withCapacity(32);
     if (!d) return nullptr;
     setNumber(d, "control ID", id);
@@ -296,7 +296,7 @@ OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_
     setNumber(d, "IOAudioEngineDescription", 0);
     setNumber(d, "base class", baseClass);
     setNumber(d, "class", cls);
-    setNumber(d, "scope", OutputScope);
+    setNumber(d, "scope", piano_audio_control_scope(input));
     setNumber(d, "element", 0);
     setBool(d, "read only", false);
     setNumber(d, "value", value);
@@ -309,10 +309,10 @@ OSDictionary *makeControl(uint32_t id, uint32_t baseClass, uint32_t cls, uint32_
         setNumber(d, "center value", value);
         setNumber(d, "right value", value);
         setNumber(d, "left channel", 1);
-        setNumber(d, "right channel", 2);
+        setNumber(d, "right channel", input ? 1 : 2);
     } else {
         if (!piano_audio_level_dictionary<OSDictionary, OSArray>(d, value,
-                [](OSDictionary *dict, const char *key, uint64_t v, unsigned bits) { setNumber(dict, key, v, bits); })) {
+                [](OSDictionary *dict, const char *key, uint64_t v, unsigned bits) { setNumber(dict, key, v, bits); }, input ? 1 : 2)) {
             d->release();
             return nullptr;
         }
@@ -387,17 +387,16 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("piano-audio-notification-contract", "counted-cval64:raw-integer");
     e->setProperty("piano-audio-timing-contract", tp.contract);
     e->setProperty("piano-audio-ring-contract", PIANO_AUDIO_RING_CONTRACT);
-    if (!isInput) {
-        setNumber(e, "piano-audio-volume", volumePercent);
-        e->setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse);
-    }
+    setNumber(e, piano_audio_level_key(isInput), volumePercent);
+    e->setProperty(piano_audio_mute_key(isInput), masterMute ? kOSBooleanTrue : kOSBooleanFalse);
+    if (isInput) e->setProperty("piano-audio-input-contract", "mic-delivery1:inpt/main:mono:db-linear:pre-HAL");
 }
 
 OSArray *PianoAudioDevice::controls() const {
-    OSArray *a = OSArray::withCapacity(isInput ? 1 : 2);
-    if (!a || isInput) return a;
-    OSDictionary *level = makeControl(ControlVolume, LevelBaseClass, LevelClass, volumePercent, false);
-    OSDictionary *mute = makeControl(ControlMute, MuteBaseClass, MuteClass, masterMute ? 1 : 0, true);
+    OSArray *a = OSArray::withCapacity(2);
+    if (!a) return a;
+    OSDictionary *level = makeControl(ControlVolume, LevelBaseClass, LevelClass, volumePercent, false, isInput);
+    OSDictionary *mute = makeControl(ControlMute, MuteBaseClass, MuteClass, masterMute ? 1 : 0, true, isInput);
     if (level) { a->setObject(level); level->release(); }
     if (mute) { a->setObject(mute); mute->release(); }
     return a;
@@ -421,15 +420,16 @@ IOReturn PianoAudioDevice::apply(OSObject *properties, IORegistryEntry *client) 
     OSDictionary *d = OSDynamicCast(OSDictionary, properties);
     if (!d) return kIOReturnBadArgument;
     bool controlsChanged = false;
-    if (!isInput) {
-        OSNumber *volume = OSDynamicCast(OSNumber, d->getObject("piano-audio-volume"));
-        OSBoolean *mute = OSDynamicCast(OSBoolean, d->getObject("piano-audio-mute"));
+    {
+        OSNumber *volume = OSDynamicCast(OSNumber, d->getObject(piano_audio_level_key(isInput)));
+        OSBoolean *mute = OSDynamicCast(OSBoolean, d->getObject(piano_audio_mute_key(isInput)));
         const int v = volume && volume->unsigned32BitValue() <= 100 ? int(volume->unsigned32BitValue()) : -1;
         const int m = mute ? (mute->isTrue() ? 1 : 0) : -1;
         if (v >= 0 || m >= 0) {
-            if (gTransport->control) gTransport->control(gTransport->context, v, m);
-            if (v >= 0) { volumePercent = uint32_t(v); setNumber(this, "piano-audio-volume", volumePercent); controlsChanged = true; }
-            if (m >= 0) { masterMute = m != 0; setProperty("piano-audio-mute", masterMute ? kOSBooleanTrue : kOSBooleanFalse); controlsChanged = true; }
+            auto control = isInput ? gTransport->input_control : gTransport->control;
+            if (control) control(gTransport->context, v, m);
+            if (v >= 0) { volumePercent = uint32_t(v); setNumber(this, piano_audio_level_key(isInput), volumePercent); controlsChanged = true; }
+            if (m >= 0) { masterMute = m != 0; setProperty(piano_audio_mute_key(isInput), masterMute ? kOSBooleanTrue : kOSBooleanFalse); controlsChanged = true; }
         }
     }
     if (OSNumber *owner = OSDynamicCast(OSNumber, d->getObject("exclusive access owner"))) {
@@ -511,6 +511,7 @@ void PianoAudioDevice::run() {
     const TimingProfile &tp = timingProfile(timingMode);
     int16_t period[PIANO_AUDIO_PERIOD_FRAMES * OutputChannels];
     uint64_t done = 0, soundPeriods = 0, latePeriods = 0, maxLate = 0;
+    uint64_t inputDelivered = 0, firstInput = 0;
     for (;;) {
         IOLockLock(lock);
         while (running && __atomic_load_n(&gDeviceSleep,__ATOMIC_ACQUIRE)) {
@@ -536,6 +537,8 @@ void PianoAudioDevice::run() {
             const uint32_t captured = gTransport->capture(gTransport->context, period, tp.periodFrames);
             if (captured < tp.periodFrames) bzero(period + captured * ch, (tp.periodFrames - captured) * 2 * ch);
             piano_audio_copy_to_ring(buffer, tp.ringFrames, uint32_t(done % tp.ringFrames), period, tp.periodFrames, ch);
+            inputDelivered += captured;
+            if (captured && !firstInput) firstInput = done + 1;
             piano_audio_dev_captured = piano_audio_dev_captured + captured;
         } else {
             piano_audio_copy_from_ring(period, buffer, tp.ringFrames, uint32_t(done % tp.ringFrames), tp.periodFrames, ch);
@@ -566,6 +569,9 @@ void PianoAudioDevice::run() {
     IOLog("PianoAudio: HAL ring read: %s mode %u periods %llu with sound %llu frames %llu write-end %llu\n",
           isInput ? "input" : "output", timingMode, (unsigned long long)(done / tp.periodFrames),
           (unsigned long long)soundPeriods, (unsigned long long)done, (unsigned long long)status()->writeEnd);
+    if (isInput) IOLog("PianoAudio: mic HAL stop: seed %u requested %llu delivered %llu startup-or-missing %llu first-frame %llu read-end %llu\n",
+          seed, (unsigned long long)done, (unsigned long long)inputDelivered, (unsigned long long)(done - inputDelivered),
+          (unsigned long long)firstInput, (unsigned long long)status()->reserved);
     uint64_t maxLateNs;
     absolutetime_to_nanoseconds(maxLate, &maxLateNs);
     IOLog("PianoAudio: HAL wake: %s mode %u late-periods %llu max-us %llu\n", isInput ? "input" : "output", timingMode,
@@ -623,21 +629,21 @@ IOReturn PianoAudioUserClient::externalMethod(uint32_t selector, IOExternalMetho
         startedIO = false;
         return device->stopIO();
     case 2: {                                              // SetControlValue: control UCID, integer raw value
-        if (!device || a->scalarInputCount < 2 || a->scalarInput[0] > UINT32_MAX || device->isInput) return kIOReturnBadArgument;
+        if (!device || a->scalarInputCount < 2 || a->scalarInput[0] > UINT32_MAX) return kIOReturnBadArgument;
         const uint32_t id = uint32_t(a->scalarInput[0]);
         const uint64_t raw = a->scalarInput[1];
         OSDictionary *d = OSDictionary::withCapacity(1);
         if (!d) return kIOReturnNoMemory;
         IOReturn result = kIOReturnSuccess;
         if (id == ControlVolume) {
-            const int p = piano_audio_control_percent(raw);
+            const int p = piano_audio_control_decode(device->isInput, id, raw);
             if (p < 0 || p > 100) result = kIOReturnBadArgument;
-            else if (OSNumber *n = OSNumber::withNumber(uint32_t(p), 32)) { d->setObject("piano-audio-volume", n); n->release(); }
+            else if (OSNumber *n = OSNumber::withNumber(uint32_t(p), 32)) { d->setObject(piano_audio_level_key(device->isInput), n); n->release(); }
             else result = kIOReturnNoMemory;
         } else if (id == ControlMute) {
-            const int m = piano_audio_control_bool(raw);
+            const int m = piano_audio_control_decode(device->isInput, id, raw);
             if (m < 0) result = kIOReturnBadArgument;
-            else d->setObject("piano-audio-mute", m ? kOSBooleanTrue : kOSBooleanFalse);
+            else d->setObject(piano_audio_mute_key(device->isInput), m ? kOSBooleanTrue : kOSBooleanFalse);
         } else {
             result = kIOReturnBadArgument;
         }

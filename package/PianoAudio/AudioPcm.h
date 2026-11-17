@@ -28,6 +28,9 @@ typedef struct PianoPcmTransport {
     uint32_t (*capture)(void *context, int16_t *mono, uint32_t frames);
     /* The kernel's master volume (0..100 percent, -1: unchanged) and mute (0, 1; -1: unchanged); may be null (no such control). */
     void (*control)(void *context, int volume_percent, int mute);
+    /* Independent digital input level/mute, applied after FIFO read and before
+     * delivery to the mapped HAL ring. Does not change VA gain or clocks. */
+    void (*input_control)(void *context, int level_percent, int mute);
 } PianoPcmTransport;
 
 typedef struct {

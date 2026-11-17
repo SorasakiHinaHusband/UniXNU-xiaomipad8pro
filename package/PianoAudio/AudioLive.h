@@ -29,6 +29,7 @@
 #include "AudioTiming.h"
 #include "AudioLedger.h"
 #include "AudioSession.h"
+#include "AudioCapture.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,6 +64,10 @@ typedef struct {
     int have_sound;
     int32_t volume_q15;                  /* level 9: the master volume (0..32767), from the device's property or the boot argument */
     int muted;                           /* level 9: the master mute */
+    int32_t input_q15;
+    int input_muted;
+    uint32_t input_controls, input_runs;
+    AudioCaptureHal input_hal;            /* one HAL StartIO, single engine writer */
     uint64_t offered, taken, dropped, captured, controls;
     uint32_t producer_seq, epoch, boundary_ms, producer_ms, producer_frames, producer_late_us;
     uint64_t hal_sample, hal_host, hal_write_end;
@@ -80,6 +85,7 @@ uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t fr
 uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames);
 /* Level 9: the master volume in percent (0 silent, 100 unity, the shared -36 dB squared curve) and the mute; out of range: unchanged. */
 void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
+void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */
 int32_t audio_ceiling_db(unsigned db);
@@ -153,6 +159,12 @@ typedef struct {
     int16_t mono[AUDIO_PERIOD_FRAMES + 1];
     uint32_t mic_starts, mic_periods, mic_drops, mic_repeats, mic_full;
     int va_on;
+    /* Reset per DSP capture start, independent of a HAL open/close window. */
+    AudioCapturePcm mic_pcm[3];            /* DEC0, DEC1, mono before settling/control */
+    uint64_t mic_frames, mic_settle, mic_full_frames, mic_tail_frames;
+    uint64_t mic_underrun_base, mic_overrun_base;
+    uint32_t mic_drop_base, mic_repeat_base, mic_full_base;
+    uint32_t mic_first_read, mic_first_pcm, mic_diag_at;
     /* ---- the exchange */
     uint32_t sends, queue_full, received, stray, timeouts;
     int sleeping, parked, sleep_failed, sleep_quiet, sleep_safe;
@@ -180,6 +192,7 @@ void audio_live_sleep(AudioLive *l, uint32_t generation);
 int audio_live_parked(AudioLive *l);  /* 1 safe, 0 draining, -1 unsafe */
 int audio_live_rearm(AudioLive *l);
 void audio_live_sleep_fail(AudioLive *l); /* owner-thread safe mute, retain all uncertain backing */
+void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now_ms);
 const char *audio_live_state(int state);
 
 #ifdef __cplusplus

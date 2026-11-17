@@ -369,7 +369,13 @@ uint32_t ar_pump_write(ArPump *p, uint8_t *out, uint32_t capacity, uint32_t now_
 int ar_pump_done(ArPump *p, const ArAnswer *a)
 {
     if (a->opcode != (p->capture ? AR_OP_READ_DONE : AR_OP_WRITE_DONE) || a->dst_port != p->port) return 0;
+    if (p->capture && (a->src_domain != GPR_DOMAIN_ADSP || a->dst_domain != GPR_DOMAIN_APPS || a->src_port != AR_IID_CAP_SHMEM)) {
+        p->bad_origin++; p->errors++; return -1;
+    }
     const uint64_t at = a->address - p->base;
+    if (p->capture && (a->address < p->base || at >= (uint64_t)p->slots * p->period_bytes)) {
+        p->bad_range++; p->errors++; return -1;
+    }
     const uint32_t slot = (uint32_t)(at / p->period_bytes);
     if (a->address < p->base || at % p->period_bytes || slot >= p->slots || !p->busy[slot] || a->token != p->token_base + slot ||
         a->handle != p->handle) {
@@ -378,7 +384,19 @@ int ar_pump_done(ArPump *p, const ArAnswer *a)
     }
     p->busy[slot] = 0; p->in_flight--;
     if (a->status) {p->errors++; p->last_status = a->status; return -1;}
-    if (p->capture && (a->offset > p->period_bytes || a->data_bytes > p->period_bytes - a->offset)) {p->errors++; return -1;}
+    if (p->capture && (a->payload_bytes < 24 || a->offset > p->period_bytes || a->data_bytes > p->period_bytes - a->offset)) {
+        p->bad_range++; p->errors++; return -1;
+    }
+    if (p->capture && ((a->offset | a->data_bytes) & 3u)) {p->bad_alignment++; p->errors++; return -1;}
+    if (p->capture) {
+        if (!p->returned || a->data_bytes < p->min_bytes) p->min_bytes = a->data_bytes;
+        if (a->data_bytes > p->max_bytes) p->max_bytes = a->data_bytes;
+        if (!p->returned || a->offset < p->min_offset) p->min_offset = a->offset;
+        if (a->offset > p->max_offset) p->max_offset = a->offset;
+        p->short_returns += a->data_bytes < p->period_bytes;
+        p->zero_returns += a->data_bytes == 0;
+        p->returned_bytes += a->data_bytes;
+    }
     p->last_slot = slot;
     p->returned++;
     return 1;

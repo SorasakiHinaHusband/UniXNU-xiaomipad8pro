@@ -7,7 +7,7 @@
  * integers; dB coordinates are signed 32.32 numbers, decoded by GetFixed64.
  * Keep publication shared with the host's CoreFoundation dictionary decoder. */
 template <class Dictionary, class Array, class SetNumber>
-static bool piano_audio_level_dictionary(Dictionary *d, uint32_t value, SetNumber number)
+static bool piano_audio_level_dictionary(Dictionary *d, uint32_t value, SetNumber number, uint32_t channels = 2)
 {
     Dictionary *range = Dictionary::withCapacity(4);
     Array *map = Array::withCapacity(1);
@@ -33,7 +33,7 @@ static bool piano_audio_level_dictionary(Dictionary *d, uint32_t value, SetNumbe
     number(d, "center value", value, 32);
     number(d, "right value", value, 32);
     number(d, "left channel", 1, 32);
-    number(d, "right channel", 2, 32);
+    number(d, "right channel", channels == 1 ? 1 : 2, 32);
     return true;
 }
 #endif

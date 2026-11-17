@@ -78,9 +78,9 @@ static float decibels(const Curve &c, int32_t raw) {
     return std::fma(float(clamped - c.first), slope, c.dbFirst);
 }
 int main() {
-    for (uint32_t value : {0U, 25U, 60U, 100U}) {
+    for (uint32_t channels : {1U, 2U}) for (uint32_t value : {0U, 25U, 50U, 60U, 100U}) {
         Dictionary *d = Dictionary::withCapacity(16);
-        CHECK((piano_audio_level_dictionary<Dictionary, Array>(d, value, number)));
+        CHECK((piano_audio_level_dictionary<Dictionary, Array>(d, value, number, channels)));
         number(d, "value", value, 32);
         // Round-trip a property list as IORegistry serialization does.
         CFDataRef bytes = CFPropertyListCreateData(nullptr, d->cf, kCFPropertyListXMLFormat_v1_0, 0, nullptr);
@@ -90,7 +90,7 @@ int main() {
         CHECK(raw32(dict, "minimum value") == 0 && raw32(dict, "maximum value") == 100);
         CHECK(raw32(dict, "transfer function") == 0);
         for (const char *s : {"left value", "center value", "right value", "value"}) CHECK(raw32(dict, s) == int32_t(value));
-        CHECK(raw32(dict, "left channel") == 1 && raw32(dict, "right channel") == 2);
+        CHECK(raw32(dict, "left channel") == 1 && raw32(dict, "right channel") == int(channels));
         CHECK(!get(dict, "start db value") && !get(dict, "integer steps"));
         Curve c; CHECK(decode(dict, c));
         CHECK(c.first == 0 && c.last == 100 && c.dbFirst == -36.0f && std::abs(c.dbLast) < 5e-6f && c.dbLast <= 0.0f);

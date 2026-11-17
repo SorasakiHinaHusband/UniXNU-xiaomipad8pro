@@ -93,10 +93,15 @@ void audio_live_shared_init(AudioLiveShared *sh, int16_t *out_storage, int16_t *
     (void)audio_ring_init(&sh->out, out_storage, AUDIO_LIVE_RING, 2);
     (void)audio_ring_init(&sh->in, in_storage, AUDIO_LIVE_MIC_RING, 1);
     sh->volume_q15 = volume_q15 < 0 ? 0 : volume_q15 > AUDIO_Q15_ONE ? AUDIO_Q15_ONE : volume_q15;
+    sh->input_q15 = AUDIO_Q15_ONE;
 }
 
 void audio_live_running(AudioLiveShared *sh, int output, int input)
 {
+    if (input && !load(&sh->want_in)) {
+        zero(&sh->input_hal, sizeof sh->input_hal); /* engine stopped */
+        ++sh->input_runs;
+    }
     if (output && !load(&sh->want_out)) {__atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE); store(&sh->sound, 0);}   /* a new run: only its own sound starts the path */
     store(&sh->want_out, output ? 1 : 0);
     store(&sh->want_in, input ? 1 : 0);
@@ -125,8 +130,21 @@ uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t fr
 
 uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames)
 {
-    if (!load(&sh->capturing)) return 0;
+    AudioCaptureHal *h = &sh->input_hal;
+    h->requested += frames;
+    if (!load(&sh->capturing)) {h->startup += frames; return 0;}
     const uint32_t n = audio_ring_read(&sh->in, mono, frames);
+    const int muted = load(&sh->input_muted);
+    const int32_t gain = __atomic_load_n(&sh->input_q15, __ATOMIC_ACQUIRE);
+    if (n && !h->first_delivery) h->first_delivery = h->requested - frames + 1;
+    h->delivered += n;
+    h->missing += frames - n;
+    if (muted) h->muted += n;
+    for (uint32_t i = 0; i < n; ++i) {
+        mono[i] = muted ? 0 : (int16_t)((int32_t)mono[i] * gain / AUDIO_Q15_ONE);
+        if (muted) sh->input_hal.mute_nonzero += mono[i] != 0;
+        audio_capture_sample(&h->pcm, mono[i]);
+    }
     sh->captured += n;
     return n;
 }
@@ -136,6 +154,14 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute)
     if (volume_percent >= 0 && volume_percent <= 100) __atomic_store_n(&sh->volume_q15, audio_volume_q15(volume_percent), __ATOMIC_RELEASE);
     if (mute == 0 || mute == 1) store(&sh->muted, mute);
     sh->controls++;
+}
+
+void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute)
+{
+    const int32_t gain = piano_audio_input_q15(level_percent);
+    if (gain >= 0) __atomic_store_n(&sh->input_q15, gain, __ATOMIC_RELEASE);
+    if (mute == 0 || mute == 1) store(&sh->input_muted, mute);
+    __atomic_add_fetch(&sh->input_controls, 1, __ATOMIC_RELEASE);
 }
 
 /* ------------------------------------------------------------------------------------------------ the configuration */
@@ -628,6 +654,11 @@ static int live_va_off(void *owner)
 
 static void mic_begin(AudioLive *l)
 {
+    zero(l->mic_pcm, sizeof l->mic_pcm);
+    l->mic_frames = l->mic_settle = l->mic_full_frames = l->mic_tail_frames = 0;
+    l->mic_first_read = l->mic_first_pcm = 0;
+    l->mic_drop_base = l->mic_drops; l->mic_repeat_base = l->mic_repeats; l->mic_full_base = l->mic_full;
+    l->mic_underrun_base = l->sh->in.underruns; l->mic_overrun_base = l->sh->in.overruns;
     ar_mic_defaults(&l->micplan);
     l->micplan.buffer_phys = l->ops.dma_phys + AUDIO_DMA_MIC;
     l->micplan.buffer_bytes = AUDIO_MIC_SLOTS * AUDIO_MIC_PERIOD_BYTES;
@@ -650,6 +681,7 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->mic_ending = l->cap_unsent = l->cap_error = 0;
     l->mic_reason = 0;
     l->mic_at = now;
+    l->mic_diag_at = now;
     l->mic_idle_at = 0;
     if (ar_pump_init_capture(&l->cap, base, l->mplan.seq.handle, l->ports->data, AUDIO_MIC_SLOTS, AUDIO_MIC_PERIOD_BYTES,
                              AUDIO_LIVE_MIC_DEPTH, AUDIO_LATE_MS))
@@ -670,14 +702,26 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
     uint32_t frames = a->data_bytes / 4u;
     if (frames > AUDIO_PERIOD_FRAMES) frames = AUDIO_PERIOD_FRAMES;
     const int settle = now - l->mic_at < AUDIO_LIVE_MIC_SETTLE_MS;
+    if (!l->mic_first_read) l->mic_first_read = now - l->mic_at + 1;
+    l->mic_frames += frames;
+    if (settle) l->mic_settle += frames;
     for (uint32_t i = 0; i < frames; ++i) {
         const int16_t a0 = (int16_t)(src[4 * i] | src[4 * i + 1] << 8), a1 = (int16_t)(src[4 * i + 2] | src[4 * i + 3] << 8);
-        l->mono[i] = settle ? 0 : (int16_t)(((int32_t)a0 + a1) / 2);
+        const int16_t mono = (int16_t)(((int32_t)a0 + a1) / 2);
+        audio_capture_sample(&l->mic_pcm[0], a0);
+        audio_capture_sample(&l->mic_pcm[1], a1);
+        audio_capture_sample(&l->mic_pcm[2], mono);
+        if ((a0 || a1) && !l->mic_first_pcm) l->mic_first_pcm = now - l->mic_at + 1;
+        l->mono[i] = settle ? 0 : mono;
     }
     l->mic_periods++;
     AudioRing *r = &l->sh->in;
     const uint32_t fill = audio_ring_fill(r);
-    if (fill > AUDIO_LIVE_MIC_TARGET + 3u * AUDIO_PERIOD_FRAMES) {l->mic_full++; drift_reset(&l->mic_drift); return;}   /* not read: dropped */
+    if (fill > AUDIO_LIVE_MIC_TARGET + 3u * AUDIO_PERIOD_FRAMES) {
+        l->mic_full++;
+        if (load(&l->sh->want_in)) l->mic_full_frames += frames; else l->mic_tail_frames += frames;
+        drift_reset(&l->mic_drift); return;
+    }   /* not read: dropped */
     const int slip = drift_update(&l->mic_drift, fill);
     if (frames && slip > 0) {
         frames--;   /* the Mic's engine runs slow: one frame less */
@@ -690,9 +734,33 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
     (void)audio_ring_write(r, l->mono, frames);
 }
 
+/* Bounded snapshots, at one-second intervals and stop, rather than one line
+ * per 10 ms READ. Totals start at this DSP capture run; HAL totals identify
+ * their independent StartIO window. PCM sums/squares permit AC/DC analysis. */
+void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now)
+{
+    const ArPump *p = &l->cap;
+    LOG(l, "mic health: run %u event %s ms %u active %d sent %u returned %u flight %u errors %u late %u status %#x bytes %llu min %u max %u offset-min %u offset-max %u short %u zero %u align %u origin %u range %u",
+        l->mic_starts, event, now - l->mic_at, load(&l->sh->want_in), p->sent, p->returned, p->in_flight, p->errors, p->late,
+        p->last_status, (unsigned long long)p->returned_bytes, p->min_bytes, p->max_bytes, p->min_offset, p->max_offset,
+        p->short_returns, p->zero_returns, p->bad_alignment, p->bad_origin, p->bad_range);
+    LOG(l, "mic frames: run %u returned %llu settle %llu full-periods %u active-full %llu idle-tail %llu fifo-missing %llu fifo-overrun %llu drop %u repeat %u fill %u first-read-ms+1 %u first-pcm-ms+1 %u",
+        l->mic_starts, (unsigned long long)l->mic_frames, (unsigned long long)l->mic_settle, l->mic_full - l->mic_full_base,
+        (unsigned long long)l->mic_full_frames, (unsigned long long)l->mic_tail_frames,
+        (unsigned long long)(l->sh->in.underruns - l->mic_underrun_base), (unsigned long long)(l->sh->in.overruns - l->mic_overrun_base),
+        l->mic_drops - l->mic_drop_base, l->mic_repeats - l->mic_repeat_base, audio_ring_fill(&l->sh->in), l->mic_first_read, l->mic_first_pcm);
+    for (unsigned i = 0; i < 3; ++i) {
+        const AudioCapturePcm *s = &l->mic_pcm[i];
+        LOG(l, "mic PCM: run %u layer %s frames %llu nonzero %llu peak %u sum %lld squares %llu clipped %llu",
+            l->mic_starts, i == 0 ? "DEC0" : i == 1 ? "DEC1" : "mono", (unsigned long long)s->frames,
+            (unsigned long long)s->nonzero, s->peak, (long long)s->sum, (unsigned long long)s->squares, (unsigned long long)s->clipped);
+    }
+}
+
 static void mic_fault(AudioLive *l, int reason, uint32_t now)
 {
     store(&l->sh->capturing, 0);
+    audio_live_mic_report(l, "fault", now);
     l->mic_reason = reason;
     LOG(l, "live: mic: STOPPED: %s after %u ms (%u periods sent, %u returned, %u late, %u errors, last status %#x): undoing the plan",
         audio_guard_reason(reason), now - l->mic_at, l->cap.sent, l->cap.returned, l->cap.late, l->cap.errors, l->cap.last_status);
@@ -707,6 +775,7 @@ static void capture_tick(AudioLive *l, uint32_t now)
     if (r && l->sleeping) {l->sleep_failed=1; return;}
     if (r) {mic_fault(l, r, now); return;}
     if (l->sleeping) l->mic_ending = 1;
+    if (now - l->mic_diag_at >= 1000) {audio_live_mic_report(l, "tick", now); l->mic_diag_at = now;}
     if (load(&l->sh->want_in)) l->mic_idle_at = 0;
     else if (!l->mic_idle_at) l->mic_idle_at = now ? now : 1;
     if (l->mic_idle_at && now - l->mic_idle_at >= l->cfg.idle_ms) l->mic_ending = 1;
@@ -723,6 +792,7 @@ static void capture_tick(AudioLive *l, uint32_t now)
     }
     if (l->mic_ending && !l->cap_unsent && !l->cap.in_flight) {
         store(&l->sh->capturing, 0);
+        audio_live_mic_report(l, "stop", now);
         LOG(l, "live: mic: the Mic device stopped: down after %u ms (%u periods, %u dropped, %u repeated, %u times the ring was full): "
             "the plan undone", now - l->mic_at, l->mic_periods, l->mic_drops, l->mic_repeats, l->mic_full);
         ar_seq_stop(&l->mplan.seq);
@@ -764,6 +834,8 @@ static void mic_tick(AudioLive *l, uint32_t now)
         else if (reason && reason != AudioGuardLate && reason != AudioGuardQuiet) l->mic_state = LiveOff;
         else l->mic_state = LiveDown;
         LOG(l, "live: mic: %s", l->mic_state == LiveOff ? "the mic path is OFF for this boot" : "down");
+        LOG(l, "mic release: run %u down %d va %d handle %#x undo-errors %u", l->mic_starts, down, l->va_on,
+            l->mplan.seq.handle, l->mplan.seq.undo_errors);
     }
 }
 
@@ -881,6 +953,11 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
     l->received++;
     ArAnswer a;
     const int kind = ar_parse(packet, length, &a);
+    if (kind == ArBad && a.opcode == AR_OP_READ_DONE && a.dst_port == l->ports->data && l->mic_state == LiveRunning) {
+        l->cap.bad_range++; l->cap.errors++; l->cap_error = 1;
+        LOG(l, "live: dsp: READ_DONE refused: malformed payload %u", a.payload_bytes);
+        return;
+    }
     if (kind == ArWriteDone && l->spk_state == LiveRunning) {
         const int r = ar_pump_done(&l->pump, &a);
         if (r == 1) {++l->done_batch; return;}

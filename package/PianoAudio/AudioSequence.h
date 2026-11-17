@@ -138,6 +138,9 @@ typedef struct {
     uint8_t busy[AR_PUMP_MAX_SLOTS];
     uint32_t last_slot;      /* the slot of the last period returned */
     uint32_t sent, returned, errors, late, last_status;
+    uint32_t bad_origin, bad_alignment, bad_range, short_returns, zero_returns;
+    uint32_t min_bytes, max_bytes, min_offset, max_offset;
+    uint64_t returned_bytes;
 } ArPump;
 /* 0, or -1 for a geometry that does not fit (slots 2..16, depth 1..slots, period > 0). */
 int ar_pump_init(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint32_t slots, uint32_t period_bytes, uint32_t depth,

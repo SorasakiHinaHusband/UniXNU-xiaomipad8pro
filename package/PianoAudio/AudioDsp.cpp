@@ -183,6 +183,20 @@ uint32_t gTickMaxUs, gSliceMaxUs;
 uint32_t gPmRequest, gPmAck, gPmSleep, gPmGeneration;
 int gPmResult, gPmFailed;
 
+uint32_t gMicHalReportAt, gMicHalControls;
+
+void micHalReport(const char *event)
+{
+    const AudioCaptureHal &h = gShared->input_hal; // engine thread, or stopped
+    piano_audio_log("mic HAL: run %u event %s requested %llu delivered %llu startup %llu missing %llu muted %llu mute-nonzero %llu first-frame+1 %llu gain-q15 %d mute %d",
+        gShared->input_runs, event, (unsigned long long)h.requested, (unsigned long long)h.delivered,
+        (unsigned long long)h.startup, (unsigned long long)h.missing, (unsigned long long)h.muted,
+        (unsigned long long)h.mute_nonzero, (unsigned long long)h.first_delivery,
+        __atomic_load_n(&gShared->input_q15, __ATOMIC_ACQUIRE), __atomic_load_n(&gShared->input_muted, __ATOMIC_ACQUIRE));
+    piano_audio_log("mic HAL PCM: run %u frames %llu nonzero %llu peak %u sum %lld squares %llu clipped %llu",
+        gShared->input_runs, (unsigned long long)h.pcm.frames, (unsigned long long)h.pcm.nonzero, h.pcm.peak,
+        (long long)h.pcm.sum, (unsigned long long)h.pcm.squares, (unsigned long long)h.pcm.clipped);
+}
 
 uint32_t elapsedUs(uint64_t start)
 {
@@ -214,6 +228,8 @@ void liveSleep(uint32_t ms)
 
 void dspRunning(void *, int output, int input)
 {
+    const bool wasInput = __atomic_load_n(&gShared->want_in, __ATOMIC_ACQUIRE) != 0;
+    if (!input && wasInput) micHalReport("stop");
     const bool wasOutput = __atomic_load_n(&gShared->want_out, __ATOMIC_ACQUIRE) != 0;
     if (gLive && output && !wasOutput) {
         gIoSound = gLive->sound_periods;
@@ -232,6 +248,11 @@ void dspRunning(void *, int output, int input)
     }
     __atomic_store_n(&gShared->boundary_ms,nowMs(),__ATOMIC_RELEASE);
     audio_live_running(gShared, output, input);
+    if (input && !wasInput) {
+        gMicHalReportAt = nowMs();
+        gMicHalControls = __atomic_load_n(&gShared->input_controls, __ATOMIC_ACQUIRE);
+        micHalReport("start");
+    }
     liveWake();
 }
 uint32_t dspPlay(void *, const int16_t *stereo, uint32_t frames)
@@ -241,14 +262,31 @@ uint32_t dspPlay(void *, const int16_t *stereo, uint32_t frames)
     if (wake) liveWake();
     return n;
 }
-uint32_t dspCapture(void *, int16_t *mono, uint32_t frames) {return audio_live_capture(gShared, mono, frames);}
+uint32_t dspCapture(void *, int16_t *mono, uint32_t frames)
+{
+    const bool first = !gShared->input_hal.first_delivery;
+    const uint32_t n = audio_live_capture(gShared, mono, frames);
+    const uint32_t now = nowMs(), controls = __atomic_load_n(&gShared->input_controls, __ATOMIC_ACQUIRE);
+    if (first && n) piano_audio_log("mic HAL first: run %u host-ms %u frames %u", gShared->input_runs, now, n);
+    if (now - gMicHalReportAt >= 1000 || controls != gMicHalControls) {
+        micHalReport(controls != gMicHalControls ? "control" : "tick");
+        gMicHalReportAt = now; gMicHalControls = controls;
+    }
+    return n;
+}
 void dspControl(void *, int volume, int mute)
 {
     audio_live_control(gShared, volume, mute);
     liveWake();   // an unmute while sound plays brings the speaker path up again
 }
+void dspInputControl(void *, int level, int mute)
+{
+    audio_live_input_control(gShared, level, mute);
+    piano_audio_log("mic control: input-level %d mute %d gain-q15 %d effective-mute %d contract mic-input1:linear-db:pre-HAL",
+        level, mute, __atomic_load_n(&gShared->input_q15, __ATOMIC_ACQUIRE), __atomic_load_n(&gShared->input_muted, __ATOMIC_ACQUIRE));
+}
 const PianoPcmTransport kDsp = {"dsp", nullptr, AUDIO_LIVE_OUTPUT_LATENCY, AUDIO_LIVE_INPUT_LATENCY, dspRunning, dspPlay, dspCapture,
-                                dspControl};
+                                dspControl, dspInputControl};
 
 void liveSummary(const AudioLive &l, char *line, size_t size)
 {

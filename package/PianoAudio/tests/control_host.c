@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "../AudioControl.h"
 #include "../AudioControlNotification.h"
 
@@ -108,6 +109,22 @@ int main(void)
     CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
     corrupt[10] = 50; corrupt[15] = 1;
     CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
+    /* input state follows */
     printf("audio control host: %u checks (integer raw + independent counted-cval receiver)\n", checks);
+    CHECK(piano_audio_control_scope(1) == 0x696e7074U);
+    CHECK(piano_audio_control_scope(0) == PIANO_AUDIO_CONTROL_SCOPE_OUTPUT);
+    CHECK(!strcmp(piano_audio_level_key(1), "piano-audio-input-level"));
+    CHECK(!strcmp(piano_audio_mute_key(1), "piano-audio-input-mute"));
+    CHECK(strcmp(piano_audio_mute_key(1), piano_audio_mute_key(0)));
+    CHECK(piano_audio_control_decode(1, 1, 50) == 50);
+    CHECK(piano_audio_control_decode(1, 2, 1) == 1);
+    CHECK(piano_audio_control_decode(1, 99, 50) == -1);
+    CHECK(piano_audio_control_decode(1, 1, 101) == -1);
+    CHECK(piano_audio_control_decode(1, 1, UINT64_MAX) == -1);
+    d.d = 0.1; CHECK(piano_audio_control_decode(1, 1, d.u) == 10);
+    d.d = NAN; CHECK(piano_audio_control_decode(1, 1, d.u) == -1);
+    d.d = INFINITY; CHECK(piano_audio_control_decode(1, 1, d.u) == -1);
+    d.d = -0.5; CHECK(piano_audio_control_decode(1, 1, d.u) == -1);
+    f.f = NAN; CHECK(piano_audio_control_decode(1, 1, f.u) == -1);
     return 0;
 }

@@ -162,11 +162,12 @@ uint32_t ar_prm_vote(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t to
 
 /* Answers. */
 typedef struct {
-    uint32_t opcode, token, src_port, dst_port, src_domain;
+    uint32_t opcode, token, src_port, dst_port, src_domain, dst_domain;
     uint32_t result_opcode, status;  /* basic result: the command and its status (0 success); framework state: 1 ready; PRM: status */
     uint32_t handle;                 /* AR_OP_MEM_MAP_DONE */
     uint64_t address;                /* write/read done: the buffer */
     uint32_t data_bytes, offset;     /* read done: bytes filled, starting offset bytes into the buffer */
+    uint32_t payload_bytes;
 } ArAnswer;
 enum {ArUnknown = 0, ArBasicResult = 1, ArMapped = 2, ArWriteDone = 3, ArReadDone = 4, ArFrameworkState = 5, ArPrmDone = 6, ArBad = -1};
 int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a);

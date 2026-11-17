@@ -424,6 +424,7 @@ int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a)
     for (unsigned i = 0; i < sizeof *a; ++i) ((uint8_t *)a)[i] = 0;
     if (gpr_decode(in, length, &p) != GprOk) return ArBad;
     a->opcode = p.opcode; a->token = p.token; a->src_port = p.src_port; a->dst_port = p.dst_port; a->src_domain = p.src_domain;
+    a->dst_domain = p.dst_domain; a->payload_bytes = p.payload_bytes;
     const uint8_t *d = p.payload;
     switch (p.opcode) {
     case GPR_OP_BASIC_RESULT:
