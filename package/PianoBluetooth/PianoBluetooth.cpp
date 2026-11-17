@@ -1134,8 +1134,13 @@ void PianoBluetooth::pump()
     setProperty("piano-bt-h4-completions", fCompletions, 64);
     setProperty("piano-bt-h4-le-reports", fLeReports, 64);
     setProperty("piano-bt-h4-backpressure", p.backpressurePolls, 64);
-    note("bt-path1: H4 stats rx=%llu tx=%llu packets=%llu/%llu completions=%llu LE-reports=%llu retained=%lu backpressure=%llu TX-timeouts=%u",
-         p.rxBytes, p.txBytes, fRxPackets, fTxPackets, fCompletions, fLeReports, (unsigned long)p.rawHave, p.backpressurePolls, p.txTimeouts);
+    const auto &framing = fRxDecoder.stats();
+    setProperty("piano-bt-h4-resyncs", framing.resyncs, 64);
+    setProperty("piano-bt-h4-oversized", framing.oversized, 64);
+    setProperty("piano-bt-h4-ibs", framing.ibs, 64);
+    note("bt-path1: H4 stats rx=%llu tx=%llu packets=%llu/%llu completions=%llu LE-reports=%llu retained=%lu backpressure=%llu TX-timeouts=%u resyncs=%llu oversized=%llu IBS=%llu",
+         p.rxBytes, p.txBytes, fRxPackets, fTxPackets, fCompletions, fLeReports, (unsigned long)p.rawHave, p.backpressurePolls, p.txTimeouts,
+         framing.resyncs, framing.oversized, framing.ibs);
   }
 }
 
