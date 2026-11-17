@@ -95,6 +95,61 @@ inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t c
 inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t cap, const avc::Config &cfg, bool prepend) {
   return avc::normalize(p,n,out,cap,cfg,prepend);
 }
+// Target version6 indexed keys are stable table positions, confirmed in the
+// decoded 27.3 initializer: SampleDescriptionExtensionAtoms=49 (0x1972d1cd8),
+// avcC=105 and sinf=109 (0x1972d2038; constant strings 0x19735aff4).
+inline bool dictionaryEntry(const uint8_t *p, uint32_t n, uint16_t index, const char *name, vtwire::Atom &out, bool *present = nullptr) {
+  if (!atoms(p,n)) return false;
+  const uint8_t *at=p,*end=p+n; vtwire::Atom item; bool found=false;
+  while (vtwire::next(at,end,item)) {
+    if (item.type != vtwire::cc("keyv") || !atoms(item.body,item.size)) return false;
+    const uint8_t *q=item.body,*e=q+item.size;vtwire::Atom key,value;
+    if (!vtwire::next(q,e,key) || !vtwire::next(q,e,value) || q!=e) return false;
+    bool match=false;
+    if (key.type==vtwire::cc("idxk")) {
+      if (key.size!=2) return false;
+      match=(uint32_t(key.body[0])|(uint32_t(key.body[1])<<8))==index;
+    } else if (key.type==vtwire::cc("strk")) {
+      char text[128];if(!vtwire::plistString(key.body,key.size,text,sizeof text))return false;
+      match=!strcmp(text,name);
+    } else return false;
+    if (match) { if(present)*present=true;if(found)return false;found=true;out=value; }
+  }
+  return found;
+}
+inline bool plistData(const uint8_t *p,uint32_t n,const uint8_t *&bytes,uint32_t &count) {
+  if (!p || n<41 || memcmp(p,"bplist00",8))return false;
+  const uint8_t *t=p+n-32;const unsigned os=t[6];
+  if (!os || os>8 || t[7]!=1 || vtwire::be64(t+8)!=1 || vtwire::be64(t+16)!=0)return false;
+  const uint64_t table=vtwire::be64(t+24);if(table<9 || table>n-32 || os>n-32-table)return false;
+  uint64_t at=0;for(unsigned i=0;i<os;++i)at=(at<<8)|p[table+i];
+  if(at<8 || at>=table || (p[at]&0xf0)!=0x40)return false;
+  uint64_t length=p[at++]&15;
+  if(length==15){if(at>=table || (p[at]&0xf0)!=0x10 || (p[at]&15)>3)return false;
+    const unsigned size=1u<<(p[at++]&15);if(size>table-at)return false;
+    length=0;for(unsigned i=0;i<size;++i)length=(length<<8)|p[at++];
+  }
+  if(length>UINT32_MAX || length!=table-at)return false;
+  bytes=p+at;count=uint32_t(length);return true;
+}
+inline bool sampleFormat(const vtwire::Atom &fdsc,const avc::Config &cfg) {
+  using namespace vtwire; Atom media,codec,dimensions,extensions,dictionary,description,configuration;
+  auto le32=[](const uint8_t *p){uint32_t v;memcpy(&v,p,4);return v;};
+  if (!unique(fdsc.body,fdsc.size,cc("mdia"),media) || media.size!=4 || le32(media.body)!=cc("vide") ||
+      !unique(fdsc.body,fdsc.size,cc("codc"),codec) || codec.size!=4 || le32(codec.body)!=cc("avc1") ||
+      !unique(fdsc.body,fdsc.size,cc("vdim"),dimensions) || dimensions.size!=8 || le32(dimensions.body)!=320 || le32(dimensions.body+4)!=240 ||
+      !unique(fdsc.body,fdsc.size,cc("extn"),extensions) || !unique(extensions.body,extensions.size,cc("dict"),dictionary))return false;
+  Atom protection; bool protectedData=false;
+  dictionaryEntry(dictionary.body,dictionary.size,101,"CommonEncryptionProtected",protection,&protectedData);
+  dictionaryEntry(dictionary.body,dictionary.size,102,"CommonEncryptionTrackEncryptionBox",protection,&protectedData);
+  dictionaryEntry(dictionary.body,dictionary.size,103,"CommonEncryptionOriginalFormat",protection,&protectedData);
+  if (protectedData || !dictionaryEntry(dictionary.body,dictionary.size,49,"SampleDescriptionExtensionAtoms",description) || description.type!=cc("dict") ||
+      !dictionaryEntry(description.body,description.size,105,"avcC",configuration) || configuration.type!=cc("datv"))return false;
+  dictionaryEntry(description.body,description.size,109,"sinf",protection,&protectedData);
+  if(protectedData)return false;
+  const uint8_t *p=nullptr;uint32_t n=0;avc::Config incoming;
+  return plistData(configuration.body,configuration.size,p,n) && avc::config(p,n,incoming) && cfg.same(incoming);
+}
 struct InputReport {
   int64_t token = 0;
   bool hasToken = false, transportReject = false;
@@ -146,6 +201,10 @@ inline bool inputRequest(const uint8_t *m, uint32_t n, InputReport &r, const avc
         (!unique(sbuf.body,sbuf.size,vtwire::cc("opts"),outputPts) || outputPts.size != 24 || !finiteTime(outputPts.body,true))) return false;
     if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("crpt"),protectedAtom) ||
         vtwire::find(sbuf.body,sbuf.size,vtwire::cc("kdcr"),protectedAtom)) return false;
+    r.decision = "sample-format-change";
+    vtwire::Atom fdsc;
+    if (vtwire::find(sbuf.body,sbuf.size,vtwire::cc("fdsc"),fdsc) &&
+        (!unique(sbuf.body,sbuf.size,vtwire::cc("fdsc"),fdsc) || !sampleFormat(fdsc,*cfg)))return false;
     r.decision = "sample-not-qualified";
     if (!avc::accessUnit(r.data,r.bytes,*cfg,&r.picture)) return false;
   } else if (!sample(r.data,r.bytes)) return false;

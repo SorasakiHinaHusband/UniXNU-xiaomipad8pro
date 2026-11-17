@@ -58,9 +58,29 @@ static std::vector<uint8_t> frameRequest(const std::vector<uint8_t> &sample,uint
   std::vector<uint8_t> request(head,head+w.size());const auto at=request.size();request.resize(at+16+sbuf.size());
   put32(request.data()+at,uint32_t(16+sbuf.size()));put32(request.data()+at+4,cc("para"));put32(request.data()+at+8,cc(",sbf"));put32(request.data()+at+12,cc("=sbf"));memcpy(request.data()+at+16,sbuf.data(),sbuf.size());return request;
 }
+static std::vector<uint8_t> entry(unsigned key,uint32_t type,const std::vector<uint8_t> &value) {
+  std::vector<uint8_t> body;uint8_t idx[2]={uint8_t(key),uint8_t(key>>8)};
+  appendAtom(body,vtwire::cc("idxk"),idx,2);appendAtom(body,type,value.data(),uint32_t(value.size()));
+  std::vector<uint8_t> out;appendAtom(out,vtwire::cc("keyv"),body.data(),uint32_t(body.size()));return out;
+}
+static std::vector<uint8_t> sampleFormatBody(const std::vector<uint8_t> &conf,bool protection=false,bool duplicate=false) {
+  using namespace vtwire;uint8_t plist[1024];Plist pl;int top=pl.data(conf.data(),uint32_t(conf.size()));unsigned n=pl.write(top,plist,sizeof plist);
+  auto e=entry(105,cc("datv"),{plist,plist+n});auto descriptions=e;if(duplicate)descriptions.insert(descriptions.end(),e.begin(),e.end());
+  if(protection){auto sinf=entry(109,cc("datv"),{plist,plist+n});descriptions.insert(descriptions.end(),sinf.begin(),sinf.end());}
+  auto dict=entry(49,cc("dict"),descriptions);std::vector<uint8_t> extn;appendAtom(extn,cc("dict"),dict.data(),uint32_t(dict.size()));
+  std::vector<uint8_t> fdsc;uint32_t media=cc("vide"),codec=cc("avc1"),dims[2]={320,240};
+  appendAtom(fdsc,cc("mdia"),&media,4);appendAtom(fdsc,cc("codc"),&codec,4);appendAtom(fdsc,cc("vdim"),dims,8);appendAtom(fdsc,cc("extn"),extn.data(),uint32_t(extn.size()));return fdsc;
+}
 static void streamTests() {
   const auto s=makeSps(), p=makePps();auto conf=avcc(s,p);avc::Config c;
   CHECK(avc::config(conf.data(),uint32_t(conf.size()),c));CHECK(c.valid()&&c.pocType==0&&c.hfiProfile()==1&&c.hfiLevel()==4&&c.s.maxReorder==1&&c.s.maxDpb==2);
+  auto formatBody=sampleFormatBody(conf);vtwire::Atom fdsc;fdsc.type=vtwire::cc("fdsc");fdsc.body=formatBody.data();fdsc.size=uint32_t(formatBody.size());
+  CHECK(vtcontract::sampleFormat(fdsc,c));
+  for(auto bad:{sampleFormatBody(conf,true),sampleFormatBody(conf,false,true),sampleFormatBody(avcc(makeSps(77,2),p))}){
+    fdsc.body=bad.data();fdsc.size=uint32_t(bad.size());CHECK(!vtcontract::sampleFormat(fdsc,c));
+  }
+  auto invalidFormat=formatBody;invalidFormat[8]^=1;fdsc.body=invalidFormat.data();fdsc.size=uint32_t(invalidFormat.size());CHECK(!vtcontract::sampleFormat(fdsc,c));
+  fdsc.body=formatBody.data();for(unsigned n=0;n<formatBody.size();++n){fdsc.size=n;CHECK(!vtcontract::sampleFormat(fdsc,c));}
   CHECK(c.same(c));avc::Config different=c;different.pps[2]^=1;CHECK(!c.same(different));
   CHECK(!avc::config(nullptr,0,different));
   for(auto invalid:{makeSps(100),makeSps(77,1),makeSps(77,0,5),makeSps(77,0,2,20),makeSps(77,0,2,19,true),makeSps(77,0,2,19,false,true),makeSps(77,0,2,19,false,false,3)}){
@@ -96,6 +116,9 @@ static void streamTests() {
   auto empty=std::vector<uint8_t>{};appendNal(empty,s);appendNal(empty,p);CHECK(!avc::accessUnit(empty.data(),uint32_t(empty.size()),c));
   auto protectedHeader=samples[1];protectedHeader[4]|=0x80;CHECK(!avc::accessUnit(protectedHeader.data(),uint32_t(protectedHeader.size()),c));
   auto badLength=samples[1];vtwire::put32(badLength.data(),uint32_t(badLength.size()));CHECK(!avc::accessUnit(badLength.data(),uint32_t(badLength.size()),c));
+  // Every bit of the admitted parameter record is bounded even on malformed
+  // input; sanitizer runs exercise this same parser used by the kernel.
+  for(unsigned i=0;i<conf.size()*8;++i){auto mutated=conf;mutated[i/8]^=uint8_t(1u<<(i%8));avc::Config parsed;(void)avc::config(mutated.data(),uint32_t(mutated.size()),parsed);}
   uint8_t forbidden[]={0x61,0,0,1};CHECK(!avc::ebsp(forbidden,sizeof forbidden));forbidden[3]=3;CHECK(!avc::ebsp(forbidden,sizeof forbidden));
   uint8_t escaped[]={0x61,0,0,3,2};CHECK(avc::ebsp(escaped,sizeof escaped));escaped[4]=4;CHECK(!avc::ebsp(escaped,sizeof escaped));
 }

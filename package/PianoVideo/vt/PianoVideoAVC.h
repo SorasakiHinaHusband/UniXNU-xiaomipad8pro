@@ -185,7 +185,7 @@ inline uint32_t normalize(const uint8_t *p, uint32_t n, uint8_t *out, uint32_t c
   }
   return at;
 }
-inline bool normalized(const uint8_t *p, uint32_t n, const Config &c) {
+inline bool normalized(const uint8_t *p, uint32_t n, const Config &c, Picture *picture = nullptr) {
   if (!p || !c.valid() || n < 6 || n > MaxAu) return false;
   uint32_t at = 0, count = 0, previousMb = 0; bool have = false;
   Picture first;
@@ -210,6 +210,7 @@ inline bool normalized(const uint8_t *p, uint32_t n, const Config &c) {
     } else if (kind != 6 || have) return false;
     at = end;
   }
+  if (have && picture) *picture = first;
   return have;
 }
 } }
