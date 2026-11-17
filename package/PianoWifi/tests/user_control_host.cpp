@@ -54,6 +54,13 @@ int main()
   CHECK(u.allowed(u.read()));
   // Polling GET13/19/21 before the timer does not consume events. Exactly one
   // notification survives repeated polls, with coherent current reads.
+  Association canceled = {}, newJoin = {}, failed = {};
+  canceled.result = 2;
+  CHECK(!associationLinkDownEvent(canceled, newJoin)); // canceled2 -> fresh pending0 must not abort auto-join
+  failed.result = 2;
+  CHECK(associationLinkDownEvent(newJoin, failed));
+  Association oldLink = {}; oldLink.associated = oldLink.authorized = true; oldLink.result = 1;
+  CHECK(associationLinkDownEvent(oldLink, newJoin));
   State st;
   Association connected = {};
   connected.associated = connected.authorized = true;

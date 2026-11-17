@@ -1074,7 +1074,7 @@ void PianoWifi80211::syncAssociation(bool emit)
     if (ssidChanged) postEvent(kEvSsidChanged);
     if (bssidChanged) postEvent(kEvBssidChanged);
     postEvent(kEvLinkChanged, &link, sizeof link);
-  } else if (transition.disconnected || (!next.associated && resultChanged)) {
+  } else if (associationLinkDownEvent(old, next)) {
     link.down = 1;
     postEvent(kEvLinkChanged, &link, sizeof link);
     if (next.result && !transition.assocDone && !raw.user_stop) assocDone(next);

@@ -3920,7 +3920,7 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   bool newRequest = false;
   if (gProfileLock) {
     IOLockLock(gProfileLock);
-    newRequest = gProfileSet && gProfileGeneration != gStaProfileGeneration;
+    newRequest = gProfileFromMenu && gProfileSet && gProfileGeneration != gStaProfileGeneration;
     IOLockUnlock(gProfileLock);
   }
   out->user_stop = !gUserControl.allowed(user) || newRequest;

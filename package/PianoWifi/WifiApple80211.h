@@ -532,6 +532,15 @@ inline AssociationTransition associationTransition(const Association &old, const
   return t;
 }
 
+// A new pending result0 is progress, not another link-down indication.
+// Failure before association still needs a down notification; an old live
+// association going away always does, independently of the result code.
+inline bool associationLinkDownEvent(const Association &old, const Association &next)
+{
+  return associationTransition(old, next).disconnected ||
+         (!next.associated && next.result != 0 && old.result != next.result);
+}
+
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
