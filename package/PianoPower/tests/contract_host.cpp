@@ -197,13 +197,47 @@ static void invalidation() {
     auto initialGeneration=notifyCommand.c.generation;
     assert(piano_contract_receive(&notifyCommand.c,notifyCommand.now,notify,24)==1);
     assert(notifyCommand.c.generation==initialGeneration); // command completion notify alone is not a detach
-    notifyCommand.complete(); assert(notifyCommand.c.valid && notifyCommand.c.generation==initialGeneration);
+    auto notifyTargetSeq=notifyCommand.c.seq+1;
+    for(unsigned i=0; i<100 && notifyCommand.c.seq<notifyTargetSeq; ++i) assert(notifyCommand.step()>=0);
+    assert(notifyCommand.c.valid && notifyCommand.c.generation==initialGeneration && notifyCommand.c.seq==notifyTargetSeq);
     Ppm stale; stale.complete(); auto previousGeneration=stale.c.generation;
     piano_contract_refresh(&stale.c); stale.snapshots=0; stale.shortStatus=true; stale.complete();
     assert(!stale.c.valid && !stale.c.status_valid && !stale.c.pdos && !stale.c.ma && stale.c.generation==previousGeneration);
     Ppm sourceChange; sourceChange.complete(); previousGeneration=sourceChange.c.generation;
     sourceChange.pdos[1]=fixed(9000,1800); piano_contract_refresh(&sourceChange.c); sourceChange.snapshots=0; sourceChange.complete();
     assert(sourceChange.c.valid && sourceChange.c.source_ma==1800 && sourceChange.c.generation==previousGeneration+1);
+    Ppm active; active.complete();
+    auto activeSeq=active.c.seq, activeGen=active.c.generation; auto activeUpdated=active.c.updated_ms;
+    piano_contract_refresh(&active.c); assert(active.step()==1); // periodic status GET written, no CCI yet
+    auto activeCommand=active.c.command; auto activeWrites=active.writes;
+    assert(active.c.stage==PianoContractStatus && active.c.wire==2);
+    assert(piano_contract_receive(&active.c,active.now,notify,24)==1);
+    auto activeNotifyMs=active.c.notify_ms;
+    assert(active.c.notify_pending && active.c.stage==PianoContractStatus && active.c.command==activeCommand);
+    assert(active.c.valid && !piano_contract_fresh(&active.c,active.now));
+    assert(active.c.seq==activeSeq && active.c.generation==activeGen && active.c.updated_ms==activeUpdated);
+    assert(active.step()==2); // next non-BUSY CCI resolves notification mid-GET
+    assert(!active.c.notify_pending && active.c.stage==PianoContractAck && active.c.valid);
+    assert(active.writes==activeWrites && active.c.seq==activeSeq && active.c.updated_ms==activeUpdated);
+    assert(piano_contract_fresh(&active.c,active.now));
+    for(unsigned i=0; i<100 && active.c.seq==activeSeq; ++i) assert(active.step()>=0);
+    assert(active.c.seq==activeSeq+1 && active.c.generation==activeGen);
+    Ppm activeBusy; activeBusy.complete(); piano_contract_refresh(&activeBusy.c); assert(activeBusy.step()==1);
+    assert(piano_contract_receive(&activeBusy.c,activeBusy.now,notify,24)==1);
+    activeNotifyMs=activeBusy.c.notify_ms; activeCommand=activeBusy.c.command; activeUpdated=activeBusy.c.updated_ms;
+    activeBusy.busy=true; activeBusy.cciConnector=127; activeBusy.shortPayload=true; activeBusy.ucsiError=true;
+    assert(activeBusy.step()==1 && activeBusy.c.notify_pending && activeBusy.c.command==activeCommand);
+    activeBusy.now+=200;
+    assert(piano_contract_receive(&activeBusy.c,activeBusy.now,notify,24)==1);
+    assert(activeBusy.c.notify_ms==activeNotifyMs && activeBusy.c.updated_ms==activeUpdated);
+    assert(activeBusy.step()==1 && activeBusy.c.notify_pending);
+    assert(!piano_contract_next(&activeBusy.c,activeNotifyMs+5000,request));
+    assert(activeBusy.c.quarantined && !activeBusy.c.valid && activeBusy.c.last_error==PIANO_CONTRACT_TIMEOUT);
+    Ppm activeConnector; activeConnector.complete(); activeGen=activeConnector.c.generation;
+    piano_contract_refresh(&activeConnector.c); assert(activeConnector.step()==1);
+    assert(piano_contract_receive(&activeConnector.c,activeConnector.now,notify,24)==1);
+    activeConnector.cciConnector=1; assert(activeConnector.step()==2);
+    assert(!activeConnector.c.valid && !activeConnector.c.notify_pending && activeConnector.c.generation==activeGen+1);
     Ppm notifyError; notifyError.complete();
     assert(piano_contract_receive(&notifyError.c,notifyError.now,notify,24)==1);
     notifyError.ucsiError=true; assert(notifyError.step()==-1);

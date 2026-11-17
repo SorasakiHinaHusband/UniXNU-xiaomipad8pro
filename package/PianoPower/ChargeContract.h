@@ -224,23 +224,26 @@ static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_m
     c->updated_ms = now_ms; ++c->seq; c->stage = PianoContractIdle; c->wire = 0;
 }
 /* Return 0 not this owner/unexpected late transport ACK; 1 consumed; 2 new
- * complete snapshot or resolved idle notification; -1 invalidated. Notify only schedules CCI reading: the
+ * complete snapshot or resolved notification; -1 invalidated. Notify only schedules CCI reading: the
  * notification also denotes command completion and is NOT itself a detach. */
 static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms, const uint8_t *data, uint32_t length) {
     uint32_t opcode, cci, result, payload, flags, rdo; uint16_t version;
-    uint64_t echo; unsigned bytes, i, n, next;
+    uint64_t echo; unsigned bytes, i, n, next; int notify_resolved;
     const uint8_t *message;
     if (!data || length < 12 || piano_contract_u32(data) != PIANO_CONTRACT_OWNER) return 0;
     opcode = piano_contract_u32(data + 8);
     if (opcode == PIANO_CONTRACT_NOTIFY) {
         if (length != 24 || piano_contract_u32(data + 16) != 0) return 0;
         ++c->notifies;
-        if (c->stage == PianoContractIdle && c->linked && !c->quarantined) {
-            /* The same notification reports ACK_COMPLETE and connector change.
-             * Only CCI can distinguish them. Suspend authorization immediately,
-             * retain the last sample, and read CCI without issuing another GET. */
-            c->notify_pending = 1; c->notify_ms = c->command_ms = now_ms;
-            c->stage = PianoContractNotifyRead; c->wire = 0;
+        if (c->linked && !c->quarantined) {
+            /* The same notification reports command completion and connector
+             * change. Suspend authorization until CCI distinguishes them, also
+             * during a periodic GET. Preserve the active transaction and the
+             * first notification's deadline across a notification storm. */
+            if (!c->notify_pending) { c->notify_pending = 1; c->notify_ms = now_ms; }
+            if (c->stage == PianoContractIdle) {
+                c->command_ms = now_ms; c->stage = PianoContractNotifyRead; c->wire = 0;
+            }
         }
         if (c->wire == 2 && !c->in_flight) c->poll_ms = now_ms;
         return 1;
@@ -277,8 +280,9 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (((cci >> 1) & 127u) && !c->connector_event) {
         c->connector_event = 1; piano_contract_invalidate(c, PIANO_CONTRACT_CHANGED, 1);
     }
+    notify_resolved = c->notify_pending;
+    c->notify_pending = 0;
     if (c->stage == PianoContractNotifyRead) {
-        c->notify_pending = 0;
         if (cci & ((1u << 25) | (1u << 26) | (1u << 27) | (1u << 30))) {
             piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
         }
@@ -292,7 +296,7 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (c->stage == PianoContractProbe) {
         if (cci & (1u << 31)) piano_contract_ack_stage(c, PianoContractCapability, c->connector_event);
         else { c->stage = PianoContractCapability; c->wire = 0; }
-        return 1;
+        return notify_resolved ? 2 : 1;
     }
     echo = (uint64_t)piano_contract_u32(data + 20) | (uint64_t)piano_contract_u32(data + 24) << 32;
     if (echo != c->command) { piano_contract_fail(c, PIANO_CONTRACT_CCI, 1); return -1; }
@@ -300,13 +304,13 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
     }
     if (c->stage == PianoContractAck) {
-        if (!(cci & (1u << 29))) { c->wire = 2; c->poll_ms = now_ms + 200; return 1; }
+        if (!(cci & (1u << 29))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
         if (c->command & ((uint64_t)1 << 16)) c->connector_event = 0;
         c->stage = c->next_stage; c->wire = 0;
         if (c->stage == PianoContractCommit) { piano_contract_publish(c, now_ms); return 2; }
-        return 1;
+        return notify_resolved ? 2 : 1;
     }
-    if (!(cci & (1u << 31))) { c->wire = 2; c->poll_ms = now_ms + 200; return 1; }
+    if (!(cci & (1u << 31))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
     message = data + 28; next = PianoContractIdle;
     if (c->stage == PianoContractCapability) {
         if (payload != 16 || message[4] != 1) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
@@ -350,6 +354,6 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         next = !offset && n == 4 ? PianoContractPdos4 : PianoContractVerify;
     } else { piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1; }
     piano_contract_ack_stage(c, next, c->connector_event && (c->stage == PianoContractStatus || c->stage == PianoContractVerify));
-    return 1;
+    return notify_resolved ? 2 : 1;
 }
 #endif
