@@ -88,27 +88,43 @@ bool load(NSString *folder,NSDictionary *m,const char *name,Clip &clip) {
   output.alwaysCopiesSampleData=YES;if(!check("compressed-reader",reader&&[reader canAddOutput:output]))return false;
   [reader addOutput:output];if(!check("reader-start",[reader startReading]))return false;
   NSArray *packets=ref[@"packets"],*gold=ref[@"output"];
-  bool ok=true;unsigned i=0;CMTime previous=kCMTimeInvalid;
+  bool ok=true;int64_t mediaOffset=0;unsigned i=0,editMarkers=0;CMTime previous=kCMTimeInvalid;
   while(CMSampleBufferRef sample=[output copyNextSampleBuffer]) {
+    // AVAssetReader emits zero-sample edit-boundary notifications before
+    // media. They are container events, never AVC AUs sent to the decoder.
+    if(CMSampleBufferGetNumSamples(sample)==0 && !CMSampleBufferGetDataBuffer(sample) &&
+       !CMSampleBufferGetFormatDescription(sample) &&
+       (CFEqual(CMGetAttachment(sample,CFSTR("EditBoundary"),nullptr) ?: kCFBooleanFalse,kCFBooleanTrue) ||
+        CFEqual(CMGetAttachment(sample,CFSTR("DrainAfterDecoding"),nullptr) ?: kCFBooleanFalse,kCFBooleanTrue) ||
+        CMGetAttachment(sample,CFSTR("PostNotificationWhenConsumed"),nullptr) ||
+        CFEqual(CMGetAttachment(sample,CFSTR("EmptyMedia"),nullptr) ?: kCFBooleanFalse,kCFBooleanTrue))) {
+      ++editMarkers;CFRelease(sample);if(editMarkers>8){ok=false;break;}continue;
+    }
     const auto bytes=compressed(sample);CMTime p=CMSampleBufferGetPresentationTimeStamp(sample),d=CMSampleBufferGetDecodeTimeStamp(sample);
-    const int64_t pts=CMTimeConvertScale(p,90000,kCMTimeRoundingMethod_Default).value;
+    const CMTime outputPts=CMSampleBufferGetOutputPresentationTimeStamp(sample);
+    const int64_t rawPts=CMTimeConvertScale(p,90000,kCMTimeRoundingMethod_Default).value;
+    const int64_t pts=CMTimeConvertScale(outputPts,90000,kCMTimeRoundingMethod_Default).value;
+    if(!i)mediaOffset=rawPts-pts;
     const int64_t dts=CMTimeConvertScale(CMTIME_IS_VALID(d)?d:p,90000,kCMTimeRoundingMethod_Default).value;
     bool idr=false,isref=false;
     ok &= CMSampleBufferGetNumSamples(sample)==1 && i<packets.count && nals(bytes,idr,isref);
     if(i<packets.count) {
       NSDictionary *packet=packets[i];const std::string expected=[[packet[@"data_hash"] substringFromIndex:7] UTF8String];
-      ok &= hash(bytes.data(),bytes.size())==expected && pts==[packet[@"pts"] longLongValue] && dts==[packet[@"dts"] longLongValue] &&
-        bytes.size()==[packet[@"size"] unsignedLongLongValue] && idr==[packet[@"flags"] hasPrefix:@"K"];
+      ok &= hash(bytes.data(),bytes.size())==expected && pts==[packet[@"pts"] longLongValue] && rawPts==pts+mediaOffset && dts==[packet[@"dts"] longLongValue]+mediaOffset &&
+        bytes.size()==uint64_t([packet[@"size"] longLongValue]) && idr==[packet[@"flags"] hasPrefix:@"K"];
     }
     ok &= !CMTIME_IS_VALID(previous)||CMTimeCompare(CMTIME_IS_VALID(d)?d:p,previous)>0;previous=CMTIME_IS_VALID(d)?d:p;
     const unsigned display=unsigned(pts/3000);std::string sha;
     if(pts>=0 && pts%3000==0 && display<gold.count && [gold[display][@"pts"] longLongValue]==pts)sha=[gold[display][@"sha256"] UTF8String];else ok=false;
-    if(!clip.format){clip.format=(CMVideoFormatDescriptionRef)CFRetain(CMSampleBufferGetFormatDescription(sample));}
+    CMVideoFormatDescriptionRef description=CMSampleBufferGetFormatDescription(sample);
+    if(!description){CFRelease(sample);ok=false;break;}
+    if(!clip.format){clip.format=(CMVideoFormatDescriptionRef)CFRetain(description);}
     else ok &= CFEqual(clip.format,CMSampleBufferGetFormatDescription(sample));
     clip.samples.push_back(sample);clip.gold.push_back(sha);clip.pts.push_back(pts);clip.dts.push_back(dts);clip.idr.push_back(idr);clip.reference.push_back(isref);++i;
   }
-  ok &= reader.status==AVAssetReaderStatusCompleted && i==60 && packets.count==60 && gold.count==60 && clip.idr[0] && clip.idr[30];
-  std::printf("video-v6: fixture=%s samples=%u closed-gop-boundary=30 dts-order=1 software-truth=1\n",name,i);
+  std::printf("video-v6: demux-state ok=%u markers=%u status=%ld count=%u packets=%lu gold=%lu idr0=%u idr30=%u\n",unsigned(ok),editMarkers,long(reader.status),i,(unsigned long)packets.count,(unsigned long)gold.count,unsigned(clip.idr[0]),unsigned(clip.idr[30]));
+  ok &= reader.status==AVAssetReaderStatusCompleted && editMarkers<=8 && i==60 && packets.count==60 && gold.count==60 && clip.idr[0] && clip.idr[30];
+  std::printf("video-v6: fixture=%s samples=%u closed-gop-boundary=30 dts-order=1 media-offset=%lld/90000 output-pts-audited=1 software-truth=1\n",name,i,(long long)mediaOffset);
   return check("demux-every-packet-pts-dts-sha",ok);
 }
 std::vector<uint8_t> formatWire(CMVideoFormatDescriptionRef format) {
@@ -123,21 +139,30 @@ bool audit(Clip &clip) {
   using namespace vtwire;
   auto fmt=formatWire(clip.format),m=wire(cc("dsta"),cc(",fds"),cc("=fds"),fmt);contract::FormatReport report;pianovideo::avc::Config config;
   if(!check("real-coremedia-format-contract",contract::formatRequest(m.data(),uint32_t(m.size()),report,&config)))return false;
-  using Serialize=OSStatus(*)(CFAllocatorRef,CFAllocatorRef,CMSampleBufferRef,void*,CMBlockBufferRef*);
-  auto fn=reinterpret_cast<Serialize>(dlsym(RTLD_DEFAULT,"VTParavirtualizationCreateSerializedAtomDataBlockBufferForSampleBuffer"));
-  if(!check("real-sample-serializer",fn!=nullptr))return false;
+  // These exported PV entry points invoke Apple's private serializer. The
+  // request, sample timing, count, sizes and data are all Apple's own bytes.
+  using Create=OSStatus(*)(uint32_t,uint32_t,const uint8_t*,uint64_t,CMBlockBufferRef*,CFTypeRef*);
+  using Append=OSStatus(*)(CFTypeRef,uint32_t,uint32_t,uint32_t,CMSampleBufferRef,void*,CMBlockBufferRef*);
+  using Int=OSStatus(*)(CFTypeRef,uint32_t,int64_t);
+  using UInt=OSStatus(*)(CFTypeRef,uint32_t,uint32_t);
+  auto create=reinterpret_cast<Create>(dlsym(RTLD_DEFAULT,"VTParavirtualizationCreateMessageAndByteStream"));
+  auto append=reinterpret_cast<Append>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendCMSampleBufferWithLimitAndCopyRemainingData"));
+  auto integer=reinterpret_cast<Int>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendSInt64"));
+  auto flags=reinterpret_cast<UInt>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendUInt32"));
+  if(!check("real-sample-serializer",create&&append&&integer&&flags))return false;
   bool ok=true;
   for(unsigned i=0;i<clip.samples.size();++i) {
-    CMBlockBufferRef b=nullptr;OSStatus rc=fn(kCFAllocatorDefault,kCFAllocatorDefault,clip.samples[i],nullptr,&b);
-    std::vector<uint8_t> value;if(!rc&&b){value.resize(CMBlockBufferGetDataLength(b));rc=CMBlockBufferCopyDataBytes(b,0,value.size(),value.data());}if(b)CFRelease(b);
-    if(rc||value.empty()){ok=false;continue;}
-    // Only the envelope is ours; every sbuf atom comes from the same Apple
-    // serializer used by PV. Keep all timing/count/size/format metadata intact.
-    std::vector<uint8_t> request(HeaderBytes+48+16+value.size());uint8_t uuid[16]={};Writer w(request.data(),uint32_t(request.size()));
-    w.header(cc("dfrm"),FlagRequest,uuid,1000+i);w.s64(cc(",frm"),int64_t(0x56360000+i));w.u32(cc(",dfl"),1);
-    const unsigned head=w.size();uint8_t *p=request.data()+head;put32(p,uint32_t(16+value.size()));put32(p+4,cc("para"));put32(p+8,cc(",sbf"));put32(p+12,cc("=sbf"));memcpy(p+16,value.data(),value.size());
-    contract::InputReport input;const bool accepted=contract::inputRequest(request.data(),head+16+uint32_t(value.size()),input,&config);
-    if(!accepted)std::printf("video-v6: serializer rejection clip=%s sample=%u decision=%s bytes=%zu\n",clip.name,i,input.decision,value.size());
+    CMBlockBufferRef b=nullptr,remaining=nullptr;CFTypeRef stream=nullptr;uint8_t uuid[16]={};
+    OSStatus rc=create(cc("dfrm"),FlagRequest,uuid,1000+i,&b,&stream);
+    if(!rc)rc=integer(stream,cc(",frm"),int64_t(0x56360000+i));
+    if(!rc)rc=flags(stream,cc(",dfl"),1);
+    if(!rc)rc=append(stream,cc(",sbf"),6,2*1024*1024,clip.samples[i],nullptr,&remaining);
+    std::vector<uint8_t> request;
+    if(!rc&&b&&!remaining){request.resize(CMBlockBufferGetDataLength(b));rc=CMBlockBufferCopyDataBytes(b,0,request.size(),request.data());}
+    if(remaining)CFRelease(remaining);if(stream)CFRelease(stream);if(b)CFRelease(b);
+    if(rc||request.empty()){ok=false;continue;}
+    contract::InputReport input;const bool accepted=contract::inputRequest(request.data(),uint32_t(request.size()),input,&config);
+    if(!accepted)std::printf("video-v6: serializer rejection clip=%s sample=%u decision=%s bytes=%zu\n",clip.name,i,input.decision,request.size());
     ok &= accepted && input.hasToken && input.token==int64_t(0x56360000+i);
     std::vector<uint8_t> normalized(contract::kMaxAuBytes);
     ok &= accepted && contract::normalize(input.data,input.bytes,normalized.data(),uint32_t(normalized.size()),config,i==0)>0;
@@ -146,7 +171,7 @@ bool audit(Clip &clip) {
 }
 struct Frame {
   uint64_t token=0,submitUs=0;CMTime pts=kCMTimeInvalid,duration=kCMTimeInvalid;std::string gold;
-  unsigned calls=0,images=0,errors=0;bool noOutput=false,reject=false,submitted=false;
+  OSStatus submissionStatus=0;unsigned calls=0,images=0,errors=0;bool noOutput=false,reject=false,submitted=false;
 };
 struct Held { CVPixelBufferRef image=nullptr;std::string sha; };
 struct Context {
@@ -203,7 +228,7 @@ VTDecompressionSessionRef create(CMVideoFormatDescriptionRef format,CFDictionary
 }
 bool credit(Context &ctx) {
   pthread_mutex_lock(&ctx.lock);bool ok=true;
-  while(ctx.inflight>=8){timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_sec+=5;
+  while(ctx.inflight>=7){timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_sec+=5;
     if(pthread_cond_timedwait(&ctx.changed,&ctx.lock,&until)){ok=false;break;}}
   pthread_mutex_unlock(&ctx.lock);return check("callback-credit-progress",ok);
 }
@@ -211,7 +236,7 @@ bool submit(VTDecompressionSessionRef session,CMSampleBufferRef sample,Context &
   Frame &f=ctx.frames[index];f.token=(ctx.epoch<<32)|uint64_t(index+1);f.pts=CMSampleBufferGetOutputPresentationTimeStamp(sample);
   f.duration=CMSampleBufferGetOutputDuration(sample);f.gold=gold;f.noOutput=suppress;f.reject=reject;
   pthread_mutex_lock(&ctx.lock);f.submitted=true;f.submitUs=nowUs();++ctx.inflight;ctx.high=std::max(ctx.high,ctx.inflight);pthread_mutex_unlock(&ctx.lock);
-  VTDecodeInfoFlags info=0;const OSStatus rc=VTDecompressionSessionDecodeFrame(session,sample,VTDecodeFrameFlags(flags),&f,&info);
+  VTDecodeInfoFlags info=0;const OSStatus rc=VTDecompressionSessionDecodeFrame(session,sample,VTDecodeFrameFlags(flags),&f,&info);f.submissionStatus=rc;
   auto bytes=compressed(sample);const auto digest=hash(bytes.data(),bytes.size());
   std::printf("video-v6: submit phase=%s epoch=%llu index=%u token=%llu flags=%u pts=%lld/%d dts=%lld/%d bytes=%zu sha256=%s status=%d info=%u\n",
     ctx.phase,(unsigned long long)ctx.epoch,index,(unsigned long long)f.token,flags,(long long)f.pts.value,f.pts.timescale,
@@ -219,7 +244,7 @@ bool submit(VTDecompressionSessionRef session,CMSampleBufferRef sample,Context &
   // Synchronous transport failures can retire in Apple's synchronous error path;
   // count this rejection once if no callback occurred. Accepted work may not.
   if(rc){pthread_mutex_lock(&ctx.lock);if(!f.calls&&ctx.inflight)--ctx.inflight;pthread_mutex_unlock(&ctx.lock);}
-  return check(reject?"reject-before-etb":"decode-submit",reject?(rc||f.errors):!rc,rc);
+  return reject ? true : check("decode-submit",!rc,rc);
 }
 bool drain(VTDecompressionSessionRef session,Context &ctx,const char *stage) {
   pthread_mutex_lock(&ctx.lock);ctx.finished=true;const unsigned early=ctx.beforeFinish;pthread_mutex_unlock(&ctx.lock);
@@ -261,7 +286,7 @@ bool stream(Clip &clip,Clip &other,CFDictionaryRef spec,const char *phase,uint64
   const uint64_t elapsed=nowUs()-ctx.startUs;std::printf("video-v6: summary phase=%s epoch=%llu submitted=%u callbacks=%u images=%u nulls=%u errors=%u high-water=%u early=%u elapsed-us=%llu fps=%.3f max-callback-us=%llu longest-output-gap-us=%llu\n",
     phase,(unsigned long long)epoch,submitted,ctx.callbacks,ctx.images,ctx.nulls,ctx.errors,ctx.high,ctx.beforeFinish,(unsigned long long)elapsed,
     elapsed?ctx.images*1000000.0/elapsed:0.0,(unsigned long long)ctx.maxLatency,(unsigned long long)ctx.longestUs);pthread_mutex_unlock(&ctx.lock);
-  ok &= check("all-token-pts-hashes",complete)&&check("bounded-eight-credits",ctx.high<=8)&&check("stream-output-before-eof",ctx.beforeFinish>0);
+  ok &= check("all-token-pts-hashes",complete)&&check("bounded-seven-plus-ack-credit",ctx.high<=7)&&check("stream-output-before-eof",ctx.beforeFinish>0);
   close(session,ctx);return ok;
 }
 CMSampleBufferRef make(CMVideoFormatDescriptionRef format,const std::vector<uint8_t>& bytes,CMTime pts=CMTimeMake(6001,60000)) {
@@ -280,6 +305,7 @@ void single(CFDictionaryRef spec) {
   sb=make(format,large);if(sb){submit(session,sb,ctx,1,1,"",false,true);CFRelease(sb);drain(session,ctx,"oversize-empty-finish");}
   sb=make(format,bytes);if(sb){submit(session,sb,ctx,2,0,"",false,true);CFRelease(sb);drain(session,ctx,"flags-zero-empty-finish");}
   sb=make(format,bytes);if(sb){submit(session,sb,ctx,3,1,kGolden);CFRelease(sb);drain(session,ctx,"single-golden-drain");}
+  for(unsigned i=0;i<3;++i)check("reject-has-error-disposition",ctx.frames[i].images==0&&(ctx.frames[i].submissionStatus||ctx.frames[i].errors));
   check("original-one-golden-callback",ctx.frames[3].calls==1&&ctx.frames[3].images==1&&ctx.frames[3].errors==0&&ctx.images==1);
   close(session,ctx);CFRelease(format);
 }
@@ -288,7 +314,7 @@ void cancel(Clip &clip,Clip &other,CFDictionaryRef spec) {
   unsigned submitted=0;for(unsigned i=0;i<8;++i)if(submit(session,clip.samples[i],ctx,i,9,clip.gold[i]))++submitted;
   pthread_mutex_lock(&ctx.lock);ctx.cancelling=true;const unsigned pending=ctx.inflight;pthread_mutex_unlock(&ctx.lock);
   std::printf("video-v6: cancel-begin epoch=20 accepted=%u pending=%u no-wait-before-invalidate=1\n",submitted,pending);
-  check("cancel-had-accepted-work",submitted==8);close(session,ctx);
+  check("cancel-had-accepted-work",submitted==8);check("cancel-had-pending",pending>0);close(session,ctx);
   std::printf("video-v6: cancel-joined epoch=20 callbacks=%u remaining-public-callbacks-not-required=%u\n",ctx.callbacks,ctx.inflight);
   stream(clip,other,spec,"recreate-at-idr",21,9,-1,30,60,false);
 }
@@ -298,7 +324,7 @@ int run(NSString *folder,bool qualify) {
   if(!audit(ip)||!audit(ibp))return 1;
   if(!qualify){std::printf("video-v6: %s self-test failures=%u no-vt-session=1\n",failures?"FAIL":"PASS",failures.load());return failures?1:0;}
   CFDictionaryRef spec=specification();if(!spec)return 1;std::printf("video-v6: begin pid=%d stamp-us=%llu hardware-required=1 pv-required=1\n",getpid(),(unsigned long long)nowUs());
-  single(spec);stream(ibp,ip,spec,"ibp-async",1,1);stream(ip,ibp,spec,"ip-temporal",2,9);stream(ibp,ip,spec,"ibp-no-output",3,9,1);cancel(ibp,ip,spec);CFRelease(spec);
+  single(spec);stream(ibp,ip,spec,"ibp-async",1,1);stream(ip,ibp,spec,"ip-temporal",2,9);stream(ibp,ip,spec,"ibp-temporal",3,9);stream(ibp,ip,spec,"ibp-no-output",4,9,1);cancel(ibp,ip,spec);CFRelease(spec);
   std::printf("video-v6: %s qualification failures=%u bounded-stream-correctness-only=1\n",failures?"FAIL":"PASS",failures.load());return failures?1:0;
 }
 }
