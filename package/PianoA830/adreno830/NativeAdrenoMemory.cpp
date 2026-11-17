@@ -338,7 +338,7 @@ IOReturn NativeAdrenoMemory::allocatePooled(size_t bytes,unsigned bits,bool cont
     /* UniXNU-piano: here and below the bound is NativeAdrenoMemoryMaxBytes (NativeAdrenoMemory.h; 256 MiB upstream). */
     if(!bytes || (bytes&4095) || !outputWidth(bits) || bytes>NativeAdrenoMemoryMaxBytes)return kIOReturnBadArgument;
     NativeAdrenoCpuState cpu{};
-    const IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+    const IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess) {failure_={"cpu-abi",status};return status;}
     const IOReturn result=takePooled(bytes,UINT64_C(1)<<bits,contiguous);
     failure_={result==kIOReturnNoMemory?"pool-span-metadata":"pool-capacity",result};
     return result;

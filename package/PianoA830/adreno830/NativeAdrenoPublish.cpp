@@ -804,22 +804,17 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
 /* One core call under this connection's lock. */
 IOReturn AGXDeviceUserClient::locked(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
-    if(!lock_) {
-        if(method==NativeAdrenoMethodBoAlloc)
-            boot_progress_gpu_event("BoAlloc refused: stage=connection-lock bytes=0 status=not-ready inner=not-called pool=unavailable");
-        return kIOReturnNotReady;
-    }
-    lockMetered(lock_,Adreno830WaitConnection);
-    const IOReturn status=live_?box_->core.dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+    if(lock_)lockMetered(lock_,Adreno830WaitConnection);
+    const IOReturn status=lock_ && live_?box_->core.dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
 #ifdef ADRENO830_MACOS
     char failure[NativeAdrenoMapLineBytes]={},totals[NativeAdrenoMapLineBytes]={};
     if(method==NativeAdrenoMethodBoAlloc && status) {
         /* Per-call by-value snapshot BEFORE unlocking: a concurrent success cannot erase this refusal. */
         static uint64_t refusalSequence;
         const unsigned long long call=__atomic_add_fetch(&refusalSequence,1ull,__ATOMIC_RELAXED);
-        const NativeAdrenoAllocRefusal r=live_?box_->core.lastAllocRefusal():NativeAdrenoAllocRefusal{};
+        const NativeAdrenoAllocRefusal r=lock_ && live_?box_->core.lastAllocRefusal():NativeAdrenoAllocRefusal{};
         const char *stage=r.failure.status?r.failure.stage:
-            !live_?"not-open":r.why==NativeAdrenoAllocWhyObjects?"object-slots":
+            !lock_?"connection-lock":!live_?"not-open":r.why==NativeAdrenoAllocWhyObjects?"object-slots":
             r.why==NativeAdrenoAllocWhyLimit?"object-limit":"request-dispatch";
         const uint64_t bytes=input && input_size==sizeof(NativeAdrenoAbiBoAlloc)?
             static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes:0;
@@ -828,13 +823,13 @@ IOReturn AGXDeviceUserClient::locked(uint32_t method,const void *input,size_t in
         {NativeAdrenoSubmitGuard guard(g.submit,NativeAdrenoSubmitLockMemory);
          free=NativeAdrenoMemory::poolFreeBytes();pool=NativeAdrenoMemory::poolBytes();}
         snprintf(failure,sizeof failure,"BoAlloc refused: n=%llu slot=%u stage=%s bytes=%llu status=%#x inner=%s",call,slot_,stage,
-            (unsigned long long)bytes,unsigned(status),strstr(stage,"create")?"not-exported":"returned");
+            (unsigned long long)bytes,unsigned(status),strstr(stage,"create")?"not-exported":!strcmp(stage,"prepare")?"prepare-result":"driver-check");
         snprintf(totals,sizeof totals,"BoAlloc totals: n=%llu slot=%u pool=%llu/%llu free=%llu mapped=%llu unmapped=%llu",call,slot_,
             (unsigned long long)(pool-free),(unsigned long long)pool,(unsigned long long)free,
             (unsigned long long)t.mapped,(unsigned long long)t.unmapped);
     }
 #endif
-    IOLockUnlock(lock_);
+    if(lock_)IOLockUnlock(lock_);
 #ifdef ADRENO830_MACOS
     if(failure[0]) {boot_progress_gpu_event(failure);boot_progress_gpu_event(totals);}
 #endif
