@@ -31,7 +31,7 @@ struct Session {
   uint8_t uuid[16] = {};
   uint32_t native = 0;
   IOLock *lock = nullptr;
-  bool started=false, stopping=false, workerRunning=false, busy=false;
+  bool started=false, stopping=false, invalidating=false, workerRunning=false, busy=false;
   pianovideo::avc::Config config;
   pianovideo::stream::Ledger frames;
   struct Input { uint8_t *bytes=nullptr; uint32_t size=0; } inputs[pianovideo::stream::Credits];
@@ -252,7 +252,7 @@ void worker(void *arg,wait_result_t){
   }
   // Cancellation suppresses success before STOP/CLOSE. Old epoch replies cannot
   // enter a new session: teardown joins this worker before releasing the client.
-  IOLockLock(s->lock);const bool invalidated=s->stopping;s->stopping=true;s->guest.cancel();
+  IOLockLock(s->lock);const bool invalidated=s->invalidating;s->stopping=true;s->guest.cancel();
   const bool finish=s->finishWanted;const uint64_t finishID=s->finishRequest;s->finishWanted=false;
   // Error dispositions are sent exactly once. Invalidation instead aborts the
   // old epoch and joins; it never sends a successful late frame.
@@ -285,7 +285,7 @@ void worker(void *arg,wait_result_t){
   thread_terminate(current_thread());
 }
 void teardown(Session *s) {
-  IOLockLock(s->lock);s->stopping=true;
+  IOLockLock(s->lock);s->invalidating=true;s->stopping=true;
   IOLockWakeup(s->lock,&s->busy,false);
   while(s->workerRunning)IOLockSleep(s->lock,&s->workerRunning,THREAD_UNINT);
   IOLockUnlock(s->lock);
@@ -321,9 +321,14 @@ int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
 }
 int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   if(!contract::inputRequest(m,n,r,&s->config))return kBadData;
-  uint8_t *input=static_cast<uint8_t *>(IOMalloc(contract::kMaxAuBytes));if(!input)return kNoMemory;
   IOLockLock(s->lock);
-  if(!s->started||s->stopping||s->finishWanted){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);return kBadState;}
+  if(!s->started||s->stopping||s->finishWanted||s->frames.pending==pianovideo::stream::Credits||s->frames.find(uint64_t(r.token))){
+    IOLockUnlock(s->lock);r.decision="state-or-credit-or-duplicate";return kBadState;
+  }
+  // Reserve under the session lock before allocating. Even a rejected ninth
+  // request cannot transiently allocate a ninth MiB of SW AU storage.
+  uint8_t *input=static_cast<uint8_t *>(IOMalloc(contract::kMaxAuBytes));
+  if(!input){IOLockUnlock(s->lock);return kNoMemory;}
   const bool first=s->frames.accepted==0;
   if(first&&!r.picture.idr){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);r.decision="first-picture-not-IDR";return kBadData;}
   const uint32_t normalized=contract::normalize(r.data,r.bytes,input,contract::kMaxAuBytes,s->config,first);
