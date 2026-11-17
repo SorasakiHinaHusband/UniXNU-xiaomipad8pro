@@ -1207,7 +1207,8 @@ bool identityVerify()
   bool ok = verifySmmuIdentity(gIdentity, gIdentityPa, smmuRead, [](uint32_t, uint32_t, uint32_t, uint32_t) {});
   ok &= smmuRead(0x800 + 4 * gIdentity.slot) == (0x80000000u | pianohw::kUsbStream);
   ok &= (smmuRead(0xc00 + 4 * gIdentity.slot) & kS2crFields) == gIdentity.bank;
-  return ok && !(smmuRead(gIdentity.cb() + kCbFsr) & kFsrFaults);
+  uint64_t stamp = 0;
+  return ok && !identityOwners(gIdentity, smmuRead, stamp) && !(smmuRead(gIdentity.cb() + kCbFsr) & kFsrFaults);
 }
 bool identitySetup()
 {
@@ -2524,6 +2525,7 @@ IOReturn PianoDwc3::callPlatformFunction(const OSSymbol *functionName, bool wait
   if (ask == kAskState) __atomic_store_n(&gHandoffAsk, uint32_t(kAskState), __ATOMIC_RELEASE);
   const bool awake = gSleep.state() == SleepState::awake;
   if ((ask != kAskRelease || awake) && handoffDecide(__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE), ask) != HandoffDo::nothing) {
+    if (ask == kAskReclaim) handoffSet(kHoReclaiming);
     __atomic_store_n(&gHandoffAsk, ask, __ATOMIC_RELEASE);
     gWake.kick();
   } else {
