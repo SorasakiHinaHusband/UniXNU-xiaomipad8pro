@@ -382,6 +382,8 @@ class Controller {
   bool wantLit() const { return displayOn_ && !asleep_ && !(cfg_.lidWatch && lid_ == 0); }
   bool lit(unsigned i) const { return ic_[i].lit; }
   uint16_t code() const { return code_; }
+  uint16_t floor() const { return cfg_.floor; }
+  bool exponential() const { return exponential_; }
   const IcState &ic(unsigned i) const { return ic_[i]; }
   bool pending() const
   {

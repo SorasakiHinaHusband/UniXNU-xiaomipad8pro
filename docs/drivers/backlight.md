@@ -80,9 +80,7 @@ piano), so there is no clock, firmware or vote, and no PianoA830 lock is needed.
 
 Watched properties: NativeGopDisplay's `piano-display-power` (boolean, set with each change; read every second, so a call missed while
 PianoBacklight was not yet published is caught up) and PianoKeyboard's `piano-keyboard-hall` (1 open, 0 closed; every 250 ms with
-`piano-backlight-lid=1`); with `piano-backlight-auto=1` also PianoSensors' `piano-sensors-light-target` (permille) with
-`piano-sensors-seq` and `piano-sensors-lux`, read on the same 250 ms poll and taken when the sequence or the value moves (absent until
-PianoSensors' level 4: inert until then; PianoSensors does not register itself, so it is found by class beside this service).
+`piano-backlight-lid=1`); with `piano-backlight-auto=1` also PianoSensors' immutable `piano-sensors-light` snapshot, read every 250 ms. Only a valid target from the current sensor session is consumed; an invalid/fault snapshot retires the old target. PianoSensors level 4 registers its service for class matching.
 Published: `piano-backlight-code`, `-percent`, `-lit`, `-found-code`; with `piano-backlight-auto=1` also `piano-backlight-auto`
 (automatic now), `-offset` (signed 32-bit, in steps), `-ambient-permille`, `-ambient-lux`. `setProperties` (administrator only):
 `piano-backlight-percent` (0-100), `piano-backlight-step` (signed) and, with `piano-backlight-auto=1`, `piano-backlight-auto` (0/1).
@@ -91,9 +89,9 @@ Published: `piano-backlight-code`, `-percent`, `-lit`, `-found-code`; with `pian
 A target (the light policy's curve, smoothed in the sensor kext: at most one per 250 ms, none at rest) sets the code: permille x 2047,
 never under the floor. The brightness keys then shift the curve by this driver's own steps (x 2^(1/3) with the linear mapping, 1/16 of
 the range with the exponential one): the offset stays for the boot, so "a step darker than automatic" holds as the room changes, and a
-press is always a visible step unless the code is at an end. `piano-backlight-percent` switches to manual (targets recorded only);
+press is always a visible step unless the code is at an end. `piano-backlight-percent` switches to manual (targets not applied);
 `piano-backlight-auto=1` as a property requests it again (a fresh session target, the offset kept), `=0` leaves; a target of -1 (the sensor
-gone) leaves with the code as it is. Writes happen only on a change and not while dark (the newest code lights the wake). The writes'
+gone) leaves with the code as it is. Writes happen only on a change and not while dark (wake awaits a fresh automatic target). The writes'
 own lines are folded into one per 10 s: `ambient: N targets in S s, lux A..B, target P..Q permille, offset K, code X -> Y (Z %)`; the
 first target says `automatic brightness: on (PianoSensors): ...`, a key `step +1 from ... in automatic mode: offset 0 -> 1, code ...`.
 

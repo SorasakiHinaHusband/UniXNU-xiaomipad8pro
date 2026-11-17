@@ -586,6 +586,8 @@ void PianoBacklight::publishState()
   memcpy(fPublished, state, sizeof(state));
   fHavePublished = true;
   setProperty("piano-backlight-code", fCtl.code(), 32);
+  setProperty("piano-backlight-floor", uint64_t(fCtl.floor()), 32);
+  setProperty("piano-backlight-exponential", fCtl.exponential());
   setProperty("piano-backlight-percent", percentOf(fCtl.code()), 32);
   setProperty("piano-backlight-lit", fCtl.lit(0) && fCtl.lit(1));
   setProperty("piano-backlight-control", fCtl.controlling());
