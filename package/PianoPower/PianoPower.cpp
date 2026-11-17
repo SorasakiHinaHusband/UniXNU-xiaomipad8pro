@@ -130,7 +130,7 @@ void readArgs()
   if (gArgs.b4pd) { gArgs.policy = 1; gArgs.hv = 2; }
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
   gArgs.board = bootArg("piano-power-board", 1);   // the stock board configuration at level 2 with writes (PianoMca.h)
-  gArgs.ucsi = bootArg("piano-power-ucsi", 1);     // one read of the UCSI owner's buffer per charger generation (PianoMca.h)
+  gArgs.ucsi = bootArg("piano-power-ucsi", 1);     // policy: periodic/event status observer; otherwise legacy per-generation probe
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -535,7 +535,7 @@ bool PianoPower::start(IOService *provider)
   fRingLock = IOSimpleLockAlloc();
   fConfigLock = IOLockAlloc();
   setProperty("PianoChargeBuild", "PianoBuckContractV1");
-  note("buck: PianoBuckContractV1 HV_ICL=1600 FCC=1500 FV=4400 CP=read-only");
+  note("buck: PianoBuckContractV1 status=PianoBuckStatusV2 HV_ICL=1600 FCC=1500 FV=4400 CP=read-only");
   thread_t t = nullptr;
   if (!fConfigLock || !fRingLock || kernel_thread_start(&PianoPower::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -656,6 +656,8 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("PackSampleMs", fPackMs); n("PackAgeMs", now >= fPackMs ? now - fPackMs : ~0u);
   n("SourceMA", c.source_ma); n("SourcePDOCount", c.pdos); n("UCSIVersion", c.version); n("CCI", c.cci);
   n("ContractNotifyPending", c.notify_pending); n("ContractNotifyMs", c.notify_ms);
+  n("UCSIStage", c.stage); n("UCSIInFlight", c.in_flight); n("UCSIQuarantined", c.quarantined);
+  n("UCSILastCommand", c.command); n("UCSIControlReadback", c.control_readback);
   n("ContractTimeouts", c.timeouts); n("ContractFailures", c.failures);
   n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
   n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
@@ -685,6 +687,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
     const GaugeReading &g = fPack[i]; char key[32];
 #define PACKNUM(name, value) snprintf(key, sizeof key, "Pack%u" name, i); n(key, uint32_t(value))
     PACKNUM("Valid", g.ok); PACKNUM("SOC", g.socPct); PACKNUM("MA", g.currentMa); PACKNUM("TempDC", g.tempDeciC);
+    PACKNUM("MV", g.voltageMv); PACKNUM("Error", g.error); PACKNUM("FailedCommand", g.failedCommand);
     PACKNUM("ISC", fIsc[i]); PACKNUM("SOA", fSoa[i]);
 #undef PACKNUM
   }
@@ -695,8 +698,11 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   setProperty("PianoCharge", d); d->release();
   note("buck: seq=%u gen=%u link=%u raw=%d effective=%d valid=%u connector=%u sink=%u pd=%u", fStatusSeq, c.generation,
        fMca.links, piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1, x.type, c.valid, c.connector, c.sink, c.pd);
-  note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s", c.generation, c.seq, c.rdo, c.protocol,
-       c.mv, c.ma, c.last_error, piano_contract_fresh(&c, now) ? "validated" : "no PD contract");
+  note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s stage=%u inflight=%u quarantine=%u cci=%#x cmd=%#llx control=%#llx",
+       c.generation, c.seq, c.rdo, c.protocol, c.mv, c.ma, c.last_error,
+       piano_contract_fresh(&c, now) ? "validated" : !piano_contract_status_fresh(&c, now) ? "status unknown/stale" :
+       !c.connected ? "fresh disconnected status" : !c.sink ? "fresh source status" : !c.pd ? "fresh non-PD status" : "fresh PD status/invalid RDO",
+       c.stage, c.in_flight, c.quarantined, c.cci, c.command, c.control_readback);
   for (unsigned i = 0; i < c.pdos && i < 7; ++i) note("buck-pdo: gen=%u index=%u raw=%#x", c.generation, i + 1, c.source_pdo[i]);
   note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d fv=%u/%d valid=%u", fStatusSeq, p.icl_ma, s.icl_set,
        x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma, fvMv, x.fv_raw, fvValid);
@@ -709,8 +715,9 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   note("buck-board: seq=%u valid=%#x age=%u/%u/%u/%u", fStatusSeq, board ? board->valid : 0,
        board ? board->age_ms[0] : ~0u, board ? board->age_ms[1] : ~0u,
        board ? board->age_ms[2] : ~0u, board ? board->age_ms[3] : ~0u);
-  for (unsigned i = 0; i < 2; ++i) note("buck-pack: seq=%u pack=%u valid=%u soc=%d ma=%d temp=%d isc=%u soa=%u age=%llu",
-       fStatusSeq, i, fPack[i].ok, fPack[i].socPct, fPack[i].currentMa, fPack[i].tempDeciC, fIsc[i], fSoa[i], now - fPackMs);
+  for (unsigned i = 0; i < 2; ++i) note("buck-pack: seq=%u pack=%u valid=%u soc=%d ma=%d temp=%d isc=%u soa=%u age=%llu mv=%d error=%u failed=%#x",
+       fStatusSeq, i, fPack[i].ok, fPack[i].socPct, fPack[i].currentMa, fPack[i].tempDeciC, fIsc[i], fSoa[i], now - fPackMs,
+       fPack[i].voltageMv, unsigned(fPack[i].error), fPack[i].failedCommand);
 }
 
 // kOff: the thread hands the charger over (decide with the sleep flag until the plan is ready, at most 2 s) and acknowledges; the
@@ -1279,6 +1286,13 @@ void PianoPower::diagPortLine(char *line, size_t size, bool board)
   const int termRaw = VAL(McaTermVolt);
   static const char *const kPan[] = {"not answered yet", "answered", "NO ANSWER"};
   static const char *const kUcsi[] = {"off", "due", "asked", "answered", "NO ANSWER"};
+  const char *ucsi = kUcsi[m.ucsi < 5 ? m.ucsi : 0];
+  if (fPolicyOn) {
+    const uint64_t now = nowMs();
+    ucsi = !gArgs.ucsi ? "observer disabled" : fContract.quarantined ? "observer quarantined" :
+           piano_contract_fresh(&fContract, now) ? "observer PD valid" :
+           piano_contract_status_fresh(&fContract, now) ? "observer non-PD valid" : "observer querying/unknown";
+  }
   if (!board) {
     snprintf(line, size,
              "diag port: verify (0x21002) %d, PD state (0x2100d) %d, data role (0x2100c) %d, OTG boost (0x200d) %d, gate (0x200e) %d, "
@@ -1290,7 +1304,7 @@ void PianoPower::diagPortLine(char *line, size_t size, bool board)
              "diag board: CP (0x201c) %d, CID (0x201b) %#x, OTG (0x201a) %d, sent %#x%s; float (0x2007) %d = %d mV; port enable %s; "
              "UCSI %s; charger_pd %s (generation %u); battery (gauges) %d mA",
              VAL(McaCpState), (uint32_t)VAL(McaCidCfg), VAL(McaOtgCfg), m.board_done, m.board_allowed ? "" : " (off)", termRaw,
-             HAS(McaTermVolt) ? (termRaw + 3600) / 2 : -1, kPan[m.pan_enabled < 3 ? m.pan_enabled : 0], kUcsi[m.ucsi < 5 ? m.ucsi : 0],
+             HAS(McaTermVolt) ? (termRaw + 3600) / 2 : -1, kPan[m.pan_enabled < 3 ? m.pan_enabled : 0], ucsi,
              servreg_state_name(pd), ups, fBattery.ok ? fBattery.currentMa : 0);
   }
 #undef VAL
@@ -1354,7 +1368,7 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     // Independent power evidence keeps AC connected while charge is stopped,
     // even if this round's Type-C observer did not answer.
     const uint64_t now = nowMs();
-    const bool ucsiPower = fContract.status_valid && now >= fContract.updated_ms && now - fContract.updated_ms <= 15000 &&
+    const bool ucsiPower = piano_contract_status_fresh(&fContract, now) &&
                            fContract.connected && fContract.sink;
     const bool busPower = piano_mca_has(&fMca, McaBusVoltage) && fMca.value[McaBusVoltage] >= 4000000;
     if (ucsiPower || busPower) v.external = v.chargeCapable = true;

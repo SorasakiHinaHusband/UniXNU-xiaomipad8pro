@@ -8,6 +8,21 @@ PPS uses 20 mV and 50 mA. Malformed, stale or failed reads revoke authorization.
 This implementation is host-tested; PD/PPS and runtime health actuator behavior
 still need tablet verification.
 
+The observer polls status every five seconds and on port events, including a
+connected non-PD SDP sink. Such a sample has a fresh status sequence and age,
+with PD contract validity and budget remaining zero. CONTROL readback is only
+diagnostic: completion follows serialized CCI command/ACK indications, even when
+CONTROL reads zero or an older value. Transport timeouts still quarantine the
+unsequenced channel until relink. Status diagnostics distinguish the built-in
+observer from the legacy probe, and include stage, CCI and quarantine state.
+
+The first tablet run booted and charged on SDP, but the extra CONTROL-echo check
+prevented status completion and voided its actuator precondition. One later gauge
+report also contained an invalid all-ones voltage. Gauge voltage/error/failed
+command are now exposed per pack. The follow-up spec waits within a shared
+75-second budget for a newer valid dual-gauge report; it retains rejected
+attempts and never treats a failed read or an older valid report as fresh.
+
 The first buck profile caps HV input at 1600 mA and battery current at 1500 mA,
 requires the existing 4400 mV float setting, and reads SC8541 CTRL2 to confirm the
 pump is off. It never enables the pump. Missing pump state prevents source voltage

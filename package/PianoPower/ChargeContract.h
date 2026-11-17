@@ -101,6 +101,7 @@ typedef struct {
     uint16_t version, status_change;
     uint32_t cci, rdo, source_pdo[7], mv, ma, source_ma;
     uint32_t status_flags, capabilities;
+    uint64_t control_readback;       /* diagnostic only: CONTROL need not echo writes */
     uint64_t updated_ms;
     int32_t last_error;
     /* Diagnostic transport state. in_flight is 0, READ=0x11, or WRITE=0x12. */
@@ -136,6 +137,9 @@ static inline void piano_contract_link(PianoChargeContract *c, int up) {
 static inline void piano_contract_refresh(PianoChargeContract *c) { c->wanted = 1; }
 static inline int piano_contract_fresh(const PianoChargeContract *c, uint64_t now_ms) {
     return c->valid && !c->notify_pending && now_ms >= c->updated_ms && now_ms - c->updated_ms <= PIANO_CONTRACT_FRESH_MS;
+}
+static inline int piano_contract_status_fresh(const PianoChargeContract *c, uint64_t now_ms) {
+    return c->status_valid && !c->notify_pending && now_ms >= c->updated_ms && now_ms - c->updated_ms <= PIANO_CONTRACT_FRESH_MS;
 }
 static inline void piano_contract_fail(PianoChargeContract *c, int error, int quarantine) {
     piano_contract_invalidate(c, error, 0); ++c->failures;
@@ -228,7 +232,7 @@ static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_m
  * notification also denotes command completion and is NOT itself a detach. */
 static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms, const uint8_t *data, uint32_t length) {
     uint32_t opcode, cci, result, payload, flags, rdo; uint16_t version;
-    uint64_t echo; unsigned bytes, i, n, next; int notify_resolved;
+    unsigned bytes, i, n, next; int notify_resolved;
     const uint8_t *message;
     if (!data || length < 12 || piano_contract_u32(data) != PIANO_CONTRACT_OWNER) return 0;
     opcode = piano_contract_u32(data + 8);
@@ -264,6 +268,7 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     result = piano_contract_u32(data + 12 + bytes);
     if (result) { piano_contract_fail(c, PIANO_CONTRACT_RETURN, 0); return -1; }
     c->version = version; cci = piano_contract_u32(data + 16); c->cci = cci;
+    c->control_readback = (uint64_t)piano_contract_u32(data + 20) | (uint64_t)piano_contract_u32(data + 24) << 32;
     /* When BUSY, the other CCI fields are not authoritative (UCSI CCI
      * semantics); in particular they must not invent a connector event. */
     if (cci & (1u << 28)) {
@@ -298,8 +303,11 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         else { c->stage = PianoContractCapability; c->wire = 0; }
         return notify_resolved ? 2 : 1;
     }
-    echo = (uint64_t)piano_contract_u32(data + 20) | (uint64_t)piano_contract_u32(data + 24) << 32;
-    if (echo != c->command) { piano_contract_fail(c, PIANO_CONTRACT_CCI, 1); return -1; }
+    /* CONTROL is the command input, not a response transaction identifier.
+     * In particular a transport WRITE ACK may precede CCI completion, with
+     * zero/old CONTROL in a READ. Only the serialized CCI command/ACK
+     * completion advances us. Keep the original deadline across CCI=0 polls;
+     * a transport timeout still quarantines late, unsequenced responses. */
     if (cci & ((1u << 25) | (1u << 26) | (1u << 27) | (1u << 30))) {
         piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
     }

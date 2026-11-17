@@ -27,6 +27,7 @@ struct Integration {
   std::vector<PianoChargeWrite> writes;
   unsigned voltageRequests=0;
   int32_t iclReadbackOverride=-1;
+  bool pd=true;
 
   Integration() {
     piano_contract_init(&contract); piano_contract_link(&contract,1);
@@ -40,7 +41,7 @@ struct Integration {
   void fill() {
     auto put=[&](int field,int32_t value) {m.valid|=1u<<field;m.value[field]=value;};
     put(McaBusVoltage,int32_t(bus*1000));put(McaBusCurrent,int32_t(icl*1000));
-    put(McaType,PIANO_CHG_T_PD);put(McaIcl,iclReadbackOverride<0?int32_t(icl):iclReadbackOverride);put(McaChargeEnable,int32_t(enable));
+    put(McaType,pd?PIANO_CHG_T_PD:PIANO_CHG_T_SDP);put(McaIcl,iclReadbackOverride<0?int32_t(icl):iclReadbackOverride);put(McaChargeEnable,int32_t(enable));
     put(McaTermVolt,5200);put(McaVerify,0);put(McaTbat,30);put(McaPdState,2);put(McaLpd,0);
     LinkView v;v.nowMs=now;v.chargerPdUp=true;v.chargerPdUpMs=1;
     v.contract=&contract;v.safetyFresh=true;v.cpOff=true;v.dtptValid=true;
@@ -84,13 +85,13 @@ struct Integration {
       assert((control&255)==4 || (control&255)==6 || (control&255)==0x10 || (control&255)==0x12);
     } else {
       assert(n==12 && op==PIANO_CONTRACT_READ);length=64;response[12]=0x10;response[13]=1;
-      piano_contract_put32(response+20,uint32_t(control));piano_contract_put32(response+24,uint32_t(control>>32));
+      // The PPM returns no CONTROL echo. CCI and serialized ACKs associate replies.
       uint32_t cci=0;uint8_t *msg=response+28;
       if(contract.stage!=PianoContractProbe) {
         const unsigned command=control&255;
         cci=command==4?1u<<29:1u<<31;
         if(command==6) {cci|=16u<<8;msg[0]=4;msg[4]=1;msg[5]=16;}
-        else if(command==0x12) {cci|=9u<<8;piano_contract_put32(msg,1u<<19|3u<<16);piano_contract_put32(msg+4,rdo);}
+        else if(command==0x12) {cci|=9u<<8;piano_contract_put32(msg,1u<<19|(pd?3u:1u)<<16);piano_contract_put32(msg+4,pd?rdo:0);}
         else if(command==0x10) {cci|=12u<<8;for(unsigned i=0;i<3;++i)piano_contract_put32(msg+4*i,source[i]);}
       }
       piano_contract_put32(response+16,cci);
@@ -106,7 +107,7 @@ struct Integration {
         assert(icl<=100 && voltageRequests==requests); // no extra 9V or 5V request during bounded validation
       }
     }
-    assert(contract.seq==seq+1 && contract.valid);
+    assert(contract.seq==seq+1 && contract.status_valid && bool(contract.valid)==pd);
   }
   void tick() {now+=5000;observe();decide();}
   bool wrote5(size_t after) const {
@@ -120,6 +121,19 @@ struct Integration {
 };
 
 int main() {
+  Integration sdp;sdp.pd=false;sdp.observe();sdp.decide();
+  assert(sdp.contract.connected && sdp.contract.sink && !sdp.contract.pd && !sdp.contract.last_error);
+  assert(sdp.link.in.valid & PIANO_CHG_IN_GAUGES);
+  assert(!sdp.voltageRequests && !sdp.link.in.contract_ma && sdp.icl<=500);
+  auto sample=sdp.contract.updated_ms; auto seq=sdp.contract.seq;
+  sdp.tick();assert(sdp.contract.seq==seq+1 && sdp.contract.updated_ms>sample && !sdp.voltageRequests);
+  // A failed next report stays invalid; only a new valid pair restores the input.
+  sdp.packs[1].ok=false;sdp.packs[1].voltageMv=65535;sdp.fill();
+  assert(!(sdp.link.in.valid & PIANO_CHG_IN_GAUGES));
+  sdp.now+=30000;sdp.packs[1].ok=true;sdp.packs[1].voltageMv=3900;sdp.observe();sdp.fill();
+  assert(sdp.link.in.valid & PIANO_CHG_IN_GAUGES);
+  assert(sdp.packs[0].socPct==25 && sdp.packs[1].socPct==25 && !sdp.voltageRequests);
+
   Integration s;s.observe();s.fill();
   assert(s.link.in.contract_mv==5000 && s.link.in.contract_ma==3000);
   assert(s.link.in.fixed9_ma==2000 && s.link.in.pps9_ma==3000);

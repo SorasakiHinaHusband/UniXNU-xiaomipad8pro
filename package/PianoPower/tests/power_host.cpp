@@ -1381,6 +1381,18 @@ static void testGauge()
     ones.regs[r] = 0xffff;
   I2cBus busE(ones.io());
   CHECK(!readGauge(busE).ok);
+
+  // The saved buck1 restore report had one all-ones voltage with otherwise
+  // plausible fields. Reject that report, without losing the next real read.
+  Gauge transient;
+  fillGauge(transient, 65535, 211, 24, 1009, 4290, 323, 0);
+  I2cBus busF(transient.io());
+  const GaugeReading bad = readGauge(busF);
+  CHECK(!bad.ok && bad.error == I2cResult::ok && bad.failedCommand == 0xff);
+  CHECK(bad.voltageMv == 65535 && bad.currentMa == 211 && bad.socPct == 24);
+  transient.regs[kGaugeVoltage] = 3785;
+  const GaugeReading recovered = readGauge(busF);
+  CHECK(recovered.ok && recovered.voltageMv == 3785 && recovered.currentMa == 211 && recovered.socPct == 24);
 }
 
 // ------------------------------------------------------------------------------------------------------------ MCA model

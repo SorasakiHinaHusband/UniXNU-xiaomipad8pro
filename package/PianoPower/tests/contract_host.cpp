@@ -47,19 +47,22 @@ struct Ppm {
     uint16_t version=0x110;
     unsigned stage=0, reads=0, writes=0, acks=0, connectorAcks=0, snapshots=0;
     bool busy=false, shortStatus=false, changeOnVerify=false;
-    bool transportError=false, ucsiError=false, wrongEcho=false, shortPayload=false, missingPdoFeature=false;
+    bool transportError=false, ucsiError=false, echoControl=false, shortPayload=false, missingPdoFeature=false;
+    uint64_t staleControl=0;
+    unsigned completionDelay=0, pendingPolls=0;
     unsigned cciConnector=0, connectorCount=1;
     Ppm() { piano_contract_init(&c); piano_contract_link(&c,1); }
     int step() {
         uint8_t request[PIANO_CONTRACT_REQUEST_MAX];
         auto n=piano_contract_next(&c,now,request); ++now;
-        if (!n) return 0;
+        if (!n) { now+=200; return 0; }
         assert(piano_contract_u32(request)==PIANO_CONTRACT_OWNER && piano_contract_u32(request+4)==1);
         unsigned op=piano_contract_u32(request+8);
         if(op==PIANO_CONTRACT_WRITE) {
             ++writes;
             assert(n==(version<0x200 ? 64u:544u));
             control=uint64_t(piano_contract_u32(request+20)) | uint64_t(piano_contract_u32(request+24))<<32;
+            pendingPolls=completionDelay;
             unsigned cmd=control&255;
             assert(cmd==4 || cmd==6 || cmd==0x10 || cmd==0x12);
             if(cmd==4) { ++acks; if(control & (uint64_t(1)<<16)) {++connectorAcks; cciConnector=0;} }
@@ -73,12 +76,14 @@ struct Ppm {
         uint8_t response[544]={}; unsigned size=version<0x200 ? 64:544;
         piano_contract_put32(response,PIANO_CONTRACT_OWNER); piano_contract_put32(response+4,1); piano_contract_put32(response+8,op);
         response[12]=uint8_t(version); response[13]=uint8_t(version>>8);
-        piano_contract_put32(response+20,uint32_t(control)+(wrongEcho?1u:0u)); piano_contract_put32(response+24,uint32_t(control>>32));
+        const auto readControl=echoControl?control:staleControl;
+        piano_contract_put32(response+20,uint32_t(readControl)); piano_contract_put32(response+24,uint32_t(readControl>>32));
         uint8_t *msg=response+28;
         uint32_t cci=0;
         unsigned cmd=control&255;
         if(c.stage!=PianoContractProbe) {
-            if(busy) cci=1u<<28;
+            if(pendingPolls) --pendingPolls; // transport ACK precedes CCI completion
+            else if(busy) cci=1u<<28;
             else if(cmd==4) cci=1u<<29;
             else {
                 cci=1u<<31;
@@ -180,8 +185,7 @@ static void invalidation() {
     assert(reject.c.last_error==PIANO_CONTRACT_RETURN && !reject.c.valid);
     Ppm ppmError; ppmError.step(); ppmError.step(); ppmError.ucsiError=true; assert(ppmError.step()==-1);
     assert(ppmError.c.last_error==PIANO_CONTRACT_CCI);
-    Ppm echo; echo.step(); echo.step(); echo.wrongEcho=true; assert(echo.step()==-1);
-    assert(echo.c.last_error==PIANO_CONTRACT_CCI && echo.c.quarantined);
+    Ppm echo; echo.echoControl=true; echo.complete(); assert(echo.c.valid); // echo is permitted, never required
     Ppm payload; payload.step(); payload.step(); payload.shortPayload=true; assert(payload.step()==-1);
     assert(payload.c.last_error==PIANO_CONTRACT_PAYLOAD);
     Ppm feature; feature.missingPdoFeature=true; feature.complete();
@@ -263,4 +267,39 @@ static void invalidation() {
     assert(!piano_contract_next(&busy.c,busy.now+6000,request));
     assert(busy.c.quarantined && busy.c.last_error==PIANO_CONTRACT_TIMEOUT);
 }
-int main() { decoding(); protocol(); invalidation(); std::puts("charge contract: fixed/PPS units, UCSI framing/ACK, source/status coherence, generations, invalidation and late ACK tests PASS"); }
+static void asynchronousNonPd() {
+    const unsigned modes[]={1,2,4,5};
+    for(unsigned mode : modes) {
+        Ppm p; p.status=1u<<19 | mode<<16; p.rdo=0;
+        p.staleControl=0xfeed01000012ull; p.completionDelay=1;
+        p.complete();
+        assert(p.c.status_valid && p.c.connected && p.c.sink && !p.c.pd && !p.c.valid);
+        assert(!p.c.quarantined && !p.c.failures && !p.c.last_error && p.c.seq==1);
+        assert(!p.c.rdo && !p.c.pdos && !p.c.mv && !p.c.ma && !p.c.protocol);
+        assert(p.c.control_readback==p.staleControl && p.writes==4 && p.acks==2);
+        assert(piano_contract_status_fresh(&p.c,p.now) && !piano_contract_fresh(&p.c,p.now));
+        auto seq=p.c.seq, gen=p.c.generation; auto sampled=p.c.updated_ms;
+        assert(!piano_contract_status_fresh(&p.c,sampled+15001));
+        p.now+=5000; piano_contract_refresh(&p.c); p.snapshots=0; p.complete();
+        assert(p.c.seq==seq+1 && p.c.updated_ms>sampled && p.c.generation==gen);
+        uint8_t notify[24]={}; piano_contract_put32(notify,PIANO_CONTRACT_OWNER);
+        piano_contract_put32(notify+8,PIANO_CONTRACT_NOTIFY);
+        assert(piano_contract_receive(&p.c,p.now,notify,24)==1);
+        assert(!piano_contract_status_fresh(&p.c,p.now));
+        p.cciConnector=1; p.snapshots=0;
+        for(unsigned i=0;i<100 && p.c.seq==seq+1;++i) assert(p.step()>=0);
+        assert(p.c.seq==seq+2 && p.c.generation==gen+1 && !p.c.pd && p.c.status_valid);
+        assert(p.connectorAcks==1 && piano_contract_status_fresh(&p.c,p.now));
+    }
+    Ppm retry; retry.step(); retry.step(); retry.ucsiError=true; assert(retry.step()==-1);
+    assert(!retry.c.quarantined && !retry.c.status_valid);
+    retry.ucsiError=false; retry.now+=5000; piano_contract_refresh(&retry.c); retry.complete();
+    assert(retry.c.valid && !retry.c.last_error && retry.c.seq==1);
+    // A command that never completes retains its deadline, without new GETs.
+    Ppm stuck; stuck.step(); stuck.step(); stuck.completionDelay=100;
+    stuck.pendingPolls=100; auto writes=stuck.writes; auto deadline=stuck.c.command_ms+5000;
+    assert(stuck.step()==1 && stuck.c.cci==0 && !stuck.c.quarantined);
+    uint8_t request[544]; assert(!piano_contract_next(&stuck.c,deadline,request));
+    assert(stuck.c.quarantined && stuck.c.last_error==PIANO_CONTRACT_TIMEOUT && stuck.writes==writes && !stuck.c.status_valid);
+}
+int main() { decoding(); protocol(); invalidation(); asynchronousNonPd(); std::puts("charge contract: fixed/PPS, zero/stale CONTROL, asynchronous CCI/ACK, fresh non-PD refresh/events and timeout quarantine PASS"); }
