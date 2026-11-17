@@ -171,6 +171,7 @@ typedef struct {
     /* Validated UCSI session, distinct from source advertisements and measured draw. */
     uint32_t contract_generation, contract_link_generation, contract_mv, contract_ma;
     uint32_t fixed9_ma, pps9_ma;   /* raw source PDO/APDO budgets at 9V, only with IN_SOURCE */
+    uint8_t contract_observing;   /* active bounded UCSI reread after a change; never a failed or quarantined transport */
     uint8_t contract_protocol;    /* 1=fixed, 2=PPS; decoded using the selected raw PDO */
     uint32_t safety;              /* SAFE_*: valid and safe, not absence of a driver */
     uint32_t faults;              /* nonzero confirmed prohibited state (wet/ISC/SOA), not missing data */

@@ -1566,7 +1566,7 @@ static void testKick()
 
 // The production session supplements the firmware model with independent UCSI RDO readback. ACK and contract may disagree.
 struct StrictSim : Sim {
-  bool contractValid = true, sourceValid = true, contractFollows = true;
+  bool contractValid = true, sourceValid = true, contractFollows = true, contractObserving = false;
   bool iclReadable = true, busReadable = true;
   uint32_t contractGen = 1, contractLink = 1, contractMv = 5000, contractMa = 3000;
   uint32_t fixed9 = 3000, pps9 = 3000, safe = PIANO_CHG_SAFE_ALL, faults = 0;
@@ -1579,6 +1579,7 @@ struct StrictSim : Sim {
     if (sourceValid) in.valid |= PIANO_CHG_IN_SOURCE;
     if (!iclReadable) in.valid &= ~PIANO_CHG_IN_ICL;
     if (!busReadable) in.valid &= ~PIANO_CHG_IN_BUS;
+    in.contract_observing = contractObserving;
     in.contract_generation = contractGen;
     in.contract_link_generation = contractLink;
     in.contract_mv = contractMv; in.contract_ma = contractMa;
@@ -1606,6 +1607,39 @@ struct StrictSim : Sim {
 
 static void testContractSession()
 {
+  // An inherited HV source may belong to a running firmware pump. Read-only CP off must precede even a5V withdrawal.
+  {
+    StrictSim s; s.busMv = 9000; s.contractMv = 9000; s.safe &= ~PIANO_CHG_SAFE_CP_OFF;
+    for (int i = 0; i < 8; ++i) {s.step(); CHECK(!s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));}
+    CHECK(s.busMv == 9000 && s.icl <= 500 && s.fcc <= 500 && s.plan.transition);
+    s.safe |= PIANO_CHG_SAFE_CP_OFF; s.step(); CHECK(s.wrote(PIANO_CHG_PD_FIXED,5000) && s.busMv == 5000);
+  }
+  {
+    StrictSim s; s.run(); CHECK(s.busMv == 9000);
+    s.safe &= ~PIANO_CHG_SAFE_CP_OFF; s.cfg.admin_stop = 1;
+    s.step(); CHECK(s.enable == 0 && s.busMv == 9000 && !s.wrote(PIANO_CHG_PD_FIXED));
+    s.run(3); CHECK(s.enable == 0 && s.busMv == 9000 && s.icl <= 500 && s.plan.transition);
+    s.safe |= PIANO_CHG_SAFE_CP_OFF; s.step(); CHECK(s.busMv == 5000 && s.enable == 0);
+  }
+  // UCSI temporarily invalidates RDO while rereading after our5->9V request. Observe behind100mA without undoing a valid transition.
+  {
+    StrictSim s;
+    for (int i = 0; i < 12 && !s.wrote(PIANO_CHG_PD_FIXED,9000); ++i) s.step();
+    CHECK(s.st.hv == PIANO_CHG_HV_ASKED && s.busMv == 9000);
+    s.contractValid = false; s.contractObserving = true;
+    s.step(); CHECK(s.st.hv == PIANO_CHG_HV_ASKED && s.icl <= 100 && s.fcc <= 500 && !s.wrote(PIANO_CHG_PD_FIXED,5000));
+    s.step(); CHECK(s.st.hv == PIANO_CHG_HV_ASKED && !s.wrote(PIANO_CHG_PD_FIXED));
+    s.contractValid = true; s.contractObserving = false; s.contractGen++;
+    s.step(); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600 && s.busMv == 9000);
+  }
+  for (bool failed : {false,true}) {
+    StrictSim s;
+    for (int i = 0; i < 12 && !s.wrote(PIANO_CHG_PD_FIXED,9000); ++i) s.step();
+    s.contractValid = false; s.contractObserving = !failed;
+    s.run(4);
+    CHECK(s.busMv == 5000 && s.st.hv == PIANO_CHG_HV_BLOCKED && s.icl <= 100 && s.fcc <= 500);
+    CHECK(!s.wrote(PIANO_CHG_PD_FIXED,9000));   // no unvalidated resend after timeout or a real UCSI failure
+  }
   {
     StrictSim s; s.run();
     CHECK(s.st.hv == PIANO_CHG_HV_ON && s.busMv == 9000 && s.icl == 1600 && s.fcc <= 1500);
