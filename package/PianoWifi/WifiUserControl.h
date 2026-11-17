@@ -8,9 +8,9 @@
 
 namespace pianowifi {
 struct WifiUserControl;
-// SET19 carries no user-origin bit. Protect the initial no-profile phase until
-// an accepted join or a root-controlled arm explicitly enables physical OFF.
-// ON alone cannot arm this: airportd sends ON during interface attachment.
+// SET19 and SET20 carry no user-origin bit. Keep boot safety until a root-
+// controlled arm explicitly enables physical OFF. Neither startup ON nor
+// automatic joins can establish that the user requested a power change.
 struct WifiBootPower {
   uint32_t armed = 0;
   bool enabled = true; // configured once, before publishing the driver

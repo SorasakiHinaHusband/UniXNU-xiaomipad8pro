@@ -3318,7 +3318,7 @@ int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 struct sysctl_oid gOidPs;
 
 // A raw Apple80211 power request does not identify user intent. Root can arm
-// physical OFF before a first join; this is one-way for the rest of this boot.
+// physical OFF explicitly; this is one-way for the rest of this boot.
 int sysctlPowerExplicit(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
   int value = gBootPower.isArmed() ? 1 : 0;
@@ -3408,7 +3408,6 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
   gProfileFromFile = false;
   gProfileFromMenu = true;
   const uint32_t generation = ++gProfileGeneration;
-  gBootPower.arm(); // only after validation and successful owner/profile handoff
   IOLockUnlock(gProfileLock);
   gProfileStampValid = false;
   __atomic_store_n(&gMenuJoinRequested, 1u, __ATOMIC_RELEASE);
@@ -3425,7 +3424,7 @@ extern "C" int piano_wifi_user_control(uint32_t operation)
   if (operation == PIANO_WIFI_USER_LEAVE) w = gUserControl.disconnect();
   else if (operation <= PIANO_WIFI_USER_ON) {
     if (!gBootPower.setPower(gUserControl, operation == PIANO_WIFI_USER_ON)) {
-      note("PianoWifiBootPowerGuardV1 pre-join OFF acknowledged: owner stays ON, no physical stop");
+      note("PianoWifiBootPowerGuardV1 unarmed OFF acknowledged: owner stays ON, no physical stop");
       return 0;
     }
     w = gUserControl.read();
@@ -3482,10 +3481,10 @@ void registerPsSysctl()
   gOidPowerExplicit.oid_name = "piano_wifi_power_explicit";
   gOidPowerExplicit.oid_handler = sysctlPowerExplicit;
   gOidPowerExplicit.oid_fmt = "I";
-  gOidPowerExplicit.oid_descr = "write 1 as root to allow physical Wi-Fi OFF before the first accepted join (one-way per boot)";
+  gOidPowerExplicit.oid_descr = "write 1 as root to allow physical Wi-Fi OFF explicitly (one-way per boot)";
   gOidPowerExplicit.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gOidPowerExplicit);
-  note("PianoWifiBootPowerGuardV1 piano-wifi-boot-on=%u: pre-join OFF %s; accepted SET20 or explicit root arm enables physical OFF",
+  note("PianoWifiBootPowerGuardV1 piano-wifi-boot-on=%u: unarmed OFF %s; only explicit root arm enables physical OFF",
        gBootPower.enabled ? 1u : 0u, gBootPower.enabled ? "acknowledged with radio ON" : "unrestricted");
   __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
   gOidPs.oid_parent = &sysctl__machdep_children;

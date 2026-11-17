@@ -205,9 +205,12 @@ int main()
     r.put32(0, 2); // invalid payload cannot mutate/arm the guard
     CHECK(r.control(kPower, sizeof(Power)).error == kErrInval);
     CHECK(!r.bootGuard.isArmed() && r.owner.read() == initial && r.powerEvents == 6);
-    // Production arms only at the successfully accepted SET20 handoff or an
-    // explicit root write. Exercise both entrances to the same atomic arm.
+    // Automatic SET20 cannot prove user power intent. Joining must leave the
+    // guard in place; only an explicit root write arms real OFF.
     if (!explicitArm) CHECK(!r.associate().error && r.owner.join());
+    CHECK(!r.bootGuard.isArmed());
+    r.setPowerRecord(false);
+    CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower() && !r.owner.radioStop());
     r.bootGuard.arm();
     CHECK(r.bootGuard.isArmed());
     for (unsigned cycle = 0; cycle < 3; ++cycle) {
