@@ -191,6 +191,7 @@ static void guestTests() {
   CHECK(guest.deadline==2010&&guest.matches(100,dbuf)&&!guest.matches(99,dbuf)&&!guest.matches(100,demt));
   CHECK(!guest.begin(101,demt,20)&&!guest.reply(99,dbuf)&&!guest.reply(100,demt));
   CHECK(!guest.expired(2009)&&guest.expired(2010));
+  CHECK(!(guest.matches(100,dbuf)&&!guest.expired(2010))); // actual handler rejects overdue replies
   guest.clear();CHECK(!guest.type&&!guest.request&&!guest.expired(9000));
   CHECK(guest.begin(101,dbuf,9000)&&guest.reply(101,dbuf)&&!guest.reply(101,dbuf)&&!guest.matches(101,dbuf));
   CHECK(!guest.expired(999999));
@@ -279,13 +280,15 @@ static void delayedGuestTests() {
   SelfTest<Peer>::OutputFrame held;CHECK(f.tx.popOutput(held));
   stream::Guest guest;CHECK(guest.begin(100,0x44627566,0));
   const uint8_t au[]={0,0,0,1,0x41,0x9a,0x22};
-  for(unsigned i=102;i<108;++i){CHECK(f.tx.streamSubmit(au,sizeof au,i)==0);f.peer.output(i,4);f.pump();}
-  CHECK(f.tx.r.ebd==7&&f.tx.r.decoded==7&&f.tx.ledger.pending==7&&f.tx.ledger.rawHeld[held.index]);
+  for(unsigned i=102;i<108;++i){CHECK(f.tx.streamSubmit(au,sizeof au,i)==0);if(i<105)f.peer.output(i,4);f.pump();}
+  CHECK(f.tx.r.ebd==7&&f.tx.r.decoded==4&&f.tx.ledger.pending==7&&f.tx.ledger.rawHeld[held.index]);
   // Guest has not replied, but HFI input ownership and output progress continue.
   CHECK(guest.matches(100,0x44627566)&&!guest.expired(1999));
   CHECK(guest.reply(100,0x44627566)&&guest.begin(101,0x44656d74,1999));
   CHECK(f.tx.releaseOutput(held.index,held.token)==0);f.releaseAll();
-  CHECK(guest.reply(101,0x44656d74));guest.clear();f.drain();f.close();
+  CHECK(guest.reply(101,0x44656d74));guest.clear();
+  for(unsigned i=105;i<108;++i){f.peer.output(i,4);f.pump();f.releaseAll();}
+  CHECK(f.tx.r.decoded==7&&f.tx.ledger.pending==0);f.drain();f.close();
 }
 static void drainPictureTests() {
   Fixture f;f.start(91);f.peer.lastWithPicture=true;f.peer.finalToken=91;
