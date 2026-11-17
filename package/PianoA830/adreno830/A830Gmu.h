@@ -279,7 +279,7 @@ public:
      * RSCC TCSes (1 ms each, record only); clear the AHB fence; CM3 reset; GBIF arbiter halt (100 ms, record only); GX GDSC
      * collapse with a temporary host GX vote when GX is still on; RSCC sleep (record only); GBIF halt released. Always
      * completes; warnings say what did not. The GMU is then off and the OOB references are dropped. */
-    IOReturn forceOff();
+    IOReturn forceOff(bool strict=false);
     /* 4.7.4: CM3 reset, GENERAL_9 saved, RSCC_CONTROL_REQ BIT0, RSC_STATUS0_DRV0 bit16 within 100 ms, request cleared.
      * Skipped before the first successful boot and when already asleep. Step 0x30, reason 5. */
     IOReturn rsccSleep();

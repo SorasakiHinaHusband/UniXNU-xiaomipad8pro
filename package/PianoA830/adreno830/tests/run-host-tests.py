@@ -127,7 +127,7 @@ class Runner:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('#include "XnuMemoryFixture.h"\n')
         (includes / 'kern/clock.h').write_text('#include "Adreno830HostClock.h"\n')
-        self.includes = ['-I', includes, '-I', TESTS, '-I', ROOT]
+        self.includes = ['-I', includes, '-I', TESTS, '-I', ROOT, '-I', ROOT.parents[1] / 'include'] + (['-DADRENO830_MACOS'] if args.macos else [])
         self.objects = {}
 
     def host_objects(self, kinds):
@@ -239,6 +239,7 @@ def main():
     parser.add_argument('--firmware', type=Path, help='directory with the gen80000 images (test_sha256 per image)')
     parser.add_argument('--pins', type=Path, help='firmware pins (default: <firmware>/../../../scripts/data/sm8750-gpu-inputs.json)')
     parser.add_argument('--tree', type=Path, help='UniXNU build tree for the kernel-object check (default: found under --unixnu)')
+    parser.add_argument('--macos', action='store_true', help='exercise the native macOS conditional paths')
     parser.add_argument('--out', type=Path, default=ROOT / 'build/host-tests')
     parser.add_argument('names', nargs='*', help='run only these tests (e.g. test_status)')
     args = parser.parse_args()

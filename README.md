@@ -21,6 +21,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   (Dock, menu bar, Finder, Control Center as GPU clients); the first sessions' resets and GPU map refusals are fixed, and
   the display now draws the pointer layer and copies no frame before its GPU fence (built and host-tested, to be run:
   `docs/drivers/native-gop-display.md` §5a).
+  A bounded [607 MHz qualification mode](docs/drivers/gpu.md#607-mhz-qualification-r3a) is experimental; the daily ceiling stays 342 MHz pending tablet qualification.
 - Input: the Xiaomi keyboard cover (keys, touchpad) and the touch screen (taps, drags, two-finger scroll) reach macOS; the
   touch screen's orientation on this unit and its controller watchdog recovery are fixed (built, to be run).
 - A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;

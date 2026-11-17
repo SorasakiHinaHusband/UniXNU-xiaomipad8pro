@@ -21,6 +21,8 @@
 #include "A830PowerState.h"
 #include "A830Recovery.h"
 #include "A830Dcvs.h"
+#include "A830Qualification.h"
+#include <stdarg.h>
 #ifdef ADRENO830_MACOS
 #include "A830Idle.h"
 #include "A830Suspend.h"
@@ -43,6 +45,10 @@
 #ifdef ADRENO830_HOST_TEST
 #include <new>
 #endif
+
+extern "C" __attribute__((weak)) void adreno830_qualification_note(const char *) {}
+extern "C" __attribute__((weak)) bool adreno830_qualification_board(piano_gpu_temps *) {return false;}
+extern "C" __attribute__((weak)) void adreno830_qualification_unsafe() {}
 
 #ifndef ADRENO830_HOST_TEST
 #include <IOKit/IOLib.h>
@@ -178,6 +184,17 @@ struct Adreno830Device {
 extern "C" {__attribute__((weak)) volatile uint32_t sm8750_aoss_qmp_owner;}
 namespace {
 Adreno830Device g830;
+A830Qualification gQualification;
+bool gQualificationEnabled=false;
+uint64_t gQualificationInjectAt=0;
+bool gQualificationInjectionScheduled=false;
+bool qualificationMode(const Adreno830Board *b) {return b && b->knobs.maxlevel==7 && b->knobs.dcvs_max_mhz==607;}
+void qualLog(const char *format,...) __attribute__((format(printf,1,2)));
+void qualLog(const char *format,...) {
+    char line[960];va_list ap;va_start(ap,format);vsnprintf(line,sizeof line,format,ap);va_end(ap);
+    adreno830_qualification_note(line);
+}
+void qualificationUnsafe(void *) {adreno830_qualification_unsafe();} // no logger, allocation, power or HFI lock on the emergency path
 /* The cmd-db snapshot: 128 KiB, static storage (never a stack object: XNU kernel stacks are 16 KiB, ARCHITECTURE 4.1.1). */
 #if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
 /* UniXNU-piano (k27 native kext): a one-time heap allocation instead (Sm8750Rpmh.h allows either). The k27 kernel collection places a
@@ -1170,6 +1187,27 @@ IOReturn stageInputs(Adreno830Device *d,Adreno830Failure *f)
     if((r=A830Votes::build(d->rpmh,*b,d->levels,options,&d->votes))!=kIOReturnSuccess)
         return refuse(f,A830S0StepVotes,A830ReasonCmdDb,d->votes.error_resource,
                       uint64_t(d->votes.error_step)<<16|(d->votes.error_value&0xffff),0,r);
+    if(qualificationMode(b)) {
+        if(b->knobs.profile!=1 || b->knobs.speedbin || b->knobs.acd || b->knobs.hfi || b->knobs.rails!=1 ||
+           b->knobs.ddr_boot!=11 || b->knobs.ddr_floor!=11 || !b->knobs.dcvs || b->knobs.dcvs_min_mhz!=160 ||
+           d->votes.levels!=11 || d->votes.gx_count!=12 || d->votes.cx_count!=3 || d->votes.perf_dwords!=49 ||
+           d->votes.initial!=1 || d->votes.level[6].khz!=607000 || d->votes.bw[A830BwLevelNum]!=12)
+            return refuse(f,A830S0StepVotes,A830ReasonArgument,0,d->votes.levels,11,kIOReturnBadArgument);
+        const Sm8750RpmhArc *arcs[5]={&d->rpmh.gfx,&d->rpmh.mx,&d->rpmh.cx,&d->rpmh.gmxc,&d->rpmh.gbx};
+        const char *names[5]={"gfx","mx","cx","gmxc","gbx"};
+        for(unsigned a=0;a<5;++a) {
+            const auto &arc=*arcs[a];qualLog("R3a ARC %s present=%u count=%u",names[a],arc.present,arc.count);
+            for(unsigned i=0;i<arc.count;++i)qualLog("R3a ARC %s index=%u vlvl=%x",names[a],i,arc.vlvl[i]);
+        }
+        for(unsigned g=0;g<d->votes.gx_count;++g)qualLog("R3a GX %u khz=%u gx=%08x dep=%08x",g,
+            d->votes.gx[g].khz,d->votes.gx[g].vote,d->votes.gx[g].dep);
+        for(unsigned c=0;c<3;++c)qualLog("R3a CX %u khz=%u vote=%08x",c,d->votes.cx[c].khz,d->votes.cx[c].vote);
+        const Sm8750RpmhBcm *bcms[4]={&d->rpmh.sh0,&d->rpmh.mc0,&d->rpmh.acv,&d->rpmh.cn0};
+        for(unsigned i=0;i<4;++i)qualLog("R3a BCM %u addr=%x unit=%u width=%u vcd=%u",i,bcms[i]->addr,bcms[i]->unit,bcms[i]->width,bcms[i]->vcd);
+        for(unsigned i=0;i<12;++i)qualLog("R3a DDR %u kbps=%u wait=%x words=%08x,%08x,%08x",i,d->votes.ddr_kbps[i],
+            d->votes.bw_wait_mask,d->votes.bw[A830BwDdrData+i*8],d->votes.bw[A830BwDdrData+i*8+1],d->votes.bw[A830BwDdrData+i*8+2]);
+        qualLog("R3a C5-607-v1 full-table verified M1=49 GX12 CX3 M2=160 profile1 speedbin0 ACDoff host-rails1 DDR11");
+    }
     if(!A830Votes::levelAtOrAbove(d->votes,b->knobs.dcvs_min_mhz) || !A830Votes::levelAtOrBelow(d->votes,b->knobs.dcvs_max_mhz))
         return refuse(f,A830S0StepLevelTable,A830ReasonArgument,Adreno830KnobDcvsMax,b->knobs.dcvs_max_mhz,b->knobs.dcvs_min_mhz);
     /* gen80000_gmu.bin blocks (4.7.1): the PREALLOC requests size the GMU memory of S3. */
@@ -2138,6 +2176,8 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
         return scope.end(r);
     }
     g830.level=args->level;g830.bus=args->bus;
+    if(gQualificationEnabled)qualLog("R3a fresh-M9 ACK level=%u bus=%u header=%08x at-us=%llu elapsed-us=%llu",args->level,args->bus,
+        g830.hfi.header(A830HfiM9Vote),nowUs(),nowUs()-gQualification.failedAt()/1000);
     /* P2: with IFPC on (FEATURE_CTRL{IFPC,1,0x1680}) the GPU top half keeps GX up and polls the AHB fence (4.12.1, 4.17). */
     g830.irq.setIfpc(args->ifpc);
     return scope.end(kIOReturnSuccess);
@@ -2145,8 +2185,10 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
 IOReturn opGmuForceOff(void *)
 {
     TraceScope scope("gmuForceOff");
-    const IOReturn r=g830.gmu.forceOff();
+    const IOReturn r=g830.gmu.forceOff(gQualificationEnabled);
     g830.hfi.stop();
+    if(gQualificationEnabled)qualLog("R3a strict-off result=%x at-us=%llu elapsed-us=%llu",unsigned(r),nowUs(),
+        nowUs()-gQualification.failedAt()/1000);
     return scope.end(r);
 }
 IOReturn opRsccSleep(void *)
@@ -2221,6 +2263,9 @@ void ropGate(void *,uint8_t gate,uint8_t cause)
     if(gate==A830GateRecovering) {traceRecoveryGate(gate);native_adreno_recovery_begin(A830FaultBlamesClient(cause));}
     else if(gate==A830GateOpen) {native_adreno_recovery_end(true);traceRecoveryGate(gate);}
     else {native_adreno_recovery_end(false);traceRecoveryGate(gate);}
+    if(gQualificationEnabled)qualLog("R3a gate=%u cause=%u ACK-level=%u bus=%u at-us=%llu elapsed-us=%llu sticky=%u",gate,cause,
+        g830.power_state.votedLevel(),g830.power_state.votedBus(),nowUs(),nowUs()-gQualification.failedAt()/1000,
+        g830.power_state.qualificationLatched());
 }
 void ropFenceSignal(void *) {g830.fence.wakeAll();}
 void ropIrqRestore(void *)
@@ -2247,7 +2292,7 @@ void ropSnapshot(void *,A830HangSnapshot *snapshot)
         snapshot->smmuFsr[i]=smmuRead(uint32_t(cb+A830_SMMU_CB_FSR));
         snapshot->smmuFar[i]=smmuFar(cb);
     }
-    if(snapshot->cxOn)drainHfiLate();
+    if(snapshot->cxOn && !gQualificationEnabled)drainHfiLate();
 #ifdef ADRENO830_MACOS
     native_adreno_note_hang_snapshot(snapshot);   /* UniXNU-piano: the snapshot on the console (NativeAdrenoPublish.cpp) */
 #endif
@@ -2476,14 +2521,70 @@ void dcvsQueueRow(void *)
     g830.fence.takeQueue(&queue);
     adreno830_status_queue(&queue);
     adreno830_status_meter();
+    if(gQualificationEnabled) {
+        const auto &s=g830.dcvs.stats();const auto &h=g830.hfi.stats();const auto &r=g830.recovery.stats();
+        qualLog("R3a COUNTERS at-us=%llu vote=%u failures=%u sent=%u ack=%u timeout=%u errors=%u stale=%u malformed=%u queuefull=%u dropped=%u drop=%08x req=%08x requested=%u/%u forceoff=%u recover=%u recoverfail=%u gbif=%u level=%u bus=%u sticky=%u reason=%u ready=%u high=%u",
+            nowUs(),s.votes,s.voteFailures,h.sent,h.acks,h.timeouts,h.errors,h.stale_acks,h.malformed,h.queue_full,h.dropped_acks,h.drop_header,
+            h.last_request,h.last_level,h.last_bw,g830.gmu.report().force_offs,r.recoveries,r.failures,r.gbifTimeouts,
+            g830.power_state.votedLevel(),g830.power_state.votedBus(),g830.power_state.qualificationLatched(),
+            gQualification.reason(),gQualification.ready(),gQualification.high());
+        qualLog("R3a RES at-us=%llu windows=%u busy=%u ceiling=%u l1=%u l2=%u l3=%u l4=%u l5=%u l6=%u l7=%u l8=%u l9=%u l10=%u l11=%u",
+            nowUs(),s.windows,s.busyPermille,s.ceiling,s.residency[1],s.residency[2],s.residency[3],s.residency[4],s.residency[5],
+            s.residency[6],s.residency[7],s.residency[8],s.residency[9],s.residency[10],s.residency[11]);
+        qualLog("R3a ACK at-us=%llu l1=%u l2=%u l3=%u l4=%u l5=%u l6=%u l7=%u l8=%u l9=%u l10=%u l11=%u last=%08x hfi-vote-fail=%u host-sent=%u host-fail=%u host-held=%x mx=%u cx=%u ddr=%u gpu-peak=%d",
+            nowUs(),h.level_acks[1],h.level_acks[2],h.level_acks[3],h.level_acks[4],h.level_acks[5],h.level_acks[6],h.level_acks[7],h.level_acks[8],
+            h.level_acks[9],h.level_acks[10],h.level_acks[11],h.last_ack,h.vote_failures,g830.host.sent,g830.host.failures,g830.host.held,
+            g830.host.mx_hlvl,g830.host.cx_hlvl,g830.host.ddr_kbps,g830.dcvs.thermal().peak_deci);
+    }
 }
+void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
+{
+    const auto &h=g830.hfi.failure();
+    qualLog("R3a vote-unknown request=%08x seq=%u requested=%u/%u oldACK=%u/%u error=%x reason=%u at-us=%llu",
+        h.hdr,A830_HFI_HDR_SEQ(h.hdr),requested,bus,g830.power_state.votedLevel(),g830.power_state.votedBus(),unsigned(error),h.reason,nowUs());
+    gQualification.fault(A830QualVote,nowUs()*1000);
+}
+void qualificationThread(void *)
+{
+    for(;;) {
+        const uint64_t now=nowUs()*1000;
+        if(g830.power_state.qualificationLatched() && !gQualification.reason())gQualification.fault(A830QualVote,now);
+        Sm8750TsensSample gpu={};Sm8750TsensReadGpu(&g830.tsens_io,&gpu);
+        piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
+        const bool ok=adreno830_qualification_board(&board);
+        gQualification.tick(now,gpu,board,ok);
+        if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr);
+        const uint64_t age0=board.age_ms[0],age1=board.age_ms[1];
+        qualLog("R3a TEMP at-us=%llu gpu-valid=%02x gpu-max=%d gpu-raw=%x,%x,%x,%x,%x,%x,%x,%x board-ok=%u state=%u valid=%x disabled=%x rounds=%u period=%u msm=%d quiet=%d age-ms=%llu,%llu sample-us=%llu,%llu ready=%u high=%u sticky=%u reason=%u opened-us=%llu failed-us=%llu",
+            now/1000,gpu.valid,gpu.max_deci,gpu.raw[0],gpu.raw[1],gpu.raw[2],gpu.raw[3],gpu.raw[4],gpu.raw[5],gpu.raw[6],gpu.raw[7],
+            ok,board.state,board.valid,board.disabled,board.rounds,board.period_ms,board.milli_c[0],board.milli_c[1],age0,age1,
+            board.sample_us[0],board.sample_us[1],gQualification.ready(),gQualification.high(),g830.power_state.qualificationLatched(),
+            gQualification.reason(),gQualification.openedAt()/1000,gQualification.failedAt()/1000);
+        os().sleep_us(1000000);
+    }
+}
+void qualificationService(void *,uint64_t now) {
+    gQualification.checkLease(now);
+    const uint64_t at=__atomic_load_n(&gQualificationInjectAt,__ATOMIC_ACQUIRE);
+    if(at && now>=at && __atomic_exchange_n(&gQualificationInjectAt,0ull,__ATOMIC_ACQ_REL)) {
+        if(gQualification.high() && g830.power_state.votedLevel()>3 && g830.hfi.armDropAck()) {
+            qualLog("R3a injection armed from ACK level=%u at-us=%llu",g830.power_state.votedLevel(),nowUs());
+            g830.dcvs.forceQualificationVote();
+        } else qualLog("R3a injection refused: high ACK/permit missing at deadline");
+    }
+}
+void qualificationSample(void *,uint64_t now,const Sm8750TsensSample *gpu) {gQualification.sample(now,*gpu);}
 IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
 {
     const Adreno830Board *b=d->board;
     adreno830_status_step(A830S10StepPower);
     bindPower(d);
+#ifdef ADRENO830_MACOS
+    if(qualificationMode(b) && gIdle.mode!=1)return refuse(f,A830S10StepPower,A830ReasonArgument,0,gIdle.mode,1,kIOReturnBadArgument);
+#endif
     adreno830_status_step(A830S10StepDcvs);
     A830DcvsConfig config;
+    config.qualification607=qualificationMode(b);
     config.governor=b->knobs.dcvs!=0;
     config.minMhz=b->knobs.dcvs_min_mhz;config.maxMhz=b->knobs.dcvs_max_mhz;
     config.maxGiven=(b->flags&(1u<<Adreno830KnobDcvsMax))!=0;
@@ -2514,12 +2615,21 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
             idleEvent(e);
         }
     }
-    const A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow,
+    A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow,
                            gIdle.mode>=2?dcvsIdleTick:nullptr};
 #else
-    const A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow};
+    A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow};
 #endif
     d->tsens_io={nullptr,tsensRead};
+    if(config.qualification607) {
+        gQualificationEnabled=true;
+        d->recovery.qualification(qualificationUnsafe,nullptr);
+        gQualification.init(&d->power_state,&d->recovery);
+        d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;
+        ops.qualificationService=qualificationService;ops.qualificationSample=qualificationSample;
+        if(!os().thread_start || os().thread_start(qualificationThread,nullptr)!=kIOReturnSuccess)
+            return refuse(f,A830S10StepDcvs,A830ReasonNoMemory,0,0,0,kIOReturnNoMemory);
+    }
     IOReturn r=d->dcvs.init(config,table,d->power_win,d->power_env,ops,&d->power_state,&d->recovery,
                             mapped(A830WinTsensTm)?&d->tsens_io:nullptr);
     if(r!=kIOReturnSuccess)return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,r,0,r);
@@ -2769,12 +2879,31 @@ extern "C" void adreno830_start_reset(void)
 {
     g830.~Adreno830Device();
     new (&g830) Adreno830Device();
+    gQualification=A830Qualification{};gQualificationEnabled=false;
+    gQualificationInjectAt=0;gQualificationInjectionScheduled=false;
 #ifdef ADRENO830_MACOS
     gSaved=SuspendSaved{};   /* UniXNU-piano */
 #endif
+
     memset(&cmdDbSnapshot,0,sizeof cmdDbSnapshot);
     traceReset();
 }
 void adreno830_set_os(const Adreno830Os *table) {osTable=table;}
 Adreno830Device *adreno830_device_for_test(void) {return &g830;}
 #endif
+
+// Board sysctl: read flags (enabled/ready/high/sticky, then reason in bits 8+); write 1=one permit, 2=one dropped ACK.
+extern "C" int adreno830_qual607_control(int command)
+{
+    if(!gQualificationEnabled)return -1;
+    if(command==1) {if(!gQualification.arm())return -2;qualLog("R3a permit requested");}
+    else if(command==2) {
+        if(!gQualification.high() || g830.power_state.votedLevel()<=3 ||
+           __atomic_exchange_n(&gQualificationInjectionScheduled,true,__ATOMIC_ACQ_REL))return -2;
+        // Schedule on the device clock. SSH latency cannot shorten the600-second normal soak or consume its2-second tail.
+        const uint64_t at=gQualification.openedAt()+600000000000ull;
+        __atomic_store_n(&gQualificationInjectAt,at,__ATOMIC_RELEASE);
+        qualLog("R3a injection scheduled for-us=%llu",at/1000);
+    } else if(command!=0)return -2;
+    return 1|(gQualification.ready()?2:0)|(gQualification.high()?4:0)|(g830.power_state.qualificationLatched()?8:0)|int(gQualification.reason()<<8);
+}

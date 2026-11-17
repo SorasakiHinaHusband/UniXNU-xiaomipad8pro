@@ -50,8 +50,9 @@ IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,
     if(!config.windowMs || !config.targetBusyPermille || config.initialLevel<1 || config.initialLevel>table.count ||
        config.initialBus>=table.ddrLevels || config.underrunFloorLevel>=table.ddrLevels)
         return kIOReturnBadArgument;
+    if(config.qualification607 && (!recovery || !adreno830_annibale()))return kIOReturnBadArgument;
     config_=config;table_=table;io_=io;env_=env;ops_=ops;power_=power;recovery_=recovery;tsens_=tsens;
-    stats_={};
+    stats_={};forceVote_=false;
     annibale_=adreno830_annibale();hot_=false;stopped_=false;
     stats_.annibale=annibale_;
     Sm8750ThermalInit(&thermal_);
@@ -82,6 +83,7 @@ IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,
     {
         const uint32_t khz=__atomic_load_n(&gExternalCeilingKhz,__ATOMIC_ACQUIRE);
         externalCeiling_=khz?levelAtMost(khz):0;
+        if(config.qualification607)power_->setQualificationExternal(externalCeiling_,busOf(externalCeiling_));
     }
 #endif
     power_->setTarget(level_,bus_);
@@ -168,7 +170,9 @@ uint8_t A830Dcvs::ceiling() const
 #else
     const uint8_t ceiling=min8(knobCeiling_,thermalCeiling_);
 #endif
-    return ceiling?ceiling:1;
+    uint8_t limited=ceiling,bus=busOf(ceiling);
+    power_->limitQualification(limited,bus);
+    return limited?limited:1;
 }
 
 uint8_t A830Dcvs::fixedLevel() const
@@ -230,7 +234,14 @@ void A830Dcvs::park()
 }
 
 #ifdef ADRENO830_MACOS
-void A830Dcvs::noteCeiling() {env_.wake(env_.context);}   /* UniXNU-piano */
+void A830Dcvs::noteCeiling() {
+    if(config_.qualification607) {
+        const uint32_t khz=__atomic_load_n(&gExternalCeilingKhz,__ATOMIC_ACQUIRE);
+        const uint8_t level=khz?levelAtMost(khz):0;
+        power_->setQualificationExternal(level,busOf(level));
+    }
+    env_.wake(env_.context);
+}
 #endif
 
 /* ---- service thread ------------------------------------------------------------------------------------------------ */
@@ -238,6 +249,7 @@ void A830Dcvs::noteCeiling() {env_.wake(env_.context);}   /* UniXNU-piano */
 uint64_t A830Dcvs::serviceTick(uint64_t now)
 {
     if(!initialized_)return now+ms(1000);
+    if(ops_.qualificationService)ops_.qualificationService(ops_.context,now);
     /* 1. A pending recovery first: nothing else may touch the GPU meanwhile. */
     if(recovery_ && recovery_->pending()) {
         recovery_->runPending();
@@ -507,10 +519,12 @@ uint8_t A830Dcvs::wanted(uint64_t now) const
 
 void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille)
 {
+    power_->limitQualification(level,bus);
     if(!level || level>table_.count)return;
     if(stopped_)return;              /* annibale: an unacknowledged vote ended the changes (the target stays level_) */
     power_->setTarget(level,bus);    /* sent as HFI M9 if the GMU starts before this vote goes out */
-    if(level==level_ && bus==bus_)return;
+    const bool force=config_.qualification607 && __atomic_exchange_n(&forceVote_,false,__ATOMIC_ACQ_REL);
+    if(level==level_ && bus==bus_ && !force)return;
     if(now<retryAt_)return;
     /* bw: the bus level under KGSL's no-AB mark 0xFFFF0000 (design), or alone (annibale, section 14 row 24); the AB vote
      * replaces the mark when the GMU takes one. */
@@ -523,13 +537,39 @@ void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille
     IOReturn result=A830ReturnNotResponding;
     /* Under the mutex no power transition runs; only an Active GMU takes a vote (asleep: target recorded above). */
     const bool active=power_->phase()==A830PowerActive;
-    if(active)result=ops_.perfVote(ops_.context,level,bw);
+    if(active) {
+        // Recheck the independent heartbeat's cap after acquiring the mutex.
+        uint8_t boundedBus=bus;
+        power_->limitQualification(level,boundedBus);
+        if(boundedBus!=bus) {bus=boundedBus;bw=annibale_?uint32_t(bus):bus|A830_HFI_BW_NO_AB;}
+        result=ops_.perfVote(ops_.context,level,bw);
+    }
     if(active && result==kIOReturnSuccess)power_->noteVoted(level,bus);
     power_->unlock();
     if(!active)return;
+    if(config_.qualification607 && result==kIOReturnSuccess && recovery_->pending()) {
+        account(env_.nowNs(env_.context));level_=0;bus_=0;
+        recovery_->runPending();haveSample_=false;
+        if(!recovery_->lost()) {level_=power_->votedLevel();bus_=power_->votedBus();policy_=level_;}
+        lastAccount_=env_.nowNs(env_.context);return;
+    }
     if(result!=kIOReturnSuccess) {
         ++stats_.voteFailures;
         adreno830_status_add32(&adreno830_status.vote_failures,1);
+        if(config_.qualification607) {
+            const uint64_t failed=env_.nowNs(env_.context);
+            account(failed);level_=0;bus_=0; // hardware frequency is UNKNOWN until strict off + a fresh M9 succeeds
+            power_->latchQualification();
+            updateWakeTargets();power_->setTarget(1,2);
+            if(ops_.qualificationFault)ops_.qualificationFault(ops_.context,level,bus,result);
+            else {recovery_->closeQualification();recovery_->report(A830FaultHfi,uint32_t(result));}
+            // HFI and power locks are both released. Do not wait for another service/status tick.
+            recovery_->runPending();
+            haveSample_=false;
+            if(!recovery_->lost()) {level_=power_->votedLevel();bus_=power_->votedBus();policy_=level_;}
+            lastAccount_=env_.nowNs(env_.context);
+            return;
+        }
         if(annibale_) {
             /* annibale (kernel-sequences 13): a vote the GMU did not acknowledge ends the frequency changes for this boot;
              * the GPU keeps the level it acknowledged last, and so does the next GMU start (HFI M9 of the target). */
@@ -550,6 +590,7 @@ void A830Dcvs::sampleThermal(uint64_t now)
 {
     Sm8750TsensSample sample;
     const int read=Sm8750TsensReadGpu(tsens_,&sample);
+    if(ops_.qualificationSample)ops_.qualificationSample(ops_.context,now,&sample);
     Sm8750ThermalUpdate(&thermal_,read,&sample);   /* the zone (Unknown, Critical) and the last usable reading */
     if(thermal_.ever_valid)stats_.tempDeci=thermal_.last_deci;
     stats_.zone=uint8_t(thermal_.zone);

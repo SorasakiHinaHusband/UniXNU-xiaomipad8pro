@@ -111,6 +111,11 @@ public:
     const A830HangSnapshot &snapshot() const {return snapshot_;}
     const A830RecoveryStats &stats() const {return stats_;}
     const A830RecoveryConfig &config() const {return config_;}
+    void qualification(void (*unsafe)(void *),void *context) {qualification_=true;unsafe_=unsafe;unsafeContext_=context;}
+    // No power or HFI mutex: the independent heartbeat may close the actual submit ring.
+    void closeQualification();
+    bool safeOff() const {return __atomic_load_n(&safeOff_,__ATOMIC_ACQUIRE);}
+    bool qualificationSafeLow() const {return __atomic_load_n(&qualificationSafeLow_,__ATOMIC_ACQUIRE);}
 
     /* GBIF halt (4.13.4; KGSL gen8_halt_gbif / Linux a8xx_bus_clear_pending_transactions): returns the acknowledgements
      * that timed out (bit 0 GX, 1 client, 2 arbiter); halts are released in any case. */
@@ -137,6 +142,11 @@ private:
     uint8_t pendingCause_=A830FaultNone;
     uint64_t pendingDetail_=0;
     bool lost_=false,running_=false,initialized_=false;
+    bool qualification_=false,qualificationClosed_=false;
+    bool safeOff_=false;
+    bool qualificationSafeLow_=false;
+    void (*unsafe_)(void *)=nullptr;
+    void *unsafeContext_=nullptr;
     uint64_t history_[4]={};            /* start times of the recent recoveries */
     /* watchdog */
     uint64_t wdLastProgress_=0;

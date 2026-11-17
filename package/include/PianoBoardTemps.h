@@ -57,4 +57,12 @@ int piano_thermal_board_temps(struct piano_board_temps *t);
 #ifdef __cplusplus
 }
 #endif
+// Separate versioned API: preserve the charging ABI. Board thermistors, not calibrated skin limits.
+#define PIANO_GPU_TEMPS_VERSION 1u
+struct piano_gpu_temps {
+  uint32_t version, state, valid, disabled, period_ms, rounds;
+  int32_t milli_c[2]; // msm, quiet
+  uint32_t age_ms[2];
+  uint64_t sample_us[2];
+};
 #endif

@@ -80,6 +80,7 @@ struct A830DcvsTable {
 };
 
 struct A830DcvsConfig {
+    bool qualification607=false;
     /* boot knobs (ARCHITECTURE 3.6) */
     bool governor=true;                 /* pagani-gpu-dcvs (1); 0 = fixed at fixedLevel */
     uint32_t minMhz=160,maxMhz=734;     /* pagani-gpu-dcvs-min / -max */
@@ -146,6 +147,9 @@ struct A830DcvsOps {
      * in flight and no holder; lastSubmitNs: the newest submission. Returns the next time it needs a look (ns), 0 for none. May be null. */
     uint64_t (*idleTick)(void *context,uint64_t now,bool quiet,uint64_t lastSubmitNs);
 #endif
+    void (*qualificationFault)(void *context,uint8_t requested,uint8_t bus,IOReturn error)=nullptr;
+    void (*qualificationService)(void *context,uint64_t now)=nullptr;
+    void (*qualificationSample)(void *context,uint64_t now,const Sm8750TsensSample *)=nullptr;
 };
 
 struct A830DcvsStats {
@@ -179,6 +183,7 @@ public:
 
     /* Hooks (lock-free, interrupt-safe). */
     void noteSubmit();                  /* every submission (wake boost, idle clock) */
+    void forceQualificationVote() {__atomic_store_n(&forceVote_,true,__ATOMIC_RELEASE);env_.wake(env_.context);}
     void noteVsync();                   /* a display TE */
     void noteLateFrame(uint32_t lateUs);/* a swap after its target TE */
     void noteUnderruns(uint32_t total); /* MDP INTF1 underrun count (cumulative) */
@@ -235,6 +240,7 @@ private:
     Sm8750Thermal thermal_{};
     A830DcvsStats stats_{};
     bool initialized_=false,started_=false;
+    bool forceVote_=false;
     bool annibale_=false,hot_=false,stopped_=false;   /* the profile at init(); annibale thermal hold; votes ended */
     /* levels */
     uint8_t level_=0,bus_=0,floor_=1,knobCeiling_=1,thermalCeiling_=1;

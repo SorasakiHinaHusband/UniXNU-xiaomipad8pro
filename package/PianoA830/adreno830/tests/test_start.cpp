@@ -675,7 +675,7 @@ IOReturn A830Gmu::coldBoot(uint32_t *init_result)
     if(gmuFatalAfterBoot)__atomic_store_n(&fatal_,1u,__ATOMIC_RELEASE);   /* a top half or a poll took a fatal bit since */
     return kIOReturnSuccess;
 }
-IOReturn A830Gmu::forceOff() {hit("A830Gmu::forceOff");booted_=false;return kIOReturnSuccess;}
+IOReturn A830Gmu::forceOff(bool) {hit("A830Gmu::forceOff");booted_=false;return kIOReturnSuccess;}
 IOReturn A830Gmu::oobSet(uint32_t *ack_us,uint32_t)
 {
     IOReturn r;gmuStep("A830Gmu::oobSet",failure_,&r);
@@ -1050,6 +1050,8 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
     recoveryOps=ops;
     return hit("A830Recovery::init");
 }
+void A830Recovery::closeQualification() {}
+int Sm8750TsensReadGpu(const Sm8750TsensIo *,Sm8750TsensSample *out) {*out={};return Sm8750TsensNoData;}
 static bool reportPends;   /* UniXNU-piano: a report leaves the recovery pending (A830Recovery::pending), as the real one does */
 void A830Recovery::report(uint8_t cause,uint64_t)
 {

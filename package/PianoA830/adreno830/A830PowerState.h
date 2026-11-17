@@ -244,6 +244,28 @@ public:
     void setTarget(uint8_t level,uint8_t bus);
     void setWakeTargets(uint8_t submitLevel,uint8_t submitBus,uint8_t touchLevel,uint8_t touchBus);
     void noteVoted(uint8_t level,uint8_t bus);   /* a GX_BW_PERF_VOTE was acknowledged */
+    // Qualification ceiling is atomic so the independent thermal heartbeat never waits on HFI/power.
+    void setQualificationCeiling(uint8_t level,uint8_t bus) {
+        if(qualificationLatched() && level>3) {level=3;bus=3;}
+        __atomic_store_n(&qualificationCap_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);
+    }
+    void latchQualification() {__atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);setQualificationCeiling(3,3);}
+    bool qualificationLatched() const {return __atomic_load_n(&qualificationSticky_,__ATOMIC_ACQUIRE);}
+    void setQualificationExternal(uint8_t level,uint8_t bus) {__atomic_store_n(&qualificationExternal_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);}
+    void setQualificationLease(uint64_t until) {__atomic_store_n(&qualificationLease_,until,__ATOMIC_RELEASE);}
+    void limitQualification(uint8_t &level,uint8_t &bus) {
+        const uint32_t cap=__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE);
+        if(qualificationLatched() && level>3) {level=3;bus=3;}
+        if((cap&255u) && level>(cap&255u)) {level=uint8_t(cap);bus=uint8_t(cap>>8);}
+        const uint32_t ext=__atomic_load_n(&qualificationExternal_,__ATOMIC_ACQUIRE);
+        if(cap && (ext&255u) && level>(ext&255u)) {level=uint8_t(ext);bus=uint8_t(ext>>8);}
+        if(cap && level>3) {
+            const uint64_t until=__atomic_load_n(&qualificationLease_,__ATOMIC_ACQUIRE);
+            if(!until || env_.nowNs(env_.context)>=until) {
+                __atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);level=1;bus=2;
+            }
+        }
+    }
 
     /* Recovery (A830Recovery, mutex held by the caller): Recovering drains the holders (config.drainUs); endRecovery
      * returns to Active (ok) or Lost; markLost is final. */
@@ -313,6 +335,10 @@ private:
     uint64_t lastActivity_=0,sleptAt_=0,idleSince_=0,nextSlumberRow_=0;
     uint32_t seenSubmitted_=0;
     uint8_t targetLevel_=2,targetBus_=2,submitLevel_=0,submitBus_=0,touchLevel_=0,touchBus_=0;
+    uint32_t qualificationCap_=0;
+    uint32_t qualificationExternal_=0;
+    uint64_t qualificationLease_=0;
+    bool qualificationSticky_=false;
     uint8_t votedLevel_=0,votedBus_=0,slumberMode_=A830SlumberOff;
     bool cxOn_=true,cxLost_=false,cxRestored_=false,rsccSlept_=false,ifpcActive_=false,ifpcWanted_=false,touchPending_=false;
     bool initialized_=false;

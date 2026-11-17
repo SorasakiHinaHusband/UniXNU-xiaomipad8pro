@@ -13,5 +13,6 @@ uint32_t hookLevel();
 void hookStart(IOService *svc, uint32_t level, uint32_t periodS, uint32_t delayS);
 // callPlatformFunction("piano-thermal-board-temps", param1 = struct piano_board_temps *): true when filled.
 bool hookBoardTemps(void *param1);
+bool hookGpuTemps(void *param1);
 }  // namespace pianothermal::adc
 #endif

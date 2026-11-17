@@ -37,6 +37,9 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <sys/errno.h>
+#include <PianoBoardTemps.h>
 #include "PianoA830.h"
 #include "PianoA830Rows.h"
 #include "A830Idle.h"
@@ -58,6 +61,41 @@
 #include "PianoLlccIsland.h"
 #include "PianoGpuCeiling.h"
 #include "PianoGpuIdle.h"
+
+extern "C" int adreno830_qual607_control(int);
+extern "C" void adreno830_qualification_note(const char *line) {piano_a830_note("%s",line);}
+extern "C" void adreno830_qualification_unsafe() {
+  // Native 0070 uses the SMC conduit (k27 0069). A graceful halt can wait on the very power mutex/HFI
+  // whose deadline expired. Only this unconfirmed-GX emergency bypasses filesystem and IOKit shutdown.
+  register uint64_t function __asm__("x0")=0x84000008u; // PSCI SYSTEM_OFF
+  __asm__ volatile("dsb sy; smc #0" : "+r"(function) : : "x1","x2","x3","memory");
+  function=0x84000009u; // SYSTEM_RESET if SYSTEM_OFF unexpectedly returned
+  __asm__ volatile("dsb sy; smc #0" : "+r"(function) : : "x1","x2","x3","memory");
+  panic("PianoA830: emergency PSCI power-off and reset returned");
+}
+extern "C" bool adreno830_qualification_board(piano_gpu_temps *out) {
+  IOService *thermal=IOService::copyMatchingService(IOService::serviceMatching("PianoThermal"));
+  if(!thermal)return false;
+  const IOReturn r=thermal->callPlatformFunction("piano-thermal-gpu-temps",false,out,nullptr,nullptr,nullptr);
+  thermal->release();return r==kIOReturnSuccess;
+}
+SYSCTL_DECL(_machdep);
+static struct sysctl_oid gQual607Oid;
+static int qual607Sysctl(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+  int value=adreno830_qual607_control(0);
+  const int err=sysctl_handle_int(oidp,&value,0,req);
+  if(err || !req->newptr)return err;
+  if(value!=1 && value!=2)return EINVAL;
+  return adreno830_qual607_control(value)<0?EAGAIN:0;
+}
+static void registerQual607() {
+  bzero(&gQual607Oid,sizeof gQual607Oid);
+  gQual607Oid.oid_parent=&sysctl__machdep_children;gQual607Oid.oid_number=OID_AUTO;
+  gQual607Oid.oid_kind=int(CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  gQual607Oid.oid_name="piano_gpu_qual607";gQual607Oid.oid_handler=qual607Sysctl;gQual607Oid.oid_fmt="I";
+  gQual607Oid.oid_descr="R3a qualification flags; write 1 permit, 2 one queued ACK loss";
+  gQual607Oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQual607Oid);
+}
 #include <PianoDisplayFollow.h>
 
 extern "C" const Adreno830Board *piano_a830_board(void);
@@ -1139,6 +1177,7 @@ bool PianoA830::start(IOService *provider)
   static bool started;
   if (started) return true;
   started = true;
+  registerQual607();
   if (gLevel > 2) {
     piano_a830_note("piano-gpu=%u: unknown level (1 survey, 2 bring-up); nothing done", gLevel);
     return true;

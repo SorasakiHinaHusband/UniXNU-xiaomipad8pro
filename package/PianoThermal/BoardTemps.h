@@ -62,6 +62,24 @@ inline int fillBoardTemps(const Snapshot &s, uint64_t nowUs, piano_board_temps *
   return n;
 }
 
+inline bool fillGpuTemps(const Snapshot &s, uint64_t nowUs, piano_gpu_temps *t)
+{
+  if (!t || t->version != PIANO_GPU_TEMPS_VERSION) return false;
+  t->state = s.state; t->valid = t->disabled = 0; t->period_ms = s.periodMs; t->rounds = s.rounds;
+  const int channels[2] = {channelIndex("msm"), channelIndex("quiet")};
+  for (unsigned r = 0; r < 2; ++r) {
+    const int i = channels[r];
+    t->milli_c[r] = 0; t->age_ms[r] = 0; t->sample_us[r] = 0;
+    if (s.disabledMask & (1u << i)) t->disabled |= 1u << r;
+    if (!(s.validMask & (1u << i)) || s.state != PIANO_BOARD_TEMPS_RUNNING) continue;
+    const uint64_t age = nowUs >= s.atUs[i] ? (nowUs - s.atUs[i]) / 1000 : UINT32_MAX;
+    t->sample_us[r] = s.atUs[i]; t->age_ms[r] = age > UINT32_MAX ? UINT32_MAX : uint32_t(age);
+    t->milli_c[r] = s.milliC[i];
+    if (age <= uint64_t(s.periodMs) * 2) t->valid |= 1u << r;
+  }
+  return true;
+}
+
 static_assert(int(Role::battery) == PIANO_BOARD_TEMP_BATTERY && int(Role::charger) == PIANO_BOARD_TEMP_CHARGER &&
                   int(Role::connector) == PIANO_BOARD_TEMP_CONNECTOR && int(Role::connector2) == PIANO_BOARD_TEMP_CONNECTOR2,
               "the API's indices are the roles'");

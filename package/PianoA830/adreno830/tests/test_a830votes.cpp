@@ -79,6 +79,7 @@ struct Spec {
     uint8_t vcd[3];         /* SH0, MC0, ACV */
     bool shortGfx;
     bool noSh0;
+    int bx=0;              /* 0 absent, 1 real, 2 dummy */
 };
 
 static uint32_t imageRead(void *,uint32_t offset) {return get32(image.bytes+offset);}
@@ -98,6 +99,7 @@ static void load(const Spec &s)
                             {"gfx.lvl",0x30020,arcAux(s.shortGfx?ShortGfx:GfxLevels)}};
     if(s.gmxc==1)arc.push_back({"gmxc.lvl",0x30030,arcAux(GmxcLevels)});
     if(s.gmxc==2)arc.push_back({"gmxc.lvl",0x30030,arcAux({})});
+    if(s.bx)arc.push_back({"gbx.lvl",0x30040,arcAux(s.bx==1?std::vector<uint16_t>{0,0x30,0x40,0x80}:std::vector<uint16_t>{})});
     slave(Sm8750CmdDbSlaveArc,arc);
     const Sm8750RpmhIo io={nullptr,imageRead,imageWrite,imageDelay};
     CHECK(Sm8750CmdDbCopy(&io,&db)==Sm8750RpmhOk);
@@ -632,6 +634,23 @@ int main()
     testAgainstKit();
     testAnnibale();
     testAnnibaleFullTable();
+    for(int bx=0;bx<3;++bx) {
+        Spec s={1,true,{1,0,0},false,false,bx};load(s);
+        Sm8750RpmhResources res;CHECK(Sm8750RpmhResourcesParse(&db,&res)==0);
+        Sm8750GpuLevelTable levels;CHECK(Sm8750GpuLevelsSelect(Sm8750DtGpuBins,6,A830VotesNoFuse,0,0,&levels)==0);
+        static A830VoteTables t;adreno830_profile_value=A830ProfileAnnibale;
+        CHECK(A830Votes::build(res,board,levels,A830VotesFullTable,&t)==0 && t.perf_dwords==49);
+        for(unsigned g=1;g<=11;++g) {
+            const uint32_t rounded=t.gx[g].vote>>16;
+            const uint32_t expected=bx==1?(rounded<=0x30?1:rounded<=0x40?2:3):63;
+            CHECK(((t.gx[g].dep>>20)&63)==expected);
+            CHECK((t.gx[g].dep&~(63u<<20))==(A830Votes::dependencyVote(res.mx,levels.levels[g-1].vlvl,false)&~(63u<<20)));
+        }
+        if(bx==1) {
+            res.gbx.vlvl[1]=0;CHECK(A830Votes::build(res,board,levels,A830VotesFullTable,&t)!=0);
+            res.gbx.vlvl[1]=0x30;res.gbx.count=17;CHECK(A830Votes::build(res,board,levels,A830VotesFullTable,&t)!=0);
+        }
+    }
     std::printf("PASS: A830Votes GX/dependency/CX votes, BW table (x=y and x=0), ACD 0x0FF0, level selection and HFI tables "
                 "match the KGSL formulas and the AdrenoFirmware kit (design); annibale's 160/222/342 MHz table, initial level "
                 "1, x = 0 rows, 24-dword perf payload and bus-only bw word (annibale); pagani-gpu-maxlevel: the design's whole "

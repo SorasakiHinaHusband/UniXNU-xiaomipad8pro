@@ -747,7 +747,7 @@ IOReturn A830Gmu::haltGbif(uint32_t mask,bool release)
 
 /* --- force-off (ARCHITECTURE 4.7.9) ---------------------------------------------------------------------------------- */
 
-IOReturn A830Gmu::forceOff()
+IOReturn A830Gmu::forceOff(bool strict)
 {
     if(!bound_)return kIOReturnNotReady;
     bool access_ok=true;
@@ -761,7 +761,7 @@ IOReturn A830Gmu::forceOff()
     put(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_PWR_COL_KEEPALIVE),0);
     barrier();
     /* 2. GPU RSCC votes complete, 1 ms each, record only. */
-    (void)waitRsccTcs(A830_T_RSCC_TCS_FORCE_OFF_US);
+    if(waitRsccTcs(A830_T_RSCC_TCS_FORCE_OFF_US)!=kIOReturnSuccess && strict)access_ok=false;
     /* 3. AHB fence: dropped-write status cleared, allow mode. */
     put(A830GmuWindowGmu,gmuReg(A8XX_GMUAO_AHB_FENCE_STATUS_CLR),A830_AHB_FENCE_STATUS_CLR_VALUE);
     put(A830GmuWindowGmu,gmuReg(A8XX_GMUAO_AHB_FENCE_CTRL),A830_AHB_FENCE_CTRL_ALLOW);
@@ -770,31 +770,40 @@ IOReturn A830Gmu::forceOff()
     put(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_CM3_SYSRESET),A830_GMU_CM3_SYSRESET_ASSERT);
     barrier();
     booted_=false;
+    uint32_t reset=0;
+    if(strict && (!rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_CM3_SYSRESET),&reset) ||
+                  reset!=A830_GMU_CM3_SYSRESET_ASSERT))access_ok=false;
     /* 5. CX traffic halted at the GBIF arbiter, 100 ms, record only (terminate-mode SMMU: nothing stalls the halt). */
-    if(haltGbif(A8XX_GBIF_HALT_ARB,false)!=kIOReturnSuccess)warn(A830GmuWarnGbifHalt);
+    if(haltGbif(A8XX_GBIF_HALT_ARB,false)!=kIOReturnSuccess) {warn(A830GmuWarnGbifHalt);if(strict)access_ok=false;}
     /* 6. GX still powered: collapse its GDSC under a temporary host GX vote, then drop the vote. */
     uint32_t gx=0;
-    if(rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS),&gx) && !(gx&A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF)) {
+    const bool gxRead=rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS),&gx);
+    if(!gxRead && strict)access_ok=false;
+    if(gxRead && (gx&A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF)!=A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF) {
         const bool voted=hooks_.gx_vote && !hooks_.gx_vote(hooks_.gx_cookie,1);
-        if(!voted)warn(A830GmuWarnGxVote);
+        if(!voted) {warn(A830GmuWarnGxVote);if(strict)access_ok=false;}
         uint32_t gdscr=0;
         if(rd(A830GmuWindowGmu,GxGdscr,&gdscr))put(A830GmuWindowGmu,GxGdscr,gdscr|SM8750_GDSC_SW_COLLAPSE);
         else access_ok=false;
         barrier();
         uint32_t cfg=0;
         if(pollMask(A830GmuWindowGmu,GxCfgGdscr,GxPowerDownComplete,GxPowerDownComplete,A830_T_GX_GDSC_OFF_US,
-                    A830_T_GX_ON_STEP_US,false,&cfg,nullptr))warn(A830GmuWarnGxStuck);
-        if(voted && hooks_.gx_vote(hooks_.gx_cookie,0))warn(A830GmuWarnGxVote);
+                    A830_T_GX_ON_STEP_US,false,&cfg,nullptr)) {warn(A830GmuWarnGxStuck);if(strict)access_ok=false;}
+        if(voted && hooks_.gx_vote(hooks_.gx_cookie,0)) {warn(A830GmuWarnGxVote);if(strict)access_ok=false;}
     }
     /* 7. RSCC sleep (its CM3 reset again is harmless), record only; the GBIF halt released. The power-off of 4.2.3 is the
      * caller's, P1 and later. */
     const A830GmuFailure kept=failure_;
-    if(rsccSleep()!=kIOReturnSuccess)warn(A830GmuWarnRsccSleep);
+    if(rsccSleep()!=kIOReturnSuccess) {warn(A830GmuWarnRsccSleep);if(strict)access_ok=false;}
     failure_=kept;
     put(A830GmuWindowGpu,gpuReg(A8XX_GBIF_HALT),0);
     barrier();
-    if(rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS),&gx) && !(gx&A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF))
-        warn(A830GmuWarnGxStillOn);
+    const bool finalRead=rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS),&gx);
+    if(!finalRead || (gx&A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF)!=A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF) {
+        warn(A830GmuWarnGxStillOn);if(strict)access_ok=false;
+    }
+    uint32_t cfg=0;
+    if(strict && (!rd(A830GmuWindowGmu,GxCfgGdscr,&cfg) || (cfg&GxPowerDownComplete)!=GxPowerDownComplete))access_ok=false;
     oob_refs_[0]=oob_refs_[1]=0;
     __atomic_store_n(&info_pending_,0u,__ATOMIC_RELEASE);
     __atomic_store_n(&ao_pending_,0u,__ATOMIC_RELEASE);

@@ -60,6 +60,10 @@ IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &i
     suspended_=false;
 #endif
     targetLevel_=votedLevel_=config.defaultLevel;targetBus_=votedBus_=config.defaultBus;
+    qualificationCap_=0;
+    qualificationExternal_=0;
+    qualificationLease_=0;
+    qualificationSticky_=false;
     submitLevel_=submitBus_=touchLevel_=touchBus_=0;
     initialized_=true;
     return kIOReturnSuccess;
@@ -266,6 +270,7 @@ void A830PowerState::setIfpc(bool enable) {ifpcWanted_=enable;}
 
 void A830PowerState::setTarget(uint8_t level,uint8_t bus)
 {
+    limitQualification(level,bus);
     if(!level)return;   /* GMU level 0 is off (KGSL gen8_gmu_dcvs_set refuses it) */
     __atomic_store_n(&targetLevel_,level,__ATOMIC_RELAXED);
     __atomic_store_n(&targetBus_,bus,__ATOMIC_RELAXED);
@@ -273,6 +278,7 @@ void A830PowerState::setTarget(uint8_t level,uint8_t bus)
 
 void A830PowerState::setWakeTargets(uint8_t submitLevel,uint8_t submitBus,uint8_t touchLevel,uint8_t touchBus)
 {
+    limitQualification(submitLevel,submitBus);limitQualification(touchLevel,touchBus);
     submitLevel_=submitLevel;submitBus_=submitBus;touchLevel_=touchLevel;touchBus_=touchBus;
 }
 
@@ -422,6 +428,7 @@ IOReturn A830PowerState::enterLocked(uint8_t mode,uint64_t now)
 IOReturn A830PowerState::bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t *step,uint16_t *subStep,
                                  void (*progress)(void *,uint16_t),void *progressContext)
 {
+    limitQualification(level,bus);
     uint16_t local=0,sub=0;
     if(!step)step=&local;
     if(!subStep)subStep=&sub;
@@ -489,6 +496,7 @@ IOReturn A830PowerState::wakeLocked(A830WakeReason reason)
     if(reason==A830WakeSubmit && submitLevel_>level) {level=submitLevel_;bus=submitBus_;}
     /* A touch, or the display coming back (its first frames follow), starts the GMU at the touch boost level. */
     if((reason==A830WakeTouch || reason==A830WakeScreen) && touchLevel_>level) {level=touchLevel_;bus=touchBus_;}
+    limitQualification(level,bus);
     uint16_t step=0,sub=0;
     const IOReturn result=bringUp(level,bus,slumberMode_==A830SlumberFull,&step,&sub,nullptr,nullptr);
     if(result!=kIOReturnSuccess) {

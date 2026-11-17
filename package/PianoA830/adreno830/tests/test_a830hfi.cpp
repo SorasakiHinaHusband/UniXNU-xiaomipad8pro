@@ -894,6 +894,28 @@ int main()
     testAnnibaleVotes();
     testAnnibaleClear();
     testLateDrain();
+    // C5: real queue/doorbell and real matching ACK consumed, then the unmodified timeout path. No pre-queue fake.
+    {
+        A830Hfi h;boot(h);CHECK(h.start(annibaleTables,1,2)==0);h.qualification(true);
+        CHECK(h.armDropAck());const uint64_t at=fw.now;const size_t sent=fw.received.size();
+        CHECK(h.perfVote(3,3)==kIOReturnTimeout);
+        CHECK(fw.received.size()==sent+1 && fw.received.back()[1]==1 && fw.received.back()[2]==3 && fw.received.back()[3]==3);
+        CHECK(fw.now-at==1000000 && h.stats().dropped_acks==1 && h.stats().timeouts==1 && h.stats().late_drains==0);
+        const uint32_t dropped=h.stats().drop_header;CHECK(dropped==fw.received.back()[0] && !h.armDropAck());
+        // A duplicate from the old sequence cannot acknowledge a different runtime request.
+        fw.scripts[30].before={{A830_HFI_HDR(30,A830_HFI_MSG_ACK,3,0),dropped,0}};
+        CHECK(h.perfVote(2,2)==0 && h.stats().stale_acks==1);
+        h.stop();CHECK(h.resetQueues()==0 && h.start(annibaleTables,1,2)==0 && h.status(A830HfiM9Vote)==0);
+        CHECK(!h.armDropAck());
+        // Late, short and failed-status ACKs all reject; none can add the legacy 3-second runtime drain.
+        for(unsigned kind=0;kind<3;++kind) {
+            boot(h);CHECK(h.start(annibaleTables,1,2)==0);h.qualification(true);
+            if(kind==0)fw.scripts[30].delay=11000;
+            if(kind==1)fw.ackDwords[30]=2;
+            if(kind==2)fw.scripts[30].status=1;
+            CHECK(h.perfVote(3,3)!=0 && h.stats().late_drains==0);
+        }
+    }
     std::printf("PASS: A830Hfi queues, wrap and 0xFAFAFAFA padding, whole-header ACK match, v5 answers, F2H handling (reason "
                 "16/22), 1 s timeout, NMI and CM3 exits, M1-M9 encodings, perf/slumber votes, dbg drain under the lock "
                 "(design); 4-entry perf table, no M7, M9 {1,1,2}, strict FEATURE_CTRL and short ACKs, bit 0/2 poll clear, "

@@ -1044,6 +1044,25 @@ int main()
         adreno830_profile_value=A830ProfileAnnibale;
         checks+=13;
     }
+    // C5 strict stop: each formerly warning-only branch must deny a restart.
+    for(unsigned fault=0;fault<9;++fault) {
+        initial();A830Gmu gmu;bindGmu(gmu);boot(gmu);
+        CHECK(gmu.oobSet(nullptr)==0 && gmu.waitGxOn()==0);
+        if(fault==1)m.tcs_busy=true;
+        if(fault==2)m.gbif_ack=false;
+        if(fault==3)m.gx_collapse_ok=false;
+        if(fault==4)m.rscc_sleep_ok=false;
+        if(fault==5)m.vote_fail=-5;
+        if(fault==6)m.fail_read=m.reads+1;
+        if(fault==7)m.fail_write=m.writes+1;
+        if(fault==8) {m.cfg_ignore=uint32_t(SYSRESET);R(SYSRESET)=0;}
+        const IOReturn r=gmu.forceOff(true);
+        CHECK(fault?r!=0:r==0);++checks;
+    }
+    for(unsigned bit=1;bit<=2;++bit) {
+        initial();A830Gmu gmu;bindGmu(gmu);boot(gmu);R(GXSTAT)=bit;m.gx_collapse_ok=false;
+        CHECK(gmu.forceOff(true)!=0);++checks; // either lone status bit is insufficient
+    }
     CHECK(memory.release()==kIOReturnSuccess && fixture.live.empty());
     std::printf("PASS: A830 GMU over a register model with %s gen80000_gmu.bin: B1-B8 and its fatal/recorded conditions, OOB and "
                 "GX confirmation, force-off in KGSL order, RSCC/GENERAL_9, slumber S2-S9, IFPC helpers, CX timer seed, 336/337 "

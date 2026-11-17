@@ -450,6 +450,33 @@ replaced it.
 Adreno830, ArmSmmu4K, AdrenoPM4: MIT (their LICENSE files in `package/PianoA830`). Board glue and tooling: BSD-2-Clause-Patent
 (`package/PianoA830/LICENSE`). Linux/KGSL: specification only. Vendor firmware: never in this repository.
 
+### 607 MHz qualification (R3a)
+
+The exact combination `piano-gpu-maxlevel=7 piano-gpu-dcvs-max=607` selects C5 qualification. It requires profile 1,
+speedbin 0 (the 11 public levels), ACD off, HFI 0, host rails 1, boot/floor DDR 11, governor on, minimum 160 and idle 1.
+S0 validates and prints every ARC/GX/dependency/CX/BCM row before any high-frequency permit. BX is conditional on a usable
+cmd-db resource and uses the rounded GX corner in bits 25:20; absent/dummy BX retains the no-constraint bits.
+
+The mode starts at 160 and stays under 342 until two fresh 5-second msm/quiet rounds and all eight GPU sensors are healthy.
+`machdep.piano_gpu_qual607` reads enabled/ready/high/sticky in bits 0..3 and the first exit reason above bit 8. Write 1 once
+to request the permit; write 2 once while the acknowledged level exceeds 342 to schedule at the 600-second boundary the discard of the matching ACK of a real queued
+runtime id 30. Startup M9 and unrelated ACKs are never injected. The normal soak is 600 seconds, with at most 2 seconds for
+the final injection; this absolute permit cannot be renewed. A 2.5-second heartbeat lease also constrains votes and wakes.
+
+Any sampled GPU temperature at70 C, quiet at40 C, msm at65 C, invalid/stale sensor input, expired permit or runtime vote
+failure closes submission and latches a boot ceiling of 342. The driver stops the GMU, verifies CM3 reset, both GX-off/clock
+bits, CFG power-down and RSCC completion, restarts M9 at 160/bus2, and reopens only after CP/secure initialization succeeds.
+Further errors still receive strict shutdown; exhausting the recovery budget does not skip power-off. Cooling below60 C
+can restore 342, and thermal/unknown/external caps can still reduce to 160. The governor and 70/60 hysteresis are unchanged.
+Unconfirmed shutdown or an expired 5-second failure deadline triggers independent native PSCI power-off, then reset if it
+returns; that emergency deliberately bypasses filesystem/IOKit shutdown. Use only volatile qualification images.
+
+Host negative tests cover conditional BX, 11/14 table layouts, applied-but-discarded/late/short/status ACKs, strict stop and
+restart failures, repeat faults, stopped heartbeat, transient hot samples, and sticky thermal/external/park/wake paths.
+`gpu-qualification-load.m` moves its own windows without Automation consent. A separate fresh Metal client clears and reads back 196608 pixels in each phase, including after recovery. The offline checker recomputes the actual
+tables before permit and adjudicates normal/injected phases. Real high-frequency stability, benefit, temperatures and GUI
+recovery remain tablet gates. These operator limits are not OEM skin-safety certification or permission for 734 MHz.
+
 ### User BO fallback without a lifetime kernel mapping (experimental)
 
 `piano-gpu-user-vm=1` selects a prepared, wired named VM object for non-contiguous user BOs that cannot use the shared pool.

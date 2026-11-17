@@ -121,6 +121,8 @@ struct A830HfiStats {
     uint32_t last_unknown;      /* header of the last unexpected message */
     uint32_t last_err[18];      /* last F2H_MSG_ERR: hdr, code, data[16] */
     uint32_t votes,vote_failures;
+    uint32_t dropped_acks=0,drop_header=0,last_request=0,last_level=0,last_bw=0;
+    uint32_t level_acks[Adreno830LevelMax+1]={},last_ack=0;
     /* drainLate (annibale profile): drains done, rounds polled, messages found (ACKs that came too late, F2H_MSG_ERR), and
      * the last late F2H_MSG_ERR (hdr, code, data[16]). */
     uint32_t late_drains,late_rounds,late_messages,late_acks,late_errors;
@@ -143,6 +145,11 @@ public:
     IOReturn resetQueues();
     /* The GMU is going down (forced off, slumber done): no message until the next resetQueues()/start(). */
     void stop();
+    void qualification(bool enabled) {qualification_=enabled;}
+    bool armDropAck() {
+        if(!qualification_ || __atomic_exchange_n(&dropUsed_,true,__ATOMIC_ACQ_REL))return false;
+        __atomic_store_n(&dropArmed_,true,__ATOMIC_RELEASE);return true;
+    }
 
     /* One command: payload excludes the header (dwords <= 254); waits for the matching ACK. ack may be null. On an ACK
      * whose status is non-zero the answer is still returned and the result is kIOReturnIOError (reason 15). An acknowledged
@@ -237,6 +244,7 @@ private:
     uint32_t version_=0;
     bool ready_=false,started_=false,ab_=false,first_ack_=false,pending_=false;
     bool late_done_=false;    /* the last failure was drained already (drainLate) */
+    bool qualification_=false,dropUsed_=false,dropArmed_=false;
     uint8_t level_=0,bus_=0,pending_level_=0,pending_bus_=0;
     uint32_t gx_levels_=0;    /* GX entries of the tables start() sent (level bound of perfVote) */
     uint32_t bus_levels_=0;   /* DDR levels (bus bound) */

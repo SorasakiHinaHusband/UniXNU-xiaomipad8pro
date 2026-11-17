@@ -442,6 +442,12 @@ void hookStart(IOService *svc, uint32_t level, uint32_t periodS, uint32_t delayS
 }
 
 bool hookBoardTemps(void *param1) { return piano_thermal_board_temps(static_cast<piano_board_temps *>(param1)) >= 0; }
+bool hookGpuTemps(void *param1)
+{
+  Snapshot s;
+  if (!readSnapshot(s)) s = Snapshot();
+  return fillGpuTemps(s, nowNs() / 1000, static_cast<piano_gpu_temps *>(param1));
+}
 
 }  // namespace pianothermal::adc
 

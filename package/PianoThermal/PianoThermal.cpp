@@ -603,6 +603,8 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
   }
   if (functionName && functionName->isEqualTo("piano-thermal-board-temps"))   // B6: param1 = struct piano_board_temps *
     return adc::hookBoardTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
+  if (functionName && functionName->isEqualTo("piano-thermal-gpu-temps"))
+    return adc::hookGpuTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
   // docs/policy.md 5.2: param1 = the mode (0 by the power source, 1 Power Saver, 2 Balanced). Taken by the governor (mode 3) at its
   // next tick and by the fixed level (mode 2, which has no power caps: ignored there); without CPU frequency control unsupported.
   if (functionName && functionName->isEqualTo("piano-thermal-profile")) {

@@ -326,7 +326,8 @@ IOReturn A830Hfi::transact(uint8_t id,const uint32_t *payload,uint32_t dwords,A8
     const IOReturn result=exchange(id,payload,dwords,ack,step,message,tolerate,&pushed);
     /* annibale: a command that reached the queue and failed is followed by the late drain before the caller reports it
      * (field-notes 9-1). failure() is the command's own. */
-    if(result!=kIOReturnSuccess && pushed && adreno830_annibale())(void)drainLateLocked(A830HfiLateDrainUs);
+    if(result!=kIOReturnSuccess && pushed && adreno830_annibale() && !(qualification_ && !message && id==A830_HFI_H2F_GX_BW_PERF_VOTE))
+        (void)drainLateLocked(A830HfiLateDrainUs);
     return result;
 }
 
@@ -343,6 +344,13 @@ IOReturn A830Hfi::exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A8
     *pushed=true;
     IOReturn result=push(header,payload,dwords);
     if(result!=kIOReturnSuccess)return result;
+    if(!message && id==A830_HFI_H2F_GX_BW_PERF_VOTE) {
+        stats_.last_request=header;stats_.last_level=dwords>1?payload[1]:0;stats_.last_bw=dwords>2?payload[2]:0;
+    }
+    // Arm only after this runtime command has really entered the queue and rung the doorbell.
+    const bool drop=qualification_ && !message && id==A830_HFI_H2F_GX_BW_PERF_VOTE &&
+                    __atomic_exchange_n(&dropArmed_,false,__ATOMIC_ACQ_REL);
+    if(drop)stats_.drop_header=header;
     A830HfiAck local;
     A830HfiAck *answer=ack?ack:&local;
     const uint64_t deadline=io_.now(io_.context)+A830_T_HFI_ACK_US;
@@ -359,6 +367,10 @@ IOReturn A830Hfi::exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A8
         Message incoming;
         int popped;
         while((popped=pop(A830_HFI_QUEUE_ID_MSG,&incoming))>0) {
+            if(drop && A830_HFI_HDR_TYPE(incoming.words[0])==A830_HFI_MSG_ACK && incoming.dwords>=2 &&
+               (incoming.words[1]&~A830_HFI_HDR_RECORD)==(header&~A830_HFI_HDR_RECORD)) {
+                ++stats_.dropped_acks;continue; // consume matching ACK and every duplicate; let the real deadline fail
+            }
             const Outcome outcome=handle(incoming,header,answer,step);
             if(outcome==Fatal)return failure_.ior;
             if(outcome==Matched)matched=true;
@@ -435,6 +447,8 @@ IOReturn A830Hfi::perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigne
     const IOReturn result=transact(A830_HFI_H2F_GX_BW_PERF_VOTE,payload,3,nullptr,step,message,false);
     if(result!=kIOReturnSuccess) {++stats_.vote_failures;return result;}
     ++stats_.votes;
+    if(level<=Adreno830LevelMax)++stats_.level_acks[level];
+    stats_.last_ack=message?headers_[message]:stats_.last_request;
     if(level!=A830HfiNoVote)level_=level;
     if((bw&0xffu)!=A830HfiNoVote)bus_=uint8_t(bw&0xffu);
     pending_=false;
