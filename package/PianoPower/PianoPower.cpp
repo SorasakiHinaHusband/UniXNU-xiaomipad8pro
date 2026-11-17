@@ -341,6 +341,8 @@ class PianoPower : public IOService {
   // the DSP and its charger properties (level 2)
   PianoMca fMca;
   PianoChargeContract fContract{};
+  uint8_t fContractLoggedStage = 0xff;
+  uint32_t fContractLogCount = 0;
   uint64_t fContractRefresh = 0;
   bool fContractWasFresh = false;
   uint32_t fContractSeenGeneration = 0;
@@ -658,6 +660,9 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("ContractNotifyPending", c.notify_pending); n("ContractNotifyMs", c.notify_ms);
   n("UCSIStage", c.stage); n("UCSIInFlight", c.in_flight); n("UCSIQuarantined", c.quarantined);
   n("UCSILastCommand", c.command); n("UCSIControlReadback", c.control_readback);
+  n("UCSIInitialized", c.initialized); n("UCSIEnabled", c.enabled); n("UCSINotifies", c.notifies);
+  n("UCSIReads", c.reads); n("UCSIReadReplies", c.read_replies); n("UCSIWrites", c.writes); n("UCSIWriteReplies", c.write_replies);
+  n("UCSIResets", c.resets); n("UCSITimeoutLayer", c.timeout_layer); n("UCSIRingDropped", fDropped);
   n("ContractTimeouts", c.timeouts); n("ContractFailures", c.failures);
   n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
   n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
@@ -1634,7 +1639,16 @@ void PianoPower::pumpMca(uint64_t now)
   if (fPolicyOn && gArgs.ucsi) {
     if (now >= fContractRefresh) {piano_contract_refresh(&fContract); fContractRefresh = now + 5000;}
     const uint32_t n = piano_contract_next(&fContract, now, out);
-    if (n && piano_adsp_send(fChannel, out, n)) piano_contract_timeout(&fContract, now);
+    if (n && piano_adsp_send(fChannel, out, n)) { fContract.timeout_layer = 1; piano_contract_timeout(&fContract, now); }
+    // A bounded first-init trace distinguishes a silent transport from an
+    // uninitialized PPM or a command that never completed. No payload dump.
+    if (fContract.stage != fContractLoggedStage && fContractLogCount < 32) {
+      fContractLoggedStage = fContract.stage; ++fContractLogCount;
+      note("ucsi-init: stage=%u initialized=%u cmd=%#llx cci=%#x reads=%u/%u writes=%u/%u notify=%u reset=%u timeout-layer=%u [PianoUcsiInitV3]",
+           fContract.stage, fContract.initialized, fContract.command, fContract.cci,
+           fContract.read_replies, fContract.reads, fContract.write_replies, fContract.writes,
+           fContract.notifies, fContract.resets, fContract.timeout_layer);
+    }
   }
   // Expiry/timeout may occur in next(), without a receive callback. Revoke
   // all unsent writes and decide the fallback BEFORE sending any MCA write.

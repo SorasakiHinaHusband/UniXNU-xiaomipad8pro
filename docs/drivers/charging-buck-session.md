@@ -69,3 +69,15 @@ Restore with `sudo piano-charge-config 1 80 75 1 0` in unconditional cleanup.
 The portable regressions include exact 79/80/76/75 hysteresis, leak detection,
 firmware disable, atomic rejection, RDO units, generation and transition barriers:
 `bash package/PianoPower/tests/run-charge-host.sh`.
+
+The observer initializes each new PPM generation before issuing GET commands:
+read VERSION/CCI, clear a latched reset if needed, PPM_RESET with RESET_COMPLETE
+polling, enable command/error notifications and complete its CCI/ACK handshake,
+then query capabilities and enable the supported charging events. A cold PPM in
+notifications-disabled state need only process RESET and notification-enable;
+a GLINK WRITE response alone does not complete GET_CAPABILITY. The independent
+cold PPM regression enforces that boundary, including delayed reset, missing
+notifications, old CONTROL, reconnect and bounded failure. `PianoUcsiInitV3`
+identifies the initialization trace; `PianoCharge` also exposes initialization,
+enabled events, request/reply counts and the timeout layer. Tablet qualification
+of this sequence remains pending.

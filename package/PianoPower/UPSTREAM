@@ -127,3 +127,9 @@ I_TERM, AUTO_RECHG, analog drop, CHARGER_INHIBIT) and the host driver's value fo
 the pulse of piano-power-chgen=2 is this repository's experiment (that an edge of the command restarts this charger is a hypothesis,
 not a fact of that source).
 The arbiter's duplicate APID mappings of one PPID (one per EE) are what this repository's dev14 log shows.
+
+ChargeContract.h's PPM initialization and event enable (2026-11-17) are new project code, copyright Leo Zhang,
+BSD-2-Clause-Patent. Behaviour only: UCSI 1.2 sections 4.3 and 4.5.1 (cold notifications-disabled state, RESET/ENABLE,
+RESET_COMPLETE polling); third-party yzddmr6/xiaomipad-8pro-mainline a43f79c27444faff59576b1309e125f037448abc pins
+Linux 1c21cb9895d69c1c5e83ceae68952fedf522644a: drivers/usb/typec/ucsi/{ucsi.c,ucsi_glink.c},
+drivers/soc/qcom/pmic_glink{,_altmode}.c and include/linux/soc/qcom/pmic_glink.h. No third-party source text incorporated.

@@ -13,6 +13,8 @@ done
   "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/contract_link_host"
 "$T/contract_link_host"
 "$T/contract_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_init_host.cpp" -o "$T/contract_init_host"
+"$T/contract_init_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/policy_host.cpp" "$T/ChargePolicy.o" -o "$T/policy_host"
 "$T/policy_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/power_host.cpp" \

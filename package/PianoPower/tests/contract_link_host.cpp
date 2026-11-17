@@ -82,14 +82,14 @@ struct Integration {
     uint32_t length=16;
     if(op==PIANO_CONTRACT_WRITE) {
       assert(n==64);control=piano_contract_u32(request+20)|(uint64_t(piano_contract_u32(request+24))<<32);
-      assert((control&255)==4 || (control&255)==6 || (control&255)==0x10 || (control&255)==0x12);
+      assert((control&255)==1 || (control&255)==5 || (control&255)==4 || (control&255)==6 || (control&255)==0x10 || (control&255)==0x12);
     } else {
       assert(n==12 && op==PIANO_CONTRACT_READ);length=64;response[12]=0x10;response[13]=1;
       // The PPM returns no CONTROL echo. CCI and serialized ACKs associate replies.
       uint32_t cci=0;uint8_t *msg=response+28;
       if(contract.stage!=PianoContractProbe) {
         const unsigned command=control&255;
-        cci=command==4?1u<<29:1u<<31;
+        cci=command==1?1u<<27:command==4?1u<<29:1u<<31;
         if(command==6) {cci|=16u<<8;msg[0]=4;msg[4]=1;msg[5]=16;}
         else if(command==0x12) {cci|=9u<<8;piano_contract_put32(msg,1u<<19|(pd?3u:1u)<<16);piano_contract_put32(msg+4,pd?rdo:0);}
         else if(command==0x10) {cci|=12u<<8;for(unsigned i=0;i<3;++i)piano_contract_put32(msg+4*i,source[i]);}

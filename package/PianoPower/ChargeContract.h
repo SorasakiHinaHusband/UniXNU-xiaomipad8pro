@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* Copyright (c) 2026 Leo Zhang. */
-/* Read-only UCSI observation over the existing PMIC GLINK owner. This is a
+/* Status-only UCSI observation over the existing PMIC GLINK owner. This is a
  * command codec, not another GLINK client or a PD policy manager. The owner
  * serializes next/receive/timeout on its worker and must exclude other UCSI
  * users. Facts: USB PD fixed/PPS units; UCSI 1.x/2.x register layouts and
@@ -11,7 +11,10 @@
  * buffer bytes + u32 result. WRITE has the same full buffer and trailing
  * reserved word, and receives a 16-byte transport ACK. Each GET is followed
  * by polling CCI and ACK_CC_CI, including polling ACK_COMPLETE. Neither the
- * transport ACK nor advertised PDOs alone authorize a contract.
+ * transport ACK nor advertised PDOs alone authorize a contract. A cold PPM
+ * must first be reset and have command notifications enabled (UCSI 1.2 4.3);
+ * disabled PPMs need not process GET commands. RESET_COMPLETE is polled,
+ * never acknowledged as a normal command. No connector reset or role swap.
  *
  * 1.x MessageIn is 16 bytes: fetch four PDOs, then at most three. A final
  * connector-status read must agree with the initial RDO before publication.
@@ -91,7 +94,8 @@ static inline int piano_contract_decode(const uint32_t *pdo, unsigned count, uin
 enum {
     PianoContractIdle = 0, PianoContractProbe, PianoContractCapability,
     PianoContractStatus, PianoContractPdos0, PianoContractPdos4,
-    PianoContractVerify, PianoContractAck, PianoContractCommit, PianoContractNotifyRead
+    PianoContractVerify, PianoContractAck, PianoContractCommit, PianoContractNotifyRead,
+    PianoContractClearReset, PianoContractReset, PianoContractEnableBasic, PianoContractEnableEvents
 };
 typedef struct {
     /* Published snapshot. valid means PD sink + complete source list + decoded
@@ -107,11 +111,12 @@ typedef struct {
     /* Diagnostic transport state. in_flight is 0, READ=0x11, or WRITE=0x12. */
     uint8_t in_flight, linked, quarantined, stage, next_stage, wire, wanted, polls;
     uint8_t notify_pending;          /* unknown notification; last snapshot cannot authorize more current */
+    uint8_t initialized, timeout_layer; /* 1 transport, 2 command, 3 notification, 4 reset */
     uint8_t connector_event, stage_connected, stage_sink, stage_pd, stage_pdos;
-    uint16_t stage_change;
+    uint16_t stage_change, features;
     uint32_t stage_flags, stage_rdo, stage_pdo[7];
-    uint32_t notifies, failures, timeouts;
-    uint64_t command, sent_ms, command_ms, poll_ms, notify_ms;
+    uint32_t notifies, failures, timeouts, reads, writes, read_replies, write_replies, resets;
+    uint64_t command, sent_ms, command_ms, poll_ms, notify_ms, reset_ms, enabled;
 } PianoChargeContract;
 
 static inline void piano_contract_zero(void *v, unsigned n) {
@@ -157,6 +162,19 @@ static inline unsigned piano_contract_buffer_size(uint16_t version) {
 static inline uint64_t piano_contract_stage_command(const PianoChargeContract *c) {
     uint64_t con = (uint64_t)c->connector << 16;
     switch (c->stage) {
+        case PianoContractClearReset: return 0x05u;
+        case PianoContractReset: return 0x01u;
+        case PianoContractEnableBasic: return 0x80010005ull;
+        case PianoContractEnableEvents: {
+            /* Required connection/mode/direction/partner/error/completion
+             * events; optional source/power/reset events only if advertised.
+             * Charging observes no alternate modes or role-swap policy. */
+            uint64_t mask = 0xd8050000ull;
+            if (c->features & 16u) mask |= 0x00600000ull;
+            if (c->features & 64u) mask |= 0x00020000ull;
+            if (c->features & 128u) mask |= 0x00800000ull;
+            return mask | 0x05u;
+        }
         case PianoContractCapability: return 0x06u;
         case PianoContractStatus: case PianoContractVerify: return 0x12u | con;
         case PianoContractPdos0: return 0x10u | con | ((uint64_t)1 << 23) | ((uint64_t)3 << 32) | ((uint64_t)1 << 34);
@@ -171,14 +189,27 @@ static inline uint64_t piano_contract_stage_command(const PianoChargeContract *c
 static inline uint32_t piano_contract_next(PianoChargeContract *c, uint64_t now_ms, uint8_t out[PIANO_CONTRACT_REQUEST_MAX]) {
     unsigned bytes, i; uint32_t opcode, length;
     if (!c->linked || c->quarantined) return 0;
+    /* A latched reset is cleared asynchronously. Linux attempts RESET even
+     * when that command never completes, provided transport replies arrived. */
+    if (c->stage == PianoContractClearReset && c->wire == 2 && !c->in_flight &&
+        now_ms >= c->command_ms && now_ms - c->command_ms >= 5000) {
+        c->stage = PianoContractReset; c->wire = 0;
+    }
+    if (c->stage == PianoContractReset && c->reset_ms && now_ms >= c->reset_ms && now_ms - c->reset_ms >= 10000) {
+        c->timeout_layer = 4; piano_contract_timeout(c, now_ms); return 0;
+    }
     if (c->notify_pending && now_ms >= c->notify_ms && now_ms - c->notify_ms >= 5000) {
+        c->timeout_layer = 3;
         piano_contract_timeout(c, now_ms); return 0;
     }
     if (c->in_flight) {
-        if (now_ms >= c->sent_ms && now_ms - c->sent_ms >= 1500) piano_contract_timeout(c, now_ms);
+        if (now_ms >= c->sent_ms && now_ms - c->sent_ms >= 1500) {
+            c->timeout_layer = 1; piano_contract_timeout(c, now_ms);
+        }
         return 0;
     }
-    if (c->wire == 2 && now_ms >= c->command_ms && now_ms - c->command_ms >= 5000) {
+    if (c->stage != PianoContractReset && c->wire == 2 && now_ms >= c->command_ms && now_ms - c->command_ms >= 5000) {
+        c->timeout_layer = 2;
         piano_contract_timeout(c, now_ms); return 0;
     }
     if (c->stage == PianoContractIdle) {
@@ -200,7 +231,12 @@ static inline uint32_t piano_contract_next(PianoChargeContract *c, uint64_t now_
         piano_contract_put32(out + 20, (uint32_t)c->command);
         piano_contract_put32(out + 24, (uint32_t)(c->command >> 32));
         c->command_ms = now_ms; c->polls = 0;
-    }
+        ++c->writes;
+        if (c->stage == PianoContractReset) {
+            if (!c->reset_ms) c->reset_ms = now_ms;
+            ++c->resets;
+        }
+    } else ++c->reads;
     c->in_flight = (uint8_t)opcode; c->sent_ms = now_ms;
     return length;
 }
@@ -258,7 +294,8 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         if (length != 16) { piano_contract_fail(c, PIANO_CONTRACT_FRAME, 1); return -1; }
         result = piano_contract_u32(data + 12);
         if (result) { piano_contract_fail(c, PIANO_CONTRACT_RETURN, 0); return -1; }
-        c->wire = 2; c->poll_ms = now_ms; return 1;
+        ++c->write_replies;
+        c->wire = 2; c->poll_ms = now_ms + (c->stage == PianoContractReset ? 20 : 0); return 1;
     }
     if (length != 64 && length != 544) { piano_contract_fail(c, PIANO_CONTRACT_FRAME, 1); return -1; }
     bytes = length - 16; version = (uint16_t)(data[12] | (uint16_t)data[13] << 8);
@@ -267,8 +304,29 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     }
     result = piano_contract_u32(data + 12 + bytes);
     if (result) { piano_contract_fail(c, PIANO_CONTRACT_RETURN, 0); return -1; }
+    ++c->read_replies;
     c->version = version; cci = piano_contract_u32(data + 16); c->cci = cci;
     c->control_readback = (uint64_t)piano_contract_u32(data + 20) | (uint64_t)piano_contract_u32(data + 24) << 32;
+    /* Initial mailbox data is not proof of an initialized OPM. A disabled
+     * PPM can answer READ/WRITE transport while ignoring GET_CAPABILITY. */
+    if (c->stage == PianoContractProbe && !c->initialized) {
+        c->stage = (cci & (1u << 27)) ? PianoContractClearReset : PianoContractReset;
+        c->reset_ms = 0; c->connector_event = c->notify_pending = 0;
+        c->wire = 0; return 1;
+    }
+    if (c->stage == PianoContractClearReset) {
+        if ((cci & (1u << 31)) && !(cci & (1u << 28))) { c->stage = PianoContractReset; c->wire = 0; }
+        else { c->wire = 2; c->poll_ms = now_ms + 20; }
+        c->notify_pending = 0; return 1;
+    }
+    if (c->stage == PianoContractReset) {
+        if (cci == (1u << 27)) {
+            c->stage = PianoContractEnableBasic; c->wire = 0;
+            c->connector_event = c->notify_pending = 0; c->reset_ms = 0;
+        } else if (cci) c->wire = 0; /* still doing something else: resend within the ORIGINAL reset bound */
+        else { c->wire = 2; c->poll_ms = now_ms + 20; }
+        return 1;
+    }
     /* When BUSY, the other CCI fields are not authoritative (UCSI CCI
      * semantics); in particular they must not invent a connector event. */
     if (cci & (1u << 28)) {
@@ -299,7 +357,7 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         return 2;   /* authorization changed; no new sample or freshness timestamp */
     }
     if (c->stage == PianoContractProbe) {
-        if (cci & (1u << 31)) piano_contract_ack_stage(c, PianoContractCapability, c->connector_event);
+        if (cci & (1u << 31)) piano_contract_ack_stage(c, PianoContractCapability, 0);
         else { c->stage = PianoContractCapability; c->wire = 0; }
         return notify_resolved ? 2 : 1;
     }
@@ -315,16 +373,21 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         if (!(cci & (1u << 29))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
         if (c->command & ((uint64_t)1 << 16)) c->connector_event = 0;
         c->stage = c->next_stage; c->wire = 0;
+        if (c->stage == PianoContractStatus && !c->initialized) c->initialized = 1;
         if (c->stage == PianoContractCommit) { piano_contract_publish(c, now_ms); return 2; }
         return notify_resolved ? 2 : 1;
     }
     if (!(cci & (1u << 31))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
     message = data + 28; next = PianoContractIdle;
-    if (c->stage == PianoContractCapability) {
+    if (c->stage == PianoContractEnableBasic || c->stage == PianoContractEnableEvents) {
+        c->enabled = c->command & ~0xffffull;
+        next = c->stage == PianoContractEnableBasic ? PianoContractCapability : PianoContractStatus;
+    } else if (c->stage == PianoContractCapability) {
         if (payload != 16 || message[4] != 1) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
         c->capabilities = piano_contract_u32(message);
+        c->features = (uint16_t)(message[5] | (uint16_t)message[6] << 8);
         if (!(c->capabilities & 4u) || !(message[5] & 16u)) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
-        next = PianoContractStatus;
+        next = c->initialized ? PianoContractStatus : PianoContractEnableEvents;
     } else if (c->stage == PianoContractStatus || c->stage == PianoContractVerify) {
         if (payload < 9 || payload > (bytes == 48 ? 16u : 19u)) { piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1; }
         flags = piano_contract_u32(message); rdo = piano_contract_u32(message + 4);

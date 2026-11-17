@@ -22,6 +22,8 @@ T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
   "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/contract_link_host"
 "$T/contract_link_host"
 "$T/contract_host" || { echo "Error: PianoPower contract host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_init_host.cpp" -o "$T/contract_init_host"
+"$T/contract_init_host" || { echo "Error: PianoPower cold UCSI host tests failed" >&2; exit 1; }
 "$T/policy_host" || { echo "Error: PianoPower charging-policy host tests failed" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomQrtr.c" -o "$T/QcomQrtr.o"   # the QMI helpers Servreg.h uses
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$D/package/include" -c "$P/QrtrPorts.c" -o "$T/QrtrPorts.o"

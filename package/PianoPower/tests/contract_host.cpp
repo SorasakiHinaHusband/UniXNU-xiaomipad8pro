@@ -51,7 +51,9 @@ struct Ppm {
     uint64_t staleControl=0;
     unsigned completionDelay=0, pendingPolls=0;
     unsigned cciConnector=0, connectorCount=1;
-    Ppm() { piano_contract_init(&c); piano_contract_link(&c,1); }
+    // These focused GET/ACK/error tests start with an initialized PPM. The
+    // independent cold wire model in contract_init_host covers initialization.
+    Ppm() { piano_contract_init(&c); piano_contract_link(&c,1); c.initialized=1; }
     int step() {
         uint8_t request[PIANO_CONTRACT_REQUEST_MAX];
         auto n=piano_contract_next(&c,now,request); ++now;
@@ -175,7 +177,7 @@ static void invalidation() {
     uint8_t late[64]={}; piano_contract_put32(late,PIANO_CONTRACT_OWNER); piano_contract_put32(late+4,1); piano_contract_put32(late+8,PIANO_CONTRACT_READ); late[12]=0x10; late[13]=1;
     assert(piano_contract_receive(&timeout.c,1511,late,64)==0 && timeout.c.seq==seq);
     piano_contract_refresh(&timeout.c); assert(!piano_contract_next(&timeout.c,1600,request));
-    piano_contract_link(&timeout.c,1); timeout.now=2000; timeout.complete(); assert(timeout.c.valid);
+    piano_contract_link(&timeout.c,1); timeout.c.initialized=1; timeout.now=2000; timeout.complete(); assert(timeout.c.valid);
     Ppm truncated; assert(piano_contract_next(&truncated.c,10,request)==12);
     assert(piano_contract_receive(&truncated.c,11,late,63)==-1);
     assert(!truncated.c.valid && truncated.c.quarantined);

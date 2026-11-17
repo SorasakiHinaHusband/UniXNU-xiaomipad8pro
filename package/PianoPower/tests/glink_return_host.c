@@ -171,6 +171,45 @@ static void shared_channel_returns(void)
     qcom_glink_poll(&f.g);
     CHECK(!f.g.retry_pending && f.tt==f.th && deliveries==before+3);
 }
+static void pmic_receive(void *p,QcomGlinkChannel *c,const uint8_t *bytes,uint32_t n)
+{
+    (void)c; unsigned *received=p;
+    CHECK(n==64 && get32(bytes)==0x800b && get32(bytes+8)==0x11 && bytes[12]==0x10 && bytes[13]==1);
+    ++*received;
+}
+/* PMIC and QRTR share the FIFO but not receive-intent ownership. A successful
+ * UCSI READ payload must not lose its RX_DONE when QRTR fills the TX side. */
+static void pmic_channel_returns(int reuse)
+{
+    Fixture f;QcomGlinkChannel *qrtr=setup(&f,reuse,1);
+    uint8_t storage[64], payload[72]={0};unsigned received=0;
+    const QcomGlinkClient client={NULL,pmic_receive};
+    QcomGlinkChannel *pmic=qcom_glink_channel(&f.g,"PMIC_RTR_ADSP_APPS",64,1,storage,&client,&received,1);
+    CHECK(pmic!=NULL);pmic->open_sent=pmic->open_acked=pmic->remote_open=pmic->up=1;
+    pmic->rcid=9;pmic->local[0].advertised=1;
+    put32(payload,64);put32(payload+8,0x800b);put32(payload+16,0x11);payload[20]=0x10;payload[21]=1;
+    const unsigned before=deliveries;
+    f.th=sizeof f.tx-24;
+    data(&f,QCOM_GLINK_TX_DATA,1,"lux!",4,0);
+    remote(&f,QCOM_GLINK_TX_DATA,9,1,payload,sizeof payload);
+    qcom_glink_poll(&f.g);
+    CHECK(received==1 && deliveries==before+1 && f.g.done_deferred==2);
+    CHECK(qrtr->local[0].done_due && pmic->local[0].done_due && f.g.retry_pending);
+    f.tt=f.th;qcom_glink_poll(&f.g);
+    unsigned mask=0;
+    while(f.tt!=f.th){
+        uint8_t h[8];for(unsigned i=0;i<8;++i)h[i]=f.tx[(f.tt+i)%sizeof f.tx];
+        const unsigned cmd=h[0],cid=h[2]|(unsigned)h[3]<<8;
+        if(cmd==(reuse?QCOM_GLINK_RX_DONE_W_REUSE:QCOM_GLINK_RX_DONE)){
+            CHECK(get32(h+4)==1 && (cid==qrtr->lcid || cid==pmic->lcid));
+            const unsigned bit=cid==pmic->lcid?2:1;CHECK(!(mask&bit));mask|=bit;
+        }
+        f.tt=(f.tt+8+(cmd==QCOM_GLINK_INTENT?8*get32(h+4):0))%sizeof f.tx;
+    }
+    CHECK(mask==3 && f.g.done_retried==2 && received==1);
+    qcom_glink_poll(&f.g);
+    CHECK(!f.g.retry_pending && !pmic->local[0].busy && received==1 && deliveries==before+1);
+}
 int main(void)
 {
     for(int reuse=0;reuse<=1;++reuse)for(int frag=0;frag<=1;++frag)completion(reuse,frag,1);
@@ -178,6 +217,7 @@ int main(void)
     multiple_returns();
     close_reopen();
     shared_channel_returns();
+    pmic_channel_returns(0);pmic_channel_returns(1);
     printf("glink_return_host: %u checks, %u failures, %u delivered, %u kicks\n",checks,failures,deliveries,kicks);
     return failures?1:0;
 }
