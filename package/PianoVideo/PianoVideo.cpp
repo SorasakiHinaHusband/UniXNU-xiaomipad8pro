@@ -33,6 +33,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 #include <libkern/crypto/sha2.h>
@@ -711,7 +712,7 @@ extern "C" int piano_video_native_decode(uint32_t sid, const uint8_t *bytes, uin
           r.rawBytes > raw->size || !r.drainAck || !r.last || r.ebd != 1 || r.psc != 1 || r.decoded != 1)
         rc = kErrHfi;
       else {
-        owner->loan = IOMemoryDescriptor::withSubRange(owner->hw.arenaMem, raw->off, raw->size, kIODirectionInOut);
+        owner->loan = IOSubMemoryDescriptor::withSubRange(owner->hw.arenaMem, raw->off, raw->size, kIODirectionInOut);
         if (!owner->loan) rc = kErrNoMemory;
         else {
           frame->memory = owner->loan;
