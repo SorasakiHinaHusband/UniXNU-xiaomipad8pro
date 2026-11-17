@@ -34,6 +34,7 @@ struct Model {
   uint32_t gctl = kPrtcapDevice << kGctlPrtcapShift, gsts = 0, guctl = 0x0c808010, gusb2 = kGusb2PhySusphy | kGusb2PhyEnblslpm | 0x1400,
            gusb3 = kGusb3PipeSusphy | 0x0100000, gevntsiz = 0x1000, dctl = kDctlRunStop, dsts = 0;
   int csftrstReads = 0, haltReads = 0;
+  bool deviceCanHalt = true;
   bool pipeClock = true;   // false: DCTL.CSFTRST never clears (no PIPE clock)
   uint32_t qsGeneral = 0, qsHs = kQsUtmiOtgVbusValid | kQsSwSessvldSel | 0x10, qsSs = kQsLane0PwrPresent;
   // xHCI
@@ -207,7 +208,7 @@ struct Model {
       return dctl;
     }
     if (pa == kDwc3 + kDsts) {
-      if (!(dctl & kDctlRunStop) && --haltReads <= 0) dsts |= kDstsDevCtrlHlt;
+      if (deviceCanHalt && !(dctl & kDctlRunStop) && --haltReads <= 0) dsts |= kDstsDevCtrlHlt;
       return dsts;
     }
     if (pa == kQscratch + kQsGeneralCfg) return qsGeneral;
@@ -693,6 +694,15 @@ void testNeutral()
 
 int main()
 {
+  {
+    Model m;
+    m.deviceCanHalt = false;
+    TestHal h{m};
+    const SwitchResult sw = hostSwitch(h, HostPolicy());
+    CHECK(!sw.ok && !sw.devHalted && m.glueStores == 0);
+    CHECK(prtcap(m.gctl) == kPrtcapDevice && m.xhciStores == 0);
+  }
+
   testSwitch();
   testGates();
   testXhci();

@@ -12,7 +12,7 @@ struct DomainOwner {
   bool borrow() const {return state==DomainState::ready;}
 };
 struct DomainInfo {
-  uint32_t version=1,state=0,slot=~0u,bank=~0u,asid=0;
+  uint32_t version=1,state=0,slot=~0u,bank=~0u,asid=0,fsr=0;
   bool configured=false,net=false;
   uint64_t table=0;
 };

@@ -499,7 +499,7 @@ void cleanToPoc(const void *start, size_t length)
 
 bool dmaAlloc(uint32_t bytes)
 {
-  if (gDma.va) return gDma.bytes >= bytes;
+  if (gDma.va) return gDma.bytes >= bytes && (gArgs.smmu != 2 || identityRange(gDma.bus, gDma.bytes));
   const uint64_t masks[2] = {0x00000000ffff0000ull, 0x0000000fffff0000ull};
   for (unsigned i = 0; i < 2 && !gDma.va; ++i) {
     IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -512,7 +512,7 @@ bool dmaAlloc(uint32_t bytes)
     IOByteCount contiguous = 0;
     const uint64_t pa = b->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
     uint8_t *cached = static_cast<uint8_t *>(b->getBytesNoCopy());
-    if (!pa || (pa & (kRegionAlign - 1)) || contiguous < bytes || !cached) {
+    if (!pa || (pa & (kRegionAlign - 1)) || contiguous < bytes || !cached || (gArgs.smmu == 2 && !identityRange(pa, bytes))) {
       b->complete();
       b->release();
       continue;
@@ -838,6 +838,7 @@ struct NubIrq {
   pianoirq::SpiLine line;
   pianoirq::StormGuard storm;
   volatile uint64_t entries, strays, polls, registers, enables, disables;
+  volatile uint32_t inFlight, quiescing;
 };
 NubIrq gNubIrq;
 
@@ -857,6 +858,25 @@ void lineUnmask()
     dsb();
   }
 }
+void nubDeliver()
+{
+  NubIrq &q = gNubIrq;
+  __atomic_add_fetch(&q.inFlight, 1u, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&q.quiescing, __ATOMIC_SEQ_CST) && __atomic_load_n(&q.enabled, __ATOMIC_SEQ_CST) && q.action)
+    q.action(q.target, q.refCon, q.nub, 0);
+  __atomic_sub_fetch(&q.inFlight, 1u, __ATOMIC_SEQ_CST);
+}
+bool nubDrain()
+{
+  NubIrq &q = gNubIrq;
+  __atomic_store_n(&q.quiescing, 1u, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&q.enabled, false, __ATOMIC_SEQ_CST);
+  lineMask();
+  const uint64_t end = nowMs() + 1000;
+  while (__atomic_load_n(&q.inFlight, __ATOMIC_SEQ_CST) && nowMs() < end) IOSleep(1);
+  return __atomic_load_n(&q.inFlight, __ATOMIC_SEQ_CST) == 0;
+}
+
 // Primary interrupt context (ArmCpu's handler, before the EOI): Apple's filter runs here and disables the source until its work
 // loop has run (IOFilterInterruptEventSource's disableInterruptOccurred calls disableInterrupt below).
 void nubPrimary(void *)
@@ -872,7 +892,7 @@ void nubPrimary(void *)
     lineMask();
     return;
   }
-  q.action(q.target, q.refCon, q.nub, 0);
+  nubDeliver();
 }
 void nubPoll(void *, wait_result_t)
 {
@@ -882,7 +902,7 @@ void nubPoll(void *, wait_result_t)
     IOSleep(1);
     if (!q.enabled || !q.action) continue;
     const boolean_t was = ml_set_interrupts_enabled(FALSE);
-    if (q.enabled && q.action) q.action(q.target, q.refCon, q.nub, 0);
+    nubDeliver();
     ml_set_interrupts_enabled(was);
     pianoirq::bump(q.polls);
   }
@@ -946,8 +966,7 @@ IOReturn PianoUsbHostNub::unregisterInterrupt(int source)
 {
   NubIrq &q = gNubIrq;
   if (source != 0) return kIOReturnNoInterrupt;
-  q.enabled = false;
-  lineMask();
+  if (!nubDrain()) return kIOReturnBusy;
   q.action = nullptr;
   q.target = nullptr;
   q.refCon = nullptr;
@@ -959,7 +978,8 @@ IOReturn PianoUsbHostNub::enableInterrupt(int source)
   NubIrq &q = gNubIrq;
   if (source != 0) return kIOReturnNoInterrupt;
   pianoirq::bump(q.enables);
-  q.enabled = true;
+  if (__atomic_load_n(&q.quiescing, __ATOMIC_ACQUIRE)) return kIOReturnNotReady;
+  __atomic_store_n(&q.enabled, true, __ATOMIC_SEQ_CST);
   lineUnmask();
   return kIOReturnSuccess;
 }
@@ -969,7 +989,7 @@ IOReturn PianoUsbHostNub::disableInterrupt(int source)
   NubIrq &q = gNubIrq;
   if (source != 0) return kIOReturnNoInterrupt;
   pianoirq::bump(q.disables);
-  q.enabled = false;
+  __atomic_store_n(&q.enabled, false, __ATOMIC_SEQ_CST);
   lineMask();
   return kIOReturnSuccess;
 }
@@ -1134,6 +1154,7 @@ void appleLine(const char *when, const AppleState &s)
 // Level 6 after the switch: the gate, the nub, Apple's xHCI on it (stages 30..32); appleTick is one sample of the watch (stage 33).
 bool appleUp()
 {
+  __atomic_store_n(&gNubIrq.quiescing, 0u, __ATOMIC_SEQ_CST);
   stage(30, "the host stack's gate resource PianoUsbHostStack (IOUSBHostFamily's and IOUSBMassStorageDriver's resource personalities)");
   IOService::publishResource(kStackGate);
   // AppleUSBHostResources and AppleUSBHostResourcesTypeC share one match category on IOResources: one of them starts.
@@ -1258,6 +1279,7 @@ void appleTerminate(void *arg, wait_result_t)
 }
 bool appleDown(const Xhci &x)
 {
+  if (!nubDrain()) { note("usb-a2b poll callback drain unconfirmed; controller held"); return false; }
   if (gNub) {
     __atomic_store_n(&gAppleTerminated, 0u, __ATOMIC_RELEASE);
     thread_t thread = nullptr;
@@ -1456,15 +1478,18 @@ bool sharedDomain(bool baseline)
   const bool ok = gDwc3 && gDwc3->callPlatformFunction(pianousb::kDomainFunction, false, &info, nullptr, nullptr, nullptr) == kIOReturnSuccess;
   note("usb-a2b borrower domain %s bank %u ASID %u CDC %u net %u baseline-required %u", ok ? "ready" : "NOT ready",
        info.bank, info.asid, info.configured, info.net, baseline);
+  note("usb-a2b domain fault raw %08x fault_bits %08x", info.fsr, info.fsr & kFsrFaults);
   return ok && (!baseline || (info.configured && info.net));
 }
 volatile uint32_t gLoanRequest;
+uint64_t gLoanRequestAt;
 int loanSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
   int value = int(__atomic_load_n(&gLoanRequest, __ATOMIC_ACQUIRE));
   const int err = sysctl_handle_int(oidp, &value, 0, req);
   if (err || !req->newptr) return err;
   if (value != 1 || gArgs.handoff != 6 || !gArgs.back || !bootArg("piano-usbhost-test-loan", 0)) return EINVAL;
+  __atomic_store_n(&gLoanRequestAt, nowMs() + 2000, __ATOMIC_RELEASE);
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gLoanRequest, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
   gPortWake.kick();
@@ -1504,7 +1529,7 @@ bool liveUp(LiveHost &h)
 {
   h.sessions++;
   gReturnSafe = true;
-  if (!gLoan.deadline || nowMs() >= gLoan.deadline || (gArgs.handoff == 6 && !sharedDomain(false))) return false;
+  if (!gLoan.deadline || nowMs() >= gLoan.deadline || (gArgs.handoff == 6 && (!sharedDomain(false) || !controllerClassPresent()))) return false;
   note("hand-off: host session %u: %s", h.sessions, gArgs.handoff == 6 ? "the switch, then Apple's xHCI on the nub" : "the switch, then our xHCI probe");
   if (!hostSwitchLogged(h.sw)) {
     if (h.sw.stores) gReturnSafe = hostEnd(nullptr, h.sw, true);
@@ -1537,6 +1562,26 @@ bool liveUp(LiveHost &h)
       else gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true);
       return false;
     }
+    const XhciAt at = xhciAt(h.x);
+    const uint64_t readyEnd = nowMs() + 1000;
+    while ((gHal.rd(at.op + kOpUsbSts) & kUsbStsHalted) && nowMs() < readyEnd && nowMs() < gLoan.deadline) IOSleep(10);
+    bool portsPowered = h.x.maxPorts != 0;
+    for (unsigned i = 1; i <= h.x.maxPorts; ++i) {
+      const uint32_t port = gHal.rd(portscAt(h.x, i));
+      portsPowered &= !h.x.ppc || (port & kPortPp);
+      portLine(h.x, i, port, "Apple root port:");
+    }
+    if (!(gHal.rd(at.op + kOpUsbCmd) & kUsbCmdRun) || (gHal.rd(at.op + kOpUsbSts) & kUsbStsHalted) || !portsPowered || nowMs() >= gLoan.deadline) {
+      note("usb-a2b Apple controller/root ports not running before deadline");
+      gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true);
+      return false;
+    }
+    const AppleState dma = appleState(h.x);
+    const uint64_t command = rd64(gHal, at.op + kOpCrcr) & ~0x3full;
+    const bool dmaCovered = identityRange(dma.dcbaap & ~0x3full, 64) && identityRange(command, 64) &&
+        identityRange(dma.erstba & ~0x3full, 16) && identityRange(dma.erdp & ~0xfull, 16);
+    note("usb-a2b Apple DMA identity-covered %u CRCR %#llx", dmaCovered, (unsigned long long)command);
+    if (!dmaCovered) { gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true); return false; }
     appleWatchBegin(h.x, h.apple);
   } else {
     h.pr = Probe();
@@ -1832,7 +1877,7 @@ void portManager(IOService *self)
     SwitchAction a = rs.step(hostWitness ? Role::host : Role::device, v.connected, now);
     if (!v.connected && !diagnostic) gLoan.disconnected();
     if (bootArg("piano-usbhost-test-loan", 0)) a = SwitchAction::none;
-    if (diagnostic && gLoan.phase == LoanPhase::idle) a = SwitchAction::toHost;
+    if (diagnostic && gLoan.phase == LoanPhase::idle && nowMs() >= __atomic_load_n(&gLoanRequestAt, __ATOMIC_ACQUIRE)) a = SwitchAction::toHost;
     bool present = false;
     if (gLive.active) {
       for (unsigned i = 1; i <= gLive.x.maxPorts; ++i) present |= (gHal.rd(portscAt(gLive.x, i)) & kPortCcs) != 0;
@@ -1880,7 +1925,10 @@ void portManager(IOService *self)
     const auto earliest = [&deadline](uint64_t t) { if (t && (!deadline || t < deadline)) deadline = t; };
     earliest(rs.deadline());
     if (gLive.active) { earliest(gLive.nextPoll); earliest(gLoan.deadline); }
-    if (diagnostic && gLoan.phase == LoanPhase::idle) earliest(nowMs() + 2000);
+    if (diagnostic && gLoan.phase == LoanPhase::idle) {
+      const uint64_t at = __atomic_load_n(&gLoanRequestAt, __ATOMIC_ACQUIRE);
+      earliest(at > nowMs() ? at : nowMs() + 2000);
+    }
     portWait(seen, deadline);
   }
 }

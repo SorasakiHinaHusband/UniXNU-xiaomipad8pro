@@ -2505,6 +2505,7 @@ IOReturn PianoDwc3::callPlatformFunction(const OSSymbol *functionName, bool wait
     auto *info = static_cast<DomainInfo *>(param1);
     if (!info || info->version != 1 || gArgs.smmu != 2) return kIOReturnUnsupported;
     info->state = uint32_t(gDomain.state);
+    if (gDomain.borrow()) info->fsr = smmuRead(gIdentity.cb() + pianousbhost::kCbFsr);
     info->slot = gIdentity.slot; info->bank = gIdentity.bank; info->asid = gIdentity.asid; info->table = gIdentityPa;
     info->configured = __atomic_load_n(&gDomainConfigured, __ATOMIC_ACQUIRE) != 0;
     info->net = __atomic_load_n(&gDomainNet, __ATOMIC_ACQUIRE) != 0;
