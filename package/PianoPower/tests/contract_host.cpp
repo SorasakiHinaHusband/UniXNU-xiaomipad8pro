@@ -48,6 +48,7 @@ struct Ppm {
     unsigned stage=0, reads=0, writes=0, acks=0, snapshots=0;
     bool busy=false, shortStatus=false, changeOnVerify=false;
     bool transportError=false, ucsiError=false, wrongEcho=false, shortPayload=false, missingPdoFeature=false;
+    unsigned cciConnector=0, connectorCount=1;
     Ppm() { piano_contract_init(&c); piano_contract_link(&c,1); }
     int step() {
         uint8_t request[PIANO_CONTRACT_REQUEST_MAX];
@@ -81,7 +82,7 @@ struct Ppm {
             else if(cmd==4) cci=1u<<29;
             else {
                 cci=1u<<31;
-                if(cmd==6) { cci|=16u<<8; msg[0]=4; msg[4]=1; msg[5]=missingPdoFeature?0:16; }
+                if(cmd==6) { cci|=16u<<8; msg[0]=4; msg[4]=uint8_t(connectorCount); msg[5]=missingPdoFeature?0:16; }
                 else if(cmd==0x12) {
                     cci|=(shortStatus?8u:9u)<<8;
                     piano_contract_put32(msg,status);
@@ -98,6 +99,7 @@ struct Ppm {
         }
         if(ucsiError && c.stage!=PianoContractProbe) cci|=1u<<30;
         if(shortPayload && c.stage!=PianoContractProbe) cci=(cci&~0xff00u)|(17u<<8);
+        cci|=cciConnector<<1;
         piano_contract_put32(response+16,cci);
         auto result=piano_contract_receive(&c,now,response,size);
         if(result==2) ++snapshots;
@@ -173,6 +175,13 @@ static void invalidation() {
     assert(payload.c.last_error==PIANO_CONTRACT_PAYLOAD);
     Ppm feature; feature.missingPdoFeature=true; feature.complete();
     assert(feature.c.last_error==PIANO_CONTRACT_CAPABILITY && !feature.c.status_valid);
+    Ppm count; count.connectorCount=2; count.complete();
+    assert(count.c.last_error==PIANO_CONTRACT_CAPABILITY && !count.c.valid);
+    Ppm connector; connector.cciConnector=2; assert(connector.step()==-1);
+    assert(connector.c.last_error==PIANO_CONTRACT_CCI && !connector.c.valid && !connector.acks);
+    Ppm connectorChange; connectorChange.step(); connectorChange.step(); connectorChange.cciConnector=2;
+    assert(connectorChange.step()==-1);
+    assert(connectorChange.c.last_error==PIANO_CONTRACT_CCI && !connectorChange.c.valid && !connectorChange.acks);
     Ppm notifyCommand; notifyCommand.step(); notifyCommand.step();
     auto initialGeneration=notifyCommand.c.generation;
     assert(piano_contract_receive(&notifyCommand.c,notifyCommand.now,notify,24)==1);

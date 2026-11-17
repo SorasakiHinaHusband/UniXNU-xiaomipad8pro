@@ -255,6 +255,11 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     c->version = version; cci = piano_contract_u32(data + 16); c->cci = cci;
     payload = (cci >> 8) & 255u;
     if (payload > (bytes == 48 ? 16u : 256u)) { piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1; }
+    /* This tablet has one connector. Never acknowledge an event for a
+     * connector whose status/source PDOs we did not query. */
+    if (((cci >> 1) & 127u) && ((cci >> 1) & 127u) != c->connector) {
+        piano_contract_fail(c, PIANO_CONTRACT_CCI, 0); return -1;
+    }
     if (((cci >> 1) & 127u) && !c->connector_event) {
         c->connector_event = 1; piano_contract_invalidate(c, PIANO_CONTRACT_CHANGED, 1);
     }
@@ -280,7 +285,7 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
     if (!(cci & (1u << 31))) { c->wire = 2; c->poll_ms = now_ms + 200; return 1; }
     message = data + 28; next = PianoContractIdle;
     if (c->stage == PianoContractCapability) {
-        if (payload != 16 || !(message[4] & 127u)) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
+        if (payload != 16 || message[4] != 1) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
         c->capabilities = piano_contract_u32(message);
         if (!(c->capabilities & 4u) || !(message[5] & 16u)) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
         next = PianoContractStatus;
