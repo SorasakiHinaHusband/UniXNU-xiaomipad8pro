@@ -4,6 +4,7 @@
 // Build as an arm64 Cocoa app; launch in a proven GUI session with `open Redraw.app`.
 #import <Cocoa/Cocoa.h>
 #include <math.h>
+#include <sys/sysctl.h>
 static unsigned long long draws;
 @interface LoadView : NSView
 @property NSUInteger phase;
@@ -46,6 +47,15 @@ static unsigned long long draws;
 }
 - (void)tick:(NSTimer *)timer {
     (void)timer;double elapsed=NSProcessInfo.processInfo.systemUptime-self.start;++self.ticks;
+    NSFileManager *files=NSFileManager.defaultManager;
+    int guard=0;size_t guardBytes=sizeof guard;
+    bool exitGuard=sysctlbyname("machdep.piano_gpu_qual607",&guard,&guardBytes,NULL,0)==0 && guard>=0 && (guard&8) &&
+        ((guard>>8)!=1 || ![files fileExistsAtPath:@"/tmp/gpur3a/allow-fallback"]);
+    if(exitGuard || elapsed>=1000 || [files fileExistsAtPath:@"/tmp/gpur3a-stop"]) {
+        // A same-directory image lets the companion file:// page observe the stop without a server or Automation.
+        [files copyItemAtPath:@"/tmp/gpuoom/pattern0.png" toPath:@"/tmp/gpur3a/stop.png" error:NULL];
+        [NSApp terminate:nil];return;
+    }
     NSRect screen=NSScreen.mainScreen.visibleFrame;
     for(NSUInteger i=0;i<self.windows.count;++i) {
         NSWindow *w=self.windows[i];NSRect f=w.frame;
@@ -59,7 +69,6 @@ static unsigned long long draws;
         if(f) {fprintf(f,"REDRAW elapsed=%.3f moves=%llu draws=%llu windows=%lu ticks=%llu\n",elapsed,self.moves,draws,
             (unsigned long)self.windows.count,self.ticks);fclose(f);}
     }
-    if(elapsed>=1000)[NSApp terminate:nil];
 }
 @end
 int main(void) {
