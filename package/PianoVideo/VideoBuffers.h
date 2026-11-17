@@ -11,7 +11,7 @@ namespace pianovideo
 namespace session
 {
 constexpr uint32_t kArenaBase = kIovaBase + kUcRegionBytes, kArenaBytes = 64 * 1024 * 1024;
-constexpr unsigned kArenaPages = kArenaBytes / 4096, kMaxN = 64, kSlots = 140;
+constexpr unsigned kArenaPages = kArenaBytes / 4096, kMaxN = 64, kSlots = 141;
 constexpr uint32_t kInputBytes = 7077888, kRawBytes = 147456, kDpbBytes = 155648, kUvOffset = 98304;
 constexpr uint32_t comvBytes(unsigned n) { return 43008 * n + 512; }
 enum BufferType : uint32_t { Bitstream = 1, Raw = 2, Partial = 5, Dpb = 6, Bin = 7, Line = 8, Comv = 10, NonComv = 11, Persist = 12 };
@@ -48,7 +48,7 @@ struct Layout {
   bool init()
   {
     used = bytes = 0;
-    if (!add(Bitstream, 0, kInputBytes, 1) || !add(Persist, 0, 498176, 0))
+    if (!add(Bitstream, 0, kInputBytes, 1) || !add(Bitstream, 1, kInputBytes, 1) || !add(Persist, 0, 498176, 0))
       return false;
     for (unsigned set = 0; set < 2; ++set)
       for (unsigned i = 0; i < 5; ++i)

@@ -256,7 +256,7 @@ static void layoutTests()
 {
   Layout l;
   CHECK(l.init());
-  CHECK(l.used == 140 && l.bytes < kArenaBytes);
+  CHECK(l.used == 141 && l.bytes == 56623104 && l.bytes < kArenaBytes);
   CHECK(scratchBytes(1, 4) == 172544 && scratchBytes(1, 64) == 2753024);
   std::vector<uint64_t> words(vsmmu::kSessionTablePages * 512), pages(kArenaPages), uc(vsmmu::kUcPages);
   for (unsigned i = 0; i < pages.size(); ++i)

@@ -9,6 +9,7 @@
 #include "VideoHfi.h"
 #include "VideoBuffers.h"
 #include "VideoFixture.h"
+#include "VideoStreamState.h"
 namespace pianovideo
 {
 namespace session
@@ -81,7 +82,19 @@ public:
   const uint8_t *accessUnit = kAccessUnit;
   uint32_t accessUnitBytes = sizeof kAccessUnit;
   bool checkGolden = true;
+  bool streaming = false;
+  uint32_t expectedPoc = 2, expectedProfile = 0, expectedLevel = 4;
+  stream::Ledger ledger;
+  struct OutputFrame { uint64_t token = 0; unsigned index = 0; uint32_t bytes = 0; };
+  OutputFrame outputs[stream::Credits] = {};
+  unsigned outputHead = 0, outputCount = 0;
   explicit SelfTest(Owner &owner, Layout &l) : o(owner), layout(l) {}
+  bool pscSupported() const {
+    if (!streaming) return psc.supported();
+    return psc.resolution == 0x014000f0 && !psc.crop[0] && !psc.crop[1] && psc.depth == 0x00080008 && psc.coded == 1 &&
+      psc.n && psc.n <= kMaxN && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
+      (!(psc.returned & (1u << 7)) || psc.profile == expectedProfile) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
+  }
   // Called only by the exclusive worker, before OPEN. Input validation is also
   // enforced at the native API boundary before the V3 DMA/power preparation.
   bool nativeInput(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t callerToken)
@@ -344,7 +357,7 @@ public:
           if (r.error && !cleanup)
             continue;
           if (type == Settings) {
-            if (port != 1 || r.psc || !psc.supported()) {
+            if (port != 1 || r.psc || !pscSupported()) {
               fail(kErrHfi, type, flags, port, p[5], b[2]);
               continue;
             }
@@ -419,6 +432,14 @@ public:
     }
     b->readonly = (v[10] & 0x10) != 0;
     if (b->type == Bitstream) {
+      if (streaming) {
+        if (b->readonly || !ledger.ebd(b->index)) { fail(kErrHfi, Buffers); return; }
+        b->queued = false; ++r.ebd;
+        deadline = o.hw.nowUs() + 5000000;
+        o.hw.note("V6 EBD session %08x index %u token %llu count %u", sessionId,b->index,
+                  (unsigned long long)ledger.inputToken[b->index],r.ebd);
+        return;
+      }
       if (++r.ebd != 1) {
         fail(kErrHfi, Buffers);
         return;
@@ -429,8 +450,12 @@ public:
                                  (unsigned long long)token, r.ebd);
       return;
     }
-    if (b->type != Raw)
-      return; // retain internal reference memory until close or final PAS quiesce
+    if (b->type != Raw) {
+      // Running firmware must keep split DPB/internal allocations. A return is
+      // not permission to overwrite a reference; unsupported return fails closed.
+      if (streaming && !cleanup) fail(kErrHfi, Buffers, p[2], p[4], p[5], header);
+      return;
+    }
     b->queued = false;
     ++r.rawReturns;
     if (v[10] & 0x20000000) {
@@ -448,6 +473,19 @@ public:
     if (!v[7]) {
       if (!(v[10] & 0x10000000) && !cleanup)
         fail(kErrHfi, Buffers);
+      return;
+    }
+    if (streaming) {
+      if (cleanup) return; // cancellation never delivers a late success
+      const uint64_t returnedToken = uint64_t(v[8]) | (uint64_t(v[9]) << 32);
+      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 7) || (picture & ~7u) ||
+          outputCount == stream::Credits || !ledger.picture(returnedToken,b->index)) {
+        fail(kErrHfi, Buffers, p[2], p[4], p[5], header); return;
+      }
+      outputs[(outputHead+outputCount)%stream::Credits]={returnedToken,b->index,v[7]};++outputCount;++r.decoded;
+      deadline = o.hw.nowUs()+5000000;
+      o.hw.note("V6 FBD session %08x token %llu index %u picture %u count %u",sessionId,
+                (unsigned long long)returnedToken,b->index,picture,r.decoded);
       return;
     }
     if (cleanup || !rawStarted || v[6] || v[8] != uint32_t(token) || v[9] != uint32_t(token >> 32) || frameError || !(picture & 1) || (picture & 0x40) ||
@@ -498,6 +536,10 @@ public:
     o.rep.fsr |= fault.fsr & vsmmu::kFsrFaults;
     if (fault.fsr & vsmmu::kFsrFaults)
       rc = fail(kErrFault);
+    if (streaming) {
+      ledger.ack = r.drainAck; ledger.last = r.last;
+      if (!ledger.pending && !ledger.draining && ledger.inputsEmpty()) deadline = UINT64_MAX;
+    }
     if (o.hw.nowUs() >= deadline && !cleanup)
       rc = fail(kErrHfiTimeout);
     return rc;
@@ -550,7 +592,8 @@ public:
       return r.error;
     // // acceptance is established by PSC downstream; this is only submission/consumption
     stage(Config);
-    if (property(0x03000100, 1, 0, 9) || property(0x03000168, 0, 1))
+    if (property(0x03000100, 1, 0, 9) || property(0x03000168, 0, 1) ||
+        (streaming && property(0x0300015b, 1, 1)))
       return r.error;
     for (unsigned i = 1; i < 10; ++i) {
       if (i == 2) {
@@ -559,7 +602,7 @@ public:
       } else if (property(kPscIds[i], psc.value(i), 1, (i == 7 || i == 8) ? 9 : i == 9 ? 10 : 1))
         return r.error;
     }
-    if (property(0x03000107, 4, 2, 9) || property(0x03000108, 18, 2, 9) || property(0x03000169, 1, 1) || property(0x03000123, 64, 1) ||
+    if (property(0x03000107, streaming ? expectedProfile : 4, 2, 9) || property(0x03000108, streaming ? expectedLevel : 18, 2, 9) || property(0x03000169, 1, 1) || property(0x03000123, 64, 1) ||
         property(0x0300010a, 1, 0) || property(0x0300010b, 4, 0) || buffer(*layout.find(Persist, 0)) || scratch(0, 4) ||
         subscribe(1, false) || subscribe(1, true))
       return r.error;
@@ -571,6 +614,7 @@ public:
     for (unsigned i = 0; i < accessUnitBytes; ++i)
       o.dma.arena[input.off + i] = accessUnit[i];
     o.hw.barrier();
+    if (streaming && (!ledger.accept(token) || !ledger.submit(token,0))) return fail(kErrHfi);
     ++r.etb;
     stage(FirstPsc); // RX may arrive immediately after ETB; the next pump sees this phase
     if (buffer(input, false, accessUnitBytes) || wait([this] { return r.psc == 1; }))
@@ -617,6 +661,11 @@ public:
       if (buffer(b))
         return r.error;
     }
+    if (streaming) {
+      accessUnit = nullptr; accessUnitBytes = 0;
+      o.hw.note("V6 persistent OPEN ready session %08x PSC %u N %u decode-order 1 aperture %u entries %u",sessionId,r.psc,psc.n,layout.bytes,layout.used);
+      return 0;
+    }
     stage(Draining);
     drainSent = true;
     if (tx(Drain, 7, 1, 0) ||
@@ -625,6 +674,57 @@ public:
     o.hw.note("V4 frame gate PASS ETB %u EBD %u PSC %u decoded %u drain-ack %u LAST %u N %u", r.etb, r.ebd, r.psc, r.decoded,
               unsigned(r.drainAck), unsigned(r.last), psc.n);
     return 0;
+  }
+  int streamSubmit(const uint8_t *bytes, uint32_t size, uint64_t t) {
+    if (!streaming || !rawStarted || cleanup || r.error || !bytes || !size || size > (1u<<20)) return -22;
+    if (ledger.paused) {
+      const uint32_t cause=Drain;
+      if(tx(Resume,3,1,1,&cause,1)||tx(Resume,3,2,1,&cause,1)||!ledger.resume())return fail(kErrHfi);
+      drainSent=r.drainAck=r.last=false;stage(Output);
+      for(unsigned i=0;i<(psc.n<2?2:psc.n);++i){auto &b=*layout.find(Raw,i);if(!b.queued&&!ledger.rawHeld[i]&&buffer(b))return r.error;}
+      o.hw.note("V6 resume session %08x BITSTREAM RAW cause DRAIN",sessionId);
+    }
+    const int index=ledger.freeInput();
+    if(index<0 || ledger.pending==stream::Credits)return 1; // back-pressure, no mutation
+    if(!ledger.accept(t)||!ledger.submit(t,unsigned(index)))return fail(kErrHfi);
+    Buffer &b=*layout.find(Bitstream,unsigned(index));
+    if(b.queued||b.readonly||b.pendingRelease)return fail(kErrHfi);
+    for(unsigned i=0;i<size;++i)o.dma.arena[b.off+i]=bytes[i];
+    o.hw.barrier();token=t;++r.etb;deadline=o.hw.nowUs()+5000000;
+    o.hw.note("V6 ETB session %08x token %llu index %u bytes %u count %u input-reuse %u",sessionId,
+              (unsigned long long)t,b.index,size,r.etb,ledger.inputReuse);
+    return buffer(b,false,size);
+  }
+  bool popOutput(OutputFrame &f) {
+    if(!outputCount)return false;f=outputs[outputHead];outputHead=(outputHead+1)%stream::Credits;--outputCount;return true;
+  }
+  int releaseOutput(unsigned index,uint64_t t) {
+    if(!streaming||!ledger.release(index,t)||!ledger.retire(t))return fail(kErrHfi);
+    Buffer *b=layout.find(Raw,index);
+    if(!b||b->queued||b->readonly||b->pendingRelease)return fail(kErrHfi);
+    o.hw.note("V6 RAW recycle session %08x token %llu index %u raw-reuse %u",sessionId,(unsigned long long)t,index,ledger.rawReuse);
+    if(!cleanup && !(r.drainAck&&r.last))return buffer(*b);
+    return 0;
+  }
+  int beginDrain() {
+    if(!streaming||r.error||cleanup)return -22;
+    if(ledger.paused||ledger.draining)return 0;
+    if(!ledger.beginDrain())return fail(kErrHfi);
+    stage(Draining);drainSent=true;r.drainAck=r.last=false;deadline=o.hw.nowUs()+5000000;
+    return tx(Drain,7,1,0);
+  }
+  int drainStatus() {
+    if(r.error)return r.error;
+    if(ledger.paused)return 1;
+    if(!ledger.drainReady())return 0;
+    // ACK+LAST fences all prior RAW events. Any accepted picture with no FBD
+    // remains explicit no-output; caller retires it via the same completion path.
+    return ledger.pending ? 2 : (ledger.drained()?1:0);
+  }
+  int retireNoOutput(uint64_t t) {
+    auto *f=ledger.find(t);
+    if(!ledger.drainReady()||!f||f->phase!=stream::Phase::Submitted)return -22;
+    return ledger.retire(t)?0:-22;
   }
   int shutdown()
   {
