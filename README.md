@@ -13,7 +13,7 @@ SM8750 pieces to be shared later (the code still lives here, and the build pins 
 is the frozen archive of the earlier Linux + Gunyah guest path. The map of repositories, local trees and rules:
 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
 
-## State (2026-11-17)
+## State (2026-11-17, midday)
 
 - macOS boots natively on the tablet, also by itself from power-on (an installed copy, see below); root and Data are on UFS
   (`package/NativeUfs`, `package/NativeRamBlock`).
@@ -36,21 +36,23 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   extension is next ([docs/drivers/camera.md](docs/drivers/camera.md)).
 - Wi-Fi: the installed system joins by itself at boot (WPA2, DHCP, DNS, HTTPS), rejoins after a drop, and came back by itself
   after a system sleep and after a firmware crash (boot 10m; ESP v5 brings both to the installed system — its first boot joined
-  on its own). The macOS Wi-Fi menu is in progress ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md)): since 2026-11-16
-  macOS's own scan runs through our Apple80211 user client (CoreWLAN: 5 networks in 21 ms, 16 cached, no failures, run
-  wifi-iouc5); the menu's list, joining from the menu and the country code are next; joining stays a profile file and our
-  supplicant until then ([docs/drivers/wifi.md](docs/drivers/wifi.md)).
-- Sound (2026-11-16, RAM boots): macOS uses our speaker as its default output and plays through it; level and mute controls
-  are being tested. Hardware video decode: the video firmware is authenticated by the secure world and shut down cleanly
-  (V2); no decoding yet.
+  on its own). Joining through macOS itself works since 2026-11-17 on RAM boots (run wifi-join9b): `networksetup` -> airportd ->
+  IO80211's Apple80211Associate2 -> our driver -> WPA2 association, the four-way handshake by our supplicant, DHCP, gateway and
+  DNS ([docs/results-2026-11-17.md](docs/results-2026-11-17.md)); the menu's own list/click proof and the installed system's update
+  are next ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md), [docs/drivers/wifi.md](docs/drivers/wifi.md)).
+- Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
+  test; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
+- Hardware video decode (2026-11-17, RAM boots): the video firmware loads, is authenticated, boots and answers the host interface
+  (HFI) with its version; power cycles repeat cleanly. Decoding a frame is next ([docs/drivers/video.md](docs/drivers/video.md)).
 - Boot time is being worked on: most of launchd's 40 s is our 4 KiB code-signature pre-hash of the compressed dyld shared
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
   pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;
   a parallel version stays the fallback); probes built, then into the installed ESP ([docs/boot-time.md](docs/boot-time.md) §9).
-- Not working yet: the Wi-Fi menu's network list and menu-driven joining, Bluetooth, the sensors, hardware video decode, and
+- Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, hardware video decode, and
   a clean restart — every reboot of the 27.3 line ends in IOPlatformExpert's panic 30 s after the halt begins
   (`Halt/Restart Timed Out`, console captures since 2026-11-13).
-- Latest results: [docs/results-2026-11-16.md](docs/results-2026-11-16.md) (macOS's Wi-Fi scan through our user client, the
+- Latest results: [docs/results-2026-11-17.md](docs/results-2026-11-17.md) (Wi-Fi join through macOS, sound with volume control, the
+  video firmware booting and talking HFI); before: [docs/results-2026-11-16.md](docs/results-2026-11-16.md) (macOS's Wi-Fi scan through our user client, the
   video firmware authenticated, macOS sound output, the boot-window analysis); earlier: [docs/results-2026-11-14.md](docs/results-2026-11-14.md)
   (Wi-Fi on the installed system with sleep and crash recovery, the built-in `en0` handed to Wi-Fi, the boot-time probes).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, audio, sensors, thermal, USB host, video,
