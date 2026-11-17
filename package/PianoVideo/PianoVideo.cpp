@@ -735,7 +735,7 @@ extern "C" int piano_video_native_decode(uint32_t sid, const uint8_t *bytes, uin
 
 extern "C" void piano_video_native_frame_release(uint32_t sid, native::Frame *frame)
 {
-  if (!gNativeLock || !frame) return;
+  if (!gNativeLock || !frame || !frame->memory) return;
   IOLockLock(gNativeLock);
   const bool ours = gNativeOwner && gNativeOwner->loan && frame->memory == gNativeOwner->loan;
   const int rc = ours ? gNativeState.release(sid, frame->token) : -22;
@@ -826,11 +826,11 @@ bool PianoVideo::start(IOService *provider)
        "%#x/%#x, carveout %#llx)",
        gArgs.level, gArgs.cc, gArgs.smmu, gArgs.carveout, gArgs.delay, gArgs.repeat, gArgs.samples, (unsigned long long)kIris,
        (unsigned long long)kVideoCc, kIrisSpi, kStreamFirst, kStreamSecond, (unsigned long long)kCarveout);
-  if (gArgs.level > 5) note("piano-video=%u: the highest level is 5 (docs/drivers/video.md section 8); running the survey only", gArgs.level);
+  if (gArgs.level > 6) note("piano-video=%u: the highest level is 6; running the survey only", gArgs.level);
   if (gArgs.level >= 2 && gArgs.level <= 5)
     note("levels 2-4: cycles=%u hold-ms=%u idle-ms=%u resumes=%u unload=%u stop=%u mmcx-floor=%#x", gArgs.cycles, gArgs.holdMs,
          gArgs.idleMs, gArgs.resumes, gArgs.unload, gArgs.stop, gArgs.mmcxFloor);
-  note("level 1: loads only, nothing written");
+  if (gArgs.level != 6) note("level 1: loads only, nothing written");
   setProperty("piano-video", gArgs.level, 32);
   if (!gArgs.level || gArgs.level == 6) return true;
   thread_t t = nullptr;
