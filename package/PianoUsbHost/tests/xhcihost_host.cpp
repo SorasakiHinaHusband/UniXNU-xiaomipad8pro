@@ -11,6 +11,7 @@
 //   - the ports: power switched on, a connection seen, a USB 2 port reset to enabled + high speed, PED never stored as 1.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 xhcihost_host.cpp -o /tmp/xhcihost_host && /tmp/xhcihost_host
 #include "XhciHost.h"
+#include "AppleDmaReadback.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -690,6 +691,39 @@ void testNeutral()
   CHECK(hcsScratchpads(0x1fu << 27) == 31 && hcsScratchpads(1u << 21) == 32 && hcsErstMax(0x20) == 4);
 }
 
+void testAppleDmaReadback()
+{
+  // Regression: a real command executes in this register/DMA model while
+  // CRCR's pointer reads zero (xHCI 5.4.5), just as on usb-a2c. The old
+  // predicate rejects that working controller. Readable DMA pointers still
+  // must be present and in the identity window, including their high halves.
+  Model m;
+  m.deviceOnPort1 = false;
+  TestHal h{m};
+  const Run r = bringUp(m);
+  CHECK(r.noop.ok && m.cmdDeq > m.bus && m.doorbells != 0);
+  AppleDmaReadback dma = appleDmaReadback(h, r.x);
+  CHECK(dma.dcbaap == m.dcbaap && dma.erstba == m.erstba && dma.erdp == m.erdp);
+  CHECK((dma.crcr & ~0x3full) == 0 && !identityRange(dma.crcr & ~0x3full, 64));
+  CHECK(dma.failure() == nullptr);
+  m.crcr |= kCrcrCrr;
+  CHECK(appleDmaReadback(h, r.x).crcr == kCrcrCrr);
+  CHECK(appleDmaReadback(h, r.x).failure() == nullptr);
+  const uint64_t good = m.dcbaap;
+  for (uint64_t bad : {0ull, (2ull << 30) - 64, 1ull << 36}) {
+    m.dcbaap = bad;
+    CHECK(std::strcmp(appleDmaReadback(h, r.x).failure(), "apple-dma-dcbaap") == 0);
+    m.dcbaap = good;
+    m.erstba = bad;
+    CHECK(std::strcmp(appleDmaReadback(h, r.x).failure(), "apple-dma-erstba") == 0);
+    m.erstba = dma.erstba;
+    m.erdp = bad;
+    CHECK(std::strcmp(appleDmaReadback(h, r.x).failure(), "apple-dma-erdp") == 0);
+    m.erdp = dma.erdp;
+  }
+  CHECK(appleDmaReadback(h, r.x).failure() == nullptr && clean(m));
+}
+
 }  // namespace
 
 int main()
@@ -709,6 +743,7 @@ int main()
   testXhciEdges();
   testRings();
   testNeutral();
+  testAppleDmaReadback();
   if (failures) {
     std::printf("xhcihost_host: %d failure(s)\n", failures);
     return 1;

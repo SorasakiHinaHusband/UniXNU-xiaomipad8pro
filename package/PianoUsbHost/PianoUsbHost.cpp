@@ -64,6 +64,7 @@
 #include "UsbHostSurvey.h"
 #include "XhciHost.h"
 #include "SmmuIdentity.h"
+#include "AppleDmaReadback.h"
 #include "SmmuStream.h"
 #include "ChargerPmic.h"
 #include "../common/PianoIrq.h"
@@ -1518,6 +1519,14 @@ void registerLoanSysctl()
 }
 ControllerLoan gLoan;
 bool gReturnSafe = true;
+const char *gLoanFailure = "none";
+
+void loanFailure(const char *step)
+{
+  gLoanFailure = step;
+  note("usb-a2d loan FAIL step=%s stage=%d now-ms=%llu deadline-ms=%llu [PianoUsbLoanA2d]", step,
+       piano_usbhost_stage, (unsigned long long)nowMs(), (unsigned long long)gLoan.deadline);
+}
 
 // ---- the live host session (the switch's "host")
 struct LiveHost {
@@ -1537,10 +1546,15 @@ bool liveUp(LiveHost &h)
 {
   h.sessions++;
   gReturnSafe = true;
-  if (!gLoan.deadline || nowMs() >= gLoan.deadline || (gArgs.handoff == 6 && (!sharedDomain(false) || !controllerClassPresent()))) return false;
+  if (!gLoan.deadline || nowMs() >= gLoan.deadline) { loanFailure("loan-deadline"); return false; }
+  if (gArgs.handoff == 6) {
+    if (!sharedDomain(false)) { loanFailure("shared-domain"); return false; }
+    if (!controllerClassPresent()) { loanFailure("apple-class"); return false; }
+  }
   note("hand-off: host session %u: %s", h.sessions, gArgs.handoff == 6 ? "the switch, then Apple's xHCI on the nub" : "the switch, then our xHCI probe");
   gHostDeadline = gLoan.deadline;
   if (!hostSwitchLogged(h.sw)) {
+    loanFailure("dwc3-role-switch");
     if (h.sw.stores) gReturnSafe = hostEnd(nullptr, h.sw, true);
     return false;
   }
@@ -1548,6 +1562,7 @@ bool liveUp(LiveHost &h)
     h.x = readCaps(gHal);
     if (!h.x.sane) {
       stage(-11, "the capability words are not an xHCI's");
+      loanFailure("xhci-capabilities");
       gReturnSafe = hostEnd(nullptr, h.sw, true);
       return false;
     }
@@ -1557,16 +1572,18 @@ bool liveUp(LiveHost &h)
       if (pr.running) {
         const StopResult st = xhciStop(gHal, pr.x);
         note("xHCI stop before Apple's driver: halted and reset: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
-        if (!st.ok) { gReturnSafe = false; return false; }
+        if (!st.ok) { loanFailure("h5-stop"); gReturnSafe = false; return false; }
         pr.running = false;
       }
       if (!ok) {
+        loanFailure("h5-probe");
         gReturnSafe = hostEnd(&pr, h.sw, true);
         return false;
       }
     }
     const int started = nowMs() >= gLoan.deadline ? 0 : appleUpBounded(gLoan.deadline);
     if (started != 1) {
+      loanFailure(started < 0 ? "apple-start-unconfirmed" : "apple-start");
       if (started < 0) { gReturnSafe = false; note("usb-a2b Apple start unconfirmed; held for boot guard"); }
       else gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true);
       return false;
@@ -1580,21 +1597,29 @@ bool liveUp(LiveHost &h)
       portsPowered &= !h.x.ppc || (port & kPortPp);
       portLine(h.x, i, port, "Apple root port:");
     }
-    if (!(gHal.rd(at.op + kOpUsbCmd) & kUsbCmdRun) || (gHal.rd(at.op + kOpUsbSts) & kUsbStsHalted) || !portsPowered || nowMs() >= gLoan.deadline) {
-      note("usb-a2b Apple controller/root ports not running before deadline");
+    const uint32_t cmd = gHal.rd(at.op + kOpUsbCmd), sts = gHal.rd(at.op + kOpUsbSts);
+    const char *notReady = !(cmd & kUsbCmdRun) ? "apple-run" : (sts & kUsbStsHalted) ? "apple-halted" :
+                          !portsPowered ? "apple-root-power" : nowMs() >= gLoan.deadline ? "apple-ready-deadline" : nullptr;
+    if (notReady) {
+      note("usb-a2d Apple ready USBCMD %08x USBSTS %08x ports %u PPC %u powered %u", cmd, sts, h.x.maxPorts, h.x.ppc, portsPowered);
+      loanFailure(notReady);
       gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true);
       return false;
     }
-    const AppleState dma = appleState(h.x);
-    const uint64_t command = rd64(gHal, at.op + kOpCrcr) & ~0x3full;
-    const bool dmaCovered = identityRange(dma.dcbaap & ~0x3full, 64) && identityRange(command, 64) &&
-        identityRange(dma.erstba & ~0x3full, 16) && identityRange(dma.erdp & ~0xfull, 16);
-    note("usb-a2b Apple DMA identity-covered %u CRCR %#llx", dmaCovered, (unsigned long long)command);
-    if (!dmaCovered) { gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true); return false; }
+    const AppleDmaReadback dma = appleDmaReadback(gHal, h.x);
+    const char *dmaFailure = dma.failure();
+    note("usb-a2d Apple DMA readable-covered %u DCBAAP %#llx ERSTBA %#llx ERDP %#llx CRCR-raw %#llx (pointer read-as-zero; not an address) [PianoUsbDmaReadbackA2d]",
+         !dmaFailure, (unsigned long long)dma.dcbaap, (unsigned long long)dma.erstba, (unsigned long long)dma.erdp, (unsigned long long)dma.crcr);
+    if (dmaFailure) {
+      loanFailure(dmaFailure);
+      gReturnSafe = appleDown(h.x) && hostEnd(nullptr, h.sw, true);
+      return false;
+    }
     appleWatchBegin(h.x, h.apple);
   } else {
     h.pr = Probe();
     if (!xhciProbe(h.pr)) {
+      loanFailure("h5-probe");
       gReturnSafe = hostEnd(&h.pr, h.sw, true);
       return false;
     }
@@ -1932,6 +1957,8 @@ void portManager(IOService *self)
         if (st == pianousb::kHoDevice) st = dwc3Ask(pianousb::kAskState, 0);
         const bool free = pianousb::handoffCoreFree(true, st);
         note("hand-off: release: %s", pianousb::handoffStateName(st));
+        gLoanFailure = "none";
+        if (!free) loanFailure("gadget-release");
         const bool ok = free && liveUp(gLive);
         if (!ok) {
           gLoan.returning();
@@ -1939,7 +1966,7 @@ void portManager(IOService *self)
           if ((free && gReturnSafe) || st == pianousb::kHoUnsafe)
             reclaimed = dwc3Ask(pianousb::kAskReclaim, 5000) == pianousb::kHoDevice;
           gLoan.returned(gReturnSafe, gReturnSafe, reclaimed);
-          note("usb-a2b loan FAILED return %s", gLoan.phase == LoanPhase::device ? "device" : "HELD for boot guard");
+          note("usb-a2b loan FAILED return %s step=%s", gLoan.phase == LoanPhase::device ? "device" : "HELD for boot guard", gLoanFailure);
         }
         rs.done(a, ok);
       }

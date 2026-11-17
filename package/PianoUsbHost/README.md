@@ -85,3 +85,12 @@ orientation) and expires independently of publisher progress. Pending
 notifications, link loss and observer failure revoke the role witness.
 The diagnostic loan waits for a fresh snapshot, but does not claim a VBUS
 source or request a role swap. The A2 class is checked before releasing CDC.
+
+The Apple DMA readback gate checks DCBAAP, ERSTBA and ERDP against the identity
+window. CRCR is status evidence only: xHCI 5.4.5, Table 5-24 specifies that its
+command-ring pointer always reads zero. Checking that value as a DMA address
+rejected usb-a2c after the DWC3 host switch and H5 No-Op had already succeeded.
+`AppleDmaReadback.h` keeps the readable-pointer checks and reports which one
+failed; loan-start failures log their step before cleanup. This gate does not
+prove Apple's command DMA or peripheral enumeration. The existing deadline,
+Apple stop, callback drain and gadget reclaim requirements still apply.
