@@ -71,14 +71,17 @@ int main(int argc, char **argv) {
         fputs("configuration range refused\n", stderr); return 2;
     }
     io_service_t service = 0;
-    for (int i = 0; i < (apply ? 120 : 1); ++i) {
+    CFDictionaryRef d = NULL;
+    // Matching service registration precedes charger firmware/telemetry. Saved
+    // settings wait for that readiness too, rather than exiting at early boot.
+    for (int i = 0; i < (apply ? 180 : 1); ++i) {
         service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PianoPower"));
-        if (service) break;
-        sleep(1);
+        if (service) d = state(service);
+        if (d) break;
+        if (service) {IOObjectRelease(service); service = 0;}
+        if (apply) sleep(1);
     }
-    if (!service) {fputs("PianoPower unavailable\n", stderr); return 1;}
-    CFDictionaryRef d = state(service);
-    if (!d) {IOObjectRelease(service); fputs("PianoCharge state unavailable\n", stderr); return 1;}
+    if (!service || !d) {fputs("PianoCharge state unavailable\n", stderr); return 1;}
     v[5] = number(d, "ConfigRevision");
     if (show) {
         CFDataRef xml = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, NULL);

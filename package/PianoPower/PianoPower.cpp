@@ -649,10 +649,16 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("Generation", c.generation); n("LinkGeneration", fMca.links); n("ContractSeq", c.seq);
   n("RawType", uint32_t(piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1));
   n("EffectiveType", uint32_t(x.type)); n("Connector", c.connector); n("Connected", c.connected);
-  n("Sink", c.sink); n("PD", c.pd); n("ContractValid", c.valid && now >= c.updated_ms && now - c.updated_ms <= 15000);
+  n("Sink", c.sink); n("PD", c.pd); n("ContractValid", piano_contract_fresh(&c, now));
   n("ContractStatusValid", c.status_valid); n("RDO", c.rdo); n("Protocol", c.protocol); n("ContractMV", c.mv); n("ContractMA", c.ma);
   n("PackSampleMs", fPackMs); n("PackAgeMs", now >= fPackMs ? now - fPackMs : ~0u);
   n("SourceMA", c.source_ma); n("SourcePDOCount", c.pdos); n("UCSIVersion", c.version); n("CCI", c.cci);
+  n("ContractNotifyPending", c.notify_pending); n("ContractNotifyMs", c.notify_ms);
+  n("ContractTimeouts", c.timeouts); n("ContractFailures", c.failures);
+  n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
+  n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
+  n("VoltagePending", s.contract_transition || (s.pending & (1u << PIANO_CHG_S_VOLT)));
+  n("ModePending", s.contract_mode_change); n("RestoreRequired", s.volt_want_prop == PIANO_CHG_PD_FIXED && s.volt_want_value == 5000 && x.bus_mv >= 6000);
   n("ContractError", uint32_t(c.last_error)); n("ContractAgeMs", c.updated_ms && now >= c.updated_ms ? now - c.updated_ms : ~0u);
   for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
@@ -688,7 +694,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   note("buck: seq=%u gen=%u link=%u raw=%d effective=%d valid=%u connector=%u sink=%u pd=%u", fStatusSeq, c.generation,
        fMca.links, piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1, x.type, c.valid, c.connector, c.sink, c.pd);
   note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s", c.generation, c.seq, c.rdo, c.protocol,
-       c.mv, c.ma, c.last_error, c.valid ? "validated" : "no PD contract");
+       c.mv, c.ma, c.last_error, piano_contract_fresh(&c, now) ? "validated" : "no PD contract");
   for (unsigned i = 0; i < c.pdos && i < 7; ++i) note("buck-pdo: gen=%u index=%u raw=%#x", c.generation, i + 1, c.source_pdo[i]);
   note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d", fStatusSeq, p.icl_ma, s.icl_set,
        x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma);
@@ -1356,7 +1362,7 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     v.healthPending = !v.healthApplied;
     // Actual positive pack current AND confirmed enabled, never the software
     // desired charge vote. A health stop never means FullyCharged.
-    v.charging = v.charging && enable && fBattery.currentMa >= 50;
+    v.charging = v.external && fBattery.charging && enable && fBattery.currentMa >= 50;
     if (!v.charging) v.timeToFull = v.timeRemaining = kTimeUnknown;
   }
   if (v.implausible) {
@@ -2227,7 +2233,8 @@ void PianoPower::run()
       if (fWatch.ticks != ticks || (fFix.nextDue() && now >= fFix.nextDue())) fixPoll(now);
     }
     serviceMca(now);
-    // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
+    // The built-in contract observer exclusively owns UCSI while policy is on.
+    // Otherwise the legacy relay is ready after link/quiet/probe completion.
     if (fChannel)
       piano_usbc_relay_step(fChannel, !fPolicyOn && fWasUp && !fQuiet.raised && fMca.ucsi != 1 && fMca.ucsi != 2, fMca.links, this);
     // Between the sleep handover's acknowledgement and the wake: no report (the gauges' I2C idle, docs/power.md 4); after the wake
@@ -2263,7 +2270,7 @@ void PianoPower::run()
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;
     assert_wait_timeout((event_t)this, THREAD_UNINT, wait, kMillisecondScale);
-    bool pending = __atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE) || __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked() || piano_usbc_relay_pending();
+    bool pending = __atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE) || __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked() || (!fPolicyOn && piano_usbc_relay_pending());
     IOSimpleLockLock(fRingLock);
     pending |= fRingCount != 0;
     IOSimpleLockUnlock(fRingLock);

@@ -157,6 +157,10 @@ class ChargeLink {
       for (unsigned i = 0; i < x.pdos; ++i)
         for (unsigned k = 0; k < 3; ++k) x.pdo[i][k] = m.pdo[i][k];
     }
+    if (v.contract) {
+      x.contract_notify_pending = v.contract->notify_pending;
+      x.contract_notify_ms = v.contract->notify_ms;
+    }
     if (v.contract) x.contract_observing = v.contract->linked && !v.contract->quarantined &&
         v.contract->stage != PianoContractIdle &&
         (v.contract->last_error == PIANO_CONTRACT_OK || v.contract->last_error == PIANO_CONTRACT_CHANGED);

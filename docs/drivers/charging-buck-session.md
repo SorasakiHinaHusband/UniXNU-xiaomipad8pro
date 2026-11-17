@@ -16,6 +16,11 @@ clear ISC/SOA and the current contract are required for new HV. Voltage changes
 wait for reduced-current ACKs and an ICL readback; the new RDO and measured bus
 must settle before current can rise. An expected RDO re-read has a bounded
 15-second window at ICL 100/FCC 500 mA; a failed read withdraws that exception.
+An idle or active UCSI notification suspends authorization until CCI separates a
+command completion from a connector event. A healthy existing HV session waits
+at ICL 100/FCC 500 for at most five seconds, without renewing the snapshot age or
+extending the deadline under notification storms. A pending 5 V restore remains
+an obligation across cable and mode changes until its ACK and readback agree.
 The existing protected 5 V SDP/Rp ramp remains available without a PD contract.
 
 Boot with `piano-power-health=1 piano-power-hv=1` for the 80/75 vote and fixed 9 V
