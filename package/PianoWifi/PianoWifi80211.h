@@ -47,6 +47,10 @@ extern "C" int piano_kev_post_msg(struct kev_msg *) __asm__("_kev_post_msg");
 // (the interface not yet attached to the network stack).
 extern "C" bool piano_netif_set_subtype(IONetworkInterface *netif, unsigned int subfamily)
     __asm__("__ZN18IONetworkInterface19setInterfaceSubTypeEj");
+// The family's exported implementation, called directly like setInterfaceSubType
+// above. Before BSD attachment it updates the saved flags used by ifnet_attach.
+extern "C" bool piano_netif_set_flags(IONetworkInterface *netif, unsigned short flags, unsigned short clear)
+    __asm__("__ZN18IONetworkInterface8setFlagsEtt");
 #ifndef EJUSTRETURN
 #define EJUSTRETURN (-2)   // sys/errno.h's kernel-private value: handled, the caller returns 0 and nothing after runs
 #endif
@@ -347,6 +351,14 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
 {
   if (!IO80211Controller::configureInterface(netif)) return false;
   fNetif = netif;
+  // airportd uses the attachment's IFF_UP as its default power preference.
+  // Publish administrative availability before that event can be queued; a
+  // later configd enable or our first power event cannot repair its old flags.
+  // This is not link authorization: do not set IFF_RUNNING or reassert UP after
+  // publication. A saved user-OFF still wins in airportd and every SET19 is obeyed.
+  if (!piano_netif_set_flags(netif, IFF_UP, 0)) return false;
+  note80211("PianoWifiBootPowerV1 initial administrative UP before BSD publication: flags %#x, running %u",
+            unsigned(netif->getFlags()), (netif->getFlags() & IFF_RUNNING) ? 1u : 0u);
   fSubtypeTaken = piano_netif_set_subtype(netif, 3 /* IFNET_SUBFAMILY_WIFI */);
   netif->setProperty("IO80211InterfaceRole", "Infrastructure");
   // PianoWifiEthernet registers the interface before PianoWifi80211::start
@@ -446,6 +458,9 @@ void PianoWifi80211::attachStep()
     return;
   }
   snprintf(fIfName, sizeof fIfName, "%s%u", ifnet_name(ifp), unsigned(ifnet_unit(ifp)));
+  note80211("PianoWifiBootPowerV1 filter attach: flags %#x, up %u, running %u",
+            unsigned(ifnet_flags(ifp)), (ifnet_flags(ifp) & IFF_UP) ? 1u : 0u,
+            (ifnet_flags(ifp) & IFF_RUNNING) ? 1u : 0u);
   // IO80211.framework finds the interface's service by the property IOInterfaceName (any class) and reads the role there; the
   // family sets it with the name, this only makes sure of it.
   OSObject *existingName = fNetif->copyProperty("IOInterfaceName");

@@ -321,6 +321,72 @@ int main()
     }
   }
 
+  // Replay the decoded airportd attachment policy (event9, flags bit0,
+  // optional global PowerEnabled). The policy model is ours; the request
+  // parser, power event decisions and serial drain below are production code.
+  // This catches a tempting "ignore first OFF" workaround as well as a lost
+  // ON during an unfinished physical stop.
+  {
+    auto attachPower = [](bool adminUp, int preference) {
+      return adminUp && (preference < 0 || preference != 0);
+    };
+    for (int preference : {-1, 0, 1}) {
+      PowerRig oldBoot;
+      CHECK(!attachPower(false, preference));
+      // The old DOWN publication selects OFF regardless of initial GET=ON.
+      CHECK(oldBoot.getPower());
+      for (unsigned daemon = 0; daemon < 2; ++daemon) {
+        oldBoot.setPowerRecord(attachPower(false, preference));
+        CHECK(!oldBoot.control(kPower, sizeof(Power)).error);
+      }
+      oldBoot.owner.radioOff(oldBoot.owner.read());
+      oldBoot.publish();
+      CHECK(!oldBoot.getPower() && !oldBoot.owner.allowed(oldBoot.owner.read()));
+      CHECK(oldBoot.powerEvents == 2 && oldBoot.eventPower.state[0] == 0);
+
+      PowerRig fixedBoot;
+      for (unsigned daemon = 0; daemon < 2; ++daemon) {
+        fixedBoot.setPowerRecord(attachPower(true, preference));
+        CHECK(!fixedBoot.control(kPower, sizeof(Power)).error);
+      }
+      if (preference == 0) fixedBoot.owner.radioOff(fixedBoot.owner.read());
+      fixedBoot.publish();
+      CHECK(fixedBoot.getPower() == (preference != 0));
+      CHECK(fixedBoot.owner.allowed(fixedBoot.owner.read()) == (preference != 0));
+      CHECK(fixedBoot.powerEvents == 2);
+    }
+    for (bool finishOffBeforeOn : {false, true}) {
+      PowerRig r;
+      r.setPowerRecord(false);
+      CHECK(!r.control(kPower, sizeof(Power)).error && !r.getPower());
+      const uint32_t off = r.owner.read();
+      if (finishOffBeforeOn) r.owner.radioOff(off);
+      r.setPowerRecord(true);
+      CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower());
+      if (!finishOffBeforeOn) {
+        CHECK(r.owner.radioStop() && !r.owner.allowed(r.owner.read()));
+        r.owner.radioOff(r.owner.read());
+      }
+      r.publish();
+      CHECK(r.getPower() && r.owner.allowed(r.owner.read()) && !r.owner.radioStop());
+      CHECK(r.powerEvents == 2 && r.eventPower.state[0] == 1);
+    }
+    // A single persisted OFF must survive polls and worker completion forever;
+    // administrative UP is an initialization default, not a periodic override.
+    PowerRig persistedOff;
+    persistedOff.setPowerRecord(false);
+    CHECK(!persistedOff.control(kPower, sizeof(Power)).error);
+    persistedOff.owner.radioOff(persistedOff.owner.read());
+    for (unsigned poll = 0; poll < 100; ++poll) {
+      persistedOff.publish();
+      CHECK(!persistedOff.getPower());
+      CHECK(!persistedOff.owner.join());
+      CHECK(persistedOff.ask(true, kScanReq, 0).error == kErrPowerOff);
+    }
+    CHECK(persistedOff.powerEvents == 1 && persistedOff.eventPower.state[0] == 0);
+    std::puts("boot power replay: DOWN/OFF twice, UP/ON twice, persisted OFF and drained OFF->ON passed");
+  }
+
   // ---- power: on by default; off answers EPWROFF to scans, on again restores them; each set asks for the event
   {
     Rig r;
