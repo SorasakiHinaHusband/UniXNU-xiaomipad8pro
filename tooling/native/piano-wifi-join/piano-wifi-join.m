@@ -11,11 +11,13 @@
 //   psk=PASSPHRASE       for wpa2-psk: 8 to 63 printable characters, or 64 hex digits
 //   bssid=aa:bb:cc:dd:ee:ff   optional: the access point to prefer
 //   mac=02:..:..:..:..:..     optional: the station's own address (locally administered)
-// Lines starting with # are comments; every line ends with a newline, the last one too (a file still being written is
-// refused: replace the file by a rename). The profile goes into the kernel through the sysctl machdep.piano_wifi_join — never a
-// command-line argument, never a log line: this program prints only what was wrong, or the lengths it handed over — and every
-// copy of it in this process is wiped before it exits. With no file, or no PianoWifi (the sysctl is absent without
-// piano-wifi=6 or higher), it exits quietly with 0.
+// Profile bytes stay in memory. CoreWLAN owns association; the read-only kernel receipt
+// proves that its SET20 published a new profile. This RunAtLoad job exits after one
+// request and never overrides a later user disconnect.
+#import <Foundation/Foundation.h>
+#import <CoreWLAN/CoreWLAN.h>
+#include <sys/time.h>
+#include "BootJoin.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -43,7 +45,7 @@ static int safe_open(const char *path)
   if (!slash || slash == dir) return -1;
   *slash = 0;
   struct stat ds;
-  if (lstat(dir, &ds) != 0) return -2;
+  if (lstat(dir, &ds) != 0) return errno == ENOENT ? -2 : -1;
   if (!S_ISDIR(ds.st_mode) || ds.st_uid != 0 || (ds.st_mode & 077)) {
     fprintf(stderr, "piano-wifi-join: the profile's directory must be root's with mode 700; not read\n");
     return -1;
@@ -58,6 +60,59 @@ static int safe_open(const char *path)
   }
   return fd;
 }
+
+struct apple_join {
+  const struct piano_wifi_profile *profile;
+  CWInterface *interface;
+  CWNetwork *network;
+};
+static uint32_t receipt(void *unused)
+{
+  (void)unused;
+  char line[256] = {}; size_t n = sizeof line;
+  if (sysctlbyname(PIANO_WIFI_PROFILE_SYSCTL, line, &n, NULL, 0)) return 0;
+  unsigned generation = 0;
+  if (!strstr(line, "source apple-set20")) return 0;
+  return sscanf(line, "set (generation %u)", &generation) == 1 ? generation : 0;
+}
+static int ready(void *context)
+{
+  struct apple_join *a = context;
+  if (a->network) return 1;
+  // Match the installed pre-G5 boot-settle boundary, after airportd startup cleanup.
+  struct timeval boot = {}; size_t n = sizeof boot;
+  if (sysctlbyname("kern.boottime", &boot, &n, NULL, 0) || time(NULL) - boot.tv_sec < 120) return 0;
+  a->interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
+  if (!a->interface || !a->interface.powerOn) return 0;
+  NSData *name = [NSData dataWithBytes:a->profile->ssid length:a->profile->ssid_len];
+  NSError *error = nil;
+  NSSet<CWNetwork *> *found = [a->interface scanForNetworksWithSSID:name error:&error];
+  if (error || !found.count) return 0;
+  for (CWNetwork *network in found) {
+    if (![network.ssidData isEqualToData:name]) continue;
+    if (a->profile->flags & PianoWifiProfileBssid) {
+      char bssid[18]; const uint8_t *b = a->profile->bssid;
+      snprintf(bssid, sizeof bssid, "%02x:%02x:%02x:%02x:%02x:%02x", b[0],b[1],b[2],b[3],b[4],b[5]);
+      if ([network.bssid caseInsensitiveCompare:[NSString stringWithUTF8String:bssid]] != NSOrderedSame) continue;
+    }
+    a->network = network;
+    return 1;
+  }
+  return 0;
+}
+static int associate(void *context)
+{
+  struct apple_join *a = context;
+  const struct piano_wifi_profile *p = a->profile;
+  NSString *password = p->psk_len ? [[NSString alloc] initWithBytes:p->psk length:p->psk_len encoding:NSUTF8StringEncoding] : nil;
+  NSError *error = nil;
+  puts("piano-wifi-join: Apple boot join invoked (credentials not logged)"); fflush(stdout);
+  const BOOL ok = [a->interface associateToNetwork:a->network password:password error:&error];
+  // Do not print NSError descriptions: Apple may include network identifiers.
+  if (!ok) fprintf(stderr, "piano-wifi-join: Apple association failed (code %ld)\n", (long)error.code);
+  return ok;
+}
+static void pause_join(void *unused) { (void)unused; sleep(2); }
 
 int main(int argc, char **argv)
 {
@@ -94,19 +149,20 @@ int main(int argc, char **argv)
     piano_wifi_profile_wipe(&p);
     return 1;
   }
-  const int rc = sysctlbyname(PIANO_WIFI_PROFILE_SYSCTL, NULL, NULL, &p, sizeof p);
-  const int err = errno;
-  const unsigned ssid = p.ssid_len, psk = p.psk_len;
-  const char *security = piano_wifi_security_name(p.security);
+  // Bound both readiness and synchronous CoreWLAN/XPC calls. No retry after an
+  // association (including an API failure or missing receipt).
+  alarm(360);
+  int rc;
+  @autoreleasepool {
+    struct apple_join a = { &p, nil, nil };
+    struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
+    rc = piano_boot_join(&transport, 120);
+  }
   piano_wifi_profile_wipe(&p);
-  if (rc != 0) {
-    fprintf(stderr, "piano-wifi-join: the kernel refused the profile (%s)\n", strerror(err));
+  if (rc) {
+    fprintf(stderr, "piano-wifi-join: boot transaction failed stage %d; no retry\n", rc);
     return 1;
   }
-  if (psk)
-    printf("piano-wifi-join: handed over a network name of %u byte(s), %s with a passphrase of %u character(s)\n", ssid,
-           security, psk);
-  else
-    printf("piano-wifi-join: handed over a network name of %u byte(s), %s\n", ssid, security);
+  puts("PianoWifiBootAppleJoinV1: fresh SET20/profile receipt; one boot request complete");
   return 0;
 }

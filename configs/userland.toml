@@ -243,12 +243,28 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-wifi-supplicant.plist"
 mode = "0644"
 
 [[unit]]
-name = "piano-wifi-join"
-about = "hands PianoWifi the join profile once at boot, from the root-only file /private/var/db/piano-wifi/profile (the owner places it; never in a repository) into the root-only sysctl machdep.piano_wifi_join; logs lengths only (docs/drivers/wifi.md section 13.2); exits at once with no profile or no PianoWifi"
+name = "piano-login-readiness"
+about = "fail-closed selected-account and focused secure-field proof for the host login tool; no password values read"
 default_on = true
 
 [[unit.file]]
-source = "tooling/native/piano-wifi-join/piano-wifi-join.c"
+source = "tooling/native/piano-login-readiness.c"
+build = "cc"
+frameworks = ["ApplicationServices"]
+arch = "arm64"
+dest = "/usr/local/libexec/piano-login-readiness"
+mode = "0755"
+
+[[unit]]
+name = "piano-wifi-join"
+about = "one supported CoreWLAN boot association from the root-only Piano profile after AirPort readiness; requires a fresh SET20 receipt; never retries a later user disconnect"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-wifi-join/piano-wifi-join.m"
+frameworks = ["Foundation", "CoreWLAN"]
+cflags = ["-fobjc-arc"]
+inputs = ["tooling/native/piano-wifi-join/BootJoin.h", "package/PianoWifi/WifiProfile.h"]
 build = "cc"
 arch = "arm64"
 dest = "/usr/local/libexec/piano-wifi-join"

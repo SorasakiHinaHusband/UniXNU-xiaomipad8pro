@@ -3248,9 +3248,10 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   IOLockLock(gProfileLock);
   if (gProfileSet)
     snprintf(line, sizeof line, "set (generation %u): a network name of %u byte(s), %s%s, the access point %s, the station's "
-             "address %s", gProfileGeneration, unsigned(gProfile.ssid_len), piano_wifi_security_name(gProfile.security),
+             "address %s, source %s", gProfileGeneration, unsigned(gProfile.ssid_len), piano_wifi_security_name(gProfile.security),
              gProfile.psk_len ? " with a passphrase" : "", (gProfile.flags & PianoWifiProfileBssid) ? "given" : "not given",
-             (gProfile.flags & PianoWifiProfileMac) ? "given" : "not given");
+             (gProfile.flags & PianoWifiProfileMac) ? "given" : "not given",
+             gProfileFromMenu ? "apple-set20" : gProfileFromFile ? "file" : "sysctl");
   else
     snprintf(line, sizeof line, "not set");
   IOLockUnlock(gProfileLock);
@@ -3411,6 +3412,7 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
   IOLockUnlock(gProfileLock);
   gProfileStampValid = false;
   __atomic_store_n(&gMenuJoinRequested, 1u, __ATOMIC_RELEASE);
+  note("PianoWifiBootJoinReceiptV1: SET20 accepted");
   note("PianoWifiMenuJoinProfile: menu join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s (none of it is logged)",
        generation, unsigned(incoming->ssid_len), piano_wifi_security_name(incoming->security),
        incoming->psk_len ? " with a passphrase" : "", (incoming->flags & PianoWifiProfileBssid) ? "given" : "not given");
