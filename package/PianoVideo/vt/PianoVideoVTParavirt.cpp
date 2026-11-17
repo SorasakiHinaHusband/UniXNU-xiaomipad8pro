@@ -1,32 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-//
-// VideoToolbox's paravirtualized codecs, as Apple's virtual machines offer them: the guest half of the channel. VideoToolbox in
-// iPadOS 27 carries a whole paravirtualized decoder, encoder, JPEG session and motion estimation processor
-// (ParavirtualizedVideoDecoder_*, ParavirtualizedVideoEncoder_*), and uses them for every eligible codec once
-// VTParavirtualizationIsRunningInGuest: once VideoToolboxParavirtualizationSupport.framework (AppleParavirtGPU-1) has opened
-// the service AppleVideoToolboxParavirtualizationDriver. That framework is the whole guest transport, read from the 24A446
-// dyld shared cache (IOServiceOpen type 0):
-//   selector 0  scalars {size} -> {capacity, send buffer, queue}: the buffer a message to the host is written into and the
-//               IODataQueue the host's messages arrive in, both mapped into the caller by the kernel (16 KiB first; grown to a
-//               larger message, page rounded, before it is written).
-//   selector 1  structure in: a guest UUID (16 bytes) a session registers; selector 2 deregisters it.
-//   selector 3  scalars {length, IOSurface IDs (up to 5)} -> {status}: the message of `length` bytes now in the send buffer.
-//   selector 4  no arguments: the queue was drained (after the notification's dequeue loop).
-//   notification port type 0: the queue's (IODataQueueAllocateNotificationPort; each dequeue takes at most 16 KiB).
-// A message (VTParavirtualizationCreateMessageAndByteStream) is a FigAtom 'vtpv' of 48 bytes, big endian: its size and type,
-// the message type (a FourCC), flags, the guest UUID, a request ID and 8 reserved bytes; atoms of serialized CF types and
-// sample buffers follow.
-//
-// This file is the transport: the classes under Apple's names (the platform sandbox lets a process open only the user clients
-// it names, as DroidVMSensorProcessor.cpp's), the buffers, the queue, and a record of every message for the host rig (peek.py):
-// droidvm_vtpv_log, and whole messages in a contiguous capture region at droidvm_vtpv_capture_pa: the first of each type and
-// direction, CaptureEntries slots of CaptureBytes (the length, the direction -- 0 from the guest, 1 to it -- then the message).
-// Each message then goes to the host's side (PianoVideoVTHost.cpp: the decoder and encoder over crosvm's virtio-media), whose
-// messages to the guest are queued here. The service is
-// published at boot with piano-video-vt=1 (among the board's built-in boot arguments; =0 on the command line turns it off),
-// or when root writes 1 to kern.piano_video_vt (registered at run time, as DroidVMMotion.c's; it reads the stage), and only
-// when crosvm gives a virtio-media decoder or encoder: without it VideoToolbox keeps its own codecs. Each process asks once
-// (VTParavirtualizationIsRunningInGuest is a dispatch_once), so only processes started after the write use the channel.
+// Copyright (c) 2026 Leo Zhang.
+// Native V5a bounded transport adapted from the approved UniXNU frontend (UPSTREAM).
+// Apple's 27.3 PV support opens this exact service/type0. Selectors:0 shared
+// send/queue buffers,1/2 UUID register/deregister,3 copied vtpv message plus up
+// to5 IOSurface IDs,4 queue-drained; notification type0. Replies are enqueued
+// asynchronously; no guest-dependent wait is allowed inside selector3.
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -37,6 +15,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
+#include "PianoVideoVTContract.h"
 
 extern kmod_info_t g_kernel_kmod_info;
 static IOBufferMemoryDescriptor *capture;
@@ -51,7 +30,7 @@ extern "C" int proc_selfpid(void);
 
 namespace {
 constexpr uint32_t FirstSendBytes = 0x4000;       // the framework's first request
-constexpr uint64_t MaxSendBytes = 64ull << 20;    // a message's limit (a compressed frame and its attachments)
+constexpr uint64_t MaxSendBytes = pianovideo::vtcontract::kMaxMessageBytes;    // a message's limit (a compressed frame and its attachments)
 constexpr uint32_t QueueBytes = 256 * 1024;       // the host's messages waiting for the guest
 constexpr uint32_t HeaderBytes = 48;              // the 'vtpv' atom
 constexpr uint32_t MaxSurfaces = 5;
@@ -138,6 +117,8 @@ class AppleVideoToolboxParavirtualizationUserClient : public IOUserClient {
     uint64_t capacity;
     IOLock *sendLock;     // the queue has one producer at a time: the guest's thread and the host's workers both send
     void *host;
+    uint8_t uuids[32][16];
+    unsigned uuidCount;
     static bool sendToGuest(void *transport, const uint8_t *bytes, uint32_t size);
 
     IOReturn buffers(uint64_t size, uint64_t *out);
@@ -166,14 +147,16 @@ bool AppleVideoToolboxParavirtualizationUserClient::start(IOService *provider) {
     droidvm_vtpv_opens = droidvm_vtpv_opens + 1;
     IOLog("PianoVideo: vt user client opened by pid %d (count %u)\n", proc_selfpid(), droidvm_vtpv_opens);
     host = droidvm_vthost_client_open(this, sendToGuest, owner, proc_selfpid());
-    return true;
+    return host != nullptr;
 }
 
 IOReturn AppleVideoToolboxParavirtualizationUserClient::clientClose() {
     droidvm_vtpv_closes = droidvm_vtpv_closes + 1;
+    IOLockLock(lock);
     void *closing = host;
     host = nullptr;
     droidvm_vthost_client_close(closing);
+    IOLockUnlock(lock);
     if (!isInactive()) terminate();
     return kIOReturnSuccess;
 }
@@ -192,8 +175,9 @@ void AppleVideoToolboxParavirtualizationUserClient::free() {
 // Selector 0: the send buffer at least `size` bytes (a new one, mapped anew, when it must grow; the framework stops using the
 // old one as it takes the answer) and the queue, made and mapped once.
 IOReturn AppleVideoToolboxParavirtualizationUserClient::buffers(uint64_t size, uint64_t *out) {
-    size = size < FirstSendBytes ? FirstSendBytes : (size + page_size - 1) & ~uint64_t(page_size - 1);
     if (size > MaxSendBytes) { droidvm_vtpv_buffer_fail = 5; return kIOReturnNoMemory; }
+    size = size < FirstSendBytes ? FirstSendBytes : (size + page_size - 1) & ~uint64_t(page_size - 1);
+    if (size > MaxSendBytes + page_size) { droidvm_vtpv_buffer_fail = 5; return kIOReturnNoMemory; }
     if (!queue) {
         queue = IOSharedDataQueue::withCapacity(QueueBytes);
         if (!queue) { droidvm_vtpv_buffer_fail = 1; return kIOReturnNoMemory; }
@@ -221,18 +205,30 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::buffers(uint64_t size, u
     out[0] = capacity;
     out[1] = sendMap->getAddress();
     out[2] = queueMap->getAddress();
+    IOLog("PianoVideoVT V5a: selector0 pid %d capacity %llu shared-send-and-queue 1\n", proc_selfpid(), capacity);
     return kIOReturnSuccess;
 }
 
 // Selector 3: a message of `length` bytes in the send buffer, with the IDs of the IOSurfaces that go with it. Recorded; the
-// host's side is not there yet, so nothing answers it.
+// the private snapshot is dispatched to the native bounded frontend.
 IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length, const uint64_t *surfaces, unsigned count,
                                                                uint64_t *status) {
-    if (!send || length < HeaderBytes || length > capacity) {
+    if (!send || length < HeaderBytes || length > capacity || length > MaxSendBytes) {
         droidvm_vtpv_refused = droidvm_vtpv_refused + 1;
         return kIOReturnBadArgument;
     }
-    const uint8_t *bytes = static_cast<const uint8_t *>(send->getBytesNoCopy());
+    // The caller controls this shared mapping. Snapshot once and parse only the
+    // private copy; a concurrent userspace mutation cannot change checked lengths.
+    uint8_t *bytes = static_cast<uint8_t *>(IOMalloc(length));
+    if (!bytes) return kIOReturnNoMemory;
+    memcpy(bytes, send->getBytesNoCopy(), length);
+    vtwire::Header checked;
+    if (!pianovideo::vtcontract::message(bytes, uint32_t(length)) || !vtwire::header(bytes, uint32_t(length), checked)) {
+        IOFree(bytes, length); return kIOReturnBadArgument;
+    }
+    bool owned = checked.type == vtwire::cc("decs") || checked.type == vtwire::cc("encs");
+    for (unsigned i = 0; i < uuidCount; ++i) if (!memcmp(uuids[i], checked.uuid, 16)) owned = true;
+    if (!owned) { IOFree(bytes, length); return kIOReturnNotPermitted; }
     const uint32_t seq = droidvm_vtpv_messages;
     droidvm_vtpv_record &r = droidvm_vtpv_log[seq % LogEntries];
     r.seq = seq;
@@ -251,8 +247,10 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length,
     IOLog("PianoVideo: vt message %c%c%c%c received count %u\n", char(r.type >> 24), char(r.type >> 16), char(r.type >> 8), char(r.type), droidvm_vtpv_messages);
     uint32_t ids[MaxSurfaces];
     for (unsigned i = 0; i < r.surface_count; ++i) ids[i] = r.surfaces[i];
-    if (host) droidvm_vthost_message(host, bytes, uint32_t(length), ids, r.surface_count);
-    *status = 0;
+    const int rc = host ? droidvm_vthost_message(host, bytes, uint32_t(length), ids, r.surface_count) : -1;
+    IOFree(bytes, length);
+    *status = uint64_t(int64_t(rc));
+    if (rc) droidvm_vtpv_refused = droidvm_vtpv_refused + 1;
     return kIOReturnSuccess;
 }
 
@@ -264,7 +262,7 @@ bool AppleVideoToolboxParavirtualizationUserClient::sendToGuest(void *transport,
     const bool sent = self->queue && self->queue->enqueue(const_cast<uint8_t *>(bytes), size);
     IOLockUnlock(self->sendLock);
     if (sent) droidvm_vtpv_sent = droidvm_vtpv_sent + 1;
-    else droidvm_vtpv_dropped = droidvm_vtpv_dropped + 1;
+    else { droidvm_vtpv_dropped = droidvm_vtpv_dropped + 1; IOLog("PianoVideoVT V5a: transport DROP size %u\n", size); }
     return sent;
 }
 
@@ -280,9 +278,21 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         if (!result) a->scalarOutputCount = 3;
         break;
     case 1: case 2:
-        if (a->structureInputSize != 16) { result = kIOReturnBadArgument; break; }
-        if (selector == 1) droidvm_vtpv_uuids = droidvm_vtpv_uuids + 1;
-        result = kIOReturnSuccess;
+        if (a->structureInputSize != 16 || !a->structureInput) { result = kIOReturnBadArgument; break; }
+        { unsigned found = uuidCount;
+          for (unsigned i = 0; i < uuidCount; ++i) if (!memcmp(uuids[i], a->structureInput, 16)) { found = i; break; }
+          if (selector == 1) {
+            if (found == uuidCount) {
+              if (uuidCount == 32) { result = kIOReturnNoResources; break; }
+              memcpy(uuids[uuidCount++], a->structureInput, 16);
+              droidvm_vtpv_uuids = droidvm_vtpv_uuids + 1;
+            }
+          } else {
+            if (found == uuidCount) { result = kIOReturnBadArgument; break; }
+            memcpy(uuids[found], uuids[--uuidCount], 16);
+          }
+          result = kIOReturnSuccess;
+        }
         break;
     case 3:
         if (a->scalarInputCount < 1 || a->scalarInputCount > 1 + MaxSurfaces || a->scalarOutputCount < 1) {
@@ -316,6 +326,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort
     }
     IOLockUnlock(lock);
     droidvm_vtpv_notify_result = uint32_t(result);
+    IOLog("PianoVideoVT V5a: notification type %u pid %d status %08x\n", type, proc_selfpid(), result);
     return result;
 }
 

@@ -33,5 +33,11 @@ int main() {
   ext[38]=1;ext[39]=0;ext[40]=5;memcpy(ext+41,session::kAccessUnit+30,5);
   vtwire::ImageDescription d;d.codec=vtwire::cc("avc1");d.width=320;d.height=240;d.extensions=ext;d.extensionsSize=46;
   CHECK(vtcontract::format(d));d.width=321;CHECK(!vtcontract::format(d));d.width=320;ext[9]=100;CHECK(!vtcontract::format(d));
+  uint8_t wire[256]={},uuid[16]={};vtwire::Writer msg(wire,sizeof wire);msg.header(vtwire::cc("dfrm"),vtwire::FlagRequest,uuid,1);msg.s64(vtwire::cc(",frm"),0);
+  CHECK(vtcontract::message(wire,msg.size()));msg.s64(vtwire::cc(",frm"),1);CHECK(!vtcontract::message(wire,msg.size()));
+  CHECK(!vtcontract::message(wire,msg.size()-1));
+  uint8_t plist[48]={};memcpy(plist,"bplist00",8);plist[8]=0x5f;plist[9]=0x1f;plist[16]=8;
+  plist[22]=1;plist[23]=1;vtwire::put64(plist+24,1);vtwire::put64(plist+32,0);vtwire::put64(plist+40,16);
+  char name[96];CHECK(!vtwire::plistString(plist,sizeof plist,name,sizeof name));
   if(failures)return 1;std::puts("PianoVideo V5a contract: sample/all-NAL/format/layout/overflow/cancel tests PASS");return 0;
 }

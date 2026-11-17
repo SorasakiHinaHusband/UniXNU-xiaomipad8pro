@@ -7,7 +7,9 @@
 #include "../VideoFixture.h"
 namespace pianovideo { namespace vtcontract {
 constexpr uint32_t kMaxAuBytes = 1u << 20;
-constexpr uint32_t kMaxMessageBytes = kMaxAuBytes + 65536;
+// Permit a bounded oversized-sample envelope so VT receives a synchronous
+// dfrm error and its send channel remains usable for the following valid AU.
+constexpr uint32_t kMaxMessageBytes = 4u << 20;
 constexpr uint32_t kParameterBytes = 35; // start4+SPS22+start4+PPS5
 inline bool atoms(const uint8_t *p, uint32_t n) {
   const uint8_t *at = p, *end = p + n;

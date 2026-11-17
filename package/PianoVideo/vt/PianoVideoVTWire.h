@@ -109,7 +109,7 @@ inline bool plistString(const uint8_t *p, uint32_t n, char *out, uint32_t outSiz
     const uint32_t offsetSize = trailer[6], refSize = trailer[7];
     const uint64_t objects = be64(trailer + 8), top = be64(trailer + 16), table = be64(trailer + 24);
     (void)refSize;
-    if (!offsetSize || offsetSize > 8 || top >= objects || table + objects * offsetSize > n - 32) return false;
+    if (!offsetSize || offsetSize > 8 || top >= objects || table > n - 32 || objects > (n - 32 - table) / offsetSize) return false;
     uint64_t offset = 0;
     for (uint32_t i = 0; i < offsetSize; ++i) offset = offset << 8 | p[table + top * offsetSize + i];
     if (offset >= n - 32) return false;
@@ -118,12 +118,15 @@ inline bool plistString(const uint8_t *p, uint32_t n, char *out, uint32_t outSiz
     uint64_t length = marker & 0x0f, at = offset + 1;
     if (length == 0x0f) {
         if (at >= n || (p[at] & 0xf0) != 0x10) return false;
-        const uint32_t bytes = 1u << (p[at] & 0x0f);
+        const uint32_t power = p[at] & 0x0f;
+        if (power > 3) return false;
+        const uint32_t bytes = 1u << power;
+        if (at + 1 > n - 32 || bytes > n - 32 - at - 1) return false;
         length = 0;
         for (uint32_t i = 0; i < bytes; ++i) length = length << 8 | p[at + 1 + i];
         at += 1 + bytes;
     }
-    if (at + length > n - 32 || length >= outSize) return false;
+    if (at > n - 32 || length > n - 32 - at || length >= outSize) return false;
     memcpy(out, p + at, length);
     out[length] = 0;
     return true;
