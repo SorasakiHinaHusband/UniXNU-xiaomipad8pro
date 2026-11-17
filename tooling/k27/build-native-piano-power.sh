@@ -13,6 +13,8 @@ set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
 P=$D/package/PianoPower
 T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror "$P/tests/trace_host.cpp" -o "$T/trace_host"
+"$T/trace_host" || { echo "Error: ADSP trace decoding host tests failed" >&2; exit 1; }
 "$D/package/include/tests/run.sh"   # PianoScmLock.h: the secure-call lock around every SCM request and PAS sequence (docs/scm-lock.md)
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/PianoMca.c" -o "$T/PianoMca.o"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/ChargePolicy.c" -o "$T/ChargePolicy.o"   # the charging policy (charging-policy.md)

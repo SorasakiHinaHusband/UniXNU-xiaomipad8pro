@@ -762,6 +762,17 @@ and `piano_qrtr_close` (§5c). Still open: NativeGopDisplay's transform (R2 only
 6. A fatal-free DSP with an unchanged charger generation can still stop communicating. Check progress of GLINK receive counters
    and fresh MCA answers alongside the sensor requests; sens-ab1 lost both while its cached health state remained unchanged.
 
+### 10.4 Bounded transport observation
+
+With `piano-sensors=4`, PianoPower arms `[sens-trace1]` diagnostics. The first outgoing SSC 514 identifies the light's local QRTR
+port and starts the shared PMIC comparison window. Each port records at most 64 enqueues, publishes, consumed packets, raw receives
+and blocked sends; shared GLINK doorbells have 64 records per direction. No payload or calibration values are printed.
+An enqueue is a host queue copy. A publish identifies the GLINK write-index interval and packet ID. A consume means the DSP-owned
+read index was observed reaching that packet's end, including FIFO wrap; it does not prove the sensor service handled the request.
+Raw receive headers are logged before router/QMI/client validation. PMIC is a separate GLINK channel, so its QRTR addresses are zero;
+only MCA read/write packets have a sequence, while PAN/UCSI use transaction -1. Missing events after a cap, a lost console line or an
+unobserved full FIFO lap are inconclusive. These diagnostics change no transport decision, retry, deadline or sensor request.
+
 ## 11. Licence note
 
 PianoSensors is BSD-2-Clause-Patent. PaganiSensors (BSD-2-Clause-Patent) is reused with `UPSTREAM` records. Linux's fastrpc driver and
