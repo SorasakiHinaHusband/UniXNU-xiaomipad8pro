@@ -49,6 +49,15 @@
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
 #include "CopyRows.h"
+#include "../include/PianoGpuQualificationDisplay.h"
+static void qualificationDisplay(const PianoGpuQualificationDisplay *evidence) {
+    uint32_t enabled=0;
+    if(!PE_parse_boot_argn("piano-gpu-r3b",&enabled,sizeof enabled) || enabled!=1)return;
+    IOService *gpu=IOService::copyMatchingService(IOService::serviceMatching("PianoA830"));
+    if(!gpu)return;
+    gpu->callPlatformFunction("piano-gpu-qualification-display",false,const_cast<PianoGpuQualificationDisplay *>(evidence),nullptr,nullptr,nullptr);
+    gpu->release();
+}
 
 using gopcompose::Job;
 using gopcompose::Rect;
@@ -1292,6 +1301,12 @@ IOReturn NativeGopDisplay::swap_begin_gated()
               fCopies, fCopies ? fCopyNs / fCopies / 1000 : 0, fCopies ? fPrepareNs / fCopies / 1000 : 0,
               fCopies ? fReadNs / fCopies / 1000 : 0, fCopies ? fConvertNs / fCopies / 1000 : 0, fCopies ? fWriteNs / fCopies / 1000 : 0,
               fCopyMaxNs / 1000, fWaitReleased);
+        uint64_t reportNs=0;
+        absolutetime_to_nanoseconds(reportNow, &reportNs);
+        const PianoGpuQualificationDisplay evidence={reportNs/1000,periodNs/1000,fSubmitted,fFrames,fDropped,fCopies,
+            fCopies?fCopyNs/fCopies/1000:0,fCopyMaxNs/1000,fCopies?fPrepareNs/fCopies/1000:0,
+            fCopies?fReadNs/fCopies/1000:0,fCopies?fConvertNs/fCopies/1000:0,fCopies?fWriteNs/fCopies/1000:0};
+        qualificationDisplay(&evidence);
         if (fCopiesSkipped)
             GOPLOG("%llu copies skipped for newer ones\n", fCopiesSkipped);
         GOPLOG("at most %llu frames in a second\n", fPeakFps);

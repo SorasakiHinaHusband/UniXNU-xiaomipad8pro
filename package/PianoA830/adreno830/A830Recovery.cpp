@@ -62,6 +62,7 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
 void A830Recovery::closeQualification()
 {
     if(!qualification_)return;
+    power_->blockQualification(true);
     power_->latchQualification();
     if(!__atomic_exchange_n(&qualificationClosed_,true,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&safeOff_,false,__ATOMIC_RELEASE);
@@ -122,6 +123,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
         adreno830_status_add32(&adreno830_status.faults,1);
         if(hangClass(cause))adreno830_status_add32(&adreno830_status.hangs,1);
         if(qualification_) {
+            power_->blockQualification(true);
             power_->latchQualification();
             const bool safe=ops_.gmuForceOff(ops_.context)==kIOReturnSuccess;
             __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
@@ -308,6 +310,7 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     if(stats_.lastMs>stats_.maxMs)stats_.maxMs=stats_.lastMs;
     wdArmed_=false;
     if(qualification_)__atomic_store_n(&qualificationSafeLow_,true,__ATOMIC_RELEASE);
+    power_->blockQualification(false);
     rops_.gate(rops_.context,A830GateOpen,cause);
     __atomic_store_n(&qualificationClosed_,false,__ATOMIC_RELEASE);
     adreno830_status_running();

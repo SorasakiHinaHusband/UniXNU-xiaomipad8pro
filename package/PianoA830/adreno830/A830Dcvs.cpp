@@ -52,7 +52,7 @@ IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,
         return kIOReturnBadArgument;
     if(config.qualification607 && (!recovery || !adreno830_annibale()))return kIOReturnBadArgument;
     config_=config;table_=table;io_=io;env_=env;ops_=ops;power_=power;recovery_=recovery;tsens_=tsens;
-    stats_={};forceVote_=false;
+    stats_={};forceVote_=false;highStreakNs_=l7StreakNs_=0;
     annibale_=adreno830_annibale();hot_=false;stopped_=false;
     stats_.annibale=annibale_;
     Sm8750ThermalInit(&thermal_);
@@ -230,6 +230,7 @@ void A830Dcvs::noteUnderruns(uint32_t total) {__atomic_store_n(&underrunTotal_,t
 
 void A830Dcvs::park()
 {
+    if(config_.qualificationR3b)power_->parkQualification();
     if(!__atomic_exchange_n(&parked_,1u,__ATOMIC_ACQ_REL))env_.wake(env_.context);
 }
 
@@ -250,6 +251,7 @@ uint64_t A830Dcvs::serviceTick(uint64_t now)
 {
     if(!initialized_)return now+ms(1000);
     if(ops_.qualificationService)ops_.qualificationService(ops_.context,now);
+    if(config_.qualificationR3b)sampleThermal(now);
     /* 1. A pending recovery first: nothing else may touch the GPU meanwhile. */
     if(recovery_ && recovery_->pending()) {
         recovery_->runPending();
@@ -394,6 +396,11 @@ void A830Dcvs::account(uint64_t now)
     if(now<=lastAccount_) {lastAccount_=now;return;}
     const uint8_t at=power_->phase()==A830PowerActive?level_:0;
     residencyNs_[at<=Adreno830LevelMax?at:0]+=now-lastAccount_;
+    stats_.residencyTotalNs[at<=Adreno830LevelMax?at:0]+=now-lastAccount_;
+    highStreakNs_=at>3?highStreakNs_+now-lastAccount_:0;
+    l7StreakNs_=at==7?l7StreakNs_+now-lastAccount_:0;
+    if(highStreakNs_>stats_.residencyHighLongestNs)stats_.residencyHighLongestNs=highStreakNs_;
+    if(l7StreakNs_>stats_.residency607LongestNs)stats_.residency607LongestNs=l7StreakNs_;
     lastAccount_=now;
 }
 
@@ -544,7 +551,10 @@ void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille
         if(boundedBus!=bus) {bus=boundedBus;bw=annibale_?uint32_t(bus):bus|A830_HFI_BW_NO_AB;}
         result=ops_.perfVote(ops_.context,level,bw);
     }
-    if(active && result==kIOReturnSuccess)power_->noteVoted(level,bus);
+    if(active && result==kIOReturnSuccess) {
+        if(config_.qualificationR3b && ops_.qualificationAck)ops_.qualificationAck(ops_.context,level,bus);
+        power_->noteVoted(level,bus);
+    }
     power_->unlock();
     if(!active)return;
     if(config_.qualification607 && result==kIOReturnSuccess && recovery_->pending()) {
@@ -588,6 +598,17 @@ void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille
 
 void A830Dcvs::sampleThermal(uint64_t now)
 {
+    if(config_.qualificationR3b) {
+        const uint64_t s=ops_.qualificationThermal?ops_.qualificationThermal(ops_.context):0;
+        thermalCeiling_=(s&(1ull<<40))?uint8_t(s):1;
+        hot_=false;stats_.thermalHot=false;
+        stats_.tempDeci=int16_t(s>>8);stats_.filteredDeci=int16_t(s>>24);
+        stats_.thermalCeiling=thermalCeiling_;stats_.limiting=thermalCeiling_<knobCeiling_;
+        thermal_.last_deci=stats_.tempDeci;thermal_.ever_valid=(s&(1ull<<40))!=0;
+        thermal_.zone=thermal_.ever_valid?Sm8750ThermalNormal:Sm8750ThermalUnknown;
+        if(stats_.tempDeci>thermal_.peak_deci)thermal_.peak_deci=stats_.tempDeci;
+        stats_.zone=uint8_t(thermal_.zone);publishThermal(true);return;
+    }
     Sm8750TsensSample sample;
     const int read=Sm8750TsensReadGpu(tsens_,&sample);
     if(ops_.qualificationSample)ops_.qualificationSample(ops_.context,now,&sample);

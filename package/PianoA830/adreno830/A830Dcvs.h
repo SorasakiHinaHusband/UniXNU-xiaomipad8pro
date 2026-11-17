@@ -80,6 +80,7 @@ struct A830DcvsTable {
 };
 
 struct A830DcvsConfig {
+    bool qualificationR3b=false;
     bool qualification607=false;
     /* boot knobs (ARCHITECTURE 3.6) */
     bool governor=true;                 /* pagani-gpu-dcvs (1); 0 = fixed at fixedLevel */
@@ -149,6 +150,8 @@ struct A830DcvsOps {
 #endif
     void (*qualificationFault)(void *context,uint8_t requested,uint8_t bus,IOReturn error)=nullptr;
     void (*qualificationService)(void *context,uint64_t now)=nullptr;
+    void (*qualificationAck)(void *,uint8_t &,uint8_t &)=nullptr;
+    uint64_t (*qualificationThermal)(void *context)=nullptr; // R3b atomic guard snapshot
     void (*qualificationSample)(void *context,uint64_t now,const Sm8750TsensSample *)=nullptr;
 };
 
@@ -159,6 +162,8 @@ struct A830DcvsStats {
     uint8_t level,bus,floor,ceiling,thermalCeiling,zone;
     uint16_t busyPermille;              /* last status period */
     int32_t tempDeci;                   /* hottest GPU sensor, last valid read */
+    uint64_t residencyHighLongestNs,residency607LongestNs;
+    uint64_t residencyTotalNs[Adreno830LevelMax + 1];
     uint32_t residency[Adreno830LevelMax + 1];   /* permille of the last residency window, by GMU level */
     bool annibale;                      /* the annibale profile was in effect at init() */
     bool thermalHot;                    /* annibale: held at 160 MHz by the 70/60 C rule */
@@ -274,6 +279,7 @@ private:
 #endif
     /* periodic */
     uint64_t nextStatus_=0,nextWatchdog_=0,residencyStart_=0,statusStart_=0,statusBusyNs_=0,statusNs_=0,lastAccount_=0;
+    uint64_t highStreakNs_=0,l7StreakNs_=0;
     uint64_t residencyNs_[Adreno830LevelMax + 1]={};
     /* underruns */
     uint32_t underrunStreak_=0;

@@ -62,6 +62,7 @@
 #include "PianoGpuCeiling.h"
 #include "PianoGpuIdle.h"
 #include "PianoGpuQualificationLog.h"
+#include "../../include/PianoGpuQualificationDisplay.h"
 
 extern "C" int adreno830_qual607_control(int);
 using QualLog=pianogpu::QualificationLog<>;
@@ -1315,6 +1316,10 @@ IOReturn PianoA830::setPowerState(unsigned long state, IOService *)
 IOReturn PianoA830::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
                                          void *param4)
 {
+  if (functionName && functionName->isEqualTo("piano-gpu-qualification-display")) {
+    adreno830_qualification_display(static_cast<const PianoGpuQualificationDisplay *>(param1));
+    return kIOReturnSuccess;
+  }
   if (functionName && functionName->isEqualTo("native-adreno-fences")) {
     if (!param1 || !param2) return kIOReturnBadArgument;
     return native_adreno_fences(static_cast<uint32_t *>(param1), static_cast<uint32_t *>(param2)) ? kIOReturnSuccess : kIOReturnNotReady;

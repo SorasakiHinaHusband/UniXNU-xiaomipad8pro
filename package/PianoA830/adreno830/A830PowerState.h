@@ -61,6 +61,7 @@ struct A830GmuStartArgs {
     bool ifpc;              /* HFI M5: FEATURE_CTRL{9,1,0x1680} (P2) instead of {9,0,0} */
     bool rsccWake;          /* B3: the last power-down ran the RSCC sleep sequence (4.7.4) */
     bool cxLost;            /* CX collapsed since the last start: TCM and GMU-side registers are gone */
+    uint8_t *ackLevel=nullptr,*ackBus=nullptr; // optional actual M9 result after the last-moment R3b cap
 };
 
 /* Line bits of A830PowerOps::irqEnable: the A830IrqOff* bits of Adreno830Status.h. */
@@ -252,8 +253,17 @@ public:
     void latchQualification() {__atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);setQualificationCeiling(3,3);}
     bool qualificationLatched() const {return __atomic_load_n(&qualificationSticky_,__ATOMIC_ACQUIRE);}
     void setQualificationExternal(uint8_t level,uint8_t bus) {__atomic_store_n(&qualificationExternal_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);}
+    void qualificationGuard(void (*check)(void *,uint64_t),void *context) {qualificationCheck_=check;qualificationContext_=context;}
+    void blockQualification(bool block) {if(qualificationCheck_)__atomic_store_n(&qualificationBlocked_,block,__ATOMIC_RELEASE);}
+    bool qualificationBlocked() const {return __atomic_load_n(&qualificationBlocked_,__ATOMIC_ACQUIRE);}
+    void parkQualification() {__atomic_store_n(&qualificationParked_,true,__ATOMIC_RELEASE);}
+    uint8_t qualificationCap() const {return uint8_t(__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE));}
+    uint8_t qualificationEffectiveCap() {uint8_t level=7,bus=6;limitQualification(level,bus);return level;}
+    void checkQualification() {if(qualificationCheck_)qualificationCheck_(qualificationContext_,env_.nowNs(env_.context));}
     void setQualificationLease(uint64_t until) {__atomic_store_n(&qualificationLease_,until,__ATOMIC_RELEASE);}
     void limitQualification(uint8_t &level,uint8_t &bus) {
+        checkQualification();
+        if(__atomic_load_n(&qualificationParked_,__ATOMIC_ACQUIRE)) {level=1;bus=2;}
         const uint32_t cap=__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE);
         if(qualificationLatched() && level>3) {level=3;bus=3;}
         if((cap&255u) && level>(cap&255u)) {level=uint8_t(cap);bus=uint8_t(cap>>8);}
@@ -261,7 +271,7 @@ public:
         if(cap && (ext&255u) && level>(ext&255u)) {level=uint8_t(ext);bus=uint8_t(ext>>8);}
         if(cap && level>3) {
             const uint64_t until=__atomic_load_n(&qualificationLease_,__ATOMIC_ACQUIRE);
-            if(!until || env_.nowNs(env_.context)>=until) {
+            if(!until || (qualificationCheck_?env_.nowNs(env_.context)>until:env_.nowNs(env_.context)>=until)) {
                 __atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);level=1;bus=2;
             }
         }
@@ -335,10 +345,12 @@ private:
     uint64_t lastActivity_=0,sleptAt_=0,idleSince_=0,nextSlumberRow_=0;
     uint32_t seenSubmitted_=0;
     uint8_t targetLevel_=2,targetBus_=2,submitLevel_=0,submitBus_=0,touchLevel_=0,touchBus_=0;
+    void (*qualificationCheck_)(void *,uint64_t)=nullptr;
+    void *qualificationContext_=nullptr;
     uint32_t qualificationCap_=0;
     uint32_t qualificationExternal_=0;
     uint64_t qualificationLease_=0;
-    bool qualificationSticky_=false;
+    bool qualificationSticky_=false,qualificationParked_=false,qualificationBlocked_=false;
     uint8_t votedLevel_=0,votedBus_=0,slumberMode_=A830SlumberOff;
     bool cxOn_=true,cxLost_=false,cxRestored_=false,rsccSlept_=false,ifpcActive_=false,ifpcWanted_=false,touchPending_=false;
     bool initialized_=false;

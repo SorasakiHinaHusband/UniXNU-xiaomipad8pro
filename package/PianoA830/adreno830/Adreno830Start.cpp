@@ -22,6 +22,7 @@
 #include "A830Recovery.h"
 #include "A830Dcvs.h"
 #include "A830Qualification.h"
+#include "../../include/PianoGpuQualificationDisplay.h"
 #include <stdarg.h>
 #ifdef ADRENO830_MACOS
 #include "A830Idle.h"
@@ -2177,11 +2178,15 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
         g830.failure=f;g830.failure.stage=A830SGmu;
         return scope.end(r);
     }
-    g830.level=args->level;g830.bus=args->bus;
+    const uint8_t ackLevel=gQualification.r3b()?g830.hfi.currentLevel():args->level;
+    const uint8_t ackBus=gQualification.r3b()?g830.hfi.currentBus():args->bus;
+    if(args->ackLevel)*args->ackLevel=ackLevel;
+    if(args->ackBus)*args->ackBus=ackBus;
+    g830.level=ackLevel;g830.bus=ackBus;
     if(gQualificationEnabled) {
         uint64_t highAcks=0;
         for(unsigned i=4;i<=Adreno830LevelMax;++i)highAcks+=g830.hfi.stats().level_acks[i];
-        qualLog("R3a fresh-M9 ACK level=%u bus=%u header=%08x at-us=%llu elapsed-us=%llu high-acks=%llu",args->level,args->bus,
+        qualLog("R3a fresh-M9 ACK level=%u bus=%u header=%08x at-us=%llu elapsed-us=%llu high-acks=%llu",ackLevel,ackBus,
             g830.hfi.header(A830HfiM9Vote),nowUs(),nowUs()-gQualification.failedAt()/1000,highAcks);
     }
     /* P2: with IFPC on (FEATURE_CTRL{IFPC,1,0x1680}) the GPU top half keeps GX up and polls the AHB fence (4.12.1, 4.17). */
@@ -2537,6 +2542,13 @@ void dcvsQueueRow(void *)
         qualLog("R3a RES at-us=%llu windows=%u busy=%u ceiling=%u l1=%u l2=%u l3=%u l4=%u l5=%u l6=%u l7=%u l8=%u l9=%u l10=%u l11=%u",
             nowUs(),s.windows,s.busyPermille,s.ceiling,s.residency[1],s.residency[2],s.residency[3],s.residency[4],s.residency[5],
             s.residency[6],s.residency[7],s.residency[8],s.residency[9],s.residency[10],s.residency[11]);
+        if(gQualification.r3b())qualLog("R3b LIVE at-us=%llu l0=%llu l1=%llu l2=%llu l3=%llu l4=%llu l5=%llu l6=%llu l7=%llu l8=%llu l9=%llu l10=%llu l11=%llu high-long-us=%llu l7-long-us=%llu",
+            nowUs(),s.residencyTotalNs[0]/1000,s.residencyTotalNs[1]/1000,s.residencyTotalNs[2]/1000,s.residencyTotalNs[3]/1000,
+            s.residencyTotalNs[4]/1000,s.residencyTotalNs[5]/1000,s.residencyTotalNs[6]/1000,s.residencyTotalNs[7]/1000,
+            s.residencyTotalNs[8]/1000,s.residencyTotalNs[9]/1000,s.residencyTotalNs[10]/1000,s.residencyTotalNs[11]/1000,s.residencyHighLongestNs/1000,s.residency607LongestNs/1000);
+        if(gQualification.r3b())qualLog("R3b WORK at-us=%llu submitted=%u completed=%u missed=%u q-us=%u q-max=%u depth=%u polled=%u rs-jobs=%u rs-us=%u ext-jobs=%u ext-busy-us=%u ext-max-us=%u",
+            nowUs(),queue.submitted,queue.completed,queue.missed,queue.avg_us,queue.max_us,queue.depth,queue.polled,
+            queue.rs_jobs,queue.rs_avg_us,queue.ext_jobs,queue.ext_busy_us,queue.ext_max_us);
         qualLog("R3a ACK at-us=%llu l1=%u l2=%u l3=%u l4=%u l5=%u l6=%u l7=%u l8=%u l9=%u l10=%u l11=%u last=%08x hfi-vote-fail=%u host-sent=%u host-fail=%u host-held=%x mx=%u cx=%u ddr=%u gpu-peak=%d",
             nowUs(),h.level_acks[1],h.level_acks[2],h.level_acks[3],h.level_acks[4],h.level_acks[5],h.level_acks[6],h.level_acks[7],h.level_acks[8],
             h.level_acks[9],h.level_acks[10],h.level_acks[11],h.last_ack,h.vote_failures,g830.host.sent,g830.host.failures,g830.host.held,
@@ -2552,21 +2564,41 @@ void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
 }
 void qualificationThread(void *)
 {
+    uint64_t logAt=0;uint32_t lastReason=0;
     for(;;) {
         const uint64_t now=nowUs()*1000;
         if(g830.power_state.qualificationLatched() && !gQualification.reason())gQualification.fault(A830QualVote,now);
         Sm8750TsensSample gpu={};Sm8750TsensReadGpu(&g830.tsens_io,&gpu);
+        if(gQualification.r3b())for(unsigned i=0;i<8;++i)
+            if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050)qualificationUnsafe(nullptr);
         piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
         const bool ok=adreno830_qualification_board(&board);
         gQualification.tick(now,gpu,board,ok);
         if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr);
-        const uint64_t age0=board.age_ms[0],age1=board.age_ms[1];
-        qualLog("R3a TEMP at-us=%llu gpu-valid=%02x gpu-max=%d gpu-raw=%x,%x,%x,%x,%x,%x,%x,%x board-ok=%u state=%u valid=%x disabled=%x rounds=%u period=%u msm=%d quiet=%d age-ms=%llu,%llu sample-us=%llu,%llu ready=%u high=%u sticky=%u reason=%u opened-us=%llu failed-us=%llu inhibit=%u",
-            now/1000,gpu.valid,gpu.max_deci,gpu.raw[0],gpu.raw[1],gpu.raw[2],gpu.raw[3],gpu.raw[4],gpu.raw[5],gpu.raw[6],gpu.raw[7],
-            ok,board.state,board.valid,board.disabled,board.rounds,board.period_ms,board.milli_c[0],board.milli_c[1],age0,age1,
-            board.sample_us[0],board.sample_us[1],gQualification.ready(),gQualification.high(),g830.power_state.qualificationLatched(),
-            gQualification.reason(),gQualification.openedAt()/1000,gQualification.failedAt()/1000,gQualification.inhibit());
-        os().sleep_us(1000000);
+        const bool event=gQualification.r3b() && (gQualification.thermal().events || gQualification.reason()!=lastReason);
+        if(event) {
+            const auto &t=gQualification.thermal();
+            qualLog("R3b EVENT at-us=%llu event=%u step=%u board-cap=%u effective=%u raw=%d filtered=%d reason=%u failed-us=%llu",
+                now/1000,t.events,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(),t.raw,t.filter16/16,gQualification.reason(),gQualification.failedAt()/1000);
+        }
+        lastReason=gQualification.reason();
+        if(!gQualification.r3b() || now>=logAt || event) {
+            const uint64_t age0=board.age_ms[0],age1=board.age_ms[1];
+            qualLog("R3a TEMP at-us=%llu gpu-valid=%02x gpu-max=%d gpu-raw=%x,%x,%x,%x,%x,%x,%x,%x board-ok=%u state=%u valid=%x disabled=%x rounds=%u period=%u msm=%d quiet=%d age-ms=%llu,%llu sample-us=%llu,%llu ready=%u high=%u sticky=%u reason=%u opened-us=%llu failed-us=%llu inhibit=%u",
+                now/1000,gpu.valid,gpu.max_deci,gpu.raw[0],gpu.raw[1],gpu.raw[2],gpu.raw[3],gpu.raw[4],gpu.raw[5],gpu.raw[6],gpu.raw[7],
+                ok,board.state,board.valid,board.disabled,board.rounds,board.period_ms,board.milli_c[0],board.milli_c[1],age0,age1,
+                board.sample_us[0],board.sample_us[1],gQualification.ready(),gQualification.high(),g830.power_state.qualificationLatched(),
+                gQualification.reason(),gQualification.openedAt()/1000,gQualification.failedAt()/1000,gQualification.inhibit());
+            if(gQualification.r3b()) {
+                auto &t=gQualification.thermal();
+                qualLog("R3b THERM at-us=%llu seq=%llu reads=%u min-valid=%x gap-us=%llu peaks=%d,%d,%d,%d,%d,%d,%d,%d raw=%d filtered=%d trend=%d step=%u board-cap=%u effective=%u downs=%u ups=%u healthy=%u",
+                    now/1000,t.sequence,t.reads,t.minValid,t.maxGap/1000,t.peaks[0],t.peaks[1],t.peaks[2],t.peaks[3],t.peaks[4],t.peaks[5],t.peaks[6],t.peaks[7],
+                    t.raw,t.filter16/16,t.trend,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(),t.downs,t.ups,t.healthy);
+                t.resetPeaks();
+            }
+        logAt=now+1000000000ull;
+        }
+        os().sleep_us(gQualification.r3b()?100000:1000000);
     }
 }
 void qualificationService(void *,uint64_t now) {
@@ -2591,6 +2623,9 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
     adreno830_status_step(A830S10StepDcvs);
     A830DcvsConfig config;
     config.qualification607=qualificationMode(b);
+    config.qualificationR3b=b->qualification_r3b==1;
+    if(b->qualification_r3b && (!config.qualification607 || b->qualification_r3b!=1))
+        return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_r3b,1,kIOReturnBadArgument);
     config.governor=b->knobs.dcvs!=0;
     config.minMhz=b->knobs.dcvs_min_mhz;config.maxMhz=b->knobs.dcvs_max_mhz;
     config.maxGiven=(b->flags&(1u<<Adreno830KnobDcvsMax))!=0;
@@ -2633,8 +2668,16 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
 #endif
         gQualificationEnabled=true;
         d->recovery.qualification(qualificationUnsafe,nullptr);
-        gQualification.init(&d->power_state,&d->recovery);
+        gQualification.init(&d->power_state,&d->recovery,config.qualificationR3b,qualificationUnsafe);
+        if(config.qualificationR3b)qualLog("R3b CONFIG R3b-607-v1 soft=800 cool=750 hard=850 halt=1050 floor=3 guard-ms=100 lease-ms=250 down-ms=500 up-ms=2000 board-hold=62000,37000 board-release=60000,35000 board-hard=65000,40000");
         d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;
+        if(config.qualificationR3b) {
+            d->hfi.qualificationLimiter([](void *p,uint8_t &level,uint8_t &bus) {
+                static_cast<A830PowerState *>(p)->limitQualification(level,bus);
+            },&d->power_state);
+            ops.qualificationAck=[](void *,uint8_t &level,uint8_t &bus) {level=g830.hfi.currentLevel();bus=g830.hfi.currentBus();};
+        }
+        ops.qualificationThermal=[](void *) {return gQualification.thermalSnapshot();};
         ops.qualificationService=qualificationService;ops.qualificationSample=qualificationSample;
         if(!os().thread_start || os().thread_start(qualificationThread,nullptr)!=kIOReturnSuccess)
             return refuse(f,A830S10StepDcvs,A830ReasonNoMemory,0,0,0,kIOReturnNoMemory);
@@ -2915,4 +2958,10 @@ extern "C" int adreno830_qual607_control(int command)
         qualLog("R3a injection scheduled for-us=%llu",at/1000);
     } else if(command!=0)return -2;
     return 1|(gQualification.ready()?2:0)|(gQualification.high()?4:0)|(g830.power_state.qualificationLatched()?8:0)|int(gQualification.reason()<<8);
+}
+
+extern "C" void adreno830_qualification_display(const PianoGpuQualificationDisplay *d) {
+    if(!d || !gQualificationEnabled || !gQualification.r3b())return;
+    qualLog("R3b DISPLAY at-us=%llu period-us=%llu submitted=%llu shown=%llu dropped=%llu copies=%llu mean-us=%llu max-us=%llu prepare-us=%llu read-us=%llu convert-us=%llu write-us=%llu",
+        d->atUs,d->periodUs,d->submitted,d->shown,d->dropped,d->copies,d->meanUs,d->maxUs,d->prepareUs,d->readUs,d->convertUs,d->writeUs);
 }

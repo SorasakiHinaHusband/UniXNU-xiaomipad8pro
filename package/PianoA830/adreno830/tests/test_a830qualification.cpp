@@ -138,4 +138,5 @@ int main() {
     CHECK(fillGpuTemps(s,10002000,&b) && !b.valid);
     s.state=3;CHECK(fillGpuTemps(s,1000,&b) && !b.valid);
     std::printf("PASS: C5 qualification: two fresh rounds, partial/invalid/hot/expired guards, independent deadline, actual gate closure, strict recovery refusal/escalation, low M9, sticky wake/thermal/external/park and mutable160 (%u checks)\n",gChecks);
+    return 0;
 }

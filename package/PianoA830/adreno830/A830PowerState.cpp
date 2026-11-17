@@ -60,10 +60,11 @@ IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &i
     suspended_=false;
 #endif
     targetLevel_=votedLevel_=config.defaultLevel;targetBus_=votedBus_=config.defaultBus;
+    qualificationCheck_=nullptr;qualificationContext_=nullptr;
     qualificationCap_=0;
     qualificationExternal_=0;
     qualificationLease_=0;
-    qualificationSticky_=false;
+    qualificationSticky_=false;qualificationParked_=false;qualificationBlocked_=false;
     submitLevel_=submitBus_=touchLevel_=touchBus_=0;
     initialized_=true;
     return kIOReturnSuccess;
@@ -92,18 +93,20 @@ void A830PowerState::setFaultSink(void (*sink)(void *,uint8_t,uint64_t),void *co
 
 IOReturn A830PowerState::acquire()
 {
+    checkQualification();
+    if(qualificationBlocked())return A830ReturnNotResponding;
     /* Fast path: increment, then look at the phase (a transition stores its phase, then looks at the count). */
     __atomic_fetch_add(&refs_,1u,__ATOMIC_SEQ_CST);
 #ifdef ADRENO830_MACOS
     /* UniXNU-piano (A830Suspend.h): the suspend gate is a second word of the same protocol (suspend() stores it, then looks at the
      * count): a holder either counts before the gate shut or sees it and backs off. */
-    if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive && !__atomic_load_n(&suspended_,__ATOMIC_SEQ_CST))
+    if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive && !__atomic_load_n(&suspended_,__ATOMIC_SEQ_CST) && !qualificationBlocked())
         return kIOReturnSuccess;
     __atomic_fetch_sub(&refs_,1u,__ATOMIC_SEQ_CST);
     /* Shut: wait for the resume without the mutex (suspend() and resume() take it), polled every millisecond. */
     for(uint64_t waited=0;suspended() && waited<uint64_t(config_.suspendWaitMs)*1000u;waited+=1000)env_.sleepUs(env_.context,1000);
 #else
-    if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive)return kIOReturnSuccess;
+    if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive && !qualificationBlocked())return kIOReturnSuccess;
     __atomic_fetch_sub(&refs_,1u,__ATOMIC_SEQ_CST);
 #endif
     lock();
@@ -117,6 +120,7 @@ IOReturn A830PowerState::acquire()
     case A830PowerSlumber: result=wakeLocked(A830WakeSubmit);break;
     default: result=A830ReturnNotResponding;break;   /* down, recovering, lost (transitions hold the mutex) */
     }
+    if(qualificationBlocked())result=A830ReturnNotResponding;
     if(result==kIOReturnSuccess)__atomic_fetch_add(&refs_,1u,__ATOMIC_SEQ_CST);
     unlock();
     return result;
@@ -252,6 +256,8 @@ uint64_t A830PowerState::tick(uint64_t now)
 
 IOReturn A830PowerState::wake(A830WakeReason reason)
 {
+    checkQualification();
+    if(qualificationBlocked())return A830ReturnNotResponding;
     lock();
     const IOReturn result=wakeLocked(reason);
     unlock();
@@ -457,7 +463,8 @@ IOReturn A830PowerState::bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t
     at(A830WakeStepGmu);
     if(!ops_.gmuStart || !ops_.cpStart || !ops_.secureResume)return kIOReturnUnsupported;
     /* cxLost stays set until a GMU start succeeds: every attempt after a collapse reloads the whole firmware. */
-    const A830GmuStartArgs args={level,bus,ifpcWanted_,rsccSlept_,cxLost_};
+    limitQualification(level,bus);
+    const A830GmuStartArgs args={level,bus,ifpcWanted_,rsccSlept_,cxLost_,&level,&bus};
     result=ops_.gmuStart(ops_.context,&args,subStep);
     if(result!=kIOReturnSuccess)return result;
     rsccSlept_=false;cxLost_=false;cxRestored_=false;

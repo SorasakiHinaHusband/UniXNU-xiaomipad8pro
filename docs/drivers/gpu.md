@@ -505,3 +505,15 @@ The backing selection is announced on the direct startup IOLog channel, before t
 of newly observed hardware fence seqnos, including completions whose latency stamps aged out, excluding recovery skips and forced
 completions. Repeated waits, display queries and IRQ/DCVS observations do not count a completion twice. This counter starts when
 the accountant starts and is separate from caller WaitFence timeouts (including polls) and display fence deadlines.
+
+The explicit `piano-gpu-r3b=1` switch selects the bounded R3b-607 engineering thermal contract only with the existing
+level-7/607 qualification configuration. One 100 ms eight-channel guard owns the 80 C soft / 75 C continuous-2 s up /
+85 C hard policy, with a 250 ms snapshot lease; normal down steps are at least 500 ms apart and stop at a 342 MHz ceiling.
+Board msm/quiet limits 62/37 C cap at 342; two fresh 60/35 C rounds release that cap. Hard 65/40 C board limits, invalid
+or stale sensors and ACK faults close submissions and use the strict-off / fresh 160 MHz M9 / boot-sticky342 recovery.
+105 C invokes the independent unsafe halt. R3b THERM/LIVE/WORK/EVENT records extend the read-only C5LOG export with guard
+peaks, cap changes, cumulative acknowledged residency and queue/service costs. These are experimental parameters,
+not a measured skin-temperature bound or daily qualification; other modes retain their existing thermal policy.
+The guard sequence counts consecutive VALID TSENS register reads; the hardware exposes no conversion sequence here,
+so this is not evidence of an independent ADC conversion per read. DISPLAY period records keep copy/composition costs
+separate from WORK queue residence and service costs.

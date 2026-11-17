@@ -145,6 +145,7 @@ public:
     IOReturn resetQueues();
     /* The GMU is going down (forced off, slumber done): no message until the next resetQueues()/start(). */
     void stop();
+    void qualificationLimiter(void (*limit)(void *,uint8_t &,uint8_t &),void *context) {qualLimit_=limit;qualContext_=context;}
     void qualification(bool enabled) {qualification_=enabled;}
     bool armDropAck() {
         if(!qualification_ || __atomic_exchange_n(&dropUsed_,true,__ATOMIC_ACQ_REL))return false;
@@ -244,6 +245,8 @@ private:
     uint32_t version_=0;
     bool ready_=false,started_=false,ab_=false,first_ack_=false,pending_=false;
     bool late_done_=false;    /* the last failure was drained already (drainLate) */
+    void (*qualLimit_)(void *,uint8_t &,uint8_t &)=nullptr;
+    void *qualContext_=nullptr;
     bool qualification_=false,dropUsed_=false,dropArmed_=false;
     uint8_t level_=0,bus_=0,pending_level_=0,pending_bus_=0;
     uint32_t gx_levels_=0;    /* GX entries of the tables start() sent (level bound of perfVote) */

@@ -443,6 +443,11 @@ IOReturn A830Hfi::acdLocked(const A830VoteTables &tables)
 
 IOReturn A830Hfi::perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message)
 {
+    if(qualLimit_) {
+        uint8_t boundedLevel=level==A830HfiNoVote?level_:level,boundedBus=uint8_t(bw);
+        qualLimit_(qualContext_,boundedLevel,boundedBus); // after M1..M8 / mutex wait, immediately before enqueue
+        level=boundedLevel;bw=(bw&~255u)|boundedBus;
+    }
     const uint32_t payload[3]={A830_HFI_GX_BW_PERF_ACK_BLOCK,level,bw};
     const IOReturn result=transact(A830_HFI_H2F_GX_BW_PERF_VOTE,payload,3,nullptr,step,message,false);
     if(result!=kIOReturnSuccess) {++stats_.vote_failures;return result;}

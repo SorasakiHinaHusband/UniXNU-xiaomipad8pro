@@ -916,6 +916,18 @@ int main()
             CHECK(h.perfVote(3,3)!=0 && h.stats().late_drains==0);
         }
     }
+    // R3b: the limiter executes under the HFI lock, after bootstrap, immediately before the real M9/runtime queue write.
+    {
+        A830Hfi h;boot(h);uint8_t cap=1;
+        h.qualificationLimiter([](void *p,uint8_t &l,uint8_t &b) {
+            const uint8_t c=*static_cast<uint8_t *>(p);if(l>c) {l=c;b=c==3?3:2;}
+        },&cap);
+        fw.scripts[A830_HFI_H2F_TABLE].delay=100;
+        CHECK(h.start(annibaleTables,3,3)==0 && h.currentLevel()==1 && h.currentBus()==2);
+        CHECK(fw.received.back()[2]==1 && fw.received.back()[3]==2 && h.stats().level_acks[1]==1);
+        cap=2;CHECK(h.perfVote(3,3)==0 && h.currentLevel()==2 && h.currentBus()==2);
+        CHECK(fw.received.back()[2]==2 && fw.received.back()[3]==2 && h.stats().level_acks[2]==1);
+    }
     std::printf("PASS: A830Hfi queues, wrap and 0xFAFAFAFA padding, whole-header ACK match, v5 answers, F2H handling (reason "
                 "16/22), 1 s timeout, NMI and CM3 exits, M1-M9 encodings, perf/slumber votes, dbg drain under the lock "
                 "(design); 4-entry perf table, no M7, M9 {1,1,2}, strict FEATURE_CTRL and short ACKs, bit 0/2 poll clear, "
