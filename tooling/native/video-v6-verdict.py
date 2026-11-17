@@ -50,7 +50,7 @@ def evaluate(console, tool, manifest):
     require('PASS original-one-golden-callback ' in tool, 'original golden')
     require('PASS cancel-had-pending ' in tool and 'PASS no-callback-after-invalidate ' in tool, 'cancel and joined new epoch')
     require(re.search(r'V6 resume session .* BITSTREAM RAW cause DRAIN', console) is not None, 'actual drain resume')
-    require(re.search(r'V6 drain barrier session .* ACK LAST pending0 terminal0', console) is not None, 'nonterminal barrier')
+    require(re.search(r'V6: drain barrier session .* ACK LAST pending0 terminal0', console) is not None, 'nonterminal barrier')
     # A retained console may replay its boot. Exact duplicate evidence lines do
     # not count twice; protocol duplicates still fail the real kernel ledger.
     closes = set(re.findall(r'V6 native close session ([^\n\r]+)', console))
