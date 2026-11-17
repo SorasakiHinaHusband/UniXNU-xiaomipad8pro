@@ -1567,6 +1567,8 @@ static void testKick()
 // The production session supplements the firmware model with independent UCSI RDO readback. ACK and contract may disagree.
 struct StrictSim : Sim {
   bool contractValid = true, sourceValid = true, contractFollows = true, contractObserving = false;
+  bool notifyPending = false;
+  uint64_t notifyMs = 0;
   bool iclReadable = true, busReadable = true;
   uint32_t contractGen = 1, contractLink = 1, contractMv = 5000, contractMa = 3000;
   uint32_t fixed9 = 3000, pps9 = 3000, safe = PIANO_CHG_SAFE_ALL, faults = 0;
@@ -1579,6 +1581,7 @@ struct StrictSim : Sim {
     if (sourceValid) in.valid |= PIANO_CHG_IN_SOURCE;
     if (!iclReadable) in.valid &= ~PIANO_CHG_IN_ICL;
     if (!busReadable) in.valid &= ~PIANO_CHG_IN_BUS;
+    in.contract_notify_pending = notifyPending; in.contract_notify_ms = notifyMs;
     in.contract_observing = contractObserving;
     in.contract_generation = contractGen;
     in.contract_link_generation = contractLink;
@@ -1607,12 +1610,41 @@ struct StrictSim : Sim {
 
 static void testContractSession()
 {
+  // An idle UCSI notification may be a delayedACK rather than a connector change. Inspect CCI behind100mA, without renewing a storm.
+  {
+    StrictSim s; s.run(); CHECK(s.st.hv == PIANO_CHG_HV_ON);
+    s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false;
+    s.step(1000); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl <= 100 && s.fcc <= 500);
+    CHECK(!s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));
+    s.notifyPending = false; s.contractValid = true;
+    s.step(1000); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600 && s.busMv == 9000);
+    s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false;
+    for (int i = 0; i < 4; ++i) {s.step(1000); CHECK(s.busMv == 9000 && !s.wrote(PIANO_CHG_PD_FIXED)); s.notifyMs = s.now;}
+    s.step(1000); CHECK(s.busMv == 5000 && s.wrote(PIANO_CHG_PD_FIXED,5000)); // input timer renewal cannot extend the latched bound
+  }
+  {
+    StrictSim s; s.run(); s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false;
+    s.step(1000); CHECK(s.busMv == 9000);
+    s.notifyPending = false; s.contractGen++; // CCI has now confirmed an actual connector change; observation privilege ends
+    s.step(1000); CHECK(s.busMv == 5000 && s.wrote(PIANO_CHG_PD_FIXED,5000));
+  }
+  {
+    StrictSim s; s.run(); s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false; s.cfg.admin_stop = 1;
+    s.step(1000); CHECK(s.enable == 0 && s.st.hv != PIANO_CHG_HV_ON);
+    s.step(1000); CHECK(s.busMv == 5000); // health stop outranks notification observation
+  }
   // An inherited HV source may belong to a running firmware pump. Read-only CP off must precede even a5V withdrawal.
   {
     StrictSim s; s.busMv = 9000; s.contractMv = 9000; s.safe &= ~PIANO_CHG_SAFE_CP_OFF;
     for (int i = 0; i < 8; ++i) {s.step(); CHECK(!s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));}
     CHECK(s.busMv == 9000 && s.icl <= 500 && s.fcc <= 500 && s.plan.transition);
     s.safe |= PIANO_CHG_SAFE_CP_OFF; s.step(); CHECK(s.wrote(PIANO_CHG_PD_FIXED,5000) && s.busMv == 5000);
+  }
+  {
+    StrictSim s; s.run(); s.safe &= ~PIANO_CHG_SAFE_CP_OFF;
+    s.step(); CHECK(s.busMv == 9000 && !s.wrote(PIANO_CHG_PD_FIXED));
+    s.safe |= PIANO_CHG_SAFE_CP_OFF; s.step();
+    CHECK(s.busMv == 5000 && s.icl <= 500 && s.wrote(PIANO_CHG_PD_FIXED,5000)); // restore obligation survives safety recovery
   }
   {
     StrictSim s; s.run(); CHECK(s.busMv == 9000);

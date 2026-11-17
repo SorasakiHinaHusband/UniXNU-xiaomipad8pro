@@ -715,7 +715,7 @@ static int gauge_fresh(const PianoChargeInput *in, uint64_t now)
 /* Current UCSI session authorization. Source advertisements alone never authorize draw. */
 static int strict_contract(const PianoChargeInput *in)
 {
-    return (in->valid & PIANO_CHG_IN_CONTRACT) && in->contract_generation &&
+    return (in->valid & PIANO_CHG_IN_CONTRACT) && !in->contract_notify_pending && in->contract_generation &&
            in->contract_link_generation == in->generation &&
            (in->contract_protocol == 1 || in->contract_protocol == 2) &&
            in->contract_mv >= 4500 && in->contract_mv <= 10000 &&
@@ -757,6 +757,12 @@ static void strict_fallback(const PianoChargeInput *in, PianoChargeState *s, Pia
 static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p,
                           const Temps *t, uint64_t now, int charge_ok)
 {
+    s->voltage_observe_hold = 0;
+    if (!in->contract_notify_pending) {s->contract_notify_seen = 0; s->contract_notify_since = 0;}
+    else if (!s->contract_notify_seen) {
+        s->contract_notify_seen = 1;
+        s->contract_notify_since = in->contract_notify_ms;
+    } else if (in->contract_notify_ms < s->contract_notify_since) s->contract_notify_since = in->contract_notify_ms;
     const int contract = strict_contract(in);
     const int at5 = contract && in->contract_protocol == 1 && in->contract_mv < HV_5V_MAX_MV &&
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < HV_5V_MAX_MV;
@@ -784,22 +790,44 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
         strict_fallback(in, s, p, !charge_ok ? PIANO_CHG_FALLBACK_HEALTH : PIANO_CHG_FALLBACK_MODE);
         return 0;
     }
+    /* A withdrawn voltage must reach5V before any re-adoption of HV. Otherwise a recovered safety input could cancel the
+     * barrier while an older5V request is still pending, raising current immediately before that request executes. */
+    if (s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000 &&
+        (!at5 || s->volt_set_prop != PIANO_CHG_PD_FIXED || s->volt_set_value != 5000 ||
+         (s->pending & (1u << PIANO_CHG_S_VOLT)))) {
+        strict_fallback(in, s, p, PIANO_CHG_FALLBACK_READBACK);
+        return 0;
+    }
     if (!contract) {
+        const int healthy = gauge_fresh(in, now) && t->valid &&
+                            (in->safety & PIANO_CHG_SAFE_ALL) == PIANO_CHG_SAFE_ALL && !in->faults &&
+                            t->cool >= 15 && t->warm <= 45 && !s->conn_hot && !s->chgr_hot &&
+                            (in->valid & PIANO_CHG_IN_VERIFY) && in->verify == 0 &&
+                            (in->valid & PIANO_CHG_IN_FV) && in->fv_raw == piano_charge_fv_raw(PIANO_CHG_FV_DEFAULT);
+        const int notify_observing = in->contract_notify_pending && s->hv == PIANO_CHG_HV_ON &&
+                                     now >= in->contract_notify_ms && now >= s->contract_notify_since &&
+                                     now - s->contract_notify_since < 5000 && healthy &&
+                                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_MIN_MV && in->bus_mv <= HV_MAX_MV;
+        if (notify_observing) {
+            s->voltage_observe_hold = 1;
+            s->contract_transition = 1;
+            s->transition_ma = PIANO_CHG_ICL_DEFAULT;
+            p->fallback = PIANO_CHG_FALLBACK_NO_CONTRACT;
+            return 0;
+        }
         /* A requested voltage change necessarily invalidates the old RDO while UCSI rereads it. This is a short observation
          * gap, not authority to draw or request more: only the already issued request may settle behind a 100mA limit. */
         const int observing = in->contract_observing && s->hv == PIANO_CHG_HV_ASKED &&
-                              now < s->hv_asked_ms + HV_SETTLE_MS && gauge_fresh(in, now) && t->valid &&
-                              (in->safety & PIANO_CHG_SAFE_ALL) == PIANO_CHG_SAFE_ALL && !in->faults &&
-                              t->cool >= 15 && t->warm <= 45 && !s->conn_hot && !s->chgr_hot &&
-                              (in->valid & PIANO_CHG_IN_VERIFY) && in->verify == 0 &&
-                              (in->valid & PIANO_CHG_IN_FV) && in->fv_raw == piano_charge_fv_raw(PIANO_CHG_FV_DEFAULT);
+                              now < s->hv_asked_ms + HV_SETTLE_MS && healthy;
         if (observing) {
             s->contract_transition = 1;
             s->transition_ma = PIANO_CHG_ICL_DEFAULT;
             p->fallback = PIANO_CHG_FALLBACK_NO_CONTRACT;
             return 0;
         }
-        const int expired = s->hv == PIANO_CHG_HV_ASKED && now >= s->hv_asked_ms + HV_SETTLE_MS;
+        const int expired = (s->hv == PIANO_CHG_HV_ASKED && now >= s->hv_asked_ms + HV_SETTLE_MS) ||
+                            (s->hv == PIANO_CHG_HV_ON && in->contract_notify_pending &&
+                             now >= s->contract_notify_since && now - s->contract_notify_since >= 5000);
         if (s->hv == PIANO_CHG_HV_ASKED) s->hv = PIANO_CHG_HV_BLOCKED;
         strict_fallback(in, s, p, expired ? PIANO_CHG_FALLBACK_TIMEOUT : PIANO_CHG_FALLBACK_NO_CONTRACT);
         return 0;
@@ -1452,7 +1480,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     }
     const int new_hv_write = s->volt_want_prop == PIANO_CHG_PPS ||
                              (s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value != 5000);
-    if (strict_voltage_ready(c, in, s) &&
+    if (strict_voltage_ready(c, in, s) && (!c->strict_contract || !s->voltage_observe_hold) &&
         (!c->strict_contract || !new_hv_write || strict_contract(in))) plan_volt(c, s, p, now);
     if (charge_ok) {
         if (s->disabled && !kick_holding(s, now)) plan_enable(c, in, s, p, now, 1);

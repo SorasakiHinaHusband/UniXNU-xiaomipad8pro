@@ -171,6 +171,8 @@ typedef struct {
     /* Validated UCSI session, distinct from source advertisements and measured draw. */
     uint32_t contract_generation, contract_link_generation, contract_mv, contract_ma;
     uint32_t fixed9_ma, pps9_ma;   /* raw source PDO/APDO budgets at 9V, only with IN_SOURCE */
+    uint64_t contract_notify_ms; /* first unresolved notification, monotonic; repeated notifications cannot renew it */
+    uint8_t contract_notify_pending;
     uint8_t contract_observing;   /* active bounded UCSI reread after a change; never a failed or quarantined transport */
     uint8_t contract_protocol;    /* 1=fixed, 2=PPS; decoded using the selected raw PDO */
     uint32_t safety;              /* SAFE_*: valid and safe, not absence of a driver */
@@ -214,6 +216,8 @@ typedef struct {
     uint8_t soc_failures, fw_block;
     uint32_t contract_generation;
     uint8_t contract_mode, contract_transition, contract_mode_change, contract_recheck;
+    uint8_t contract_notify_seen, voltage_observe_hold;
+    uint64_t contract_notify_since;
     uint32_t transition_ma;
     uint8_t handover_fault;       /* refusal/timeout is not successful hardware handover */
     /* the float voltage */
