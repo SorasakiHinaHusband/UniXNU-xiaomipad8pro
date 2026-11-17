@@ -28,14 +28,22 @@ typedef struct {
 #else
 #define PIANO_AUDIO_ABI_ASSERT _Static_assert
 #endif
-PIANO_AUDIO_ABI_ASSERT(sizeof(mach_msg_header_t) == 24, "Mach header ABI");
+/* XNU's internal ports are pointers: its 32-byte header is deflated to the
+ * 24-byte user header on copyout. Keep the 40-byte body intact in both ABIs. */
+#ifdef KERNEL
+PIANO_AUDIO_ABI_ASSERT(sizeof(mach_msg_header_t) == 32, "kernel Mach header ABI");
+#else
+PIANO_AUDIO_ABI_ASSERT(sizeof(mach_msg_header_t) == 24, "user Mach header ABI");
+#endif
 PIANO_AUDIO_ABI_ASSERT(sizeof(PianoAudio2ControlNotification) == 32, "IOAudio2 record ABI");
-PIANO_AUDIO_ABI_ASSERT(sizeof(PianoAudio2NotificationMessage) == 64, "IOAudio2 message ABI");
-PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2NotificationMessage, count) == 0x1c, "IOAudio2 count offset");
-PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2NotificationMessage, entry) == 0x20, "IOAudio2 entries offset");
+PIANO_AUDIO_ABI_ASSERT(sizeof(PianoAudio2NotificationMessage) == sizeof(mach_msg_header_t) + 40, "IOAudio2 native message ABI");
+PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2NotificationMessage, count) == sizeof(mach_msg_header_t) + 4, "IOAudio2 count offset");
+PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2NotificationMessage, entry) == sizeof(mach_msg_header_t) + 8, "IOAudio2 entries offset");
 PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2ControlNotification, controlID) == 0, "IOAudio2 UCID offset");
 PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2ControlNotification, event) == 4, "IOAudio2 event offset");
 PIANO_AUDIO_ABI_ASSERT(offsetof(PianoAudio2ControlNotification, value) == 8, "IOAudio2 value offset");
+PIANO_AUDIO_ABI_ASSERT(sizeof(PianoAudio2NotificationMessage) - sizeof(mach_msg_header_t) + 24 == 64,
+                       "IOAudio2 user wire message ABI");
 #undef PIANO_AUDIO_ABI_ASSERT
 
 static inline void piano_audio_control_notification(PianoAudio2NotificationMessage *message,

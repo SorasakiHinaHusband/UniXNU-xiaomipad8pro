@@ -29,6 +29,32 @@ static int receiver(const void *wire, size_t bytes, uint32_t id, int32_t value)
     return 1;
 }
 
+// Replay the XNU kernel's 32-byte pointer-port header and its copyout
+// contraction to a 24-byte user header. The body bytes come from the actual
+// serializer above, not a second hand-written cval body.
+static void kernel_copyout(const PianoAudio2NotificationMessage *actual, unsigned char wire[64])
+{
+    struct KernelMessage {
+        uint32_t bits, size;
+        uint64_t remote, local;
+        uint32_t voucher, id;
+        unsigned char body[40];
+    } kernel;
+    _Static_assert(sizeof kernel == 72, "kernel message replay size");
+    _Static_assert(offsetof(struct KernelMessage, body) == 32, "kernel body replay offset");
+    memset(&kernel, 0, sizeof kernel);
+    kernel.bits = actual->header.msgh_bits;
+    kernel.size = sizeof kernel;
+    kernel.remote = actual->header.msgh_remote_port;
+    memcpy(kernel.body, (const unsigned char *)actual + 24, 40);
+    const uint32_t user_header[6] = {
+        kernel.bits, kernel.size - 8, (uint32_t)kernel.remote,
+        (uint32_t)kernel.local, kernel.voucher, kernel.id
+    };
+    memcpy(wire, user_header, 24);
+    memcpy(wire + 24, kernel.body, 40);
+}
+
 int main(void)
 {
     CHECK(PIANO_AUDIO_CONTROL_BASE_LEVEL == 0x6c65766cU);
@@ -44,6 +70,10 @@ int main(void)
         memset(&message, 0xa5, sizeof message);
         piano_audio_control_notification(&message, 123, 1, (uint32_t)applied);
         CHECK(receiver(&message, sizeof message, 1, (int32_t)raw));
+        unsigned char wire[64];
+        kernel_copyout(&message, wire);
+        CHECK(receiver(wire, sizeof wire, 1, (int32_t)raw));
+        CHECK(memcmp(wire, &message, sizeof wire) == 0);
         const unsigned char *b = (const unsigned char *)&message;
         CHECK(word(b, 0) == 19 && word(b, 8) == 123);
         CHECK(word(b, 12) == 0 && word(b, 16) == 0 && word(b, 20) == 0);
@@ -63,6 +93,9 @@ int main(void)
         memset(&message, 0xa5, sizeof message);
         piano_audio_control_notification(&message, 123, 2, (uint32_t)applied);
         CHECK(receiver(&message, sizeof message, 2, (int32_t)raw));
+        unsigned char wire[64];
+        kernel_copyout(&message, wire);
+        CHECK(receiver(wire, sizeof wire, 2, (int32_t)raw));
     }
     // Old property-address sender: 56 bytes, cval where count belongs.
     uint32_t old[14] = {19, 56, 123, 0, 0, 0, 0, 0x6376616c, 0x6f757470, 0, 1};
