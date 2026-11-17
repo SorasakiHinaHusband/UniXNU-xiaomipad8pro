@@ -469,6 +469,7 @@ class Power {
           // disable_power, but leaving the request asserted poisons the next power-up after a firmware run: clear it
           // while the wrapper is still accessible before disabling the clocks and domain.
           ops.wr(kIris + kCpuNocLpiCtl, 0, "CPU NoC LPI: request withdrawn after timeout (cycle-safe)");
+          ops.hw.note("power-off: CPU NoC request readback %08x after timeout (cycle-safe)", ops.rd(kIris + kCpuNocLpiCtl));
           break;
         }
         ops.wr(kIris + kCpuNocLpiCtl, 0, "CPU NoC LPI: request withdrawn");

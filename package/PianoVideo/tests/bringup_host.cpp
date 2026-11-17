@@ -1291,6 +1291,10 @@ static void testV2CpuLpiTimeoutCleanup()
   CHECK(x.m->count("lpi cpu") == 3);
   CHECK((x.m->R(kIris + kCpuNocLpiCtl) & kLpiReq) == 0);
   CHECK(x.m->logged("CPU NoC LPI: request withdrawn after timeout (cycle-safe)"));
+  unsigned readbacks = 0;
+  for (const auto &line : x.m->lines)
+    readbacks += line == "power-off: CPU NoC request readback 00000000 after timeout (cycle-safe)";
+  CHECK(readbacks == 3);
 }
 
 static void testV2Refusals()
