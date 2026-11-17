@@ -23,6 +23,7 @@ int main() {
   CHECK(!vtcontract::extent(0,UINT64_MAX,240,320,92160));
   vtcontract::Surface s; s.base=0x1000;s.size=115200;s.id=1;s.format=vtwire::cc("420v");s.planes=2;
   s.plane[0]={320,240,0,320,0};s.plane[1]={160,120,76800,320,0}; CHECK(vtcontract::surface(s));
+  const auto allocation=s.size;s.size=uint64_t(vtcontract::kMaxSurfaceBytes)+1;CHECK(!vtcontract::surface(s));s.size=allocation;
   s.plane[1].nonlinear=1;CHECK(!vtcontract::surface(s));s.plane[1].nonlinear=0;
   s.plane[1].offset=76801;CHECK(!vtcontract::surface(s));
   vtcontract::State st; CHECK(!st.accept());st.started=true;CHECK(st.accept());CHECK(!st.accept());CHECK(st.success());

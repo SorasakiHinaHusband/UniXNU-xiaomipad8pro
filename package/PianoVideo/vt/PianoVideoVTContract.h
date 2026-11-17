@@ -10,6 +10,7 @@ constexpr uint32_t kMaxAuBytes = 1u << 20;
 // Permit a bounded oversized-sample envelope so VT receives a synchronous
 // dfrm error and its send channel remains usable for the following valid AU.
 constexpr uint32_t kMaxMessageBytes = 4u << 20;
+constexpr uint32_t kMaxSurfaceBytes = 4u << 20; // bounded task wiring for the tiny qualification pool
 constexpr uint32_t kParameterBytes = 35; // start4+SPS22+start4+PPS5
 inline bool atoms(const uint8_t *p, uint32_t n) {
   const uint8_t *at = p, *end = p + n;
@@ -115,7 +116,7 @@ struct Surface {
   uint64_t base = 0, size = 0; uint32_t id = 0, format = 0, planes = 0; Plane plane[2];
 };
 inline bool surface(const Surface &s) {
-  return s.base && s.size && s.base <= UINT64_MAX-s.size && s.format == vtwire::cc("420v") && s.planes == 2 &&
+  return s.base && s.size && s.size <= kMaxSurfaceBytes && s.base <= UINT64_MAX-s.size && s.format == vtwire::cc("420v") && s.planes == 2 &&
     s.plane[0].width == 320 && s.plane[0].height == 240 && s.plane[1].width == 160 && s.plane[1].height == 120 &&
     !s.plane[0].nonlinear && !s.plane[1].nonlinear &&
     extent(s.plane[0].offset,s.plane[0].stride,240,320,s.size) && extent(s.plane[1].offset,s.plane[1].stride,120,320,s.size) &&
