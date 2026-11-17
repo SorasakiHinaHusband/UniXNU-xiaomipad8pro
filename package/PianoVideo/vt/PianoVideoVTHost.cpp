@@ -182,8 +182,8 @@ void worker(void *arg,wait_result_t) {
     if(s->stopping)break;
     if(s->inputReady){s->inputReady=false;s->busy=true;IOLockUnlock(s->lock);frame(s);IOLockLock(s->lock);s->busy=false;continue;}
     if(s->finishWanted){
-      const uint64_t finish=s->finishRequest;s->finishWanted=false;s->state.finish();IOLockUnlock(s->lock);
-      const int nativeRC=piano_video_native_finish(s->native);if(nativeRC)failure(s,71,nativeRC);
+      const uint64_t finish=s->finishRequest;const bool accepted=s->state.accepted;s->finishWanted=false;s->state.finish();IOLockUnlock(s->lock);
+      const int nativeRC=accepted?piano_video_native_finish(s->native):0;if(nativeRC)failure(s,71,nativeRC);
       const int rc=nativeRC?nativeRC:s->firstError;
       Header h;h.type=cc("dfin");h.request=finish;memcpy(h.uuid,s->uuid,16);status(s->client,h,rc?kDecodeError:0);
       IOLog("PianoVideoVT V5a: terminal dfin session %u status %d no-restart 1\n",s->native,rc);IOLockLock(s->lock);
@@ -261,7 +261,11 @@ void inventory(Client *c,const Header &h) {
 }
 void properties(Client *c,const Header &h,bool value) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[512];int root;
-  if(value)root=p->boolean(c->session&&c->session->state.started&&!c->session->state.cancelled);
+  if(value){
+    Session *s=c->session;bool hardware=false;
+    if(s){IOLockLock(s->lock);hardware=s->state.started&&!s->state.cancelled;IOLockUnlock(s->lock);}
+    root=p->boolean(hardware);
+  }
   else{
     const int keys[]={p->string("PropertyType"),p->string("ReadWriteStatus")};const int values[]={p->string("Boolean"),p->string("ReadOnly")};
     const int name=p->string("UsingHardwareAcceleratedVideoDecoder"),type=p->dict(keys,values,2);root=p->dict(&name,&type,1);
@@ -315,7 +319,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
   }else if(!owned){if(h.flags&FlagRequest)status(c,h,kBadState);}
   else switch(h.type){
     case cc("dsta"):status(c,h,start(s,m,n));break;
-    case cc("dcan"):{ImageDescription d;const bool can=s->state.started&&!s->state.cancelled&&descriptor(m,n,d);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);send(c,w,b);IOLog("PianoVideoVT V5a: dcan ,can %u side-effect-free 1\n",unsigned(can));break;}
+    case cc("dcan"):{ImageDescription d;IOLockLock(s->lock);const bool active=s->state.started&&!s->state.cancelled;IOLockUnlock(s->lock);const bool can=active&&descriptor(m,n,d);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);send(c,w,b);IOLog("PianoVideoVT V5a: dcan ,can %u side-effect-free 1\n",unsigned(can));break;}
     case cc("dsts"):case cc("dtil"):status(c,h,kUnsupported);IOLog("PianoVideoVT V5a: tiles rejected before-DMA 1\n");break;
     case cc("dfrm"):{const int error=queue(s,m,n);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),error);w.u32(cc(",inf"),error?0:1);send(c,w,b);break;}
     case cc("dfin"):{IOLockLock(s->lock);const bool schedule=s->workerRunning&&!s->stopping&&!s->finishWanted&&!s->state.terminal;if(schedule){s->finishWanted=true;s->finishRequest=h.request;s->state.finish();IOLockWakeup(s->lock,&s->busy,false);}IOLockUnlock(s->lock);if(!schedule)status(c,h,s->state.terminal?0:kBadState);break;}
