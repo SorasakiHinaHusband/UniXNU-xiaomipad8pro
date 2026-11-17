@@ -688,7 +688,9 @@ keeps quick off/on and leave/join requests from skipping teardown. Existing save
 
 The 27.3 ABI is power24 bytes, optional disassociate12 bytes and deauth16 bytes. The voluntary disconnect notification is
 LINK_CHANGED4 with exactly32 bytes (down at0, involuntary at0x10, reason at0x14, subreason at0x18), also returned by GET156.
-POWER_CHANGED1 follows coherent GET19; station mode remains1 while off. Current GET state and last-notified state are
+POWER_CHANGED1 follows coherent GET19; station mode remains1 while off. AppleAssociate2 polls GET21 rather than waiting for
+event9: a canceled join returns terminal2, and a new accepted profile generation returns pending0 before the worker consumes
+it. This prevents the previous station's retained success/failure from completing the new request. Current GET state and last-notified state are
 separate, so a poll cannot consume an event before it is posted. Association-event storage is separate from request scratch.
 
 Host coverage includes three station teardown cycles in firmware order, power/leave intent races, ABI validation and
