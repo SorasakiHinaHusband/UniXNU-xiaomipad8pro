@@ -787,3 +787,16 @@ runtime type encodings, plus exported symbol names that are only cited: no Apple
 client model come from libssc (GPL-3.0) and Android's sensor behaviour (the reporting modes, one client per sensor) as specification
 only, Linux's qrtr and QMI interface (GPL-2.0) for what a gone client means; the RAM image's carrier follows UniXNU's addon layout
 (`scripts/make-gpu-addon.py`, DarwinBoot's `GpuAddon` slot) as a format; the kext inflates it with libkern's own zlib.
+
+### Passive shared-edge snapshots
+
+With `piano-sensors=4`, sens-trace2 registers five root-only, read-only string sysctls under `machdep`:
+`piano_glink_fifo`, `piano_smem_state`, `piano_smem_crash`, `piano_glink_owner`, and `piano_sensors_faults`.
+Each read includes version/start/end uptime and explicit validity. FIFO indices and SMEM443/429/423 are read afresh;
+SMMU stream matches/context/global faults come from the existing mapping, without clearing faults or changing routes.
+The owner copy has a sequence/indices consistency check (three attempts, no wait); failed checks are unavailable evidence.
+Up to 16 pending TX frame boundaries are decoded. Raw bytes stop at protocol headers (FastRPC40B, QRTR/QMI39B or PMIC12B),
+never file data, SUID or calibration; crash text is separately limited to 80 bytes. Each export is capped at 64KiB.
+IPCC reads only CONFIG; counters/last values observe existing receive/clear/send calls. Enable strobes are recorded requests,
+not mask readbacks; remote mask/pending/ACK and independent watchdog state remain unknown. No new doorbell or SMP2P ACK is issued.
+These are diagnostic interfaces, not a repair or evidence that sensors work on the tablet.

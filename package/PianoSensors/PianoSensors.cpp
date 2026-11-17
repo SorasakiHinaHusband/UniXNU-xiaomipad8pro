@@ -41,6 +41,8 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <PianoObserveSysctl.h>
+#include "SensorsFaultObserve.h"
 #include <libkern/zlib.h>
 #include <machine/machine_routines.h>
 #include <PianoAdspContract.h>
@@ -256,6 +258,22 @@ void streamsOf(uint32_t bank, uint16_t out[4])
   out[1] = uint16_t(base + 0x80);
   out[2] = uint16_t(base + 0x40);
   out[3] = uint16_t(base + 0x60);
+}
+
+// Read request uses only the existing permanent mapping. It never calls mapSmmu/applySmmu.
+int sysctlFaults(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  return pianoobserve::readOnly(req, [](pianoobserve::Text &t) {
+    t.add("sens-trace2 version=1 export=smmu start_ms=%llu mapped=%u\n", (unsigned long long)nowMs(), gSmmuVa != 0);
+    if (!gSmmuVa) t.add("status=unmapped\n");
+    else {uint16_t sids[4]; streamsOf(gArgs.bank, sids); sensorsobserve::faults(t, smmuRead, kSmmuBytes, sids);}
+    t.add("end_ms=%llu truncated=%u\n", (unsigned long long)nowMs(), t.truncated);
+  });
+}
+void registerFaultObserve()
+{
+  static struct sysctl_oid oid;
+  pianoobserve::registerReadOnly(oid, "piano_sensors_faults", 0, sysctlFaults);
 }
 
 char gSmmuText[200] = "not read";
@@ -870,6 +888,7 @@ bool PianoSensors::start(IOService *provider)
          "piano-rotate=%u piano-rotate-test=%u", gArgs.als, gArgs.rotate, gArgs.accelHz, gArgs.accelBatch, gArgs.axesText,
          gArgs.axesOk ? "" : " (not a map: the default " PS_ACCEL_AXES ")", gArgs.backlight, gArgs.backlightAuto, gArgs.rotateAgent,
          gArgs.rotateTest);
+  if (gArgs.level == 4) registerFaultObserve();
   gSelf = this;
   setProperty("piano-sensors", gArgs.level, 32);
   registerService();   // consumers (PianoBacklight's automatic mode, piano-rotated) find the service by matching
