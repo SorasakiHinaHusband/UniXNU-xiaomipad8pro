@@ -322,7 +322,7 @@ int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
 int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   if(!contract::inputRequest(m,n,r,&s->config))return kBadData;
   IOLockLock(s->lock);
-  if(!s->started||s->stopping||s->finishWanted||s->frames.pending==pianovideo::stream::Credits||s->frames.find(uint64_t(r.token))){
+  if(!s->started||s->stopping||s->firstError||s->finishWanted||s->frames.pending==pianovideo::stream::Credits||s->frames.find(uint64_t(r.token))){
     IOLockUnlock(s->lock);r.decision="state-or-credit-or-duplicate";return kBadState;
   }
   // Reserve under the session lock before allocating. Even a rejected ninth
@@ -338,7 +338,9 @@ int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   const unsigned index=unsigned(record-s->frames.frames);s->inputs[index]={input,normalized};
   const unsigned pending=s->frames.pending;
   char digest[65];hash(input,normalized,digest);
-  IOLockUnlock(s->lock);
+  // Successful admission returns with the session lock held through reply
+  // enqueue/publication. Error paths unlock themselves. This also prevents an
+  // unrelated worker failure from settling an unpublished frame too early.
   IOLog("PianoVideoVT V6: accepted session %u token %llu flags %u normalized-bytes %u SHA256 %s pending %u SW-cap 8388608\n",s->native,uint64_t(r.token),r.flags,normalized,digest,pending);
   droidvm_vthost_frames_in=droidvm_vthost_frames_in+1;return 0;
 }
@@ -447,7 +449,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
       // No work is visible to the worker until its dfrm reply is enqueued.
       // Otherwise an enqueue failure could trigger PV's fallback emit after
       // the worker has already emitted that same frame (especially rejects).
-      IOLockLock(s->lock);
+      if(error)IOLockLock(s->lock);
       const bool scheduled=error&&r.hasToken&&!r.transportReject&&(r.flags&1)&&s->workerRunning&&!s->stopping&&
         !s->frames.find(uint64_t(r.token))&&s->rejected.count<contract::RejectedFrames::Capacity;
       if(error&&!scheduled){IOLockUnlock(s->lock);IOLockUnlock(c->lock);return error;}

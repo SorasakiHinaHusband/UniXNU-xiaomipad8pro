@@ -376,6 +376,7 @@ static void admissionPublication() {
   l.cancel();CHECK(l.pending==0&&!l.publish(0x5678));
 }
 int main() {
+  admissionPublication();
   ledgerTests();guestTests();ownerTests();persistentTests();firstPscTests();omittedPscTests();delayedGuestTests();drainPictureTests();noOutputTests();capacityTests();
   for(unsigned i=0;i<16;++i)negativeTests(i);
   staleRetiredTests();timeoutTests(true);timeoutTests(false);cancelTests();idleTests();
