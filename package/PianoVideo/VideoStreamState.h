@@ -5,7 +5,7 @@
 #include <stdint.h>
 namespace pianovideo { namespace stream {
 constexpr unsigned Credits = 8, Inputs = 2, Raws = 64;
-enum class Phase : uint8_t { Free, Queued, Submitted, Picture, Delivering };
+enum class Phase : uint8_t { Free, Queued, Submitted, Picture, Delivering, Emitted };
 struct Record {
   uint64_t token = 0, serial = 0;
   uint32_t flags = 0;
@@ -49,6 +49,22 @@ struct Ledger {
   bool drained() {if(!drainReady()||pending||!loansEmpty())return false;draining=false;paused=true;return true;}
   bool resume() {if(stopped||draining||pending||!paused)return false;paused=ack=last=false;return true;}
   void cancel() {stopped=true;for(auto &f:frames)if(f.phase!=Phase::Free){f.phase=Phase::Free;++cancelled;}pending=0;}
+};
+// One guest request at a time. An epoch belongs to one session UUID; IDs never
+// reset within it. No blocking wait is required to keep pumping firmware.
+struct Guest {
+  uint64_t request=0, deadline=0;
+  uint32_t type=0;
+  bool replied=false, stopped=false;
+  bool begin(uint64_t id,uint32_t t,uint64_t now) {
+    if(stopped||!id||!t||(type&&!replied))return false;
+    request=id;type=t;deadline=now+2000;replied=false;return true;
+  }
+  bool matches(uint64_t id,uint32_t t) const {return !stopped&&type&&id==request&&t==type&&!replied;}
+  bool reply(uint64_t id,uint32_t t) {if(!matches(id,t))return false;replied=true;return true;}
+  bool expired(uint64_t now) const {return type&&!replied&&now>=deadline;}
+  void clear(){request=deadline=0;type=0;replied=false;}
+  void cancel(){clear();stopped=true;}
 };
 // Exclusivity is independent of per-picture credits. Quiesce failure is sticky.
 struct Owner {

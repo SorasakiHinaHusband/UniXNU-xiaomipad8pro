@@ -264,6 +264,7 @@ public:
       if (r.psc || r.stage != FirstPsc)
         return fail(kErrHfi, Settings);
       psc = Psc{};
+      if(streaming){psc.poc=expectedPoc;psc.profile=expectedProfile;psc.level=expectedLevel;}
     }
     picture = 0;
     frameError = false;
@@ -478,7 +479,7 @@ public:
     if (streaming) {
       if (cleanup) return; // cancellation never delivers a late success
       const uint64_t returnedToken = uint64_t(v[8]) | (uint64_t(v[9]) << 32);
-      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 7) || (picture & ~7u) ||
+      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 15) || (picture & ~15u) ||
           outputCount == stream::Credits || !ledger.picture(returnedToken,b->index)) {
         fail(kErrHfi, Buffers, p[2], p[4], p[5], header); return;
       }

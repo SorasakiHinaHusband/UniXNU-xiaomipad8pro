@@ -5,7 +5,7 @@
 #pragma once
 #include <stdint.h>
 class IOMemoryDescriptor;
-namespace pianovideo { namespace native {
+namespace pianovideo { namespace avc { struct Config; } namespace native {
 struct Layout {
   uint32_t width = 320, height = 240, stride = 384, scanlines = 256;
   uint32_t yOffset = 0, uvOffset = 98304, bytes = 147456;
@@ -16,6 +16,7 @@ struct Frame {
   const volatile uint8_t *cpu = nullptr; // borrowed WC mapping, valid until release
   uint32_t length = 0, iova = 0;
   uint64_t token = 0;
+  uint32_t index = ~0u;
   Layout layout;
 };
 } }
@@ -23,14 +24,18 @@ extern "C" {
 bool piano_video_native_ready(void);
 // Reserve the exclusive core without powering it. Native session IDs are fresh.
 int piano_video_native_open(uint32_t *session);
-// Worker-only, synchronous bounded operations; selector3 must never invoke these.
-// decode copies and ETBs the supplied normalized Annex-B AU with the caller token.
-int piano_video_native_decode(uint32_t session, const uint8_t *bytes, uint32_t size, uint64_t token,
-                              pianovideo::native::Frame *frame);
-void piano_video_native_frame_release(uint32_t session, pianovideo::native::Frame *frame);
-// Terminal: ACK+LAST required, no restart. decode may already have sent DRAIN to
-// release a delayed first frame; finish validates/completes that same transaction.
-int piano_video_native_finish(uint32_t session);
+// Worker-only. First submit prepares V3 once and starts the persistent session;
+// subsequent submissions return 1 for input back-pressure, without mutation.
+int piano_video_native_submit(uint32_t session, const uint8_t *bytes, uint32_t size, uint64_t token,
+                              const pianovideo::avc::Config *format);
+// Always pump HFI, including while the guest owes Dbuf/Demt. 0=picture, 1=none.
+int piano_video_native_poll(uint32_t session, pianovideo::native::Frame *frame);
+int piano_video_native_frame_release(uint32_t session, pianovideo::native::Frame *frame);
+void piano_video_native_cancel(uint32_t session);
+int piano_video_native_drain(uint32_t session);
+// 1=ACK+LAST and inputs returned, 0=pending, negative=error. Explicit no-output
+// tokens are returned individually only after the ACK/LAST fence.
+int piano_video_native_drain_status(uint32_t session, uint64_t *noOutputToken);
 // Always attempts STOP/CLOSE and PAS/routes/TLB teardown. On unconfirmed quiesce
 // all DMA and dependencies remain retained and subsequent opens are refused.
 int piano_video_native_close(uint32_t session);
