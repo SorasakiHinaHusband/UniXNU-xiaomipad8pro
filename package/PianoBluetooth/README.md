@@ -2,7 +2,7 @@
 
 The Qualcomm WCN7860's Bluetooth side for native macOS 27 on piano: a 4-wire UART on QUP2 SE6 (`serial@898000`, "UART14", SPI 461)
 to the chip, BT_EN on GPIO 3 of the pm8550ve "f" PMIC (SPMI SID 5, PPID 0x58a), the PMU's six rails shared with PianoWifi through
-`package/include/PianoWcnRails.h`. Levels 1–4 built, host-tested and linked; **not run on the tablet yet**.
+`package/include/PianoWcnRails.h`. Levels 1–3 passed a tablet boot; level 4 remains host-tested. Level 5 adds the POSIX H4 endpoint for the separately staged macOS 27.3 runtime; its tablet result is pending.
 
 - `piano-bt=1`: a read-only survey: the QUP2 vote word and the five branch clocks of the wrapper and SE6, the SE6 clock source
   (RCG, DFS levels), the UART's four pins and the PMU's WLAN_EN / SW_CTRL, the wrapper's version and SE6's registers (only when
@@ -16,6 +16,13 @@ to the chip, BT_EN on GPIO 3 of the pm8550ve "f" PMIC (SPMI SID 5, PPID 0x58a), 
 - `piano-bt=4`: the controller: HCI_Reset, the QCA version, 3.2 Mbit/s, the rampatch and NVM read at run time from the tablet's own
   `bluetooth_a`, logging off, HCI_Reset, the build label, the unit's address from the locally built ADT (private, never logged),
   HCI_Reset again, Read Local Version. The controller then idles (no host stack yet).
+- `piano-bt=5`: the level-4 controller at fixed 3.2 Mbit/s, IBS disabled, followed by a persistent byte-stream worker and
+  `/dev/cu.BLTH` (root:wheel 0600, one open). The daemon's termios/IOSSIOSPEED calls record line settings; the worker owns the
+  actual hardware configuration. RX backpressure retains bytes and leaves the hardware FIFO untouched when full. BlueTool's
+  `kern.qbt_power_on` read queues an acknowledgement on the same worker; it does not repeat firmware download on an already
+  initialized controller. Publishes `bluetooth` with OSData transport properties and the same valid address written to HCI,
+  and releases the `PianoBluetoothStack` resource for the separately gated Apple consumer. Only level 5 derives a stable locally
+  administered address from the chosen chip identifier when no private ADT address was supplied. Addresses are never logged.
 - From level 2 the driver joins the power tree: system sleep takes the radio down (BT_EN low, the UART stopped, its clock votes and
   the rails let go), the wake climbs the ladder again. Every failure leaves the radio off the same way.
 
@@ -29,6 +36,8 @@ batched tablet test list with its expected lines: `docs/drivers/bluetooth.md`.
 | `GeniUart.h` | portable: the GENI/UART registers and decoders; level 1's survey and its gates (no store); the pure plans: the serial clock for a baud rate, the UART set-up writes, the SE6 RCG entry, FIFO word packing, the RX status |
 | `BtBringup.h` | portable: levels 2..4 over callbacks (powerOn, uartUp, controllerUp, bringUp), the polled GENI UART, safeOff |
 | `BtRpmh.h` | portable: one VRM transaction on apps DRV-2 (the rails when Bluetooth comes first) |
+| `QbtTty.c`, `qbt_transport.h` | BSD POSIX H4 frontend from UniXNU QcaBluetooth; see `NOTICE.md` |
+| `Address.h` | private-address validation and the domain-separated stable local fallback for level 5 |
 | `BtFirmware.c`, `BtFirmware.h` | `bluetooth_a`/`_b` through NativeUfs's partition reader and PianoPower's FatVolume.c, read only |
 | `HciH4.h` | portable: H4 encoding and the incremental decoder (IBS bytes between packets, resynchronisation, bounded packets) |
 | `QcaCodec.h` | portable: the QCA vendor commands and replies, file names, the NVM tag patcher, the download plan, the controller set-up sequence (steps 400..412) over callbacks |

@@ -188,6 +188,7 @@ struct Port {
   unsigned evHead = 0, evCount = 0;
   uint8_t *raw = nullptr;              // the loopback test's capture: raw bytes instead of the decoder
   size_t rawCap = 0, rawHave = 0;
+  uint64_t backpressurePolls = 0;
 };
 
 namespace detail {
@@ -239,6 +240,13 @@ inline size_t portPoll(Port &p)
   using namespace detail;
   const RxStatus rs = decodeRxStatus(seRd(p, kRxFifoStatus));
   if (!rs.words) return 0;
+  // A raw owner must make room before popping any FIFO word. The GENI's hardware RFR
+  // watermark holds the controller while the owner's downstream byte FIFO is full.
+  const size_t bytes = size_t(rs.words) * 4 - (rs.last ? 4 - rs.lastBytes : 0);
+  if (p.raw && (p.rawHave > p.rawCap || bytes > p.rawCap - p.rawHave)) {
+    ++p.backpressurePolls;
+    return 0;
+  }
   size_t total = 0;
   for (uint32_t w = 0; w < rs.words; ++w) {
     uint8_t b[4];

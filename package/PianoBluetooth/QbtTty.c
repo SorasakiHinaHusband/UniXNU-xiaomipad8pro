@@ -49,6 +49,7 @@ struct bt_termios64 {
     uint32_t pad;
     uint64_t ispeed,ospeed;
 };
+_Static_assert(sizeof(struct bt_termios64) == 72, "27.3 termios64 ABI");
 static struct qbt_transport_ops bt_ops;
 static LCK_GRP_DECLARE(bt_tty_grp,"unixnu.bt.tty");
 static LCK_MTX_DECLARE(bt_tty_lock,&bt_tty_grp);

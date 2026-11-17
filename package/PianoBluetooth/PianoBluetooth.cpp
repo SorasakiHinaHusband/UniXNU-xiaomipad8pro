@@ -44,6 +44,9 @@
 #define PIANO_WCN_RAILS_KERNEL
 #include <PianoWcnRails.h>
 #include "BtBringup.h"
+#include "Address.h"
+#include "qbt_transport.h"
+#include <sys/errno.h>
 #include "BtFirmware.h"
 #include "BtRpmh.h"
 #include "GeniUart.h"
@@ -100,6 +103,13 @@ void readArgs()
   gArgs.blind = bootArg("piano-bt-blind", 0);
   gArgs.addr = bootArg("piano-bt-addr", 1);
   gArgs.stop = bootArg("piano-bt-stop", 0);
+  if (gArgs.level == 5) {
+    // This endpoint is a fixed, already initialized H4 line; in-band sleep is not
+    // a byte protocol the Apple POSIX client understands.
+    gArgs.baud = kOperBaud;
+    gArgs.ibs = 0;
+    gArgs.addr = 1;
+  }
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -779,18 +789,17 @@ uint8_t gAddress[6];
 bool readAddress()
 {
   IORegistryEntry *e = IORegistryEntry::fromPath(kAddressNode, gIODTPlane);
-  if (!e) return false;
-  OSData *d = OSDynamicCast(OSData, e->getProperty(kAddressProperty));
-  bool ok = d && d->getLength() == 6;
-  if (ok) memcpy(gAddress, d->getBytesNoCopy(), 6);
-  e->release();
-  if (!ok) return false;
-  bool zero = true, ones = true;
-  for (uint8_t b : gAddress) {
-    zero = zero && b == 0;
-    ones = ones && b == 0xff;
-  }
-  return !zero && !ones && !(gAddress[0] & 1u);   // a unicast address that is not all zeros or all ones
+  OSData *d = e ? OSDynamicCast(OSData, e->getProperty(kAddressProperty)) : nullptr;
+  const bool copied = d && d->getLength() == 6;
+  if (copied) memcpy(gAddress, d->getBytesNoCopy(), 6);
+  if (e) e->release();
+  if (copied && addressValid(gAddress)) return true;
+  if (gArgs.level != 5) return false;  // levels 1..4 retain their private-input-only contract
+  e = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+  d = e ? OSDynamicCast(OSData, e->getProperty("unique-chip-id")) : nullptr;
+  const bool ok = d && deriveAddress(static_cast<const uint8_t *>(d->getBytesNoCopy()), d->getLength(), gAddress);
+  if (e) e->release();
+  return ok;
 }
 
 Bringup gB;   // the port's buffers (3 KiB): a global, not on the kernel stack
@@ -921,10 +930,22 @@ class PianoBluetooth : public IOService {
   void run();
   void survey();
   void levels();
+  bool publishRadio();
+  void transportResult();
+  void pump();
+  static void transportWake(void *);
+  static int transportPower(void *, bool);
   static void thread(void *self, wait_result_t);
   IOLock *fLock = nullptr;
   bool fWant = false, fSuspended = false, fJoined = false;
   unsigned fRuns = 0;
+  bool fTransport = false, fPowerRequest = false;
+  int fBootError = EAGAIN;
+  IOService *fRadio = nullptr;
+  uint64_t fNextStats = 0;
+  uint64_t fTxPackets = 0, fRxPackets = 0, fCompletions = 0, fLeReports = 0;
+  H4Decoder fTxDecoder, fRxDecoder;
+  size_t fObserved = 0;
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
@@ -955,7 +976,7 @@ bool PianoBluetooth::start(IOService *provider)
     note("levels: 1 survey, 2 power%s%s (baud %u, peri %u, ibs %u, reset0 %u, loop %u, release %u, blind %u, addr %u, stop %u)",
          gArgs.level >= 3 ? ", 3 UART" : "", gArgs.level >= 4 ? ", 4 controller" : "", gArgs.baud, gArgs.peri, gArgs.ibs, gArgs.reset0,
          gArgs.loop, gArgs.release, gArgs.blind, gArgs.addr, gArgs.stop);
-  if (gArgs.level > 4) note("piano-bt=%u: levels above 4 are not implemented; running up to level 4", gArgs.level);
+  if (gArgs.level > 5) note("piano-bt=%u: levels above 5 are not implemented; running up to level 4", gArgs.level);
   note("level 1: loads only, nothing written (the SPMI observer's read command is the only store)");
   setProperty("piano-bt", gArgs.level, 32);
   fLock = IOLockAlloc();
@@ -963,10 +984,27 @@ bool PianoBluetooth::start(IOService *provider)
     stage(-1, "no lock");
     return true;
   }
+  if (gArgs.level == 5) {
+    if (!publishRadio()) {
+      stage(-500, "bt-path1: no valid address or bluetooth service; the H4 endpoint stays absent");
+      return true;
+    }
+    const qbt_transport_ops ops = {this, transportWake, transportPower};
+    const int error = qbt_transport_init(&ops);
+    if (error) {
+      note("bt-path1: transport initialization failed (%d)", error);
+      return true;
+    }
+    fTransport = true;
+    publishResource("PianoBluetoothStack", this);
+    note("bt-path1: bluetooth service published, address present, POSIX H4 endpoint requested at 3200000");
+  }
   if (gArgs.level >= 2) fJoined = pianopower::join(this) == kIOReturnSuccess;   // kOff takes the radio down before a sleep
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoBluetooth::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
+    fBootError = ENOMEM;
+    if (fTransport) transportResult();
     return true;
   }
   thread_deallocate(t);
@@ -977,6 +1015,128 @@ void PianoBluetooth::thread(void *self, wait_result_t)
 {
   thread_set_thread_name(current_thread(), "piano-bt");
   static_cast<PianoBluetooth *>(self)->run();
+}
+
+// The service's name is the actual IOServiceNameMatching contract in 26C5035r.
+// Its three wire properties are OSData, not OSNumber or formatted address text.
+bool PianoBluetooth::publishRadio()
+{
+  if (!readAddress()) return false;
+  IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/bluetooth", gIODTPlane);
+  IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+  const uint32_t encoding = 1, baud = kOperBaud;
+  bool ok = node && chosen && node->setProperty("local-mac-address", gAddress, 6) &&
+            chosen->setProperty("mac-address-bluetooth0", gAddress, 6);
+  if (node) {
+    ok = ok && node->setProperty("transport-encoding", &encoding, sizeof encoding) &&
+               node->setProperty("transport-speed", &baud, sizeof baud);
+    node->release();
+  }
+  if (chosen) chosen->release();
+  if (!ok) return false;
+  IOService *radio = new IOService;
+  if (!radio) return false;
+  if (!radio->init()) { radio->release(); return false; }
+  radio->setName("bluetooth");
+  ok = radio->setProperty("device_type", "bluetooth") &&
+       radio->setProperty("transport-encoding", &encoding, sizeof encoding) &&
+       radio->setProperty("transport-speed", &baud, sizeof baud) &&
+       radio->setProperty("local-mac-address", gAddress, 6);
+  if (!ok || !radio->attach(IOService::getPlatform())) { radio->release(); return false; }
+  fRadio = radio;
+  radio->registerService();
+  return true;
+}
+
+void PianoBluetooth::transportWake(void *context)
+{
+  PianoBluetooth *self = static_cast<PianoBluetooth *>(context);
+  // The continuous worker polls at most 1 ms apart. Avoid taking fLock here:
+  // transport_result calls this while that same worker owns fLock.
+  IOLockWakeup(self->fLock, &self->fWant, true);
+}
+
+int PianoBluetooth::transportPower(void *context, bool enabled)
+{
+  PianoBluetooth *self = static_cast<PianoBluetooth *>(context);
+  if (!enabled) return ENOTSUP;
+  IOLockLock(self->fLock);
+  if (self->fSuspended) { IOLockUnlock(self->fLock); return ENETDOWN; }
+  self->fPowerRequest = true;
+  IOLockWakeup(self->fLock, &self->fWant, true);
+  IOLockUnlock(self->fLock);
+  return 0;
+}
+
+namespace {
+// The owner retains bytes the tty cannot take. portPoll refuses to pop a FIFO
+// snapshot unless it fits here, including when portSend polls RX while waiting.
+uint8_t gStream[16384], gTransportTx[512];
+}
+
+void PianoBluetooth::transportResult()
+{
+  if (!fBootError) {
+    gB.port.raw = gStream;
+    gB.port.rawCap = sizeof gStream;
+    // A repeated boot/power query must not discard bytes already in flight.
+    if (!gB.port.rawHave) fObserved = 0;
+  }
+  qbt_transport_boot_result(fBootError, gB.setup.build, kOperBaud);
+  setProperty("piano-bt-host-ready", fBootError == 0);
+  note("bt-path1: H4 controller %s error=%d (fixed 3200000, IBS disabled)", fBootError ? "unavailable" : "ready", fBootError);
+}
+
+void PianoBluetooth::pump()
+{
+  Port &p = gB.port;
+  auto flush = [&]() {
+    if (p.rawHave > fObserved) {
+      fRxDecoder.feed(gStream + fObserved, p.rawHave - fObserved, [&](uint8_t type, const uint8_t *packet, size_t bytes) {
+        if (!packet) return;
+        ++fRxPackets;
+        if (type == kH4Event && bytes >= 5 && packet[0] == kEvCommandComplete) {
+          ++fCompletions;
+          if (fCompletions <= 24) note("bt-path1: command complete opcode=%04x status=%02x", le16(packet + 3), bytes > 5 ? packet[5] : 255);
+        }
+        if (type == kH4Event && bytes >= 3 && packet[0] == 0x3e && (packet[2] == 2 || packet[2] == 0x0d)) ++fLeReports;
+      });
+      fObserved = p.rawHave;
+    }
+    const uint32_t taken = qbt_transport_receive(gStream, uint32_t(p.rawHave));
+    if (taken) {
+      memmove(gStream, gStream + taken, p.rawHave - taken);
+      p.rawHave -= taken;
+      fObserved -= taken;
+    }
+  };
+  flush();
+  (void)portPoll(p);
+  flush();
+  const uint32_t n = qbt_transport_tx_take(gTransportTx, sizeof gTransportTx);
+  if (n) {
+    fTxDecoder.feed(gTransportTx, n, [&](uint8_t, const uint8_t *packet, size_t) { if (packet) ++fTxPackets; });
+    const int rc = portSend(p, gTransportTx, n, 1000);
+    if (rc && rc != kBtCancelled) {
+      fBootError = EIO;
+      note("bt-path1: H4 TX failed (%d); endpoint unavailable", rc);
+      safeOff(gB, gHw, bringupOptions(4, false));
+      qbt_transport_power_result(false, EIO, nullptr, kOperBaud);
+      setProperty("piano-bt-host-ready", false);
+      return;
+    }
+    flush();
+  }
+  if (nowUs() >= fNextStats) {
+    fNextStats = nowUs() + 5000000;
+    setProperty("piano-bt-h4-rx-bytes", p.rxBytes, 64);
+    setProperty("piano-bt-h4-tx-bytes", p.txBytes, 64);
+    setProperty("piano-bt-h4-completions", fCompletions, 64);
+    setProperty("piano-bt-h4-le-reports", fLeReports, 64);
+    setProperty("piano-bt-h4-backpressure", p.backpressurePolls, 64);
+    note("bt-path1: H4 stats rx=%llu tx=%llu packets=%llu/%llu completions=%llu LE-reports=%llu retained=%lu backpressure=%llu TX-timeouts=%u",
+         p.rxBytes, p.txBytes, fRxPackets, fTxPackets, fCompletions, fLeReports, (unsigned long)p.rawHave, p.backpressurePolls, p.txTimeouts);
+  }
 }
 
 void PianoBluetooth::survey()
@@ -1056,10 +1216,12 @@ void PianoBluetooth::survey()
 void PianoBluetooth::levels()
 {
   unsigned level = gArgs.level > 4 ? 4 : gArgs.level;
+  fBootError = EIO;
   ++fRuns;
   note("levels 2..%u: climb %u%s", level, fRuns, fRuns > 1 ? " (after a wake)" : "");
   if (!mapWindows()) {
     stage(-200, "levels 2+: the windows could not be mapped; nothing was written");
+    if (fTransport) transportResult();
     return;
   }
   if (level >= 4) {
@@ -1079,6 +1241,11 @@ void PianoBluetooth::levels()
   if (level >= 4) note("level 4: %s", haveAddress ? "a private address is in this ADT: it will be set (never logged)"
                                                   : gArgs.addr ? "no usable private address in this ADT: the NVM's default stays"
                                                                : "piano-bt-addr=0: the NVM's default stays");
+  if (fTransport && !haveAddress) {
+    stage(-500, "bt-path1: controller identity unavailable; bring-up refused");
+    transportResult();
+    return;
+  }
   const Options o = bringupOptions(level, haveAddress);
   stage(200, "level 2: the shared rails and BT_EN");
   int rc = powerOn(gB, gHw, o);
@@ -1119,6 +1286,11 @@ void PianoBluetooth::levels()
   setProperty("piano-bt-state", state);
   note("state: %s; rails %#x", state, piano_wcn_load(&piano_wcn_rails_state));
   if (!rc) stage(int32_t(level * 100 + 99), "the ladder reached its level");
+  fBootError = !rc && level == 4 && gB.setup.step == kStepLocalVersion ? 0 : EIO;
+  if (fTransport) {
+    if (fBootError) safeOff(gB, gHw, bringupOptions(4, false));
+    transportResult();
+  }
 }
 
 void PianoBluetooth::run()
@@ -1135,12 +1307,24 @@ void PianoBluetooth::run()
     return;
   }
   IOLockLock(fLock);
-  fWant = true;
+  fWant = !fSuspended;
   for (;;) {
-    while (!fWant) IOLockSleep(fLock, &fWant, THREAD_UNINT);
-    fWant = false;
-    if (fSuspended) continue;
-    levels();
+    while (fSuspended || (!fWant && !fPowerRequest && (!fTransport || fBootError)))
+      IOLockSleep(fLock, &fWant, THREAD_UNINT);
+    if (fWant) {
+      fWant = false;
+      levels();
+    }
+    // A BlueTool request on an initialized controller only acknowledges the
+    // current result. It never races or repeats firmware download.
+    if (fPowerRequest) {
+      fPowerRequest = false;
+      transportResult();
+    }
+    if (fTransport && !fBootError && gB.up && !__atomic_load_n(&gAbort, __ATOMIC_ACQUIRE)) pump();
+    IOLockUnlock(fLock);
+    IOSleep(1);  // bounded polled FIFO; hardware RTS/CTS supplies backpressure
+    IOLockLock(fLock);
   }
 }
 
@@ -1152,7 +1336,12 @@ void PianoBluetooth::quiesce(const char *why)
   IOLockLock(fLock);
   const bool wasUp = gB.up;
   safeOff(gB, gHw, bringupOptions(gArgs.level, false));
+  gB.port.raw = nullptr;
+  gB.port.rawHave = 0;
+  fObserved = 0;
+  fBootError = ENETDOWN;
   fSuspended = true;
+  if (fTransport) qbt_transport_power_result(false, ENETDOWN, nullptr, kOperBaud);
   __atomic_store_n(&gAbort, false, __ATOMIC_RELEASE);
   IOLockUnlock(fLock);
   note("%s: the radio is off (%s; BT_EN low, the UART stopped, the clock votes and the rails let go; rails state %#x)", why,
@@ -1170,6 +1359,7 @@ IOReturn PianoBluetooth::setPowerState(unsigned long state, IOService *)
   if (fSuspended) {
     fSuspended = false;
     fWant = true;
+    fBootError = EAGAIN;
     IOLockWakeup(fLock, &fWant, true);
     note("wake: the ladder climbs again to level %u", gArgs.level > 4 ? 4 : gArgs.level);
   }

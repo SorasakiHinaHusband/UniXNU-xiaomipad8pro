@@ -31,7 +31,7 @@ if grep -nE 'kPinWlanEn[^;]*write|write[^;]*kPinWlanEn' "$P/BtBringup.h" "$P/Pia
   echo "Error: PianoBluetooth writes WLAN_EN" >&2; exit 1
 fi
 python3 "$D/tooling/k27/build-native-kext.py" PianoBluetooth "$P/PianoBluetooth.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/BtFirmware.c" "$D/package/PianoPower/FatVolume.c" "${INC[@]}" --obj "${K27_OBJ:-k27-native-obj}"
+  "$P/BtFirmware.c" "$P/QbtTty.c" "$D/package/PianoPower/FatVolume.c" "${INC[@]}" --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words (DRV-2, GCC votes) and the rails helper's two words, and NativeUfs's partition reader, come from those kexts
 # (libraries in PianoBluetooth.json, both linked before PianoBluetooth in configs/k27-native-kexts.txt), resolved by the KC link.

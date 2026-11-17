@@ -17,6 +17,7 @@
 //     five registers written, only this driver's vote bits withdrawn, the rails put on every failure.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoKeyboard -I../../include bt_bringup_host.cpp -o /tmp/bt_bringup_host
 #include "BtBringup.h"
+#include "Address.h"
 #include "BtRpmh.h"
 #include "PianoWcnRails.h"
 #include "QcaSim.h"
@@ -678,6 +679,50 @@ static void testFaults()
   }
 }
 
+// The persistent H4 owner can be backpressured after a partial tty write. A
+// full capture must leave the UART FIFO untouched; space later receives every
+// byte, including an ACL header/payload that the setup event queue would drop.
+static void testRawBackpressure()
+{
+  Board b;
+  const Hw hw = hwFor(b);
+  CHECK(bringUp(gB, hw, options(3), fwFor(b), gNvm, sizeof gNvm) == kBtOk);
+  uint8_t capture[64] = {};
+  gB.port.raw = capture;
+  gB.port.rawCap = sizeof capture;
+  gB.port.rawHave = sizeof capture - 4;
+  const uint8_t acl[] = {2, 1, 0x20, 3, 0, 0xaa, 0xbb, 0xcc};
+  for (uint8_t byte : acl) b.rxFifo.push_back(byte);
+  const uint64_t received = gB.port.rxBytes;
+  CHECK(portPoll(gB.port) == 0 && b.rxFifo.size() == sizeof acl);
+  CHECK(gB.port.rawHave == sizeof capture - 4 && gB.port.backpressurePolls == 1);
+  gB.port.rawHave = sizeof capture - sizeof acl;
+  CHECK(portPoll(gB.port) == sizeof acl && b.rxFifo.empty());
+  CHECK(gB.port.rawHave == sizeof capture && !memcmp(capture + sizeof capture - sizeof acl, acl, sizeof acl));
+  CHECK(gB.port.rxBytes == received + sizeof acl && gB.port.droppedPackets == 0);
+  // Include a last partial word in the reservation calculation.
+  b.rxFifo.push_back(0x04); b.rxFifo.push_back(0x10); b.rxFifo.push_back(0x01);
+  CHECK(portPoll(gB.port) == 0 && b.rxFifo.size() == 3);
+  gB.port.rawHave = sizeof capture - 3;
+  CHECK(portPoll(gB.port) == 3 && b.rxFifo.empty());
+  CHECK(capture[61] == 4 && capture[62] == 0x10 && capture[63] == 1);
+  gB.port.raw = nullptr;
+  gB.port.rawHave = 0;
+  safeOff(gB, hw, options(3));
+}
+
+static void testAddress()
+{
+  const uint8_t seed[8] = {1, 2, 3, 4, 5, 6, 7, 8}, zeros[8] = {};
+  uint8_t first[6], second[6];
+  CHECK(deriveAddress(seed, sizeof seed, first) && deriveAddress(seed, sizeof seed, second));
+  CHECK(!memcmp(first, second, 6) && addressValid(first) && (first[0] & 3) == 2);
+  CHECK(!deriveAddress(zeros, sizeof zeros, second) && !deriveAddress(seed, 7, second));
+  CHECK(!deriveAddress(nullptr, sizeof seed, second) && !addressValid(zeros));
+  first[0] |= 1;
+  CHECK(!addressValid(first));
+}
+
 // The RSC transaction against a TCS model: an idle TCS taken (2 first), the commands, the trigger, completion, the TCS back to idle;
 // a TCS that never completes is left and skipped next time.
 struct RscModel {
@@ -766,6 +811,8 @@ int main()
   testWifiFirst();
   testFaults();
   testRsc();
+  testRawBackpressure();
+  testAddress();
   if (failures) {
     std::printf("bt_bringup_host: %d failure(s)\n", failures);
     return 1;
