@@ -58,7 +58,7 @@ extern "C" {
 enum {
     PIANO_CHG_T_UNKNOWN = 0, PIANO_CHG_T_SDP = 1, PIANO_CHG_T_CDP = 2, PIANO_CHG_T_DCP = 3, PIANO_CHG_T_FLOAT = 4,
     PIANO_CHG_T_HVDCP = 5, PIANO_CHG_T_HVDCP3 = 6, PIANO_CHG_T_HVDCP3_B = 7, PIANO_CHG_T_HVDCP3P5 = 8, PIANO_CHG_T_TYPEC = 9,
-    PIANO_CHG_T_PD = 10, PIANO_CHG_T_PD_VERIFY = 11, PIANO_CHG_T_PPS = 12, PIANO_CHG_T_OCP = 15,
+    PIANO_CHG_T_PD = 10, PIANO_CHG_T_PPS = 11, PIANO_CHG_T_PD_VERIFY = 12, PIANO_CHG_T_OCP = 15,
 };
 
 /* What the policy makes of a type. */
@@ -105,6 +105,8 @@ typedef struct {
                             * only while a connector reads below 50 degC; a sag, a quick detach or a refusal lowers this boot's
                             * ceiling by one step. 0: the Rp limit at once, within icl_cap_ma, and a sag ends the trust */
     uint16_t rp_cap_ma;    /* the stepped Rp limit's ceiling (0: icl_cap_ma; at most PIANO_CHG_RP_ABS_MAX); only with ramp */
+    uint8_t strict_contract; /* production buck session: current UCSI contract and safety gates required for HV */
+    uint8_t admin_stop;    /* explicit administrator inhibit; owner bounds its lease, never a synthetic SOC */
     uint8_t kick;          /* the charging restart (piano-power-kick, docs §17): a charger that keeps the battery at 0 mA with input to
                             * spare gets 0x2003 = 0 and then 1 (at most three times per attach, two minutes apart) */
 } PianoChargeConfig;
@@ -115,6 +117,9 @@ void piano_charge_config_default(PianoChargeConfig *c);
 /* Preserve Battery Health: on/off and the thresholds (stop 50..100, resume 40..stop-1; resume 0 = stop - 5). Returns 0, or -1 when
  * the values are refused (the configuration is then unchanged). Stop 100 is the same as off. */
 int piano_charge_config_limit(PianoChargeConfig *c, unsigned on, unsigned stop_pct, unsigned resume_pct);
+/* Atomic validated configuration; no state reset, so threshold updates keep hysteresis memory. mode: 0=5V, 1=fixed, 2=PPS. */
+int piano_charge_config_transaction(PianoChargeConfig *c, unsigned on, unsigned stop_pct, unsigned resume_pct,
+                                    unsigned mode, unsigned admin_stop);
 
 /* valid bits of PianoChargeInput */
 enum {
@@ -125,9 +130,12 @@ enum {
      * unknown, never cool */
     PIANO_CHG_IN_NTC = 1u << 10, PIANO_CHG_IN_CHGR = 1u << 11, PIANO_CHG_IN_CONN1 = 1u << 12, PIANO_CHG_IN_CONN2 = 1u << 13,
     PIANO_CHG_IN_IBUS = 1u << 14,   /* the firmware's bus current (0x20004): whether the input is used up (the steps) */
+    PIANO_CHG_IN_CONTRACT = 1u << 16, PIANO_CHG_IN_SOURCE = 1u << 17,
     PIANO_CHG_IN_AICL = 1u << 15,   /* 0x2029, the input current the firmware holds itself to (it walks to the request, and on the Mac's
                                      * port stopped at 1750-1800 under 2000) */
 };
+enum {PIANO_CHG_SAFE_BOARD = 1u, PIANO_CHG_SAFE_CP_OFF = 2u, PIANO_CHG_SAFE_LPD_DRY = 4u,
+      PIANO_CHG_SAFE_DTPT = 8u, PIANO_CHG_SAFE_ALL = 15u};
 enum {PIANO_CHG_AWAKE = 0, PIANO_CHG_WILL_SLEEP = 1};
 
 typedef struct {
@@ -160,6 +168,12 @@ typedef struct {
     uint32_t rp_ma;
     /* the board thermistors, 0.1 degC: the battery's (joins the pack temperatures), the charger's, the two connectors' */
     int32_t t_ntc_dc, t_chgr_dc, t_conn1_dc, t_conn2_dc;
+    /* Validated UCSI session, distinct from source advertisements and measured draw. */
+    uint32_t contract_generation, contract_link_generation, contract_mv, contract_ma;
+    uint32_t fixed9_ma, pps9_ma;   /* raw source PDO/APDO budgets at 9V, only with IN_SOURCE */
+    uint8_t contract_protocol;    /* 1=fixed, 2=PPS; decoded using the selected raw PDO */
+    uint32_t safety;              /* SAFE_*: valid and safe, not absence of a driver */
+    uint32_t faults;              /* nonzero confirmed prohibited state (wet/ISC/SOA), not missing data */
 } PianoChargeInput;
 
 /* the write slots */
@@ -196,6 +210,11 @@ typedef struct {
     uint8_t hold, hot, cold, disabled, soc_lost, stop_noted, fw_noted;
     uint64_t soc_lost_ms, off_since_ms;
     uint8_t charge_ok;
+    uint8_t soc_failures, fw_block;
+    uint32_t contract_generation;
+    uint8_t contract_mode, contract_transition, contract_mode_change;
+    uint32_t transition_ma;
+    uint8_t handover_fault;       /* refusal/timeout is not successful hardware handover */
     /* the float voltage */
     uint8_t term_hot;
     /* the firmware losing a source the PMIC still sees (#18) */
@@ -234,7 +253,7 @@ enum {
     PIANO_CHG_EV_ATTACH = 1u << 0, PIANO_CHG_EV_DETACH = 1u << 1, PIANO_CHG_EV_TYPE = 1u << 2,
     PIANO_CHG_EV_HV_ASKED = 1u << 3, PIANO_CHG_EV_HV_ON = 1u << 4, PIANO_CHG_EV_HV_BLOCKED = 1u << 5, PIANO_CHG_EV_HV_RETRY = 1u << 6,
     PIANO_CHG_EV_LIMIT_STOP = 1u << 7, PIANO_CHG_EV_LIMIT_RESUME = 1u << 8, PIANO_CHG_EV_HOT = 1u << 9, PIANO_CHG_EV_COLD = 1u << 10,
-    PIANO_CHG_EV_SOC_LOST = 1u << 11,      /* no charge reading for 5 min: the limit cannot be enforced, charging goes on */
+    PIANO_CHG_EV_SOC_LOST = 1u << 11,      /* repeated gauge failures: conservative stop; known SOC hold remains */
     PIANO_CHG_EV_STOP_LEAK = 1u << 12,     /* stopped for a minute, 0x2003 reads 0, and the packs still take > 100 mA */
     PIANO_CHG_EV_FW_DISABLED = 1u << 13,   /* 0x2003 reads 0 although the policy never wrote 0: the firmware's own (not overridden) */
     PIANO_CHG_EV_GAVE_UP = 1u << 14,       /* a value refused 3 times in a row: left until the next attach, wake or generation */
@@ -280,11 +299,18 @@ enum {
     PIANO_CHG_KICK_EV_GAVE_UP = 1u << 4,   /* three restarts without charging: none more until the next attach, wake or generation */
     PIANO_CHG_KICK_EV_ABANDONED = 1u << 5, /* a write of the restart not answered within a minute: left to the enable's own rules */
 };
-enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP};
+enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP,
+      PIANO_CHG_OFF_ADMIN, PIANO_CHG_OFF_STALE, PIANO_CHG_OFF_FAULT, PIANO_CHG_OFF_FIRMWARE};
 /* where the input limit came from (plan.icl_why) */
 enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR};
 
+enum {PIANO_CHG_FALLBACK_NONE = 0, PIANO_CHG_FALLBACK_NO_CONTRACT, PIANO_CHG_FALLBACK_SAFETY,
+      PIANO_CHG_FALLBACK_GAUGE, PIANO_CHG_FALLBACK_HEALTH, PIANO_CHG_FALLBACK_MODE,
+      PIANO_CHG_FALLBACK_READBACK, PIANO_CHG_FALLBACK_TIMEOUT, PIANO_CHG_FALLBACK_SOURCE};
+
 typedef struct {
+    uint8_t fallback;             /* PIANO_CHG_FALLBACK_*; diagnostic, not a successful transition */
+    uint8_t transition;           /* reduced-current ACK/readback barrier active */
     PianoChargeWrite write[PIANO_CHG_MAX_WRITES];   /* in this order */
     uint8_t writes;
     /* what the policy wants now (for the log and the registry) */

@@ -29,8 +29,8 @@ static_assert(PIANO_CHG_ENABLE == PIANO_MCA_CHARGE_ENABLE && PIANO_CHG_FCC == PI
 static_assert(PIANO_CHG_FV == PIANO_MCA_TERM_VOLT && PIANO_CHG_PD_FIXED == PIANO_MCA_PD_FIXED);
 static_assert(int(PIANO_CHG_T_SDP) == int(PIANO_MCA_TYPE_SDP) && int(PIANO_CHG_T_CDP) == int(PIANO_MCA_TYPE_CDP) && int(PIANO_CHG_T_DCP) == int(PIANO_MCA_TYPE_DCP));
 static_assert(int(PIANO_CHG_T_FLOAT) == int(PIANO_MCA_TYPE_FLOAT) && int(PIANO_CHG_T_HVDCP3P5) == int(PIANO_MCA_TYPE_HVDCP_3P5));
-static_assert(int(PIANO_CHG_T_TYPEC) == int(PIANO_MCA_TYPE_C) && int(PIANO_CHG_T_PD) == int(PIANO_MCA_TYPE_PD) && int(PIANO_CHG_T_PPS) == int(PIANO_MCA_TYPE_PD_PPS));
-static_assert(int(PIANO_CHG_T_PD_VERIFY) == int(PIANO_MCA_TYPE_PD_VERIFY) && int(PIANO_CHG_T_OCP) == int(PIANO_MCA_TYPE_DCP_B));  // 15: one id, two names
+static_assert(int(PIANO_CHG_T_TYPEC) == int(PIANO_MCA_TYPE_C) && int(PIANO_CHG_T_PD) == int(PIANO_MCA_TYPE_PD) && int(PIANO_CHG_T_PPS) == 11);
+static_assert(int(PIANO_CHG_T_PD_VERIFY) == 12 && int(PIANO_CHG_T_OCP) == int(PIANO_MCA_TYPE_DCP_B));  // 15: one id, two names
 
 // ------------------------------------------------------------------------------------------------------- the firmware and source
 struct Sim {
@@ -715,7 +715,7 @@ static void testLimit()
     t.soc = 95;
     for (int i = 0; i < 5; ++i) { t.step(); CHECK(!t.wrote(PIANO_CHG_ENABLE) && !t.plan.hold_awake); }
   }
-  // no charge reading: the decision stands for 5 min, then charging goes on
+  // Lost gauges never release a known health hold, including after five minutes.
   {
     Sim t;
     t.cfg.limit = 1;
@@ -728,7 +728,7 @@ static void testLimit()
     t.step(299000);
     CHECK(!t.wrote(PIANO_CHG_ENABLE));
     t.step(1000);
-    CHECK((t.plan.events & PIANO_CHG_EV_SOC_LOST) && t.wrote(PIANO_CHG_ENABLE, 1) && !t.plan.hold_awake);
+    CHECK(t.st.hold && t.enable == 0 && !t.wrote(PIANO_CHG_ENABLE, 1) && !t.plan.hold_awake);
   }
   // the mode's hot and cold stops (55 / below 53, below 0 / 2)
   {
@@ -834,7 +834,7 @@ static void testSleep()
     s.step(100);
     CHECK(s.plan.writes == 0 && s.plan.sleep_ready);
   }
-  // a refused handover write is not waited for after its tries
+  // A refused handover is a fault, never a successful hardware acknowledgement.
   {
     Sim s;
     s.cfg.hv = 1;
@@ -844,7 +844,7 @@ static void testSleep()
     s.sleep = PIANO_CHG_WILL_SLEEP;
     bool ready = false;
     for (int i = 0; i < 6 && !ready; ++i) { s.step(100); ready = s.plan.sleep_ready; }
-    CHECK(ready && s.icl == 1600 && s.busMv == 5000);
+    CHECK(!ready && s.st.handover_fault && s.icl == 1600 && s.busMv == 5000);
   }
   // #18: after a wake the firmware sees no source while the PMIC does: re-sync twice, then report
   {
