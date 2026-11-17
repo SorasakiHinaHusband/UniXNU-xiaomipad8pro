@@ -58,3 +58,38 @@ Build: `tooling/k27/build-native-piano-audio.sh` (all host tests, the copies che
 check, `check-audio2-family.py`). PianoAudio is in `configs/k27-native-kexts.txt` after PianoPower and NativeUfs (whose functions it
 imports by name; its descriptor names both as libraries) and inert without `piano-audio`. No firmware, preset or topology is in the
 repository; the build pins the stock preset (size and SHA-256) and stages the owner's own copy in the ignored `out/firmware/`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
+
+## Reversible system sleep (host verified; tablet acceptance pending)
+
+`piano-audio-sleep=1` opts level 8–10 into one PianoAudio power-tree owner.
+A CPU assertion blocks sleep until the live hardware and the enabled k27 0064
+cancellation interface are ready. Each off request parks existing HAL readers,
+keeps their client intent and controls, fades/drains periods, and waits for the
+normal graph STOP/UNMAP/plan-owned clock release. Powered-down muted amplifiers
+keep their configuration. The same owner zeros the now-unmapped buffers and
+parks; it does not reset or restart the shared ADSP, or alter shared LPASS votes.
+On wake it remuxes pins, clears stale FIFO/sound state, rebuilds fresh plans on
+demand with generation tokens, and reanchors existing HAL status pages with a
+new seed. No HAL device, UID, control, user client or mapping is recreated.
+
+The 8-second drain budget includes charger quiet. An unresolved command, undo
+error, unhealthy DSP, or reader barrier failure cancels sleep and holds the CPU
+assertion. Uncertain DMA backing is retained; an unacknowledged MEM_MAP is never
+aborted just to claim park. That failed boot does not claim successful rearm.
+Initial on, off-before-on and repeated PM state requests are idempotent.
+
+`machdep.piano_audio_ledger` is a read-only, bounded 128-event speaker ledger.
+It records IO epoch boundaries, short reads/skips/slips and park/rearm, with
+exact missing frames and last producer, HAL, pump and monitor context. Refills
+only publish atomic memory words; the reader formats CSV outside that path.
+The header reports overwritten events, concurrent slot overwrite returns EAGAIN,
+and producer context unavailable during publication uses `producer_late_us=4294967295`.
+No PCM is recorded. Times ending in `_ms` share the tick's mach-absolute domain;
+`hal_host` is mach ticks. `slip` is signed two's complement in the unsigned CSV.
+A software short read is not a DSP hardware empty indication. Existing counters,
+FIFO geometry, timing, gain and mic algorithms remain unchanged.
+
+Host tests exercise three duplex sleep cycles, quiet overlap, ordered undo,
+control retention, a pending MAP reply, lost MAP retaining ownership, ledger
+wrap, and existing HAL/FIFO/safety cases. The tablet must still prove actual
+s2idle entry, timer wake and acoustic output after each wake.

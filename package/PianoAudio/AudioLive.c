@@ -849,8 +849,20 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
     if (l->held != l->was_held)
         LOG(l, l->held ? "live: dsp: PianoPower asks for quiet: nothing new goes to the DSP until it ends" : "live: dsp: quiet over");
     l->was_held = l->held;
-    spk_tick(l, now_ms);
-    mic_tick(l, now_ms);
+    if (l->sleeping && l->held) {
+        /* Shared charger quiet forbids new DSP packets, including undo. Mute
+         * locally once, keep receiving DONE, then continue drain when released.
+         * The PM owner's 8s deadline cancels an unbounded quiet. */
+        if (!l->sleep_quiet) {
+            l->sleep_quiet=1;
+            if (audio_amps_off(l->amps)) l->sleep_failed=1;
+            l->unmuted=0;
+            if (l->spk_state==LiveRunning) {l->spk_mode=SpkQuiet; l->spk_ending=1;}
+        }
+    } else if (!l->sleep_failed) {
+        spk_tick(l, now_ms);
+        mic_tick(l, now_ms);
+    }
     if (l->aborting && l->spk_state != LiveStarting && l->spk_state != LiveRunning && l->spk_state != LiveStopping &&
         l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping)
         finish(l, now_ms);
@@ -959,7 +971,7 @@ int audio_live_parked(AudioLive *l)
 
 int audio_live_rearm(AudioLive *l)
 {
-    if (!l->parked || audio_live_parked(l)!=1) return -1;
+    if (!l->parked || audio_live_parked(l)!=1 || !l->guard || l->guard->state!=AdgRun) return -1;
     if (l->ops.tdm_pins && l->ops.tdm_pins(l->ops.ctx,1)) return -1;
     audio_ring_reset(&l->sh->out); audio_ring_reset(&l->sh->in);
     store(&l->sh->sound,0); store(&l->sh->have_sound,0);

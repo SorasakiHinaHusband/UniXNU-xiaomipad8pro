@@ -342,3 +342,16 @@ before `sleep`.
 `tooling/k27/build-native-piano-policy.sh`, `tooling/k27/kext/PianoPolicy.json`, `configs/k27-native-kexts.txt`,
 `tooling/k27/build-policy-test-images.sh`, `tooling/native/piano-policy-agent/piano-policy-agent.sh` and its
 `com.unixnu.piano-policy-agent.plist` (installed by `configs/userland.toml`).
+
+### Explicit AC lid sleep opt-in
+
+`piano-policy-lid-sleep-ac=1` lets the sole PianoPolicy lid owner issue one
+`kIOPMSleepNow` demand request per eligible closed epoch on known external power,
+after reporting the real AC and clamshell state. The default remains lock only.
+Unknown power, absent sleep/lid-wake capability, a cover never seen open, and
+`piano-keyboard-lid` ownership conflict still prohibit this request. Powerd's
+clamshell masks remain its own. Physical hall polarity and full tablet recovery
+are acceptance gates; `piano-keyboard-hall-active-low` defaults to 1 from the
+third-party Linux DT, and every raw edge is logged even with poll tracing off.
+The first unattended sleep test leaves acting lid off and uses the existing
+kernel maximum-duration wake timer. Real cover acceptance is attended.

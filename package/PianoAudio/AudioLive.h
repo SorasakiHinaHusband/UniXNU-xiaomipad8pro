@@ -155,7 +155,7 @@ typedef struct {
     int va_on;
     /* ---- the exchange */
     uint32_t sends, queue_full, received, stray, timeouts;
-    int sleeping, parked, sleep_failed;
+    int sleeping, parked, sleep_failed, sleep_quiet;
     uint32_t sleep_generation, ledger_epoch, ledger_out, done_batch;
     uint32_t monitor_start, monitor_end, monitor_field;
     AudioLedger *ledger;   /* optional fixed allocation owned for the boot */
