@@ -106,10 +106,10 @@ inline const char *requestName(int32_t type)
 // Vendor Apple, class KEV_IEEE80211_CLASS (6), subclass 1, the data: the interface's name (16 bytes) and then the payload.
 // The codes are sheng's and AirportItlwm's historical ones (REPORT.md section 4: "prior-art evidence to test", not re-decoded).
 constexpr uint32_t kEventClass = 6, kEventSubclass = 1;
-// 27.3's IO80211 event vocabulary names the cache notification immediately
-// after SCAN_DONE.  Airportd's per-channel subset path waits for this cache
-// transition before completing its XPC request; the transport remains the
-// kernel-event socket while selector 5 (the IOUC event pipe) is zero.
+// This transport posts BSD kernel events, not the IO80211 internal event
+// ordinal table. In 27.3 airportd's BSD callback, 11 is COUNTRY_CODE_CHANGED
+// (which clears the scan cache); 15 is SCAN_CACHE_UPDATED. The synchronous
+// scan/association paths also drain GET11 and poll GET21, respectively.
 enum : uint32_t {
   kEvPowerChanged = 1,
   kEvSsidChanged = 2,
@@ -117,7 +117,7 @@ enum : uint32_t {
   kEvLinkChanged = 4,
   kEvAssocDone = 9,
   kEvScanDone = 10,
-  kEvScanCacheUpdated = 11,
+  kEvScanCacheUpdated = 15,
 };
 
 // Link-changed event4 and GET156: 27.3 airportd/CoreWiFi consume the same 32 bytes.
@@ -560,6 +560,14 @@ struct State {
   uint32_t acceptedUnknown = 0;   // requests answered only because of `accept`
   uint32_t sheng = 0;             // kSheng*: the UniXNU-sheng binding bits above (a runtime switch)
 };
+
+// A successful SET19 must notify even when it repeats the boot-on state:
+// airportd's event consumer initializes its cached power and scan clients.
+// A GET observes state; it cannot substitute for this notification.
+inline bool powerEventRequired(const State &s, bool power, bool acceptedSet = false)
+{
+  return acceptedSet || s.eventPower != power;
+}
 
 // Current GET state and last-notified state are separate: a GET arriving
 // before the periodic callback cannot swallow a pending link/power event.

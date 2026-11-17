@@ -123,7 +123,7 @@ class PianoWifi80211 : public IO80211Controller {
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
-  void syncAssociation(bool emit = true);
+  void syncAssociation(bool emit = true, bool powerSetAccepted = false);
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
   void noteIdentity(const char *why);
   void setOverride(bool on, bool onInterface);
@@ -672,7 +672,10 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
                                      power ? PIANO_WIFI_USER_ON : PIANO_WIFI_USER_OFF);
     // The coherent GET view and event baseline come from the same owner.
     // This also restores the old state if the owner refused the operation.
-    syncAssociation(true);
+    const bool powerSetAccepted = !a.error && (a.effects & kDoPowerChanged);
+    if (powerSetAccepted)
+      note80211("PianoWifiPowerAckV2 SET19 %s accepted: coherent power notification", power ? "on" : "off");
+    syncAssociation(true, powerSetAccepted);
   }
   // Every scan request and every list end, with a serial and the asking process (ADOPTION.md 6.1 item 3): that is how a
   // client's scan through airportd — CoreWLAN's, which came back empty in 15 ms — is told from airportd's own scheduled ones.
@@ -863,7 +866,8 @@ void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
     // this profile because selector 5 reports no IOUC event pipe.
     if (power) {
       self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
-      note80211("%s: scan cache updated event 11 posted before scan done", self->fIfName);
+      note80211("%s: PianoWifiPowerAckV2 scan cache updated BSD event %u posted before scan done", self->fIfName,
+                unsigned(pianowifi::a80211::kEvScanCacheUpdated));
     }
     self->postEvent(pianowifi::a80211::kEvScanDone);
   }
@@ -1000,7 +1004,7 @@ void PianoWifi80211::linkChanged(bool up)
 // Ethernet personality live in a separate kext and have no callback ABI to
 // the apple80211 front end.  Polling also covers roam/rejoin and a firmware
 // initiated leave uniformly.
-void PianoWifi80211::syncAssociation(bool emit)
+void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
 {
   using namespace pianowifi::a80211;
   if (!fState || !fSyncLock) return;
@@ -1029,7 +1033,7 @@ void PianoWifi80211::syncAssociation(bool emit)
        ssidChanged = false, stateChanged = false;
   IOLockLock(fLock);
   next.modern = fState->association.modern;
-  powerChanged = fState->eventPower != (raw.power != 0);
+  powerChanged = powerEventRequired(*fState, raw.power != 0, powerSetAccepted);
   old = observeAssociation(*fState, next, raw.power != 0, emit);
   LinkEvent link = {};
   link.down = next.authorized ? 0 : 1;

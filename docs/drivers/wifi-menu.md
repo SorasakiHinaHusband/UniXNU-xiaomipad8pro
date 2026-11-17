@@ -688,12 +688,17 @@ keeps quick off/on and leave/join requests from skipping teardown. Existing save
 
 The 27.3 ABI is power24 bytes, optional disassociate12 bytes and deauth16 bytes. The voluntary disconnect notification is
 LINK_CHANGED4 with exactly32 bytes (down at0, involuntary at0x10, reason at0x14, subreason at0x18), also returned by GET156.
-POWER_CHANGED1 follows coherent GET19; station mode remains1 while off. AppleAssociate2 polls GET21 rather than waiting for
+POWER_CHANGED1 follows every accepted SET19, including an already-on request, after the owner snapshot is coherent;
+station mode remains1 while off. This preserves airportd's power initialization and client notification even when the
+requested value did not change. The BSD cache-update notification is15: 27.3 airportd interprets11 as a country change,
+clears its scan cache and starts autojoin. These BSD numbers must not be inferred from the framework's internal event list.
+AppleAssociate2 polls GET21 rather than waiting for
 event9: a canceled join returns terminal2, and a new accepted profile generation returns pending0 before the worker consumes
 it. This prevents the previous station's retained success/failure from completing the new request. Current GET state and last-notified state are
 separate, so a poll cannot consume an event before it is posted. Association-event storage is separate from request scratch.
 
 Host coverage includes three station teardown cycles in firmware order, power/leave intent races, ABI validation and
 GET-before-notification ordering. This is source/model validation; real disconnect, physical off/on and automatic
-reconnection with DHCP/gateway/DNS still require the unattended wifi-power1 three-cycle RAM qualification. No result is
+reconnection with DHCP/gateway/DNS still require the unattended wifi-power3 three-cycle RAM qualification. The two earlier
+power runs stopped before association; they did not qualify disconnect cycles. No result is
 claimed for the installed system by this change.

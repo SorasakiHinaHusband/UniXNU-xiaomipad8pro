@@ -7,6 +7,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. apple80211_host.cpp -o /tmp/apple80211_host && /tmp/apple80211_host
 #include "WifiApple80211.h"
 #include "PianoWifiUcTransport.h"
+#include "WifiUserControl.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -115,6 +116,50 @@ struct Rig {
   }
 };
 
+// Replay the request/effect/owner/notification boundary, rather than merely
+// checking handle's effect bit. Firmware stop completion is explicit here;
+// the separate Sta suite verifies its actual command ordering.
+struct PowerRig : Rig {
+  WifiUserControl owner;
+  unsigned powerEvents = 0, downEvents = 0;
+  Power eventPower{};
+  void publish(bool acceptedPowerSet = false) {
+    const bool on = WifiUserControl::power(owner.read());
+    const bool notify = powerEventRequired(st, on, acceptedPowerSet);
+    Association next = st.association;
+    if (!owner.allowed(owner.read())) { next = {}; next.result = 2; }
+    const Association old = observeAssociation(st, next, on, true);
+    if (notify) { ++powerEvents; eventPower = {1, 1, {on ? 1u : 0u, 0, 0, 0}}; }
+    if (associationLinkDownEvent(old, next)) {
+      ++downEvents;
+      st.linkEvent = {};
+      st.linkEvent.down = 1; // explicit local leave: involuntary/reason remain zero
+    }
+  }
+  Answer control(int32_t type, uint32_t length) {
+    const Answer a = ask(true, type, length);
+    if (!a.error && (a.effects & (kDoPowerChanged | kDoDisassociate))) {
+      if (a.effects & kDoDisassociate) owner.disconnect();
+      else owner.setPower(st.power);
+      publish((a.effects & kDoPowerChanged) != 0);
+    }
+    return a;
+  }
+  void setPowerRecord(bool on) {
+    std::memset(user.mem.data(), 0, sizeof(Power));
+    put32(0, 1); put32(4, 1); put32(8, on ? 1 : 0);
+  }
+  bool getPower() {
+    const Answer a = ask(false, kPower, sizeof(Power));
+    CHECK(!a.error && a.wrote == 24 && u32(0) == 1 && u32(4) == 1);
+    CHECK(u32(12) == 0 && u32(16) == 0 && u32(20) == 0);
+    // Apple80211GetPower: any nonzero state among the returned radios is ON.
+    bool on = false;
+    for (uint32_t i = 0; i < u32(4) && i < 4; ++i) on |= u32(8 + 4 * i) != 0;
+    return on;
+  }
+};
+
 static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, bool rsn)
 {
   Bss b;
@@ -166,7 +211,7 @@ int main()
         offsetof(ScanResult, elementsLength) == 0x8a);
   CHECK(offsetof(ScanResult, channel) == 4 && offsetof(ScanResult, ssid) == 0x61 && offsetof(ScanResult, capability) == 0x1a);
   CHECK(sizeof(Power) == 24 && sizeof(Rssi) == 52 && sizeof(LinkEvent) == 32 && sizeof(Channel) == 12);
-  CHECK(kEvScanDone == 10 && kEvScanCacheUpdated == 11);
+  CHECK(kEvScanDone == 10 && kEvScanCacheUpdated == 15);
   CHECK(kChannelsInfoBytes == 0x2720 && kChannelsInfoCountAt == 0x0c && kChannelsInfoChannelAt == 0x32e &&
         kChannelsInfoBitmapAt == 0x12d0 && kChannelCount == 22 && kGapDefault == kGapAll);
   CHECK(kSiocSA80211 == 0x802869c8UL && kSiocGA80211 == 0xc02869c9UL);
@@ -236,6 +281,44 @@ int main()
       if (std::memcmp(result.elements + at, want, sizeof want) == 0) { found = true; break; }
     }
     CHECK(found);
+  }
+
+  // Raw IOC numbers and the exact Apple startup/on/off/on sequence. SET22
+  // and SET29 are leave operations, never aliases for SET19 power.
+  {
+    PowerRig r;
+    CHECK(kPower == 19 && kDisassociate == 22 && kDeauth == 29);
+    CHECK(r.getPower() && r.powerEvents == 0);
+    for (unsigned bootSet = 0; bootSet < 2; ++bootSet) {
+      r.setPowerRecord(true);
+      CHECK(!r.control(19, 24).error);
+      CHECK(r.getPower() && r.powerEvents == bootSet + 1);
+      CHECK(r.eventPower.version == 1 && r.eventPower.radios == 1 && r.eventPower.state[0] == 1);
+    }
+    r.publish(); r.publish(); // timer/polls cannot duplicate the SET notification
+    CHECK(r.powerEvents == 2);
+    r.setPowerRecord(false);
+    CHECK(!r.control(19, 24).error && !r.getPower() && r.owner.radioStop());
+    CHECK(r.powerEvents == 3 && r.eventPower.state[0] == 0 && r.eventPower.radios == 1);
+    r.owner.radioOff(r.owner.read()); // quiesced DMA and physical power-down
+    r.setPowerRecord(true);
+    CHECK(!r.control(19, 24).error && r.getPower() && r.owner.allowed(r.owner.read()));
+    CHECK(r.powerEvents == 4 && r.eventPower.state[0] == 1);
+    r.put32(0, 2); // a refused SET cannot generate an acknowledgement
+    CHECK(r.control(19, 24).error == kErrInval && r.getPower() && r.powerEvents == 4);
+    for (int32_t leave : {22, 29}) {
+      CHECK(r.owner.join());
+      Association live{}; live.associated = live.authorized = true; live.result = 1;
+      observeAssociation(r.st, live, true, true);
+      std::memset(r.user.mem.data(), 0, 16); r.put32(0, 1); r.put32(4, 3);
+      const unsigned downBefore = r.downEvents;
+      CHECK(!r.control(leave, leave == 29 ? 16 : 12).error);
+      CHECK(!r.st.association.associated && !r.st.association.authorized);
+      CHECK(r.downEvents == downBefore + 1 && r.st.linkEvent.down == 1 && !r.st.linkEvent.involuntary);
+      CHECK(r.getPower() && r.powerEvents == 4);
+      CHECK(!r.ask(false, kLinkChangedEventData, 32).error && r.user.mem[0] == 1 && r.u32(16) == 0);
+      r.owner.stopped(r.owner.read());
+    }
   }
 
   // ---- power: on by default; off answers EPWROFF to scans, on again restores them; each set asks for the event
