@@ -706,6 +706,12 @@ static int soc_valid(const PianoChargeInput *in)
     return (in->valid & PIANO_CHG_IN_GAUGES) && in->soc_max_pct >= 0 && in->soc_max_pct <= 100;
 }
 
+static int gauge_fresh(const PianoChargeInput *in, uint64_t now)
+{
+    return soc_valid(in) && packs_valid(in) && (!in->gauge_ms ||
+           (in->gauge_ms <= now && now - in->gauge_ms <= 65000));
+}
+
 /* Current UCSI session authorization. Source advertisements alone never authorize draw. */
 static int strict_contract(const PianoChargeInput *in)
 {
@@ -772,8 +778,7 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
         return 0;
     }
     if (!contract) {strict_fallback(in, s, p, PIANO_CHG_FALLBACK_NO_CONTRACT); return 0;}
-    if (!soc_valid(in) || !packs_valid(in) || !t->valid ||
-        (in->gauge_ms && (in->gauge_ms > now || now - in->gauge_ms > 65000))) {
+    if (!gauge_fresh(in, now) || !t->valid) {
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_GAUGE); return 0;
     }
     if ((in->safety & PIANO_CHG_SAFE_ALL) != PIANO_CHG_SAFE_ALL || in->faults ||
@@ -987,8 +992,7 @@ static int protection(const PianoChargeConfig *c, const PianoChargeInput *in, Pi
                       const Temps *t, uint64_t now)
 {
     if (!limit_on(c)) s->hold = 0;   /* disabling health clears only its SOC vote */
-    if (soc_valid(in) && packs_valid(in) && (!in->gauge_ms ||
-        (in->gauge_ms <= now && now - in->gauge_ms <= 65000))) {
+    if (gauge_fresh(in, now)) {
         if (limit_on(c)) {
             const uint8_t hold = (uint8_t)piano_charge_soc_hold(s->hold, in->soc_max_pct, c->stop_pct, c->resume_pct);
             if (hold != s->hold) p->events |= hold ? PIANO_CHG_EV_LIMIT_STOP : PIANO_CHG_EV_LIMIT_RESUME;
@@ -1357,7 +1361,11 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
             icl = contract ? umin(icl, umin(in->contract_ma, PIANO_CHG_ICL_CAP)) : PIANO_CHG_ICL_DEFAULT;
         }
         if (s->contract_transition) icl = umin(icl, s->transition_ma);
-        if (!soc_valid(in) || !packs_valid(in) || !t.valid) icl = umin(icl, PIANO_CHG_ICL_DEFAULT);
+        if (!gauge_fresh(in, now) || !t.valid) icl = umin(icl, PIANO_CHG_ICL_DEFAULT);
+        const uint32_t live_safety = PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT;
+        if ((in->safety & live_safety) != live_safety ||
+            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in))))
+            icl = umin(icl, s->icl_set ? s->icl_set : PIANO_CHG_ICL_DEFAULT);
         p->transition = s->contract_transition;
     }
     icl = board_cap(s, p, icl);
@@ -1387,7 +1395,11 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     full = umin(full, fcc_cap(c));
     if (c->strict_contract) {
         full = umin(full ? full : PIANO_CHG_FCC_DEFAULT, PIANO_CHG_FCC_CAP);
-        if (s->contract_transition || !soc_valid(in) || !packs_valid(in)) full = umin(full, PIANO_CHG_FCC_DEFAULT);
+        const uint32_t live_safety = PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT;
+        if (s->contract_transition || !gauge_fresh(in, now) || !t.valid ||
+            (in->safety & live_safety) != live_safety ||
+            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in))))
+            full = umin(full, s->fcc_set ? umin(s->fcc_set, PIANO_CHG_FCC_DEFAULT) : PIANO_CHG_FCC_DEFAULT);
     }
     const uint32_t fcc = fcc_target(s, full, &t, now);
     p->icl_ma = icl;

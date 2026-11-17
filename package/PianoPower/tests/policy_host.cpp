@@ -1701,6 +1701,17 @@ static void testAtomicHealth()
   g.step(); CHECK(g.enable == 0 && g.plan.why_off == PIANO_CHG_OFF_STALE);
   g.step(360000); CHECK(g.enable == 0 && !g.wrote(PIANO_CHG_ENABLE,1));
   g.bothGauges = true; g.step(); CHECK(g.enable == 1);
+  // Missing critical safety inputs cannot authorize a new FCC/ICL rise at5V; CP absence alone does not alter SDP/Rp.
+  StrictSim c; c.type = PIANO_CHG_T_SDP; c.contractValid = false; c.sourceValid = false;
+  c.cfg.rp = 1; c.cfg.ramp = 1; c.cfg.rp_cap_ma = 3000; c.loadMa = 3000;
+  c.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  c.safe &= ~PIANO_CHG_SAFE_LPD_DRY;
+  c.run(); CHECK(c.fcc <= 500 && c.icl <= 100);
+  c.safe |= PIANO_CHG_SAFE_LPD_DRY; c.safe &= ~PIANO_CHG_SAFE_CP_OFF;
+  c.run(); CHECK(c.fcc == 1500 && c.icl > 1000); // CP unknown denies HV only
+  c.safe &= ~PIANO_CHG_SAFE_DTPT; const auto oldIcl = c.icl;
+  c.run(); CHECK(c.fcc <= 500 && c.icl <= oldIcl);
+  StrictSim p; p.contractValid = false; p.run(); CHECK(p.fcc <= 500);
   // A sleep handover cannot discard admin inhibit or declare success merely because there are no queued writes.
   StrictSim h; h.cfg.hv = 0; h.run(2); h.cfg.admin_stop = 1; h.step();
   h.sleep = PIANO_CHG_WILL_SLEEP; h.step(); CHECK(h.enable == 0 && !h.plan.charge);
