@@ -89,3 +89,13 @@ b94834a8364d8007d5c12af1b5ad2e0a74a80094fcecb6a583a6d0d6b2ada923) and sm8750-xia
 79fe7c8009621e4fe00423a10218eacee6b92294ee978a5044026d0e05d127dd); the Bluetooth Core Specification (H4, HCI events). Not read
 and not used for anything: any Apple binary beyond the kernel collection's kext names, class names and Info.plist matching
 dictionaries (docs/drivers/bluetooth.md section 5), any Qualcomm binary; the controller firmware is data loaded at run time.
+
+Level 5 transport addition (2026-11-17):
+  QcaBluetooth https://github.com/UniXNU/QcaBluetooth, commit
+  effe4ec5c57cd400a5f818b21c9903fef237edbc: src/qbt_tty.c and
+  include/qbt_transport.h copied with their BSD-2-Clause-Patent SPDX notices
+  into QbtTty.c and qbt_transport.h. Original full copyright and terms are in
+  LICENSES/QcaBluetooth-BSD-2-Clause-Patent.txt; provenance in NOTICE.md.
+  No GPL core, firmware blob or Apple executable is part of this import.
+  Stable address fallback follows UniXNU-sheng commit
+  0eea3a200aa426ab282b61a956c8013deb74b68a, package/BluetoothProbe.cpp.

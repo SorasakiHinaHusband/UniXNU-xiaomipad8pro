@@ -1024,7 +1024,7 @@ bool PianoBluetooth::publishRadio()
   if (!readAddress()) return false;
   IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/bluetooth", gIODTPlane);
   IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-  const uint32_t encoding = 1, baud = kOperBaud;
+  uint32_t encoding = 1, baud = kOperBaud;
   bool ok = node && chosen && node->setProperty("local-mac-address", gAddress, 6) &&
             chosen->setProperty("mac-address-bluetooth0", gAddress, 6);
   if (node) {
