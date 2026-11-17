@@ -740,7 +740,11 @@ static int strict_voltage_ready(const PianoChargeConfig *c, const PianoChargeInp
 static void strict_fallback(const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, uint8_t reason)
 {
     p->fallback = reason;
-    const int raised = volt_raised(s) || ((in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_5V_MAX_MV) ||
+    const int withdrawal_pending = s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000 &&
+                                   (s->volt_set_prop != PIANO_CHG_PD_FIXED || s->volt_set_value != 5000 ||
+                                    (s->pending & (1u << PIANO_CHG_S_VOLT)));
+    const int raised = volt_raised(s) || withdrawal_pending ||
+                       ((in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_5V_MAX_MV) ||
                        (strict_contract(in) && in->contract_mv >= HV_5V_MAX_MV);
     s->contract_transition = (uint8_t)raised;
     s->transition_ma = 500;
@@ -766,10 +770,20 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
     const int contract = strict_contract(in);
     const int at5 = contract && in->contract_protocol == 1 && in->contract_mv < HV_5V_MAX_MV &&
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < HV_5V_MAX_MV;
+    /* With no PD contract, a fresh measured5V plus our explicit5V ACK can finish withdrawal; it never authorizes a new HV. */
+    const int returned5 = (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= ONLINE_MV && in->bus_mv < HV_5V_MAX_MV &&
+                          (!contract || (in->contract_protocol == 1 && in->contract_mv < HV_5V_MAX_MV));
     const int at9 = contract && in->contract_mv >= HV_MIN_MV && in->contract_mv <= HV_MAX_MV &&
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_MIN_MV && in->bus_mv <= HV_MAX_MV;
     if (s->contract_generation && s->contract_generation != in->contract_generation) s->contract_recheck = 1;
     s->contract_generation = in->contract_generation;
+    if (contract && s->contract_restore_generation != in->contract_generation) {
+        s->contract_restore_generation = in->contract_generation;
+        if (s->contract_mode_change || (s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000)) {
+            /* A new validated source gets its own bounded withdrawal attempts; failed SDP writes cannot poison the next charger. */
+            s->tries[PIANO_CHG_S_VOLT] = s->mismatch[PIANO_CHG_S_VOLT] = s->rewrites[PIANO_CHG_S_VOLT] = 0;
+        }
+    }
     if (s->contract_mode != c->hv) {
         if (volt_raised(s) || at9 || s->contract_mode_change) s->contract_mode_change = 1;
         s->contract_mode = c->hv;
@@ -778,7 +792,11 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
     }
     if (s->contract_mode_change) {
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_MODE);
-        if (at5 && s->volt_set_prop == PIANO_CHG_PD_FIXED && s->volt_set_value == 5000 &&
+        /* The mode-change obligation survives cable loss, including detach clearing the old request and its ACK. */
+        s->contract_transition = 1;
+        s->transition_ma = contract ? umin(500, in->contract_ma) : PIANO_CHG_ICL_DEFAULT;
+        want_volt(s, PIANO_CHG_PD_FIXED, 5000);
+        if (returned5 && s->volt_set_prop == PIANO_CHG_PD_FIXED && s->volt_set_value == 5000 &&
             !(s->pending & (1u << PIANO_CHG_S_VOLT)) && strict_barrier(in, s)) {
             s->contract_mode_change = s->contract_transition = 0;
             s->hv = PIANO_CHG_HV_OFF;
@@ -793,7 +811,7 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
     /* A withdrawn voltage must reach5V before any re-adoption of HV. Otherwise a recovered safety input could cancel the
      * barrier while an older5V request is still pending, raising current immediately before that request executes. */
     if (s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000 &&
-        (!at5 || s->volt_set_prop != PIANO_CHG_PD_FIXED || s->volt_set_value != 5000 ||
+        (!returned5 || s->volt_set_prop != PIANO_CHG_PD_FIXED || s->volt_set_value != 5000 ||
          (s->pending & (1u << PIANO_CHG_S_VOLT)))) {
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_READBACK);
         return 0;

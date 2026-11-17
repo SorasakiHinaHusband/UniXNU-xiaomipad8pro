@@ -1567,7 +1567,7 @@ static void testKick()
 // The production session supplements the firmware model with independent UCSI RDO readback. ACK and contract may disagree.
 struct StrictSim : Sim {
   bool contractValid = true, sourceValid = true, contractFollows = true, contractObserving = false;
-  bool notifyPending = false;
+  bool notifyPending = false, refuseFixed5 = false;
   uint64_t notifyMs = 0;
   bool iclReadable = true, busReadable = true;
   uint32_t contractGen = 1, contractLink = 1, contractMv = 5000, contractMa = 3000;
@@ -1597,6 +1597,9 @@ struct StrictSim : Sim {
         CHECK(st.icl_set && st.icl_set <= st.transition_ma && st.fcc_set && st.fcc_set <= 500);
         CHECK((in.valid & PIANO_CHG_IN_ICL) && uint32_t(in.icl_ma) <= st.transition_ma);
         CHECK(!(st.pending & ((1u << PIANO_CHG_S_ICL) | (1u << PIANO_CHG_S_FCC))));
+      }
+      if (refuseFixed5 && w.property == PIANO_CHG_PD_FIXED && w.value == 5000) {
+        piano_charge_ack(&st,w.property,w.value,1); continue;
       }
       apply(w);
       if (contractFollows) {
@@ -1652,6 +1655,40 @@ static void testContractSession()
     s.step(); CHECK(s.enable == 0 && s.busMv == 9000 && !s.wrote(PIANO_CHG_PD_FIXED));
     s.run(3); CHECK(s.enable == 0 && s.busMv == 9000 && s.icl <= 500 && s.plan.transition);
     s.safe |= PIANO_CHG_SAFE_CP_OFF; s.step(); CHECK(s.busMv == 5000 && s.enable == 0);
+  }
+  // Cable loss during PPS->fixed cleanup cannot strand a mode-change behind an FCC that rose again on SDP.
+  {
+    StrictSim s; s.cfg.hv = 2; s.run(); CHECK(s.protocol == 2 && s.busMv == 9000);
+    CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,1,0) == 0);
+    s.step(); CHECK(s.st.contract_mode_change && s.icl <= 500);
+    s.source = false; s.typecSource = false; s.contractValid = false; s.sourceValid = false;
+    s.step(); CHECK(!s.st.attached && s.st.contract_mode_change && s.st.volt_want_prop == 0);
+    s.source = true; s.typecSource = true; s.type = PIANO_CHG_T_SDP; s.busMv = 5000; s.contractMv = 5000; s.protocol = 1;
+    s.step(); CHECK(s.icl <= 100 && s.fcc <= 500 && s.st.contract_mode_change);
+    s.step(); CHECK(!s.st.contract_mode_change && s.busMv == 5000); // measured5V + explicitACK + current barrier; no fabricatedPD
+    s.type = PIANO_CHG_T_PD; s.contractValid = true; s.sourceValid = true; s.contractGen++;
+    s.run(); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.protocol == 1 && s.busMv == 9000);
+  }
+  // A nonPD source may refuse the5V property. Keep the barrier, and grant a new validated PD generation fresh bounded attempts.
+  {
+    StrictSim s; s.cfg.hv = 2; s.run();
+    CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,1,0) == 0); s.step();
+    s.contractValid = false; s.sourceValid = false; s.busMv = 5000; s.contractMv = 5000; s.protocol = 1;
+    s.refuseFixed5 = true; s.run(5); CHECK(s.st.contract_mode_change && s.icl <= 100 && s.fcc <= 500);
+    CHECK(s.st.tries[PIANO_CHG_S_VOLT] == 3);
+    s.refuseFixed5 = false; s.contractValid = true; s.sourceValid = true; s.contractGen++;
+    s.run(); CHECK(!s.st.contract_mode_change && s.busMv == 9000 && s.st.hv == PIANO_CHG_HV_ON);
+  }
+  // A source reaching5V before the5000 ACK must still hold the lowered current barrier until that ACK arrives.
+  {
+    StrictSim s; s.run(); s.safe &= ~PIANO_CHG_SAFE_LPD_DRY;
+    s.step(); CHECK(s.icl <= 500);
+    s.contractMv = 5000; s.busMv = 5000; s.protocol = 1; s.ackWrites = false;
+    s.step(); CHECK(s.wrote(PIANO_CHG_PD_FIXED,5000) && s.fcc <= 500);
+    s.safe |= PIANO_CHG_SAFE_LPD_DRY;
+    s.step(); CHECK(s.plan.transition && s.plan.fcc_ma <= 500 && s.plan.icl_ma <= 500);
+    piano_charge_ack(&s.st,PIANO_CHG_PD_FIXED,5000,0); s.ackWrites = true;
+    s.run(); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.busMv == 9000);
   }
   // UCSI temporarily invalidates RDO while rereading after our5->9V request. Observe behind100mA without undoing a valid transition.
   {

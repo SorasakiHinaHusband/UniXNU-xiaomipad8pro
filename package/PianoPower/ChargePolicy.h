@@ -214,7 +214,7 @@ typedef struct {
     uint64_t soc_lost_ms, off_since_ms;
     uint8_t charge_ok;
     uint8_t soc_failures, fw_block;
-    uint32_t contract_generation;
+    uint32_t contract_generation, contract_restore_generation;
     uint8_t contract_mode, contract_transition, contract_mode_change, contract_recheck;
     uint8_t contract_notify_seen, voltage_observe_hold;
     uint64_t contract_notify_since;
