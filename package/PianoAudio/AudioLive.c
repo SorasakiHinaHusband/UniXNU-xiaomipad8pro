@@ -711,6 +711,9 @@ static void capture_begin(AudioLive *l, uint32_t now)
         AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
     LOG(l, "live: mic: mic-clock2:prime-target:fixed-center reserve %u band %u ring %u",
         AUDIO_LIVE_MIC_TARGET, AUDIO_LIVE_SLIP_BAND, AUDIO_LIVE_MIC_RING);
+    LOG(l, "live: mic: mic-clock3:queue-margin center %u trough %u batch-bias %u band %u transport-latency %u",
+        AUDIO_LIVE_MIC_TARGET, AUDIO_LIVE_MIC_RESERVE, AUDIO_LIVE_MIC_BATCH_BIAS,
+        AUDIO_LIVE_SLIP_BAND, AUDIO_LIVE_INPUT_LATENCY);
     LOG(l, "live: mic: read-v2:56bytes:no-offset request %#x endpoint %#x port %#x base %#llx handle %#x period %u slots %u token %#x",
         AR_OP_READ, AR_IID_CAP_SHMEM, l->cap.port, (unsigned long long)l->cap.base, l->cap.handle,
         l->cap.period_bytes, l->cap.slots, l->cap.token_base);
@@ -738,7 +741,10 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
     l->mic_periods++;
     AudioRing *r = &l->sh->in;
     const uint32_t fill = audio_ring_fill(r);
-    if (fill > AUDIO_LIVE_MIC_TARGET + 3u * AUDIO_PERIOD_FRAMES) {
+    /* A completion batch can raise fill above the controller's mean without
+     * exhausting storage. Use the actual room for this return plus a possible
+     * repeat; the old target+3-period cutoff discarded still-fitting PCM. */
+    if (fill + frames + 1u > AUDIO_LIVE_MIC_RING) {
         l->mic_full++;
         if (load(&l->sh->want_in)) l->mic_full_frames += frames; else l->mic_tail_frames += frames;
         drift_reset(&l->mic_drift); return;

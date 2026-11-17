@@ -57,8 +57,10 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/preset_host.c" "$P/AudioPreset.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/FatVolume.c" -o "$T/preset_host"
 "${C[@]}" "$P/tests/live_host.c" "$P/AudioLive.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/live_host"
+"${C[@]}" "$P/tests/mic_fifo_host.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
+  "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/mic_fifo_host"
 "${C[@]}" "$P/tests/va_host.c" "$P/AudioVa.c" -o "$T/va_host"
-for t in gpr_host audioreach_host sequence_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host va_host; do
+for t in gpr_host audioreach_host sequence_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host mic_fifo_host va_host; do
   "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }
 done
 # The preset loader on a FAT32 image with 4096-byte sectors, one per cluster, as build-esp.py makes the ESP (mtools).

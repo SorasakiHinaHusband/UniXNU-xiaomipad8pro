@@ -41,11 +41,16 @@ extern "C" {
 #define AUDIO_LIVE_IDLE_MAX_MS 600000u
 #define AUDIO_LIVE_STATUS_MS 500u        /* the amplifiers' status while they play */
 #define AUDIO_LIVE_LATE_STOPS 3u         /* late stops of a path before it is off for the boot */
-#define AUDIO_LIVE_MIC_RING 4096u        /* independent mono capture FIFO */
-#define AUDIO_LIVE_MIC_TARGET 960u
+#define AUDIO_LIVE_MIC_RING 8192u        /* mono FIFO: center + batch + band + consumer phase need >4096 */
 #define AUDIO_LIVE_MIC_DEPTH PIANO_AUDIO_IN_FLIGHT
 #define AUDIO_LIVE_MIC_SETTLE_MS 100u    /* the capture's first periods: zeros */
 #define AUDIO_LIVE_SLIP_BAND 240u        /* frames the smoothed fill may stray from where it settled before single frames slip */
+/* The producer samples before every write in a completion batch. Its mean
+ * can exceed the trough by (depth-1)*period/2. Include that bias AND the
+ * controller's deadband so a nominal 20 ms trough is not actually zero. */
+#define AUDIO_LIVE_MIC_RESERVE 960u
+#define AUDIO_LIVE_MIC_BATCH_BIAS ((AUDIO_LIVE_MIC_DEPTH - 1u) * AUDIO_PERIOD_FRAMES / 2u)
+#define AUDIO_LIVE_MIC_TARGET (AUDIO_LIVE_MIC_RESERVE + AUDIO_LIVE_SLIP_BAND + AUDIO_LIVE_MIC_BATCH_BIAS)
 #define AUDIO_VOLUME_STEP 1024           /* Q15 per 10 ms period: the master volume's ramp (a full swing in 0.32 s) */
 #define AUDIO_LIVE_IDLE_TICK_MS 2000u    /* the tick with both paths down (the transport wakes the owner sooner) */
 /* The latency the transport adds, for the devices' registry (AudioPcm.h output_latency/input_latency). */

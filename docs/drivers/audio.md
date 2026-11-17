@@ -735,10 +735,21 @@ responses and short PCM delivery; hardware acoustic acceptance remains pending.
 A real level-10 tablet run confirmed two-decimator PCM, mono delivery, exact input
 mute zeros and clean capture release/restart. The startup-learned FIFO waterline
 could nevertheless cause continuous single-frame drops and missing samples when
-completion batching changed. The Mic now waits for a 960-frame reserve plus the
-first consumer batch, then corrects around a fixed 960-frame center. Startup waits
+completion batching changed. Acoustic gain/mute/recovery acceptance subsequently
+passed, but sparse missing samples remained. The fixed center had omitted the
+pre-write average's batch bias: four 480-frame completions can raise the sampled
+mean 720 frames above its trough. With a 240-frame deadband, a 960-frame center
+could therefore permit a zero trough. The Mic now derives its 1920-frame center
+from a 960-frame trough reserve, the 240-frame band and that 720-frame bias; it
+waits for this center plus the first consumer batch before delivery. Startup waits
 are counted separately; subsequent missing frames remain failures. Bounded reports
-include primed state, smoothed fill and target. The DSP queue, mapped ring and
-speaker controller retain their existing geometry. Equal-clock and ±200 ppm host
-models cover batched completion delivery; hardware continuity and the complete
-acoustic timeline score still require the next tablet run.
+include primed state, smoothed fill and target. The internal mono FIFO grows from
+4096 to 8192 frames to retain a full completion burst and phase/filter transients
+above the new center. A return is discarded only when its actual samples plus a
+possible repeat cannot fit; the old center-relative cutoff could discard fitting
+PCM. The DSP queue, mapped ring and speaker controller retain their geometry.
+Published input latency becomes
+2640 frames (55 ms), including the 240-frame engine latency; the separate safety
+offset remains 480 frames. Host models replay the recorded short-return counters
+and bounded completion batching; the revised reserve still needs a 60-second
+tablet capture to establish hardware continuity.
