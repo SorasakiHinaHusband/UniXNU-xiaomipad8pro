@@ -113,9 +113,10 @@ int read(Mem &m, unsigned q, uint32_t *out, uint32_t cap, uint32_t *bytes, Barri
   barrier();   // the packet after the index that announced it
   const uint32_t size = m.ld(qbase(q) + r);
   if (!size) return -1;
+  const uint32_t available = w >= r ? w - r : kHfiQueueBytes - r + w;
   int rc = 0;
   uint32_t next = w;
-  if (size <= kHfiCorePacketBytes && size <= cap && !(size & 3)) {
+  if (size <= kHfiCorePacketBytes && size <= cap && size <= available && !(size & 3)) {
     uint32_t at = r;
     for (uint32_t i = 0; i < size / 4; ++i) {
       out[i] = m.ld(qbase(q) + at);
@@ -146,7 +147,8 @@ inline uint32_t begin(uint32_t *buf, uint32_t session, Ids &ids)
   return kHfiHeaderBytes;
 }
 // One packet {size, type, flags, payload_info, port, packet_id, reserved[2]} + payload words, appended; the header's size and count.
-inline void add(uint32_t *buf, uint32_t type, uint32_t flags, uint32_t payloadInfo, const uint32_t *payload, uint32_t words, Ids &ids)
+inline void add(uint32_t *buf, uint32_t type, uint32_t flags, uint32_t payloadInfo, const uint32_t *payload, uint32_t words, Ids &ids,
+                uint32_t port = kHfiPortNone)
 {
   uint32_t *p = buf + buf[0] / 4;
   const uint32_t size = kHfiPacketBytes + 4 * words;
@@ -154,7 +156,7 @@ inline void add(uint32_t *buf, uint32_t type, uint32_t flags, uint32_t payloadIn
   p[1] = type;
   p[2] = flags;
   p[3] = payloadInfo;
-  p[4] = kHfiPortNone;
+  p[4] = port;
   p[5] = ids.packet++;
   p[6] = p[7] = 0;
   for (uint32_t i = 0; i < words; ++i) p[8 + i] = payload[i];
@@ -249,7 +251,7 @@ inline bool parse(const uint32_t *buf, uint32_t bytes, Reply &r)
       } else {
         ++r.malformed;
       }
-    } else if (type > kHfiCmdBegin && type < kHfiCmdEnd) {
+    } else if (type == kHfiCmdInit) {
       if (flags & kHfiFwSuccess) r.initDone = true;
       else r.initFailed = true;
     }

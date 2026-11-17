@@ -109,3 +109,12 @@ tests/bringup_host.cpp hashes it and parses its ELF and program headers, as the 
 
 Not read and not used for anything: any Qualcomm or Xiaomi binary beyond that (vpu35_4v.mbn is data for the secure world's
 loader, never disassembled), Apple binaries beyond public headers and class/symbol names.
+
+V4 (2026-11-17): VideoSession.h, VideoBuffers.h, VideoArena.h and their host tests are original BSD-2-Clause-Patent code,
+Copyright (c) 2026 Leo Zhang. Protocol/size facts studied from third-party yzddmr6/linux-sm8750-piano at
+1c21cb9895d69c1c5e83ceae68952fedf522644a (iris_hfi_gen2_command/response/defines, iris_hfi_common, iris_buffer, iris_vpu_buffer,
+iris_hfi_gen2, iris_ctrls, iris_state, iris_common). UniXNU-sheng 0eea3a200aa426ab282b61a956c8013deb74b68a QcomIris
+IrisSession/IrisBuffers/IrisMedia was a read-only sequence comparison; no source text from either reference was copied.
+VideoFixture.h is our own libx264 encode of an internally generated constant YUV420P frame, with SEI removed. Exact reproduction,
+SPS fields and independent software NV12 SHA-256 are checked by tests/fixture_host.py. No third-party media, firmware, Apple payload
+or per-unit calibration is part of this fixture.

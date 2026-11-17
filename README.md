@@ -44,6 +44,8 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   test; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
 - Hardware video decode (2026-11-17, RAM boots): the video firmware loads, is authenticated, boots and answers the host interface
   (HFI) with its version; power cycles repeat cleanly. Decoding a frame is next ([docs/drivers/video.md](docs/drivers/video.md)).
+  A bounded kernel H.264 single-frame self-test (`piano-video=5`) is implemented and host-checked; tablet frame verification is pending.
+  It does not enable a macOS video consumer.
 - Boot time is being worked on: most of launchd's 40 s is our 4 KiB code-signature pre-hash of the compressed dyld shared
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
   pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;

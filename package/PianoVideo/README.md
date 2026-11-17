@@ -1,7 +1,8 @@
 # PianoVideo
 
 piano's video core for native macOS 27: the SM8750 Iris (VPU 3.5) that decodes H.264, HEVC and VP9 and encodes H.264 and HEVC in
-hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 HFI remains unverified on the tablet**.
+hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; **V3 INIT/version, ten collapse/resume cycles and legal teardown are tablet-confirmed** in `vid-v3b`.
+V4 is implemented as a kernel self-test; real frame decode is still awaiting tablet verification.
 `piano-video-vt=1` publishes the VideoToolbox paravirtual service with a capability-only stub backend. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core
@@ -25,7 +26,12 @@ hardware. **V2 power/PAS is tablet-confirmed** for three cycles in `vid-v2c5`; *
   INIT/version results, PC/resume cycles, faults/watchdog/SFR, and teardown results. `piano-video-resumes=0 piano-video-unload=0`
   explicitly selects the earlier collapsed steady state. V2's defaults and power/PAS sequence are unchanged.
 
-Levels 2-4 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
+- `piano-video=5` (V4): one own 320×240 Baseline H.264 IDR, under V3's power/PAS/SMMU owner. Separate wired NC data
+  mappings, first PSC and real DPB/COMV counts, all five input internals including PARTIAL, RAW NV12 active-area SHA-256,
+  DRAIN/LAST, both STOPs and CLOSE. Five-second transaction, bounded cleanup; unsafe quiesce/detach retains every DMA owner.
+  It always tears down, uses no VT consumer and does not repeat the ten V3 resume cycles. No playback support is claimed.
+
+Levels 2-5 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
 every wait is bounded, V3 cleanup reports unsafe releases and keeps their DMA, and nothing is written below `piano-video=2`. Design, decisions, the
 batched tablet test list with its expected lines and the risks: `docs/drivers/video.md` (section 12 for levels 2-4).
 
@@ -39,7 +45,10 @@ batched tablet test list with its expected lines and the risks: `docs/drivers/vi
 | `VideoFirmware.h` | portable: V2's pin, the image's place in the carveout, PAS 9 + MP_VIDEO_VAR under the secure-call lock, PAS shutdown |
 | `VideoSmmu.h` | portable: V3's SMMU plan, our table for the UC region, the bank and routes, the teardown |
 | `VideoHfi.h` | portable: V3's queue table and queues, HFI gen2 packets and answers, the boot words |
-| `VideoBringup.h` | portable: levels 2-4 as one sequence (V1, V2, V3, the idle collapse, resume, unload, failures) |
+| `VideoSession.h`, `VideoBuffers.h`, `VideoArena.h` | portable V4 session, fixed fixture geometry, guarded 64 MiB arena and expanded same-bank tables |
+| `VideoFixture.h` | own generated SPS/PPS/IDR; reproduction, SPS inspection and software golden verification in `tests/fixture_host.py` |
+| `tests/session_host.cpp` | asynchronous scripted peer, counts 1/4/7/64, reordered replies, checksum and failure injection (host evidence only) |
+| `VideoBringup.h` | portable: levels 2-5 as one sequence (V1, V2, V3, the idle collapse, resume, unload, failures) |
 | `VideoHw.h` | the facts, each with its source |
 | `FatVolume.c/h`, `QcomMdt.c/h`, `Sm8750Scm.c/h` | copies of PianoPower's (the build checks them byte for byte; Sm8750Scm is MIT); FatVolume serves the shared loader's ESP source |
 | `tests/video_host.cpp` | level 1's host tests against register models (the gate, the allowlist of loads, decoders, verdicts, SMMU) |

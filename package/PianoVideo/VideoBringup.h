@@ -25,6 +25,8 @@
 #include "VideoHfi.h"
 #include "VideoPower.h"
 #include "VideoSmmu.h"
+#include "VideoArena.h"
+#include "VideoSession.h"
 
 namespace pianovideo {
 
@@ -48,6 +50,9 @@ struct Dma {
   uint64_t *tables = nullptr;
   uint64_t tablesPa = 0;
   void *owner = nullptr;   // the Hw's bookkeeping
+  bool session = false;
+  volatile uint8_t *arena = nullptr;
+  uint64_t arenaPages[session::kArenaPages] = {};
 };
 
 // "Off 1.5 s after the last frame" (docs/drivers/video.md section 4.5): the collapse decision, from the last activity.
@@ -100,6 +105,8 @@ class Bringup {
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
   bool firstHfi = false;
+  session::Layout layout;
+  session::Result v4;
   unsigned lifecycleEvent = 0;
   void phase(const char *name, int rc) { hw.note("V3 lifecycle %u %s result %d", ++lifecycleEvent, name, rc); }
   bool domainPowerReady() const { return pst.on && pst.railsUp && pst.busOn && pst.axi0 && power.codecReadable(); }
@@ -193,7 +200,7 @@ class Bringup {
     opt = o;
     rep = Report{};
     rep.level = int(o.level);
-    if (o.level < 2 || o.level > 4) return kErrArgument;   // inert below piano-video=2: nothing is read or written
+    if (o.level < 2 || o.level > 5) return kErrArgument;   // inert below piano-video=2: nothing is read or written
     power.stopAt = o.stop;
     firmware.stopAt = o.stop;
     // The boot framebuffer owns the display rail until a native display voter exists.  Keep
@@ -232,13 +239,16 @@ class Bringup {
   {
     char *s = rep.summary;
     const unsigned size = sizeof rep.summary;
-    const char *v = rep.level == 2 ? "V1" : rep.level == 3 ? "V2" : rep.level == 4 ? "V3" : "V?";
+    const char *v = rep.level == 2 ? "V1" : rep.level == 3 ? "V2" : rep.level == 4 ? "V3" : "V4";
     if (rep.error) {
       snprintf(s, size, "%s FAILED at step %d: %s; cycles %u/%u; writes %u (%u logged)", v, rep.failedStep, errorName(rep.error),
                rep.cyclesOk, rep.cycles, log.writes, log.logged);
       return;
     }
-    if (rep.level == 4)
+    if (rep.level == 5)
+      snprintf(s, size, "V4 ok: kernel AVC decoded %u checksum PASS close %d teardown %d dma-held %u", v4.decoded, v4.close,
+               teardownRc, unsigned(dmaHeld));
+    else if (rep.level == 4)
       snprintf(s, size, "V3 ok: firmware %.48s; handshake %llu us; collapse/resume %u/%u; fsr %08x; fw lines %u; writes %u (%u logged)",
                rep.versionText, (unsigned long long)rep.handshakeUs, rep.resumesOk, opt.resumes, rep.fsr, rep.debugLines, log.writes,
                log.logged);
@@ -457,6 +467,9 @@ class Bringup {
     teardown();
     hw.note("V3 outcome first-HFI %s first-error %d stage %d teardown %d dma-held %u", firstHfi ? "PASS" : "FAIL", rc, stepNo,
             teardownRc, unsigned(dmaHeld));
+    if (opt.level == 5)
+      hw.note("V4 outcome first-error %d stage %d decoded 0 checksum FAIL close 0 teardown %d dma-held %u", rc, stepNo,
+              teardownRc, unsigned(dmaHeld));
     return fail(stepNo, rc);
   }
 
@@ -476,15 +489,34 @@ class Bringup {
     if (plan.error) return smmuFail(kStepSmmuPlan, kErrSmmu);
     bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
+    dma.session = opt.level == 5;
+    if (dma.session && !layout.init()) return smmuFail(kStepSmmuTables, kErrNoMemory);
     if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
     dmaHeld = true;
     tables.cpu = dma.tables;
     tables.pa = dma.tablesPa;
+    tables.pageCount = dma.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages;
     if (!vsmmu::build(tables, dma.pages, vsmmu::kUcPages, dma.scratch)) {
       hw.note("smmu: a page of the UC region or the table is not a 4 KiB page of XNU's RAM");
       return smmuFail(kStepSmmuTables, kErrSmmu);
     }
-    hw.cleanToPoc(tables.cpu, vsmmu::kTablePages * 4096);
+    if (dma.session && (!dma.arena || !session::buildArena(tables, layout, dma.arenaPages)))
+      return smmuFail(kStepSmmuTables, kErrSmmu);
+    hw.cleanToPoc(tables.cpu, tables.pageCount * 4096);
+    if (dma.session) {
+      unsigned mapped = 0;
+      for (unsigned i = 0; i < session::kArenaPages; ++i) mapped += layout.mapped(i);
+      hw.note("V4 mapping arena [%08x,%08x) reserved %u pages mapped %u guards-invalid %u tables %u full-walk PASS",
+              session::kArenaBase, session::kArenaBase + session::kArenaBytes, layout.bytes, mapped,
+              session::kArenaPages - mapped, tables.pageCount);
+      for (unsigned i = 0; i < layout.used; ++i) {
+        const session::Buffer &b = layout.buf[i];
+        hw.note("V4 mapping type %u index %u port %u capacity %u IOVA [%08x,%08x) PA-first %llx PA-last %llx",
+                b.type,b.index,b.port,b.capacity,b.iova(),b.iova()+b.capacity,
+                (unsigned long long)dma.arenaPages[b.off/4096],
+                (unsigned long long)dma.arenaPages[(b.off+b.capacity-1)/4096]);
+      }
+    }
     for (unsigned i = 0; i < vsmmu::kWindowPages; ++i) {   // the self-check: every page of the window as the SMMU will walk it
       const uint64_t want = i < vsmmu::kUcPages ? dma.pages[i] : dma.scratch;
       if (vsmmu::walk(tables, kIovaBase + 4096 * i + 0x10) != want + 0x10) {
@@ -757,6 +789,7 @@ class Bringup {
 
   int v3()
   {
+    if (opt.level == 5) hw.note("V4 image contract vid-v4a: same-bank one-AU bounded kernel self-test");
     hw.note("V3: prepare UC, power on, SMMU bank/routes, PAS 9, HFI boot and handshake; collapse after %u ms idle; %u resume(s)%s", opt.idleMs,
             opt.resumes, opt.unload ? "; then unload" : "");
     hw.note("V3 evidence contract vid-v3b: S1 lifecycle; c5 power/PAS and HFI unchanged");
@@ -794,6 +827,28 @@ class Bringup {
     firstHfi = true;
     hw.note("V3 first-HFI PASS: INIT success version received cmd-consumed %u doorbells %u fsr %08x watchdog %u",
             mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead), doorbells, rep.fsr, unsigned(watchdogSeen != 0));
+    if (opt.level == 5) {
+      session::SelfTest<Bringup<Hw>> test(*this, layout);
+      rc = test.run();
+      v4 = test.r;
+      if (rc) {
+        failureRaw(60 + int(v4.failedStage), rc);
+        queueTrace("V4-error"); bankTrace("V4-error"); coreTrace("V4-error"); sfrTrace("V4-error");
+      } else {
+        waitIdle();
+        rc = collapse();
+        if (!rc) rc = resume(false);
+      }
+      const int un = teardown();
+      if (!rc) rc = un;
+      hw.note("V4 outcome first-error %d stage %u decoded %u checksum %s close %d teardown %d dma-held %u",
+              rc, rc ? (v4.error ? v4.failedStage : 60u) : 0u, v4.decoded, v4.checksum ? "PASS" : "FAIL", v4.close,
+              teardownRc, unsigned(dmaHeld));
+      hw.note("V4 complete ETB %u EBD %u PSC %u RELEASE_DONE %u drain-ack %u LAST %u STOP %u/%u CLOSE %u watchdog %u fault-bits %08x",
+              v4.etb,v4.ebd,v4.psc,v4.releases,unsigned(v4.drainAck),unsigned(v4.last),unsigned(v4.stopRaw),unsigned(v4.stopInput),
+              unsigned(v4.closed),unsigned(watchdogSeen != 0),rep.fsr);
+      return rc ? fail(60 + int(v4.error ? v4.failedStage : session::Finished), rc) : kOk;
+    }
     waitIdle();
     if ((rc = collapse())) return v3fail(kStepPcPrep, rc);
     for (unsigned i = 1; i <= opt.resumes; ++i) {

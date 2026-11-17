@@ -1,0 +1,433 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Copyright (c) 2026 Leo Zhang.
+// Independent scripted firmware peer: asynchronous commands, reordered PSC/FBD packets, ownership and fault injection.
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
+#include <cstring>
+#include <vector>
+#include <string>
+#include <memory>
+#include <CommonCrypto/CommonDigest.h>
+#include "VideoSession.h"
+#include "VideoArena.h"
+using namespace pianovideo;
+using namespace pianovideo::session;
+static unsigned failures = 0;
+#define CHECK(x)                                                                                                                           \
+  do {                                                                                                                                     \
+    if (!(x)) {                                                                                                                            \
+      std::printf("FAIL line %u: %s\n", __LINE__, #x);                                                                                     \
+      ++failures;                                                                                                                          \
+    }                                                                                                                                      \
+  } while (0)
+struct TestHw {
+  uint64_t clock = 0;
+  std::string log;
+  void barrier() {}
+  void stage(int, const char *) {}
+  void sleepMs(unsigned n) { clock += uint64_t(n) * 1000; }
+  uint64_t nowUs() { return clock; }
+  void note(const char *fmt, ...)
+  {
+    char b[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    log += "PianoVideo: ";
+    log += b;
+    log += '\n';
+    if (std::getenv("VIDEO_SESSION_ECHO"))
+      std::printf("PianoVideo: %s\n", b);
+  }
+  void hashActive(const volatile uint8_t *base, char hash[65])
+  {
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    activeRows(base, [&](const uint8_t *p, unsigned n) { CC_SHA256_Update(&ctx, p, n); });
+    uint8_t h[32];
+    CC_SHA256_Final(h, &ctx);
+    hexDigest(h, hash);
+  }
+};
+struct TestOps {
+  bool fault = false, watchdog = false;
+  uint32_t rd(uint64_t pa) { return pa == kIris + kWrapperIntrStatus ? (watchdog ? 8 : 0) : (fault && (pa & 4095) == vsmmu::kFsr ? 2 : 0); }
+};
+struct Peer {
+  TestHw hw;
+  TestOps ops;
+  vsmmu::Plan plan;
+  hfi::Mem mem;
+  hfi::Ids ids;
+  uint32_t tx[hfi::kBufferWords] = {}, rx[hfi::kBufferWords] = {};
+  struct {
+    volatile uint8_t *arena = nullptr;
+  } dma;
+  struct {
+    uint32_t fsr = 0;
+  } rep;
+  unsigned watchdogSamples = 0, watchdogSeen = 0, rxEvents = 0;
+  unsigned n = 4, inputCount = 0, dpbs = 0, partial = 0, releaseCount = 0, stops = 0, closes = 0, hostErrors = 0;
+  uint32_t activeSid = 0;
+  bool dropPsc = false, badPixels = false, badPsc = false, badRelease = false, dropClose = false, dropStop = false, dropLast = false,
+       dropDrainAck = false;
+  bool wrongTimestamp = false, wrongIova = false, corrupt = false, sessionError = false, readonly = false, late = false,
+       systemError = false;
+  bool opened = false, input = false, raw = false, resumed = false;
+  std::vector<uint32_t> uc;
+  std::vector<uint8_t> arena;
+  std::vector<std::vector<uint32_t>> raws, pendingReleases;
+  std::vector<uint32_t> traceTypes, comvSizes, comvCounts, headers, packets;
+  Peer() : uc(kUcBytes / 4), arena(kArenaBytes, 0)
+  {
+    mem.uc = uc.data();
+    dma.arena = arena.data();
+    hfi::initQueues(mem);
+    plan.bank = 3;
+    plan.pages = 128;
+  }
+  static std::vector<uint32_t> packet(uint32_t type, uint32_t flags, uint32_t port, uint32_t payload, const std::vector<uint32_t> &v = {})
+  {
+    std::vector<uint32_t> p = {uint32_t(32 + 4 * v.size()), type, flags, payload, port, 0xeeee, 0, 0};
+    p.insert(p.end(), v.begin(), v.end());
+    return p;
+  }
+  void reply(std::vector<std::vector<uint32_t>> packets, uint32_t sid = kSessionId)
+  {
+    std::vector<uint32_t> b = {32, sid, 0xdddd, 0, 0, 0, 0, uint32_t(packets.size())};
+    for (const auto &p : packets)
+      b.insert(b.end(), p.begin(), p.end());
+    b[0] = uint32_t(4 * b.size());
+    CHECK(hfi::write(mem, hfi::kMsgq, b.data(), b[0], [] {}) == 0);
+  }
+  void packetTrace(const char *, unsigned, const uint32_t *, unsigned) {}
+  void drainDebug() {}
+  int send(unsigned bytes, const char *)
+  {
+    // Exercise the real ring, including wrap. The peer consumes it before responding, like the firmware owner.
+    CHECK(hfi::write(mem, hfi::kCmdq, tx, bytes, [] {}) == 0);
+    uint32_t data[hfi::kBufferWords], size = 0;
+    CHECK(hfi::read(mem, hfi::kCmdq, data, sizeof data, &size, [] {}) == 0);
+    CHECK(size == bytes);
+    CHECK(data[7] == 1 && data[0] == bytes);
+    const uint32_t *p = data + 8;
+    const uint32_t type = p[1], flags = p[2], port = p[4], payload = p[3];
+    headers.push_back(data[2]);
+    packets.push_back(p[5]);
+    traceTypes.push_back(type);
+    if (type == 0x01000003) {
+      CHECK(!data[1] && port == 0 && flags == 3 && payload == 1 && p[8] != 0);
+      activeSid = p[8];
+      opened = true;
+      return 0;
+    }
+    CHECK(opened && data[1] == activeSid);
+    if (type == 0x01000005) {
+      CHECK(flags == 3 && payload == 0);
+      if (port == 1)
+        input = true;
+      else
+        raw = true;
+      return 0;
+    }
+    if (type == 0x01000008) {
+      CHECK(port == 1 && flags == 3 && payload == 1 && p[8] == 0x0100000c && releaseCount == 5);
+      resumed = true;
+      for (const auto &b : pendingReleases)
+        reply({packet(0x01000009, 0, 1, 5, b)});
+      pendingReleases.clear();
+      return 0;
+    }
+    if (type == 0x03000193)
+      comvCounts.push_back(p[8]);
+    if (type == 0x01000009) {
+      CHECK(payload == 5 && p[0] == 96);
+      std::vector<uint32_t> b(p + 8, p + 24);
+      const uint32_t bt = b[0];
+      CHECK((b[10] & 0x200) != 0 && b[3] == 0 && b[4] == 0 && b[6] == 0);
+      CHECK(b[2] >= 0x80400000 && uint64_t(b[2]) + b[5] <= 0x84400000);
+      if (b[10] & 1) {
+        CHECK(flags == 3);
+        ++releaseCount;
+        b[10] = badRelease ? 0 : 1;
+        pendingReleases.push_back(b);
+        return 0;
+      }
+      CHECK(flags == 1);
+      if (bt == 10)
+        comvSizes.push_back(b[5]);
+      if (bt == 5) {
+        CHECK(b[5] == 196608);
+        ++partial;
+      }
+      if (bt == 6) {
+        CHECK(raw && resumed && b[5] == 155648);
+        ++dpbs;
+      }
+      if (bt == 2) {
+        CHECK(raw && resumed && b[5] == 147456 && b[7] == 0);
+        raws.push_back(b);
+      }
+      if (bt == 1) {
+        CHECK(input && !raw && b[5] == 7077888 && b[7] == 286 && b[8] == 1000000);
+        CHECK(std::memcmp(arena.data() + b[2] - kArenaBase, kAccessUnit, sizeof kAccessUnit) == 0);
+        ++inputCount;
+        b[7] = 0;
+        reply({packet(type, 0, 1, 5, b)});
+        if (!dropPsc)
+          reply({packet(0x0100000c, 0, 1, 0), packet(0x03000103, 0, 1, 1, {badPsc ? 0x01400100u : 0x014000f0u}),
+                 packet(0x03000105, 0, 1, 13, {0, 0}), packet(0x0300010f, 0, 1, 1, {0x00080008}), packet(0x03000120, 0, 1, 1, {1}),
+                 packet(0x03000124, 0, 1, 1, {n}), packet(0x03000128, 0, 1, 1, {2}), packet(0x03000107, 0, 1, 1, {0}),
+                 packet(0x03000108, 0, 1, 1, {4}), packet(0x03000155, 0, 1, 1, {0x14000003})});
+      }
+      return 0;
+    }
+    if (type == 0x01000007) {
+      CHECK(port == 1 && flags == 7 && raw && resumed && inputCount == 1 && dpbs == n && raws.size() == (n < 2 ? 2 : n));
+      if (!dropDrainAck)
+        reply({packet(type, 1, 1, 0)});
+      auto b = raws.back();
+      b[7] = 147456;
+      b[8] = wrongTimestamp ? 42 : 1000000;
+      b[10] = readonly ? 0x10 : 0;
+      uint8_t *base = arena.data() + b[2] - kArenaBase;
+      for (unsigned y = 0; y < 240; ++y)
+        for (unsigned x = 0; x < 320; ++x)
+          base[y * 384 + x] = 64;
+      for (unsigned y = 0; y < 120; ++y)
+        for (unsigned x = 0; x < 320; x += 2) {
+          base[98304 + y * 384 + x] = 96;
+          base[98304 + y * 384 + x + 1] = 160;
+        }
+      if (badPixels)
+        base[0] = 0;
+      if (wrongIova)
+        b[2] += 4096;
+      std::vector<std::vector<uint32_t>> ps = {packet(0x01000009, 0, 2, 5, b), packet(0x03000162, 0, 2, 1, {1})};
+      if (corrupt)
+        ps.push_back(packet(0x06000002, 2, 2, 0));
+      if (sessionError)
+        ps.push_back(packet(0x04000001, 4, 0, 0));
+      if (systemError)
+        ps.push_back(packet(0x05000001, 8, 0, 0));
+      reply(ps);
+      if (!dropLast) {
+        b = raws.front();
+        b[10] = 0x10000000;
+        reply({packet(0x01000009, 0, 2, 5, b)});
+      }
+      return 0;
+    }
+    if (type == 0x01000006) {
+      CHECK(flags == 7);
+      ++stops;
+      if (!dropStop)
+        reply({packet(type, 1, port, 0)});
+      return 0;
+    }
+    if (type == 0x01000004) {
+      CHECK(flags == 7 && !port);
+      ++closes;
+      if (!dropClose) {
+        reply({packet(type, 1, 0, 0)});
+        if (late)
+          reply({packet(0x03000162, 0, 2, 1, {1})});
+      }
+      return 0;
+    }
+    // Verify every payload category of the pinned property/subscription contract independently of the implementation's builder.
+    if (type == 0x0100000b) {
+      CHECK(flags == 3 && payload == 11 && (p[8] == 1 || p[8] == 2));
+    } else {
+      CHECK(type > 0x03000000 && type < 0x03ffffff && flags == 0);
+    }
+    return 0;
+  }
+};
+static void layoutTests()
+{
+  Layout l;
+  CHECK(l.init());
+  CHECK(l.used == 140 && l.bytes < kArenaBytes);
+  CHECK(scratchBytes(1, 4) == 172544 && scratchBytes(1, 64) == 2753024);
+  std::vector<uint64_t> words(vsmmu::kSessionTablePages * 512), pages(kArenaPages), uc(vsmmu::kUcPages);
+  for (unsigned i = 0; i < pages.size(); ++i)
+    pages[i] = 0x900000000ull + uint64_t((i * 7907) % kArenaPages) * 4096;
+  for (unsigned i = 0; i < uc.size(); ++i)
+    uc[i] = 0x8d0000000ull + uint64_t(i) * 4096;
+  vsmmu::Tables t{words.data(), 0x8e0000000ull, vsmmu::kSessionTablePages};
+  CHECK(vsmmu::build(t, uc.data(), unsigned(uc.size()), 0x8e1000000ull));
+  CHECK(buildArena(t, l, pages.data()));
+  for (unsigned i = 0; i < l.used; ++i) {
+    const auto &b = l.buf[i];
+    CHECK(vsmmu::walk(t, b.iova() + b.capacity - 1) == pages[(b.off + b.capacity - 1) / 4096] + ((b.capacity - 1) & 4095));
+    CHECK(vsmmu::walk(t, b.iova() + ((b.capacity + 16383) & ~16383u)) == 0);
+  }
+  CHECK(vsmmu::walk(t, kArenaBase - 1) == 0x8e1000fffull);
+  CHECK(vsmmu::walk(t, kArenaBase + kArenaBytes) == 0);
+  auto original = pages[0];
+  pages[0] = 1;
+  CHECK(!buildArena(t, l, pages.data()));
+  pages[0] = original;
+  // Capacity, geometry and count boundaries fail before any DMA use.
+  Psc p;
+  CHECK(p.supported());
+  p.n = 0;
+  CHECK(!p.supported());
+  p.n = 65;
+  CHECK(!p.supported());
+  p.n = 64;
+  CHECK(p.supported());
+  p.crop[1] = 1;
+  CHECK(!p.supported());
+}
+static void happy(unsigned n)
+{
+  Peer p;
+  p.n = n;
+  p.readonly = true;
+  Layout l;
+  CHECK(l.init());
+  SelfTest<Peer> s(p, l);
+  CHECK(s.run() == 0);
+  CHECK(!s.r.error && !s.r.close && s.r.closed && s.r.checksum && s.r.decoded == 1);
+  CHECK(s.r.etb == 1 && s.r.ebd == 1 && s.r.psc == 1 && s.r.releases == 5 && s.r.last && s.r.drainAck);
+  CHECK(p.partial == 2 && p.dpbs == n && p.inputCount == 1 && p.stops == 2 && p.closes == 1 && p.hw.clock < 5000000);
+  CHECK(p.comvCounts == std::vector<uint32_t>({4, n}));
+  CHECK(p.comvSizes == std::vector<uint32_t>({172544, 43008 * n + 512}));
+  CHECK(l.find(Raw, n < 2 ? 1 : n - 1)->readonly);
+  CHECK(l.find(Bin, 0)->released && l.find(Bin, 1)->queued);
+  CHECK(l.find(Bin, 0)->iova() != l.find(Bin, 1)->iova());
+  for (unsigned i = 0; i < p.headers.size(); ++i) {
+    CHECK(p.headers[i] == i);
+    CHECK(p.packets[i] == i);
+  }
+}
+static void negative(unsigned kind)
+{
+  Peer p;
+  Layout l;
+  CHECK(l.init());
+  switch (kind) {
+  case 0:
+    p.dropPsc = true;
+    break;
+  case 1:
+    p.badPixels = true;
+    break;
+  case 2:
+    p.n = 65;
+    break;
+  case 3:
+    p.badPsc = true;
+    break;
+  case 4:
+    p.badRelease = true;
+    break;
+  case 5:
+    p.dropClose = true;
+    break;
+  case 6:
+    p.dropStop = true;
+    break;
+  case 7:
+    p.dropLast = true;
+    break;
+  case 8:
+    p.wrongTimestamp = true;
+    break;
+  case 9:
+    p.wrongIova = true;
+    break;
+  case 10:
+    p.corrupt = true;
+    break;
+  case 11:
+    p.sessionError = true;
+    break;
+  case 12:
+    p.ops.fault = true;
+    break;
+  case 13:
+    p.ops.watchdog = true;
+    break;
+  case 14:
+    p.late = true;
+    break;
+  case 15:
+    p.systemError = true;
+    break;
+  case 16:
+    p.dropDrainAck = true;
+    break;
+  }
+  SelfTest<Peer> s(p, l);
+  CHECK(s.run() != 0);
+  CHECK(s.r.error && p.hw.clock <= 8000000);
+  CHECK(!s.r.checksum || kind == 5 || kind == 6 || kind == 7 || kind == 14 || kind == 16);
+  // Failure never frees a buffer/arena, even after an unacknowledged STOP/CLOSE. Only ownership flags change on RELEASE_DONE.
+  CHECK(p.dma.arena == p.arena.data());
+  CHECK(l.find(Bitstream, 0)->capacity == 7077888);
+  if (kind == 11)
+    CHECK(s.r.errorType == 0x04000001);
+  if (kind == 15)
+    CHECK(s.r.error == kErrSysError);
+  if (kind == 4)
+    CHECK(l.find(Bin, 0)->pendingRelease && !l.find(Bin, 0)->released);
+  if (kind == 5)
+    CHECK(!s.r.closed && s.r.close != 0);
+}
+static void malformed()
+{
+  Peer p;
+  Layout l;
+  CHECK(l.init());
+  SelfTest<Peer> s(p, l);
+  s.deadline = 100000;
+  auto pkt = Peer::packet(0x03000162, 0, 2, 1, {1});
+  std::vector<uint32_t> b = {68, kSessionId, 0, 0, 0, 0, 0, 1};
+  b.insert(b.end(), pkt.begin(), pkt.end());
+  CHECK(s.validate(b.data(), 68));
+  for (unsigned i = 0; i < 68; ++i)
+    CHECK(!s.validate(b.data(), i));
+  auto bad = b;
+  bad[7] = 0;
+  CHECK(!s.validate(bad.data(), 68));
+  bad = b;
+  bad[8] = 35;
+  CHECK(!s.validate(bad.data(), 68));
+  bad = b;
+  bad[11] = 13;
+  CHECK(!s.validate(bad.data(), 68));
+  bad = b;
+  bad[12] = 3;
+  CHECK(!s.validate(bad.data(), 68));
+  bad = b;
+  bad[1] = 42;
+  CHECK(s.receive(bad.data(), 68) != 0);
+  // Wrong bank/offset/session, duplicate buffer return and unsanctioned release cannot mutate a live entry.
+  Peer q;
+  SelfTest<Peer> u(q, l);
+  u.deadline = 100000;
+  u.rawStarted = true;
+  auto &raw = *l.find(Raw, 0);
+  raw.queued = true;
+  std::vector<uint32_t> v = {2, 0, raw.iova(), 0, 0, 147456, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
+  auto bp = Peer::packet(0x01000009, 0, 2, 5, v);
+  std::vector<uint32_t> bb = {128, kSessionId, 0, 0, 0, 0, 0, 1};
+  bb.insert(bb.end(), bp.begin(), bp.end());
+  CHECK(u.receive(bb.data(), 128) != 0 && !raw.released);
+}
+int main()
+{
+  layoutTests();
+  for (unsigned n : {1u, 4u, 7u, 64u})
+    happy(n);
+  for (unsigned i = 0; i < 17; ++i)
+    negative(i);
+  malformed();
+  std::printf("V4 host: %s (scripted firmware, never hardware evidence)\n", failures ? "FAIL" : "PASS");
+  return failures ? 1 : 0;
+}

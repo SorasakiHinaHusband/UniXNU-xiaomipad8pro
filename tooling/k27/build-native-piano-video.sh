@@ -33,6 +33,9 @@ for f in Sm8750Scm.c Sm8750Scm.h; do
 done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/video_host.cpp" -o "$O/host-tests/video_host"
 "$O/host-tests/video_host" || { echo "Error: PianoVideo host tests failed (level 1)" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror -I "$P" "$P/tests/session_host.cpp" -o "$O/host-tests/session_host"
+"$O/host-tests/session_host" || { echo "Error: PianoVideo V4 protocol/arena tests failed" >&2; exit 1; }
+python3 "$P/tests/fixture_host.py" || { echo "Error: PianoVideo own AVC fixture/golden check failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_host.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" -o "$O/host-tests/vt_host"
 "$O/host-tests/vt_host" || { echo "Error: PianoVideo VT host tests failed (V0b)" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomMdt.c" -o "$O/host-tests/QcomMdt.o"

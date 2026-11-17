@@ -636,7 +636,7 @@ struct Model {
 
   // ------------------------------------------------------------------------------------------ physical memory, DMA, the core's view
   std::map<uint64_t, uint8_t *> phys;   // 4 KiB page -> host bytes
-  std::vector<uint8_t> uc, scratchPage;
+  std::vector<uint8_t> uc, scratchPage, sessionArena;
   std::vector<uint64_t> tableMem;
   unsigned dmaAllocs = 0, dmaFrees = 0;
   uint8_t *physPtr(uint64_t pa)
@@ -651,13 +651,20 @@ struct Model {
     if (p) std::memcpy(&v, p, 8);
     return v;
   }
+  void hashActive(const volatile uint8_t *base, char text[65])
+  {
+    CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
+    session::activeRows(base, [&](const uint8_t *p, unsigned n) { CC_SHA256_Update(&ctx,p,n); });
+    uint8_t digest[32]; CC_SHA256_Final(digest,&ctx); session::hexDigest(digest,text);
+  }
   bool dmaAlloc(Dma &d)
   {
     if (f.dmaFail) return false;
     ++dmaAllocs;
     uc.assign(kUcBytes, 0);
     scratchPage.assign(4096, 0);
-    tableMem.assign(vsmmu::kTablePages * 512, 0x5a5a5a5a5a5a5a5aull);
+    const unsigned tablePages = d.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages;
+    tableMem.assign(tablePages * 512, 0x5a5a5a5a5a5a5a5aull);
     for (unsigned i = 0; i < vsmmu::kUcPages; ++i) {
       d.pages[i] = 0x8d0000000ull + uint64_t((i * 389u) % 773u) * 0x1000;   // scattered, unique
       phys[d.pages[i]] = uc.data() + 4096 * i;
@@ -665,8 +672,16 @@ struct Model {
     d.scratch = 0x8e0000000ull;
     phys[d.scratch] = scratchPage.data();
     d.tablesPa = 0x8e1000000ull;
-    for (unsigned i = 0; i < vsmmu::kTablePages; ++i) phys[d.tablesPa + 4096 * i] = reinterpret_cast<uint8_t *>(tableMem.data()) + 4096 * i;
+    for (unsigned i = 0; i < tablePages; ++i) phys[d.tablesPa + 4096 * i] = reinterpret_cast<uint8_t *>(tableMem.data()) + 4096 * i;
     d.tables = tableMem.data();
+    if (d.session) {
+      sessionArena.assign(session::kArenaBytes,0);
+      d.arena = sessionArena.data();
+      for (unsigned i=0; i<session::kArenaPages; ++i) {
+        d.arenaPages[i]=0x900000000ull+uint64_t((i*7907)%session::kArenaPages)*4096;
+        phys[d.arenaPages[i]]=sessionArena.data()+4096*i;
+      }
+    }
     d.uc = reinterpret_cast<volatile uint32_t *>(uc.data());
     return true;
   }
@@ -683,6 +698,7 @@ struct Model {
     ++dmaFrees;
     phys.clear();
     d.uc = nullptr;
+    d.arena = nullptr;
     d.tables = nullptr;
   }
   bool dmaRd(uint16_t sid, uint32_t iova, uint32_t *v)
@@ -713,7 +729,7 @@ struct Model {
   // ------------------------------------------------------------------------------------------------------------ the firmware
   struct Fw {
     bool authed = false, suspended = false, hfiUp = false, pcReady = false, idle = false, wfi = false;
-    uint32_t ucError = 0;
+    uint32_t ucError = 0, session = 0;
     unsigned boots = 0, inits = 0, versions = 0, ifpcs = 0, pcPreps = 0, services = 0;
     uint32_t ubwc[7] = {};
     std::vector<uint32_t> headerIds, packetIds;
@@ -808,13 +824,14 @@ struct Model {
     ++fw.services;
     std::vector<uint32_t> msg;
     while (qRead(hfi::kCmdq, msg)) {
-      if (msg[1] != 0) violation("a host message with a session before any session");
+      if (msg[1] && msg[1] != fw.session) violation("a host message with a session before any session");
       fw.headerIds.push_back(msg[2]);
       uint32_t at = 8;
       for (uint32_t i = 0; i < msg[7] && at < msg.size(); ++i) {
         const uint32_t *p = msg.data() + at, size = p[0], type = p[1], flags = p[2];
         fw.packetIds.push_back(p[5]);
-        if (type == kHfiCmdInit) {
+        if (type == session::Open) fw.session = p[8];
+        else if (type == kHfiCmdInit) {
           ++fw.inits;
           if (p[8] != kHfiArchLx || flags != (kHfiHostResponse | kHfiHostIntr | kHfiHostNonDiscardable) || size != 36)
             violation("a malformed INIT packet");
@@ -1046,7 +1063,7 @@ static void quiet(const Model &m, const char *what)
 // ======================================================================================================================== V1
 static void testInert()
 {
-  for (unsigned level : {0u, 1u, 5u}) {
+  for (unsigned level : {0u, 1u, 6u}) {
     Run x(level);
     CHECK(x.go() == kErrArgument);
     CHECK(x.m->reads == 0 && x.m->writes == 0 && x.b->log.writes == 0);
@@ -1591,6 +1608,34 @@ static void testV3Failures()
   }
 }
 
+static void testV4Lifetime()
+{
+  // The session peer is tested separately; here an unresponsive peer reaches real V3 teardown with the expanded scatter arena.
+  for (unsigned kind=0; kind<3; ++kind) {
+    Run x(5);
+    uint32_t bytes=0;
+    const uint8_t *db=x.m->cmdDb(&bytes);
+    x.b->opt=x.o; x.b->res=rpmh::resources(db,bytes);
+    CHECK(x.b->smmuSetup()==0 && x.b->on()==0 && x.b->smmuApply()==0 && x.b->firmware.load()==0 && x.b->bootCore()==0);
+    CHECK(x.b->tables.pageCount==36 && x.b->dma.arena);
+    for (unsigned i=0;i<session::kArenaPages;++i) if (x.b->layout.mapped(i)) {
+      uint64_t pa=0;
+      CHECK(x.m->translate(kStreamFirst,session::kArenaBase+4096*i,&pa) && pa==x.b->dma.arenaPages[i]);
+      CHECK(x.m->translate(kStreamSecond,session::kArenaBase+4096*i,&pa) && pa==x.b->dma.arenaPages[i]);
+    }
+    session::SelfTest<Bringup<Model>> test(*x.b,x.b->layout);
+    CHECK(test.run()==kErrHfiTimeout && test.r.stage==session::Finished && test.r.close!=0 && !test.r.closed);
+    CHECK(x.b->dmaHeld && x.m->dmaFrees==0 && x.m->fw.authed);
+    if (kind==1) x.m->f.scmFail="shutdown";
+    if (kind==2) x.m->f.tlbStuck=true;
+    const int rc=x.b->teardown();
+    CHECK(rc==(kind==1?kErrScm:kind==2?kErrSmmu:0));
+    CHECK(x.b->dmaHeld==(kind!=0) && x.m->dmaFrees==(kind==0?1u:0u));
+    if (!kind) CHECK(x.m->allOff() && !x.m->fw.authed && x.m->last("scm shutdown")<x.m->first("smmu route-off"));
+    quiet(*x.m,"V4 unresponsive session teardown");
+  }
+}
+
 static void testV3SepFault()
 {
   // With SEP 0 in TCR2 (what a bank left as found could hold), the model's hypervisor family faults every IOVA with bit 31 set: the
@@ -1863,6 +1908,7 @@ int main()
   testV3SteadyState();
   testV3Failures();
   testV3SepFault();
+  testV4Lifetime();
   testQueues();
   testPackets();
   testRpmhPieces();

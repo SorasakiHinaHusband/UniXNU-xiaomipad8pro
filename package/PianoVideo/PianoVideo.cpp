@@ -527,69 +527,93 @@ struct KernelHw {
                   [&](Sm8750SmcResult *r) { return Sm8750ScmPasSetRemoteState(&gScm, state, 0, r); });
   }
 
-  // V3's memory: the UC region (non-contiguous XNU pages, a write-combined view) with one scratch page after it, and the table's
-  // four contiguous 4 KiB pages (one 16 KiB XNU page, cacheable, cleaned before the SMMU walks it).
-  IOBufferMemoryDescriptor *ucMem = nullptr, *tableMem = nullptr;
-  IOMemoryMap *ucMap = nullptr;
+  // Prepared XNU owners; cached zero+clean precedes the sole NC/WC data view. No cached writes after mapping.
+  IOBufferMemoryDescriptor *ucMem = nullptr, *tableMem = nullptr, *arenaMem = nullptr;
+  IOMemoryMap *ucMap = nullptr, *arenaMap = nullptr;
+  bool ucPrepared = false, tablePrepared = false, arenaPrepared = false;
+  uint64_t uniquePages[32768] = {};
+  bool rememberPage(uint64_t pa)
+  {
+    if ((pa & 4095) || pa < kXnuDramBase || pa >= kXnuDramEnd) return false;
+    const uint64_t n = pa >> 12;
+    unsigned slot = unsigned(n ^ (n >> 15)) & 32767;
+    for (unsigned i = 0; i < 32768; ++i) {
+      if (uniquePages[slot] == pa) return false;
+      if (!uniquePages[slot]) { uniquePages[slot] = pa; return true; }
+      slot = (slot + 1) & 32767;
+    }
+    return false;
+  }
   bool dmaAlloc(Dma &d)
   {
     const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
+    const uint64_t tableBytes = ((d.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
     ucMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), bytes, 0x0000000ffffff000ull);
-    tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), 0x4000, 0x0000000fffffc000ull);
-    bool ok = ucMem && tableMem && ucMem->prepare() == kIOReturnSuccess;
-    if (ok && tableMem->prepare() != kIOReturnSuccess) {
-      ucMem->complete();
-      ok = false;
+    tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), tableBytes, 0x0000000fffffc000ull);
+    if (d.session) arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        IOOptionBits(kIODirectionInOut), session::kArenaBytes, 0x0000000ffffff000ull);
+    if (!ucMem || !tableMem || (d.session && !arenaMem)) { dmaFree(d); return false; }
+    ucPrepared = ucMem->prepare() == kIOReturnSuccess;
+    tablePrepared = tableMem->prepare() == kIOReturnSuccess;
+    if (d.session) arenaPrepared = arenaMem->prepare() == kIOReturnSuccess;
+    if (!ucPrepared || !tablePrepared || (d.session && !arenaPrepared)) { dmaFree(d); return false; }
+    uint8_t *cached = static_cast<uint8_t *>(ucMem->getBytesNoCopy());
+    bzero(cached, bytes); ::cleanToPoc(cached, bytes);
+    d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
+    IOByteCount tableSegment = 0;
+    d.tablesPa = tableMem->getPhysicalSegment(0, &tableSegment, kIOMemoryMapperNone);
+    bool ok = d.tables && d.tablesPa && tableSegment >= tableBytes;
+    bzero(uniquePages, sizeof uniquePages);
+    for (unsigned i = 0; ok && i < vsmmu::kUcPages; ++i) {
+      IOByteCount segment = 0;
+      d.pages[i] = ucMem->getPhysicalSegment(4096ull * i, &segment, kIOMemoryMapperNone);
+      ok = segment >= 4096 && rememberPage(d.pages[i]);
     }
-    if (ok) {
-      uint8_t *cached = static_cast<uint8_t *>(ucMem->getBytesNoCopy());
-      bzero(cached, bytes);
-      ::cleanToPoc(cached, bytes);
-      for (unsigned i = 0; ok && i < vsmmu::kUcPages; ++i) {
-        d.pages[i] = ucMem->getPhysicalSegment(4096ull * i, nullptr, kIOMemoryMapperNone);
-        ok = d.pages[i] && !(d.pages[i] & 0xfff);
+    d.scratch = ucMem->getPhysicalSegment(kUcBytes, nullptr, kIOMemoryMapperNone);
+    ok = ok && rememberPage(d.scratch);
+    for (unsigned i = 0; ok && i < tableBytes / 4096; ++i) ok = rememberPage(d.tablesPa + 4096ull * i);
+    if (d.session) {
+      uint8_t *arenaCached = static_cast<uint8_t *>(arenaMem->getBytesNoCopy());
+      bzero(arenaCached, session::kArenaBytes); ::cleanToPoc(arenaCached, session::kArenaBytes);
+      for (unsigned i = 0; ok && i < session::kArenaPages; ++i) {
+        IOByteCount segment = 0;
+        d.arenaPages[i] = arenaMem->getPhysicalSegment(4096ull * i, &segment, kIOMemoryMapperNone);
+        ok = segment >= 4096 && rememberPage(d.arenaPages[i]);
       }
-      d.scratch = ok ? ucMem->getPhysicalSegment(kUcBytes, nullptr, kIOMemoryMapperNone) : 0;
-      d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
-      d.tablesPa = tableMem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-      ucMap = ok ? ucMem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
-      d.uc = ucMap ? reinterpret_cast<volatile uint32_t *>(ucMap->getVirtualAddress()) : nullptr;
-      ok = ok && d.scratch && d.tables && d.tablesPa && d.uc;
-      if (!ok) {
-        if (ucMap) ucMap->release();
-        ucMap = nullptr;
-        ucMem->complete();
-        tableMem->complete();
-      }
+      arenaMap = ok ? arenaMem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+      d.arena = arenaMap ? reinterpret_cast<volatile uint8_t *>(arenaMap->getVirtualAddress()) : nullptr;
+      ok = ok && d.arena;
     }
-    if (!ok) {
-      if (ucMem) ucMem->release();
-      if (tableMem) tableMem->release();
-      ucMem = tableMem = nullptr;
-      ::note("dma: no memory for the UC region (%u bytes) or the table", kUcBytes);
-      return false;
-    }
+    ucMap = ok ? ucMem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+    d.uc = ucMap ? reinterpret_cast<volatile uint32_t *>(ucMap->getVirtualAddress()) : nullptr;
+    ok = ok && d.uc;
+    if (!ok) { dmaFree(d); return false; }
     ::note("dma: UC region %u bytes in %u pages (first %#llx), write-combined at %p; table %#llx", kUcBytes, vsmmu::kUcPages,
            (unsigned long long)d.pages[0], (void *)d.uc, (unsigned long long)d.tablesPa);
+    if (d.session) ::note("V4 backing unique PASS UC scratch tables arena pages %u prepared 1 NC-view 1 no-UC-alias 1",
+                         unsigned(vsmmu::kUcPages + 1 + tableBytes / 4096 + session::kArenaPages));
     return true;
+  }
+  void hashActive(const volatile uint8_t *base, char text[65])
+  {
+    SHA256_CTX ctx; SHA256_Init(&ctx);
+    session::activeRows(base, [&](const uint8_t *p, unsigned n) { SHA256_Update(&ctx, p, n); });
+    uint8_t hash[32]; SHA256_Final(hash, &ctx); session::hexDigest(hash, text);
   }
   void dmaFree(Dma &d)
   {
+    if (arenaMap) arenaMap->release();
     if (ucMap) ucMap->release();
-    if (ucMem) {
-      ucMem->complete();
-      ucMem->release();
-    }
-    if (tableMem) {
-      tableMem->complete();
-      tableMem->release();
-    }
-    ucMap = nullptr;
-    ucMem = tableMem = nullptr;
-    d.uc = nullptr;
-    d.tables = nullptr;
+    if (arenaMem) { if (arenaPrepared) arenaMem->complete(); arenaMem->release(); }
+    if (ucMem) { if (ucPrepared) ucMem->complete(); ucMem->release(); }
+    if (tableMem) { if (tablePrepared) tableMem->complete(); tableMem->release(); }
+    arenaMap = ucMap = nullptr;
+    arenaMem = ucMem = tableMem = nullptr;
+    arenaPrepared = ucPrepared = tablePrepared = false;
+    d.arena = nullptr; d.uc = nullptr; d.tables = nullptr;
   }
+
 };
 
 KernelHw gHw;
@@ -630,8 +654,8 @@ bool PianoVideo::start(IOService *provider)
        "%#x/%#x, carveout %#llx)",
        gArgs.level, gArgs.cc, gArgs.smmu, gArgs.carveout, gArgs.delay, gArgs.repeat, gArgs.samples, (unsigned long long)kIris,
        (unsigned long long)kVideoCc, kIrisSpi, kStreamFirst, kStreamSecond, (unsigned long long)kCarveout);
-  if (gArgs.level > 4) note("piano-video=%u: the highest level is 4 (docs/drivers/video.md section 8); running the survey only", gArgs.level);
-  if (gArgs.level >= 2 && gArgs.level <= 4)
+  if (gArgs.level > 5) note("piano-video=%u: the highest level is 5 (docs/drivers/video.md section 8); running the survey only", gArgs.level);
+  if (gArgs.level >= 2 && gArgs.level <= 5)
     note("levels 2-4: cycles=%u hold-ms=%u idle-ms=%u resumes=%u unload=%u stop=%u mmcx-floor=%#x", gArgs.cycles, gArgs.holdMs,
          gArgs.idleMs, gArgs.resumes, gArgs.unload, gArgs.stop, gArgs.mmcxFloor);
   note("level 1: loads only, nothing written");
@@ -658,7 +682,7 @@ void PianoVideo::run()
     note("waiting %u s", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
   }
-  if (gArgs.level == 4) {
+  if (gArgs.level == 4 || gArgs.level == 5) {
     note("V3 survey deferred: c5 power precedes Iris MMIO and video TLB maintenance");
     bringup();
     unmapAll();
@@ -710,7 +734,7 @@ void PianoVideo::run()
   stage(6, "done");
   note("done: %llu MMIO loads, %llu stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, (unsigned long long)gStores,
        gPageCount, gMapFailures);
-  if (gArgs.level >= 2 && gArgs.level <= 4) bringup();
+  if (gArgs.level >= 2 && gArgs.level <= 5) bringup();
   unmapAll();   // the register pages only: V3's steady state keeps its UC region and table (KernelHw), and a later level maps again
 }
 

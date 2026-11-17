@@ -151,6 +151,7 @@ Plan plan(Read rd)
 // --------------------------------------------------------------------------------------------------------------- the table
 // Four 4 KiB pages, physically contiguous: L1, L2, then two L3 tables covering [kIovaBase, kIovaBase + 4 MiB).
 constexpr unsigned kTablePages = 4, kWindowPages = kUcRegionBytes / 4096, kUcPages = kUcBytes / 4096;
+constexpr unsigned kSessionTablePages = 36;
 static_assert(kWindowPages == 2 * 512, "two level-3 tables");
 constexpr uint64_t kOutMask = 0x0000fffffffff000ull;
 constexpr uint64_t kDescTable = 3, kDescPage = 3, kAf = 1ull << 10, kShOuter = 2ull << 8, kApRw = 1ull << 6;
@@ -159,6 +160,7 @@ constexpr uint64_t pageDesc(uint64_t pa) { return (pa & kOutMask) | kAf | kShOut
 struct Tables {
   uint64_t *cpu = nullptr;   // 4 x 512 descriptors (written through a cacheable mapping, cleaned before the SMMU walks)
   uint64_t pa = 0;           // of page 0; 4 KiB aligned, the four pages contiguous
+  unsigned pageCount = kTablePages;
 };
 // pages: the UC region's kUcPages physical 4 KiB pages; scratch: a zeroed 4 KiB page for the rest of the window. False when a page
 // is not a 4 KiB-aligned page of XNU's RAM.
@@ -168,7 +170,8 @@ inline bool build(Tables &t, const uint64_t *pages, unsigned count, uint64_t scr
   for (unsigned i = 0; i < count; ++i)
     if ((pages[i] & 0xfff) || pages[i] < kXnuDramBase || pages[i] >= kXnuDramEnd) return false;
   if ((scratch & 0xfff) || scratch < kXnuDramBase || scratch >= kXnuDramEnd) return false;
-  for (unsigned i = 0; i < kTablePages * 512; ++i) t.cpu[i] = 0;
+  if (t.pageCount < kTablePages || t.pageCount > kSessionTablePages) return false;
+  for (unsigned i = 0; i < t.pageCount * 512; ++i) t.cpu[i] = 0;
   uint64_t *l1 = t.cpu, *l2 = t.cpu + 512, *l3 = t.cpu + 1024;
   l1[kIovaBase >> 30] = tableDesc(t.pa + 4096);
   const unsigned l2i = (kIovaBase >> 21) & 511u;
@@ -181,7 +184,7 @@ inline bool build(Tables &t, const uint64_t *pages, unsigned count, uint64_t scr
 inline uint64_t walk(const Tables &t, uint32_t iova)
 {
   auto at = [&](uint64_t pa) -> uint64_t {
-    if (pa < t.pa || pa >= t.pa + kTablePages * 4096) return 0;
+    if (pa < t.pa || pa >= t.pa + t.pageCount * 4096) return 0;
     return t.cpu[(pa - t.pa) / 8];
   };
   uint64_t d = at(t.pa + 8 * (iova >> 30));

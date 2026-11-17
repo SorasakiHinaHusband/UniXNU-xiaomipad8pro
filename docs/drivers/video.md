@@ -676,3 +676,34 @@ with `piano-video-stop=33` to separate the file from the calls. `FAILED at stage
    arguments; no addon has booted on piano yet (kc-space.md §9). T0 checks it first; `PIANO_FW_ADDON=0` builds images without it
    (V2/V3 then read the ESP). `build-esp.py` with this collection needs the staged copy (or `--allow-missing-firmware`, after which
    stage 30 reports `not found` on that system).
+
+
+## 13. V4 kernel single-frame self-test (implemented, tablet result pending)
+
+`piano-video=5` adds one bounded session inside V3's verified lifecycle; it leaves the paravirtual backend stub in place.
+The committed fixture is an own encode of constant Y/Cb/Cr=64/96/160 at 320×240: SPS/PPS/one Baseline IDR, 286 bytes,
+SHA-256 `ed63e8ee3deeb819b059f5c8346f66da0592b1922eec0198a47a6efa33f96923`. Host reproduction and independent software decode
+are checked by `package/PianoVideo/tests/fixture_host.py`; no external media or firmware is embedded.
+
+OPEN/config/subscriptions/START BITSTREAM lead to one ETB and first PSC. Asynchronous OPEN/START/RESUME are accepted by
+PSC/downstream evidence, with every error and packet ID logged. STOP/CLOSE and DRAIN retain their real response requirements.
+The PSC minimum controls DPB count and aggregate COMV size (`43008*N+512`, N=1..64). Pre/post scratch uses separate storage,
+including PARTIAL; release requests precede replacements and RESUME, while old storage remains owned until matching RELEASE_DONE.
+The frame gate requires all five releases. RAW starts before DPB/FTB submission; at least max(N,2) RAW buffers accommodate LAST.
+
+A separate 64 MiB IOVA arena follows the UC window, using the same bank/ASID and both video SIDs. Every backing page is wired,
+checked for uniqueness and mapped at 4 KiB granularity; guards stay invalid. Thirty-six table pages cover both windows. The
+fixture-sized HFI buffers use the pinned VPU35 size facts, not a general codec calculator. CPU data access uses one NC/WC view
+following cached zero/clean; no live table edits or cached data writes occur during the session.
+
+Success needs one nonempty, correlated, error-free RAW completion and 115200 active NV12 bytes hashing to
+`bd230ec4a9cd22c274831d1b526c43d3ceb39a089257c3cb4114fbea0a8102dc`, excluding row/bottom padding (stride384, UV offset98304).
+The pre-submit sentinel must differ. EBD, internal release and an empty LAST are not decoded pictures. DRAIN ACK/LAST, STOP RAW,
+STOP BITSTREAM, CLOSE, idle/collapse and V3 PAS/quiesce/route/TLB/power teardown all remain required. The five-second transaction
+budget and one-second command/cleanup waits preserve first-error evidence; unconfirmed PAS or domain release keeps all DMA.
+
+The host model covers counts 1/4/7/64, command-first PSC/FBD headers, delayed scratch release, malformed packets, incorrect pixels,
+addresses/timestamps, corruption, session/system errors, missing completions, READONLY and late replies. Expanded-arena lifetime
+checks exercise the real portable V3 teardown on a nonresponsive session, including PAS/TLB failures. These are host checks;
+only a future tablet run can confirm rel0039 session acceptance and pixel DMA. QuickTime, Safari, IOSurface and VT selection
+remain separate consumer work.
