@@ -147,22 +147,9 @@ while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
   case "$kind" in daemon|agent) PLIST_CHANGED="$PLIST_CHANGED$unit " ;; esac
 done < "$S/manifest.tsv"
 
-# 1a. The policy's install/check hook is synchronous: an already logged-in
-# session must be protected before the installer reports success. At the login
-# window it prepares UID 501's state; the Aqua agent finishes at first login.
+# A removed policy must restore its persistent state before losing its files.
 passd_on=$(awk -F '\t' -v p="$PASSD" '$9 == p {print $3}' "$S/manifest.tsv")
-if [ -n "$passd_on" ]; then
-  passd_valid=1
-  while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
-    [ "$unit" = piano-passd-policy ] || continue
-    [ -f "$R$dest" ] && [ "$(sum "$R$dest")" = "$want" ] || passd_valid=0
-  done < "$S/manifest.tsv"
-  if [ "$passd_valid" != 1 ]; then say 'passd policy: incomplete unit; hook refused'; FAILED=1
-  elif [ "$passd_on" = 0 ]; then
-    if [ "$MODE" != --check ]; then sh "$R$PASSD" --remove || FAILED=1; fi
-  elif [ "$MODE" = --check ]; then sh "$R$PASSD" --check || FAILED=1
-  else sh "$R$PASSD" --install || FAILED=1; fi
-elif [ "$MODE" != --check ]; then
+if [ -z "$passd_on" ] && [ "$MODE" != --check ]; then
   passd_revert || { FAILED=1; PASSD_KEEP=1; }
 fi
 
@@ -203,6 +190,23 @@ if [ "$MODE" != --check ]; then
     awk -F '\t' '$1 == "piano-passd-policy"' "$STATE/receipt.tsv" >> "$STATE/receipt.tsv.new"
   fi
   mv -f "$STATE/receipt.tsv.new" "$STATE/receipt.tsv"
+fi
+
+# Install/check only after the file receipt is written in the installer tree:
+# an interrupted first install must not leave an override with no file receipt.
+# With a GUI this is synchronous; without one, prepare for the Aqua agent.
+if [ -n "$passd_on" ]; then
+  passd_valid=1
+  while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
+    [ "$unit" = piano-passd-policy ] || continue
+    [ -f "$R$dest" ] && [ "$(sum "$R$dest")" = "$want" ] || passd_valid=0
+  done < "$S/manifest.tsv"
+  if [ "$passd_valid" != 1 ]; then say 'passd policy: incomplete unit; hook refused'; FAILED=1
+  elif [ "$MODE" != --check ] && ! ours "$PASSD"; then say 'passd policy: file receipt missing; hook refused'; FAILED=1
+  elif [ "$passd_on" = 0 ]; then
+    if [ "$MODE" != --check ]; then sh "$R$PASSD" --remove || FAILED=1; fi
+  elif [ "$MODE" = --check ]; then sh "$R$PASSD" --check || FAILED=1
+  else sh "$R$PASSD" --install || FAILED=1; fi
 fi
 
 # 3. Jobs.

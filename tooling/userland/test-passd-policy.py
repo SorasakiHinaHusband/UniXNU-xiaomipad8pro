@@ -33,6 +33,9 @@ elif a[0] == 'print-disabled':
     for label, v in s['overrides'].items(): print('  "' + label + '" => ' + str(v).lower())
     print('}')
 elif a[0] in ('enable', 'disable'):
+    receipt = pathlib.Path(os.environ['PIANO_USERLAND_ROOT']) / 'private/var/db/piano-userland/receipt.tsv'
+    if not receipt.is_file() or 'piano-passd-policy' not in receipt.read_text():
+        print('MISSING_POLICY_RECEIPT_BEFORE_OVERRIDE', file=sys.stderr); sys.exit(77)
     if a[1].startswith('gui/501/') and not s['gui']: sys.exit(113)
     s['overrides'][a[1].rsplit('/', 1)[1]] = a[0] == 'disable'
 elif a[0] == 'bootout':
@@ -169,6 +172,16 @@ class PolicyTests(unittest.TestCase):
                 rc, out = rig.run('--live')
                 self.assertEqual(rc, 0, out)
                 self.assertFalse(self.model(rig)['overrides']['com.apple.passd'])
+
+    def test_first_install_receipt_write_failure_does_not_disable(self):
+        with tempfile.TemporaryDirectory() as d:
+            rig = self.rig(Path(d), '/bin/sh', prior=False)
+            rig.root('/private/var/db/piano-userland/receipt.tsv.new').mkdir(parents=True)
+            rc, out = rig.run('--live')
+            self.assertEqual(rc, 1, out)
+            self.assertIn('receipt.tsv.new', out)
+            self.assertFalse(self.model(rig)['overrides']['com.apple.passd'])
+            self.assertNotIn('disable gui/501/com.apple.passd', rig.calls)
 
 
 if __name__ == '__main__':
