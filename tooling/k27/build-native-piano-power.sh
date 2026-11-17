@@ -17,6 +17,8 @@ T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/PianoMca.c" -o "$T/PianoMca.o"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/ChargePolicy.c" -o "$T/ChargePolicy.o"   # the charging policy (charging-policy.md)
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/policy_host.cpp" "$T/ChargePolicy.o" -o "$T/policy_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_host.cpp" -o "$T/contract_host"
+"$T/contract_host" || { echo "Error: PianoPower contract host tests failed" >&2; exit 1; }
 "$T/policy_host" || { echo "Error: PianoPower charging-policy host tests failed" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomQrtr.c" -o "$T/QcomQrtr.o"   # the QMI helpers Servreg.h uses
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$D/package/include" -c "$P/QrtrPorts.c" -o "$T/QrtrPorts.o"

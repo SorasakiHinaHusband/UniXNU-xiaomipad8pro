@@ -273,3 +273,22 @@ arch = "arm64"
 frameworks = ["CoreFoundation"]
 dest = "/usr/local/bin/piano-wifi"
 mode = "0755"
+
+[[unit]]
+name = "piano-charge-config"
+about = "administrator-only atomic charging health thresholds and fixed/PPS buck mode; optional saved daily configuration, no raw hardware writes"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-charge-config/piano-charge-config.c"
+build = "cc"
+arch = "arm64"
+frameworks = ["IOKit", "CoreFoundation"]
+dest = "/usr/local/bin/piano-charge-config"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-charge-config/com.unixnu.piano-charge-config.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-charge-config.plist"
+mode = "0644"

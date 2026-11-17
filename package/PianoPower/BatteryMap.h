@@ -35,6 +35,9 @@ struct BatteryValues {
   unsigned timeRemaining = kTimeUnknown, timeToEmpty = kTimeUnknown, timeToFull = kTimeUnknown;  // minutes
   uint32_t updateSec = 0;      // the calendar time of this reading (0: unknown, not published; "UpdateTime" on a Mac)
   // the adapter, when a source is seen on the Type-C port (its Rp current, ChargerPmic.h; the firmware's contract at level 2)
+  bool healthEnabled = false, healthHold = false, healthPending = false, healthApplied = false;
+  unsigned healthStop = 80, healthResume = 75, healthReason = 0, healthRevision = 0;
+  bool adapterContractKnown = false;
   bool adapter = false;
   bool adapterPd = false;      // the numbers come from a PD contract, not just a Type-C Rp
   unsigned adapterMv = 0, adapterMa = 0, adapterWatts = 0;
@@ -47,9 +50,9 @@ constexpr uint32_t kFamilyTypeC = 0xe0004009u;
 // and whenever the firmware has not answered yet. What macOS shows as the adapter comes from here when it is available.
 struct AdapterReal {
   bool ok = false;      // a reading this cycle
-  bool pd = false;      // the firmware's type is a PD one (a contract, not just a Type-C Rp)
-  int32_t mv = 0;       // the bus voltage the firmware reports
-  int32_t ma = 0;       // the offer in force: the matching fixed PDO's mA, else the input limit asked
+  bool pd = false;      // validated current UCSI PD sink contract
+  int32_t mv = 0;       // selected contract voltage
+  int32_t ma = 0;       // selected RDO operating current
 };
 
 inline unsigned minutes(long mah, long ma)
@@ -117,6 +120,7 @@ inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const Pac
       v.adapterMv = unsigned(real->mv);
       v.adapterMa = unsigned(real->ma > 5000 ? 5000 : real->ma);
       v.adapterPd = real->pd;
+      v.adapterContractKnown = real->pd;
     } else {
       v.adapterMv = 5000;
       v.adapterMa = rpMilliamps(port->rpBits);

@@ -54,6 +54,14 @@ class AppleSmartBattery : public IOPMPowerSource {
  public:
   void apply(const BatteryValues &v)
   {
+    flag("PianoChargeLimitEnabled", v.healthEnabled);
+    flag("PianoChargeHold", v.healthHold);
+    flag("PianoChargePending", v.healthPending);
+    flag("PianoChargeApplied", v.healthApplied);
+    number("PianoChargeStop", v.healthStop); number("PianoChargeResume", v.healthResume);
+    number("PianoChargeReason", v.healthReason); number("PianoChargeRevision", v.healthRevision);
+    flag("PianoAdapterContractKnown", v.adapterContractKnown);
+    text("PianoAdapterSource", v.adapterContractKnown ? "UCSI RDO" : "Rp/unknown");
     setBatteryInstalled(v.installed);
     setExternalConnected(v.external);
     setExternalChargeCapable(v.chargeCapable);

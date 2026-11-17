@@ -26,10 +26,12 @@
 #include "PianoBoardTemps.h"
 #include "ChargePolicy.h"
 #include "PianoMca.h"
+#include "ChargeContract.h"
 
 namespace pianopower {
 
 struct LinkOptions {
+  bool strictContract = false;     // production contract-bounded buck session
   bool writes = true;              // piano-power-write
   unsigned hv = 0;                 // piano-power-hv: 0, 1 fixed 9 V PDO, 2 also a PPS APDO
   bool qc3 = false;                // piano-power-b4pd: HVDCP3 9 V request (0x2011)
@@ -43,6 +45,8 @@ struct LinkOptions {
 
 // What the owner knows besides the codec, for one decision.
 struct LinkView {
+  const PianoChargeContract *contract = nullptr;
+  bool safetyFresh = false, cpOff = false, dtptValid = false, dtpt = false;
   uint64_t nowMs = 0;
   bool chargerPdUp = false;                   // msm/adsp/charger_pd reports up (PianoQrtr.c's servreg listener)
   uint64_t chargerPdUpMs = 0;                 // when it was seen coming up (nowMs's clock; each up again moves it)
@@ -107,6 +111,7 @@ class ChargeLink {
   void configure(PianoMca &m, const LinkOptions &o)
   {
     piano_charge_config_default(&cfg);
+    cfg.strict_contract = o.strictContract ? 1 : 0;
     cfg.writes = o.writes && m.policy ? 1 : 0;
     cfg.hv = uint8_t(o.hv > 2 ? 2 : o.hv);
     cfg.qc3 = o.qc3 ? 1 : 0;
@@ -117,7 +122,7 @@ class ChargeLink {
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
     // 0x2003 = 0 through the codec only for battery health's stop and the charging restart's
-    piano_mca_use_external_policy(&m, cfg.limit || cfg.kick, cfg.hv >= 2, cfg.qc3);
+    piano_mca_use_external_policy(&m, cfg.strict_contract || cfg.limit || cfg.kick, cfg.strict_contract || cfg.hv >= 2, cfg.qc3);
     piano_mca_allow_icl(&m, piano_charge_icl_max(&cfg));   // the codec's bound follows the policy's (1600 unless stepped higher)
   }
 
@@ -152,6 +157,44 @@ class ChargeLink {
       for (unsigned i = 0; i < x.pdos; ++i)
         for (unsigned k = 0; k < 3; ++k) x.pdo[i][k] = m.pdo[i][k];
     }
+    if (v.contract) x.contract_observing = v.contract->linked && !v.contract->quarantined &&
+        v.contract->stage != PianoContractIdle &&
+        (v.contract->last_error == PIANO_CONTRACT_OK || v.contract->last_error == PIANO_CONTRACT_CHANGED);
+    // Only the selected raw PDO + current RDO grant a contract. MCA triplets
+    // remain diagnostics and never authorize a new HV request.
+    if (v.contract && piano_contract_fresh(v.contract, v.nowMs)) {
+      const PianoChargeContract &c = *v.contract;
+      x.valid |= PIANO_CHG_IN_CONTRACT | PIANO_CHG_IN_SOURCE;
+      x.contract_generation = c.generation;
+      x.contract_link_generation = m.links;
+      x.contract_mv = c.mv; x.contract_ma = c.ma; x.contract_protocol = c.protocol;
+      x.fixed9_ma = x.pps9_ma = 0;
+      bool fixed5 = false;
+      for (unsigned i = 0; i < c.pdos && i < 7; ++i) {
+        const uint32_t raw = c.source_pdo[i];
+        if ((raw >> 30) == 0) {
+          const uint32_t mv = ((raw >> 10) & 1023) * 50, ma = (raw & 1023) * 10;
+          if (mv == 5000 && ma >= 100) fixed5 = true;
+          if (mv == 9000 && ma >= 100 && ma <= 5000) x.fixed9_ma = ma;
+        } else if ((raw >> 28) == 12) {
+          const uint32_t lo = ((raw >> 8) & 255) * 100, hi = ((raw >> 17) & 255) * 100, ma = (raw & 127) * 50;
+          if (lo >= 3000 && lo <= 9000 && hi >= 9000 && hi <= 21000 && ma >= 500 && ma <= 5000)
+            x.pps9_ma = ma > 3000 ? 3000 : ma;
+        }
+      }
+      if (fixed5 && has(McaPdState) && m.value[McaPdState] == 2 &&
+          (!has(McaType) || x.type == PIANO_CHG_T_UNKNOWN || x.type == PIANO_CHG_T_FLOAT ||
+           x.type == PIANO_CHG_T_TYPEC || x.type == PIANO_CHG_T_DCP)) {
+        x.type = c.protocol == PIANO_CONTRACT_PPS ? PIANO_CHG_T_PPS : PIANO_CHG_T_PD;
+        x.valid |= PIANO_CHG_IN_TYPE;
+      }
+    }
+    if (m.board_allowed && m.board_done == 7) x.safety |= PIANO_CHG_SAFE_BOARD;
+    if (v.safetyFresh && v.cpOff) x.safety |= PIANO_CHG_SAFE_CP_OFF;
+    if (has(McaLpd) && m.value[McaLpd] == 0) x.safety |= PIANO_CHG_SAFE_LPD_DRY;
+    if (v.safetyFresh && v.dtptValid && !v.dtpt) x.safety |= PIANO_CHG_SAFE_DTPT;
+    if (has(McaLpd) && m.value[McaLpd] != 0) x.faults |= 1;
+    if (v.safetyFresh && v.dtptValid && v.dtpt) x.faults |= 2;
     // the gauges only when both packs read (one charger feeds both)
     if (v.packs && v.packsFresh && v.packs[0].ok && v.packs[1].ok) {
       const GaugeReading &a = v.packs[0], &b = v.packs[1];
@@ -191,7 +234,7 @@ class ChargeLink {
   bool due(const PianoMca &m, const LinkView &v) const
   {
     if (!m.external) return false;
-    if (m.cycles != lastCycles_) return true;
+    if (force_ || m.cycles != lastCycles_) return true;
     const bool handover = v.willSleep || v.shutdown;
     return handover && (!lastHandover_ || answers != answersAtDecision_);
   }
@@ -203,7 +246,7 @@ class ChargeLink {
     const bool handover = v.willSleep || v.shutdown;
     if (!v.chargerPdUp) {
       if (!pdNoted_) {pdNoted_ = true; o.waitingPd = true;}
-      if (handover) o.handoverReady = true;   // nothing can be sent: nothing to wait for
+      if (handover) o.handoverReady = !st.disabled && !st.pending;
       hold = false;
       return;
     }
@@ -211,13 +254,14 @@ class ChargeLink {
     if (m.links != boardLinks_) {boardLinks_ = m.links; boardNoted_ = false;}
     if (!piano_mca_board_settled(&m)) {
       if (!boardNoted_) {boardNoted_ = true; o.waitingBoard = true;}
-      if (handover) o.handoverReady = true;
+      if (handover) o.handoverReady = false;
       return;
     }
     if (!due(m, v)) {
       o.handoverReady = handover && lastHandover_ && plan.sleep_ready && !m.queued && !m.sent_write;
       return;
     }
+    force_ = false;
     const bool newCycle = m.cycles != lastCycles_;
     lastCycles_ = m.cycles;
     lastHandover_ = handover;
@@ -257,6 +301,38 @@ class ChargeLink {
     }
   }
 
+  void requestDecision() {force_ = true;}
+
+  // A configuration/contract change revokes unsent policy writes. The single
+  // already-sent transaction is still matched and its ACK reported; board
+  // setup is never cancelled. No stale unsent enable/HV/up-current escapes.
+  void cancelQueued(PianoMca &m)
+  {
+    unsigned dst = m.sent_write ? 1 : 0;
+    for (unsigned i = dst; i < m.queued; ++i) {
+      const uint32_t prop = m.queue[i].property;
+      if (prop == PIANO_MCA_CP_STATE || prop == PIANO_MCA_OTG_CFG || prop == PIANO_MCA_CID_CFG) {
+        m.queue[dst++] = m.queue[i];
+      } else {
+        const int slot = prop == PIANO_CHG_ENABLE ? PIANO_CHG_S_ENABLE : prop == PIANO_CHG_FCC ? PIANO_CHG_S_FCC :
+                         prop == PIANO_CHG_ICL ? PIANO_CHG_S_ICL : prop == PIANO_CHG_FV ? PIANO_CHG_S_FV :
+                         prop == PIANO_CHG_PD_FIXED || prop == PIANO_CHG_PPS ? PIANO_CHG_S_VOLT : -1;
+        if (slot >= 0) st.pending &= uint8_t(~(1u << slot));
+        // Cancellation is not a firmware refusal. An unsent stop alone
+        // creates no right to lift a firmware-owned disable afterwards.
+        if (prop == PIANO_CHG_ENABLE && !m.queue[i].value && !disableObligation_) st.disabled = 0;
+      }
+    }
+    m.queued = uint8_t(dst);
+  }
+
+  // Called only when the owner hands this serialized request to GLINK.
+  void sent(const PianoMca &m)
+  {
+    if (m.sent_write && m.queued && m.queue[0].property == PIANO_CHG_ENABLE && !m.queue[0].value)
+      disableObligation_ = true;
+  }
+
   // The codec answered a write (McaWritten): the policy learns the result; a taken limit, enable or voltage is read back next cycle.
   void answered(const PianoMca &m)
   {
@@ -264,6 +340,7 @@ class ChargeLink {
     answers++;
     piano_charge_ack(&st, m.last_property, m.last_value, m.last_result);
     if (m.last_result) return;
+    if (m.last_property == PIANO_CHG_ENABLE) disableObligation_ = m.last_value == 0;
     const int slot = m.last_property == PIANO_MCA_ICL ? 0 : m.last_property == PIANO_MCA_CHARGE_ENABLE ? 1
                      : m.last_property == PIANO_MCA_PD_FIXED || m.last_property == PIANO_MCA_PPS ? 2 : -1;
     if (slot >= 0) rb_[slot] = Pending{m.last_property, m.last_value, m.cycles, true};
@@ -281,6 +358,7 @@ class ChargeLink {
   struct Pending {uint32_t property = 0, value = 0, cycle = 0; bool armed = false;};
   struct Shown {uint8_t cls = 0xff, hv = 0xff, charge = 0xff, why = 0xff, hold = 0xff; uint32_t icl = 0, fcc = 0;};
   uint32_t lastCycles_ = 0, answersAtDecision_ = 0, boardLinks_ = 0;
+  bool force_ = false, disableObligation_ = false;
   bool lastHandover_ = false, pdNoted_ = false, boardNoted_ = false;
   Pending rb_[3];
   Shown shown_;

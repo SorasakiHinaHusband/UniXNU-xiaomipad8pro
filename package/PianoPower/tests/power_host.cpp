@@ -1334,6 +1334,12 @@ static void testGauge()
   uint16_t v = 0;
   CHECK(busA.readWord(kGaugeAddress, kGaugeVoltage, &v) == I2cResult::ok && v == 3912);
   CHECK(a.starts == 2 && a.stops == 1 && a.reg == kGaugeVoltage);
+  // A one-byte safety register must NACK its sole byte and leave the bus
+  // released so the next ordinary two-byte gauge read remains intact.
+  a.regs[0x72] = 3;
+  uint8_t alert = 0;
+  CHECK(busA.readRegisterByte(kGaugeAddress, 0x72, &alert) == I2cResult::ok && alert == 3);
+  CHECK(a.mSda && a.mScl && a.sda() && a.scl());
   const GaugeReading ga = readGauge(busA);
   CHECK(ga.ok && ga.voltageMv == 3912 && ga.currentMa == -321 && ga.socPct == 47 && ga.remainingMah == 2300 && ga.fullMah == 4900);
   CHECK(ga.tempDeciC == 305 && ga.status == (kGaugeDsg | kGaugeInit) && ga.cycles == 172);
@@ -2886,6 +2892,42 @@ static void testRtc()
   CHECK(!r.ok && r.rtc.apid < 0);
 }
 
+static void testBuckQueueCancellation()
+{
+  PianoMca m; piano_mca_init(&m, 1, 1);
+  ChargeLink link; LinkOptions o; o.strictContract = true;
+  link.configure(m, o);
+  for (unsigned i = 0; i < 5; ++i) {
+    CHECK(piano_mca_queue(&m, PIANO_CHG_ENABLE, 0, 1) == 0);
+    link.st.pending |= 1u << PIANO_CHG_S_ENABLE;
+    link.st.disabled = 1;
+    link.cancelQueued(m);
+    CHECK(!m.queued && !link.st.pending && !link.st.disabled && !link.st.tries[PIANO_CHG_S_ENABLE]);
+  }
+  CHECK(!(link.st.events & PIANO_CHG_EV_GAVE_UP));
+  CHECK(piano_mca_queue(&m, PIANO_CHG_ENABLE, 0, 1) == 0);
+  m.sent_write = 1;
+  link.sent(m);
+  link.st.disabled = 1;
+  link.st.pending |= 1u << PIANO_CHG_S_ENABLE;
+  CHECK(piano_mca_queue(&m, PIANO_CHG_FCC, 1500, 4) == 0);
+  link.st.pending |= 1u << PIANO_CHG_S_FCC;
+  link.cancelQueued(m);
+  CHECK(m.queued == 1 && link.st.disabled && (link.st.pending & (1u << PIANO_CHG_S_ENABLE)));
+  CHECK(!(link.st.pending & (1u << PIANO_CHG_S_FCC)) && !link.st.tries[PIANO_CHG_S_FCC]);
+  // A source triplet never grants a contract; the raw selected PDO/RDO
+  // snapshot must belong to this link and remain fresh.
+  PianoChargeContract c{}; piano_contract_init(&c);
+  c.valid = c.status_valid = c.connected = c.sink = c.pd = 1;
+  c.generation = 3; c.updated_ms = 1000; c.protocol = PIANO_CONTRACT_FIXED; c.mv = 5000; c.ma = 1200;
+  c.pdos = 2; c.source_pdo[0] = (5000 / 50 << 10) | 300; c.source_pdo[1] = (9000 / 50 << 10) | 200;
+  m.links = 2; LinkView v; v.nowMs = 1000; v.contract = &c;
+  PianoChargeInput x; ChargeLink::fill(x, m, v);
+  CHECK((x.valid & PIANO_CHG_IN_CONTRACT) && x.contract_link_generation == 2 && x.contract_ma == 1200 && x.fixed9_ma == 2000);
+  v.nowMs = 16001; ChargeLink::fill(x, m, v);
+  CHECK(!(x.valid & (PIANO_CHG_IN_CONTRACT | PIANO_CHG_IN_SOURCE)) && !x.fixed9_ma);
+}
+
 int main()
 {
   testRtc();
@@ -2894,6 +2936,7 @@ int main()
   testChgEn();
   testChgFix();
   testGauge();
+  testBuckQueueCancellation();
   testMcaCodec();
   testMcaPolicy();
   testMcaHv();

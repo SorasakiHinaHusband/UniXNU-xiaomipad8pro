@@ -63,6 +63,9 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   video firmware booting and talking HFI); before: [docs/results-2026-11-16.md](docs/results-2026-11-16.md) (macOS's Wi-Fi scan through our user client, the
   video firmware authenticated, macOS sound output, the boot-window analysis); earlier: [docs/results-2026-11-14.md](docs/results-2026-11-14.md)
   (Wi-Fi on the installed system with sleep and crash recovery, the built-in `en0` handed to Wi-Fi, the boot-time probes).
+- [Contract-bounded buck charging](docs/drivers/charging-buck-session.md): UCSI/RDO
+  validation and admin 80/75 health control are implemented and host-tested;
+  PD/PPS and the runtime stop/resume actuator await tablet verification.
 - Most other drivers (power and charging, touch, keyboard cover, backlight, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
   tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).

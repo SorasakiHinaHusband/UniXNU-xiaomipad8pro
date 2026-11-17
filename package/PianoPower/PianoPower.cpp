@@ -53,6 +53,7 @@
 // has current to spare (0x2003 = 0, 5 s, then 1; charging-policy.md §17), and every report ends with a `charging:` balance line
 // (input, battery, the system by difference) at every level.
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBSD.h>
@@ -86,6 +87,7 @@ extern "C" {
 #include "UsbcRelay.h"   // the USB-C owners for one client kext (package/include/PianoUsbcContract.h, PianoUsbcRelay.cpp)
 }
 #include "ChargeLink.h"
+#include "ChargeContract.h"
 
 using namespace pianopower;
 
@@ -338,6 +340,25 @@ class PianoPower : public IOService {
   PackReading fBattery;
   // the DSP and its charger properties (level 2)
   PianoMca fMca;
+  PianoChargeContract fContract{};
+  uint64_t fContractRefresh = 0;
+  bool fContractWasFresh = false;
+  uint32_t fContractSeenGeneration = 0;
+  IOLock *fConfigLock = nullptr;
+  struct ChargeRequest {uint32_t enabled, stop, resume, mode, inhibit, revision;} fConfigRequest{};
+  bool fConfigPending = false;
+  uint32_t fConfigRevision = 0;
+  uint64_t fInhibitUntil = 0;
+  int32_t fConfigError = 0;
+  uint32_t fStatusSeq = 0;
+  uint8_t fCpCtrl = 0, fIsc[2] = {}, fSoa[2] = {};
+  uint32_t fSafetyValid = 0;
+  uint64_t fSafetyMs = 0;
+  bool fHandoverFault = false;
+  void applyChargeRequest(uint64_t now);
+  void sampleSafety(uint64_t now);
+  void publishCharge(uint64_t now, const piano_board_temps *board);
+
   PianoAdspChannel *fChannel = nullptr;
   IOSimpleLock *fRingLock = nullptr;
   static constexpr unsigned kRing = 8;
@@ -436,6 +457,7 @@ class PianoPower : public IOService {
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setProperties(OSObject *properties) override;
   IOReturn setPowerState(unsigned long state, IOService *device) override;
   void systemWillShutdown(IOOptionBits specifier) override;
 };
@@ -511,12 +533,16 @@ bool PianoPower::start(IOService *provider)
          gArgs.psInject);
   setProperty("piano-power", gArgs.level, 32);
   fRingLock = IOSimpleLockAlloc();
+  fConfigLock = IOLockAlloc();
+  setProperty("PianoChargeBuild", "PianoBuckContractV1");
+  note("buck: PianoBuckContractV1 HV_ICL=1600 FCC=1500 FV=4400 CP=read-only");
   thread_t t = nullptr;
-  if (!fRingLock || kernel_thread_start(&PianoPower::thread, this, &t) != KERN_SUCCESS) {
+  if (!fConfigLock || !fRingLock || kernel_thread_start(&PianoPower::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
     return true;   // stays attached and does nothing more
   }
   thread_deallocate(t);
+  registerService();
   // With the policy the charger is handed over before a system sleep and told everything again after it (docs/power.md §4), and a
   // stop of ours is lifted at shutdown: setPowerState and systemWillShutdown need the power tree.
   if (fPolicyOn) {
@@ -524,6 +550,159 @@ bool PianoPower::start(IOService *provider)
     note("policy: joined the power tree (%#x): sleep hands the charger over, a wake sends everything again", r);
   }
   return true;
+}
+
+// Only this complete, versioned transaction is writable. Hardware writes remain
+// in the worker and pass both existing policy and codec allowlists.
+IOReturn PianoPower::setProperties(OSObject *properties)
+{
+  if (!fPolicyOn || !fConfigLock || !gArgs.write) return kIOReturnUnsupported;
+  if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+    return kIOReturnNotPrivileged;
+  OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+  if (!d || d->getCount() != 6) return kIOReturnBadArgument;
+  static const char *const keys[] = {"ChargeLimitEnabled", "ChargeLimitStop", "ChargeLimitResume", "ChargeMode",
+                                    "ChargeTestInhibitSeconds", "ChargeConfigRevision"};
+  uint32_t v[6];
+  for (unsigned i = 0; i < 6; ++i) {
+    OSNumber *n = OSDynamicCast(OSNumber, d->getObject(keys[i]));
+    if (!n || n->unsigned64BitValue() > 0xffffffffu) return kIOReturnBadArgument;
+    v[i] = n->unsigned32BitValue();
+  }
+  PianoChargeConfig checked;
+  piano_charge_config_default(&checked);
+  if (v[4] > 180 || piano_charge_config_transaction(&checked, v[0], v[1], v[2], v[3], v[4] != 0))
+    return kIOReturnBadArgument;
+  IOLockLock(fConfigLock);
+  if (__atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE) || v[5] != fConfigRevision) {
+    IOLockUnlock(fConfigLock);
+    return kIOReturnBusy;
+  }
+  fConfigRequest = {v[0], v[1], v[2], v[3], v[4], v[5]};
+  __atomic_store_n(&fConfigPending, true, __ATOMIC_RELEASE);
+  IOLockUnlock(fConfigLock);
+  thread_wakeup((event_t)this);
+  return kIOReturnSuccess;
+}
+
+void PianoPower::applyChargeRequest(uint64_t now)
+{
+  if (fInhibitUntil && now >= fInhibitUntil) {
+    fInhibitUntil = 0;
+    fLink.cfg.admin_stop = 0;
+    fLink.requestDecision();
+    note("buck: inhibit expired=1 restore=health");
+  }
+  if (!__atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE)) return;
+  IOLockLock(fConfigLock);
+  const ChargeRequest q = fConfigRequest;
+  const int r = piano_charge_config_transaction(&fLink.cfg, q.enabled, q.stop, q.resume, q.mode, q.inhibit != 0);
+  fConfigError = r;
+  if (!r) {
+    fInhibitUntil = q.inhibit ? now + uint64_t(q.inhibit) * 1000 : 0;
+    ++fConfigRevision;
+    fLink.cancelQueued(fMca);
+    fLink.requestDecision();
+  }
+  __atomic_store_n(&fConfigPending, false, __ATOMIC_RELEASE);
+  IOLockUnlock(fConfigLock);
+  note("buck: config rev=%u enabled=%u stop=%u resume=%u mode=%u inhibit=%u error=%d", fConfigRevision,
+       fLink.cfg.limit, fLink.cfg.stop_pct, fLink.cfg.resume_pct, fLink.cfg.hv, q.inhibit, r);
+}
+
+// Same worker and pin ownership as the gauge reads: no parallel I2C client and
+// no CP or fuel-gauge configuration writes. The one-byte command selects a
+// read-only register; SC8541 CTRL2 bit4 is observed, never cleared here.
+void PianoPower::sampleSafety(uint64_t now)
+{
+  fSafetyValid = 0;
+  for (unsigned i = 0; i < 2; ++i) {
+    GaugeBus &b = gBuses[i];
+    if (!b.sda.page.va || !b.scl.page.va) continue;
+    takePin(b.scl); takePin(b.sda); IODelay(20);
+    const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
+    I2cBus bus(io);
+    if (!i && bus.readRegisterByte(0x6a, 0x0f, &fCpCtrl) == I2cResult::ok) fSafetyValid |= 1;
+    if (bus.readRegisterByte(0x55, 0x72, &fIsc[i]) == I2cResult::ok) fSafetyValid |= 2u << (2 * i);
+    if (bus.readRegisterByte(0x55, 0x70, &fSoa[i]) == I2cResult::ok) fSafetyValid |= 4u << (2 * i);
+    givePin(b.sda); givePin(b.scl);
+  }
+  fSafetyMs = now;
+}
+
+void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
+{
+  const PianoChargeState &s = fLink.st;
+  const PianoChargePlan &p = fLink.plan;
+  const PianoChargeInput &x = fLink.in;
+  const PianoChargeContract &c = fContract;
+  const bool enabledValid = piano_mca_has(&fMca, McaChargeEnable);
+  const int32_t enabled = enabledValid ? fMca.value[McaChargeEnable] : -1;
+  const bool applied = !s.pending && !fMca.queued && enabledValid && enabled == int(p.charge);
+  OSDictionary *d = OSDictionary::withCapacity(80);
+  if (!d) return;
+  auto n = [&](const char *key, uint64_t value) {
+    OSNumber *v = OSNumber::withNumber(value, 64);
+    if (v) {d->setObject(key, v); v->release();}
+  };
+  n("Version", 1); n("Seq", ++fStatusSeq); n("UptimeMs", now);
+  n("Generation", c.generation); n("LinkGeneration", fMca.links); n("ContractSeq", c.seq);
+  n("RawType", uint32_t(piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1));
+  n("EffectiveType", uint32_t(x.type)); n("Connector", c.connector); n("Connected", c.connected);
+  n("Sink", c.sink); n("PD", c.pd); n("ContractValid", c.valid && now >= c.updated_ms && now - c.updated_ms <= 15000);
+  n("ContractStatusValid", c.status_valid); n("RDO", c.rdo); n("Protocol", c.protocol); n("ContractMV", c.mv); n("ContractMA", c.ma);
+  n("PackSampleMs", fPackMs); n("PackAgeMs", now >= fPackMs ? now - fPackMs : ~0u);
+  n("SourceMA", c.source_ma); n("SourcePDOCount", c.pdos); n("UCSIVersion", c.version); n("CCI", c.cci);
+  n("ContractError", uint32_t(c.last_error)); n("ContractAgeMs", c.updated_ms && now >= c.updated_ms ? now - c.updated_ms : ~0u);
+  for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
+  n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
+  n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
+  n("CPControl", fCpCtrl); n("LPDValid", piano_mca_has(&fMca, McaLpd)); n("LPD", uint32_t(fMca.value[McaLpd]));
+  n("DTPT", fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1]);
+  n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
+  n("RequestedICL", p.icl_ma); n("AppliedICL", s.icl_set); n("ICLReadback", uint32_t(x.icl_ma)); n("AICL", uint32_t(x.aicl_ma));
+  n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FV", 4400);
+  n("HealthEnabled", fLink.cfg.limit); n("HealthStop", fLink.cfg.stop_pct); n("HealthResume", fLink.cfg.resume_pct);
+  n("Mode", fLink.cfg.hv); n("HealthHold", s.hold); n("HealthDesired", p.charge); n("HealthPending", !applied);
+  n("HealthApplied", applied); n("HealthReason", p.why_off); n("EnableReadback", uint32_t(enabled));
+  n("HealthInhibitSeconds", fInhibitUntil > now ? (fInhibitUntil - now + 999) / 1000 : 0);
+  IOLockLock(fConfigLock);
+  n("ConfigRevision", fConfigRevision); n("HealthGeneration", fConfigRevision); n("ConfigPending", __atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE));
+  n("ConfigError", uint32_t(fConfigError));
+  IOLockUnlock(fConfigLock);
+  n("HandoverFault", fHandoverFault); n("PendingSlots", s.pending);
+  n("LastACKProperty", fMca.last_property); n("LastACKValue", fMca.last_value); n("LastACKError", uint32_t(fMca.last_result));
+  n("Timeouts", fMca.timeouts); n("Fallback", p.fallback);
+  for (unsigned i = 0; i < 2; ++i) {
+    const GaugeReading &g = fPack[i]; char key[32];
+#define PACKNUM(name, value) snprintf(key, sizeof key, "Pack%u" name, i); n(key, uint32_t(value))
+    PACKNUM("Valid", g.ok); PACKNUM("SOC", g.socPct); PACKNUM("MA", g.currentMa); PACKNUM("TempDC", g.tempDeciC);
+    PACKNUM("ISC", fIsc[i]); PACKNUM("SOA", fSoa[i]);
+#undef PACKNUM
+  }
+  for (unsigned i = 0; i < PIANO_BOARD_TEMP_COUNT; ++i) {
+    char key[32]; snprintf(key, sizeof key, "Board%uAgeMs", i); n(key, board ? board->age_ms[i] : ~0u);
+  }
+  n("BoardValid", board ? board->valid : 0);
+  setProperty("PianoCharge", d); d->release();
+  note("buck: seq=%u gen=%u link=%u raw=%d effective=%d valid=%u connector=%u sink=%u pd=%u", fStatusSeq, c.generation,
+       fMca.links, piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1, x.type, c.valid, c.connector, c.sink, c.pd);
+  note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s", c.generation, c.seq, c.rdo, c.protocol,
+       c.mv, c.ma, c.last_error, c.valid ? "validated" : "no PD contract");
+  for (unsigned i = 0; i < c.pdos && i < 7; ++i) note("buck-pdo: gen=%u index=%u raw=%#x", c.generation, i + 1, c.source_pdo[i]);
+  note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d", fStatusSeq, p.icl_ma, s.icl_set,
+       x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma);
+  note("buck-health: seq=%u rev=%u enabled=%u stop=%u resume=%u hold=%u desired=%u pending=%u applied=%u reason=%u inhibit=%u",
+       fStatusSeq, fConfigRevision, fLink.cfg.limit, fLink.cfg.stop_pct, fLink.cfg.resume_pct, s.hold, p.charge, !applied,
+       applied, p.why_off, fInhibitUntil > now ? 1u : 0u);
+  note("buck-safety: seq=%u valid=%#x cp=%#x lpd=%d dtpt=%u ack=%#x/%u/%d timeout=%u fallback=%u", fStatusSeq, fSafetyValid,
+       fCpCtrl, piano_mca_has(&fMca, McaLpd) ? fMca.value[McaLpd] : -1,
+       fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1], fMca.last_property, fMca.last_value, fMca.last_result, fMca.timeouts, p.fallback);
+  note("buck-board: seq=%u valid=%#x age=%u/%u/%u/%u", fStatusSeq, board ? board->valid : 0,
+       board ? board->age_ms[0] : ~0u, board ? board->age_ms[1] : ~0u,
+       board ? board->age_ms[2] : ~0u, board ? board->age_ms[3] : ~0u);
+  for (unsigned i = 0; i < 2; ++i) note("buck-pack: seq=%u pack=%u valid=%u soc=%d ma=%d temp=%d isc=%u soa=%u age=%llu",
+       fStatusSeq, i, fPack[i].ok, fPack[i].socPct, fPack[i].currentMa, fPack[i].tempDeciC, fIsc[i], fSoa[i], now - fPackMs);
 }
 
 // kOff: the thread hands the charger over (decide with the sleep flag until the plan is ready, at most 2 s) and acknowledges; the
@@ -1150,24 +1329,36 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     }
   }
   AdapterReal real;
-  if (gArgs.level >= 2 && piano_mca_has(&fMca, McaBusVoltage)) {
-    real.ok = true;
-    real.mv = fMca.value[McaBusVoltage] / 1000;
-    real.pd = piano_mca_has(&fMca, McaType) &&
-              (fMca.value[McaType] == PIANO_MCA_TYPE_PD || fMca.value[McaType] == PIANO_MCA_TYPE_PD_VERIFY ||
-               fMca.value[McaType] == PIANO_MCA_TYPE_PD_PPS);
-    // The offer in force: the fixed PDO the bus sits on when there is one, else the input limit asked
-    real.ma = 0;
-    for (unsigned i = 0; i < fMca.pdos && i < 7; ++i)
-      if (fMca.pdo[i][2] > 0 && real.mv >= int32_t(fMca.pdo[i][0]) && real.mv <= int32_t(fMca.pdo[i][1]))
-        real.ma = int32_t(fMca.pdo[i][2]);
-    if (!real.ma && piano_mca_has(&fMca, McaIcl) && fMca.value[McaIcl] > 0) real.ma = fMca.value[McaIcl];
+  if (fPolicyOn && piano_contract_fresh(&fContract, nowMs())) {
+    real.ok = real.pd = true;
+    real.mv = fContract.mv;
+    real.ma = fContract.ma;
   }
   clock_sec_t sec = 0;
   clock_usec_t usec = 0;
   clock_get_calendar_microtime(&sec, &usec);
   const uint32_t nowSec = sec > 1600000000 ? uint32_t(sec) : 0;   // before 2020: the calendar is not up yet
-  const BatteryValues v = mapBattery(fPack, 2, published, port, gArgs.psFloor, &real, nowSec, gArgs.psGuard);
+  BatteryValues v = mapBattery(fPack, 2, published, port, gArgs.psFloor, &real, nowSec, gArgs.psGuard);
+  if (fPolicyOn) {
+    const PianoChargeState &s = fLink.st;
+    v.healthEnabled = fLink.cfg.limit != 0; v.healthStop = fLink.cfg.stop_pct; v.healthResume = fLink.cfg.resume_pct;
+    v.healthHold = s.hold; v.healthReason = fLink.plan.why_off; v.healthRevision = fConfigRevision;
+    // Independent power evidence keeps AC connected while charge is stopped,
+    // even if this round's Type-C observer did not answer.
+    const uint64_t now = nowMs();
+    const bool ucsiPower = fContract.status_valid && now >= fContract.updated_ms && now - fContract.updated_ms <= 15000 &&
+                           fContract.connected && fContract.sink;
+    const bool busPower = piano_mca_has(&fMca, McaBusVoltage) && fMca.value[McaBusVoltage] >= 4000000;
+    if (ucsiPower || busPower) v.external = v.chargeCapable = true;
+    const bool enableKnown = piano_mca_has(&fMca, McaChargeEnable);
+    const bool enable = enableKnown && fMca.value[McaChargeEnable] == 1;
+    v.healthApplied = enableKnown && !s.pending && !fMca.queued && enable == (fLink.plan.charge != 0);
+    v.healthPending = !v.healthApplied;
+    // Actual positive pack current AND confirmed enabled, never the software
+    // desired charge vote. A health stop never means FullyCharged.
+    v.charging = v.charging && enable && fBattery.currentMa >= 50;
+    if (!v.charging) v.timeToFull = v.timeRemaining = kTimeUnknown;
+  }
   if (v.implausible) {
     note("[%llus] ps: implausible pack reading (%d/%d mAh): the power source is %s", t, published.remainingMah, published.fullMah,
          pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
@@ -1337,10 +1528,12 @@ void PianoPower::startCharger()
   piano_mca_init(&fMca, gArgs.write ? 1 : 0, gArgs.hv != 0);
   piano_mca_allow_unsuspend(&fMca, gArgs.unsuspend != 0);
   piano_mca_allow_board(&fMca, gArgs.board != 0);
-  piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0);
+  piano_contract_init(&fContract);
+  piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0 && !fPolicyOn);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   if (fPolicyOn) {
     LinkOptions o;
+    o.strictContract = true;
     o.writes = gArgs.write != 0;
     o.hv = gArgs.hv;
     o.qc3 = gArgs.b4pd != 0;
@@ -1415,11 +1608,29 @@ void PianoPower::logMcaEvents()
 
 void PianoPower::pumpMca(uint64_t now)
 {
-  uint8_t out[PIANO_MCA_REQUEST_BYTES];
+  uint8_t out[PIANO_CONTRACT_REQUEST_MAX];
+  if (fPolicyOn && gArgs.ucsi) {
+    if (now >= fContractRefresh) {piano_contract_refresh(&fContract); fContractRefresh = now + 5000;}
+    const uint32_t n = piano_contract_next(&fContract, now, out);
+    if (n && piano_adsp_send(fChannel, out, n)) piano_contract_timeout(&fContract, now);
+  }
+  // Expiry/timeout may occur in next(), without a receive callback. Revoke
+  // all unsent writes and decide the fallback BEFORE sending any MCA write.
+  if (fPolicyOn) {
+    const bool fresh = piano_contract_fresh(&fContract, now);
+    if ((fContractWasFresh && !fresh) || fContractSeenGeneration != fContract.generation) {
+      fLink.cancelQueued(fMca);
+      fLink.requestDecision();
+      stepPolicy(now);
+    }
+    fContractWasFresh = fresh;
+    fContractSeenGeneration = fContract.generation;
+  }
   if (!fRequestDue) {
     const uint32_t n = piano_mca_next(&fMca, out);
     if (n) {
       if (piano_adsp_send(fChannel, out, n)) note("mca: send queue full");
+      else if (fPolicyOn) fLink.sent(fMca);
       fRequestDue = now + (fMca.sent_write ? gArgs.writeMs : 1000);   // a write's answer may take the firmware longer than a read's
     }
   }
@@ -1431,7 +1642,7 @@ void PianoPower::pumpMca(uint64_t now)
       fPanDue = now + 5000;
     }
   }
-  if (!fUcsiDue) {
+  if (!fPolicyOn && !fUcsiDue) {
     const uint32_t n = piano_mca_ucsi_next(&fMca, out);
     if (n) {
       note("ucsi: reading the buffer of owner 0x800b (read only)");
@@ -1474,6 +1685,8 @@ void PianoPower::serviceMca(uint64_t now)
     note("mca: %s", ready ? (pdUp ? "msm/adsp/charger_pd is up: reading the charger properties" : "reading the charger properties")
                           : "the charger is not reachable now: requests stop");
     piano_mca_link(&fMca, ready);
+    piano_contract_link(&fContract, ready);
+    fContractRefresh = now;
     fRequestDue = fPanDue = fUcsiDue = 0;
     fCycleDue = now + 5000;
     fWasUp = ready;
@@ -1491,6 +1704,17 @@ void PianoPower::serviceMca(uint64_t now)
     }
     IOSimpleLockUnlock(fRingLock);
     if (!length) break;
+    if (fPolicyOn && length >= 12 && data[0] == 0x0b && data[1] == 0x80 && !data[2] && !data[3]) {
+      const bool cv = fContract.valid;
+      const uint32_t cg = fContract.generation;
+      const int cr = piano_contract_receive(&fContract, now, data, length);
+      if ((cv && !fContract.valid) || cg != fContract.generation || cr < 0) {
+        fLink.cancelQueued(fMca);
+        fLink.requestDecision();
+      }
+      if (cr == 2 || cr < 0) fLink.requestDecision();
+      continue;
+    }
     if (piano_usbc_relay_receive(data, length)) continue;   // the UCSI client's traffic (UsbcRelay.h): not PianoMca's
     const int r = piano_mca_receive(&fMca, data, length);
     if (r == McaAnswer || r == McaCycleDone || r == McaWritten) fRequestDue = 0;
@@ -1530,6 +1754,7 @@ void PianoPower::serviceMca(uint64_t now)
            piano_usbc_relay_attached() ? "the UCSI client is not ready yet" : "we run no UCSI client");
     }
     if (r == McaPanNotified) {
+      if (fPolicyOn) piano_contract_refresh(&fContract);
       note("mca: USB-C port notification (port %u): acknowledged", data[12]);
       // Read only: the notification to the port-event clients (PortEvents.c, PianoAdspContract.h; PianoDp's D2), the acknowledgement
       // already queued. Nothing to do without a client.
@@ -1609,6 +1834,8 @@ void PianoPower::relinkMca(uint64_t now, const char *why)
   note("mca: %s: the charger codec is linked again (board configuration, port enable, UCSI read, every property read again)", why);
   piano_mca_link(&fMca, 0);
   piano_mca_link(&fMca, 1);
+  piano_contract_link(&fContract, 1);
+  fContractRefresh = now;
   fRequestDue = fPanDue = fUcsiDue = 0;
   fCycleDue = now + 5000;
 }
@@ -1883,6 +2110,7 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
 void PianoPower::stepPolicy(uint64_t now)
 {
   if (!fPolicyOn || fPolicyEnded) return;
+  applyChargeRequest(now);
   const bool sleepAsk = __atomic_load_n(&fSleepAsk, __ATOMIC_ACQUIRE) != 0;
   const bool downAsk = __atomic_load_n(&fShutdownAsk, __ATOMIC_ACQUIRE) != 0;
   if (sleepAsk && !fHandover) {
@@ -1910,14 +2138,20 @@ void PianoPower::stepPolicy(uint64_t now)
   fPdUpsSeen = ups;
   v.chargerPdUpMs = fPdUpMs;
   v.packs = fPack;
-  v.packsFresh = fGauges && fPackMs && now - fPackMs <= 3ull * gArgs.period * 1000;
+  v.packsFresh = fGauges && fPackMs && now >= fPackMs && now - fPackMs <= 45000;
   v.packsMs = fPackMs;
   v.wakes = __atomic_load_n(&fWakes, __ATOMIC_ACQUIRE);
   v.willSleep = fHandover;
   v.shutdown = fShutdownSeen;
+  v.contract = &fContract;
   PortState port;
   piano_board_temps board;
   if (reachable && fLink.due(fMca, v)) {
+    if (!fHandover && !fShutdownSeen) sampleSafety(now);
+    v.safetyFresh = fSafetyMs && now >= fSafetyMs && now - fSafetyMs <= 10000;
+    v.cpOff = (fSafetyValid & 1) && !(fCpCtrl & 0x10);
+    v.dtptValid = (fSafetyValid & 0x1e) == 0x1e;
+    v.dtpt = fIsc[0] >= 3 || fIsc[1] >= 3 || fSoa[0] || fSoa[1];
     // the port every decision (the Rp current, the #18 check), not only every report
     if (fSpmi && fCharger.found) {
       port = readPort(gIo, fCharger);
@@ -1934,12 +2168,21 @@ void PianoPower::stepPolicy(uint64_t now)
   }
   LinkOutcome o;
   if (reachable) fLink.step(fMca, v, o);
-  else o.handoverReady = true;   // nothing reachable: nothing to hand over
+  else o.handoverReady = !fLink.st.disabled && !fLink.st.pending;
+  if (o.decided) {
+    publishCharge(now, v.board);
+    if (gArgs.ps) publishBattery((now - fStartMs) / 1000, v.port);
+  }
   if (o.decided || o.waitingPd || o.waitingBoard || o.refused || o.full) logPolicy(o, now);
   if (o.resync) relinkMca(now, o.events & PIANO_CHG_EV_WAKE ? "after the wake" : "the firmware lost the source (#18)");
   setHold(reachable && fLink.hold && !fShutdownSeen);
   if (fHandover && !fHandoverAcked && (o.handoverReady || now >= fHandoverUntil)) {
     fHandoverAcked = true;
+    if (!o.handoverReady) {
+      fHandoverFault = true;
+      setProperty("PianoChargeHandoverFault", true);
+      note("buck: handover pending=1 fault=timeout recovery=required");
+    }
     note("policy: sleep handover %s: acknowledged", o.handoverReady ? "done" : "not complete after 2 s");
     acknowledgeSetPowerState();
   }
@@ -1950,6 +2193,7 @@ void PianoPower::stepPolicy(uint64_t now)
       if (IOPMrootDomain *root = getPMRootDomain()) root->releasePMAssertion(fHoldId);
       fHoldId = 0;
     }
+    if (!o.handoverReady) {fHandoverFault = true; setProperty("PianoChargeHandoverFault", true);}
     fPolicyEnded = true;
     __atomic_store_n(&fShutdownDone, 1u, __ATOMIC_RELEASE);
   }
@@ -1985,7 +2229,7 @@ void PianoPower::run()
     serviceMca(now);
     // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
     if (fChannel)
-      piano_usbc_relay_step(fChannel, fWasUp && !fQuiet.raised && fMca.ucsi != 1 && fMca.ucsi != 2, fMca.links, this);
+      piano_usbc_relay_step(fChannel, !fPolicyOn && fWasUp && !fQuiet.raised && fMca.ucsi != 1 && fMca.ucsi != 2, fMca.links, this);
     // Between the sleep handover's acknowledgement and the wake: no report (the gauges' I2C idle, docs/power.md 4); after the wake
     // the one that fell due runs at once.
     if (const int q = fSleepReports.update(fPolicyOn, fHandover, fHandoverAcked))
@@ -2008,6 +2252,7 @@ void PianoPower::run()
       if (fCycleDue && fCycleDue < next) next = fCycleDue;
       if (fRequestDue && fRequestDue < next) next = fRequestDue;
       if (fPanDue && fPanDue < next) next = fPanDue;
+      if (fPolicyOn && now + 200 < next) next = now + 200;
     }
     if (fReadyWarnDue && fReadyWarnDue < next) next = fReadyWarnDue;
     if (fWdog.nextDue() && fWdog.nextDue() < next) next = fWdog.nextDue();
@@ -2018,7 +2263,7 @@ void PianoPower::run()
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;
     assert_wait_timeout((event_t)this, THREAD_UNINT, wait, kMillisecondScale);
-    bool pending = __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked() || piano_usbc_relay_pending();
+    bool pending = __atomic_load_n(&fConfigPending, __ATOMIC_ACQUIRE) || __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked() || piano_usbc_relay_pending();
     IOSimpleLockLock(fRingLock);
     pending |= fRingCount != 0;
     IOSimpleLockUnlock(fRingLock);
