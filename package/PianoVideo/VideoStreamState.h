@@ -26,7 +26,11 @@ struct Ledger {
     return nullptr;
   }
   bool publish(uint64_t t) {auto *f=find(t);if(!f||f->phase!=Phase::Admitting||stopped)return false;f->phase=Phase::Queued;return true;}
-  int freeInput() const {for(unsigned i=0;i<Inputs;++i)if(!inputOwned[i])return int(i);return -1;}
+  int freeInput() const {
+    int chosen=-1;
+    for(unsigned i=0;i<Inputs;++i)if(!inputOwned[i]&&(chosen<0||inputUses[i]<inputUses[chosen]))chosen=int(i);
+    return chosen;
+  }
   bool submit(uint64_t t,unsigned i) {
     Record *f=find(t);if(stopped||!f||f->phase!=Phase::Queued||i>=Inputs||inputOwned[i])return false;
     inputOwned[i]=true;inputToken[i]=t;if(inputUses[i]++)++inputReuse;f->phase=Phase::Submitted;return true;

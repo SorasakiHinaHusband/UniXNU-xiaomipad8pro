@@ -370,6 +370,8 @@ static void admissionPublication() {
   CHECK(!l.submit(0x1234,0)); // worker cannot DMA before the dfrm reply exists
   CHECK(l.publish(0x1234)&&!l.publish(0x1234)&&l.submit(0x1234,0));
   CHECK(!l.accept(0x1234,1,false));
+  CHECK(l.ebd(0)&&l.freeInput()==1); // exercise both owned HW inputs on the same stream
+
   auto *failed=l.accept(0x5678,1,false);CHECK(failed&&failed->phase==stream::Phase::Admitting);
   failed->phase=stream::Phase::Emitted; // transport fallback owns this failed enqueue
   CHECK(!l.publish(0x5678)&&!l.submit(0x5678,1));
