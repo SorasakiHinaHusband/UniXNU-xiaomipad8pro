@@ -27,6 +27,13 @@ def main():
     entries = {row['CFBundleIdentifier']: row for row in metadata(sys.argv[1])}
     descriptor = json.loads((Path(__file__).parent / 'kext/PianoBluetooth.json').read_text())
     problems = []
+    shim = json.loads((Path(__file__).parent / 'kext/PianoUsbHostStandIn.json').read_text())
+    platform = entries.get('com.unixnu.driver.ARMPlatformStandIn', {})
+    if not platform.get('_PrelinkExecutableLoadAddr'):
+        problems.append('native platform stand-in executable absent')
+    for bundle in shim['stands_in_for']:
+        if bundle in entries:
+            problems.append(f'{bundle}: Apple-only hardware implementation was retained')
     # These dependencies were absent before the Bluetooth library was retained.
     # Every personality in each must be explicitly gated, including any unexpected
     # new personality in a future input KC (checking only the patched names misses it).

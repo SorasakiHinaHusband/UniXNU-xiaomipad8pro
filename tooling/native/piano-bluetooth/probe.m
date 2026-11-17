@@ -85,6 +85,15 @@ int main(int argc, const char *argv[])
         alarm((unsigned)(2 * seconds + 30));
         setvbuf(stdout, NULL, _IOLBF, 0);
         printf("piano-bt-path1 probe: started=1 scan=%u\n", scan);
+        // Preflight before defaultController: its coordinator allocates managers
+        // too. If this process's scoped grant is refused, never open a grant dialog.
+        CBManagerAuthorization initialAuthorization = CBManager.authorization;
+        printf("piano-bt-path1 probe: initial_authorization=%ld\n", (long)initialAuthorization);
+        if (initialAuthorization != CBManagerAuthorizationAllowedAlways) {
+            puts("piano-bt-path1 probe: le_skipped_client_policy=1 client_initialization_skipped=1");
+            if (scan) puts("piano-bt-path1 scan: complete=1 client_policy_unavailable=1 classic_reports=0 le_reports=0");
+            return 5;
+        }
         IOBluetoothHostController *controller = [IOBluetoothHostController defaultController];
         NSInteger power = controller ? controller.powerState : -1;
         printf("piano-bt-path1 probe: default_object=%u power=%ld\n", controller != nil, (long)power);

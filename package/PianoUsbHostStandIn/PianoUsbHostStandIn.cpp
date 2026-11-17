@@ -7,7 +7,8 @@
 // branch into them). So the stand-in gives what an absent device gives: classes no object belongs to (an OSDynamicCast against them
 // fails, a personality on them never matches). The report's other eleven symbols, the gAppleARMUSBCable* keys, are AppleARMPlatform's:
 // ARMPlatformStandIn defines them in the stack build (package/ARMPlatformStandIn/UsbCableKeys.cpp). Nothing here runs.
-// Linked only with PIANO_USBHOST_STACK=1 (tooling/k27/build-native-image.sh), loaded only when the stack loads (piano-usbhost=6).
+// Also reused by ARMPlatformStandIn for BluetoothFamily's USB consumer dependencies;
+// the standard collection links these definitions exactly once, without hardware personalities.
 #include <IOKit/IOService.h>
 
 class AppleSMCFamily : public IOService {

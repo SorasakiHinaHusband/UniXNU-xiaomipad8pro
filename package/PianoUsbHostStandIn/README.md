@@ -1,5 +1,10 @@
 # PianoUsbHostStandIn
 
+The standard native collection also needs these definitions for BluetoothFamily's
+USB consumer dependencies. It compiles this package's source into ARMPlatformStandIn,
+with the cable keys, and substitutes the same seven Apple bundles there. The optional
+USB host profile therefore does not add a second standalone copy of this kext.
+
 The stand-in (`scripts/kc-build.py` `stands_in_for`) for seven Apple SoC kexts that Apple's USB host stack reaches through its
 libraries and piano does not have: AppleSMC, RTBuddy, AppleA7IOP, AppleARMPMU, AppleEmbeddedTempSensor, AppleOnboardSerial and
 IOSlowAdaptiveClockingFamily (IOUSBHostFamily -> AppleSMC -> the rest; IOAccessoryManager -> AppleOnboardSerial). The kept kexts refer

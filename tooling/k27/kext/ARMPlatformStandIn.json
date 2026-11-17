@@ -8,7 +8,14 @@
   "stands_in_for": [
     "com.apple.driver.AppleARMPlatform",
     "com.apple.driver.AppleIISController",
-    "com.apple.driver.AppleAudioClockLibs"
+    "com.apple.driver.AppleAudioClockLibs",
+    "com.apple.driver.AppleSMC",
+    "com.apple.driver.RTBuddy",
+    "com.apple.driver.AppleA7IOP",
+    "com.apple.driver.AppleARMPMU",
+    "com.apple.driver.AppleEmbeddedTempSensor",
+    "com.apple.driver.AppleOnboardSerial",
+    "com.apple.iokit.IOSlowAdaptiveClockingFamily"
   ],
   "libraries": {
     "com.apple.kpi.iokit": "18.0.0",

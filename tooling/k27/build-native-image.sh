@@ -32,9 +32,9 @@ if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   KEPT=
   for k in $LIST; do case " ${PIANO_USBHOST_STACK_DROP-$DROP_DEFAULT} " in *" $k "*) echo "PIANO_USBHOST_STACK=1: $k left out" >&2 ;; *) KEPT="$KEPT $k" ;; esac; done
   if [ "${PIANO_USBHOST_A2:-0}" = 1 ]; then
-    LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStackA2 PianoXhciHost"
+    LIST="$KEPT PianoUsbHostStackA2 PianoXhciHost"
   else
-    LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStack"
+    LIST="$KEPT PianoUsbHostStack"
   fi
 fi
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh

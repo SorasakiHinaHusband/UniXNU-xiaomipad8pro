@@ -26,80 +26,6 @@
     }
   },
   "patch_personalities": {
-    "com.apple.driver.AppleARMPMU": {
-      "AppleARMCharger": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleARMPassthroughPowerSource": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
-    "com.apple.driver.AppleEmbeddedTempSensor": {
-      "AMCTempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleDieTempController": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "ApplePMGRTempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSCCTempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSocHot": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleT700XTempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleT8015TempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleT8020MTRTempSensor": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleVTempDispatcher": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
-    "com.apple.driver.AppleOnboardSerial": {
-      "AppleOnboardSerialBSDClient": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
-    "com.apple.driver.AppleSMC": {
-      "AppleSMCACAMDriver": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCAOP": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCCharger": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCChargerUtil": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCDockUSB_UFP": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCHighVoltageCharger": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCKeysEndpoint": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCPMU": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCPowerOut": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "AppleSMCSensorDispatcher": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
     "com.apple.driver.AppleUSBHostMergeProperties": {
       "AnkerUsbPowerSinkCapability-3000": {
         "IOProviderClass": "PianoBluetoothUnusedHardware"
@@ -186,23 +112,6 @@
         "IOProviderClass": "PianoBluetoothUnusedHardware"
       },
       "iPod": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      }
-    },
-    "com.apple.driver.RTBuddy": {
-      "RTBuddy": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "RTBuddy64": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "RTBuddyARG": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "RTBuddyRouteOnly": {
-        "IOProviderClass": "PianoBluetoothUnusedHardware"
-      },
-      "RTBuddyService": {
         "IOProviderClass": "PianoBluetoothUnusedHardware"
       }
     },
