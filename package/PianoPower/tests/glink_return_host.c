@@ -113,11 +113,37 @@ static void multiple_returns(void)
     CHECK(done==3 && f.g.done_retried==3 && deliveries==before+3);
     qcom_glink_poll(&f.g);CHECK(!f.g.retry_pending && deliveries==before+3);
 }
+static void close_reopen(void)
+{
+    Fixture f;QcomGlinkChannel *c=setup(&f,1,1);
+    const unsigned before=deliveries;
+    f.th=sizeof f.tx-24;
+    data(&f,QCOM_GLINK_TX_DATA,1,"lux!",4,0);qcom_glink_poll(&f.g);
+    CHECK(c->local[0].done_due && deliveries==before+1);
+    remote(&f,QCOM_GLINK_CLOSE,7,0,NULL,0);
+    qcom_glink_poll(&f.g);
+    CHECK(c->local[0].done_due && c->remote_open && f.rt!=f.rh);
+    f.tt=f.th;qcom_glink_poll(&f.g);
+    CHECK(take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==1);
+    CHECK(!c->remote_open && !c->up && !c->local[0].done_due && !c->local[0].busy);
+    const char name[]="IPCRTR";
+    remote(&f,QCOM_GLINK_OPEN,8,sizeof name,(const uint8_t *)name,sizeof name);qcom_glink_poll(&f.g);
+    CHECK(c->remote_open && c->rcid==8 && !c->up);
+    take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1);
+    remote(&f,QCOM_GLINK_OPEN_ACK,c->lcid,0,NULL,0);qcom_glink_poll(&f.g);
+    CHECK(c->up && c->local[0].advertised);
+    CHECK(take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==0);
+    uint8_t payload[12];put32(payload,4);put32(payload+4,0);memcpy(payload+8,"lux!",4);
+    remote(&f,QCOM_GLINK_TX_DATA,8,1,payload,sizeof payload);qcom_glink_poll(&f.g);
+    CHECK(deliveries==before+2 && take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==1);
+    qcom_glink_poll(&f.g);CHECK(deliveries==before+2 && take(&f,QCOM_GLINK_RX_DONE_W_REUSE,1)==0);
+}
 int main(void)
 {
     for(int reuse=0;reuse<=1;++reuse)for(int frag=0;frag<=1;++frag)completion(reuse,frag,1);
     intent_grant();
     multiple_returns();
+    close_reopen();
     printf("glink_return_host: %u checks, %u failures, %u delivered, %u kicks\n",checks,failures,deliveries,kicks);
     return failures?1:0;
 }

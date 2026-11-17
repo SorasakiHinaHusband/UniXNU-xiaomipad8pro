@@ -701,8 +701,8 @@ void serviceSmp2p() {
 
 void applyClients();
 void pumpSends();
-uint32_t gUnknownSeen, gReturnsSeen, gReturnLogs;
-bool gReturnsLogged;
+uint32_t gUnknownSeen, gReturnsSeen, gReturnRetrySeen, gReturnLogs;
+bool gReturnsLogged, gReturnRecoveryLogged;
 void serviceGlink() {
     if (!gGlinkStarted) return;
     if (!gGlink.rx.data) {
@@ -720,12 +720,16 @@ void serviceGlink() {
         if (gGlink.broken) say("GLINK: the transport is broken (link generation %u)", gLinkTrack.generation);
     }
     pumpSends();
-    const uint32_t returns = gGlink.done_deferred + gGlink.reply_deferred;
-    if (!gReturnsLogged || (returns != gReturnsSeen && (gReturnLogs < 8 || !(returns & 63u)))) {
+    const uint32_t retired = gGlink.done_retried + gGlink.reply_retried;
+    const uint32_t returns = gGlink.done_deferred + gGlink.reply_deferred + retired;
+    const bool changed = returns != gReturnsSeen || gGlink.retry_pending != gReturnRetrySeen;
+    if (!gReturnsLogged || (changed && (gReturnLogs < 8 || !(returns & 63u))) || (!gReturnRecoveryLogged && retired)) {
         say("GLINK returns: done %u deferred/%u retired, replies %u/%u, tx-full %u, retry %u [sens-ab2:rx-return-debt]",
             gGlink.done_deferred, gGlink.done_retried, gGlink.reply_deferred, gGlink.reply_retried, gGlink.tx_blocked,
             gGlink.retry_pending);
-        gReturnsLogged = true; gReturnsSeen = returns; ++gReturnLogs;
+        gReturnsLogged = true; gReturnsSeen = returns; gReturnRetrySeen = gGlink.retry_pending;
+        if (retired) gReturnRecoveryLogged = true;
+        ++gReturnLogs;
     }
     if (!agreed && gGlink.version_agreed) say("GLINK: version agreed (features %#x)", gGlink.features);
     if (gGlink.unknown_opens != gUnknownSeen) {
