@@ -59,6 +59,9 @@ extern volatile uint32_t piano_mm_votes[32];
 volatile int32_t piano_video_stage = 0;
 }
 #include "VideoBringup.h"
+#include "VideoNativeState.h"
+#include "vt/PianoVideoNative.h"
+#include "vt/PianoVideoVTContract.h"
 
 using namespace pianovideo;
 
@@ -633,7 +636,156 @@ struct KernelHw {
 KernelHw gHw;
 Bringup<KernelHw> gBringup(gHw);
 
+// V5 has one serialized consumer worker, disjoint from the autonomous V4 mode.
+// Keep the owner object alive permanently if PAS/domain/TLB cleanup cannot be
+// confirmed. No destructor is permitted to free an arena still owned by DMA.
+struct NativeOwner {
+  KernelHw hw;
+  Bringup<KernelHw> core;
+  session::SelfTest<Bringup<KernelHw>> tx;
+  IOMemoryDescriptor *loan = nullptr;
+  bool prepared = false, attempted = false;
+  NativeOwner() : core(hw), tx(core, core.layout) {}
+};
+IOLock *gNativeLock;
+native::State gNativeState;
+NativeOwner *gNativeOwner;
+
+void hashBytes(const uint8_t *bytes, uint32_t size, char text[65])
+{
+  SHA256_CTX ctx; SHA256_Init(&ctx); SHA256_Update(&ctx, bytes, size);
+  uint8_t digest[32]; SHA256_Final(digest, &ctx); session::hexDigest(digest, text);
+}
+
+
 }  // namespace
+
+extern "C" bool piano_video_native_ready(void)
+{
+  return gArgs.level == 6 && gNativeLock;
+}
+
+extern "C" int piano_video_native_open(uint32_t *sessionId)
+{
+  if (!piano_video_native_ready()) return -45;
+  IOLockLock(gNativeLock);
+  const int rc = gNativeState.acquire(sessionId);
+  IOLockUnlock(gNativeLock);
+  note("V5 native reserve result %d session %08x firmware-open 0", rc, rc ? 0 : *sessionId);
+  return rc;
+}
+
+extern "C" int piano_video_native_decode(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t token,
+                                         native::Frame *frame)
+{
+  // Redundant validation across the internal boundary: no caller-selected IOVA,
+  // no partial AU, and no power/DMA for malformed input.
+  if (!piano_video_native_ready() || !frame || !vtcontract::normalizedAu(bytes, size)) return -22;
+  *frame = native::Frame{};
+  IOLockLock(gNativeLock);
+  const int begin = gNativeState.begin(sid, token);
+  IOLockUnlock(gNativeLock);
+  if (begin) return begin;
+  NativeOwner *owner = new NativeOwner;
+  int rc = owner ? 0 : kErrNoMemory;
+  gNativeOwner = owner;
+  if (owner) {
+    Options options;
+    options.level = 6;
+    options.mmcxFloor = gArgs.mmcxFloor;
+    rc = owner->core.run(options);
+    owner->prepared = rc == 0;
+    if (!rc) {
+      char hash[65]; hashBytes(bytes, size, hash);
+      note("V5 native ETB caller session %08x token %llu bytes %u SHA256 %s", sid, (unsigned long long)token, size, hash);
+      if (!owner->tx.nativeInput(sid, bytes, size, token)) rc = kErrArgument;
+      else {
+        owner->attempted = true;
+        rc = owner->tx.transaction();
+      }
+    }
+    if (!rc) {
+      auto &r = owner->tx.r;
+      session::Buffer *raw = owner->core.layout.find(session::Raw, r.rawIndex);
+      if (!raw || raw->queued || raw->pendingRelease || r.rawBytes < session::kRawBytes ||
+          r.rawBytes > raw->size || !r.drainAck || !r.last || r.ebd != 1 || r.psc != 1 || r.decoded != 1)
+        rc = kErrHfi;
+      else {
+        owner->loan = IOMemoryDescriptor::withSubRange(owner->hw.arenaMem, raw->off, raw->size, kIODirectionInOut);
+        if (!owner->loan) rc = kErrNoMemory;
+        else {
+          frame->memory = owner->loan;
+          frame->cpu = owner->core.dma.arena + raw->off;
+          frame->length = raw->size;
+          frame->iova = raw->iova();
+          frame->token = token;
+          note("V5 native descriptor retained session %08x token %llu length %u IOVA %08x WC 1 stride 384 scanlines 256 UV 98304",
+               sid, (unsigned long long)token, frame->length, frame->iova);
+        }
+      }
+    }
+  }
+  IOLockLock(gNativeLock);
+  gNativeState.decoded(rc);
+  IOLockUnlock(gNativeLock);
+  note("V5 native decode result %d session %08x token %llu", rc, sid, (unsigned long long)token);
+  return rc;
+}
+
+extern "C" void piano_video_native_frame_release(uint32_t sid, native::Frame *frame)
+{
+  if (!gNativeLock || !frame) return;
+  IOLockLock(gNativeLock);
+  const bool ours = gNativeOwner && gNativeOwner->loan && frame->memory == gNativeOwner->loan;
+  const int rc = ours ? gNativeState.release(sid, frame->token) : -22;
+  if (!rc) {
+    gNativeOwner->loan->release(); gNativeOwner->loan = nullptr;
+    *frame = native::Frame{};
+  }
+  IOLockUnlock(gNativeLock);
+  note("V5 native descriptor release session %08x result %d", sid, rc);
+}
+
+extern "C" int piano_video_native_finish(uint32_t sid)
+{
+  if (!gNativeLock) return -45;
+  IOLockLock(gNativeLock);
+  const int rc = gNativeState.finish(sid);
+  IOLockUnlock(gNativeLock);
+  note("V5 native finish session %08x result %d terminal-drain 1 restart 0", sid, rc);
+  return rc;
+}
+
+extern "C" int piano_video_native_close(uint32_t sid)
+{
+  if (!gNativeLock) return -45;
+  IOLockLock(gNativeLock);
+  const int start = gNativeState.closing(sid);
+  IOLockUnlock(gNativeLock);
+  if (start) return start; // never free while worker or descriptor consumer owns it
+  NativeOwner *owner = gNativeOwner;
+  int rc = 0;
+  bool held = false;
+  if (owner) {
+    if (owner->attempted) rc = owner->tx.shutdown();
+    // run() already performs fail-safe teardown on failed initialization.
+    if (owner->prepared) {
+      const int un = owner->core.teardown();
+      if (!rc) rc = un;
+    }
+    held = owner->core.dmaHeld;
+    note("V5 native close session %08x result %d ETB %u EBD %u PSC %u decoded %u drain-ack %u LAST %u STOP %u/%u CLOSE %u "
+         "teardown %d dma-held %u watchdog %u fault-bits %08x", sid, rc, owner->tx.r.etb, owner->tx.r.ebd, owner->tx.r.psc,
+         owner->tx.r.decoded, unsigned(owner->tx.r.drainAck), unsigned(owner->tx.r.last), unsigned(owner->tx.r.stopRaw),
+         unsigned(owner->tx.r.stopInput), unsigned(owner->tx.r.closed), owner->core.teardownRc, unsigned(held),
+         unsigned(owner->core.watchdogSeen != 0), owner->core.rep.fsr);
+    if (!held) { delete owner; gNativeOwner = nullptr; unmapAll(); }
+  } else note("V5 native close session %08x result 0 no-input 1 firmware-open 0 DMA 0", sid);
+  IOLockLock(gNativeLock);
+  gNativeState.closed(held);
+  IOLockUnlock(gNativeLock);
+  return rc;
+}
 
 // ------------------------------------------------------------------------------------------------------------ the service
 class PianoVideo : public IOService {
@@ -660,6 +812,11 @@ IOService *PianoVideo::probe(IOService *provider, SInt32 *score)
 bool PianoVideo::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
+  if (gArgs.level == 6) {
+    gNativeLock = IOLockAlloc();
+    if (!gNativeLock) return false;
+    note("V5 native AVC bridge ready level 6 exclusive single-AU descriptor-WC 1 no-autonomous-selftest 1");
+  }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();
     note("vt attach: piano-video-vt=1 result=%d", vt);
@@ -674,7 +831,7 @@ bool PianoVideo::start(IOService *provider)
          gArgs.idleMs, gArgs.resumes, gArgs.unload, gArgs.stop, gArgs.mmcxFloor);
   note("level 1: loads only, nothing written");
   setProperty("piano-video", gArgs.level, 32);
-  if (!gArgs.level) return true;
+  if (!gArgs.level || gArgs.level == 6) return true;
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoVideo::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");

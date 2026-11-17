@@ -36,8 +36,10 @@ done
 "${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror -I "$P" "$P/tests/session_host.cpp" -o "$O/host-tests/session_host"
 "$O/host-tests/session_host" || { echo "Error: PianoVideo V4 protocol/arena tests failed" >&2; exit 1; }
 python3 "$P/tests/fixture_host.py" || { echo "Error: PianoVideo own AVC fixture/golden check failed" >&2; exit 1; }
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_host.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" -o "$O/host-tests/vt_host"
-"$O/host-tests/vt_host" || { echo "Error: PianoVideo VT host tests failed (V0b)" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_host.cpp" -o "$O/host-tests/vt_host"
+"$O/host-tests/vt_host" || { echo "Error: PianoVideo VT wire host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_contract_host.cpp" -o "$O/host-tests/vt_contract_host"
+"$O/host-tests/vt_contract_host" || { echo "Error: PianoVideo V5a contract tests failed" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomMdt.c" -o "$O/host-tests/QcomMdt.o"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/bringup_host.cpp" "$O/host-tests/QcomMdt.o" \
   -o "$O/host-tests/bringup_host"
@@ -49,7 +51,7 @@ VIDEO_HOST_FW=$([ -f "$FW" ] && echo "$FW" || true) "$O/host-tests/bringup_host"
 python3 "$D/tooling/persist/firmware.py" stage --kext PianoVideo --header "$O/gen/PianoVideoFirmwarePins.h" \
   --source "$O/gen/PianoVideoFirmware.c" "$FW=2409160:95c5882f9b66b93ad2635604b7db563cc310481e017fa6b82e0ce6cbb9eae01b"
 python3 "$D/tooling/k27/build-native-kext.py" PianoVideo "$P/PianoVideo.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/FatVolume.c" "$P/QcomMdt.c" "$P/Sm8750Scm.c" "$P/vt/PianoVideoVTParavirt.cpp" "$P/vt/PianoVideoVTHost.cpp" "$P/vt/PianoVideoVTStubMedia.cpp" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" \
+  "$P/FatVolume.c" "$P/QcomMdt.c" "$P/Sm8750Scm.c" "$P/vt/PianoVideoVTParavirt.cpp" "$P/vt/PianoVideoVTHost.cpp" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" \
   "$D/package/common/PianoFirmwareZlib.c" "$O/gen/PianoVideoFirmware.c" -I "$P" -I "$D/package/common" -I "$O/gen" \
   --obj "${K27_OBJ:-k27-native-obj}"
 # PianoVideoVTParavirt owns two Apple-named IOService classes.  As with the audited accelerator, move its

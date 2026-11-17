@@ -11,6 +11,8 @@
 #include <CommonCrypto/CommonDigest.h>
 #include "VideoSession.h"
 #include "VideoArena.h"
+#include "VideoNativeState.h"
+#include "vt/PianoVideoVTContract.h"
 using namespace pianovideo;
 using namespace pianovideo::session;
 static unsigned failures = 0;
@@ -71,6 +73,8 @@ struct Peer {
   unsigned watchdogSamples = 0, watchdogSeen = 0, rxEvents = 0;
   unsigned n = 4, inputCount = 0, dpbs = 0, partial = 0, releaseCount = 0, stops = 0, closes = 0, hostErrors = 0;
   uint32_t activeSid = 0;
+  uint64_t expectedToken = kTimestamp;
+  std::vector<uint8_t> expectedInput = std::vector<uint8_t>(kAccessUnit, kAccessUnit + sizeof kAccessUnit);
   bool dropPsc = false, badPixels = false, badPsc = false, badRelease = false, dropClose = false, dropStop = false, dropLast = false,
        dropDrainAck = false;
   bool wrongTimestamp = false, wrongIova = false, corrupt = false, sessionError = false, readonly = false, late = false,
@@ -94,9 +98,9 @@ struct Peer {
     p.insert(p.end(), v.begin(), v.end());
     return p;
   }
-  void reply(std::vector<std::vector<uint32_t>> packets, uint32_t sid = kSessionId)
+  void reply(std::vector<std::vector<uint32_t>> packets, uint32_t sid = 0)
   {
-    std::vector<uint32_t> b = {32, sid, 0xdddd, 0, 0, 0, 0, uint32_t(packets.size())};
+    std::vector<uint32_t> b = {32, sid ? sid : activeSid, 0xdddd, 0, 0, 0, 0, uint32_t(packets.size())};
     for (const auto &p : packets)
       b.insert(b.end(), p.begin(), p.end());
     b[0] = uint32_t(4 * b.size());
@@ -171,8 +175,8 @@ struct Peer {
         raws.push_back(b);
       }
       if (bt == 1) {
-        CHECK(input && !raw && b[5] == 7077888 && b[7] == 286 && b[8] == 1000000);
-        CHECK(std::memcmp(arena.data() + b[2] - kArenaBase, kAccessUnit, sizeof kAccessUnit) == 0);
+        CHECK(input && !raw && b[5] == 7077888 && b[7] == expectedInput.size() && b[8] == uint32_t(expectedToken) && b[9] == uint32_t(expectedToken >> 32));
+        CHECK(std::memcmp(arena.data() + b[2] - kArenaBase, expectedInput.data(), expectedInput.size()) == 0);
         ++inputCount;
         b[7] = 0;
         b[8] = b[9] = 0; // input completion metadata is not an echoed-timestamp contract; RAW is correlated strictly
@@ -191,7 +195,8 @@ struct Peer {
         reply({packet(type, 1, 1, 0)});
       auto b = raws.back();
       b[7] = 147456;
-      b[8] = wrongTimestamp ? 42 : 1000000;
+      b[8] = wrongTimestamp ? 42 : uint32_t(expectedToken);
+      b[9] = uint32_t(expectedToken >> 32);
       b[10] = readonly ? 0x10 : 0;
       uint8_t *base = arena.data() + b[2] - kArenaBase;
       for (unsigned y = 0; y < 240; ++y)
@@ -422,8 +427,47 @@ static void malformed()
   bb.insert(bb.end(), bp.begin(), bp.end());
   CHECK(u.receive(bb.data(), 128) != 0 && !raw.released);
 }
+static void nativeTests()
+{
+  // Unlike the fixed V4 fixture, the native worker consumes a copied, normalized
+  // external AU and correlates both words of an arbitrary caller token. Holding
+  // the descriptor does not STOP/CLOSE or change any DMA ownership flags.
+  for (uint64_t token : {0x1020304050607080ull, 0x55ull}) {
+    Peer p; p.n = 9;
+    uint8_t sample[252], normalized[287];
+    vtwire::put32(sample, 248); memcpy(sample + 4, kAccessUnit + 38, 248);
+    CHECK(vtcontract::normalize(sample, sizeof sample, normalized, sizeof normalized) == sizeof normalized);
+    p.expectedInput.assign(normalized, normalized + sizeof normalized); p.expectedToken = token;
+    Layout l; CHECK(l.init()); SelfTest<Peer> tx(p, l);
+    CHECK(tx.nativeInput(0x56351234, normalized, sizeof normalized, token));
+    CHECK(tx.transaction() == 0 && tx.r.decoded == 1 && tx.r.drainAck && tx.r.last);
+    CHECK(p.activeSid == 0x56351234 && p.stops == 0 && p.closes == 0);
+    CHECK(tx.r.rawIndex < 9 && tx.r.rawBytes == kRawBytes);
+    CHECK(!tx.nativeInput(0x56350002, normalized, sizeof normalized, token + 1));
+    CHECK(tx.shutdown() == 0 && p.closes == 1 && p.stops == 2);
+    CHECK(p.dma.arena == p.arena.data()); // only the PAS/domain owner may free it
+  }
+  // Descriptor loan/worker lifetime and failed-quiesce fencing: neither close
+  // while decoding nor close while a consumer holds RAW can free the owner.
+  native::State st; uint32_t sid = 0, other = 0;
+  CHECK(st.acquire(&sid) == 0 && sid != kSessionId);
+  CHECK(st.acquire(&other) == -16 && st.begin(sid + 1, 44) == -22);
+  CHECK(st.begin(sid, 0xdeadbeef01234567ull) == 0);
+  CHECK(st.closing(sid) == -16); st.decoded(0);
+  CHECK(st.closing(sid) == -16 && st.begin(sid, 8) == -45);
+  CHECK(st.release(sid, 7) == -22 && st.release(sid, 0xdeadbeef01234567ull) == 0);
+  CHECK(st.release(sid, 0xdeadbeef01234567ull) == -22 && st.finish(sid) == 0);
+  CHECK(st.closing(sid) == 0); st.closed(false);
+  const auto old = sid; CHECK(st.acquire(&sid) == 0 && sid != old);
+  CHECK(st.begin(sid, 8) == 0); st.decoded(-5);
+  CHECK(st.finish(sid) == -5 && st.closing(sid) == 0); st.closed(true);
+  CHECK(st.phase == native::Phase::Poisoned && st.acquire(&sid) == -16);
+  native::State preInput; CHECK(preInput.acquire(&sid) == 0 && preInput.closing(sid) == 0);
+  preInput.closed(false); CHECK(preInput.acquire(&other) == 0 && other != sid);
+}
 int main()
 {
+  nativeTests();
   layoutTests();
   for (unsigned n : {1u, 4u, 7u, 64u})
     happy(n);

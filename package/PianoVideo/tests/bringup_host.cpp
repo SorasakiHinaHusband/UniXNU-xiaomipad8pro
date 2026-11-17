@@ -1066,7 +1066,7 @@ static void quiet(const Model &m, const char *what)
 // ======================================================================================================================== V1
 static void testInert()
 {
-  for (unsigned level : {0u, 1u, 6u}) {
+  for (unsigned level : {0u, 1u, 7u}) {
     Run x(level);
     CHECK(x.go() == kErrArgument);
     CHECK(x.m->reads == 0 && x.m->writes == 0 && x.b->log.writes == 0);
@@ -1639,6 +1639,25 @@ static void testV4Lifetime()
   }
 }
 
+static void testV5DemandLifetime()
+{
+  for (unsigned kind = 0; kind < 4; ++kind) {
+    Run x(6);
+    CHECK(x.go() == kOk && x.b->firstHfi && x.b->rep.version);
+    CHECK(x.b->dmaHeld && x.b->dma.session && x.b->pst.on && x.m->fw.authed);
+    CHECK(x.b->tables.pageCount == vsmmu::kSessionTablePages);
+    CHECK(x.m->fw.session == 0 && x.b->v4.etb == 0 && x.b->rep.collapses == 0); // no autonomous session
+    if (kind == 1) x.m->f.scmFail = "shutdown";
+    if (kind == 2) x.m->f.tlbStuck = true;
+    if (kind == 3) x.m->f.releaseSmrStuck = true;
+    const int rc = x.b->teardown();
+    CHECK(rc == (kind == 1 ? kErrScm : kind ? kErrSmmu : kOk));
+    CHECK(x.b->dmaHeld == (kind != 0) && x.m->dmaFrees == (kind ? 0u : 1u));
+    if (!kind) CHECK(x.m->allOff() && !x.m->fw.authed);
+    quiet(*x.m, "V5 demand owner teardown");
+  }
+}
+
 static void testV3SepFault()
 {
   // With SEP 0 in TCR2 (what a bank left as found could hold), the model's hypervisor family faults every IOVA with bit 31 set: the
@@ -1912,6 +1931,7 @@ int main()
   testV3Failures();
   testV3SepFault();
   testV4Lifetime();
+  testV5DemandLifetime();
   testQueues();
   testPackets();
   testRpmhPieces();

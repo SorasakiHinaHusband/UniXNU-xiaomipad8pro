@@ -200,7 +200,7 @@ class Bringup {
     opt = o;
     rep = Report{};
     rep.level = int(o.level);
-    if (o.level < 2 || o.level > 5) return kErrArgument;   // inert below piano-video=2: nothing is read or written
+    if (o.level < 2 || o.level > 6) return kErrArgument;   // inert below piano-video=2: nothing is read or written
     power.stopAt = o.stop;
     firmware.stopAt = o.stop;
     // The boot framebuffer owns the display rail until a native display voter exists.  Keep
@@ -245,7 +245,9 @@ class Bringup {
                rep.cyclesOk, rep.cycles, log.writes, log.logged);
       return;
     }
-    if (rep.level == 5)
+    if (rep.level == 6)
+      snprintf(s, size, "V5 native core ready: INIT/version %u dma-held %u", unsigned(rep.version), unsigned(dmaHeld));
+    else if (rep.level == 5)
       snprintf(s, size, "V4 ok: kernel AVC decoded %u checksum PASS close %d teardown %d dma-held %u", v4.decoded, v4.close,
                teardownRc, unsigned(dmaHeld));
     else if (rep.level == 4)
@@ -489,7 +491,7 @@ class Bringup {
     if (plan.error) return smmuFail(kStepSmmuPlan, kErrSmmu);
     bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
-    dma.session = opt.level == 5;
+    dma.session = opt.level >= 5;
     if (dma.session && !layout.init()) return smmuFail(kStepSmmuTables, kErrNoMemory);
     if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
     dmaHeld = true;
@@ -827,6 +829,10 @@ class Bringup {
     firstHfi = true;
     hw.note("V3 first-HFI PASS: INIT success version received cmd-consumed %u doorbells %u fsr %08x watchdog %u",
             mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead), doorbells, rep.fsr, unsigned(watchdogSeen != 0));
+    if (opt.level == 6) {
+      hw.note("V5 native core ready INIT/version 1 exclusive 1 no-autonomous-ETB 1");
+      return kOk;
+    }
     if (opt.level == 5) {
       session::SelfTest<Bringup<Hw>> test(*this, layout);
       rc = test.run();

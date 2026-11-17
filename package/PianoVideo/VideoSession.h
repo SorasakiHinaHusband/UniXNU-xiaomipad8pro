@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
-// V4: one bounded AVC transaction over the verified V3 owner. No macOS/VT consumer.
+// V4/V5: one bounded AVC transaction over the verified V3 owner.
+// V4 supplies the fixture; V5 supplies caller bytes/session/token and retains RAW until the consumer finishes.
 // Protocol facts: Linux iris gen2/VPU35 at the pin in UPSTREAM; UniXNU-sheng used as a read-only sequence reference.
 #pragma once
 #include "VideoOps.h"
@@ -58,6 +59,7 @@ enum Stage : unsigned {
 struct Result {
   int error = 0, close = 0;
   unsigned stage = 0, failedStage = 0, psc = 0, etb = 0, ebd = 0, decoded = 0, releases = 0, rawReturns = 0;
+  uint32_t rawIndex = ~0u, rawBytes = 0;
   uint32_t errorType = 0, errorFlags = 0, errorPort = 0, errorId = 0, errorHeader = 0;
   bool checksum = false, drainAck = false, last = false, stopRaw = false, stopInput = false, closed = false;
 };
@@ -74,7 +76,20 @@ public:
   uint32_t stopPending = 0, picture = 0, errorSerial = 0;
   bool frameError = false;
   uint64_t deadline = 0;
+  uint32_t sessionId = kSessionId;
+  uint64_t token = kTimestamp;
+  const uint8_t *accessUnit = kAccessUnit;
+  uint32_t accessUnitBytes = sizeof kAccessUnit;
+  bool checkGolden = true;
   explicit SelfTest(Owner &owner, Layout &l) : o(owner), layout(l) {}
+  // Called only by the exclusive worker, before OPEN. Input validation is also
+  // enforced at the native API boundary before the V3 DMA/power preparation.
+  bool nativeInput(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t callerToken)
+  {
+    if (openSent || !sid || !bytes || !size || size > kInputBytes) return false;
+    sessionId = sid; token = callerToken; accessUnit = bytes; accessUnitBytes = size; checkGolden = false;
+    return true;
+  }
   void stage(Stage s)
   {
     r.stage = s;
@@ -92,7 +107,7 @@ public:
       r.errorPort = port;
       r.errorId = id;
       r.errorHeader = header;
-      o.hw.note("V4 first-error %d stage %u session %08x header %u type %08x flags %08x port %u packet %u", code, r.stage, kSessionId,
+      o.hw.note("V4 first-error %d stage %u session %08x header %u type %08x flags %08x port %u packet %u", code, r.stage, sessionId,
                 header, type, flags, port, id);
     }
     return code;
@@ -102,7 +117,7 @@ public:
   {
     if (words > hfi::kBufferWords - 16 || o.ids.header == 0xffffffffu || o.ids.packet == 0xffffffffu)
       return fail(kErrHfi);
-    hfi::begin(o.tx, systemOpen ? 0 : kSessionId, o.ids);
+    hfi::begin(o.tx, systemOpen ? 0 : sessionId, o.ids);
     hfi::add(o.tx, type, flags, payload, data, words, o.ids, port);
     o.hw.note("V4 TX stage %u session %08x header %u packet %u type %08x port %u flags %08x payload %u words %u", r.stage, o.tx[1], o.tx[2],
               o.tx[13], type, port, flags, payload, words);
@@ -138,7 +153,7 @@ public:
     if (!b.size || b.size > b.capacity || b.off > kArenaBytes - b.capacity || dataSize > b.size ||
         (release ? (!b.queued || b.pendingRelease || b.readonly) : (b.queued || b.pendingRelease || b.readonly)))
       return fail(kErrHfi);
-    uint32_t v[16] = {b.type, b.index, b.iova(), 0, 0, b.size, 0, dataSize, dataSize ? kTimestamp : 0, 0, release ? 0x201u : 0x200u,
+    uint32_t v[16] = {b.type, b.index, b.iova(), 0, 0, b.size, 0, dataSize, dataSize ? uint32_t(token) : 0, dataSize ? uint32_t(token >> 32) : 0, release ? 0x201u : 0x200u,
                       0,      0,       0,        0, 0};
     // Update ownership before ringing: RX can only be processed by this worker, after this call returns.
     if (release)
@@ -226,7 +241,7 @@ public:
       // No new system transaction is outstanding; errors were handled above. Do not reinterpret session SUCCESS as INIT.
       return 0;
     }
-    if (b[1] != kSessionId || r.closed)
+    if (b[1] != sessionId || r.closed)
       return fail(kErrHfi, 0, b[1], 0, 0, b[2]);
     bool hasPsc = false;
     for (unsigned at = 32; at < bytes; at += b[at / 4])
@@ -364,7 +379,7 @@ public:
               fail(kErrHfi, type, flags, port, p[5], b[2]);
             else {
               r.closed = true;
-              o.hw.note("V4 CLOSE success 1 session %08x", kSessionId);
+              o.hw.note("V4 CLOSE success 1 session %08x", sessionId);
             }
           }
           // OPEN/START/RESUME and subscriptions have no mandatory standalone ACK in the reference protocol.
@@ -410,6 +425,8 @@ public:
       }
       b->queued = false;
       o.hw.note("V4 EBD count %u", r.ebd);
+      if (!checkGolden) o.hw.note("V5 native EBD session %08x token %llu owned-input 1 count %u", sessionId,
+                                 (unsigned long long)token, r.ebd);
       return;
     }
     if (b->type != Raw)
@@ -433,7 +450,7 @@ public:
         fail(kErrHfi, Buffers);
       return;
     }
-    if (cleanup || !rawStarted || v[6] || v[8] != kTimestamp || v[9] || frameError || !(picture & 1) || (picture & 0x40) ||
+    if (cleanup || !rawStarted || v[6] || v[8] != uint32_t(token) || v[9] != uint32_t(token >> 32) || frameError || !(picture & 1) || (picture & 0x40) ||
         ++r.decoded != 1) {
       fail(kErrHfi, Buffers, p[2], p[4], p[5], header);
       return;
@@ -445,7 +462,12 @@ public:
     r.checksum = sameText(hash, kGolden);
     o.hw.note("V4 RAW FBD decoded %u active 115200 checksum %s readonly %u", r.decoded, r.checksum ? "PASS" : "FAIL",
               unsigned(b->readonly));
-    if (!r.checksum)
+    r.rawIndex = b->index;
+    r.rawBytes = v[7];
+    if (!checkGolden)
+      o.hw.note("V5 native FBD session %08x token %llu index %u iova %08x bytes %u active 115200 SHA256 %s", sessionId,
+                (unsigned long long)token, b->index, b->iova(), v[7], hash);
+    if (checkGolden && !r.checksum)
       fail(kErrHfi, Buffers);
   }
   int pump()
@@ -515,10 +537,12 @@ public:
   int transaction()
   {
     deadline = o.hw.nowUs() + 5000000;
-    o.hw.note("V4 evidence contract vid-v4a: bounded one-AU kernel AVC no-consumer");
-    o.hw.note("V4 fixture bytes %u SHA256 %s", unsigned(sizeof kAccessUnit), kAuSha);
+    if (checkGolden) o.hw.note("V4 evidence contract vid-v4a: bounded one-AU kernel AVC no-consumer");
+    if (checkGolden) o.hw.note("V4 fixture bytes %u SHA256 %s", unsigned(sizeof kAccessUnit), kAuSha);
+    else o.hw.note("V5 transaction caller-input session %08x token %llu bytes %u embedded-fixture 0", sessionId,
+                   (unsigned long long)token, accessUnitBytes);
     stage(Opening);
-    const uint32_t sid = kSessionId;
+    const uint32_t sid = sessionId;
     if (tx(Open, 3, 0, 1, &sid, 1, true))
       return r.error;
     openSent = true;
@@ -544,12 +568,12 @@ public:
     if (tx(Start, 3, 1, 0) || consumed())
       return r.error;
     Buffer &input = *layout.find(Bitstream, 0);
-    for (unsigned i = 0; i < sizeof kAccessUnit; ++i)
-      o.dma.arena[input.off + i] = kAccessUnit[i];
+    for (unsigned i = 0; i < accessUnitBytes; ++i)
+      o.dma.arena[input.off + i] = accessUnit[i];
     o.hw.barrier();
     ++r.etb;
     stage(FirstPsc); // RX may arrive immediately after ETB; the next pump sees this phase
-    if (buffer(input, false, sizeof kAccessUnit) || wait([this] { return r.psc == 1; }))
+    if (buffer(input, false, accessUnitBytes) || wait([this] { return r.psc == 1; }))
       return r.error;
     o.hw.note("V4 acceptance OPEN CONFIG START BITSTREAM downstream-PSC 1");
     stage(Reconfigure);
@@ -596,7 +620,7 @@ public:
     stage(Draining);
     drainSent = true;
     if (tx(Drain, 7, 1, 0) ||
-        wait([this] { return r.decoded == 1 && r.checksum && r.ebd == 1 && r.drainAck && r.last && r.releases == 5; }, 5000))
+        wait([this] { return r.decoded == 1 && (!checkGolden || r.checksum) && r.ebd == 1 && r.drainAck && r.last && r.releases == 5; }, 5000))
       return r.error;
     o.hw.note("V4 frame gate PASS ETB %u EBD %u PSC %u decoded %u drain-ack %u LAST %u N %u", r.etb, r.ebd, r.psc, r.decoded,
               unsigned(r.drainAck), unsigned(r.last), psc.n);
