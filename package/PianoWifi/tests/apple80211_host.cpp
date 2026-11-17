@@ -121,6 +121,8 @@ struct Rig {
 // the separate Sta suite verifies its actual command ordering.
 struct PowerRig : Rig {
   WifiUserControl owner;
+  WifiBootPower bootGuard;
+  PowerRig() { bootGuard.enabled = false; } // existing unrestricted-lifecycle replays
   unsigned powerEvents = 0, downEvents = 0;
   Power eventPower{};
   void publish(bool acceptedPowerSet = false) {
@@ -140,7 +142,7 @@ struct PowerRig : Rig {
     const Answer a = ask(true, type, length);
     if (!a.error && (a.effects & (kDoPowerChanged | kDoDisassociate))) {
       if (a.effects & kDoDisassociate) owner.disconnect();
-      else owner.setPower(st.power);
+      else bootGuard.setPower(owner, st.power);
       publish((a.effects & kDoPowerChanged) != 0);
     }
     return a;
@@ -183,6 +185,42 @@ static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, 
 
 int main()
 {
+  // Replay validated SET19 -> production boot guard -> owner -> coherent GET
+  // and accepted-SET event. Early OFF must not create even a pending cycle.
+  for (bool explicitArm : {false, true}) {
+    PowerRig r;
+    r.bootGuard.enabled = true;
+    CHECK(!r.bootGuard.isArmed() && r.getPower());
+    const uint32_t initial = r.owner.read();
+    for (unsigned daemon = 0; daemon < 3; ++daemon) {
+      r.setPowerRecord(false);
+      CHECK(!r.control(kPower, sizeof(Power)).error);
+      CHECK(r.getPower() && r.owner.read() == initial && !r.owner.radioStop());
+      CHECK(r.eventPower.radios == 1 && r.eventPower.state[0] == 1);
+      r.setPowerRecord(true);
+      CHECK(!r.control(kPower, sizeof(Power)).error && !r.bootGuard.isArmed());
+    }
+    CHECK(r.powerEvents == 6 && r.downEvents == 0);
+    r.setPowerRecord(false);
+    r.put32(0, 2); // invalid payload cannot mutate/arm the guard
+    CHECK(r.control(kPower, sizeof(Power)).error == kErrInval);
+    CHECK(!r.bootGuard.isArmed() && r.owner.read() == initial && r.powerEvents == 6);
+    // Production arms only at the successfully accepted SET20 handoff or an
+    // explicit root write. Exercise both entrances to the same atomic arm.
+    if (!explicitArm) CHECK(!r.associate().error && r.owner.join());
+    r.bootGuard.arm();
+    CHECK(r.bootGuard.isArmed());
+    for (unsigned cycle = 0; cycle < 3; ++cycle) {
+      r.setPowerRecord(false);
+      CHECK(!r.control(kPower, sizeof(Power)).error && !r.getPower());
+      CHECK(r.owner.radioStop() && r.eventPower.state[0] == 0);
+      r.owner.radioOff(r.owner.read());
+      r.setPowerRecord(true);
+      CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower());
+      CHECK(r.owner.allowed(r.owner.read()) && r.bootGuard.isArmed());
+    }
+  }
+
   // D.1 keeps one explicit boot-argument A/B: omitted/zero is the new asynchronous path;
   // one selects the legacy preassigned/synchronous path.
   CHECK(!useIfnet2Old(0));

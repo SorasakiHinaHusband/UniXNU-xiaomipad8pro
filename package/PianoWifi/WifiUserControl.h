@@ -7,6 +7,19 @@
 #include <stdint.h>
 
 namespace pianowifi {
+struct WifiUserControl;
+// SET19 carries no user-origin bit. Protect the initial no-profile phase until
+// an accepted join or a root-controlled arm explicitly enables physical OFF.
+// ON alone cannot arm this: airportd sends ON during interface attachment.
+struct WifiBootPower {
+  uint32_t armed = 0;
+  bool enabled = true; // configured once, before publishing the driver
+  void arm() { __atomic_store_n(&armed, 1u, __ATOMIC_RELEASE); }
+  bool isArmed() const { return __atomic_load_n(&armed, __ATOMIC_ACQUIRE) != 0; }
+  bool suppressOff() const { return enabled && !isArmed(); }
+  bool setPower(WifiUserControl &owner, bool on) const;
+};
+
 struct WifiUserControl {
   enum : uint32_t { kPower = 1, kJoin = 2, kCycle = 4, kSerial = 8 };
   uint32_t word = kPower | kJoin;
@@ -51,4 +64,10 @@ struct WifiUserControl {
     stopped(w);
   }
 };
+inline bool WifiBootPower::setPower(WifiUserControl &owner, bool on) const
+{
+  if (!on && suppressOff()) return false;
+  owner.setPower(on);
+  return true;
+}
 }

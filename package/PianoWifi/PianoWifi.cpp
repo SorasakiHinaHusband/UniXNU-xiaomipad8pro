@@ -108,7 +108,7 @@
 
 using namespace pianowifi;
 
-namespace { WifiUserControl gUserControl; }
+namespace { WifiUserControl gUserControl; WifiBootPower gBootPower; }
 
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
@@ -290,6 +290,7 @@ void readArgs()
   // piano-wifi-crashtest=S: a test, S s after the port first opens on a pass a restart began, the chip is asked once for its
   // crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one boot shows a crash's restart.
   gArgs.restart = bootArg("piano-wifi-restart", gArgs.level >= 8 ? 1 : 0);
+  gBootPower.enabled = bootArg("piano-wifi-boot-on", 1) != 0;
   gArgs.restartCap = bootArg("piano-wifi-restarts", 6);
   if (!gArgs.restartCap || gArgs.restartCap > 100) gArgs.restartCap = 6;
   gArgs.crashTest = bootArg("piano-wifi-crashtest", 0);
@@ -3316,6 +3317,24 @@ int sysctlPs(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 struct sysctl_oid gOidPs;
 
+// A raw Apple80211 power request does not identify user intent. Root can arm
+// physical OFF before a first join; this is one-way for the rest of this boot.
+int sysctlPowerExplicit(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = gBootPower.isArmed() ? 1 : 0;
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming != 1) return EINVAL;
+  gBootPower.arm();
+  note("PianoWifiBootPowerGuardV1 explicit root arm: physical OFF enabled for this boot");
+  return 0;
+}
+struct sysctl_oid gOidPowerExplicit;
+
 // machdep.piano_wifi_phy (boot 10r): the most wanted PHY of a join (0 legacy, 1 HT, 2 VHT); a change makes the associated
 // station leave and join again with it (level 7).
 int sysctlPhy(struct sysctl_oid *, void *, int, struct sysctl_req *req)
@@ -3389,6 +3408,7 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
   gProfileFromFile = false;
   gProfileFromMenu = true;
   const uint32_t generation = ++gProfileGeneration;
+  gBootPower.arm(); // only after validation and successful owner/profile handoff
   IOLockUnlock(gProfileLock);
   gProfileStampValid = false;
   __atomic_store_n(&gMenuJoinRequested, 1u, __ATOMIC_RELEASE);
@@ -3403,7 +3423,13 @@ extern "C" int piano_wifi_user_control(uint32_t operation)
   if (gArgs.level < 8 || !gArgs.restart) return ENOTSUP;
   uint32_t w;
   if (operation == PIANO_WIFI_USER_LEAVE) w = gUserControl.disconnect();
-  else if (operation <= PIANO_WIFI_USER_ON) w = gUserControl.setPower(operation == PIANO_WIFI_USER_ON);
+  else if (operation <= PIANO_WIFI_USER_ON) {
+    if (!gBootPower.setPower(gUserControl, operation == PIANO_WIFI_USER_ON)) {
+      note("PianoWifiBootPowerGuardV1 pre-join OFF acknowledged: owner stays ON, no physical stop");
+      return 0;
+    }
+    w = gUserControl.read();
+  }
   else return EINVAL;
   note("PianoWifiPowerLifecycleV1 request %s serial %u: power %u, join %u, cycle %u",
        operation == PIANO_WIFI_USER_LEAVE ? "leave" : operation == PIANO_WIFI_USER_ON ? "on" : "off",
@@ -3450,6 +3476,17 @@ void registerPhySysctls()
 
 void registerPsSysctl()
 {
+  gOidPowerExplicit.oid_parent = &sysctl__machdep_children;
+  gOidPowerExplicit.oid_number = OID_AUTO;
+  gOidPowerExplicit.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidPowerExplicit.oid_name = "piano_wifi_power_explicit";
+  gOidPowerExplicit.oid_handler = sysctlPowerExplicit;
+  gOidPowerExplicit.oid_fmt = "I";
+  gOidPowerExplicit.oid_descr = "write 1 as root to allow physical Wi-Fi OFF before the first accepted join (one-way per boot)";
+  gOidPowerExplicit.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidPowerExplicit);
+  note("PianoWifiBootPowerGuardV1 piano-wifi-boot-on=%u: pre-join OFF %s; accepted SET20 or explicit root arm enables physical OFF",
+       gBootPower.enabled ? 1u : 0u, gBootPower.enabled ? "acknowledged with radio ON" : "unrestricted");
   __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
   gOidPs.oid_parent = &sysctl__machdep_children;
   gOidPs.oid_number = OID_AUTO;

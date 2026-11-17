@@ -686,6 +686,18 @@ suppresses retries until another SET20; power-off cancels scans, drains station 
 Power-on reloads the firmware through the existing restart path and permits the retained profile to reconnect. A stop serial
 keeps quick off/on and leave/join requests from skipping teardown. Existing saved profiles are retained.
 
+`piano-wifi-boot-on=1` is the safe default: before the first accepted menu join (SET20), a SET19 OFF is acknowledged with
+the owner still ON, no stop serial and no physical power change. Startup ON requests do not release this guard. An accepted
+join enables normal menu OFF/ON for the rest of the boot. For an explicit OFF before any join, root first writes
+`sysctl machdep.piano_wifi_power_explicit=1`, then uses the normal power control; the arm is one-way for this boot.
+`piano-wifi-boot-on=0` enables unrestricted SET19 behavior, including saved startup OFF. SET19 carries no user-origin bit:
+an automatic SET20 also ends the protected phase. This fallback is pending tablet qualification.
+
+The 27.3 `networksetup` text `Off (forced)` is a separate SystemConfiguration existence check: zero matching AirPort service
+or interface dictionaries returns that text before CoreWLAN power is read. It is not a GET19 or hardware-switch value.
+Boot checks must await genuine supported readiness and separately read CoreWLAN power; they must retain an early forced
+sample and a readiness timeout as evidence. The driver does not synthesize those dictionaries.
+
 The 27.3 ABI is power24 bytes, optional disassociate12 bytes and deauth16 bytes. The voluntary disconnect notification is
 LINK_CHANGED4 with exactly32 bytes (down at0, involuntary at0x10, reason at0x14, subreason at0x18), also returned by GET156.
 POWER_CHANGED1 follows every accepted SET19, including an already-on request, after the owner snapshot is coherent;

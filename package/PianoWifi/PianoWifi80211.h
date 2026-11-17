@@ -355,7 +355,7 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
   // Publish administrative availability before that event can be queued; a
   // later configd enable or our first power event cannot repair its old flags.
   // This is not link authorization: do not set IFF_RUNNING or reassert UP after
-  // publication. A saved user-OFF still wins in airportd and every SET19 is obeyed.
+  // publication. The owner's default boot guard separately protects pre-join OFF.
   if (!piano_netif_set_flags(netif, IFF_UP, 0)) return false;
   note80211("PianoWifiBootPowerV1 initial administrative UP before BSD publication: flags %#x, running %u",
             unsigned(netif->getFlags()), (netif->getFlags() & IFF_RUNNING) ? 1u : 0u);
