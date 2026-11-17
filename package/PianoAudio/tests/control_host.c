@@ -58,6 +58,8 @@ static void kernel_copyout(const PianoAudio2NotificationMessage *actual, unsigne
 
 int main(void)
 {
+    union { uint32_t u; float f; } f;
+    union { uint64_t u; double d; } d;
     CHECK(PIANO_AUDIO_CONTROL_BASE_LEVEL == 0x6c65766cU);
     CHECK(PIANO_AUDIO_CONTROL_CLASS_VOLUME == 0x766c6d65U);
     CHECK(PIANO_AUDIO_CONTROL_BASE_TOGGLE == 0x746f676cU);
@@ -85,8 +87,11 @@ int main(void)
     for (unsigned i = 0; i < sizeof bad / sizeof *bad; ++i) {
         CHECK(piano_audio_control_percent(bad[i]) == -1);
         CHECK(piano_audio_control_bool(bad[i]) == -1);
+        CHECK(piano_audio_control_decode(0, 1, bad[i]) == -1);
+        CHECK(piano_audio_control_decode(0, 2, bad[i]) == -1);
     }
     CHECK(piano_audio_control_bool(2) == -1);
+    CHECK(piano_audio_control_decode(0, 2, 2) == -1);
     for (uint64_t raw = 0; raw <= 1; ++raw) {
         const int applied = piano_audio_control_bool(raw);
         CHECK(applied == (int)raw);
@@ -109,8 +114,6 @@ int main(void)
     CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
     corrupt[10] = 50; corrupt[15] = 1;
     CHECK(!receiver(corrupt, sizeof corrupt, 1, 50));
-    /* input state follows */
-    printf("audio control host: %u checks (integer raw + independent counted-cval receiver)\n", checks);
     CHECK(piano_audio_control_scope(1) == 0x696e7074U);
     CHECK(piano_audio_control_scope(0) == PIANO_AUDIO_CONTROL_SCOPE_OUTPUT);
     CHECK(!strcmp(piano_audio_level_key(1), "piano-audio-input-level"));
@@ -133,5 +136,6 @@ int main(void)
     d.d = INFINITY; CHECK(piano_audio_control_decode(1, 1, d.u) == -1);
     d.d = -0.5; CHECK(piano_audio_control_decode(1, 1, d.u) == -1);
     f.f = NAN; CHECK(piano_audio_control_decode(1, 1, f.u) == -1);
+    printf("audio control host: %u checks (integer raw + independent counted-cval receiver + input controls)\n", checks);
     return 0;
 }

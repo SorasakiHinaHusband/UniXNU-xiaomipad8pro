@@ -49,6 +49,7 @@ static inline int piano_audio_input_percent(uint64_t raw)
 static inline int piano_audio_control_decode(int input, uint32_t id, uint64_t raw)
 {
     if (id != 1 && id != 2) return -1;
+    if (!input) return id == 1 ? piano_audio_control_percent(raw) : piano_audio_control_bool(raw);
     const int p = input ? piano_audio_input_percent(raw) : piano_audio_control_percent(raw);
     return id == 1 || p < 0 ? p : p != 0;
 }
