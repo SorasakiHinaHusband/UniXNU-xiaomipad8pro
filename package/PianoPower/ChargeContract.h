@@ -95,7 +95,8 @@ enum {
     PianoContractIdle = 0, PianoContractProbe, PianoContractCapability,
     PianoContractStatus, PianoContractPdos0, PianoContractPdos4,
     PianoContractVerify, PianoContractAck, PianoContractCommit, PianoContractNotifyRead,
-    PianoContractClearReset, PianoContractReset, PianoContractEnableBasic, PianoContractEnableEvents
+    PianoContractClearReset, PianoContractReset, PianoContractEnableBasic, PianoContractEnableEvents,
+    PianoContractRejected
 };
 typedef struct {
     /* Published snapshot. valid means PD sink + complete source list + decoded
@@ -105,6 +106,10 @@ typedef struct {
     uint16_t version, status_change;
     uint32_t cci, rdo, source_pdo[7], mv, ma, source_ma;
     uint32_t status_flags, capabilities;
+    /* Last completed command's bounded MessageIn, before ACK clears it. These
+     * are protocol data, never a contract until status/PDO/RDO agree. */
+    uint32_t message_in[4];
+    uint8_t message_length, message_command, cap_connectors, pending_error;
     uint64_t control_readback;       /* diagnostic only: CONTROL need not echo writes */
     uint64_t updated_ms;
     int32_t last_error;
@@ -245,6 +250,13 @@ static inline void piano_contract_ack_stage(PianoChargeContract *c, unsigned nex
     c->command = 0x04u | ((uint64_t)1 << 17) | (connector_ack ? (uint64_t)1 << 16 : 0);
     c->wire = 0;
 }
+/* A local capability rejection is not a failed PPM command. Drain its
+ * COMMAND_COMPLETE before stopping; retrying initialization would reset a
+ * successfully initialized PPM forever, without learning anything new. */
+static inline void piano_contract_reject(PianoChargeContract *c, int error) {
+    c->pending_error = (uint8_t)error;
+    piano_contract_ack_stage(c, PianoContractRejected, 0);
+}
 static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_ms) {
     PianoContractDecoded d; unsigned i; int changed;
     int valid = c->stage_connected && c->stage_sink && c->stage_pd &&
@@ -336,7 +348,6 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         c->wire = 2; c->poll_ms = now_ms + 200; return 1;
     }
     payload = (cci >> 8) & 255u;
-    if (payload > (bytes == 48 ? 16u : 256u)) { piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1; }
     /* This tablet has one connector. Never acknowledge an event for a
      * connector whose status/source PDOs we did not query. */
     if (((cci >> 1) & 127u) && ((cci >> 1) & 127u) != c->connector) {
@@ -375,20 +386,40 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
         if (!(cci & (1u << 29))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
         if (c->command & ((uint64_t)1 << 16)) c->connector_event = 0;
         c->stage = c->next_stage; c->wire = 0;
+        if (c->stage == PianoContractRejected) {
+            piano_contract_fail(c, c->pending_error, 1); return -1;
+        }
         if (c->stage == PianoContractStatus && !c->initialized) c->initialized = 1;
         if (c->stage == PianoContractCommit) { piano_contract_publish(c, now_ms); return 2; }
         return notify_resolved ? 2 : 1;
     }
     if (!(cci & (1u << 31))) { c->wire = 2; c->poll_ms = now_ms + 200; return notify_resolved ? 2 : 1; }
+    /* During ACK polling the old completion (and its data length) can remain
+     * latched. Validate length only when consuming a command's MessageIn. */
+    if (payload > (bytes == 48 ? 16u : 256u)) {
+        if (c->stage == PianoContractCapability) { piano_contract_reject(c, PIANO_CONTRACT_CAPABILITY); return 1; }
+        piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1;
+    }
     message = data + 28; next = PianoContractIdle;
+    if (payload) {
+        uint8_t sample[16] = {0};
+        for (i = 0; i != payload && i != sizeof(sample); ++i) sample[i] = message[i];
+        for (i = 0; i != 4; ++i) c->message_in[i] = piano_contract_u32(sample + 4 * i);
+        c->message_length = (uint8_t)payload; c->message_command = (uint8_t)c->command;
+    }
     if (c->stage == PianoContractEnableBasic || c->stage == PianoContractEnableEvents) {
         c->enabled = c->command & ~0xffffull;
         next = c->stage == PianoContractEnableBasic ? PianoContractCapability : PianoContractStatus;
     } else if (c->stage == PianoContractCapability) {
-        if (payload != 16 || message[4] != 1) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
+        if (payload != 16) { piano_contract_reject(c, PIANO_CONTRACT_CAPABILITY); return 1; }
         c->capabilities = piano_contract_u32(message);
         c->features = (uint16_t)(message[5] | (uint16_t)message[6] << 8);
-        if (!(c->capabilities & 4u) || !(message[5] & 16u)) { piano_contract_fail(c, PIANO_CONTRACT_CAPABILITY, 0); return -1; }
+        /* bNumConnectors is seven bits; tolerate the reserved high bit as the
+         * reference OPM does. Query only our physical connector even when the
+         * PPM describes other ports. PD/PDO optional capabilities do not gate
+         * GET_CONNECTOR_STATUS or the publication of a non-PD connection. */
+        c->cap_connectors = message[4] & 127u;
+        if (c->cap_connectors < c->connector) { piano_contract_reject(c, PIANO_CONTRACT_CAPABILITY); return 1; }
         next = c->initialized ? PianoContractStatus : PianoContractEnableEvents;
     } else if (c->stage == PianoContractStatus || c->stage == PianoContractVerify) {
         if (payload < 9 || payload > (bytes == 48 ? 16u : 19u)) { piano_contract_fail(c, PIANO_CONTRACT_PAYLOAD, 0); return -1; }
@@ -407,7 +438,7 @@ static inline int piano_contract_receive(PianoChargeContract *c, uint64_t now_ms
             c->stage_connected = (uint8_t)((flags >> 19) & 1u); c->stage_sink = (uint8_t)(!(flags & (1u << 20)));
             c->stage_pd = (uint8_t)(((flags >> 16) & 7u) == 3u);
             c->stage_pdos = 0; piano_contract_zero(c->stage_pdo, (unsigned)sizeof(c->stage_pdo));
-            next = c->stage_connected && c->stage_sink && c->stage_pd ? PianoContractPdos0 : PianoContractCommit;
+            next = c->stage_connected && c->stage_sink && c->stage_pd && (c->features & 16u) ? PianoContractPdos0 : PianoContractCommit;
         }
     } else if (c->stage == PianoContractPdos0 || c->stage == PianoContractPdos4) {
         unsigned offset = c->stage == PianoContractPdos0 ? 0 : 4;

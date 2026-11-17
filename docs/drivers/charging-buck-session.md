@@ -77,7 +77,18 @@ then query capabilities and enable the supported charging events. A cold PPM in
 notifications-disabled state need only process RESET and notification-enable;
 a GLINK WRITE response alone does not complete GET_CAPABILITY. The independent
 cold PPM regression enforces that boundary, including delayed reset, missing
-notifications, old CONTROL, reconnect and bounded failure. `PianoUcsiInitV3`
+notifications, old CONTROL, reconnect and bounded failure. `PianoUcsiMessageInV4`
 identifies the initialization trace; `PianoCharge` also exposes initialization,
-enabled events, request/reply counts and the timeout layer. Tablet qualification
-of this sequence remains pending.
+enabled events, request/reply counts and the timeout layer. The tablet has
+confirmed RESET, basic notification enable, ACK and GET_CAPABILITY completion;
+the capability-to-status path still needs tablet qualification.
+
+COMMAND_COMPLETE with CCI `0x80001000` carries a successful 16-byte capability
+response. UCSI 1.1 MessageIn is at offset 16 in the 48-byte mailbox, or offset 28
+in the GLINK READ_BUF response. Connector count uses seven bits; optional PD/PDO
+capabilities do not prevent observing a non-PD sink. A PD contract still requires
+advertised PDO-query support and the complete selected PDO/RDO validation.
+Locally rejected capability data is acknowledged before quarantine, without
+restarting the PPM. The bounded `ucsi-message` trace and `UCSIMessageIn0..3`,
+`UCSIMessageLength`, `UCSIMessageCommand`, `UCSIAttributes`, `UCSIFeatures` and
+`UCSIConnectors` retain the evidence for the next status-path qualification.

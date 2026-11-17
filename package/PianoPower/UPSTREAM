@@ -133,3 +133,9 @@ BSD-2-Clause-Patent. Behaviour only: UCSI 1.2 sections 4.3 and 4.5.1 (cold notif
 RESET_COMPLETE polling); third-party yzddmr6/xiaomipad-8pro-mainline a43f79c27444faff59576b1309e125f037448abc pins
 Linux 1c21cb9895d69c1c5e83ceae68952fedf522644a: drivers/usb/typec/ucsi/{ucsi.c,ucsi_glink.c},
 drivers/soc/qcom/pmic_glink{,_altmode}.c and include/linux/soc/qcom/pmic_glink.h. No third-party source text incorporated.
+
+The capability/status completion changes (2026-11-17) use the same third-party
+pin for wire facts only: the packed 16-byte capability, seven-bit connector
+count, optional PDO-query support, status bit offsets, and command ACK before
+local capability validation. Implementation and synthetic fixtures are original
+project code, copyright Leo Zhang, BSD-2-Clause-Patent.

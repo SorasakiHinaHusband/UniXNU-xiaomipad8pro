@@ -663,6 +663,10 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("UCSIInitialized", c.initialized); n("UCSIEnabled", c.enabled); n("UCSINotifies", c.notifies);
   n("UCSIReads", c.reads); n("UCSIReadReplies", c.read_replies); n("UCSIWrites", c.writes); n("UCSIWriteReplies", c.write_replies);
   n("UCSIResets", c.resets); n("UCSITimeoutLayer", c.timeout_layer); n("UCSIRingDropped", fDropped);
+  n("UCSIAttributes", c.capabilities); n("UCSIFeatures", c.features); n("UCSIConnectors", c.cap_connectors);
+  n("UCSIMessageLength", c.message_length); n("UCSIMessageCommand", c.message_command);
+  n("UCSIMessageIn0", c.message_in[0]); n("UCSIMessageIn1", c.message_in[1]);
+  n("UCSIMessageIn2", c.message_in[2]); n("UCSIMessageIn3", c.message_in[3]);
   n("ContractTimeouts", c.timeouts); n("ContractFailures", c.failures);
   n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
   n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
@@ -1641,13 +1645,18 @@ void PianoPower::pumpMca(uint64_t now)
     const uint32_t n = piano_contract_next(&fContract, now, out);
     if (n && piano_adsp_send(fChannel, out, n)) { fContract.timeout_layer = 1; piano_contract_timeout(&fContract, now); }
     // A bounded first-init trace distinguishes a silent transport from an
-    // uninitialized PPM or a command that never completed. No payload dump.
+    // uninitialized PPM or a command that never completed. The bounded UCSI
+    // MessageIn words distinguish capability fields from a CCI failure.
     if (fContract.stage != fContractLoggedStage && fContractLogCount < 32) {
       fContractLoggedStage = fContract.stage; ++fContractLogCount;
-      note("ucsi-init: stage=%u initialized=%u cmd=%#llx cci=%#x reads=%u/%u writes=%u/%u notify=%u reset=%u timeout-layer=%u [PianoUcsiInitV3]",
+      note("ucsi-init: stage=%u initialized=%u cmd=%#llx cci=%#x reads=%u/%u writes=%u/%u notify=%u reset=%u timeout-layer=%u [PianoUcsiMessageInV4]",
            fContract.stage, fContract.initialized, fContract.command, fContract.cci,
            fContract.read_replies, fContract.reads, fContract.write_replies, fContract.writes,
            fContract.notifies, fContract.resets, fContract.timeout_layer);
+      if (fContract.message_length)
+        note("ucsi-message: cmd=%#x length=%u in=%08x/%08x/%08x/%08x attrs=%#x features=%#x connectors=%u",
+             fContract.message_command, fContract.message_length, fContract.message_in[0], fContract.message_in[1],
+             fContract.message_in[2], fContract.message_in[3], fContract.capabilities, fContract.features, fContract.cap_connectors);
     }
   }
   // Expiry/timeout may occur in next(), without a receive callback. Revoke

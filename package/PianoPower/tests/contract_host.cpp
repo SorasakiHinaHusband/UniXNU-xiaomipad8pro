@@ -188,12 +188,14 @@ static void invalidation() {
     Ppm ppmError; ppmError.step(); ppmError.step(); ppmError.ucsiError=true; assert(ppmError.step()==-1);
     assert(ppmError.c.last_error==PIANO_CONTRACT_CCI);
     Ppm echo; echo.echoControl=true; echo.complete(); assert(echo.c.valid); // echo is permitted, never required
-    Ppm payload; payload.step(); payload.step(); payload.shortPayload=true; assert(payload.step()==-1);
-    assert(payload.c.last_error==PIANO_CONTRACT_PAYLOAD);
+    Ppm payload; payload.step(); payload.step(); payload.shortPayload=true; assert(payload.step()==1);
+    payload.shortPayload=false; payload.complete(); // drain the rejected command before stopping
+    assert(payload.c.last_error==PIANO_CONTRACT_CAPABILITY && payload.c.quarantined && payload.acks==1);
     Ppm feature; feature.missingPdoFeature=true; feature.complete();
-    assert(feature.c.last_error==PIANO_CONTRACT_CAPABILITY && !feature.c.status_valid);
+    assert(feature.c.status_valid && feature.c.pd && !feature.c.valid && !feature.c.pdos);
+    assert(feature.c.last_error==PIANO_CONTRACT_RDO); // status is useful, PD authority remains withheld
     Ppm count; count.connectorCount=2; count.complete();
-    assert(count.c.last_error==PIANO_CONTRACT_CAPABILITY && !count.c.valid);
+    assert(count.c.cap_connectors==2 && count.c.valid && count.c.status_valid);
     Ppm connector; connector.cciConnector=2; assert(connector.step()==-1);
     assert(connector.c.last_error==PIANO_CONTRACT_CCI && !connector.c.valid && !connector.acks);
     Ppm connectorChange; connectorChange.step(); connectorChange.step(); connectorChange.cciConnector=2;
