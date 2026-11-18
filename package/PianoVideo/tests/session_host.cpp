@@ -470,8 +470,10 @@ static void generalGeometryTests() {
   tx.streaming=true;tx.activeWidth=1920;tx.activeHeight=1080;
   tx.expectedProfile=4;tx.expectedLevel=11;
   tx.psc.resolution=0x07800440;tx.psc.crop[0]=0;tx.psc.crop[1]=8;
+  tx.psc.returned=0x2a;
   tx.psc.poc=tx.expectedPoc;tx.psc.profile=4;tx.psc.level=11;tx.psc.n=16;
   CHECK(tx.pscSupported());
+  tx.psc.returned=0x0a;CHECK(!tx.pscSupported());tx.psc.returned=0x2a;
   tx.psc.n=17;CHECK(!tx.pscSupported());tx.psc.n=16;
   tx.psc.crop[1]=7;CHECK(!tx.pscSupported());tx.psc.crop[1]=10;CHECK(!tx.pscSupported());
   tx.psc.crop[1]=8;CHECK(tx.adoptPscGeometry());

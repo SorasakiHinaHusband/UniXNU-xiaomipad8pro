@@ -1620,7 +1620,7 @@ static void testV4Lifetime()
     const uint8_t *db=x.m->cmdDb(&bytes);
     x.b->opt=x.o; x.b->res=rpmh::resources(db,bytes);
     CHECK(x.b->smmuSetup()==0 && x.b->on()==0 && x.b->smmuApply()==0 && x.b->firmware.load()==0 && x.b->bootCore()==0);
-    CHECK(x.b->tables.pageCount==36 && x.b->dma.arena);
+    CHECK(x.b->tables.pageCount==132 && x.b->dma.arena);
     for (unsigned i=0;i<session::kArenaPages;++i) if (x.b->layout.mapped(i)) {
       uint64_t pa=0;
       CHECK(x.m->translate(kStreamFirst,session::kArenaBase+4096*i,&pa) && pa==x.b->dma.arenaPages[i]);

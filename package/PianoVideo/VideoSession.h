@@ -132,6 +132,7 @@ public:
     if (!w || !h || ((w|h|left|top|right|bottom)&1) || left+right>=w || top+bottom>=h ||
         w-left-right!=activeWidth || h-top-bottom!=activeHeight) return false;
     if (!layout.general) return psc.resolution==0x014000f0 && !psc.crop[0] && !psc.crop[1];
+    if ((psc.returned & 0x2a) != 0x2a) return false; // coded resolution, bit depth and firmware minimum are mandatory
     AvcGeometry g;
     if (!g.configure(w,h) || w>layout.geometry.width || h>layout.geometry.height ||
         g.raw>layout.rawBytes() || g.dpb>layout.dpbBytes()) return false;
