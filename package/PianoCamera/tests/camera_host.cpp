@@ -190,6 +190,7 @@ struct Board {
   std::vector<std::string> vrmLog;
   // Level 3: CAMCC PLL0, the CAMSS blocks, the SMMU, the frame buffer, the frames.
   bool pll0NoLock = false, csidResetStuck = false, sensorMute = false, framePadded = false, dmaFail = false;
+  bool wmStopStuck = false;
   unsigned extraLines = 0;   // a frame longer than the mode by this many lines (an overflow)
   bool mm1On = false;
   // The tablet's rules (tabletC1/tabletC3): an MCLK RCG on the XO has a root and its branch runs only while GCC's camera XO branch
@@ -468,6 +469,7 @@ struct Board {
       return;
     }
     if (inRange(pa, kSmmu, kSmmuBytes)) return smmuStore(uint32_t(pa - kSmmu), value);
+    if (wmStopStuck && pa == kTfeLite0 + kWm0 + kWmCfg && !(value & kWmEnable)) return;
     if (pa == kTfeLite0 + kWm0 + kWmCfg && !(value & kWmEnable) && wmEnabled()) events.push_back("wm off");
     if (pa == kCsidLite0 + kCsidRdiCtrl && !(value & 1u) && (v(pa) & 1u)) events.push_back("rdi stop");
     if ((pa == kGcc + kGccCameraHfAxi || pa == kCamCc + kCcCamnocRtAxi) && !(value & kCbcrEnable) && (v(pa) & kCbcrEnable)) {
@@ -1023,11 +1025,13 @@ struct TestOps {
   }
   bool dmaAlloc(uint64_t bytes, bool tables, Dma &d)
   {
+    if (dmaReserve.ready()) return dmaReserve.take(bytes, tables, d);
     if (b.dmaFail) return false;
     b.mem.assign(bytes, 0x5a);
     d.pa = b.memPa;
     d.bytes = bytes;
     d.cpu = b.mem.data();
+    d.cookie = &b;
     if (tables) {
       b.tableMem.assign(1024, 0x1234567812345678ull);   // two pages, not zeroed: the window builder must clear them
       d.tablePa = b.tablePa;
@@ -1038,8 +1042,19 @@ struct TestOps {
   }
   void dmaFree(Dma &d)
   {
+    if (dmaReserve.ready()) {
+      CHECK(dmaReserve.giveBack(d));
+      return;
+    }
     ++b.frees;
     d = Dma();
+  }
+  DmaReserve dmaReserve;
+  void reserveDma()
+  {
+    Dma d;
+    CHECK(dmaAlloc(16u << 20, true, d));
+    dmaReserve.install(d);
   }
   void cacheClean(const void *, uint64_t) { ++b.cleans; }
   void cacheInvalidate(const void *, uint64_t) { ++b.invalidates; }
@@ -2272,6 +2287,45 @@ static void testLiveStream()
   CHECK(result.aeVerdict == AeVerdict::converged && r.b.smmuFaults == 0 && r.b.violations.empty());
 }
 
+// Desktop-era contiguous allocations may fail while the boot reservation must
+// still serve both geometries. Real Stream teardown, not a test shortcut,
+// returns each lease; an unconfirmed WM stop must retain it.
+static void testReservedLiveDma()
+{
+  L3Rig r;
+  r.ops.reserveDma();
+  r.b.dmaFail = true;   // all later physical allocations are unavailable
+  StreamOptions opt;
+  opt.live = true;
+  opt.pattern = false;
+  for (Sensor sensor : {Sensor::front, Sensor::rear, Sensor::front}) {
+    r.ops.liveFrames = 0;
+    r.ops.liveSequence = r.ops.liveSOF = 0;
+    r.ops.liveLimit = 3;
+    const auto result = r.run(sensor, opt);
+    CHECK(result.ok && result.cleanOff && result.bufferFreed && !r.ops.dmaReserve.busy());
+    CHECK(r.ops.liveFrames == 3 && result.pa == r.b.memPa);
+    CHECK(result.bytes == (sensor == Sensor::rear ? 16u << 20 : 8u << 20));
+    CHECK(r.b.allocs == 1 && r.b.frees == 0 && r.b.violations.empty());
+  }
+  // Refuse oversize or simultaneous leases without losing the reservation.
+  Dma d, other;
+  CHECK(!r.ops.dmaReserve.take((16u << 20) + 1, true, d));
+  CHECK(r.ops.dmaReserve.take(8u << 20, true, d));
+  CHECK(!r.ops.dmaReserve.take(8u << 20, true, other));
+  CHECK(!r.ops.dmaReserve.giveBack(other) && r.ops.dmaReserve.busy());
+  CHECK(r.ops.dmaReserve.giveBack(d));
+
+  L3Rig unsafe;
+  unsafe.ops.reserveDma();
+  unsafe.b.wmStopStuck = true;
+  unsafe.ops.liveLimit = 2;
+  const auto result = unsafe.run(Sensor::front, opt);
+  CHECK(!result.ok && !result.cleanOff && !result.wmStopped && !result.bufferFreed);
+  CHECK(unsafe.ops.dmaReserve.busy() && !unsafe.ops.dmaReserve.take(8u << 20, true, d));
+  CHECK(unsafe.b.allocs == 1 && unsafe.b.frees == 0);
+}
+
 // The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
 // one after another, each from what the one before left (the SMMU words the release keeps, PLL0's configuration), each with its
 // power-down complete, the board as found after the last.
@@ -2357,6 +2411,7 @@ int main()
   testExposureLoop();
   testIsp();
   testLiveStream();
+  testReservedLiveDma();
   testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);

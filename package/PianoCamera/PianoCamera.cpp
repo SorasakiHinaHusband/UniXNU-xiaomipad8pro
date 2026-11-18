@@ -791,11 +791,30 @@ class Ops {
     va_end(ap);
     IOLog("PianoCamera: %s\n", line);
   }
+  // Level 5 must reserve before the desktop fragments wired memory. This costs
+  // 16 MiB + 16 KiB for the service's lifetime, not one allocation per app start.
+  // No MMIO, power or SMMU route is changed here. Failed hardware teardown keeps
+  // the lease; the existing unsafe-state gate then refuses another start.
+  bool reserveDma()
+  {
+    Dma d;
+    if (!dmaAlloc(kRawCap, true, d)) return false;
+    dmaReserve.install(d);
+    ::note("dma reserve ready bytes=%llu pa=%#llx tables=%#llx alignment=2097152 policy=early-dma-v1",
+           (unsigned long long)d.bytes, (unsigned long long)d.pa, (unsigned long long)d.tablePa);
+    return true;
+  }
   // Level 3: the frame buffer (one physically contiguous range, 2 MiB aligned, below 1 TiB: the write master's reach), a cacheable
-  // kernel view; the window's two table pages (one 16 KiB XNU page, contiguous).
+  // kernel view; the window's two 4 KiB table pages in a 16 KiB contiguous allocation.
   bool dmaAlloc(uint64_t bytes, bool tables, Dma &d)
   {
     renew(d);
+    if (dmaReserve.ready()) {
+      const bool ok = dmaReserve.take(bytes, tables, d);
+      ::note("dma reserve lease bytes=%llu tables=%u busy=%u result=%u pa=%#llx", (unsigned long long)bytes,
+             tables, dmaReserve.busy(), ok, (unsigned long long)d.pa);
+      return ok;
+    }
     stackCheck("the frame buffer's allocation");
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), bytes, 0x000000ffffe00000ull);
@@ -854,6 +873,12 @@ class Ops {
   }
   void dmaFree(Dma &d)
   {
+    if (dmaReserve.ready()) {
+      const uint64_t pa = d.pa;
+      const bool ok = dmaReserve.giveBack(d);
+      ::note("dma reserve return pa=%#llx result=%u busy=%u", (unsigned long long)pa, ok, dmaReserve.busy());
+      return;   // keep both prepared descriptors; never free a live DMA target
+    }
     if (IOBufferMemoryDescriptor *buf = static_cast<IOBufferMemoryDescriptor *>(d.cookie)) {
       buf->complete();
       buf->release();
@@ -946,6 +971,7 @@ class Ops {
     IOLockUnlock(gServeLock);
   }
   IOBufferMemoryDescriptor *tableMem = nullptr;
+  DmaReserve dmaReserve;
   const Survey *survey = nullptr;
   bool gccHeld = false;
 };
@@ -1152,6 +1178,10 @@ void PianoCamera::thread(void *self, wait_result_t)
 // Everything of size in gWork (the camera thread's stack is 16 KiB; c3rp of 2026-11-13 overflowed it).
 void PianoCamera::run()
 {
+  if (gArgs.level >= 5 && !gWork.ops.reserveDma()) {
+    stage(-7, "level 5: early DMA reserve failed; no hardware started, no capture service");
+    return;
+  }
   if (gArgs.delay) {
     note("waiting %u s", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
@@ -1381,10 +1411,10 @@ void PianoCamera::serveLive(uint32_t sensor)
   gLiveStatus.aeSamples = result ? result->aeCount : 0;
   gLiveStatus.state = !result || result->ok ? kPianoCameraStopped : kPianoCameraFailed;
   if (!gLiveStatus.cleanOff || gLiveStatus.guardFault || gLiveStatus.smmuFault) gHardwareUnsafe = true;
-  note("abi2 live stopped sensor=%u state=%u clean=%u guard=%u smmu=%#x frames=%llu drops=%llu paced=%llu ae=%u",
+  note("abi2 live stopped sensor=%u state=%u clean=%u guard=%u smmu=%#x frames=%llu drops=%llu paced=%llu ae=%u failedStep=%d",
        sensor, gLiveStatus.state, gLiveStatus.cleanOff, gLiveStatus.guardFault, gLiveStatus.smmuFault,
        (unsigned long long)gLiveStatus.produced, (unsigned long long)gLiveStatus.dropped,
-       (unsigned long long)gLiveStatus.paced, gLiveStatus.aeSamples);
+       (unsigned long long)gLiveStatus.paced, gLiveStatus.aeSamples, int(gLiveStatus.failedStep));
   IOBufferMemoryDescriptor *mem = gLiveMemory;
   gLiveMemory = nullptr;
   gLiveActive = false;

@@ -1,10 +1,12 @@
 # Cameras (B11): PianoCamera, the level ladder
 
 2026-11-18: the B-TC CoreMediaIO extension, Camera consent and AVFoundation discovery passed on 27.3; its pattern stream delivered
-31 valid moving frames. Real sensor starts failed before the hardware worker: the CPU-only 48 MiB shared ring requested 16 KiB
-alignment, which XNU turns into physical contiguity on this 4 KiB-page kernel. The shared ring and ABI1 copy buffer now request
-the allocator's runtime page alignment. Private CAMSS DMA keeps its required contiguous allocation. Start, mapping and hardware
-resource failures have separate diagnostics; real front/rear app frames and live shutdown still await tablet verification.
+31 valid moving frames. After correcting the CPU ring's alignment, `cmio-real-avf4` reached both chip IDs and the hardware worker's
+step 307. Both late private DMA allocations failed: VM found no contiguous 8/16 MiB run. No real frame reached AVFoundation.
+Level 5 now reserves the largest private DMA buffer and table pages on the early camera thread, then reuses bounded sensor views
+after safe teardown. Its physical alignment, SMMU geometry and guards are unchanged; an unsafe stop retains the lease. Completed
+steps log register readbacks, with bounded first-frame/timeout status snapshots. Reservation efficacy and real app frames remain
+unverified on the tablet. The CPU ring and ABI1 copy buffer retain runtime page alignment.
 
 Status, 2026-11-13: **both sensors' first RAW10 frames on the tablet** (cplan, §8.4: the rear's colour bars exact at 4080x3072,
 30 fps through our SMMU window; the front's 3264x1836 frames; every power-down complete), the scenes still black (fixed since: the

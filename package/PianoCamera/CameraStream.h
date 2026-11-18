@@ -186,6 +186,35 @@ struct Dma {
   void *cookie = nullptr;
 };
 
+// Non-owning lease of an early allocation. Only the sequence's safe dmaFree()
+// point may return it: a failed stop/window release must keep it pinned/busy.
+// A smaller sensor maps only its requested extent, never the spare capacity.
+class DmaReserve {
+ public:
+  void install(const Dma &d) { backing_ = d; }
+  bool ready() const { return backing_.cookie != nullptr; }
+  bool busy() const { return busy_; }
+  bool take(uint64_t bytes, bool tables, Dma &d)
+  {
+    if (!ready() || busy_ || !bytes || bytes > backing_.bytes || (tables && !backing_.tables)) return false;
+    d = backing_;
+    d.bytes = bytes;
+    busy_ = true;
+    return true;
+  }
+  bool giveBack(Dma &d)
+  {
+    if (!busy_ || d.cookie != backing_.cookie || d.cpu != backing_.cpu || d.pa != backing_.pa) return false;
+    busy_ = false;
+    d = Dma();
+    return true;
+  }
+
+ private:
+  Dma backing_;
+  bool busy_ = false;
+};
+
 struct ChannelStats {
   uint32_t min = 1023, max = 0;
   uint64_t sum = 0, count = 0;
@@ -530,7 +559,63 @@ class Stream {
     }
     return false;
   }
-  bool stopHere(int step) { return opt.stopAt && step >= opt.stopAt ? !fail(step, StreamFailure::stopped) : false; }
+  bool stopHere(int step)
+  {
+    checkpoint(step);
+    return opt.stopAt && step >= opt.stopAt ? !fail(step, StreamFailure::stopped) : false;
+  }
+
+  void checkpoint(int step)
+  {
+    const unsigned sensor = rear_ ? 1 : 2;
+    switch (step) {
+    case kStepL3Sensor:
+      ops.note("checkpoint step=%d sensor=%u id=%04x mclk-hz=%u", step, sensor, s.result().id, s.result().mclkHz);
+      break;
+    case kStepL3Bus:
+    case kStepL3Axi:
+      ops.note("checkpoint step=%d sensor=%u mm1=%u hf-axi=%08x", step, sensor, u_.mm1, ops.rd(kGcc + kGccCameraHfAxi));
+      break;
+    case kStepL3Pll:
+      ops.note("checkpoint step=%d sensor=%u pll-mode=%08x opmode=%08x l=%08x", step, sensor,
+               ops.rd(kCamCc + kCcPll0), ops.rd(kCamCc + kCcPll0 + kPllOpmode), ops.rd(kCamCc + kCcPll0 + kTaycanL));
+      break;
+    case kStepL3Clocks:
+      ops.note("checkpoint step=%d sensor=%u ife-lite=%08x csid=%08x phy=%08x timer-cfg=%08x", step, sensor,
+               ops.rd(kCamCc + kCcIfeLite), ops.rd(kCamCc + kCcIfeLiteCsid),
+               ops.rd(kCamCc + csiphyBranch(f_->csiphy)), ops.rd(kCamCc + csiTimerRcg(f_->csiphy) + kRcgCfg));
+      break;
+    case kStepL3Versions:
+      ops.note("checkpoint step=%d sensor=%u csid-version=%08x tfe-version=%08x", step, sensor, r_.csidVersion, r_.tfeVersion);
+      break;
+    case kStepL3Smmu:
+    case kStepL3Memory:
+      ops.note("checkpoint step=%d sensor=%u group=%u smr=%08x s2cr=%08x bus=%#llx pa=%#llx bytes=%llu", step, sensor, plan_.slot,
+               ops.rd(kSmmu + iova::smrOffset(plan_.slot)), ops.rd(kSmmu + iova::s2crOffset(plan_.slot)),
+               (unsigned long long)r_.busAddr, (unsigned long long)d_.pa, (unsigned long long)d_.bytes);
+      break;
+    case kStepL3CsidReset:
+      ops.note("checkpoint step=%d sensor=%u csid-top=%08x", step, sensor, ops.rd(kCsidLite0 + kCsidTopStatus));
+      break;
+    case kStepL3Wm:
+      ops.note("checkpoint step=%d sensor=%u wm-cfg=%08x addr=%08x incr=%08x", step, sensor,
+               ops.rd(kTfeLite0 + kWm0 + kWmCfg), ops.rd(kTfeLite0 + kWm0 + kWmImageAddr), ops.rd(kTfeLite0 + kWm0 + kWmFrameIncr));
+      break;
+    case kStepL3Csid:
+      ops.note("checkpoint step=%d sensor=%u rx-cfg0=%08x rdi-cfg0=%08x cfg1=%08x ctrl=%08x", step, sensor,
+               ops.rd(kCsidLite0 + kCsidRxCfg0), ops.rd(kCsidLite0 + kCsidRdiCfg0),
+               ops.rd(kCsidLite0 + kCsidRdiCfg1), ops.rd(kCsidLite0 + kCsidRdiCtrl));
+      break;
+    case kStepL3Phy:
+      ops.note("checkpoint step=%d sensor=%u phy=%u version=%08x ctrl5=%08x ctrl6=%08x settle=%u writes=%u", step, sensor,
+               f_->csiphy, r_.phyVersion, ops.rd(ctrl(5)), ops.rd(ctrl(6)), r_.settle, r_.phyWritten);
+      break;
+    case kStepL3Sensor2:
+      ops.note("checkpoint step=%d sensor=%u table-writes=%u controls=%u readback=%u exposure=%u gain=%u", step, sensor,
+               r_.tableWrites, r_.controlWrites, r_.readBack, r_.readExposure, r_.readGain);
+      break;
+    }
+  }
 
   uint32_t rcgOf(unsigned i) const { return i == kL3RcgTimer ? csiTimerRcg(f_->csiphy) : kL3Rcgs[i].off; }
   uint32_t branchOf(unsigned i) const
@@ -887,6 +972,9 @@ class Stream {
     u_.streaming = true;
     if (!section("on", nullptr)) return false;
     r_.streamed = true;
+    uint8_t on = 0;
+    const bool readOn = s.sensorRead(0x0100, &on, 1);
+    ops.note("checkpoint step=312 sensor=%u event=stream-on reg0100=%02x readback=%u", rear_ ? 1 : 2, on, readOn);
     return true;
   }
 
@@ -895,6 +983,9 @@ class Stream {
   void stream()
   {
     ops.step(kStepL3Stream, "the stream: SOF/EOF/BUF_DONE polled, the write master re-armed after each frame");
+    ops.note("checkpoint step=320 sensor=%u event=poll-start top=%08x buf=%08x rx=%08x rdi=%08x wm=%08x", rear_ ? 1 : 2,
+             ops.rd(kCsidLite0 + kCsidTopStatus), ops.rd(kCsidLite0 + kCsidBufStatus),
+             ops.rd(kCsidLite0 + kCsidRxStatus), ops.rd(kCsidLite0 + kCsidRdiStatus), ops.rd(kTfeLite0 + kWm0 + kWmCfg));
     t0_ = ops.nowUs();
     // the exposure loop's frames on top of the stream's own bound
     const uint64_t loopUs = aeOn() ? uint64_t(opt.aeSteps) * (opt.aeSettle + 1) * opt.frameMs * 1000 : 0;
@@ -1038,6 +1129,8 @@ class Stream {
           ++r_.staleBufDone;
         } else {
           if (!r_.firstFrameUs) {
+            ops.note("checkpoint step=320 sensor=%u event=first-done top=%08x buf=%08x rx=%08x rdi=%08x after-us=%llu", rear_ ? 1 : 2,
+                     top, buf, rx, rdi, (unsigned long long)at);
             r_.firstFrameUs = at;
             readPhyStatus(r_.phyStatusFirst);
             r_.phyFirstRead = true;
@@ -1070,6 +1163,8 @@ class Stream {
         }
       }
       if (now >= frameDeadline_ || (!opt.live && now >= deadline_)) {
+        ops.note("checkpoint step=320 sensor=%u event=timeout top=%08x buf=%08x rx=%08x rdi=%08x wm=%08x polls=%u", rear_ ? 1 : 2,
+                 top, buf, rx, rdi, ops.rd(wm + kWmCfg), r_.polls);
         fail(kStepL3Stream, r_.bufDone || r_.aeFrames ? StreamFailure::frameTimeout : StreamFailure::noFrame);
         return false;
       }
@@ -1234,6 +1329,8 @@ class Stream {
       }
       u_.csid = false;
     }
+    ops.note("checkpoint step=330 sensor=%u wm=%08x stopped=%u rdi-ctrl=%08x phy-ctrl5=%08x late=%u", rear_ ? 1 : 2,
+             ops.rd(wm + kWmCfg), r_.wmStopped, ops.rd(c + kCsidRdiCtrl), ops.rd(ctrl(5)), r_.lateFrames);
   }
 
   void statistics()
@@ -1316,6 +1413,8 @@ class Stream {
     r_.cleanOff = s.result().cleanOff && !u_.mm1 && !u_.hfAxi && !u_.pll && !u_.route && !u_.dma && !u_.streaming && !u_.phy && !u_.wm;
     for (bool b : u_.branch) r_.cleanOff = r_.cleanOff && !b;
     for (bool b : u_.rcg) r_.cleanOff = r_.cleanOff && !b;
+    ops.note("checkpoint step=340 sensor=%u route-released=%u dma-returned=%u clean=%u hf-axi=%08x", rear_ ? 1 : 2,
+             !u_.route, r_.bufferFreed, r_.cleanOff, ops.rd(kGcc + kGccCameraHfAxi));
   }
 
   StreamResult r_;
