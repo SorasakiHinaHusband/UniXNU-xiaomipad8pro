@@ -27,6 +27,7 @@ static os_log_t gLog;
   CVPixelBufferPoolRef _outputPools[2], _sourcePool;
   NSArray<CMIOExtensionStreamFormat *> *_formats;
   dispatch_source_t _timer;
+  dispatch_semaphore_t _timerCancelled;
   dispatch_queue_t _outputQueue, _captureQueue;
   int32_t _nativeWidth, _nativeHeight;
   uint32_t _sensor;
@@ -364,6 +365,23 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   return YES;
 }
 
+// Called only with a fully converted, immutable source after its RAW lease has been returned.
+- (void)acceptSource:(CVPixelBufferRef)pb sequence:(uint64_t)sequence drops:(uint64_t)drops sourceNs:(uint64_t)sourceNs
+{
+  // Backpressure bounds this handoff to one frame instead of accumulating an async queue of sources.
+  dispatch_sync(_outputQueue, ^{
+    if (!atomic_load(&self->_running)) return;
+    if (self->_latest) CVPixelBufferRelease(self->_latest);
+    self->_latest = CVPixelBufferRetain(pb);
+    self->_latestSequence = sequence;
+    self->_latestDrops = drops;
+    self->_latestSourceNs = sourceNs;
+    ++self->_sourceFrames;
+    if (self->_stalled) os_log(gLog, "camera source resumed sensor=%u seq=%llu", self->_sensor, sequence);
+    self->_stalled = NO;
+  });
+}
+
 - (void)readLive
 {
   uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 8 * NSEC_PER_SEC;
@@ -390,18 +408,7 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
         const CMTime source = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(frame.sofTicks), NSEC_PER_SEC,
                                                 kCMTimeRoundingMethod_RoundHalfAwayFromZero);
         const uint64_t sourceNs = CMTIME_IS_NUMERIC(source) && source.value > 0 ? (uint64_t)source.value : 0;
-        // Backpressure here bounds the handoff to one frame; never retain an accumulating async queue of sources.
-        dispatch_sync(_outputQueue, ^{
-          if (!atomic_load(&self->_running)) return;
-          if (self->_latest) CVPixelBufferRelease(self->_latest);
-          self->_latest = CVPixelBufferRetain(pb);
-          self->_latestSequence = frame.sequence;
-          self->_latestDrops = frame.drops;
-          self->_latestSourceNs = sourceNs;
-          ++self->_sourceFrames;
-          if (self->_stalled) os_log(gLog, "camera source resumed sensor=%u seq=%llu", self->_sensor, frame.sequence);
-          self->_stalled = NO;
-        });
+        [self acceptSource:pb sequence:frame.sequence drops:frame.drops sourceNs:sourceNs];
       } else atomic_fetch_add(&_captureDropped, 1);
       if (pb) CVPixelBufferRelease(pb);
       if (result) {
@@ -414,17 +421,8 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   }
 }
 
-- (BOOL)startStreamAndReturnError:(NSError **)outError
+- (BOOL)openLiveAndReturnError:(NSError **)outError
 {
-  if (atomic_load(&_running)) return YES;
-  _lastReadSequence = _ispTotal = _ispMax = _converted = 0;
-  atomic_store(&_captureDropped, 0);
-  dispatch_sync(_outputQueue, ^{
-    self->_frame = self->_dropped = self->_repeated = self->_sourceFrames = self->_staleTicks = 0;
-    self->_lastPublishedSequence = self->_lastPresentationTicks = self->_lastPresentationNs = self->_lastDropCount = 0;
-    self->_latestSequence = self->_latestDrops = self->_latestSourceNs = 0;
-    self->_stalled = self->_configurationChanged = NO;
-  });
   if (_sensor) {
     _work = malloc((size_t)_nativeWidth * _nativeHeight * 3 * sizeof(float));
     _rgb = malloc((size_t)_nativeWidth * _nativeHeight * 3);
@@ -460,9 +458,27 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
       return ioResult(result, outError);
     }
   }
+  return YES;
+}
+
+- (BOOL)startStreamAndReturnError:(NSError **)outError
+{
+  if (atomic_load(&_running)) return YES;
+  _lastReadSequence = _ispTotal = _ispMax = _converted = 0;
+  atomic_store(&_captureDropped, 0);
+  dispatch_sync(_outputQueue, ^{
+    self->_frame = self->_dropped = self->_repeated = self->_sourceFrames = self->_staleTicks = 0;
+    self->_lastPublishedSequence = self->_lastPresentationTicks = self->_lastPresentationNs = self->_lastDropCount = 0;
+    self->_latestSequence = self->_latestDrops = self->_latestSourceNs = 0;
+    self->_stalled = self->_configurationChanged = NO;
+  });
+  if (![self openLiveAndReturnError:outError]) return NO;
   atomic_store(&_running, true);
   dispatch_sync(_outputQueue, ^{
     self->_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self->_outputQueue);
+    self->_timerCancelled = dispatch_semaphore_create(0);
+    dispatch_semaphore_t cancelled = self->_timerCancelled;
+    dispatch_source_set_cancel_handler(self->_timer, ^{ dispatch_semaphore_signal(cancelled); });
     __weak PianoStreamSource *weakSelf = self;
     dispatch_source_set_event_handler(self->_timer, ^{ [weakSelf tick]; });
     [self retimeOutput];
@@ -472,6 +488,11 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   });
   if (_sensor) dispatch_async(_captureQueue, ^{ [self readLive]; });
   return YES;
+}
+
+- (IOReturn)stopLive:(PianoCameraLiveStatus *)state
+{
+  return _connection ? liveCall(_connection, kPianoCameraLiveStop, NULL, 0, state, sizeof *state) : kIOReturnSuccess;
 }
 
 - (void)closeLive
@@ -487,12 +508,18 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
 {
   if (!atomic_exchange(&_running, false)) return YES;
   // Cancel on the output queue, then stop/wake the RAW waiter, drain both queues, and only then free mappings/ISP memory.
+  __block dispatch_semaphore_t cancelled;
   dispatch_sync(_outputQueue, ^{
-    if (self->_timer) dispatch_source_cancel(self->_timer);
+    if (self->_timer) {
+      cancelled = self->_timerCancelled;
+      dispatch_source_cancel(self->_timer);
+    }
     self->_timer = nil;
+    self->_timerCancelled = nil;
   });
+  if (cancelled) dispatch_semaphore_wait(cancelled, DISPATCH_TIME_FOREVER);
   PianoCameraLiveStatus state = {0};
-  IOReturn result = _connection ? liveCall(_connection, kPianoCameraLiveStop, NULL, 0, &state, sizeof state) : kIOReturnSuccess;
+  IOReturn result = [self stopLive:&state];
   dispatch_sync(_captureQueue, ^{});
   dispatch_sync(_outputQueue, ^{
     if (self->_latest) CVPixelBufferRelease(self->_latest);
