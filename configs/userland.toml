@@ -24,6 +24,12 @@
 format = 1
 staging = "/private/var/piano/userland"
 
+# Explicit opt-in for already verified B-TC code under this worktree's out/.
+# stage.py preserves the seals and installs each bundle under /Applications.
+[camera_package]
+apps = ["PianoCamera.app", "PianoCameraCapture.app"]
+
+
 [[unit]]
 name = "piano-passd-policy"
 about = "UID 501 passd disable + bootout, with original override restored when the unit is removed; native lacks the AppleKeyStore unlock contract (docs/userland.md)"

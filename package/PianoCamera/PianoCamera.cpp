@@ -92,6 +92,25 @@ bool gKeepFrame;      // the next level-3 frameReady copies the frame into gRawM
 uint64_t gKept;       // the bytes it copied
 uint32_t gCaptures;
 
+// gServeLock protects leases, the worker's reference, and PM/start arbitration.
+// The DMA target is never mapped to userspace. Each connection gets different
+// memory, so a mapping retained after close cannot see a later session.
+enum LiveSlotState { slotFree, slotWriting, slotReady, slotHeld };
+LiveSlotState gSlotState[kPianoCameraSlots];
+PianoCameraLiveFrame gSlots[kPianoCameraSlots];
+PianoCameraLiveStatus gLiveStatus;
+IOBufferMemoryDescriptor *gLiveMemory;
+uint64_t gLiveToken;
+bool gLiveActive, gLiveStop, gSuspended, gHardwareUnsafe;
+uint32_t gLiveSensor;
+
+void cancelLiveLocked()
+{
+  gLiveStop = true;
+  IOLockWakeup(gServeLock, &gLiveStatus, false);
+}
+
+
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
   uint32_t v = fallback;
@@ -851,6 +870,61 @@ class Ops {
     memcpy(gRawBytes, buf, n);
     gKept = n;
   }
+  uint64_t hostTicks() { return mach_absolute_time(); }
+  bool liveCancelled()
+  {
+    IOLockLock(gServeLock);
+    const bool cancelled = gLiveStop;
+    IOLockUnlock(gServeLock);
+    return cancelled;
+  }
+  void livePaced(uint64_t missing)
+  {
+    IOLockLock(gServeLock);
+    ++gLiveStatus.paced;
+    gLiveStatus.dropped += missing;
+    IOLockUnlock(gServeLock);
+  }
+  void liveFrame(const uint8_t *buf, const StreamResult &r, uint64_t sequence, uint64_t sof, uint64_t missing)
+  {
+    const uint32_t bytes = r.frameBytes;
+    IOLockLock(gServeLock);
+    gLiveStatus.dropped += missing;
+    if (gLiveStop) {
+      IOLockUnlock(gServeLock);
+      return;
+    }
+    unsigned slot = 0;
+    while (slot < kPianoCameraSlots && gSlotState[slot] != slotFree) ++slot;
+    if (slot == kPianoCameraSlots || bytes > kPianoCameraSlotBytes || !bytes) {
+      ++gLiveStatus.dropped;
+      IOLockUnlock(gServeLock);
+      return;
+    }
+    auto *base = static_cast<uint8_t *>(gLiveMemory->getBytesNoCopy());
+    gSlotState[slot] = slotWriting;
+    IOLockUnlock(gServeLock);
+    memcpy(base + uint64_t(slot) * kPianoCameraSlotBytes, buf, bytes);
+    IOLockLock(gServeLock);
+    if (gLiveStop) {
+      gSlotState[slot] = slotFree;
+    } else {
+      const bool rear = gLiveSensor == kPianoCameraRear;
+      gSlots[slot] = {kPianoCameraLiveVersion, gLiveSensor, slot, r.width, r.height, bytes / r.height,
+                      rear ? kPianoCameraGRBG : kPianoCameraBGGR, kRawBlack,
+                      r.exposure, r.gain, rear ? kRearExposure.gUnit : kFrontExposure.gUnit, bytes,
+                      sequence, sof, gLiveStatus.dropped};
+      // Unlock publishes both the metadata and completed payload. Wait acquires
+      // the same lock before granting a lease.
+      gSlotState[slot] = slotReady;
+      gLiveStatus.state = kPianoCameraStreaming;
+      if (++gLiveStatus.produced == 1)
+        ::note("abi2 first RAW sensor=%u seq=%llu sof=%llu bytes=%u", gLiveSensor, (unsigned long long)sequence,
+               (unsigned long long)sof, bytes);
+      IOLockWakeup(gServeLock, &gLiveStatus, false);
+    }
+    IOLockUnlock(gServeLock);
+  }
   IOBufferMemoryDescriptor *tableMem = nullptr;
   const Survey *survey = nullptr;
   bool gccHeld = false;
@@ -987,6 +1061,7 @@ class PianoCamera : public IOService {
   OSDeclareDefaultStructors(PianoCamera)
   void run();
   bool sequence(char *verdict, size_t size);
+  void serveLive(uint32_t sensor);
   void serve();
   static void thread(void *self, wait_result_t);
 
@@ -1016,8 +1091,7 @@ bool PianoCamera::start(IOService *provider)
   if (gArgs.level > 3) {   // 4 (the software ISP) lives in user space: both are level 5's kernel side
     if (gArgs.level != 5) note("piano-camera=%u: level 4 is the user-space ISP (docs/drivers/camera.md 4.4); running 5", gArgs.level);
     gArgs.level = 5;
-    note("level 5: the user client PianoCameraUserClient (a capture per call: the sensor up, the exposure loop, the last RAW10 frame "
-         "kept in memory 0, everything down; an administrator only)");
+    note("level 5: PianoCameraUserClient diagnostic ABI 1 and entitled live ABI 2");
     setProperty("IOUserClientClass", "PianoCameraUserClient");
   }
   if (gPlanText[0] && gPlan.error)
@@ -1248,6 +1322,59 @@ bool PianoCamera::sequence(char *verdict, size_t size)
   return planGoesOn(clean, false);
 }
 
+// Run the same hardware sequence as ABI 1 with its live consumer and cancellation.
+void PianoCamera::serveLive(uint32_t sensor)
+{
+  IOLockLock(gSequenceLock);
+  Work &k = gWork;
+  IOLockLock(gServeLock);
+  const bool cancelled = gLiveStop || gSuspended;
+  IOLockUnlock(gServeLock);
+  const StreamResult *result = nullptr;
+  if (!cancelled) {
+    renew(k.po);
+    k.po.rearCci = !gArgs.rearBus;
+    k.po.mclk24 = true;
+    k.po.cciKhz = gArgs.cciKhz;
+    k.po.bitHalfUs = gArgs.halfUs;
+    k.po.busPullUp = gArgs.pull != 0;
+    k.po.blind = gArgs.blind != 0;
+    k.po.camss = k.po.votes = true;
+    renew(k.o);
+    k.o.live = true;
+    k.o.pattern = false;
+    k.o.ae = gArgs.ae != 0;
+    k.o.aeTarget = gArgs.aeTarget;
+    k.ops.survey = &k.survey;
+    Session<Ops> &session = k.session.make(k.ops, k.po);
+    Stream<Ops> &stream = k.stream.make(k.ops, session, k.o);
+    result = &stream.run(sensor == kPianoCameraRear ? Sensor::rear : Sensor::front, gLoader, gPmic, k.so, k.survey);
+  }
+  IOLockLock(gServeLock);
+  gLiveStatus.cleanOff = !result || result->cleanOff;
+  gLiveStatus.failedStep = result ? result->failedStep : 0;
+  gLiveStatus.guardFault = result && result->failure == StreamFailure::guard;
+  gLiveStatus.smmuFault = result ? result->fault.fsr & iova::kFsrFaults : 0;
+  gLiveStatus.aeSamples = result ? result->aeCount : 0;
+  gLiveStatus.state = !result || result->ok ? kPianoCameraStopped : kPianoCameraFailed;
+  if (!gLiveStatus.cleanOff || gLiveStatus.guardFault || gLiveStatus.smmuFault) gHardwareUnsafe = true;
+  note("abi2 live stopped sensor=%u state=%u clean=%u guard=%u smmu=%#x frames=%llu drops=%llu paced=%llu ae=%u",
+       sensor, gLiveStatus.state, gLiveStatus.cleanOff, gLiveStatus.guardFault, gLiveStatus.smmuFault,
+       (unsigned long long)gLiveStatus.produced, (unsigned long long)gLiveStatus.dropped,
+       (unsigned long long)gLiveStatus.paced, gLiveStatus.aeSamples);
+  IOBufferMemoryDescriptor *mem = gLiveMemory;
+  gLiveMemory = nullptr;
+  gLiveActive = false;
+  IOLockWakeup(gServeLock, &gLiveStatus, false);
+  IOLockUnlock(gServeLock);
+  if (result) {
+    k.stream.drop();
+    k.session.drop();
+  }
+  IOLockUnlock(gSequenceLock);
+  mem->release();
+}
+
 // Level 5: the camera thread waits for a user client's capture (gRequest), runs it as a level-3 sequence with the request's sensor,
 // pattern and exposure loop (one frame after the loop), keeps the frame in memory type 0 and its description in gInfo, and is idle
 // (everything powered down) between captures.
@@ -1270,7 +1397,13 @@ void PianoCamera::serve()
   stage(7, "level 5: ready for captures (PianoCameraUserClient)");
   for (;;) {
     IOLockLock(gServeLock);
-    while (!gRequestPending) IOLockSleep(gServeLock, &gRequestPending, THREAD_UNINT);
+    while (!gRequestPending && !gLiveActive) IOLockSleep(gServeLock, &gRequestPending, THREAD_UNINT);
+    if (gLiveActive) {
+      const uint32_t sensor = gLiveSensor;
+      IOLockUnlock(gServeLock);
+      serveLive(sensor);
+      continue;
+    }
     const PianoCameraCaptureArgs q = gRequest;
     IOLockUnlock(gServeLock);
     note("level 5: capture %u: the %s, %s, exposure loop %s (target %u)", gCaptures + 1, q.sensor == kPianoCameraFront ? "front" : "rear",
@@ -1308,6 +1441,16 @@ class PianoCameraUserClient : public IOUserClient {
  public:
   bool initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties) override;
   IOReturn clientClose() override;
+  void free() override;
+
+ private:
+  IOReturn liveMethod(uint32_t selector, IOExternalMethodArguments *a);
+  IOReturn startLive(const PianoCameraLiveStartArgs &args);
+  IOBufferMemoryDescriptor *ring_ = nullptr;
+  uint64_t token_ = 0;
+  bool admin_ = false, closed_ = false;
+
+ public:
   IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *dispatch, OSObject *target,
                           void *reference) override;
   IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
@@ -1315,18 +1458,158 @@ class PianoCameraUserClient : public IOUserClient {
 
 OSDefineMetaClassAndStructors(PianoCameraUserClient, IOUserClient)
 
-// An administrator only, in this version (the camera extension, sandboxed and not root, needs an entitlement check: camera.md 4.5).
+// The signed provider can use ABI 2. ABI 1 remains an administrator diagnostic.
 bool PianoCameraUserClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties)
 {
-  if (clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return false;
+  admin_ = clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+  if (type != 0) return false;
+  if (!admin_) {
+    OSObject *e = IOUserClient::copyClientEntitlement(owningTask, "com.unixnu.piano-camera.client");
+    const bool allowed = e == kOSBooleanTrue;
+    if (e) e->release();
+    if (!allowed) return false;
+  }
+  if (!admin_) note("abi2 entitled role user client");
+
   return IOUserClient::initWithTask(owningTask, securityToken, type, properties);
 }
 
 IOReturn PianoCameraUserClient::clientClose()
 {
+  if (!gServeLock) return kIOReturnNotReady;
+  IOLockLock(gServeLock);
+  closed_ = true;
+  if (token_ && token_ == gLiveToken && gLiveActive) cancelLiveLocked();
+  IOLockUnlock(gServeLock);
   if (!isInactive()) terminate();
   return kIOReturnSuccess;
 }
+
+void PianoCameraUserClient::free()
+{
+  if (ring_) ring_->release();
+  IOUserClient::free();
+}
+
+IOReturn PianoCameraUserClient::startLive(const PianoCameraLiveStartArgs &args)
+{
+  if (args.version != kPianoCameraLiveVersion || (args.sensor != kPianoCameraRear && args.sensor != kPianoCameraFront))
+    return kIOReturnBadArgument;
+  IOLockLock(gServeLock);
+  if (closed_ || token_ || gRequestPending || gLiveActive || !gServing || gSuspended || gHardwareUnsafe) {
+    IOLockUnlock(gServeLock);
+    return kIOReturnBusy;
+  }
+  IOLockUnlock(gServeLock);
+
+  const IOOptionBits options = IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared);
+  auto *ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, options,
+                                                          kPianoCameraSlots * uint64_t(kPianoCameraSlotBytes), 16384);
+  if (!ring || !ring->getBytesNoCopy()) {
+    if (ring) ring->release();
+    return kIOReturnNoMemory;
+  }
+  // A new mapping can be read even before the first lease.
+  memset(ring->getBytesNoCopy(), 0, kPianoCameraSlots * uint64_t(kPianoCameraSlotBytes));
+  IOLockLock(gServeLock);
+  if (closed_ || token_ || gRequestPending || gLiveActive || gSuspended || gHardwareUnsafe) {
+    IOLockUnlock(gServeLock);
+    ring->release();
+    return kIOReturnBusy;
+  }
+  ring_ = ring;
+  ring->retain();
+  gLiveMemory = ring;
+  token_ = ++gLiveToken;
+  gLiveSensor = args.sensor;
+  gLiveStatus = {};
+  gLiveStatus.version = kPianoCameraLiveVersion;
+  gLiveStatus.sensor = args.sensor;
+  gLiveStatus.state = kPianoCameraStarting;
+  for (auto &state : gSlotState) state = slotFree;
+  gLiveStop = false;
+  gLiveActive = true;
+  IOLockWakeup(gServeLock, &gRequestPending, false);
+  IOLockUnlock(gServeLock);
+  return kIOReturnSuccess;
+}
+
+IOReturn PianoCameraUserClient::liveMethod(uint32_t selector, IOExternalMethodArguments *a)
+{
+  if (selector == kPianoCameraLiveStart) {
+    if (!a->structureInput || a->structureInputSize != sizeof(PianoCameraLiveStartArgs) || a->structureOutputSize)
+      return kIOReturnBadArgument;
+    PianoCameraLiveStartArgs args;
+    memcpy(&args, a->structureInput, sizeof args);
+    return startLive(args);
+  }
+  PianoCameraLiveReleaseArgs release = {};
+  if (selector == kPianoCameraLiveRelease) {
+    if (!a->structureInput || a->structureInputSize != sizeof release || a->structureOutputSize)
+      return kIOReturnBadArgument;
+    memcpy(&release, a->structureInput, sizeof release);
+    if (release.version != kPianoCameraLiveVersion || release.slot >= kPianoCameraSlots) return kIOReturnBadArgument;
+  } else {
+    const size_t size = selector == kPianoCameraLiveWait ? sizeof(PianoCameraLiveFrame) : sizeof(PianoCameraLiveStatus);
+    if (a->structureInputSize || !a->structureOutput || a->structureOutputSize != size) return kIOReturnBadArgument;
+  }
+
+  IOLockLock(gServeLock);
+  IOReturn rc = kIOReturnNotOpen;
+  if (closed_ || !token_ || token_ != gLiveToken) {
+    IOLockUnlock(gServeLock);
+    return rc;
+  }
+  switch (selector) {
+  case kPianoCameraLiveStop: {
+    cancelLiveLocked();
+    uint64_t deadline;
+    clock_interval_to_deadline(4000, kMillisecondScale, &deadline);
+    while (gLiveActive && token_ == gLiveToken) {
+      if (IOLockSleepDeadline(gServeLock, &gLiveStatus, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) break;
+    }
+    rc = token_ != gLiveToken ? kIOReturnNotOpen : gLiveActive ? kIOReturnTimeout : kIOReturnSuccess;
+    if (!rc) memcpy(a->structureOutput, &gLiveStatus, sizeof gLiveStatus);
+    break;
+  }
+  case kPianoCameraLiveInfo:
+    memcpy(a->structureOutput, &gLiveStatus, sizeof gLiveStatus);
+    rc = kIOReturnSuccess;
+    break;
+  case kPianoCameraLiveWait: {
+    uint64_t deadline;
+    clock_interval_to_deadline(250, kMillisecondScale, &deadline);
+    while (!closed_ && gLiveActive && !gLiveStop && token_ == gLiveToken) {
+      unsigned best = kPianoCameraSlots;
+      for (unsigned i = 0; i < kPianoCameraSlots; ++i)
+        if (gSlotState[i] == slotReady && (best == kPianoCameraSlots || gSlots[i].sequence < gSlots[best].sequence)) best = i;
+      if (best < kPianoCameraSlots) {
+        gSlotState[best] = slotHeld;
+        memcpy(a->structureOutput, &gSlots[best], sizeof(PianoCameraLiveFrame));
+        rc = kIOReturnSuccess;
+        break;
+      }
+      const auto wake = IOLockSleepDeadline(gServeLock, &gLiveStatus, deadline, THREAD_ABORTSAFE);
+      if (wake != THREAD_AWAKENED) {
+        rc = wake == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
+        break;
+      }
+    }
+    break;
+  }
+  case kPianoCameraLiveRelease:
+    rc = kIOReturnBadArgument;
+    if (gSlotState[release.slot] == slotHeld && release.sequence == gSlots[release.slot].sequence) {
+      gSlotState[release.slot] = slotFree;
+      rc = kIOReturnSuccess;
+    }
+    break;
+  default: rc = kIOReturnUnsupported; break;
+  }
+  IOLockUnlock(gServeLock);
+  return rc;
+}
+
 
 // One capture: posted to the camera thread, waited for (at most the request's timeout); one at a time.
 static IOReturn capture(const PianoCameraCaptureArgs &args, PianoCameraFrameInfo &out)
@@ -1336,7 +1619,7 @@ static IOReturn capture(const PianoCameraCaptureArgs &args, PianoCameraFrameInfo
     IOLockUnlock(gServeLock);
     return kIOReturnNotReady;
   }
-  if (gRequestPending) {
+  if (gRequestPending || gLiveActive || gSuspended || gHardwareUnsafe) {
     IOLockUnlock(gServeLock);
     return kIOReturnBusy;
   }
@@ -1360,7 +1643,10 @@ static IOReturn capture(const PianoCameraCaptureArgs &args, PianoCameraFrameInfo
 IOReturn PianoCameraUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *,
                                                void *)
 {
-  if (!a || !a->structureOutput || a->structureOutputSize < sizeof(PianoCameraFrameInfo)) return kIOReturnBadArgument;
+  if (!a || a->scalarInputCount || a->scalarOutputCount || !gServeLock) return kIOReturnBadArgument;
+  if (selector >= kPianoCameraLiveStart && selector <= kPianoCameraLiveRelease) return liveMethod(selector, a);
+  if (!admin_) return kIOReturnNotPrivileged;
+  if (!a->structureOutput || a->structureOutputSize < sizeof(PianoCameraFrameInfo)) return kIOReturnBadArgument;
   PianoCameraFrameInfo info;
   IOReturn rc = kIOReturnSuccess;
   switch (selector) {
@@ -1389,17 +1675,32 @@ IOReturn PianoCameraUserClient::externalMethod(uint32_t selector, IOExternalMeth
 
 IOReturn PianoCameraUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
-  if (type != kPianoCameraMemoryRaw || !gRawMem) return kIOReturnBadArgument;
-  gRawMem->retain();
-  *memory = gRawMem;
+  if (!gServeLock) return kIOReturnNotReady;
+  IOLockLock(gServeLock);
+  IOBufferMemoryDescriptor *buffer = nullptr;
+  if (!closed_) {
+    if (type == kPianoCameraMemoryRing) buffer = ring_;
+    if (type == kPianoCameraMemoryRaw && admin_ && gServing) buffer = gRawMem;
+  }
+  if (buffer) buffer->retain();
+  IOLockUnlock(gServeLock);
+  if (!buffer) return kIOReturnBadArgument;
+  *memory = buffer;
   *options = kIOMapReadOnly;
   return kIOReturnSuccess;
 }
 
-// A sequence is short (well under a second) and always ends powered down: a power transition only waits for it.
+// Block new capture requests and signal live cancellation before waiting for the hardware sequence.
 IOReturn PianoCamera::setPowerState(unsigned long state, IOService *)
 {
-  if (state == pianopower::kOff && gSequenceLock) {
+  const bool off = state == pianopower::kOff;
+  if (gServeLock) {
+    IOLockLock(gServeLock);
+    gSuspended = off;
+    if (off && gLiveActive) cancelLiveLocked();
+    IOLockUnlock(gServeLock);
+  }
+  if (off && gSequenceLock) {
     IOLockLock(gSequenceLock);
     IOLockUnlock(gSequenceLock);
   }

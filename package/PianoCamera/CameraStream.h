@@ -52,6 +52,7 @@ namespace pianocamera {
 
 struct StreamOptions {
   unsigned frames = 2;            // BUF_DONEs to collect (piano-camera-frames, 1..8)
+  bool live = false;              // one private DMA address queued at a time, until the owner cancels
   bool pattern = true;            // the rear's colour bars (piano-camera-pattern; 0: the scene)
   unsigned timeoutMs = 3000;      // the stream's hard bound from stream-on (piano-camera-timeout-ms, 500..10000)
   unsigned firstFrameMs = 1000, frameMs = 200, pollUs = 100, lateMs = 100;
@@ -150,7 +151,7 @@ enum : int {
 };
 
 enum class StreamFailure : uint8_t {
-  none, sensor, refused, allowlist, votes, pll, rcg, branch, smmu, memory, csidReset, table, noFrame, frameTimeout, stopped,
+  none, sensor, refused, allowlist, votes, pll, rcg, branch, smmu, memory, csidReset, table, noFrame, frameTimeout, stopped, guard,
 };
 inline const char *streamFailureName(StreamFailure f)
 {
@@ -170,6 +171,7 @@ inline const char *streamFailureName(StreamFailure f)
   case StreamFailure::noFrame: return "no frame arrived";
   case StreamFailure::frameTimeout: return "the frames stopped (or the stream's deadline passed)";
   case StreamFailure::stopped: return "stopped (piano-camera-stop)";
+  case StreamFailure::guard: return "the write master changed the DMA guard";
   }
   return "?";
 }
@@ -430,6 +432,8 @@ class Stream {
     wmEver_ = false;
     mode_ = nullptr;
     aeStride_ = 0;
+    sofTicks_ = sequence_ = completedSequence_ = 0;
+    liveGuardIntact_ = true;
     r_.attempted = true;
     r_.which = which;
     rear_ = which == Sensor::rear;
@@ -439,8 +443,15 @@ class Stream {
     if (up(which, loader, pmic, so, survey)) {
       stream();
       stop();
-      statistics();
-      if (r_.stats.done) ops.frameReady(d_.cpu, r_);   // the last frame, the write master stopped (level 5 keeps a copy)
+      if (opt.live) {
+        if (r_.wmStopped && !guardIntact()) {
+          liveGuardIntact_ = false;
+          fail(kStepL3Stats, StreamFailure::guard);
+        }
+      } else {
+        statistics();
+        if (r_.stats.done) ops.frameReady(d_.cpu, r_);
+      }
     } else if (u_.streaming || u_.wm) {
       stop();
     }
@@ -451,8 +462,8 @@ class Stream {
     reportStream(ops, r_, opt.pattern, opt.gain);   // before the power-down: nothing found is lost if it goes wrong
     down();
     r_.sensor = s.result();
-    r_.ok = !r_.failedStep && r_.bufDone >= opt.frames && r_.stats.done && r_.stats.guardIntact && !(r_.fault.fsr & iova::kFsrFaults) &&
-            r_.cleanOff;
+    r_.ok = !r_.failedStep && !(r_.fault.fsr & iova::kFsrFaults) && r_.cleanOff &&
+            (opt.live ? liveGuardIntact_ : r_.bufDone >= opt.frames && r_.stats.done && r_.stats.guardIntact);
     return r_;
   }
 
@@ -699,7 +710,13 @@ class Stream {
     put(c + kCsidRdiCfg0, ops.rd(c + kCsidRdiCfg0) | kRdiCfg0Enable, "CSID RDI0 CFG0: enable");
     put(c + kCsidRxMask, 0xffffffffu, "CSID CSI2 RX IRQ mask: all (polled; no interrupt is attached)");
     put(c + kCsidRdiMask, kRdiMaskL3, "CSID RDI0 IRQ mask: SOF/EOF/RUP_DONE/errors (polled)");
-    for (unsigned k = 0; k < 2; ++k) {
+    if (opt.live) {
+      // Queue exactly one target. Repeating the AUP would permit hardware to
+      // write the same address again while CPU consumption is in progress.
+      put(c + kCsidRupAup, kCsidAupRdi0, "CSID RUP_AUP: single private DMA target");
+      put(c + kCsidRupAup, kCsidRupRdi0, "CSID RUP_AUP: RUP RDI0");
+      put(c + kCsidRupAup, kCsidRupRdi0, "CSID RUP_AUP: RUP RDI0");
+    } else for (unsigned k = 0; k < 2; ++k) {
       rup_ |= kCsidAupRdi0;
       put(c + kCsidRupAup, rup_, "CSID RUP_AUP: AUP RDI0");
       rup_ |= kCsidRupRdi0;
@@ -885,11 +902,82 @@ class Stream {
     last_ = t0_;
     rdiSince_ = rxSince_ = 0;
     sofLogged_ = eofLogged_ = 0;
-    if (!aeOn() || exposureLoop())
+    if (opt.live)
+      streamLive();
+    else if (!aeOn() || exposureLoop())
       while (r_.bufDone < opt.frames && waitFrame(true)) {
       }
     r_.streamUs = ops.nowUs() - t0_;
     readPhyStatus(r_.phyStatus);
+  }
+
+  bool guardIntact()
+  {
+    ops.cacheInvalidate(d_.cpu + r_.frameBytes, r_.bytes - r_.frameBytes);
+    for (uint64_t i = r_.frameBytes; i < r_.bytes; ++i)
+      if (d_.cpu[i] != 0xa5) return false;
+    return true;
+  }
+
+  void streamLive()
+  {
+    uint64_t nextPublish = 0;
+    AeStep current, previous;
+    bool havePrevious = false;
+    unsigned nextAe = 1;
+    ops.note("abi2 live %s mode %ux%u RAW10 stride %u", f_->name, r_.width, r_.height, r_.frameBytes / r_.height);
+    while (!ops.liveCancelled() && waitFrame(true)) {
+      // BUF_DONE consumed the single queued address. The private DMA target
+      // stays unarmed during cache synchronization, copy and AE sampling.
+      if (!guardIntact()) {
+        liveGuardIntact_ = false;
+        fail(kStepL3Stream, StreamFailure::guard);
+        break;
+      }
+      if (sofTicks_ && sequence_ > completedSequence_) {
+        const uint64_t missing = sequence_ - completedSequence_ - 1;
+        const uint64_t at = captureUs_;
+        const bool publish = !nextPublish || at + 2000 >= nextPublish;
+        if (publish) {
+          if (!nextPublish || at > nextPublish + 66667) nextPublish = at;
+          nextPublish += 66667;
+          ops.cacheInvalidate(d_.cpu, r_.frameBytes);
+          ops.liveFrame(d_.cpu, r_, sequence_, sofTicks_, missing);
+        } else {
+          ops.livePaced(missing);
+        }
+        completedSequence_ = sequence_;
+      } else {
+        ops.livePaced(1);
+      }
+      sofTicks_ = 0;
+      if (aeOn() && r_.bufDone >= nextAe) {
+        current = AeStep{};
+        current.exposure = r_.exposure;
+        current.gain = r_.gain;
+        aeSample(current);
+        const auto &f = xf();
+        uint64_t ev = uint64_t(current.exposure) * current.gain, next = ev;
+        const uint64_t prevEv = uint64_t(previous.exposure) * previous.gain;
+        r_.aeVerdict = aeRule(current, havePrevious ? &previous : nullptr, ev, prevEv, uint64_t(f.eMin) * f.gMin,
+                              uint64_t(eMax()) * f.gMax, opt.aeTarget, next);
+        ++r_.aeCount;
+        if (r_.aeVerdict == AeVerdict::none) {
+          uint32_t e, g;
+          aeSplit(f, eMax(), next, e, g);
+          if (!aeApply(e, g)) {
+            fail(kStepL3Stream, StreamFailure::table, "continuous exposure control failed");
+            break;
+          }
+        }
+        previous = current;
+        havePrevious = true;
+        nextAe = r_.bufDone + 6;
+      }
+      if (ops.liveCancelled()) break;
+      putQuiet(kTfeLite0 + kWm0 + kWmImageAddr, uint32_t(r_.busAddr >> 8));
+      putQuiet(kCsidLite0 + kCsidRupAup, kCsidAupRdi0);
+    }
   }
 
   // One frame (a BUF_DONE of RDI0 at least opt.staleUs after stream-on and after the previous frame), re-arming the write master
@@ -901,6 +989,7 @@ class Stream {
   {
     const uint64_t c = kCsidLite0, wm = kTfeLite0 + kWm0;
     for (;;) {
+      if (opt.live && ops.liveCancelled()) return false;
       ++r_.polls;
       const uint32_t top = ops.rd(c + kCsidTopStatus), buf = ops.rd(c + kCsidBufStatus), rx = ops.rd(c + kCsidRxStatus),
                      rdi = ops.rd(c + kCsidRdiStatus);
@@ -920,6 +1009,11 @@ class Stream {
         r_.rdiErrFirstUs = at;
       }
       if (final && (rdi & kRdiInputSof)) {
+        if (opt.live) {
+          ++sequence_;
+          sofTicks_ = ops.hostTicks();
+          captureUs_ = now;
+        }
         ++r_.sof;
         if (sofLogged_ < StreamResult::kFrameLog && sofLogged_ <= r_.bufDone) r_.sofUs[sofLogged_++] = at;
       }
@@ -959,7 +1053,7 @@ class Stream {
             }
             if (sofLogged_ < r_.bufDone) sofLogged_ = r_.bufDone;   // keep the per-frame columns aligned when an SOF was not seen
             if (eofLogged_ < r_.bufDone) eofLogged_ = r_.bufDone;
-            rearm = r_.bufDone < opt.frames;   // the same buffer again (only the last frame is analysed)
+            rearm = !opt.live && r_.bufDone < opt.frames;   // the same buffer again (only the last frame is analysed)
           } else {
             ++r_.aeFrames;
           }
@@ -974,7 +1068,7 @@ class Stream {
           return true;
         }
       }
-      if (now >= frameDeadline_ || now >= deadline_) {
+      if (now >= frameDeadline_ || (!opt.live && now >= deadline_)) {
         fail(kStepL3Stream, r_.bufDone || r_.aeFrames ? StreamFailure::frameTimeout : StreamFailure::noFrame);
         return false;
       }
@@ -1233,6 +1327,8 @@ class Stream {
   const SensorFacts *f_ = &kSensors[0];
   const CameraTableMode *mode_ = nullptr;
   uint32_t aeStride_ = 0;
+  uint64_t sofTicks_ = 0, captureUs_ = 0, sequence_ = 0, completedSequence_ = 0;
+  bool liveGuardIntact_ = true;
   // the stream's clock and its per-frame bookkeeping (waitFrame)
   uint64_t t0_ = 0, deadline_ = 0, frameDeadline_ = 0, last_ = 0;
   uint32_t rdiSince_ = 0, rxSince_ = 0;

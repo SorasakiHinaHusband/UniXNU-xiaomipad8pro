@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 
 SOURCE = Path(__file__).resolve().parent
+REPO = SOURCE.parents[2]
 TEAM = "VAELT5D9YC"
 HOST = "com.unixnu.PianoCamera"
 EXT = HOST + ".Extension"
@@ -106,7 +107,7 @@ def build_package(package, version, build):
     env = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer")
     frameworks = {
         HOST: ("Foundation", "SystemExtensions"),
-        EXT: ("Foundation", "CoreMediaIO", "CoreMedia", "CoreVideo", "IOSurface", "IOKit"),
+        EXT: ("Foundation", "CoreMediaIO", "CoreMedia", "CoreVideo", "IOSurface", "IOKit", "CoreGraphics"),
         CAPTURE: ("AppKit", "AVFoundation", "CoreMedia", "CoreVideo", "CoreImage", "CoreGraphics"),
     }
     with tempfile.TemporaryDirectory() as temp:
@@ -186,6 +187,14 @@ def fail(identifier):
     raise SystemExit(f"{identifier} failed the signing, bundle or entitlement contract")
 
 
+def source_commit():
+    return subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"], text=True).strip()
+
+
+def package_record(package):
+    return {"source_commit": source_commit(), "executables": verify_package(package)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
@@ -194,18 +203,22 @@ def main():
     args = parser.parse_args()
     package = args.package.resolve()
     if args.verify:
-        manifest = verify_package(package)
+        manifest = package_record(package)
         if manifest != json.loads((package / "cdhashes.json").read_text()):
             raise SystemExit("Signed executables differ from the package manifest")
-        print(f"Verified {len(manifest)} final arm64 CDHashes")
+        print(f"Verified {len(manifest['executables'])} final arm64 CDHashes")
         return
+    dirty = subprocess.check_output(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no",
+                                     "--", "tooling/camera/extension", "package/PianoCamera"], text=True)
+    if dirty:
+        raise SystemExit("Commit camera sources before packaging")
     package.parent.mkdir(parents=True, exist_ok=True)
     if package.exists():
         raise SystemExit("Package destination already exists")
     with tempfile.TemporaryDirectory(prefix=".camera-", dir=package.parent) as temp:
         working = Path(temp) / "package"
         build_package(working, "1.1", args.build)
-        manifest = verify_package(working)
+        manifest = package_record(working)
         (working / "cdhashes.json").write_text(json.dumps(manifest, indent=2) + "\n")
         working.rename(package)
     print(package / "cdhashes.json")

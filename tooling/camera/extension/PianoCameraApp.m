@@ -38,13 +38,13 @@ static NSString *const kExtension = @"com.unixnu.PianoCamera.Extension";
   printf("PianoCamera: request finished: %s\n", result == OSSystemExtensionRequestCompleted ? "completed"
                                                  : result == OSSystemExtensionRequestWillCompleteAfterReboot ? "will complete after a reboot"
                                                                                                               : "unknown result");
-  self.status = 0;
+  self.status = result == OSSystemExtensionRequestCompleted ? 0 : 4;
   self.done = YES;
 }
 
 - (void)request:(OSSystemExtensionRequest *)request didFailWithError:(NSError *)error
 {
-  printf("PianoCamera: request failed: %s %ld: %s\n", error.domain.UTF8String, (long)error.code, error.localizedDescription.UTF8String);
+  printf("PianoCamera: request failed: %s %ld\n", error.domain.UTF8String, (long)error.code);
   self.status = 1;
   self.done = YES;
 }
@@ -53,9 +53,8 @@ static NSString *const kExtension = @"com.unixnu.PianoCamera.Extension";
 {
   if (!properties.count) printf("PianoCamera: sysextd knows no %s\n", kExtension.UTF8String);
   for (OSSystemExtensionProperties *p in properties)
-    printf("PianoCamera: %s %s (%s) at %s: enabled %d, awaiting approval %d, uninstalling %d\n", p.bundleIdentifier.UTF8String,
-           p.bundleShortVersion.UTF8String, p.bundleVersion.UTF8String, p.URL.path.UTF8String, p.isEnabled, p.isAwaitingUserApproval,
-           p.isUninstalling);
+    printf("PianoCamera: %s %s (%s): enabled %d, awaiting approval %d, uninstalling %d\n", p.bundleIdentifier.UTF8String,
+           p.bundleShortVersion.UTF8String, p.bundleVersion.UTF8String, p.isEnabled, p.isAwaitingUserApproval, p.isUninstalling);
   self.status = 0;
   self.done = YES;
 }

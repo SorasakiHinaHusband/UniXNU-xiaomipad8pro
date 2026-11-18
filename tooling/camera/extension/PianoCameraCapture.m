@@ -7,6 +7,7 @@
 
 @interface FrameSink : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property(nonatomic) NSUInteger frames, invalid, dropped;
+@property(nonatomic) size_t expectedWidth, expectedHeight;
 @property(nonatomic) BOOL moved, scene, saved;
 @property(nonatomic) uint64_t firstFingerprint;
 @property(nonatomic) CMTime lastPTS;
@@ -27,6 +28,11 @@
     size_t width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel);
     size_t stride = CVPixelBufferGetBytesPerRow(pixel);
     const uint8_t *base = CVPixelBufferGetBaseAddress(pixel);
+    if (!base || width != _expectedWidth || height != _expectedHeight || stride < width * 4) {
+        CVPixelBufferUnlockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly);
+        ++_invalid;
+        return;
+    }
     unsigned lo = 255, hi = 0;
     uint64_t fingerprint = 14695981039346656037ULL;
     for (size_t y = 0; y < height; y += 8) {
@@ -48,7 +54,7 @@
     _moved |= fingerprint != _firstFingerprint;
     BOOL scene = hi >= 16 && hi - lo >= 8;
     _scene |= scene;
-    if (!_saved && _file && scene) {
+    if (_frames == 1 && _file) {
         CIImage *image = [CIImage imageWithCVPixelBuffer:pixel];
         CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         NSError *error = nil;
@@ -59,6 +65,7 @@
         if (!_saved) printf("PNG error domain=%s code=%ld\n", error.domain.UTF8String, (long)error.code);
         else {
             NSData *data = [NSData dataWithContentsOfFile:_file];
+            if (!data.length) { _saved = NO; return; }
             unsigned char digest[CC_SHA256_DIGEST_LENGTH];
             CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
             printf("saved sequence=%lu sha256=", (unsigned long)_frames);
@@ -118,8 +125,18 @@ static BOOL capture(AVCaptureDevice *device, int seconds, NSString *file)
     CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription);
     printf("capture begin %s %dx%d duration=%.9f\n", device.localizedName.UTF8String, size.width, size.height,
            CMTimeGetSeconds(device.activeVideoMinFrameDuration));
+    sink.expectedWidth = size.width;
+    sink.expectedHeight = size.height;
     [session startRunning];
-    if (session.isRunning) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    if (session.isRunning) {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:10];
+        __block BOOL received = NO;
+        while (!received && [until timeIntervalSinceNow] > 0) {
+            dispatch_sync(queue, ^{ received = sink.frames > 0; });
+            if (!received) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        }
+        if (received) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    }
     [session stopRunning];
     [output setSampleBufferDelegate:nil queue:NULL];
     __block BOOL ok;

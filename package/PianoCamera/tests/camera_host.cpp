@@ -1046,6 +1046,19 @@ struct TestOps {
   // level 5's copy of the last frame (the kernel's Ops keeps it for the user client)
   std::vector<uint8_t> kept;
   void frameReady(const uint8_t *buf, const StreamResult &r) { kept.assign(buf, buf + uint64_t(r.stats.stride) * r.height); }
+  unsigned liveFrames = 0, liveSkips = 0, liveLimit = 0;
+  uint64_t liveSequence = 0, liveSOF = 0;
+  bool liveCancelled() { return liveLimit && liveFrames >= liveLimit; }
+  uint64_t hostTicks() { return b.now; }
+  void livePaced(uint64_t missing) { liveSkips += 1 + missing; }
+  void liveFrame(const uint8_t *, const StreamResult &, uint64_t seq, uint64_t sof, uint64_t missing)
+  {
+    CHECK(seq > liveSequence && sof > liveSOF);
+    CHECK(missing == 0 && b.aupFifo.empty());
+    liveSequence = seq;
+    liveSOF = sof;
+    ++liveFrames;
+  }
   uint64_t nowUs() { return b.now; }
   void msleep(unsigned ms) { udelay(ms * 1000); }
   int vrm(unsigned rail, const VrmCmd *cmds, unsigned n) { return b.vrm(rail, cmds, n); }
@@ -2243,6 +2256,22 @@ static void testIsp()
   }
 }
 
+// The private DMA address is consumed before copying; cancellation still
+// tears down the SMMU and rails. AE continues measuring after convergence.
+static void testLiveStream()
+{
+  L3Rig r;
+  r.ops.liveLimit = 8;
+  StreamOptions opt;
+  opt.live = true;
+  opt.pattern = false;
+  opt.aeTarget = 236;
+  const auto result = r.run(Sensor::front, opt);
+  CHECK(result.ok && result.cleanOff && result.bufferFreed);
+  CHECK(r.ops.liveFrames == 8 && r.ops.liveSkips >= 6 && result.aeCount >= 2);
+  CHECK(result.aeVerdict == AeVerdict::converged && r.b.smmuFaults == 0 && r.b.violations.empty());
+}
+
 // The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
 // one after another, each from what the one before left (the SMMU words the release keeps, PLL0's configuration), each with its
 // power-down complete, the board as found after the last.
@@ -2327,6 +2356,7 @@ int main()
   testL3Diagnostics();
   testExposureLoop();
   testIsp();
+  testLiveStream();
   testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);
