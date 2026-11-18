@@ -21,7 +21,7 @@
 #include "A830PowerState.h"
 #include "A830Recovery.h"
 #include "A830Dcvs.h"
-#include "A830Qualification.h"
+#include "A830QualificationExitTest.h"
 #include "../../include/PianoGpuQualificationDisplay.h"
 #include <stdarg.h>
 #ifdef ADRENO830_MACOS
@@ -2629,18 +2629,14 @@ void qualificationThread(void *)
         piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
         const bool ok=adreno830_qualification_board(&board);
         const auto test=__atomic_load_n(&gQualificationExitTest,__ATOMIC_ACQUIRE);
-        const bool cool=ok && board.version==PIANO_GPU_TEMPS_VERSION && board.valid==3 && !board.disabled &&
-            board.state==PIANO_BOARD_TEMPS_RUNNING && board.period_ms==5000 && board.age_ms[0]<=10000 && board.age_ms[1]<=10000 &&
-            board.milli_c[0]>=-40000 && board.milli_c[1]>=-40000 && board.milli_c[0]<62000 && board.milli_c[1]<37000 &&
-            gpu.valid==255 && gpu.max_deci>=-400 && gpu.max_deci<800 && !gQualification.high() &&
-            g830.power_state.phase()==A830PowerActive && !g830.recovery.pending() && !g830.recovery.busy();
-        const bool injectTrip=test==3 && cool && !gQualification.reason() && g830.power_state.votedLevel()==3;
+        bool injectTrip=false;
         if(test==3 || test==4) {
-            const bool injectDrop=test==4 && cool && gQualification.reason()==A830QualBoardHot &&
-                g830.recovery.qualificationLowConfirmed();
-            if(injectDrop)g830.recovery.requestQualificationLow(A830QualBoardHot,now,true);
-            qualLog("R3b3 inject command=%u accepted=%u raw=%d msm=%d quiet=%d at-us=%llu",
-                test,injectTrip || injectDrop,gpu.max_deci,board.milli_c[0],board.milli_c[1],now/1000);
+            const bool accepted=a830ExitTestAllowed(test,gpu,board,ok,gQualification,g830.power_state,g830.recovery);
+            injectTrip=accepted && test==3;
+            qualLog("R3b4 inject command=%u accepted=%u raw=%d msm=%d quiet=%d period=%u age-ms=%u,%u phase=%u level=%u at-us=%llu",
+                test,accepted,gpu.max_deci,board.milli_c[0],board.milli_c[1],board.period_ms,board.age_ms[0],board.age_ms[1],
+                unsigned(g830.power_state.phase()),g830.power_state.votedLevel(),now/1000);
+            if(accepted && test==4)g830.recovery.requestQualificationLow(A830QualBoardHot,now,true);
             __atomic_store_n(&gQualificationExitTest,test-2,__ATOMIC_RELEASE);
         }
         gQualification.tick(now,gpu,board,ok,injectTrip);

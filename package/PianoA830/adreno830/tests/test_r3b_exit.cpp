@@ -3,6 +3,7 @@
 #define A830_R3B_ENTRY runOriginalR3b
 #include "test_a830r3b.cpp"
 #undef A830_R3B_ENTRY
+#include "A830QualificationExitTest.h"
 
 int main()
 {
@@ -30,10 +31,35 @@ int main()
         CHECK(power.targetLevel()==3 && qual.failedAt()==at && !qual.deadlineMissed(at+5000000000ull));
     }
 
-    // Test-only reason=3 at cool readings, then a second transaction on the same already-latched boot.
-    bootB();power.noteVoted(3,3);
-    qual.tick(gEnv.now,gpu(),board(),true,true);
+    // Replay the idle desktop at the ordinary ADC cadence and an existing 160 MHz ACK.
+    bootB();
+    auto idleBoard=board(4);
+    idleBoard.period_ms=30000;idleBoard.milli_c[0]=59393;idleBoard.milli_c[1]=29583;
+    idleBoard.age_ms[0]=4410;idleBoard.age_ms[1]=4410;
+    idleBoard.sample_us[0]=90838872;idleBoard.sample_us[1]=90839682;
+    raw=Sm8750TsensValidBit|660u;
+    const auto idleGpu=gpu();
+    qual.tick(gEnv.now,idleGpu,idleBoard,true);
+    CHECK(power.votedLevel()==1 && !qual.ready() && !qual.high() && power.qualificationEffectiveCap()==1);
+    const auto allowed=[&](uint32_t command) {return a830ExitTestAllowed(command,idleGpu,idleBoard,true,qual,power,recovery);};
+    CHECK(allowed(3) && !allowed(4));
+    power.noteVoted(0,0);CHECK(!allowed(3));
+    power.noteVoted(3,3);CHECK(allowed(3));
+    power.noteVoted(4,4);CHECK(!allowed(3));
+    power.noteVoted(1,2);
+    auto refusedBoard=idleBoard;refusedBoard.age_ms[1]=10001;
+    CHECK(!a830ExitTestAllowed(3,idleGpu,refusedBoard,true,qual,power,recovery));
+    refusedBoard=idleBoard;refusedBoard.milli_c[0]=62000;
+    CHECK(!a830ExitTestAllowed(3,idleGpu,refusedBoard,true,qual,power,recovery));
+    auto refusedGpu=idleGpu;refusedGpu.max_deci=800;
+    CHECK(!a830ExitTestAllowed(3,refusedGpu,idleBoard,true,qual,power,recovery));
+    CHECK(!a830ExitTestAllowed(3,idleGpu,idleBoard,false,qual,power,recovery));
+
+    qual.tick(gEnv.now,idleGpu,idleBoard,true,allowed(3));
+    CHECK(!allowed(3) && !allowed(4)); // Pending low vote blocks a second command.
     CHECK(qual.reason()==A830QualBoardHot && recovery.runPending()==0);
+    CHECK(!allowed(3) && allowed(4));
+    CHECK(gOps.count("confirmLow")==1 && gOps.gates.empty() && !gOps.count("gmuForceOff"));
     const auto at=qual.failedAt();
     gEnv.now+=60000000000ull;
     recovery.requestQualificationLow(A830QualBoardHot,gEnv.now,true);
