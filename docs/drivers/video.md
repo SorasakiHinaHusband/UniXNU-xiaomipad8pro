@@ -7,13 +7,15 @@ hash and safe teardown. V6p completed one 60-frame Main AVC stream with matching
 Stock QuickTime displays the first hardware frame, but V7d drops the following 59 frames: the bridge drains during preroll
 and subsequently exhausts its admission credits. V7e keeps the eight-credit limit, defers successful replies beyond four
 published frames without blocking the receive path, and makes finish a completion barrier for this decode-order endpoint.
-Rejected requests use Apple's error completion once. Continuous playback with this change still needs tablet qualification.
+Rejected requests use Apple's error completion once. V7e2 and V8a subsequently qualified stock QuickTime playback of the
+owned320×240 Main and1920×1080 High AVC fixtures:60 native/client frames,0 dropped and optically confirmed motion.
+V9 implements bounded HEVC Main/Main10/P010 for qualification; no HEVC tablet result is claimed.
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
 
-The native Iris bridge is an opt-in qualification endpoint; stock QuickTime selection and a first frame are confirmed,
-but continuous playback in apps is not. The SoC's video core decodes H.264, HEVC and VP9 at its lowest clock for every common stream (§4.5), and encodes H.264
+The native Iris bridge is an opt-in qualification endpoint; stock QuickTime continuous playback is confirmed for the two
+owned AVC fixtures. Throughput for other streams needs measurement. The SoC's video core decodes H.264, HEVC and VP9 (§4.5), and encodes H.264
 and HEVC. Gate: battery life (owner priority) and daily use (QuickTime, Safari, wallpapers, thumbnails);
 not a login gate. Ubuntu uses it: H.264/HEVC/VP9 decode and H.264/H.265 encode verified at 1080p and 4K, AV1 in software
 (`xiaomipad-8pro-mainline/docs/STATUS.md`, `README.en.md`; the core lists AV1, but a third-party piano report has AV1 decode failing
@@ -830,6 +832,32 @@ useQC08C, and only crop-adjusted active rows reach a checked420v IOSurface. Pool
 The owned High1080 and Main720 clips, compressed identities, PTS/DTS and independent software NV12 hashes are in
 `package/PianoVideo/tests/fixtures/v8`. `tooling/native/build-video-avc-audit.sh` checks actual CoreMedia formats and all
 compressed packets without creating a VT session. The next image must prove native/client counts, returned geometry,
-safe close and optical motion in stock QuickTime. High/1080p are implemented but not tablet-qualified. HEVC/P010,
+safe close and optical motion in stock QuickTime. V8a subsequently passed these checks. HEVC/P010,
 aerial playback, Safari/MSE and concurrent sessions remain separate gates; cinematic boot is a frozen-surface/Metal
 handoff, with no established HEVC movie dependency.
+
+## 17. Bounded HEVC implementation (V9; tablet qualification pending)
+
+The first visible HEVC target is Aerial wallpaper: the27.3 default asset is Main10,3840×2160, High tier6.1 with temporal
+layers, WPP and B pictures. Its consumer can submit synchronous flags0/2. Official cinematic boot instead hands RGB
+surfaces to WindowServer/Metal; no HEVC movie dependency has been established there.
+
+V9 adds hvc1 inventory and capability queries, immutable hvcC/VPS/SPS/PPS admission, Main/Main10 progressive limited-range
+420, four-byte NAL lengths, one complete AU≤1MiB and an IDR session start. Protected streams, other profiles/chroma,
+parameter-set changes and concurrent native owners fail closed. Codec3 uses HEVC PSC fields including tier, requires
+returned resolution/crop/depth/minimum/profile/level/tier and sizes COMV, split references and RAW from the returned N.
+The bounded HEVC aperture is768MiB, N≤10,388 table pages and524288 PA uniqueness slots; AVC retains256MiB/N16.
+Two disjoint scratch generations and16KiB invalid guards remain mandatory. Allocation failure frees partial preparation;
+unconfirmed DMA teardown retains backing and poisons subsequent opens.
+
+Main8 uses linearNV12/420v and QC08C references. Main10 uses linearP010/x420 and QC10C references; HFI stride is in
+pixels while CPU copy stride is in bytes. Each active plane is checked independently against its own IOSurface offsets
+and row bytes, with a64MiB surface bound. Synchronous admission returns selector3 immediately, progresses one request
+without waiting for a future admission, and answers the original request only after Demt acknowledgement. Cancellation,
+send failure and the eight-second request deadline have one completion owner. Async AVC retains its four published/eight
+credit window and completion-barrier finish.
+
+HEVC capability level183 is the implemented admission ceiling, not a measured4K240 playback claim. The single V9 RAM
+qualification first exercises an owned stock QuickTime Main10 fixture with native/client identities, geometry, teardown
+and optical motion, then an AVC regression and Main8 on the same boot. Aerial selection, TSA/retiming, sustained cadence,
+colour and looping remain separate runtime acceptance checks; the installed static wallpaper stays in place.
