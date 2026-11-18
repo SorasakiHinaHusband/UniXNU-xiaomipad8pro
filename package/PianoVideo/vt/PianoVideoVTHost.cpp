@@ -191,12 +191,20 @@ void settleCurrent(Session *s){
 // Caller holds the session lock. A deferred success becomes DMA-eligible only
 // after its actual reply is in the receive queue. Never wait inside selector3:
 // its caller holds the guest send mutex needed by Dbuf/Demt acknowledgement.
-bool answerAdmission(Session *s,pianovideo::stream::Record &f,uint64_t id){
+bool answerAdmission(Session *s,pianovideo::stream::Record &f,uint64_t id,bool deferred=false){
+  // Cancellation may have happened between the worker's loop check and this
+  // lock acquisition. Test it atomically with success enqueue/publication.
+  if(s->stopping||s->invalidating||s->firstError||f.phase!=pianovideo::stream::Phase::Admitting)return false;
   uint8_t b[128];Writer w(b,sizeof b);w.header(cc("dfrm"),FlagReply,s->uuid,id);
   w.s32(cc(",err"),0);w.u32(cc(",inf"),1);
   const bool sent=send(s->client,w,b);
   if(sent)s->frames.publish(f.token);
-  else {f.phase=pianovideo::stream::Phase::Emitted;s->stopping=true;}
+  else {
+    // Only an immediate selector return can transfer completion ownership to
+    // Apple's transport-error path. A deferred request still needs its reply.
+    if(!deferred)f.phase=pianovideo::stream::Phase::Emitted;
+    s->stopping=true;
+  }
   IOLog("PianoVideoVT V7e: admission reply token %llu request %llu sent %u published %u live %u pending %u\n",
     f.token,id,unsigned(sent),unsigned(sent&&!s->stopping),s->frames.published(),s->frames.pending);
   return sent;
@@ -209,15 +217,15 @@ void worker(void *arg,wait_result_t){
     IOLockLock(s->lock);
     auto *admission=s->frames.nextAdmission();
     bool expired=false;
-    if(admission){
+    if(admission&&!s->stopping&&!s->invalidating&&!s->firstError){
       auto &in=s->inputs[unsigned(admission-s->frames.frames)];
       expired=in.reply&&nowMs()>=in.deadline;
       if(!expired&&in.reply&&s->frames.replyReady()){
-        const uint64_t reply=in.reply;in.reply=in.deadline=0;
-        answerAdmission(s,*admission,reply);
+        const uint64_t reply=in.reply;
+        if(answerAdmission(s,*admission,reply,true))in.reply=in.deadline=0;
       }
     }
-    const bool admissionStopped=s->stopping;
+    const bool admissionStopped=s->stopping||s->invalidating||s->firstError;
     IOLockUnlock(s->lock);
     // QT's asynchronous PV request has a 1.1 s reply deadline. A held reply
     // must fail explicitly while there is still time to wake that caller.
@@ -296,9 +304,10 @@ void worker(void *arg,wait_result_t){
       // A stuck native picture still reaches the existing progress timeout.
       IOLockLock(s->lock);const bool done=s->frames.pending==0;
       Header h;h.type=cc("dfin");h.request=s->finishRequest;memcpy(h.uuid,s->uuid,16);
-      if(done)s->finishWanted=false;
+      const bool answered=done&&!s->stopping&&!s->invalidating&&!s->firstError;
+      if(answered){s->finishWanted=false;status(s->client,h,0);}
       IOLockUnlock(s->lock);
-      if(done){status(s->client,h,0);IOLog("PianoVideoVT V7e: finish barrier session %u pending0 guest0 preserve-reference 1 hardware-drain 0\n",s->native);}
+      if(answered)IOLog("PianoVideoVT V7e: finish barrier session %u pending0 guest0 preserve-reference 1 hardware-drain 0\n",s->native);
     }
     IOSleep(1);
   }
