@@ -1,0 +1,15 @@
+SPDX-License-Identifier: MIT
+Copyright (c) 2026, Leo Zhang.
+
+Return a non-null description for Metal's pipeline descriptor formatter.
+
+--- NativeBridgeMetalFrontend.mm
++++ NativeBridgeMetalFrontend.mm
+@@ -1615,2 +1615,7 @@
+ @implementation NBFunction
++- (NSString *)formattedDescription:(NSUInteger)indent {
++ NSString *padding=[@"" stringByPaddingToLength:MIN(indent,(NSUInteger)128) withString:@" " startingAtIndex:0];
++ return [NSString stringWithFormat:@"%@<NBFunction: %@>",padding,_name ?: @"unnamed"];
++}
++- (NSString *)description {return [self formattedDescription:0];}
+ - (void)dealloc {if(_handle)nmb_function_release(_handle);}

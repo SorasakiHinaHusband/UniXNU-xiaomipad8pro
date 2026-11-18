@@ -604,6 +604,8 @@ def make_seed(tmp):
                                                   'RunAtLoad': True}, fmt=plistlib.FMT_XML))
         write(mnt / 'private/var/settime.sh', 'exit 0\n')
         write(mnt / 'private/var/piano/userland/files/old/stale', 'from an earlier userland\n')
+        write(mnt / 'Library/GPUBundles/T.bundle/Contents/MacOS/T', b'the old plugin', 0o755)
+        write(mnt / 'Library/GPUBundles/T.bundle/Contents/MacOS/retained.dylib', b'the unchanged backend', 0o755)
     seed = tmp / 'seed/scratch-data.img'
     seed.parent.mkdir()
     ssm.packed_ramdisk.pack(raw, seed)
@@ -683,6 +685,27 @@ def seed_tests(tmp):
     code, text = stage_run('--manifest', manifest, '--seed', seed, '--trust', trust, '--out', out)
     after = {n: sha((out / n).read_bytes()) for n in before}
     check(code == 0 and 'up to date' in text and before == after, 'the second run: up to date, the outputs byte for byte the same')
+    # A first WindowServer can load Metal before the independent boot installer runs.
+    # Inspect the real packed APFS output without running install.sh: the loader must already see the new plugin.
+    bundle = tmp / 'T.bundle'
+    write(bundle / 'Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'T'}))
+    write(bundle / 'Contents/MacOS/T', b'#!/bin/sh\necho the fixed plugin\n', 0o755)
+    gpu_out = tmp / 'out/gpu'
+    code_gpu, text_gpu = stage_run('--manifest', manifest, '--seed', seed, '--trust', trust, '--out', gpu_out,
+                                   '--gpu-bundle', bundle)
+    check(code_gpu == 0, 'GPU seed staging succeeds' + ('' if code_gpu == 0 else ':\n' + text_gpu[-2000:]))
+    if code_gpu == 0:
+        gpu_record = json.loads((gpu_out / 'userland.json').read_text())
+        with attached(unpack(gpu_out / 'scratch-data.img', tmp / 'gpu.raw'), readonly=True) as mnt:
+            dest = '/Library/GPUBundles/T.bundle/Contents/MacOS/T'
+            check((mnt / dest.lstrip('/')).read_bytes() == (bundle / 'Contents/MacOS/T').read_bytes(),
+                  'before any boot job: the GPU loader path already holds the fixed executable')
+            check((mnt / 'Library/GPUBundles/T.bundle/Contents/MacOS/retained.dylib').read_bytes() == b'the unchanged backend',
+                  'a delta bundle retains the base seed backend')
+            check(not (mnt / 'usr/local/libexec/tool').exists(), 'ordinary userland still waits for the root installer')
+            check(dest in gpu_record['seed_gpu_files'] and len(gpu_record['seed_gpu_files']) == 2,
+                  'the build record distinguishes preinstalled GPU files')
+        check(sha(seed.read_bytes()) == seed_sha, 'preinstalling GPU files leaves the recipe seed unchanged')
     code, text = stage_run('--manifest', manifest, '--seed', seed, '--trust', trust, '--out', out, '--force')
     with attached(unpack(out / 'scratch-data.img', tmp / 'check2.raw'), readonly=True) as mnt:
         job = plistlib.loads((mnt / ssm.BOOT_JOB).read_bytes())['ProgramArguments'][2]

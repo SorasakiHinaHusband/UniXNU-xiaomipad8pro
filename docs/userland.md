@@ -154,6 +154,12 @@ The trust cache modules:
 | On piano every module loads: `attempting to load 5 external trust cache modules`, `loaded external trust cache module: 0` … `4`, and never `skipping engineering trust cache module`, in 37 native boots | verified (logs) | `logs/native-runs/*/xnu-console.txt` |
 | A sixth module (ours first, the Turnip module second, the OS's after) is therefore loaded the same way | inferred; needs-boot (U1) | — |
 
+Seed mode also places GPU bundle files at their final `/Library/GPUBundles` paths before packing. WindowServer may load Metal
+before the independent boot installer runs; replacing the executable later with `install -S` leaves that process using its old
+mapping. The staged and final copies share APFS extents, and `userland.json` lists these files under `seed_gpu_files`. A delta
+bundle preserves omitted backend files. Other userland files still use the boot installer; live layers keep the existing rollback
+behavior. The RAM image's final GPU path and trust cache must be verified together before submission.
+
 ## 4. The seed identity and the Data store (`data-store.md`)
 
 Every restage makes a new seed identity, because APFS writes times and transaction ids. `stage.py` prints what that means:

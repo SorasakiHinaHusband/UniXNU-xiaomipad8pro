@@ -12,6 +12,9 @@ to the trust cache, and a record of every file's sha256.
     stage.py --plan                                                the manifest, checked, as a table; nothing built
     --gpu-bundle BUNDLE (with any mode, repeatable)                a Metal plugin bundle as one more unit, gpu-<name>: every file of
                                                                    BUNDLE at /Library/GPUBundles/<name>.bundle/..., Mach-Os trusted
+In seed mode GPU bundle files are also put at their final paths before packing. WindowServer can load Metal before the boot
+installer runs; staging an updated executable only beside install.sh would leave its first process using the seed's old binary.
+Live mode keeps the existing installer and rollback path.
 
 The system layer (docs/data-store.md section 9): the files that change are installed on the running system, never staged into the
 seed of an ESP that keeps the owner's Data (that seed is the store's base, tooling/persist/base-seed.py). `stage.py --live DIR
@@ -67,7 +70,7 @@ D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
 import common  # noqa: E402  (tooling/persist/common.py: seed identity, trust cache hashes, the installed seed)
 
-FORMAT = 1   # the staged layout's version: part of the stamp; raise it when the same inputs are to be staged differently
+FORMAT = 2   # seed GPU bundles are present before the boot installer runs
 INSTALLER = D / 'tooling/userland/install.sh'
 DIRS = {'/Library/LaunchDaemons': 'daemon', '/Library/LaunchAgents': 'agent', '/usr/local/bin': 'file', '/usr/local/libexec': 'file',
         '/usr/local/share/piano/wallpaper': 'file'}   # the last: the still wallpaper's data files (unit piano-still-wallpaper)
@@ -491,6 +494,31 @@ def boot_command(plan):
     return f'sh {plan["staging"]}/install.sh --boot'
 
 
+def seed_gpu_files(mount, staging, built):
+    """Put GPU files in the loader's paths before the first WindowServer. Retain omitted bundle resources.
+    Clone from the staged APFS files, so the installer and loader share data extents rather than doubling the RAM image.
+    Other userland files still go through the root boot installer; live layers never call this function.
+    """
+    installed = []
+    for f, data in built:
+        if not GPU_BUNDLE_FILE.fullmatch(f['dest']):
+            continue
+        source = mount / staging / (f.get('staged') or f'files/{f["unit"]}/{f["name"]}')
+        target = mount / f['dest'].lstrip('/')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not (target.is_file() and target.read_bytes() == data):
+            temporary = target.with_name(target.name + '.userland-new')
+            temporary.unlink(missing_ok=True)
+            sh(['cp', '-c', str(source), str(temporary)], timeout=60, check=True)
+            os.replace(temporary, target)
+        os.chmod(target, int(f['mode'], 8))
+        if common.sha(target) != f['sha256']:
+            raise SystemExit(f'{f["dest"]}: seed GPU file differs from the staged manifest')
+        sh(['xattr', '-c', str(target)], timeout=60, check=False)
+        installed.append(f['dest'])
+    return installed
+
+
 def add_boot_command(job, command, settime):
     """The seed's boot job, rewritten in place (same file, so the same owner): COMMAND right after settime.sh, once; the commands
     already there (stage-soft-metal.py --boot-run, --log-errors loops, which never end) stay, after it. Returns (script, changed)."""
@@ -639,11 +667,13 @@ def stage_seed(a, plan):
     (out / 'stamp').unlink(missing_ok=True)   # a run cut short below leaves no stamp: the next one restages
     with mounted_seed(seed_in, out, packed) as (mount, volume):
         written, removed = sync_tree(mount / staging, tree)
+        gpu_files = seed_gpu_files(mount, staging, built)
         script, changed = add_boot_command(mount / ssm.BOOT_JOB, command, ssm.SETTIME)
         listing = sh(['ls', '-lnR', str(mount / staging)], timeout=60, capture_output=True, text=True).stdout
         listing = listing.replace(str(mount), '')
         print(f'{volume}: /{staging}: {len(written)} written, {len(removed)} removed{": " + " ".join(removed) if removed else ""}\n'
               f'{listing.strip()}')
+        print(f'seed GPU files ready before launchd: {len(gpu_files)}')
         print(f'the boot job {"now runs" if changed else "already ran"}: {script}')
     seed_info_out = common.seed_info(seed_out)
     record = {
@@ -651,6 +681,7 @@ def stage_seed(a, plan):
         'inputs': {'seed': {'path': rel(seed_in), **{k: seed_info_in[k] for k in ('file_sha256', 'identity_sha256', 'logical_bytes')}},
                    'trust': {'path': rel(trust_in), 'sha256': sha(trust_bytes)}},
         'files': files_record(built),
+        'seed_gpu_files': gpu_files,
         'planned': [u['name'] for u in plan['units'] if u['planned']],
         'outputs': {'seed': {'path': rel(seed_out), **{k: seed_info_out[k] for k in ('file_sha256', 'identity_sha256',
                                                                                      'logical_bytes', 'bytes')}},

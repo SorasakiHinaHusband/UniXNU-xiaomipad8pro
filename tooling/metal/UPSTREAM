@@ -40,6 +40,10 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   0003-frontend-surface-texture-sizes-limits.patch (2026-11-12, MIT as the file: no fixed cap on two-plane YCbCr surface textures,
   every refused or large texture, buffer and surface texture on the console with its geometry and the runtime's memory for it, the
   device's texture dimensions and memory figures answered from Turnip's tu_darwin_limits, a limits line per process).
+  0004-frontend-function-formatted-description.patch (MIT, ours: NBFunction descriptions for Metal pipeline formatters;
+  context from UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12).
+  0005-frontend-quartzcore-generic-texcoords.patch (MIT, ours: keep the generic QuartzCore vertex matrix bindings when Metal omits
+  the two optional texcoord count constants; context from the same UniXNU-turnip revision).
 Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is
   this repository's package/NativeSoftMetal/NativeSoftMetalPlugin.mm reporter (2026-11-11) with chaining to the process's own handlers.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a

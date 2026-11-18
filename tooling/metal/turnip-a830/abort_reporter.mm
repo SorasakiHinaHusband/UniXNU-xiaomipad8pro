@@ -28,6 +28,8 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+extern "C" const char *nmb_runtime_build();
+
 namespace {
 // The processes the reporter is installed in by default: the kernel's grant list (package/PianoA830 NativeAdrenoPublish.h) without WebKit.
 const char *const kProcesses[] = {"WindowServer", "Dock", "WallpaperAgent", "iconservicesagent", "Finder", "loginwindow", "ControlCenter",
@@ -181,6 +183,9 @@ void onTerminate()
 
 __attribute__((constructor)) void installReporter()
 {
+    // Unconditional loader identity for the first compositor, before any boot job can replace its executable.
+    if (!strcmp(getprogname(), "WindowServer"))
+        report("bridge=%s frontend=fc5354-seeded-v1", nmb_runtime_build());
     // PIANO_METAL_REPORT in the environment stands in for the boot argument (the build Mac's check, tooling/metal/check-turnip-a830-host.py).
     const char *forced = getenv("PIANO_METAL_REPORT");
     const unsigned mode = forced && *forced ? (unsigned)strtoul(forced, nullptr, 0) : bootArgValue("piano-metal-report", 1);
