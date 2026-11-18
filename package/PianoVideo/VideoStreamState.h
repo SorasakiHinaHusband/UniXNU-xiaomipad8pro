@@ -31,6 +31,7 @@ struct Completion {
   bool expired(uint64_t now) const {return synchronous&&!replied&&now>=deadline;}
   bool claimEmit() {if(emitAttempted||replied)return false;emitAttempted=true;return true;}
   void sent(bool ok) {emitSent=ok;if(!ok)failed=true;}
+  bool needsErrorEmit() const {return !synchronous&&!emitSent;}
   bool ack() {if(!emitSent||acknowledged||replied)return false;acknowledged=true;return true;}
   // An error reply is the sole completion owner if emission never began.
   // After a Demt was sent it only releases the waiting original call; it never
@@ -62,6 +63,12 @@ struct Ledger {
     Record *next=nullptr;
     for(auto &f:frames)if(f.phase==Phase::Admitting&&(!next||f.serial<next->serial))next=&f;
     return next;
+  }
+  Record *nextQueued() {
+    Record *next=nullptr;
+    for(auto &f:frames)if((f.phase==Phase::Admitting||f.phase==Phase::Queued||f.phase==Phase::SyncQueued)&&(!next||f.serial<next->serial))next=&f;
+    // A later synchronous AU cannot overtake an older held async admission.
+    return next&&next->phase!=Phase::Admitting?next:nullptr;
   }
   bool replyReady() const {return !stopped&&published()<PublishedWindow;}
   Record *accept(uint64_t t, uint32_t flags = 1, bool published = true) {

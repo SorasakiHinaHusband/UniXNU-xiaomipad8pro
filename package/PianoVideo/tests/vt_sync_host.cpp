@@ -83,7 +83,18 @@ static void asynchronousRegression() {
   // A sync record neither depends on publication nor consumes the async window.
   auto *sync=l.accept(6,0,false);assert(sync&&sync->phase==stream::Phase::SyncQueued&&l.submit(6,0));
   assert(l.published()==4&&l.retire(1)&&l.replyReady()&&l.publish(5));
+  stream::Ledger order;assert(order.accept(20,1,false));auto *later=order.accept(21,0,false);
+  assert(later&&!order.nextQueued());assert(order.publish(20)&&order.nextQueued()->token==20);
+  assert(order.submit(20,0)&&order.nextQueued()==later);
   assert(vtcontract::completionInfo(1,true,0)==1&&vtcontract::completionInfo(3,false,0)==3);
+  // queue->enqueue false guarantees the attempted async Demt was not
+  // delivered. Its accepted token still needs the cleanup error emission;
+  // sync instead settles through its original reply, never a second Demt.
+  stream::Completion async;async.begin(1,70,0);assert(async.claimEmit());async.sent(false);
+  unsigned delivered=0;assert(async.needsErrorEmit());if(async.needsErrorEmit()){++delivered;async.sent(true);}
+  assert(delivered==1&&!async.needsErrorEmit());
+  stream::Completion syncFailure;syncFailure.begin(0,71,0);assert(syncFailure.claimEmit());syncFailure.sent(false);
+  assert(!syncFailure.needsErrorEmit()&&syncFailure.claimReply(false,1)==71&&!syncFailure.claimReply(false,2));
   assert(vtcontract::completionInfo(0,true,0)==0&&vtcontract::completionInfo(2,false,0)==2);
 }
 int main(){success(0);success(2);failures();asynchronousRegression();std::puts("V9 sync host PASS selector-release reentry ACK-before-reply single-owner cancel send-failure deadline async-window4");}

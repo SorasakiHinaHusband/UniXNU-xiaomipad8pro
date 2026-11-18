@@ -189,7 +189,7 @@ void emitFrame(Session *s,int error,const uint8_t *uuid=nullptr){
   w.u32(cc(",inf"),contract::completionInfo(async,uuid!=nullptr,error));if(uuid)w.uuid(cc(",uui"),uuid);
   s->currentError=error;s->currentImage=uuid&&!error;
   const bool sent=request(s,w,b,id,cc("Demt"));
-  IOLockLock(s->lock);s->currentEmitted=sent;if(s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f){f->completion.sent(sent);f->phase=pianovideo::stream::Phase::Emitted;}}IOLockUnlock(s->lock);
+  IOLockLock(s->lock);s->currentEmitted=sent;if(s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f){f->completion.sent(sent);if(sent||f->completion.synchronous)f->phase=pianovideo::stream::Phase::Emitted;}}IOLockUnlock(s->lock);
   IOLog("PianoVideoVT V6: Demt session %u token %llu status %d image %u completed-once 1\n",s->native,s->currentToken,error,unsigned(uuid!=nullptr));
 }
 void settleCurrent(Session *s){
@@ -306,8 +306,7 @@ void worker(void *arg,wait_result_t){
     }
     // Submit the oldest accepted AU. EBD releases DMA input, never frame credit.
     IOLockLock(s->lock);
-    int chosen=-1;uint64_t oldest=UINT64_MAX;
-    for(unsigned i=0;i<pianovideo::stream::Credits;++i){auto &f=s->frames.frames[i];if((f.phase==pianovideo::stream::Phase::Queued||f.phase==pianovideo::stream::Phase::SyncQueued)&&f.serial<oldest){chosen=int(i);oldest=f.serial;}}
+    auto *queued=s->frames.nextQueued();const int chosen=queued?int(queued-s->frames.frames):-1;
     IOLockUnlock(s->lock);
     if(chosen>=0){
       auto &in=s->inputs[chosen];auto &record=s->frames.frames[chosen];
@@ -363,7 +362,7 @@ void worker(void *arg,wait_result_t){
     w.s64(cc(",frm"),rejection.token);w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
     IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);
   }
-  if(!invalidated)for(auto &f:s->frames.frames)if(f.phase!=pianovideo::stream::Phase::Free && f.phase!=pianovideo::stream::Phase::Emitted){
+  if(!invalidated)for(auto &f:s->frames.frames)if(f.phase!=pianovideo::stream::Phase::Free && f.phase!=pianovideo::stream::Phase::Emitted&&f.completion.needsErrorEmit()){
     uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
     w.s64(cc(",frm"),int64_t(f.token));w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
     IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);f.phase=pianovideo::stream::Phase::Emitted;
@@ -409,8 +408,8 @@ void attributes(Session *s) {
   else IOLog("PianoVideoVT V9: Dpba active %ux%u format %08x depth %u IOSurface pool\n",s->config.s.width,s->config.s.height,s->config.pixelFormat(),s->config.depth);
 }
 int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
-  contract::FormatReport r;if(!descriptor(s->client,h,m,n,r,&s->config)||s->config.format()!=s->selectedCodec)return kUnsupported;
   IOLockLock(s->lock);const bool started=s->started||s->stopping;IOLockUnlock(s->lock);if(started)return kBadState;
+  contract::FormatReport r;if(!descriptor(s->client,h,m,n,r,&s->config)||s->config.format()!=s->selectedCodec)return kUnsupported;
   const int rc=piano_video_native_open(&s->native);if(rc)return kDecodeError;
   s->started=true;s->workerRunning=true;thread_t t=nullptr;
   if(kernel_thread_start(worker,s,&t)!=KERN_SUCCESS){s->workerRunning=false;s->stopping=true;piano_video_native_close(s->native);s->native=0;return kNoMemory;}

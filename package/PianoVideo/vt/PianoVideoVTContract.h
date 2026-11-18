@@ -170,6 +170,7 @@ inline bool sampleFormat(const vtwire::Atom &fdsc,const codec::Config &cfg) {
   if (protectedData || !dictionaryEntry(dictionary.body,dictionary.size,49,"SampleDescriptionExtensionAtoms",description) || description.type!=cc("dict") ||
       !dictionaryEntry(description.body,description.size,cfg.isHevc()?112:105,cfg.isHevc()?"hvcC":"avcC",configuration) || configuration.type!=cc("datv"))return false;
   dictionaryEntry(description.body,description.size,109,"sinf",protection,&protectedData);
+  dictionaryEntry(description.body,description.size,cfg.isHevc()?105:112,cfg.isHevc()?"avcC":"hvcC",protection,&protectedData);
   if(protectedData)return false;
   const uint8_t *p=nullptr;uint32_t n=0;codec::Config incoming;
   return plistData(configuration.body,configuration.size,p,n) &&
