@@ -76,7 +76,23 @@ prove_desktop() {
 fresh_panel() {
   local photo=$1 proof age
   rm -f -- "$photo" || return 1
-  /bin/bash /tmp/tmo.sh 8 imagesnap -q -w 1.5 -d 'HD Pro Webcam C920' "$photo" >/dev/null 2>&1 || return 1
+  if [ -n "${DESK_LOGIN_RECORDING_FRAME:-}" ]; then
+    # A recorder owns the C920 (a second camera client reconfigures it and corrupts the recording): take a frame the recorder
+    # wrote after this request, complete (JPEG SOI..EOI), copied atomically.
+    local req n=0 tmp="$photo.part"
+    req=$(date +%s)
+    while [ "$n" -lt 30 ]; do
+      if [ -s "$DESK_LOGIN_RECORDING_FRAME" ] && [ "$(stat -f %m "$DESK_LOGIN_RECORDING_FRAME")" -gt "$req" ] &&
+         cp "$DESK_LOGIN_RECORDING_FRAME" "$tmp" 2>/dev/null &&
+         [ "$(head -c 2 "$tmp" | xxd -p)" = ffd8 ] && [ "$(tail -c 2 "$tmp" | xxd -p)" = ffd9 ]; then
+        mv -f "$tmp" "$photo"; break
+      fi
+      n=$((n + 1)); sleep 0.1
+    done
+    rm -f -- "$tmp"; [ -s "$photo" ] || return 1
+  else
+    /bin/bash /tmp/tmo.sh 8 imagesnap -q -w 1.5 -d 'HD Pro Webcam C920' "$photo" >/dev/null 2>&1 || return 1
+  fi
   [ -s "$photo" ] && [ "$photo" -nt "$scratch/wake" ] || return 1
   proof=$(/bin/bash tooling/native/panel-lit.sh --grade "$photo") || return 1
   age=$(( $(date +%s) - $(stat -f %m "$photo") ))
