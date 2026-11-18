@@ -13,6 +13,7 @@
 #include <libkern/crypto/sha2.h>
 #include "PianoVideoVTWire.h"
 #include "PianoVideoVTContract.h"
+#include "PianoVideoVTSurface.h"
 #include "../VideoStreamState.h"
 using namespace vtwire;
 using pianovideo::native::Frame;
@@ -47,6 +48,8 @@ struct Session {
   uint8_t replyUuid[16]={};
   IOUserClient *surfaces=nullptr;
   unsigned surfaceOpens=0,surfaceCloses=0,maps=0;
+  pianovideo::vtsurface::Lease surfaceLease;
+  unsigned surfaceLookups=0,surfaceInvalidates=0,surfaceReleases=0;
   Frame frame;
   uint64_t currentToken=0;
   bool current=false, currentAccepted=false, currentEmitted=false, currentImage=false;
@@ -88,8 +91,18 @@ IOService *surfaceRoot() {
   IOService *root=matching?IOService::waitForMatchingService(matching,1000000000ULL):nullptr;
   OSSafeReleaseNULL(matching);return root;
 }
+IOReturn surfaceMethod(Session *s,uint32_t selector,uint32_t id,void *output=nullptr,uint32_t *bytes=nullptr) {
+  uint64_t scalar=id;
+  IOExternalMethodArguments a={};a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=selector;
+  a.scalarInput=&scalar;a.scalarInputCount=1;a.structureOutput=output;a.structureOutputSize=bytes?*bytes:0;
+  IOUserClient2022 *client=OSDynamicCast(IOUserClient2022,s->surfaces);
+  const IOReturn rc=client?client->externalMethod(selector,reinterpret_cast<IOExternalMethodArgumentsOpaque *>(&a)):
+    s->surfaces->callExternalMethod(selector,&a);
+  if(bytes)*bytes=uint32_t(a.structureOutputSize);return rc;
+}
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
+  if(!id || s->surfaceLease.held()){failure(s,45,kBadState);return false;}
   if (!s->surfaces) {
     IOService *root=surfaceRoot();
     const IOReturn rc=root?root->newUserClient(s->client->task,s->client->task,0,nullptr,&s->surfaces):kIOReturnNotFound;
@@ -99,15 +112,14 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
     if(rc || !s->surfaces){failure(s,40,int(rc));return false;}
   }
   uint8_t *result=static_cast<uint8_t *>(IOMallocZero(bytes));if(!result){failure(s,41,kNoMemory);return false;}
-  uint64_t scalar=id;
-  IOExternalMethodArguments a={};a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=4;a.scalarInput=&scalar;a.scalarInputCount=1;
-  a.structureOutput=result;a.structureOutputSize=bytes;
-  IOUserClient2022 *newClient=OSDynamicCast(IOUserClient2022,s->surfaces);
-  const IOReturn rc=newClient?newClient->externalMethod(4,reinterpret_cast<IOExternalMethodArgumentsOpaque *>(&a)):
-    s->surfaces->callExternalMethod(4,&a);
-  bool ok=!rc && a.structureOutputSize==bytes;
+  uint32_t resultBytes=bytes;
+  const IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
+  // A successful method owns both references, even if layout validation fails.
+  if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
+  bool ok=!rc && resultBytes==bytes;
   if(ok)ok=contract::surfaceResult(result,bytes,id,v);
-  IOLog("PianoVideoVT V5a: surface lookup id %u status %08x result-bytes %u format %08x planes %u valid %u\n",id,rc,unsigned(a.structureOutputSize),v.format,v.planes,unsigned(ok));
+  IOLog("PianoVideoVT V5a: surface lookup id %u status %08x result-bytes %u format %08x planes %u valid %u\n",id,rc,resultBytes,v.format,v.planes,unsigned(ok));
+  IOLog("PianoVideoVT V6p: lookup token %llu request %llu id %u status %08x held %u\n",s->frame.token,s->guest.request,id,rc,unsigned(s->surfaceLease.held()));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
 bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
@@ -133,8 +145,24 @@ bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
   OSSafeReleaseNULL(map);mem->complete();mem->release();--s->maps;return ok;
 }
 uint64_t nowMs(){uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);return ns/1000000;}
+bool releaseSurface(Session *s){
+  struct Methods {
+    Session *s;
+    int call(uint32_t selector,uint32_t id){
+      const IOReturn rc=surfaceMethod(s,selector,id);
+      if(!rc){if(selector==pianovideo::vtsurface::Invalidate)++s->surfaceInvalidates;else ++s->surfaceReleases;}
+      IOLog("PianoVideoVT V6p: surface dispose token %llu id %u selector %u status %08x maps %u\n",s->frame.token,id,selector,rc,s->maps);
+      if(rc)failure(s,selector==pianovideo::vtsurface::Invalidate?43:44,int(rc));
+      return int(rc);
+    }
+  } methods{s};
+  const bool ok=s->surfaceLease.dispose(methods);
+  IOLog("PianoVideoVT V6p: surface balance lookup %u invalidate %u release %u held %u maps %u\n",
+    s->surfaceLookups,s->surfaceInvalidates,s->surfaceReleases,unsigned(s->surfaceLease.held()),s->maps);
+  return ok;
+}
 void closeSurface(Session *s){
-  if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;}
+  if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;s->surfaceLease.closed();}
 }
 bool request(Session *s,Writer &w,const uint8_t *b,uint64_t id,uint32_t type){
   IOLockLock(s->lock);const bool admitted=!s->stopping&&s->guest.begin(id,type,nowMs());s->replyHasSurface=false;
@@ -181,7 +209,9 @@ void worker(void *arg,wait_result_t){
         IOLockLock(s->lock);const bool cancelled=s->stopping;IOLockUnlock(s->lock);
         ok=ok&&!cancelled&&copyFrame(s,s->frame,v);
         const uint64_t copyEnd=nowMs();
-        closeSurface(s); // lookup refs/task mappings are scoped to this copy
+        // Unmap first, then drop this lookup's references. Keep the session's
+        // client alive: stop() revokes creator authorization for the whole task.
+        const bool disposed=releaseSurface(s);ok=ok&&disposed;
         IOLog("PianoVideoVT V6: copy timing token %llu lookup-ms %llu map-copy-unmap-ms %llu close-ms %llu surface-open %u surface-close %u maps %u\n",s->frame.token,
           lookupEnd-lookupStart,copyEnd-lookupEnd,nowMs()-copyEnd,s->surfaceOpens,s->surfaceCloses,s->maps);
         const int released=piano_video_native_frame_release(s->native,&s->frame);
@@ -275,6 +305,8 @@ void worker(void *arg,wait_result_t){
   s->frames.cancel();IOLockUnlock(s->lock);
   piano_video_native_cancel(s->native);
   closeSurface(s);
+  IOLog("PianoVideoVT V6p: surface final lookup %u invalidate %u release %u held %u maps %u open %u close %u\n",
+    s->surfaceLookups,s->surfaceInvalidates,s->surfaceReleases,unsigned(s->surfaceLease.held()),s->maps,s->surfaceOpens,s->surfaceCloses);
   if(s->frame.memory)piano_video_native_frame_release(s->native,&s->frame);
   for(auto &in:s->inputs)if(in.bytes){IOFree(in.bytes,contract::kMaxAuBytes);in={};}
   if(finish){Header h;h.type=cc("dfin");h.request=finishID;memcpy(h.uuid,s->uuid,16);status(s->client,h,kDecodeError);}
@@ -426,6 +458,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
           Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.u32(cc(",ver"),6);w.plist(cc(",hin"),*p,info);send(c,w,b);delete p;
         }
         IOLog("PianoVideoVT V5a: +dec selected com.unixnu.pianovideo.decoder.avc pid %d\n",c->pid);
+        IOLog("PianoVideoVT V6p: session-client per-copy invalidate56 release1 no-address-cache\n");
       }
     }
   }else if(!owned){

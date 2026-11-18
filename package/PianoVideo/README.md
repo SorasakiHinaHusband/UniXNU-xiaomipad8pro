@@ -65,6 +65,7 @@ batched tablet test list with its expected lines and the risks: `docs/drivers/vi
 | `tests/bringup_host.cpp` | levels 2-4 against one SoC model (VIDEO_CC, the core, DRV-2, cmd-db, the secure world, the SMMU, a firmware reached through our table), every wait made to fail, every secure call refused, the stop argument at every step |
 | `vt/` | VideoToolbox paravirtual frontend and wire format from third-party UniXNU-droidvm commit 706338e; bounded native avc1 endpoint, descriptor/WC layout contract, IOSurfaceRoot lookup/copy and asynchronous guest completion |
 | `tests/vt_host.cpp` | protocol6 wire atom round-trip; V5a parsing/layout/cancel contracts in `tests/vt_contract_host.cpp` |
+| `tests/vt_surface_host.cpp` | production lookup-lease policy against the decoded reference-pair contract; repeated IDs, bounded ownership and failed disposal |
 
 Build: `tooling/k27/build-native-piano-video.sh` (the secure-call lock's tests, the shared firmware loader's tests, the copies'
 check, the host protocol/lifetime/layout tests, the pin, the objects with the loader's `package/common` files, the import check). PianoVideo is in

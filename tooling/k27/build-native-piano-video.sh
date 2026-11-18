@@ -40,6 +40,8 @@ done
 python3 "$P/tests/fixture_host.py" || { echo "Error: PianoVideo own AVC fixture/golden check failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_host.cpp" -o "$O/host-tests/vt_host"
 "$O/host-tests/vt_host" || { echo "Error: PianoVideo VT wire host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_surface_host.cpp" -o "$O/host-tests/vt_surface_host"
+"$O/host-tests/vt_surface_host" || { echo "Error: PianoVideo VT surface lifetime tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P/vt" "$P/tests/vt_contract_host.cpp" -o "$O/host-tests/vt_contract_host"
 "$O/host-tests/vt_contract_host" || { echo "Error: PianoVideo V5a contract tests failed" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomMdt.c" -o "$O/host-tests/QcomMdt.o"
