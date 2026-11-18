@@ -320,19 +320,19 @@ IOReturn A830Hfi::drainLocked(unsigned queue,uint16_t step)
 /* ---- one command ---------------------------------------------------------------------------------------------------- */
 
 IOReturn A830Hfi::transact(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,
-                           unsigned message,bool tolerate)
+                           unsigned message,bool tolerate,uint32_t timeoutUs,bool dropAck)
 {
     bool pushed=false;
-    const IOReturn result=exchange(id,payload,dwords,ack,step,message,tolerate,&pushed);
+    const IOReturn result=exchange(id,payload,dwords,ack,step,message,tolerate,&pushed,timeoutUs,dropAck);
     /* annibale: a command that reached the queue and failed is followed by the late drain before the caller reports it
      * (field-notes 9-1). failure() is the command's own. */
-    if(result!=kIOReturnSuccess && pushed && adreno830_annibale() && !(qualification_ && !message && id==A830_HFI_H2F_GX_BW_PERF_VOTE))
+    if(result!=kIOReturnSuccess && pushed && adreno830_annibale() && !qualLimit_ && !(qualification_ && !message && id==A830_HFI_H2F_GX_BW_PERF_VOTE))
         (void)drainLateLocked(A830HfiLateDrainUs);
     return result;
 }
 
 IOReturn A830Hfi::exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,
-                           unsigned message,bool tolerate,bool *pushed)
+                           unsigned message,bool tolerate,bool *pushed,uint32_t timeoutUs,bool dropAck)
 {
     late_done_=false;
     if(!ready_ || !shared_)return fail(step,A830ReasonUnexpectedState,kIOReturnNotReady,0,0);
@@ -349,13 +349,17 @@ IOReturn A830Hfi::exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A8
     }
     // Arm only after this runtime command has really entered the queue and rung the doorbell.
     const bool drop=qualification_ && !message && id==A830_HFI_H2F_GX_BW_PERF_VOTE &&
-                    __atomic_exchange_n(&dropArmed_,false,__ATOMIC_ACQ_REL);
+                    (dropAck || __atomic_exchange_n(&dropArmed_,false,__ATOMIC_ACQ_REL));
     if(drop)stats_.drop_header=header;
     A830HfiAck local;
     A830HfiAck *answer=ack?ack:&local;
-    const uint64_t deadline=io_.now(io_.context)+A830_T_HFI_ACK_US;
+    const uint64_t deadline=io_.now(io_.context)+timeoutUs;
     bool matched=false,bit23=false;
     for(;;) {
+        if(timeoutUs<A830_T_HFI_ACK_US && io_.now(io_.context)>=deadline) {
+            ++stats_.timeouts;
+            return fail(step,A830ReasonTimeout,kIOReturnTimeout,header,stats_.last_info,0);
+        }
         const uint32_t info=rd(A8XX_GMUCX_GMU2HOST_INTR_INFO);
         stats_.last_info=info;
         if((info&A830_GMU2HOST_CM3_FAULT_LINUX) && !bit23) {bit23=true;++stats_.info_bit23;}   /* record only */
@@ -441,7 +445,7 @@ IOReturn A830Hfi::acdLocked(const A830VoteTables &tables)
     return transact(A830_HFI_H2F_ACD_TBL,tables.acd+1,A830_HFI_ACD_TABLE_DWORDS-1,nullptr,step,A830HfiM3Acd,false);
 }
 
-IOReturn A830Hfi::perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message)
+IOReturn A830Hfi::perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message,uint32_t timeoutUs,bool dropAck)
 {
     if(qualLimit_) {
         uint8_t boundedLevel=level==A830HfiNoVote?level_:level,boundedBus=uint8_t(bw);
@@ -449,7 +453,7 @@ IOReturn A830Hfi::perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigne
         level=boundedLevel;bw=(bw&~255u)|boundedBus;
     }
     const uint32_t payload[3]={A830_HFI_GX_BW_PERF_ACK_BLOCK,level,bw};
-    const IOReturn result=transact(A830_HFI_H2F_GX_BW_PERF_VOTE,payload,3,nullptr,step,message,false);
+    const IOReturn result=transact(A830_HFI_H2F_GX_BW_PERF_VOTE,payload,3,nullptr,step,message,false,timeoutUs,dropAck);
     if(result!=kIOReturnSuccess) {++stats_.vote_failures;return result;}
     ++stats_.votes;
     if(level<=Adreno830LevelMax)++stats_.level_acks[level];
@@ -561,6 +565,19 @@ IOReturn A830Hfi::sendStart()
 }
 
 /* ---- run time ------------------------------------------------------------------------------------------------------ */
+
+IOReturn A830Hfi::confirmThermalExit(bool dropAck)
+{
+    lock();
+    IOReturn result=kIOReturnNotReady;
+    if(qualification_ && ready_ && started_ && gx_levels_>1 && bus_levels_>2) {
+        // Shorter than the submission retry window. The strict restart keeps the normal HFI deadline.
+        result=perfVoteLocked(1,noAbBits()|2,A830_HFI_H2F_GX_BW_PERF_VOTE,0,100000,dropAck);
+        if(result==kIOReturnSuccess && (level_!=1 || bus_!=2))result=kIOReturnIOError;
+    }
+    unlock();
+    return result;
+}
 
 IOReturn A830Hfi::voteLocked(uint8_t level,uint32_t bw)
 {

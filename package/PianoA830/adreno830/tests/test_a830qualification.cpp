@@ -16,10 +16,10 @@ static Sm8750TsensIo tsens={nullptr,tempRead};
 static void voteFault(void *,uint8_t,uint8_t,IOReturn) {CHECK(!gEnv.locked);qual.fault(A830QualVote,gEnv.now);}
 static void lease(void *,uint64_t now) {qual.checkLease(now);}
 static void sample(void *,uint64_t now,const Sm8750TsensSample *s) {qual.sample(now,*s);}
-static void boot() {
+static void boot(const A830RecoveryOps &opsRecovery=gRecoveryOps) {
     resetAll();unsafe=0;raw=Sm8750TsensValidBit|450;adreno830_profile_value=A830ProfileAnnibale;
     CHECK(power.init(A830PowerConfig{},gIo,gPowerEnv,gPowerOps)==kIOReturnSuccess);
-    CHECK(recovery.init(A830RecoveryConfig{},gIo,gPowerEnv,gPowerOps,gRecoveryOps,&power)==kIOReturnSuccess);
+    CHECK(recovery.init(A830RecoveryConfig{},gIo,gPowerEnv,gPowerOps,opsRecovery,&power)==kIOReturnSuccess);
     recovery.qualification(halt,nullptr);power.start(1,2);
     qual=A830Qualification{};qual.init(&power,&recovery);
     A830DcvsConfig c;c.qualification607=true;c.maxLevel=7;c.maxMhz=607;c.maxGiven=true;c.initialLevel=1;c.initialBus=2;

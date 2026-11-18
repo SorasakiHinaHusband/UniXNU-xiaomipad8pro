@@ -510,7 +510,11 @@ The explicit `piano-gpu-r3b=1` switch selects the bounded R3b-607 engineering th
 level-7/607 qualification configuration. One 100 ms eight-channel guard owns the 80 C soft / 75 C continuous-2 s up /
 85 C hard policy, with a 250 ms snapshot lease; normal down steps are at least 500 ms apart and stop at a 342 MHz ceiling.
 Board msm/quiet limits 62/37 C cap at 342; two fresh 60/35 C rounds release that cap. Hard 65/40 C board limits, invalid
-or stale sensors and ACK faults close submissions and use the strict-off / fresh 160 MHz M9 / boot-sticky342 recovery.
+or stale sensors trigger a fresh 160 MHz / bus 2 runtime ACK with submissions temporarily retried and existing work left
+in place. An asleep GPU defers the low vote to its next M9. An unconfirmed low vote or a real fault uses checked strict-off
+and a fresh 160 MHz M9. Both paths latch the 342 MHz ceiling for the boot. The opt-in `piano-gpu-r3b-exit-test=1`
+holds the cool control at 342 MHz and disables high qualification. Root commands 3 and 4 on the existing sysctl
+inject one board-hard predicate at low temperature and then drop one matching fresh 160 MHz runtime ACK.
 105 C invokes the independent unsafe halt. R3b THERM/LIVE/WORK/EVENT records extend the read-only C5LOG export with guard
 peaks, cap changes, cumulative acknowledged residency and queue/service costs. These are experimental parameters,
 not a measured skin-temperature bound or daily qualification; other modes retain their existing thermal policy.

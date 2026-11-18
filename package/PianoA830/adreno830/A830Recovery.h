@@ -71,6 +71,11 @@ struct A830RecoveryOps {
     IOReturn (*readPipe)(void *context,uint8_t pipe,uint32_t reg,uint32_t *value);
     /* A830Cp/A830Smmu: per-pipe CP fault registers, CB0/CB2 FSR/FAR into the snapshot (may be null). */
     void (*snapshot)(void *context,A830HangSnapshot *snapshot);
+    /* R3b runs these under the power mutex. The vote must prove a new 160 MHz / bus 2 ACK. */
+    IOReturn (*qualificationLowVote)(void *context,bool dropAck)=nullptr;
+    IOReturn (*qualificationQuiesce)(void *context)=nullptr;
+    bool (*qualificationGxOff)(void *context)=nullptr;
+    void (*qualificationStage)(void *context,const char *stage,IOReturn result)=nullptr;
 };
 
 struct A830RecoveryConfig {
@@ -97,7 +102,10 @@ public:
                   const A830RecoveryOps &recoveryOps,A830PowerState *power);
     /* Any context: remember the first cause and wake the service thread. Reports during a recovery are coalesced. */
     void report(uint8_t cause,uint64_t detail);
-    bool pending() const {return __atomic_load_n(&pendingCause_,__ATOMIC_ACQUIRE)!=A830FaultNone;}
+    bool pending() const {return faultPending() || __atomic_load_n(&lowRequest_,__ATOMIC_ACQUIRE);}
+    void requestQualificationLow(uint32_t reason,uint64_t now,bool dropAck=false);
+    uint64_t protectionAt() const {return __atomic_load_n(&protectionAt_,__ATOMIC_ACQUIRE);}
+    bool qualificationLowConfirmed() const {return qualificationSafeLow();}
     /* Service thread: run the pending recovery, if any. */
     IOReturn runPending();
     /* Synchronous recovery of `cause` (takes the power mutex). */
@@ -113,7 +121,8 @@ public:
     const A830RecoveryConfig &config() const {return config_;}
     void qualification(void (*unsafe)(void *),void *context) {qualification_=true;unsafe_=unsafe;unsafeContext_=context;}
     // No power or HFI mutex: the independent heartbeat may close the actual submit ring.
-    void closeQualification();
+    void closeQualification(uint8_t cause=A830FaultHfi);
+    void qualificationR3b() {qualificationR3b_=true;}
     bool safeOff() const {return __atomic_load_n(&safeOff_,__ATOMIC_ACQUIRE);}
     bool qualificationSafeLow() const {return __atomic_load_n(&qualificationSafeLow_,__ATOMIC_ACQUIRE);}
 
@@ -124,7 +133,21 @@ public:
     void capture(uint8_t cause,uint64_t detail,A830HangSnapshot *out);
 
 private:
+    static constexpr uint8_t Publishing=A830FaultCount;
+    bool faultPending() const {
+        const auto cause=__atomic_load_n(&pendingCause_,__ATOMIC_ACQUIRE);
+        return cause!=A830FaultNone && cause!=Publishing;
+    }
+    void stage(const char *name,IOReturn result=kIOReturnSuccess) {
+        if(rops_.qualificationStage)rops_.qualificationStage(rops_.context,name,result);
+    }
     IOReturn recoverLocked(uint8_t cause,uint64_t detail);
+    bool qualificationAsleep() const {
+        return power_->phase()==A830PowerSlumber && power_->rsccSlept() &&
+            (!power_->cxOn() || (rops_.qualificationGxOff && rops_.qualificationGxOff(rops_.context)));
+    }
+    IOReturn strictOff(bool provenAsleep);
+    void minimalSnapshot(uint8_t cause,uint64_t detail);
     void loseLocked(uint8_t cause,uint8_t stage,uint16_t step,IOReturn result);
     bool allowed(uint64_t now);
     uint32_t rd(uint8_t window,uint32_t offset) const {return io_.read32(io_.context,window,offset);}
@@ -142,7 +165,9 @@ private:
     uint8_t pendingCause_=A830FaultNone;
     uint64_t pendingDetail_=0;
     bool lost_=false,running_=false,initialized_=false;
-    bool qualification_=false,qualificationClosed_=false;
+    bool qualification_=false,qualificationClosed_=false,qualificationR3b_=false;
+    uint64_t protectionAt_=0;
+    uint32_t lowRequest_=0;
     bool safeOff_=false;
     bool qualificationSafeLow_=false;
     void (*unsafe_)(void *)=nullptr;

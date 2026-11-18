@@ -928,6 +928,26 @@ int main()
         cap=2;CHECK(h.perfVote(3,3)==0 && h.currentLevel()==2 && h.currentBus()==2);
         CHECK(fw.received.back()[2]==2 && fw.received.back()[3]==2 && h.stats().level_acks[2]==1);
     }
+    for(unsigned scenario=0;scenario<7;++scenario) {
+        A830Hfi h;boot(h);CHECK(h.start(annibaleTables,1,2)==0);h.qualification(true);
+        const uint32_t oldAck=h.stats().last_ack;
+        const size_t sent=fw.received.size();
+        fw.scripts[30].before={{A830_HFI_HDR(30,A830_HFI_MSG_ACK,3,0),oldAck,0}};
+        if(scenario==1)fw.scripts[30].delay=200;
+        if(scenario==2)fw.scripts[30].delay=1100;
+        if(scenario==3)fw.scripts[30].drop=true;
+        if(scenario==4)fw.scripts[30].status=1;
+        if(scenario==6)h.stop();
+        const uint64_t at=fw.now;
+        CHECK((h.confirmThermalExit(scenario==5)==kIOReturnSuccess)==(scenario<2));
+        if(scenario==6) {CHECK(fw.received.size()==sent && !h.pending(nullptr,nullptr));continue;}
+        CHECK(fw.received.size()==sent+1 && fw.received.back()[2]==1 && fw.received.back()[3]==2);
+        const uint32_t request=fw.received.back()[0];
+        CHECK(h.stats().last_request==request && request!=oldAck);
+        CHECK(h.stats().last_ack==(scenario<2?request:oldAck));
+        CHECK(fw.now-at<=100000 && !h.stats().late_drains);
+        if(scenario==5)CHECK(h.stats().dropped_acks==1 && h.stats().drop_header==request);
+    }
     std::printf("PASS: A830Hfi queues, wrap and 0xFAFAFAFA padding, whole-header ACK match, v5 answers, F2H handling (reason "
                 "16/22), 1 s timeout, NMI and CM3 exits, M1-M9 encodings, perf/slumber votes, dbg drain under the lock "
                 "(design); 4-entry perf table, no M7, M9 {1,1,2}, strict FEATURE_CTRL and short ACKs, bit 0/2 poll clear, "

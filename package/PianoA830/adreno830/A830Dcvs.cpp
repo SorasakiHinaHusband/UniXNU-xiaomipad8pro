@@ -543,13 +543,14 @@ void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille
     power_->lock();
     IOReturn result=A830ReturnNotResponding;
     /* Under the mutex no power transition runs; only an Active GMU takes a vote (asleep: target recorded above). */
-    const bool active=power_->phase()==A830PowerActive;
+    const bool active=power_->phase()==A830PowerActive && !power_->qualificationBlocked();
     if(active) {
         // Recheck the independent heartbeat's cap after acquiring the mutex.
         uint8_t boundedBus=bus;
         power_->limitQualification(level,boundedBus);
         if(boundedBus!=bus) {bus=boundedBus;bw=annibale_?uint32_t(bus):bus|A830_HFI_BW_NO_AB;}
-        result=ops_.perfVote(ops_.context,level,bw);
+        if(!power_->qualificationBlocked())result=ops_.perfVote(ops_.context,level,bw);
+        else {power_->unlock();return;}
     }
     if(active && result==kIOReturnSuccess) {
         if(config_.qualificationR3b && ops_.qualificationAck)ops_.qualificationAck(ops_.context,level,bus);

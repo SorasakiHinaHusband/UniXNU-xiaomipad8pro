@@ -18,7 +18,10 @@ class A830Qualification {
 public:
     void init(A830PowerState *power,A830Recovery *recovery,bool r3b=false,void (*unsafe)(void *)=nullptr) {
         power_=power;recovery_=recovery;r3b_=r3b;unsafe_=unsafe;power_->setQualificationCeiling(3,3);
-        if(r3b)power_->qualificationGuard([](void *p,uint64_t now) {static_cast<A830Qualification *>(p)->checkLease(now);},this);
+        if(r3b) {
+            recovery_->qualificationR3b();
+            power_->qualificationGuard([](void *p,uint64_t now) {static_cast<A830Qualification *>(p)->checkLease(now);},this);
+        }
     }
     bool r3b() const {return r3b_;}
     A830R3bThermal &thermal() {return thermal_;}
@@ -30,25 +33,29 @@ public:
         if(!ready() || power_->qualificationLatched() || __atomic_exchange_n(&armed_,true,__ATOMIC_ACQ_REL))return false;
         return true;
     }
-    uint32_t reason() const {return __atomic_load_n(&reason_,__ATOMIC_ACQUIRE);}
-    uint64_t failedAt() const {return __atomic_load_n(&failedAt_,__ATOMIC_ACQUIRE);}
+    uint32_t reason() const {return uint32_t(__atomic_load_n(&firstFailure_,__ATOMIC_ACQUIRE)&7);}
+    uint64_t failedAt() const {return __atomic_load_n(&firstFailure_,__ATOMIC_ACQUIRE)>>3;}
     uint64_t openedAt() const {return __atomic_load_n(&openedAt_,__ATOMIC_ACQUIRE);}
     void fault(uint32_t reason,uint64_t now) {
-        uint32_t expected=0;
-        (void)__atomic_compare_exchange_n(&reason_,&expected,reason,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
-        // Preserve the first boot reason, but never suppress a later hardware-unknown vote failure.
-        const bool underway=recovery_->busy() || recovery_->pending();
-        if(!underway || !failedAt())__atomic_store_n(&failedAt_,now,__ATOMIC_RELEASE);
+        // One publication for the incident and its timestamp. A later real HFI fault still needs recovery.
+        uint64_t expected=0;
+        const bool first=__atomic_compare_exchange_n(&firstFailure_,&expected,now<<3|reason,false,
+                                                     __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
         __atomic_store_n(&high_,false,__ATOMIC_RELEASE);
-        recovery_->closeQualification();
-        if(reason==A830QualSensor || reason==A830QualGpuHot)power_->setQualificationCeiling(1,2);
-        if(underway)return;
+        if(reason==A830QualSensor || reason==A830QualGpuHot || (r3b_ && reason==A830QualBoardHot))
+            power_->setQualificationCeiling(1,2);
+        if(r3b_ && reason!=A830QualVote) {
+            if(first)recovery_->requestQualificationLow(reason,now);
+            return;
+        }
+        if(!r3b_)__atomic_store_n(&legacyProtectionAt_,now,__ATOMIC_RELEASE);
+        if(!r3b_)recovery_->closeQualification();
         recovery_->report(A830FaultHfi,reason);
     }
     // Called every second by a separate kernel thread. 600 s soak + at most 2 s for the last, dropped ACK.
     // A missing callback/service, partial VALID mask, implausible reading or stalled sample is never a permit.
-    void tick(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk) {
-        if(r3b_) {tickR3b(now,gpu,board,boardOk);return;}
+    void tick(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard=false) {
+        if(r3b_) {tickR3b(now,gpu,board,boardOk,injectBoardHard);return;}
         __atomic_store_n(&heartbeatAt_,now,__ATOMIC_RELEASE);
         if(power_->qualificationLatched() && !reason())fault(A830QualVote,now);
         bool gpuOk=gpu.valid==255;
@@ -111,11 +118,11 @@ public:
         else if(gpu.valid!=255 && !power_->qualificationLatched())fault(A830QualSensor,now);
     }
     bool deadlineMissed(uint64_t now) const {
-        const uint64_t at=failedAt();
+        const uint64_t at=r3b_?recovery_->protectionAt():__atomic_load_n(&legacyProtectionAt_,__ATOMIC_ACQUIRE);
         return at && now>=at && now-at>=5000000000ull && !recovery_->safeOff() && !recovery_->qualificationSafeLow();
     }
 private:
-    void tickR3b(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk) {
+    void tickR3b(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard) {
         // Last protection runs before any board call/log/fault path can stall.
         for(unsigned i=0;i<8;++i)if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr);break;}
         checkLease(now); // never renew a missing guard's expired lease
@@ -127,11 +134,11 @@ private:
         __atomic_store_n(&inhibit_,(!gpuOk?A830QualGpuInvalid:0u)|(!thermal_.healthy?A830QualBoardInvalid:0u)|
             (thermal_.raw>=800?A830QualGpuOver:0u)|(thermal_.boardCap?A830QualBoardOver:0u)|
             (thermal_.entryRounds<2?A830QualNeedRounds:0u),__ATOMIC_RELEASE);
-        const bool hardBoard=boardOk && board.valid==3 && board.state==PIANO_BOARD_TEMPS_RUNNING &&
-            (board.milli_c[0]>=65000 || board.milli_c[1]>=40000);
+        const bool hardBoard=injectBoardHard || (boardOk && board.valid==3 && board.state==PIANO_BOARD_TEMPS_RUNNING &&
+            (board.milli_c[0]>=65000 || board.milli_c[1]>=40000));
         if(high() || (!reason() && ((gpuOk && thermal_.raw>=850) || hardBoard))) {
             if(thermal_.raw>=850)fault(A830QualGpuHot,now);
-            else if(board.milli_c[0]>=65000 || board.milli_c[1]>=40000)fault(A830QualBoardHot,now);
+            else if(hardBoard)fault(A830QualBoardHot,now);
             else if(!thermal_.healthy)fault(A830QualSensor,now);
             else if(now-openedAt()>=602000000000ull)fault(A830QualExpired,now);
         }
@@ -140,7 +147,7 @@ private:
         }
         const uint64_t end=openedAt()+602000000000ull;
         power_->setQualificationLease(now+A830R3bThermal::Lease<end?now+A830R3bThermal::Lease:end);
-        uint8_t cap=uint8_t(thermal_.published());
+        uint8_t cap=hardBoard?1:uint8_t(thermal_.published());
         if(!high() && cap>3)cap=3;
         const uint8_t buses[]={0,2,2,3,4,4,4,6};
         power_->setQualificationCeiling(cap,buses[cap]);
@@ -152,8 +159,9 @@ private:
     A830PowerState *power_=nullptr;
     A830Recovery *recovery_=nullptr;
     bool ready_=false,high_=false,armed_=false;
-    uint32_t reason_=0,rounds_=0,lastRound_=0,inhibit_=A830QualNeedRounds;
-    uint64_t openedAt_=0,failedAt_=0,lastSamples_[2]={};
+    uint32_t rounds_=0,lastRound_=0,inhibit_=A830QualNeedRounds;
+    uint64_t firstFailure_=0,legacyProtectionAt_=0;
+    uint64_t openedAt_=0,lastSamples_[2]={};
     uint64_t heartbeatAt_=0;
 };
 #endif

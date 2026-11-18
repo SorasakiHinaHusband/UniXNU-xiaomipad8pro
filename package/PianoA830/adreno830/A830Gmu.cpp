@@ -255,6 +255,30 @@ int A830GmuGxVote(void *opaque,int on)
     return status;
 }
 
+int A830GmuGxVoteStrict(void *opaque,int on)
+{
+    auto *voter=static_cast<A830GmuGxVoter *>(opaque);
+    if(!voter || !voter->drv2 || !voter->res || !voter->res->gfx.present || !voter->res->gmxc.present)
+        return Sm8750RpmhArgument;
+    const auto &gfx=voter->res->gfx;
+    const auto &gmxc=voter->res->gmxc;
+    const Sm8750RpmhArc *order[]={on?&gmxc:&gfx,on?&gfx:&gmxc};
+    for(const auto *rail:order) {
+        uint32_t level=0;
+        int status=on?Sm8750RpmhArcLevel(rail,1,&level):0;
+        if(!status) {
+            const Sm8750RpmhCmd command={rail->addr,level};
+            status=Sm8750RpmhWriteActive(voter->drv2,&command,1,1,&voter->result);
+        }
+        voter->status=status;
+        if(status)return status;
+        if(rail==&gfx)voter->gfx_hlvl=level;
+        else voter->gmxc_hlvl=level;
+    }
+    voter->held=on;
+    return 0;
+}
+
 IOReturn A830Gmu::fail(uint16_t step,uint16_t reason,uint64_t reg,uint64_t value,uint64_t expect,IOReturn result)
 {
     failure_={step,reason,reg,value,expect};
@@ -284,7 +308,7 @@ void A830Gmu::barrier()
 }
 
 int A830Gmu::pollMask(unsigned window,uint32_t offset,uint32_t mask,uint32_t want,uint32_t timeout_us,uint32_t step_us,
-    bool sleep,uint32_t *value,uint32_t *elapsed_us)
+    bool sleep,uint32_t *value,uint32_t *elapsed_us,bool strict)
 {
     const uint64_t start=os_.now_us(os_.cookie);
     for(;;) {
@@ -293,7 +317,7 @@ int A830Gmu::pollMask(unsigned window,uint32_t offset,uint32_t mask,uint32_t wan
         const uint64_t spent=os_.now_us(os_.cookie)-start;
         if(value)*value=current;
         if(elapsed_us)*elapsed_us=spent>UINT32_MAX?UINT32_MAX:uint32_t(spent);
-        if(!read)return 2;
+        if(!read || (strict && current==UINT32_MAX))return 2;
         if((current&mask)==want)return 0;
         if(spent>=timeout_us)return 1;
         if(sleep)os_.sleep_us(os_.cookie,step_us);else os_.delay_us(os_.cookie,step_us);
@@ -650,28 +674,29 @@ IOReturn A830Gmu::readBusy(uint64_t *ticks)
 
 /* --- RSCC (ARCHITECTURE 4.7.4, B3) ----------------------------------------------------------------------------------- */
 
-IOReturn A830Gmu::rsccSleep()
+IOReturn A830Gmu::rsccSleep(bool strict)
 {
     if(!bound_)return kIOReturnNotReady;
     /* KGSL gen8_rscc_sleep_sequence: nothing to do before the first boot completed, or twice. */
-    if(!first_boot_done_ || rscc_asleep_)return kIOReturnSuccess;
+    if(!strict && (!first_boot_done_ || rscc_asleep_))return kIOReturnSuccess;
     const uint32_t request=gmuReg(A8XX_GMUAO_RSCC_CONTROL_REQ);
     if(!wr(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_CM3_SYSRESET),A830_GMU_CM3_SYSRESET_ASSERT))
         return fail(A830GmuStepRsccSleep,A830ReasonReadback,A830_GMU_PHYS+gmuReg(A8XX_GMUCX_CM3_SYSRESET),1,0,kIOReturnIOError);
     barrier();
     booted_=false;
     uint32_t wptr=0;
-    if(rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GENERAL_9),&wptr)) {log_wptr_=wptr;report_.log_wptr=wptr;}
+    if(!strict && rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GENERAL_9),&wptr)) {log_wptr_=wptr;report_.log_wptr=wptr;}
     if(!wr(A830GmuWindowGmu,request,A830_GMU_RSCC_CONTROL_SLEEP))
         return fail(A830GmuStepRsccSleep,A830ReasonReadback,A830_GMU_PHYS+request,A830_GMU_RSCC_CONTROL_SLEEP,0,kIOReturnIOError);
     barrier();
     uint32_t value=0;
     const uint32_t status=rsccReg(A8XX_RSCC_RSC_STATUS0_DRV0);
     const int poll=pollMask(A830GmuWindowRscc,status,A830_RSCC_SLEEP_DONE,A830_RSCC_SLEEP_DONE,A830_T_RSCC_US,A830_POLL_STEP_US,
-                            true,&value,nullptr);
+                            true,&value,nullptr,strict);
     if(poll)return fail(A830GmuStepRsccSleep,poll==2?A830ReasonReadback:A830ReasonTimeout,A830_RSCC_PHYS+status,value,
                         A830_RSCC_SLEEP_DONE,poll==2?kIOReturnIOError:kIOReturnTimeout);
-    (void)wr(A830GmuWindowGmu,request,0);
+    if(!wr(A830GmuWindowGmu,request,0) && strict)
+        return fail(A830GmuStepRsccSleep,A830ReasonReadback,A830_GMU_PHYS+request,0,0,kIOReturnIOError);
     barrier();
     rscc_asleep_=true;
     ++report_.rscc_sleeps;
@@ -716,17 +741,18 @@ IOReturn A830Gmu::wakeRscc()
 }
 
 /* GPU RSCC TCS0..9 DRV0 status bit0 (idle): nothing of the GMU's RPMh voting is outstanding. */
-IOReturn A830Gmu::waitRsccTcs(uint32_t timeout_us)
+IOReturn A830Gmu::waitRsccTcs(uint32_t timeout_us,bool strict)
 {
     IOReturn result=kIOReturnSuccess;
     for(uint32_t tcs=0;tcs<A8XX_RSCC_TCS_COUNT;++tcs) {
         uint32_t value=0;
         const uint32_t offset=rsccReg(A8XX_RSCC_TCS_DRV0_STATUS(tcs));
         const int poll=pollMask(A830GmuWindowRscc,offset,A8XX_RSCC_TCS_IDLE,A8XX_RSCC_TCS_IDLE,timeout_us,A830_POLL_STEP_US,true,
-                                &value,nullptr);
+                                &value,nullptr,strict);
         if(poll && result==kIOReturnSuccess) {
             result=poll==2?kIOReturnIOError:kIOReturnTimeout;
             failure_={0,uint16_t(poll==2?A830ReasonReadback:A830ReasonTimeout),A830_RSCC_PHYS+offset,value,A8XX_RSCC_TCS_IDLE};
+            if(strict)break;
         }
     }
     if(result!=kIOReturnSuccess)warn(A830GmuWarnTcsBusy);
@@ -809,6 +835,87 @@ IOReturn A830Gmu::forceOff(bool strict)
     __atomic_store_n(&ao_pending_,0u,__ATOMIC_RELEASE);
     ++report_.force_offs;
     return access_ok?kIOReturnSuccess:kIOReturnIOError;
+}
+
+bool A830Gmu::gxOffProven()
+{
+    uint32_t status=0,cfg=0;
+    const uint32_t off=A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF;
+    return bound_ && rd(A830GmuWindowGmu,gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS),&status) && status!=UINT32_MAX &&
+        (status&off)==off && rd(A830GmuWindowGmu,GxCfgGdscr,&cfg) && cfg!=UINT32_MAX && (cfg&GxPowerDownComplete);
+}
+
+IOReturn A830Gmu::forceOffStrict(int (*gxVote)(void *,int),void *cookie)
+{
+    if(!bound_)return kIOReturnNotReady;
+    enum : uint16_t {Mask=0x81,Client,Arbiter,Tcs,Fence,Reset,Gx,GxVote,GxCollapse,Rscc,Release};
+    const auto put=[&](unsigned window,uint32_t offset,uint32_t value,uint16_t step) {
+        if(wr(window,offset,value)) {barrier();return kIOReturnSuccess;}
+        return fail(step,A830ReasonReadback,offset,value,0,kIOReturnIOError);
+    };
+    const auto wait=[&](unsigned window,uint32_t offset,uint32_t mask,uint32_t want,uint32_t us,uint16_t step) {
+        uint32_t value=0;
+        const int result=pollMask(window,offset,mask,want,us,A830_POLL_STEP_US,true,&value,nullptr,true);
+        if(!result)return kIOReturnSuccess;
+        return fail(step,result==2?A830ReasonReadback:A830ReasonTimeout,offset,value,want,
+                    result==2?kIOReturnIOError:kIOReturnTimeout);
+    };
+    const auto gmuPut=[&](uint32_t reg,uint32_t value,uint16_t step) {return put(A830GmuWindowGmu,gmuReg(reg),value,step);};
+    const auto gmuWait=[&](uint32_t reg,uint32_t mask,uint32_t want,uint16_t step) {
+        return wait(A830GmuWindowGmu,gmuReg(reg),mask,want,0,step);
+    };
+    const uint32_t irqRegs[]={A8XX_GMUCX_GMU2HOST_INTR_MASK,A8XX_GMUAO_AO_HOST_INTERRUPT_MASK,
+        A8XX_GMUCX_GMU2HOST_INTR_CLR,A8XX_GMUAO_AO_HOST_INTERRUPT_CLR};
+    IOReturn result;
+    for(const auto reg:irqRegs)if((result=gmuPut(reg,UINT32_MAX,Mask))!=kIOReturnSuccess)return result;
+    if((result=gmuPut(A8XX_GMUCX_CX_FALNEXT_INTF,A830_GMU_CX_FAL_VETO,Mask))!=kIOReturnSuccess ||
+       (result=gmuPut(A8XX_GMUCX_PWR_COL_KEEPALIVE,0,Mask))!=kIOReturnSuccess)return result;
+
+    // GBIF is in the CX aperture. Skip RBBM and CP because no stable GX hold has been established.
+    const auto gbif=[&](uint32_t mask,uint16_t step) {
+        IOReturn r=put(A830GmuWindowGpu,gpuReg(A8XX_GBIF_HALT),mask,step);
+        if(r==kIOReturnSuccess)r=wait(A830GmuWindowGpu,gpuReg(A8XX_GBIF_HALT_ACK),mask,mask,A830_T_GBIF_HALT_US,step);
+        return r;
+    };
+    if((result=gbif(A8XX_GBIF_HALT_CLIENT,Client))!=kIOReturnSuccess ||
+       (result=gbif(A8XX_GBIF_HALT_ARB,Arbiter))!=kIOReturnSuccess ||
+       (result=put(A830GmuWindowGpu,gpuReg(A8XX_GBIF_HALT),0,Release))!=kIOReturnSuccess)return result;
+    if((result=waitRsccTcs(A830_T_RSCC_TCS_FORCE_OFF_US,true))!=kIOReturnSuccess) {failure_.step=Tcs;return result;}
+    if((result=gmuPut(A8XX_GMUAO_AHB_FENCE_STATUS_CLR,A830_AHB_FENCE_STATUS_CLR_VALUE,Fence))!=kIOReturnSuccess ||
+       (result=gmuPut(A8XX_GMUAO_AHB_FENCE_CTRL,A830_AHB_FENCE_CTRL_ALLOW,Fence))!=kIOReturnSuccess ||
+       (result=gmuWait(A8XX_GMUAO_AHB_FENCE_CTRL,UINT32_MAX,A830_AHB_FENCE_CTRL_ALLOW,Fence))!=kIOReturnSuccess)return result;
+    if((result=gmuPut(A8XX_GMUCX_CM3_SYSRESET,A830_GMU_CM3_SYSRESET_ASSERT,Reset))!=kIOReturnSuccess ||
+       (result=gmuWait(A8XX_GMUCX_CM3_SYSRESET,UINT32_MAX,A830_GMU_CM3_SYSRESET_ASSERT,Reset))!=kIOReturnSuccess)return result;
+    booted_=false;
+    if((result=gbif(A8XX_GBIF_HALT_ARB,Arbiter))!=kIOReturnSuccess)return result;
+    uint32_t gx=0;
+    constexpr uint32_t off=A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF;
+    const uint32_t status=gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS);
+    if(!rd(A830GmuWindowGmu,status,&gx) || gx==UINT32_MAX)
+        return fail(Gx,A830ReasonReadback,status,gx,off,kIOReturnIOError);
+    if((gx&off)!=off) {
+        const int vote=gxVote?gxVote(cookie,1):-1;
+        if(vote)return fail(GxVote,A830ReasonReadback,0,uint32_t(vote),1,kIOReturnIOError);
+        uint32_t gdscr=0;
+        if(!rd(A830GmuWindowGmu,GxGdscr,&gdscr) || gdscr==UINT32_MAX)
+            return fail(GxCollapse,A830ReasonReadback,GxGdscr,gdscr,0,kIOReturnIOError);
+        if((result=put(A830GmuWindowGmu,GxGdscr,gdscr|SM8750_GDSC_SW_COLLAPSE,GxCollapse))!=kIOReturnSuccess ||
+           (result=wait(A830GmuWindowGmu,GxCfgGdscr,GxPowerDownComplete,GxPowerDownComplete,A830_T_GX_GDSC_OFF_US,GxCollapse))!=kIOReturnSuccess)
+            return result;
+        if((result=wait(A830GmuWindowGmu,status,off,off,A830_T_GX_GDSC_OFF_US,Gx))!=kIOReturnSuccess)return result;
+        const int unvote=gxVote(cookie,0);
+        if(unvote)return fail(GxVote,A830ReasonReadback,0,uint32_t(unvote),0,kIOReturnIOError);
+    }
+    if((result=rsccSleep(true))!=kIOReturnSuccess) {failure_.step=Rscc;return result;}
+    if((result=gmuWait(A8XX_GMUCX_GFX_PWR_CLK_STATUS,off,off,Gx))!=kIOReturnSuccess ||
+       (result=wait(A830GmuWindowGmu,GxCfgGdscr,GxPowerDownComplete,GxPowerDownComplete,0,GxCollapse))!=kIOReturnSuccess)
+        return result;
+    if((result=put(A830GmuWindowGpu,gpuReg(A8XX_GBIF_HALT),0,Release))!=kIOReturnSuccess)return result;
+    oob_refs_[0]=oob_refs_[1]=0;
+    __atomic_store_n(&info_pending_,0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&ao_pending_,0u,__ATOMIC_RELEASE);
+    ++report_.force_offs;
+    return kIOReturnSuccess;
 }
 
 /* --- slumber, GMU side (ARCHITECTURE 4.17 P1) ---------------------------------------------------------------------- */

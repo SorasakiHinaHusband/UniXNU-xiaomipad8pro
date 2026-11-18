@@ -168,6 +168,7 @@ public:
      * bus 1..ddr_levels-1 or 0xFF; level 0 is refused (XO); nothing is sent when both are unchanged. While the HFI is
      * not started (slumber) the vote is only remembered (pending()) and kIOReturnSuccess returned. Without AB the bw word
      * is bus | 0xFFFF0000 (design) or the bus alone (annibale, K/adreno8_hfi.c:553,658: {1, level, bus}). */
+    IOReturn confirmThermalExit(bool dropAck); // always exchange a new runtime 160 MHz / bus 2 vote
     IOReturn perfVote(uint8_t level,uint8_t bus);
     IOReturn perfVote(uint8_t level,uint8_t bus,uint32_t ab_kbps);   /* ab_kbps: A830HfiNoAb = no AB vote */
     /* The same with the bw word built by the caller (A830Dcvs: A830Votes::bwWord): bits [7:0] the bus level (out of range =
@@ -216,13 +217,13 @@ private:
     enum Outcome {Continue,Matched,Fatal};
 
     IOReturn transact(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,unsigned message,
-                      bool tolerate);
+                      bool tolerate,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);
     IOReturn exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,unsigned message,
-                      bool tolerate,bool *pushed);   /* transact without the annibale late drain */
+                      bool tolerate,bool *pushed,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);   /* transact without the annibale late drain */
     uint32_t drainLateLocked(uint32_t microseconds);
     IOReturn startLocked(const A830VoteTables &tables,const A830HfiStartOptions &options);
     IOReturn acdLocked(const A830VoteTables &tables);
-    IOReturn perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message);
+    IOReturn perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);
     IOReturn voteLocked(uint8_t level,uint32_t bw);   /* perfVote/perfVoteBw: pending while stopped, checks, unchanged */
     IOReturn push(uint32_t header,const uint32_t *payload,uint32_t dwords);
     int pop(unsigned queue,Message *message);          /* 1 message, 0 empty, -1 corrupt */

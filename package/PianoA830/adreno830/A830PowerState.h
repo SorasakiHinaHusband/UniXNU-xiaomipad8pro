@@ -250,12 +250,13 @@ public:
         if(qualificationLatched() && level>3) {level=3;bus=3;}
         __atomic_store_n(&qualificationCap_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);
     }
-    void latchQualification() {__atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);setQualificationCeiling(3,3);}
+    void latchQualification() {__atomic_store_n(&qualificationSticky_,true,__ATOMIC_RELEASE);}
+    void holdQualificationLow(bool hold) {__atomic_store_n(&qualificationLow_,hold,__ATOMIC_RELEASE);}
     bool qualificationLatched() const {return __atomic_load_n(&qualificationSticky_,__ATOMIC_ACQUIRE);}
     void setQualificationExternal(uint8_t level,uint8_t bus) {__atomic_store_n(&qualificationExternal_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);}
     void qualificationGuard(void (*check)(void *,uint64_t),void *context) {qualificationCheck_=check;qualificationContext_=context;}
-    void blockQualification(bool block) {if(qualificationCheck_)__atomic_store_n(&qualificationBlocked_,block,__ATOMIC_RELEASE);}
-    bool qualificationBlocked() const {return __atomic_load_n(&qualificationBlocked_,__ATOMIC_ACQUIRE);}
+    void blockQualification(bool block) {if(qualificationCheck_)__atomic_store_n(&qualificationBlocked_,block,__ATOMIC_SEQ_CST);}
+    bool qualificationBlocked() const {return __atomic_load_n(&qualificationBlocked_,__ATOMIC_SEQ_CST);}
     void parkQualification() {__atomic_store_n(&qualificationParked_,true,__ATOMIC_RELEASE);}
     uint8_t qualificationCap() const {return uint8_t(__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE));}
     uint8_t qualificationEffectiveCap() {uint8_t level=7,bus=6;limitQualification(level,bus);return level;}
@@ -263,10 +264,12 @@ public:
     void setQualificationLease(uint64_t until) {__atomic_store_n(&qualificationLease_,until,__ATOMIC_RELEASE);}
     void limitQualification(uint8_t &level,uint8_t &bus) {
         checkQualification();
-        if(__atomic_load_n(&qualificationParked_,__ATOMIC_ACQUIRE)) {level=1;bus=2;}
+        if(__atomic_load_n(&qualificationParked_,__ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&qualificationLow_,__ATOMIC_ACQUIRE)) {level=1;bus=2;return;}
         const uint32_t cap=__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE);
-        if(qualificationLatched() && level>3) {level=3;bus=3;}
+        if(qualificationLatched() && (level>3 || bus>3)) {if(level>3)level=3;if(bus>3)bus=3;}
         if((cap&255u) && level>(cap&255u)) {level=uint8_t(cap);bus=uint8_t(cap>>8);}
+        if(uint8_t(cap)==1 && bus>2)bus=2;
         const uint32_t ext=__atomic_load_n(&qualificationExternal_,__ATOMIC_ACQUIRE);
         if(cap && (ext&255u) && level>(ext&255u)) {level=uint8_t(ext);bus=uint8_t(ext>>8);}
         if(cap && level>3) {
@@ -279,6 +282,7 @@ public:
 
     /* Recovery (A830Recovery, mutex held by the caller): Recovering drains the holders (config.drainUs); endRecovery
      * returns to Active (ok) or Lost; markLost is final. */
+    void pinQualificationWake() {qualificationLowAtWake_=true;} // power mutex held
     IOReturn beginRecovery();
     void endRecovery(bool ok,uint8_t level,uint8_t bus);
     void markLost();
@@ -350,7 +354,8 @@ private:
     uint32_t qualificationCap_=0;
     uint32_t qualificationExternal_=0;
     uint64_t qualificationLease_=0;
-    bool qualificationSticky_=false,qualificationParked_=false,qualificationBlocked_=false;
+    bool qualificationSticky_=false,qualificationParked_=false,qualificationBlocked_=false,qualificationLow_=false;
+    bool qualificationLowAtWake_=false;
     uint8_t votedLevel_=0,votedBus_=0,slumberMode_=A830SlumberOff;
     bool cxOn_=true,cxLost_=false,cxRestored_=false,rsccSlept_=false,ifpcActive_=false,ifpcWanted_=false,touchPending_=false;
     bool initialized_=false;

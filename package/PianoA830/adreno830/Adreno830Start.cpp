@@ -190,6 +190,7 @@ A830Qualification gQualification;
 bool gQualificationEnabled=false;
 uint64_t gQualificationInjectAt=0;
 bool gQualificationInjectionScheduled=false;
+uint32_t gQualificationExitTest=0;
 bool qualificationMode(const Adreno830Board *b) {return b && b->knobs.maxlevel==7 && b->knobs.dcvs_max_mhz==607;}
 void qualLog(const char *format,...) __attribute__((format(printf,1,2)));
 void qualLog(const char *format,...) {
@@ -2022,6 +2023,7 @@ IOReturn stageFence(Adreno830Device *d,Adreno830Failure *f)
     /* annibale with pagani-gpu-irq=1: its hw_init masks every RBBM interrupt; A830Irq unmasks the fence one itself while 332
      * is attached (after the attach below, again after every re-initialization of the device side). */
     irq.own_mask=adreno830_annibale() && b->knobs.irq?uint32_t(A830_INT_MASK_FENCE_ONLY):0u;
+    irq.softwareFaultSnapshot=b->qualification_r3b==1;
     IOReturn r=d->irq.start(irq);
     if(r!=kIOReturnSuccess)return refuse(f,A830S8StepStart,A830ReasonNoMemory,0,r,0,r);
 #ifdef ADRENO830_MACOS
@@ -2193,11 +2195,31 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
     g830.irq.setIfpc(args->ifpc);
     return scope.end(kIOReturnSuccess);
 }
+bool qualificationCxAccessible()
+{
+    uint32_t gdsc=0,ahb=0,clock=0;
+    return g830.power_state.cxOn() && mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc) &&
+        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GDS_HW_CTRL,&gdsc) && gdsc!=UINT32_MAX &&
+        (gdsc&SM8750_GDSC_PWR_ON) &&
+        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_AHB_CBCR,&ahb) && ahb!=UINT32_MAX &&
+        (ahb&SM8750_CBCR_ENABLE) &&
+        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GMU_CBCR,&clock) && clock!=UINT32_MAX &&
+        (!(clock&SM8750_CBCR_CLK_OFF) || SM8750_CBCR_NOC_FSM_STATUS(clock)==SM8750_CBCR_NOC_FSM_ON);
+}
+
 IOReturn opGmuForceOff(void *)
 {
     TraceScope scope("gmuForceOff");
-    const IOReturn r=g830.gmu.forceOff(gQualificationEnabled);
-    g830.hfi.stop();
+    IOReturn r;
+    if(gQualification.r3b()) {
+        r=qualificationCxAccessible()?g830.gmu.forceOffStrict(A830GmuGxVoteStrict,&g830.gx_voter):kIOReturnNotReady;
+        const auto &f=g830.gmu.failure();
+        qualLog("R3b3 strict result=%x step=%u reg=%llx value=%llx want=%llx at-us=%llu",
+            unsigned(r),r==kIOReturnSuccess?0:f.step,f.reg,f.value,f.expect,nowUs());
+    } else {
+        r=g830.gmu.forceOff(gQualificationEnabled);
+        g830.hfi.stop();
+    }
     if(gQualificationEnabled)qualLog("R3a strict-off result=%x at-us=%llu elapsed-us=%llu",unsigned(r),nowUs(),
         nowUs()-gQualification.failedAt()/1000);
     return scope.end(r);
@@ -2205,7 +2227,7 @@ IOReturn opGmuForceOff(void *)
 IOReturn opRsccSleep(void *)
 {
     TraceScope scope("rsccSleep");
-    return scope.end(g830.gmu.rsccSleep());
+    return scope.end(g830.gmu.rsccSleep(gQualification.r3b()));
 }
 IOReturn opOobSet(void *) {uint32_t ack=0;return g830.gmu.oobSet(&ack);}
 void opOobClear(void *) {g830.gmu.oobClear();}
@@ -2308,6 +2330,37 @@ void ropSnapshot(void *,A830HangSnapshot *snapshot)
     native_adreno_note_hang_snapshot(snapshot);   /* UniXNU-piano: the snapshot on the console (NativeAdrenoPublish.cpp) */
 #endif
 }
+IOReturn ropQualificationLow(void *,bool drop)
+{
+    if(!qualificationCxAccessible())return kIOReturnNotReady;
+    const IOReturn result=g830.hfi.confirmThermalExit(drop);
+    const auto &h=g830.hfi.stats();
+    qualLog("R3b3 low vote result=%x level=%u bus=%u request=%08x ack=%08x drop=%08x dropped=%u at-us=%llu",
+        unsigned(result),h.last_level,h.last_bw,h.last_request,h.last_ack,h.drop_header,h.dropped_acks,nowUs());
+    return result;
+}
+IOReturn ropQualificationQuiesce(void *)
+{
+    // Qualification selects annibale: GMU AO and HFI device IRQs are masked, with no host handlers.
+    if(!adreno830_annibale())return kIOReturnUnsupported;
+    g830.hfi.stop();
+    const IOReturn irq=g830.irq.quiesceForRecovery();
+    if(irq!=kIOReturnSuccess)return irq;
+    for(unsigned waited=0;!g830.irq.recoveryUsersDrained();waited+=50) {
+        if(waited>=100000)return kIOReturnTimeout;
+        os().sleep_us(50);
+    }
+    return kIOReturnSuccess;
+}
+bool ropQualificationGxOff(void *)
+{
+    return qualificationCxAccessible() && g830.gmu.gxOffProven();
+}
+void ropQualificationStage(void *,const char *stage,IOReturn result)
+{
+    qualLog("R3b3 exit %s result=%x at-us=%llu sticky=%u voted=%u/%u",stage,unsigned(result),
+        nowUs(),g830.power_state.qualificationLatched(),g830.power_state.votedLevel(),g830.power_state.votedBus());
+}
 void powerFaultSink(void *,uint8_t cause,uint64_t detail) {g830.recovery.report(cause,detail);}
 /* The power state machine and the recovery, bound once (S8; started in S10). */
 void bindPower(Adreno830Device *d)
@@ -2322,7 +2375,8 @@ void bindPower(Adreno830Device *d)
     d->power_env={nullptr,envNowNs,envSleepUs,envDelayUs,envLock,envUnlock,envWait,envWake,envStartThread};
     d->power_ops={nullptr,opCxPowerOn,opCxPowerOff,opSmmuRestore,opCxTimerSeed,opGmuStart,opGmuForceOff,opRsccSleep,opOobSet,
                   opOobClear,opHfiSend,opCpStart,opSecureResume,opIrqEnable,opLastSubmitted,opRetired};
-    d->recovery_ops={nullptr,ropFailInflight,ropGate,ropFenceSignal,ropIrqRestore,ropReadPipe,ropSnapshot};
+    d->recovery_ops={nullptr,ropFailInflight,ropGate,ropFenceSignal,ropIrqRestore,ropReadPipe,ropSnapshot,
+                     ropQualificationLow,ropQualificationQuiesce,ropQualificationGxOff,ropQualificationStage};
     /* P0 by default (ARCHITECTURE 4.17): no slumber, no IFPC; the machine still owns the transitions the recovery runs.
      * pagani-gpu-slumber selects P1 (1: full collapse, 2: keeping CX), pagani-gpu-ifpc P2 and pagani-gpu-ahbto the CX_AHB
      * timeout detection of each GMU start (IMPLEMENTATION_PLAN M13 c, e, f). */
@@ -2574,7 +2628,22 @@ void qualificationThread(void *)
         if(gQualification.r3b())gQualification.sample(now,gpu); // raw exit before board lookup, filtering, logging or HFI
         piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
         const bool ok=adreno830_qualification_board(&board);
-        gQualification.tick(now,gpu,board,ok);
+        const auto test=__atomic_load_n(&gQualificationExitTest,__ATOMIC_ACQUIRE);
+        const bool cool=ok && board.version==PIANO_GPU_TEMPS_VERSION && board.valid==3 && !board.disabled &&
+            board.state==PIANO_BOARD_TEMPS_RUNNING && board.period_ms==5000 && board.age_ms[0]<=10000 && board.age_ms[1]<=10000 &&
+            board.milli_c[0]>=-40000 && board.milli_c[1]>=-40000 && board.milli_c[0]<62000 && board.milli_c[1]<37000 &&
+            gpu.valid==255 && gpu.max_deci>=-400 && gpu.max_deci<800 && !gQualification.high() &&
+            g830.power_state.phase()==A830PowerActive && !g830.recovery.pending() && !g830.recovery.busy();
+        const bool injectTrip=test==3 && cool && !gQualification.reason() && g830.power_state.votedLevel()==3;
+        if(test==3 || test==4) {
+            const bool injectDrop=test==4 && cool && gQualification.reason()==A830QualBoardHot &&
+                g830.recovery.qualificationLowConfirmed();
+            if(injectDrop)g830.recovery.requestQualificationLow(A830QualBoardHot,now,true);
+            qualLog("R3b3 inject command=%u accepted=%u raw=%d msm=%d quiet=%d at-us=%llu",
+                test,injectTrip || injectDrop,gpu.max_deci,board.milli_c[0],board.milli_c[1],now/1000);
+            __atomic_store_n(&gQualificationExitTest,test-2,__ATOMIC_RELEASE);
+        }
+        gQualification.tick(now,gpu,board,ok,injectTrip);
         if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr);
         const bool event=gQualification.r3b() && (gQualification.thermal().events || gQualification.reason()!=lastReason);
         if(event) {
@@ -2626,10 +2695,14 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
     A830DcvsConfig config;
     config.qualification607=qualificationMode(b);
     config.qualificationR3b=b->qualification_r3b==1;
+    if(b->qualification_exit_test && (!config.qualificationR3b || b->qualification_exit_test!=1))
+        return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_exit_test,1,kIOReturnBadArgument);
     if(b->qualification_r3b && (!config.qualification607 || b->qualification_r3b!=1))
         return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_r3b,1,kIOReturnBadArgument);
     config.governor=b->knobs.dcvs!=0;
-    config.minMhz=b->knobs.dcvs_min_mhz;config.maxMhz=b->knobs.dcvs_max_mhz;
+    // Use the 342 MHz control without a load generator; thermal and sticky limits still apply.
+    config.minMhz=b->qualification_exit_test?342:b->knobs.dcvs_min_mhz;
+    config.maxMhz=b->knobs.dcvs_max_mhz;
     config.maxGiven=(b->flags&(1u<<Adreno830KnobDcvsMax))!=0;
     config.maxLevel=uint8_t(b->knobs.maxlevel);   /* pagani-gpu-maxlevel: the ceiling level (S0 checked <= 16) */
     config.thermalTargetDeci=int32_t(b->knobs.ttarget)*10;   /* pagani-gpu-ttarget (S0 checked 50..100 C) */
@@ -2934,7 +3007,7 @@ extern "C" void adreno830_start_reset(void)
     g830.~Adreno830Device();
     new (&g830) Adreno830Device();
     gQualification=A830Qualification{};gQualificationEnabled=false;
-    gQualificationInjectAt=0;gQualificationInjectionScheduled=false;
+    gQualificationInjectAt=0;gQualificationInjectionScheduled=false;gQualificationExitTest=0;
 #ifdef ADRENO830_MACOS
     gSaved=SuspendSaved{};   /* UniXNU-piano */
 #endif
@@ -2946,10 +3019,11 @@ void adreno830_set_os(const Adreno830Os *table) {osTable=table;}
 Adreno830Device *adreno830_device_for_test(void) {return &g830;}
 #endif
 
-// Board sysctl: read flags (enabled/ready/high/sticky, then reason in bits 8+); write 1=one permit, 2=one dropped ACK.
+// Flags: enabled/ready/high/sticky, then reason in bits 8+. Commands 3/4 need the R3b exit-test boot arg.
 extern "C" int adreno830_qual607_control(int command)
 {
     if(!gQualificationEnabled)return -1;
+    if((command==1 || command==2) && g830.board->qualification_exit_test)return -2;
     if(command==1) {if(!gQualification.arm())return -2;qualLog("R3a permit requested");}
     else if(command==2) {
         if(!gQualification.high() || g830.power_state.votedLevel()<=3 ||
@@ -2958,6 +3032,11 @@ extern "C" int adreno830_qual607_control(int command)
         const uint64_t at=gQualification.openedAt()+600000000000ull;
         __atomic_store_n(&gQualificationInjectAt,at,__ATOMIC_RELEASE);
         qualLog("R3a injection scheduled for-us=%llu",at/1000);
+    } else if(command==3 || command==4) {
+        if(!g830.board->qualification_exit_test)return -2;
+        uint32_t expected=uint32_t(command-3);
+        if(!__atomic_compare_exchange_n(&gQualificationExitTest,&expected,uint32_t(command),false,
+                                       __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return -2;
     } else if(command!=0)return -2;
     return 1|(gQualification.ready()?2:0)|(gQualification.high()?4:0)|(g830.power_state.qualificationLatched()?8:0)|int(gQualification.reason()<<8);
 }

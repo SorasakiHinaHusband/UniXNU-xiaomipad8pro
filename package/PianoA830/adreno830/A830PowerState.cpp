@@ -64,7 +64,7 @@ IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &i
     qualificationCap_=0;
     qualificationExternal_=0;
     qualificationLease_=0;
-    qualificationSticky_=false;qualificationParked_=false;qualificationBlocked_=false;
+    qualificationSticky_=false;qualificationParked_=false;qualificationBlocked_=false;qualificationLow_=false;qualificationLowAtWake_=false;
     submitLevel_=submitBus_=touchLevel_=touchBus_=0;
     initialized_=true;
     return kIOReturnSuccess;
@@ -370,7 +370,9 @@ IOReturn A830PowerState::enterLocked(uint8_t mode,uint64_t now)
         }
     /* S5: stop the busy counter, PREPARE_SLUMBER at the default level, fence to ALLOW, keep GEMNOC out of collapse. */
     wr(A830PowerWinGmu,gmuReg(A8XX_GMUCX_POWER_COUNTER_ENABLE),0);
-    const uint32_t prepare[2]={uint32_t(config_.defaultBus)|A830_HFI_BW_NO_AB,config_.defaultLevel};
+    uint8_t prepareLevel=config_.defaultLevel,prepareBus=config_.defaultBus;
+    limitQualification(prepareLevel,prepareBus);
+    const uint32_t prepare[2]={uint32_t(prepareBus)|A830_HFI_BW_NO_AB,prepareLevel};
     result=ops_.hfiSend(ops_.context,A830_HFI_H2F_PREPARE_SLUMBER,prepare,2);
     wr(A830PowerWinGmu,gmuReg(A8XX_GMUAO_AHB_FENCE_CTRL),A830_AHB_FENCE_CTRL_ALLOW);
     wr(A830PowerWinGmu,gmuReg(A8XX_GMUCX_CX_FALNEXT_INTF),A830_GMU_CX_FAL_VETO);
@@ -464,9 +466,15 @@ IOReturn A830PowerState::bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t
     if(!ops_.gmuStart || !ops_.cpStart || !ops_.secureResume)return kIOReturnUnsupported;
     /* cxLost stays set until a GMU start succeeds: every attempt after a collapse reloads the whole firmware. */
     limitQualification(level,bus);
+    const bool requireLow=__atomic_load_n(&qualificationLow_,__ATOMIC_ACQUIRE) && level==1 && bus==2;
     const A830GmuStartArgs args={level,bus,ifpcWanted_,rsccSlept_,cxLost_,&level,&bus};
     result=ops_.gmuStart(ops_.context,&args,subStep);
     if(result!=kIOReturnSuccess)return result;
+    if(requireLow && (level!=1 || bus!=2))return kIOReturnIOError;
+    if(qualificationLowAtWake_ && level==1 && bus==2) {
+        qualificationLowAtWake_=false;
+        holdQualificationLow(false);
+    }
     rsccSlept_=false;cxLost_=false;cxRestored_=false;
     __atomic_store_n(&ifpcActive_,ifpcWanted_,__ATOMIC_RELEASE);
     at(A830WakeStepCp);
@@ -493,7 +501,7 @@ IOReturn A830PowerState::wakeLocked(A830WakeReason reason)
 {
     const A830PowerPhase current=phase();
     if(current==A830PowerActive)return kIOReturnSuccess;
-    if(current!=A830PowerSlumber)return A830ReturnNotResponding;
+    if(current!=A830PowerSlumber || qualificationBlocked())return A830ReturnNotResponding;
 #ifdef ADRENO830_MACOS
     if(suspended() && reason!=A830WakeSuspend)return A830ReturnNotResponding;   /* UniXNU-piano: the suspend gate */
 #endif

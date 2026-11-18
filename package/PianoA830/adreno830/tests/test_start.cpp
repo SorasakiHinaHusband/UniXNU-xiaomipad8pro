@@ -697,7 +697,10 @@ IOReturn A830Gmu::attachInterrupts(const A830GmuIrqOps &ops)
     return hit("A830Gmu::attachInterrupts");
 }
 IOReturn A830Gmu::reenableInterrupts() {return hit("A830Gmu::reenableInterrupts");}
-IOReturn A830Gmu::rsccSleep() {return hit("A830Gmu::rsccSleep");}
+bool A830Gmu::gxOffProven() {return true;}
+int A830GmuGxVoteStrict(void *,int) {return 0;}
+IOReturn A830Gmu::forceOffStrict(int (*)(void *,int),void *) {return hit("A830Gmu::forceOffStrict");}
+IOReturn A830Gmu::rsccSleep(bool) {return hit("A830Gmu::rsccSleep");}
 IOReturn A830Gmu::pollFatal() {return hit("A830Gmu::pollFatal");}
 void A830Gmu::gmuWork() {}
 void A830Hfi::setIo(const A830HfiIo &io) {CHECK(io.read && io.write && io.sleep && io.now && io.lock && io.unlock);io_=io;}
@@ -735,6 +738,7 @@ IOReturn A830Hfi::start(const A830VoteTables &tables,const A830HfiStartOptions &
 }
 IOReturn A830Hfi::sendStart() {status_[A830HfiM8Start]=0;return hit("A830Hfi::sendStart");}
 IOReturn A830Hfi::send(uint8_t,const uint32_t *,uint8_t,A830HfiAck *) {return hit("A830Hfi::send");}
+IOReturn A830Hfi::confirmThermalExit(bool) {return hit("A830Hfi::confirmThermalExit");}
 IOReturn A830Hfi::perfVote(uint8_t level,uint8_t bus) {level_=level;bus_=bus;return hit("A830Hfi::perfVote");}
 IOReturn A830Hfi::perfVote(uint8_t level,uint8_t bus,uint32_t) {level_=level;bus_=bus;return hit("A830Hfi::perfVote(ab)");}
 IOReturn A830Hfi::drainDebug() {return hit("A830Hfi::drainDebug");}
@@ -873,6 +877,7 @@ IOReturn A830Irq::start(const A830IrqConfig &config)
     return hit("A830Irq::start");
 }
 IOReturn A830Irq::attachCxHost(uint32_t intid) {CHECK(intid==112);hit("A830Irq::attachCxHost");return kIOReturnSuccess;}
+IOReturn A830Irq::quiesceForRecovery() {return hit("A830Irq::quiesceForRecovery");}
 IOReturn A830Irq::quiesce(bool) {return hit("A830Irq::quiesce");}
 IOReturn A830Irq::restore() {return hit("A830Irq::restore");}
 IOReturn A830IrqGuard::resume() {return kIOReturnSuccess;}
@@ -1050,7 +1055,8 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
     recoveryOps=ops;
     return hit("A830Recovery::init");
 }
-void A830Recovery::closeQualification() {}
+void A830Recovery::closeQualification(uint8_t) {}
+void A830Recovery::requestQualificationLow(uint32_t,uint64_t,bool) {}
 int Sm8750TsensReadGpu(const Sm8750TsensIo *,Sm8750TsensSample *out) {*out={};return Sm8750TsensNoData;}
 static bool reportPends;   /* UniXNU-piano: a report leaves the recovery pending (A830Recovery::pending), as the real one does */
 void A830Recovery::report(uint8_t cause,uint64_t)

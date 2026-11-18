@@ -124,7 +124,7 @@ static int qual607Sysctl(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
   int value=adreno830_qual607_control(0);
   const int err=sysctl_handle_int(oidp,&value,0,req);
   if(err || !req->newptr)return err;
-  if(value!=1 && value!=2)return EINVAL;
+  if(value<1 || value>4)return EINVAL;
   return adreno830_qual607_control(value)<0?EAGAIN:0;
 }
 static void registerQual607(bool record) {
@@ -132,7 +132,7 @@ static void registerQual607(bool record) {
   gQual607Oid.oid_parent=&sysctl__machdep_children;gQual607Oid.oid_number=OID_AUTO;
   gQual607Oid.oid_kind=int(CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED|CTLFLAG_OID2);
   gQual607Oid.oid_name="piano_gpu_qual607";gQual607Oid.oid_handler=qual607Sysctl;gQual607Oid.oid_fmt="I";
-  gQual607Oid.oid_descr="R3a qualification flags; write 1 permit, 2 one queued ACK loss";
+  gQual607Oid.oid_descr="GPU qualification flags; commands 3 and 4 require the R3b exit test";
   gQual607Oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQual607Oid);
   if(record) {
     gQualLog=static_cast<QualLog *>(IOMallocZero(sizeof(QualLog)));gQualLogLock=IOSimpleLockAlloc();

@@ -4,8 +4,15 @@
 #include "test_a830qualification.cpp"
 #undef main
 static uint64_t snapshot(void *) {return qual.thermalSnapshot();}
+static IOReturn lowVote(void *,bool drop) {
+    CHECK(gEnv.locked && power.qualificationBlocked() && power.qualificationEffectiveCap()==1);
+    return gOps.hit(drop?"dropLow":"confirmLow");
+}
+static IOReturn quiesce(void *) {CHECK(gEnv.locked);return gOps.hit("strictQuiesce");}
 static void bootB() {
-    dcvs=A830Dcvs{};boot();qual=A830Qualification{};qual.init(&power,&recovery,true,halt);
+    A830RecoveryOps ops=gRecoveryOps;ops.qualificationLowVote=lowVote;ops.qualificationQuiesce=quiesce;
+    ops.qualificationGxOff=[](void *) {return true;};
+    dcvs=A830Dcvs{};boot(ops);qual=A830Qualification{};qual.init(&power,&recovery,true,halt);
     A830DcvsConfig c;c.qualification607=true;c.qualificationR3b=true;c.maxLevel=7;c.maxMhz=607;c.maxGiven=true;
     c.initialLevel=1;c.initialBus=2;A830DcvsOps o=gDcvsOps;
     o.qualificationFault=voteFault;o.qualificationService=lease;o.qualificationSample=sample;o.qualificationThermal=snapshot;
@@ -49,7 +56,7 @@ static void pureBoundaries() {
     bootB();openB();gEnv.now+=250000000;qual.checkLease(gEnv.now);CHECK(!qual.reason());
     uint8_t l=7,bus=6;power.limitQualification(l,bus);CHECK(!qual.reason() && !power.qualificationLatched());
     ++gEnv.now;power.setTarget(11,10);CHECK(qual.reason()==A830QualSensor && recovery.pending() && power.targetLevel()==1);
-    CHECK(gOps.gates.back()==A830GateRecovering); // expired lease closes ring even without service
+    CHECK(power.qualificationBlocked() && gOps.gates.empty()); // retry submissions until the service verifies the ACK
     bootB();openB();gEnv.now+=251000000;tickB();CHECK(qual.reason()==A830QualSensor && !qual.high());
     bootB();openB();gEnv.now+=251000000;CHECK(power.acquire()!=0);CHECK(recovery.pending());
     bootB();raw=Sm8750TsensValidBit|850;qual.sample(gEnv.now,gpu());
@@ -143,7 +150,11 @@ static void failuresB() {
     }
     bootB();openB();qual.fault(A830QualSensor,gEnv.now);gEnv.now+=5000000000ull;qual.tick(gEnv.now,gpu(),board(100),true);CHECK(unsafe==1);
 }
-int main() {
+#ifndef A830_R3B_ENTRY
+#define A830_R3B_ENTRY main
+#endif
+int A830_R3B_ENTRY() {
     pureBoundaries();stepsAndBoard();failuresB();
     std::printf("PASS: R3b real policy/DCVS/power/recovery boundaries, thermal/board dwell, stale250/251, strict off/low M9/late ACK, independent105 halt, external/boost/wake/park (%u checks)\n",gChecks);
+    return 0;
 }
