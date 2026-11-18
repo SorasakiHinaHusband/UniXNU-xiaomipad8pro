@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <algorithm>
 #include <CommonCrypto/CommonDigest.h>
 #include "VideoSession.h"
 #include "VideoArena.h"
@@ -515,6 +516,10 @@ static void hevcProtocolTests() {
     Peer p;p.hevc=true;p.depth=depth;p.hevcPicture=kind;p.firmwareMinimum=6;
     CHECK(p.hg.configure(320,256,depth));
     Layout layout;CHECK(layout.initHevc(320,256,depth));SelfTest<Peer> tx(p,layout);
+    for(unsigned i=0;i<layout.maxN();++i) {
+      const auto &raw=*layout.find(Raw,i);
+      std::fill(p.arena.begin()+raw.off,p.arena.begin()+raw.off+raw.capacity,0x5c);
+    }
     tx.streaming=true;tx.activeWidth=320;tx.activeHeight=256;tx.expectedDepth=depth;
     tx.expectedProfile=depth==10?2:0;tx.expectedLevel=4;tx.expectedTier=0;
     tx.psc.resolution=0x01400100;tx.psc.depth=(depth<<16)|depth;tx.psc.profile=tx.expectedProfile;
@@ -525,6 +530,12 @@ static void hevcProtocolTests() {
     CHECK(tx.pump()==0 && tx.deadline==UINT64_MAX);
     CHECK(tx.nativeInput(0x5635abcd,kAccessUnit,sizeof kAccessUnit,kTimestamp));
     CHECK(tx.transaction()==0 && tx.pump()==0);
+    bool pristine=true;
+    for(unsigned i=0;i<layout.maxN();++i) {
+      const auto &raw=*layout.find(Raw,i);
+      for(unsigned j=0;j<raw.capacity;++j)pristine&=p.arena[raw.off+j]==0x5c;
+    }
+    CHECK(pristine); // this peer returns FBD metadata without writing pixels
     CHECK(tx.psc.n==6 && tx.psc.returned==0x7ae && tx.r.psc==1 && tx.r.decoded==1);
     CHECK(p.partial==0 && p.releaseCount==4 && p.dpbs==6 && p.raws.size()==6);
     CHECK(p.comvCounts==std::vector<uint32_t>({4,6}));

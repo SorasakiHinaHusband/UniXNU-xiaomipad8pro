@@ -122,6 +122,9 @@ public:
   uint32_t accessUnitBytes = sizeof kAccessUnit;
   bool checkGolden = true;
   bool streaming = false;
+  // The original single-picture ladder verifies a sentinel and dumps packets.
+  // Production frames use validated FBD ownership and retained binary history.
+  bool qualificationTrace() const { return !streaming || !layout.general; }
   uint32_t expectedPoc = 2, expectedProfile = 0, expectedLevel = 4;
   uint32_t expectedDepth = 8, expectedTier = 0;
   uint32_t activeWidth = 320, activeHeight = 240;
@@ -253,7 +256,10 @@ public:
       return fail(kErrHfi);
     hfi::begin(o.tx, systemOpen ? 0 : sessionId, o.ids);
     hfi::add(o.tx, type, flags, payload, data, words, o.ids, port);
-    o.hw.note("V4 TX stage %u session %08x header %u packet %u type %08x port %u flags %08x payload %u words %u", r.stage, o.tx[1], o.tx[2],
+    // Keep the reviewed OPB/output-START proof without formatting every command
+    // twice (property and packet); the complete packet still enters history.
+    if (qualificationTrace() || type == 0x03000184 || (type == Start && port == 2))
+      o.hw.note("V4 TX stage %u session %08x header %u packet %u type %08x port %u flags %08x payload %u words %u", r.stage, o.tx[1], o.tx[2],
               o.tx[13], type, port, flags, payload, words);
     if(streaming&&history)history->commands.add(o.tx,o.tx[0],o.hw.nowUs());
     const int rc = o.send(o.tx[0], "V4-session");
@@ -261,13 +267,13 @@ public:
   }
   int property(uint32_t id, uint32_t value, uint32_t port, uint32_t payload = 1)
   {
-    o.hw.note("V4 property %08x port %u payload %u value %08x", id, port, payload, value);
+    if (qualificationTrace()) o.hw.note("V4 property %08x port %u payload %u value %08x", id, port, payload, value);
     return tx(id, 0, port, payload, &value, 1);
   }
   int pair(uint32_t id, uint32_t a, uint32_t b, uint32_t port)
   {
     const uint32_t v[2] = {a, b};
-    o.hw.note("V4 property %08x port %u payload 13 values %08x/%08x", id, port, a, b);
+    if (qualificationTrace()) o.hw.note("V4 property %08x port %u payload 13 values %08x/%08x", id, port, a, b);
     return tx(id, 0, port, 13, v, 2);
   }
   int subscribe(unsigned port, bool properties)
@@ -411,7 +417,7 @@ public:
                                       : (type > 0x01000000 && type < 0x01ffffff);
         if (!kind)
           continue;
-        o.hw.note("V4 RX pass %u stage %u session %08x header %u packet %u type %08x port %u flags %08x bytes %u", pass, r.stage, b[1],
+        if (qualificationTrace()) o.hw.note("V4 RX pass %u stage %u session %08x header %u packet %u type %08x port %u flags %08x bytes %u", pass, r.stage, b[1],
                   b[2], p[5], type, port, flags, p[0]);
         if (pass == 1) {
           if (type == 0x06000001 || type == 0x06000002 || type == 0x06000004) {
@@ -812,6 +818,10 @@ public:
         return r.error;
     for (unsigned i = 0; i < count; ++i) {
       Buffer &b = *layout.find(Raw, i);
+      // General native output never checked the diagnostic sentinel. Firmware
+      // owns and writes RAW after queueing; do not overwrite it just to discard
+      // the check. Preserve the barrier and the exact descriptor/queue order.
+      if (streaming && layout.general) { o.hw.barrier(); if (buffer(b)) return r.error; continue; }
       for (unsigned j = 0; j < layout.rawBytes(); ++j)
         o.dma.arena[b.off + j] = 0xa5;
       char hash[65];

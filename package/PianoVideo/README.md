@@ -7,6 +7,11 @@ V5c is tablet-confirmed: one actual caller AU traverses VT and Iris into an IOSu
 V7e/V8 are tablet-qualified in stock QuickTime for the owned Main320×240 and High1920×1080 AVC fixtures: 60 native/client frames, zero dropped, optical motion confirmed. V9 adds bounded HEVC Main/Main10 and P010 for qualification; its firmware and playback behaviour remain unqualified.
 `piano-video=6 piano-video-vt=1` publishes the bounded AVC/HEVC qualification endpoint. Other levels do not publish a decoder inventory. 27.3's guest gate is a registry match for `AppleVideoToolboxParavirtualizationDriver` followed by `IOServiceOpen(type=0)` on `AppleVideoToolboxParavirtualizationUserClient`; it does not require `kern.hv_vmm_present`.
 
+General native streaming skips the legacy RAW sentinel fill and redundant per-packet text on its startup path. HFI packets,
+ownership checks, binary error histories and the OPB/output-START/PSC/FBD/publication evidence remain; the single-picture
+golden qualification keeps its sentinel and detailed trace. Synchronous session preparation still precedes readiness.
+First-input elapsed uptime is logged separately from console receipt time; optical startup parity remains unqualified.
+
 - `piano-video=1`: a read-only survey: GCC's four video branches first; VIDEO_CC only with GCC's video AHB on (PLL0, the core
   clock's RCG and dividers with the rate and the OPP it matches, both GDSCs, every branch); the core's controller registers
   (version, CTRL_INIT/CTRL_STATUS, queue table, UC region, interrupt, LPI and power-status words) only with the controller GDSC

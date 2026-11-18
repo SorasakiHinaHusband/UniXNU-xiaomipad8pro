@@ -186,6 +186,19 @@ class Bringup {
   // Bounds checked before indexing even for a malformed RX; called before the response parser.
   void packetTrace(const char *direction, unsigned seq, const uint32_t *buf, uint32_t bytes)
   {
+    // Native sessions retain binary TX/RX history and parsed error evidence.
+    // The ladder's duplicate packet dump must not serialize first-picture work.
+    if (opt.level == 6 && bytes >= kHfiHeaderBytes && !(bytes & 3) && buf[0] == bytes &&
+        buf[7] && buf[7] <= (bytes-kHfiHeaderBytes)/kHfiPacketBytes) {
+      uint32_t at=kHfiHeaderBytes;
+      unsigned n=0;
+      for (;n<buf[7] && at<=bytes && bytes-at>=kHfiPacketBytes;++n) {
+        const uint32_t size=buf[at/4];
+        if (size<kHfiPacketBytes || (size&3) || size>bytes-at) break;
+        at+=size;
+      }
+      if (n==buf[7] && at==bytes) return; // malformed diagnostics still get the original dump
+    }
     if (bytes < kHfiHeaderBytes) {
       hw.note("V3 %s %u short header bytes %u word0 %08x", direction, seq, bytes, bytes >= 4 ? buf[0] : 0);
       return;
@@ -631,7 +644,8 @@ class Bringup {
   void ring()
   {
     ops.wr(kIris + kCpuIcSoftInt, kSoftIntH2a, "IC_SOFTINT: doorbell");
-    hw.note("V3 doorbell %u tx %u cmd read %u write %u", ++doorbells, txEvents,
+    ++doorbells;
+    if (opt.level != 6) hw.note("V3 doorbell %u tx %u cmd read %u write %u", doorbells, txEvents,
             mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead), mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQWrite));
   }
   int send(uint32_t bytes, const char *what)
@@ -640,8 +654,10 @@ class Bringup {
     const uint32_t h = hfi::qhdr(hfi::kCmdq), beforeR = mem.ld(h + hfi::kQRead), beforeW = mem.ld(h + hfi::kQWrite);
     packetTrace("TX", seq, tx, bytes);
     const int rc = hfi::write(mem, hfi::kCmdq, tx, bytes, [this] { hw.barrier(); });
-    hw.note("hfi: %s: %u bytes, header %u, %u packet(s)%s", what, bytes, tx[2], tx[7], rc ? ": the command queue has no room" : "");
-    hw.note("V3 TX %u %s result %d cmd read %u->%u write %u->%u", seq, what, rc, beforeR, mem.ld(h + hfi::kQRead), beforeW, mem.ld(h + hfi::kQWrite));
+    if (opt.level != 6 || rc) {
+      hw.note("hfi: %s: %u bytes, header %u, %u packet(s)%s", what, bytes, tx[2], tx[7], rc ? ": the command queue has no room" : "");
+      hw.note("V3 TX %u %s result %d cmd read %u->%u write %u->%u", seq, what, rc, beforeR, mem.ld(h + hfi::kQRead), beforeW, mem.ld(h + hfi::kQWrite));
+    }
     if (rc) return kErrHfi;
     ring();
     return kOk;

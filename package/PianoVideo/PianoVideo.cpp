@@ -864,7 +864,11 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
   int rc=0;
   if(!owner->tx.r.etb){
     if(!picture.idr || !owner->tx.nativeInput(sid,bytes,size,token))return -22;
+    const uint64_t inputUs=nowUs();
     rc=owner->tx.transaction();
+    note("V9j3 native first-input session %08x status %d elapsed-us %llu output-ready %u qualification-trace %u uptime-us %llu",
+         sid,rc,(unsigned long long)(nowUs()-inputUs),unsigned(owner->tx.rawStarted),unsigned(owner->tx.qualificationTrace()),
+         (unsigned long long)nowUs());
     if(!rc){IOLockLock(gNativeLock);gNativeState.start(sid);IOLockUnlock(gNativeLock);}
     if(rc){owner->error=rc;nativeSnapshot(*owner,false);}
   }else rc=owner->tx.streamSubmit(bytes,size,token);

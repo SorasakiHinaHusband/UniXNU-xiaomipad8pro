@@ -8,6 +8,7 @@
 #include <cstring>
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <string>
 #include <CommonCrypto/CommonDigest.h>
 #include "VideoSession.h"
@@ -52,6 +53,7 @@ struct Peer {
   std::vector<Words> releasePending;
   std::vector<uint32_t> headers,packets,comvCounts,comvSizes;
   uint32_t sid=0;
+  std::vector<Words> wire;
   unsigned n=4,etbs=0,ftbs=0,dpbs=0,opens=0,closes=0,stops=0,drains=0;
   unsigned settingsResume=0,drainInputResume=0,drainRawResume=0;
   uint32_t pscPoc=0,pscProfile=2,pscLevel=4;
@@ -111,6 +113,7 @@ struct Peer {
     uint32_t data[hfi::kBufferWords],got=0;
     CHECK(hfi::read(mem,hfi::kCmdq,data,sizeof data,&got,[]{})==0);
     CHECK(got==bytes&&data[7]==1);
+    wire.emplace_back(data,data+got/4);
     const auto *p=data+8;const auto type=p[1],flags=p[2],port=p[4],payload=p[3];
     headers.push_back(data[2]);packets.push_back(p[5]);
     if(type==Open){CHECK(data[1]==0&&flags==3&&payload==1);sid=p[8];++opens;return 0;}
@@ -192,6 +195,37 @@ static void preparedInputTests() {
       const auto commands=f.peer.headers.size();
       CHECK(f.tx.shutdown(true)==error && f.peer.headers.size()==commands);
     }
+  }
+}
+static void productionWorkTests() {
+  // General native buffers are firmware outputs, not CPU sentinel fixtures.
+  // Poison their backing independently of the decoder and inspect every slot
+  // before any modeled FBD; this catches hidden writes as well as wrong extents.
+  Fixture f;CHECK(f.layout.init(320,240) && f.layout.general);
+  std::fill(f.peer.arena.begin(),f.peer.arena.end(),0x3c);
+  diagnostic::History history;f.tx.history=&history;
+  f.start();
+  bool pristine=true;
+  for(unsigned i=0;i<f.layout.maxN();++i) {
+    const auto &raw=*f.layout.find(Raw,i);
+    for(unsigned j=0;j<raw.capacity;++j)pristine&=f.peer.arena[raw.off+j]==0x3c;
+  }
+  CHECK(pristine);
+  CHECK(history.commands.total==f.peer.headers.size());
+  CHECK(f.peer.hw.log.find("V4 TX stage 5 ")!=std::string::npos);
+  CHECK(f.peer.hw.log.find("V4 TX stage 6 ")!=std::string::npos);
+  CHECK(f.peer.hw.log.find("V4 property ")==std::string::npos);
+  // FBD ownership, retained TX/RX evidence, publication loan and STOP/CLOSE
+  // must remain real after removing the unrelated diagnostic writes/text.
+  f.peer.output(0x100000001ull);f.pump();
+  SelfTest<Peer>::OutputFrame frame;CHECK(f.tx.popOutput(frame));
+  CHECK(frame.token==0x100000001ull && f.peer.arena[f.layout.find(Raw,frame.index)->off]==1);
+  CHECK(history.messages.total && f.tx.releaseOutput(frame.index,frame.token)==0);
+  f.close();
+  // Host-only packet evidence permits a byte-for-byte comparison with the
+  // previous implementation; no tablet or proprietary payload is involved.
+  if(std::getenv("VIDEO_PACKET_EVIDENCE"))for(const auto &p:f.peer.wire) {
+    std::printf("WIRE");for(auto w:p)std::printf(" %08x",w);std::putchar('\n');
   }
 }
 static void nativeCleanupFailureTests() {
@@ -605,7 +639,7 @@ static void passiveHardwareTests() {
   // Corrupt indices/size must never authorize an out-of-bounds pending-head read.
   m.mem.st(hfi::qhdr(0)+hfi::kQRead,size);diagnostic::Hardware bad;bad.capture(m);CHECK(!bad.headWords[0]);
 }
-int main() { preparedInputTests();nativeCleanupFailureTests();
+int main() { preparedInputTests();productionWorkTests();nativeCleanupFailureTests();
   stockReplyWindowTests();
   firstTimeoutObservationTests();passiveHardwareTests();
   ancillaryPictureTests();
