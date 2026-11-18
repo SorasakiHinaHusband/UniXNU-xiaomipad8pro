@@ -44,6 +44,8 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   context from UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12).
   0005-frontend-quartzcore-generic-texcoords.patch (MIT, ours: keep the generic QuartzCore vertex matrix bindings when Metal omits
   the two optional texcoord count constants; context from the same UniXNU-turnip revision).
+  0006-frontend-compiler-additional-arguments.patch (MIT, ours: preserve the additional compiler arguments supplied by Metal
+  clients, including Core Image's runtime-header definitions; context from the same UniXNU-turnip revision).
 Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is
   this repository's package/NativeSoftMetal/NativeSoftMetalPlugin.mm reporter (2026-11-11) with chaining to the process's own handlers.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a
