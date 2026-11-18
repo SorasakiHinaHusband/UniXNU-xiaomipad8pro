@@ -49,7 +49,10 @@ struct Nal { uint32_t type = 0, temporalId = 0; };
 inline bool header(const uint8_t *p, uint32_t n, Nal &v) {
   if (!p || n < 3 || (p[0] & 0x81) || (p[1] & 0xf8) || !(p[1] & 7)) return false;
   v.type = (p[0] >> 1) & 63; v.temporalId = (p[1] & 7) - 1;
-  if ((v.type >= 16 && v.type <= 23) || (v.type >= 32 && v.type <= 37))
+  // Temporal layer bounds for pictures are checked against SPS. Deployed hvc1
+  // streams can carry an IDR on a higher layer; do not erase that layer or
+  // confuse it with the zero temporal-id-plus1 encoding, which is invalid.
+  if (v.type >= 32 && v.type <= 37)
     if (v.temporalId) return false;
   return true;
 }
@@ -243,7 +246,8 @@ inline bool vui(Bits &b, Sps &s) {
 }
 inline bool sps(const uint8_t *p, uint32_t n, const Vps &v, Sps &s) {
   Nal h; if (n > MaxParameter || !ebsp(p, n) || !header(p, n, h) || h.type != 33) return false;
-  Bits b{p + 2, n - 2}; s = Sps{}; s.vpsId = b.read(4); s.subLayers = b.read(3) + 1; s.nested = b.read(1);
+  Bits b{p + 2, n - 2}; memset(&s, 0, sizeof(s)); s.color = 0x14000003;
+  s.vpsId = b.read(4); s.subLayers = b.read(3) + 1; s.nested = b.read(1);
   if (s.vpsId != v.id || s.subLayers != v.subLayers || s.nested != v.nested || !ptl(b, s.subLayers, s.pt) || !s.pt.same(v.pt)) return false;
   s.id = b.ue(15); if (b.ue() != 1) return false; // 4:2:0, no separate color plane
   s.codedWidth = b.ue(3840); s.codedHeight = b.ue(2176);
@@ -325,7 +329,9 @@ struct Config {
   uint32_t hfiTier() const { return s.pt.tier; }
 };
 inline bool config(const uint8_t *p, uint32_t n, Config &c) {
-  c = Config{};
+  // Clear the output in place: an aggregate assignment materializes another
+  // complete parameter/RPS store on the 16 KiB kernel stack with some compilers.
+  memset(&c, 0, sizeof(c)); c.s.color = 0x14000003;
   if (!p || n < 23 || n > 3 * MaxParameter + 38 || p[0] != 1 || (p[13] & 0xf0) != 0xf0 ||
       (p[15] & 0xfc) != 0xfc || (p[16] & 0xfc) != 0xfc || (p[17] & 0xf8) != 0xf8 ||
       (p[18] & 0xf8) != 0xf8 || (p[21] & 3) != 3 || p[22] != 3) return false;

@@ -18,10 +18,11 @@ struct Config {
   uint32_t pixelFormat() const { return depth == 10 ? 0x78343230u : 0x34323076u; } // x420 / 420v
 };
 inline bool parseAvc(const uint8_t *p, uint32_t n, Config &c) {
-  c = Config{}; if (!avc::config(p, n, c.avc)) return false; c.s = c.avc.s; return true;
+  memset(&c, 0, sizeof(c)); c.depth = 8;
+  if (!avc::config(p, n, c.avc)) return false; c.s = c.avc.s; return true;
 }
 inline bool parseHevc(const uint8_t *p, uint32_t n, Config &c) {
-  c = Config{}; c.hevcMode = true;
+  memset(&c, 0, sizeof(c)); c.hevcMode = true; c.depth = 8;
   if (!hevc::config(p, n, c.hevc)) return false;
   const hevc::Sps &s = c.hevc.s; c.depth = s.depth;
   c.s.id = s.id; c.s.width = s.width; c.s.height = s.height; c.s.codedWidth = s.codedWidth; c.s.codedHeight = s.codedHeight;
