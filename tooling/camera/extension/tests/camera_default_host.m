@@ -38,6 +38,17 @@ int main(void)
     assert([historyKey(@"com.apple.PhotoBooth") isEqual:@"camera-history/preferred-camera-history/com-apple-PhotoBooth"]);
     assert([historyKey(@"com.apple.QuickTimePlayerX") isEqual:@"camera-history/preferred-camera-history/com-apple-QuickTimePlayerX"]);
 
+    // Automatic login work requires Aqua; explicit SSH actions require the
+    // same non-root console UID and a proven GUI domain, not an Aqua manager.
+    assert(sessionAllowed(YES, 501, 501, 0, YES, NO));
+    assert(!sessionAllowed(YES, 501, 501, 501, NO, YES));
+    assert(sessionAllowed(NO, 501, 501, 501, NO, YES));
+    assert(!sessionAllowed(NO, 501, 501, 0, NO, YES));
+    assert(!sessionAllowed(NO, 501, 501, 502, YES, YES));
+    assert(!sessionAllowed(NO, 501, 501, 501, NO, NO));
+    assert(!sessionAllowed(NO, 0, 0, 0, YES, YES));
+    assert(!sessionAllowed(NO, 501, 0, 501, YES, YES));
+
     // No discovered front means no preference read or mutation.
     assert(!applyTargets(nil, YES, read, set) && reads == 0 && writes == 0);
     // nil is never inferred to be a genuinely absent history by automatic mode.
@@ -46,9 +57,11 @@ int main(void)
     assert(checkTargets(read));
     unsigned before = writes;
     assert(applyTargets(front, NO, read, set) && writes == before);
+    map = both(history(PIANO_FRONT_ID.lowercaseString));
+    assert(applyTargets(front, NO, read, set) && writes == before && checkTargets(read));
 
     // A current synthetic choice is replaceable. Older history may be retained by AVFoundation.
-    map = both(history(PIANO_PATTERN_ID));
+    map = both(history(PIANO_PATTERN_ID.lowercaseString));
     assert(applyTargets(front, NO, read, set) && writes == before + 2); before = writes;
     // A deliberate rear choice, including older history entries, survives automatic login policy.
     NSArray *rear = @[history(PIANO_REAR_ID)[0], history(PIANO_PATTERN_ID)[0]];
@@ -86,6 +99,6 @@ int main(void)
     assert(methodMatches(AVCaptureDevice.class, selection, "v", 2));
     assert(methodMatches(NSClassFromString(@"AVCaptureProprietaryDefaultsSingleton"),
         NSSelectorFromString(@"objectForKey:"), "@", 1));
-    puts("camera-default no-camera/typed-history/preservation/explicit-selection/readback/ABI PASS");
+    puts("camera-default session/no-camera/typed-history/preservation/explicit-selection/readback/ABI PASS");
   }
 }

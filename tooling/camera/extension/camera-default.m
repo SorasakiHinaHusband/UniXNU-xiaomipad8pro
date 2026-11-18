@@ -8,6 +8,7 @@
 #import <objc/runtime.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
 #import "Devices.h"
@@ -55,7 +56,8 @@ static BOOL validHistory(id value)
 
 static BOOL historyIsFront(id value)
 {
-  return validHistory(value) && [value count] && [value[0][@"DeviceUID"] isEqual:PIANO_FRONT_ID];
+  return validHistory(value) && [value count] &&
+      [value[0][@"DeviceUID"] caseInsensitiveCompare:PIANO_FRONT_ID] == NSOrderedSame;
 }
 
 static void report(NSString *domain, const char *action)
@@ -81,7 +83,7 @@ static BOOL applyTargets(id front, BOOL explicitSelection, PianoHistoryReader re
         report(domain, before ? "deferred-unknown-layout" : "deferred-unavailable-or-absent");
         complete = NO; continue;
       }
-      if ([before count] && ![before[0][@"DeviceUID"] isEqual:PIANO_PATTERN_ID]) {
+      if ([before count] && [before[0][@"DeviceUID"] caseInsensitiveCompare:PIANO_PATTERN_ID] != NSOrderedSame) {
         report(domain, "retained-real-choice"); continue;
       }
     }
@@ -103,19 +105,42 @@ static BOOL checkTargets(PianoHistoryReader read)
   return ready;
 }
 
-#ifndef PIANO_CAMERA_DEFAULT_HOST_TEST
-static BOOL aquaSession(void)
+static BOOL sessionAllowed(BOOL automatic, uid_t user, uid_t effectiveUser, uid_t consoleUser, BOOL aqua, BOOL gui)
 {
-  if (!getuid()) return NO;
-  NSTask *task = [NSTask new]; NSPipe *pipe = [NSPipe pipe];
+  if (!user || user != effectiveUser) return NO;
+  return automatic ? aqua : user == consoleUser && gui;
+}
+
+#ifndef PIANO_CAMERA_DEFAULT_HOST_TEST
+static BOOL launchctlCommand(NSArray<NSString *> *arguments, NSString **output)
+{
+  NSTask *task = [NSTask new]; NSPipe *pipe = output ? [NSPipe pipe] : nil;
   task.executableURL = [NSURL fileURLWithPath:@"/bin/launchctl"];
-  task.arguments = @[@"managername"]; task.standardOutput = pipe;
+  task.arguments = arguments; task.standardOutput = output ? (id)pipe : NSFileHandle.fileHandleWithNullDevice;
   task.standardError = NSFileHandle.fileHandleWithNullDevice;
   if (![task launchAndReturnError:NULL]) return NO;
-  NSData *data = [pipe.fileHandleForReading readDataToEndOfFile]; [task waitUntilExit];
-  NSString *name = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-  return !task.terminationStatus && [[name stringByTrimmingCharactersInSet:
-      NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqual:@"Aqua"];
+  NSData *data = output ? [pipe.fileHandleForReading readDataToEndOfFile] : nil; [task waitUntilExit];
+  if (output) *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  return !task.terminationStatus;
+}
+
+static BOOL commandSession(BOOL automatic)
+{
+  uid_t user = getuid();
+  if (!user || user != geteuid()) return NO;
+  if (automatic) {
+    NSString *manager = nil;
+    BOOL aqua = launchctlCommand(@[@"managername"], &manager) &&
+        [[manager stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqual:@"Aqua"];
+    return sessionAllowed(YES, user, geteuid(), 0, aqua, NO);
+  }
+  // Explicit selection / inspection may come from the logged-in user's SSH
+  // session. Prove that user owns the console and has a GUI bootstrap domain;
+  // no AppleEvents, Accessibility permission, or GUI launch is needed.
+  struct stat console;
+  if (stat("/dev/console", &console) || console.st_uid != user) return NO;
+  BOOL gui = launchctlCommand(@[@"print", [NSString stringWithFormat:@"gui/%u", user]], NULL);
+  return sessionAllowed(NO, user, geteuid(), console.st_uid, NO, gui);
 }
 
 static AVCaptureDevice *discoverFront(void)
@@ -128,7 +153,8 @@ static AVCaptureDevice *discoverFront(void)
   NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 30;
   do {
     for (AVCaptureDevice *device in discovery.devices)
-      if ([device.uniqueID isEqual:PIANO_FRONT_ID] && device.connected && !device.suspended) return device;
+      if (device.uniqueID.length && [device.uniqueID caseInsensitiveCompare:PIANO_FRONT_ID] == NSOrderedSame &&
+          device.connected && !device.suspended) return device;
     [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
   } while (NSProcessInfo.processInfo.systemUptime < deadline);
   return nil;
@@ -163,7 +189,7 @@ int main(int argc, const char **argv)
     if (![@[@"--apply", @"--set-front", @"--check"] containsObject:mode]) return 2;
     // Guard synchronous private framework IPC too, not just discovery.
     alarm(45);
-    if (!aquaSession()) { puts("CMIO_CAMERA_DEFAULT_NEEDS_AQUA_USER"); return 1; }
+    if (!commandSession([mode isEqual:@"--apply"])) { puts("CMIO_CAMERA_DEFAULT_NEEDS_LOGGED_IN_USER"); return 1; }
     BOOL check = [mode isEqual:@"--check"], explicitSelection = [mode isEqual:@"--set-front"];
     NSString *path = receiptPath(), *directory = path.stringByDeletingLastPathComponent;
     if (!check) {
