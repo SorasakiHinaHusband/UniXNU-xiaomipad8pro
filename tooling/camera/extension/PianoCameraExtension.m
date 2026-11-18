@@ -54,8 +54,12 @@ static os_log_t gLog;
       (__bridge NSString *)kCMFormatDescriptionExtension_TransferFunction:
           (__bridge NSString *)kCMFormatDescriptionTransferFunction_sRGB,
   };
-  if (CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_32BGRA, width, height,
-                                      (__bridge CFDictionaryRef)color, &_fd)) return nil;
+  OSStatus formatResult = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_32BGRA, width, height,
+                                                        (__bridge CFDictionaryRef)color, &_fd);
+  if (formatResult) {
+    os_log_error(gLog, "camera init failed sensor=%u step=format result=%d", _sensor, (int)formatResult);
+    return nil;
+  }
   CMTime frame = CMTimeMake(1, kFps);
   _format = [CMIOExtensionStreamFormat streamFormatWithFormatDescription:_fd maxFrameDuration:frame minFrameDuration:frame
                                                      validFrameDurations:nil];
@@ -65,7 +69,11 @@ static os_log_t gLog;
     (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
     (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
   };
-  if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &_pool)) return nil;
+  CVReturn poolResult = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &_pool);
+  if (poolResult) {
+    os_log_error(gLog, "camera init failed sensor=%u step=pixel-pool result=%d", _sensor, (int)poolResult);
+    return nil;
+  }
   _queue = dispatch_queue_create("com.unixnu.PianoCamera.frames", DISPATCH_QUEUE_SERIAL);
   return self;
 }
@@ -281,6 +289,7 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   if (_sensor) {
     _work = malloc((size_t)_width * _height * 3 * sizeof(float));
     _rgb = malloc((size_t)_width * _height * 3);
+    const char *step = !_work ? "isp-work" : !_rgb ? "isp-rgb" : "service-open";
     IOReturn result = _work && _rgb ? kIOReturnNotFound : kIOReturnNoMemory;
     if (_work && _rgb) {
       io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PianoCamera"));
@@ -291,16 +300,23 @@ static BOOL ioResult(IOReturn status, NSError **outError)
       os_log(gLog, "camera role open sensor=%u result=%#x", _sensor, result);
     }
     if (!result) {
+      step = "abi2-start";
       PianoCameraLiveStartArgs req = {kPianoCameraLiveVersion, _sensor};
       result = liveCall(_connection, kPianoCameraLiveStart, &req, sizeof req, NULL, 0);
+      os_log(gLog, "camera ABI2 start sensor=%u result=%#x", _sensor, result);
     }
     if (!result) {
+      step = "ring-map";
       result = IOConnectMapMemory64(_connection, kPianoCameraMemoryRing, mach_task_self(), &_raw, &_rawSize,
                                     kIOMapAnywhere | kIOMapReadOnly);
-      if (!result && _rawSize != kPianoCameraSlots * (uint64_t)kPianoCameraSlotBytes) result = kIOReturnBadArgument;
+      os_log(gLog, "camera ring map sensor=%u bytes=%llu result=%#x", _sensor, _rawSize, result);
+      if (!result && _rawSize != kPianoCameraSlots * (uint64_t)kPianoCameraSlotBytes) {
+        step = "ring-length";
+        result = kIOReturnBadArgument;
+      }
     }
     if (result) {
-      os_log_error(gLog, "camera stream start failed sensor=%u result=%#x", _sensor, result);
+      os_log_error(gLog, "camera stream start failed sensor=%u step=%{public}s result=%#x", _sensor, step, result);
       [self closeLive];
       return ioResult(result, outError);
     }

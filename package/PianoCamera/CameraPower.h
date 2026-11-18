@@ -272,6 +272,7 @@ class Session {
     if (!r_.failedStep) {
       r_.failedStep = -step;
       r_.failure = f;
+      ops.note("sensor failed step=%d reason=%s last=%08x", step, failureName(f), r_.lastValue);
     }
     return false;
   }

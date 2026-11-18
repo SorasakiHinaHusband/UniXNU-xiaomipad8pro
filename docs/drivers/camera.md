@@ -1,5 +1,11 @@
 # Cameras (B11): PianoCamera, the level ladder
 
+2026-11-18: the B-TC CoreMediaIO extension, Camera consent and AVFoundation discovery passed on 27.3; its pattern stream delivered
+31 valid moving frames. Real sensor starts failed before the hardware worker: the CPU-only 48 MiB shared ring requested 16 KiB
+alignment, which XNU turns into physical contiguity on this 4 KiB-page kernel. The shared ring and ABI1 copy buffer now request
+the allocator's runtime page alignment. Private CAMSS DMA keeps its required contiguous allocation. Start, mapping and hardware
+resource failures have separate diagnostics; real front/rear app frames and live shutdown still await tablet verification.
+
 Status, 2026-11-13: **both sensors' first RAW10 frames on the tablet** (cplan, §8.4: the rear's colour bars exact at 4080x3072,
 30 fps through our SMMU window; the front's 3264x1836 frames; every power-down complete), the scenes still black (fixed since: the
 exposure loop, §4.3 "After cplan"; image `cae`); level 2 takes level 3's path for either sensor (§4.2 "After c2fx"). Earlier,

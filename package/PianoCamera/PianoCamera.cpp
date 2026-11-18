@@ -799,9 +799,14 @@ class Ops {
     stackCheck("the frame buffer's allocation");
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), bytes, 0x000000ffffe00000ull);
-    if (!buf || buf->prepare() != kIOReturnSuccess) {
-      if (buf) buf->release();
-      ::note("dma: no physically contiguous %llu bytes (2 MiB aligned) for the frame buffer", (unsigned long long)bytes);
+    if (!buf) {
+      ::note("dma: failed step=frame-alloc bytes=%llu alignment=2097152 result=%#x", (unsigned long long)bytes, kIOReturnNoMemory);
+      return false;
+    }
+    const IOReturn prepared = buf->prepare();
+    if (prepared != kIOReturnSuccess) {
+      ::note("dma: failed step=frame-prepare bytes=%llu result=%#x", (unsigned long long)bytes, prepared);
+      buf->release();
       return false;
     }
     IOByteCount length = 0;
@@ -809,23 +814,38 @@ class Ops {
     d.bytes = bytes;
     d.cpu = static_cast<uint8_t *>(buf->getBytesNoCopy());
     d.cookie = buf;
-    if (!d.pa || length < bytes || !d.cpu) {
-      ::note("dma: the frame buffer is not one segment (%#llx, %llu of %llu bytes)", (unsigned long long)d.pa, (unsigned long long)length,
-             (unsigned long long)bytes);
+    if (!d.pa || length < bytes || !d.cpu || (d.pa & (kIovaBlockBytes - 1)) || d.pa >= kWmAddressLimit ||
+        bytes > kWmAddressLimit - d.pa) {
+      ::note("dma: failed step=frame-layout pa=%#llx segment=%llu bytes=%llu cpu=%u result=%#x", (unsigned long long)d.pa,
+             (unsigned long long)length, (unsigned long long)bytes, d.cpu != nullptr, kIOReturnBadArgument);
       dmaFree(d);
       return false;
     }
     if (tables) {
       tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
           kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), 0x4000, 0x000000fffffff000ull);
-      if (!tableMem || tableMem->prepare() != kIOReturnSuccess) {
-        if (tableMem) tableMem->release();
+      if (!tableMem) {
+        ::note("dma: failed step=table-alloc bytes=16384 result=%#x", kIOReturnNoMemory);
+        dmaFree(d);
+        return false;
+      }
+      const IOReturn tablePrepared = tableMem->prepare();
+      if (tablePrepared != kIOReturnSuccess) {
+        ::note("dma: failed step=table-prepare result=%#x", tablePrepared);
+        tableMem->release();
         tableMem = nullptr;
         dmaFree(d);
         return false;
       }
-      d.tablePa = tableMem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+      IOByteCount tableLength = 0;
+      d.tablePa = tableMem->getPhysicalSegment(0, &tableLength, kIOMemoryMapperNone);
       d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
+      if (!d.tablePa || (d.tablePa & 0xfff) || tableLength < 0x4000 || !d.tables) {
+        ::note("dma: failed step=table-layout pa=%#llx segment=%llu cpu=%u result=%#x", (unsigned long long)d.tablePa,
+               (unsigned long long)tableLength, d.tables != nullptr, kIOReturnBadArgument);
+        dmaFree(d);
+        return false;
+      }
     }
     ::note("dma: frame buffer %llu bytes at %#llx (cpu %p)%s", (unsigned long long)bytes, (unsigned long long)d.pa, (void *)d.cpu,
            tables ? "; the window's tables follow" : "");
@@ -1332,6 +1352,7 @@ void PianoCamera::serveLive(uint32_t sensor)
   IOLockUnlock(gServeLock);
   const StreamResult *result = nullptr;
   if (!cancelled) {
+    note("abi2 worker start sensor=%u", sensor);
     renew(k.po);
     k.po.rearCci = !gArgs.rearBus;
     k.po.mclk24 = true;
@@ -1349,6 +1370,8 @@ void PianoCamera::serveLive(uint32_t sensor)
     Session<Ops> &session = k.session.make(k.ops, k.po);
     Stream<Ops> &stream = k.stream.make(k.ops, session, k.o);
     result = &stream.run(sensor == kPianoCameraRear ? Sensor::rear : Sensor::front, gLoader, gPmic, k.so, k.survey);
+  } else {
+    note("abi2 worker cancelled before hardware sensor=%u", sensor);
   }
   IOLockLock(gServeLock);
   gLiveStatus.cleanOff = !result || result->cleanOff;
@@ -1381,13 +1404,17 @@ void PianoCamera::serveLive(uint32_t sensor)
 void PianoCamera::serve()
 {
   gRawMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared),
-                                                     kRawCap, 16384);
+                                                     kRawCap, 1);
   gRawBytes = gRawMem ? static_cast<uint8_t *>(gRawMem->getBytesNoCopy()) : nullptr;
   memset(&gInfo, 0, sizeof gInfo);
   gInfo.version = kPianoCameraABIVersion;
   gInfo.status = 1;
   gInfo.level = 5;
   if (!gRawBytes) {
+    note("level 5: failed step=%s bytes=%llu result=%#x", gRawMem ? "raw-cpu-view" : "raw-alloc",
+         (unsigned long long)kRawCap, kIOReturnNoMemory);
+    if (gRawMem) gRawMem->release();
+    gRawMem = nullptr;
     stage(-7, "level 5: no memory for the frame (16 MiB); no user client");
     return;
   }
@@ -1462,16 +1489,24 @@ OSDefineMetaClassAndStructors(PianoCameraUserClient, IOUserClient)
 bool PianoCameraUserClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties)
 {
   admin_ = clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
-  if (type != 0) return false;
+  if (type != 0) {
+    note("camera open failed step=client-type type=%u", type);
+    return false;
+  }
   if (!admin_) {
     OSObject *e = IOUserClient::copyClientEntitlement(owningTask, "com.unixnu.piano-camera.client");
     const bool allowed = e == kOSBooleanTrue;
     if (e) e->release();
-    if (!allowed) return false;
+    if (!allowed) {
+      note("camera open failed step=client-entitlement");
+      return false;
+    }
   }
   if (!admin_) note("abi2 entitled role user client");
 
-  return IOUserClient::initWithTask(owningTask, securityToken, type, properties);
+  const bool initialized = IOUserClient::initWithTask(owningTask, securityToken, type, properties);
+  if (!initialized) note("camera open failed step=client-init");
+  return initialized;
 }
 
 IOReturn PianoCameraUserClient::clientClose()
@@ -1493,26 +1528,39 @@ void PianoCameraUserClient::free()
 
 IOReturn PianoCameraUserClient::startLive(const PianoCameraLiveStartArgs &args)
 {
-  if (args.version != kPianoCameraLiveVersion || (args.sensor != kPianoCameraRear && args.sensor != kPianoCameraFront))
+  if (args.version != kPianoCameraLiveVersion || (args.sensor != kPianoCameraRear && args.sensor != kPianoCameraFront)) {
+    note("abi2 start failed sensor=%u step=arguments version=%u result=%#x", args.sensor, args.version, kIOReturnBadArgument);
     return kIOReturnBadArgument;
+  }
   IOLockLock(gServeLock);
   if (closed_ || token_ || gRequestPending || gLiveActive || !gServing || gSuspended || gHardwareUnsafe) {
+    note("abi2 start failed sensor=%u step=arbitration closed=%u token=%llu pending=%u active=%u serving=%u suspended=%u unsafe=%u result=%#x",
+         args.sensor, closed_, (unsigned long long)token_, gRequestPending, gLiveActive, gServing, gSuspended, gHardwareUnsafe,
+         kIOReturnBusy);
     IOLockUnlock(gServeLock);
     return kIOReturnBusy;
   }
   IOLockUnlock(gServeLock);
 
   const IOOptionBits options = IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared);
+  const uint64_t ringBytes = kPianoCameraSlots * uint64_t(kPianoCameraSlotBytes);
+  // The ring is CPU copy transport, never a DMA target. Sharing supplies runtime
+  // page alignment; an explicit alignment above page_size makes IOBMD physically
+  // contiguous (16 KiB alignment did so on our 4 KiB-page kernel).
   auto *ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, options,
-                                                          kPianoCameraSlots * uint64_t(kPianoCameraSlotBytes), 16384);
+                                                          ringBytes, 1);
   if (!ring || !ring->getBytesNoCopy()) {
+    note("abi2 start failed sensor=%u step=%s bytes=%llu result=%#x", args.sensor, ring ? "ring-cpu-view" : "ring-alloc",
+         (unsigned long long)ringBytes, kIOReturnNoMemory);
     if (ring) ring->release();
     return kIOReturnNoMemory;
   }
   // A new mapping can be read even before the first lease.
-  memset(ring->getBytesNoCopy(), 0, kPianoCameraSlots * uint64_t(kPianoCameraSlotBytes));
+  memset(ring->getBytesNoCopy(), 0, ringBytes);
   IOLockLock(gServeLock);
   if (closed_ || token_ || gRequestPending || gLiveActive || gSuspended || gHardwareUnsafe) {
+    note("abi2 start failed sensor=%u step=publish-arbitration closed=%u token=%llu pending=%u active=%u suspended=%u unsafe=%u result=%#x",
+         args.sensor, closed_, (unsigned long long)token_, gRequestPending, gLiveActive, gSuspended, gHardwareUnsafe, kIOReturnBusy);
     IOLockUnlock(gServeLock);
     ring->release();
     return kIOReturnBusy;
@@ -1529,6 +1577,8 @@ IOReturn PianoCameraUserClient::startLive(const PianoCameraLiveStartArgs &args)
   for (auto &state : gSlotState) state = slotFree;
   gLiveStop = false;
   gLiveActive = true;
+  note("abi2 ring ready sensor=%u bytes=%llu alignment=runtime-page token=%llu", args.sensor, (unsigned long long)ringBytes,
+       (unsigned long long)token_);
   IOLockWakeup(gServeLock, &gRequestPending, false);
   IOLockUnlock(gServeLock);
   return kIOReturnSuccess;
@@ -1537,8 +1587,11 @@ IOReturn PianoCameraUserClient::startLive(const PianoCameraLiveStartArgs &args)
 IOReturn PianoCameraUserClient::liveMethod(uint32_t selector, IOExternalMethodArguments *a)
 {
   if (selector == kPianoCameraLiveStart) {
-    if (!a->structureInput || a->structureInputSize != sizeof(PianoCameraLiveStartArgs) || a->structureOutputSize)
+    if (!a->structureInput || a->structureInputSize != sizeof(PianoCameraLiveStartArgs) || a->structureOutputSize) {
+      note("abi2 start failed step=method-layout input=%u output=%u result=%#x", a->structureInputSize, a->structureOutputSize,
+           kIOReturnBadArgument);
       return kIOReturnBadArgument;
+    }
     PianoCameraLiveStartArgs args;
     memcpy(&args, a->structureInput, sizeof args);
     return startLive(args);
@@ -1643,7 +1696,10 @@ static IOReturn capture(const PianoCameraCaptureArgs &args, PianoCameraFrameInfo
 IOReturn PianoCameraUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *,
                                                void *)
 {
-  if (!a || a->scalarInputCount || a->scalarOutputCount || !gServeLock) return kIOReturnBadArgument;
+  if (!a || a->scalarInputCount || a->scalarOutputCount || !gServeLock) {
+    note("camera method failed selector=%u step=method-arguments result=%#x", selector, kIOReturnBadArgument);
+    return kIOReturnBadArgument;
+  }
   if (selector >= kPianoCameraLiveStart && selector <= kPianoCameraLiveRelease) return liveMethod(selector, a);
   if (!admin_) return kIOReturnNotPrivileged;
   if (!a->structureOutput || a->structureOutputSize < sizeof(PianoCameraFrameInfo)) return kIOReturnBadArgument;
@@ -1684,7 +1740,10 @@ IOReturn PianoCameraUserClient::clientMemoryForType(UInt32 type, IOOptionBits *o
   }
   if (buffer) buffer->retain();
   IOLockUnlock(gServeLock);
-  if (!buffer) return kIOReturnBadArgument;
+  if (!buffer) {
+    note("camera map failed type=%u step=memory-descriptor result=%#x", type, kIOReturnBadArgument);
+    return kIOReturnBadArgument;
+  }
   *memory = buffer;
   *options = kIOMapReadOnly;
   return kIOReturnSuccess;

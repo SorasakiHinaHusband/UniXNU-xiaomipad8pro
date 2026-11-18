@@ -526,6 +526,7 @@ class Stream {
       r_.failedStep = -step;
       r_.failure = f;
       r_.why = why;
+      ops.note("stream failed step=%d reason=%s detail=%s last=%08x", step, streamFailureName(f), why ? why : "-", r_.lastValue);
     }
     return false;
   }
