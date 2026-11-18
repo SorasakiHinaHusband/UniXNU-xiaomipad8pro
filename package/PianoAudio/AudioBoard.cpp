@@ -129,7 +129,16 @@ void lineSda(void *, bool release) { wr32(gPin[gBus.sda].page.va, i2cCtl(gPin[gB
 void lineScl(void *, bool release) { wr32(gPin[gBus.scl].page.va, i2cCtl(gPin[gBus.scl].ctl, !release)); }
 bool readSda(void *) { return rd32(gPin[gBus.sda].page.va + 4) & 1; }
 bool readScl(void *) { return rd32(gPin[gBus.scl].page.va + 4) & 1; }
-void delayUs(void *, unsigned us) { IODelay(us); }
+
+// The native kernel can block the thread in IODelay even for a single I2C edge.
+// Use the monotonic counter for these short waits, with interrupts and preemption enabled as before.
+void delayUs(void *, unsigned us)
+{
+  uint64_t interval;
+  nanoseconds_to_absolutetime(uint64_t(us) * 1000, &interval);
+  const uint64_t start = mach_absolute_time();
+  while (mach_absolute_time() - start < interval) __asm__ volatile("yield");
+}
 
 void muxBus()
 {
@@ -139,7 +148,7 @@ void muxBus()
     wr32(gPin[i].page.va, i2cCtl(gPin[i].ctl, false));
   }
   gBus.muxed = true;
-  IODelay(4 * gArgs.i2cHalfUs);
+  delayUs(nullptr, 4 * gArgs.i2cHalfUs);
 }
 
 void restoreBus()
@@ -211,7 +220,8 @@ bool busSetup()
   gBus.usable = !foreign(a.ctl) && !foreign(b.ctl);
   gBus.i2c.configure({nullptr, lineSda, lineScl, readSda, readScl, delayUs}, gArgs.i2cHalfUs, 2000);
   piano_audio_log("bus: gpio64 CTL %08x IO %08x, gpio65 CTL %08x IO %08x as found: %s%s", a.ctl, a.io, b.ctl, b.io,
-                  gBus.usable ? "software I2C, the pins given back after each burst" : "NOT used: a pin is routed to the other TLMM (eGPIO)",
+                  gBus.usable ? "software I2C, the pins given back after each burst (counter-timed edges)"
+                              : "NOT used: a pin is routed to the other TLMM (eGPIO)",
                   gBus.usable && !(a.io & b.io & 1) ? " (a line reads low: the first transfer's recovery clocks free a held SDA)" : "");
   return gBus.usable;
 }
