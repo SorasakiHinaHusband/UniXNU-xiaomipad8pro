@@ -482,6 +482,12 @@ public:
           if (r.error && !cleanup)
             continue;
           if (type == Settings) {
+            // First HEVC qualification must retain the complete firmware
+            // response even when admission rejects it. RX payload0 alone
+            // cannot preserve the second crop word or the returned mask.
+            if(layout.hevc)o.hw.note("V9 HEVC PSC observed port %u returned %08x res %08x crop %08x/%08x depth %08x N %u profile %u level %u tier %u expected %u/%u/%u/%u",
+              port,psc.returned,psc.resolution,psc.crop[0],psc.crop[1],psc.depth,psc.n,psc.profile,psc.level,psc.tier,
+              expectedDepth,expectedProfile,expectedLevel,expectedTier);
             if (port != 1 || r.psc || !pscSupported()) {
               fail(kErrHfi, type, flags, port, p[5], b[2]);
               continue;
