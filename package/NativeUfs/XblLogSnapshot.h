@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Included in NativeUfs's root transport namespace after RootLayout.h.
 static constexpr uint32_t kXblBlock = 4096, kXblBlocks = 32;
-static constexpr uint32_t kXblBytes = kXblBlock * kXblBlocks, kXblChunk = 128;
+static constexpr uint32_t kXblBytes = kXblBlock * kXblBlocks;
 static uint8_t *gXblSnapshot;
 static struct sysctl_oid gXblOid;
 
@@ -82,7 +82,7 @@ static void captureXblLog ()
   // Only READ(10) of the verified, fixed-name extent. The OID serves the immutable RAM copy.
   if (!failure && hostRead4k (lun, lba, kXblBlocks, snapshot) != kIOReturnSuccess) failure = "payload-read";
   if (failure) {
-    IOLog ("NativeUfs: xbl-snapshot-v1: failed reason=%s\n", failure);
+    IOLog ("NativeUfs: xbl-snapshot-v2: failed reason=%s\n", failure);
     if (snapshot) IOFree (snapshot, kXblBytes);
     return;
   }
@@ -96,28 +96,11 @@ static void captureXblLog ()
   gXblOid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid (&gXblOid);
 
-  // The producer can reset before SSH. Export the same bytes over the existing
-  // console, with zero chunks implicit and CRC/count to reject any missing line.
+  // Log just the identity of the snapshot. The payload stays in the root-only OID.
   uint64_t ns = 0;
   absolutetime_to_nanoseconds (mach_absolute_time (), &ns);
   const uint32_t crc = rootCrc32 (snapshot, kXblBytes);
-  IOLog ("NativeUfs: xbl-snapshot-v1: begin uptime_ms=%llu lun=%u bytes=%u crc=%08x\n", ns / 1000000, lun, kXblBytes, crc);
-  unsigned chunks = 0;
-  constexpr char hex[] = "0123456789abcdef";
-  constexpr uint8_t zeros[kXblChunk] = {};
-  for (unsigned off = 0; off < kXblBytes; off += kXblChunk) {
-    if (!memcmp (snapshot + off, zeros, kXblChunk)) continue;
-    char line[kXblChunk * 2 + 1];
-    for (unsigned i = 0; i < kXblChunk; ++i) {
-      const uint8_t b = snapshot[off + i];
-      line[2 * i] = hex[b >> 4];
-      line[2 * i + 1] = hex[b & 15];
-    }
-    line[kXblChunk * 2] = '\0';
-    IOLog ("NativeUfs: xbl-snapshot-v1: chunk off=%05x hex=%s\n", off, line);
-    ++chunks;
-  }
-  IOLog ("NativeUfs: xbl-snapshot-v1: end chunks=%u crc=%08x\n", chunks, crc);
+  IOLog ("NativeUfs: xbl-snapshot-v2: ready uptime_ms=%llu lun=%u bytes=%u crc=%08x\n", ns / 1000000, lun, kXblBytes, crc);
 }
 
 static void releaseXblLog ()

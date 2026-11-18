@@ -12,6 +12,7 @@
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
+#include <sys/kauth.h>
 #include <sys/proc.h>
 #include <sys/select.h>
 #include <sys/sysctl.h>
@@ -396,10 +397,41 @@ static int bt_uptime_sysctl SYSCTL_HANDLER_ARGS
     uint64_t uptime=qbt_bt_uptime_ms();
     return SYSCTL_OUT(req,&uptime,sizeof(uptime));
 }
+
+static int bt_baseline_released;
+
+void qbt_transport_wait_for_baseline(void)
+{
+    lck_mtx_lock(&bt_tty_lock);
+    while (!bt_baseline_released)
+        (void)msleep(&bt_baseline_released, &bt_tty_lock, PZERO, "btbaseline", NULL);
+    lck_mtx_unlock(&bt_tty_lock);
+}
+
+static int bt_baseline_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp,arg1,arg2)
+    if (!kauth_cred_issuser(kauth_cred_get())) return EPERM;
+    lck_mtx_lock(&bt_tty_lock);
+    const int released = bt_baseline_released;
+    lck_mtx_unlock(&bt_tty_lock);
+    int error = SYSCTL_OUT(req, &released, sizeof released);
+    if (error || !req->newptr) return error;
+    int requested = 0;
+    error = SYSCTL_IN(req, &requested, sizeof requested);
+    if (error) return error;
+    if (requested != 1) return EINVAL;
+    lck_mtx_lock(&bt_tty_lock);
+    bt_baseline_released = 1;
+    wakeup(&bt_baseline_released);
+    lck_mtx_unlock(&bt_tty_lock);
+    return 0;
+}
+
 /* XNU's node macros make permanent OIDs for kernel startup. Kexts register
  * non-permanent, versioned OIDs at run time and unregister them on stop. */
 SYSCTL_DECL(_machdep);
-static struct sysctl_oid bt_boot_oid,bt_firmware_oid,bt_power_on_oid,bt_uptime_oid;
+static struct sysctl_oid bt_boot_oid,bt_firmware_oid,bt_power_on_oid,bt_uptime_oid,bt_baseline_oid;
 static bool bt_sysctls_registered;
 static void bt_tty_register_oid(struct sysctl_oid *oid,const char *name,int type,
                                sysctl_handler_t handler,const char *format,const char *description)
@@ -427,6 +459,7 @@ void qbt_transport_unregister_sysctls(void)
     sysctl_unregister_oid(&bt_firmware_oid);
     sysctl_unregister_oid(&bt_boot_oid);
     if(qbt_bt_trace_enabled)sysctl_unregister_oid(&bt_uptime_oid);
+    if(qbt_bt_wait_baseline)sysctl_unregister_oid(&bt_baseline_oid);
     bt_sysctls_registered=false;
 }
 
@@ -443,6 +476,9 @@ int qbt_transport_init(const struct qbt_transport_ops *ops)
     bt_tty_register_oid(&bt_power_on_oid,"piano_bt_power_on",CTLTYPE_INT,bt_tty_power_on_sysctl,"I","WCN7860 startup request");
     if(qbt_bt_trace_enabled)
         bt_tty_register_oid(&bt_uptime_oid,"piano_bt_uptime_ms",CTLTYPE_QUAD,bt_uptime_sysctl,"Q","BT observation monotonic milliseconds");
+    if(qbt_bt_wait_baseline)
+        bt_tty_register_oid(&bt_baseline_oid, "piano_bt_reset_baseline", CTLTYPE_INT|CTLFLAG_WR, bt_baseline_sysctl, "I",
+                            "Release the BT diagnostic startup gate after the host saves its baseline");
     bt_sysctls_registered=true;
     BT_LOG("PianoBluetooth: bt-path2: runtime sysctls registered");
     if(start && !bt_tty_make_node()) {

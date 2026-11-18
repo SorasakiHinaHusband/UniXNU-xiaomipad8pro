@@ -14,7 +14,9 @@ struct qbt_transport_ops {
 };
 extern volatile uint32_t qbt_transport_activity[4];
 extern bool qbt_bt_trace_enabled;
+extern bool qbt_bt_wait_baseline;
 uint64_t qbt_bt_uptime_ms(void);
+void qbt_transport_wait_for_baseline(void);
 int qbt_transport_init(const struct qbt_transport_ops *);
 void qbt_transport_unregister_sysctls(void);
 void qbt_transport_boot_result(int error, const char *firmware, uint32_t baud);

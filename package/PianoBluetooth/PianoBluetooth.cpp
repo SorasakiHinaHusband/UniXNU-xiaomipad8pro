@@ -61,6 +61,7 @@ extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_bt_stage = 0;
 bool qbt_bt_trace_enabled = false;
+bool qbt_bt_wait_baseline = false;
 
 uint64_t qbt_bt_uptime_ms(void)
 {
@@ -1004,6 +1005,8 @@ bool PianoBluetooth::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   qbt_bt_trace_enabled = bootArg("piano-bt-reset-trace", 0) == 1;
+  qbt_bt_wait_baseline = gArgs.level == 5 && qbt_bt_trace_enabled &&
+                        bootArg("piano-bt-wait-baseline", 0) == 1;
   if (qbt_bt_trace_enabled) {
     thread_t sampler = nullptr;
     const kern_return_t rc = kernel_thread_start(watchdogTrace, nullptr, &sampler);
@@ -1379,6 +1382,11 @@ void PianoBluetooth::run()
   if (gArgs.delay) {
     note("waiting %u s", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
+  }
+  if (qbt_bt_wait_baseline) {
+    note("bt-reset-baseline-v1: waiting for saved baseline");
+    qbt_transport_wait_for_baseline();
+    note("bt-reset-baseline-v1: released");
   }
   if (qbt_bt_trace_enabled) note("bt-reset-phase: delayed hardware survey begin");
   survey();
