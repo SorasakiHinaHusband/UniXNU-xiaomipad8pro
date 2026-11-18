@@ -550,6 +550,18 @@ static void hevcProtocolTests() {
   tx.psc.depth=0x00080008;CHECK(!tx.pscSupported());tx.psc.depth=0x000a000a;
   tx.psc.tier=0;CHECK(!tx.pscSupported());tx.psc.tier=1;
   CHECK(tx.adoptPscGeometry() && tx.rawPixelStride()==3840 && tx.rawStride()==7680 && layout.rawBytes()==25067520);
+  // Rejected PSC still preserves both crop words and the full returned mask
+  // before the first-error line; this is the evidence needed on the first boot.
+  Peer bad;Layout small;CHECK(small.initHevc(320,256,8));SelfTest<Peer> rejected(bad,small);
+  rejected.streaming=true;rejected.activeWidth=320;rejected.activeHeight=256;
+  rejected.r.stage=FirstPsc;rejected.deadline=UINT64_MAX;
+  bad.reply({Peer::packet(Settings,0,1,0),Peer::packet(0x03000103,0,1,1,{0x01400100}),
+    Peer::packet(0x03000105,0,1,13,{0,2}),Peer::packet(0x0300010f,0,1,1,{0x00080008}),
+    Peer::packet(0x03000124,0,1,1,{6}),Peer::packet(0x03000107,0,1,9,{0}),
+    Peer::packet(0x03000108,0,1,9,{4}),Peer::packet(kHevcTier,0,1,9,{0})},rejected.sessionId);
+  CHECK(rejected.pump()==kErrHfi && rejected.r.psc==0);
+  const auto observed=bad.hw.log.find("V9 HEVC PSC observed port 1 returned 000005ae res 01400100 crop 00000000/00000002 depth 00080008 N 6 profile 0 level 4 tier 0");
+  CHECK(observed!=std::string::npos && observed<bad.hw.log.find("V4 first-error"));
 }
 int main()
 {
