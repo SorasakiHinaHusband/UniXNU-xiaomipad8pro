@@ -13,7 +13,9 @@ inline bool buildArena(vsmmu::Tables &t, const Layout &layout, const uint64_t *p
   if (t.pageCount != vsmmu::kSessionTablePages)
     return false;
   uint64_t *l2 = t.cpu + 512;
-  for (unsigned i = 0; i < 32; ++i)
+  static_assert(((kArenaBase >> 21) & 511u) + kArenaBytes / (2 * 1024 * 1024) <= 512, "arena fits one L2");
+  static_assert(vsmmu::kSessionTablePages == 4 + kArenaBytes / (2 * 1024 * 1024), "arena L3 table coverage");
+  for (unsigned i = 0; i < kArenaBytes / (2 * 1024 * 1024); ++i)
     l2[((kArenaBase >> 21) & 511u) + i] = vsmmu::tableDesc(t.pa + (4 + i) * 4096);
   for (unsigned i = 0; i < kArenaPages; ++i) {
     if (!layout.mapped(i))

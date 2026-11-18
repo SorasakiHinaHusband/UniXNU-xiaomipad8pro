@@ -151,7 +151,7 @@ Plan plan(Read rd)
 // --------------------------------------------------------------------------------------------------------------- the table
 // Four 4 KiB pages, physically contiguous: L1, L2, then two L3 tables covering [kIovaBase, kIovaBase + 4 MiB).
 constexpr unsigned kTablePages = 4, kWindowPages = kUcRegionBytes / 4096, kUcPages = kUcBytes / 4096;
-constexpr unsigned kSessionTablePages = 36;
+constexpr unsigned kSessionTablePages = 132;
 static_assert(kWindowPages == 2 * 512, "two level-3 tables");
 constexpr uint64_t kOutMask = 0x0000fffffffff000ull;
 constexpr uint64_t kDescTable = 3, kDescPage = 3, kAf = 1ull << 10, kShOuter = 2ull << 8, kApRw = 1ull << 6;

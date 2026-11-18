@@ -120,6 +120,40 @@ public:
   bool checkGolden = true;
   bool streaming = false;
   uint32_t expectedPoc = 2, expectedProfile = 0, expectedLevel = 4;
+  uint32_t activeWidth = 320, activeHeight = 240;
+  Psc initialPsc;
+  uint32_t rawStride() const { return layout.general ? layout.geometry.stride : 384; }
+  uint32_t rawScanlines() const { return layout.general ? layout.geometry.scanlines : 256; }
+  // An alternate firmware coded/crop representation is allowed only when it
+  // describes the same active picture and fits every already reserved buffer.
+  bool pscGeometry() const {
+    const uint32_t w=psc.resolution>>16,h=psc.resolution&65535;
+    const uint32_t left=psc.crop[0]>>16,top=psc.crop[0]&65535,right=psc.crop[1]>>16,bottom=psc.crop[1]&65535;
+    if (!w || !h || ((w|h|left|top|right|bottom)&1) || left+right>=w || top+bottom>=h ||
+        w-left-right!=activeWidth || h-top-bottom!=activeHeight) return false;
+    if (!layout.general) return psc.resolution==0x014000f0 && !psc.crop[0] && !psc.crop[1];
+    AvcGeometry g;
+    if (!g.configure(w,h) || w>layout.geometry.width || h>layout.geometry.height ||
+        g.raw>layout.rawBytes() || g.dpb>layout.dpbBytes()) return false;
+    for(unsigned i=0;i<layout.scratchCount();++i)if(g.scratchBytes(i,psc.n)>layout.scratchSize(i,psc.n))return false;
+    return true;
+  }
+  bool adoptPscGeometry() {
+    if (!layout.general) return true;
+    AvcGeometry g;if(!g.configure(psc.resolution>>16,psc.resolution&65535))return false;
+    // Layout offsets/capacities stay unchanged. Only payload sizes may shrink.
+    for(unsigned i=0;i<layout.used;++i) {
+      auto &b=layout.buf[i];uint32_t size=b.type==Raw?g.raw:b.type==Dpb?g.dpb:b.size;
+      if(size>b.capacity)return false;
+    }
+    layout.geometry=g;
+    for(unsigned i=0;i<layout.used;++i) {
+      auto &b=layout.buf[i];if(b.type==Raw)b.size=g.raw;else if(b.type==Dpb)b.size=g.dpb;
+    }
+    o.hw.note("V8 PSC geometry active %ux%u coded %ux%u crop %08x/%08x stride %u scanlines %u UV %u RAW %u DPB %u N %u cap %u",
+      activeWidth,activeHeight,g.width,g.height,psc.crop[0],psc.crop[1],g.stride,g.scanlines,g.uvOffset,g.raw,g.dpb,psc.n,layout.maxN());
+    return true;
+  }
   stream::Ledger ledger;
   struct OutputFrame { uint64_t token = 0; unsigned index = 0; uint32_t bytes = 0; };
   OutputFrame outputs[stream::Credits] = {};
@@ -137,8 +171,8 @@ public:
   }
   bool pscSupported() const {
     if (!streaming) return psc.supported();
-    return psc.resolution == 0x014000f0 && !psc.crop[0] && !psc.crop[1] && psc.depth == 0x00080008 && psc.coded == 1 &&
-      psc.n && psc.n <= kMaxN && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
+    return pscGeometry() && psc.depth == 0x00080008 && psc.coded == 1 &&
+      psc.n && psc.n <= layout.maxN() && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
       (!(psc.returned & (1u << 7)) || (expectedProfile == 0 ? psc.profile <= 1 : psc.profile == expectedProfile)) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
   }
   // Called only by the exclusive worker, before OPEN. Input validation is also
@@ -313,7 +347,7 @@ public:
     if (hasPsc) {
       if (r.psc || r.stage != FirstPsc)
         return fail(kErrHfi, Settings);
-      psc = Psc{};
+      psc = streaming ? initialPsc : Psc{};
       if(streaming){psc.poc=expectedPoc;psc.profile=expectedProfile;psc.level=expectedLevel;}
     }
     picture = 0;
@@ -532,7 +566,7 @@ public:
       // Gen2 picture is a bitmask. Like the pinned Iris/sheng references,
       // classify known kinds and test NOSHOW explicitly; ancillary bits such
       // as the firmware's 0x80 do not invalidate an otherwise owned AVC frame.
-      if (!rawStarted || v[6] || v[7] < kRawBytes || b->readonly || frameError || !(picture & 15) || (picture & 0x40) ||
+      if (!rawStarted || v[6] || v[7] < layout.rawBytes() || b->readonly || frameError || !(picture & 15) || (picture & 0x40) ||
           outputCount == stream::Credits || !ledger.picture(returnedToken,b->index)) {
         fail(kErrHfi, Buffers, p[2], p[4], p[5], header); return;
       }
@@ -619,15 +653,16 @@ public:
   }
   int scratch(unsigned set, unsigned n)
   {
-    if (!n || n > kMaxN || property(0x03000193, n, 1))
+    if (!n || n > layout.maxN() || property(0x03000193, n, 1))
       return r.error ? r.error : fail(kErrHfi);
-    for (unsigned i = 0; i < 5; ++i) {
+    for (unsigned i = 0; i < layout.scratchCount(); ++i) {
       Buffer &b = *layout.find(scratchType[i], set);
-      b.size = scratchBytes(i, n);
+      b.size = layout.scratchSize(i, n);
+      if(!b.size || b.size>b.capacity)return fail(kErrHfi);
       if (buffer(b))
         return r.error;
     }
-    o.hw.note("V4 scratch set %u N %u COMV %u PARTIAL 196608 all-five 1", set, n, comvBytes(n));
+    o.hw.note("V8 scratch set %u N %u COMV %u count %u general %u",set,n,layout.scratchSize(1,n),layout.scratchCount(),unsigned(layout.general));
     return 0;
   }
   int transaction()
@@ -651,7 +686,7 @@ public:
       return r.error;
     for (unsigned i = 1; i < 10; ++i) {
       if (i == 2) {
-        if (pair(kPscIds[i], 0, 0, 1))
+        if (pair(kPscIds[i], psc.crop[0], psc.crop[1], 1))
           return r.error;
       } else if (property(kPscIds[i], psc.value(i), 1, (i == 7 || i == 8) ? 9 : i == 9 ? 10 : 1))
         return r.error;
@@ -675,9 +710,10 @@ public:
       return r.error;
     o.hw.note("V4 acceptance OPEN CONFIG START BITSTREAM downstream-PSC 1");
     stage(Reconfigure);
-    if (property(0x03000184, 1, 2) || property(0x03000101, 1, 2, 9) || pair(0x03000104, 0x01800100, 0x01800080, 2))
+    if (!adoptPscGeometry()) return fail(kErrHfi,Settings);
+    if (property(0x03000184, 1, 2) || property(0x03000101, 1, 2, 9) || pair(0x03000104, (rawStride()<<16)|rawScanlines(), (rawStride()<<16)|((rawScanlines()/2+15)&~15u), 2))
       return r.error;
-    for (unsigned i = 0; i < 5; ++i)
+    for (unsigned i = 0; i < layout.scratchCount(); ++i)
       if (buffer(*layout.find(scratchType[i], 0), true))
         return r.error;
     if (scratch(1, psc.n) || property(0x0300010a, 1, 0) || property(0x0300010b, 4, 0))
@@ -704,9 +740,10 @@ public:
         return r.error;
     for (unsigned i = 0; i < count; ++i) {
       Buffer &b = *layout.find(Raw, i);
-      for (unsigned j = 0; j < kRawBytes; ++j)
+      for (unsigned j = 0; j < layout.rawBytes(); ++j)
         o.dma.arena[b.off + j] = 0xa5;
       char hash[65];
+      if(layout.general){o.hw.barrier();if(buffer(b))return r.error;continue;}
       o.hw.hashActive(o.dma.arena + b.off, hash);
       if (sameText(hash, kGolden))
         return fail(kErrHfi);

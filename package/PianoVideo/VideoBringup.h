@@ -101,6 +101,7 @@ class Bringup {
   IdleClock idle;
   Report rep;
   Options opt;
+  uint32_t avcWidth = 0, avcHeight = 0; // selected before DMA preparation; zero preserves the legacy qualification
   unsigned doorbells = 0, txEvents = 0, rxEvents = 0, dbgChecks = 0, dbgErrors = 0, msgDrops = 0, watchdogSamples = 0;
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
@@ -492,7 +493,7 @@ class Bringup {
     bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
     dma.session = opt.level >= 5;
-    if (dma.session && !layout.init()) return smmuFail(kStepSmmuTables, kErrNoMemory);
+    if (dma.session && !(avcWidth ? layout.init(avcWidth,avcHeight) : layout.init())) return smmuFail(kStepSmmuTables, kErrNoMemory);
     if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
     dmaHeld = true;
     tables.cpu = dma.tables;

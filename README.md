@@ -44,11 +44,10 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
   test; the reference-aligned gain cap (231) and runtime 192/231 A/B switch have host coverage and await acoustic tablet validation;
   opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
-- Hardware video decode (2026-11-18, RAM boots): the opt-in native VideoToolbox bridge delivered our 320×240 H.264
-  frame through Iris into an IOSurface-backed callback with the exact golden SHA-256 and safe teardown (`vid-v5c`).
-  V6p decoded a complete 60-frame Main AVC clip with matching pixels and balanced surface references. Stock QuickTime
-  selects the bridge and displays its first frame; V7d then drops 59 frames. A bounded reply window and a finish barrier
-  that preserves decode-order state await continuous app playback qualification ([docs/drivers/video.md](docs/drivers/video.md)).
+- Hardware video decode (2026-11-18, RAM boots): stock QuickTime plays the owned 320×240 Main AVC fixture through the
+  native decoder: 60 native frames, 60 client-decoded frames, zero dropped frames and optically confirmed motion. The
+  bounded High AVC/1080p path is implemented for qualification; HEVC, aerial wallpaper, Safari and concurrent sessions
+  remain unqualified ([docs/drivers/video.md](docs/drivers/video.md)).
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
   firmware initialization, the Bluetooth menu and discovery are not yet tablet-confirmed
@@ -58,7 +57,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
   pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;
   a parallel version stays the fallback); probes built, then into the installed ESP ([docs/boot-time.md](docs/boot-time.md) §9).
-- Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, hardware video playback in apps, and
+- Not working yet: the Wi-Fi menu's own list (joining through macOS works on RAM boots), Bluetooth, the sensors, general video playback, and
   a clean restart — every reboot of the 27.3 line ends in IOPlatformExpert's panic 30 s after the halt begins
   (`Halt/Restart Timed Out`, console captures since 2026-11-13).
 - Safari's synchronous Apple Pay query can hang while native lacks the AppleKeyStore unlock contract. A reversible UID 501

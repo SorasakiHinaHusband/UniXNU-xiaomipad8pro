@@ -8,6 +8,7 @@ class IOMemoryDescriptor;
 namespace pianovideo { namespace avc { struct Config; } namespace native {
 struct Layout {
   uint32_t width = 320, height = 240, stride = 384, scanlines = 256;
+  uint32_t codedWidth = 320, codedHeight = 240, cropLeft = 0, cropTop = 0;
   uint32_t yOffset = 0, uvOffset = 98304, bytes = 147456;
   uint32_t format = 0x34323076, bitdepth = 8; // 420v, linear NV12
 };

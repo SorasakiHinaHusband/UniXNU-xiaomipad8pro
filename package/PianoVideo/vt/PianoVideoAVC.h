@@ -55,6 +55,7 @@ struct Sps {
   uint32_t maxReorder = 0, maxDpb = 0;
   uint32_t codedWidth = 0, codedHeight = 0, width = 0, height = 0;
   uint32_t left = 0, top = 0, right = 0, bottom = 0;
+  uint32_t color = 0x14000003; // unspecified video signal, limited-range
   uint32_t macroblocks() const { return (codedWidth / 16) * (codedHeight / 16); }
 };
 struct Pps { uint32_t id = 0, spsId = 0; bool bottomPoc = false, entropy = false; };
@@ -100,7 +101,12 @@ inline bool sps(const uint8_t *p, uint32_t n, Sps &s) {
   if (b.read(1)) {
     if (b.read(1)) { const uint32_t aspect = b.read(8); if (aspect == 255) { if (!b.read(16) || !b.read(16)) return false; } else if (!aspect || aspect > 16) return false; }
     if (b.read(1)) b.read(1);
-    if (b.read(1)) { b.read(3); b.read(1); if (b.read(1)) { b.read(8); b.read(8); b.read(8); } }
+    if (b.read(1)) {
+      const uint32_t format=b.read(3); if (b.read(1)) return false; // 420v is video-range
+      const bool description=b.read(1);uint32_t primaries=0,transfer=0,matrix=3;
+      if(description){primaries=b.read(8);transfer=b.read(8);matrix=b.read(8);}
+      s.color=matrix|(transfer<<8)|(primaries<<16)|(uint32_t(description)<<24)|(format<<26)|(1u<<29);
+    }
     if (b.read(1)) { if (b.ue() > 5 || b.ue() > 5) return false; }
     if (b.read(1)) { uint32_t tick = b.read(32), scale = b.read(32); b.read(1); if (!tick || !scale) return false; }
     const bool nalHrd = b.read(1); if (nalHrd && !hrd(b)) return false;

@@ -555,7 +555,7 @@ struct KernelHw {
     const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
     const uint64_t tableBytes = ((d.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
     // CPU-only metadata follows the same owner lifetime. Keeping 384 KiB in static __DATA exceeds the KC insertion gap.
-    uniqueCapacity = d.session ? 32768 : 2048;
+    uniqueCapacity = d.session ? 131072 : 2048;
     const uint64_t ledgerBytes = uint64_t(uniqueCapacity + (d.session ? session::kArenaPages : 0)) * sizeof(uint64_t);
     ledgerMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), ledgerBytes,
                                                                0x0000000ffffff000ull);
@@ -733,6 +733,7 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
     gNativeOwner=owner;owner->config=*format;
     owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
     owner->tx.history=&owner->history;
+    owner->core.avcWidth=format->s.codedWidth;owner->core.avcHeight=format->s.codedHeight;
     Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
     rc=owner->core.run(options);owner->prepared=rc==0;
     if(!rc){
@@ -743,6 +744,14 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
       owner->tx.psc.poc=owner->tx.expectedPoc;
       owner->tx.psc.profile=owner->tx.expectedProfile;
       owner->tx.psc.level=owner->tx.expectedLevel;
+      owner->tx.activeWidth=format->s.width;owner->tx.activeHeight=format->s.height;
+      owner->tx.psc.resolution=(format->s.codedWidth<<16)|format->s.codedHeight;
+      owner->tx.psc.crop[0]=(format->s.left<<16)|format->s.top;
+      owner->tx.psc.crop[1]=(format->s.right<<16)|format->s.bottom;
+      owner->tx.psc.color=format->s.color;
+      owner->tx.initialPsc=owner->tx.psc;
+      note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
+        format->s.codedWidth,format->s.codedHeight,format->hfiProfile(),format->hfiLevel());
       if(!owner->tx.nativeInput(sid,bytes,size,token))rc=kErrArgument;
       else{owner->attempted=true;rc=owner->tx.transaction();}
       if(!rc){IOLockLock(gNativeLock);gNativeState.start(sid);IOLockUnlock(gNativeLock);}
@@ -769,6 +778,14 @@ extern "C" int piano_video_native_poll(uint32_t sid,native::Frame *frame)
   o.loans[f.index]=loan;
   frame->memory=loan;frame->cpu=o.core.dma.arena+b->off;frame->length=b->size;
   frame->iova=b->iova();frame->token=f.token;frame->index=f.index;
+  const auto &g=o.core.layout.geometry;const auto &psc=o.tx.psc;
+  frame->layout.width=o.config.s.width;frame->layout.height=o.config.s.height;
+  frame->layout.codedWidth=g.width;frame->layout.codedHeight=g.height;
+  frame->layout.cropLeft=psc.crop[0]>>16;frame->layout.cropTop=psc.crop[0]&65535;
+  frame->layout.stride=g.stride;frame->layout.scanlines=g.scanlines;
+  frame->layout.yOffset=frame->layout.cropTop*g.stride+frame->layout.cropLeft;
+  frame->layout.uvOffset=g.uvOffset+(frame->layout.cropTop/2)*g.stride+frame->layout.cropLeft;
+  frame->layout.bytes=g.raw;
   return 0;
 }
 extern "C" int piano_video_native_frame_release(uint32_t sid,native::Frame *frame)
@@ -879,6 +896,7 @@ bool PianoVideo::start(IOService *provider)
     note("V6 bounded AVC streaming ready level 6 exclusive credits8 inputs2 RAW-reuse descriptor-WC 1");
     note("V6c completion disposition AVC-known NOSHOW40 ancillary-ignored finish-sticky");
     note("V6f first-timeout snapshot armed passive console IORegistry before-cleanup");
+    note("V8 bounded AVC High geometry1920x1080 aperture256 Ncap16 scratch4");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();

@@ -117,13 +117,13 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   // A successful method owns both references, even if layout validation fails.
   if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
   bool ok=!rc && resultBytes==bytes;
-  if(ok)ok=contract::surfaceResult(result,bytes,id,v);
+  if(ok)ok=contract::surfaceResult(result,bytes,id,v,s->config.s.width,s->config.s.height);
   IOLog("PianoVideoVT V5a: surface lookup id %u status %08x result-bytes %u format %08x planes %u valid %u\n",id,rc,resultBytes,v.format,v.planes,unsigned(ok));
   IOLog("PianoVideoVT V6p: lookup token %llu request %llu id %u status %08x held %u\n",s->frame.token,s->guest.request,id,rc,unsigned(s->surfaceLease.held()));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
 bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
-  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v)){failure(s,60,kBadData);return false;}
+  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v,f.layout.width,f.layout.height)){failure(s,60,kBadData);return false;}
   IOMemoryDescriptor *mem=IOMemoryDescriptor::withAddressRange(v.base,v.size,kIODirectionInOut,s->client->task);
   const IOReturn prepared=mem?mem->prepare():kIOReturnNoMemory;
   if(prepared){OSSafeReleaseNULL(mem);failure(s,61,int(prepared));return false;}
@@ -136,11 +136,12 @@ bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
     // WC source reads only; never create a cached arena alias or treat IOVA as PA.
     for(unsigned p=0;p<2;++p){
       const uint32_t off=p?l.uvOffset:l.yOffset,rows=p?l.height/2:l.height;
-      for(uint32_t y=0;y<rows;++y)for(uint32_t x=0;x<l.width;++x)
-        dst[v.plane[p].offset+uint64_t(y)*v.plane[p].stride+x]=f.cpu[off+uint64_t(y)*l.stride+x];
+      for(uint32_t y=0;y<rows;++y)
+        memcpy(dst+v.plane[p].offset+uint64_t(y)*v.plane[p].stride,
+          const_cast<const uint8_t *>(f.cpu)+off+uint64_t(y)*l.stride,l.width);
     }
     __asm__ volatile("dsb sy" ::: "memory");
-    IOLog("PianoVideoVT V5a: copy success token %llu active 320x240 bytes 115200 stride %u scanlines %u uv-offset %u IOSurface %u\n",f.token,l.stride,l.scanlines,l.uvOffset,v.id);
+    IOLog("PianoVideoVT V8: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u\n",f.token,l.width,l.height,l.width*l.height*3/2,l.stride,l.scanlines,l.uvOffset,v.id);
   }else failure(s,62,kNoMemory);
   OSSafeReleaseNULL(map);mem->complete();mem->release();--s->maps;return ok;
 }
@@ -375,9 +376,9 @@ void attributes(Session *s) {
   Plist *p=new Plist();if(!p){failure(s,10,kNoMemory);return;}
   uint8_t b[640];const int fmt=p->integer(cc("420v"));
   const int keys[]={p->string("Width"),p->string("Height"),p->string("PixelFormatType"),p->string("BytesPerRowAlignment"),p->string("PlaneAlignment"),p->string("IOSurfaceProperties")};
-  const int values[]={p->integer(320),p->integer(240),p->array(&fmt,1),p->integer(64),p->integer(256),p->dict(nullptr,nullptr,0)};
+  const int values[]={p->integer(s->config.s.width),p->integer(s->config.s.height),p->array(&fmt,1),p->integer(64),p->integer(256),p->dict(nullptr,nullptr,0)};
   const int attrs=p->dict(keys,values,6);Writer w(b,sizeof b);w.header(cc("Dpba"),0,s->uuid,0);w.plist(cc(",pba"),*p,attrs);send(s->client,w,b);delete p;
-  IOLog("PianoVideoVT V5a: Dpba active 320x240 420v IOSurface pool\n");
+  IOLog("PianoVideoVT V8: Dpba active %ux%u 420v IOSurface pool\n",s->config.s.width,s->config.s.height);
 }
 int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
   contract::FormatReport r;if(!descriptor(s->client,h,m,n,r))return kUnsupported;
@@ -387,7 +388,7 @@ int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
   s->started=true;s->workerRunning=true;thread_t t=nullptr;
   if(kernel_thread_start(worker,s,&t)!=KERN_SUCCESS){s->workerRunning=false;s->stopping=true;piano_video_native_close(s->native);s->native=0;return kNoMemory;}
   thread_deallocate(t);attributes(s);
-  IOLog("PianoVideoVT V5a: dsta native session %u bounded-format 320x240 Baseline/Main stream\n",s->native);return 0;
+  IOLog("PianoVideoVT V8: dsta native session %u bounded-format %ux%u profile %u level %u progressive8bit420\n",s->native,s->config.s.width,s->config.s.height,s->config.s.profile,s->config.s.level);return 0;
 }
 int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   if(!contract::inputRequest(m,n,r,&s->config))return kBadData;
@@ -418,11 +419,11 @@ void inventory(Client *c,const Header &h) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[2048];int entry=0;
   if(h.type==cc("decs")){
     const int type=p->string("avc1");const int keys[]={p->string("VTCodecType"),p->string("CMClassImplementationName"),p->string("IsPreferredInternalPlugin"),p->string("VTRating"),p->string("CMClassImplementationID")};
-    const int values[]={p->array(&type,1),p->string("PianoVideo native AVC V5a qualification"),p->boolean(false),p->integer(400),p->string("com.unixnu.pianovideo.decoder.avc")};entry=p->dict(keys,values,5);
+    const int values[]={p->array(&type,1),p->string("PianoVideo native bounded AVC High"),p->boolean(false),p->integer(400),p->string("com.unixnu.pianovideo.decoder.avc")};entry=p->dict(keys,values,5);
   }
   const int list=p->array(&entry,h.type==cc("decs")&&piano_video_native_ready()?1:0);
   Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.plist(h.type==cc("decs")?cc(",dec"):cc(",enc"),*p,list);w.u32(cc(",ver"),6);send(c,w,b);delete p;
-  IOLog("PianoVideoVT V5a: inventory version6 avc1-only qualification encoders0\n");
+  IOLog("PianoVideoVT V8: inventory version6 avc1-only bounded1920x1080 encoders0\n");
 }
 void properties(Client *c,const Header &h,bool value) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[512];int root;

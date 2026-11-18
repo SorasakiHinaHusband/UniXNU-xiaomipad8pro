@@ -805,3 +805,31 @@ with interrupt side effects are excluded. The snapshot changes no waits, timeout
 service preserves the same text independently of owner teardown; `V6f snapshot exported IORegistry 1` confirms publication.
 Absent domains are marked unreadable rather than read speculatively. The unchanged V6 tool and fixtures reproduce the
 original phase order. This is diagnostic instrumentation, not a firmware-stall fix or a continuous-decoding qualification.
+
+
+## 16. Stock playback qualification and bounded High AVC (V8)
+
+The V7e2 RAM test qualified the owned 320×240 Main AVC fixture in unmodified QuickTime: 60 native frames, client lifetime
+60 decoded/0 dropped, rate1 and optically confirmed fixture motion. The asynchronous reply window stays four with eight
+credits and two input slots; VT finish preserves decode-order references instead of issuing HFI EOS. Exhaustive exclusion
+of all software-factory attempts is still unknown. This result does not qualify other resolutions, codecs or clients.
+
+The V8 implementation admits progressive limited-range 8-bit420 Baseline/Main/High AVC through active1920×1080,
+POC0/2, references≤4, reorder≤4, one SPS/PPS, four-byte NAL lengths and one complete AU≤1MiB per sample. It validates
+High syntax, scaling lists/8×8 transforms, avcC extensions, coded/active dimensions, crop and level mappings through4.2.
+Field coding, POC1, FMO, transform bypass, high bit depths, other chroma formats, full range, protected samples and DRC
+remain rejected. Exact same-configuration dcan is unchanged.
+
+The native path derives FIRST_IPSC geometry and pixel crop from the stream, checks active dimensions against the SPS,
+and adopts bounded firmware-returned coded geometry. Initial COMV usesN4; PSC's realN controls COMV count and split
+DPB/RAW supply. General AVC uses at most16 pictures and four scratch types (AV1-only PARTIAL is omitted), with two
+disjoint scratch generations. At coded1920×1088 it reserves186,449,920 bytes including guards within a256MiB aperture;
+132 SMMU table pages cover that aperture. Legacy self-tests retain their prior layout. RAW uses linearNV12, references
+useQC08C, and only crop-adjusted active rows reach a checked420v IOSurface. Pool size remains bounded to4MiB.
+
+The owned High1080 and Main720 clips, compressed identities, PTS/DTS and independent software NV12 hashes are in
+`package/PianoVideo/tests/fixtures/v8`. `tooling/native/build-video-avc-audit.sh` checks actual CoreMedia formats and all
+compressed packets without creating a VT session. The next image must prove native/client counts, returned geometry,
+safe close and optical motion in stock QuickTime. High/1080p are implemented but not tablet-qualified. HEVC/P010,
+aerial playback, Safari/MSE and concurrent sessions remain separate gates; cinematic boot is a frozen-surface/Metal
+handoff, with no established HEVC movie dependency.

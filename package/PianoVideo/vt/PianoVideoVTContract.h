@@ -137,7 +137,7 @@ inline bool sampleFormat(const vtwire::Atom &fdsc,const avc::Config &cfg) {
   auto le32=[](const uint8_t *p){uint32_t v;memcpy(&v,p,4);return v;};
   if (!unique(fdsc.body,fdsc.size,cc("mdia"),media) || media.size!=4 || le32(media.body)!=cc("vide") ||
       !unique(fdsc.body,fdsc.size,cc("codc"),codec) || codec.size!=4 || le32(codec.body)!=cc("avc1") ||
-      !unique(fdsc.body,fdsc.size,cc("vdim"),dimensions) || dimensions.size!=8 || le32(dimensions.body)!=320 || le32(dimensions.body+4)!=240 ||
+      !unique(fdsc.body,fdsc.size,cc("vdim"),dimensions) || dimensions.size!=8 || le32(dimensions.body)!=cfg.s.width || le32(dimensions.body+4)!=cfg.s.height ||
       !unique(fdsc.body,fdsc.size,cc("extn"),extensions) || !unique(extensions.body,extensions.size,cc("dict"),dictionary))return false;
   Atom protection; bool protectedData=false;
   dictionaryEntry(dictionary.body,dictionary.size,101,"CommonEncryptionProtected",protection,&protectedData);
@@ -243,17 +243,22 @@ inline bool format(const vtwire::ImageDescription &d, FormatReport *report = nul
   r.decision = "codec";
   if (d.codec != cc("avc1")) return false;
   r.decision = "dimensions";
-  if (d.width != 320 || d.height != 240) return false;
+  if (!d.width || !d.height || d.width > 1920 || d.height > 1080 || ((d.width | d.height) & 1)) return false;
   r.decision = "avcC-missing-or-duplicate";
   Atom avc;
   if (!unique(d.extensions, r.atomBytes, cc("avcC"), avc)) return false;
   r.avcBytes = avc.size;
   r.decision = "avcC-configuration";
   avc::Config parsed;
-  if (!avc::config(avc.body,avc.size,parsed)) return false;
+  if (!avc::config(avc.body,avc.size,parsed) || d.width != parsed.s.width || d.height != parsed.s.height) return false;
   Atom protectedAtom;
   r.decision = "protected-or-hevc";
   if (find(d.extensions, r.atomBytes, cc("sinf"), protectedAtom) || find(d.extensions, r.atomBytes, cc("hvcC"), protectedAtom)) return false;
+  Atom colr;
+  if(find(d.extensions,r.atomBytes,cc("colr"),colr)) {
+    if(!unique(d.extensions,r.atomBytes,cc("colr"),colr)||colr.size<10)return false;
+    if(vtwire::be32(colr.body)==cc("nclx") && (colr.size!=11 || (colr.body[10]&0x80)))return false;
+  }
   if (config) *config = parsed;
   r.decision = "accept";
   return true;
@@ -283,25 +288,34 @@ inline bool extent(uint64_t offset, uint64_t stride, uint64_t rows, uint64_t wid
   return rows && width && stride >= width && offset <= size && width <= size-offset && rows-1 <= (size-offset-width)/stride;
 }
 inline bool layout(const native::Layout &l, uint64_t length) {
-  return l.width == 320 && l.height == 240 && l.stride == 384 && l.scanlines == 256 && l.yOffset == 0 && l.uvOffset == 98304 &&
-    l.bytes <= length && l.bytes >= 144256 && l.bitdepth == 8 && l.format == vtwire::cc("420v") &&
-    extent(l.yOffset,l.stride,l.height,l.width,l.bytes) && extent(l.uvOffset,l.stride,l.height/2,l.width,l.bytes);
+  return l.width >= 96 && l.height >= 96 && l.width <= 1920 && l.height <= 1080 && !((l.width|l.height)&1) &&
+    l.codedWidth >= l.width && l.codedWidth <= 1920 && l.codedHeight >= l.height && l.codedHeight <= 1088 &&
+    !((l.codedWidth|l.codedHeight|l.cropLeft|l.cropTop)&1) &&
+    l.cropLeft <= l.codedWidth-l.width && l.cropTop <= l.codedHeight-l.height &&
+    l.stride == ((l.codedWidth+127)&~127u) && l.scanlines == ((l.codedHeight+31)&~31u) &&
+    l.yOffset == l.cropTop*l.stride+l.cropLeft && l.uvOffset == l.stride*l.scanlines+(l.cropTop/2)*l.stride+l.cropLeft &&
+    l.stride >= l.width && l.stride <= 1920 && !(l.stride & 127) && l.scanlines >= l.height && l.scanlines <= 1088 && !(l.scanlines & 31) &&
+    l.bytes <= length && l.bytes <= kMaxSurfaceBytes && l.bitdepth == 8 && l.format == vtwire::cc("420v") &&
+    !(l.yOffset & 1) && !(l.uvOffset & 1) &&
+    extent(l.yOffset,l.stride,l.height,l.width,l.bytes) && extent(l.uvOffset,l.stride,l.height/2,l.width,l.bytes) &&
+    uint64_t(l.yOffset) + uint64_t(l.height-1)*l.stride + l.width <= l.uvOffset;
 }
 struct Plane { uint64_t width = 0, height = 0, offset = 0, stride = 0; uint32_t nonlinear = 0; };
 struct Surface {
   uint64_t base = 0, size = 0; uint32_t id = 0, format = 0, planes = 0; Plane plane[2];
 };
-inline bool surface(const Surface &s) {
-  return s.base && s.size && s.size <= kMaxSurfaceBytes && s.base <= UINT64_MAX-s.size && s.format == vtwire::cc("420v") && s.planes == 2 &&
-    s.plane[0].width == 320 && s.plane[0].height == 240 && s.plane[1].width == 160 && s.plane[1].height == 120 &&
+inline bool surface(const Surface &s, uint32_t width = 320, uint32_t height = 240) {
+  return width >= 96 && height >= 96 && width <= 1920 && height <= 1080 && !((width|height)&1) &&
+    s.base && s.size && s.size <= kMaxSurfaceBytes && s.base <= UINT64_MAX-s.size && s.format == vtwire::cc("420v") && s.planes == 2 &&
+    s.plane[0].width == width && s.plane[0].height == height && s.plane[1].width == width/2 && s.plane[1].height == height/2 &&
     !s.plane[0].nonlinear && !s.plane[1].nonlinear &&
-    extent(s.plane[0].offset,s.plane[0].stride,240,320,s.size) && extent(s.plane[1].offset,s.plane[1].stride,120,320,s.size) &&
-    s.plane[1].offset >= s.plane[0].offset + 239*s.plane[0].stride + 320;
+    extent(s.plane[0].offset,s.plane[0].stride,height,width,s.size) && extent(s.plane[1].offset,s.plane[1].stride,height/2,width,s.size) &&
+    s.plane[1].offset >= s.plane[0].offset + uint64_t(height-1)*s.plane[0].stride + width;
 }
 // Native 27.3 IOSurface lookup lock result. Plane+0x6c is a byte:
 // IOSurfaceClientGetBytesPerRowOfPlane 0x1876b7978 uses ldrb, as does
 // GetBaseAddressOfPlane 0x1876b7c2c. Neighbouring bytes are not this flag.
-inline bool surfaceResult(const uint8_t *b, uint32_t n, uint32_t id, Surface &v) {
+inline bool surfaceResult(const uint8_t *b, uint32_t n, uint32_t id, Surface &v, uint32_t width = 320, uint32_t height = 240) {
   if (!b || n != 0xc68) return false;
   auto u64 = [&](uint32_t at) { uint64_t x; memcpy(&x,b+at,8); return x; };
   auto u32 = [&](uint32_t at) { uint32_t x; memcpy(&x,b+at,4); return x; };
@@ -310,7 +324,7 @@ inline bool surfaceResult(const uint8_t *b, uint32_t n, uint32_t id, Surface &v)
     const uint32_t at=0x88+p*0x98;
     v.plane[p]={u64(at),u64(at+8),u64(at+0x18),u64(at+0x20),b[at+0x6c]};
   }
-  return v.id==id && surface(v);
+  return v.id==id && surface(v,width,height);
 }
 // All calls under the session lock. Invalid input does not consume the one-AU
 // budget. Cancellation suppresses success, settles an accepted frame once.

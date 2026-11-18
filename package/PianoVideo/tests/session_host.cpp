@@ -465,8 +465,35 @@ static void nativeTests()
   native::State preInput; CHECK(preInput.acquire(&sid) == 0 && preInput.closing(sid) == 0);
   preInput.closed(false); CHECK(preInput.acquire(&other) == 0 && other != sid);
 }
+static void generalGeometryTests() {
+  Peer p;Layout layout;CHECK(layout.init(1920,1088));SelfTest<Peer> tx(p,layout);
+  tx.streaming=true;tx.activeWidth=1920;tx.activeHeight=1080;
+  tx.expectedProfile=4;tx.expectedLevel=11;
+  tx.psc.resolution=0x07800440;tx.psc.crop[0]=0;tx.psc.crop[1]=8;
+  tx.psc.poc=tx.expectedPoc;tx.psc.profile=4;tx.psc.level=11;tx.psc.n=16;
+  CHECK(tx.pscSupported());
+  tx.psc.n=17;CHECK(!tx.pscSupported());tx.psc.n=16;
+  tx.psc.crop[1]=7;CHECK(!tx.pscSupported());tx.psc.crop[1]=10;CHECK(!tx.pscSupported());
+  tx.psc.crop[1]=8;CHECK(tx.adoptPscGeometry());
+  tx.psc.resolution=0x07800438;tx.psc.crop[1]=0;
+  CHECK(tx.pscSupported() && tx.adoptPscGeometry());
+  CHECK(layout.geometry.stride==1920 && layout.geometry.scanlines==1088 && layout.rawBytes()==3133440);
+  CHECK(layout.find(Raw,15)->size==3133440 && layout.find(Dpb,15)->size==3153920);
+  std::vector<uint64_t> words(vsmmu::kSessionTablePages*512),pages(kArenaPages),uc(vsmmu::kUcPages);
+  for(unsigned i=0;i<pages.size();++i)pages[i]=0x900000000ull+4096ull*i;
+  for(unsigned i=0;i<uc.size();++i)uc[i]=0x8d0000000ull+4096ull*i;
+  vsmmu::Tables tables{words.data(),0x8e0000000ull,vsmmu::kSessionTablePages};
+  CHECK(vsmmu::build(tables,uc.data(),unsigned(uc.size()),0x8e1000000ull));
+  CHECK(buildArena(tables,layout,pages.data()));
+  // Exercise the newly added L3 tables beyond the old 64 MiB aperture.
+  const auto *last=layout.find(Raw,15);CHECK(last && last->off>64*1024*1024);
+  CHECK(vsmmu::walk(tables,last->iova()+last->capacity-1)==pages[(last->off+last->capacity-1)/4096]+((last->capacity-1)&4095));
+  CHECK(!vsmmu::walk(tables,last->iova()+((last->capacity+16383)&~16383u)));
+  CHECK(!vsmmu::walk(tables,kArenaBase+kArenaBytes));
+}
 int main()
 {
+  generalGeometryTests();
   nativeTests();
   layoutTests();
   for (unsigned n : {1u, 4u, 7u, 64u})

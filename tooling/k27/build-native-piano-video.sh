@@ -33,6 +33,8 @@ for f in Sm8750Scm.c Sm8750Scm.h; do
 done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/video_host.cpp" -o "$O/host-tests/video_host"
 "$O/host-tests/video_host" || { echo "Error: PianoVideo host tests failed (level 1)" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror -I "$P" "$P/tests/geometry_host.cpp" -o "$O/host-tests/geometry_host"
+"$O/host-tests/geometry_host" || { echo "Error: PianoVideo AVC geometry tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror -I "$P" "$P/tests/session_host.cpp" -o "$O/host-tests/session_host"
 "$O/host-tests/session_host" || { echo "Error: PianoVideo V4 protocol/arena tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -O2 -Wall -Wextra -Werror -I "$P" "$P/tests/stream_host.cpp" -o "$O/host-tests/stream_host"
