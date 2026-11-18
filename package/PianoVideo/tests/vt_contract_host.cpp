@@ -83,7 +83,7 @@ static void streamTests() {
   fdsc.body=formatBody.data();for(unsigned n=0;n<formatBody.size();++n){fdsc.size=n;CHECK(!vtcontract::sampleFormat(fdsc,c));}
   CHECK(c.same(c));avc::Config different=c;different.pps[2]^=1;CHECK(!c.same(different));
   CHECK(!avc::config(nullptr,0,different));
-  for(auto invalid:{makeSps(100),makeSps(77,1),makeSps(77,0,5),makeSps(77,0,2,20),makeSps(77,0,2,19,true),makeSps(77,0,2,19,false,true),makeSps(77,0,2,19,false,false,3)}){
+  for(auto invalid:{makeSps(100),makeSps(77,1),makeSps(77,0,5),makeSps(77,0,2,120),makeSps(77,0,2,19,true),makeSps(77,0,2,19,false,true),makeSps(77,0,2,19,false,false,3)}){
     auto bad=avcc(invalid,p);CHECK(!avc::config(bad.data(),uint32_t(bad.size()),different));
   }
   for(auto invalid:{makePps(true,1),makePps(true,0,true),makePps(true,0,false,1)}){
