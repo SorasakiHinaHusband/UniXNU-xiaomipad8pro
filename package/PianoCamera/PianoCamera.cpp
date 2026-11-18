@@ -73,7 +73,7 @@ struct Args {
   uint32_t cc, mclkcc, blocks, qup, spmi, smmu;
   uint32_t votes, mmcxFloor;
   uint32_t frames, pattern, timeoutMs, gain;
-  uint32_t ae, aeTarget, aeSteps;
+  uint32_t ae, aeTarget, aeSteps, liveDiagnostics;
 };
 Args gArgs;
 char gPlanText[160];   // piano-camera-plan as given
@@ -102,6 +102,7 @@ PianoCameraLiveStatus gLiveStatus;
 IOBufferMemoryDescriptor *gLiveMemory;
 uint64_t gLiveToken;
 bool gLiveActive, gLiveStop, gSuspended, gHardwareUnsafe;
+bool gFrontProbePassed;   // camera worker, under gSequenceLock
 uint32_t gLiveSensor;
 
 void cancelLiveLocked()
@@ -148,6 +149,7 @@ void readArgs()
   gArgs.ae = bootArg("piano-camera-ae", 1) ? 1 : 0;   // level 3: the exposure loop for the scene (CameraStream.h)
   gArgs.aeTarget = clampArg(bootArg("piano-camera-ae-target", 160), 16, 800);
   gArgs.aeSteps = clampArg(bootArg("piano-camera-ae-steps", 8), 1, 8);
+  gArgs.liveDiagnostics = bootArg("piano-camera-live-diagnostics", 0) != 0;
   // piano-camera-plan (CameraPlan.h): its level for probe and the power tree; a plan that does not parse leaves level 1 (the survey
   // and the plan's error line, nothing written).
   gPlanText[0] = 0;
@@ -1396,10 +1398,32 @@ void PianoCamera::serveLive(uint32_t sensor)
     k.o.pattern = false;
     k.o.ae = gArgs.ae != 0;
     k.o.aeTarget = gArgs.aeTarget;
+    k.o.liveDiagnostics = gArgs.liveDiagnostics != 0;
     k.ops.survey = &k.survey;
-    Session<Ops> &session = k.session.make(k.ops, k.po);
-    Stream<Ops> &stream = k.stream.make(k.ops, session, k.o);
-    result = &stream.run(sensor == kPianoCameraRear ? Sensor::rear : Sensor::front, gLoader, gPmic, k.so, k.survey);
+    const Sensor which = sensor == kPianoCameraRear ? Sensor::rear : Sensor::front;
+    auto run = [&](unsigned probeFrames) {
+      k.o.liveProbeFrames = probeFrames;
+      Session<Ops> &session = k.session.make(k.ops, k.po);
+      Stream<Ops> &stream = k.stream.make(k.ops, session, k.o);
+      return &stream.run(which, gLoader, gPmic, k.so, k.survey);
+    };
+    if (k.o.liveDiagnostics && which == Sensor::front && !gFrontProbePassed) {
+      constexpr unsigned frames = 30;
+      note("abi2 front probe begin limit=%u timeout-ms=%u", frames, k.o.timeoutMs);
+      result = run(frames);
+      gFrontProbePassed = result->ok && result->bufferFreed && result->bufDone == frames;
+      note("abi2 front probe end frames=%u clean=%u passed=%u failedStep=%d", result->bufDone, result->cleanOff, gFrontProbePassed,
+           int(result->failedStep));
+      if (gFrontProbePassed && !k.ops.liveCancelled()) {
+        k.stream.drop();
+        k.session.drop();
+        result = nullptr;
+      }
+    }
+    if (!result && !k.ops.liveCancelled()) {
+      if (k.o.liveDiagnostics) note("abi2 app stream begin sensor=%u", sensor);
+      result = run(0);
+    }
   } else {
     note("abi2 worker cancelled before hardware sensor=%u", sensor);
   }

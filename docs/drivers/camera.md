@@ -1,14 +1,16 @@
 # Cameras (B11): PianoCamera, the level ladder
 
 2026-11-18, avf5: the early reservation worked on the tablet. The live front path published its first RAW frame and completed
-151 hardware frames in 5.49 seconds. After cancellation, the final guard check failed at step331; the tablet reset before its
-fault registers or completed teardown were captured. The guard write's extent/origin and reset cause remain unknown. No real
-AVFoundation PNG or rear live capture was recovered. Frame-mode geometry matches the reference; no sensor/crop/increment guess
-is justified. A host-tested safety change refuses live bypass routes, drains an outstanding frame on cancellation, and disables
-the write master immediately on a detected guard/translation fault, keeping unsafe DMA/table/clock resources pinned. It preserves
-the step checkpoints and logs the first bad guard offset/value and fault registers before teardown. This change has no tablet
-qualification; its next image is held until the physical guard/reset cause is established. Full guard scans while armed also
-need a measured performance qualification.
+151 hardware frames in 5.49 seconds. After cancellation, the final guard check failed at step 331. The tablet reset before
+the fault registers, completed teardown, rear capture or AVFoundation PNGs were captured. The guard write and reset causes
+remain open.
+
+The host-tested live path requires a translating buffer-plus-guard aperture, drains an outstanding frame on cancellation,
+and immediately disables the write master when it detects guard damage or a translation fault. It retains unsafe DMA,
+tables and clocks and refuses further hardware starts. With `piano-camera-live-diagnostics=1`, the first front request
+captures 30 private frames and must return its DMA lease cleanly before the same request starts sending frames to the app.
+The context bank must read back in terminate mode with fault reporting. The worker polls context faults, including during
+stop, and logs write-master and RDI0 registers for the first 20 completions of each stream. Tablet measurements are pending.
 
 Earlier on 2026-11-18: the B-TC CoreMediaIO extension, Camera consent and AVFoundation discovery passed on 27.3; its pattern stream delivered
 31 valid moving frames. After correcting the CPU ring's alignment, `cmio-real-avf4` reached both chip IDs and the hardware worker's

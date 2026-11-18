@@ -2302,6 +2302,62 @@ static void testLiveStream()
   CHECK(longRun.ops.logIndex("csiphy4 status 0-10 at the end:") >= 0 && longRun.b.violations.empty());
 }
 
+static void testBoundedLiveStream()
+{
+  L3Rig r;
+  r.ops.reserveDma();
+  r.b.r[kCsidLite0 + kCsidRdiMeasure0] = 1836u << 16 | 4080u;
+  r.b.r[kCsidLite0 + kCsidRdiBytesPing] = 7490880;
+  bool sawCountersEnabled = false;
+  r.ops.invalidateHook = [&](const void *, uint64_t) {
+    if (r.b.v(kCsidLite0 + kCsidRdiCfg0) & kRdiCfg0Enable)
+      sawCountersEnabled |= r.b.v(kCsidLite0 + kCsidRdiCfg1) == (kRdiCfg1Mipi | kRdiMeasureEnable) &&
+                            !(r.b.v(kCsidLite0 + kCsidRdiMeasureCtrl) & kRdiMeasureCompare);
+  };
+  StreamOptions opt;
+  opt.live = opt.liveDiagnostics = true;
+  opt.pattern = false;
+  opt.liveProbeFrames = 30;
+  const auto bounded = r.run(Sensor::front, opt);
+  CHECK(bounded.ok && bounded.cleanOff && bounded.bufferFreed && bounded.bufDone == 30);
+  CHECK(r.b.framesWritten == 30 && r.b.aupFifo.empty() && r.ops.liveFrames == 0 && !r.ops.dmaReserve.busy());
+  CHECK(sawCountersEnabled);
+  CHECK(r.ops.logIndex("dma context sensor=2 phase=bounded") >= 0);
+  CHECK(r.ops.logIndex("dma frame sensor=2 phase=bounded n=20 ") >= 0);
+  CHECK(r.ops.logIndex("dma frame sensor=2 phase=bounded n=21 ") == -1);
+  CHECK(r.ops.logIndex("dma rdi sensor=2 phase=bounded n=1 lines=1836 measure=072c0ff0 bytes-ping=00724d40") >= 0);
+  CHECK(r.ops.logIndex("dma final sensor=2 phase=bounded frames=30 guard=intact fsr=00000000") >= 0);
+  opt.liveProbeFrames = 0;
+  r.ops.liveLimit = 4;
+  const auto app = r.run(Sensor::front, opt);
+  CHECK(app.ok && app.cleanOff && app.bufferFreed && app.pa == bounded.pa && r.ops.liveFrames == 4);
+  CHECK(r.ops.logIndex("dma frame sensor=2 phase=app n=1 ") >= 0 && r.b.violations.empty());
+
+  L3Rig timeout;
+  opt.liveProbeFrames = 30;
+  opt.timeoutMs = 100;
+  const auto late = timeout.run(Sensor::front, opt);
+  CHECK(!late.ok && late.failure == StreamFailure::frameTimeout && late.bufDone < 30);
+  CHECK(timeout.ops.liveFrames == 0 && late.streamUs <= 101000);
+}
+
+static void testCameraSmmuFaultModeReadback()
+{
+  for (uint32_t stuck : {iova::kSctlrCfcfg, iova::kSctlrCfie, iova::kSctlrHupcf}) {
+    L3Rig r;
+    const RoutePlan plan = planRoute(kSmmuBytes, [&](uint32_t off) { return r.b.v(kSmmu + off); });
+    CHECK(plan.route == Route::window);
+    auto read = [&](uint32_t off) { return r.b.v(kSmmu + off); };
+    auto write = [&](uint32_t off, uint32_t value) {
+      if (off == plan.window.cb + iova::kCbSctlr && (value & iova::kSctlrM)) value |= stuck;
+      r.b.r[kSmmu + off] = value;
+    };
+    const char *error = iova::apply(plan.window, kCamStream, 0x90000000, read, write, [] { return true; });
+    CHECK(error && std::strstr(error, "terminate/report"));
+    CHECK(read(iova::s2crOffset(plan.slot)) == plan.foundS2cr && read(iova::smrOffset(plan.slot)) == plan.foundSmr);
+  }
+}
+
 // Desktop-era contiguous allocations may fail while the boot reservation must
 // still serve both geometries. Real Stream teardown, not a test shortcut,
 // returns each lease; an unconfirmed WM stop must retain it.
@@ -2431,11 +2487,14 @@ static void testLiveDmaFence()
           const unsigned bank = r.b.v(kSmmu + iova::s2crOffset(i)) & 0xffu;
           r.b.r[kSmmu + (pages + bank) * 4096 + iova::kCbFsr] = 2;
           r.b.r[kSmmu + (pages + bank) * 4096 + 0x60] = kIovaWindowBase + (8u << 20);
+          r.b.r[kSmmu + (pages + bank) * 4096 + 0x68] = 0x10;
         }
     };
     const auto result = r.run(Sensor::front, opt);
     CHECK(result.failure == StreamFailure::smmu && result.fault.fsr == 2);
     CHECK(result.fault.farLo == kIovaWindowBase + (8u << 20) && !result.bufferFreed && r.ops.dmaReserve.busy());
+    CHECK(result.fault.fsynr0 == 0x10);
+    CHECK(r.ops.logIndex("dma fault sensor=2 fsr=00000002 far=0000000020800000 fsynr=00000010") >= 0);
     CHECK(result.wmStopped && r.b.violations.empty() && r.ops.liveFrames == 0);
   }
   for (bool bank : {false, true}) {
@@ -2535,6 +2594,8 @@ int main()
   testExposureLoop();
   testIsp();
   testLiveStream();
+  testBoundedLiveStream();
+  testCameraSmmuFaultModeReadback();
   testReservedLiveDma();
   testLiveDmaFence();
   testPlan();

@@ -53,6 +53,8 @@ namespace pianocamera {
 struct StreamOptions {
   unsigned frames = 2;            // BUF_DONEs to collect (piano-camera-frames, 1..8)
   bool live = false;              // one private DMA address queued at a time, until the owner cancels
+  unsigned liveProbeFrames = 0;   // a bounded live run keeps its frames out of the client ring
+  bool liveDiagnostics = false;
   bool pattern = true;            // the rear's colour bars (piano-camera-pattern; 0: the scene)
   unsigned timeoutMs = 3000;      // the stream's hard bound from stream-on (piano-camera-timeout-ms, 500..10000)
   unsigned firstFrameMs = 1000, frameMs = 200, pollUs = 100, lateMs = 100;
@@ -484,8 +486,14 @@ class Stream {
       stop();
     }
     if (u_.route && !quarantined_) {   // preserve the first fault across quarantine
-      r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
-      r_.faultRead = true;
+      readDmaFault();
+      if (opt.live && (r_.fault.fsr & iova::kFsrFaults)) {
+        quarantineDma();
+        fail(kStepL3Stats, StreamFailure::smmu, "live DMA translation fault; resources quarantined");
+      } else if (opt.liveDiagnostics && r_.streamed && r_.wmStopped) {
+        ops.note("dma final sensor=%u phase=%s frames=%u guard=intact fsr=%08x", rear_ ? 1 : 2,
+                 livePhase(), r_.bufDone, r_.fault.fsr);
+      }
     }
     if (!quarantined_) {
       reportStream(ops, r_, opt.pattern, opt.gain);
@@ -751,6 +759,9 @@ class Stream {
                                     ops.udelay(1);
                                     return ++spins > 10000;
                                   });
+      if (opt.liveDiagnostics)
+        ops.note("dma context sensor=%u phase=%s bank=%u sctlr=%08x policy=terminate-poll applied=%u", rear_ ? 1 : 2,
+                 livePhase(), plan_.bank, ops.rd(kSmmu + plan_.window.cb + iova::kCbSctlr), !e);
       if (e) return fail(kStepL3Memory, StreamFailure::smmu, e);
       r_.busAddr = kIovaWindowBase;
     } else {
@@ -800,7 +811,9 @@ class Stream {
     put(c + kCsidRxCfg0, csidRxCfg0(f_->lanes, f_->csiphy), "CSID RX_CFG0: lanes - 1, lane map, PHY + 1");
     put(c + kCsidRxCfg1, 1, "CSID RX_CFG1: ECC correction");
     put(c + kCsidRdiCfg0, kRdiCfg0Base, "CSID RDI0 CFG0: RAW10 (0x2b), payload only, VC 0, timestamps");
-    put(c + kCsidRdiCfg1, kRdiCfg1Mipi, "CSID RDI0 CFG1: MIPI packing");
+    if (opt.liveDiagnostics)
+      put(c + kCsidRdiMeasureCtrl, ops.rd(c + kCsidRdiMeasureCtrl) & ~kRdiMeasureCompare, "CSID RDI0: disable dimension comparisons");
+    put(c + kCsidRdiCfg1, kRdiCfg1Mipi | (opt.liveDiagnostics ? kRdiMeasureEnable : 0), "CSID RDI0 CFG1: MIPI packing");
     put(c + kCsidRdiCtrl, 0, "CSID RDI0 CTRL: 0");
     put(c + kCsidRdiCfg0, ops.rd(c + kCsidRdiCfg0) | kRdiCfg0Enable, "CSID RDI0 CFG0: enable");
     put(c + kCsidRxMask, 0xffffffffu, "CSID CSI2 RX IRQ mask: all (polled; no interrupt is attached)");
@@ -998,7 +1011,7 @@ class Stream {
              ops.rd(kCsidLite0 + kCsidRxStatus), ops.rd(kCsidLite0 + kCsidRdiStatus), ops.rd(kTfeLite0 + kWm0 + kWmCfg));
     t0_ = ops.nowUs();
     // the exposure loop's frames on top of the stream's own bound
-    const uint64_t loopUs = aeOn() ? uint64_t(opt.aeSteps) * (opt.aeSettle + 1) * opt.frameMs * 1000 : 0;
+    const uint64_t loopUs = !opt.live && aeOn() ? uint64_t(opt.aeSteps) * (opt.aeSettle + 1) * opt.frameMs * 1000 : 0;
     deadline_ = t0_ + uint64_t(opt.timeoutMs) * 1000 + loopUs;
     frameDeadline_ = t0_ + uint64_t(opt.firstFrameMs) * 1000;
     last_ = t0_;
@@ -1025,6 +1038,29 @@ class Stream {
     return true;
   }
 
+  const char *livePhase() const { return opt.liveProbeFrames ? "bounded" : "app"; }
+
+  void readDmaFault()
+  {
+    r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
+    r_.faultRead = true;
+  }
+
+  void traceLiveFrame()
+  {
+    const uint64_t c = kCsidLite0, wm = kTfeLite0 + kWm0;
+    const uint32_t measure = ops.rd(c + kCsidRdiMeasure0);
+    const uint32_t ping = ops.rd(c + kCsidRdiBytesPing), pong = ops.rd(c + kCsidRdiBytesPong);
+    ops.note("dma frame sensor=%u phase=%s n=%u bus=%#llx payload=%u window=%llu wm=%08x addr=%08x incr=%08x size0=%08x size2=%08x "
+             "consumed=%08x last=%08x fifo=%08x current=%08x",
+             rear_ ? 1 : 2, livePhase(), r_.bufDone, (unsigned long long)r_.busAddr, r_.frameBytes, (unsigned long long)r_.bytes,
+             ops.rd(wm + kWmCfg), ops.rd(wm + kWmImageAddr), ops.rd(wm + kWmFrameIncr), ops.rd(wm + kWmImageCfg0),
+             ops.rd(wm + kWmImageCfg2), ops.rd(wm + kWmLastConsumed), ops.rd(wm + kWmLastFrame), ops.rd(wm + kWmFifoCount),
+             ops.rd(wm + kWmCurrentAddr));
+    ops.note("dma rdi sensor=%u phase=%s n=%u lines=%u measure=%08x bytes-ping=%08x bytes-pong=%08x", rear_ ? 1 : 2,
+             livePhase(), r_.bufDone, measure >> 16, measure, ping, pong);
+  }
+
   // Called on the detecting thread before any error log, sensor transaction or
   // power teardown. A CFG readback alone is not a posted-write drain. Fault the
   // owned stream as well, and retain its mapping and backing memory until reboot.
@@ -1034,20 +1070,20 @@ class Stream {
     r_.wmStopped = !(ops.rd(kTfeLite0 + kWm0 + kWmCfg) & kWmEnable);
     u_.wm = !r_.wmStopped;
     putQuiet(kSmmu + iova::s2crOffset(plan_.slot), kS2crFault);
+    if (!(r_.fault.fsr & iova::kFsrFaults)) readDmaFault();
+    ops.note("dma fault sensor=%u fsr=%08x far=%08x%08x fsynr=%08x gfsr=%08x phase=%s frame=%u", rear_ ? 1 : 2,
+             r_.fault.fsr, r_.fault.farHi, r_.fault.farLo, r_.fault.fsynr0, r_.fault.gfsr, livePhase(), r_.bufDone);
     const uint32_t blocked = ops.rd(kSmmu + iova::s2crOffset(plan_.slot));
     quarantined_ = true;
     ops.note("dma fence sensor=%u wm-stopped=%u s2cr=%08x pending=%u guard-offset=%u value=%02x", rear_ ? 1 : 2,
              r_.wmStopped, blocked, targetPending_, r_.stats.guardFirstBad, guardBadValue_);
-    ops.note("dma fault sensor=%u fsr=%08x far=%08x%08x fsynr=%08x gfsr=%08x", rear_ ? 1 : 2,
-             r_.fault.fsr, r_.fault.farHi, r_.fault.farLo, r_.fault.fsynr0, r_.fault.gfsr);
   }
 
   bool checkLiveDma(int step)
   {
     if (!opt.live || !u_.route || !u_.dma) return true;
-    r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
-    r_.faultRead = true;
-    if (r_.fault.fsr & iova::kFsrFaults) {
+    if (ops.rd(kSmmu + plan_.window.cb + iova::kCbFsr) & iova::kFsrFaults) {
+      readDmaFault();
       quarantineDma();
       return fail(step, StreamFailure::smmu, "live DMA translation fault; resources quarantined");
     }
@@ -1070,7 +1106,10 @@ class Stream {
       // BUF_DONE consumed the single queued address. The private DMA target
       // stays unarmed during cache synchronization, copy and AE sampling.
       if (!checkLiveDma(kStepL3Stream) || ops.liveCancelled()) break;
-      if (sofTicks_ && sequence_ > completedSequence_) {
+      if (opt.liveDiagnostics && r_.bufDone <= 20) traceLiveFrame();
+      if (opt.liveProbeFrames) {
+        if (r_.bufDone >= opt.liveProbeFrames) break;
+      } else if (sofTicks_ && sequence_ > completedSequence_) {
         const uint64_t missing = sequence_ - completedSequence_ - 1;
         const uint64_t at = captureUs_;
         const bool publish = !nextPublish || at + 2000 >= nextPublish;
@@ -1111,6 +1150,10 @@ class Stream {
         nextAe = r_.bufDone + 6;
       }
       if (ops.liveCancelled()) break;
+      if (opt.liveProbeFrames && ops.nowUs() >= deadline_) {
+        fail(kStepL3Stream, StreamFailure::frameTimeout, "bounded live stream deadline");
+        break;
+      }
       putQuiet(kTfeLite0 + kWm0 + kWmImageAddr, uint32_t(r_.busAddr >> 8));
       putQuiet(kCsidLite0 + kCsidRupAup, kCsidAupRdi0);
       targetPending_ = true;
@@ -1211,7 +1254,7 @@ class Stream {
           return true;
         }
       }
-      if (now >= frameDeadline_ || (!opt.live && now >= deadline_)) {
+      if (now >= frameDeadline_ || ((!opt.live || opt.liveProbeFrames) && now >= deadline_)) {
         if (opt.live && targetPending_) quarantineDma();
         ops.note("checkpoint step=320 sensor=%u event=timeout top=%08x buf=%08x rx=%08x rdi=%08x wm=%08x polls=%u", rear_ ? 1 : 2,
                  top, buf, rx, rdi, ops.rd(wm + kWmCfg), r_.polls);
@@ -1375,6 +1418,7 @@ class Stream {
     }
     if (u_.csid) {
       for (unsigned ms = 0; ms < opt.lateMs; ++ms) {
+        if (!checkLiveDma(kStepL3Stop)) return;
         const uint32_t buf = ops.rd(c + kCsidBufStatus);
         if (buf & kCsidBufRdi0) {
           ++r_.lateFrames;
