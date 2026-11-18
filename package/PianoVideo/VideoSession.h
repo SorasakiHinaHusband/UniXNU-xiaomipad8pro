@@ -112,6 +112,7 @@ public:
   Result r;
   Psc psc;
   bool openSent = false, inputStarted = false, rawStarted = false, drainSent = false, closeSent = false, cleanup = false;
+  bool failClosedCleanup = false;
   uint32_t stopPending = 0, picture = 0, errorSerial = 0;
   bool frameError = false;
   uint64_t deadline = 0;
@@ -658,15 +659,19 @@ public:
       }
       o.packetTrace("RX", ++o.rxEvents, o.rx, bytes);
       const int got = receive(o.rx, bytes);
-      if (got)
+      if (got) {
         rc = got;
+        if (failClosedCleanup) return rc;
+      }
     }
     o.drainDebug();
     const uint32_t irq = o.ops.rd(kIris + kWrapperIntrStatus);
     ++o.watchdogSamples;
     o.watchdogSeen |= irq & (1u << 3);
-    if (o.watchdogSeen)
+    if (o.watchdogSeen) {
       rc = fail(kErrWatchdog);
+      if (failClosedCleanup) return rc;
+    }
     const vsmmu::Fault fault = vsmmu::fault(o.plan, o.ops);
     o.rep.fsr |= fault.fsr & vsmmu::kFsrFaults;
     if (fault.fsr & vsmmu::kFsrFaults)
@@ -684,8 +689,9 @@ public:
     const uint64_t until = o.hw.nowUs() + uint64_t(ms) * 1000;
     for (;;) {
       const int rc = pump();
-      if (rc && !cleanup)
+      if (rc && (!cleanup || failClosedCleanup))
         return rc;
+      if (failClosedCleanup && r.error) return r.error;
       if (done())
         return 0;
       if (o.hw.nowUs() >= until)
@@ -867,9 +873,17 @@ public:
     if(!ledger.drainReady()||!f||f->phase!=stream::Phase::Submitted)return -22;
     return ledger.retire(t)?0:-22;
   }
-  int shutdown()
+  int shutdown(bool failClosed = false)
   {
     cleanup = true;
+    failClosedCleanup = failClosed;
+    auto abortCleanup = [this](int error) {
+      r.close = error;
+      o.hw.note("V9c session cleanup stopped at first error %d no-further-HFI 1",error);
+      stage(Finished);
+      return error;
+    };
+    if (failClosed && r.error) return abortCleanup(r.error);
     int rc = 0;
     if (rawStarted) {
       stage(StopRaw);
@@ -879,6 +893,7 @@ public:
         got = wait([this] { return r.stopRaw; });
       if (got && !rc)
         rc = got;
+      if (failClosed && (got || r.error)) return abortCleanup(got ? got : r.error);
     }
     if (inputStarted) {
       stage(StopInput);
@@ -888,6 +903,7 @@ public:
         got = wait([this] { return r.stopInput; });
       if (got && !rc)
         rc = got;
+      if (failClosed && (got || r.error)) return abortCleanup(got ? got : r.error);
     }
     if (openSent) {
       stage(Closing);
@@ -897,6 +913,7 @@ public:
         got = wait([this] { return r.closed; });
       if (got && !rc)
         rc = got;
+      if (failClosed && (got || r.error)) return abortCleanup(got ? got : r.error);
     }
     // A bounded extra pump detects already queued late replies; all backing still belongs to V3 until PAS/detach/TLB.
     const int late = pump();

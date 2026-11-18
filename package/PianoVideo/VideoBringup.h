@@ -166,6 +166,10 @@ class Bringup {
     const uint32_t irq = ops.rd(kIris + kWrapperIntrStatus);
     watchdogSeen |= irq & (1u << 3);
     ++watchdogSamples;
+    if (opt.level == 6 && watchdogSeen) {
+      hw.note("V9c core %s watchdog observed irq %08x no-further-trace-MMIO 1",when,irq);
+      return;
+    }
     hw.note("V3 core %s us %llu ctrl %08x tz %08x irq %08x mask %08x watchdog %u cpu-noc %08x/%08x video-noc %08x/%08x", when,
             (unsigned long long)hw.nowUs(), ops.rd(kIris + kCtrlStatus), ops.rd(kIris + kTzCpuStatus), irq,
             ops.rd(kIris + kWrapperIntrMask), unsigned(watchdogSeen != 0), ops.rd(kIris + kCpuNocLpiCtl),
@@ -435,6 +439,10 @@ class Bringup {
       phase("release-resume", un);
     }
     coreTrace("before-teardown");
+    if (opt.level == 6 && watchdogSeen) {
+      quarantineReason = kErrWatchdog;
+      return teardown();
+    }
     queueTrace("before-teardown");
     sfrTrace("before-teardown");
     if (routed.bank) faultRc = checkFault();

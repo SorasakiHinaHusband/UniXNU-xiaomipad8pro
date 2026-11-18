@@ -58,6 +58,7 @@ struct Peer {
   uint32_t pscResolution=0x014000f0,pscDepth=0x00080008,pscCoded=1,pscCrop0=0,pscCrop1=0;
   bool omitOptional=false;
   unsigned decodeOrderProperties=0;
+  bool watchdogOnStop=false,watchdogOnClose=false;
   bool autoEbd=true,autoDrainAck=true,autoDrainLast=true,dropStop=false,dropClose=false,lateClose=false;
   bool lastWithPicture=false;
   uint64_t finalToken=0;
@@ -141,8 +142,8 @@ struct Peer {
       if(autoDrainLast){if(lastWithPicture)output(finalToken,4,0x10000000);else emptyLast();}
       return 0;
     }
-    if(type==Stop){CHECK(flags==7);++stops;if(!dropStop)reply({packet(Stop,1,port,0)});return 0;}
-    if(type==Close){CHECK(flags==7&&port==0);++closes;if(!dropClose){reply({packet(Close,1,0,0)});if(lateClose)reply({packet(0x03000162,0,2,1,{2})});}return 0;}
+    if(type==Stop){CHECK(flags==7);++stops;if(watchdogOnStop)ops.watchdog=true;if(!dropStop)reply({packet(Stop,1,port,0)});return 0;}
+    if(type==Close){if(watchdogOnClose)ops.watchdog=true;CHECK(flags==7&&port==0);++closes;if(!dropClose){reply({packet(Close,1,0,0)});if(lateClose)reply({packet(0x03000162,0,2,1,{2})});}return 0;}
     if(type==0x03000193)comvCounts.push_back(p[8]);
     if(type==0x0300015b&&port==1){CHECK(p[8]==1&&payload==1&&etbs==0);++decodeOrderProperties;}
     if(type==Subscribe)CHECK(flags==3&&payload==11);
@@ -160,6 +161,23 @@ struct Fixture {
   void drain() {CHECK(tx.beginDrain()==0);pump();CHECK(tx.drainStatus()==1);}
   void close() {CHECK(tx.shutdown()==0);CHECK(peer.stops==2&&peer.closes==1&&tx.r.closed);}
 };
+static void nativeCleanupFailureTests() {
+  for(unsigned kind=0;kind<3;++kind) {
+    Fixture f;f.start();f.pump();f.releaseAll();
+    if(kind==0)f.peer.dropStop=true;
+    if(kind==1)f.peer.watchdogOnStop=true;
+    if(kind==2)f.peer.watchdogOnClose=true;
+    const unsigned samples=f.peer.watchdogSamples;
+    const int rc=f.tx.shutdown(true);
+    CHECK(rc==(kind==0?kErrHfiTimeout:kErrWatchdog) && f.tx.r.close==rc);
+    CHECK(f.peer.stops==(kind==2?2u:1u) && f.peer.closes==(kind==2?1u:0u));
+    if(kind==1)CHECK(f.tx.r.stopRaw); // ACK does not erase the same-pump watchdog
+    if(kind==2)CHECK(f.tx.r.closed && f.peer.watchdogSamples-samples==3);
+    const unsigned stops=f.peer.stops,closes=f.peer.closes;
+    CHECK(f.tx.shutdown(true)==rc && f.peer.stops==stops && f.peer.closes==closes);
+    CHECK(f.peer.hw.log.find("no-further-HFI 1")!=std::string::npos);
+  }
+}
 static void ledgerTests() {
   stream::Ledger l;
   CHECK(l.freeInput()==0&&!l.find(1));
@@ -554,7 +572,7 @@ static void passiveHardwareTests() {
   // Corrupt indices/size must never authorize an out-of-bounds pending-head read.
   m.mem.st(hfi::qhdr(0)+hfi::kQRead,size);diagnostic::Hardware bad;bad.capture(m);CHECK(!bad.headWords[0]);
 }
-int main() {
+int main() { nativeCleanupFailureTests();
   stockReplyWindowTests();
   firstTimeoutObservationTests();passiveHardwareTests();
   ancillaryPictureTests();

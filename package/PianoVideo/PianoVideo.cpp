@@ -864,7 +864,7 @@ extern "C" int piano_video_native_close(uint32_t sid)
          owner->core.watchdogSeen ? kErrWatchdog : owner->core.rep.fsr ? kErrFault : owner->core.quarantineReason;
     if (!rc && owner->attempted) {
       owner->tx.ledger.cancel();
-      rc = owner->tx.shutdown();
+      rc = owner->tx.shutdown(true);
       note("V6 ownership session %08x input-reuse %u raw-reuse %u high-water %u cancelled %u loans %u",sid,
            owner->tx.ledger.inputReuse,owner->tx.ledger.rawReuse,owner->tx.ledger.highWater,owner->tx.ledger.cancelled,unsigned(loans));
     }

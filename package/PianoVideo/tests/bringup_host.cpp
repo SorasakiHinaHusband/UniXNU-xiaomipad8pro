@@ -1662,19 +1662,20 @@ static void testNativeQuarantine()
 {
   // Real Bringup against the existing register/PAS/DMA model: quarantine must
   // precede every cleanup MMIO, PAS shutdown, domain detach and physical off.
-  for (unsigned kind=0;kind<3;++kind) {
+  for (unsigned kind=0;kind<4;++kind) {
     Run x(6);
     CHECK(x.go()==kOk && x.b->dmaHeld && x.b->pst.on && x.m->fw.authed);
     if(kind==0)x.b->quarantineReason=kErrHfiTimeout;
     if(kind==1)x.b->watchdogSeen=8;
     if(kind==2)x.b->rep.fsr=2;
+    if(kind==3)x.m->R(kIris+kWrapperIntrStatus)=8;
     const unsigned reads=x.b->ops.reads,writes=x.b->log.writes,frees=x.m->dmaFrees;
     const auto calls=x.m->calls;
-    const int want=kind==0?kErrHfiTimeout:kind==1?kErrWatchdog:kErrFault;
+    const int want=kind==0?kErrHfiTimeout:(kind==1||kind==3)?kErrWatchdog:kErrFault;
     CHECK(x.b->teardown()==want && x.b->quarantineReason==want);
-    CHECK(x.b->ops.reads==reads && x.b->log.writes==writes && x.m->calls==calls);
+    CHECK(x.b->ops.reads==reads+(kind==3?1u:0u) && x.b->log.writes==writes && x.m->calls==calls);
     CHECK(x.b->dmaHeld && x.b->pst.on && x.m->fw.authed && x.m->dmaFrees==frees);
-    CHECK(x.b->teardown()==want && x.b->ops.reads==reads && x.b->log.writes==writes);
+    CHECK(x.b->teardown()==want && x.b->ops.reads==reads+(kind==3?1u:0u) && x.b->log.writes==writes);
     CHECK(x.m->logged("no-cleanup-MMIO 1 reboot-required 1"));
     quiet(*x.m,"native failure quarantine");
   }
