@@ -28,6 +28,21 @@ staging = "/private/var/piano/userland"
 # stage.py preserves the seals and installs each bundle under /Applications.
 [camera_package]
 apps = ["PianoCamera.app", "PianoCameraCapture.app"]
+# Optional private capture directory. Used only with PIANO_CAMERA_PACKAGE and
+# PAD_USERLAND=1, on a fresh volatile test seed; never applied by the live installer.
+approval_env = "PIANO_CAMERA_APPROVAL"
+
+[[unit]]
+name = "piano-camera-runtime"
+about = "read-only CS_OPS_CDHASH verification of the running camera extension against its approved staged hash"
+default_on = true
+
+[[unit.file]]
+source = "tooling/camera/extension/runtime-cdhash.c"
+build = "cc"
+arch = "arm64"
+dest = "/usr/local/bin/piano-camera-runtime"
+mode = "0755"
 
 
 [[unit]]

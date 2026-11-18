@@ -462,3 +462,27 @@ Then the owner's system: section 7.5, with the owner present.
   processes to the console, `power.md` §6.5).
 
 The outputs are `out/userland/{build,stage,live}` (ignored).
+
+### Camera approval in volatile test seeds
+
+With `PAD_USERLAND=1` and `PIANO_CAMERA_PACKAGE` selecting a final verified package
+from the current worktree, `PIANO_CAMERA_APPROVAL` can select a private directory
+captured immediately after genuine system-extension approval. This opt-in needs
+`sysext-db.xml`, `sysext-staged-tree.txt`, `sysext-changed-files.txt`,
+`sysext-marker.txt` and `sysext-before.txt`; incomplete or unfamiliar state is
+refused. The complete database and signed staged bundle are seeded together,
+with hash/version/UUID fields derived from the final signed package. The origin
+apps are also present before daemon startup. Host staging persists and reads
+back root:wheel ownership on the copied APFS seed using noninteractive sudo.
+
+The database is not managed by the live userland installer; this option is
+refused for `--live`. It preserves B-TC signing and the existing CSR policy.
+Camera TCC consent remains a separate interactive step. A successful host audit
+is not evidence that the provider started on a tablet boot.
+
+Run `python3 tooling/camera/extension/test-bake-sysext.py` for synthetic contract
+checks. With `--capture CAPTURE --package PACKAGE --record AUDIT`, the same check
+verifies the genuine capture against the final signatures and records every
+preserved and derived field. `piano-camera-runtime PID EXPECTED_CDHASH` reads
+`CS_OPS_CDHASH` from the live extension process, independently of disk codesign
+metadata.
