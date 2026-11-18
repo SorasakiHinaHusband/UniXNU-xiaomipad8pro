@@ -10,6 +10,11 @@ The combined fix preserves those compiler arguments and adds a 640×480 BGRA com
 output. Physical sensor acquisition remains 15 fps; extra output frames repeat the latest source, with explicit counters and a
 stale-source cutoff. Native modes remain available. The signed client has a discovery-only `--inventory` mode; its ordinary
 capture still selects the first native mode. QuickTime's traced preview path adds no known source-rate/FourCC requirement.
+A complete host Core Image replay also exposes missing Metal function return/argument reflection after source compilation.
+The userland compatibility agent therefore selects Core Image's existing legacy CIKL metadata path for UID 501 through its
+`com.apple.coreimage` preference suite. This affects custom CIKL kernels in that user's apps; it leaves ordinary Metal rendering
+available. The helper saves the prior typed preference and restores it with `piano-coreimage-compat --remove`. The normal
+Metal CIKL path can return when the frontend supplies full function reflection. No Apple app binary or resource is modified.
 Actual stock-app preview, switching and recording are still unqualified; the combined test runs QuickTime first, polls app
 processes and windows, then tests Photo Booth independently and retains user/system crash reports from each phase.
 
