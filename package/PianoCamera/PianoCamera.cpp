@@ -1154,6 +1154,10 @@ bool PianoCamera::start(IOService *provider)
          gArgs.pattern, gArgs.timeoutMs, gArgs.gain, gArgs.mclk24);
   if (gArgs.level == 1) note("level 1: loads only, nothing written (the SPMI observer's read command is the only store)");
   setProperty("piano-camera", gArgs.level, 32);
+  // Share the actual boot policy with the CMIO publisher; synthetic cameras are
+  // diagnostic devices too, and must not survive piano-camera-pattern=0.
+  setProperty("piano-camera-pattern", gArgs.pattern, 32);
+  note("cmio-apps3-device-policy-v1: pattern=%u", gArgs.pattern);
   gSequenceLock = IOLockAlloc();
   gServeLock = IOLockAlloc();
   thread_t t = nullptr;

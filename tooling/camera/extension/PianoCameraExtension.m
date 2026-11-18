@@ -590,18 +590,38 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
 @end
 
 @implementation PianoProviderSource
+static BOOL publishTestCamera(void)
+{
+  io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PianoCamera"));
+  if (!service) return NO;
+  CFTypeRef value = IORegistryEntryCreateCFProperty(service, CFSTR("piano-camera-pattern"), kCFAllocatorDefault, 0);
+  IOObjectRelease(service);
+  int flag = 0;
+  const BOOL enabled = value && CFGetTypeID(value) == CFNumberGetTypeID() &&
+                       CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &flag) && flag == 1;
+  if (value) CFRelease(value);
+  return enabled;
+}
+
 - (instancetype)initWithClientQueue:(dispatch_queue_t)queue
 {
   if (!(self = [super init])) return nil;
   _provider = [CMIOExtensionProvider providerWithSource:self clientQueue:queue];
-  PianoDeviceSource *pattern = [[PianoDeviceSource alloc] initWithName:PIANO_PATTERN_NAME
-                                     identifier:PIANO_PATTERN_ID sensor:0 width:1280 height:720];
   PianoDeviceSource *front = [[PianoDeviceSource alloc] initWithName:PIANO_FRONT_NAME
                                      identifier:PIANO_FRONT_ID sensor:kPianoCameraFront width:816 height:459];
   PianoDeviceSource *rear = [[PianoDeviceSource alloc] initWithName:PIANO_REAR_NAME
                                      identifier:PIANO_REAR_ID sensor:kPianoCameraRear width:1020 height:768];
-  if (!pattern || !front || !rear) return nil;
-  _deviceSources = @[pattern, front, rear];
+  if (!front || !rear) return nil;
+  const BOOL testEnabled = publishTestCamera();
+  NSMutableArray *sources = [NSMutableArray arrayWithObjects:front, rear, nil];
+  if (testEnabled) {
+    PianoDeviceSource *pattern = [[PianoDeviceSource alloc] initWithName:PIANO_PATTERN_NAME
+                                       identifier:PIANO_PATTERN_ID sensor:0 width:1280 height:720];
+    if (!pattern) return nil;
+    [sources addObject:pattern];
+  }
+  _deviceSources = [sources copy];
+  os_log(gLog, "camera device policy cmio-apps3-device-policy-v1 pattern=%u real=2", testEnabled);
   for (PianoDeviceSource *source in _deviceSources) {
     NSError *error = nil;
     if (![_provider addDevice:source.device error:&error]) {

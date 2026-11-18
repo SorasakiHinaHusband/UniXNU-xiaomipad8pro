@@ -220,10 +220,13 @@ int main(int argc, const char **argv)
             piano[idKey] = device;
             printf("discovered %s %s\n", device.localizedName.UTF8String, idKey.UTF8String);
         }
-        BOOL pattern = capture(piano[PIANO_PATTERN_ID], 2, nil);
+        // The synthetic control is optional when the kernel disables patterns.
+        const BOOL hasPattern = piano[PIANO_PATTERN_ID] != nil;
+        BOOL pattern = !hasPattern || capture(piano[PIANO_PATTERN_ID], 2, nil);
         BOOL front = capture(piano[PIANO_FRONT_ID], 5, [directory stringByAppendingPathComponent:@"front.png"]);
         BOOL rear = capture(piano[PIANO_REAR_ID], 5, [directory stringByAppendingPathComponent:@"rear.png"]);
-        printf("CLIENT %s pattern=%d front=%d rear=%d\n", pattern && front && rear ? "PASS" : "FAIL", pattern, front, rear);
+        printf("CLIENT %s pattern=%s front=%d rear=%d\n", pattern && front && rear ? "PASS" : "FAIL",
+               hasPattern ? (pattern ? "PASS" : "FAIL") : "DISABLED", front, rear);
         return pattern && front && rear ? 0 : 1;
     }
 }
