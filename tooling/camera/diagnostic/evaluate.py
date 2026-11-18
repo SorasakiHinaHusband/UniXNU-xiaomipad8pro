@@ -72,15 +72,21 @@ def inspect(output, boot):
                 later["presentationTime"]["value"] * first["presentationTime"]["scale"])
         except KeyError:
             increasing = False
-        if not increasing:
-            print(f"INCONCLUSIVE {sensor} first/frame-32 PTS ordering")
+        surface_ids = capture.get("surfaceIDs", [])
+        if not increasing or len(surface_ids) != 32 or surface_ids[0] == surface_ids[-1]:
+            print(f"INCONCLUSIVE {sensor} retained first/frame-32 time or surface identity is invalid")
+            continue
+        if sensor == "pattern" and first.get("pattern", {}).get("passed") and later.get("pattern", {}).get("passed"):
+            if first["pattern"]["rgb"]["counter"] == later["pattern"]["rgb"]["counter"]:
+                print("INCONCLUSIVE pattern counter did not advance between retained frames")
+                continue
         for frame in (1, 32):
             key = f"{sensor}-{frame}"
             meta = read(f"{key}-frame.json")
             replay = read(f"{key}-replay.json")
             files = {name: output / (key + name) for name in ("-y.bin", "-uv.bin", "-cpu.png",
                                                             "-A.bgra", "-A.png", "-B.bgra", "-B.png")}
-            if not meta or meta.get("error"):
+            if not meta or meta.get("error") or meta.get("surface", {}).get("id") != surface_ids[frame - 1]:
                 print(f"INCONCLUSIVE {key} no valid immutable 420v snapshot")
                 continue
             planes = meta["planes"]

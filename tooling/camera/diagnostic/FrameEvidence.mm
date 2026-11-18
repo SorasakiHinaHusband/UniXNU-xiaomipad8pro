@@ -124,6 +124,29 @@ NSDictionary *CheckPattern(NSData *bgra, unsigned counter, BOOL mirrored)
              @"counterMismatches": @(badBits), @"sweepPoints": @(sweepPoints), @"sweepMismatches": @(badSweep)};
 }
 
+static NSDictionary *PatternPlanes(const uint8_t *ys, size_t yRow, const uint8_t *uv, size_t uvRow,
+                                    unsigned counter, double kr, double kb)
+{
+    unsigned points = 0, badY = 0, badUV = 0;
+    unsigned sweep = counter * 6 % FrameHeight;
+    for (unsigned y = 60; y < FrameHeight; y += 4) for (unsigned x = 9; x < FrameWidth; x += 16) {
+        unsigned position = (x + counter * 8) % 80;
+        if (position < 4 || position > 75 || (y + 2 >= sweep && y < sweep + 6)) continue;
+        const uint8_t *bgr = Expected(x, y, counter);
+        double luma = kr * bgr[2] + (1 - kr - kb) * bgr[1] + kb * bgr[0];
+        double expectedY = 16 + luma * 219 / 255;
+        double expectedU = 128 + (bgr[0] - luma) * 224 / (510 * (1 - kb));
+        double expectedV = 128 + (bgr[2] - luma) * 224 / (510 * (1 - kr));
+        const uint8_t *chroma = uv + (y / 2) * uvRow + (x & ~1u);
+        ++points;
+        badY += fabs(ys[y * yRow + x] - expectedY) > 18;
+        badUV += fabs(chroma[0] - expectedU) > 24 || fabs(chroma[1] - expectedV) > 24;
+    }
+    BOOL passed = points > 3000 && badY * 1000 <= points * 5 && badUV * 1000 <= points * 5;
+    return @{@"points": @(points), @"yMismatches": @(badY), @"uvMismatches": @(badUV),
+             @"totalMismatches": @(badY + badUV), @"passed": @(passed)};
+}
+
 static NSDictionary *Time(CMTime t)
 {
     return @{@"value": @(t.value), @"scale": @(t.timescale), @"epoch": @(t.epoch), @"flags": @(t.flags)};
@@ -254,9 +277,28 @@ static id AttachmentValue(id value)
     } else if (matrix) {
         matrixName = [NSString stringWithFormat:@"BT.601 fallback for %@", matrix];
     }
-    meta[@"cpuMatrix"] = matrixName;
     size_t yRow = [planes[0][@"rowBytes"] unsignedLongValue], uvRow = [planes[1][@"rowBytes"] unsignedLongValue];
     const uint8_t *ys = (const uint8_t *)bytes[0].bytes, *uv = (const uint8_t *)bytes[1].bytes;
+    NSDictionary *planeCheck = nil;
+    if (pattern) {
+        for (unsigned bit = 0; bit < 24; bit++) {
+            unsigned x = 16 + bit * Cell + Cell / 2;
+            _patternFrame = (_patternFrame << 1) | (ys[31 * yRow + x] > 126 ? 1u : 0u);
+        }
+        planeCheck = PatternPlanes(ys, yRow, uv, uvRow, _patternFrame, kr, kb);
+        if (!matrix) {
+            // An absent matrix attachment leaves SD conversion coefficients
+            // ambiguous. Let the known bars distinguish 601 from 709.
+            NSDictionary *candidate = PatternPlanes(ys, yRow, uv, uvRow, _patternFrame, 0.2126, 0.0722);
+            meta[@"unlabelledMatrixPatternChecks"] = @{@"601": planeCheck, @"709": candidate};
+            if ([candidate[@"totalMismatches"] unsignedIntValue] < [planeCheck[@"totalMismatches"] unsignedIntValue]) {
+                kr = 0.2126; kb = 0.0722;
+                matrixName = @"BT.709 (inferred from pattern planes)";
+                planeCheck = candidate;
+            }
+        }
+    }
+    meta[@"cpuMatrix"] = matrixName;
     NSMutableData *bgra = [NSMutableData dataWithLength:RGBRow * FrameHeight];
     uint8_t *dest = (uint8_t *)bgra.mutableBytes;
     auto byte = [](double x) { return (uint8_t)std::clamp(lround(x), 0L, 255L); };
@@ -270,29 +312,9 @@ static id AttachmentValue(id value)
     }
     _cpu = [bgra copy];
     if (pattern) {
-        for (unsigned bit = 0; bit < 24; bit++) {
-            unsigned x = 16 + bit * Cell + Cell / 2;
-            _patternFrame = (_patternFrame << 1) | (ys[31 * yRow + x] > 126 ? 1u : 0u);
-        }
-        NSDictionary *check = CheckPattern(_cpu, _patternFrame, NO);
-        unsigned points = 0, badY = 0, badUV = 0;
-        for (unsigned y = 60; y < FrameHeight; y += 4) for (unsigned x = 9; x < FrameWidth; x += 16) {
-            unsigned b = (x + _patternFrame * 8) % 80, sweep = _patternFrame * 6 % FrameHeight;
-            if (b < 4 || b > 75 || (y + 2 >= sweep && y < sweep + 6)) continue;
-            const uint8_t *rgb = Expected(x, y, _patternFrame);
-            double l = kr * rgb[2] + (1 - kr - kb) * rgb[1] + kb * rgb[0];
-            double expectedY = 16 + l * 219 / 255;
-            double expectedU = 128 + (rgb[0] - l) * 224 / (510 * (1 - kb));
-            double expectedV = 128 + (rgb[2] - l) * 224 / (510 * (1 - kr));
-            const uint8_t *chroma = uv + (y / 2) * uvRow + (x & ~1u);
-            ++points;
-            badY += fabs(ys[y * yRow + x] - expectedY) > 18;
-            badUV += fabs(chroma[0] - expectedU) > 24 || fabs(chroma[1] - expectedV) > 24;
-        }
-        _patternGood = [check[@"passed"] boolValue] && points > 3000 &&
-                       badY * 1000 <= points * 5 && badUV * 1000 <= points * 5;
-        meta[@"pattern"] = @{@"rgb": check, @"planePoints": @(points), @"yMismatches": @(badY),
-                             @"uvMismatches": @(badUV), @"passed": @(_patternGood)};
+        NSDictionary *rgb = CheckPattern(_cpu, _patternFrame, NO);
+        _patternGood = [rgb[@"passed"] boolValue] && [planeCheck[@"passed"] boolValue];
+        meta[@"pattern"] = @{@"rgb": rgb, @"planes": planeCheck, @"passed": @(_patternGood)};
     }
     if (!WritePNG(_cpu, [prefix stringByAppendingString:@"-cpu.png"])) return fail(@"write CPU PNG");
     if (!WriteJSON(meta, [prefix stringByAppendingString:@"-frame.json"])) return fail(@"write frame metadata");
