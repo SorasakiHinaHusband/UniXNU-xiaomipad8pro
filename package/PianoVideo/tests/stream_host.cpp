@@ -183,6 +183,36 @@ static void ledgerTests() {
   // the consumer releases them or final quiesce fences the entire arena.
   CHECK(!l.loansEmpty()&&l.release(0,11)&&!l.release(0,11)&&l.loansEmpty());
 }
+static void stockReplyWindowTests() {
+  // A stock producer waits for each dfrm reply, but never waits for decoded
+  // callbacks. Four replies may precede ACK; the fifth must not enter DMA.
+  stream::Ledger l;
+  uint64_t held=0;unsigned replies=0,acks=0,maxPending=0;
+  for(uint64_t token=1;token<=60;++token){
+    auto *f=l.accept(token,9,false);CHECK(f&&f->phase==stream::Phase::Admitting);
+    if(l.pending>maxPending)maxPending=l.pending;
+    if(l.replyReady()) {CHECK(l.publish(token));++replies;}
+    else {
+      held=token;CHECK(l.published()==4&&l.pending==5&&l.nextAdmission()==f);
+      CHECK(!l.submit(token,0)); // unpublished reply cannot race its completion
+      // The receiver runs independently of the waiting producer. Retiring the
+      // earliest ACK opens the window without requiring the held frame.
+      CHECK(l.retire(++acks));CHECK(l.replyReady()&&l.nextAdmission()->token==held);
+      CHECK(l.publish(held));++replies;held=0;
+    }
+    CHECK(l.published()<=stream::PublishedWindow&&l.pending<=5);
+  }
+  CHECK(replies==60&&acks==56&&maxPending==5&&!held);
+  // A finish at the end of preroll does not complete until the outstanding
+  // Demt ACK, and must not turn a ready picture into a firmware drain.
+  while(l.pending)CHECK(l.retire(++acks));
+  CHECK(acks==60&&l.pending==0&&!l.draining&&!l.paused&&l.replyReady());
+  CHECK(l.accept(61,9,false)&&l.publish(61)); // same epoch continues normally
+  for(uint64_t token=62;token<=65;++token)CHECK(l.accept(token,9,false));
+  CHECK(l.nextAdmission()->token==62); // oldest reservation, not array slot
+  l.cancel();CHECK(!l.replyReady()&&!l.nextAdmission()&&l.pending==0&&l.cancelled==5);
+  CHECK(!l.publish(65)); // no late success after cancellation
+}
 static void guestTests() {
   stream::Guest guest;
   constexpr uint32_t dbuf=0x44627566,demt=0x44656d74;
@@ -517,6 +547,7 @@ static void passiveHardwareTests() {
   m.mem.st(hfi::qhdr(0)+hfi::kQRead,size);diagnostic::Hardware bad;bad.capture(m);CHECK(!bad.headWords[0]);
 }
 int main() {
+  stockReplyWindowTests();
   firstTimeoutObservationTests();passiveHardwareTests();
   ancillaryPictureTests();
   finishDispositionTests();

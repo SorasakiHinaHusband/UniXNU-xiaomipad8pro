@@ -35,9 +35,9 @@ struct Session {
   bool started=false, stopping=false, invalidating=false, workerRunning=false, busy=false;
   pianovideo::avc::Config config;
   pianovideo::stream::Ledger frames;
-  struct Input { uint8_t *bytes=nullptr; uint32_t size=0; } inputs[pianovideo::stream::Credits];
+  struct Input { uint8_t *bytes=nullptr; uint32_t size=0; uint64_t reply=0, deadline=0; } inputs[pianovideo::stream::Credits];
   contract::RejectedFrames rejected;
-  bool finishWanted=false, drainStarted=false;
+  bool finishWanted=false;
   uint64_t finishRequest=0;
   int firstError=0, closeError=0;
   uint64_t nextRequest=100;
@@ -188,11 +188,41 @@ void settleCurrent(Session *s){
   s->guest.clear();s->current=false;s->currentAccepted=false;s->currentEmitted=false;
   IOLockUnlock(s->lock);
 }
+// Caller holds the session lock. A deferred success becomes DMA-eligible only
+// after its actual reply is in the receive queue. Never wait inside selector3:
+// its caller holds the guest send mutex needed by Dbuf/Demt acknowledgement.
+bool answerAdmission(Session *s,pianovideo::stream::Record &f,uint64_t id){
+  uint8_t b[128];Writer w(b,sizeof b);w.header(cc("dfrm"),FlagReply,s->uuid,id);
+  w.s32(cc(",err"),0);w.u32(cc(",inf"),1);
+  const bool sent=send(s->client,w,b);
+  if(sent)s->frames.publish(f.token);
+  else {f.phase=pianovideo::stream::Phase::Emitted;s->stopping=true;}
+  IOLog("PianoVideoVT V7e: admission reply token %llu request %llu sent %u published %u live %u pending %u\n",
+    f.token,id,unsigned(sent),unsigned(sent&&!s->stopping),s->frames.published(),s->frames.pending);
+  return sent;
+}
 void worker(void *arg,wait_result_t){
   Session *s=static_cast<Session *>(arg);thread_set_thread_name(current_thread(),"piano-video-v6");
   bool nativeStarted=false;
   for(;;){
     IOLockLock(s->lock);const bool stopping=s->stopping||s->firstError;IOLockUnlock(s->lock);if(stopping)break;
+    IOLockLock(s->lock);
+    auto *admission=s->frames.nextAdmission();
+    bool expired=false;
+    if(admission){
+      auto &in=s->inputs[unsigned(admission-s->frames.frames)];
+      expired=in.reply&&nowMs()>=in.deadline;
+      if(!expired&&in.reply&&s->frames.replyReady()){
+        const uint64_t reply=in.reply;in.reply=in.deadline=0;
+        answerAdmission(s,*admission,reply);
+      }
+    }
+    const bool admissionStopped=s->stopping;
+    IOLockUnlock(s->lock);
+    // QT's asynchronous PV request has a 1.1 s reply deadline. A held reply
+    // must fail explicitly while there is still time to wake that caller.
+    if(expired){failure(s,77,kDecodeError);break;}
+    if(admissionStopped)break;
     // This pump runs even while waiting for a guest surface or Demt ACK.
     if(nativeStarted){const int rc=piano_video_native_poll(s->native,&s->frame);if(rc<0){failure(s,70,rc);break;}}
     IOLockLock(s->lock);const uint32_t stage=s->guest.type;const bool replied=s->guest.replied;
@@ -259,24 +289,16 @@ void worker(void *arg,wait_result_t){
       }
     }
     IOLockLock(s->lock);const bool finish=s->finishWanted;const bool rejectedPending=s->rejected.count!=0;IOLockUnlock(s->lock);
-    if(finish&&chosen<0){
-      if(!s->drainStarted){const int rc=piano_video_native_drain(s->native);if(rc){failure(s,71,rc);break;}s->drainStarted=true;}
-      if(!s->current&&!s->frame.memory&&!rejectedPending){
-        uint64_t noOutput=0;const int rc=piano_video_native_drain_status(s->native,&noOutput);
-        if(rc<0){failure(s,71,rc);break;}
-        if(rc==2){
-          IOLockLock(s->lock);auto *f=s->frames.find(noOutput);const bool valid=f&&f->phase==pianovideo::stream::Phase::Submitted;
-          if(valid)f->phase=pianovideo::stream::Phase::Delivering;IOLockUnlock(s->lock);
-          if(!valid){failure(s,76,kBadData);break;}
-          s->current=true;s->currentAccepted=true;s->currentToken=noOutput;emitFrame(s,0);
-        }else if(rc==1){
-          IOLockLock(s->lock);const bool done=s->frames.pending==0;
-          Header h;h.type=cc("dfin");h.request=s->finishRequest;memcpy(h.uuid,s->uuid,16);
-          if(done){s->finishWanted=false;s->drainStarted=false;}
-          IOLockUnlock(s->lock);
-          if(done){status(s->client,h,s->firstError?kDecodeError:0);IOLog("PianoVideoVT V6: drain barrier session %u ACK LAST pending0 terminal0\n",s->native);}
-        }
-      }
+    if(finish&&chosen<0&&!s->current&&!s->frame.memory&&!rejectedPending){
+      // This endpoint requires decode-order output and one complete picture per
+      // AU. Keep pumping those pictures and their guest ACKs; Finish is a join,
+      // not EOS. Even preroll calls it with its ready first picture in flight.
+      // A stuck native picture still reaches the existing progress timeout.
+      IOLockLock(s->lock);const bool done=s->frames.pending==0;
+      Header h;h.type=cc("dfin");h.request=s->finishRequest;memcpy(h.uuid,s->uuid,16);
+      if(done)s->finishWanted=false;
+      IOLockUnlock(s->lock);
+      if(done){status(s->client,h,0);IOLog("PianoVideoVT V7e: finish barrier session %u pending0 guest0 preserve-reference 1 hardware-drain 0\n",s->native);}
     }
     IOSleep(1);
   }
@@ -290,6 +312,13 @@ void worker(void *arg,wait_result_t){
     uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
     w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
     IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);
+  }
+  // A held dfrm never became eligible. Its nonzero reply lets the Apple PV
+  // decoder complete that token itself; do not also send a Demt for it.
+  for(unsigned i=0;i<pianovideo::stream::Credits;++i)if(s->inputs[i].reply){
+    Header h;h.type=cc("dfrm");h.request=s->inputs[i].reply;memcpy(h.uuid,s->uuid,16);
+    s->inputs[i].reply=s->inputs[i].deadline=0;s->frames.frames[i].phase=pianovideo::stream::Phase::Emitted;
+    IOLockUnlock(s->lock);status(s->client,h,kDecodeError);IOLockLock(s->lock);
   }
   contract::RejectedFrame rejection;
   while(s->rejected.pop(rejection))if(!invalidated){
@@ -459,6 +488,7 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
         }
         IOLog("PianoVideoVT V5a: +dec selected com.unixnu.pianovideo.decoder.avc pid %d\n",c->pid);
         IOLog("PianoVideoVT V6p: session-client per-copy invalidate56 release1 no-address-cache\n");
+        IOLog("PianoVideoVT V7e: reply-window4 credits8 software-finish no-EOS\n");
       }
     }
   }else if(!owned){
@@ -479,26 +509,21 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
     case cc("dsts"):case cc("dtil"):status(c,h,kUnsupported);IOLog("PianoVideoVT V5a: tiles rejected before-DMA 1\n");break;
     case cc("dfrm"):{
       contract::InputReport r;const int error=queue(s,m,n,r);
-      // No work is visible to the worker until its dfrm reply is enqueued.
-      // Otherwise an enqueue failure could trigger PV's fallback emit after
-      // the worker has already emitted that same frame (especially rejects).
-      if(error)IOLockLock(s->lock);
-      const bool scheduled=error&&r.hasToken&&!r.transportReject&&(r.flags&1)&&s->workerRunning&&!s->stopping&&
-        !s->frames.find(uint64_t(r.token))&&s->rejected.count<contract::RejectedFrames::Capacity;
-      if(error&&!scheduled){IOLockUnlock(s->lock);IOLockUnlock(c->lock);return error;}
-      uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),error);w.u32(cc(",inf"),error?2:1);
-      const bool sent=send(c,w,b);
-      if(sent){
-        if(scheduled)s->rejected.push(r.token,error);
-        else if(!s->stopping)s->frames.publish(uint64_t(r.token));
-      }else{
-        auto *f=s->frames.find(uint64_t(r.token));if(f)f->phase=pianovideo::stream::Phase::Emitted;
-        s->stopping=true; // error-stop: settle all other tokens; fallback owns only this token
-      }
+      // A rejected request belongs to Apple's immediate error completion path.
+      // Returning an error and later sending Demt would complete it twice.
+      if(error){IOLockUnlock(c->lock);return error;}
+      auto *f=s->frames.find(uint64_t(r.token));
+      const bool deferred=!s->frames.replyReady()||s->frames.nextAdmission()!=f;
+      bool sent=false;
+      if(deferred){
+        auto &in=s->inputs[unsigned(f-s->frames.frames)];in.reply=h.request;in.deadline=nowMs()+900;
+        IOLog("PianoVideoVT V7e: admission held token %llu request %llu live %u pending %u deadline-ms 900 selector-return 1\n",
+          uint64_t(r.token),h.request,s->frames.published(),s->frames.pending);
+      }else sent=answerAdmission(s,*f,h.request);
       IOLockUnlock(s->lock);
       IOLog("PianoVideoVT V6: dfrm request %llu token %llu decision %s status %d reply-enqueued %u published %u\n",
         h.request,uint64_t(r.token),r.decision,error,unsigned(sent),unsigned(sent&&!s->stopping));
-      if(!sent){IOLockUnlock(c->lock);return kDecodeError;}
+      if(!deferred&&!sent){IOLockUnlock(c->lock);return kDecodeError;}
       break;
     }
     case cc("dfin"):{

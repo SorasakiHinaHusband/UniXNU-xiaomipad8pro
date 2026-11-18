@@ -5,6 +5,10 @@
 #include <stdint.h>
 namespace pianovideo { namespace stream {
 constexpr unsigned Credits = 8, Inputs = 2, Raws = 64;
+// Reply to at most four dfrm requests ahead of their Demt acknowledgements.
+// The next request can reserve a credit but stays Admitting until its reply;
+// selector3 must return so the earlier frames' guest replies remain routable.
+constexpr unsigned PublishedWindow = 4;
 enum class FinishDecision { Schedule, Failed, BadState };
 inline FinishDecision finishDecision(bool started, bool invalidating, bool failed, bool running, bool stopping, bool pending) {
   // A decoder error ends native work, but the PV session still owns its error
@@ -28,6 +32,15 @@ struct Ledger {
   uint64_t accepted = 0, barrier = 0;
   bool draining = false, ack = false, last = false, paused = false, stopped = false;
   Record *find(uint64_t t) { for(auto &f:frames) if(f.phase!=Phase::Free && f.token==t)return &f; return nullptr; }
+  unsigned published() const {
+    unsigned n=0;for(const auto &f:frames)if(f.phase!=Phase::Free&&f.phase!=Phase::Admitting)++n;return n;
+  }
+  Record *nextAdmission() {
+    Record *next=nullptr;
+    for(auto &f:frames)if(f.phase==Phase::Admitting&&(!next||f.serial<next->serial))next=&f;
+    return next;
+  }
+  bool replyReady() const {return !stopped&&published()<PublishedWindow;}
   Record *accept(uint64_t t, uint32_t flags = 1, bool published = true) {
     if(stopped || draining || pending==Credits || find(t))return nullptr;
     for(auto &f:frames)if(f.phase==Phase::Free){f={t,++accepted,flags,published?Phase::Queued:Phase::Admitting};++pending;if(pending>highWater)highWater=pending;return &f;}

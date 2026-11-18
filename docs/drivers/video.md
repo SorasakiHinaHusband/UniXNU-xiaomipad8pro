@@ -1,14 +1,19 @@
 # Video: the Iris video core natively (PianoVideo) and VideoToolbox through the VM-era paravirtual decoder
 
-Status, 2026-11-17: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
+Status, 2026-11-18: V2 power/PAS and V3 INIT/version/lifecycle are tablet-confirmed. V4 (`vid-v4a`) decoded
 our real 320×240 AVC AU and matched the exact active NV12 golden hash, with safe DMA teardown (§13).
 V5c is tablet-confirmed: real caller input traverses VT and Iris into an IOSurface-backed callback with the original golden
-hash and safe teardown. V6 implements bounded persistent Baseline/Main AVC streaming; its continuous hardware qualification is pending (§15).
+hash and safe teardown. V6p completed one 60-frame Main AVC stream with matching pixels and balanced surface references.
+Stock QuickTime displays the first hardware frame, but V7d drops the following 59 frames: the bridge drains during preroll
+and subsequently exhausts its admission credits. V7e keeps the eight-credit limit, defers successful replies beyond four
+published frames without blocking the receive path, and makes finish a completion barrier for this decode-order endpoint.
+Rejected requests use Apple's error completion once. Continuous playback with this change still needs tablet qualification.
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate
 
-Normal apps still use VideoToolbox software decoding; the native Iris bridge is an opt-in qualification endpoint. The SoC's video core decodes H.264, HEVC and VP9 at its lowest clock for every common stream (§4.5), and encodes H.264
+The native Iris bridge is an opt-in qualification endpoint; stock QuickTime selection and a first frame are confirmed,
+but continuous playback in apps is not. The SoC's video core decodes H.264, HEVC and VP9 at its lowest clock for every common stream (§4.5), and encodes H.264
 and HEVC. Gate: battery life (owner priority) and daily use (QuickTime, Safari, wallpapers, thumbnails);
 not a login gate. Ubuntu uses it: H.264/HEVC/VP9 decode and H.264/H.265 encode verified at 1080p and 4K, AV1 in software
 (`xiaomipad-8pro-mainline/docs/STATUS.md`, `README.en.md`; the core lists AV1, but a third-party piano report has AV1 decode failing

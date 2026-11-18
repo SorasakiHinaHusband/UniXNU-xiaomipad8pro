@@ -44,12 +44,11 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - Sound (2026-11-17, RAM boots): the speakers play at the system volume (volume slider and keys, mute), one continuous tone per
   test; the reference-aligned gain cap (231) and runtime 192/231 A/B switch have host coverage and await acoustic tablet validation;
   opt-in reversible audio sleep has host coverage and awaits tablet acceptance; the microphone is next ([docs/drivers/audio.md](docs/drivers/audio.md)).
-- Hardware video decode (2026-11-17, RAM boots): the opt-in native VideoToolbox bridge delivered our 320×240 H.264
+- Hardware video decode (2026-11-18, RAM boots): the opt-in native VideoToolbox bridge delivered our 320×240 H.264
   frame through Iris into an IOSurface-backed callback with the exact golden SHA-256 and safe teardown (`vid-v5c`).
-  A bounded Baseline/Main streaming implementation and owned 60-frame IP/IBP qualification clips now have host coverage;
-  continuous hardware decoding awaits tablet qualification. The post-PSC stall has passive first-timeout diagnostics
-  for the next test ([docs/drivers/video.md](docs/drivers/video.md)).
-  Normal app playback remains unqualified.
+  V6p decoded a complete 60-frame Main AVC clip with matching pixels and balanced surface references. Stock QuickTime
+  selects the bridge and displays its first frame; V7d then drops 59 frames. A bounded reply window and a finish barrier
+  that preserves decode-order state await continuous app playback qualification ([docs/drivers/video.md](docs/drivers/video.md)).
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
   firmware initialization, the Bluetooth menu and discovery are not yet tablet-confirmed
