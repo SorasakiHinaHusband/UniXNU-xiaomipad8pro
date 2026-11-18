@@ -40,7 +40,7 @@ static inline void ppt_line(struct ppt_page *p, const char *s, unsigned n)
 static inline void ppt_select(struct ppt_page *p, const char *s, unsigned n)
 {
     unsigned start = 0, frames = 0, panic_rows = 0;
-    int in_panic = 0, found = 0;
+    int in_panic = 0, found = 0, in_backtrace = 0;
     for (unsigned y = 0; y < PPT_ROWS; ++y)
         for (unsigned x = 0; x < PPT_COLS; ++x) p->cells[y][x] = ' ';
     p->x = p->y = 0;
@@ -50,7 +50,8 @@ static inline void ppt_select(struct ppt_page *p, const char *s, unsigned n)
         unsigned len = end - start;
         const char *line = s + start;
         if (ppt_has(line, len, "panic(cpu")) { in_panic = found = 1; }
-        int frame = ppt_has(line, len, "lr: 0x") && ppt_has(line, len, "fp: 0x");
+        if (ppt_has(line, len, "Panicked thread:") && ppt_has(line, len, "backtrace:")) in_backtrace = 1;
+        int frame = in_backtrace && ppt_has(line, len, "lr: 0x") && ppt_has(line, len, "fp: 0x");
         if (frame && frames < 12) {
             if (!frames) { if (p->y < 8) p->y = 8; p->x = 0; ppt_string(p, "FIRST 12 BACKTRACE FRAMES (LR / FP)\n"); }
             ppt_line(p, line, len); ++frames; in_panic = 0;

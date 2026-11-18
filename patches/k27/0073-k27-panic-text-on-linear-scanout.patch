@@ -146,7 +146,7 @@ diff --git a/osfmk/console/piano_panic_text_core.h b/osfmk/console/piano_panic_t
 new file mode 100644
 --- /dev/null
 +++ b/osfmk/console/piano_panic_text_core.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + * Copyright (c) 2026 Leo Zhang. All rights reserved.
 + * Panic-only, bounded text selection and BGRA rendering. No kernel services.
@@ -189,7 +189,7 @@ new file mode 100644
 +static inline void ppt_select(struct ppt_page *p, const char *s, unsigned n)
 +{
 +    unsigned start = 0, frames = 0, panic_rows = 0;
-+    int in_panic = 0, found = 0;
++    int in_panic = 0, found = 0, in_backtrace = 0;
 +    for (unsigned y = 0; y < PPT_ROWS; ++y)
 +        for (unsigned x = 0; x < PPT_COLS; ++x) p->cells[y][x] = ' ';
 +    p->x = p->y = 0;
@@ -199,7 +199,8 @@ new file mode 100644
 +        unsigned len = end - start;
 +        const char *line = s + start;
 +        if (ppt_has(line, len, "panic(cpu")) { in_panic = found = 1; }
-+        int frame = ppt_has(line, len, "lr: 0x") && ppt_has(line, len, "fp: 0x");
++        if (ppt_has(line, len, "Panicked thread:") && ppt_has(line, len, "backtrace:")) in_backtrace = 1;
++        int frame = in_backtrace && ppt_has(line, len, "lr: 0x") && ppt_has(line, len, "fp: 0x");
 +        if (frame && frames < 12) {
 +            if (!frames) { if (p->y < 8) p->y = 8; p->x = 0; ppt_string(p, "FIRST 12 BACKTRACE FRAMES (LR / FP)\n"); }
 +            ppt_line(p, line, len); ++frames; in_panic = 0;
