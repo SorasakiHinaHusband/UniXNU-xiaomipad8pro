@@ -6,11 +6,12 @@ initialization: its CIKernel array was empty. Static tracing and a host reproduc
 additional compiler arguments. The same trace finds separate Photo Booth format gates: max frame rate at least 24 fps and a
 normal-quality BGRA format at least 640×480. The original 15 fps modes and front's 459-line image miss those gates.
 
-The combined fix preserves those compiler arguments and adds a 640×480 BGRA compatibility format with 15–30 fps software-paced
-output. Physical sensor acquisition remains 15 fps; extra output frames repeat the latest source, with explicit counters and a
+The combined fix selects the existing legacy CIKL backend and adds a 640×480 BGRA compatibility format with 15–30 fps
+software-paced output. Physical sensor acquisition remains 15 fps; extra output frames repeat the latest source, with explicit counters and a
 stale-source cutoff. Native modes remain available. The signed client has a discovery-only `--inventory` mode; its ordinary
 capture still selects the first native mode. QuickTime's traced preview path adds no known source-rate/FourCC requirement.
 A complete host Core Image replay also exposes missing Metal function return/argument reflection after source compilation.
+The selected legacy path bypasses both missing contracts with the existing seed GPU; no GPU replacement is required.
 The userland compatibility agent therefore selects Core Image's existing legacy CIKL metadata path for UID 501 through its
 `com.apple.coreimage` preference suite and the GUI session environment before apps launch. This affects custom CIKL kernels in that user's apps; it leaves ordinary Metal rendering
 available. The helper saves the prior typed preference and GUI environment value and restores them with `piano-coreimage-compat --remove`. The normal
