@@ -915,11 +915,13 @@ public:
         rc = got;
       if (failClosed && (got || r.error)) return abortCleanup(got ? got : r.error);
     }
-    // A bounded extra pump detects already queued late replies; all backing still belongs to V3 until PAS/detach/TLB.
+    // A bounded extra pump detects already queued late replies while backing
+    // remains owned by the core.
     const int late = pump();
     if (late && !rc)
       rc = late;
     r.close = rc;
+    const bool released = failClosed && !rc && r.closed;
     unsigned queued = 0, refs = 0, pending = 0;
     for (unsigned i = 0; i < layout.used; ++i) {
       Buffer &b = layout.buf[i];
@@ -927,8 +929,10 @@ public:
       refs += b.readonly;
       pending += b.pendingRelease;
       if (b.queued || b.readonly || b.pendingRelease)
-        o.hw.note("V4 ledger type %u index %u iova %08x queued %u readonly %u pending-release %u retained-until-PAS 1", b.type, b.index,
-                  b.iova(), unsigned(b.queued), unsigned(b.readonly), unsigned(b.pendingRelease));
+        o.hw.note("V4 ledger type %u index %u iova %08x queued %u readonly %u pending-release %u %s", b.type, b.index,
+                  b.iova(), unsigned(b.queued), unsigned(b.readonly), unsigned(b.pendingRelease),
+                  released ? "released-on-close 1" : "retained-until-PAS 1");
+      if (released) b.queued = b.readonly = b.pendingRelease = false;
     }
     o.hw.note("V4 session end closed %u close-error %d queued %u readonly %u pending %u arena-retained 1", unsigned(r.closed), r.close,
               queued, refs, pending);

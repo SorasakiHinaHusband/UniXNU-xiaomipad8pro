@@ -513,6 +513,43 @@ class Bringup {
     failureRaw(stepNo, rc);
     return rc;
   }
+  bool prepareLayout()
+  {
+    return hevc ? layout.initHevc(avcWidth, avcHeight, bitdepth) :
+           avcWidth ? layout.init(avcWidth, avcHeight) : layout.init();
+  }
+  bool mapArena()
+  {
+    if (!dma.arena || !session::buildArena(tables, layout, dma.arenaPages, dma.arenaBytes)) return false;
+    const uint32_t span = layout.arenaBytes();
+    unsigned mapped = 0;
+    for (unsigned i = 0; i < span / 4096; ++i) mapped += layout.mapped(i);
+    hw.note("V4 mapping arena [%08x,%08x) reserved %u pages mapped %u guards-invalid %u tables %u full-walk PASS",
+            session::kArenaBase, session::kArenaBase + span, layout.bytes, mapped, span / 4096 - mapped, tables.pageCount);
+    for (unsigned i = 0; i < layout.used; ++i) {
+      const session::Buffer &b = layout.buf[i];
+      hw.note("V4 mapping type %u index %u port %u capacity %u IOVA [%08x,%08x) PA-first %llx PA-last %llx",
+              b.type,b.index,b.port,b.capacity,b.iova(),b.iova()+b.capacity,
+              (unsigned long long)dma.arenaPages[b.off/4096],
+              (unsigned long long)dma.arenaPages[(b.off+b.capacity-1)/4096]);
+    }
+    return true;
+  }
+  int prepareResidentSession()
+  {
+    if (opt.level != 6 || !firstHfi || !fst.loaded || !dmaHeld || !domainPowerReady()) return kErrHfi;
+    watchdogSeen |= ops.rd(kIris + kWrapperIntrStatus) & (1u << 3);
+    ++watchdogSamples;
+    if (watchdogSeen) return kErrWatchdog;
+    if (const int rc = checkFault()) return rc;
+    if (!prepareLayout() || !layout.arenaBytes() || layout.arenaBytes() > dma.arenaBytes) return kErrNoMemory;
+    // The previous CLOSE ack fences arena DMA. Keep the live UC/queues
+    // intact and synchronize changed arena leaves before the next OPEN.
+    if (!mapArena()) return kErrSmmu;
+    hw.cleanToPoc(tables.cpu, tables.pageCount * 4096);
+    if (!vsmmu::tlbSync(ops, plan.cb()) || !vsmmu::globalSync(ops)) return kErrSmmu;
+    return checkFault();
+  }
   int smmuSetup()
   {
     hw.stage(kStepSmmuPlan, "SMMU: two free groups and a free bank for 0x1940/0x1947");
@@ -524,10 +561,12 @@ class Bringup {
     bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
     dma.session = opt.level >= 5;
-    if (dma.session && !(hevc ? layout.initHevc(avcWidth,avcHeight,bitdepth) : avcWidth ? layout.init(avcWidth,avcHeight) : layout.init())) return smmuFail(kStepSmmuTables, kErrNoMemory);
-    dma.arenaBytes = layout.arenaBytes();
-    if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
-    dmaHeld = true;
+    if (dma.session && !prepareLayout()) return smmuFail(kStepSmmuTables, kErrNoMemory);
+    if (!dmaHeld) {
+      dma.arenaBytes = layout.arenaBytes();
+      if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
+      dmaHeld = true;
+    }
     tables.cpu = dma.tables;
     tables.pa = dma.tablesPa;
     tables.pageCount = dma.session ? vsmmu::sessionTablePages(dma.arenaBytes) : vsmmu::kTablePages;
@@ -535,23 +574,8 @@ class Bringup {
       hw.note("smmu: a page of the UC region or the table is not a 4 KiB page of XNU's RAM");
       return smmuFail(kStepSmmuTables, kErrSmmu);
     }
-    if (dma.session && (!dma.arena || !session::buildArena(tables, layout, dma.arenaPages)))
-      return smmuFail(kStepSmmuTables, kErrSmmu);
+    if (dma.session && !mapArena()) return smmuFail(kStepSmmuTables, kErrSmmu);
     hw.cleanToPoc(tables.cpu, tables.pageCount * 4096);
-    if (dma.session) {
-      unsigned mapped = 0;
-      for (unsigned i = 0; i < dma.arenaBytes/4096; ++i) mapped += layout.mapped(i);
-      hw.note("V4 mapping arena [%08x,%08x) reserved %u pages mapped %u guards-invalid %u tables %u full-walk PASS",
-              session::kArenaBase, session::kArenaBase + dma.arenaBytes, layout.bytes, mapped,
-              dma.arenaBytes/4096 - mapped, tables.pageCount);
-      for (unsigned i = 0; i < layout.used; ++i) {
-        const session::Buffer &b = layout.buf[i];
-        hw.note("V4 mapping type %u index %u port %u capacity %u IOVA [%08x,%08x) PA-first %llx PA-last %llx",
-                b.type,b.index,b.port,b.capacity,b.iova(),b.iova()+b.capacity,
-                (unsigned long long)dma.arenaPages[b.off/4096],
-                (unsigned long long)dma.arenaPages[(b.off+b.capacity-1)/4096]);
-      }
-    }
     for (unsigned i = 0; i < vsmmu::kWindowPages; ++i) {   // the self-check: every page of the window as the SMMU will walk it
       const uint64_t want = i < vsmmu::kUcPages ? dma.pages[i] : dma.scratch;
       if (vsmmu::walk(tables, kIovaBase + 4096 * i + 0x10) != want + 0x10) {

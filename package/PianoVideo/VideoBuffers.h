@@ -59,6 +59,7 @@ struct Layout {
     if (!capacity || used >= kSlots || end > arenaLimit())
       return false;
     Buffer &b = buf[used++];
+    b = Buffer{};
     b.type = type;
     b.index = index;
     b.off = uint32_t(off);

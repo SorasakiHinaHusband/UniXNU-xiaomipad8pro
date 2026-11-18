@@ -103,6 +103,31 @@ static void verifyArena(const Layout &l) {
   CHECK(buildArena(t, shortened, pages.data()));
   CHECK(!vsmmu::walk(t, kArenaBase + last * 4096));
 }
+static void residentArenaTest() {
+  constexpr unsigned tableCount = vsmmu::kSessionTablePages;
+  std::vector<uint64_t> words(tableCount * 512), pages(kAvcArenaBytes / 4096), uc(vsmmu::kUcPages);
+  for (unsigned i = 0; i < uc.size(); ++i) uc[i] = kXnuDramBase + i * 4096ull;
+  for (unsigned i = 0; i < pages.size(); ++i) pages[i] = kXnuDramBase + 0x100000000ull + i * 4096ull;
+  vsmmu::Tables t{words.data(), kXnuDramBase + 0x2000000, tableCount};
+  const uint64_t scratch = kXnuDramBase + 0x3000000;
+  CHECK(vsmmu::build(t, uc.data(), unsigned(uc.size()), scratch));
+  Layout layout;
+  CHECK(layout.init(1920,1088));
+  CHECK(buildArena(t,layout,pages.data(),kAvcArenaBytes));
+  layout.buf[0].queued = layout.buf[0].readonly = layout.buf[0].pendingRelease = true;
+  const uint64_t queuePage = vsmmu::walk(t,kIovaBase);
+  const std::vector<uint64_t> links(words.begin(),words.begin()+vsmmu::kTablePages*512);
+  CHECK(layout.initHevc(1920,1088,10));
+  CHECK(layout.arenaBytes() == 188 * 1024 * 1024);
+  CHECK(!layout.buf[0].queued && !layout.buf[0].readonly && !layout.buf[0].pendingRelease);
+  CHECK(buildArena(t,layout,pages.data(),kAvcArenaBytes));
+  CHECK(std::equal(links.begin(),links.end(),words.begin()));
+  CHECK(vsmmu::walk(t,kIovaBase) == queuePage);
+  for (unsigned i = 0; i < pages.size(); ++i)
+    CHECK(vsmmu::walk(t,kArenaBase+i*4096) == (layout.mapped(i) ? pages[i] : 0));
+  CHECK(layout.init(1920,1088));
+  CHECK(buildArena(t,layout,pages.data(),kAvcArenaBytes));
+}
 static void hevcTests() {
   CHECK(kAvcArenaBytes == 256 * 1024 * 1024 && kArenaBytes == 768 * 1024 * 1024);
   CHECK(kArenaPages == 196608 && vsmmu::kSessionTablePages == 132 && vsmmu::kMaxSessionTablePages == 388);
@@ -234,6 +259,7 @@ int main() {
   }
   CHECK(legacy.init(1920,1088) && legacy.init() && !legacy.general && legacy.bytes == 56623104);
   hevcTests();
+  residentArenaTest();
   std::printf("geometry: %s (%u failures)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
