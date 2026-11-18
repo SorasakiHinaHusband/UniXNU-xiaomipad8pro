@@ -1059,6 +1059,19 @@ static void expire_pending(PianoChargeState *s, uint64_t now)
 
 static int limit_on(const PianoChargeConfig *c) {return c->limit && c->stop_pct < 100;}
 
+/* An already enabled 5 V session can leave termination to the firmware
+ * while the gauges recover. This never authorizes an enable or a current rise. */
+static int stale_soc_stop(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s)
+{
+    if (s->soc_failures < SOC_FAILURES_STOP) return 0;
+    const uint32_t needed = PIANO_CHG_IN_BUS | PIANO_CHG_IN_ENABLE;
+    const int at5 = (in->valid & needed) == needed && in->bus_mv >= ONLINE_MV && in->bus_mv < HV_5V_MAX_MV &&
+                    (!(in->valid & PIANO_CHG_IN_CONTRACT) ||
+                     (in->contract_protocol == 1 && in->contract_mv < HV_5V_MAX_MV));
+    return !(c->strict_contract && !c->hv && at5 && s->attached && in->enable == 1 && !s->disabled &&
+             !volt_raised(s) && !s->contract_transition && !s->contract_mode_change);
+}
+
 /* Battery health: the charge hysteresis, the mode's hot/cold stops, and what happens without a charge reading. Returns charge_ok. */
 static int protection(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p,
                       const Temps *t, uint64_t now)
@@ -1086,7 +1099,7 @@ static int protection(const PianoChargeConfig *c, const PianoChargeInput *in, Pi
     }
     p->why_off = s->hold ? PIANO_CHG_OFF_LIMIT : s->hot ? PIANO_CHG_OFF_HOT : s->cold ? PIANO_CHG_OFF_COLD :
                  c->admin_stop ? PIANO_CHG_OFF_ADMIN : in->faults ? PIANO_CHG_OFF_FAULT :
-                 s->soc_failures >= SOC_FAILURES_STOP ? PIANO_CHG_OFF_STALE :
+                 stale_soc_stop(c, in, s) ? PIANO_CHG_OFF_STALE :
                  c->strict_contract && s->fw_block ? PIANO_CHG_OFF_FIRMWARE : PIANO_CHG_OFF_NONE;
     return p->why_off == PIANO_CHG_OFF_NONE;
 }
@@ -1181,15 +1194,16 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
             s->transition_ma = strict_contract(in) ? umin(500, in->contract_ma) : PIANO_CHG_ICL_DEFAULT;
             icl = umin(icl, s->transition_ma); fcc = umin(fcc, 500);
         }
-        const int stop = s->hot || s->cold || c->admin_stop || in->faults || s->soc_failures >= SOC_FAILURES_STOP ||
+        const int stale_stop = stale_soc_stop(c, in, s);
+        const int stop = s->hot || s->cold || c->admin_stop || in->faults || stale_stop ||
                          (c->strict_contract && s->fw_block) || (limit_on(c) && (s->hold || !c->sleep_charge));
         if (stop) {
             p->why_off = s->hold ? PIANO_CHG_OFF_LIMIT : s->hot ? PIANO_CHG_OFF_HOT : s->cold ? PIANO_CHG_OFF_COLD :
                          c->admin_stop ? PIANO_CHG_OFF_ADMIN : in->faults ? PIANO_CHG_OFF_FAULT :
-                         s->soc_failures >= SOC_FAILURES_STOP ? PIANO_CHG_OFF_STALE :
+                         stale_stop ? PIANO_CHG_OFF_STALE :
                          c->strict_contract && s->fw_block ? PIANO_CHG_OFF_FIRMWARE : PIANO_CHG_OFF_SLEEP;
             if (s->enable_set != 0 && !(c->strict_contract && s->fw_block && !s->disabled)) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 0, 1);
-        } else if (s->disabled) {
+        } else if (s->disabled && (!c->strict_contract || gauge_fresh(in, now))) {
             /* a charging restart's stop (or one of battery health's being lifted): charging stays on for the sleep */
             plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
         }
@@ -1501,7 +1515,9 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     if (strict_voltage_ready(c, in, s) && (!c->strict_contract || !s->voltage_observe_hold) &&
         (!c->strict_contract || !new_hv_write || strict_contract(in))) plan_volt(c, s, p, now);
     if (charge_ok) {
-        if (s->disabled && !kick_holding(s, now)) plan_enable(c, in, s, p, now, 1);
+        if (s->disabled && !kick_holding(s, now)) {
+            if (!c->strict_contract || gauge_fresh(in, now)) plan_enable(c, in, s, p, now, 1);
+        }
         else if ((in->valid & PIANO_CHG_IN_ENABLE) && !in->enable && !s->fw_noted) {s->fw_noted = 1; p->events |= PIANO_CHG_EV_FW_DISABLED;}
     }
     /* the restart: the input measured against the limit it is held to (the one taken, or the firmware's own when lower) */

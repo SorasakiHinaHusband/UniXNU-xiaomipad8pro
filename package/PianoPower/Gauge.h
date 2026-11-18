@@ -195,7 +195,7 @@ struct GaugeReading {
 
 inline int16_t asSigned(uint16_t v) { return int16_t(v); }
 
-inline GaugeReading readGauge(I2cBus &bus)
+inline GaugeReading readGaugeOnce(I2cBus &bus)
 {
   static const uint8_t kOrder[] = {kGaugeVoltage, kGaugeCurrent, kGaugeAverageCurrent, kGaugeSoc, kGaugeRemaining, kGaugeFull,
                                    kGaugeTemperature, kGaugeStatus, kGaugeCycles};
@@ -223,6 +223,25 @@ inline GaugeReading readGauge(I2cBus &bus)
   g.ok = g.voltageMv >= 2500 && g.voltageMv <= 5000 && g.socPct <= 100 && g.tempDeciC > -400 && g.tempDeciC < 900;
   if (!g.ok) g.failedCommand = 0xff;
   return g;
+}
+
+inline bool gaugeWordSentinel(const GaugeReading &g)
+{
+  return g.remainingMah == 0xffff || g.fullMah == 0xffff || g.status == 0xffff || g.cycles == 0xffff;
+}
+
+inline GaugeReading readGauge(I2cBus &bus)
+{
+  const GaugeReading first = readGaugeOnce(bus);
+  if (first.ok && !gaugeWordSentinel(first)) return first;
+
+  // Do not feed one failed observation to every policy decision until the next
+  // report. Each attempt starts over with the command pointers and a new sample.
+  const GaugeReading next = readGaugeOnce(bus);
+  // Capacity/flags are independent of the voltage, SOC and temperature gate.
+  // Keep a credible core reading if its reread failed; publication still has
+  // its own capacity guard. A failed core reading is never made valid here.
+  return next.ok || !first.ok ? next : first;
 }
 
 struct PackReading {

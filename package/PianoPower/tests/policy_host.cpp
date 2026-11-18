@@ -1821,10 +1821,60 @@ static void testAtomicHealth()
   h.enable = 1; h.step(); CHECK(!h.plan.sleep_ready);   // ACK cache disagrees with the actual enable readback
 }
 
+static void testRam13GaugeLoss()
+{
+  StrictSim s;
+  s.cfg.hv = 0;
+  s.cfg.rp = 1;
+  s.cfg.ramp = 1;
+  s.cfg.rp_cap_ma = 3000;
+  s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  s.type = PIANO_CHG_T_SDP;
+  s.contractValid = s.sourceValid = false;
+  s.soc = 41;
+  s.run();
+  for (unsigned burst = 0; burst < 2; ++burst) {
+    s.bothGauges = false;
+    for (uint64_t elapsed = 0; elapsed < 30000; elapsed += 1600) {
+      s.step(1600);
+      CHECK(s.plan.why_off == PIANO_CHG_OFF_NONE && s.enable == 1 && !s.wrote(PIANO_CHG_ENABLE));
+      CHECK(s.icl == 100 && s.fcc == 500 && !s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));
+    }
+    s.bothGauges = true;
+    s.step();
+    CHECK(!s.st.soc_failures && s.enable == 1 && s.fcc == 1500);
+  }
+  s.soc = 80;
+  s.step();
+  s.bothGauges = false;
+  s.soc = 40;
+  s.run(4);
+  CHECK(s.enable == 0 && s.plan.why_off == PIANO_CHG_OFF_LIMIT && !s.wrote(PIANO_CHG_ENABLE, 1));
+  s.bothGauges = true;
+  s.step();
+  CHECK(s.enable == 1 && s.wrote(PIANO_CHG_ENABLE, 1));
+  s.bothGauges = false;
+  s.cfg.admin_stop = 1;
+  s.step();
+  CHECK(s.enable == 0 && s.plan.why_off == PIANO_CHG_OFF_ADMIN);
+  s.cfg.admin_stop = 0;
+  s.step();
+  CHECK(s.enable == 0 && !s.wrote(PIANO_CHG_ENABLE, 1));
+  s.bothGauges = true;
+  s.step();
+  CHECK(s.enable == 1);
+  s.bothGauges = false;
+  s.run(2);
+  s.faults = 1;
+  s.step();
+  CHECK(s.enable == 0 && s.plan.why_off == PIANO_CHG_OFF_FAULT);
+}
+
 int main()
 {
   testContractSession();
   testAtomicHealth();
+  testRam13GaugeLoss();
   testTables();
   testFiveVolt();
   testThermal();

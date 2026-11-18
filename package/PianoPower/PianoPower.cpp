@@ -1432,7 +1432,8 @@ void PianoPower::report()
            fPack[0].currentMa, fPack[0].socPct, fPack[0].status, fPack[1].voltageMv, fPack[1].currentMa, fPack[1].socPct,
            fPack[1].status);
     else
-      note("[%llus] battery: no gauge answers (A: %s, B: %s)", t, i2cName(fPack[0].error), i2cName(fPack[1].error));
+      note("[%llus] battery: no usable gauge sample (A: %s at %#x, B: %s at %#x)", t, i2cName(fPack[0].error),
+           fPack[0].failedCommand, i2cName(fPack[1].error), fPack[1].failedCommand);
   }
   // The RTC from the first report after IOBSD is published: the kernel's calendar (k27 0060, IOKitInitializeTime) reads the same
   // observer channels earlier in bsd_init, and IOKitBSDInit publishes IOBSD after it, so the two never share a channel.
@@ -1955,14 +1956,15 @@ void PianoPower::policyLine(char *line, size_t size)
   const PianoChargeConfig &c = fLink.cfg;
   static const char *const kWhy[] = {"row", "Rp", "9 V row", "connector hot", "charger hot"};
   static const char *const kHv[] = {"5 V", "9 V asked", "9 V", "9 V blocked"};
-  static const char *const kOff[] = {"", " (battery health limit)", " (battery too hot)", " (battery too cold)", " (asleep)"};
+  static const char *const kOff[] = {"", " (battery health limit)", " (battery too hot)", " (battery too cold)", " (asleep)",
+                                    " (admin inhibit)", " (gauge data unavailable)", " (safety fault)", " (firmware inhibit)"};
   char rp[24] = "";
   if (p.rp_ma) snprintf(rp, sizeof rp, ", %u mA advertised", p.rp_ma);
   snprintf(line, size,
            "policy: %s, input limit %u mA (%s%s), charge current %u mA, %s, %s%s, hold %s; %u decisions, %u writes queued, %u "
            "refused, %u relinks; Rp %s; battery health %s",
            piano_charge_class_name(p.cls), p.icl_ma, kWhy[p.icl_why < 5 ? p.icl_why : 0], rp, p.fcc_ma, kHv[p.hv < 4 ? p.hv : 0],
-           p.charge ? "charging" : "not charging", kOff[p.why_off < 5 ? p.why_off : 0], fLink.hold ? "on" : "off", fLink.decisions,
+           p.charge ? "charging" : "not charging", kOff[p.why_off <= PIANO_CHG_OFF_FIRMWARE ? p.why_off : 0], fLink.hold ? "on" : "off", fLink.decisions,
            fLink.queuedTotal, fLink.refusedTotal, fLink.resyncs,
            !c.rp ? "not trusted" : fLink.st.rp_distrust ? "DISTRUSTED (a sag or quick detaches)" : "trusted",
            c.limit ? (fLink.st.hold ? "stopped at the limit" : "on") : "off");
@@ -2068,7 +2070,9 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
     note("policy: battery health: %d %% is down to the resume (%u %%): charging resumes", in.soc_max_pct, c.resume_pct);
   if (e & PIANO_CHG_EV_HOT) note("policy: battery health: the battery is at 55 C or more: charging stops until below 53 C");
   if (e & PIANO_CHG_EV_COLD) note("policy: battery health: the battery is below 0 C: charging stops until 2 C");
-  if (e & PIANO_CHG_EV_SOC_LOST) note("policy: battery health: no charge reading for 5 min: the limit cannot be held, charging goes on");
+  if (e & PIANO_CHG_EV_SOC_LOST)
+    note("policy: PianoBuck5VStaleV1: no fresh dual-gauge SOC; hold %u, charge vote %u, off reason %u",
+         fLink.st.hold, fLink.plan.charge, fLink.plan.why_off);
   if (e & PIANO_CHG_EV_STOP_LEAK)
     note("policy: WARNING: 0x2003 reads 0 a minute after the stop and the packs still take %d mA: the bit does not stop charging "
          "here; turn piano-power-health off and report", in.ibat_ma);

@@ -258,7 +258,7 @@ enum {
     PIANO_CHG_EV_ATTACH = 1u << 0, PIANO_CHG_EV_DETACH = 1u << 1, PIANO_CHG_EV_TYPE = 1u << 2,
     PIANO_CHG_EV_HV_ASKED = 1u << 3, PIANO_CHG_EV_HV_ON = 1u << 4, PIANO_CHG_EV_HV_BLOCKED = 1u << 5, PIANO_CHG_EV_HV_RETRY = 1u << 6,
     PIANO_CHG_EV_LIMIT_STOP = 1u << 7, PIANO_CHG_EV_LIMIT_RESUME = 1u << 8, PIANO_CHG_EV_HOT = 1u << 9, PIANO_CHG_EV_COLD = 1u << 10,
-    PIANO_CHG_EV_SOC_LOST = 1u << 11,      /* repeated gauge failures: conservative stop; known SOC hold remains */
+    PIANO_CHG_EV_SOC_LOST = 1u << 11,      /* repeated gauge failures; a known SOC hold remains */
     PIANO_CHG_EV_STOP_LEAK = 1u << 12,     /* stopped for a minute, 0x2003 reads 0, and the packs still take > 100 mA */
     PIANO_CHG_EV_FW_DISABLED = 1u << 13,   /* 0x2003 reads 0 although the policy never wrote 0: the firmware's own (not overridden) */
     PIANO_CHG_EV_GAVE_UP = 1u << 14,       /* a value refused 3 times in a row: left until the next attach, wake or generation */

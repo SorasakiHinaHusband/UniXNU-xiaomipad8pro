@@ -1404,6 +1404,25 @@ static void testGauge()
   transient.regs[kGaugeVoltage] = 3785;
   const GaugeReading recovered = readGauge(busF);
   CHECK(recovered.ok && recovered.voltageMv == 3785 && recovered.currentMa == 211 && recovered.socPct == 24);
+
+  // ram13: either pack can ACK a bogus word, and this very sample must be
+  // repaired before it becomes the policy and UI's observation for 30 s.
+  Gauge ramA, ramB;
+  fillGauge(ramA, 3885, 576, 41, 1725, 4290, 399, 0);
+  fillGauge(ramB, 3884, 577, 40, 1715, 4344, 365, 0);
+  ramA.replies[kGaugeVoltage] = {0xffff, 3885};
+  ramB.replies[kGaugeSoc] = {0xffff, 40};
+  I2cBus ramBusA(ramA.io()), ramBusB(ramB.io());
+  GaugeReading sample[2] = {readGauge(ramBusA), readGauge(ramBusB)};
+  CHECK(sample[0].ok && sample[1].ok && combinePacks(sample, 2).fullMah == 8634);
+  ramA.replies[kGaugeFull] = {0xffff, 4290};
+  ramB.replies[kGaugeRemaining] = {0xffff, 1715};
+  ramB.replies[kGaugeStatus] = {0xffff, 0};
+  sample[0] = readGauge(ramBusA);
+  sample[1] = readGauge(ramBusB);
+  const PackReading restored = combinePacks(sample, 2);
+  CHECK(restored.ok && restored.packs == 2 && restored.fullMah == 8634 && restored.remainingMah == 3440);
+  CHECK(restored.socPct == 40 && restored.charging && !restored.full);
 }
 
 // ------------------------------------------------------------------------------------------------------------ MCA model
@@ -2200,13 +2219,14 @@ static void testGaugeReobserve()
     for (uint16_t final : {0u, 1u, 3u, 255u}) {
       Gauge g; g.replies[reg] = {255, final}; I2cBus bus(g.io()); GaugeAlerts a;
       a.beginSample(); const auto reads = a.readPack(bus, pack); a.sampled(reads);
-      CHECK(g.reads == 3 && g.starts == 6 && g.stops == 3);
-      CHECK(a.retried == bit && a.retryValid == bit && a.rereads == 1);
+      const unsigned attempts = !field && final == 255 ? 2 : 1;
+      CHECK(g.reads == 2 + attempts && g.starts == 2 * g.reads && g.stops == g.reads);
+      CHECK(a.retried == bit && a.retryValid == bit && a.rereads == attempts);
       CHECK((field ? a.firstSoa[pack] : a.firstIsc[pack]) == 255);
       CHECK((field ? a.soa[pack] : a.isc[pack]) == final);
       CHECK(a.active() == (field ? final != 0 : final == 3));
       CHECK(bool(a.valid & bit) == (field || final <= 3));
-      a.beginSample(); CHECK(!a.retried && !a.retryValid && a.rereads == 1);
+      a.beginSample(); CHECK(!a.retried && !a.retryValid && a.rereads == attempts);
     }
     // A failed reread never converts the successful first255 into clear.
     Gauge g; g.regs[reg] = 255; g.nackReadNumber = field + 2;
@@ -2409,6 +2429,13 @@ static void testLinkRp()
     r.period();
     CHECK(r.d.last(PIANO_MCA_ICL) == 900);
   }
+  Gauge ram13;
+  ram13.replies[0x72] = {255, 255, 0};
+  I2cBus bus(ram13.io());
+  GaugeAlerts alerts;
+  alerts.sampled(0x18 | alerts.readPack(bus, 0));
+  CHECK(alerts.complete() && !alerts.active() && alerts.rereads == 2 &&
+        alerts.firstIsc[0] == 255 && alerts.isc[0] == 0);
 }
 
 // The codec's late answers (2026-11-12 P1/P2: "write ... = 900: no answer (-60)", and the limit read back as written the next cycle).
