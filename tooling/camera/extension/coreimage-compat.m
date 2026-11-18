@@ -3,6 +3,8 @@
 // Select Core Image's legacy CIKL metadata path until native Metal has function reflection.
 #import <Foundation/Foundation.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 int main(int argc, const char **argv)
 {
@@ -18,6 +20,14 @@ int main(int argc, const char **argv)
     if (argc != 2) return 2;
 #endif
     if (![@[@"--apply", @"--check", @"--remove"] containsObject:mode]) return 2;
+    // A login agent and an explicit retry must preserve the same original value.
+    if (![mode isEqualToString:@"--check"]) {
+      if (![[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES
+               attributes:@{NSFilePosixPermissions:@0700} error:NULL]) return 1;
+      NSString *lock = [directory stringByAppendingPathComponent:@"coreimage-compat.lock"];
+      int fd = open(lock.fileSystemRepresentation, O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd < 0 || flock(fd, LOCK_EX)) return 1; // Process exit releases this descriptor and lock.
+    }
     NSString *path = [directory stringByAppendingPathComponent:@"coreimage-compat.plist"];
     NSString *key = @"CI_USE_MTL_DAG_FOR_CIKL_SRC";
     CFStringRef app = (__bridge CFStringRef)domain, property = (__bridge CFStringRef)key;
