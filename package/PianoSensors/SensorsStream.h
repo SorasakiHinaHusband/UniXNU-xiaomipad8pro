@@ -87,6 +87,7 @@ typedef struct {
     int display;                         /* NativeGopDisplay's piano-display-power: 1 on, 0 off, -1 unknown (counts as on) */
     int lid;                             /* PianoKeyboard's piano-keyboard-hall: 1 open, 0 closed, -1 unknown (counts as open) */
     int attached;                        /* PianoKeyboard's piano-keyboard-attached: 1 attached, anything else detached */
+    int accel_with_cover;                /* explicit bench acquisition only; the glue requires a forced consumer */
 } SsConditions;
 
 typedef struct {
@@ -150,8 +151,10 @@ void ss_sensor(SsEngine *e, int stream, int found, const SscSuid *suid, int64_t 
 void ss_from_list(SsEngine *e, const ScClient *list);
 /* The consumers' and the hardware's state (repeating it is harmless). */
 void ss_conditions(SsEngine *e, const SsConditions *c);
-/* The level-4 accelerometer gate: consumer, display on, and MCU cover detached. */
+/* The level-4 accelerometer gate: consumer, display on, and MCU cover detached (or explicit bench acquisition). */
 int ss_accel_wanted(const SsConditions *c);
+/* The actual condition holding acquisition, or null when wanted. Sleep/guard are applied separately. */
+const char *ss_accel_blocker(const SsConditions *c);
 /* A system sleep begins (1: every stream is disabled) or ended (0). */
 void ss_sleep(SsEngine *e, int asleep);
 /* One QMI message the stream's port received. */

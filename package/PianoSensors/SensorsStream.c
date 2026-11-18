@@ -15,7 +15,13 @@ static const PasStream *cstream_of(const SsEngine *e, int i) {return i == SS_LIG
 
 int ss_accel_wanted(const SsConditions *c)
 {
-    return c && c->accel_consumer && c->display != 0 && c->attached != 1;
+    return c && !ss_accel_blocker(c);
+}
+
+const char *ss_accel_blocker(const SsConditions *c)
+{
+    return !c || !c->accel_consumer ? "no consumer" : c->display == 0 ? "display off"
+           : c->attached == 1 && !c->accel_with_cover ? "cover attached" : 0;
 }
 
 void ss_defaults(SsConfig *c)
@@ -139,8 +145,7 @@ static void apply(SsEngine *e, uint64_t at)
                         : c->lid == 0 ? "lid closed" : 0;
     const int accel = !held && ss_accel_wanted(c);
     pas_want(&e->accel, accel, at);
-    e->ch[SS_ACCEL].why = held ? held : !c->accel_consumer ? "no consumer" : c->display == 0 ? "display off"
-                        : c->attached == 1 ? "cover attached" : 0;
+    e->ch[SS_ACCEL].why = held ? held : ss_accel_blocker(c);
     if (!accel) set_edge(e, PS_EDGE_NONE, at);
 }
 
@@ -404,6 +409,16 @@ static void send_due(SsEngine *e, int i, uint64_t at)
     ch->ever_sent = 1;
     ch->txn = txn;
     pas_sent(s, action, at);
+    if (i == SS_ACCEL && ch->requests == 1) {
+        SntText t;
+        snt_str(line(e, i, &t), "first request:");
+        snt_kd(&t, "txn", txn);
+        snt_ks(&t, "action", action == PAS_ACT_ENABLE ? "enable" : "disable");
+        snt_kd(&t, "msg", action == PAS_ACT_ENABLE ? SSC_MSG_SENSOR_CONFIG : SSC_MSG_DISABLE_REQ);
+        snt_str(&t, " suid_low="); snt_hex(&t, ch->suid.low);
+        snt_str(&t, " suid_high="); snt_hex(&t, ch->suid.high);
+        emit(e, i, &t, at, 1);   /* one per boot, cannot spend the first-sample log budget */
+    }
     observe(e, i, at);
 }
 
@@ -420,6 +435,15 @@ static void response(SsEngine *e, int i, const SscQmi *m, uint64_t at)
     const int bad = ssc_qmi_response(m, &r);
     const int ok = !bad && ssc_response_ok(&r);
     const int action = s->outstanding;
+    if (i == SS_ACCEL && ch->requests == 1) {
+        SntText t;
+        snt_str(line(e, i, &t), "first response:");
+        snt_kd(&t, "txn", m->transaction);
+        snt_ks(&t, "action", action == PAS_ACT_ENABLE ? "enable" : "disable");
+        snt_kd(&t, "ok", ok);
+        snt_kd(&t, "error", bad ? -1 : (int64_t)r.error);
+        emit(e, i, &t, at, 1);
+    }
     if (ok) {
         ch->responses++;
         if (r.has_client) {
@@ -665,6 +689,8 @@ void ss_status(const SsEngine *e, int i, char *out, uint32_t size)
     snt_kd(&t, "unanswered", ch->timeouts);
     snt_kd(&t, "rearmed", s->rearmed);
     snt_kd(&t, "errors", ch->errors);
+    snt_kd(&t, "reports", ch->reports);
+    snt_kd(&t, "physical", ch->physical);
     snt_kd(&t, "samples", ch->samples);
     snt_kd(&t, "dropped", ch->dropped);
     if (ch->unreliable) snt_kd(&t, "unreliable", ch->unreliable);

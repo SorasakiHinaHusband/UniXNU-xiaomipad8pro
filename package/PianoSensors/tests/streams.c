@@ -358,15 +358,21 @@ static SsConditions cond;
 
 static void conditions(int light, int accel, int display, int lid, int attached)
 {
-    cond = (SsConditions){light, accel, display, lid, attached};
+    cond = (SsConditions){light, accel, display, lid, attached, 0};
     ss_conditions(&eng, &cond);
 }
 
 static void test_accel_gate_contract(void)
 {
-    SsConditions c = {1, 1, 1, 1, 0};
+    SsConditions c = {1, 1, 1, 1, 0, 0};
     CHECK(ss_accel_wanted(&c));
     c.attached = 1; CHECK(!ss_accel_wanted(&c));
+    CHECK(!strcmp(ss_accel_blocker(&c), "cover attached"));
+    c.accel_with_cover = 1; CHECK(ss_accel_wanted(&c));
+    c.display = 0; CHECK(!ss_accel_wanted(&c) && !strcmp(ss_accel_blocker(&c), "display off"));
+    c.display = 1; c.accel_consumer = 0;
+    CHECK(!ss_accel_wanted(&c) && !strcmp(ss_accel_blocker(&c), "no consumer"));
+    c.accel_consumer = 1; c.accel_with_cover = 0;
     c.attached = 0; c.display = 0; CHECK(!ss_accel_wanted(&c));
     c.display = 1; c.accel_consumer = 0; CHECK(!ss_accel_wanted(&c));
     CHECK(!ss_accel_wanted(NULL));
@@ -703,6 +709,57 @@ static void test_accel(void)
 }
 
 // ---------------------------------------------------------------- guard and strikes
+static void test_accel_cover_acquisition(void)
+{
+    SsConfig cfg;
+    ss_defaults(&cfg);
+    fresh(&cfg);
+    bring_up(0);
+    conditions(0, 1, 1, 1, 1);
+    run(600);
+    CHECK(hub[SS_ACCEL].requests == 0);         // production cover gate remains the default
+    cond.accel_with_cover = 1;
+    ss_conditions(&eng, &cond);
+    allow = 0;
+    run(600);
+    CHECK(hub[SS_ACCEL].requests == 0);         // diagnostic acquisition still requires a guard token
+    allow = 1;
+    hold_pose(0, 9.81f, 0, 600);
+    CHECK(cond.attached == 1 && eng.cond.attached == 1 && eng.ch[SS_ACCEL].samples > 0);
+    CHECK(hub[SS_ACCEL].enables == 1 && hub[SS_ACCEL].rate_bits == fb(10.0f) && out.edge == PS_EDGE_LEFT);
+    ss_sleep(&eng, 1);
+    run(200);
+    CHECK(!hub[SS_ACCEL].enabled && out.edge == PS_EDGE_NONE && ss_idle(&eng));
+    ss_sleep(&eng, 0);
+    run(600);
+    CHECK(hub[SS_ACCEL].enabled && out.edge == PS_EDGE_LEFT);
+    cond.display = 0;
+    ss_conditions(&eng, &cond);
+    run(200);
+    CHECK(!hub[SS_ACCEL].enabled && out.edge == PS_EDGE_NONE);
+    cond.display = 1; cond.accel_consumer = 0;
+    ss_conditions(&eng, &cond);
+    run(600);
+    CHECK(!hub[SS_ACCEL].enabled);
+    cond.accel_consumer = 1;
+    ss_conditions(&eng, &cond);
+    run(600);
+    CHECK(hub[SS_ACCEL].enabled);
+    cond.accel_with_cover = 0;
+    ss_conditions(&eng, &cond);
+    run(200);
+    CHECK(!hub[SS_ACCEL].enabled && out.edge == PS_EDGE_NONE);
+    cond.accel_with_cover = 1;
+    ss_conditions(&eng, &cond);
+    run(600);
+    ss_off(&eng);
+    const uint32_t sent = hub[SS_ACCEL].requests, samples = eng.ch[SS_ACCEL].samples;
+    run(600);
+    CHECK(hub[SS_ACCEL].requests == sent && eng.ch[SS_ACCEL].samples == samples && out.edge == PS_EDGE_NONE);
+    CHECK(clean() == 0 && results_bad == 0 && hub[SS_LIGHT].requests == 0);
+    printf("PASS attached-cover bench acquisition: real cover retained, 513/1025/edge, default cover gate, guard, sleep, display, consumer and strike\n");
+}
+
 static void test_guard(void)
 {
     SsConfig cfg;
@@ -1057,6 +1114,7 @@ int main(int argc, char **argv)
     test_light_cycles();
     test_accel_gate_contract();
     test_accel();
+    test_accel_cover_acquisition();
     test_guard();
     test_sleep();
     test_service();

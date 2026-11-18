@@ -75,7 +75,7 @@ struct Args {
   uint64_t rpcPa;
   uint32_t rpcFrame, rpcLadder, rpcDeadline;   // the file service's framing, its ladder, the attach -> listening deadline (s)
   // level 4 (sensors.md §5c), and the consumers' own arguments it follows
-  uint32_t als, rotate, accelHz, accelBatch, conditionTrace;
+  uint32_t als, rotate, accelHz, accelBatch, accelCover, conditionTrace;
   uint32_t backlight, backlightAuto, rotateAgent, rotateTest;
   char axesText[32];
   SfxAxes axes;
@@ -114,6 +114,7 @@ void readArgs()
   if (gArgs.rpcDeadline > 45) gArgs.rpcDeadline = 45;   // the sensor PD's watchdog fired 59 s after an attach left unserved
   gArgs.als = bootArg("piano-sensors-als", 1);
   gArgs.rotate = bootArg("piano-sensors-rotate", 1);
+  gArgs.accelCover = bootArg("piano-sensors-accel-cover", 0) == 1 && gArgs.rotate >= 2;
   gArgs.accelHz = bootArg("piano-sensors-accel-hz", SS_ACCEL_HZ);
   if (gArgs.accelHz < 1 || gArgs.accelHz > 100) gArgs.accelHz = SS_ACCEL_HZ;
   gArgs.accelBatch = bootArg("piano-sensors-accel-batch", 0);
@@ -799,13 +800,15 @@ SsConditions readConditions(uint64_t now)
   }
   // The accelerometer: piano-rotated reads the edge (piano-rotate>=1) unless it tests with its own edges (piano-rotate-test=1).
   c.accel_consumer = gArgs.rotate >= 2 || (gArgs.rotate == 1 && gArgs.rotateAgent >= 1 && gArgs.rotateTest != 1);
+  c.accel_with_cover = gArgs.accelCover;
   gAccelWhy = gArgs.rotate == 0 ? "piano-sensors-rotate=0" : gArgs.rotate >= 2 ? "piano-sensors-rotate=2"
               : c.accel_consumer ? "piano-rotated" : "no rotation agent (piano-rotate=0 or piano-rotate-test=1)";
   static int lastDisplay = -2, lastLid = -2, lastAttached = -2, lastWanted = -1;
-  const int wanted = c.accel_consumer && c.display != 0 && c.attached != 1;
+  const int wanted = ss_accel_wanted(&c);
   if (gArgs.conditionTrace && (c.display != lastDisplay || c.lid != lastLid || c.attached != lastAttached || wanted != lastWanted)) {
-    note("conditions: display=%d lid=%d attached=%d consumer=%d accel=%s (%s)", c.display, c.lid, c.attached, c.accel_consumer,
-         wanted ? "wanted" : "off", wanted ? "cover detached/display on" : gAccelWhy);
+    note("conditions: display=%d lid=%d attached=%d consumer=%d accel=%s (%s) bench-cover=%d", c.display, c.lid, c.attached,
+         c.accel_consumer, wanted ? "wanted" : "off", wanted ? "display on/cover permitted" : ss_accel_blocker(&c),
+         c.accel_with_cover);
     lastDisplay = c.display; lastLid = c.lid; lastAttached = c.attached; lastWanted = wanted;
   }
   return c;
@@ -888,6 +891,8 @@ bool PianoSensors::start(IOService *provider)
          "piano-rotate=%u piano-rotate-test=%u", gArgs.als, gArgs.rotate, gArgs.accelHz, gArgs.accelBatch, gArgs.axesText,
          gArgs.axesOk ? "" : " (not a map: the default " PS_ACCEL_AXES ")", gArgs.backlight, gArgs.backlightAuto, gArgs.rotateAgent,
          gArgs.rotateTest);
+  if (gArgs.level >= 4 && gArgs.accelCover)
+    note("accel: bench acquisition with the cover allowed (piano-sensors-accel-cover=1); display, sleep and guard still gate it");
   if (gArgs.level == 4) registerFaultObserve();
   gSelf = this;
   setProperty("piano-sensors", gArgs.level, 32);
