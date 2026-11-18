@@ -803,7 +803,7 @@ extern "C" int piano_video_native_poll(uint32_t sid,native::Frame *frame)
   frame->layout.stride=stride;frame->layout.scanlines=scanlines;
   frame->layout.yOffset=frame->layout.cropTop*stride+frame->layout.cropLeft*pixelBytes;
   frame->layout.uvOffset=l.uvOffset()+(frame->layout.cropTop/2)*stride+frame->layout.cropLeft*pixelBytes;
-  frame->layout.bytes=l.rawBytes();frame->layout.bitdepth=o.config.depth;frame->layout.format=o.config.pixelFormat();
+  frame->layout.bytes=l.rawBytes();frame->layout.codec=o.config.format();frame->layout.bitdepth=o.config.depth;frame->layout.format=o.config.pixelFormat();
   frame->noOutput=!f.bytes;
   return 0;
 }
@@ -916,6 +916,7 @@ bool PianoVideo::start(IOService *provider)
     note("V6c completion disposition AVC-known NOSHOW40 ancillary-ignored finish-sticky");
     note("V6f first-timeout snapshot armed passive console IORegistry before-cleanup");
     note("V8 bounded AVC High geometry1920x1080 aperture256 Ncap16 scratch4");
+    note("V9 HEVC Main/Main10 geometry3840x2160 aperture768 Ncap10 P010 sync8s candidate-unqualified");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();
