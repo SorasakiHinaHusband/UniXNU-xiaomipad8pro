@@ -4,26 +4,7 @@
 # `staging`, adds the Mach-Os' CDHashes to the trust cache and writes the record; the seed's boot job then runs the staged
 # install.sh, which installs them with these owners and modes.
 #
-# [[unit]]
-name = "piano-coreimage-compat"
-about = "UID 501 Core Image legacy CIKL metadata path while native Metal lacks visible-function reflection; prior preference retained for --remove"
-default_on = true
-
-[[unit.file]]
-source = "tooling/camera/extension/coreimage-compat.m"
-build = "cc"
-arch = "arm64"
-frameworks = ["Foundation"]
-dest = "/usr/local/bin/piano-coreimage-compat"
-mode = "0755"
-
-[[unit.file]]
-source = "tooling/camera/extension/com.unixnu.piano-coreimage-compat.plist"
-build = "copy"
-dest = "/Library/LaunchAgents/com.unixnu.piano-coreimage-compat.plist"
-mode = "0644"
-
-[[unit]]       one piece: name, about, default_on (its launchd job runs in the installed profile: loaded at install; false: the
+# [[unit]]       one piece: name, about, default_on (its launchd job runs in the installed profile: loaded at install; false: the
 #                job file is installed with Disabled and the owner turns it on with launchctl enable), status = "planned" (listed,
 #                not built or staged). A unit has at most one launchd job; a unit without one is a command-line tool and is always
 #                installed (default_on must be true).
@@ -50,6 +31,25 @@ apps = ["PianoCamera.app", "PianoCameraCapture.app"]
 # Optional private capture directory. Used only with PIANO_CAMERA_PACKAGE and
 # PAD_USERLAND=1, on a fresh volatile test seed; never applied by the live installer.
 approval_env = "PIANO_CAMERA_APPROVAL"
+
+[[unit]]
+name = "piano-coreimage-compat"
+about = "UID 501 Core Image legacy CIKL metadata path while native Metal lacks visible-function reflection; prior preference retained for --remove"
+default_on = true
+
+[[unit.file]]
+source = "tooling/camera/extension/coreimage-compat.m"
+build = "cc"
+arch = "arm64"
+frameworks = ["Foundation"]
+dest = "/usr/local/bin/piano-coreimage-compat"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/camera/extension/com.unixnu.piano-coreimage-compat.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-coreimage-compat.plist"
+mode = "0644"
 
 [[unit]]
 name = "piano-camera-runtime"
