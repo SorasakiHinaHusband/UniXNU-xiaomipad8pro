@@ -57,6 +57,16 @@
 ["adt"."chosen"."asmb"."u32"]
 "lp-sip1" = 1
 
+# Explicit retained diagnostics contract (k27 0071). The generator does not
+# copy DTS reserved-memory nodes into the ADT; these bounds are checked again
+# before the kernel maps the tail, separately from XNU's owned DRAM window.
+["adt"."chosen"."piano-retained-ram"."u64"]
+"cvp-base" = 0x9cb00000
+"cvp-size" = 0x700000
+"pstore-size" = 0x6f0000
+"reset-reason-base" = 0x9d1f0000
+"reset-reason-size" = 0x10000
+
 ["adt"."defaults"."u32"]
 "sleep-disabled" = 1
 # 0, the truthful value natively (the 27.0.1 line's images set it with PIANO_VMM_PRESENT=0; configs/k27-adt.toml's note on
