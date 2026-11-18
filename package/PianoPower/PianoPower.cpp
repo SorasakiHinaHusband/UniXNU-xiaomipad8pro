@@ -69,6 +69,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include "SpmiObserver.h"
+#include "PonHistory.h"
 #include "ChargerPmic.h"
 #include "ChargerWdog.h"
 #include "ChargerEnable.h"
@@ -107,6 +108,7 @@ struct Args {
   uint32_t ramp, rpMax, writeMs, kick;
   uint32_t wdog, chgen, chgfix, chgwatch;
   bool hasRtcOffset;
+  bool ponHistory;
   uint32_t rtcOffset;
 };
 Args gArgs;
@@ -121,6 +123,7 @@ uint32_t bootArg(const char *name, uint32_t fallback)
 void readArgs()
 {
   gArgs.level = bootArg("piano-power", 0);
+  gArgs.ponHistory = bootArg("piano-pon-history", 0) == 1;
   gArgs.period = bootArg("piano-power-period", 30);
   if (gArgs.period < 5) gArgs.period = 5;
   if (gArgs.period > 3600) gArgs.period = 3600;
@@ -476,13 +479,19 @@ OSDefineMetaClassAndStructors(PianoPower, IOService)
 IOService *PianoPower::probe(IOService *provider, SInt32 *score)
 {
   readArgs();
-  if (!gArgs.level || !OSDynamicCast(IOPlatformExpertDevice, provider)) return nullptr;
+  if ((!gArgs.level && !gArgs.ponHistory) || !OSDynamicCast(IOPlatformExpertDevice, provider)) return nullptr;
   return IOService::probe(provider, score);
 }
 
 bool PianoPower::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
+  if (!gArgs.level) {
+    note("start: PON history only; charger/gauges/ADSP untouched");
+    probeSpmi();
+    registerService();
+    return true;
+  }
   note("start: piano-power=%u period %u s, gauges %s; %s", gArgs.level, gArgs.period, gArgs.gauge ? "on" : "off",
        gArgs.level >= 2 ? "level 2: the DSP's charger firmware is started and its charger properties are managed"
                         : gArgs.chgfix ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's "
@@ -791,9 +800,12 @@ bool PianoPower::probeSpmi()
   fArbiter = spmiArbiter(gIo);
   note("spmi: arbiter version %#x, %u APIDs%s", fArbiter.version, fArbiter.count, fArbiter.v7 ? "" : " (not a v7 arbiter: stop)");
   if (!fArbiter.v7) {
+    if (gArgs.ponHistory) readPonHistory(gIo, fArbiter, note);
     stage(-1, "SPMI arbiter");
     return false;
   }
+  if (gArgs.ponHistory) readPonHistory(gIo, fArbiter, note);
+  if (!gArgs.level) return true;
   fCharger = discoverCharger(gIo, fArbiter);
   note("charger PMIC (SID 7): %u peripherals, owned by EE0 %u, EE1 %u, EE2 %u, EE3 %u, others %u", fCharger.peripherals,
        fCharger.ownedBy[0], fCharger.ownedBy[1], fCharger.ownedBy[2], fCharger.ownedBy[3],
