@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
 // Native V6 endpoint of the approved UniXNU VT frontend (vt/UPSTREAM).
-// One exclusive, bounded Baseline/Main320x240 AVC stream. Selector3 snapshots,
+// One exclusive, bounded AVC/HEVC stream. Selector3 snapshots,
 // validates and enqueues. The worker pumps HFI during asynchronous guest waits;
-// output lookups/maps are scoped to a copy. No DRC, synchronous decode or HEVC.
+// output lookups/maps are scoped to a copy. Synchronous completion stays on the worker.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -30,10 +30,10 @@ struct Client;
 struct Session {
   Client *client = nullptr;
   uint8_t uuid[16] = {};
-  uint32_t native = 0;
+  uint32_t native = 0, selectedCodec = 0;
   IOLock *lock = nullptr;
   bool started=false, stopping=false, invalidating=false, workerRunning=false, busy=false;
-  pianovideo::avc::Config config;
+  pianovideo::codec::Config config;
   pianovideo::stream::Ledger frames;
   struct Input { uint8_t *bytes=nullptr; uint32_t size=0; uint64_t reply=0, deadline=0; } inputs[pianovideo::stream::Credits];
   contract::RejectedFrames rejected;
@@ -117,31 +117,25 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   // A successful method owns both references, even if layout validation fails.
   if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
   bool ok=!rc && resultBytes==bytes;
-  if(ok)ok=contract::surfaceResult(result,bytes,id,v,s->config.s.width,s->config.s.height);
+  if(ok)ok=contract::surfaceResult(result,bytes,id,v,s->config.s.width,s->config.s.height,s->config.pixelFormat());
   IOLog("PianoVideoVT V5a: surface lookup id %u status %08x result-bytes %u format %08x planes %u valid %u\n",id,rc,resultBytes,v.format,v.planes,unsigned(ok));
   IOLog("PianoVideoVT V6p: lookup token %llu request %llu id %u status %08x held %u\n",s->frame.token,s->guest.request,id,rc,unsigned(s->surfaceLease.held()));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
 bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
-  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v,f.layout.width,f.layout.height)){failure(s,60,kBadData);return false;}
+  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v,f.layout.width,f.layout.height,f.layout.format)){failure(s,60,kBadData);return false;}
   IOMemoryDescriptor *mem=IOMemoryDescriptor::withAddressRange(v.base,v.size,kIODirectionInOut,s->client->task);
   const IOReturn prepared=mem?mem->prepare():kIOReturnNoMemory;
   if(prepared){OSSafeReleaseNULL(mem);failure(s,61,int(prepared));return false;}
   ++s->maps;
   IOMemoryMap *map=mem->createMappingInTask(kernel_task,0,kIOMapAnywhere);
   uint8_t *dst=map?reinterpret_cast<uint8_t *>(map->getVirtualAddress()):nullptr;
-  const bool ok=dst && map->getLength()>=v.size;
+  const bool ok=dst && map->getLength()>=v.size && pianovideo::vtsurface::copy(f.layout,f.length,const_cast<const uint8_t *>(f.cpu),v,dst);
   if(ok){
     const auto &l=f.layout;
-    // WC source reads only; never create a cached arena alias or treat IOVA as PA.
-    for(unsigned p=0;p<2;++p){
-      const uint32_t off=p?l.uvOffset:l.yOffset,rows=p?l.height/2:l.height;
-      for(uint32_t y=0;y<rows;++y)
-        memcpy(dst+v.plane[p].offset+uint64_t(y)*v.plane[p].stride,
-          const_cast<const uint8_t *>(f.cpu)+off+uint64_t(y)*l.stride,l.width);
-    }
     __asm__ volatile("dsb sy" ::: "memory");
-    IOLog("PianoVideoVT V8: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u\n",f.token,l.width,l.height,l.width*l.height*3/2,l.stride,l.scanlines,l.uvOffset,v.id);
+    if(l.codec==cc("avc1"))IOLog("PianoVideoVT V8: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u\n",f.token,l.width,l.height,l.width*l.height*3/2,l.stride,l.scanlines,l.uvOffset,v.id);
+    else IOLog("PianoVideoVT V9: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u format %08x depth %u\n",f.token,l.width,l.height,l.width*l.height*3/2*(l.bitdepth==10?2:1),l.stride,l.scanlines,l.uvOffset,v.id,l.format,l.bitdepth);
   }else failure(s,62,kNoMemory);
   OSSafeReleaseNULL(map);mem->complete();mem->release();--s->maps;return ok;
 }
@@ -166,19 +160,36 @@ void closeSurface(Session *s){
   if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;s->surfaceLease.closed();}
 }
 bool request(Session *s,Writer &w,const uint8_t *b,uint64_t id,uint32_t type){
-  IOLockLock(s->lock);const bool admitted=!s->stopping&&s->guest.begin(id,type,nowMs());s->replyHasSurface=false;
-  s->replyError=kDecodeError;IOLockUnlock(s->lock);
-  if(!admitted)return false;
-  const bool ok=send(s->client,w,b);if(!ok)failure(s,30,kDecodeError);return ok;
+  // Queue transport while holding the cancellation fence. The send callback
+  // only appends to the receive queue; selector3/guest ACK runs independently.
+  IOLockLock(s->lock);const bool admitted=!s->stopping&&!s->invalidating&&!s->firstError&&s->guest.begin(id,type,nowMs());
+  s->replyHasSurface=false;s->replyError=kDecodeError;
+  const bool ok=admitted&&send(s->client,w,b);IOLockUnlock(s->lock);
+  if(!ok)failure(s,30,kDecodeError);return ok;
+}
+// Caller holds the session lock; exactly one original reply may be claimed.
+bool syncReply(Session *s,pianovideo::stream::Record &f,int error){
+  const bool success=!error&&!s->stopping&&!s->invalidating&&!s->firstError;
+  const uint64_t id=f.completion.claimReply(success,nowMs());
+  if(!id)return false;
+  uint8_t b[128];Writer w(b,sizeof b);w.header(cc("dfrm"),FlagReply,s->uuid,id);
+  w.s32(cc(",err"),success?0:(error?error:kDecodeError));w.u32(cc(",inf"),0);
+  const bool sent=send(s->client,w,b);
+  IOLog("PianoVideoVT V9: sync reply token %llu request %llu status %d after-Demt-ACK %u sent %u\n",f.token,id,success?0:(error?error:kDecodeError),unsigned(f.completion.acknowledged),unsigned(sent));
+  return sent;
 }
 void emitFrame(Session *s,int error,const uint8_t *uuid=nullptr){
+  IOLockLock(s->lock);auto *record=s->currentAccepted?s->frames.find(s->currentToken):nullptr;
+  const bool allowed=!s->stopping&&!s->invalidating&&!s->firstError&&(!record||(!record->completion.expired(nowMs())&&record->completion.claimEmit()));
+  const uint32_t async=record?(record->flags&1):1;IOLockUnlock(s->lock);
+  if(!allowed)return;
   uint8_t b[192];const uint64_t id=s->nextRequest++;Writer w(b,sizeof b);
   w.header(cc("Demt"),FlagHostRequest,s->uuid,id);w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),error);
   // Asynchronous=1, FrameDropped=2. A NULL no-output completion has no Dbuf UUID.
-  w.u32(cc(",inf"),uuid&&!error?1:3);if(uuid)w.uuid(cc(",uui"),uuid);
+  w.u32(cc(",inf"),contract::completionInfo(async,uuid!=nullptr,error));if(uuid)w.uuid(cc(",uui"),uuid);
   s->currentError=error;s->currentImage=uuid&&!error;
   const bool sent=request(s,w,b,id,cc("Demt"));
-  IOLockLock(s->lock);s->currentEmitted=sent;if(sent&&s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f)f->phase=pianovideo::stream::Phase::Emitted;}IOLockUnlock(s->lock);
+  IOLockLock(s->lock);s->currentEmitted=sent;if(s->currentAccepted){auto *f=s->frames.find(s->currentToken);if(f){f->completion.sent(sent);f->phase=pianovideo::stream::Phase::Emitted;}}IOLockUnlock(s->lock);
   IOLog("PianoVideoVT V6: Demt session %u token %llu status %d image %u completed-once 1\n",s->native,s->currentToken,error,unsigned(uuid!=nullptr));
 }
 void settleCurrent(Session *s){
@@ -218,9 +229,10 @@ void worker(void *arg,wait_result_t){
     IOLockLock(s->lock);
     auto *admission=s->frames.nextAdmission();
     bool expired=false;
+    for(const auto &f:s->frames.frames)if(f.phase!=pianovideo::stream::Phase::Free&&f.completion.expired(nowMs()))expired=true;
     if(admission&&!s->stopping&&!s->invalidating&&!s->firstError){
       auto &in=s->inputs[unsigned(admission-s->frames.frames)];
-      expired=in.reply&&nowMs()>=in.deadline;
+      expired=expired||(in.reply&&nowMs()>=in.deadline);
       if(!expired&&in.reply&&s->frames.replyReady()){
         const uint64_t reply=in.reply;
         if(answerAdmission(s,*admission,reply,true))in.reply=in.deadline=0;
@@ -261,6 +273,14 @@ void worker(void *arg,wait_result_t){
         IOLog("PianoVideoVT V6: Demt ACK token %llu wait-ms %llu\n",s->currentToken,nowMs()-(s->guest.deadline-2000));
         if(replyError){failure(s,31,replyError);break;}
         if(s->currentAccepted&&s->currentImage)droidvm_vthost_frames_out=droidvm_vthost_frames_out+1;
+        IOLockLock(s->lock);auto *completed=s->currentAccepted?s->frames.find(s->currentToken):nullptr;
+        bool syncFailed=false;
+        if(completed){
+          if(!completed->completion.ack())syncFailed=true;
+          else if(completed->completion.synchronous&&!syncReply(s,*completed,s->currentError))syncFailed=true;
+        }
+        IOLockUnlock(s->lock);
+        if(syncFailed){failure(s,78,kDecodeError);break;}
         settleCurrent(s);
       }
     }
@@ -274,7 +294,8 @@ void worker(void *arg,wait_result_t){
         const uint32_t flags=valid?f->flags:0;if(valid)f->phase=pianovideo::stream::Phase::Delivering;IOLockUnlock(s->lock);
         if(!valid){failure(s,75,kBadData);break;}
         s->current=true;s->currentAccepted=true;s->currentToken=s->frame.token;
-        if(flags&2){
+        if((flags&2)||s->frame.noOutput){
+          IOLog("PianoVideoVT V9: no-output token %llu do-not-output %u firmware-NOSHOW %u codec %08x\n",s->currentToken,unsigned((flags&2)!=0),unsigned(s->frame.noOutput),s->config.format());
           const int released=piano_video_native_frame_release(s->native,&s->frame);
           if(released){failure(s,74,released);break;}emitFrame(s,0);
         }else{
@@ -286,7 +307,7 @@ void worker(void *arg,wait_result_t){
     // Submit the oldest accepted AU. EBD releases DMA input, never frame credit.
     IOLockLock(s->lock);
     int chosen=-1;uint64_t oldest=UINT64_MAX;
-    for(unsigned i=0;i<pianovideo::stream::Credits;++i){auto &f=s->frames.frames[i];if(f.phase==pianovideo::stream::Phase::Queued&&f.serial<oldest){chosen=int(i);oldest=f.serial;}}
+    for(unsigned i=0;i<pianovideo::stream::Credits;++i){auto &f=s->frames.frames[i];if((f.phase==pianovideo::stream::Phase::Queued||f.phase==pianovideo::stream::Phase::SyncQueued)&&f.serial<oldest){chosen=int(i);oldest=f.serial;}}
     IOLockUnlock(s->lock);
     if(chosen>=0){
       auto &in=s->inputs[chosen];auto &record=s->frames.frames[chosen];
@@ -322,6 +343,12 @@ void worker(void *arg,wait_result_t){
     uint8_t b[160];Writer w(b,sizeof b);w.header(cc("Demt"),FlagHostRequest,s->uuid,s->nextRequest++);
     w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
     IOLockUnlock(s->lock);send(s->client,w,b);IOLockLock(s->lock);
+  }
+  // A synchronous original always has one reply owner, including cancel,
+  // native timeout, failed Dbuf/Demt send and failed guest ACK. Never emit a
+  // second frame after a Demt attempt or authorize a late successful reply.
+  for(auto &f:s->frames.frames)if(f.phase!=pianovideo::stream::Phase::Free&&f.completion.synchronous){
+    syncReply(s,f,kDecodeError);f.phase=pianovideo::stream::Phase::Emitted;
   }
   // A held dfrm never became eligible. Its nonzero reply lets the Apple PV
   // decoder complete that token itself; do not also send a Demt for it.
@@ -365,8 +392,8 @@ void teardown(Session *s) {
   IOLog("PianoVideoVT V5a: invalidate safe worker-joined 1 surfaces-released 1 close-status %d\n",s->closeError);
 }
 void destroy(Session *s){if(!s)return;teardown(s);IOLockFree(s->lock);delete s;}
-bool descriptor(Client *c,const Header &h,const uint8_t *m,uint32_t n,contract::FormatReport &r) {
-  const bool valid=contract::formatRequest(m,n,r);
+bool descriptor(Client *c,const Header &h,const uint8_t *m,uint32_t n,contract::FormatReport &r,pianovideo::codec::Config *config) {
+  const bool valid=contract::formatRequest(m,n,r,config);
   IOLog("PianoVideoVT V5b: format %c%c%c%c request %llu pid %d fds-type %08x bytes %u declared %u codec %08x size %ux%u extensions %u atoms %u terminal-zero4 %u avcC %u decision %s\n",
     int(h.type>>24),int((h.type>>16)&255),int((h.type>>8)&255),int(h.type&255),h.request,c->pid,
     r.parameterType,r.bytes,r.declared,r.codec,r.width,r.height,r.extensionBytes,r.atomBytes,unsigned(r.terminalZero),r.avcBytes,r.decision);
@@ -374,23 +401,25 @@ bool descriptor(Client *c,const Header &h,const uint8_t *m,uint32_t n,contract::
 }
 void attributes(Session *s) {
   Plist *p=new Plist();if(!p){failure(s,10,kNoMemory);return;}
-  uint8_t b[640];const int fmt=p->integer(cc("420v"));
+  uint8_t b[640];const int fmt=p->integer(s->config.pixelFormat());
   const int keys[]={p->string("Width"),p->string("Height"),p->string("PixelFormatType"),p->string("BytesPerRowAlignment"),p->string("PlaneAlignment"),p->string("IOSurfaceProperties")};
   const int values[]={p->integer(s->config.s.width),p->integer(s->config.s.height),p->array(&fmt,1),p->integer(64),p->integer(256),p->dict(nullptr,nullptr,0)};
   const int attrs=p->dict(keys,values,6);Writer w(b,sizeof b);w.header(cc("Dpba"),0,s->uuid,0);w.plist(cc(",pba"),*p,attrs);send(s->client,w,b);delete p;
-  IOLog("PianoVideoVT V8: Dpba active %ux%u 420v IOSurface pool\n",s->config.s.width,s->config.s.height);
+  if(!s->config.isHevc())IOLog("PianoVideoVT V8: Dpba active %ux%u 420v IOSurface pool\n",s->config.s.width,s->config.s.height);
+  else IOLog("PianoVideoVT V9: Dpba active %ux%u format %08x depth %u IOSurface pool\n",s->config.s.width,s->config.s.height,s->config.pixelFormat(),s->config.depth);
 }
 int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
-  contract::FormatReport r;if(!descriptor(s->client,h,m,n,r))return kUnsupported;
+  contract::FormatReport r;if(!descriptor(s->client,h,m,n,r,&s->config)||s->config.format()!=s->selectedCodec)return kUnsupported;
   IOLockLock(s->lock);const bool started=s->started||s->stopping;IOLockUnlock(s->lock);if(started)return kBadState;
-  if(!contract::formatRequest(m,n,r,&s->config))return kUnsupported;
   const int rc=piano_video_native_open(&s->native);if(rc)return kDecodeError;
   s->started=true;s->workerRunning=true;thread_t t=nullptr;
   if(kernel_thread_start(worker,s,&t)!=KERN_SUCCESS){s->workerRunning=false;s->stopping=true;piano_video_native_close(s->native);s->native=0;return kNoMemory;}
   thread_deallocate(t);attributes(s);
-  IOLog("PianoVideoVT V8: dsta native session %u bounded-format %ux%u profile %u level %u progressive8bit420\n",s->native,s->config.s.width,s->config.s.height,s->config.s.profile,s->config.s.level);return 0;
+  if(!s->config.isHevc())IOLog("PianoVideoVT V8: dsta native session %u bounded-format %ux%u profile %u level %u progressive8bit420\n",s->native,s->config.s.width,s->config.s.height,s->config.s.profile,s->config.s.level);
+  else IOLog("PianoVideoVT V9: dsta native session %u bounded-format %ux%u codec %08x profile %u level %u depth %u\n",s->native,s->config.s.width,s->config.s.height,s->config.format(),s->config.s.profile,s->config.s.level,s->config.depth);
+  return 0;
 }
-int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
+int queue(Session *s,const uint8_t *m,uint32_t n,uint64_t request,contract::InputReport &r){
   if(!contract::inputRequest(m,n,r,&s->config))return kBadData;
   IOLockLock(s->lock);
   if(!s->started||s->stopping||s->firstError||s->finishWanted||s->frames.pending==pianovideo::stream::Credits||s->frames.find(uint64_t(r.token))){
@@ -406,6 +435,7 @@ int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   if(!normalized){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);return kBadData;}
   auto *record=s->frames.accept(uint64_t(r.token),r.flags,false);
   if(!record){IOLockUnlock(s->lock);IOFree(input,contract::kMaxAuBytes);r.decision="credit-or-duplicate";return kBadState;}
+  record->completion.begin(r.flags,request,nowMs());
   const unsigned index=unsigned(record-s->frames.frames);s->inputs[index]={input,normalized};
   const unsigned pending=s->frames.pending;
   char digest[65];hash(input,normalized,digest);
@@ -416,14 +446,22 @@ int queue(Session *s,const uint8_t *m,uint32_t n,contract::InputReport &r){
   droidvm_vthost_frames_in=droidvm_vthost_frames_in+1;return 0;
 }
 void inventory(Client *c,const Header &h) {
-  Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[2048];int entry=0;
-  if(h.type==cc("decs")){
-    const int type=p->string("avc1");const int keys[]={p->string("VTCodecType"),p->string("CMClassImplementationName"),p->string("IsPreferredInternalPlugin"),p->string("VTRating"),p->string("CMClassImplementationID")};
-    const int values[]={p->array(&type,1),p->string("PianoVideo native bounded AVC High"),p->boolean(false),p->integer(400),p->string("com.unixnu.pianovideo.decoder.avc")};entry=p->dict(keys,values,5);
-  }
-  const int list=p->array(&entry,h.type==cc("decs")&&piano_video_native_ready()?1:0);
+  Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[4096];int entries[2]={};
+  const bool ready=piano_video_native_ready();
+  if(h.type==cc("decs")&&ready){entries[0]=contract::inventoryEntry(*p,false);entries[1]=contract::inventoryEntry(*p,true);}
+  const int list=p->array(entries,h.type==cc("decs")&&ready?2:0);
   Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.plist(h.type==cc("decs")?cc(",dec"):cc(",enc"),*p,list);w.u32(cc(",ver"),6);send(c,w,b);delete p;
-  IOLog("PianoVideoVT V8: inventory version6 avc1-only bounded1920x1080 encoders0\n");
+  IOLog("PianoVideoVT V9: inventory version6 avc1 hvc1 ready %u encoders0 rating400\n",unsigned(ready));
+}
+void capabilities(Client *c,const Header &h,const uint8_t *m,uint32_t n){
+  int32_t codec=0,version=0;
+  const bool supported=paramS32(m,n,cc(",cod"),codec)&&(uint32_t(codec)==cc("avc1")||uint32_t(codec)==cc("hvc1"))&&
+    paramS32(m,n,cc(",ver"),version)&&version==6&&piano_video_native_ready();
+  if(!supported){status(c,h,kUnsupported);return;}
+  Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[2048];
+  const int root=contract::capabilities(*p,uint32_t(codec)==cc("hvc1"));Writer w(b,sizeof b);
+  w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.u32(cc(",ver"),6);w.plist(cc(",dca"),*p,root);send(c,w,b);delete p;
+  IOLog("PianoVideoVT V9: dcap codec %08x version6 metadata-only native-owner-unchanged 1 HEVC-admission-level183 runtime-unqualified 1\n",uint32_t(codec));
 }
 void properties(Client *c,const Header &h,bool value) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[512];int root;
@@ -484,19 +522,20 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
   IOLockLock(c->lock);
   s=c->session;const bool owned=s&&!memcmp(s->uuid,h.uuid,16);
   if(h.type==cc("decs")||h.type==cc("encs"))inventory(c,h);
+  else if(h.type==cc("dcap"))capabilities(c,h,m,n);
   else if(h.type==cc("+dec")){
     int32_t codec=0;
-    if(c->session||!paramS32(m,n,cc(",cod"),codec)||uint32_t(codec)!=cc("avc1"))status(c,h,kUnsupported);
+    if(c->session||!paramS32(m,n,cc(",cod"),codec)||(uint32_t(codec)!=cc("avc1")&&uint32_t(codec)!=cc("hvc1")))status(c,h,kUnsupported);
     else{
       s=new Session();if(s)s->lock=IOLockAlloc();
       if(!s||!s->lock){delete s;status(c,h,kNoMemory);}
       else{
-        s->client=c;memcpy(s->uuid,h.uuid,16);c->session=s;droidvm_vthost_sessions=droidvm_vthost_sessions+1;
+        s->selectedCodec=uint32_t(codec);s->client=c;memcpy(s->uuid,h.uuid,16);c->session=s;droidvm_vthost_sessions=droidvm_vthost_sessions+1;
         Plist *p=new Plist();if(!p)status(c,h,kNoMemory);else{
-          uint8_t b[320];const int key=p->string("VTHostBuildVersion"),value=p->string("PianoVideo native V6 bounded streaming");const int info=p->dict(&key,&value,1);
+          uint8_t b[320];const int key=p->string("VTHostBuildVersion"),value=p->string("PianoVideo native V9 bounded AVC HEVC");const int info=p->dict(&key,&value,1);
           Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.u32(cc(",ver"),6);w.plist(cc(",hin"),*p,info);send(c,w,b);delete p;
         }
-        IOLog("PianoVideoVT V5a: +dec selected com.unixnu.pianovideo.decoder.avc pid %d\n",c->pid);
+        IOLog("PianoVideoVT V9: +dec selected com.unixnu.pianovideo.decoder.%s codec %08x pid %d\n",uint32_t(codec)==cc("hvc1")?"hevc":"avc",uint32_t(codec),c->pid);
         IOLog("PianoVideoVT V6p: session-client per-copy invalidate56 release1 no-address-cache\n");
         IOLog("PianoVideoVT V7e: reply-window4 credits8 software-finish no-EOS\n");
       }
@@ -509,23 +548,27 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
   else switch(h.type){
     case cc("dsta"):status(c,h,start(s,h,m,n));break;
     case cc("dcan"):{
-      contract::FormatReport r;const bool valid=descriptor(c,h,m,n,r);
+      pianovideo::codec::Config *candidate=new pianovideo::codec::Config();
+      contract::FormatReport r;const bool valid=candidate&&descriptor(c,h,m,n,r,candidate);
       IOLockLock(s->lock);const bool active=s->started&&!s->stopping;IOLockUnlock(s->lock);
-      pianovideo::avc::Config candidate;const bool can=active&&valid&&contract::formatRequest(m,n,r,&candidate)&&s->config.same(candidate);uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);
+      const bool can=active&&valid&&s->config.same(*candidate);delete candidate;uint8_t b[128];Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.s32(cc(",can"),can?1:0);
       const bool sent=send(c,w,b);
       IOLog("PianoVideoVT V5b: dcan request %llu pid %d active %u decision %s status 0 ,can %u transport %u side-effect-free 1\n",h.request,c->pid,unsigned(active),active?r.decision:"inactive-session",unsigned(can),unsigned(sent));
       IOLog("PianoVideoVT V5a: dcan ,can %u side-effect-free 1\n",unsigned(can));break;
     }
     case cc("dsts"):case cc("dtil"):status(c,h,kUnsupported);IOLog("PianoVideoVT V5a: tiles rejected before-DMA 1\n");break;
     case cc("dfrm"):{
-      contract::InputReport r;const int error=queue(s,m,n,r);
+      contract::InputReport r;const int error=queue(s,m,n,h.request,r);
       // A rejected request belongs to Apple's immediate error completion path.
       // Returning an error and later sending Demt would complete it twice.
       if(error){IOLockUnlock(c->lock);return error;}
       auto *f=s->frames.find(uint64_t(r.token));
-      const bool deferred=!s->frames.replyReady()||s->frames.nextAdmission()!=f;
+      const bool synchronous=!(r.flags&1);
+      const bool deferred=synchronous||!s->frames.replyReady()||s->frames.nextAdmission()!=f;
       bool sent=false;
-      if(deferred){
+      if(synchronous){
+        IOLog("PianoVideoVT V9: sync admitted token %llu request %llu worker-ready 1 selector-return 1 deadline-ms 8000\n",uint64_t(r.token),h.request);
+      }else if(deferred){
         auto &in=s->inputs[unsigned(f-s->frames.frames)];in.reply=h.request;in.deadline=nowMs()+900;
         IOLog("PianoVideoVT V7e: admission held token %llu request %llu live %u pending %u deadline-ms 900 selector-return 1\n",
           uint64_t(r.token),h.request,s->frames.published(),s->frames.pending);

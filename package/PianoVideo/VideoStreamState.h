@@ -17,11 +17,34 @@ inline FinishDecision finishDecision(bool started, bool invalidating, bool faile
   if(failed)return FinishDecision::Failed;
   return running&&!stopping&&!pending?FinishDecision::Schedule:FinishDecision::BadState;
 }
-enum class Phase : uint8_t { Free, Admitting, Queued, Submitted, Picture, Delivering, Emitted };
+// Synchronous requests own a deferred original reply. They can enter hardware
+// before that reply; asynchronous requests still wait for publication.
+enum class Phase : uint8_t { Free, Admitting, SyncQueued, Queued, Submitted, Picture, Delivering, Emitted };
+struct Completion {
+  static constexpr uint64_t SyncDeadlineMs = 8000; // target PV operation timeout is 10 s
+  uint64_t request=0, deadline=0;
+  bool synchronous=false, emitAttempted=false, emitSent=false, acknowledged=false, replied=false, failed=false;
+  void begin(uint32_t flags,uint64_t id,uint64_t now) {
+    *this=Completion{};synchronous=!(flags&1);request=synchronous?id:0;
+    deadline=synchronous?now+SyncDeadlineMs:0;
+  }
+  bool expired(uint64_t now) const {return synchronous&&!replied&&now>=deadline;}
+  bool claimEmit() {if(emitAttempted||replied)return false;emitAttempted=true;return true;}
+  void sent(bool ok) {emitSent=ok;if(!ok)failed=true;}
+  bool ack() {if(!emitSent||acknowledged||replied)return false;acknowledged=true;return true;}
+  // An error reply is the sole completion owner if emission never began.
+  // After a Demt was sent it only releases the waiting original call; it never
+  // authorizes a second emit. Claim under the session lock before transport.
+  uint64_t claimReply(bool success,uint64_t now) {
+    if(!synchronous||replied||!request||(success&&(!acknowledged||failed||expired(now))))return 0;
+    replied=true;if(!success)failed=true;return request;
+  }
+};
 struct Record {
   uint64_t token = 0, serial = 0;
   uint32_t flags = 0;
   Phase phase = Phase::Free;
+  Completion completion;
 };
 struct Ledger {
   Record frames[Credits] = {};
@@ -33,7 +56,7 @@ struct Ledger {
   bool draining = false, ack = false, last = false, paused = false, stopped = false;
   Record *find(uint64_t t) { for(auto &f:frames) if(f.phase!=Phase::Free && f.token==t)return &f; return nullptr; }
   unsigned published() const {
-    unsigned n=0;for(const auto &f:frames)if(f.phase!=Phase::Free&&f.phase!=Phase::Admitting)++n;return n;
+    unsigned n=0;for(const auto &f:frames)if((f.flags&1)&&f.phase!=Phase::Free&&f.phase!=Phase::Admitting)++n;return n;
   }
   Record *nextAdmission() {
     Record *next=nullptr;
@@ -43,7 +66,7 @@ struct Ledger {
   bool replyReady() const {return !stopped&&published()<PublishedWindow;}
   Record *accept(uint64_t t, uint32_t flags = 1, bool published = true) {
     if(stopped || draining || pending==Credits || find(t))return nullptr;
-    for(auto &f:frames)if(f.phase==Phase::Free){f={t,++accepted,flags,published?Phase::Queued:Phase::Admitting};++pending;if(pending>highWater)highWater=pending;return &f;}
+    for(auto &f:frames)if(f.phase==Phase::Free){f=Record{};f.token=t;f.serial=++accepted;f.flags=flags;f.phase=published?Phase::Queued:((flags&1)?Phase::Admitting:Phase::SyncQueued);++pending;if(pending>highWater)highWater=pending;return &f;}
     return nullptr;
   }
   bool publish(uint64_t t) {auto *f=find(t);if(!f||f->phase!=Phase::Admitting||stopped)return false;f->phase=Phase::Queued;return true;}
@@ -53,7 +76,7 @@ struct Ledger {
     return chosen;
   }
   bool submit(uint64_t t,unsigned i) {
-    Record *f=find(t);if(stopped||!f||f->phase!=Phase::Queued||i>=Inputs||inputOwned[i])return false;
+    Record *f=find(t);if(stopped||!f||(f->phase!=Phase::Queued&&f->phase!=Phase::SyncQueued)||i>=Inputs||inputOwned[i])return false;
     inputOwned[i]=true;inputToken[i]=t;if(inputUses[i]++)++inputReuse;f->phase=Phase::Submitted;return true;
   }
   bool ebd(unsigned i) {if(i>=Inputs||!inputOwned[i])return false;inputOwned[i]=false;return true;}

@@ -74,13 +74,14 @@ static std::vector<uint8_t> sampleFormatBody(const std::vector<uint8_t> &conf,bo
 static void streamTests() {
   const auto s=makeSps(), p=makePps();auto conf=avcc(s,p);avc::Config c;
   CHECK(avc::config(conf.data(),uint32_t(conf.size()),c));CHECK(c.valid()&&c.pocType==0&&c.hfiProfile()==2&&c.hfiLevel()==4&&c.s.maxReorder==1&&c.s.maxDpb==2);
+  codec::Config wrapped;CHECK(codec::parseAvc(conf.data(),uint32_t(conf.size()),wrapped));
   auto formatBody=sampleFormatBody(conf);vtwire::Atom fdsc;fdsc.type=vtwire::cc("fdsc");fdsc.body=formatBody.data();fdsc.size=uint32_t(formatBody.size());
-  CHECK(vtcontract::sampleFormat(fdsc,c));
+  CHECK(vtcontract::sampleFormat(fdsc,wrapped));
   for(auto bad:{sampleFormatBody(conf,true),sampleFormatBody(conf,false,true),sampleFormatBody(avcc(makeSps(77,2),p))}){
-    fdsc.body=bad.data();fdsc.size=uint32_t(bad.size());CHECK(!vtcontract::sampleFormat(fdsc,c));
+    fdsc.body=bad.data();fdsc.size=uint32_t(bad.size());CHECK(!vtcontract::sampleFormat(fdsc,wrapped));
   }
-  auto invalidFormat=formatBody;invalidFormat[8]^=1;fdsc.body=invalidFormat.data();fdsc.size=uint32_t(invalidFormat.size());CHECK(!vtcontract::sampleFormat(fdsc,c));
-  fdsc.body=formatBody.data();for(unsigned n=0;n<formatBody.size();++n){fdsc.size=n;CHECK(!vtcontract::sampleFormat(fdsc,c));}
+  auto invalidFormat=formatBody;invalidFormat[8]^=1;fdsc.body=invalidFormat.data();fdsc.size=uint32_t(invalidFormat.size());CHECK(!vtcontract::sampleFormat(fdsc,wrapped));
+  fdsc.body=formatBody.data();for(unsigned n=0;n<formatBody.size();++n){fdsc.size=n;CHECK(!vtcontract::sampleFormat(fdsc,wrapped));}
   CHECK(c.same(c));avc::Config different=c;different.pps[2]^=1;CHECK(!c.same(different));
   CHECK(!avc::config(nullptr,0,different));
   for(auto invalid:{makeSps(100),makeSps(77,1),makeSps(77,0,5),makeSps(77,0,2,120),makeSps(77,0,2,19,true),makeSps(77,0,2,19,false,true),makeSps(77,0,2,19,false,false,3)}){
@@ -97,14 +98,14 @@ static void streamTests() {
   for(auto &sample:samples){
     avc::Picture pic;CHECK(avc::accessUnit(sample.data(),uint32_t(sample.size()),c,&pic));
     std::vector<uint8_t> normalized(sample.size()+c.parameterBytes());
-    auto bytes=vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),uint32_t(normalized.size()),c,true);
+    auto bytes=vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),uint32_t(normalized.size()),wrapped,true);
     CHECK(bytes==normalized.size()&&avc::normalized(normalized.data(),bytes,c));
-    CHECK(!vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),bytes-1,c,true));
+    CHECK(!vtcontract::normalize(sample.data(),uint32_t(sample.size()),normalized.data(),bytes-1,wrapped,true));
     normalized[5]^=1;CHECK(!avc::normalized(normalized.data(),bytes,c));
     vtcontract::InputReport report;
-    for(unsigned flags:{1u,3u,5u,9u,11u,15u}) {auto request=frameRequest(sample,flags);CHECK(vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&report.flags==flags&&report.hasToken&&report.token==124);}
-    for(unsigned flags:{0u,2u,8u,17u,0x80000001u}) {auto request=frameRequest(sample,flags);CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&report.transportReject);}
-    for(auto request:{frameRequest(sample,1,2),frameRequest(sample,1,1,1),frameRequest(sample,1,1,0,71),frameRequest(sample,1,1,0,80)})CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&c)&&!report.transportReject);
+    for(unsigned flags:{0u,1u,2u,3u,4u,5u,6u,8u,9u,11u,15u}) {auto request=frameRequest(sample,flags);CHECK(vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&wrapped)&&report.flags==flags&&report.hasToken&&report.token==124);}
+    for(unsigned flags:{16u,17u,0x80000001u}) {auto request=frameRequest(sample,flags);CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&wrapped)&&report.transportReject);}
+    for(auto request:{frameRequest(sample,1,2),frameRequest(sample,1,1,1),frameRequest(sample,1,1,0,71),frameRequest(sample,1,1,0,80)})CHECK(!vtcontract::inputRequest(request.data(),uint32_t(request.size()),report,&wrapped)&&!report.transportReject);
     for(unsigned i=0;i<sample.size();++i)CHECK(!avc::accessUnit(sample.data(),i,c));
   }
   // Multiple slices must retain one picture, strictly increasing MB addresses.
@@ -191,7 +192,7 @@ int main() {
   CHECK(vtcontract::formatRequest(request,requestBytes,report)&&report.terminalZero&&!strcmp(report.decision,"accept"));
   vtwire::put32(request+8,vtwire::cc("dcan"));CHECK(vtcontract::formatRequest(request,requestBytes,report));
   fds[33]=65;CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"dimensions"));fds[33]=64;
-  vtwire::put32(fds+4,vtwire::cc("hvc1"));CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"codec"));vtwire::put32(fds+4,vtwire::cc("avc1"));
+  vtwire::put32(fds+4,vtwire::cc("hvc1"));CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"hvcC-missing-or-duplicate"));vtwire::put32(fds+4,vtwire::cc("avc1"));
   vtwire::put32(fds,135);CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"declared-size"));vtwire::put32(fds,136);
   vtwire::put32(p+12,vtwire::cc("=dat"));CHECK(!vtcontract::formatRequest(request,requestBytes,report)&&!strcmp(report.decision,"fds-type"));vtwire::put32(p+12,vtwire::cc("=fds"));
   CHECK(!vtcontract::formatRequest(request,requestBytes-1,report));
