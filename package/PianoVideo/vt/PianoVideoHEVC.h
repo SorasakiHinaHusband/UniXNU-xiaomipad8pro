@@ -431,17 +431,18 @@ inline bool slice(const uint8_t *p, uint32_t n, const Config &c, Picture &v) {
     if (c.p.deblockOverride && b.read(1)) { disabled = b.read(1); if (!disabled) { b.se(-6, 6); b.se(-6, 6); } }
     if (c.p.loopAcross && (saoY || saoC || !disabled)) b.read(1);
   }
+  uint64_t entryExtent = 0;
   if (c.p.tiles || c.p.wpp) {
     const uint32_t entries = b.ue(c.s.ctbs() - 1); if (!b.good || entries > 8192) return false;
     if (entries) {
-      const uint32_t bits = b.ue(31) + 1; uint64_t extent = 0;
-      for (uint32_t i = 0; i < entries; ++i) { extent += uint64_t(b.read(bits)) + 1; if (extent > n) return false; }
+      const uint32_t bits = b.ue(31) + 1;
+      for (uint32_t i = 0; i < entries; ++i) { entryExtent += uint64_t(b.read(bits)) + 1; if (entryExtent > n) return false; }
     }
   }
   if (c.p.headerExtension) { const uint32_t bytes = b.ue(256); if (!b.good) return false; for (uint32_t i = 0; i < bytes; ++i) b.read(8); }
   // Slice data stays opaque to the host, but a truncated header or empty CABAC
   // payload is never admitted. The firmware validates coding-tree syntax.
-  return b.align() && b.byte < b.n;
+  return b.align() && b.byte < b.n && entryExtent < b.n - b.byte;
 }
 inline bool sei(const uint8_t *p, uint32_t n) {
   Bits b{p + 2, n - 2};

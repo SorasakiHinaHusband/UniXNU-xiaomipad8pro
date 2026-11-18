@@ -53,6 +53,35 @@ static void unit() {
     Fixture f(10, true, size.first, size.second); c::Config cfg; assert(!c::parseHevc(f.hvcc.data(), f.hvcc.size(), cfg));
   }
   Fixture f; c::Config cfg; assert(c::parseHevc(f.hvcc.data(), f.hvcc.size(), cfg));
+  for (unsigned payload : {0u, 1u, 2u}) {
+    Bytes au; append(au, f.slice(19, 2, 0, 1, payload));
+    assert(c::accessUnit(au.data(), au.size(), cfg) == (payload == 2));
+  }
+  Bytes enormous; append(enormous, f.slice(19, 2, 0, UINT32_MAX, 2));
+  assert(!c::accessUnit(enormous.data(), enormous.size(), cfg));
+  Bytes excessive(h::MaxAu + 1); assert(!c::accessUnit(excessive.data(), excessive.size(), cfg));
+  Bytes many;
+  for (unsigned i = 0; i < 64; ++i) append(many, Bytes{78, 1, 5, 1, 0, 0x80});
+  append(many, f.slice()); assert(!c::accessUnit(many.data(), many.size(), cfg));
+  // Mutations cover every bit of independently constructed parameter/slice
+  // syntax. Accepted variants must still satisfy the allocation and complete
+  // normalization contract; ASan/UBSan watch every rejected parse as well.
+  for (size_t bit = 0; bit < f.hvcc.size() * 8; ++bit) {
+    Bytes bytes = f.hvcc; bytes[bit / 8] ^= 1u << (bit & 7); c::Config candidate;
+    if (c::parseHevc(bytes.data(), bytes.size(), candidate)) {
+      assert(candidate.valid() && (candidate.depth == 8 || candidate.depth == 10));
+      assert(candidate.s.width <= 3840 && candidate.s.height <= 2160 && candidate.s.codedHeight <= 2176 && candidate.s.maxDpb <= h::MaxDpb);
+    } else assert(!candidate.valid());
+  }
+  Bytes original; append(original, f.slice(1, 0));
+  for (size_t bit = 0; bit < original.size() * 8; ++bit) {
+    Bytes bytes = original; bytes[bit / 8] ^= 1u << (bit & 7);
+    Bytes output(bytes.size() + cfg.parameterBytes() + 16, 0xa5); const uint32_t cap = output.size() - 16;
+    const bool valid = c::accessUnit(bytes.data(), bytes.size(), cfg);
+    const uint32_t written = c::normalize(bytes.data(), bytes.size(), output.data(), cap, cfg, true);
+    assert(bool(written) == valid); if (valid) assert(c::normalized(output.data(), written, cfg));
+    for (size_t i = cap; i < output.size(); ++i) assert(output[i] == 0xa5);
+  }
   const uint8_t illegal[][7] = {{2,1,0,0,0,0x80,0x80},{2,1,0,0,1,0x80,0x80},{2,1,0,0,3,4,0x80},{2,1,0,0,3,0x80,0x80}};
   for (const auto &nal : illegal) assert(!h::ebsp(nal, sizeof(nal)));
   const uint8_t valid[] = {2,1,0,0,3,0,0x80}; assert(h::ebsp(valid, sizeof(valid)));

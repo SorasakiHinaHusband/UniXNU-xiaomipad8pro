@@ -41,11 +41,13 @@ struct Fixture {
       0xf0, 0, 0xfc, 0xfd, uint8_t(0xf8 + depth - 8), uint8_t(0xf8 + depth - 8), 0, 0, 0x0f, 3};
     for (const auto &n : {vps, sps, pps}) { hvcc.push_back(0x80 | (n[0] >> 1)); hvcc.push_back(0); hvcc.push_back(1); hvcc.push_back(n.size() >> 8); hvcc.push_back(n.size()); hvcc.insert(hvcc.end(), n.begin(), n.end()); }
   }
-  Bytes slice(unsigned type = 19, unsigned kind = 2, unsigned temporal = 0) const {
+  Bytes slice(unsigned type = 19, unsigned kind = 2, unsigned temporal = 0, unsigned entryBytes = 0, unsigned payloadBytes = 1) const {
     Writer w; w.put(1, 1); if (type >= 16) w.put(0, 1); w.ue(0); w.ue(kind);
     if (type != 19 && type != 20) { w.put(1, 8); w.put(1, 1); }
     if (kind != 2) { w.put(0, 1); if (kind == 0) w.put(0, 1); w.ue(0); }
-    w.se(0); if (wpp) w.ue(0); w.end(); w.put(0x80, 8); return w.nal(type, temporal);
+    w.se(0);
+    if (wpp) { w.ue(entryBytes ? 1 : 0); if (entryBytes) { w.ue(31); w.put(entryBytes - 1, 32); } }
+    w.end(); for (unsigned i = 0; i < payloadBytes; ++i) w.put(0x80, 8); return w.nal(type, temporal);
   }
 };
 static void append(Bytes &out, const Bytes &nal) {
