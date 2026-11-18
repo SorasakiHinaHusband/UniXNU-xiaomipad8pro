@@ -2307,6 +2307,13 @@ static void testReservedLiveDma()
     CHECK(r.ops.liveFrames == 3 && result.pa == r.b.memPa);
     CHECK(result.bytes == (sensor == Sensor::rear ? 16u << 20 : 8u << 20));
     CHECK(r.b.allocs == 1 && r.b.frees == 0 && r.b.violations.empty());
+    // This is the one-boot evidence contract consumed by the tablet spec.
+    // A missing completion marker must fail here, before spending a boot.
+    for (unsigned step : {201, 202, 203, 205, 210, 213, 214, 215, 230, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309,
+                          310, 311, 312, 320, 330, 340}) {
+      const std::string prefix = "checkpoint step=" + std::to_string(step) + " sensor=" + (sensor == Sensor::rear ? "1 " : "2 ");
+      CHECK(r.ops.logIndex(prefix.c_str()) >= 0);
+    }
   }
   // Refuse oversize or simultaneous leases without losing the reservation.
   Dma d, other;

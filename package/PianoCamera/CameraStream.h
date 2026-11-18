@@ -656,6 +656,7 @@ class Stream {
     ops.step(kStepL3Bus, "MM1 on (the camera NoC; the shared multimedia votes)");
     if (ops.mmBus(true)) return fail(kStepL3Bus, StreamFailure::votes);
     u_.mm1 = true;
+    checkpoint(kStepL3Bus);
     ops.step(kStepL3Axi, "GCC camera HF AXI on (where off; halt check skipped, as Linux)");
     const uint32_t axi = ops.rd(kGcc + kGccCameraHfAxi);
     if (!branchEnabled(axi)) {
