@@ -5,6 +5,53 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+
+// An independent reference checks all active bytes, including different colors
+// inside a 2x2 chroma block, unequal row pitches, padding and allocation canaries.
+static void nv12(void)
+{
+  enum { w = 640, h = 480, ss = w * 4 + 28, yr = w + 64, cr = w + 128 };
+  uint8_t *src = malloc(ss * h), *ys = malloc(yr * h + 32), *uv = malloc(cr * h / 2 + 32);
+  assert(src && ys && uv);
+  for (unsigned frame = 0; frame < 6; ++frame) {
+    memset(ys, 0xa5, yr * h + 32); memset(uv, 0xa5, cr * h / 2 + 32);
+    for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+      uint8_t *p = src + y * ss + x * 4;
+      p[0] = (uint8_t)(x + frame * 17); p[1] = (uint8_t)(y + frame * 31);
+      p[2] = (uint8_t)(x ^ y ^ frame); p[3] = 255;
+    }
+    assert(pianoOutputBGRAto420v(src, w, h, ss, ys, yr, uv, cr));
+    for (unsigned y = 0; y < h; ++y) {
+      for (unsigned x = 0; x < w; ++x) {
+        const uint8_t *p = src + y * ss + x * 4;
+        double l = .2126 * p[2] + .7152 * p[1] + .0722 * p[0];
+        assert(abs(ys[y * yr + x] - (int)lround(16 + 219 * l / 255)) <= 1);
+        if (!(x & 1) && !(y & 1)) {
+          double sumU = 0, sumV = 0;
+          for (unsigned dy = 0; dy < 2; ++dy) for (unsigned dx = 0; dx < 2; ++dx) {
+            const uint8_t *q = src + (y + dy) * ss + (x + dx) * 4;
+            double ql = .2126 * q[2] + .7152 * q[1] + .0722 * q[0];
+            sumU += 128 + (q[0] - ql) * 224 / (510 * (1 - .0722));
+            sumV += 128 + (q[2] - ql) * 224 / (510 * (1 - .2126));
+          }
+          assert(abs(uv[(y / 2) * cr + x] - (int)lround(sumU / 4)) <= 1);
+          assert(abs(uv[(y / 2) * cr + x + 1] - (int)lround(sumV / 4)) <= 1);
+        }
+      }
+      for (size_t x = w; x < yr; ++x) assert(ys[y * yr + x] == 0xa5);
+      if (!(y & 1)) for (size_t x = w; x < cr; ++x) assert(uv[(y / 2) * cr + x] == 0xa5);
+    }
+    for (unsigned x = 0; x < 32; ++x) assert(ys[yr * h + x] == 0xa5 && uv[cr * h / 2 + x] == 0xa5);
+  }
+  assert(!pianoOutputBGRAto420v(src, w - 1, h, ss, ys, yr, uv, cr));
+  assert(!pianoOutputBGRAto420v(src, w, h - 1, ss, ys, yr, uv, cr));
+  assert(!pianoOutputBGRAto420v(src, w, h, w * 4 - 1, ys, yr, uv, cr));
+  assert(!pianoOutputBGRAto420v(src, w, h, ss, ys, w - 1, uv, cr));
+  assert(!pianoOutputBGRAto420v(src, w, h, ss, ys, yr, uv, w - 1));
+  free(src); free(ys); free(uv);
+  puts("camera CPU 420v all-plane reference/padded-pitches/canaries PASS");
+}
 
 static void geometry(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh,
                      uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -84,6 +131,7 @@ int main(void)
   geometry(1280, 720, 640, 480, 0, 60, 640, 360);
   geometry(1, 1000, 640, 480, 319, 0, 1, 480);
   cadence();
+  nv12();
   puts("camera output geometry/durations/freshness/cadence PASS");
   return 0;
 }

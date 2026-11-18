@@ -24,7 +24,7 @@ static os_log_t gLog;
 @end
 
 @implementation PianoStreamSource {
-  CVPixelBufferPoolRef _outputPools[2], _sourcePool;
+  CVPixelBufferPoolRef _outputPools[2], _sourcePool, _compatPool;
   NSArray<CMIOExtensionStreamFormat *> *_formats;
   dispatch_source_t _timer;
   dispatch_semaphore_t _timerCancelled;
@@ -91,8 +91,12 @@ static BOOL validDuration(NSUInteger index, CMTime time)
   for (unsigned index = 0; index < 2; ++index) {
     PianoOutputFormat f = pianoOutputFormat(width, height, index);
     CMFormatDescriptionRef description = NULL;
-    OSStatus result = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_32BGRA, f.width, f.height,
-                                                    (__bridge CFDictionaryRef)color, &description);
+    NSMutableDictionary *extensions = [color mutableCopy];
+    if (index) extensions[(__bridge NSString *)kCMFormatDescriptionExtension_YCbCrMatrix] =
+        (__bridge NSString *)kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2;
+    const OSType subtype = index ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA;
+    OSStatus result = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subtype, f.width, f.height,
+                                                    (__bridge CFDictionaryRef)extensions, &description);
     if (!result) {
       [formats addObject:[CMIOExtensionStreamFormat streamFormatWithFormatDescription:description
                            maxFrameDuration:CMTimeMake(1, f.minFps) minFrameDuration:CMTimeMake(1, f.maxFps)
@@ -106,6 +110,12 @@ static BOOL validDuration(NSUInteger index, CMTime time)
     }
   }
   _formats = [formats copy];
+  NSDictionary *compatAttrs = @{
+    (id)kCVPixelBufferWidthKey: @(kPianoCompatWidth), (id)kCVPixelBufferHeightKey: @(kPianoCompatHeight),
+    (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+    (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+  };
+  if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)compatAttrs, &_compatPool)) return nil;
   if (sensor && makePool(width, height, &_sourcePool)) return nil;
   return self;
 }
@@ -114,6 +124,7 @@ static BOOL validDuration(NSUInteger index, CMTime time)
 {
   if (_latest) CVPixelBufferRelease(_latest);
   if (_sourcePool) CVPixelBufferPoolRelease(_sourcePool);
+  if (_compatPool) CVPixelBufferPoolRelease(_compatPool);
   for (unsigned i = 0; i < 2; ++i) if (_outputPools[i]) CVPixelBufferPoolRelease(_outputPools[i]);
 }
 
@@ -192,7 +203,7 @@ static BOOL validDuration(NSUInteger index, CMTime time)
     os_log_error(gLog, "camera format rejected sensor=%u index=%{public}@ duration=%{public}@ max=%{public}@",
                  _sensor, index, requested, requestedMax);
     if (outError) *outError = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL
-                     userInfo:@{NSLocalizedDescriptionKey: @"Expected native 15 fps or 640x480 BGRA at 15..30 fps."}];
+                     userInfo:@{NSLocalizedDescriptionKey: @"Expected native BGRA at 15 fps or 640x480 420v at 15..30 fps."}];
   }
   return accepted;
 }
@@ -251,6 +262,9 @@ static BOOL ioResult(IOReturn status, NSError **outError)
                         kCVAttachmentMode_ShouldPropagate);
   CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB,
                         kCVAttachmentMode_ShouldPropagate);
+  if (CVPixelBufferIsPlanar(pb))
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
   CMVideoFormatDescriptionRef description = NULL;
   OSStatus error = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &description);
   if (!error) {
@@ -306,7 +320,7 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
     }
     return;
   }
-  // Two fixed pools, four buffers apiece: format changes cannot grow the output allocation beyond eight.
+  // Bounded BGRA working/native pools plus a four-buffer 420v delivery pool.
   CVPixelBufferRef pb = borrowPixel(_outputPools[_activeFormat], 4);
   if (!pb) { ++_dropped; return; }
   if (!CVPixelBufferLockBaseAddress(pb, 0)) {
@@ -320,11 +334,28 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
                            CVPixelBufferGetBytesPerRow(pb));
       CVPixelBufferUnlockBaseAddress(_latest, kCVPixelBufferLock_ReadOnly);
     }
+    CVPixelBufferRef delivered = pb;
+    if (initialized && _activeFormat == 1) {
+      delivered = borrowPixel(_compatPool, 4);
+      initialized = delivered && !CVPixelBufferLockBaseAddress(delivered, 0);
+      if (initialized) {
+        initialized = pianoOutputBGRAto420v(CVPixelBufferGetBaseAddress(pb), kPianoCompatWidth, kPianoCompatHeight,
+            CVPixelBufferGetBytesPerRow(pb), CVPixelBufferGetBaseAddressOfPlane(delivered, 0),
+            CVPixelBufferGetBytesPerRowOfPlane(delivered, 0), CVPixelBufferGetBaseAddressOfPlane(delivered, 1),
+            CVPixelBufferGetBytesPerRowOfPlane(delivered, 1));
+        CVPixelBufferUnlockBaseAddress(delivered, 0);
+      }
+    }
     CVPixelBufferUnlockBaseAddress(pb, 0);
-    if (initialized && atomic_load(&_running))
-      [self publish:pb ticks:mach_absolute_time() sequence:_sensor ? _latestSequence : _frame + 1
+    if (initialized && atomic_load(&_running)) {
+      if (_activeFormat == 1 && !_frame)
+        os_log(gLog, "camera cpu420v-v1 sensor=%u Y=%zu UV=%zu complete-before-send", _sensor,
+               CVPixelBufferGetBytesPerRowOfPlane(delivered, 0), CVPixelBufferGetBytesPerRowOfPlane(delivered, 1));
+      [self publish:delivered ticks:mach_absolute_time() sequence:_sensor ? _latestSequence : _frame + 1
               drops:_latestDrops + atomic_load(&_captureDropped)];
+    }
     else ++_dropped;
+    if (delivered && delivered != pb) CVPixelBufferRelease(delivered);
   } else ++_dropped;
   CVPixelBufferRelease(pb);
 }

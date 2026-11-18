@@ -52,8 +52,9 @@ static CaptureSink *Capture(AVCaptureDevice *device, NSString *label, NSString *
     if (!device || device.formats.count <= 1) return nil;
     AVCaptureDeviceFormat *format = device.formats[1];
     CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    const OSType subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription);
     if (dimensions.width != FrameWidth || dimensions.height != FrameHeight ||
-        CMFormatDescriptionGetMediaSubType(format.formatDescription) != kCVPixelFormatType_32BGRA) return nil;
+        subtype != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return nil;
     BOOL supports30 = NO;
     for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges)
         supports30 |= range.minFrameRate <= 30 && range.maxFrameRate >= 30;
@@ -100,7 +101,7 @@ static CaptureSink *Capture(AVCaptureDevice *device, NSString *label, NSString *
         printf("CAPTURE_SETUP_FAIL %s active index changed\n", label.UTF8String);
         return nil;
     }
-    printf("CAPTURE_BEGIN %s index=1 640x480 requested=420v MetalCompatibility=YES\n", label.UTF8String);
+    printf("CAPTURE_BEGIN %s index=1 640x480 native=420v requested=420v MetalCompatibility=YES\n", label.UTF8String);
     [session startRunning];
     BOOL reached32 = dispatch_semaphore_wait(sink.ready, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) == 0;
     BOOL formatStayed = [device.activeFormat isEqual:format];
@@ -117,7 +118,7 @@ static CaptureSink *Capture(AVCaptureDevice *device, NSString *label, NSString *
         label.UTF8String, sink->frames, sink->dropped, repeats, reached32, formatStayed);
     NSDictionary *receipt = @{@"surfaceIDs": sink.surfaceIDs, @"repeatedSurfaceIDs": @(repeats),
         @"frames": @(sink->frames), @"dropped": @(sink->dropped), @"activeIndex1": @(formatStayed),
-        @"requestedOutput": @"420v 640x480 MetalCompatibility=YES",
+        @"requestedOutput": @"420v 640x480 MetalCompatibility=YES", @"nativeOutput": @"420v",
         @"activeMinFrameDuration": @{@"value": @(minDuration.value), @"scale": @(minDuration.timescale)},
         @"activeMaxFrameDuration": @{@"value": @(maxDuration.value), @"scale": @(maxDuration.timescale)}};
     WriteJSON(receipt, [dir stringByAppendingPathComponent:[label stringByAppendingString:@"-capture.json"]]);

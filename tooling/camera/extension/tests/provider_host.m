@@ -15,10 +15,23 @@
 {
   [super publish:pb ticks:ticks sequence:sequence drops:drops];
   assert(!CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly));
-  const uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
-  const size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb);
-  for (size_t y = 0; y < h; ++y)
-    for (size_t x = 0; x < w; ++x) assert(bytes[y * stride + x * 4 + 3] == 255);
+  const size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+  if (CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA) {
+    const uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
+    const size_t stride = CVPixelBufferGetBytesPerRow(pb);
+    for (size_t y = 0; y < h; ++y)
+      for (size_t x = 0; x < w; ++x) assert(bytes[y * stride + x * 4 + 3] == 255);
+  } else {
+    assert(CVPixelBufferGetPlaneCount(pb) == 2);
+    assert(CVPixelBufferGetWidthOfPlane(pb, 0) == w && CVPixelBufferGetHeightOfPlane(pb, 0) == h);
+    assert(CVPixelBufferGetWidthOfPlane(pb, 1) == w / 2 && CVPixelBufferGetHeightOfPlane(pb, 1) == h / 2);
+    for (unsigned plane = 0; plane < 2; ++plane) {
+      const uint8_t *bytes = CVPixelBufferGetBaseAddressOfPlane(pb, plane);
+      const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
+      for (size_t y = 0; y < (h >> plane); ++y) for (size_t x = 0; x < w; ++x)
+        assert(bytes[y * stride + x] >= 16 && bytes[y * stride + x] <= (plane ? 240 : 235));
+    }
+  }
   CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
   @synchronized (self) {
     [self.observations addObject:@{@"width": @(w), @"height": @(h), @"ticks": @(ticks), @"sequence": @(sequence)}];
@@ -92,7 +105,7 @@ static void metadata(void)
       CMIOExtensionStreamFormat *f = source.formats[j];
       CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(f.formatDescription);
       assert(d.width == (j ? 640 : widths[i]) && d.height == (j ? 480 : heights[i]));
-      assert(CMFormatDescriptionGetMediaSubType(f.formatDescription) == kCVPixelFormatType_32BGRA);
+      assert(CMFormatDescriptionGetMediaSubType(f.formatDescription) == (j ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA));
       assert(!CMTimeCompare(f.minFrameDuration, CMTimeMake(1, j ? 30 : 15)));
       assert(!CMTimeCompare(f.maxFrameDuration, CMTimeMake(1, 15)));
       assert(!f.validFrameDurations.count);

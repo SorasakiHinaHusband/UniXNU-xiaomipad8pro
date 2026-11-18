@@ -83,3 +83,30 @@ static inline void pianoOutputScaleBGRA(const uint8_t *src, uint32_t sw, uint32_
     }
   }
 }
+
+// BT.709 video-range NV12. Complete both CPU planes before publishing the buffer;
+// the compatibility mode must not require a downstream GPU color conversion.
+// Each UV pair averages the same 2x2 block as the four individually written Y codes.
+static inline int pianoOutputBGRAto420v(const uint8_t *src, uint32_t w, uint32_t h, size_t ss,
+                                       uint8_t *ys, size_t yStride, uint8_t *uv, size_t uvStride)
+{
+  if (!src || !ys || !uv || !w || !h || (w & 1) || (h & 1) ||
+      ss < (size_t)w * 4 || yStride < w || uvStride < w) return 0;
+  for (uint32_t y = 0; y < h; y += 2) {
+    for (uint32_t x = 0; x < w; x += 2) {
+      int r = 0, g = 0, b = 0;
+      for (unsigned dy = 0; dy < 2; ++dy) {
+        for (unsigned dx = 0; dx < 2; ++dx) {
+          const uint8_t *p = src + (y + dy) * ss + (size_t)(x + dx) * 4;
+          ys[(y + dy) * yStride + x + dx] =
+              (uint8_t)(16 + (11966 * p[2] + 40254 * p[1] + 4064 * p[0] + 32768) / 65536);
+          b += p[0]; g += p[1]; r += p[2];
+        }
+      }
+      uint8_t *chroma = uv + (y / 2) * uvStride + x;
+      chroma[0] = (uint8_t)((128 * 262144 - 6596 * r - 22188 * g + 28784 * b + 131072) / 262144);
+      chroma[1] = (uint8_t)((128 * 262144 + 28784 * r - 26145 * g - 2639 * b + 131072) / 262144);
+    }
+  }
+  return 1;
+}

@@ -1,5 +1,13 @@
 # Cameras (B11): PianoCamera, the level ladder
 
+2026-11-19, compatibility output (host verified; tablet preview pending): index 1 now advertises and delivers
+640×480 `420v` at 15–30 fps. The provider synchronously converts its complete BGRA working frame into BT.709 video-range
+Y and interleaved CbCr planes, using each plane's reported stride, before sending the retained sample. Native index 0
+remains BGRA. This removes the automatic BGRA-to-420v conversion from Photo Booth's input path. The earlier diagnostic
+capture already had damaged luma before its Core Image replay; its chroma bars were intact. Retained provider frames 1
+and 32 pass the diagnostic CPU plane, color-bar, counter and sweep checks on the host. Stock-app previews require the
+new tablet test; distortion-effect graph compatibility remains a separate issue.
+
 2026-11-18, stock applications: the baked-approval image delivered 77 valid front and 73 valid rear colour frames through the
 AVFoundation client, with clean stops and no reported guard/SMMU fault. Photo Booth subsequently aborted during fish-eye effect
 initialization: its CIKernel array was empty. Static tracing and a host reproduction identify the Metal frontend's omitted
