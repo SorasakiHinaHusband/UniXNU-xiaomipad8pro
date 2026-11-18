@@ -39,6 +39,8 @@ extern const uint8_t verified_root_key[];
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <PianoPowerContract.h>   // UniXNU-piano: native-ufs-suspend=1 (RootPower.h)
 #include <PianoDiskIdentity.h>    // UniXNU-piano: the windows as internal UFS disks to diskutil (piano-disk-identity)
@@ -46,6 +48,8 @@ extern const uint8_t verified_root_key[];
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
 #include "SmmuTakeover.h"
+
+SYSCTL_DECL (_machdep);
 
 static UfsRootDiagnostics gRootDiagnostic;
 // UniXNU-piano: every bring-up stage also goes to the console (the native-run log mailbox), so a stall shows where it is.
@@ -1640,6 +1644,7 @@ static uint32_t be32w (const uint8_t *at)
 }
 
 #include "RootLayout.h"
+#include "XblLogSnapshot.h"
 #include "RootWindowRead.h"
 #include "RootPublication.h"
 
@@ -3485,6 +3490,7 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   native_ufs_root_step = 2;
+  captureXblLog ();
   if (gPerf) perfLinkLine ();
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
@@ -3597,6 +3603,7 @@ bool NativeUfs::startRoot (IOService *provider)
 
 void NativeUfs::stop (IOService *provider)
 {
+  releaseXblLog ();
   if (fPowerJoined) {
     PMstop ();
     fPowerJoined = false;

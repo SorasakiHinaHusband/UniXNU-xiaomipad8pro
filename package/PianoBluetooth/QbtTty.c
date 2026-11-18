@@ -23,6 +23,10 @@
 extern kern_return_t thread_terminate(thread_t);
 #define BT_TTY_FIFO 8192u
 #define BT_TTY_NAME "cu.BLTH"
+#define BT_LOG(fmt, ...) do { \
+    if(qbt_bt_trace_enabled)printf(fmt " [uptime_ms=%llu]\n", ##__VA_ARGS__, qbt_bt_uptime_ms()); \
+    else printf(fmt "\n", ##__VA_ARGS__); \
+} while(0)
 /* The ioctls of a 64-bit client (sys/ttycom.h, sys/filio.h, IOKit/serial/ioss.h). */
 #define BT_TIOCGETA   0x40487413u
 #define BT_TIOCSETA   0x80487414u
@@ -172,8 +176,13 @@ static int bt_tty_power_on(void)
 /* The serial device. One client at a time, as the daemon asks with TIOCEXCL. */
 static int bt_tty_open(dev_t dev __unused,int flags __unused,int devtype __unused,struct proc *p)
 {
+    if(qbt_bt_trace_enabled)BT_LOG("[bluetooth tty] open begin pid=%d",proc_pid(p));
     lck_mtx_lock(&bt_tty_lock);
-    if(bt_tty.open){lck_mtx_unlock(&bt_tty_lock);return EBUSY;}
+    if(bt_tty.open){
+        lck_mtx_unlock(&bt_tty_lock);
+        if(qbt_bt_trace_enabled)BT_LOG("[bluetooth tty] open end error=%d",EBUSY);
+        return EBUSY;
+    }
     bt_tty.open=true;bt_tty.closing=false;
     bt_tty.rx_head=bt_tty.rx_len=bt_tty.tx_head=bt_tty.tx_len=0;
     bt_tty_termios_default();
@@ -187,20 +196,21 @@ static int bt_tty_open(dev_t dev __unused,int flags __unused,int devtype __unuse
     bt_tty_count(2);
     /* A client on a stopped controller restarts it. */
     if(!error && boot>0)error=bt_tty_power_on();
-    printf("[bluetooth tty] open pid=%d boot=%d error=%d\n",proc_pid(p),boot,error);
+    BT_LOG("[bluetooth tty] open pid=%d boot=%d error=%d",proc_pid(p),boot,error);
     if(error) {
         lck_mtx_lock(&bt_tty_lock);bt_tty.open=false;lck_mtx_unlock(&bt_tty_lock);
-        return error==EWOULDBLOCK?EIO:error;
+        if(error==EWOULDBLOCK)error=EIO;
     }
-    bt_kick();
-    return 0;
+    else bt_kick();
+    if(qbt_bt_trace_enabled)BT_LOG("[bluetooth tty] open end error=%d",error);
+    return error;
 }
 static int bt_tty_close(dev_t dev __unused,int flags __unused,int devtype __unused,struct proc *p __unused)
 {
     lck_mtx_lock(&bt_tty_lock);
     bt_tty.closing=true;
     bt_tty_wake_readers();bt_tty_wake_writers();
-    printf("[bluetooth tty] close rx_dropped=%llu\n",bt_tty.rx_dropped);
+    BT_LOG("[bluetooth tty] close rx_dropped=%llu",bt_tty.rx_dropped);
     bt_tty.open=bt_tty.closing=false;
     bt_tty.rx_head=bt_tty.rx_len=bt_tty.tx_head=bt_tty.tx_len=0;
     lck_mtx_unlock(&bt_tty_lock);
@@ -297,7 +307,7 @@ static int bt_tty_ioctl(dev_t dev __unused,u_long cmd,caddr_t data,int fflag __u
         uint64_t speed;memcpy(&speed,data,sizeof(speed));
         bt_tty.termios.ispeed=bt_tty.termios.ospeed=speed;
         bt_tty_count(3);
-        printf("[bluetooth tty] speed request %llu, line %u\n",speed,bt_tty.speed);
+        BT_LOG("[bluetooth tty] speed request %llu, line %u",speed,bt_tty.speed);
         break;
     }
     case BT_TIOCFLUSH: {
@@ -349,7 +359,7 @@ static void bt_tty_node_thread(void *context __unused,wait_result_t result __unu
         struct timespec pause={0,100*1000*1000};
         (void)msleep(&bt_tty.node_thread,NULL,PZERO,"btnode",&pause);
     }
-    printf("[bluetooth tty] /dev/" BT_TTY_NAME " %s after %u waits\n",bt_tty.node?"made":"not made",tries);
+    BT_LOG("[bluetooth tty] /dev/" BT_TTY_NAME " %s after %u waits",bt_tty.node?"made":"not made",tries);
     thread_terminate(current_thread());
 }
 
@@ -374,13 +384,22 @@ static int bt_tty_power_on_sysctl SYSCTL_HANDLER_ARGS
     if(req->newptr)return EPERM;
     if(!req->oldptr)return SYSCTL_OUT(req,&result,sizeof(result));
     bt_tty_count(0);
+    if(qbt_bt_trace_enabled)BT_LOG("[bluetooth tty] BlueTool power request begin");
     result=bt_tty_power_on();
+    if(qbt_bt_trace_enabled)BT_LOG("[bluetooth tty] BlueTool power request end error=%d",result);
     return SYSCTL_OUT(req,&result,sizeof(result));
+}
+static int bt_uptime_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp,arg1,arg2)
+    if(req->newptr)return EPERM;
+    uint64_t uptime=qbt_bt_uptime_ms();
+    return SYSCTL_OUT(req,&uptime,sizeof(uptime));
 }
 /* XNU's node macros make permanent OIDs for kernel startup. Kexts register
  * non-permanent, versioned OIDs at run time and unregister them on stop. */
 SYSCTL_DECL(_machdep);
-static struct sysctl_oid bt_boot_oid,bt_firmware_oid,bt_power_on_oid;
+static struct sysctl_oid bt_boot_oid,bt_firmware_oid,bt_power_on_oid,bt_uptime_oid;
 static bool bt_sysctls_registered;
 static void bt_tty_register_oid(struct sysctl_oid *oid,const char *name,int type,
                                sysctl_handler_t handler,const char *format,const char *description)
@@ -407,6 +426,7 @@ void qbt_transport_unregister_sysctls(void)
     sysctl_unregister_oid(&bt_power_on_oid);
     sysctl_unregister_oid(&bt_firmware_oid);
     sysctl_unregister_oid(&bt_boot_oid);
+    if(qbt_bt_trace_enabled)sysctl_unregister_oid(&bt_uptime_oid);
     bt_sysctls_registered=false;
 }
 
@@ -421,8 +441,10 @@ int qbt_transport_init(const struct qbt_transport_ops *ops)
     bt_tty_register_oid(&bt_boot_oid,"piano_bt_boot",CTLTYPE_INT,bt_tty_boot_sysctl,"I","WCN7860 kernel bring-up result");
     bt_tty_register_oid(&bt_firmware_oid,"piano_bt_firmware",CTLTYPE_STRING,sysctl_handle_string,"A","WCN7860 firmware build label");
     bt_tty_register_oid(&bt_power_on_oid,"piano_bt_power_on",CTLTYPE_INT,bt_tty_power_on_sysctl,"I","WCN7860 startup request");
+    if(qbt_bt_trace_enabled)
+        bt_tty_register_oid(&bt_uptime_oid,"piano_bt_uptime_ms",CTLTYPE_QUAD,bt_uptime_sysctl,"Q","BT observation monotonic milliseconds");
     bt_sysctls_registered=true;
-    printf("PianoBluetooth: bt-path2: runtime sysctls registered\n");
+    BT_LOG("PianoBluetooth: bt-path2: runtime sysctls registered");
     if(start && !bt_tty_make_node()) {
         thread_t thread=THREAD_NULL;
         if(kernel_thread_start(bt_tty_node_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
@@ -441,7 +463,7 @@ void qbt_transport_power_result(bool enabled,int error,const char *firmware,uint
     bt_tty.boot=error?error:enabled?0:ENETDOWN;
     if(!enabled || error)bt_tty.rx_head=bt_tty.rx_len=bt_tty.tx_head=bt_tty.tx_len=0;
     bt_tty.power_pending=false;bt_tty.power_result=error;
-    printf("[bluetooth tty] power=%u error=%d firmware=%s speed=%u\n",enabled,error,firmware?firmware:"",speed);
+    BT_LOG("[bluetooth tty] power=%u error=%d firmware=%s speed=%u",enabled,error,firmware?firmware:"",speed);
     wakeup(&bt_tty.boot);
     wakeup(&bt_tty.power_pending);
     /* Blocked clients observe the new state on their next pass. */
