@@ -54,7 +54,8 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;
   firmware initialization, the Bluetooth menu and discovery are not yet tablet-confirmed
-  ([Bluetooth](docs/drivers/bluetooth.md)).
+  ([Bluetooth](docs/drivers/bluetooth.md)). A captured native-stack reset identified an uninitialized POSIX transport mutex;
+  explicit initialization is implemented and awaits repeated tablet qualification ([analysis result](docs/results-2026-11-19.md)).
   The next test corrects the firmware partition's bounded FAT prefix and runtime activation when boot arguments exceed the user-space view.
 - Boot time is being worked on: most of launchd's 40 s is our 4 KiB code-signature pre-hash of the compressed dyld shared
   cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager

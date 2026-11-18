@@ -56,8 +56,12 @@ struct bt_termios64 {
 };
 _Static_assert(sizeof(struct bt_termios64) == 72, "27.3 termios64 ABI");
 static struct qbt_transport_ops bt_ops;
-static LCK_GRP_DECLARE(bt_tty_grp,"unixnu.bt.tty");
-static LCK_MTX_DECLARE(bt_tty_lock,&bt_tty_grp);
+/* Kernel STARTUP records are not run for this kext. Initialize before any
+ * sysctl or cdev can expose the transport, and retain the lock while its
+ * worker and device callbacks exist (stop only unregisters the sysctls). */
+static lck_grp_t *bt_tty_grp;
+static lck_mtx_t bt_tty_lock;
+static unsigned bt_tty_init_claimed;
 static struct {
     int major;
     void *node;
@@ -466,8 +470,17 @@ void qbt_transport_unregister_sysctls(void)
 int qbt_transport_init(const struct qbt_transport_ops *ops)
 {
     if(!ops || !ops->wake || !ops->power)return EINVAL;
+    /* Claim before taking the lock: a second start must not initialize an
+     * already live mutex, even while the first start is still publishing. */
+    if(__atomic_exchange_n(&bt_tty_init_claimed,1u,__ATOMIC_ACQUIRE))return EALREADY;
+    bt_tty_grp=lck_grp_alloc_init("unixnu.bt.tty",LCK_GRP_ATTR_NULL);
+    if(!bt_tty_grp) {
+        __atomic_store_n(&bt_tty_init_claimed,0u,__ATOMIC_RELEASE);
+        return ENOMEM;
+    }
+    lck_mtx_init(&bt_tty_lock,bt_tty_grp,LCK_ATTR_NULL);
+    BT_LOG("PianoBluetooth: bt-mutexfix1: transport lock initialized before publication");
     lck_mtx_lock(&bt_tty_lock);
-    if(bt_ops.wake){lck_mtx_unlock(&bt_tty_lock);return EALREADY;}
     bt_ops=*ops;
     bool start=!bt_tty.node_thread;bt_tty.node_thread=true;
     lck_mtx_unlock(&bt_tty_lock);
