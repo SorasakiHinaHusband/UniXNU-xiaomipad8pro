@@ -812,8 +812,11 @@ bool gLlccAuditPrepared;
 enum class LlccAuditState { waiting, complete, stopped };
 LlccAuditState gLlccAuditState;
 bool gLlccIsland3;
-uint32_t gLlccIsland3Before[5], gLlccIsland3After[5];  // ATTR0..3, ALLOC3
-unsigned gLlccIsland3BeforeSeen, gLlccIsland3AfterSeen;
+struct LlccIslandReadback {
+  uint32_t before[5], after[5];  // ATTR0..3, ALLOC3
+  unsigned beforeSeen, afterSeen;
+};
+LlccIslandReadback gLlccIsland3Readback;
 const char *gLlccIsland3Result;
 
 void finishLlccAudit(LlccAuditState state)
@@ -856,6 +859,50 @@ int llccAuditCommand(int command, int token)
   return 0;
 }
 
+bool llccIslandSkip(unsigned index, const LlccIslandReadback &readback)
+{
+  using namespace pianollcc;
+  return kIsland3Accesses[index].seq == 20 && !(readback.before[4] & kIsland3Bit);
+}
+
+enum class LlccIslandResult { ok, accessFailed, unexpected, readbackFailed };
+
+// Both modes use the same single-access path and stop at the same failing row.
+LlccIslandResult llccIslandAccess(unsigned index, LlccIslandReadback &readback, uint32_t &value)
+{
+  using namespace pianollcc;
+  const auto &access = kIsland3Accesses[index];
+  const bool alloc3 = access.offset == kIsland3Alloc3;
+  const uint32_t expected = alloc3 ? readback.before[4] & ~kIsland3Bit : access.expected;
+  value = access.store ? expected : 0;
+  const bool answered = access.store ? llccWrite(&gMayMap, access.view, access.offset, value)
+                                     : llccRead(&gMayMap, access.view, access.offset, &value);
+  if (!answered) return LlccIslandResult::accessFailed;
+
+  if (access.seq == 4 || access.seq == 19) {
+    const unsigned slot = alloc3 ? 4 : index - 3;
+    readback.before[slot] = value;
+    readback.beforeSeen |= 1u << slot;
+  } else if (access.seq == 21) {
+    const unsigned slot = index - (kIsland3Count - 5);
+    readback.after[slot] = value;
+    readback.afterSeen |= 1u << slot;
+  }
+  if (access.store || (value & access.mask) == (expected & access.mask)) return LlccIslandResult::ok;
+  return access.seq == 21 ? LlccIslandResult::readbackFailed : LlccIslandResult::unexpected;
+}
+
+const char *llccIslandResultName(LlccIslandResult result)
+{
+  switch (result) {
+  case LlccIslandResult::ok: return "ok";
+  case LlccIslandResult::accessFailed: return "access-failed";
+  case LlccIslandResult::readbackFailed: return "write not accepted";
+  case LlccIslandResult::unexpected: return "unexpected";
+  }
+  return "unexpected";
+}
+
 int llccIsland3Command(int command, int token)
 {
   using namespace pianollcc;
@@ -871,7 +918,7 @@ int llccIsland3Command(int command, int token)
   const auto physical = static_cast<unsigned long long>(access.physical());
   const char *op = access.store ? "store" : "load";
   if (command == token && !gLlccAuditPrepared) {
-    if (access.seq == 20 && !(gLlccIsland3Before[4] & kIsland3Bit)) {
+    if (llccIslandSkip(gLlccAuditIndex, gLlccIsland3Readback)) {
       IOLog("PianoA830: sens-island3 SKIP token=%d seq=20 pa=0x%08llx bit12=0\n", token, physical);
       ++gLlccAuditIndex;
       return 0;
@@ -883,43 +930,30 @@ int llccIsland3Command(int command, int token)
   if (command != -token || !gLlccAuditPrepared) return EINVAL;
   gLlccAuditPrepared = false;
 
-  const bool alloc3 = access.offset == kIsland3Alloc3;
-  const uint32_t expected = alloc3 ? gLlccIsland3Before[4] & ~kIsland3Bit : access.expected;
-  uint32_t value = access.store ? expected : 0;
-  const bool answered = access.store ? llccWrite(&gMayMap, access.view, access.offset, value)
-                                     : llccRead(&gMayMap, access.view, access.offset, &value);
-  if (answered) {
-    if (access.seq == 4 || access.seq == 19) {
-      const unsigned slot = alloc3 ? 4 : gLlccAuditIndex - 3;
-      gLlccIsland3Before[slot] = value;
-      gLlccIsland3BeforeSeen |= 1u << slot;
-    } else if (access.seq == 21) {
-      const unsigned slot = gLlccAuditIndex - (kIsland3Count - 5);
-      gLlccIsland3After[slot] = value;
-      gLlccIsland3AfterSeen |= 1u << slot;
-    }
-  }
+  uint32_t value;
+  const auto result = llccIslandAccess(gLlccAuditIndex, gLlccIsland3Readback, value);
+  const bool ok = result == LlccIslandResult::ok;
   ++gLlccAuditIndex;
-  const bool ok = answered && (access.store || (value & access.mask) == (expected & access.mask));
   IOLog("PianoA830: sens-island3 POST token=%d seq=%u op=%s pa=0x%08llx value=0x%08x status=%s next=%s\n",
-        token, access.seq, op, physical, value, !answered ? "access-failed" : !ok ? "unexpected" : "ok",
+        token, access.seq, op, physical, value,
+        llccIslandResultName(result == LlccIslandResult::readbackFailed ? LlccIslandResult::unexpected : result),
         !ok ? "stop" : gLlccAuditIndex == kIsland3Count ? "release" : "step");
   if (!ok) {
-    gLlccIsland3Result = !answered ? "access-failed" : access.seq == 21 ? "write not accepted" : "unexpected";
+    gLlccIsland3Result = llccIslandResultName(result);
     finishLlccAudit(LlccAuditState::stopped);
     return EIO;
   }
   return 0;
 }
 
-void llccIsland3Summary(const char *result)
+void llccIslandSummary(const char *mode, const char *result, const LlccIslandReadback &readback)
 {
-  const auto &b = gLlccIsland3Before;
-  const auto &a = gLlccIsland3After;
-  IOLog("PianoA830: sens-island3 SUMMARY result=%s ATTR before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x "
+  const auto &b = readback.before;
+  const auto &a = readback.after;
+  IOLog("PianoA830: %s SUMMARY result=%s ATTR before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x "
         "ALLOC3 before=%08x after=%08x valid=%02x/%02x\n",
-        result, b[0], b[1], b[2], b[3], a[0], a[1], a[2], a[3], b[4], a[4],
-        gLlccIsland3BeforeSeen, gLlccIsland3AfterSeen);
+        mode, result, b[0], b[1], b[2], b[3], a[0], a[1], a[2], a[3], b[4], a[4],
+        readback.beforeSeen, readback.afterSeen);
 }
 
 int sysctlLlccAudit(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
@@ -954,10 +988,11 @@ void islandPublish(IOService *service)
 // piano-llcc-island=1 (piano-gpu=2) the programming.
 void islandStart(IOService *service, unsigned level)
 {
-  if (bootArg("piano-llcc-audit", 0) == 1 || bootArg("piano-llcc-island", 0) == 3) return;
+  const uint32_t want = bootArg("piano-llcc-island", 0xffffffffu);
+  if (bootArg("piano-llcc-audit", 0) == 1 || want == 3 || want == 4) return;
   // Opt-in until a tablet boot has shown the reads are safe under Gunyah: without piano-llcc-island (0 = read only,
   // 1 = read and program) the GPU boot does not touch the LLCC at all and the island stays "unknown".
-  if (bootArg("piano-llcc-island", 0xffffffffu) == 0xffffffffu) {
+  if (want == 0xffffffffu) {
     piano_a830_note("llcc: ISLAND1 not read (piano-llcc-island=0 reads it, =1 programs it)");
     return;
   }
@@ -967,7 +1002,6 @@ void islandStart(IOService *service, unsigned level)
   islandLine("as found", r, state);
   gIslandState = uint8_t(state);
   __atomic_store_n(&gLlccArmed, 1u, __ATOMIC_RELEASE);
-  const uint32_t want = bootArg("piano-llcc-island", 0);
   if (want == 1 && level < 2) piano_a830_note("llcc: piano-llcc-island=1 needs piano-gpu=2 (piano-gpu=1 writes nothing): not programmed");
   if (want == 1 && level >= 2) {
     piano_a830_note("llcc: piano-llcc-island=1: reserving ISLAND1's ways (ATTR0 0x7fffffff, ATTR1 0; ATTR2/ATTR3 only where 0)");
@@ -991,6 +1025,20 @@ void islandStart(IOService *service, unsigned level)
 }
 }  // namespace
 
+// The shared ADSP starter calls this once before firmware/PAS. Keep the legacy
+// GPU readiness path unarmed so it cannot issue extra LLCC reads.
+extern "C" void piano_a830_llcc_island4_run(bool ownsStart)
+{
+  LlccIslandReadback readback{};
+  auto result = LlccIslandResult::ok;
+  for (unsigned index = 0; ownsStart && result == LlccIslandResult::ok && index < pianollcc::kIsland3Count; ++index) {
+    if (llccIslandSkip(index, readback)) continue;
+    uint32_t value;
+    result = llccIslandAccess(index, readback, value);
+  }
+  llccIslandSummary("sens-island4", ownsStart ? llccIslandResultName(result) : "ownership-unproven", readback);
+}
+
 // Called once by the normal shared ADSP owner before firmware/PAS. Only the
 // root sysctl's acknowledged access command can reach the LLCC while it waits.
 extern "C" void piano_a830_llcc_audit_wait(bool island3)
@@ -998,7 +1046,7 @@ extern "C" void piano_a830_llcc_audit_wait(bool island3)
   gLlccIsland3 = island3;
   gLlccAuditLock = IOLockAlloc();
   if (!gLlccAuditLock) {
-    if (island3) llccIsland3Summary("lock-failed");
+    if (island3) llccIslandSummary("sens-island3", "lock-failed", gLlccIsland3Readback);
     else IOLog("PianoA830: sens-trace29 STOP lock allocation failed\n");
     return;
   }
@@ -1029,7 +1077,7 @@ extern "C" void piano_a830_llcc_audit_wait(bool island3)
     }
   }
   if (island3) {
-    llccIsland3Summary(gLlccIsland3Result);
+    llccIslandSummary("sens-island3", gLlccIsland3Result, gLlccIsland3Readback);
     IOLog("PianoA830: sens-island3 RELEASE seq=22\n");
   }
   IOLockUnlock(gLlccAuditLock);
