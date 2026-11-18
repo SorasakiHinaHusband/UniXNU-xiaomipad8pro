@@ -3412,7 +3412,7 @@ extern "C" int piano_wifi_net_menu_join_profile(const struct piano_wifi_profile 
   IOLockUnlock(gProfileLock);
   gProfileStampValid = false;
   __atomic_store_n(&gMenuJoinRequested, 1u, __ATOMIC_RELEASE);
-  note("PianoWifiBootJoinReceiptV1: SET20 accepted");
+  note("PianoWifiBootJoinReceiptV1: SET20 accepted; PianoWifiSET20Generation=%u", generation);
   note("PianoWifiMenuJoinProfile: menu join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s (none of it is logged)",
        generation, unsigned(incoming->ssid_len), piano_wifi_security_name(incoming->security),
        incoming->psk_len ? " with a passphrase" : "", (incoming->flags & PianoWifiProfileBssid) ? "given" : "not given");

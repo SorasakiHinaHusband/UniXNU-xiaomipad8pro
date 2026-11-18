@@ -5,7 +5,7 @@
 # password is handed to piano-input.py on stdin (`type --stdin`): never echoed, never in argv or ps, never written anywhere; this
 # script prints only what it waited for and when.
 #
-#   desk-login.sh [--console FILE] [--timeout SECS] [--secret FILE] [--now]
+#   desk-login.sh [--console FILE] [--timeout SECS] [--secret FILE] [--webcam-dir DIR] [--now]
 #
 # The input transaction is: non-text wake, NEW lit observation, selected account
 # and secure-field focus proof, clear, one stdin type. Finder is marked BEFORE
@@ -15,12 +15,13 @@
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 MAIN=$(git rev-parse --git-common-dir); MAIN=$(cd "$MAIN/.." && pwd -P)
-CONSOLE= TIMEOUT=600 SECRET=$MAIN/private/login.secret NOW=0 LOGIN_UID=${DESK_LOGIN_UID:-501}
+CONSOLE= TIMEOUT=600 SECRET=$MAIN/private/login.secret NOW=0 LOGIN_UID=${DESK_LOGIN_UID:-501} WEBCAM_DIR=
 while [ $# -gt 0 ]; do
   case $1 in
     --console) CONSOLE=$2; shift ;;
     --timeout) TIMEOUT=$2; shift ;;
     --secret) SECRET=$2; shift ;;
+    --webcam-dir) WEBCAM_DIR=$2; shift ;;
     --uid) LOGIN_UID=$2; shift ;;
     --now) NOW=1 ;;
     *) echo "desk-login: unknown argument" >&2; exit 2 ;;
@@ -32,6 +33,11 @@ case $LOGIN_UID in ''|*[!0-9]*|0) echo 'desk-login: a nonzero target UID is requ
 case $(cd "$(dirname "$SECRET")" && pwd -P)/ in "$D/private/"*|"$D/out/"*|"$MAIN/private/"*) ;; *)
   echo "desk-login: secret is not under this repository's private/ or out/" >&2; exit 2 ;; esac
 read -r -a INPUT <<< "${DESK_LOGIN_INPUT:-python3 tooling/native/piano-input.py}"
+if [ -n "$WEBCAM_DIR" ]; then
+  mkdir -p -- "$WEBCAM_DIR"
+  command -v imagesnap >/dev/null
+  command -v ffmpeg >/dev/null
+fi
 probe() {
   if [ -n "${DESK_LOGIN_PROBE:-}" ]; then
     local command
@@ -59,6 +65,13 @@ fresh_lit() {
     }
     END {exit !lit}' "$CONSOLE"
 }
+prove_lit() {
+  if [ -n "$WEBCAM_DIR" ]; then
+    /bin/bash tooling/native/panel-lit.sh "$WEBCAM_DIR/$2.jpg"
+  else
+    fresh_lit "$1"
+  fi
+}
 if [ -z "$CONSOLE" ]; then
   while [ "$(left)" -gt 0 ]; do
     CONSOLE=$(ls -t logs/usb-console/*-port0.txt 2>/dev/null | head -n 1 || true)
@@ -81,7 +94,7 @@ done
 wake_mark=$(lines)
 "${INPUT[@]}" key shift >/dev/null
 echo "desk-login: non-text wake sent; fresh-frame mark=$wake_mark"
-until fresh_lit "$wake_mark"; do
+until prove_lit "$wake_mark" after-wake; do
   [ "$(left)" -gt 0 ] || { echo 'desk-login: no NEW lit frame; nothing typed' >&2; exit 2; }
   sleep 2
 done
@@ -95,7 +108,7 @@ printf '%s\n' "$proof" | grep -qx 'focused_password_field=yes'
 proof=$(probe ready) || { echo 'desk-login: password focus lost; nothing typed' >&2; exit 2; }
 printf '%s\n' "$proof" | grep -qx 'selected_login_account=yes'
 printf '%s\n' "$proof" | grep -qx 'focused_password_field=yes'
-fresh_lit "$wake_mark" || { echo 'desk-login: display became dark; nothing typed' >&2; exit 2; }
+prove_lit "$wake_mark" before-input || { echo 'desk-login: display became dark or no fresh webcam proof; nothing typed' >&2; exit 2; }
 echo 'desk-login: NEW lit frame, selected account and focused cleared password field confirmed'
 mark=$(lines); typed=$(since)
 "${INPUT[@]}" type --stdin --enter < "$SECRET" >/dev/null
