@@ -811,6 +811,10 @@ unsigned gLlccAuditIndex;
 bool gLlccAuditPrepared;
 enum class LlccAuditState { waiting, complete, stopped };
 LlccAuditState gLlccAuditState;
+bool gLlccIsland3;
+uint32_t gLlccIsland3Before[5], gLlccIsland3After[5];  // ATTR0..3, ALLOC3
+unsigned gLlccIsland3BeforeSeen, gLlccIsland3AfterSeen;
+const char *gLlccIsland3Result;
 
 void finishLlccAudit(LlccAuditState state)
 {
@@ -852,6 +856,72 @@ int llccAuditCommand(int command, int token)
   return 0;
 }
 
+int llccIsland3Command(int command, int token)
+{
+  using namespace pianollcc;
+  if (gLlccAuditState != LlccAuditState::waiting) return ECANCELED;
+  if (gLlccAuditIndex == kIsland3Count) {
+    if (command != token) return EINVAL;
+    gLlccIsland3Result = "ok";
+    finishLlccAudit(LlccAuditState::complete);
+    return 0;
+  }
+
+  const auto &access = kIsland3Accesses[gLlccAuditIndex];
+  const auto physical = static_cast<unsigned long long>(access.physical());
+  const char *op = access.store ? "store" : "load";
+  if (command == token && !gLlccAuditPrepared) {
+    if (access.seq == 20 && !(gLlccIsland3Before[4] & kIsland3Bit)) {
+      IOLog("PianoA830: sens-island3 SKIP token=%d seq=20 pa=0x%08llx bit12=0\n", token, physical);
+      ++gLlccAuditIndex;
+      return 0;
+    }
+    IOLog("PianoA830: sens-island3 PRE token=%d seq=%u op=%s pa=0x%08llx\n", token, access.seq, op, physical);
+    gLlccAuditPrepared = true;
+    return 0;
+  }
+  if (command != -token || !gLlccAuditPrepared) return EINVAL;
+  gLlccAuditPrepared = false;
+
+  const bool alloc3 = access.offset == kIsland3Alloc3;
+  const uint32_t expected = alloc3 ? gLlccIsland3Before[4] & ~kIsland3Bit : access.expected;
+  uint32_t value = access.store ? expected : 0;
+  const bool answered = access.store ? llccWrite(&gMayMap, access.view, access.offset, value)
+                                     : llccRead(&gMayMap, access.view, access.offset, &value);
+  if (answered) {
+    if (access.seq == 4 || access.seq == 19) {
+      const unsigned slot = alloc3 ? 4 : gLlccAuditIndex - 3;
+      gLlccIsland3Before[slot] = value;
+      gLlccIsland3BeforeSeen |= 1u << slot;
+    } else if (access.seq == 21) {
+      const unsigned slot = gLlccAuditIndex - (kIsland3Count - 5);
+      gLlccIsland3After[slot] = value;
+      gLlccIsland3AfterSeen |= 1u << slot;
+    }
+  }
+  ++gLlccAuditIndex;
+  const bool ok = answered && (access.store || (value & access.mask) == (expected & access.mask));
+  IOLog("PianoA830: sens-island3 POST token=%d seq=%u op=%s pa=0x%08llx value=0x%08x status=%s next=%s\n",
+        token, access.seq, op, physical, value, !answered ? "access-failed" : !ok ? "unexpected" : "ok",
+        !ok ? "stop" : gLlccAuditIndex == kIsland3Count ? "release" : "step");
+  if (!ok) {
+    gLlccIsland3Result = !answered ? "access-failed" : access.seq == 21 ? "write not accepted" : "unexpected";
+    finishLlccAudit(LlccAuditState::stopped);
+    return EIO;
+  }
+  return 0;
+}
+
+void llccIsland3Summary(const char *result)
+{
+  const auto &b = gLlccIsland3Before;
+  const auto &a = gLlccIsland3After;
+  IOLog("PianoA830: sens-island3 SUMMARY result=%s ATTR before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x "
+        "ALLOC3 before=%08x after=%08x valid=%02x/%02x\n",
+        result, b[0], b[1], b[2], b[3], a[0], a[1], a[2], a[3], b[4], a[4],
+        gLlccIsland3BeforeSeen, gLlccIsland3AfterSeen);
+}
+
 int sysctlLlccAudit(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
 {
   if (!kauth_cred_issuser(kauth_cred_get())) return EPERM;
@@ -859,7 +929,7 @@ int sysctlLlccAudit(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
   const int token = gLlccAuditGeneration + int(gLlccAuditIndex) + 1;
   int command = gLlccAuditState == LlccAuditState::waiting ? token : gLlccAuditState == LlccAuditState::complete ? 0 : -1;
   int error = sysctl_handle_int(oid, &command, 0, req);
-  if (!error && req->newptr) error = llccAuditCommand(command, token);
+  if (!error && req->newptr) error = gLlccIsland3 ? llccIsland3Command(command, token) : llccAuditCommand(command, token);
   IOLockUnlock(gLlccAuditLock);
   return error;
 }
@@ -884,7 +954,7 @@ void islandPublish(IOService *service)
 // piano-llcc-island=1 (piano-gpu=2) the programming.
 void islandStart(IOService *service, unsigned level)
 {
-  if (bootArg("piano-llcc-audit", 0) == 1) return;
+  if (bootArg("piano-llcc-audit", 0) == 1 || bootArg("piano-llcc-island", 0) == 3) return;
   // Opt-in until a tablet boot has shown the reads are safe under Gunyah: without piano-llcc-island (0 = read only,
   // 1 = read and program) the GPU boot does not touch the LLCC at all and the island stays "unknown".
   if (bootArg("piano-llcc-island", 0xffffffffu) == 0xffffffffu) {
@@ -922,12 +992,14 @@ void islandStart(IOService *service, unsigned level)
 }  // namespace
 
 // Called once by the normal shared ADSP owner before firmware/PAS. Only the
-// root sysctl's acknowledged load command can reach the LLCC while it waits.
-extern "C" void piano_a830_llcc_audit_wait(void)
+// root sysctl's acknowledged access command can reach the LLCC while it waits.
+extern "C" void piano_a830_llcc_audit_wait(bool island3)
 {
+  gLlccIsland3 = island3;
   gLlccAuditLock = IOLockAlloc();
   if (!gLlccAuditLock) {
-    IOLog("PianoA830: sens-trace29 STOP lock allocation failed\n");
+    if (island3) llccIsland3Summary("lock-failed");
+    else IOLog("PianoA830: sens-trace29 STOP lock allocation failed\n");
     return;
   }
   IOLockLock(gLlccAuditLock);
@@ -939,18 +1011,26 @@ extern "C" void piano_a830_llcc_audit_wait(void)
   oid.oid_name = "piano_llcc_diag";
   oid.oid_handler = sysctlLlccAudit;
   oid.oid_fmt = "I";
-  oid.oid_descr = "Root-only, host-acknowledged LLCC audit read";
+  oid.oid_descr = island3 ? "Root-only, host-acknowledged LLCC SCID12 access" : "Root-only, host-acknowledged LLCC audit read";
   oid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&oid);
-  IOLog("PianoA830: sens-trace29 READY token=%d steps=%u awaiting host\n", gLlccAuditGeneration + 1, pianollcc::kAuditCount);
+  if (island3)
+    IOLog("PianoA830: sens-island3 READY token=%d steps=%u awaiting host\n", gLlccAuditGeneration + 1, pianollcc::kIsland3Count);
+  else
+    IOLog("PianoA830: sens-trace29 READY token=%d steps=%u awaiting host\n", gLlccAuditGeneration + 1, pianollcc::kAuditCount);
   uint64_t deadline;
   clock_interval_to_deadline(330, kSecondScale, &deadline);
   while (gLlccAuditState == LlccAuditState::waiting) {
     if (IOLockSleepDeadline(gLlccAuditLock, &gLlccAuditState, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
         gLlccAuditState == LlccAuditState::waiting) {
       gLlccAuditState = LlccAuditState::stopped;
-      IOLog("PianoA830: sens-trace29 STOP host handshake timed out\n");
+      if (island3) gLlccIsland3Result = "host-timeout";
+      else IOLog("PianoA830: sens-trace29 STOP host handshake timed out\n");
     }
+  }
+  if (island3) {
+    llccIsland3Summary(gLlccIsland3Result);
+    IOLog("PianoA830: sens-island3 RELEASE seq=22\n");
   }
   IOLockUnlock(gLlccAuditLock);
 }
