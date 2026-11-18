@@ -13,132 +13,214 @@
 #include "../../../package/PianoCamera/PianoCameraABI.h"
 #include "../../../package/PianoCamera/CameraIsp.h"
 #import "Devices.h"
+#include "CameraOutput.h"
 
-static const int32_t kFps = 15;
 static os_log_t gLog;
 
 // ------------------------------------------------------------------------------------------------------------------ the stream
 @interface PianoStreamSource : NSObject <CMIOExtensionStreamSource>
 @property(nonatomic, strong) CMIOExtensionStream *stream;
-@property(nonatomic, strong) CMIOExtensionStreamFormat *format;
 - (instancetype)initWithWidth:(int32_t)width height:(int32_t)height sensor:(uint32_t)sensor;
 @end
 
 @implementation PianoStreamSource {
-  CVPixelBufferPoolRef _pool;
-  CMFormatDescriptionRef _fd;
+  CVPixelBufferPoolRef _outputPools[2], _sourcePool;
+  NSArray<CMIOExtensionStreamFormat *> *_formats;
   dispatch_source_t _timer;
-  dispatch_queue_t _queue;
-  uint64_t _frame;
-  int32_t _width, _height;
+  dispatch_queue_t _outputQueue, _captureQueue;
+  int32_t _nativeWidth, _nativeHeight;
   uint32_t _sensor;
   atomic_bool _running;
+  atomic_uint_fast64_t _captureDropped;
+  // Output queue owns all published state and the immutable latest source reference.
+  NSUInteger _activeFormat;
+  CMTime _duration, _maxDuration;
+  CVPixelBufferRef _latest;
+  uint64_t _latestSequence, _latestDrops, _latestSourceNs;
+  uint64_t _frame, _dropped, _repeated, _sourceFrames, _staleTicks;
+  uint64_t _lastPublishedSequence, _lastPresentationTicks, _lastPresentationNs, _lastDropCount;
+  BOOL _configurationChanged, _stalled;
+  // Capture queue owns the RAW lease, ISP buffers and these capture counters.
   io_connect_t _connection;
   mach_vm_address_t _raw;
   mach_vm_size_t _rawSize;
   float *_work;
   uint8_t *_rgb;
-  uint64_t _dropped, _lastSequence, _lastDropCount, _lastCaptureNs, _ispTotal, _ispMax;
+  uint64_t _lastReadSequence, _ispTotal, _ispMax, _converted;
+}
+
+static CVReturn makePool(uint32_t width, uint32_t height, CVPixelBufferPoolRef *pool)
+{
+  NSDictionary *attrs = @{
+    (id)kCVPixelBufferWidthKey : @(width), (id)kCVPixelBufferHeightKey : @(height),
+    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  return CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, pool);
+}
+
+static NSDictionary *timeDictionary(CMTime time)
+{
+  return CFBridgingRelease(CMTimeCopyAsDictionary(time, kCFAllocatorDefault));
+}
+
+static BOOL validDuration(NSUInteger index, CMTime time)
+{
+  return CMTIME_IS_NUMERIC(time) && time.epoch == 0 && pianoOutputDurationValid((unsigned)index, time.value, time.timescale);
 }
 
 - (instancetype)initWithWidth:(int32_t)width height:(int32_t)height sensor:(uint32_t)sensor
 {
   if (!(self = [super init])) return nil;
-  _width = width;
-  _height = height;
+  _nativeWidth = width;
+  _nativeHeight = height;
   _sensor = sensor;
+  _duration = _maxDuration = CMTimeMake(1, kPianoNativeFps);
   atomic_init(&_running, false);
+  atomic_init(&_captureDropped, 0);
+  _outputQueue = dispatch_queue_create("com.unixnu.PianoCamera.output", DISPATCH_QUEUE_SERIAL);
+  _captureQueue = dispatch_queue_create("com.unixnu.PianoCamera.capture", DISPATCH_QUEUE_SERIAL);
   NSDictionary *color = @{
       (__bridge NSString *)kCMFormatDescriptionExtension_ColorPrimaries:
           (__bridge NSString *)kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
       (__bridge NSString *)kCMFormatDescriptionExtension_TransferFunction:
           (__bridge NSString *)kCMFormatDescriptionTransferFunction_sRGB,
   };
-  OSStatus formatResult = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_32BGRA, width, height,
-                                                        (__bridge CFDictionaryRef)color, &_fd);
-  if (formatResult) {
-    os_log_error(gLog, "camera init failed sensor=%u step=format result=%d", _sensor, (int)formatResult);
-    return nil;
+  NSMutableArray *formats = [NSMutableArray array];
+  for (unsigned index = 0; index < 2; ++index) {
+    PianoOutputFormat f = pianoOutputFormat(width, height, index);
+    CMFormatDescriptionRef description = NULL;
+    OSStatus result = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_32BGRA, f.width, f.height,
+                                                    (__bridge CFDictionaryRef)color, &description);
+    if (!result) {
+      [formats addObject:[CMIOExtensionStreamFormat streamFormatWithFormatDescription:description
+                           maxFrameDuration:CMTimeMake(1, f.minFps) minFrameDuration:CMTimeMake(1, f.maxFps)
+                           validFrameDurations:nil]];
+      CFRelease(description);
+      result = makePool(f.width, f.height, &_outputPools[index]);
+    }
+    if (result) {
+      os_log_error(gLog, "camera init failed sensor=%u format=%u result=%d", _sensor, index, (int)result);
+      return nil;
+    }
   }
-  CMTime frame = CMTimeMake(1, kFps);
-  _format = [CMIOExtensionStreamFormat streamFormatWithFormatDescription:_fd maxFrameDuration:frame minFrameDuration:frame
-                                                     validFrameDurations:nil];
-  NSDictionary *attrs = @{
-    (id)kCVPixelBufferWidthKey : @(_width),
-    (id)kCVPixelBufferHeightKey : @(_height),
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-  };
-  CVReturn poolResult = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &_pool);
-  if (poolResult) {
-    os_log_error(gLog, "camera init failed sensor=%u step=pixel-pool result=%d", _sensor, (int)poolResult);
-    return nil;
-  }
-  _queue = dispatch_queue_create("com.unixnu.PianoCamera.frames", DISPATCH_QUEUE_SERIAL);
+  _formats = [formats copy];
+  if (sensor && makePool(width, height, &_sourcePool)) return nil;
   return self;
 }
 
 - (void)dealloc
 {
-  if (_fd) CFRelease(_fd);
-  if (_pool) CVPixelBufferPoolRelease(_pool);
+  if (_latest) CVPixelBufferRelease(_latest);
+  if (_sourcePool) CVPixelBufferPoolRelease(_sourcePool);
+  for (unsigned i = 0; i < 2; ++i) if (_outputPools[i]) CVPixelBufferPoolRelease(_outputPools[i]);
 }
 
-- (NSArray<CMIOExtensionStreamFormat *> *)formats { return @[ _format ]; }
+- (NSArray<CMIOExtensionStreamFormat *> *)formats { return _formats; }
 
 - (NSSet<CMIOExtensionProperty> *)availableProperties
 {
-  return [NSSet setWithObjects:CMIOExtensionPropertyStreamActiveFormatIndex, CMIOExtensionPropertyStreamFrameDuration, nil];
+  return [NSSet setWithObjects:CMIOExtensionPropertyStreamActiveFormatIndex, CMIOExtensionPropertyStreamFrameDuration,
+                              CMIOExtensionPropertyStreamMaxFrameDuration, nil];
 }
 
 - (CMIOExtensionStreamProperties *)streamPropertiesForProperties:(NSSet<CMIOExtensionProperty> *)properties error:(NSError **)outError
 {
   CMIOExtensionStreamProperties *p = [CMIOExtensionStreamProperties streamPropertiesWithDictionary:@{}];
-  if ([properties containsObject:CMIOExtensionPropertyStreamActiveFormatIndex]) p.activeFormatIndex = @0;
-  if ([properties containsObject:CMIOExtensionPropertyStreamFrameDuration]) {
-    CMTime frame = CMTimeMake(1, kFps);
-    p.frameDuration = CFBridgingRelease(CMTimeCopyAsDictionary(frame, kCFAllocatorDefault));
-  }
+  dispatch_sync(_outputQueue, ^{
+    if ([properties containsObject:CMIOExtensionPropertyStreamActiveFormatIndex]) p.activeFormatIndex = @(self->_activeFormat);
+    if ([properties containsObject:CMIOExtensionPropertyStreamFrameDuration]) p.frameDuration = timeDictionary(self->_duration);
+    if ([properties containsObject:CMIOExtensionPropertyStreamMaxFrameDuration]) p.maxFrameDuration = timeDictionary(self->_maxDuration);
+    os_log(gLog, "camera format query sensor=%u index=%lu duration=%lld/%d max=%lld/%d", self->_sensor,
+           (unsigned long)self->_activeFormat, self->_duration.value, self->_duration.timescale,
+           self->_maxDuration.value, self->_maxDuration.timescale);
+  });
   return p;
 }
 
-- (BOOL)setStreamProperties:(CMIOExtensionStreamProperties *)streamProperties error:(NSError **)outError
+- (void)retimeOutput
 {
-  NSNumber *index = streamProperties.activeFormatIndex;
-  NSDictionary *duration = streamProperties.frameDuration;
-  if ((!index || [index isEqualToNumber:@0]) &&
-      (!duration || CMTimeCompare(CMTimeMakeFromDictionary((__bridge CFDictionaryRef)duration), CMTimeMake(1, kFps)) == 0))
-    return YES;
-  if (outError) *outError = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL userInfo:nil];
-  return NO;
+  if (_timer) {
+    uint64_t interval = (uint64_t)llround(CMTimeGetSeconds(_duration) * NSEC_PER_SEC);
+    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, NSEC_PER_MSEC);
+  }
+}
+
+- (BOOL)setStreamProperties:(CMIOExtensionStreamProperties *)properties error:(NSError **)outError
+{
+  NSNumber *index = properties.activeFormatIndex;
+  NSDictionary *requested = properties.frameDuration, *requestedMax = properties.maxFrameDuration;
+  __block BOOL accepted = NO;
+  __block NSDictionary *changed;
+  dispatch_sync(_outputQueue, ^{
+    NSUInteger next = index ? index.unsignedIntegerValue : self->_activeFormat;
+    CMTime duration = requested ? CMTimeMakeFromDictionary((__bridge CFDictionaryRef)requested) : self->_duration;
+    CMTime maximum = requestedMax ? CMTimeMakeFromDictionary((__bridge CFDictionaryRef)requestedMax) : self->_maxDuration;
+    if (next > 1 || (index && index.doubleValue != (double)next)) return;
+    // A format-only transition chooses a valid duration before notifying the client.
+    if (!requested && !validDuration(next, duration)) duration = CMTimeMake(1, kPianoNativeFps);
+    if (!requestedMax && !validDuration(next, maximum)) maximum = CMTimeMake(1, kPianoNativeFps);
+    if (!validDuration(next, duration) || !validDuration(next, maximum)) return;
+    if (CMTimeCompare(duration, maximum) > 0) {
+      // AVCapture clients may set min/max separately, in either order.
+      if (requested && !requestedMax) maximum = duration;
+      else if (requestedMax && !requested) duration = maximum;
+      else return;
+    }
+    const BOOL different = next != self->_activeFormat || CMTimeCompare(duration, self->_duration) ||
+                           CMTimeCompare(maximum, self->_maxDuration);
+    self->_activeFormat = next;
+    self->_duration = duration;
+    self->_maxDuration = maximum;
+    if (different) {
+      self->_configurationChanged = YES;
+      [self retimeOutput];
+      changed = @{
+        CMIOExtensionPropertyStreamActiveFormatIndex: [CMIOExtensionPropertyState propertyStateWithValue:@(next)],
+        CMIOExtensionPropertyStreamFrameDuration: [CMIOExtensionPropertyState propertyStateWithValue:timeDictionary(duration)],
+        CMIOExtensionPropertyStreamMaxFrameDuration: [CMIOExtensionPropertyState propertyStateWithValue:timeDictionary(maximum)],
+      };
+    }
+    accepted = YES;
+    os_log(gLog, "camera format set sensor=%u index=%lu duration=%lld/%d max=%lld/%d running=%u", self->_sensor,
+           (unsigned long)next, duration.value, duration.timescale, maximum.value, maximum.timescale,
+           atomic_load(&self->_running));
+  });
+  if (changed) [_stream notifyPropertiesChanged:changed];
+  if (!accepted) {
+    os_log_error(gLog, "camera format rejected sensor=%u index=%{public}@ duration=%{public}@ max=%{public}@",
+                 _sensor, index, requested, requestedMax);
+    if (outError) *outError = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL
+                     userInfo:@{NSLocalizedDescriptionKey: @"Expected native 15 fps or 640x480 BGRA at 15..30 fps."}];
+  }
+  return accepted;
 }
 
 - (BOOL)authorizedToStartStreamForClient:(CMIOExtensionClient *)client { return YES; }
 
-// The frame: eight vertical colour bars scrolling left, a white line sweeping down, the frame number's bits as squares at the top.
+// Eight moving bars, a sweeping line and 24 clipped counter squares.
 - (void)fill:(CVPixelBufferRef)pb
 {
   uint8_t *base = CVPixelBufferGetBaseAddress(pb);
   const size_t stride = CVPixelBufferGetBytesPerRow(pb);
+  const int32_t width = (int32_t)CVPixelBufferGetWidth(pb), height = (int32_t)CVPixelBufferGetHeight(pb);
   static const uint8_t bars[8][3] = {{255, 255, 255}, {0, 255, 255}, {255, 255, 0}, {0, 255, 0},
-                                     {255, 0, 255}, {0, 0, 255},   {255, 0, 0},   {16, 16, 16}};   // B, G, R
-  const uint32_t shift = (uint32_t)(_frame * 8 % _width), sweep = (uint32_t)(_frame * 6 % _height);
-  for (int32_t y = 0; y < _height; ++y) {
+                                     {255, 0, 255}, {0, 0, 255},   {255, 0, 0},   {16, 16, 16}};
+  const uint32_t shift = (uint32_t)(_frame * 8 % width), sweep = (uint32_t)(_frame * 6 % height);
+  for (int32_t y = 0; y < height; ++y) {
     uint8_t *row = base + (size_t)y * stride;
-    for (int32_t x = 0; x < _width; ++x) {
-      const uint8_t *c = bars[((x + shift) % _width) * 8 / _width];
+    for (int32_t x = 0; x < width; ++x) {
+      const uint8_t *c = bars[((x + shift) % width) * 8 / width];
       uint8_t *px = row + (size_t)x * 4;
       const int line = (uint32_t)y >= sweep && (uint32_t)y < sweep + 4;
-      px[0] = line ? 255 : c[0];
-      px[1] = line ? 255 : c[1];
-      px[2] = line ? 255 : c[2];
-      px[3] = 255;
+      px[0] = line ? 255 : c[0]; px[1] = line ? 255 : c[1]; px[2] = line ? 255 : c[2]; px[3] = 255;
     }
   }
-  for (int bit = 0; bit < 24; ++bit) {   // the frame counter: 24 squares of 32 px, white for 1
+  const int32_t cell = MAX(1, MIN(48, (width - 32) / 24)), square = MIN(32, cell);
+  for (int bit = 0; bit < 24; ++bit) {
     const uint8_t v = (_frame >> (23 - bit)) & 1 ? 255 : 0;
-    for (int32_t y = 16; y < 48; ++y)
-      for (int32_t x = 16 + bit * 48; x < 48 + bit * 48; ++x) {
+    for (int32_t y = 16; y < MIN(48, height); ++y)
+      for (int32_t x = 16 + bit * cell; x < MIN(16 + bit * cell + square, width); ++x) {
         uint8_t *px = base + (size_t)y * stride + (size_t)x * 4;
         px[0] = px[1] = px[2] = v;
       }
@@ -147,8 +229,7 @@ static os_log_t gLog;
 
 static IOReturn liveCall(io_connect_t connection, uint32_t op, const void *in, size_t inSize, void *out, size_t size)
 {
-  IOReturn status = IOConnectCallStructMethod(connection, op, in, inSize, out, &size);
-  return status;
+  return IOConnectCallStructMethod(connection, op, in, inSize, out, &size);
 }
 
 static BOOL ioResult(IOReturn status, NSError **outError)
@@ -159,10 +240,11 @@ static BOOL ioResult(IOReturn status, NSError **outError)
 
 - (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
 {
+  if (ticks <= _lastPresentationTicks) { ++_dropped; return; }
   CMTime pts = CMClockMakeHostTimeFromSystemUnits(ticks);
   CMTime ns = CMTimeConvertScale(pts, NSEC_PER_SEC, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
-  if (!CMTIME_IS_NUMERIC(ns) || ns.value <= 0) { ++_dropped; return; }
-  CMSampleTimingInfo timing = {CMTimeMake(1, kFps), pts, kCMTimeInvalid};
+  if (!CMTIME_IS_NUMERIC(ns) || ns.value <= 0 || (uint64_t)ns.value <= _lastPresentationNs) { ++_dropped; return; }
+  CMSampleTimingInfo timing = {_duration, pts, kCMTimeInvalid};
   CMSampleBufferRef sample = NULL;
   CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
                         kCVAttachmentMode_ShouldPropagate);
@@ -175,39 +257,73 @@ static BOOL ioResult(IOReturn status, NSError **outError)
     CFRelease(description);
   }
   if (error) { ++_dropped; return; }
-  const BOOL gap = _lastCaptureNs && (drops != _lastDropCount || (uint64_t)ns.value - _lastCaptureNs > 100000000);
-  if (gap) os_log(gLog, "camera cadence gap sensor=%u seq=%llu delta_ns=%llu kernel_drops=%llu",
-                  _sensor, sequence, (uint64_t)ns.value - _lastCaptureNs, drops);
-  _lastCaptureNs = ns.value;
+  const uint64_t interval = (uint64_t)llround(CMTimeGetSeconds(_duration) * NSEC_PER_SEC);
+  const BOOL gap = _configurationChanged || (_lastPresentationNs &&
+                   (drops != _lastDropCount || (uint64_t)ns.value - _lastPresentationNs > interval * 2));
+  if (gap) os_log(gLog, "camera cadence gap sensor=%u seq=%llu delta_ns=%llu source_drops=%llu format_change=%u",
+                  _sensor, sequence, _lastPresentationNs ? (uint64_t)ns.value - _lastPresentationNs : 0, drops,
+                  _configurationChanged);
+  _lastPresentationTicks = ticks;
+  _lastPresentationNs = ns.value;
   _lastDropCount = drops;
-  _lastSequence = sequence;
+  _configurationChanged = NO;
+  const BOOL repeated = _sensor && sequence == _lastPublishedSequence;
+  _lastPublishedSequence = sequence;
+  if (repeated) ++_repeated;
   [_stream sendSampleBuffer:sample
               discontinuity:gap ? CMIOExtensionStreamDiscontinuityFlagSampleDropped : CMIOExtensionStreamDiscontinuityFlagNone
        hostTimeInNanoseconds:ns.value];
   CFRelease(sample);
   if (++_frame == 1)
-    os_log(gLog, "camera first sample sensor=%u seq=%llu pts_ns=%lld isp_ns=%llu", _sensor, sequence, ns.value, _ispMax);
+    os_log(gLog, "camera first sample sensor=%u index=%lu seq=%llu pts_ns=%lld", _sensor,
+           (unsigned long)_activeFormat, sequence, ns.value);
+  if (_frame % 30 == 0)
+    os_log(gLog, "camera output sensor=%u index=%lu sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu duration=%lld/%d",
+           _sensor, (unsigned long)_activeFormat, _frame, _sourceFrames, _repeated, _dropped, _staleTicks,
+           _duration.value, _duration.timescale);
 }
 
-- (CVPixelBufferRef)borrowPixel
+static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshold)
 {
   CVPixelBufferRef pb = NULL;
-  NSDictionary *limits = @{(__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @8};
-  CVReturn status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, _pool,
-                                           (__bridge CFDictionaryRef)limits, &pb);
-  if (status) ++_dropped;
+  NSDictionary *limits = @{(__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey: @(threshold)};
+  CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limits, &pb);
   return pb;
 }
 
 - (void)tick
 {
   if (!atomic_load(&_running)) return;
-  CVPixelBufferRef pb = [self borrowPixel];
-  if (!pb) return;
+  const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  if (_sensor && (!_latest || !pianoOutputSourceFresh(now, _latestSourceNs))) {
+    ++_staleTicks;
+    if (_latest && !_stalled) {
+      os_log_error(gLog, "camera source stalled sensor=%u seq=%llu age_ns=%llu repeated=%llu", _sensor,
+                   _latestSequence, now >= _latestSourceNs ? now - _latestSourceNs : 0, _repeated);
+      _stalled = YES;
+      _configurationChanged = YES;
+    }
+    return;
+  }
+  // Two fixed pools, four buffers apiece: format changes cannot grow the output allocation beyond eight.
+  CVPixelBufferRef pb = borrowPixel(_outputPools[_activeFormat], 4);
+  if (!pb) { ++_dropped; return; }
   if (!CVPixelBufferLockBaseAddress(pb, 0)) {
-    [self fill:pb];
+    BOOL initialized = YES;
+    if (!_sensor) [self fill:pb];
+    else if (CVPixelBufferLockBaseAddress(_latest, kCVPixelBufferLock_ReadOnly)) initialized = NO;
+    else {
+      pianoOutputScaleBGRA(CVPixelBufferGetBaseAddress(_latest), _nativeWidth, _nativeHeight,
+                           CVPixelBufferGetBytesPerRow(_latest), CVPixelBufferGetBaseAddress(pb),
+                           (uint32_t)CVPixelBufferGetWidth(pb), (uint32_t)CVPixelBufferGetHeight(pb),
+                           CVPixelBufferGetBytesPerRow(pb));
+      CVPixelBufferUnlockBaseAddress(_latest, kCVPixelBufferLock_ReadOnly);
+    }
     CVPixelBufferUnlockBaseAddress(pb, 0);
-    [self publish:pb ticks:mach_absolute_time() sequence:_frame + 1 drops:_dropped];
+    if (initialized && atomic_load(&_running))
+      [self publish:pb ticks:mach_absolute_time() sequence:_sensor ? _latestSequence : _frame + 1
+              drops:_latestDrops + atomic_load(&_captureDropped)];
+    else ++_dropped;
   } else ++_dropped;
   CVPixelBufferRelease(pb);
 }
@@ -218,32 +334,33 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   const uint32_t rawWidth = rear ? 4080 : 3264, rawHeight = rear ? 3072 : 1836, stride = rear ? 5104 : 4080;
   if (frame->version != kPianoCameraLiveVersion || frame->sensor != _sensor || frame->slot >= kPianoCameraSlots ||
       frame->width != rawWidth || frame->height != rawHeight || frame->stride != stride ||
-      frame->bayer != (rear ? kPianoCameraGRBG : kPianoCameraBGGR) ||
-      frame->black >= 1023 || frame->bytes != stride * rawHeight || frame->bytes > kPianoCameraSlotBytes ||
-      !frame->sofTicks || frame->sequence <= _lastSequence ||
+      frame->bayer != (rear ? kPianoCameraGRBG : kPianoCameraBGGR) || frame->black >= 1023 ||
+      frame->bytes != stride * rawHeight || frame->bytes > kPianoCameraSlotBytes || !frame->sofTicks ||
+      frame->sequence <= _lastReadSequence ||
       (uint64_t)frame->slot * kPianoCameraSlotBytes + frame->bytes > _rawSize) return NO;
   uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   PianoIspStats stats;
   const uint8_t *raw = (const uint8_t *)(uintptr_t)_raw + (uint64_t)frame->slot * kPianoCameraSlotBytes;
-  if (pianoIsp(raw, rawWidth, rawHeight, stride, frame->bayer, frame->black, 2, _work, _rgb, &stats)) return NO;
+  if (pianoIsp(raw, rawWidth, rawHeight, stride, frame->bayer, frame->black, 2, _work, _rgb, &stats) ||
+      stats.width != (uint32_t)_nativeWidth || stats.height != (uint32_t)_nativeHeight) return NO;
   if (CVPixelBufferLockBaseAddress(pb, 0)) return NO;
   uint8_t *base = CVPixelBufferGetBaseAddress(pb);
   const size_t rowBytes = CVPixelBufferGetBytesPerRow(pb);
-  for (int32_t y = 0; y < _height; ++y) {
+  for (int32_t y = 0; y < _nativeHeight; ++y) {
     uint8_t *row = base + y * rowBytes;
-    for (int32_t x = 0; x < _width; ++x) {
+    for (int32_t x = 0; x < _nativeWidth; ++x) {
       // The rear sensor is mounted upside down. Leave selfie mirroring to clients.
-      size_t source = rear ? (size_t)(_height - 1 - y) * _width + _width - 1 - x : (size_t)y * _width + x;
-      row[x * 4 + 0] = _rgb[source * 3 + 2];
-      row[x * 4 + 1] = _rgb[source * 3 + 1];
-      row[x * 4 + 2] = _rgb[source * 3 + 0];
-      row[x * 4 + 3] = 255;
+      size_t source = rear ? (size_t)(_nativeHeight - 1 - y) * _nativeWidth + _nativeWidth - 1 - x :
+                             (size_t)y * _nativeWidth + x;
+      row[x * 4 + 0] = _rgb[source * 3 + 2]; row[x * 4 + 1] = _rgb[source * 3 + 1];
+      row[x * 4 + 2] = _rgb[source * 3 + 0]; row[x * 4 + 3] = 255;
     }
   }
   CVPixelBufferUnlockBaseAddress(pb, 0);
-  uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+  const uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
   _ispTotal += elapsed;
   _ispMax = MAX(_ispMax, elapsed);
+  ++_converted;
   return YES;
 }
 
@@ -252,7 +369,7 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 8 * NSEC_PER_SEC;
   while (atomic_load(&_running)) {
     @autoreleasepool {
-      PianoCameraLiveFrame frame;
+      PianoCameraLiveFrame frame = {0};
       IOReturn result = liveCall(_connection, kPianoCameraLiveWait, NULL, 0, &frame, sizeof frame);
       if (result == kIOReturnTimeout && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline) continue;
       if (result) {
@@ -264,13 +381,28 @@ static BOOL ioResult(IOReturn status, NSError **outError)
         break;
       }
       deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + NSEC_PER_SEC;
-      CVPixelBufferRef pb = [self borrowPixel];
-      BOOL valid = pb && [self convert:&frame pixel:pb];
+      CVPixelBufferRef pb = borrowPixel(_sourcePool, 3);
+      const BOOL valid = pb && [self convert:&frame pixel:pb];
       PianoCameraLiveReleaseArgs release = {kPianoCameraLiveVersion, frame.slot, frame.sequence};
       result = liveCall(_connection, kPianoCameraLiveRelease, &release, sizeof release, NULL, 0);
-      if (valid && !result && atomic_load(&_running))
-        [self publish:pb ticks:frame.sofTicks sequence:frame.sequence drops:frame.drops + _dropped];
-      else if (pb) ++_dropped;
+      if (valid && !result && atomic_load(&_running)) {
+        _lastReadSequence = frame.sequence;
+        const CMTime source = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(frame.sofTicks), NSEC_PER_SEC,
+                                                kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+        const uint64_t sourceNs = CMTIME_IS_NUMERIC(source) && source.value > 0 ? (uint64_t)source.value : 0;
+        // Backpressure here bounds the handoff to one frame; never retain an accumulating async queue of sources.
+        dispatch_sync(_outputQueue, ^{
+          if (!atomic_load(&self->_running)) return;
+          if (self->_latest) CVPixelBufferRelease(self->_latest);
+          self->_latest = CVPixelBufferRetain(pb);
+          self->_latestSequence = frame.sequence;
+          self->_latestDrops = frame.drops;
+          self->_latestSourceNs = sourceNs;
+          ++self->_sourceFrames;
+          if (self->_stalled) os_log(gLog, "camera source resumed sensor=%u seq=%llu", self->_sensor, frame.sequence);
+          self->_stalled = NO;
+        });
+      } else atomic_fetch_add(&_captureDropped, 1);
       if (pb) CVPixelBufferRelease(pb);
       if (result) {
         os_log_error(gLog, "camera RAW lease release failed sensor=%u result=%#x", _sensor, result);
@@ -285,10 +417,17 @@ static BOOL ioResult(IOReturn status, NSError **outError)
 - (BOOL)startStreamAndReturnError:(NSError **)outError
 {
   if (atomic_load(&_running)) return YES;
-  _frame = _dropped = _lastSequence = _lastDropCount = _lastCaptureNs = _ispTotal = _ispMax = 0;
+  _lastReadSequence = _ispTotal = _ispMax = _converted = 0;
+  atomic_store(&_captureDropped, 0);
+  dispatch_sync(_outputQueue, ^{
+    self->_frame = self->_dropped = self->_repeated = self->_sourceFrames = self->_staleTicks = 0;
+    self->_lastPublishedSequence = self->_lastPresentationTicks = self->_lastPresentationNs = self->_lastDropCount = 0;
+    self->_latestSequence = self->_latestDrops = self->_latestSourceNs = 0;
+    self->_stalled = self->_configurationChanged = NO;
+  });
   if (_sensor) {
-    _work = malloc((size_t)_width * _height * 3 * sizeof(float));
-    _rgb = malloc((size_t)_width * _height * 3);
+    _work = malloc((size_t)_nativeWidth * _nativeHeight * 3 * sizeof(float));
+    _rgb = malloc((size_t)_nativeWidth * _nativeHeight * 3);
     const char *step = !_work ? "isp-work" : !_rgb ? "isp-rgb" : "service-open";
     IOReturn result = _work && _rgb ? kIOReturnNotFound : kIOReturnNoMemory;
     if (_work && _rgb) {
@@ -320,17 +459,18 @@ static BOOL ioResult(IOReturn status, NSError **outError)
       [self closeLive];
       return ioResult(result, outError);
     }
-    atomic_store(&_running, true);
-    dispatch_async(_queue, ^{ [self readLive]; });
-  } else {
-    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
-    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / kFps, NSEC_PER_MSEC);
-    __weak PianoStreamSource *weakSelf = self;
-    dispatch_source_set_event_handler(_timer, ^{ [weakSelf tick]; });
-    atomic_store(&_running, true);
-    dispatch_resume(_timer);
   }
-  os_log(gLog, "camera stream start sensor=%u", _sensor);
+  atomic_store(&_running, true);
+  dispatch_sync(_outputQueue, ^{
+    self->_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self->_outputQueue);
+    __weak PianoStreamSource *weakSelf = self;
+    dispatch_source_set_event_handler(self->_timer, ^{ [weakSelf tick]; });
+    [self retimeOutput];
+    dispatch_resume(self->_timer);
+    os_log(gLog, "camera stream start sensor=%u index=%lu duration=%lld/%d source_fps=%d", self->_sensor,
+           (unsigned long)self->_activeFormat, self->_duration.value, self->_duration.timescale, kPianoNativeFps);
+  });
+  if (_sensor) dispatch_async(_captureQueue, ^{ [self readLive]; });
   return YES;
 }
 
@@ -339,24 +479,31 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   if (_raw) IOConnectUnmapMemory64(_connection, kPianoCameraMemoryRing, mach_task_self(), _raw);
   if (_connection) IOServiceClose(_connection);
   _raw = _rawSize = _connection = 0;
-  free(_rgb);
-  free(_work);
-  _rgb = NULL;
-  _work = NULL;
+  free(_rgb); free(_work);
+  _rgb = NULL; _work = NULL;
 }
 
 - (BOOL)stopStreamAndReturnError:(NSError **)outError
 {
   if (!atomic_exchange(&_running, false)) return YES;
-  if (_timer) dispatch_source_cancel(_timer);
-  _timer = nil;
+  // Cancel on the output queue, then stop/wake the RAW waiter, drain both queues, and only then free mappings/ISP memory.
+  dispatch_sync(_outputQueue, ^{
+    if (self->_timer) dispatch_source_cancel(self->_timer);
+    self->_timer = nil;
+  });
   PianoCameraLiveStatus state = {0};
   IOReturn result = _connection ? liveCall(_connection, kPianoCameraLiveStop, NULL, 0, &state, sizeof state) : kIOReturnSuccess;
-  dispatch_sync(_queue, ^{});
+  dispatch_sync(_captureQueue, ^{});
+  dispatch_sync(_outputQueue, ^{
+    if (self->_latest) CVPixelBufferRelease(self->_latest);
+    self->_latest = NULL;
+    os_log(gLog, "camera output stop sensor=%u sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu",
+           self->_sensor, self->_frame, self->_sourceFrames, self->_repeated, self->_dropped, self->_staleTicks);
+  });
   [self closeLive];
-  os_log(gLog, "camera stream stop sensor=%u result=%#x state=%u clean=%u guard=%u smmu=%#x sent=%llu dropped=%llu kernel_drops=%llu isp_avg_ns=%llu isp_max_ns=%llu",
-         _sensor, result, state.state, state.cleanOff, state.guardFault, state.smmuFault, _frame, _dropped, state.dropped,
-         _frame ? _ispTotal / _frame : 0, _ispMax);
+  os_log(gLog, "camera stream stop sensor=%u result=%#x state=%u clean=%u guard=%u smmu=%#x capture_dropped=%llu kernel_drops=%llu converted=%llu isp_avg_ns=%llu isp_max_ns=%llu",
+         _sensor, result, state.state, state.cleanOff, state.guardFault, state.smmuFault, (uint64_t)atomic_load(&_captureDropped),
+         state.dropped, _converted, _converted ? _ispTotal / _converted : 0, _ispMax);
   if (!result && _sensor && state.state != kPianoCameraStopped) result = kIOReturnIOError;
   return ioResult(result, outError);
 }
@@ -467,7 +614,7 @@ int main(void)
 {
   @autoreleasepool {
     gLog = os_log_create("com.unixnu.PianoCamera", "extension");
-    os_log(gLog, "PianoCamera extension starting at %d fps", kFps);
+    os_log(gLog, "PianoCamera extension starting: sensor=%d fps compat=15..30 fps", kPianoNativeFps);
     dispatch_queue_t control = dispatch_queue_create("com.unixnu.PianoCamera.client", DISPATCH_QUEUE_SERIAL);
     __attribute__((objc_precise_lifetime)) PianoProviderSource *source = [[PianoProviderSource alloc] initWithClientQueue:control];
     if (!source) return 1;
