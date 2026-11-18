@@ -862,6 +862,13 @@ without waiting for a future admission, and answers the original request only af
 send failure and the eight-second request deadline have one completion owner. Async AVC retains its four published/eight
 credit window and completion-barrier finish.
 
+The V9i presentation candidate brackets each CPU destination write with the native IOSurface writable lock/unlock
+protocol, validates the lock's current layout, and cleans the written plane extents to PoC before unlocking and emitting
+Demt. A DSB and temporary memory-descriptor completion alone do not publish dirty CPU cache lines to a retained
+noncoherent GPU import. The same transaction covers NV12 and P010, preserving the guest pool's display lifetime.
+Host gradient/reuse checks cover byte visibility and padding; zero flicker or transparent frames in a valid continuous
+camera recording remains a separate tablet acceptance gate. Decode completion alone does not qualify presentation.
+
 V9d limits native HEVC admission to1920×1080, coded height≤1088 and Apple level≤120 (Level4), consistently in inventory,
 dcap, dsta/dcan and the native-submit boundary. The wider parser and bounded4K/N10 layout remain available for analysis;
 4K/Level6.1 is declined with UnsupportedDataFormat before a native reservation, PAS or HFI. This is a conservative

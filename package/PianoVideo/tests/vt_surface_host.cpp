@@ -65,6 +65,38 @@ static void copyTest(bool ten) {
   assert(!vtsurface::copy(l,l.bytes-1,src.data(),s,dst.data()));
   auto badLayout=l;badLayout.uvOffset+=2;assert(!vtsurface::copy(badLayout,src.size(),src.data(),s,dst.data()));
   if(ten){bad=s;++bad.plane[0].offset;assert(!vtsurface::copy(l,src.size(),src.data(),bad,dst.data()));}
+
+  // A noncoherent reader retains this backing across two producer rewrites.
+  // memcpy/ordering alone leaves its RAM view stale; publication must cover
+  // every active byte before the completion fence, without writing padding.
+  struct Device {
+    const std::vector<uint8_t> &cpu;
+    std::vector<uint8_t> ram;
+    unsigned cleans=0,completions=0;
+    Device(const std::vector<uint8_t> &v):cpu(v),ram(v.size(),0){}
+    void clean(const uint8_t *p,uint64_t bytes){
+      const size_t offset=size_t(p-cpu.data());
+      assert(offset<=cpu.size() && bytes<=cpu.size()-offset);
+      memcpy(ram.data()+offset,p,size_t(bytes));++cleans;
+    }
+    void finish(){assert(cleans==2*(completions+1));++completions;}
+  } device(dst);
+  for(unsigned epoch=0;epoch<2;++epoch){
+    for(unsigned p=0;p<2;++p)for(unsigned y=0;y<(p?l.height/2:l.height);++y){
+      auto at=(p?l.uvOffset:l.yOffset)+uint64_t(y)*l.stride;
+      for(unsigned x=0;x<rowBytes;++x)src[at+x]^=0xff;
+    }
+    const auto old=device.ram;
+    assert(vtsurface::copy(l,src.size(),src.data(),s,dst.data()));
+    bool stale=false;
+    for(size_t i=0;i<dst.size();++i)if(touched[i] && old[i]!=dst[i])stale=true;
+    assert(stale && device.ram==old); // the old copy+DSB contract cannot publish
+    assert(vtsurface::copyAndPublish(l,src.size(),src.data(),s,dst.data(),device));
+    for(size_t i=0;i<dst.size();++i)if(touched[i])assert(device.ram[i]==dst[i]);
+  }
+  const auto cleanCalls=device.cleans;
+  assert(!vtsurface::copyAndPublish(l,l.bytes-1,src.data(),s,dst.data(),device));
+  assert(device.cleans==cleanCalls && device.completions==2);
 }
 int main() {
   copyTest(false);copyTest(true);
@@ -97,5 +129,5 @@ int main() {
     bad.close(); pending.closed(); assert(!pending.held());
   }
   p.close(); lease.closed();
-  puts("PianoVideo VT surface tests: NV12/P010 gradients arbitrary-stride/offset padding 4K/64MiB bounds repeated-ID/ref-pair/error/cancel pass");
+  puts("PianoVideo VT surface tests: NV12/P010 gradients arbitrary-stride/offset padding 4K/64MiB bounds reused-noncoherent-publication repeated-ID/ref-pair/error/cancel pass");
 }

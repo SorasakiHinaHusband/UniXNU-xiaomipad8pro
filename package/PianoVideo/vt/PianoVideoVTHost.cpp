@@ -49,6 +49,7 @@ struct Session {
   IOUserClient *surfaces=nullptr;
   unsigned surfaceOpens=0,surfaceCloses=0,maps=0;
   pianovideo::vtsurface::Lease surfaceLease;
+  uint32_t writeSurfaceID=0;
   unsigned surfaceLookups=0,surfaceInvalidates=0,surfaceReleases=0;
   Frame frame;
   uint64_t currentToken=0;
@@ -100,6 +101,25 @@ IOReturn surfaceMethod(Session *s,uint32_t selector,uint32_t id,void *output=nul
     s->surfaces->callExternalMethod(selector,&a);
   if(bytes)*bytes=uint32_t(a.structureOutputSize);return rc;
 }
+IOReturn surfaceWriteMethod(Session *s,uint32_t selector,uint32_t id,void *output,uint32_t &bytes){
+  const pianovideo::vtsurface::WriteRequest input={id,0,0}; // ordinary writable access
+  IOExternalMethodArguments a={};a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=selector;
+  a.structureInput=&input;a.structureInputSize=sizeof input;a.structureOutput=output;a.structureOutputSize=bytes;
+  IOUserClient2022 *client=OSDynamicCast(IOUserClient2022,s->surfaces);
+  const IOReturn rc=client?client->externalMethod(selector,reinterpret_cast<IOExternalMethodArgumentsOpaque *>(&a)):
+    s->surfaces->callExternalMethod(selector,&a);
+  bytes=uint32_t(a.structureOutputSize);return rc;
+}
+bool unlockSurfaceWrite(Session *s){
+  if(!s->writeSurfaceID)return true;
+  const uint32_t id=s->writeSurfaceID;uint32_t seed=0,bytes=sizeof seed;
+  const IOReturn rc=surfaceWriteMethod(s,pianovideo::vtsurface::WriteUnlock,id,&seed,bytes);
+  // A successful operation released the lock even if its output is malformed.
+  if(!rc)s->writeSurfaceID=0;
+  IOLog("PianoVideoVT V9i: write-unlock token %llu id %u status %08x bytes %u seed %u\n",s->frame.token,id,rc,bytes,seed);
+  if(rc||bytes!=sizeof seed){failure(s,82,rc?int(rc):kBadData);return false;}
+  return true;
+}
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
   if(!id || s->surfaceLease.held()){failure(s,45,kBadState);return false;}
@@ -122,25 +142,53 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   IOLog("PianoVideoVT V6p: lookup token %llu request %llu id %u status %08x held %u\n",s->frame.token,s->guest.request,id,rc,unsigned(s->surfaceLease.held()));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
-bool copyFrame(Session *s,const Frame &f,const contract::Surface &v) {
-  if(!f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(v,f.layout.width,f.layout.height,f.layout.format)){failure(s,60,kBadData);return false;}
+bool copyFrame(Session *s,const Frame &f,const contract::Surface &lookup) {
+  if(s->writeSurfaceID || !f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(lookup,f.layout.width,f.layout.height,f.layout.format)){failure(s,60,kBadData);return false;}
+  constexpr uint32_t resultSize=0xc68;
+  uint8_t *result=static_cast<uint8_t *>(IOMallocZero(resultSize));
+  if(!result){failure(s,80,kNoMemory);return false;}
+  uint32_t bytes=resultSize;
+  const IOReturn locked=surfaceWriteMethod(s,pianovideo::vtsurface::WriteLock,lookup.id,result,bytes);
+  if(!locked)s->writeSurfaceID=lookup.id;
+  contract::Surface v;
+  const bool valid=!locked && bytes==resultSize && contract::surfaceResult(result,bytes,lookup.id,v,f.layout.width,f.layout.height,f.layout.format);
+  uint32_t seed=0;if(bytes==resultSize)memcpy(&seed,result+0x68,sizeof seed);
+  IOFree(result,resultSize);
+  IOLog("PianoVideoVT V9i: write-lock token %llu id %u status %08x bytes %u valid %u seed %u\n",f.token,lookup.id,locked,bytes,unsigned(valid),seed);
+  if(!valid){failure(s,81,locked?int(locked):kBadData);unlockSurfaceWrite(s);return false;}
   IOMemoryDescriptor *mem=IOMemoryDescriptor::withAddressRange(v.base,v.size,kIODirectionInOut,s->client->task);
   const IOReturn prepared=mem?mem->prepare():kIOReturnNoMemory;
-  if(prepared){OSSafeReleaseNULL(mem);failure(s,61,int(prepared));return false;}
+  if(prepared){OSSafeReleaseNULL(mem);failure(s,61,int(prepared));unlockSurfaceWrite(s);return false;}
   ++s->maps;
   IOMemoryMap *map=mem->createMappingInTask(kernel_task,0,kIOMapAnywhere);
   uint8_t *dst=map?reinterpret_cast<uint8_t *>(map->getVirtualAddress()):nullptr;
-  const bool ok=dst && map->getLength()>=v.size && pianovideo::vtsurface::copy(f.layout,f.length,const_cast<const uint8_t *>(f.cpu),v,dst);
+  struct Publisher {
+    uintptr_t line;
+    Publisher(){uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));line=uintptr_t(4)<<((ctr>>16)&15);}
+    void clean(const uint8_t *start,uint64_t length){
+      const uintptr_t end=uintptr_t(start)+length;
+      for(uintptr_t a=uintptr_t(start)&~(line-1);a<end;a+=line)__asm__ volatile("dc cvac, %0"::"r"(a):"memory");
+    }
+    void finish(){__asm__ volatile("dsb sy":::"memory");}
+  } publisher;
+  bool ok=dst && map->getLength()>=v.size && pianovideo::vtsurface::copyAndPublish(f.layout,f.length,const_cast<const uint8_t *>(f.cpu),v,dst,publisher);
+  OSSafeReleaseNULL(map);
+  const IOReturn completed=mem->complete();mem->release();--s->maps;
+  if(completed){failure(s,83,int(completed));ok=false;}
+  const bool unlocked=unlockSurfaceWrite(s);ok=ok&&unlocked;
   if(ok){
     const auto &l=f.layout;
-    __asm__ volatile("dsb sy" ::: "memory");
+    IOLog("PianoVideoVT V9i: published token %llu IOSurface %u format %08x depth %u clean-to-PoC 1 unlocked 1 before-Demt 1\n",f.token,v.id,l.format,l.bitdepth);
     if(l.codec==cc("avc1"))IOLog("PianoVideoVT V8: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u\n",f.token,l.width,l.height,l.width*l.height*3/2,l.stride,l.scanlines,l.uvOffset,v.id);
     else IOLog("PianoVideoVT V9: copy success token %llu active %ux%u bytes %u stride %u scanlines %u uv-offset %u IOSurface %u format %08x depth %u\n",f.token,l.width,l.height,l.width*l.height*3/2*(l.bitdepth==10?2:1),l.stride,l.scanlines,l.uvOffset,v.id,l.format,l.bitdepth);
   }else failure(s,62,kNoMemory);
-  OSSafeReleaseNULL(map);mem->complete();mem->release();--s->maps;return ok;
+  return ok;
 }
 uint64_t nowMs(){uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);return ns/1000000;}
 bool releaseSurface(Session *s){
+  // An unsuccessful unlock remains owned until session client close. Never
+  // invalidate a handle or advertise another picture while its write is live.
+  if(s->writeSurfaceID)return false;
   struct Methods {
     Session *s;
     int call(uint32_t selector,uint32_t id){
@@ -157,7 +205,7 @@ bool releaseSurface(Session *s){
   return ok;
 }
 void closeSurface(Session *s){
-  if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;s->surfaceLease.closed();}
+  if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;s->surfaceLease.closed();s->writeSurfaceID=0;}
 }
 bool request(Session *s,Writer &w,const uint8_t *b,uint64_t id,uint32_t type){
   // Queue transport while holding the cancellation fence. The send callback
