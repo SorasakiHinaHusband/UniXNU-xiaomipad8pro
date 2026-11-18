@@ -206,7 +206,12 @@ if [ -n "$passd_on" ]; then
   elif [ "$passd_on" = 0 ]; then
     if [ "$MODE" != --check ]; then sh "$R$PASSD" --remove || FAILED=1; fi
   elif [ "$MODE" = --check ]; then sh "$R$PASSD" --check || FAILED=1
-  else sh "$R$PASSD" --install || FAILED=1; fi
+  else
+    # The policy drops to UID 501. The boot hook's umask can leave its
+    # parent root-only even when the policy directory itself is owned by 501.
+    if chmod a+x "$STATE"; then sh "$R$PASSD" --install || FAILED=1
+    else say 'passd policy: state parent is not searchable; hook refused'; FAILED=1; fi
+  fi
 fi
 
 # 3. Jobs.

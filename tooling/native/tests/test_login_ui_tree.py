@@ -16,7 +16,14 @@ static AXError fixture_copy(AXUIElementRef node,CFStringRef key,CFTypeRef *out) 
  CFTypeRef value=CFDictionaryGetValue((CFDictionaryRef)node,key);
  if(!value)return kAXErrorNoValue; *out=CFRetain(value);return kAXErrorSuccess;
 }
+static unsigned setters;
+static AXError fixture_set(AXUIElementRef node,CFStringRef key,CFTypeRef value) {
+ (void)node; (void)key; (void)value;
+ ++setters;
+ return kAXErrorAttributeUnsupported;
+}
 #define AXUIElementCopyAttributeValue fixture_copy
+#define AXUIElementSetAttributeValue fixture_set
 #define main production_main
 #include "tooling/native/piano-login-readiness.c"
 #undef main
@@ -34,17 +41,27 @@ int main(void) {
  CFDictionarySetValue(field,kAXWindowAttribute,window);CFDictionarySetValue(label,kAXValueAttribute,CFSTR("fixture-user"));
  const void *windows[]={window,other};children(app,windows,2);
  const void *ready[]={label,field};children(window,ready,2);
- AXUIElementRef answer=selected_field((AXUIElementRef)app,CFSTR("fixture-user"),CFSTR("Fixture User"));assert(answer);CFRelease(answer);
+ AXUIElementRef answer=selected_field((AXUIElementRef)window,CFSTR("fixture-user"),NULL);assert(answer);
+ assert(focused_field((AXUIElementRef)app,answer,(AXUIElementRef)field,1));
+ assert(setters==0);
+ assert(!focused_field((AXUIElementRef)app,answer,(AXUIElementRef)label,0));
+ assert(setters==0);
+ assert(!focused_field((AXUIElementRef)app,answer,(AXUIElementRef)label,1));
+ assert(setters==1);
+ CFDictionarySetValue(app,kAXFocusedUIElementAttribute,field);
+ assert(focused_field((AXUIElementRef)app,answer,(AXUIElementRef)label,1));
+ assert(setters==2);
+ CFRelease(answer);
  // Label in a different account/window must never authorize this field.
  const void *onlyfield[]={field},*onlylabel[]={label};children(window,onlyfield,1);children(other,onlylabel,1);
- assert(!selected_field((AXUIElementRef)app,CFSTR("fixture-user"),CFSTR("Fixture User")));
+ assert(!selected_field((AXUIElementRef)window,CFSTR("fixture-user"),CFSTR("Fixture User")));
  // Even within one window, a visible chooser's account label is not selection.
  children(other,NULL,0);children(list,onlylabel,1);const void *chooser[]={list,field};children(window,chooser,2);
- assert(!selected_field((AXUIElementRef)app,CFSTR("fixture-user"),CFSTR("Fixture User")));
+ assert(!selected_field((AXUIElementRef)window,CFSTR("fixture-user"),CFSTR("Fixture User")));
  // Correct window plus multiple secure fields is ambiguous and fails closed.
  CFMutableDictionaryRef second=node(kAXTextFieldRole);CFDictionarySetValue(second,kAXSubroleAttribute,kAXSecureTextFieldSubrole);
  const void *two[]={label,field,second};children(window,two,3);
- assert(!selected_field((AXUIElementRef)app,CFSTR("fixture-user"),CFSTR("Fixture User")));
+ assert(!selected_field((AXUIElementRef)window,CFSTR("fixture-user"),CFSTR("Fixture User")));
 }
 '''
         with tempfile.TemporaryDirectory() as d:

@@ -44,9 +44,26 @@ probe() {
     read -r -a command <<< "$DESK_LOGIN_PROBE"
     "${command[@]}" "$1" "$LOGIN_UID"
   else
+    local remote="sudo -S -p '' /usr/local/libexec/piano-login-readiness $1 $LOGIN_UID"
+    if [ "$1" != desktop ]; then
+      # AX's system-wide focus is session-local. sudo alone keeps the SSH
+      # bootstrap. Use the unique pre-login SecurityAgent's audit/bootstrap.
+      remote="pid=\$(/usr/bin/pgrep -x SecurityAgent); case \"\$pid\" in \"\"|*[!0-9]*) echo focus_probe=securityagent-unavailable; exit 1;; esac; sudo -S -p '' /bin/launchctl bsexec \"\$pid\" /usr/local/libexec/piano-login-readiness $1 $LOGIN_UID"
+    fi
     # tssh owns address fallback. Credentials only on sudo stdin, never argv.
-    { cat "$SECRET"; printf '\n'; } | /bin/bash /tmp/tssh "sudo -S -p '' /usr/local/libexec/piano-login-readiness $1 $LOGIN_UID" 2>/dev/null
+    { cat "$SECRET"; printf '\n'; } | /bin/bash /tmp/tmo.sh 15 /bin/bash /tmp/tssh "$remote" 2>/dev/null
   fi
+}
+prove_focus() {
+  local proof rc=0
+  proof=$(probe "$1") || rc=$?
+  printf '%s\n' "$proof" | grep -E '^focus_probe=[a-z0-9-]+( ax=-?[0-9]+)?$' || true
+  if [ "$rc" != 0 ] && [ -z "$proof" ]; then
+    echo "focus_probe=command-failed rc=$rc"
+  fi
+  [ "$rc" = 0 ] &&
+    printf '%s\n' "$proof" | grep -qx 'selected_login_account=yes' &&
+    printf '%s\n' "$proof" | grep -qx 'focused_password_field=yes'
 }
 start=$(date +%s)
 left() { echo $(( TIMEOUT - ($(date +%s) - start) )); }
@@ -98,17 +115,19 @@ until prove_lit "$wake_mark" after-wake; do
   [ "$(left)" -gt 0 ] || { echo 'desk-login: no NEW lit frame; nothing typed' >&2; exit 2; }
   sleep 2
 done
-# Native AX proof fails closed on another account, missing secure field, or
-# unavailable Accessibility access. It never inspects the password's value.
-proof=$(probe prepare) || { echo 'desk-login: selected account/password focus unconfirmed; nothing typed' >&2; exit 2; }
-printf '%s\n' "$proof" | grep -qx 'selected_login_account=yes'
-printf '%s\n' "$proof" | grep -qx 'focused_password_field=yes'
+# Focus can settle after the optical frame. Retry only the bounded, non-text
+# proof. Mismatches and Accessibility denial still stop before input.
+focus_deadline=$(( $(date +%s) + 30 ))
+until prove_focus prepare; do
+  if [ "$(left)" -le 0 ] || [ "$(date +%s)" -ge "$focus_deadline" ]; then
+    echo 'desk-login: selected account/password focus unconfirmed; nothing typed' >&2; exit 2
+  fi
+  sleep 2
+done
 "${INPUT[@]}" key cmd+a >/dev/null
 "${INPUT[@]}" key backspace >/dev/null
-proof=$(probe ready) || { echo 'desk-login: password focus lost; nothing typed' >&2; exit 2; }
-printf '%s\n' "$proof" | grep -qx 'selected_login_account=yes'
-printf '%s\n' "$proof" | grep -qx 'focused_password_field=yes'
 prove_lit "$wake_mark" before-input || { echo 'desk-login: display became dark or no fresh webcam proof; nothing typed' >&2; exit 2; }
+prove_focus ready || { echo 'desk-login: password focus lost; nothing typed' >&2; exit 2; }
 echo 'desk-login: NEW lit frame, selected account and focused cleared password field confirmed'
 mark=$(lines); typed=$(since)
 "${INPUT[@]}" type --stdin --enter < "$SECRET" >/dev/null
