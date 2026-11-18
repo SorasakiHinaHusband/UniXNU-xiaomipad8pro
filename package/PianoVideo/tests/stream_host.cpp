@@ -241,6 +241,14 @@ static void guestTests() {
   CHECK(!replacement.reply(101,demt)&&!replacement.expired(12001));
 }
 static void ownerTests() {
+  // A known native failure must block acquisition even after DMA was freed.
+  for (int error : {-20,-24,-25}) {
+    stream::Owner failed; uint32_t session=0,next=0;
+    CHECK(failed.acquire(&session)==0 && failed.start(session));
+    CHECK(failed.closing(session,false)==0);
+    failed.closed(false,error);
+    CHECK(failed.phase==stream::Owner::Poisoned && failed.acquire(&next)==-16 && next==0);
+  }
   stream::Owner o;uint32_t a=0,b=0;
   CHECK(o.acquire(nullptr)==-22&&o.acquire(&a)==0&&o.owns(a));
   CHECK(o.acquire(&b)==-16&&!o.owns(a+1)&&!o.start(a+1));CHECK(o.start(a)&&!o.start(a));

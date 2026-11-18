@@ -10,6 +10,10 @@ published frames without blocking the receive path, and makes finish a completio
 Rejected requests use Apple's error completion once. V7e2 and V8a subsequently qualified stock QuickTime playback of the
 owned320×240 Main and1920×1080 High AVC fixtures:60 native/client frames,0 dropped and optically confirmed motion.
 V9 implements bounded HEVC Main/Main10/P010 for qualification; no HEVC tablet result is claimed.
+V9c contains failed native sessions for the rest of a boot: a firmware/session or STOP/CLOSE error retains
+the existing DMA, firmware and power dependencies and blocks another core bootstrap. DMA release alone
+does not establish hardware health. Owning-task PID/name and lifecycle reason logs support qualification;
+this containment does not establish the electrical cause of a reset or safe repeated cold initialization.
 The earlier ladder and historical test recipes below do not establish macOS app playback. Backlog item B10.
 
 ## 1. Purpose and gate

@@ -714,8 +714,10 @@ extern "C" int piano_video_native_open(uint32_t *sessionId)
   if (!piano_video_native_ready()) return -45;
   IOLockLock(gNativeLock);
   const int rc = gNativeState.acquire(sessionId);
+  const unsigned phase = unsigned(gNativeState.phase);
   IOLockUnlock(gNativeLock);
   note("V5 native reserve result %d session %08x firmware-open 0", rc, rc ? 0 : *sessionId);
+  if (rc) note("V9c cycle refused reason reserve-%d phase %u no-bootstrap 1",rc,phase);
   return rc;
 }
 
@@ -737,6 +739,8 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
     owner=new NativeOwner;
     if(!owner)return kErrNoMemory;
     gNativeOwner=owner;owner->config=*format;
+    note("V9c cycle begin reason first-IDR session %08x previous %08x previous-close %d previous-teardown %d",
+         sid,gPreviousNative.sid,gPreviousNative.closeRc,gPreviousNative.teardownRc);
     owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
     owner->tx.history=&owner->history;
     const uint32_t codedWidth=format->isHevc()?(format->s.codedWidth+31)&~31u:format->s.codedWidth;
@@ -856,14 +860,20 @@ extern "C" int piano_video_native_close(uint32_t sid)
   int rc = 0;
   bool held = false;
   if (owner) {
-    if (owner->attempted) {
+    rc = owner->tx.r.error ? owner->tx.r.error : owner->core.rep.error ? owner->core.rep.error :
+         owner->core.watchdogSeen ? kErrWatchdog : owner->core.rep.fsr ? kErrFault : owner->core.quarantineReason;
+    if (!rc && owner->attempted) {
       owner->tx.ledger.cancel();
       rc = owner->tx.shutdown();
       note("V6 ownership session %08x input-reuse %u raw-reuse %u high-water %u cancelled %u loans %u",sid,
            owner->tx.ledger.inputReuse,owner->tx.ledger.rawReuse,owner->tx.ledger.highWater,owner->tx.ledger.cancelled,unsigned(loans));
     }
-    // run() already performs fail-safe teardown on failed initialization.
+    // STOP/CLOSE failure and DMA retention are independent health conditions.
+    // Skip new HFI traffic after the first error; keep its original snapshot.
+    if (rc) owner->core.quarantineReason = rc;
+    // run() already records/retains dependencies on failed initialization.
     if (owner->prepared) {
+      note("V9c cycle end reason %s session %08x status %d",rc?"native-failure":"healthy-session-close",sid,rc);
       const int un = owner->core.teardown();
       if (!rc) rc = un;
     }
@@ -875,10 +885,11 @@ extern "C" int piano_video_native_close(uint32_t sid)
          owner->tx.r.decoded, unsigned(owner->tx.r.drainAck), unsigned(owner->tx.r.last), unsigned(owner->tx.r.stopRaw),
          unsigned(owner->tx.r.stopInput), unsigned(owner->tx.r.closed), owner->core.teardownRc, unsigned(held),
          unsigned(owner->core.watchdogSeen != 0), owner->core.rep.fsr);
-    if (!held) { delete owner; gNativeOwner = nullptr; unmapAll(); }
+    if (!held && !rc) { delete owner; gNativeOwner = nullptr; unmapAll(); }
+    else note("V9c cycle quarantined session %08x status %d dma-held %u no-reopen 1",sid,rc,unsigned(held));
   } else note("V5 native close session %08x result 0 no-input 1 firmware-open 0 DMA 0", sid);
   IOLockLock(gNativeLock);
-  gNativeState.closed(held);
+  gNativeState.closed(held,rc);
   IOLockUnlock(gNativeLock);
   return rc;
 }
@@ -917,6 +928,7 @@ bool PianoVideo::start(IOService *provider)
     note("V6f first-timeout snapshot armed passive console IORegistry before-cleanup");
     note("V8 bounded AVC High geometry1920x1080 aperture256 Ncap16 scratch4");
     note("V9 HEVC Main/Main10 geometry3840x2160 aperture768 Ncap10 P010 sync8s candidate-unqualified");
+    note("V9c native-failure quarantine no-reopen no-cleanup-MMIO owning-task identity");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();

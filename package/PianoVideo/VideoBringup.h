@@ -108,6 +108,7 @@ class Bringup {
   unsigned doorbells = 0, txEvents = 0, rxEvents = 0, dbgChecks = 0, dbgErrors = 0, msgDrops = 0, watchdogSamples = 0;
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
+  int quarantineReason = kOk; // native safety latch; dependencies live until boot reset
   bool firstHfi = false;
   session::Layout layout;
   session::Result v4;
@@ -267,6 +268,7 @@ class Bringup {
   // ------------------------------------------------------------------------------------------------------------ V1 pieces
   int on()
   {
+    hw.note("V9c power-on reason level-%u lifecycle %u already-on %u",opt.level,lifecycleEvent,unsigned(pst.on));
     const uint64_t t0 = hw.nowUs();
     const int rc = power.on();
     const uint64_t us = hw.nowUs() - t0;
@@ -275,6 +277,7 @@ class Bringup {
   }
   int off()
   {
+    hw.note("V9c power-off reason level-%u lifecycle %u watchdog %u",opt.level,lifecycleEvent,unsigned(watchdogSeen != 0));
     const uint64_t t0 = hw.nowUs();
     const int rc = power.off();
     const uint64_t us = hw.nowUs() - t0;
@@ -411,6 +414,17 @@ class Bringup {
   // synchronize, then drop power and free memory. A failure retains DMA (and any available dependencies), never reports unloaded.
   int teardown()
   {
+    // A native firmware/session failure is not an ordinary idle transition.
+    // Do not touch failed hardware again (including diagnostic MMIO), collapse
+    // a NoC with unconfirmed work, or free its DMA on this path.
+    if (opt.level == 6 && (quarantineReason || watchdogSeen || rep.fsr)) {
+      teardownRc = quarantineReason ? quarantineReason : watchdogSeen ? kErrWatchdog : kErrFault;
+      quarantineReason = teardownRc;
+      hw.note("V9c quarantine reason %d watchdog %u fault %08x dma-held %u power-held %u no-cleanup-MMIO 1 reboot-required 1",
+              teardownRc,unsigned(watchdogSeen != 0),rep.fsr,unsigned(dmaHeld),unsigned(pst.on));
+      phase("native-quarantine",teardownRc);
+      return teardownRc;
+    }
     phase("release-begin", kOk);
     int un = kOk, faultRc = kOk, offRc = kOk;
     const bool hadPas = fst.loaded || fst.initDone;
@@ -424,6 +438,10 @@ class Bringup {
     queueTrace("before-teardown");
     sfrTrace("before-teardown");
     if (routed.bank) faultRc = checkFault();
+    if (opt.level == 6 && faultRc) {
+      quarantineReason = faultRc;
+      return teardown(); // the guard above logs without further hardware access
+    }
     if (!un && hadPas) {
       if (domainPowerReady()) un = firmware.unload();
       else un = kErrScm;
@@ -442,6 +460,7 @@ class Bringup {
     // No TLB operation after off(). Do not withdraw the buses after an unconfirmed detach or quiesce.
     if (!un && detached) {
       offRc = off();
+      if (opt.level == 6 && !offRc && pst.offWarnings) offRc = kErrOffCheck;
       phase("power-off", offRc);
       hw.note("V3 teardown power result %d warnings %u rails %u bus %u controller %u codec %u", offRc, pst.offWarnings,
               unsigned(pst.railsUp), unsigned(pst.busOn), unsigned(pst.ctrlGdsc), unsigned(pst.codecGdsc));
@@ -470,6 +489,7 @@ class Bringup {
     hw.note("V3 evidence: first-HFI %s version %u teardown pending; error %d step %d", firstHfi ? "passed" : "not passed",
             unsigned(rep.version), rc, stepNo);
     hw.note("V3 version error %d stage %d received %u (see CTRL/RX/SFR evidence)", rc, stepNo, unsigned(rep.version));
+    if (opt.level == 6) quarantineReason = rc;
     teardown();
     hw.note("V3 outcome first-HFI %s first-error %d stage %d teardown %d dma-held %u", firstHfi ? "PASS" : "FAIL", rc, stepNo,
             teardownRc, unsigned(dmaHeld));

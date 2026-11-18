@@ -130,6 +130,8 @@ struct Owner {
   int acquire(uint32_t *s) {if(!s)return -22;if(phase!=Idle||serial==0xffff)return -16;*s=id=0x56360000u|++serial;phase=Reserved;return 0;}
   bool start(uint32_t s) {if(!owns(s)||phase!=Reserved)return false;phase=Running;return true;}
   int closing(uint32_t s,bool loans) {if(!owns(s))return -22;if(loans)return -16;phase=Closing;return 0;}
-  void closed(bool held) {if(phase!=Closing)return;phase=held?Poisoned:Idle;id=0;}
+  // DMA release proves memory safety, not a healthy device. A failed session
+  // must never bootstrap a new physical core in this boot.
+  void closed(bool held,int error=0) {if(phase!=Closing)return;phase=(held||error)?Poisoned:Idle;id=0;}
 };
 } }
