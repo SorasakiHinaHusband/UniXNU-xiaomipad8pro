@@ -85,8 +85,12 @@
 // framework import need not expose the Tundra class aliases on a native boot.
 static void inventory(void)
 {
+    // QuickTime still queries the legacy type; keep that diagnostic comparison.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     NSArray *types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal,
                        AVCaptureDeviceTypeExternalUnknown];
+#pragma clang diagnostic pop
     for (AVCaptureDeviceType type in types) {
         NSArray *devices = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[type]
                             mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified].devices;
