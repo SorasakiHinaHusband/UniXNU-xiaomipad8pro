@@ -552,6 +552,9 @@ struct KernelHw {
   }
   bool dmaAlloc(Dma &d)
   {
+    static constexpr uint64_t arenaPhysicalMask = 0x0000000ffffff000ull;
+    const bool traceArena = d.session && d.arenaBytes == session::kAvcArenaBytes;
+    const uint64_t arenaTid = traceArena ? thread_tid(current_thread()) : 0;
     const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
     const unsigned arenaPages = d.session ? d.arenaBytes/4096 : 0;
     const uint64_t tableBytes = ((d.session ? vsmmu::sessionTablePages(d.arenaBytes) : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
@@ -563,18 +566,31 @@ struct KernelHw {
     ucMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), bytes, 0x0000000ffffff000ull);
     tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), tableBytes, 0x0000000fffffc000ull);
-    if (d.session) arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        IOOptionBits(kIODirectionInOut), d.arenaBytes, 0x0000000ffffff000ull);
+    if (d.session) {
+      if (traceArena) ::note("V9g arena diagnostic tid %llu factory begin bytes %u alignment-arg 1 mask %#llx",
+        (unsigned long long)arenaTid, d.arenaBytes, (unsigned long long)arenaPhysicalMask);
+      arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        IOOptionBits(kIODirectionInOut), d.arenaBytes, arenaPhysicalMask);
+      if (traceArena) ::note("V9g arena diagnostic tid %llu factory returned nonnull %u prior-owners-ready %u",
+        (unsigned long long)arenaTid, unsigned(arenaMem != nullptr),
+        unsigned(ledgerMem && ucMem && tableMem));
+    }
     if (!ledgerMem || !ucMem || !tableMem || (d.session && !arenaMem)) {
       ::note("V9e allocation refused arena %u metadata %llu table %llu owners ledger %u UC %u tables %u arena %u release-partial 1",
         d.arenaBytes,(unsigned long long)ledgerBytes,(unsigned long long)tableBytes,
         unsigned(ledgerMem!=nullptr),unsigned(ucMem!=nullptr),unsigned(tableMem!=nullptr),unsigned(arenaMem!=nullptr));
+      if (traceArena) ::note("V9g arena diagnostic tid %llu explicit prepare skipped", (unsigned long long)arenaTid);
       dmaFree(d); return false;
     }
     ledgerPrepared = ledgerMem->prepare() == kIOReturnSuccess;
     ucPrepared = ucMem->prepare() == kIOReturnSuccess;
     tablePrepared = tableMem->prepare() == kIOReturnSuccess;
-    if (d.session) arenaPrepared = arenaMem->prepare() == kIOReturnSuccess;
+    if (d.session) {
+      const IOReturn prepareResult = arenaMem->prepare();
+      arenaPrepared = prepareResult == kIOReturnSuccess;
+      if (traceArena) ::note("V9g arena diagnostic tid %llu explicit prepare result %#x",
+        (unsigned long long)arenaTid, unsigned(prepareResult));
+    }
     if (!ledgerPrepared || !ucPrepared || !tablePrepared || (d.session && !arenaPrepared)) { dmaFree(d); return false; }
     uint8_t *cached = static_cast<uint8_t *>(ucMem->getBytesNoCopy());
     bzero(cached, bytes); ::cleanToPoc(cached, bytes);
@@ -718,7 +734,9 @@ extern "C" int piano_video_native_open(uint32_t *sessionId)
   const int rc = gNativeState.acquire(sessionId);
   const unsigned phase = unsigned(gNativeState.phase);
   IOLockUnlock(gNativeLock);
+  const uint64_t openUs = rc == 0 ? nowUs() : 0;
   note("V5 native reserve result %d session %08x firmware-open 0", rc, rc ? 0 : *sessionId);
+  if (!rc) note("V9g native open session %08x uptime-us %llu", *sessionId, (unsigned long long)openUs);
   if (rc) note("V9c cycle refused reason reserve-%d phase %u no-bootstrap 1",rc,phase);
   return rc;
 }
