@@ -726,7 +726,7 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
 {
   // Validate again at the internal boundary before powering or using DMA.
   codec::Picture picture;
-  if (!piano_video_native_ready() || !format || !codec::normalized(bytes,size,*format,&picture)) return -22;
+  if (!piano_video_native_ready() || !format || !codec::nativeAdmitted(*format) || !codec::normalized(bytes,size,*format,&picture)) return -22;
   IOLockLock(gNativeLock);
   const bool ours=gNativeState.owns(sid);
   IOLockUnlock(gNativeLock);
@@ -929,6 +929,7 @@ bool PianoVideo::start(IOService *provider)
     note("V8 bounded AVC High geometry1920x1080 aperture256 Ncap16 scratch4");
     note("V9 HEVC Main/Main10 geometry3840x2160 aperture768 Ncap10 P010 sync8s candidate-unqualified");
     note("V9c native-failure quarantine no-reopen no-cleanup-MMIO owning-task identity");
+    note("V9d HEVC admission1080 level120 before-native no4K quarantine-preserved");
   }
   if (bootArg("piano-video-vt", 0)) {
     const int vt = piano_video_vt_attach();

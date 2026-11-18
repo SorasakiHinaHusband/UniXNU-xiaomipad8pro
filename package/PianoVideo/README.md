@@ -80,6 +80,8 @@ V5a tool: `bash tooling/native/build-video-v5a.sh` builds an ordinary signed arm
 checks fixture and active-row hashing without querying VT; `--qualify` requires hardware and paravirtual decoding and
 checks dcan, exactly one IOSurface-backed 420v golden callback, unsupported input, terminal finish and safe invalidate.
 These host tests and implementation claims are not tablet acceptance or general AVC/HEVC playback support.
+Native HEVC admission is limited to1080p/Level4 while the4K cold-reopen stall is investigated. Wider streams are declined
+before a hardware reservation; the full parser and768MiB/N10 layout remain for analysis. Native failure quarantine stays active.
 
 V6 qualification: `bash tooling/native/build-video-v6.sh` compiles/signs the tool and audits both owned IP/IBP clips.
 Where private PV helpers are exported, it also runs actual Apple serialization of all 120 samples through the production

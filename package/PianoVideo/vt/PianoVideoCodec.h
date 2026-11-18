@@ -5,6 +5,9 @@
 #include "PianoVideoAVC.h"
 #include "PianoVideoHEVC.h"
 namespace pianovideo { namespace codec {
+// Experimental native envelope. Keep the wider parser for offline analysis;
+// unqualified 4K cold reopen must be declined before a hardware lease starts.
+constexpr uint32_t kHevcMaxLevel = 120, kHevcMaxWidth = 1920, kHevcMaxHeight = 1080, kHevcMaxCodedHeight = 1088;
 struct Config {
   avc::Config avc; hevc::Config hevc; avc::Sps s; bool hevcMode = false; uint32_t depth = 8;
   bool isHevc() const { return hevcMode; }
@@ -17,6 +20,10 @@ struct Config {
   uint32_t format() const { return hevcMode ? 0x68766331u : 0x61766331u; } // hvc1 / avc1
   uint32_t pixelFormat() const { return depth == 10 ? 0x78343230u : 0x34323076u; } // x420 / 420v
 };
+inline bool nativeAdmitted(const Config &c) {
+  return c.valid() && (!c.isHevc() || (c.s.width <= kHevcMaxWidth && c.s.height <= kHevcMaxHeight &&
+    c.s.codedWidth <= kHevcMaxWidth && c.s.codedHeight <= kHevcMaxCodedHeight && c.s.level <= kHevcMaxLevel));
+}
 inline bool parseAvc(const uint8_t *p, uint32_t n, Config &c) {
   memset(&c, 0, sizeof(c)); c.depth = 8;
   if (!avc::config(p, n, c.avc)) return false; c.s = c.avc.s; return true;

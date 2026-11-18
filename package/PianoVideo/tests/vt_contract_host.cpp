@@ -161,6 +161,19 @@ static void hevcContractTests() {
     --d.width;CHECK(!vtcontract::format(d,&report,&parsed));++d.width;
     const auto original=extensions;extensions.insert(extensions.end()-4,original.begin(),original.end()-4);
     d.extensions=extensions.data();d.extensionsSize=uint32_t(extensions.size());CHECK(!vtcontract::format(d,&report,&parsed));
+    // The parser keeps accepting the wider syntax for analysis, while the
+    // native admission boundary must reject it before a hardware lease.
+    for(const auto &outside:{hevcfixture::Fixture(depth,true,3840,2160,183),
+                            hevcfixture::Fixture(depth,true,3840,2160,120),
+                            hevcfixture::Fixture(depth,true,1920,1080,183)}) {
+      codec::Config wide;CHECK(codec::parseHevc(outside.hvcc.data(),uint32_t(outside.hvcc.size()),wide));
+      CHECK(!codec::nativeAdmitted(wide));
+      std::vector<uint8_t> ext;appendAtom(ext,cc("hvcC"),outside.hvcc.data(),uint32_t(outside.hvcc.size()));
+      ImageDescription large;large.codec=cc("hvc1");large.width=wide.s.width;large.height=wide.s.height;
+      large.extensions=ext.data();large.extensionsSize=uint32_t(ext.size());
+      CHECK(!vtcontract::format(large,&report,&parsed)&&!strcmp(report.decision,"hevc-native-envelope"));
+    }
+    CHECK(codec::nativeAdmitted(cfg));
   }
 }
 // Independent reader for the bplist object graph emitted to Apple. Check the
@@ -197,8 +210,8 @@ static void capabilitiesTests(){
     const auto per=view.key(cap,"VTPerProfileSupport");
     for(const char *profile:hevc?std::vector<const char *>{"1","2"}:std::vector<const char *>{"66","77","100"}){
       const auto support=view.key(per,profile);CHECK(bytes[view.offset(view.key(support,"VTIsHardwareAccelerated"))]==9);
-      CHECK(view.integer(view.key(support,"VTMaxDecodeLevel"))==(hevc?183:42));
-      CHECK(view.integer(view.key(support,"VTMaxPlaybackLevel"))==(hevc?183:42));
+      CHECK(view.integer(view.key(support,"VTMaxDecodeLevel"))==(hevc?120:42));
+      CHECK(view.integer(view.key(support,"VTMaxPlaybackLevel"))==(hevc?120:42));
     }
   }
 }

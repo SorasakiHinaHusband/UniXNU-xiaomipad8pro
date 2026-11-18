@@ -23,9 +23,10 @@ int main(){
   auto integer=reinterpret_cast<Int>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendSInt64"));
   auto flags=reinterpret_cast<UInt>(dlsym(RTLD_DEFAULT,"VTParavirtualizationMessageAppendUInt32"));
   const bool serializer=create&&append&&integer&&flags;
-  unsigned formats=0,samples=0;
-  for(unsigned depth:{8u,10u}){
-    hevcfixture::Fixture f(depth);const uint8_t *sets[]={f.vps.data(),f.sps.data(),f.pps.data()};
+  unsigned formats=0,samples=0,declined=0;
+  for(unsigned depth:{8u,10u})for(unsigned envelope=0;envelope<3;++envelope){
+    hevcfixture::Fixture f(depth,true,envelope==1?3840:1920,envelope==1?2160:1080,envelope?183:120);
+    const uint8_t *sets[]={f.vps.data(),f.sps.data(),f.pps.data()};
     const size_t sizes[]={f.vps.size(),f.sps.size(),f.pps.size()};CMFormatDescriptionRef format=nullptr;
     assert(!CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault,3,sets,sizes,4,nullptr,&format));
     assert(CMFormatDescriptionGetMediaSubType(format)==cc("hvc1"));
@@ -38,6 +39,16 @@ int main(){
     pianovideo::codec::Config config;contract::FormatReport report;
     const bool accepted=contract::formatRequest(message.data(),uint32_t(message.size()),report,&config);
     std::printf("V9_REAL_FORMAT depth=%u accepted=%u codec=%08x bytes=%zu decision=%s\n",depth,unsigned(accepted),report.codec,bytes,report.decision);
+    if(envelope){
+      assert(!accepted&&!strcmp(report.decision,"hevc-native-envelope"));
+      // dcan and dsta must use the same early rejection, including when a
+      // caller bypasses inventory capability filtering.
+      put32(message.data()+8,cc("dcan"));
+      Header header;assert(vtwire::header(message.data(),uint32_t(message.size()),header)&&header.type==cc("dcan"));
+      assert(!contract::formatRequest(message.data(),uint32_t(message.size()),report,&config));
+      assert(!strcmp(report.decision,"hevc-native-envelope"));
+      ++declined;CFRelease(format);continue;
+    }
     assert(accepted&&config.depth==depth&&config.s.width==1920&&config.s.height==1080);++formats;
     std::vector<uint8_t> au;hevcfixture::append(au,f.slice());CMBlockBufferRef data=nullptr;
     assert(!CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,nullptr,au.size(),kCFAllocatorDefault,nullptr,0,au.size(),0,&data));
@@ -58,5 +69,6 @@ int main(){
     }
     CFRelease(sample);CFRelease(format);
   }
-  std::printf("V9_REAL_SERIALIZER formats=%u samples=%u private-sample-wire=%s no-VT-session=1\n",formats,samples,serializer?"PASS":"SKIP-unexported");
+  assert(formats==2&&declined==4);
+  std::printf("V9d_REAL_SERIALIZER formats=%u declined=%u samples=%u private-sample-wire=%s no-VT-session=1\n",formats,declined,samples,serializer?"PASS":"SKIP-unexported");
 }

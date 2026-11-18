@@ -20,24 +20,24 @@ struct Writer {
     return out;
   }
 };
-static void ptl(Writer &w, unsigned depth) {
+static void ptl(Writer &w, unsigned depth, unsigned level = 120) {
   w.put(0, 2); w.put(0, 1); w.put(depth == 10 ? 2 : 1, 5); w.put(depth == 10 ? 0x20000000 : 0x40000000, 32);
-  w.put(0x9000, 16); w.put(0, 32); w.put(120, 8);
+  w.put(0x9000, 16); w.put(0, 32); w.put(level, 8);
 }
 static void ordering(Writer &w) { w.put(0, 1); w.ue(5); w.ue(2); w.ue(0); }
 struct Fixture {
   Bytes vps, sps, pps, hvcc; unsigned depth; bool wpp;
-  Fixture(unsigned bits = 8, bool wave = true, unsigned width = 1920, unsigned height = 1080) : depth(bits), wpp(wave) {
-    Writer v; v.put(0, 4); v.put(3, 2); v.put(0, 6); v.put(0, 3); v.put(1, 1); v.put(0xffff, 16); ptl(v, depth);
+  Fixture(unsigned bits = 8, bool wave = true, unsigned width = 1920, unsigned height = 1080, unsigned level = 120) : depth(bits), wpp(wave) {
+    Writer v; v.put(0, 4); v.put(3, 2); v.put(0, 6); v.put(0, 3); v.put(1, 1); v.put(0xffff, 16); ptl(v, depth, level);
     ordering(v); v.put(0, 6); v.ue(0); v.put(0, 1); v.put(0, 1); v.end(); vps = v.nal(32);
-    Writer s; s.put(0, 4); s.put(0, 3); s.put(1, 1); ptl(s, depth); s.ue(0); s.ue(1); s.ue(width); s.ue(height); s.put(0, 1);
+    Writer s; s.put(0, 4); s.put(0, 3); s.put(1, 1); ptl(s, depth, level); s.ue(0); s.ue(1); s.ue(width); s.ue(height); s.put(0, 1);
     s.ue(depth - 8); s.ue(depth - 8); s.ue(4); ordering(s); s.ue(0); s.ue(3); s.ue(0); s.ue(3); s.ue(0); s.ue(0);
     s.put(0, 1); s.put(1, 1); s.put(0, 1); s.put(0, 1); s.ue(1); s.ue(1); s.ue(0); s.ue(0); s.put(1, 1);
     s.put(0, 1); s.put(0, 1); s.put(1, 1); s.put(0, 1); s.put(0, 1); s.end(); sps = s.nal(33);
     Writer p; p.ue(0); p.ue(0); p.put(0, 1); p.put(0, 1); p.put(0, 3); p.put(0, 1); p.put(0, 1); p.ue(0); p.ue(0); p.se(0);
     p.put(0, 1); p.put(0, 1); p.put(0, 1); p.se(0); p.se(0); p.put(0, 1); p.put(0, 1); p.put(0, 1); p.put(0, 1);
     p.put(0, 1); p.put(wpp, 1); p.put(0, 1); p.put(0, 1); p.put(0, 1); p.put(0, 1); p.ue(0); p.put(0, 1); p.put(0, 1); p.end(); pps = p.nal(34);
-    hvcc = {1, uint8_t(depth == 10 ? 2 : 1), uint8_t(depth == 10 ? 0x20 : 0x40), 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120,
+    hvcc = {1, uint8_t(depth == 10 ? 2 : 1), uint8_t(depth == 10 ? 0x20 : 0x40), 0, 0, 0, 0x90, 0, 0, 0, 0, 0, uint8_t(level),
       0xf0, 0, 0xfc, 0xfd, uint8_t(0xf8 + depth - 8), uint8_t(0xf8 + depth - 8), 0, 0, 0x0f, 3};
     for (const auto &n : {vps, sps, pps}) { hvcc.push_back(0x80 | (n[0] >> 1)); hvcc.push_back(0); hvcc.push_back(1); hvcc.push_back(n.size() >> 8); hvcc.push_back(n.size()); hvcc.insert(hvcc.end(), n.begin(), n.end()); }
   }

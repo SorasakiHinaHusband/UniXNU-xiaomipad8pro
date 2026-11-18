@@ -861,7 +861,18 @@ without waiting for a future admission, and answers the original request only af
 send failure and the eight-second request deadline have one completion owner. Async AVC retains its four published/eight
 credit window and completion-barrier finish.
 
-HEVC capability level183 is the implemented admission ceiling, not a measured4K240 playback claim. The single V9 RAM
+V9d limits native HEVC admission to1920×1080, coded height≤1088 and Apple level≤120 (Level4), consistently in inventory,
+dcap, dsta/dcan and the native-submit boundary. The wider parser and768MiB/N10 backing remain available for analysis;
+4K/Level6.1 is declined with UnsupportedDataFormat before a native reservation, PAS or HFI. This is a conservative
+experimental envelope, not1080p HEVC tablet qualification. The single V9 RAM
 qualification first exercises an owned stock QuickTime Main10 fixture with native/client identities, geometry, teardown
 and optical motion, then an AVC regression and Main8 on the same boot. Aerial selection, TSA/retiming, sustained cadence,
 colour and looping remain separate runtime acceptance checks; the installed static wallpaper stays in place.
+
+In the saved V9c firmware-addon run, WallpaperAerialsExtension's first4K Main10 session delivered one native frame and
+closed successfully. Its next session returned the same valid PSC (depth10/profile2/level11/tier1/N8), then stopped
+consuming commands before OPB_ENABLE. The Output-stage RAW START wait returned host timeout−20; no firmware error packet
+or code was returned. N8 and the actual buffer sizes fit the768MiB/N10 layout. The physical cause of the firmware stall
+remains unknown. V9c quarantine retained dependencies and prevented another bootstrap without a tablet reset; V9d keeps
+that containment. Its early decline is intended to leave ordinary VT fallback available. Wallpaper motion and the actual
+fallback factory must be measured separately; a zero native frame count does not qualify aerial playback.

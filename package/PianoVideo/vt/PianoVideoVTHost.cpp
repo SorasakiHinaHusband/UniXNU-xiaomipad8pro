@@ -396,6 +396,8 @@ bool descriptor(Client *c,const Header &h,const uint8_t *m,uint32_t n,contract::
   IOLog("PianoVideoVT V5b: format %c%c%c%c request %llu pid %d fds-type %08x bytes %u declared %u codec %08x size %ux%u extensions %u atoms %u terminal-zero4 %u avcC %u decision %s\n",
     int(h.type>>24),int((h.type>>16)&255),int((h.type>>8)&255),int(h.type&255),h.request,c->pid,
     r.parameterType,r.bytes,r.declared,r.codec,r.width,r.height,r.extensionBytes,r.atomBytes,unsigned(r.terminalZero),r.avcBytes,r.decision);
+  if(!valid&&!strcmp(r.decision,"hevc-native-envelope"))
+    IOLog("PianoVideoVT V9d: HEVC decline pid %d request %llu size %ux%u native-reserve 0 before-PAS-HFI 1 status %d\n",c->pid,h.request,r.width,r.height,kUnsupported);
   return valid;
 }
 void attributes(Session *s) {
@@ -460,7 +462,7 @@ void capabilities(Client *c,const Header &h,const uint8_t *m,uint32_t n){
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[2048];
   const int root=contract::capabilities(*p,uint32_t(codec)==cc("hvc1"));Writer w(b,sizeof b);
   w.header(h.type,FlagReply,h.uuid,h.request);w.s32(cc(",err"),0);w.u32(cc(",ver"),6);w.plist(cc(",dca"),*p,root);send(c,w,b);delete p;
-  IOLog("PianoVideoVT V9: dcap codec %08x version6 metadata-only native-owner-unchanged 1 HEVC-admission-level183 runtime-unqualified 1\n",uint32_t(codec));
+  IOLog("PianoVideoVT V9d: dcap codec %08x version6 metadata-only native-owner-unchanged 1 HEVC-admission-level120 geometry1920x1080 runtime-unqualified 1\n",uint32_t(codec));
 }
 void properties(Client *c,const Header &h,bool value) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[512];int root;

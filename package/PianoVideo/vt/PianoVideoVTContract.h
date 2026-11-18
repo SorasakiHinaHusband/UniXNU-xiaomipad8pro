@@ -14,13 +14,13 @@ constexpr uint32_t kMaxMessageBytes = 4u << 20;
 constexpr uint32_t kMaxSurfaceBytes = 64u << 20; // bounded NV12/P010 task wiring
 constexpr uint32_t kParameterBytes = 35; // start4+SPS22+start4+PPS5
 // Same metadata for inventory registration and the global dcap query. Apple
-// profile/level numbers are deliberately separate from the HFI enums. HEVC183
-// is the implemented admission ceiling; realtime4K240 remains unqualified.
+// profile/level numbers are deliberately separate from the HFI enums. The
+// experimental HEVC envelope excludes unqualified 4K cold reopen.
 inline int capabilities(vtwire::Plist &p,bool hevc) {
   const int profileValues[]={p.integer(hevc?1:66),p.integer(hevc?2:77),hevc?-1:p.integer(100)};
   const int profiles=p.array(profileValues,hevc?2:3);
   const int keys[]={p.string("VTIsHardwareAccelerated"),p.string("VTMaxDecodeLevel"),p.string("VTMaxPlaybackLevel")};
-  const int values[]={p.boolean(true),p.integer(hevc?183:42),p.integer(hevc?183:42)};
+  const int values[]={p.boolean(true),p.integer(hevc?codec::kHevcMaxLevel:42),p.integer(hevc?codec::kHevcMaxLevel:42)};
   const int support=p.dict(keys,values,3);
   const int perKeys[]={p.string(hevc?"1":"66"),p.string(hevc?"2":"77"),hevc?-1:p.string("100")};
   const int perValues[]={support,support,support};
@@ -278,6 +278,8 @@ inline bool formatParsed(const vtwire::ImageDescription &d, FormatReport *report
   r.decision = hevc?"hvcC-configuration":"avcC-configuration";
   if (!(hevc?codec::parseHevc(parameter.body,parameter.size,parsed):codec::parseAvc(parameter.body,parameter.size,parsed)) ||
       d.width != parsed.s.width || d.height != parsed.s.height) return false;
+  r.decision = "hevc-native-envelope";
+  if (!codec::nativeAdmitted(parsed)) return false;
   Atom protectedAtom;
   r.decision = "protected-or-codec-mismatch";
   if (find(d.extensions, r.atomBytes, cc("sinf"), protectedAtom) ||
