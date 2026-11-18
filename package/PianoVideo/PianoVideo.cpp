@@ -780,82 +780,93 @@ extern "C" int piano_video_native_open(uint32_t *sessionId)
   return rc;
 }
 
+extern "C" int piano_video_native_prepare(uint32_t sid, const codec::Config *format)
+{
+  // All work here depends on the validated format, not an access unit. VT's
+  // synchronous StartSession must finish it before item/window eligibility.
+  if (!piano_video_native_ready() || !format || !codec::nativeAdmitted(*format)) return -22;
+  IOLockLock(gNativeLock);
+  const bool ours=gNativeState.owns(sid);
+  IOLockUnlock(gNativeLock);
+  if (!ours || gNativeOwner) return -22;
+  auto *owner=new NativeOwner;
+  if (!owner) return kErrNoMemory;
+  const uint64_t prepareUs=nowUs();
+  gNativeOwner=owner;owner->config=*format;
+  note("V9c cycle begin reason session-format session %08x previous %08x previous-close %d previous-teardown %d",
+       sid,gPreviousNative.sid,gPreviousNative.closeRc,gPreviousNative.teardownRc);
+  owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
+  owner->tx.history=&owner->history;owner->tx.streaming=true;
+  owner->tx.sessionId=sid;owner->tx.checkGolden=false;
+  owner->tx.accessUnit=nullptr;owner->tx.accessUnitBytes=0;
+  int rc=0;
+  const uint32_t codedWidth=format->isHevc()?(format->s.codedWidth+31)&~31u:format->s.codedWidth;
+  const uint32_t codedHeight=format->isHevc()?(format->s.codedHeight+31)&~31u:format->s.codedHeight;
+  owner->core.avcWidth=codedWidth;owner->core.avcHeight=codedHeight;
+  owner->core.hevc=format->isHevc();owner->core.bitdepth=format->depth;
+  auto &core=owner->core;
+  const bool resident=core.firstHfi;
+  if (resident) {
+    rc=core.prepareResidentSession();
+    if (!rc) {
+      bzero(const_cast<uint8_t *>(core.dma.arena),core.layout.arenaBytes());
+      core.hw.barrier();
+    }
+  } else {
+    Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
+    rc=core.run(options);
+  }
+  owner->prepared=rc==0;
+  nativeStartTrace(core,sid,resident,rc);
+  if(!rc){
+    note("V9h boot reservation leased session %08x backing %u layout %u resident %u",
+         sid,core.dma.arenaBytes,core.layout.arenaBytes(),unsigned(resident));
+    owner->tx.expectedPoc=format->s.pocType;
+    owner->tx.expectedProfile=format->hfiProfile();
+    owner->tx.expectedLevel=format->hfiLevel();
+    owner->tx.expectedDepth=format->depth;owner->tx.expectedTier=format->hfiTier();
+    owner->tx.psc.poc=owner->tx.expectedPoc;
+    owner->tx.psc.profile=owner->tx.expectedProfile;
+    owner->tx.psc.level=owner->tx.expectedLevel;
+    owner->tx.psc.depth=(format->depth<<16)|format->depth;owner->tx.psc.tier=format->hfiTier();
+    owner->tx.activeWidth=format->s.width;owner->tx.activeHeight=format->s.height;
+    owner->tx.psc.resolution=(codedWidth<<16)|codedHeight;
+    owner->tx.psc.crop[0]=(format->s.left<<16)|format->s.top;
+    owner->tx.psc.crop[1]=((format->s.right+codedWidth-format->s.codedWidth)<<16)|(format->s.bottom+codedHeight-format->s.codedHeight);
+    owner->tx.psc.color=format->s.color;
+    owner->tx.initialPsc=owner->tx.psc;
+    if(format->isHevc())note("V9e HEVC bounded Main/Main10 backing %u reserved %u Ncap10 active %ux%u coded %ux%u profile %u level %u tier %u depth %u scratch4",
+      owner->core.layout.arenaBytes(),owner->core.layout.bytes,format->s.width,format->s.height,codedWidth,codedHeight,
+      format->hfiProfile(),format->hfiLevel(),format->hfiTier(),format->depth);
+    else note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
+      format->s.codedWidth,format->s.codedHeight,format->hfiProfile(),format->hfiLevel());
+    // Record the real OPEN/input side effects even if no AU ever arrives.
+    owner->attempted=true;
+    rc=owner->tx.prepareInput();
+  }
+  if(rc){owner->error=rc;nativeSnapshot(*owner,false);}
+  note("V9j eager-session input-ready session %08x status %d elapsed-us %llu before-dsta-reply 1 ETB %u",
+       sid,rc,(unsigned long long)(nowUs()-prepareUs),owner->tx.r.etb);
+  return rc;
+}
+
 extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t token,
                                          const codec::Config *format)
 {
-  // Validate again at the internal boundary before powering or using DMA.
   codec::Picture picture;
   if (!piano_video_native_ready() || !format || size > session::kInputBytes ||
       !codec::nativeAdmitted(*format) || !codec::normalized(bytes,size,*format,&picture)) return -22;
   IOLockLock(gNativeLock);
   const bool ours=gNativeState.owns(sid);
   IOLockUnlock(gNativeLock);
-  if(!ours)return -22;
   NativeOwner *owner=gNativeOwner;
-  if(owner&&!owner->config.same(*format))return -22;
+  if(!ours || !owner || !owner->prepared || owner->error || !owner->config.same(*format))return -22;
   int rc=0;
-  if(!owner){
-    if(!picture.idr)return -22;
-    owner=new NativeOwner;
-    if(!owner)return kErrNoMemory;
-    gNativeOwner=owner;owner->config=*format;
-    note("V9c cycle begin reason first-IDR session %08x previous %08x previous-close %d previous-teardown %d",
-         sid,gPreviousNative.sid,gPreviousNative.closeRc,gPreviousNative.teardownRc);
-    owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
-    owner->tx.history=&owner->history;
-    owner->tx.streaming=true;
-    if (!owner->tx.nativeInput(sid,bytes,size,token)) {
-      owner->error=kErrArgument;
-      return owner->error;
-    }
-    const uint32_t codedWidth=format->isHevc()?(format->s.codedWidth+31)&~31u:format->s.codedWidth;
-    const uint32_t codedHeight=format->isHevc()?(format->s.codedHeight+31)&~31u:format->s.codedHeight;
-    owner->core.avcWidth=codedWidth;owner->core.avcHeight=codedHeight;
-    owner->core.hevc=format->isHevc();owner->core.bitdepth=format->depth;
-    auto &core=owner->core;
-    const bool resident=core.firstHfi;
-    if (resident) {
-      rc=core.prepareResidentSession();
-      if (!rc) {
-        bzero(const_cast<uint8_t *>(core.dma.arena),core.layout.arenaBytes());
-        core.hw.barrier();
-      }
-    } else {
-      Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
-      rc=core.run(options);
-    }
-    owner->prepared=rc==0;
-    nativeStartTrace(core,sid,resident,rc);
-    if(!rc){
-      note("V9h boot reservation leased session %08x backing %u layout %u resident %u",
-           sid,core.dma.arenaBytes,core.layout.arenaBytes(),unsigned(resident));
-      owner->tx.expectedPoc=format->s.pocType;
-      owner->tx.expectedProfile=format->hfiProfile();
-      owner->tx.expectedLevel=format->hfiLevel();
-      owner->tx.expectedDepth=format->depth;owner->tx.expectedTier=format->hfiTier();
-      owner->tx.psc.poc=owner->tx.expectedPoc;
-      owner->tx.psc.profile=owner->tx.expectedProfile;
-      owner->tx.psc.level=owner->tx.expectedLevel;
-      owner->tx.psc.depth=(format->depth<<16)|format->depth;owner->tx.psc.tier=format->hfiTier();
-      owner->tx.activeWidth=format->s.width;owner->tx.activeHeight=format->s.height;
-      owner->tx.psc.resolution=(codedWidth<<16)|codedHeight;
-      owner->tx.psc.crop[0]=(format->s.left<<16)|format->s.top;
-      owner->tx.psc.crop[1]=((format->s.right+codedWidth-format->s.codedWidth)<<16)|(format->s.bottom+codedHeight-format->s.codedHeight);
-      owner->tx.psc.color=format->s.color;
-      owner->tx.initialPsc=owner->tx.psc;
-      if(format->isHevc())note("V9e HEVC bounded Main/Main10 backing %u reserved %u Ncap10 active %ux%u coded %ux%u profile %u level %u tier %u depth %u scratch4",
-        owner->core.layout.arenaBytes(),owner->core.layout.bytes,format->s.width,format->s.height,codedWidth,codedHeight,
-        format->hfiProfile(),format->hfiLevel(),format->hfiTier(),format->depth);
-      else note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
-        format->s.codedWidth,format->s.codedHeight,format->hfiProfile(),format->hfiLevel());
-      owner->attempted=true;
-      rc=owner->tx.transaction();
-      if(!rc){IOLockLock(gNativeLock);gNativeState.start(sid);IOLockUnlock(gNativeLock);}
-    }
-    if(rc){
-      owner->error=rc;
-      nativeSnapshot(*owner,false);
-    }
+  if(!owner->tx.r.etb){
+    if(!picture.idr || !owner->tx.nativeInput(sid,bytes,size,token))return -22;
+    rc=owner->tx.transaction();
+    if(!rc){IOLockLock(gNativeLock);gNativeState.start(sid);IOLockUnlock(gNativeLock);}
+    if(rc){owner->error=rc;nativeSnapshot(*owner,false);}
   }else rc=owner->tx.streamSubmit(bytes,size,token);
   if(!rc){char digest[65];hashBytes(bytes,size,digest);
     note("V6 native submit session %08x token %llu bytes %u SHA256 %s persistent 1",sid,(unsigned long long)token,size,digest);}

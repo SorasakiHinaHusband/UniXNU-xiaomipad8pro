@@ -84,6 +84,11 @@ These host tests and implementation claims are not tablet acceptance or general 
 Native HEVC admission is limited to1080p/Level4 while the4K cold-reopen stall is investigated. Wider streams are declined
 before a hardware reservation; the full parser and768MiB/N10 layout remain for analysis. Native failure quarantine stays active.
 
+Native StartSession prepares the validated format, core and HFI input port before replying to VT. The first real IDR then
+supplies input for the existing PSC/output setup; preparation never submits a fixture or starts output. An idle prepared
+session is pumped without a picture deadline and closes through input STOP then CLOSE even if no AU arrives. This startup
+ordering is host-checked; its effect on QuickTime's opening transition still needs tablet verification.
+
 V6 qualification: `bash tooling/native/build-video-v6.sh` compiles/signs the tool and audits both owned IP/IBP clips.
 Where private PV helpers are exported, it also runs actual Apple serialization of all 120 samples through the production
 parser. On 27.3 those helpers are local: the offline audit reports SKIP, and actual target serialization is exercised by

@@ -519,6 +519,10 @@ static void hevcProtocolTests() {
     tx.expectedProfile=depth==10?2:0;tx.expectedLevel=4;tx.expectedTier=0;
     tx.psc.resolution=0x01400100;tx.psc.depth=(depth<<16)|depth;tx.psc.profile=tx.expectedProfile;
     tx.psc.level=4;tx.psc.tier=0;tx.initialPsc=tx.psc;
+    tx.sessionId=0x5635abcd;tx.checkGolden=false;tx.accessUnit=nullptr;tx.accessUnitBytes=0;
+    CHECK(tx.prepareInput()==0 && p.inputCount==0 && !p.raw && tx.ledger.pending==0);
+    p.hw.clock+=10000000;
+    CHECK(tx.pump()==0 && tx.deadline==UINT64_MAX);
     CHECK(tx.nativeInput(0x5635abcd,kAccessUnit,sizeof kAccessUnit,kTimestamp));
     CHECK(tx.transaction()==0 && tx.pump()==0);
     CHECK(tx.psc.n==6 && tx.psc.returned==0x7ae && tx.r.psc==1 && tx.r.decoded==1);

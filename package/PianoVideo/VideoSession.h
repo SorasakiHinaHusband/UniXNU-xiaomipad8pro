@@ -213,11 +213,12 @@ public:
       psc.n && psc.n <= layout.maxN() && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
       (!(psc.returned & (1u << 7)) || (expectedProfile == 0 ? psc.profile <= 1 : psc.profile == expectedProfile)) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
   }
-  // Called only by the exclusive worker, before OPEN. Input validation is also
-  // enforced at the native API boundary before the V3 DMA/power preparation.
+  // The first AU may arrive after metadata-only input preparation. It cannot
+  // change an opened session's identity or replace already submitted input.
   bool nativeInput(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t callerToken)
   {
-    if (openSent || !sid || !bytes || !size || size > kInputBytes) return false;
+    if (r.error || cleanup || r.etb || !sid || !bytes || !size || size > kInputBytes ||
+        (openSent && (sid != sessionId || !inputStarted || r.stage != Input))) return false;
     sessionId = sid; token = callerToken; accessUnit = bytes; accessUnitBytes = size; checkGolden = false;
     return true;
   }
@@ -718,13 +719,13 @@ public:
     o.hw.note("V8 scratch set %u N %u COMV %u count %u general %u",set,n,layout.scratchSize(1,n),layout.scratchCount(),unsigned(layout.general));
     return 0;
   }
-  int transaction()
+  // Format/layout-only control path. No AU, frame credit or output port is
+  // submitted here; native StartSession waits for this before reporting ready.
+  int prepareInput()
   {
+    if (r.error) return r.error;
+    if (cleanup || openSent || inputStarted || r.etb) return kErrArgument;
     deadline = o.hw.nowUs() + 5000000;
-    if (checkGolden) o.hw.note("V4 evidence contract vid-v4a: bounded one-AU kernel AVC no-consumer");
-    if (checkGolden) o.hw.note("V4 fixture bytes %u SHA256 %s", unsigned(sizeof kAccessUnit), kAuSha);
-    else o.hw.note("V5 transaction caller-input session %08x token %llu bytes %u embedded-fixture 0", sessionId,
-                   (unsigned long long)token, accessUnitBytes);
     stage(Opening);
     const uint32_t sid = sessionId;
     if (tx(Open, 3, 0, 1, &sid, 1, true))
@@ -753,6 +754,21 @@ public:
     inputStarted = true;
     if (tx(Start, 3, 1, 0) || consumed())
       return r.error;
+    deadline = UINT64_MAX; // an idle prepared session is not a missing picture
+    return 0;
+  }
+  int transaction()
+  {
+    if (r.error) return r.error;
+    if (cleanup || r.etb || rawStarted || !accessUnit || !accessUnitBytes) return kErrArgument;
+    if (checkGolden) o.hw.note("V4 evidence contract vid-v4a: bounded one-AU kernel AVC no-consumer");
+    if (checkGolden) o.hw.note("V4 fixture bytes %u SHA256 %s", unsigned(sizeof kAccessUnit), kAuSha);
+    else o.hw.note("V5 transaction caller-input session %08x token %llu bytes %u embedded-fixture 0", sessionId,
+                   (unsigned long long)token, accessUnitBytes);
+    if (!inputStarted) {
+      if (const int rc = prepareInput()) return rc;
+    } else if (!openSent || r.stage != Input) return kErrArgument;
+    deadline = o.hw.nowUs() + 5000000;
     Buffer &input = *layout.find(Bitstream, 0);
     for (unsigned i = 0; i < accessUnitBytes; ++i)
       o.dma.arena[input.off + i] = accessUnit[i];

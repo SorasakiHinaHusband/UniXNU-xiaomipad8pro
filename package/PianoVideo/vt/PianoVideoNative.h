@@ -27,7 +27,10 @@ extern "C" {
 bool piano_video_native_ready(void);
 // Reserve the exclusive core without powering it. Native session IDs are fresh.
 int piano_video_native_open(uint32_t *session);
-// Worker-only. First submit prepares V3 once and starts the persistent session;
+// Metadata-only control path, before a successful VT StartSession reply. Opens
+// HFI and starts input, with no AU or output. Close also handles zero input.
+int piano_video_native_prepare(uint32_t session, const pianovideo::codec::Config *format);
+// Worker-only. First submit requires an IDR and completes PSC/output setup;
 // subsequent submissions return 1 for input back-pressure, without mutation.
 int piano_video_native_submit(uint32_t session, const uint8_t *bytes, uint32_t size, uint64_t token,
                               const pianovideo::codec::Config *format);

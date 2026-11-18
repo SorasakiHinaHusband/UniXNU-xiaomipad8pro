@@ -161,6 +161,39 @@ struct Fixture {
   void drain() {CHECK(tx.beginDrain()==0);pump();CHECK(tx.drainStatus()==1);}
   void close() {CHECK(tx.shutdown()==0);CHECK(peer.stops==2&&peer.closes==1&&tx.r.closed);}
 };
+static void preparedInputTests() {
+  // Session creation may finish well before its first compressed sample. It
+  // must not decode the default fixture, start output, or acquire a credit.
+  for(unsigned disposition=0;disposition<4;++disposition) {
+    Fixture f;f.tx.sessionId=f.sid;f.tx.accessUnit=nullptr;f.tx.accessUnitBytes=0;
+    CHECK(f.tx.prepareInput()==0 && f.tx.r.stage==Input);
+    CHECK(f.peer.opens==1 && f.tx.openSent && f.tx.inputStarted && !f.tx.rawStarted);
+    CHECK(!f.peer.etbs && !f.peer.ftbs && !f.peer.dpbs && !f.peer.drains && !f.tx.ledger.pending);
+    CHECK(f.tx.prepareInput()==kErrArgument); // no duplicate OPEN
+    f.peer.hw.clock+=10000000;
+    CHECK(f.tx.pump()==0 && f.tx.deadline==UINT64_MAX);
+    CHECK(!f.tx.nativeInput(f.sid+1,kAccessUnit,sizeof kAccessUnit,19));
+    if(disposition==0) {
+      CHECK(f.tx.nativeInput(f.sid,kAccessUnit,sizeof kAccessUnit,19));
+      CHECK(f.tx.transaction()==0 && f.peer.opens==1 && f.peer.etbs==1);
+      f.pump();f.releaseAll();f.close();
+      CHECK(f.tx.transaction()==kErrArgument);
+    } else if(disposition==1) {
+      CHECK(f.tx.shutdown(true)==0 && f.peer.stops==1 && f.peer.closes==1);
+      CHECK(!f.tx.r.stopRaw && f.tx.r.stopInput && f.tx.r.closed);
+      CHECK(!f.peer.etbs && !f.tx.ledger.accepted);
+      for(unsigned i=0;i<f.layout.used;++i)CHECK(!f.layout.buf[i].queued);
+      CHECK(!f.tx.nativeInput(f.sid,kAccessUnit,sizeof kAccessUnit,19));
+    } else {
+      if(disposition==2)f.peer.dropStop=true;
+      else f.peer.watchdogOnStop=true;
+      const int error=disposition==2?kErrHfiTimeout:kErrWatchdog;
+      CHECK(f.tx.shutdown(true)==error && f.peer.stops==1 && !f.peer.closes);
+      const auto commands=f.peer.headers.size();
+      CHECK(f.tx.shutdown(true)==error && f.peer.headers.size()==commands);
+    }
+  }
+}
 static void nativeCleanupFailureTests() {
   for(unsigned kind=0;kind<3;++kind) {
     Fixture f;f.start();f.pump();f.releaseAll();
@@ -572,7 +605,7 @@ static void passiveHardwareTests() {
   // Corrupt indices/size must never authorize an out-of-bounds pending-head read.
   m.mem.st(hfi::qhdr(0)+hfi::kQRead,size);diagnostic::Hardware bad;bad.capture(m);CHECK(!bad.headWords[0]);
 }
-int main() { nativeCleanupFailureTests();
+int main() { preparedInputTests();nativeCleanupFailureTests();
   stockReplyWindowTests();
   firstTimeoutObservationTests();passiveHardwareTests();
   ancillaryPictureTests();

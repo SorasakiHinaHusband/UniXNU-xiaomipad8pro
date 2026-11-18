@@ -271,7 +271,6 @@ bool answerAdmission(Session *s,pianovideo::stream::Record &f,uint64_t id,bool d
 }
 void worker(void *arg,wait_result_t){
   Session *s=static_cast<Session *>(arg);thread_set_thread_name(current_thread(),"piano-video-v6");
-  bool nativeStarted=false;
   for(;;){
     IOLockLock(s->lock);const bool stopping=s->stopping||s->firstError;IOLockUnlock(s->lock);if(stopping)break;
     IOLockLock(s->lock);
@@ -292,8 +291,9 @@ void worker(void *arg,wait_result_t){
     // must fail explicitly while there is still time to wake that caller.
     if(expired){failure(s,77,kDecodeError);break;}
     if(admissionStopped)break;
-    // This pump runs even while waiting for a guest surface or Demt ACK.
-    if(nativeStarted){const int rc=piano_video_native_poll(s->native,&s->frame);if(rc<0){failure(s,70,rc);break;}}
+    // StartSession already prepared input. Observe idle HFI errors too, before
+    // the first AU and while waiting for a guest surface or Demt ACK.
+    {const int rc=piano_video_native_poll(s->native,&s->frame);if(rc<0){failure(s,70,rc);break;}}
     IOLockLock(s->lock);const uint32_t stage=s->guest.type;const bool replied=s->guest.replied;
     const int replyError=s->replyError;const bool hasSurface=s->replyHasSurface;
     const uint32_t surfaceID=s->replySurfaceID;uint8_t uuid[16];memcpy(uuid,s->replyUuid,16);
@@ -361,7 +361,7 @@ void worker(void *arg,wait_result_t){
       const int rc=piano_video_native_submit(s->native,in.bytes,in.size,record.token,&s->config);
       if(rc<0){failure(s,70,rc);break;}
       if(!rc){
-        nativeStarted=true;IOFree(in.bytes,contract::kMaxAuBytes);in={};
+        IOFree(in.bytes,contract::kMaxAuBytes);in={};
         IOLockLock(s->lock);if(!s->stopping)record.phase=pianovideo::stream::Phase::Submitted;IOLockUnlock(s->lock);
       }
     }
@@ -461,8 +461,11 @@ int start(Session *s,const Header &h,const uint8_t *m,uint32_t n) {
   IOLockLock(s->lock);const bool started=s->started||s->stopping;IOLockUnlock(s->lock);if(started)return kBadState;
   contract::FormatReport r;if(!descriptor(s->client,h,m,n,r,&s->config)||s->config.format()!=s->selectedCodec)return kUnsupported;
   const int rc=piano_video_native_open(&s->native);if(rc)return kDecodeError;
+  if(piano_video_native_prepare(s->native,&s->config)){
+    s->closeError=piano_video_native_close(s->native);s->native=0;return kDecodeError;
+  }
   s->started=true;s->workerRunning=true;thread_t t=nullptr;
-  if(kernel_thread_start(worker,s,&t)!=KERN_SUCCESS){s->workerRunning=false;s->stopping=true;piano_video_native_close(s->native);s->native=0;return kNoMemory;}
+  if(kernel_thread_start(worker,s,&t)!=KERN_SUCCESS){s->workerRunning=false;s->stopping=true;s->closeError=piano_video_native_close(s->native);s->native=0;return kNoMemory;}
   thread_deallocate(t);attributes(s);
   if(!s->config.isHevc())IOLog("PianoVideoVT V8: dsta native session %u bounded-format %ux%u profile %u level %u progressive8bit420\n",s->native,s->config.s.width,s->config.s.height,s->config.s.profile,s->config.s.level);
   else IOLog("PianoVideoVT V9: dsta native session %u bounded-format %ux%u codec %08x profile %u level %u depth %u\n",s->native,s->config.s.width,s->config.s.height,s->config.format(),s->config.s.profile,s->config.s.level,s->config.depth);
