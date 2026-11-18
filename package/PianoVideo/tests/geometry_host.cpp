@@ -20,7 +20,7 @@ static constexpr Vector vectors[] = {
   {1920,1088,1920,1088,2088960,3133440,3153920,12533760,4311552,17244672,1217536,4054272},
 };
 static void verifyLayout(const Layout &l) {
-  CHECK(l.bytes < l.arenaBytes());
+  CHECK(l.bytes <= l.arenaBytes());
   uint32_t previousEnd = 0;
   for (unsigned i = 0; i < l.used; ++i) {
     const auto &b = l.buf[i];
@@ -62,7 +62,7 @@ static constexpr HevcVector hevcVectors[] = {
 static void verifyArena(const Layout &l) {
   const unsigned pageCount = l.arenaBytes() / 4096;
   const unsigned tableCount = vsmmu::sessionTablePages(l.arenaBytes());
-  CHECK(tableCount == (l.hevc ? 388u : 132u));
+  CHECK(tableCount == 4 + (l.hevc ? (l.bytes + 2097151) / 2097152 : 128));
   std::vector<uint64_t> words(tableCount * 512), pages(pageCount), uc(vsmmu::kUcPages);
   for (unsigned i = 0; i < pages.size(); ++i)
     pages[i] = kXnuDramBase + 0x100000000ull + uint64_t((i * 149u) % pageCount) * 4096;
@@ -86,7 +86,7 @@ static void verifyArena(const Layout &l) {
     CHECK(words[512 + ((kArenaBase >> 21) & 511u) + i] == vsmmu::tableDesc(t.pa + (4 + i) * 4096));
   CHECK(!buildArena(t, l, nullptr));
   const unsigned savedCount = t.pageCount;
-  t.pageCount = l.hevc ? vsmmu::kSessionTablePages : vsmmu::kMaxSessionTablePages;
+  t.pageCount = savedCount + 1;
   CHECK(!buildArena(t, l, pages.data()));
   t.pageCount = savedCount;
   const unsigned last = (l.buf[l.used - 1].off + l.buf[l.used - 1].capacity - 1) / 4096;
@@ -114,7 +114,9 @@ static void hevcTests() {
     Layout l;
     CHECK(l.initHevc(v.w, v.h, v.depth));
     const auto &g = l.hevcGeometry;
-    CHECK(l.general && l.hevc && !l.geometry.width && l.arenaBytes() == kArenaBytes);
+    CHECK(l.general && l.hevc && !l.geometry.width && l.arenaLimit() == kArenaBytes);
+    CHECK(l.arenaBytes() >= l.bytes && l.arenaBytes() - l.bytes < 2097152);
+    CHECK(!(l.arenaBytes() & 2097151));
     CHECK(l.maxN() == 10 && l.scratchCount() == 4 && l.used == 31);
     CHECK(g.width == v.w && g.height == v.h && g.bitDepth == v.depth);
     CHECK(g.stride == v.stride && g.scanlines == v.rows && g.comvPerPicture == v.motion);
@@ -129,6 +131,23 @@ static void hevcTests() {
       CHECK(a && b && a->capacity == l.scratchSize(i,10) && b->capacity == a->capacity && a->off != b->off);
     }
     verifyLayout(l);
+    verifyArena(l);
+  }
+  // The admitted 1080p budgets include all Ncap10 buffers and invalid guards,
+  // not the stream's SPS minimum or the first PSC's possibly smaller N.
+  for (unsigned depth : {8u,10u}) {
+    Layout l;
+    CHECK(l.initHevc(1920,1088,depth));
+    CHECK(l.bytes == (depth == 8 ? 154255360u : 196034560u));
+    CHECK(l.arenaBytes() == (depth == 8 ? 155189248u : 197132288u));
+    CHECK(vsmmu::sessionTablePages(l.arenaBytes()) == (depth == 8 ? 78u : 98u));
+    const unsigned span = l.arenaBytes();
+    // PSC adoption changes geometry/payload sizes, never reserved capacities.
+    CHECK(l.hevcGeometry.configure(1920,1080,depth));
+    l.find(Dpb,0)->size = l.hevcGeometry.dpb;
+    CHECK(l.arenaBytes() == span);
+    CHECK(l.init(1920,1088) && l.arenaBytes() == kAvcArenaBytes);
+    CHECK(l.initHevc(1920,1088,depth) && l.arenaBytes() == span);
   }
   // Literal budgets independently calculated for the two scratch generations,
   // both inputs and N split DPB/RAW pairs. Each capacity has its own 16 KiB guard.
@@ -167,12 +186,15 @@ static void hevcTests() {
   for (bool hevc : {false,true}) {
     Layout l;
     l.hevc = hevc;
+    const uint32_t limit = l.arenaLimit();
+    if(hevc) CHECK(!l.arenaBytes());
     CHECK(!l.add(Raw,0,0,2) && !l.add(Raw,0,UINT32_MAX,2));
     CHECK(!l.used && !l.bytes);
-    CHECK(l.add(Raw,0,l.arenaBytes() - 16384,2));
-    CHECK(l.bytes == l.arenaBytes() && !l.add(Raw,1,1,2) && l.used == 1);
+    CHECK(l.add(Raw,0,limit - 16384,2));
+    CHECK(l.bytes == limit && l.arenaBytes() == limit && !l.add(Raw,1,1,2) && l.used == 1);
     CHECK(!l.mapped((l.arenaBytes() - 16384) / 4096));
     l.bytes = UINT32_MAX;
+    if(hevc) CHECK(!l.arenaBytes());
     CHECK(!l.add(Raw,1,4096,2) && l.used == 1 && l.bytes == UINT32_MAX);
     l.bytes = 0; l.used = kSlots;
     CHECK(!l.add(Raw,1,4096,2) && l.used == kSlots && !l.bytes);

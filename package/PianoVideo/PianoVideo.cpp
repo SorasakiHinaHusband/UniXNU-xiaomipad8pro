@@ -566,7 +566,9 @@ struct KernelHw {
     if (d.session) arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut), d.arenaBytes, 0x0000000ffffff000ull);
     if (!ledgerMem || !ucMem || !tableMem || (d.session && !arenaMem)) {
-      ::note("V9 allocation refused arena %u metadata %llu table %llu release-partial 1",d.arenaBytes,(unsigned long long)ledgerBytes,(unsigned long long)tableBytes);
+      ::note("V9e allocation refused arena %u metadata %llu table %llu owners ledger %u UC %u tables %u arena %u release-partial 1",
+        d.arenaBytes,(unsigned long long)ledgerBytes,(unsigned long long)tableBytes,
+        unsigned(ledgerMem!=nullptr),unsigned(ucMem!=nullptr),unsigned(tableMem!=nullptr),unsigned(arenaMem!=nullptr));
       dmaFree(d); return false;
     }
     ledgerPrepared = ledgerMem->prepare() == kIOReturnSuccess;
@@ -765,8 +767,9 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
       owner->tx.psc.crop[1]=((format->s.right+codedWidth-format->s.codedWidth)<<16)|(format->s.bottom+codedHeight-format->s.codedHeight);
       owner->tx.psc.color=format->s.color;
       owner->tx.initialPsc=owner->tx.psc;
-      if(format->isHevc())note("V9 HEVC bounded Main/Main10 aperture768 Ncap10 active %ux%u coded %ux%u profile %u level %u tier %u depth %u scratch4",
-        format->s.width,format->s.height,codedWidth,codedHeight,format->hfiProfile(),format->hfiLevel(),format->hfiTier(),format->depth);
+      if(format->isHevc())note("V9e HEVC bounded Main/Main10 backing %u reserved %u Ncap10 active %ux%u coded %ux%u profile %u level %u tier %u depth %u scratch4",
+        owner->core.layout.arenaBytes(),owner->core.layout.bytes,format->s.width,format->s.height,codedWidth,codedHeight,
+        format->hfiProfile(),format->hfiLevel(),format->hfiTier(),format->depth);
       else note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
         format->s.codedWidth,format->s.codedHeight,format->hfiProfile(),format->hfiLevel());
       if(!owner->tx.nativeInput(sid,bytes,size,token))rc=kErrArgument;
@@ -927,7 +930,8 @@ bool PianoVideo::start(IOService *provider)
     note("V6c completion disposition AVC-known NOSHOW40 ancillary-ignored finish-sticky");
     note("V6f first-timeout snapshot armed passive console IORegistry before-cleanup");
     note("V8 bounded AVC High geometry1920x1080 aperture256 Ncap16 scratch4");
-    note("V9 HEVC Main/Main10 geometry3840x2160 aperture768 Ncap10 P010 sync8s candidate-unqualified");
+    note("V9 HEVC Main/Main10 geometry3840x2160 aperture-layout max768 Ncap10 P010 sync8s candidate-unqualified");
+    note("V9e HEVC layout-sized backing round2MiB AVC256 unchanged quarantine-preserved");
     note("V9c native-failure quarantine no-reopen no-cleanup-MMIO owning-task identity");
     note("V9d HEVC admission1080 level120 before-native no4K quarantine-preserved");
   }

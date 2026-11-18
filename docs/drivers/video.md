@@ -850,7 +850,8 @@ V9 adds hvc1 inventory and capability queries, immutable hvcC/VPS/SPS/PPS admiss
 420, four-byte NAL lengths, one complete AU≤1MiB and an IDR session start. Protected streams, other profiles/chroma,
 parameter-set changes and concurrent native owners fail closed. Codec3 uses HEVC PSC fields including tier, requires
 returned resolution/crop/depth/minimum/profile/level/tier and sizes COMV, split references and RAW from the returned N.
-The bounded HEVC aperture is768MiB, N≤10,388 table pages and524288 PA uniqueness slots; AVC retains256MiB/N16.
+The HEVC aperture has a768MiB ceiling and N≤10. V9e backs the complete guarded layout rounded to2MiB:
+1080p Main10 uses188MiB and Main8 uses148MiB; tables and page metadata follow that span. AVC retains256MiB/N16.
 Two disjoint scratch generations and16KiB invalid guards remain mandatory. Allocation failure frees partial preparation;
 unconfirmed DMA teardown retains backing and poisons subsequent opens.
 
@@ -862,11 +863,11 @@ send failure and the eight-second request deadline have one completion owner. As
 credit window and completion-barrier finish.
 
 V9d limits native HEVC admission to1920×1080, coded height≤1088 and Apple level≤120 (Level4), consistently in inventory,
-dcap, dsta/dcan and the native-submit boundary. The wider parser and768MiB/N10 backing remain available for analysis;
+dcap, dsta/dcan and the native-submit boundary. The wider parser and bounded4K/N10 layout remain available for analysis;
 4K/Level6.1 is declined with UnsupportedDataFormat before a native reservation, PAS or HFI. This is a conservative
 experimental envelope, not1080p HEVC tablet qualification. The single V9 RAM
-qualification first exercises an owned stock QuickTime Main10 fixture with native/client identities, geometry, teardown
-and optical motion, then an AVC regression and Main8 on the same boot. Aerial selection, TSA/retiming, sustained cadence,
+qualification measures stock QuickTime AVC, Main8 and then Main10 with native/client identities, geometry, teardown
+and optical motion, stopping on quarantine or unsafe handoff. Aerial selection, TSA/retiming, sustained cadence,
 colour and looping remain separate runtime acceptance checks; the installed static wallpaper stays in place.
 
 In the saved V9c firmware-addon run, WallpaperAerialsExtension's first4K Main10 session delivered one native frame and
@@ -876,3 +877,9 @@ or code was returned. N8 and the actual buffer sizes fit the768MiB/N10 layout. T
 remains unknown. V9c quarantine retained dependencies and prevented another bootstrap without a tablet reset; V9d keeps
 that containment. Its early decline is intended to leave ordinary VT fallback available. Wallpaper motion and the actual
 fallback factory must be measured separately; a zero native frame count does not qualify aerial playback.
+
+V9d's1080p Main10 attempt failed earlier: host stage41 returned no-memory−15 while requesting the fixed768MiB backing.
+No HFI packet was sent and ETB/EBD/PSC/decoded were all zero. The aggregate refusal did not identify which descriptor
+failed. Its wallpaper capture showed no resolved motion across26.45seconds; the actual fallback factory was not recorded.
+V9e removes the unnecessary maximum-size reservation while preserving every buffer capacity, both scratch generations,
+Ncap10, invalid guards and quarantine. This allocation correction is host-checked;1080p HEVC remains tablet-unqualified.

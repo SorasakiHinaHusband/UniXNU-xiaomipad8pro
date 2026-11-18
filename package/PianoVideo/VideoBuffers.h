@@ -36,7 +36,15 @@ struct Layout {
   bool hevc = false;
   AvcGeometry geometry;
   HevcGeometry hevcGeometry;
-  uint32_t arenaBytes() const { return hevc ? kArenaBytes : kAvcArenaBytes; }
+  uint32_t arenaLimit() const { return hevc ? kArenaBytes : kAvcArenaBytes; }
+  uint32_t arenaBytes() const {
+    if (!hevc) return kAvcArenaBytes;
+    // Back the complete capacity layout, including both scratch generations,
+    // Ncap DPB/RAW pairs and their guards. The 4K ceiling is not a minimum
+    // allocation for an admitted 1080p session. L3 coverage needs 2 MiB units.
+    const uint64_t span = (uint64_t(bytes) + 0x1fffff) & ~0x1fffffull;
+    return bytes && span <= kArenaBytes ? uint32_t(span) : 0;
+  }
   unsigned scratchCount() const { return hevc ? HevcGeometry::ScratchCount : general ? AvcGeometry::ScratchCount : 5; }
   unsigned maxN() const { return hevc ? HevcGeometry::MaxN : general ? AvcGeometry::MaxN : kMaxN; }
   uint32_t scratchSize(unsigned i, unsigned n) const { return hevc ? hevcGeometry.scratchBytes(i, n) : general ? geometry.scratchBytes(i, n) : scratchBytes(i, n); }
@@ -48,7 +56,7 @@ struct Layout {
   {
     const uint64_t off = (uint64_t(bytes) + 16383) & ~16383ull;
     const uint64_t end = off + ((uint64_t(capacity) + 16383) & ~16383ull) + 16384; // invalid guard, including XNU page boundary
-    if (!capacity || used >= kSlots || end > arenaBytes())
+    if (!capacity || used >= kSlots || end > arenaLimit())
       return false;
     Buffer &b = buf[used++];
     b.type = type;

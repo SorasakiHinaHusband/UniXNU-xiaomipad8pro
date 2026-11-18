@@ -48,7 +48,8 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - Hardware video decode (2026-11-18, RAM boots): stock QuickTime plays the owned 320×240 Main and 1920×1080 High AVC fixtures through the
   native decoder: 60 native frames, 60 client-decoded frames, zero dropped frames and optically confirmed motion. The
   bounded HEVC Main/Main10 and P010 path is implemented for qualification, with native admission limited to 1080p/Level 4;
-  4K HEVC is declined before hardware entry after a wallpaper session stalled. HEVC, aerial wallpaper, Safari and concurrent sessions
+  4K HEVC is declined before hardware entry after a wallpaper session stalled. V9e reduces1080p HEVC backing to its complete
+  guarded layout after a pre-HFI allocation refusal; tablet qualification is pending. HEVC, aerial wallpaper, Safari and concurrent sessions
   remain unqualified ([docs/drivers/video.md](docs/drivers/video.md)).
 - Bluetooth: power, Wi-Fi coexistence and the SE6 UART passed the original BT1 run (including 48/48 loopback).
   An opt-in macOS 27.3 H4 transport and version-locked daemon runtime are prepared for one combined discovery test;

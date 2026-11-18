@@ -40,7 +40,8 @@ V7e/V8 are tablet-qualified in stock QuickTime for the owned Main320×240 and Hi
   pending completions without sending HFI EOS. Invalidation cancels the old epoch and joins before bounded
   STOP/CLOSE/PAS/routes/TLB teardown. Unsafe quiesce retains DMA and poisons future opens.
   V9 synchronous flags0/2 retain the original reply until frame completion, with an eight-second bound and no receive-thread wait.
-  AVC keeps its256MiB/N16 policy; HEVC uses768MiB/N10 with distinct scratch generations and invalid guards.
+  AVC keeps its256MiB/N16 policy; HEVC backs its complete guarded N10 layout rounded to2MiB, capped at768MiB.
+  At1080p this uses188MiB for Main10 or148MiB for Main8, including both scratch generations and invalid guards.
   In-place format changes, protected content, other profiles/chroma, concurrent sessions and non-IDR starts remain unsupported.
 
 Levels 2-6 write registers only through `VideoBringup.h`: every (address, value) pair is logged the first time it is written,
@@ -57,7 +58,7 @@ batched tablet test list with its expected lines and the risks: `docs/drivers/vi
 | `VideoFirmware.h` | portable: V2's pin, the image's place in the carveout, PAS 9 + MP_VIDEO_VAR under the secure-call lock, PAS shutdown |
 | `VideoSmmu.h` | portable: V3's SMMU plan, our table for the UC region, the bank and routes, the teardown |
 | `VideoHfi.h` | portable: V3's queue table and queues, HFI gen2 packets and answers, the boot words |
-| `VideoSession.h`, `VideoGeometry.h`, `VideoBuffers.h`, `VideoArena.h` | bounded AVC/HEVC session, codec-specific sizes, guarded256/768MiB arenas and same-bank tables |
+| `VideoSession.h`, `VideoGeometry.h`, `VideoBuffers.h`, `VideoArena.h` | bounded AVC/HEVC session, codec-specific sizes, guarded arenas and same-bank tables |
 | `VideoFixture.h` | own generated SPS/PPS/IDR; reproduction, SPS inspection and software golden verification in `tests/fixture_host.py` |
 | `tests/session_host.cpp` | asynchronous scripted peer, counts 1/4/7/64, reordered replies, checksum and failure injection (host evidence only) |
 | `VideoBringup.h` | portable: levels 2-6 as one sequence (V1, V2, V3, the idle collapse, resume, unload, failures) |
