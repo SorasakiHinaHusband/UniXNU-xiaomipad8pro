@@ -1,6 +1,16 @@
 # Cameras (B11): PianoCamera, the level ladder
 
-2026-11-18: the B-TC CoreMediaIO extension, Camera consent and AVFoundation discovery passed on 27.3; its pattern stream delivered
+2026-11-18, avf5: the early reservation worked on the tablet. The live front path published its first RAW frame and completed
+151 hardware frames in 5.49 seconds. After cancellation, the final guard check failed at step331; the tablet reset before its
+fault registers or completed teardown were captured. The guard write's extent/origin and reset cause remain unknown. No real
+AVFoundation PNG or rear live capture was recovered. Frame-mode geometry matches the reference; no sensor/crop/increment guess
+is justified. A host-tested safety change refuses live bypass routes, drains an outstanding frame on cancellation, and disables
+the write master immediately on a detected guard/translation fault, keeping unsafe DMA/table/clock resources pinned. It preserves
+the step checkpoints and logs the first bad guard offset/value and fault registers before teardown. This change has no tablet
+qualification; its next image is held until the physical guard/reset cause is established. Full guard scans while armed also
+need a measured performance qualification.
+
+Earlier on 2026-11-18: the B-TC CoreMediaIO extension, Camera consent and AVFoundation discovery passed on 27.3; its pattern stream delivered
 31 valid moving frames. After correcting the CPU ring's alignment, `cmio-real-avf4` reached both chip IDs and the hardware worker's
 step 307. Both late private DMA allocations failed: VM found no contiguous 8/16 MiB run. No real frame reached AVFoundation.
 Level 5 now reserves the largest private DMA buffer and table pages on the early camera thread, then reuses bounded sensor views

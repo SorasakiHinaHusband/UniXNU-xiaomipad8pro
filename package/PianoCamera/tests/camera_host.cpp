@@ -1057,13 +1057,20 @@ struct TestOps {
     dmaReserve.install(d);
   }
   void cacheClean(const void *, uint64_t) { ++b.cleans; }
-  void cacheInvalidate(const void *, uint64_t) { ++b.invalidates; }
+  std::function<void(const void *, uint64_t)> invalidateHook;
+  void cacheInvalidate(const void *p, uint64_t n)
+  {
+    ++b.invalidates;
+    if (invalidateHook) invalidateHook(p, n);
+  }
   // level 5's copy of the last frame (the kernel's Ops keeps it for the user client)
   std::vector<uint8_t> kept;
   void frameReady(const uint8_t *buf, const StreamResult &r) { kept.assign(buf, buf + uint64_t(r.stats.stride) * r.height); }
   unsigned liveFrames = 0, liveSkips = 0, liveLimit = 0;
+  unsigned cancelDelayUs = 0;
+  uint64_t cancelAtUs = 0;
   uint64_t liveSequence = 0, liveSOF = 0;
-  bool liveCancelled() { return liveLimit && liveFrames >= liveLimit; }
+  bool liveCancelled() { return (liveLimit && liveFrames >= liveLimit) || (cancelAtUs && b.now >= cancelAtUs); }
   uint64_t hostTicks() { return b.now; }
   void livePaced(uint64_t missing) { liveSkips += 1 + missing; }
   void liveFrame(const uint8_t *, const StreamResult &, uint64_t seq, uint64_t sof, uint64_t missing)
@@ -1120,6 +1127,7 @@ struct TestOps {
   {
     steps.push_back(n);
     log.push_back("step " + std::to_string(n));
+    if (n == kStepL3Stream && cancelDelayUs) cancelAtUs = b.now + cancelDelayUs;
   }
   void note(const char *fmt, ...)
   {
@@ -2285,6 +2293,13 @@ static void testLiveStream()
   CHECK(result.ok && result.cleanOff && result.bufferFreed);
   CHECK(r.ops.liveFrames == 8 && r.ops.liveSkips >= 6 && result.aeCount >= 2);
   CHECK(result.aeVerdict == AeVerdict::converged && r.b.smmuFaults == 0 && r.b.violations.empty());
+  // Cross avf5's frame/AE counts and run the complete reporting path under the
+  // host sanitizers as well; the old finite log arrays must remain bounded.
+  L3Rig longRun;
+  longRun.ops.liveLimit = 80;
+  const auto longResult = longRun.run(Sensor::front, opt);
+  CHECK(longResult.ok && longResult.bufDone >= 151 && longResult.aeCount >= 26);
+  CHECK(longRun.ops.logIndex("csiphy4 status 0-10 at the end:") >= 0 && longRun.b.violations.empty());
 }
 
 // Desktop-era contiguous allocations may fail while the boot reservation must
@@ -2331,6 +2346,108 @@ static void testReservedLiveDma()
   CHECK(!result.ok && !result.cleanOff && !result.wmStopped && !result.bufferFreed);
   CHECK(unsafe.ops.dmaReserve.busy() && !unsafe.ops.dmaReserve.take(8u << 20, true, d));
   CHECK(unsafe.b.allocs == 1 && unsafe.b.frees == 0);
+}
+
+// Exercise the ownership boundary through the real Stream, including the
+// cancellation interleaving omitted by the original frame-count-only model.
+// Fault injections test containment, not a claim about avf5's physical cause.
+static void testLiveDmaFence()
+{
+  StreamOptions opt;
+  opt.live = true;
+  opt.pattern = false;
+  opt.ae = false;
+  {
+    L3Rig r;
+    r.ops.cancelDelayUs = 10000;   // cancellation before the first 33 ms completion
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(result.ok && result.cleanOff && result.bufDone == 1 && r.ops.liveFrames == 0);
+    CHECK(result.streamUs > r.ops.cancelDelayUs && result.streamUs < 1000000 && r.b.violations.empty());
+  }
+  for (bool stuck : {false, true}) {
+    L3Rig r;
+    r.ops.reserveDma();
+    r.b.wmStopStuck = stuck;
+    r.b.sensorMute = true;   // no BUF_DONE: damage must still be detected
+    bool injected = false;
+    r.ops.invalidateHook = [&](const void *p, uint64_t) {
+      if (!injected) {
+        injected = true;
+        *const_cast<uint8_t *>(static_cast<const uint8_t *>(p)) = 0x19;
+      }
+    };
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(injected && result.failure == StreamFailure::guard && !result.ok && !result.cleanOff);
+    CHECK(!result.bufferFreed && result.bufDone == 0 && result.stats.guardFirstBad == 0);
+    CHECK(result.wmStopped == !stuck && r.ops.dmaReserve.busy());
+    CHECK(r.b.v(kSmmu + iova::s2crOffset(r.plan.slot)) == kS2crFault);
+    CHECK(r.b.titan() && r.b.mm1On && r.b.cameraNocUp() && r.b.violations.empty());
+    CHECK(r.ops.logIndex("dma fence sensor=2") >= 0 && r.ops.logIndex("dma quarantine sensor=2") >= 0);
+    CHECK(r.ops.logIndex("step 340") == -1 && r.ops.logIndex("step 330") == -1);
+    CHECK(r.ops.logIndex("dma fence") < r.ops.logIndex("stream failed"));
+    // The exact lease, not the reserved rear-sized arena, is mapped.
+    iova::Window w;
+    CHECK(iova::buildWindow(w, r.b.tableMem.data(), r.b.tableMem.data() + 512, r.b.tablePa, r.b.memPa,
+                           uint32_t(result.bytes), kIovaWindowBase));
+    CHECK(iova::translate(w, kIovaWindowBase - 1) == 0);
+    CHECK(iova::translate(w, kIovaWindowBase + result.bytes - 1) == r.b.memPa + result.bytes - 1);
+    CHECK(iova::translate(w, kIovaWindowBase + result.bytes) == 0);
+  }
+  {
+    L3Rig r;
+    r.ops.reserveDma();
+    r.ops.liveLimit = 2;
+    bool injected = false;
+    r.ops.invalidateHook = [&](const void *p, uint64_t) {
+      if (!injected && !r.ops.steps.empty() && r.ops.steps.back() == kStepL3Stop) {
+        injected = true;
+        *const_cast<uint8_t *>(static_cast<const uint8_t *>(p)) = 0x73;
+      }
+    };
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(injected && result.failure == StreamFailure::guard && result.failedStep == -kStepL3Stop);
+    CHECK(!result.cleanOff && !result.bufferFreed && result.wmStopped && r.ops.dmaReserve.busy());
+    CHECK(r.b.lastEvent("rdi stop") == -1 && r.ops.logIndex("step 340") == -1 && r.b.violations.empty());
+  }
+  {
+    L3Rig r;
+    r.ops.reserveDma();
+    r.b.extraLines = 1;
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(result.failure == StreamFailure::guard && r.ops.liveFrames == 0 && !result.bufferFreed);
+    CHECK(result.stats.guardFirstBad == 0 && result.wmStopped && r.ops.dmaReserve.busy());
+    CHECK(r.b.smmuFaults == 0 && r.b.violations.empty());
+  }
+  {
+    L3Rig r;
+    r.ops.reserveDma();
+    bool injected = false;
+    r.ops.invalidateHook = [&](const void *, uint64_t) {
+      if (injected) return;
+      injected = true;
+      const unsigned pages = 1u << (((r.b.v(kSmmu + iova::kIdr1) >> 28) & 7u) + 1);
+      for (unsigned i = 0; i < 128; ++i)
+        if (r.b.v(kSmmu + iova::smrOffset(i)) == (0x80000000u | kCamStream)) {
+          const unsigned bank = r.b.v(kSmmu + iova::s2crOffset(i)) & 0xffu;
+          r.b.r[kSmmu + (pages + bank) * 4096 + iova::kCbFsr] = 2;
+          r.b.r[kSmmu + (pages + bank) * 4096 + 0x60] = kIovaWindowBase + (8u << 20);
+        }
+    };
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(result.failure == StreamFailure::smmu && result.fault.fsr == 2);
+    CHECK(result.fault.farLo == kIovaWindowBase + (8u << 20) && !result.bufferFreed && r.ops.dmaReserve.busy());
+    CHECK(result.wmStopped && r.b.violations.empty() && r.ops.liveFrames == 0);
+  }
+  for (bool bank : {false, true}) {
+    L3Rig r;
+    r.b.r[kSmmu + iova::smrOffset(7)] = 0x80000000u | kCamStream;
+    r.b.r[kSmmu + iova::s2crOffset(7)] = bank ? 0 : 1u << 16;
+    r.b.r[kSmmu + iova::cba2rOffset(0)] = 1;
+    r.b.r[kSmmu + 0x2000] = 0;   // bank0 translation off (tabletC1 has2 global pages)
+    const auto result = r.run(Sensor::front, opt);
+    CHECK(result.failure == StreamFailure::refused && result.failedStep == -kStepL3Smmu);
+    CHECK(result.cleanOff && r.b.allocs == 0 && r.b.framesWritten == 0);
+  }
 }
 
 // The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
@@ -2419,6 +2536,7 @@ int main()
   testIsp();
   testLiveStream();
   testReservedLiveDma();
+  testLiveDmaFence();
   testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);

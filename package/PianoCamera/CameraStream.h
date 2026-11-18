@@ -463,6 +463,8 @@ class Stream {
     aeStride_ = 0;
     sofTicks_ = sequence_ = completedSequence_ = 0;
     liveGuardIntact_ = true;
+    targetPending_ = quarantined_ = false;
+    guardBadValue_ = 0xa5;
     r_.attempted = true;
     r_.which = which;
     rear_ = which == Sensor::rear;
@@ -471,12 +473,9 @@ class Stream {
     r_.height = rear_ ? kRearL3Height : kFrontL3Height;
     if (up(which, loader, pmic, so, survey)) {
       stream();
-      stop();
+      if (!quarantined_) stop();
       if (opt.live) {
-        if (r_.wmStopped && !guardIntact()) {
-          liveGuardIntact_ = false;
-          fail(kStepL3Stats, StreamFailure::guard);
-        }
+        if (!quarantined_ && r_.wmStopped) checkLiveDma(kStepL3Stats);
       } else {
         statistics();
         if (r_.stats.done) ops.frameReady(d_.cpu, r_);
@@ -484,12 +483,19 @@ class Stream {
     } else if (u_.streaming || u_.wm) {
       stop();
     }
-    if (u_.route) {   // the window's bank while it is live (FSR nonzero: the write master went outside the buffer)
+    if (u_.route && !quarantined_) {   // preserve the first fault across quarantine
       r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
       r_.faultRead = true;
     }
-    reportStream(ops, r_, opt.pattern, opt.gain);   // before the power-down: nothing found is lost if it goes wrong
-    down();
+    if (!quarantined_) {
+      reportStream(ops, r_, opt.pattern, opt.gain);
+      down();
+    } else {
+      // Keep the translating bank, tables, DMA lease, clocks and rails pinned.
+      // No speculative clock/power teardown with unconfirmed bus ownership.
+      ops.note("dma quarantine sensor=%u pending=%u wm-stopped=%u bytes=%llu policy=live-dma-fence-v1", rear_ ? 1 : 2,
+               targetPending_, r_.wmStopped, (unsigned long long)r_.bytes);
+    }
     r_.sensor = s.result();
     r_.ok = !r_.failedStep && !(r_.fault.fsr & iova::kFsrFaults) && r_.cleanOff &&
             (opt.live ? liveGuardIntact_ : r_.bufDone >= opt.frames && r_.stats.done && r_.stats.guardIntact);
@@ -713,6 +719,8 @@ class Stream {
                plan_.smr, plan_.s2cr);
     }
     if (plan_.route == Route::refused) return fail(kStepL3Smmu, StreamFailure::refused, plan_.why);
+    if (opt.live && plan_.route != Route::window)
+      return fail(kStepL3Smmu, StreamFailure::refused, "live DMA requires a bounded translating window");
     if (stopHere(kStepL3Smmu)) return false;
 
     ops.step(kStepL3Memory, "the frame buffer (stride x height + a guard, 2 MiB aligned), filled, cleaned to the PoC; the window applied");
@@ -801,6 +809,7 @@ class Stream {
       // Queue exactly one target. Repeating the AUP would permit hardware to
       // write the same address again while CPU consumption is in progress.
       put(c + kCsidRupAup, kCsidAupRdi0, "CSID RUP_AUP: single private DMA target");
+      targetPending_ = true;
       put(c + kCsidRupAup, kCsidRupRdi0, "CSID RUP_AUP: RUP RDI0");
       put(c + kCsidRupAup, kCsidRupRdi0, "CSID RUP_AUP: RUP RDI0");
     } else for (unsigned k = 0; k < 2; ++k) {
@@ -1001,14 +1010,52 @@ class Stream {
       while (r_.bufDone < opt.frames && waitFrame(true)) {
       }
     r_.streamUs = ops.nowUs() - t0_;
-    readPhyStatus(r_.phyStatus);
+    if (!quarantined_) readPhyStatus(r_.phyStatus);
   }
 
   bool guardIntact()
   {
     ops.cacheInvalidate(d_.cpu + r_.frameBytes, r_.bytes - r_.frameBytes);
     for (uint64_t i = r_.frameBytes; i < r_.bytes; ++i)
-      if (d_.cpu[i] != 0xa5) return false;
+      if (d_.cpu[i] != 0xa5) {
+        r_.stats.guardFirstBad = uint32_t(i - r_.frameBytes);
+        guardBadValue_ = d_.cpu[i];
+        return false;
+      }
+    return true;
+  }
+
+  // Called on the detecting thread before any error log, sensor transaction or
+  // power teardown. A CFG readback alone is not a posted-write drain. Fault the
+  // owned stream as well, and retain its mapping and backing memory until reboot.
+  void quarantineDma()
+  {
+    putQuiet(kTfeLite0 + kWm0 + kWmCfg, 0);
+    r_.wmStopped = !(ops.rd(kTfeLite0 + kWm0 + kWmCfg) & kWmEnable);
+    u_.wm = !r_.wmStopped;
+    putQuiet(kSmmu + iova::s2crOffset(plan_.slot), kS2crFault);
+    const uint32_t blocked = ops.rd(kSmmu + iova::s2crOffset(plan_.slot));
+    quarantined_ = true;
+    ops.note("dma fence sensor=%u wm-stopped=%u s2cr=%08x pending=%u guard-offset=%u value=%02x", rear_ ? 1 : 2,
+             r_.wmStopped, blocked, targetPending_, r_.stats.guardFirstBad, guardBadValue_);
+    ops.note("dma fault sensor=%u fsr=%08x far=%08x%08x fsynr=%08x gfsr=%08x", rear_ ? 1 : 2,
+             r_.fault.fsr, r_.fault.farHi, r_.fault.farLo, r_.fault.fsynr0, r_.fault.gfsr);
+  }
+
+  bool checkLiveDma(int step)
+  {
+    if (!opt.live || !u_.route || !u_.dma) return true;
+    r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
+    r_.faultRead = true;
+    if (r_.fault.fsr & iova::kFsrFaults) {
+      quarantineDma();
+      return fail(step, StreamFailure::smmu, "live DMA translation fault; resources quarantined");
+    }
+    if (!guardIntact()) {
+      liveGuardIntact_ = false;
+      quarantineDma();
+      return fail(step, StreamFailure::guard, "live DMA guard changed; resources quarantined");
+    }
     return true;
   }
 
@@ -1019,14 +1066,10 @@ class Stream {
     bool havePrevious = false;
     unsigned nextAe = 1;
     ops.note("abi2 live %s mode %ux%u RAW10 stride %u", f_->name, r_.width, r_.height, r_.frameBytes / r_.height);
-    while (!ops.liveCancelled() && waitFrame(true)) {
+    while (waitFrame(true)) {
       // BUF_DONE consumed the single queued address. The private DMA target
       // stays unarmed during cache synchronization, copy and AE sampling.
-      if (!guardIntact()) {
-        liveGuardIntact_ = false;
-        fail(kStepL3Stream, StreamFailure::guard);
-        break;
-      }
+      if (!checkLiveDma(kStepL3Stream) || ops.liveCancelled()) break;
       if (sofTicks_ && sequence_ > completedSequence_) {
         const uint64_t missing = sequence_ - completedSequence_ - 1;
         const uint64_t at = captureUs_;
@@ -1070,6 +1113,7 @@ class Stream {
       if (ops.liveCancelled()) break;
       putQuiet(kTfeLite0 + kWm0 + kWmImageAddr, uint32_t(r_.busAddr >> 8));
       putQuiet(kCsidLite0 + kCsidRupAup, kCsidAupRdi0);
+      targetPending_ = true;
     }
   }
 
@@ -1082,7 +1126,10 @@ class Stream {
   {
     const uint64_t c = kCsidLite0, wm = kTfeLite0 + kWm0;
     for (;;) {
-      if (opt.live && ops.liveCancelled()) return false;
+      // Cancellation revokes future submissions, not the in-flight target.
+      // Drain that target to BUF_DONE under the same bounded deadline first.
+      if (opt.live && ops.liveCancelled() && !targetPending_) return false;
+      if (!checkLiveDma(kStepL3Stream)) return false;
       ++r_.polls;
       const uint32_t top = ops.rd(c + kCsidTopStatus), buf = ops.rd(c + kCsidBufStatus), rx = ops.rd(c + kCsidRxStatus),
                      rdi = ops.rd(c + kCsidRdiStatus);
@@ -1139,6 +1186,7 @@ class Stream {
             r_.lastIntervalUs = now - last_;
           }
           bool rearm = true;
+          if (opt.live) targetPending_ = false;
           if (final) {
             const unsigned i = r_.bufDone++;
             if (i < StreamResult::kFrameLog) {
@@ -1164,6 +1212,7 @@ class Stream {
         }
       }
       if (now >= frameDeadline_ || (!opt.live && now >= deadline_)) {
+        if (opt.live && targetPending_) quarantineDma();
         ops.note("checkpoint step=320 sensor=%u event=timeout top=%08x buf=%08x rx=%08x rdi=%08x wm=%08x polls=%u", rear_ ? 1 : 2,
                  top, buf, rx, rdi, ops.rd(wm + kWmCfg), r_.polls);
         fail(kStepL3Stream, r_.bufDone || r_.aeFrames ? StreamFailure::frameTimeout : StreamFailure::noFrame);
@@ -1301,10 +1350,16 @@ class Stream {
     if (u_.wm) {
       put(wm + kWmCfg, 0, "WM0 CFG: off");
       r_.wmStopped = (ops.rd(wm + kWmCfg) & kWmEnable) == 0;
-      u_.wm = false;
+      u_.wm = !r_.wmStopped;
+      if (opt.live && !r_.wmStopped) {
+        quarantineDma();
+        fail(kStepL3Stop, StreamFailure::refused, "WM disable unconfirmed; resources quarantined");
+        return;
+      }
     } else {
       r_.wmStopped = true;
     }
+    if (!checkLiveDma(kStepL3Stop)) return;
     if (u_.csid) {
       put(c + kCsidRdiCtrl, 0, "CSID RDI0 CTRL: stop");
       put(c + kCsidRdiCfg0, ops.rd(c + kCsidRdiCfg0) & ~kRdiCfg0Enable, "CSID RDI0 CFG0: disable");
@@ -1430,6 +1485,8 @@ class Stream {
   uint32_t aeStride_ = 0;
   uint64_t sofTicks_ = 0, captureUs_ = 0, sequence_ = 0, completedSequence_ = 0;
   bool liveGuardIntact_ = true;
+  bool targetPending_ = false, quarantined_ = false;
+  uint8_t guardBadValue_ = 0xa5;
   // the stream's clock and its per-frame bookkeeping (waitFrame)
   uint64_t t0_ = 0, deadline_ = 0, frameDeadline_ = 0, last_ = 0;
   uint32_t rdiSince_ = 0, rxSince_ = 0;
