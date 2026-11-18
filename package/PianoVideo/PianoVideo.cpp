@@ -553,18 +553,22 @@ struct KernelHw {
   bool dmaAlloc(Dma &d)
   {
     const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
-    const uint64_t tableBytes = ((d.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
+    const unsigned arenaPages = d.session ? d.arenaBytes/4096 : 0;
+    const uint64_t tableBytes = ((d.session ? vsmmu::sessionTablePages(d.arenaBytes) : vsmmu::kTablePages) * 4096ull + 16383) & ~16383ull;
     // CPU-only metadata follows the same owner lifetime. Keeping 384 KiB in static __DATA exceeds the KC insertion gap.
-    uniqueCapacity = d.session ? 131072 : 2048;
-    const uint64_t ledgerBytes = uint64_t(uniqueCapacity + (d.session ? session::kArenaPages : 0)) * sizeof(uint64_t);
+    uniqueCapacity = d.session ? (d.arenaBytes > session::kAvcArenaBytes ? 524288 : 131072) : 2048;
+    const uint64_t ledgerBytes = uint64_t(uniqueCapacity + arenaPages) * sizeof(uint64_t);
     ledgerMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), ledgerBytes,
                                                                0x0000000ffffff000ull);
     ucMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), bytes, 0x0000000ffffff000ull);
     tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), tableBytes, 0x0000000fffffc000ull);
     if (d.session) arenaMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        IOOptionBits(kIODirectionInOut), session::kArenaBytes, 0x0000000ffffff000ull);
-    if (!ledgerMem || !ucMem || !tableMem || (d.session && !arenaMem)) { dmaFree(d); return false; }
+        IOOptionBits(kIODirectionInOut), d.arenaBytes, 0x0000000ffffff000ull);
+    if (!ledgerMem || !ucMem || !tableMem || (d.session && !arenaMem)) {
+      ::note("V9 allocation refused arena %u metadata %llu table %llu release-partial 1",d.arenaBytes,(unsigned long long)ledgerBytes,(unsigned long long)tableBytes);
+      dmaFree(d); return false;
+    }
     ledgerPrepared = ledgerMem->prepare() == kIOReturnSuccess;
     ucPrepared = ucMem->prepare() == kIOReturnSuccess;
     tablePrepared = tableMem->prepare() == kIOReturnSuccess;
@@ -580,7 +584,7 @@ struct KernelHw {
     if (!ledger) { dmaFree(d); return false; }
     bzero(ledger, ledgerBytes);
     d.arenaPages = d.session ? ledger : nullptr;
-    uniquePages = ledger + (d.session ? session::kArenaPages : 0);
+    uniquePages = ledger + arenaPages;
     for (unsigned i = 0; ok && i < vsmmu::kUcPages; ++i) {
       IOByteCount segment = 0;
       d.pages[i] = ucMem->getPhysicalSegment(4096ull * i, &segment, kIOMemoryMapperNone);
@@ -591,8 +595,8 @@ struct KernelHw {
     for (unsigned i = 0; ok && i < tableBytes / 4096; ++i) ok = rememberPage(d.tablesPa + 4096ull * i);
     if (d.session) {
       uint8_t *arenaCached = static_cast<uint8_t *>(arenaMem->getBytesNoCopy());
-      bzero(arenaCached, session::kArenaBytes); ::cleanToPoc(arenaCached, session::kArenaBytes);
-      for (unsigned i = 0; ok && i < session::kArenaPages; ++i) {
+      bzero(arenaCached, d.arenaBytes); ::cleanToPoc(arenaCached, d.arenaBytes);
+      for (unsigned i = 0; ok && i < arenaPages; ++i) {
         IOByteCount segment = 0;
         d.arenaPages[i] = arenaMem->getPhysicalSegment(4096ull * i, &segment, kIOMemoryMapperNone);
         ok = segment >= 4096 && rememberPage(d.arenaPages[i]);
@@ -608,7 +612,9 @@ struct KernelHw {
     ::note("dma: UC region %u bytes in %u pages (first %#llx), write-combined at %p; table %#llx", kUcBytes, vsmmu::kUcPages,
            (unsigned long long)d.pages[0], (void *)d.uc, (unsigned long long)d.tablesPa);
     if (d.session) ::note("V4 backing unique PASS UC scratch tables arena pages %u prepared 1 NC-view 1 no-UC-alias 1",
-                         unsigned(vsmmu::kUcPages + 1 + tableBytes / 4096 + session::kArenaPages));
+                         unsigned(vsmmu::kUcPages + 1 + tableBytes / 4096 + arenaPages));
+    if (d.session) ::note("V9 allocated arena %u ledger-pages %u unique-slots %u table-pages %llu metadata %llu wired-prepared 1",
+      d.arenaBytes,arenaPages,uniqueCapacity,(unsigned long long)(tableBytes/4096),(unsigned long long)ledgerBytes);
     return true;
   }
   void hashActive(const volatile uint8_t *base, char text[65])
@@ -645,7 +651,7 @@ struct NativeOwner {
   Bringup<KernelHw> core;
   session::SelfTest<Bringup<KernelHw>> tx;
   IOMemoryDescriptor *loans[stream::Raws] = {};
-  avc::Config config;
+  codec::Config config;
   diagnostic::History history;
   bool prepared = false, attempted = false;
   NativeOwner() : core(hw), tx(core, core.layout) {}
@@ -714,11 +720,11 @@ extern "C" int piano_video_native_open(uint32_t *sessionId)
 }
 
 extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uint32_t size, uint64_t token,
-                                         const avc::Config *format)
+                                         const codec::Config *format)
 {
   // Validate again at the internal boundary before powering or using DMA.
-  avc::Picture picture;
-  if (!piano_video_native_ready() || !format || !avc::normalized(bytes,size,*format,&picture)) return -22;
+  codec::Picture picture;
+  if (!piano_video_native_ready() || !format || !codec::normalized(bytes,size,*format,&picture)) return -22;
   IOLockLock(gNativeLock);
   const bool ours=gNativeState.owns(sid);
   IOLockUnlock(gNativeLock);
@@ -733,24 +739,31 @@ extern "C" int piano_video_native_submit(uint32_t sid, const uint8_t *bytes, uin
     gNativeOwner=owner;owner->config=*format;
     owner->tx.timeoutObserver=nativeTimeoutSnapshot;owner->tx.observerContext=owner;
     owner->tx.history=&owner->history;
-    owner->core.avcWidth=format->s.codedWidth;owner->core.avcHeight=format->s.codedHeight;
+    const uint32_t codedWidth=format->isHevc()?(format->s.codedWidth+31)&~31u:format->s.codedWidth;
+    const uint32_t codedHeight=format->isHevc()?(format->s.codedHeight+31)&~31u:format->s.codedHeight;
+    owner->core.avcWidth=codedWidth;owner->core.avcHeight=codedHeight;
+    owner->core.hevc=format->isHevc();owner->core.bitdepth=format->depth;
     Options options; options.level=6; options.mmcxFloor=gArgs.mmcxFloor;
     rc=owner->core.run(options);owner->prepared=rc==0;
     if(!rc){
       owner->tx.streaming=true;
-      owner->tx.expectedPoc=format->pocType;
+      owner->tx.expectedPoc=format->s.pocType;
       owner->tx.expectedProfile=format->hfiProfile();
       owner->tx.expectedLevel=format->hfiLevel();
+      owner->tx.expectedDepth=format->depth;owner->tx.expectedTier=format->hfiTier();
       owner->tx.psc.poc=owner->tx.expectedPoc;
       owner->tx.psc.profile=owner->tx.expectedProfile;
       owner->tx.psc.level=owner->tx.expectedLevel;
+      owner->tx.psc.depth=(format->depth<<16)|format->depth;owner->tx.psc.tier=format->hfiTier();
       owner->tx.activeWidth=format->s.width;owner->tx.activeHeight=format->s.height;
-      owner->tx.psc.resolution=(format->s.codedWidth<<16)|format->s.codedHeight;
+      owner->tx.psc.resolution=(codedWidth<<16)|codedHeight;
       owner->tx.psc.crop[0]=(format->s.left<<16)|format->s.top;
-      owner->tx.psc.crop[1]=(format->s.right<<16)|format->s.bottom;
+      owner->tx.psc.crop[1]=((format->s.right+codedWidth-format->s.codedWidth)<<16)|(format->s.bottom+codedHeight-format->s.codedHeight);
       owner->tx.psc.color=format->s.color;
       owner->tx.initialPsc=owner->tx.psc;
-      note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
+      if(format->isHevc())note("V9 HEVC bounded Main/Main10 aperture768 Ncap10 active %ux%u coded %ux%u profile %u level %u tier %u depth %u scratch4",
+        format->s.width,format->s.height,codedWidth,codedHeight,format->hfiProfile(),format->hfiLevel(),format->hfiTier(),format->depth);
+      else note("V8 native bounded AVC %ux%u coded %ux%u profile %u level %u aperture256 Ncap16 scratch4",format->s.width,format->s.height,
         format->s.codedWidth,format->s.codedHeight,format->hfiProfile(),format->hfiLevel());
       if(!owner->tx.nativeInput(sid,bytes,size,token))rc=kErrArgument;
       else{owner->attempted=true;rc=owner->tx.transaction();}
@@ -778,14 +791,20 @@ extern "C" int piano_video_native_poll(uint32_t sid,native::Frame *frame)
   o.loans[f.index]=loan;
   frame->memory=loan;frame->cpu=o.core.dma.arena+b->off;frame->length=b->size;
   frame->iova=b->iova();frame->token=f.token;frame->index=f.index;
-  const auto &g=o.core.layout.geometry;const auto &psc=o.tx.psc;
+  const auto &l=o.core.layout;const auto &psc=o.tx.psc;
+  const uint32_t width=l.hevc?l.hevcGeometry.width:l.geometry.width;
+  const uint32_t height=l.hevc?l.hevcGeometry.height:l.geometry.height;
+  const uint32_t stride=l.hevc?l.hevcGeometry.stride:l.geometry.stride;
+  const uint32_t scanlines=l.hevc?l.hevcGeometry.scanlines:l.geometry.scanlines;
+  const uint32_t pixelBytes=o.config.depth==10?2:1;
   frame->layout.width=o.config.s.width;frame->layout.height=o.config.s.height;
-  frame->layout.codedWidth=g.width;frame->layout.codedHeight=g.height;
+  frame->layout.codedWidth=width;frame->layout.codedHeight=height;
   frame->layout.cropLeft=psc.crop[0]>>16;frame->layout.cropTop=psc.crop[0]&65535;
-  frame->layout.stride=g.stride;frame->layout.scanlines=g.scanlines;
-  frame->layout.yOffset=frame->layout.cropTop*g.stride+frame->layout.cropLeft;
-  frame->layout.uvOffset=g.uvOffset+(frame->layout.cropTop/2)*g.stride+frame->layout.cropLeft;
-  frame->layout.bytes=g.raw;
+  frame->layout.stride=stride;frame->layout.scanlines=scanlines;
+  frame->layout.yOffset=frame->layout.cropTop*stride+frame->layout.cropLeft*pixelBytes;
+  frame->layout.uvOffset=l.uvOffset()+(frame->layout.cropTop/2)*stride+frame->layout.cropLeft*pixelBytes;
+  frame->layout.bytes=l.rawBytes();frame->layout.bitdepth=o.config.depth;frame->layout.format=o.config.pixelFormat();
+  frame->noOutput=!f.bytes;
   return 0;
 }
 extern "C" int piano_video_native_frame_release(uint32_t sid,native::Frame *frame)

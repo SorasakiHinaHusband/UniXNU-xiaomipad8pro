@@ -20,9 +20,10 @@ constexpr uint32_t Open = 0x01000003, Close = 0x01000004, Start = 0x01000005, St
 constexpr uint32_t kSessionId = 0x56340001, kTimestamp = 1000000;
 constexpr uint32_t kPscIds[10] = {0x0300015b, 0x03000103, 0x03000105, 0x0300010f, 0x03000120,
                                   0x03000124, 0x03000128, 0x03000107, 0x03000108, 0x03000155};
+constexpr uint32_t kHevcTier = 0x03000109;
 struct Psc {
   uint32_t resolution = 0x014000f0, crop[2] = {0, 0}, depth = 0x00080008, coded = 1, n = 4, poc = 0, profile = 4, level = 18,
-           color = 0x14000003;
+           color = 0x14000003, tier = 0;
   uint32_t returned = 0;
   uint32_t value(unsigned i) const
   {
@@ -35,6 +36,7 @@ struct Psc {
            : i == 7 ? profile
            : i == 8 ? level
            : i == 9 ? color
+           : i == 10 ? tier
                     : 0;
   }
   bool supported() const
@@ -120,10 +122,15 @@ public:
   bool checkGolden = true;
   bool streaming = false;
   uint32_t expectedPoc = 2, expectedProfile = 0, expectedLevel = 4;
+  uint32_t expectedDepth = 8, expectedTier = 0;
   uint32_t activeWidth = 320, activeHeight = 240;
   Psc initialPsc;
-  uint32_t rawStride() const { return layout.general ? layout.geometry.stride : 384; }
-  uint32_t rawScanlines() const { return layout.general ? layout.geometry.scanlines : 256; }
+  unsigned pscCount() const { return layout.hevc ? 11 : 10; }
+  bool pscField(unsigned i) const { return !layout.hevc || (i != 4 && i != 6); }
+  uint32_t pscId(unsigned i) const { return i == 10 ? kHevcTier : kPscIds[i]; }
+  uint32_t rawStride() const { return layout.hevc ? layout.hevcGeometry.stride : layout.general ? layout.geometry.stride : 384; }
+  uint32_t rawScanlines() const { return layout.hevc ? layout.hevcGeometry.scanlines : layout.general ? layout.geometry.scanlines : 256; }
+  uint32_t rawPixelStride() const { return rawStride() / (expectedDepth == 10 ? 2 : 1); }
   // An alternate firmware coded/crop representation is allowed only when it
   // describes the same active picture and fits every already reserved buffer.
   bool pscGeometry() const {
@@ -133,6 +140,13 @@ public:
         w-left-right!=activeWidth || h-top-bottom!=activeHeight) return false;
     if (!layout.general) return psc.resolution==0x014000f0 && !psc.crop[0] && !psc.crop[1];
     if ((psc.returned & 0x2a) != 0x2a) return false; // coded resolution, bit depth and firmware minimum are mandatory
+    if (layout.hevc) {
+      HevcGeometry g;
+      if (!g.configure(w,h,expectedDepth) || w>layout.hevcGeometry.width || h>layout.hevcGeometry.height ||
+          g.raw>layout.rawBytes() || g.dpb>layout.dpbBytes()) return false;
+      for(unsigned i=0;i<layout.scratchCount();++i)if(g.scratchBytes(i,psc.n)>layout.scratchSize(i,psc.n))return false;
+      return true;
+    }
     AvcGeometry g;
     if (!g.configure(w,h) || w>layout.geometry.width || h>layout.geometry.height ||
         g.raw>layout.rawBytes() || g.dpb>layout.dpbBytes()) return false;
@@ -141,6 +155,20 @@ public:
   }
   bool adoptPscGeometry() {
     if (!layout.general) return true;
+    if (layout.hevc) {
+      HevcGeometry g;if(!g.configure(psc.resolution>>16,psc.resolution&65535,expectedDepth))return false;
+      for(unsigned i=0;i<layout.used;++i) {
+        auto &b=layout.buf[i];const uint32_t size=b.type==Raw?g.raw:b.type==Dpb?g.dpb:b.size;
+        if(size>b.capacity)return false;
+      }
+      layout.hevcGeometry=g;
+      for(unsigned i=0;i<layout.used;++i) {
+        auto &b=layout.buf[i];if(b.type==Raw)b.size=g.raw;else if(b.type==Dpb)b.size=g.dpb;
+      }
+      o.hw.note("V9 HEVC PSC active %ux%u coded %ux%u crop %08x/%08x depth %u byte-stride %u pixel-stride %u scanlines %u UV %u RAW %u DPB %u N %u cap %u returned %08x",
+        activeWidth,activeHeight,g.width,g.height,psc.crop[0],psc.crop[1],expectedDepth,g.stride,rawPixelStride(),g.scanlines,g.uvOffset,g.raw,g.dpb,psc.n,layout.maxN(),psc.returned);
+      return true;
+    }
     AvcGeometry g;if(!g.configure(psc.resolution>>16,psc.resolution&65535))return false;
     // Layout offsets/capacities stay unchanged. Only payload sizes may shrink.
     for(unsigned i=0;i<layout.used;++i) {
@@ -172,6 +200,14 @@ public:
   }
   bool pscSupported() const {
     if (!streaming) return psc.supported();
+    if (layout.hevc) {
+      // HEVC has no CODED_FRAMES/AVC POC subscription. Never promote seeded
+      // profile/tier/level or buffer minimum to firmware-confirmed values.
+      constexpr uint32_t required = (1u<<1)|(1u<<2)|(1u<<3)|(1u<<5)|(1u<<7)|(1u<<8)|(1u<<10);
+      return (psc.returned & required) == required && pscGeometry() && psc.n && psc.n <= layout.maxN() &&
+        psc.depth == ((expectedDepth<<16)|expectedDepth) && psc.profile == expectedProfile &&
+        psc.level == expectedLevel && psc.tier == expectedTier;
+    }
     return pscGeometry() && psc.depth == 0x00080008 && psc.coded == 1 &&
       psc.n && psc.n <= layout.maxN() && (!(psc.returned & (1u << 6)) || psc.poc == expectedPoc) &&
       (!(psc.returned & (1u << 7)) || (expectedProfile == 0 ? psc.profile <= 1 : psc.profile == expectedProfile)) && (!(psc.returned & (1u << 8)) || psc.level == expectedLevel);
@@ -234,20 +270,20 @@ public:
   }
   int subscribe(unsigned port, bool properties)
   {
-    uint32_t v[11] = {properties ? 2u : 1u};
+    uint32_t v[12] = {properties ? 2u : 1u};
     unsigned count = 1;
     if (properties) {
       v[count++] = port == 1 ? 0x0300016a : 0x03000162;
       if (port == 2)
         v[count++] = 0x03000121;
     } else
-      for (unsigned i = 0; i < 10; ++i)
-        v[count++] = kPscIds[i];
+      for (unsigned i = 0; i < pscCount(); ++i)
+        if(pscField(i))v[count++] = pscId(i);
     return tx(Subscribe, 3, port, 11, v, count);
   }
   int buffer(Buffer &b, bool release = false, uint32_t dataSize = 0)
   {
-    if (!b.size || b.size > b.capacity || b.off > kArenaBytes - b.capacity || dataSize > b.size ||
+    if (!b.size || b.size > b.capacity || b.capacity > layout.arenaBytes() || b.off > layout.arenaBytes() - b.capacity || dataSize > b.size ||
         (release ? (!b.queued || b.pendingRelease || b.readonly) : (b.queued || b.pendingRelease || b.readonly)))
       return fail(kErrHfi);
     uint32_t v[16] = {b.type, b.index, b.iova(), 0, 0, b.size, 0, dataSize, dataSize ? uint32_t(token) : 0, dataSize ? uint32_t(token >> 32) : 0, release ? 0x201u : 0x200u,
@@ -398,8 +434,8 @@ public:
             continue;
           }
           if (hasPsc && port == 1) {
-            for (unsigned i = 1; i < 10; ++i)
-              if (type == kPscIds[i]) {
+            for (unsigned i = 1; i < pscCount(); ++i)
+              if (pscField(i) && type == pscId(i)) {
                 if (i == 2 && p[0] < 40) {
                   fail(kErrHfi, type);
                   break;
@@ -434,6 +470,9 @@ public:
                 case 9:
                   psc.color = p[8];
                   break;
+                case 10:
+                  psc.tier = p[8];
+                  break;
                 }
               }
           }
@@ -449,8 +488,8 @@ public:
             }
             ++r.psc;
             o.hw.note("V4 PSC FIRST_IPSC 1 input-pause 1 returned %08x N %u", psc.returned, psc.n);
-            for (unsigned i = 1; i < 10; ++i)
-              o.hw.note("V4 PSC property %08x value %08x source %s", kPscIds[i], psc.value(i),
+            for (unsigned i = 1; i < pscCount(); ++i)
+              if(pscField(i))o.hw.note("V4 PSC property %08x value %08x source %s", pscId(i), psc.value(i),
                         (psc.returned & (1u << i)) ? "returned" : "seeded");
             o.hw.note("V4 PSC crop %08x/%08x supported 1", psc.crop[0], psc.crop[1]);
           } else if (type == Buffers)
@@ -556,7 +595,8 @@ public:
       r.last = true;
       o.hw.note("V4 drain LAST raw index %u empty %u", b->index, unsigned(!v[7]));
     }
-    if (!v[7]) {
+    const bool noShow = streaming && layout.hevc && (picture & 0x40);
+    if (!v[7] && !noShow) {
       if (!(v[10] & 0x10000000) && !cleanup)
         fail(kErrHfi, Buffers);
       return;
@@ -564,14 +604,14 @@ public:
     if (streaming) {
       if (cleanup) return; // cancellation never delivers a late success
       const uint64_t returnedToken = uint64_t(v[8]) | (uint64_t(v[9]) << 32);
-      // Gen2 picture is a bitmask. Like the pinned Iris/sheng references,
-      // classify known kinds and test NOSHOW explicitly; ancillary bits such
-      // as the firmware's 0x80 do not invalidate an otherwise owned AVC frame.
-      if (!rawStarted || v[6] || v[7] < layout.rawBytes() || b->readonly || frameError || !(picture & 15) || (picture & 0x40) ||
+      // HEVC adds CRA/BLA and explicit non-display pictures. They still own a
+      // token and a RAW return; pass a NULL image disposition to the consumer.
+      const bool kind = (picture & (layout.hevc ? 0x3fu : 15u)) || noShow;
+      if (!rawStarted || v[6] || (!noShow && v[7] < layout.rawBytes()) || b->readonly || frameError || !kind || (!layout.hevc && (picture & 0x40)) ||
           outputCount == stream::Credits || !ledger.picture(returnedToken,b->index)) {
         fail(kErrHfi, Buffers, p[2], p[4], p[5], header); return;
       }
-      outputs[(outputHead+outputCount)%stream::Credits]={returnedToken,b->index,v[7]};++outputCount;++r.decoded;
+      outputs[(outputHead+outputCount)%stream::Credits]={returnedToken,b->index,noShow?0:v[7]};++outputCount;++r.decoded;
       deadline = o.hw.nowUs()+5000000;
       o.hw.note("V6 FBD session %08x token %llu index %u picture %u count %u",sessionId,
                 (unsigned long long)returnedToken,b->index,picture,r.decoded);
@@ -682,14 +722,15 @@ public:
       return r.error;
     // // acceptance is established by PSC downstream; this is only submission/consumption
     stage(Config);
-    if (property(0x03000100, 1, 0, 9) || property(0x03000168, 0, 1) ||
+    if (property(0x03000100, layout.hevc ? 3 : 1, 0, 9) || property(0x03000168, 0, 1) ||
         (streaming && property(0x0300015b, 1, 1)))
       return r.error;
-    for (unsigned i = 1; i < 10; ++i) {
+    for (unsigned i = 1; i < pscCount(); ++i) {
+      if(!pscField(i))continue;
       if (i == 2) {
-        if (pair(kPscIds[i], psc.crop[0], psc.crop[1], 1))
+        if (pair(pscId(i), psc.crop[0], psc.crop[1], 1))
           return r.error;
-      } else if (property(kPscIds[i], psc.value(i), 1, (i == 7 || i == 8) ? 9 : i == 9 ? 10 : 1))
+      } else if (property(pscId(i), psc.value(i), 1, (i == 7 || i == 8 || i == 10) ? 9 : i == 9 ? 10 : 1))
         return r.error;
     }
     if (property(0x03000107, streaming ? expectedProfile : 4, 2, 9) || property(0x03000108, streaming ? expectedLevel : 18, 2, 9) || property(0x03000169, 1, 1) || property(0x03000123, 64, 1) ||
@@ -712,7 +753,8 @@ public:
     o.hw.note("V4 acceptance OPEN CONFIG START BITSTREAM downstream-PSC 1");
     stage(Reconfigure);
     if (!adoptPscGeometry()) return fail(kErrHfi,Settings);
-    if (property(0x03000184, 1, 2) || property(0x03000101, 1, 2, 9) || pair(0x03000104, (rawStride()<<16)|rawScanlines(), (rawStride()<<16)|((rawScanlines()/2+15)&~15u), 2))
+    if (property(0x03000184, 1, 2) || property(0x03000101, expectedDepth == 10 ? 3 : 1, 2, 9) ||
+        pair(0x03000104, (rawPixelStride()<<16)|rawScanlines(), (rawPixelStride()<<16)|((rawScanlines()/2+15)&~15u), 2))
       return r.error;
     for (unsigned i = 0; i < layout.scratchCount(); ++i)
       if (buffer(*layout.find(scratchType[i], 0), true))
@@ -722,11 +764,12 @@ public:
     const uint32_t cause = Settings;
     if (tx(Resume, 3, 1, 1, &cause, 1) || subscribe(2, false))
       return r.error;
-    for (unsigned i = 1; i < 10; ++i) {
+    for (unsigned i = 1; i < pscCount(); ++i) {
+      if(!pscField(i))continue;
       if (i == 2) {
-        if (pair(kPscIds[i], psc.crop[0], psc.crop[1], 2))
+        if (pair(pscId(i), psc.crop[0], psc.crop[1], 2))
           return r.error;
-      } else if (property(kPscIds[i], psc.value(i), 2))
+      } else if (property(pscId(i), psc.value(i), 2))
         return r.error;
     }
     if (subscribe(2, true))

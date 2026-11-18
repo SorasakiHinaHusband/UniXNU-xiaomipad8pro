@@ -51,6 +51,7 @@ struct Dma {
   uint64_t tablesPa = 0;
   void *owner = nullptr;   // the Hw's bookkeeping
   bool session = false;
+  uint32_t arenaBytes = session::kAvcArenaBytes;
   volatile uint8_t *arena = nullptr;
   uint64_t *arenaPages = nullptr; // CPU metadata owned with the prepared buffers, not KC static __DATA
 };
@@ -102,6 +103,8 @@ class Bringup {
   Report rep;
   Options opt;
   uint32_t avcWidth = 0, avcHeight = 0; // selected before DMA preparation; zero preserves the legacy qualification
+  bool hevc = false;
+  uint32_t bitdepth = 8;
   unsigned doorbells = 0, txEvents = 0, rxEvents = 0, dbgChecks = 0, dbgErrors = 0, msgDrops = 0, watchdogSamples = 0;
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
@@ -493,12 +496,13 @@ class Bringup {
     bankTrace("planned");
     hw.stage(kStepSmmuTables, "the UC region's memory and our table");
     dma.session = opt.level >= 5;
-    if (dma.session && !(avcWidth ? layout.init(avcWidth,avcHeight) : layout.init())) return smmuFail(kStepSmmuTables, kErrNoMemory);
+    if (dma.session && !(hevc ? layout.initHevc(avcWidth,avcHeight,bitdepth) : avcWidth ? layout.init(avcWidth,avcHeight) : layout.init())) return smmuFail(kStepSmmuTables, kErrNoMemory);
+    dma.arenaBytes = layout.arenaBytes();
     if (!hw.dmaAlloc(dma)) return smmuFail(kStepSmmuTables, kErrNoMemory);
     dmaHeld = true;
     tables.cpu = dma.tables;
     tables.pa = dma.tablesPa;
-    tables.pageCount = dma.session ? vsmmu::kSessionTablePages : vsmmu::kTablePages;
+    tables.pageCount = dma.session ? vsmmu::sessionTablePages(dma.arenaBytes) : vsmmu::kTablePages;
     if (!vsmmu::build(tables, dma.pages, vsmmu::kUcPages, dma.scratch)) {
       hw.note("smmu: a page of the UC region or the table is not a 4 KiB page of XNU's RAM");
       return smmuFail(kStepSmmuTables, kErrSmmu);
@@ -508,10 +512,10 @@ class Bringup {
     hw.cleanToPoc(tables.cpu, tables.pageCount * 4096);
     if (dma.session) {
       unsigned mapped = 0;
-      for (unsigned i = 0; i < session::kArenaPages; ++i) mapped += layout.mapped(i);
+      for (unsigned i = 0; i < dma.arenaBytes/4096; ++i) mapped += layout.mapped(i);
       hw.note("V4 mapping arena [%08x,%08x) reserved %u pages mapped %u guards-invalid %u tables %u full-walk PASS",
-              session::kArenaBase, session::kArenaBase + session::kArenaBytes, layout.bytes, mapped,
-              session::kArenaPages - mapped, tables.pageCount);
+              session::kArenaBase, session::kArenaBase + dma.arenaBytes, layout.bytes, mapped,
+              dma.arenaBytes/4096 - mapped, tables.pageCount);
       for (unsigned i = 0; i < layout.used; ++i) {
         const session::Buffer &b = layout.buf[i];
         hw.note("V4 mapping type %u index %u port %u capacity %u IOVA [%08x,%08x) PA-first %llx PA-last %llx",
