@@ -52,6 +52,26 @@ dest = "/Library/LaunchAgents/com.unixnu.piano-coreimage-compat.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-camera-default"
+about = "one-time choice-preserving front-camera policy for Photo Booth and QuickTime; explicit --set-front and typed --check for fresh previews"
+default_on = true
+
+[[unit.file]]
+source = "tooling/camera/extension/camera-default.m"
+build = "cc"
+arch = "arm64"
+cflags = ["-fobjc-arc"]
+frameworks = ["Foundation", "AVFoundation"]
+dest = "/usr/local/bin/piano-camera-default"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/camera/extension/com.unixnu.piano-camera-default.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-camera-default.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-camera-runtime"
 about = "read-only CS_OPS_CDHASH verification of the running camera extension against its approved staged hash"
 default_on = true
