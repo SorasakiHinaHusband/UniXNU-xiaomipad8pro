@@ -1,5 +1,18 @@
 # Cameras (B11): PianoCamera, the level ladder
 
+2026-11-18, stock applications: the baked-approval image delivered 77 valid front and 73 valid rear colour frames through the
+AVFoundation client, with clean stops and no reported guard/SMMU fault. Photo Booth subsequently aborted during fish-eye effect
+initialization: its CIKernel array was empty. Static tracing and a host reproduction identify the Metal frontend's omitted
+additional compiler arguments. The same trace finds separate Photo Booth format gates: max frame rate at least 24 fps and a
+normal-quality BGRA format at least 640×480. The original 15 fps modes and front's 459-line image miss those gates.
+
+The combined fix preserves those compiler arguments and adds a 640×480 BGRA compatibility format with 15–30 fps software-paced
+output. Physical sensor acquisition remains 15 fps; extra output frames repeat the latest source, with explicit counters and a
+stale-source cutoff. Native modes remain available. The signed client has a discovery-only `--inventory` mode; its ordinary
+capture still selects the first native mode. QuickTime's traced preview path adds no known source-rate/FourCC requirement.
+Actual stock-app preview, switching and recording are still unqualified; the combined test runs QuickTime first, polls app
+processes and windows, then tests Photo Booth independently and retains user/system crash reports from each phase.
+
 2026-11-18, avf5: the early reservation worked on the tablet. The live front path published its first RAW frame and completed
 151 hardware frames in 5.49 seconds. After cancellation, the final guard check failed at step 331. The tablet reset before
 the fault registers, completed teardown, rear capture or AVFoundation PNGs were captured. The guard write and reset causes

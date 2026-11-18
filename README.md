@@ -33,9 +33,9 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once). The current ESP is
   **v5** (installed 2026-11-14): it carries Wi-Fi's sleep and crash recovery. The desktop and the lock screen show Apple's stock
   still picture and render right (run h1 on v5, photos).
-- Cameras: both sensors produced RAW frames; the macOS camera extension enumerates both and streams its test pattern.
-  Its live front path received 151 RAW frames, then a DMA guard failure and reset blocked qualification; the cause is under analysis
-  ([docs/drivers/camera.md](docs/drivers/camera.md)).
+- Cameras: the approved macOS extension delivered real front and rear colour frames through AVFoundation at 15 fps.
+  Stock-app previews remain unqualified. A combined compatibility fix addresses Photo Booth's Core Image compiler arguments and
+  format selection; QuickTime and Photo Booth are tested independently ([camera status](docs/drivers/camera.md)).
 - Wi-Fi: the installed system joins by itself at boot (WPA2, DHCP, DNS, HTTPS), rejoins after a drop, and came back by itself
   after a system sleep and after a firmware crash (boot 10m; ESP v5 brings both to the installed system — its first boot joined
   on its own). Joining through macOS itself works since 2026-11-17 on RAM boots (run wifi-join9b): `networksetup` -> airportd ->

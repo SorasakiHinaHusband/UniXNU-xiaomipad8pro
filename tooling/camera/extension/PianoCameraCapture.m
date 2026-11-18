@@ -81,6 +81,33 @@
 }
 @end
 
+// Discovery-only diagnostics use this compiled AVFoundation client: JavaScript's
+// framework import need not expose the Tundra class aliases on a native boot.
+static void inventory(void)
+{
+    NSArray *types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal,
+                       AVCaptureDeviceTypeExternalUnknown];
+    for (AVCaptureDeviceType type in types) {
+        NSArray *devices = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[type]
+                            mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified].devices;
+        printf("discovery type=%s count=%lu\n", type.UTF8String, (unsigned long)devices.count);
+        for (AVCaptureDevice *device in devices) {
+            if (![device.uniqueID.uppercaseString hasPrefix:@"6A1F2A8E-4C2B-4E8F-9B57-50494E4F000"]) continue;
+            printf("device name=%s type=%s model=%s connected=%d suspended=%d inUse=%d formats=%lu\n",
+                   device.localizedName.UTF8String, device.deviceType.UTF8String, device.modelID.UTF8String,
+                   device.connected, device.suspended, device.inUseByAnotherApplication, (unsigned long)device.formats.count);
+            for (AVCaptureDeviceFormat *format in device.formats) {
+                CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+                for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges)
+                    printf("inventory format %s %dx%d FourCC=%08x fps=%.2f..%.2f\n", device.localizedName.UTF8String,
+                           size.width, size.height, CMFormatDescriptionGetMediaSubType(format.formatDescription),
+                           range.minFrameRate, range.maxFrameRate);
+            }
+        }
+    }
+    puts("CAMERA_INVENTORY_COMPLETE");
+}
+
 static BOOL capture(AVCaptureDevice *device, int seconds, NSString *file)
 {
     if (!device) return NO;
@@ -91,7 +118,7 @@ static BOOL capture(AVCaptureDevice *device, int seconds, NSString *file)
         for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
             printf("format %s %dx%d FourCC=%08x fps=%.2f..%.2f\n", device.localizedName.UTF8String,
                    size.width, size.height, type, range.minFrameRate, range.maxFrameRate);
-            if (type == kCVPixelFormatType_32BGRA && range.minFrameRate <= 15 && range.maxFrameRate >= 15) native = format;
+            if (!native && type == kCVPixelFormatType_32BGRA && range.minFrameRate <= 15 && range.maxFrameRate >= 15) native = format;
         }
     }
     NSError *error = nil;
@@ -153,6 +180,7 @@ int main(int argc, const char **argv)
 {
     @autoreleasepool {
         if (argc != 2 || geteuid() == 0) return 2;
+        if (!strcmp(argv[1], "--inventory")) { inventory(); return 0; }
         NSString *directory = [NSString stringWithUTF8String:argv[1]];
         NSString *log = [directory stringByAppendingPathComponent:@"capture.txt"];
         if (!freopen(log.fileSystemRepresentation, "w", stdout)) return 2;
