@@ -46,9 +46,9 @@ probe() {
   else
     local remote="sudo -S -p '' /usr/local/libexec/piano-login-readiness $1 $LOGIN_UID"
     if [ "$1" != desktop ]; then
-      # AX's system-wide focus is session-local. sudo alone keeps the SSH
-      # bootstrap. Use the unique pre-login SecurityAgent's audit/bootstrap.
-      remote="pid=\$(/usr/bin/pgrep -x SecurityAgent); case \"\$pid\" in \"\"|*[!0-9]*) echo focus_probe=securityagent-unavailable; exit 1;; esac; sudo -S -p '' /bin/launchctl bsexec \"\$pid\" /usr/local/libexec/piano-login-readiness $1 $LOGIN_UID"
+      # The native probe resolves the account here, then enters the unique
+      # pre-login SecurityAgent's bootstrap for the session-local AX reads.
+      remote="pid=\$(/usr/bin/pgrep -x SecurityAgent); case \"\$pid\" in \"\"|*[!0-9]*) echo focus_probe=securityagent-unavailable; exit 1;; esac; $remote \"\$pid\""
     fi
     # tssh owns address fallback. Credentials only on sudo stdin, never argv.
     { cat "$SECRET"; printf '\n'; } | /bin/bash /tmp/tmo.sh 15 /bin/bash /tmp/tssh "$remote" 2>/dev/null

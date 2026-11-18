@@ -67,7 +67,67 @@ int main(int argc,char **argv) {
         with tempfile.TemporaryDirectory() as d:
             path=Path(d); path.chmod(0o700); profile=path/'profile';profile.write_text('fixture\n');profile.chmod(0o600)
             (path/'link').symlink_to(profile);(path/'test.m').write_text(source)
-            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-o',str(path/'test')],check=True,capture_output=True)
+            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-framework','CoreLocation','-o',str(path/'test')],check=True,capture_output=True)
             subprocess.run([str(path/'test'),str(profile),str(path/'missing'),str(path/'link')],check=True,capture_output=True)
+
+    def test_location_readiness_gates_the_scan(self):
+        source = r'''
+#include <libproc.h>
+#include <stdio.h>
+#include <time.h>
+#include <assert.h>
+static int pid_before, pid_after, reads, count;
+static uint64_t seconds;
+static int fixture_list(void *buffer, int size) {
+  if (!buffer) return count;
+  assert(size >= count * (int)sizeof(pid_t));
+  pid_t *pids = buffer;
+  for (int i = 0; i < count; ++i) pids[i] = (reads ? pid_after : pid_before) + i;
+  ++reads;
+  return count;
+}
+static int fixture_name(int pid, void *buffer, uint32_t size) {
+  (void)pid;
+  return snprintf(buffer, size, "locationd");
+}
+static uint64_t fixture_clock(clockid_t clock) {
+  (void)clock;
+  return seconds * 1000000000ULL;
+}
+#define proc_listallpids fixture_list
+#define proc_name fixture_name
+#define clock_gettime_nsec_np fixture_clock
+#define main production_main
+#include "tooling/native/piano-wifi-join/piano-wifi-join.m"
+#undef main
+static int check(struct location_readiness *state, uint64_t at, int before,
+                 int after, int candidates, char *query) {
+  seconds = at; pid_before = before; pid_after = after; count = candidates; reads = 0;
+  return location_ready(state, query, 1);
+}
+int main(void) {
+  struct location_readiness state = {};
+  assert(!check(&state, 120, 0, 0, 0, "/usr/bin/true"));
+  assert(!check(&state, 370, 100, 100, 1, "/usr/bin/true"));
+  assert(!check(&state, 379, 101, 101, 1, "/usr/bin/true"));
+  assert(!check(&state, 388, 101, 101, 1, "/usr/bin/true"));
+  assert(reads == 1);
+  assert(!check(&state, 389, 101, 102, 1, "/usr/bin/true"));
+  assert(reads == 2);
+  assert(!check(&state, 390, 102, 102, 2, "/usr/bin/true"));
+  assert(!check(&state, 391, 102, 102, 1, "/usr/bin/true"));
+  assert(!check(&state, 401, 102, 102, 1, "/usr/bin/false"));
+  assert(!check(&state, 402, 102, 102, 1, "/usr/bin/true"));
+  assert(check(&state, 412, 102, 102, 1, "/usr/bin/true"));
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            (path / 'test.m').write_text(source)
+            subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-I', str(W), str(path / 'test.m'),
+                            '-framework', 'Foundation', '-framework', 'CoreWLAN',
+                            '-framework', 'CoreLocation', '-o', str(path / 'test')],
+                           check=True, capture_output=True)
+            subprocess.run([str(path / 'test')], check=True, capture_output=True)
 
 if __name__=='__main__': unittest.main()

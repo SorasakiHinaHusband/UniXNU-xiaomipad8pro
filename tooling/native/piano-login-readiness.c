@@ -92,17 +92,8 @@ static int focused_field(AXUIElementRef app, AXUIElementRef field, AXUIElementRe
   return ok;
 }
 
-int main(int argc, char **argv)
+static int focus_probe(const char *mode, const char *shortname, const char *fullname)
 {
-  if (argc != 3 || (strcmp(argv[1], "prepare") && strcmp(argv[1], "ready") && strcmp(argv[1], "desktop"))) return 2;
-  uid_t uid = (uid_t)strtoul(argv[2], NULL, 10);
-  struct passwd *p = uid ? getpwuid(uid) : NULL;
-  if (!p) return 2;
-  if (!strcmp(argv[1], "desktop")) {
-    struct stat st;
-    if (stat("/dev/console", &st) || st.st_uid != uid) return 1;
-    puts("console_user_matches=yes"); return 0;
-  }
   struct stat st;
   if (stat("/dev/console", &st) || st.st_uid != 0) {
     puts("focus_probe=not-at-login-window"); return 1;
@@ -131,11 +122,11 @@ int main(int argc, char **argv)
   AXUIElementRef window = (AXUIElementRef)attr(app, kAXFocusedWindowAttribute);
   if (!window && focused && secure(focused)) window = (AXUIElementRef)attr(focused, kAXWindowAttribute);
   if (!window) { puts("focus_probe=window-unavailable"); return 1; }
-  CFStringRef shortname = CFStringCreateWithCString(NULL, p->pw_name, kCFStringEncodingUTF8);
-  CFStringRef fullname = p->pw_gecos[0] ? CFStringCreateWithCString(NULL, p->pw_gecos, kCFStringEncodingUTF8) : NULL;
-  AXUIElementRef field = selected_field(window, shortname, fullname);
+  CFStringRef short_label = CFStringCreateWithCString(NULL, shortname, kCFStringEncodingUTF8);
+  CFStringRef full_label = fullname[0] ? CFStringCreateWithCString(NULL, fullname, kCFStringEncodingUTF8) : NULL;
+  AXUIElementRef field = selected_field(window, short_label, full_label);
   if (!field) { puts("focus_probe=account-or-field-unconfirmed"); return 1; }
-  if (!focused_field(app, field, focused, !strcmp(argv[1], "prepare"))) {
+  if (!focused_field(app, field, focused, !strcmp(mode, "prepare"))) {
     puts("focus_probe=secure-focus-unconfirmed"); return 1;
   }
   CFTypeRef still_front = attr(system, kAXFocusedApplicationAttribute);
@@ -145,4 +136,40 @@ int main(int argc, char **argv)
   puts("focus_probe=secure-focus-confirmed");
   puts("selected_login_account=yes\nfocused_password_field=yes");
   return 0;
+}
+
+int main(int argc, char **argv)
+{
+  if (argc == 3 && !strcmp(argv[1], "desktop")) {
+    uid_t uid = (uid_t)strtoul(argv[2], NULL, 10);
+    struct stat st;
+    if (!uid || stat("/dev/console", &st) || st.st_uid != uid) return 1;
+    puts("console_user_matches=yes");
+    return 0;
+  }
+  if (argc < 2 || (strcmp(argv[1], "prepare") && strcmp(argv[1], "ready")) || geteuid()) {
+    puts("focus_probe=invalid-invocation");
+    return 2;
+  }
+  if (argc == 5 && !strcmp(argv[2], "--in-login-session"))
+    return focus_probe(argv[1], argv[3], argv[4]);
+  if (argc != 4 || argv[3][0] == '\0' || argv[3][strspn(argv[3], "0123456789")]) {
+    puts("focus_probe=invalid-invocation");
+    return 2;
+  }
+
+  // Directory Services need the original bootstrap. AX needs the login
+  // bootstrap. Carry just the resolved account labels across the exec.
+  uid_t uid = (uid_t)strtoul(argv[2], NULL, 10);
+  struct passwd *account = uid ? getpwuid(uid) : NULL;
+  if (!account || !account->pw_name || !account->pw_name[0]) {
+    puts("focus_probe=account-lookup-failed");
+    return 2;
+  }
+  const char *launchctl = "/bin/launchctl";
+  char *args[] = {(char *)launchctl, "bsexec", argv[3], argv[0], argv[1],
+                  "--in-login-session", account->pw_name, account->pw_gecos ?: "", NULL};
+  execv(launchctl, args);
+  puts("focus_probe=session-exec-failed");
+  return 2;
 }

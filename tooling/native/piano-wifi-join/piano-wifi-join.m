@@ -16,17 +16,22 @@
 // request and never overrides a later user disconnect.
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
+#import <CoreLocation/CoreLocation.h>
 #include <sys/time.h>
 #include "BootJoin.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "../../../package/PianoWifi/WifiProfile.h"
 
@@ -91,8 +96,81 @@ static int safe_open(const char *path)
   return fd;
 }
 
+enum { BootJoinDeadline = 480, LocationStableSeconds = 10, LocationQuerySeconds = 8 };
+extern char **environ;
+
+struct location_readiness {
+  pid_t pid;
+  uint64_t since;
+};
+
+static pid_t location_service_pid(void)
+{
+  const int estimated = proc_listallpids(NULL, 0);
+  if (estimated <= 0) return 0;
+  const int capacity = estimated + 64;
+  pid_t *pids = calloc((size_t)capacity, sizeof *pids);
+  if (!pids) return 0;
+  const int count = proc_listallpids(pids, capacity * sizeof *pids);
+  pid_t result = 0;
+  for (int i = 0; i < count && count < capacity; ++i) {
+    char name[64];
+    if (pids[i] <= 0 || proc_name(pids[i], name, sizeof name) <= 0 || strcmp(name, "locationd")) continue;
+    if (result) {
+      result = 0;
+      break;
+    }
+    result = pids[i];
+  }
+  free(pids);
+  return result;
+}
+
+static int location_query_result(char *executable)
+{
+  // Isolate the synchronous CoreLocation call from our CoreWLAN client.
+  // The child sets its own alarm and checks only the global switch.
+  char *args[] = { executable, "--location-query", NULL };
+  pid_t pid;
+  if (posix_spawn(&pid, executable, NULL, NULL, args, environ)) return 0;
+  int status;
+  pid_t waited;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  return waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static uint64_t monotonic_seconds(void)
+{
+  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / NSEC_PER_SEC;
+}
+
+static int location_ready(struct location_readiness *state, char *executable, unsigned attempt)
+{
+  const uint64_t now = monotonic_seconds();
+  const pid_t pid = location_service_pid();
+  if (pid != state->pid) {
+    state->pid = pid;
+    state->since = now;
+  }
+  if (!pid || now - state->since < LocationStableSeconds) {
+    timeline("location attempt=%u stable=0 present=%d", attempt, pid != 0);
+    return 0;
+  }
+
+  const int returned = location_query_result(executable);
+  const int same_pid = pid == location_service_pid();
+  timeline("location attempt=%u stable=1 query_returned=%d same_pid=%d", attempt, returned, same_pid);
+  if (returned && same_pid) return 1;
+  state->pid = 0;
+  return 0;
+}
+
 struct apple_join {
   const struct piano_wifi_profile *profile;
+  char *executable;
+  struct location_readiness location;
   CWInterface *interface;
   CWNetwork *network;
   unsigned readiness_attempt;
@@ -131,6 +209,7 @@ static int ready(void *context)
   const time_t uptime = time(NULL) - boot.tv_sec;
   timeline("settle attempt=%u uptime=%lld ready=%d", attempt, (long long)uptime, uptime >= 120);
   if (uptime < 120) return 0;
+  if (!location_ready(&a->location, a->executable, attempt)) return 0;
   timeline("interface attempt=%u begin", attempt);
   a->interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
   timeline("interface attempt=%u present=%d", attempt, a->interface != nil);
@@ -179,6 +258,16 @@ static void pause_join(void *unused) { (void)unused; sleep(2); }
 
 int main(int argc, char **argv)
 {
+  if (argc == 2 && !strcmp(argv[1], "--location-query")) {
+    alarm(LocationQuerySeconds);
+    @autoreleasepool {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      (void)[CLLocationManager locationServicesEnabled];
+#pragma clang diagnostic pop
+    }
+    return 0;
+  }
   const char *path = argc > 1 ? argv[1] : PIANO_WIFI_PROFILE_PATH;
   timeline("start");
   if (geteuid() != 0) {
@@ -225,13 +314,13 @@ int main(int argc, char **argv)
   action.sa_flags = SA_RESETHAND;
   sigemptyset(&action.sa_mask);
   const int handler = sigaction(SIGALRM, &action, NULL);
-  alarm(360);
-  timeline("readiness deadline_seconds=360 alarm_logging=%d", handler == 0);
+  alarm(BootJoinDeadline);
+  timeline("readiness deadline_seconds=%u alarm_logging=%d", BootJoinDeadline, handler == 0);
   int rc;
   @autoreleasepool {
-    struct apple_join a = { &p, nil, nil, 0 };
+    struct apple_join a = { .profile = &p, .executable = argv[0] };
     struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
-    rc = piano_boot_join(&transport, 120);
+    rc = piano_boot_join(&transport, BootJoinDeadline / 2);
   }
   piano_wifi_profile_wipe(&p);
   if (rc) {
