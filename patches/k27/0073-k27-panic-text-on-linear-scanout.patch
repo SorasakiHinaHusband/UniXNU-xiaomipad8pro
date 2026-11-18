@@ -4,6 +4,18 @@ Subject: [PATCH] k27: boot-gated panic text on the retained linear scanout
 Requires 0069 panic-hold and 0071. Default off. No device I/O or allocation
 in panic context; capture before the disabled console and render at hold.
 
+diff --git a/osfmk/console/Makefile b/osfmk/console/Makefile
+--- a/osfmk/console/Makefile
++++ b/osfmk/console/Makefile
+@@ -9,6 +9,8 @@
+ DATAFILES =
+ 
+ PRIVATE_DATAFILES = \
++	piano_panic_text.h \
++	piano_panic_text_core.h \
+ 	piano_reset_reason.h \
+ 	video_console.h \
+ 	serial_protos.h
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
