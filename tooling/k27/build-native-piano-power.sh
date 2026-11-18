@@ -68,8 +68,10 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P
   "$P/PianoUsbcRelay.cpp" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 # The imports the KC resolves from the libraries PianoPower.json names: NativeUfs's partition reads, PianoA830's DRV-2 and secure-call
-# lock words (package/include/PianoScmLock.h, docs/scm-lock.md); anything else the kernel must define.
+# lock words (package/include/PianoScmLock.h, docs/scm-lock.md) and its optional LLCC audit gate.
+# The kernel must define the remaining imports.
 . "$D/tooling/k27/k27-tree.sh"
 KERNEL=${K27_KERNEL:-$PIANO_K27_TREE/out/k27/kernel-k27-0059-native.macho}
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$D/out/native-kexts/PianoPower/objects.json" "$KERNEL" \
-  --library-prefix _native_ufs_part_ --library-prefix _sm8750_rpmh_drv2_owner --library-prefix _sm8750_scm_owner --library-prefix _piano_spmi_words | cut -c1-160 >&2
+  --library-prefix _native_ufs_part_ --library-prefix _sm8750_rpmh_drv2_owner --library-prefix _sm8750_scm_owner \
+  --library-prefix _piano_spmi_words --library-prefix _piano_a830_llcc_audit_wait | cut -c1-160 >&2

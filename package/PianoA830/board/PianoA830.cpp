@@ -52,12 +52,16 @@
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 #define PIANO_SCM_LOCK_KERNEL 1
 #include <PianoScmLock.h>
 #include <PianoSpmi.h>   // the SPMI lock's words (PianoSpmiWords), defined below
 #include <PianoPowerContract.h>
 #include "A830Suspend.h"
 #include "A830PowerState.h"
+#include "PianoLlccAudit.h"
 #include "PianoLlccIsland.h"
 #include "PianoGpuCeiling.h"
 #include "PianoGpuIdle.h"
@@ -145,6 +149,8 @@ static void registerQual607(bool record) {
   gQualLogOid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQualLogOid);
 }
 #include <PianoDisplayFollow.h>
+
+SYSCTL_DECL(_machdep);
 
 extern "C" const Adreno830Board *piano_a830_board(void);
 
@@ -799,6 +805,65 @@ int gMayMap;
 const pianollcc::Io kLlccThread = {&gMayMap, llccRead, llccWrite};
 const pianollcc::Io kLlccAny = {nullptr, llccRead, llccWrite};
 
+IOLock *gLlccAuditLock;
+int gLlccAuditGeneration;
+unsigned gLlccAuditIndex;
+bool gLlccAuditPrepared;
+enum class LlccAuditState { waiting, complete, stopped };
+LlccAuditState gLlccAuditState;
+
+void finishLlccAudit(LlccAuditState state)
+{
+  gLlccAuditState = state;
+  IOLockWakeup(gLlccAuditLock, &gLlccAuditState, true);
+}
+
+int llccAuditCommand(int command, int token)
+{
+  if (gLlccAuditState != LlccAuditState::waiting) return ECANCELED;
+  if (gLlccAuditIndex == pianollcc::kAuditCount) {
+    if (command != token) return EINVAL;
+    IOLog("PianoA830: sens-trace29 RELEASE token=%d reads=%u\n", token, gLlccAuditIndex);
+    finishLlccAudit(LlccAuditState::complete);
+    return 0;
+  }
+
+  const auto &read = pianollcc::kAuditReads[gLlccAuditIndex];
+  const auto physical = static_cast<unsigned long long>(read.physical());
+  if (command == token && !gLlccAuditPrepared) {
+    IOLog("PianoA830: sens-trace29 PRE token=%d seq=%u op=load pa=0x%08llx\n", token, gLlccAuditIndex + 1, physical);
+    gLlccAuditPrepared = true;
+    return 0;
+  }
+  if (command != -token || !gLlccAuditPrepared) return EINVAL;
+  gLlccAuditPrepared = false;
+  uint32_t value = 0;
+  const bool answered = llccRead(&gMayMap, read.view, read.offset, &value);
+  const bool ok = answered && read.accepts(value);
+  ++gLlccAuditIndex;
+  IOLog("PianoA830: sens-trace29 POST token=%d seq=%u op=load pa=0x%08llx value=0x%08x bit12=%u status=%s next=%s\n",
+        token, gLlccAuditIndex, physical, value, (value >> pianollcc::kScid) & 1u,
+        !answered ? "access-failed" : !ok ? "unexpected" : "ok",
+        !ok ? "stop" : gLlccAuditIndex == pianollcc::kAuditCount ? "release" : "step");
+  if (!ok) {
+    finishLlccAudit(LlccAuditState::stopped);
+    return EIO;
+  }
+  return 0;
+}
+
+int sysctlLlccAudit(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
+{
+  if (!kauth_cred_issuser(kauth_cred_get())) return EPERM;
+  IOLockLock(gLlccAuditLock);
+  const int token = gLlccAuditGeneration + int(gLlccAuditIndex) + 1;
+  int command = gLlccAuditState == LlccAuditState::waiting ? token : gLlccAuditState == LlccAuditState::complete ? 0 : -1;
+  int error = sysctl_handle_int(oid, &command, 0, req);
+  if (!error && req->newptr) error = llccAuditCommand(command, token);
+  IOLockUnlock(gLlccAuditLock);
+  return error;
+}
+
 void islandLine(const char *what, const pianollcc::Reading &r, pianollcc::State state)
 {
   piano_a830_note("llcc: ISLAND1 (SCID 12) %s: ATTR0 %#x (0x26841300, expect 0x7fffffff) ATTR1 %#x (0x26841308, expect 0) ATTR2 %#x "
@@ -819,6 +884,7 @@ void islandPublish(IOService *service)
 // piano-llcc-island=1 (piano-gpu=2) the programming.
 void islandStart(IOService *service, unsigned level)
 {
+  if (bootArg("piano-llcc-audit", 0) == 1) return;
   // Opt-in until a tablet boot has shown the reads are safe under Gunyah: without piano-llcc-island (0 = read only,
   // 1 = read and program) the GPU boot does not touch the LLCC at all and the island stays "unknown".
   if (bootArg("piano-llcc-island", 0xffffffffu) == 0xffffffffu) {
@@ -854,6 +920,40 @@ void islandStart(IOService *service, unsigned level)
   islandPublish(service);
 }
 }  // namespace
+
+// Called once by the normal shared ADSP owner before firmware/PAS. Only the
+// root sysctl's acknowledged load command can reach the LLCC while it waits.
+extern "C" void piano_a830_llcc_audit_wait(void)
+{
+  gLlccAuditLock = IOLockAlloc();
+  if (!gLlccAuditLock) {
+    IOLog("PianoA830: sens-trace29 STOP lock allocation failed\n");
+    return;
+  }
+  IOLockLock(gLlccAuditLock);
+  gLlccAuditGeneration = int((mach_absolute_time() & 0x7fffffull) << 8);
+  static struct sysctl_oid oid;
+  oid.oid_parent = &sysctl__machdep_children;
+  oid.oid_number = OID_AUTO;
+  oid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  oid.oid_name = "piano_llcc_diag";
+  oid.oid_handler = sysctlLlccAudit;
+  oid.oid_fmt = "I";
+  oid.oid_descr = "Root-only, host-acknowledged LLCC audit read";
+  oid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&oid);
+  IOLog("PianoA830: sens-trace29 READY token=%d steps=%u awaiting host\n", gLlccAuditGeneration + 1, pianollcc::kAuditCount);
+  uint64_t deadline;
+  clock_interval_to_deadline(330, kSecondScale, &deadline);
+  while (gLlccAuditState == LlccAuditState::waiting) {
+    if (IOLockSleepDeadline(gLlccAuditLock, &gLlccAuditState, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+        gLlccAuditState == LlccAuditState::waiting) {
+      gLlccAuditState = LlccAuditState::stopped;
+      IOLog("PianoA830: sens-trace29 STOP host handshake timed out\n");
+    }
+  }
+  IOLockUnlock(gLlccAuditLock);
+}
 
 // For kexts linked after PianoA830 (their descriptors name it as a library) and the platform function: the two words read again.
 extern "C" bool piano_a830_llcc_island_ready(void)
