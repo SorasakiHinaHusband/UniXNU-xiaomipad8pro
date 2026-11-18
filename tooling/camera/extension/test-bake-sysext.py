@@ -55,7 +55,7 @@ def fixture(root):
         'uniqueID': old_id, 'teamID': bake.TEAM, 'identifier': bake.EXT,
         'bundleVersion': {'CFBundleShortVersionString': '1.1', 'CFBundleVersion': '3'},
         'categories': ['com.apple.system_extension.cmio'], 'originPath': bake.ORIGIN,
-        'container': {'bundlePath': bake.APP}, 'stagedBundleURL': 'file://' + old_path + '/',
+        'container': {'bundlePath': bake.APP}, 'stagedBundleURL': {'relative': 'file://' + old_path + '/'},
         'stagedCdhashes': {old_hash: {'cputype': 16777228, 'cpusubtype': 0}}, 'stagedCdhash': old_hash,
         'state': 'activated_enabled', 'references': [{'appRef': 'file:///.file/id=synthetic-old-volume/',
                 'teamID': bake.TEAM, 'appIdentifier': bake.HOST}],

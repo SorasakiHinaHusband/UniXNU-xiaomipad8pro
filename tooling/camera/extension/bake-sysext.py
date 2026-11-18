@@ -113,9 +113,12 @@ def load_capture(folder):
     require(ref['teamID'] == TEAM and ref['appIdentifier'] == HOST, 'reference identity differs')
     require('appRef' not in ref or isinstance(ref['appRef'], str) and ref['appRef'].startswith('file:///'), 'unknown app reference')
     old_id = str(uuid.UUID(e['uniqueID'])).upper()
-    # Foundation.URL's Codable representation is a single absolute URL string.
+    # PropertyListEncoder uses URL's keyed Codable form (JSONEncoder's URL
+    # string special case is different). Absolute file URLs have no base key.
     old_path = ROOT + '/' + old_id + '/' + EXTNAME
-    require(e['stagedBundleURL'] == 'file://' + old_path + '/', 'staged URL and UUID disagree')
+    staged_url = e['stagedBundleURL']
+    require(isinstance(staged_url, dict) and set(staged_url) == {'relative'} and
+            staged_url['relative'] in ('file://' + old_path, 'file://' + old_path + '/'), 'staged URL and UUID disagree')
     hashes = e.get('stagedCdhashes', {})
     if hashes:
         require(isinstance(hashes, dict) and len(hashes) == 1, 'expected one architecture')
@@ -185,7 +188,8 @@ def prepare(folder, package, package_record):
     new_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'unixnu-piano-camera:' + cdhash + ':' + binaries[HOST]['cdhash'])).upper()
     new_path = ROOT + '/' + new_id + '/' + EXTNAME
     e['uniqueID'] = new_id
-    e['stagedBundleURL'] = 'file://' + new_path + '/'
+    slash = '/' if e['stagedBundleURL']['relative'].endswith('/') else ''
+    e['stagedBundleURL'] = {'relative': 'file://' + new_path + slash}
     e['bundleVersion'] = {k: info[k] for k in ('CFBundleShortVersionString', 'CFBundleVersion')}
     if 'stagedCdhashes' in e:
         e['stagedCdhashes'] = {cdhash: {'cputype': 16777228, 'cpusubtype': 0}}
@@ -196,7 +200,7 @@ def prepare(folder, package, package_record):
     if 'appRef' in e['references'][0]:
         e['references'][0]['appRef'] = 'file://' + APP + '/'
     changes = differences(original, db)
-    allowed = {'/extensions/0/uniqueID', '/extensions/0/stagedBundleURL', '/extensions/0/stagedCdhash',
+    allowed = {'/extensions/0/uniqueID', '/extensions/0/stagedBundleURL/relative', '/extensions/0/stagedCdhash',
                '/extensions/0/references/0/appRef', '/extensions/0/bundleVersion/CFBundleVersion',
                '/extensions/0/bundleVersion/CFBundleShortVersionString'}
     allowed.update('/extensions/0/stagedCdhashes/' + h for h in (original['extensions'][0].get('stagedCdhashes', {}) | e.get('stagedCdhashes', {})))
