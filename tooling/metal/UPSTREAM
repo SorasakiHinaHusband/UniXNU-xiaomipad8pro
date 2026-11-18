@@ -19,6 +19,10 @@ Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc
   passed go back by a one-shot timer armed only while something is held; cache budgets by the connection's window; a BoAlloc that
   finds no memory asks every GPU process for its cache through the Darwin notification org.unixnu.piano.gpu-reclaim and is tried
   again over about 120 ms)
+  0010-turnip-gen8-tex-line-offset-bits.patch: Mesa 7ea5e51c8a301a15202e28fef114e4c4055bc329 (MR44151), byte pitches in bits;
+  0011-turnip-gen8-multiplane-ubwc-base.patch: Mesa d286f87b1641abce126337f99caa13b11ae8ef5b (MR43965), combined UBWC Y base
+  for gen8 multi-plane descriptors, with actual-plane-count collection and unused V clearing informed by Mesa
+  cbdef9823c88c9daf5f90d0c2ccd0b5ff2c57d7c (MR44145). Upstream: https://gitlab.freedesktop.org/mesa/mesa.
   (MIT, as the files).
   Build options: UniXNU-turnip build-turnip-macos-piano.py's, with -Dtu-darwin-abi-dir pointing at the ABI below.
 Kernel ABI (MIT): https://github.com/Shad0w23333/Adreno830 1a1321056ffc5428ae925f4680093718b46ca7c2, NativeAdrenoABI.h
