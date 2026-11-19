@@ -461,6 +461,7 @@ static void lpass_read(void *ctx) {(void)ctx;}
 static int tdm_pins(void *ctx, int on) {(void)ctx; w.pins_on = on; return 0;}
 static int smmu(void *ctx) {(void)ctx; return 0;}
 static void publish(void *ctx) {(void)ctx;}
+static int g_va_fail_off;
 static int va_mic(void *ctx, int on)
 {
     (void)ctx;
@@ -470,7 +471,7 @@ static int va_mic(void *ctx, int on)
     if (on && (!w.mic_prepared || !w.cap_prepared || w.mic_started || w.cap_started)) violate("the DMIC path on outside prepared, not started graphs");
     if (!on && (w.mic_started || w.cap_started)) violate("the DMIC path off under running capture graphs");
     w.va_on = on;
-    return 0;
+    return !on && g_va_fail_off ? -1 : 0;
 }
 
 // ------------------------------------------------------------------------------------------------------ the engines
@@ -1120,6 +1121,40 @@ static void testMicRoutes(void)
     CHECK(route_applies == 2 && logged("mic release: run 2 down 1 va 0"));
 }
 
+static void mic_route_start_race(uint32_t t)
+{
+    if (t == 100 && !w.in_running) {
+        CHECK(audio_live_mic_request(&sh, 0, 4) == 0);
+        device(0, 1);   // StartIO wins before the worker observes the request
+    }
+    if (t == 500 && w.in_running) {
+        const AudioMicRouteStatus s = audio_live_mic_route_status(&sh);
+        CHECK(s.requested == 4 && s.applied == -1 && s.generation == 1 && !s.stopped);
+        CHECK(w.va_on && live.mic_state == LiveRunning && w.mic_peak == 6000);
+        device(0, 0);
+    }
+    if (t == 4000) w.wake = 1;
+    if (t == 4100) {
+        const AudioMicRouteStatus s = audio_live_mic_route_status(&sh);
+        if (g_va_fail_off) {
+            CHECK(!s.stopped && s.applied == -1 && s.generation == 1 && live.mic_state == LiveOff);
+            CHECK(audio_live_mic_request(&sh, 0, -1) == EBUSY && live.mplan.seq.undo_errors == 1);
+        } else {
+            CHECK(s.stopped && s.applied == 4 && s.generation == 2 && live.mic_state == LiveDown);
+        }
+    }
+}
+
+static void testMicRoutePendingAndFailedRelease(void)
+{
+    const struct Scenario sc = {10, 160, 20, 0, 4500, AudioPortsUbuntu, 1, mic_route_start_race};
+    for (g_va_fail_off = 0; g_va_fail_off < 2; ++g_va_fail_off) {
+        run(&sc);
+        CHECK(!w.violations && w.va_calls == 2 && logged("mic-route1: start request 4 applied -1 gen 1 run 1"));
+    }
+    g_va_fail_off = 0;
+}
+
 // A full queue every third send: everything still in order, nothing lost.
 static void testQueueFull(void)
 {
@@ -1431,6 +1466,7 @@ int main(void)
     testMicClock();
     testMic();
     testMicRoutes();
+    testMicRoutePendingAndFailedRelease();
     testInputControlsAndWrap();
     testMicShortRestart();
     testQueueFull();
