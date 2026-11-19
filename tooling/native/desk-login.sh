@@ -134,6 +134,9 @@ for attempt in 1 2; do
   fi
   [ "$console_uid" = 0 ] || { echo 'desk-login: console is no longer at the login window' >&2; exit 1; }
   "${INPUT[@]}" key shift >/dev/null
+  # 11-19: the daily v12 profile has auto-brightness with no RAM floor; at 0 lux the login window sits at 6 % (code 128), too
+  # dark for the C920 lit check. Brightness-up keys are a normal user action and only raise the panel (DESK_LOGIN_BRIGHTEN=0 off).
+  for _ in $(seq 1 "${DESK_LOGIN_BRIGHTEN:-6}"); do "${INPUT[@]}" key brightnessup >/dev/null 2>&1 || true; sleep 0.3; done
   touch "$scratch/wake"
   echo "desk-login: non-text wake sent for attempt $attempt"
   frame_deadline=$(( $(date +%s) + 20 ))
