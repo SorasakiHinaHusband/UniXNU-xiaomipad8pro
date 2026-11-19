@@ -28,13 +28,17 @@ static unsigned long long draws;
 @property NSMutableArray<NSWindow *> *windows;
 @property NSTimer *timer;
 @property double start;
+@property double thermalExitAt;
+@property BOOL moderate;
 @property unsigned long long moves, ticks;
 @end
 @implementation LoadDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;self.start=NSProcessInfo.processInfo.systemUptime;self.windows=[NSMutableArray array];
+    self.moderate=[NSUserDefaults.standardUserDefaults boolForKey:@"pianoQualificationModerate"];
+    NSUInteger windowCount=self.moderate?2:6;
     NSRect screen=NSScreen.mainScreen.visibleFrame;
-    for(NSUInteger i=0;i<6;++i) {
+    for(NSUInteger i=0;i<windowCount;++i) {
         NSWindow *w=[[NSWindow alloc] initWithContentRect:NSMakeRect(screen.origin.x+60+i*45,screen.origin.y+70+i*40,
             screen.size.width*.28,screen.size.height*.36) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable
             backing:NSBackingStoreBuffered defer:NO];
@@ -51,6 +55,15 @@ static unsigned long long draws;
     int guard=0;size_t guardBytes=sizeof guard;
     bool exitGuard=sysctlbyname("machdep.piano_gpu_qual607",&guard,&guardBytes,NULL,0)==0 && guard>=0 && (guard&8) &&
         ((guard>>8)!=1 || ![files fileExistsAtPath:@"/tmp/gpur3a/allow-fallback"]);
+    if(self.moderate && exitGuard) {
+        int reason=guard>>8;
+        // Keep the same load for the capped comparison after expiry. For a thermal trip, allow a short recovery observation.
+        if(reason==5)exitGuard=false;
+        if(reason==2 || reason==3) {
+            if(!self.thermalExitAt)self.thermalExitAt=elapsed;
+            exitGuard=elapsed-self.thermalExitAt>=20;
+        }
+    }
     if(exitGuard || elapsed>=1000 || [files fileExistsAtPath:@"/tmp/gpur3a-stop"]) {
         // A same-directory image lets the companion file:// page observe the stop without a server or Automation.
         [files copyItemAtPath:@"/tmp/gpuoom/pattern0.png" toPath:@"/tmp/gpur3a/stop.png" error:NULL];

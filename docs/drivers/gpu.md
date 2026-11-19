@@ -521,3 +521,7 @@ not a measured skin-temperature bound or daily qualification; other modes retain
 The guard sequence counts consecutive VALID TSENS register reads; the hardware exposes no conversion sequence here,
 so this is not evidence of an independent ADC conversion per read. DISPLAY period records keep copy/composition costs
 separate from WORK queue residence and service costs.
+
+In R3b with exit-test mode off, `piano-gpu-dcvs-min=607` selects the sustained-residency qualification. The request
+floor follows the effective guard ceiling, including the initial 342 MHz cap. Its absolute 625-second permit includes
+time for the four guarded up-steps and at least 600 seconds of acknowledged level-7 residency when conditions allow.

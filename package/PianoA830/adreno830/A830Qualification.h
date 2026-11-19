@@ -16,8 +16,11 @@ enum A830QualInhibit : uint32_t {A830QualGpuInvalid=1,A830QualBoardInvalid=2,A83
     A830QualBoardOver=8,A830QualNeedRounds=16};
 class A830Qualification {
 public:
-    void init(A830PowerState *power,A830Recovery *recovery,bool r3b=false,void (*unsafe)(void *)=nullptr) {
+    void init(A830PowerState *power,A830Recovery *recovery,bool r3b=false,void (*unsafe)(void *)=nullptr,
+              bool residency607=false) {
         power_=power;recovery_=recovery;r3b_=r3b;unsafe_=unsafe;power_->setQualificationCeiling(3,3);
+        // Bound the residency run from permit open, allowing the four thermally guarded up-steps before timing level 7.
+        windowNs_=r3b && residency607?625000000000ull:602000000000ull;
         if(r3b) {
             recovery_->qualificationR3b();
             power_->qualificationGuard([](void *p,uint64_t now) {static_cast<A830Qualification *>(p)->checkLease(now);},this);
@@ -79,20 +82,20 @@ public:
             if(gpuHot)fault(A830QualGpuHot,now);
             else if(boardHot)fault(A830QualBoardHot,now);
             else if(!gpuOk || !boardGood)fault(A830QualSensor,now);
-            else if(now-openedAt()>=602000000000ull)fault(A830QualExpired,now);
+            else if(now-openedAt()>=windowNs_)fault(A830QualExpired,now);
         }
         if(!openedAt() && __atomic_load_n(&armed_,__ATOMIC_ACQUIRE) && ready() && !power_->qualificationLatched()) {
             __atomic_store_n(&openedAt_,now,__ATOMIC_RELEASE);
             __atomic_store_n(&high_,true,__ATOMIC_RELEASE);
         }
-        const uint64_t end=openedAt()+602000000000ull;
+        const uint64_t end=openedAt()+windowNs_;
         power_->setQualificationLease(now+2500000000ull<end?now+2500000000ull:end);
         // After the boot latch, cool readings may still reach 342; unknown/hot must always be able to reach 160.
         power_->setQualificationCeiling(!gpuOk || gpuHot?1:high()?7:3,!gpuOk || gpuHot?2:high()?6:3);
     }
     void checkLease(uint64_t now) {
         const uint64_t at=__atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE);
-        if(r3b_ && high() && openedAt() && now>=openedAt() && now-openedAt()>=602000000000ull)
+        if(r3b_ && high() && openedAt() && now>=openedAt() && now-openedAt()>=windowNs_)
             fault(A830QualExpired,now);
         else if(__atomic_load_n(&high_,__ATOMIC_ACQUIRE) && (r3b_?(now<at || now-at>A830R3bThermal::Lease):(now>=at && now-at>=2500000000ull)))
             fault(A830QualSensor,now);
@@ -140,12 +143,12 @@ private:
             if(thermal_.raw>=850)fault(A830QualGpuHot,now);
             else if(hardBoard)fault(A830QualBoardHot,now);
             else if(!thermal_.healthy)fault(A830QualSensor,now);
-            else if(now-openedAt()>=602000000000ull)fault(A830QualExpired,now);
+            else if(now-openedAt()>=windowNs_)fault(A830QualExpired,now);
         }
         if(!openedAt() && __atomic_load_n(&armed_,__ATOMIC_ACQUIRE) && ready() && !power_->qualificationLatched()) {
             __atomic_store_n(&openedAt_,now,__ATOMIC_RELEASE);__atomic_store_n(&high_,true,__ATOMIC_RELEASE);
         }
-        const uint64_t end=openedAt()+602000000000ull;
+        const uint64_t end=openedAt()+windowNs_;
         power_->setQualificationLease(now+A830R3bThermal::Lease<end?now+A830R3bThermal::Lease:end);
         uint8_t cap=hardBoard?1:uint8_t(thermal_.published());
         if(!high() && cap>3)cap=3;
@@ -163,5 +166,6 @@ private:
     uint64_t firstFailure_=0,legacyProtectionAt_=0;
     uint64_t openedAt_=0,lastSamples_[2]={};
     uint64_t heartbeatAt_=0;
+    uint64_t windowNs_=602000000000ull;
 };
 #endif

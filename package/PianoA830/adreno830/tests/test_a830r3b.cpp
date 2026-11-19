@@ -9,11 +9,12 @@ static IOReturn lowVote(void *,bool drop) {
     return gOps.hit(drop?"dropLow":"confirmLow");
 }
 static IOReturn quiesce(void *) {CHECK(gEnv.locked);return gOps.hit("strictQuiesce");}
-static void bootB() {
+static void bootB(bool residency607=false) {
     A830RecoveryOps ops=gRecoveryOps;ops.qualificationLowVote=lowVote;ops.qualificationQuiesce=quiesce;
     ops.qualificationGxOff=[](void *) {return true;};
-    dcvs=A830Dcvs{};boot(ops);qual=A830Qualification{};qual.init(&power,&recovery,true,halt);
+    dcvs=A830Dcvs{};boot(ops);qual=A830Qualification{};qual.init(&power,&recovery,true,halt,residency607);
     A830DcvsConfig c;c.qualification607=true;c.qualificationR3b=true;c.maxLevel=7;c.maxMhz=607;c.maxGiven=true;
+    if(residency607)c.minMhz=607;
     c.initialLevel=1;c.initialBus=2;A830DcvsOps o=gDcvsOps;
     o.qualificationFault=voteFault;o.qualificationService=lease;o.qualificationSample=sample;o.qualificationThermal=snapshot;
     CHECK(dcvs.init(c,kTable,gIo,gPowerEnv,o,&power,&recovery,&tsens)==0);CHECK(dcvs.start()==0);
@@ -32,6 +33,29 @@ static void driveB(unsigned n=1,int deci=740) {
     for(unsigned i=0;i<n;++i) {
         tickB(deci);gHw.busyTicks+=A830_XO_HZ/10;dcvs.noteSubmit();dcvs.serviceTick(gEnv.now);
     }
+}
+static void residencyBudget() {
+    bootB(true);
+    openB();
+    const uint64_t opened=qual.openedAt();
+    driveB(80);
+    CHECK(dcvs.level()<=6 && !qual.reason());
+    driveB(10);
+    CHECK(dcvs.level()==7 && !qual.reason());
+    driveB(6020);
+    CHECK(qual.high() && dcvs.stats().residency607LongestNs>=600000000000ull);
+    while(gEnv.now-opened<625000000000ull)driveB();
+    CHECK(qual.reason()==A830QualExpired && !qual.high() && power.qualificationLatched());
+    driveB(20);
+    CHECK(dcvs.level()==3 && !recovery.lost());
+
+    bootB(true);
+    openB();
+    driveB(90);
+    auto hot=board(100);
+    hot.milli_c[0]=65000;
+    tickB(740,100000000,hot);
+    CHECK(qual.reason()==A830QualBoardHot && power.qualificationCap()==1);
 }
 static void pureBoundaries() {
     for(int d:{799,800,849,850}) {
@@ -154,7 +178,7 @@ static void failuresB() {
 #define A830_R3B_ENTRY main
 #endif
 int A830_R3B_ENTRY() {
-    pureBoundaries();stepsAndBoard();failuresB();
+    pureBoundaries();stepsAndBoard();failuresB();residencyBudget();
     std::printf("PASS: R3b real policy/DCVS/power/recovery boundaries, thermal/board dwell, stale250/251, strict off/low M9/late ACK, independent105 halt, external/boost/wake/park (%u checks)\n",gChecks);
     return 0;
 }

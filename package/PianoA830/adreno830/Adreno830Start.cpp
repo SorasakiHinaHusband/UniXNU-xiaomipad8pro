@@ -192,6 +192,9 @@ uint64_t gQualificationInjectAt=0;
 bool gQualificationInjectionScheduled=false;
 uint32_t gQualificationExitTest=0;
 bool qualificationMode(const Adreno830Board *b) {return b && b->knobs.maxlevel==7 && b->knobs.dcvs_max_mhz==607;}
+bool qualificationResidency(const Adreno830Board *b) {
+    return b->qualification_r3b==1 && !b->qualification_exit_test && b->knobs.dcvs_min_mhz==607;
+}
 void qualLog(const char *format,...) __attribute__((format(printf,1,2)));
 void qualLog(const char *format,...) {
     char line[960];va_list ap;va_start(ap,format);const int n=vsnprintf(line,sizeof line,format,ap);va_end(ap);
@@ -1193,7 +1196,8 @@ IOReturn stageInputs(Adreno830Device *d,Adreno830Failure *f)
                       uint64_t(d->votes.error_step)<<16|(d->votes.error_value&0xffff),0,r);
     if(qualificationMode(b)) {
         if(b->knobs.profile!=1 || b->knobs.speedbin || b->knobs.acd || b->knobs.hfi || b->knobs.rails!=1 ||
-           b->knobs.ddr_boot!=11 || b->knobs.ddr_floor!=11 || !b->knobs.dcvs || b->knobs.dcvs_min_mhz!=160 ||
+           b->knobs.ddr_boot!=11 || b->knobs.ddr_floor!=11 || !b->knobs.dcvs ||
+           (b->knobs.dcvs_min_mhz!=160 && !qualificationResidency(b)) ||
            d->votes.levels!=11 || d->votes.gx_count!=12 || d->votes.cx_count!=3 || d->votes.perf_dwords!=49 ||
            d->votes.initial!=1 || d->votes.level[6].khz!=607000 || d->votes.bw[A830BwLevelNum]!=12)
             return refuse(f,A830S0StepVotes,A830ReasonArgument,0,d->votes.levels,11,kIOReturnBadArgument);
@@ -2739,7 +2743,9 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
 #endif
         gQualificationEnabled=true;
         d->recovery.qualification(qualificationUnsafe,nullptr);
-        gQualification.init(&d->power_state,&d->recovery,config.qualificationR3b,qualificationUnsafe);
+        const bool residency607=qualificationResidency(b);
+        gQualification.init(&d->power_state,&d->recovery,config.qualificationR3b,qualificationUnsafe,residency607);
+        if(residency607)qualLog("R3b residency qualification window-s=625 floor-mhz=607");
         if(config.qualificationR3b)qualLog("R3b CONFIG R3b-607-v1 soft=800 cool=750 hard=850 halt=1050 floor=3 guard-ms=100 lease-ms=250 down-ms=500 up-ms=2000 board-hold=62000,37000 board-release=60000,35000 board-hard=65000,40000");
         d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;
         if(config.qualificationR3b) {
