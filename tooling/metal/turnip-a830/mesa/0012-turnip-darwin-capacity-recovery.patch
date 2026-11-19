@@ -1,0 +1,344 @@
+Turnip Darwin: one bounded capacity-recovery transaction for VA, heap,
+BoAlloc, BoImport and BoMap, with a first-refusal resource census.
+
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 Leo Zhang
+
+Only safely retired/cache-owned BOs are reclaimed. A failed map must be
+successfully cleaned up before any retry; a lost device keeps its quarantine.
+The frontend handles synchronous runtime reclaim after the FFI call unwinds.
+Against 0001-0011. No address-window or VM-backing change.
+
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -309,6 +309,14 @@
+ void
+ tu_drm_device_finish(struct tu_device *dev);
+ 
++#ifdef TU_HAS_DARWIN
++/* Capacity recovery is called only after the failed operation releases its locks.
++ * It never evicts live resources or bypasses a native retirement/lease gate. */
++bool tu_darwin_capacity_retry(struct tu_device *dev, const char *stage,
++                              uint64_t bytes, unsigned retries);
++void tu_darwin_capacity_done(struct tu_device *dev, unsigned retries, bool made);
++#endif
++
+ int
+ tu_device_get_gpu_timestamp(struct tu_device *dev,
+                             uint64_t *ts);
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -925,7 +925,7 @@
+    if (then && now - then < 50000000ull)
+       return;
+    p_atomic_set(&last, now);
+-   ++retire->cache_stats.reclaims_asked;
++   p_atomic_inc(&retire->cache_stats.reclaims_asked);
+    notify_post(DARWIN_RECLAIM_NOTIFICATION);
+ }
+ 
+@@ -1055,32 +1055,91 @@
+  * (darwin_ask_reclaim), each one reaps this process's own freed BOs. False: give up (five waits, or a whole series failed less than a
+  * second ago). */
+ static uint64_t darwin_retry_failed_ns;   /* when the last whole series failed; 0 after one that succeeded */
+-static bool
+-darwin_retry_wait(struct darwin_retire_state *retire, unsigned retries)
+-{
+-   if (retries >= 5)
++/* A by-value census, with independent lock scopes: retire -> vma is the release
++ * order, so a diagnostic must not acquire retire while holding vma. This logs the
++ * first capacity failure before cleanup/retry obscures its resource dimension. */
++static void
++darwin_capacity_snapshot(struct tu_device *dev, const char *stage, uint64_t bytes)
++{
++   static const char *stages[] = {"iova", "alloc", "import", "map", "heap", "sparse-iova"};
++   static uint64_t failures[ARRAY_SIZE(stages) + 1];
++   unsigned index = 0;
++   while (index < ARRAY_SIZE(stages) && strcmp(stage, stages[index]))
++      ++index;
++   const uint64_t n = p_atomic_inc_return(&failures[index]);
++   uint64_t mark = 1;
++   while (mark < n && mark <= UINT64_MAX / 10)
++      mark *= 10;
++   if (mark != n)
++      return;
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   mtx_lock(&dev->vma_mutex);
++   const uint64_t used = retire->va.used, holes = retire->va.holes;
++   struct rb_node *last = rb_tree_last(&retire->va.size);
++   const uint64_t largest = last ? rb_node_data(struct darwin_va_hole, last, by_size)->size : 0;
++   mtx_unlock(&dev->vma_mutex);
++   pthread_mutex_lock(&retire->lock);
++   const uint64_t cached = retire->cache_bytes, pending = retire->count;
++   const VkResult failure = retire->failure;
++   pthread_mutex_unlock(&retire->lock);
++   mesa_loge("NativeAdreno ws-oom2 capacity: pid=%d stage=%s request=%llu va=%llu/%llu largest=%llu holes=%llu "
++             "heap=%llu/%llu cached=%llu pending=%llu failure=%d count=%llu",
++             getpid(), stage, (unsigned long long)bytes, (unsigned long long)used,
++             (unsigned long long)dev->physical_device->va_size, (unsigned long long)largest,
++             (unsigned long long)holes, (unsigned long long)p_atomic_read(&dev->physical_device->heap.used),
++             (unsigned long long)dev->physical_device->heap.size, (unsigned long long)cached,
++             (unsigned long long)pending, failure, (unsigned long long)n);
++}
++
++/* One transaction budget across VA, native allocation/import and mapping. Notify
++ * the frontend asynchronously: its runtime may currently hold the allocation lock.
++ * Its synchronous local reclaim/retry happens after the failed FFI call unwinds.
++ * Never call the frontend synchronously here or wait while holding retire/vma. */
++bool
++tu_darwin_capacity_retry(struct tu_device *dev, const char *stage, uint64_t bytes, unsigned retries)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   if (!retire)
+       return false;
+-   if (!retries) {
+-      const uint64_t failed = p_atomic_read(&darwin_retry_failed_ns);
+-      if (failed && os_time_get_nano() - failed < 1000000000ull)
+-         return false;
+-      darwin_ask_reclaim(retire);
+-   }
++   if (!retries)
++      darwin_capacity_snapshot(dev, stage, bytes);
++   darwin_ask_reclaim(retire);
++   p_atomic_inc(&darwin_memory_pressure);
++   pthread_mutex_lock(&retire->lock);
++   VkResult collected = darwin_reap_locked(dev, retire);
++   if (collected == VK_SUCCESS)
++      darwin_cache_flush(dev, retire);
++   collected = retire->failure != VK_SUCCESS ? retire->failure : collected;
++   pthread_mutex_unlock(&retire->lock);
++   if (collected != VK_SUCCESS)
++      return false;
++   if (retries >= 5) {
++      p_atomic_set(&darwin_retry_failed_ns, os_time_get_nano());
++      return false;
++   }
++   const uint64_t failed = p_atomic_read(&darwin_retry_failed_ns);
++   if (!retries && failed && os_time_get_nano() - failed < 1000000000ull)
++      return false;
+    usleep(4000u << retries);
+    pthread_mutex_lock(&retire->lock);
+    ++retire->cache_stats.retries;
+-   if (darwin_reap_locked(retire->dev, retire) == VK_SUCCESS)
+-      darwin_cache_trim(retire->dev, retire);
++   collected = darwin_reap_locked(dev, retire);
++   if (collected == VK_SUCCESS)
++      darwin_cache_flush(dev, retire);
++   collected = retire->failure != VK_SUCCESS ? retire->failure : collected;
+    pthread_mutex_unlock(&retire->lock);
++   if (collected != VK_SUCCESS)
++      return false;
+    return true;
+ }
+ 
+ /* 0009: the series' outcome, on stderr the first time and then every 10th, 100th, ... of each. */
+-static void
+-darwin_retry_done(struct darwin_retire_state *retire, unsigned retries, bool made)
++void
++tu_darwin_capacity_done(struct tu_device *dev, unsigned retries, bool made)
+ {
+    if (!retries)
+       return;
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    static uint64_t outcomes[2];
+    p_atomic_set(&darwin_retry_failed_ns, made ? 0 : os_time_get_nano());
+    if (made) {
+@@ -1093,7 +1152,7 @@
+    while (mark < n)
+       mark *= 10;
+    if (mark == n)
+-      mesa_loge("NativeAdreno: a BoAlloc found no memory; every GPU process was asked for its cached BOs; %s after %u wait%s "
++      mesa_loge("NativeAdreno: capacity recovery requested every GPU process's idle memory; %s after %u wait%s "
+                 "(%llu time%s)", made ? "made" : "still none", retries, retries == 1 ? "" : "s", (unsigned long long)n,
+                 n == 1 ? "" : "s");
+ }
+@@ -1251,22 +1310,20 @@
+    }
+ 
+    unsigned retries = 0;   /* 0009 */
+-   for (bool flushed = false; !reused;) {
++   for (; !reused;) {
+       VkResult result = VK_SUCCESS;
+       if (lazy_vma)
+          iova = lazy_vma->msm.iova;
+       else
+          result = darwin_allocate_iova(dev, alloc_size, client_iova, flags, &iova);
+-      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !flushed) {
+-         flushed = true;
+-         pthread_mutex_lock(&retire->lock);
+-         bool any = darwin_cache_flush(dev, retire);
+-         pthread_mutex_unlock(&retire->lock);
+-         if (any)
++      if (result != VK_SUCCESS) {
++         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && tu_darwin_capacity_retry(dev, "iova", alloc_size, retries)) {
++            ++retries;
+             continue;
++         }
++         tu_darwin_capacity_done(dev, retries, false);
++         return result;
+       }
+-      if (result != VK_SUCCESS)
+-         return result;
+ 
+       NativeAdrenoAbiBoAlloc alloc = {.bytes = alloc_size, .align_log2 = 12, .contiguous = 0};
+       NativeAdrenoAbiBoAllocReply reply = {};
+@@ -1274,25 +1331,14 @@
+       if (kr != KERN_SUCCESS) {
+          if (!lazy_vma)
+             darwin_free_iova(dev, iova, alloc_size);
+-         if (!flushed) {   /* the kernel pool may be held by cached BOs */
+-            flushed = true;
+-            pthread_mutex_lock(&retire->lock);
+-            bool any = darwin_cache_flush(dev, retire);
+-            pthread_mutex_unlock(&retire->lock);
+-            if (any)
+-               continue;
+-         }
+-         /* 0009: no memory even with this process's cache given back: every GPU process is asked for its cache and the BO is tried
+-          * again after 4, 8, 16, 32 and 64 ms (once a whole series failed, not again for a second: a process that cannot have memory
+-          * must not stall each allocation). */
+-         if (kr == kIOReturnNoMemory && darwin_retry_wait(retire, retries)) {
++         if ((kr == kIOReturnNoMemory || kr == kIOReturnNoResources) &&
++             tu_darwin_capacity_retry(dev, "alloc", alloc_size, retries)) {
+             ++retries;
+             continue;
+          }
+-         darwin_retry_done(retire, retries, false);
++         tu_darwin_capacity_done(dev, retries, false);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+-      darwin_retry_done(retire, retries, true);
+ 
+       NativeAdrenoAbiBoMap map = {
+          .handle = reply.handle,
+@@ -1304,8 +1350,16 @@
+       NativeAdrenoAbiBoMapReply mapped = {};
+       kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+       if (kr != KERN_SUCCESS) {
+-         return darwin_map_failure(dev, reply.handle, iova, alloc_size, kr, !lazy_vma);
++         result = darwin_map_failure(dev, reply.handle, iova, alloc_size, kr, !lazy_vma);
++         if (result != VK_ERROR_DEVICE_LOST && (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) &&
++             tu_darwin_capacity_retry(dev, "map", alloc_size, retries)) {
++            ++retries;
++            continue;
++         }
++         tu_darwin_capacity_done(dev, retries, false);
++         return result;
+       }
++      tu_darwin_capacity_done(dev, retries, true);
+       handle = reply.handle;
+       if (lazy_vma)   /* its address now goes with the BO (darwin_bo_finish), not with the VMA */
+          lazy_vma->msm.backs_lazy_bo = true;
+@@ -1361,23 +1415,44 @@
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+       return collected;
+-   uint64_t iova;
+-   VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+-   if (result != VK_SUCCESS)
++   uint64_t iova = 0;
++   unsigned retries = 0;
++   NativeAdrenoAbiBoAllocReply reply = {};
++   for (;;) {
++      VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
++      const char *stage = "iova";
++      bool capacity = result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      if (result == VK_SUCCESS) {
++         NativeAdrenoAbiBoImport import = {.address = (uint64_t)(uintptr_t)pointer, .bytes = size};
++         reply = {};
++         kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
++         if (kr != KERN_SUCCESS) {
++            darwin_free_iova(dev, iova, size);
++            capacity = kr == kIOReturnNoMemory || kr == kIOReturnNoResources;
++            stage = "import";
++            /* A capacity refusal is not an unsupported external handle. Preserve
++             * it so the runtime/frontend can reclaim after unwinding their locks. */
++            result = vk_errorf(dev, capacity ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                               "BoImport failed: 0x%x", kr);
++         } else {
++            NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
++            NativeAdrenoAbiBoMapReply mapped = {};
++            kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
++            if (kr == KERN_SUCCESS) {
++               tu_darwin_capacity_done(dev, retries, true);
++               break;
++            }
++            result = darwin_map_failure(dev, reply.handle, iova, size, kr);
++            capacity = result != VK_ERROR_DEVICE_LOST && (kr == kIOReturnNoMemory || kr == kIOReturnNoResources);
++            stage = "map";
++         }
++      }
++      if (capacity && tu_darwin_capacity_retry(dev, stage, size, retries)) {
++         ++retries;
++         continue;
++      }
++      tu_darwin_capacity_done(dev, retries, false);
+       return result;
+-
+-   NativeAdrenoAbiBoImport import = {.address = (uint64_t)(uintptr_t)pointer, .bytes = size};
+-   NativeAdrenoAbiBoAllocReply reply = {};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+-   if (kr != KERN_SUCCESS) {
+-      darwin_free_iova(dev, iova, size);
+-      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+-   }
+-   NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+-   NativeAdrenoAbiBoMapReply mapped = {};
+-   kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+-   if (kr != KERN_SUCCESS) {
+-      return darwin_map_failure(dev, reply.handle, iova, size, kr);
+    }
+ 
+    uint32_t gem_handle = (uint32_t)reply.handle;
+@@ -2041,7 +2116,15 @@
+    out_vma->flags = flags;
+    out_vma->msm.size = size;
+    out_vma->msm.backs_lazy_bo = false;
+-   VkResult result = darwin_allocate_iova(dev, size, client_iova, bo_flags, &out_vma->msm.iova);
++   unsigned retries = 0;
++   VkResult result;
++   do {
++      result = darwin_allocate_iova(dev, size, client_iova, bo_flags, &out_vma->msm.iova);
++      if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY || !tu_darwin_capacity_retry(dev, "sparse-iova", size, retries))
++         break;
++      ++retries;
++   } while (true);
++   tu_darwin_capacity_done(dev, retries, result == VK_SUCCESS);
+    if (result == VK_SUCCESS)
+       *out_iova = out_vma->msm.iova;
+    return result;
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3593,12 +3593,28 @@
+ tu_add_to_heap(struct tu_device *dev, struct tu_bo *bo)
+ {
+    struct tu_memory_heap *mem_heap = &dev->physical_device->heap;
+-   uint64_t mem_heap_used = p_atomic_add_return(&mem_heap->used, bo->size);
+-   if (mem_heap_used > mem_heap->size) {
++   unsigned retries = 0;
++   for (;;) {
++      const uint64_t used = p_atomic_add_return(&mem_heap->used, bo->size);
++      if (used <= mem_heap->size) {
++#ifdef TU_HAS_DARWIN
++         if (dev->darwin_retire)
++            tu_darwin_capacity_done(dev, retries, true);
++#endif
++         break;
++      }
++      /* Roll back the failed reservation before any notification or wait. */
+       p_atomic_add(&mem_heap->used, -bo->size);
++#ifdef TU_HAS_DARWIN
++      if (dev->darwin_retire && tu_darwin_capacity_retry(dev, "heap", bo->size, retries)) {
++         ++retries;
++         continue;
++      }
++      if (dev->darwin_retire)
++         tu_darwin_capacity_done(dev, retries, false);
++#endif
+       tu_bo_finish(dev, bo);
+-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "Out of heap memory");
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "Out of heap memory");
+    }
+    return VK_SUCCESS;
+ }
