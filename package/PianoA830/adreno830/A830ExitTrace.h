@@ -128,6 +128,12 @@ private:
     bool lookFor342_=false,terminalClaimed_=false;
 };
 
+// Production uses one external object. Apple's kext flags give inline variables
+// separate local storage in each translation unit.
+#ifdef ADRENO830_HOST_TEST
 inline A830ExitTrace a830ExitTrace;
+#else
+extern A830ExitTrace a830ExitTrace;
+#endif
 
 #endif

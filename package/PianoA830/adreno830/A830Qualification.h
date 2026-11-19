@@ -110,7 +110,7 @@ public:
         else if(power_->qualificationLatched() && !reason())fault(A830QualVote,now,source);
         if(r3b_ && openedAt() && (now<at || now-at>A830R3bThermal::Lease))power_->setQualificationCeiling(1,2);
     }
-    void sample(uint64_t now,const Sm8750TsensSample &gpu) {
+    void sample(uint64_t now,const Sm8750TsensSample &gpu,A830ExitContext source=A830ExitContext::Dcvs) {
         if(r3b_) {
             bool valid=gpu.valid==255,hot=false;
             for(unsigned i=0;i<8;++i) {
@@ -120,8 +120,8 @@ public:
                     if(gpu.deci[i]>=850)hot=true;
                 }
             }
-            if(!reason() && hot)fault(A830QualGpuHot,now,A830ExitContext::Dcvs);
-            else if(high() && !valid)fault(A830QualSensor,now,A830ExitContext::Dcvs);
+            if(!reason() && hot)fault(A830QualGpuHot,now,source);
+            else if(high() && !valid)fault(A830QualSensor,now,source);
             return; // no filter/cap update here: the sole 100 ms owner does that in tickR3b
         }
         if(!openedAt())return;

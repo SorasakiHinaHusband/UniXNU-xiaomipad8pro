@@ -45,6 +45,8 @@
 #include <string.h>
 #ifdef ADRENO830_HOST_TEST
 #include <new>
+#else
+A830ExitTrace a830ExitTrace;
 #endif
 
 extern "C" __attribute__((weak)) void adreno830_qualification_note(const char *) {}
@@ -2637,7 +2639,7 @@ void qualificationThread(void *)
         const uint64_t now=nowUs()*1000;
         if(g830.power_state.qualificationLatched() && !gQualification.reason())gQualification.fault(A830QualVote,now);
         Sm8750TsensSample gpu={};Sm8750TsensReadGpu(&g830.tsens_io,&gpu);
-        if(gQualification.r3b())gQualification.sample(now,gpu); // raw exit before board lookup, filtering, logging or HFI
+        if(gQualification.r3b())gQualification.sample(now,gpu,A830ExitContext::Guard); // raw exit before board lookup, filtering, logging or HFI
         piano_gpu_temps board={};board.version=PIANO_GPU_TEMPS_VERSION;
         const bool ok=adreno830_qualification_board(&board);
         const auto test=__atomic_load_n(&gQualificationExitTest,__ATOMIC_ACQUIRE);
