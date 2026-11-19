@@ -317,33 +317,7 @@ void readArgs()
   gArgs.l8stats = bootArg("piano-wifi-l8stats", 1);
   // piano-wifi-phy=N (boot 10r): the most wanted PHY of a join: 0 legacy (every level up to 10q: TCP about 24 Mbit/s, the 54 Mbit/s
   // rate's ceiling), 1 HT, 2 HT and VHT; what the network offers decides the rest (WifiHtVht.h). The root-only sysctl
-  // A root diagnostic asks the worker for one involuntary-loss simulation. It
-// never changes user intent (unlike SET22), and never accesses WMI here.
-volatile uint32_t gLinkDropRequested;
-int sysctlLinkDrop(struct sysctl_oid *, void *, int, struct sysctl_req *req)
-{
-  int value = int(__atomic_load_n(&gLinkDropRequested, __ATOMIC_ACQUIRE));
-  int err = SYSCTL_OUT(req, &value, sizeof value);
-  if (err || !req->newptr) return err;
-  int incoming = 0;
-  if (req->newlen != sizeof incoming) return EINVAL;
-  err = SYSCTL_IN(req, &incoming, sizeof incoming);
-  if (err) return err;
-  if (incoming < 0 || incoming > 1) return EINVAL;
-  if (gArgs.level < 8 || !gArgs.rejoin) return ENOTSUP;
-  if (incoming) {
-    struct piano_wifi_assoc_snapshot snapshot = {};
-    if (piano_wifi_assoc_snapshot(&snapshot) || !snapshot.authorized) return ENOTCONN;
-    uint32_t empty = 0;
-    if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, 1u, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
-  } else __atomic_store_n(&gLinkDropRequested, 0u, __ATOMIC_RELEASE);
-  note("PianoWifiUsable2 link-loss probe %s", incoming ? "requested" : "cancelled");
-  return 0;
-}
-struct sysctl_oid gOidLinkDrop;
-
-// machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
+  // machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
   gArgs.phy = bootArg("piano-wifi-phy", 0);
   if (gArgs.phy > 2) gArgs.phy = 0;
   // piano-wifi-rxba=N (boot 10s, WifiBa.h): the access point's block-ack requests (it asks for them on an HT or VHT association,
@@ -3361,6 +3335,32 @@ int sysctlPowerExplicit(struct sysctl_oid *, void *, int, struct sysctl_req *req
   return 0;
 }
 struct sysctl_oid gOidPowerExplicit;
+
+// A root diagnostic asks the worker for one involuntary-loss simulation. It
+// never changes user intent (unlike SET22), and never accesses WMI here.
+volatile uint32_t gLinkDropRequested;
+int sysctlLinkDrop(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(__atomic_load_n(&gLinkDropRequested, __ATOMIC_ACQUIRE));
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming < 0 || incoming > 1) return EINVAL;
+  if (gArgs.level < 8 || !gArgs.rejoin) return ENOTSUP;
+  if (incoming) {
+    struct piano_wifi_assoc_snapshot snapshot = {};
+    if (piano_wifi_assoc_snapshot(&snapshot) || !snapshot.authorized) return ENOTCONN;
+    uint32_t empty = 0;
+    if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, 1u, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
+  } else __atomic_store_n(&gLinkDropRequested, 0u, __ATOMIC_RELEASE);
+  note("PianoWifiUsable2 link-loss probe %s", incoming ? "requested" : "cancelled");
+  return 0;
+}
+struct sysctl_oid gOidLinkDrop;
 
 // machdep.piano_wifi_phy (boot 10r): the most wanted PHY of a join (0 legacy, 1 HT, 2 VHT); a change makes the associated
 // station leave and join again with it (level 7).
