@@ -58,7 +58,11 @@ enum NativeAdrenoVmWhy : uint8_t {
     NativeAdrenoVmWhyHold,          /* the object refused a device reference (status a) */
     NativeAdrenoVmWhyNotReady,      /* the VM is not attached or poisoned */
 };
-struct NativeAdrenoVmRefusal {uint8_t why;uint64_t a,b,c;const NativeAdrenoMemory *memory;};
+struct NativeAdrenoVmRefusal {
+    uint8_t why;uint64_t a,b,c;const NativeAdrenoMemory *memory;
+    /* mapClient's per-call snapshot, copied while the shared VM lock is held. */
+    uint64_t objects=0,spans=0,capacity=0,bytes=0,keep_objects=0,keep_spans=0;
+};
 #endif
 /* Mappings refused for the render server's reserve: [0] for objects, [1] for table ranges. */
 extern "C" volatile uint32_t native_adreno_vm_reserve_refused[2];
@@ -170,7 +174,11 @@ public:
      * (0 for the render server) are mapping records and table ranges this mapping must leave free, checked under the VM's lock: else
      * kIOReturnNoResources and native_adreno_vm_reserve_refused counts it. */
     IOReturn mapClient(NativeAdrenoMemory *,uint64_t iova,unsigned permissions,unsigned writeback,unsigned shareability,
-        uint64_t *handle,size_t keep_objects=0,size_t keep_spans=0);
+        uint64_t *handle,size_t keep_objects=0,size_t keep_spans=0
+#ifdef ADRENO830_MACOS
+        ,NativeAdrenoVmRefusal *refusal=nullptr
+#endif
+        );
     /* Live mapping records and table ranges this VM can still take (no lock: a figure for the status rows and tests). */
     size_t freeObjects() const {return NativeAdrenoVmMaxObjects>objects_?NativeAdrenoVmMaxObjects-objects_:0;}
     size_t freeSpans() const {return capacity_>spanCount()?capacity_-spanCount():0;}

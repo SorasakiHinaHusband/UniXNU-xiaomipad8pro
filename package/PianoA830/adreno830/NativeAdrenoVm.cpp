@@ -554,29 +554,63 @@ void NativeAdrenoVm::attributes(const NativeAdrenoMemory &memory,unsigned permis
     if(shareability)*shareability=cached?3u:2u;
 }
 IOReturn NativeAdrenoVm::mapClient(NativeAdrenoMemory *memory,uint64_t iova,unsigned permissions,unsigned writeback,
-    unsigned shareability,uint64_t *handle,size_t keep_objects,size_t keep_spans)
+    unsigned shareability,uint64_t *handle,size_t keep_objects,size_t keep_spans
+#ifdef ADRENO830_MACOS
+    ,NativeAdrenoVmRefusal *refusal
+#endif
+    )
 {
+#ifdef ADRENO830_MACOS
+    if(refusal)*refusal={};
+    /* Validation before the lock uses only call-owned output, never the shared last-refusal slot. */
+    const auto early=[&](uint8_t why,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0) {
+        if(refusal)*refusal={why,a,b,c,memory};return status;
+    };
+#endif
     if(!handle)return kIOReturnBadArgument;
     *handle=0;
     if(!memory || writeback>1 || (shareability!=2 && shareability!=3) || (permissions&ArmSmmu4KPrivileged))
-        return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
+#ifdef ADRENO830_MACOS
+        return early(NativeAdrenoVmWhyRequest,kIOReturnBadArgument,permissions,writeback,shareability);
+#else
+        return kIOReturnBadArgument;
+#endif
     /* Memory the owner maps read-only could only be pinned for reading: the GPU gets the read half of what was asked. */
     if(memory->readOnly())permissions&=~unsigned(ArmSmmu4KWrite);
     unsigned wb=0,sh=2;
     attributes(*memory,permissions,writeback,shareability,&wb,&sh);
-    if(!attached_)return VM_REFUSE(NotReady,kIOReturnNotReady,0,0,0,memory);
+    if(!attached_)
+#ifdef ADRENO830_MACOS
+        return early(NativeAdrenoVmWhyNotReady,kIOReturnNotReady);
+#else
+        return kIOReturnNotReady;
+#endif
     VM_LOCKED;
+#ifdef ADRENO830_MACOS
+    refusal_={};
+    const auto finish=[&](IOReturn status) {
+        if(refusal) {
+            *refusal=status?refusal_:NativeAdrenoVmRefusal{};
+            refusal->objects=objects_;refusal->spans=spanCount();refusal->capacity=capacity_;refusal->bytes=bytes_;
+            refusal->keep_objects=keep_objects;refusal->keep_spans=keep_spans;
+        }
+        return status;
+    };
+#else
+    const auto finish=[](IOReturn status) {return status;};
+#endif
     /* The render server's reserve (NativeAdrenoVmRenderReserve*): another client's mapping must leave this much of both tables. */
     if(keep_objects && objects_+1+keep_objects>NativeAdrenoVmMaxObjects) {
         native_adreno_vm_reserve_refused[0]=native_adreno_vm_reserve_refused[0]+1;
-        return VM_REFUSE(ReserveObjects,kIOReturnNoResources,objects_,keep_objects,0,memory);
+        return finish(VM_REFUSE(ReserveObjects,kIOReturnNoResources,objects_,keep_objects,0,memory));
     }
     if(keep_spans && memory->spanCount()+keep_spans>capacity_-spanCount()) {
         native_adreno_vm_reserve_refused[1]=native_adreno_vm_reserve_refused[1]+1;
-        return VM_REFUSE(ReserveSpans,kIOReturnNoResources,memory->spanCount(),capacity_-spanCount(),keep_spans,memory);
+        return finish(VM_REFUSE(ReserveSpans,kIOReturnNoResources,memory->spanCount(),capacity_-spanCount(),keep_spans,memory));
     }
-    return mapLocked(memory,0,iova,permissions,wb,sh,handle);
+    return finish(mapLocked(memory,0,iova,permissions,wb,sh,handle));
 }
+
 bool NativeAdrenoVm::completed(uint64_t fence) const
 {
     if(!fence)return true;

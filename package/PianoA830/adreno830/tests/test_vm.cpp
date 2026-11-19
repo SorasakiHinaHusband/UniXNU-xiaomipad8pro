@@ -239,12 +239,17 @@ static void scattered()
     /* UniXNU-piano: the table ranges, told apart from the records: 3 needed, 2 free of 8. */
     CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhySpans && s.vm.lastRefusal().a==3 && s.vm.lastRefusal().b==2 &&
           s.vm.lastRefusal().c==8 && s.vm.lastRefusal().memory==&huge && s.vm.spanCapacity()==8);
-    uint64_t kept=0;
-    CHECK(s.vm.mapClient(&first,0x80c000,3,0,2,&kept,0,2)==kIOReturnNoResources &&   /* the render server's reserve of ranges */
+    uint64_t kept=0;NativeAdrenoVmRefusal own{};
+    CHECK(s.vm.mapClient(&first,0x80c000,3,0,2,&kept,0,2,&own)==kIOReturnNoResources &&   /* the render server's reserve of ranges */
           s.vm.lastRefusal().why==NativeAdrenoVmWhyReserveSpans && s.vm.lastRefusal().a==1 && s.vm.lastRefusal().b==2 &&
           s.vm.lastRefusal().c==2);
     CHECK(s.vm.mapClient(&first,0x80c000,3,0,2,&kept,NativeAdrenoVmMaxObjects,0)==kIOReturnNoResources &&
           s.vm.lastRefusal().why==NativeAdrenoVmWhyReserveObjects && s.vm.lastRefusal().a==3);
+    /* A second connection may overwrite the shared slot; the first call's output remains coherent. */
+    CHECK(own.why==NativeAdrenoVmWhyReserveSpans && own.memory==&first && own.objects==3 && own.spans==6 &&
+          own.capacity==8 && own.bytes==6*4096 && own.keep_objects==0 && own.keep_spans==2);
+    CHECK(s.vm.mapClient(&first,0x80c000,3,2,2,&kept,0,0,&own)==kIOReturnBadArgument &&
+          own.why==NativeAdrenoVmWhyRequest && own.memory==&first && !own.objects && !own.spans);
     refusalChecks+=3;
 #endif
     CHECK(!huge.deviceReferences() && model.writes==writes && s.vm.spanCount()==6 && !s.vm.poisoned());

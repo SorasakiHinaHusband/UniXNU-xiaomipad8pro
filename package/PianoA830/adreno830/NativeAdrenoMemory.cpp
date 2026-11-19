@@ -449,39 +449,48 @@ static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection
 IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
 {
     native_adreno_import_stage=10;
+    failure_={"import-busy",kIOReturnBusy};
     if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
     native_adreno_import_stage=11;
+    failure_={"import-validate",kIOReturnBadArgument};
     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
         !budget || budget>NativeAdrenoMemoryMaxBytes)return kIOReturnBadArgument;
     native_adreno_import_stage=12;
-    if(bytes>budget)return kIOReturnNoResources;
+    if(bytes>budget) {failure_={"import-budget",kIOReturnNoResources};return kIOReturnNoResources;}
     NativeAdrenoCpuState cpu{};
     native_adreno_import_stage=13;
-    IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+    IOReturn status=NativeAdrenoQueryCpu4K(&cpu);
+    if(status!=kIOReturnSuccess) {failure_={"import-cpu-abi",status};return status;}
     const uint64_t limit=UINT64_C(1)<<bits;
     imported_=importRange(address,bytes,kIODirectionInOut,task);
     native_adreno_import_stage=14;
+    failure_={"import-descriptor-create",kIOReturnNoMemory};
     if(!imported_)return kIOReturnNoMemory;
     native_adreno_import_stage=15;
+    failure_.stage="import-prepare";
     status=imported_->prepare();
     if(status==kNativeAdrenoProtectionFailure) {
         /* Read-only memory of the owner (a mapped file, constant data): cannot be pinned for writing. Pin it for reading only; the GPU then maps it
          * read-only. Metal's no-copy buffers over such memory are only ever read by shaders. */
         imported_->release();imported_=nullptr;
         imported_=importRange(address,bytes,kIODirectionOut,task);
-        if(!imported_)return kIOReturnNoMemory;
+        if(!imported_) {failure_={"import-readonly-descriptor",kIOReturnNoMemory};return kIOReturnNoMemory;}
+        failure_.stage="import-readonly-prepare";
         status=imported_->prepare();
         if(status==kIOReturnSuccess)read_only_=true;
     }
-    if(status!=kIOReturnSuccess) {imported_->release();imported_=nullptr;return status;}
+    if(status!=kIOReturnSuccess) {failure_.status=status;imported_->release();imported_=nullptr;return status;}
     prepared_=true;bytes_=bytes;
     status=kIOReturnUnsupported;
     native_adreno_import_stage=16;
+    failure_.stage="import-layout";
     if(imported_->getLength()!=bytes)goto failed;
     native_adreno_import_stage=17;
+    failure_.stage="import-span-metadata";
     span_capacity_=bytes/4096;
     spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {status=kIOReturnNoMemory;goto failed;}
+    failure_.stage="import-physical-spans";
     for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=imported_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
@@ -495,9 +504,9 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     native_adreno_import_stage=19;
     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)span_count_;
     __atomic_fetch_add(&liveImports,1u,__ATOMIC_RELAXED);__atomic_fetch_add(&importBytes,bytes,__ATOMIC_RELAXED);live_import_=true;
-    return kIOReturnSuccess;
+    failure_={};return kIOReturnSuccess;
 failed:
-    (void)release();return status;
+    failure_.status=status;(void)release();return status;
 }
 IOReturn NativeAdrenoMemory::importDevice(IOMemoryDescriptor *scanout,uint64_t offset,size_t bytes)
 {

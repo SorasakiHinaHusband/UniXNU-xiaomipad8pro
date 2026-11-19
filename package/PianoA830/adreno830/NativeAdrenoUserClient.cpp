@@ -496,17 +496,25 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
         return ALLOC_REFUSE(Objects,BoImport,kIOReturnNoResources,live_,entry_count_,0);
     }
     IOReturn status;
+#ifdef ADRENO830_MACOS
+    NativeAdrenoMemoryFailure failure{};uint32_t import_stage=0;
+#endif
     {
         NativeAdrenoSubmitGuard memory(submit_,NativeAdrenoSubmitLockMemory);
         status=scanout?entry->memory.importDevice(scanout_.memory,offset,(size_t)request->bytes):
             entry->memory.importTask(task,request->address,(size_t)request->bytes,output_bits_,(size_t)request->bytes);
+#ifdef ADRENO830_MACOS
+        /* The stage is shared by all connections: copy it before dropping the Memory lock, and before cleanup. */
+        if(status) {failure=entry->memory.lastFailure();import_stage=scanout?5u:native_adreno_import_stage;}
+#endif
         if(status)releaseEntry(*entry);
     }
     if(status) {
         noteImport(status,scanout?5:4,request->bytes,request->address);
 #ifdef ADRENO830_MACOS
         refuseAlloc(NativeAdrenoAllocWhyImport,NativeAdrenoMethodBoImport,status,request->bytes,uint32_t(status),
-                    scanout?5u:native_adreno_import_stage,request->address);
+                    import_stage,request->address);
+        alloc_refusal_.failure=scanout?NativeAdrenoMemoryFailure{"scanout-import",status}:failure;
 #endif
         return status;
     }
@@ -555,12 +563,18 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
      * GPU-read-only imports write-back inner-shareable from level 1, GPU-written imports and write-back requests for own BOs from
      * level 2, the scanout and everything else non-cacheable. */
     uint64_t handle=0;
-    const IOReturn status=vm_->mapClient(&entry->memory,request->iova,permissions,request->writeback,request->shareability,&handle,
-        keep_objects_,keep_spans_);
 #ifdef ADRENO830_MACOS
-    /* UniXNU-piano: the VM's reason, when no other connection's map came in between (its memory is this object). */
+    NativeAdrenoVmRefusal vm{};
+#endif
+    const IOReturn status=vm_->mapClient(&entry->memory,request->iova,permissions,request->writeback,request->shareability,&handle,
+        keep_objects_,keep_spans_
+#ifdef ADRENO830_MACOS
+        ,&vm
+#endif
+        );
+#ifdef ADRENO830_MACOS
+    /* The VM copied this call's reason and usage before releasing its own lock. */
     if(status) {
-        const NativeAdrenoVmRefusal vm=vm_->lastRefusal();
         map_refusal_={NativeAdrenoMapWhyVm,request->iova,entry->memory.bytes(),entry->memory.spanCount(),0,vm,vm.memory==&entry->memory};
         return status;
     }
