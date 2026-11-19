@@ -145,6 +145,17 @@ static void testGainAndPins(void)
 
 static void testRoutes(void)
 {
+    const char *valid[] = {"-1", "0", "2", "4", "6"};
+    const int wanted[] = {-1, 0, 2, 4, 6};
+    for (unsigned i = 0; i < sizeof valid / sizeof *valid; ++i) {
+        int route = -99;
+        CHECK(audio_mic_route_parse(valid[i], &route) && route == wanted[i]);
+    }
+    const char *invalid[] = {"", "-", "1", "-0", "-2", "3", "4294967300", "4x", "04", "6 "};
+    for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; ++i) {
+        int route = -99;
+        CHECK(!audio_mic_route_parse(invalid[i], &route) && route == -99);
+    }
     static const struct {
         int route;
         unsigned mux, mask, count, gpio[4];

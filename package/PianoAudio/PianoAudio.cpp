@@ -114,17 +114,15 @@ void readArgs()
   l.liveCeilingDb = bootArg("piano-audio-ceiling", 0); // 1..40 dB below full scale, level 9 and up; 0: the level's own
   l.liveIdleMs = bootArg("piano-audio-idle", 0);
   l.micGain = bootArg("piano-audio-mic-gain", 0);
-  int route = AUDIO_MIC_ROUTE_LEGACY, diag = 0;
-  if (PE_parse_boot_argn("piano-audio-mic-route", &route, sizeof route) && !audio_mic_route_valid(route)) {
-    piano_audio_log("mic-route1: invalid boot route %d; using legacy -1", route);
-    route = AUDIO_MIC_ROUTE_LEGACY;
+  l.micRoute = AUDIO_MIC_ROUTE_LEGACY;
+  l.micRouteDiag = 0;
+  char routeArg[32], diagArg[32];
+  if (PE_parse_boot_arg_str("piano-audio-mic-route", routeArg, sizeof routeArg) && !audio_mic_route_parse(routeArg, &l.micRoute))
+    piano_audio_log("mic-route1: invalid boot route; using legacy -1");
+  if (PE_parse_boot_arg_str("piano-audio-mic-route-diag", diagArg, sizeof diagArg)) {
+    if (diagArg[0] == '1' && !diagArg[1]) l.micRouteDiag = 1;
+    else if (diagArg[0] != '0' || diagArg[1]) piano_audio_log("mic-route1: invalid boot diag; using 0");
   }
-  if (PE_parse_boot_argn("piano-audio-mic-route-diag", &diag, sizeof diag) && diag != 0 && diag != 1) {
-    piano_audio_log("mic-route1: invalid boot diag %d; using 0", diag);
-    diag = 0;
-  }
-  l.micRoute = route;
-  l.micRouteDiag = diag;
   gArgs.volume = bootArg("piano-audio-volume", 100);
 }
 

@@ -47,11 +47,23 @@ static inline int audio_mic_route_valid(int route)
 {
     return route == AUDIO_MIC_ROUTE_LEGACY || route == 0 || route == 2 || route == 4 || route == 6;
 }
+/* The accepted boot spelling is exactly one of the signed route values. */
+static inline int audio_mic_route_parse(const char *text, int *route)
+{
+    int value;
+    if (text[0] == '-' && text[1] == '1' && !text[2]) value = -1;
+    else if (text[0] >= '0' && text[0] <= '9' && !text[1]) value = text[0] - '0';
+    else return 0;
+    if (!audio_mic_route_valid(value)) return 0;
+    *route = value;
+    return 1;
+}
 static inline unsigned audio_mic_dec0(int route) {return route == AUDIO_MIC_ROUTE_LEGACY ? 0u : (unsigned)route;}
 static inline const char *audio_mic_mono_name(int route) {return route == AUDIO_MIC_ROUTE_LEGACY ? "mean" : "DEC0";}
 
 typedef struct {
     uint32_t mux[2], src[2], tx[2], cfg[2], ctl[4];
+    uint32_t mclk, fs_count, fs_broadcast;
 } AudioVaReadback;
 unsigned audio_va_pair_mask(int route);
 /* Returns -1 for invalid route or failed MCLK, -2 for failed route readback

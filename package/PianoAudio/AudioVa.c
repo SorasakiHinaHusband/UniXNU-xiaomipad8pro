@@ -48,6 +48,9 @@ unsigned audio_va_pair_mask(int route)
 
 static void readback(const AudioVaIo *io, AudioVaReadback *rb)
 {
+    rb->mclk = rd(io, VA_MCLK_CONTROL);
+    rb->fs_count = rd(io, VA_FS_CNT_CONTROL);
+    rb->fs_broadcast = rd(io, VA_TOP_CFG0);
     rb->mux[0] = rd(io, VA_ADC_MUX0_CFG0);
     rb->mux[1] = rd(io, VA_ADC_MUX1_CFG0);
     rb->src[0] = rd(io, VA_ADC_MUX0_CFG1);

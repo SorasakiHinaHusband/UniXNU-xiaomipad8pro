@@ -358,6 +358,8 @@ void vaRouteLog(const char *event, int route, const AudioVaReadback &r, int resu
   piano_audio_log("mic-route1: %s applied %d gen %u DEC0 DMIC%u DEC1 DMIC2 mono %s mux0 %#x mux1 %#x src0 %#x src1 %#x pair-mask %#x ctl01 %#x ctl23 %#x ctl45 %#x ctl67 %#x pins %u result %d",
                   event, route, gMicRouteGeneration, audio_mic_dec0(route), audio_mic_mono_name(route), r.mux[0], r.mux[1],
                   r.src[0], r.src[1], audio_va_pair_mask(route), r.ctl[0], r.ctl[1], r.ctl[2], r.ctl[3], gLpiCount, result);
+  piano_audio_log("mic-route1: decimators %s gen %u mclk %#x fs-count %#x fs-broadcast %#x tx0 %#x cfg0 %#x tx1 %#x cfg1 %#x",
+                  event, gMicRouteGeneration, r.mclk, r.fs_count, r.fs_broadcast, r.tx[0], r.cfg[0], r.tx[1], r.cfg[1]);
 }
 
 void lpiLog(const char *event)
