@@ -62,8 +62,7 @@ class NativeBrightness {
       if (code <= floor_) return pa_sdr_millinits(minFixed());
       if (code >= max_) return 600000;
       if (reference_) return pa_sdr_millinits(pa_sdr_fixed_for_code(code));
-      const uint32_t span = max_ - floor_;
-      return pa_sdr_millinits(minFixed() + uint32_t((uint64_t(maxFixed() - minFixed()) * (code - floor_) + span / 2) / span));
+      return pa_sdr_millinits(pa_sdr_linear_fixed(floor_, code));
     }
     const uint32_t span = max_ - floor_;
     const uint32_t delta = code > floor_ ? code - floor_ : 0;

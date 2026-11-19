@@ -166,6 +166,19 @@ int main()
   test_ladder();
   test_modes();
   test_chain();
+  const pianoauto::AmbientVersion oldCurve{42, 1, PS_ALS_REFERENCE}, current{43, 2, PS_ALS_LEGACY};
+  CHECK(!oldCurve.newer(2, PS_ALS_LEGACY, 0));
+  CHECK(!current.newer(2, PS_ALS_REFERENCE, 0));
+  CHECK(current.newer(2, PS_ALS_LEGACY, 42));
+  CHECK(!current.newer(2, PS_ALS_LEGACY, 43));  // the poll and callback share one applied sequence
+  Ambient bounded;
+  bounded.configure(true, 921, true, 16, PA_SDR_MAX_CODE);
+  CHECK(bounded.target(pa_sdr_permille(1952), 11165) && bounded.code() == 1952);
+  bounded.manual();
+  CHECK(!bounded.target(450, 0) && !bounded.requested());
+  CHECK(!bounded.setAutomatic(true) && !bounded.valid());
+  bounded.invalidate(true);
+  CHECK(!bounded.target(950, 11165) && bounded.faulted());
   std::printf("PASS AmbientBacklight host tests (%u checks)\n", checks);
   return 0;
 }

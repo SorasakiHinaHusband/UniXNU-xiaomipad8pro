@@ -293,6 +293,8 @@ struct Pending {
   int32_t sleep;             // setPowerState: -1 none, 1 off (a system sleep), 0 on (the wake)
   int32_t native = -1;       // newest absolute request, encoded as signed 16.16 nits
   int32_t reference = -1;    // newest root A/B selection
+  pianoauto::AmbientVersion ambientVersion{};
+  bool ambientFault = false;
 };
 IOLock *gLock;
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
@@ -350,7 +352,7 @@ class PianoBacklight : public IOService {
   IOService *fDisplay = nullptr, *fKeyboard = nullptr, *fSensors = nullptr;   // fSensors: piano-backlight-auto=1 only
   uint64_t fSensorsSeq = ~0ull;   // PianoSensors' piano-sensors-seq as last taken
   int64_t fSensorsTarget = -2;    // its piano-sensors-light-target as last taken (-2: none yet)
-  uint64_t fPublished[23] = {};
+  uint64_t fPublished[24] = {};
   bool fHavePublished = false;
   uint64_t fNextLookupMs = 0;
   uint64_t fNextNativeMs = 0;
@@ -381,6 +383,8 @@ class PianoBacklight : public IOService {
   void publishNativeState();
   void publishAndroidModel();
   void publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code);
+  void restartAmbient();
+  void applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version);
   IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
  public:
@@ -530,7 +534,9 @@ void PianoBacklight::poll(uint64_t now, bool lidOnly)
   }
   if (fKeyboard) {
     OSNumber *hall = OSDynamicCast(OSNumber, fKeyboard->getProperty("piano-keyboard-hall"));
+    const bool wasLit = fCtl.wantLit();
     if (hall) fCtl.lid(hall->unsigned32BitValue() == 0 ? 0 : hall->unsigned32BitValue() == 1 ? 1 : -1);
+    if (wasLit != fCtl.wantLit()) restartAmbient();
   }
   // PianoSensors' light target (its level 4; the property is absent before): a new one when its sequence or the value moved.
   if (fSensors) {
@@ -542,7 +548,14 @@ void PianoBacklight::poll(uint64_t now, bool lidOnly)
     OSBoolean *valid = d ? OSDynamicCast(OSBoolean, d->getObject("valid")) : nullptr;
     OSBoolean *fault = d ? OSDynamicCast(OSBoolean, d->getObject("fault")) : nullptr;
     const uint64_t t = target ? target->unsigned64BitValue() : ~0ull, q = seq ? seq->unsigned64BitValue() : 0;
-    if (!valid || !valid->isTrue() || (fault && fault->isTrue())) {
+    if (fRevision) {
+      OSNumber *revision = d ? OSDynamicCast(OSNumber, d->getObject("revision")) : nullptr;
+      OSNumber *curve = d ? OSDynamicCast(OSNumber, d->getObject("curve")) : nullptr;
+      if (fault && fault->isTrue()) fCtl.invalidateAmbient(true); // boot-latched, independent of curve
+      if (revision && curve && seq && valid && (!valid->isTrue() || t <= 1000))
+        applyAmbient(valid->isTrue() ? int32_t(t) : -1, lux ? lux->unsigned32BitValue() : 0, "PianoSensors",
+                     {q, revision->unsigned32BitValue(), curve->unsigned32BitValue()});
+    } else if (!valid || !valid->isTrue() || (fault && fault->isTrue())) {
       fCtl.invalidateAmbient(fault && fault->isTrue());
       fSensorsTarget = -2;
     } else if (target && seq && t <= 1000 && (int64_t(t) != fSensorsTarget || q != fSensorsSeq)) {
@@ -559,7 +572,9 @@ void PianoBacklight::poll(uint64_t now, bool lidOnly)
     note("display power from NativeGopDisplay's property: %s", value ? "on" : "off");
     fDisplayKnown = true;
     fDisplayOn = value;
+    const bool wasLit = fCtl.wantLit();
     fCtl.display(value, fSystem, fApi);
+    if (wasLit != fCtl.wantLit()) restartAmbient();
   }
   fDisplayProperty = value;
 }
@@ -592,6 +607,7 @@ void PianoBacklight::serve()
   IOLockUnlock(gLock);
   if (schema.bounded()) {
     fRevision = 1;
+    fSensorsSeq = 0;
     publishAndroidModel();
   }
   if (gArgs.native) {
@@ -625,11 +641,14 @@ void PianoBacklight::serve()
     gPending.steps = 0;
     gPending.percent = gPending.automatic = gPending.sleep = -1;
     gPending.reference = -1;
+    gPending.ambientFault = false;
     const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
 
     if (p.sleep >= 0) {
+      const bool wasAsleep = fCtl.asleep();
       fCtl.sleep(p.sleep == 1);
+      if (wasAsleep != fCtl.asleep()) restartAmbient();
       for (unsigned retry = 0; p.sleep == 1 && fCtl.pending() && retry < 2; ++retry) {   // the off must take before the freeze
         IOSleep(20);
         fCtl.retry();
@@ -646,13 +665,17 @@ void PianoBacklight::serve()
       fDisplayOn = p.on;
       fSystem = p.system;
       fApi = p.api;
+      const bool wasLit = fCtl.wantLit();
       fCtl.display(p.on, p.system, p.api);
+      if (wasLit != fCtl.wantLit()) restartAmbient();
     }
     if (p.reference >= 0 && fReference != bool(p.reference)) {
       fReference = bool(p.reference);
-      ++fRevision;
-      fAndroidApply = {};
-      publishAndroidModel();
+      restartAmbient();
+    }
+    if (fRevision && p.automatic >= 0) {
+      if (p.automatic == 1 && !fCtl.ambientState().requested()) restartAmbient();
+      fCtl.automatic(p.automatic == 1, "setProperties");
     }
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
@@ -666,8 +689,9 @@ void PianoBacklight::serve()
         fCtl.manualCode(code, kNativeRequest);
       }
     }
-    if (p.automatic >= 0) fCtl.automatic(p.automatic == 1, "setProperties");
-    if (p.ambient) fCtl.ambient(p.target, p.lux, p.ambientSource);
+    if (!fRevision && p.automatic >= 0) fCtl.automatic(p.automatic == 1, "setProperties");
+    if (p.ambientFault) fCtl.invalidateAmbient(true);
+    if (p.ambient) applyAmbient(p.target, p.lux, p.ambientSource, p.ambientVersion);
     const uint64_t now = nowMs();
     if (now >= nextPoll) {
       nextPoll = now + 250;
@@ -746,6 +770,40 @@ void PianoBacklight::publishAndroidModel()
        kAndroidMarker, fReference ? "reference" : "linear", adapter.milliNits(fCtl.floor()), fCtl.floor(), PA_SDR_MAP_CRC, fRevision);
 }
 
+void PianoBacklight::restartAmbient()
+{
+  if (!fRevision) return;
+  ++fRevision;
+  fSensorsSeq = 0;
+  fCtl.invalidateAmbient(false);
+  fAndroidApply = {};
+  publishAndroidModel();
+}
+
+void PianoBacklight::applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version)
+{
+  if (!fRevision) {
+    fCtl.ambient(permille, lux, source);
+    return;
+  }
+  if (!version.newer(fRevision, fReference, fSensorsSeq)) return;
+  fSensorsSeq = version.seq;
+  if (permille < 0) {
+    fCtl.invalidateAmbient(false);
+    return;
+  }
+  if (!fCtl.ambientState().requested() || fCtl.autoFault() || !fCtl.wantLit()) return;
+  const uint32_t errors = fCtl.errors();
+  fCtl.ambient(permille, lux, source);
+  if (!fCtl.ambientState().automatic()) return;
+  const NativeBrightness adapter(fCtl.floor(), fCtl.ceiling(), fReference);
+  const uint16_t raw = pianoauto::Ambient::codeForPermille(uint32_t(permille), fCtl.floor());
+  const uint16_t requested = raw > fCtl.ceiling() ? fCtl.ceiling() : raw;
+  const uint32_t milli = adapter.milliNits(requested);
+  fAndroidApply = {"ambient", milli, errors, pa_sdr_dbv(fReference ? pa_sdr_fixed_for_code(requested)
+                                                                 : pa_sdr_linear_fixed(fCtl.floor(), requested)), fCtl.code()};
+}
+
 void PianoBacklight::publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code)
 {
   auto &request = fAndroidApply;
@@ -776,7 +834,7 @@ void PianoBacklight::publishState()
   const uint64_t state[] = {fCtl.code(), fCtl.controlling(), fCtl.wantLit(), fCtl.autoActive(), fCtl.autoFault(),
       a.requested(), a.valid(), uint64_t(uint32_t(a.lastTarget())), a.lastLux(), uint64_t(uint32_t(a.offset())), a.targets(),
       p.code, q.code, p.lit, q.lit, p.codeReadbacks, q.codeReadbacks, p.enableReadbacks, q.enableReadbacks,
-      p.errors, q.errors, fCtl.errors(), fCtl.writes()};
+      p.errors, q.errors, fCtl.errors(), fCtl.writes(), fRevision};
   static_assert(sizeof(state) == sizeof(fPublished), "backlight publication fields");
   if (fHavePublished && !memcmp(state, fPublished, sizeof(state))) return;
   memcpy(fPublished, state, sizeof(state));
@@ -803,6 +861,14 @@ void PianoBacklight::publishState()
   setProperty("piano-backlight-primary-errors", uint64_t(p.errors), 32);
   setProperty("piano-backlight-secondary-errors", uint64_t(q.errors), 32);
   if (!gArgs.autoAllowed) return;
+  if (fRevision) {
+    NativeProperties snapshot(*this);
+    if (snapshot.number("curve", fReference) && snapshot.number("revision", fRevision)
+        && snapshot.number("floor", fCtl.floor()) && snapshot.number("target", uint32_t(a.lastTarget()))
+        && snapshot.number("lux", a.lastLux()) && snapshot.number("valid", a.valid())
+        && snapshot.number("fault", fCtl.autoFault()))
+      snapshot.commit(pianoauto::kPropertyAmbientSnapshot);
+  }
   setProperty("piano-backlight-implementation", "sens-ab1:session-valid:dual-readback");
   setProperty(pianoauto::kPropertyAuto, fCtl.autoActive());
   setProperty(pianoauto::kPropertyRequested, a.requested());
@@ -828,10 +894,20 @@ IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, v
   IOLockLock(gLock);
   if (ambient) {
     const intptr_t t = intptr_t(p1);
-    gPending.ambient = true;
-    gPending.target = t < 0 ? -1 : t > 1000 ? 1000 : int32_t(t);
-    gPending.lux = uint32_t(uintptr_t(p3) > 0xffffffffu ? 0xffffffffu : uintptr_t(p3));
-    gPending.ambientSource = p2 ? static_cast<const char *>(p2) : "?";
+    const bool versioned = gNativeMax == PA_SDR_MAX_FIXED;
+    if (versioned && t >= 0 && !p4) {
+      IOLockUnlock(gLock);
+      return kIOReturnBadArgument;
+    }
+    if (versioned && t < 0 && !p4) {
+      gPending.ambientFault = true;
+    } else {
+      gPending.ambient = true;
+      gPending.target = t < 0 ? -1 : t > 1000 ? 1000 : int32_t(t);
+      gPending.lux = uint32_t(uintptr_t(p3) > 0xffffffffu ? 0xffffffffu : uintptr_t(p3));
+      gPending.ambientSource = p2 ? static_cast<const char *>(p2) : "?";
+      if (versioned) gPending.ambientVersion = *static_cast<const pianoauto::AmbientVersion *>(p4);
+    }
     ++gPending.ambientCalls;
   } else if (display) {
     gPending.display = true;
@@ -939,6 +1015,11 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
   OSBoolean *autoBoolean = OSDynamicCast(OSBoolean, automatic);
   if (!percent && !steps && !autoNumber && !autoBoolean) return kIOReturnBadArgument;
   IOLockLock(gLock);
+  if (gNativeMax == PA_SDR_MAX_FIXED && automatic &&
+      (d->getCount() != 1 || (!autoNumber && !autoBoolean) || (autoNumber && autoNumber->unsigned64BitValue() > 1))) {
+    IOLockUnlock(gLock);
+    return kIOReturnBadArgument;
+  }
   if (percent) gPending.percent = int32_t(clampArg(percent->unsigned32BitValue(), 0, 100));
   if (steps) {
     gPending.steps = int32_t(clampArg(uint32_t(gPending.steps + int32_t(steps->unsigned32BitValue()) + 20), 0, 40)) - 20;

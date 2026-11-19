@@ -6,7 +6,7 @@
 //
 // The targets come from PianoSensors' kext (AutoLight.h: SensorsPolicy's curve, smoothing and hysteresis; at most one per 250 ms,
 // none at rest) through callPlatformFunction(kFunctionAmbient, false, (void *)(intptr_t)permille, (void *)source, (void *)(uintptr_t)
-// lux, nullptr). A target is permille of the code range (PsCurvePoint's unit: 1000 = 2047). The user's brightness keys keep working
+// lux, metadata). A target is permille of the code range (PsCurvePoint's unit: 1000 = 2047). The user's brightness keys keep working
 // in automatic mode: each press shifts the curve by one of PianoBacklight's own steps (linear mapping: x 2^(1/3), three per doubling,
 // the Steps ladder's factor; exponential mapping: 1/16 of the range), and the shift (the offset) stays for the rest of the boot, so
 // "a little darker than automatic" holds as the room changes. A press always changes what is shown unless the code is at an end
@@ -40,7 +40,19 @@ constexpr const char *kPropertyValid = "piano-backlight-ambient-valid";
 constexpr const char *kPropertyOffset = "piano-backlight-offset";   // published: the user's shift in steps (signed)
 constexpr const char *kPropertyTarget = "piano-backlight-ambient-permille";
 constexpr const char *kPropertyLux = "piano-backlight-ambient-lux";
+constexpr const char *kPropertyAmbientSnapshot = "piano-backlight-ambient";
 constexpr uint16_t kAmbientFullScale = 2047;
+
+// The synchronous platform-function entry point copies this metadata before it queues an update.
+struct AmbientVersion {
+  uint64_t seq;
+  uint32_t revision, curve;
+
+  bool newer(uint32_t expectedRevision, uint32_t expectedCurve, uint64_t taken) const
+  {
+    return revision == expectedRevision && curve == expectedCurve && seq > taken;
+  }
+};
 
 enum class Mode : uint8_t { off, manual, automatic };
 

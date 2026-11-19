@@ -100,6 +100,35 @@ uint32_t ps_als_curve_permille(uint32_t lux)
     return ps_als_curve[ps_als_curve_points - 1].permille;
 }
 
+/* The lit floor is our zero-lux anchor. Positive anchors are Android-declared SDR targets. */
+static const struct { uint32_t lux, nits_fixed; } ps_reference_curve[] = {
+    {0, 0}, {82, 101u << 16}, {771, 178u << 16}, {1202, 236u << 16},
+    {2058, 343u << 16}, {5100, 465u << 16}, {8900, 560u << 16}, {11165, PA_SDR_MAX_FIXED},
+};
+enum {REFERENCE_POINTS = sizeof ps_reference_curve / sizeof ps_reference_curve[0]};
+
+uint32_t ps_als_end_lux(PsAlsCurve curve)
+{
+    return curve == PS_ALS_REFERENCE ? ps_reference_curve[REFERENCE_POINTS - 1].lux : ps_als_curve[ps_als_curve_points - 1].lux;
+}
+
+uint32_t ps_als_target_permille(PsAlsCurve curve, uint16_t floor, uint32_t lux)
+{
+    if (curve != PS_ALS_REFERENCE) return ps_als_curve_permille(lux);
+    if (lux == 0) return pa_sdr_permille(floor);
+    for (unsigned i = 1; i < REFERENCE_POINTS; ++i) {
+        const uint32_t hi = ps_reference_curve[i].lux, lo = ps_reference_curve[i - 1].lux;
+        if (lux <= hi) {
+            const uint32_t base = i == 1 ? pa_sdr_fixed_for_code(floor) : ps_reference_curve[i - 1].nits_fixed;
+            const uint32_t span = hi - lo;
+            const uint32_t fixed = base + (uint32_t)(((uint64_t)(ps_reference_curve[i].nits_fixed - base) * (lux - lo) + span / 2) / span);
+            const uint16_t code = pa_sdr_code(fixed);
+            return pa_sdr_permille(code < floor ? floor : code);
+        }
+    }
+    return pa_sdr_permille(PA_SDR_MAX_CODE);
+}
+
 void ps_als_init(PsAls *a)
 {
     a->has = 0;
@@ -113,9 +142,14 @@ static uint32_t distance(uint32_t a, uint32_t b) {return a > b ? a - b : b - a;}
 
 int32_t ps_als_step(PsAls *a, int have_sample, int32_t milli_lux, uint64_t now_ms)
 {
+    return ps_als_step_curve(a, PS_ALS_LEGACY, 0, have_sample, milli_lux, now_ms);
+}
+
+int32_t ps_als_step_curve(PsAls *a, PsAlsCurve curve, uint16_t floor, int have_sample, int32_t milli_lux, uint64_t now_ms)
+{
     if (have_sample) {
         const uint32_t lux = milli_lux <= 0 ? 0 : (uint32_t)(((int64_t)milli_lux + 500) / 1000);
-        const uint32_t target = ps_als_curve_permille(lux);
+        const uint32_t target = ps_als_target_permille(curve, floor, lux);
         if (!a->has) {
             a->has = 1;
             a->goal = target;

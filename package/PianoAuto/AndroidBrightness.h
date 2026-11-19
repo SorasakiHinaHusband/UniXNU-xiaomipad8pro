@@ -180,4 +180,17 @@ static inline uint32_t pa_sdr_millinits(uint32_t nits_fixed)
     return (uint32_t)(((uint64_t)nits_fixed * 1000 + 32768) >> 16);
 }
 
+static inline uint32_t pa_sdr_linear_fixed(uint16_t floor, uint16_t code)
+{
+    const uint32_t lo = pa_sdr_fixed_for_code(floor), span = PA_SDR_MAX_CODE - floor;
+    if (code <= floor) return lo;
+    if (code >= PA_SDR_MAX_CODE) return PA_SDR_MAX_FIXED;
+    return lo + (uint32_t)(((uint64_t)(PA_SDR_MAX_FIXED - lo) * (code - floor) + span / 2) / span);
+}
+
+static inline uint32_t pa_sdr_permille(uint16_t code)
+{
+    return (code * 1000u + 1023) / 2047;
+}
+
 #endif

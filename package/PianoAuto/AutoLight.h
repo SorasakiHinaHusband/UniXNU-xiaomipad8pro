@@ -29,9 +29,14 @@ typedef struct {
     uint32_t raw_bits, invalid;
     uint64_t sample_ms, valid_ms;
     int sample_valid;                /* last input's numeric validity; zero lux is valid */
+    PsAlsCurve curve;
+    uint32_t revision;
+    uint16_t floor;
+    int curve_waiting;               /* discard events from the old subscription until it re-arms */
 } PalLight;
 
 void pal_init(PalLight *l, const PasConfig *c);
+int pal_select_curve(PalLight *l, PsAlsCurve curve, uint32_t revision, uint16_t floor);
 /* enabled: piano-sensors-als (and PianoBacklight takes targets); display_on: NativeGopDisplay's piano-display-power; lid:
  * PianoKeyboard's piano-keyboard-hall (1 open, 0 closed, anything else unknown). */
 void pal_conditions(PalLight *l, int enabled, int display_on, int lid, uint64_t now_ms);

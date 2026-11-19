@@ -58,6 +58,7 @@ extern "C" {
 #include "SensorsRpc.h"
 #include "SensorsStream.h"
 #include "SensorsText.h"
+#include "../PianoAuto/AmbientBacklight.h"
 // NativeUfs (package/NativeUfs): GPT lookup by name and 4096-byte block reads of any LUN, read only.
 extern int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
 extern int native_ufs_part_read(uint32_t lun, uint64_t lba, uint32_t blocks, void *dst);
@@ -77,6 +78,7 @@ struct Args {
   // level 4 (sensors.md §5c), and the consumers' own arguments it follows
   uint32_t als, rotate, accelHz, accelBatch, accelCover, conditionTrace;
   uint32_t backlight, backlightAuto, rotateAgent, rotateTest;
+  bool backlightAndroid;
   char axesText[32];
   SfxAxes axes;
   int axesGiven, axesOk;
@@ -122,6 +124,7 @@ void readArgs()
   gArgs.conditionTrace = bootArg("piano-sensors-condition-trace", 0);
   gArgs.backlight = bootArg("piano-backlight", 0);         // PianoBacklight's level: its automatic mode needs 2
   gArgs.backlightAuto = bootArg("piano-backlight-auto", 0);
+  gArgs.backlightAndroid = bootArg("piano-backlight-android", 0) == 1;
   gArgs.rotateAgent = bootArg("piano-rotate", 0);          // piano-rotated exits at 0
   gArgs.rotateTest = bootArg("piano-rotate-test", 0);      // 1: the agent takes its edges from a preference, not from here
   SfxAxes gyro, mag;
@@ -664,6 +667,7 @@ SsEngine *gEngine;
 int gStreamPort[SS_STREAMS] = {-1, -1};
 PianoQrtrServer gStreamServer[SS_STREAMS];
 IOService *gSelf;
+void sendAmbient(const SsOutputs &out, const pianoauto::AmbientVersion &version);
 
 // A stream's own port, following service 400 like the list's; the engine starts the stream afresh on it.
 void openStreamPort(int stream)
@@ -684,6 +688,12 @@ int ssSend(void *, int stream, const uint8_t *data, uint32_t length)
 void ssTrace(void *, const char *line) {note("%s", line);}   // the engine limits its own lines
 void ssPublish(void *, const SsOutputs *o)
 {
+  const PalLight &light = gEngine->light;
+  const bool lightChange = (o->changed & (SS_OUT_LIGHT_STATE | SS_OUT_TARGET)) != 0;
+  static uint64_t lightSeq;
+  if (lightChange) lightSeq = o->seq;
+  const uint64_t seq = light.revision ? lightSeq : o->seq;
+  const bool valid = o->light_valid && o->target >= 0 && !o->light_fault;
   // the values first, the sequence last: a consumer that sees the new sequence reads the new values
   gSelf->setProperty("piano-sensors-lux", uint64_t(o->lux), 32);
   if (o->target >= 0) gSelf->setProperty("piano-sensors-light-target", uint64_t(o->target), 32);
@@ -692,16 +702,40 @@ void ssPublish(void *, const SsOutputs *o)
   gSelf->setProperty("piano-sensors-light-fault", bool(o->light_fault));
   gSelf->setProperty("piano-sensors-light-session", uint64_t(o->light_session), 32);
   // One immutable dictionary is the consumer transaction; separate diagnostic properties are not an atomic snapshot.
-  if (OSDictionary *d = OSDictionary::withCapacity(6)) {
-    const char *keys[] = {"target", "lux", "session", "seq"};
-    const uint64_t values[] = {uint64_t(uint32_t(o->target)), o->lux, o->light_session, o->seq};
-    for (unsigned i = 0; i < 4; ++i) {
+  if (OSDictionary *d = OSDictionary::withCapacity(light.revision ? 8 : 6)) {
+    const char *keys[] = {"target", "lux", "session", "seq", "curve", "revision"};
+    const uint64_t values[] = {uint64_t(uint32_t(o->target)), o->lux, o->light_session, seq, light.curve, light.revision};
+    for (unsigned i = 0; i < (light.revision ? 6u : 4u); ++i) {
       if (OSNumber *n = OSNumber::withNumber(values[i], 64)) { d->setObject(keys[i], n); n->release(); }
     }
     d->setObject("valid", o->light_valid ? kOSBooleanTrue : kOSBooleanFalse);
     d->setObject("fault", o->light_fault ? kOSBooleanTrue : kOSBooleanFalse);
     gSelf->setProperty("piano-sensors-light", d);
     d->release();
+  }
+  if (light.revision && lightChange) {
+    const uint32_t permille = valid ? uint32_t(o->target) : 0;
+    const uint16_t raw = pianoauto::Ambient::codeForPermille(permille, light.floor);
+    const uint16_t code = raw > PA_SDR_MAX_CODE ? uint16_t(PA_SDR_MAX_CODE) : raw;
+    const uint32_t fixed = light.curve == PS_ALS_REFERENCE ? pa_sdr_fixed_for_code(code) : pa_sdr_linear_fixed(light.floor, code);
+    note("PianoALSAndroidV1 curve=%s revision=%u session=%u lux=%u target_millinits=%u target_permille=%u valid=%u fault=%u",
+         light.curve == PS_ALS_REFERENCE ? "reference" : "legacy", light.revision, o->light_session, o->lux,
+         valid ? pa_sdr_millinits(fixed) : 0, permille, valid, o->light_fault);
+    if (valid) {
+      static uint32_t lastSession, lastRevision;
+      const SscSuid &id = gEngine->ch[SS_LIGHT].suid;
+      const ScSensor &sensor = gClient->sensor[SC_LIGHT];
+      if (lastSession != o->light_session || lastRevision != light.revision || (o->changed & SS_OUT_LIGHT_STATE)) {
+        const bool known = sensor.attr == SC_ATTR_READ && ssc_suid_equal(&id, &sensor.suid);
+        note("PianoALSAndroidV1 session=%u suid=%016llx:%016llx name=%s location=front type=%s rigid_body=%lld",
+             o->light_session, (unsigned long long)id.high, (unsigned long long)id.low,
+             known ? sensor.attrs.name : "unknown", PS_TYPE_LIGHT,
+             known && sensor.attrs.rigid_count ? (long long)sensor.attrs.rigid_body[0] : -1ll);
+        lastSession = o->light_session;
+        lastRevision = light.revision;
+      }
+    }
+    sendAmbient(*o, {seq, light.revision, uint32_t(light.curve)});
   }
   gSelf->setProperty("piano-sensors-seq", o->seq, 64);
   if (o->changed & SS_OUT_EDGE) gSelf->messageClients(kIOMessageServicePropertyChange);   // piano-rotated's interest notification
@@ -727,6 +761,15 @@ struct Watched {
 };
 Watched gDisplay = {"NativeGopDisplay", nullptr, 0, 0, nullptr}, gKeyboard = {"PianoKeyboard", nullptr, 0, 0, nullptr},
         gBacklight = {"PianoBacklight", nullptr, 0, 0, nullptr};
+
+void sendAmbient(const SsOutputs &out, const pianoauto::AmbientVersion &version)
+{
+  if (!gBacklight.service) return;  // the immutable registry snapshot is also available to the consumer
+  const intptr_t target = out.light_valid && !out.light_fault ? out.target : -1;
+  gBacklight.service->callPlatformFunction(pianoauto::kFunctionAmbient, false, reinterpret_cast<void *>(target),
+      const_cast<char *>("PianoSensors"), reinterpret_cast<void *>(uintptr_t(out.lux)),
+      const_cast<pianoauto::AmbientVersion *>(&version));
+}
 
 // Runs in the sender's context (NativeGopDisplay's gated power change, PianoKeyboard's thread): only wakes the main thread.
 IOReturn conditionChanged(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
@@ -770,12 +813,36 @@ int64_t property(IOService *s, const char *key, int64_t fallback)
   return v;
 }
 
+void selectLightCurve(IOService *backlight)
+{
+  OSObject *snapshot = backlight ? backlight->copyProperty(pianoauto::kPropertyAmbientSnapshot) : nullptr;
+  OSDictionary *d = OSDynamicCast(OSDictionary, snapshot);
+  OSNumber *curve = d ? OSDynamicCast(OSNumber, d->getObject("curve")) : nullptr;
+  OSNumber *revision = d ? OSDynamicCast(OSNumber, d->getObject("revision")) : nullptr;
+  OSNumber *floor = d ? OSDynamicCast(OSNumber, d->getObject("floor")) : nullptr;
+  if (curve && curve->unsigned64BitValue() <= PS_ALS_REFERENCE && revision && revision->unsigned32BitValue() &&
+      floor && floor->unsigned64BitValue() >= PA_SDR_MIN_CODE && floor->unsigned64BitValue() <= 1024 &&
+      pal_select_curve(&gEngine->light, PsAlsCurve(curve->unsigned32BitValue()), revision->unsigned32BitValue(), floor->unsigned32BitValue())) {
+    SsOutputs &out = gEngine->out;
+    out.light_valid = 0;
+    out.target = -1;
+    out.changed = SS_OUT_LIGHT_STATE;
+    ++out.seq;
+    gEngine->lux_pending = 0;
+    ssPublish(nullptr, &out);
+  }
+  OSSafeReleaseNULL(snapshot);
+}
+
 const char *gLightWhy = "?", *gAccelWhy = "?";
 
 SsConditions readConditions(uint64_t now)
 {
   SsConditions c;
   IOService *display = watched(gDisplay, now), *keyboard = watched(gKeyboard, now);
+  IOService *backlight = gArgs.backlightAuto == 1 && gArgs.backlight >= 2 &&
+      (gArgs.als == 1 || (gArgs.als >= 2 && gArgs.backlightAndroid)) ? watched(gBacklight, now) : nullptr;
+  if (backlight && gArgs.backlightAndroid) selectLightCurve(backlight);
   c.display = int(property(display, "piano-display-power", -1));   // unknown (not yet published) counts as on
   c.lid = int(property(keyboard, "piano-keyboard-hall", -1));
   c.attached = property(keyboard, "piano-keyboard-attached", 0) == 1;
@@ -790,7 +857,7 @@ SsConditions readConditions(uint64_t now)
   } else if (gArgs.backlight < 2 || gArgs.backlightAuto != 1) {
     c.light_consumer = 0;
     gLightWhy = "no automatic brightness (piano-backlight=2 piano-backlight-auto=1)";
-  } else if (IOService *backlight = watched(gBacklight, now)) {
+  } else if (backlight) {
     c.light_consumer = property(backlight, "piano-backlight-auto-requested", 0) == 1 &&
                        property(backlight, "piano-backlight-control", 0) == 1;
     gLightWhy = c.light_consumer ? "PianoBacklight requests automatic light" : "PianoBacklight manual or control fault";
@@ -818,7 +885,7 @@ SsConditions readConditions(uint64_t now)
 void ssLeave(void *)
 {
   IOService *backlight = watched(gBacklight, ~0ull >> 1);
-  const IOReturn r = backlight ? backlight->callPlatformFunction("PianoBacklightAmbient", false, reinterpret_cast<void *>(intptr_t(-1)),
+  const IOReturn r = backlight ? backlight->callPlatformFunction(pianoauto::kFunctionAmbient, false, reinterpret_cast<void *>(intptr_t(-1)),
                                                                  const_cast<char *>("PianoSensors"), nullptr, nullptr)
                                : kIOReturnNotFound;
   note("light: PianoBacklight told to leave automatic mode: %#x", r);
