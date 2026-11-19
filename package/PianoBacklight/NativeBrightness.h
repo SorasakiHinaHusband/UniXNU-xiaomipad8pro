@@ -33,7 +33,7 @@ class NativeBrightness {
   bool bounded() const { return max_ == PA_SDR_MAX_CODE; }
   uint32_t minFixed() const
   {
-    return bounded() ? pa_sdr_fixed_for_code(floor_) : ((500u * floor_ + kFullScale / 2) / kFullScale) << 16;
+    return bounded() ? pa_sdr_floor_fixed(floor_) : ((500u * floor_ + kFullScale / 2) / kFullScale) << 16;
   }
   uint32_t maxFixed() const { return (bounded() ? 600u : 500u) << 16; }
   uint32_t midFixed() const { return bounded() ? (minFixed() + maxFixed()) / 2 : ((minNits() + 500u) / 2) << 16; }

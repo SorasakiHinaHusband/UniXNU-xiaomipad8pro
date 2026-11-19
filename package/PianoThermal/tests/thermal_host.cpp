@@ -1008,6 +1008,34 @@ static void testAndroidCpuStep()
   g.init(CpuMode::govern, config, prime, 6, 4, 2);
   g.selectAndroidCap(kAndroidNextKhz[1]);
   CHECK(g.khz(g.tick(tick(1000, PowerSource::external))) == 2649600);
+
+  Cpucp firmware;
+  firmware.khz[0].assign(little, little + 5);
+  firmware.khz[1].assign(prime, prime + 6);
+  scmi::Channel channel;
+  channel.io = firmware.io();
+  for (unsigned d = 0; d < 2; ++d) {
+    firmware.current[d] = 2;
+    scmi::Domain domain;
+    CHECK(!scmi::describeDomain(channel, firmware.version, d, domain) && domain.indexing);
+    uint32_t frequencies[scmi::kMaxLevels]{};
+    for (unsigned i = 0; i < domain.count; ++i) frequencies[i] = domain.levels[i].khz;
+    config.capKhz = capKhz(d ? 2438 : 2400);
+    g.init(CpuMode::govern, config, frequencies, domain.count, domain.sustained, firmware.current[d]);
+    g.selectAndroidCap(kAndroidNextKhz[d]);
+    const unsigned want = g.tick(tick(1000, PowerSource::external));
+    CHECK(frequencies[want] == kAndroidNextKhz[d] && domain.levels[want].key == 3);
+    firmware.setStatus = -3;
+    CHECK(scmi::levelSet(channel, domain, d, want) == -3);
+    int actual = -1;
+    CHECK(!scmi::levelGet(channel, domain, d, actual) && actual == 2);
+    firmware.setStatus = 0;
+    CHECK(!scmi::levelSet(channel, domain, d, want));
+    CHECK(!scmi::levelGet(channel, domain, d, actual) && actual == int(want));
+    g.selectAndroidCap(0);
+    CHECK(!scmi::levelSet(channel, domain, d, g.enforce(PowerSource::external)));
+    CHECK(!scmi::levelGet(channel, domain, d, actual) && frequencies[actual] == kAndroidBaseKhz[d]);
+  }
 }
 
 int main(int argc, char **argv)

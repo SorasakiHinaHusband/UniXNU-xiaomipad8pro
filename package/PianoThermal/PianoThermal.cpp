@@ -1119,7 +1119,6 @@ void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
 
 void PianoThermal::cpuAndroidInputs(uint64_t now)
 {
-  if (androidInputsAt_ && now - androidInputsAt_ < uint64_t(gArgs.tickMs) * 1000000ull) return;
   androidInputsAt_ = now;
   refreshService(androidPower_, "IOPMPowerSource", now, androidPowerLookup_);
   OSObject *external = androidPower_ ? androidPower_->copyProperty("ExternalConnected") : nullptr;
@@ -1210,7 +1209,9 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     return;
   }
   const uint64_t now = nowNs();
-  if (gArgs.androidArmed) cpuAndroidInputs(now);
+  if (gArgs.androidArmed) {
+    if (loadTick || !androidInputsAt_) cpuAndroidInputs(now);
+  }
   else if (now - powerAtNs_ >= 10000000000ull) {
     const PowerSource p = readPowerSource();
     if (p != power_ && gArgs.cpufreq == 3) note("[%us] cpufreq: power source: %s -> %s", upS(), powerName(power_), powerName(p));

@@ -717,7 +717,8 @@ void ssPublish(void *, const SsOutputs *o)
     const uint32_t permille = valid ? uint32_t(o->target) : 0;
     const uint16_t raw = pianoauto::Ambient::codeForPermille(permille, light.floor);
     const uint16_t code = raw > PA_SDR_MAX_CODE ? uint16_t(PA_SDR_MAX_CODE) : raw;
-    const uint32_t fixed = light.curve == PS_ALS_REFERENCE ? pa_sdr_fixed_for_code(code) : pa_sdr_linear_fixed(light.floor, code);
+    const uint32_t fixed = light.curve == PS_ALS_LEGACY ? pa_sdr_linear_fixed(light.floor, code)
+        : code == light.floor ? pa_sdr_floor_fixed(code) : pa_sdr_fixed_for_code(code);
     note("PianoALSAndroidV1 curve=%s revision=%u session=%u lux=%u target_millinits=%u target_permille=%u valid=%u fault=%u",
          light.curve == PS_ALS_REFERENCE ? "reference" : "legacy", light.revision, o->light_session, o->lux,
          valid ? pa_sdr_millinits(fixed) : 0, permille, valid, o->light_fault);

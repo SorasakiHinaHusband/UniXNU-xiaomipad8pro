@@ -225,7 +225,7 @@ class Controller {
       constexpr uint8_t mode = kCfg1LinearMap | kCfg1PwmEnable;
       const bool compatible = p.answered && q.answered && !((p.reg[kRegCfg1] | q.reg[kRegCfg1]) & mode)
           && (p.reg[kRegEn] & kEnSinks) == (q.reg[kRegEn] & kEnSinks)
-          && p.reg[kRegIfs] == q.reg[kRegIfs] && (p.reg[kRegOpt2] & 3) == (q.reg[kRegOpt2] & 3);
+          && !((p.reg[kRegIfs] ^ q.reg[kRegIfs]) & 0xf8) && (p.reg[kRegOpt2] & 3) == (q.reg[kRegOpt2] & 3);
       note("Android SDR %s: primary/secondary BL_CFG1 %#x/%#x sinks %#x/%#x IFS %#x/%#x current-limit %#x/%#x",
            compatible ? "supported" : "unsupported", p.reg[kRegCfg1], q.reg[kRegCfg1], p.reg[kRegEn] & kEnSinks,
            q.reg[kRegEn] & kEnSinks, p.reg[kRegIfs], q.reg[kRegIfs], p.reg[kRegOpt2] & 3, q.reg[kRegOpt2] & 3);

@@ -180,9 +180,17 @@ static inline uint32_t pa_sdr_millinits(uint32_t nits_fixed)
     return (uint32_t)(((uint64_t)nits_fixed * 1000 + 32768) >> 16);
 }
 
+/* Round the advertised floor up to whole millinits. The native API reads it
+ * back as nits and truncates signed 16.16; use that same representable bound. */
+static inline uint32_t pa_sdr_floor_fixed(uint16_t floor)
+{
+    const uint64_t milli = ((uint64_t)pa_sdr_fixed_for_code(floor) * 1000 + 65535) >> 16;
+    return (uint32_t)((milli << 16) / 1000);
+}
+
 static inline uint32_t pa_sdr_linear_fixed(uint16_t floor, uint16_t code)
 {
-    const uint32_t lo = pa_sdr_fixed_for_code(floor), span = PA_SDR_MAX_CODE - floor;
+    const uint32_t lo = pa_sdr_floor_fixed(floor), span = PA_SDR_MAX_CODE - floor;
     if (code <= floor) return lo;
     if (code >= PA_SDR_MAX_CODE) return PA_SDR_MAX_FIXED;
     return lo + (uint32_t)(((uint64_t)(PA_SDR_MAX_FIXED - lo) * (code - floor) + span / 2) / span);

@@ -295,6 +295,7 @@ struct Pending {
   int32_t reference = -1;    // newest root A/B selection
   pianoauto::AmbientVersion ambientVersion{};
   bool ambientFault = false;
+  uint64_t nativeOrder = 0, autoOrder = 0;
 };
 IOLock *gLock;
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
@@ -303,6 +304,7 @@ uint32_t gSleepAsked, gSleepTaken;
 bool gServing, gDarkForSleep;
 bool gNativeReady;
 uint32_t gNativeMin, gNativeMax;  // fixed schema, initialized by the worker under gLock
+uint64_t gControlOrder;
 LogLimit gNativeRejectionLog{8, 10000};  // protected by gLock
 
 class NativeProperties {
@@ -364,7 +366,7 @@ class PianoBacklight : public IOService {
   uint32_t fRevision = 0, fNativePublishedRevision = 0;
   struct AndroidApply {
     const char *source = nullptr;
-    uint32_t milliNits = 0, errors = 0;
+    uint32_t revision = 0, milliNits = 0, errors = 0;
     uint16_t dbv = 0, code = 0;
     bool pendingLogged = false;
   } fAndroidApply;
@@ -384,6 +386,7 @@ class PianoBacklight : public IOService {
   void publishAndroidModel();
   void publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code);
   void restartAmbient();
+  void setAutomatic(bool on);
   void applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version);
   IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
@@ -632,6 +635,7 @@ void PianoBacklight::serve()
       const uint64_t now = nowMs();
       if (now < fNextNativeMs) {
         p.native = -1;
+        if (fRevision && p.automatic >= 0 && p.autoOrder > p.nativeOrder) p.automatic = -1;
       } else {
         gPending.native = -1;
         fNextNativeMs = now + kNativeApplyIntervalMs;
@@ -639,7 +643,8 @@ void PianoBacklight::serve()
     }
     gPending.any = gPending.display = gPending.ambient = false;
     gPending.steps = 0;
-    gPending.percent = gPending.automatic = gPending.sleep = -1;
+    gPending.percent = gPending.sleep = -1;
+    if (p.automatic >= 0) gPending.automatic = -1;
     gPending.reference = -1;
     gPending.ambientFault = false;
     const uint32_t asked = gSleepAsked;
@@ -671,12 +676,11 @@ void PianoBacklight::serve()
     }
     if (p.reference >= 0 && fReference != bool(p.reference)) {
       fReference = bool(p.reference);
+      fAndroidApply = {};  // the pending target was encoded with the old shape
       restartAmbient();
     }
-    if (fRevision && p.automatic >= 0) {
-      if (p.automatic == 1 && !fCtl.ambientState().requested()) restartAmbient();
-      fCtl.automatic(p.automatic == 1, "setProperties");
-    }
+    const bool autoAfterNative = !fRevision || (p.native >= 0 && p.autoOrder > p.nativeOrder);
+    if (p.automatic >= 0 && !autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
     if (p.native >= 0) {
@@ -685,11 +689,11 @@ void PianoBacklight::serve()
       if (NativeBrightness(fCtl.floor(), fCtl.ceiling(), fRevision && fReference).decode(uint32_t(p.native), code, &dbv)) {
         fNativeRequest = p.native;
         fNativeErrors = fCtl.errors();
-        if (fRevision) fAndroidApply = {"native", pa_sdr_millinits(uint32_t(p.native)), fNativeErrors, dbv, code};
+        if (fRevision) fAndroidApply = {"native", fRevision, pa_sdr_millinits(uint32_t(p.native)), fNativeErrors, dbv, code};
         fCtl.manualCode(code, kNativeRequest);
       }
     }
-    if (!fRevision && p.automatic >= 0) fCtl.automatic(p.automatic == 1, "setProperties");
+    if (p.automatic >= 0 && autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.ambientFault) fCtl.invalidateAmbient(true);
     if (p.ambient) applyAmbient(p.target, p.lux, p.ambientSource, p.ambientVersion);
     const uint64_t now = nowMs();
@@ -766,6 +770,8 @@ void PianoBacklight::publishAndroidModel()
 {
   const NativeBrightness adapter(fCtl.floor(), fCtl.ceiling(), fReference);
   setProperty(kReferenceProperty, uint64_t(fReference), 32);
+  setProperty("piano-backlight-map-crc", uint64_t(PA_SDR_MAP_CRC), 32);
+  setProperty("piano-backlight-sdr-revision", uint64_t(fRevision), 32);
   note("%s model=%s schema=600 min_millinits=%u max_millinits=600000 code_min=%u code_max=1952 map_crc=%08x revision=%u",
        kAndroidMarker, fReference ? "reference" : "linear", adapter.milliNits(fCtl.floor()), fCtl.floor(), PA_SDR_MAP_CRC, fRevision);
 }
@@ -776,8 +782,14 @@ void PianoBacklight::restartAmbient()
   ++fRevision;
   fSensorsSeq = 0;
   fCtl.invalidateAmbient(false);
-  fAndroidApply = {};
+  if (fAndroidApply.source && !strcmp(fAndroidApply.source, "ambient")) fAndroidApply = {};
   publishAndroidModel();
+}
+
+void PianoBacklight::setAutomatic(bool on)
+{
+  if (on && !fCtl.ambientState().requested()) restartAmbient();
+  fCtl.automatic(on, "setProperties");
 }
 
 void PianoBacklight::applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version)
@@ -800,8 +812,8 @@ void PianoBacklight::applyAmbient(int32_t permille, uint32_t lux, const char *so
   const uint16_t raw = pianoauto::Ambient::codeForPermille(uint32_t(permille), fCtl.floor());
   const uint16_t requested = raw > fCtl.ceiling() ? fCtl.ceiling() : raw;
   const uint32_t milli = adapter.milliNits(requested);
-  fAndroidApply = {"ambient", milli, errors, pa_sdr_dbv(fReference ? pa_sdr_fixed_for_code(requested)
-                                                                 : pa_sdr_linear_fixed(fCtl.floor(), requested)), fCtl.code()};
+  const uint32_t fixed = fReference ? pa_sdr_fixed_for_code(requested) : pa_sdr_linear_fixed(fCtl.floor(), requested);
+  fAndroidApply = {"ambient", fRevision, milli, errors, pa_sdr_dbv(fixed), fCtl.code()};
 }
 
 void PianoBacklight::publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code)
@@ -815,12 +827,12 @@ void PianoBacklight::publishAndroidApply(const NativeBrightness &adapter, bool a
   const unsigned errors = fCtl.errors() - request.errors;
   if (applied && code == request.code) {
     note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u applied_millinits=%u errors=%u",
-         kAndroidMarker, request.source, fRevision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+         kAndroidMarker, request.source, request.revision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
          adapter.milliNits(code), errors);
     request = {};
   } else if (!request.pendingLogged || !fCtl.controlling()) {
     note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u result=%s errors=%u",
-         kAndroidMarker, request.source, fRevision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+         kAndroidMarker, request.source, request.revision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
          fCtl.controlling() ? "pending" : "failed", errors);
     request.pendingLogged = true;
     if (!fCtl.controlling()) request = {};
@@ -980,6 +992,7 @@ IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value
   const bool logRefusal = result != kIOReturnSuccess && gNativeRejectionLog.allow(nowMs(), &dropped);
   if (result == kIOReturnSuccess) {
     gPending.native = int32_t(fixed);
+    if (gNativeMax == PA_SDR_MAX_FIXED) gPending.nativeOrder = ++gControlOrder;
     gPending.any = true;
     IOLockWakeup(gLock, &gPending, false);
   }
@@ -1025,7 +1038,10 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
     gPending.steps = int32_t(clampArg(uint32_t(gPending.steps + int32_t(steps->unsigned32BitValue()) + 20), 0, 40)) - 20;
     gPending.source = "setProperties";
   }
-  if (autoNumber || autoBoolean) gPending.automatic = autoBoolean ? autoBoolean->isTrue() : autoNumber->unsigned32BitValue() ? 1 : 0;
+  if (autoNumber || autoBoolean) {
+    gPending.automatic = autoBoolean ? autoBoolean->isTrue() : autoNumber->unsigned32BitValue() ? 1 : 0;
+    if (gNativeMax == PA_SDR_MAX_FIXED) gPending.autoOrder = ++gControlOrder;
+  }
   gPending.any = true;
   IOLockWakeup(gLock, &gPending, false);
   IOLockUnlock(gLock);

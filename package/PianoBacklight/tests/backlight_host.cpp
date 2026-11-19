@@ -909,6 +909,12 @@ static void testAndroidBrightness()
   }
   CHECK(pa_sdr_millinits(pa_sdr_fixed_for_code(347)) == 4492);  // DBV 15..16 midpoint
   CHECK(pa_sdr_fixed_for_code(1952) == 600u << 16);
+  for (uint16_t floor = PA_SDR_MIN_CODE; floor <= 1024; ++floor) {
+    const NativeBrightness adapter(floor, PA_SDR_MAX_CODE, true);
+    const uint32_t min = adapter.milliNits(floor);
+    uint16_t code = 0;
+    CHECK(adapter.decode(uint32_t((uint64_t(min) << 16) / 1000), code) && code == floor);
+  }
   for (uint16_t floor : {128, 921}) {
     const uint16_t lo = floor < PA_SDR_MIN_CODE ? uint16_t(PA_SDR_MIN_CODE) : floor;
     const NativeBrightness ref(lo, PA_SDR_MAX_CODE, true), control(lo, PA_SDR_MAX_CODE, false);
