@@ -506,8 +506,21 @@ int main()
     CHECK(r.associate().error == 0);
     CHECK(r.ask(true, kCipherKey, 148).error == 0);
     CHECK(r.ask(false, 9999, 16).error == kErrUnsupported);
-    // accepted sets that change nothing
-    CHECK(r.ask(true, kCountryCode, 8).error == 0 && r.ask(true, kPowerSave, 8).error == 0);
+    // Country SET has a version word; an unsupported change must not succeed.
+    std::memset(r.user.mem.data(), 0, 8);
+    r.put32(0, 1);
+    r.user.mem[4] = 'X'; r.user.mem[5] = 'X';
+    CHECK(r.ask(true, kCountryCode, 8).error == 0);
+    CHECK(r.ask(true, kCountryCode, 3).error == kErrInval);
+    r.user.mem[4] = 'U'; r.user.mem[5] = 'S';
+    CHECK(r.ask(true, kCountryCode, 8).error == kErrUnsupported);
+    CHECK(r.st.country[0] == 'X' && r.st.country[1] == 'X');
+    r.user.mem[6] = 'A';
+    CHECK(r.ask(true, kCountryCode, 8).error == kErrInval);
+    r.user.mem[6] = 0; r.put32(0, 2);
+    CHECK(r.ask(true, kCountryCode, 8).error == kErrInval);
+    CHECK(r.ask(true, kCountryCode, 8, false).error == kErrInval);
+    CHECK(r.ask(true, kPowerSave, 8).error == 0);
   }
 
   // ---- SET 20: both wire layouts become a level-7 profile; malformed requests are refused with a reason

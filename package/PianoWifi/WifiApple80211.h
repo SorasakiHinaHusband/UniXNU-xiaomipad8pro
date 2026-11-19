@@ -895,7 +895,20 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       s.cursor = 0;
       s.cacheCleared = true;
       return a;
-    case kCountryCode:
+    case kCountryCode: {
+      // Firmware owns the regulatory domain. Never acknowledge an unperformed
+      // change. SET51 is version1 + alpha2/NUL/pad (8 bytes), unlike GET51.
+      uint8_t country[8];
+      if (rq.length != sizeof country) { a.error = kErrInval; return a; }
+      if ((a.error = copyIn(rq, io, country, sizeof country))) return a;
+      if (country[0] != 1 || country[1] || country[2] || country[3] || country[4] < 'A' || country[4] > 'Z' ||
+          country[5] < 'A' || country[5] > 'Z' || country[6]) {
+        a.error = kErrInval;
+        return a;
+      }
+      if (country[4] != uint8_t(s.country[0]) || country[5] != uint8_t(s.country[1])) a.error = kErrUnsupported;
+      return a;
+    }
     case kLocale:
     case kPowerSave:
       return a;   // accepted, nothing to change in M1

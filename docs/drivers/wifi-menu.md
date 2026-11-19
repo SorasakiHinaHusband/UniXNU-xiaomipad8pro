@@ -714,3 +714,21 @@ GET-before-notification ordering. This is source/model validation; real disconne
 reconnection with DHCP/gateway/DNS still require the unattended wifi-power3 three-cycle RAM qualification. The two earlier
 power runs stopped before association; they did not qualify disconnect cycles. No result is
 claimed for the installed system by this change.
+
+### Desktop power handoff
+
+The boot-ON guard keeps startup policy OFF requests from parking the radio before
+login. The root `piano-wifi-controls` job hands the radio to normal desktop power
+policy after a stable console login, a published AirPort dictionary, and raw
+power ON. It arms the existing one-way control once; the menu then uses the
+ordinary POWER19 path. It does not set power or grant location authorization.
+
+COUNTRY_CODE GET51 reports the firmware country. SET51 is a versioned eight-byte
+record: the current country is idempotent; a different country is unsupported
+until firmware regulatory changes and channel updates are implemented. A public
+CoreWLAN nil can still mean location privacy filtering.
+
+The root diagnostic `machdep.piano_wifi_link_drop=1` requests one simulated link
+loss while authorized. The radio worker consumes it using the existing station
+teardown and retry path, preserving user intent. Writing zero cancels a pending
+request. This is a probe, not an AP-loss or installed-system qualification result.
