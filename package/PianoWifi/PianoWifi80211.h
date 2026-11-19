@@ -1070,6 +1070,10 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
             old.channel != next.channel || old.rssi != next.rssi;
   IOLockUnlock(fLock);
   if (!emit) { IOLockUnlock(fSyncLock); return; }
+  // The initial idle state has no authorization edge. Reconcile after BSD
+  // publication and family enable as well as on subsequent link changes,
+  // before airportd/configd receive the matching power/association events.
+  syncRunning(next.authorized);
   if (powerChanged) postEvent(kEvPowerChanged);
   if (!changed) { IOLockUnlock(fSyncLock); return; }
   const auto transition = associationTransition(old, next);
