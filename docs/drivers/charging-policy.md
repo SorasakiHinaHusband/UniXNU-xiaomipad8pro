@@ -38,7 +38,7 @@ configuration) logged and diffed with every report, a 2 s watch of the stop's mo
   configuration (always first), the port notifications and the UCSI probe.
 - A computer port (CDP) gets the CDP row, 900 mA, whatever its Type-C Rp advertises; `piano-power-rp=1` trusts a 1.5 / 3.0 A Rp,
   since 2026-11-12 in steps from the row up to the Rp current (3 A at most, `piano-power-rp-max`), each step only while the bus holds
-  and the input is used up, one step back for the boot on a sag, a quick detach or a refusal (§15; `piano-power-ramp=0`: the old
+  and the input is used up, one step back with a 60 s cool-down on a sag, a quick detach or a refusal (§15; `piano-power-ramp=0`: the old
   immediate limit within 1600 mA, §13). The board thermistors PianoThermal publishes only ever make it more conservative (§1).
 - Defaults are today's caution: ceilings ICL 1600 / FCC 1500 mA (PianoMca's allowlist), 5 V only, no float change, Preserve
   Battery Health off. Every planned write passes `piano_charge_write_allowed()`; each new write has a read-back (§7).
@@ -466,18 +466,23 @@ only on evidence, and remembers for the boot where it failed.
 
 | Rule | Value | Why |
 |---|---|---|
-| Target | min(the Rp current, `piano-power-rp-max` (3000), the board holds); a source without a PD contract only | the source's own advertisement (USB Type-C: the Type-C current before BC 1.2); 3.0 A is the most a 5 V Rp can say |
+| Target | min(the source budget, `piano-power-rp-max` (3000), the board holds) | non-PD: Rp; strict mode with hv=0: a fresh fixed 5 V selected RDO and source data, without a voltage transition; PD advertisements alone cannot raise draw |
 | Without a connector reading below 50 °C | at most 1500 mA (`RP_WITHHELD` once) | BC 1.2's CDP/DCP current and the 1.5 A Rp: what the DCP row takes without any thermistor |
 | First step | the class row (CDP 900, DCP 1500, …) | what Linux and the earlier runs wrote first; I and P1 had 100 → 900 answered at once |
-| Steps | 1500, 2000, 2500, 3000 mA (≤ 600 mA each) | each firmware ramp short (§15.3); a sag found at most one step late |
+| Steps | 1500, 2000, 2500, 3000 mA (SDP 500 → 1500 is 1000 mA; later increments ≤ 500 mA) | existing steps unchanged; a sag found at most one step late |
 | Up when | the step taken (acknowledged), held 10 s and two decisions after the decision that saw it taken (15 s with the 5 s cycle), the bus ≥ 4.65 V under it, the bus current ≥ the step − max(100 mA, step / 8) | the source has just held this much, and the system and the battery take it all, so more is of use; demand-driven: a light load never climbs |
 | Down at once | a lower target (the Rp gone, a connector at 50 °C, a PD contract, a type change) | |
-| Back one step, ceiling for the boot | the bus < 4.5 V under a step above the row; a detach within 30 s of a step up (planned or taken); the firmware refusing a step three times | a sag means the source or the cable is at its end; a port's over-current cut looks like a detach; a refusal is the firmware's own ceiling |
+| Back one step, temporary ceiling | the bus < 4.5 V under an acknowledged step above the row; a detach within 30 s of a step up (planned or taken); the firmware refusing a step three times | lower immediately, retain the ceiling for 60 s, then retry through the same ACK/hold/4.65 V/demand guards; another failure renews the cool-down |
 | Restart from the row | every attach, a new charger generation, a wake, a board hold (a hot connector or charger) released, 9 V | never straight back up to a step reached before |
 | Sleep handover | the row (as before: nothing watches the bus while asleep) | |
 
-The ceiling only goes down, survives detaches, generations and wakes, and ends with the boot (a different cable tomorrow starts
-fresh). Measured basis for the margins (P1, P2 on the Mac's port): 5.22 V open, 5.05 V at 897 mA, 4.89 V at 1594 mA, about 0.21 Ω
+The temporary ceiling and its monotonic deadline survive detaches, generations and wakes; these events cannot shorten it. After
+60 s only the ICL retry counters are refreshed, keeping pending writes and acknowledged state. The normal step guards still apply;
+expiry alone cannot authorize more current. No valid bus sample means no sag or detach. A reported bus below 4 V with a live Type-C
+connector enters the strict readback barrier; a valid 4.0–4.5 V reading under an acknowledged raised step backs off immediately.
+This replaces the permanent boot ceiling: an early transient could otherwise hold SDP at 500 mA despite later 4.84 V/497 mA readings.
+Host replay covers recovery and repeated faults; tablet qualification of this change remains pending.
+Measured basis for the margins (P1, P2 on the Mac's port): 5.22 V open, 5.05 V at 897 mA, 4.89 V at 1594 mA, about 0.21 Ω
 from the source to the charger, so 3 A would leave about 4.6 V: above the 4.5 V sag rule, below the 4.65 V needed to go higher.
 `piano-power-ramp=0` keeps the 2026-11-11 behaviour (the Rp limit at once within 1600 mA, a sag ends the trust).
 
@@ -495,7 +500,7 @@ PianoPower: mca: write input limit (0x2008) = 900: ok (0)            (the input 
 PianoPower: mca: write charge current (0x2005) = 900: ok (0)
 PianoPower: policy: input steps: up 900 -> 1500 mA (towards 3000 mA, Rp 3000 mA): it held 5040 mV with 897 mA taken
 PianoPower: policy: input steps: at 2500 mA (towards 3000 mA): the bus is below 4.65 V under it; bus 4610 mV, 2498 mA   (once per step and reason)
-PianoPower: policy: input steps: back from 2500 mA: the bus sagged below 4.5 V under it (bus 4420 mV); 2000 mA is the ceiling for the rest of this boot
+PianoPower: policy: input steps: back from 2500 mA: the bus sagged below 4.5 V under it (bus 4420 mV); ceiling 2000 mA, guarded retry after 60 s
 PianoPower: [126s] input: bus 4720 mV 2490 mA, limit 2500 mA asked, 0x2029 2500; steps 2500 mA (holding) of 3000, ceiling 0; writes 9 ok 0 no answer 0 late, 0 unmatched
 PianoPower: mca: late answer to the write of input limit (0x2008) = 1600: ok (0), after the 1000 ms window (1 late so far): handed to the policy
 PianoPower: mca: an answer that matches no request: opcode 2, input limit (0x2008), sequence 41, return code 0 (in flight: 43); 1 so far

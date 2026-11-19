@@ -519,7 +519,8 @@ bool PianoPower::start(IOService *provider)
       note("piano-power-rp=1 piano-power-ramp=1: a source without PD that advertises 1.5 or 3.0 A on its Rp is stepped from its class "
            "row to that current, at most %u mA (piano-power-rp-max): 1500, 2000, 2500, 3000, each held 10 s with the bus at 4.65 V or "
            "more and the input used up; above 1500 mA only while a connector temperature (PianoThermal) reads below 50 C; a sag below "
-           "4.5 V, a detach within 30 s of a step or a refused step: one step back, the ceiling for this boot", gArgs.rpMax);
+           "4.5 V, a detach within 30 s of a step or a refused step: one step back, guarded retry after %u s", gArgs.rpMax,
+           PIANO_CHG_RAMP_RETRY_MS / 1000);
     else
       note("piano-power-rp=%u: %s", gArgs.rp ? 1u : 0u,
            gArgs.rp ? "a source without PD that advertises 1.5 or 3.0 A on its Rp gets that as its 5 V input limit, at most 1600 mA, "
@@ -1993,13 +1994,13 @@ void PianoPower::inputLine(char *line, size_t size)
   const PianoMca &m = fMca;
   const PianoChargePlan &p = fLink.plan;
 #define HAS(f) piano_mca_has(&m, f)
-  static const char *const kWait[] = {"no steps", "writing", "holding", "bus low", "no current", "not used up", "at target"};
+  static const char *const kWait[] = {"no steps", "writing", "holding", "bus low", "no current", "not used up", "at target", "cooling"};
   snprintf(line, size,
            "input: bus %d mV %d mA, limit %d mA asked, 0x2029 %d; steps %u mA (%s) of %u, ceiling %u; writes %u ok %u no answer "
            "%u late, %u unmatched",
            HAS(McaBusVoltage) ? m.value[McaBusVoltage] / 1000 : -1, HAS(McaBusCurrent) ? m.value[McaBusCurrent] / 1000 : -1,
            HAS(McaIcl) ? m.value[McaIcl] : -1, HAS(McaAiclStatus) ? m.value[McaAiclStatus] : -1, p.ramp_ma,
-           kWait[p.ramp_wait < 7 ? p.ramp_wait : 0], p.ramp_target_ma, fLink.st.ramp_ceiling_ma, m.writes_ok, m.timeouts,
+           kWait[p.ramp_wait < 8 ? p.ramp_wait : 0], p.ramp_target_ma, fLink.st.ramp_ceiling_ma, m.writes_ok, m.timeouts,
            m.late_answers, m.ignored_answers);
 #undef HAS
 }
@@ -2121,10 +2122,10 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
   static const char *const kBack[] = {"?", "the bus sagged below 4.5 V under it", "the source went within 30 s of the step",
                                       "the firmware refused the step three times"};
   static const char *const kWait[] = {"not stepping", "writing", "holding", "the bus is below 4.65 V under it",
-                                      "no bus current reading", "the input is not used up", "at the target"};
+                                      "no bus current reading", "the input is not used up", "at the target", "cooling before a guarded retry"};
   if (e & PIANO_CHG_EV_RAMP_BACK)
-    note("policy: input steps: back from %u mA: %s (bus %d mV); %u mA is the ceiling for the rest of this boot", pl.ramp_back_from_ma,
-         kBack[pl.ramp_back_why < 4 ? pl.ramp_back_why : 0], pl.ramp_back_mv, pl.ramp_ceiling_ma);
+    note("policy: input steps: back from %u mA: %s (bus %d mV); ceiling %u mA, guarded retry after %u s", pl.ramp_back_from_ma,
+         kBack[pl.ramp_back_why < 4 ? pl.ramp_back_why : 0], pl.ramp_back_mv, pl.ramp_ceiling_ma, PIANO_CHG_RAMP_RETRY_MS / 1000);
   // the limit the input was measured against: the step, or the firmware's own (0x2029) settled below it
   char used[48] = "";
   if (pl.ramp_used_ma && pl.ramp_used_ma != (e & PIANO_CHG_EV_RAMP_STEP ? pl.ramp_from_ma : pl.ramp_ma))
@@ -2136,9 +2137,9 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
          in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1, used);
   if (e & PIANO_CHG_EV_RAMP_WAIT) {
     char ceiling[40] = "";
-    if (pl.ramp_ceiling_ma) snprintf(ceiling, sizeof ceiling, ", this boot's ceiling %u mA", pl.ramp_ceiling_ma);
+    if (pl.ramp_ceiling_ma) snprintf(ceiling, sizeof ceiling, ", temporary ceiling %u mA", pl.ramp_ceiling_ma);
     note("policy: input steps: at %u mA (towards %u mA%s): %s%s; bus %d mV, %d mA", pl.ramp_ma, pl.ramp_target_ma, ceiling,
-         kWait[pl.ramp_wait < 7 ? pl.ramp_wait : 0], pl.ramp_wait == PIANO_CHG_RAMP_NOT_USED ? used : "", in.bus_mv,
+         kWait[pl.ramp_wait < 8 ? pl.ramp_wait : 0], pl.ramp_wait == PIANO_CHG_RAMP_NOT_USED ? used : "", in.bus_mv,
          (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
   }
   // the charging restart (ChargePolicy.c kick(), charging-policy.md §17)

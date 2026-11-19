@@ -2584,23 +2584,27 @@ static void testLinkRamp()
     for (int i = 0; i < 30; ++i) r->period();
     CHECK(r->d.last(PIANO_MCA_ICL) == 2500 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_BUS_LOW && !r->link.st.ramp_ceiling_ma);
   }
-  // a source whose voltage gives way above 2.2 A: the bus sags below 4.5 V under 2.5 A: back to 2000, the ceiling for the boot; a
-  // new attach stops at 2000
+  // A source whose voltage gives way above 2.2 A: back to2000. A new attach keeps the cool-down; recovery permits a retry.
   {
     auto r = rig(o);
     r->d.kneeMa = 2200;
     r->d.kneeOhms = 1.0;
-    for (int i = 0; i < 30; ++i) r->period();
+    for (int i = 0; i < 30 && !r->link.st.ramp_ceiling_ma; ++i) r->period();
     CHECK((r->take() & PIANO_CHG_EV_RAMP_BACK) && r->link.st.ramp_ceiling_ma == 2000 && r->d.last(PIANO_MCA_ICL) == 2000);
     CHECK(r->link.plan.ramp_back_why == PIANO_CHG_BACK_SAG || r->link.st.ramp_back_why == PIANO_CHG_BACK_SAG);
-    CHECK(r->d.count(PIANO_MCA_ICL) == 5);   // 900, 1500, 2000, 2500, back to 2000: no second try at 2500
+    CHECK(r->d.count(PIANO_MCA_ICL) == 5);   // 900,1500,2000,2500,back to2000 before the cool-down
+    const auto retry = r->link.st.ramp_retry_ms;
     r->d.loadMa = 0;
     r->d.props[PIANO_MCA_BUS_VOLTAGE] = 100000;
     r->period();
     CHECK(r->d.last(PIANO_MCA_ICL) == 100);
     r->d.loadMa = 3500;
+    for (int i = 0; i < 7; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_COOLING);
+    CHECK(r->link.st.ramp_retry_ms == retry && r->d.count(PIANO_MCA_ICL, 2500) == 1);
+    r->d.kneeOhms = 0;
     for (int i = 0; i < 30; ++i) r->period();
-    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000 && !r->link.st.ramp_ceiling_ma && r->d.count(PIANO_MCA_ICL, 2500) == 2);
     CHECK(r->allAllowed());
   }
   // the system takes 1.2 A: at 1500 the input is not used up, so no higher
@@ -2632,21 +2636,27 @@ static void testLinkRamp()
     w->period();
     CHECK(w->d.last(PIANO_MCA_ICL) == 900);
   }
-  // the port cuts out above 2.1 A: the step to 2500 is followed by a detach: the ceiling 2000 for the boot
+  // The port cuts out above2.1A: each retry of2500 detaches and renews the cool-down. Recover without a reboot.
   {
     auto r = rig(o);
     r->d.tripMa = 2100;
     for (int i = 0; i < 40; ++i) r->period();
     CHECK(r->link.st.ramp_ceiling_ma == 2000 && r->link.st.ramp_back_why == PIANO_CHG_BACK_DETACH);
-    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->d.count(PIANO_MCA_ICL, 2500) == 1);
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->d.count(PIANO_MCA_ICL, 2500) >= 2);
+    r->d.tripMa = 0;
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000 && !r->link.st.ramp_ceiling_ma && r->allAllowed());
   }
-  // the firmware refuses limits above 2000: three refusals of 2500, then 2000 is the ceiling
+  // The firmware refuses limits above2000: three attempts per retry, then back off. Restore its allowance and recover.
   {
     auto r = rig(o);
     r->d.iclMax = 2000;
     for (int i = 0; i < 40; ++i) r->period();
     CHECK(r->link.st.ramp_ceiling_ma == 2000 && r->link.st.ramp_back_why == PIANO_CHG_BACK_REFUSED && r->m.icl_set == 2000);
-    CHECK(r->d.count(PIANO_MCA_ICL, 2500) == 3);
+    CHECK(r->d.count(PIANO_MCA_ICL, 2500) >= 6 && r->d.count(PIANO_MCA_ICL, 2500) % 3 == 0);
+    r->d.iclMax = 3000;
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000 && !r->link.st.ramp_ceiling_ma && r->allAllowed());
   }
   // piano-power-rp-max=2000: the steps stop there
   {

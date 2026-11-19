@@ -22,7 +22,7 @@
  *     85 degC holds it at 500 mA at most until below 75;
  *   - the Type-C Rp current as the 5 V input limit of a source without a PD contract (opt-in, cfg.rp), within the ceiling; with
  *     cfg.ramp reached in steps from the class row (1.5, 2.0, 2.5, 3.0 A, within cfg.rp_cap_ma), each step held, the bus at 4.65 V
- *     or more and the input used up before the next, and one step back for the rest of the boot when the bus sags under 4.5 V,
+ *     or more and the input used up before the next, and one step back with a 60 s cool-down when the bus sags under 4.5 V,
  *     the source goes within 30 s of a step or the firmware refuses one (the firmware's own input-current limiting reads off);
  *   - the charge current of a source whose Type-C current is trusted above its row: the DCP row's (a 1.5 / 3.0 A Rp is a 1.5 / 3 A
  *     source), within the ceiling and the same derating;
@@ -80,6 +80,7 @@ enum {
 #define PIANO_CHG_ICL_ABS_MAX 2500u   /* stock in_pps at 9 V: no configuration goes above */
 #define PIANO_CHG_FCC_ABS_MAX 3500u   /* stock chg_pps */
 #define PIANO_CHG_RP_ABS_MAX 3000u    /* the Type-C current's 3.0 A at 5 V: no stepped Rp limit goes above (cfg.rp_cap_ma) */
+#define PIANO_CHG_RAMP_RETRY_MS 60000u /* a failed step's ceiling expires; the ordinary held-step/VBUS/demand guards still apply */
 #define PIANO_CHG_ICL_CAP 1600u       /* the default ceilings: what PianoMca's allowlist takes today (docs §7, stage A) */
 #define PIANO_CHG_FCC_CAP 1500u
 #define PIANO_CHG_FV_DEFAULT 4400u    /* the firmware's own float voltage (reads 5200) */
@@ -102,8 +103,9 @@ typedef struct {
                             * connector temperature reads and is below 50 degC, and not after the bus sagged under such a limit */
     uint8_t ramp;          /* with rp: the Rp limit reached in steps from the row (docs §15), within rp_cap_ma instead of icl_cap_ma;
                             * up to 1.5 A without a connector reading (BC 1.2's and the 1.5 A Rp's current, as the DCP row), above it
-                            * only while a connector reads below 50 degC; a sag, a quick detach or a refusal lowers this boot's
-                            * ceiling by one step. 0: the Rp limit at once, within icl_cap_ma, and a sag ends the trust */
+                            * only while a connector reads below 50 degC; a sag, a quick detach or a refusal lowers the ceiling
+                            * by one step for 60 s, then the guarded steps may retry. 0: the Rp limit at once, within icl_cap_ma,
+                            * and a sag ends the trust */
     uint16_t rp_cap_ma;    /* the stepped Rp limit's ceiling (0: icl_cap_ma; at most PIANO_CHG_RP_ABS_MAX); only with ramp */
     uint8_t strict_contract; /* production buck session: current UCSI contract and safety gates required for HV;
                              * hv=0 with rp+ramp also steps fixed5V PD up to the actual RDO current, within rp_cap_ma */
@@ -231,10 +233,10 @@ typedef struct {
     uint8_t rp_distrust, rp_strikes, rp_noted;
     uint64_t rp_taken_ms;         /* since when an input limit from the Rp is in force (0: none) */
     /* the stepped Rp limit (cfg.ramp): the step wanted now (0: not stepping), the row it starts from, when the step was taken and
-     * the decisions since, when the last step up was planned (a detach within 30 s of it counts against it), this boot's ceiling
-     * (0: none; it only goes down), the last step back, and which wait reasons were logged at this step */
+     * the decisions since, when the last step up was planned (a detach within 30 s of it counts against it), the temporary ceiling
+     * (0: none), its retry deadline (kept across detach, wake and generation), the last step back and the wait reasons logged */
     uint32_t ramp_ma, ramp_row_ma, ramp_ceiling_ma;
-    uint64_t ramp_taken_ms, ramp_step_ms;
+    uint64_t ramp_taken_ms, ramp_step_ms, ramp_retry_ms;
     uint8_t ramp_decisions, ramp_back_why, ramp_waits_shown;
     uint32_t ramp_back_from_ma;
     int32_t ramp_back_mv;
@@ -278,7 +280,7 @@ enum {
     PIANO_CHG_EV_CHGR_HOT = 1u << 27,      /* the charger at or above 85 degC: input limit 500 mA at most */
     PIANO_CHG_EV_CHGR_COOL = 1u << 28,     /* the charger reads below 75 degC again */
     PIANO_CHG_EV_RAMP_STEP = 1u << 29,     /* the stepped Rp limit goes up one step (plan.ramp_from_ma -> plan.ramp_ma) */
-    PIANO_CHG_EV_RAMP_BACK = 1u << 30,     /* one step back, this boot's ceiling lowered (plan.ramp_back_*: a sag, a quick detach, a
+    PIANO_CHG_EV_RAMP_BACK = 1u << 30,     /* one step back, temporary ceiling lowered (plan.ramp_back_*: a sag, a quick detach, a
                                             * refusal) */
 };
 /* the steps wait for a reason not yet logged at this step (plan.ramp_wait); bit 31, outside the enum (an int's range before C23) */
@@ -291,7 +293,8 @@ enum {
     PIANO_CHG_RAMP_BUS_LOW,       /* the bus below 4.65 V (or not read) under this step: no higher */
     PIANO_CHG_RAMP_NO_CURRENT,    /* no bus current reading: whether the input is used up is not known */
     PIANO_CHG_RAMP_NOT_USED,      /* the input is not used up (the system and the battery take less than the step) */
-    PIANO_CHG_RAMP_TOP,           /* at the target: the Rp current, the cap or this boot's ceiling */
+    PIANO_CHG_RAMP_TOP,           /* at the target: the Rp current or cap */
+    PIANO_CHG_RAMP_COOLING,       /* failed step's temporary ceiling; retry after 60 s with all the ordinary guards */
 };
 /* why it went one step back (plan.ramp_back_why) */
 enum {PIANO_CHG_BACK_NONE = 0, PIANO_CHG_BACK_SAG, PIANO_CHG_BACK_DETACH, PIANO_CHG_BACK_REFUSED};
@@ -330,7 +333,7 @@ typedef struct {
     uint8_t icl_why;       /* PIANO_CHG_ICL_* */
     uint32_t rp_ma;        /* the Rp current the input limit follows (0: not from the Rp) */
     /* the stepped Rp limit (cfg.ramp): the step now (0: not stepping), the step it came from (PIANO_CHG_EV_RAMP_STEP), where it is
-     * heading (the Rp current within the cap and the board holds, before this boot's ceiling), the ceiling (0: none), why it waits,
+     * heading (the source current within the cap and the board holds, before the temporary ceiling), the ceiling (0: none), why it waits,
      * and the last step back (PIANO_CHG_EV_RAMP_BACK: why, from which step, the bus then) */
     uint32_t ramp_ma, ramp_from_ma, ramp_target_ma, ramp_ceiling_ma;
     uint8_t ramp_wait, ramp_back_why;

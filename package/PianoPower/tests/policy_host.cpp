@@ -1140,20 +1140,24 @@ static void testRamp()
     s.step();
     CHECK(s.wrote(PIANO_CHG_ICL, 900));
   }
-  // a source that gives way above 2.2 A: a sag under 2500 -> 2000, this boot's ceiling (kept across a generation and a wake)
+  // A sag under 2500 -> 2000. Neither a generation nor a wake shortens the cool-down; a recovered source may retry.
   {
     Sim s;
     mac(s);
     s.kneeMa = 2200;
     s.kneeOhms = 1.0;
-    for (int i = 0; i < 40; ++i) s.step();
+    for (int i = 0; i < 40 && !s.st.ramp_ceiling_ma; ++i) s.step();
     CHECK(s.st.ramp_ceiling_ma == 2000 && s.st.ramp_back_why == PIANO_CHG_BACK_SAG && s.st.ramp_back_from_ma == 2500 && s.icl == 2000);
+    const auto retry = s.st.ramp_retry_ms;
     s.generation++;
     s.wakes++;
-    for (int i = 0; i < 40; ++i) s.step();
-    CHECK(s.icl == 2000 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP && s.plan.ramp_ceiling_ma == 2000);
+    for (int i = 0; i < 10; ++i) {s.step(); CHECK(s.icl <= 2000 && s.st.ramp_retry_ms == retry);}
+    CHECK(s.icl == 2000 && s.plan.ramp_wait == PIANO_CHG_RAMP_COOLING && s.plan.ramp_ceiling_ma == 2000);
+    s.kneeOhms = 0;
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.icl == 3000 && !s.st.ramp_ceiling_ma);
   }
-  // a quick detach after a step: one step back for the boot; a slow one: nothing
+  // A quick detach after a step: one step back during the cool-down; replug cannot shorten it.
   {
     Sim s;
     mac(s);
@@ -1163,8 +1167,10 @@ static void testRamp()
     s.step();
     CHECK((s.plan.events & PIANO_CHG_EV_RAMP_BACK) && s.st.ramp_ceiling_ma == 900 && s.st.ramp_back_why == PIANO_CHG_BACK_DETACH);
     s.source = true;
+    for (int i = 0; i < 10; ++i) s.step();
+    CHECK(s.icl == 900 && s.plan.ramp_wait == PIANO_CHG_RAMP_COOLING);
     for (int i = 0; i < 20; ++i) s.step();
-    CHECK(s.icl == 900 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    CHECK(s.icl == 3000 && !s.st.ramp_ceiling_ma);
   }
   // the input not used up: no step; no bus current reading: none either; a low bus: none
   {
@@ -1209,10 +1215,10 @@ static void testRamp()
     s.refuseIcl = true;
     for (int i = 0; i < 10; ++i) s.step();
     CHECK(s.st.ramp_ceiling_ma == 1500 && s.st.ramp_back_why == PIANO_CHG_BACK_REFUSED && s.icl == 1500);
-    CHECK(s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    CHECK(s.plan.ramp_wait == PIANO_CHG_RAMP_COOLING);
     s.refuseIcl = false;
     for (int i = 0; i < 20; ++i) s.step();
-    CHECK(s.icl == 1500);
+    CHECK(s.icl == 3000 && !s.st.ramp_ceiling_ma);
   }
   // writes off: the steps for the log only, nothing sent; ramp off: the Rp limit at once within the cap (the old behaviour)
   {
@@ -1634,15 +1640,16 @@ static void testDailyFiveVoltBudget()
     PianoChargeState st;
     piano_charge_init(&st);
     PianoChargeInput x = in;
+    if (retainedCeiling) {st.ramp_ceiling_ma = 500; st.ramp_retry_ms = x.now_ms + PIANO_CHG_RAMP_RETRY_MS;}
     PianoChargePlan p{};
     for (unsigned i = 0; i < 40; ++i) {
       x.now_ms += 5000; x.gauge_ms = x.now_ms - 19526;
-      if (retainedCeiling) st.ramp_ceiling_ma = 500;
       piano_charge_decide(&cfg, &x, &st, &p);
       CHECK(p.fallback == PIANO_CHG_FALLBACK_MODE && !p.transition);
       CHECK(p.fcc_ma == 1500 && p.charge && !st.hold);
       CHECK(p.icl_why == PIANO_CHG_ICL_RP);
-      if (retainedCeiling) CHECK(p.icl_ma == 500 && p.ramp_target_ma == 3000);
+      if (retainedCeiling && x.now_ms < in.now_ms + PIANO_CHG_RAMP_RETRY_MS)
+        CHECK(p.icl_ma == 500 && p.ramp_target_ma == 3000);
       for (unsigned j = 0; j < p.writes; ++j) {
         const auto &w = p.write[j];
         CHECK(piano_charge_write_allowed(&cfg, w.property, w.value, w.bytes));
@@ -1652,7 +1659,7 @@ static void testDailyFiveVoltBudget()
       }
       x.ibus_ma = x.icl_ma - 3;
     }
-    CHECK(p.icl_ma == (retainedCeiling ? 500u : 3000u));
+    CHECK(p.icl_ma == 3000 && !st.ramp_ceiling_ma);
   }
   auto dailyPd = [](StrictSim &s) {
     s.cfg.hv = 0; s.cfg.rp = s.cfg.ramp = 1; s.cfg.rp_cap_ma = 3000;
@@ -1666,12 +1673,12 @@ static void testDailyFiveVoltBudget()
     CHECK(s.icl == 1500);
     s.busMv = 4490; s.step(); // a real sag at the first step creates precisely the hidden500 ceiling
     CHECK(s.st.ramp_ceiling_ma == 500 && s.icl == 500);
-    s.busMv = 4848; s.run(20); CHECK(s.icl == 500 && s.fcc == 1500);
+    s.busMv = 4848; s.run(10); CHECK(s.icl == 500 && s.fcc == 1500);
     CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,1,0) == 0);
-    s.run(20); CHECK(s.icl == 500); // changing mode is not an ICL reset
-    s.wakes++; s.run(20); CHECK(s.icl == 500);
+    s.step(); CHECK(s.icl == 500); // changing mode is not an ICL reset
+    s.wakes++; s.step(100); CHECK(s.icl == 500);
     s.source = s.typecSource = false; s.step();
-    s.source = s.typecSource = true; s.run(20); CHECK(s.icl == 500); // a replacement source inherits the boot ceiling
+    s.source = s.typecSource = true; s.run(20); CHECK(s.icl == 3000); // replacement can recover after the cool-down
   }
   {
     StrictSim s; dailyPd(s); s.run(20);
@@ -1705,12 +1712,99 @@ static void testDailyFiveVoltBudget()
     s.boardValid = PIANO_CHG_IN_CONN1; s.conn1Dc = 510;
     s.run(20); CHECK(s.icl <= 1500);
     s.conn1Dc = 310; s.run(20); CHECK(s.icl == 3000);
-    s.st.ramp_ceiling_ma = 2000; s.step(); CHECK(s.icl == 2000); // never discard a recorded ramp failure
+    s.st.ramp_ceiling_ma = 2000; s.st.ramp_retry_ms = s.now + PIANO_CHG_RAMP_RETRY_MS;
+    s.step(); CHECK(s.icl == 2000); // retain the failure during its cool-down
   }
   {
     StrictSim s; dailyPd(s); s.contractMa = 2200; s.run(20); CHECK(s.icl == 2200);
     s.safe &= ~PIANO_CHG_SAFE_CP_OFF; s.run(20); CHECK(s.icl == 2200); // CP gate remains specific to HV
     s.cfg.admin_stop = 1; s.step(); CHECK(s.enable == 0 && s.plan.why_off == PIANO_CHG_OFF_ADMIN);
+  }
+  {
+    StrictSim s; dailyPd(s);
+    for (unsigned i = 0; i < 20 && s.icl < 2000; ++i) s.step();
+    CHECK(s.icl == 2000);
+    s.busMv = 4490; s.step(); CHECK(s.icl == 1500 && s.st.ramp_ceiling_ma == 1500);
+    s.busMv = 5000; s.run(10); CHECK(s.icl == 1500);
+    s.contractMa = 1800; s.run(20);
+    CHECK(s.icl == 1800 && !s.st.ramp_ceiling_ma && s.plan.icl_why == PIANO_CHG_ICL_CONTRACT_5V);
+  }
+}
+
+static void testBootRampRetry()
+{
+  // Replay the installed boot's 23%, 4844mV/497mA, ICL/AICL500 and -1579mA battery load. Only the early failure is synthetic:
+  // capture begins at37s, so test all three possible causes instead of claiming that a pre37s sag was measured.
+  const uint8_t causes[] = {PIANO_CHG_BACK_SAG, PIANO_CHG_BACK_DETACH, PIANO_CHG_BACK_REFUSED};
+  for (const auto cause : causes) {
+    PianoChargeConfig c; piano_charge_config_default(&c);
+    c.strict_contract = c.limit = c.rp = c.ramp = 1; c.rp_cap_ma = 3000;
+    PianoChargeInput in{};
+    in.generation = 1; in.valid = 65535; in.safety = PIANO_CHG_SAFE_ALL;
+    in.type = PIANO_CHG_T_SDP; in.typec_source = 1; in.rp_ma = 3000;
+    in.icl_ma = in.aicl_ma = 100; in.enable = 1; in.fv_raw = 5200;
+    in.soc_min_pct = in.soc_max_pct = 23; in.vbat_max_mv = 3701; in.ibat_ma = -1579;
+    in.t_warm_dc = 362; in.t_cool_dc = 326; in.tbat_c = 33;
+    in.t_ntc_dc = 340; in.t_chgr_dc = 360; in.t_conn1_dc = in.t_conn2_dc = 320;
+    PianoChargeState s; piano_charge_init(&s);
+    PianoChargePlan p{};
+    auto cycle = [&](uint64_t now, int bus = 4844, int ibus = 497, bool refuse = false) {
+      in.now_ms = in.gauge_ms = now; in.bus_mv = bus; in.ibus_ma = ibus;
+      piano_charge_decide(&c, &in, &s, &p);
+      for (unsigned i = 0; i < p.writes; ++i) {
+        const auto &w = p.write[i];
+        CHECK(piano_charge_write_allowed(&c, w.property, w.value, w.bytes));
+        CHECK(w.property != PIANO_CHG_PD_FIXED && w.property != PIANO_CHG_PPS);
+        const bool reject = refuse && w.property == PIANO_CHG_ICL;
+        piano_charge_ack(&s, w.property, w.value, reject ? 1 : 0);
+        if (!reject && w.property == PIANO_CHG_ICL) in.icl_ma = in.aicl_ma = int32_t(w.value);
+      }
+    };
+    cycle(1000);
+    in.valid &= ~PIANO_CHG_IN_BUS; cycle(1500, 0, 0);
+    CHECK(!s.ramp_ceiling_ma && !(p.events & PIANO_CHG_EV_RAMP_BACK)); // an unavailable bus sample is not a sag/detach
+    in.valid |= PIANO_CHG_IN_BUS;
+    cycle(2000); cycle(7000); cycle(12000, 4844, 497, cause == PIANO_CHG_BACK_REFUSED);
+    CHECK((p.events & PIANO_CHG_EV_RAMP_STEP) && p.ramp_from_ma == 500 && p.ramp_ma == 1500);
+    if (cause == PIANO_CHG_BACK_SAG) cycle(13000, 4490, 1497);
+    else if (cause == PIANO_CHG_BACK_DETACH) {in.typec_source = 0; cycle(13000, 0, 0); in.typec_source = 1;}
+    else {cycle(13000, 4844, 497, true); cycle(14000, 4844, 497, true); cycle(15000);}
+    CHECK((p.events & PIANO_CHG_EV_RAMP_BACK) && s.ramp_back_why == cause && s.ramp_ceiling_ma == 500);
+    const auto retry = s.ramp_retry_ms;
+    CHECK(retry == in.now_ms + 60000);
+    cycle(37000); cycle(60000);
+    CHECK(p.icl_ma == 500 && in.aicl_ma == 500 && p.ramp_target_ma == 3000 && p.ramp_wait == PIANO_CHG_RAMP_COOLING);
+    CHECK(!p.transition && !s.rp_distrust && !s.hold && p.charge && p.fcc_ma == 1500);
+    cycle(retry - 1); CHECK(p.icl_ma == 500 && s.ramp_retry_ms == retry);
+    cycle(retry); CHECK(!s.ramp_ceiling_ma && !s.ramp_retry_ms && p.icl_ma == 500);
+    cycle(retry + 5000); cycle(retry + 10000);
+    CHECK(p.icl_ma == 1500 && (p.events & PIANO_CHG_EV_RAMP_STEP));
+    // A permanent weak source backs off again and starts a new cool-down, rather than oscillating every cycle.
+    cycle(retry + 11000, 4490, 1497);
+    CHECK(s.ramp_ceiling_ma == 500 && s.ramp_retry_ms == retry + 71000);
+    const auto retry2 = s.ramp_retry_ms;
+    cycle(retry2 + 1, 4649); cycle(retry2 + 5001, 4649); cycle(retry2 + 10001, 4649);
+    CHECK(p.icl_ma == 500 && p.ramp_wait == PIANO_CHG_RAMP_BUS_LOW);
+    in.valid &= ~PIANO_CHG_IN_IBUS; cycle(retry2 + 11001);
+    CHECK(p.icl_ma == 500 && p.ramp_wait == PIANO_CHG_RAMP_NO_CURRENT);
+    in.valid |= PIANO_CHG_IN_IBUS; cycle(retry2 + 12001, 4844, 399);
+    CHECK(p.icl_ma == 500 && p.ramp_wait == PIANO_CHG_RAMP_NOT_USED);
+    // Keep source, connector and board caps after recovery; a deadline never grants a current by itself.
+    in.rp_ma = 1500;
+    for (unsigned i = 0; i < 8; ++i) cycle(retry2 + 13001 + i * 5000, 4844, in.icl_ma - 3);
+    CHECK(p.icl_ma == 1500);
+    in.rp_ma = 3000; in.t_conn1_dc = 510;
+    for (unsigned i = 0; i < 8; ++i) cycle(retry2 + 53001 + i * 5000, 4844, in.icl_ma - 3);
+    CHECK(p.icl_ma == 1500);
+    in.t_conn1_dc = 320; in.t_chgr_dc = 850; cycle(retry2 + 93001);
+    CHECK(p.icl_ma == 500 && p.icl_why == PIANO_CHG_ICL_CHGR);
+    in.t_chgr_dc = 740;
+    for (unsigned i = 0; i < 16; ++i) cycle(retry2 + 98001 + i * 5000, 4844, in.icl_ma - 3);
+    CHECK(p.icl_ma == 3000 && !s.ramp_ceiling_ma);
+    in.soc_min_pct = in.soc_max_pct = 80; cycle(retry2 + 180001);
+    CHECK(!p.charge && s.hold && s.enable_set == 0);
+    in.soc_min_pct = in.soc_max_pct = 76; cycle(retry2 + 185001); CHECK(!p.charge && s.hold);
+    in.soc_min_pct = in.soc_max_pct = 75; cycle(retry2 + 190001); CHECK(p.charge && !s.hold && s.enable_set == 1);
   }
 }
 
@@ -1976,6 +2070,7 @@ static void testRam13GaugeLoss()
 int main()
 {
   testDailyFiveVoltBudget();
+  testBootRampRetry();
   testContractSession();
   testAtomicHealth();
   testRam13GaugeLoss();

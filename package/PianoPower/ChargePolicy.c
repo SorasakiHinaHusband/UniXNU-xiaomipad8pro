@@ -47,7 +47,7 @@
 #define RP_QUICK_MS 30000u
 #define RP_STRIKES 2
 /* The stepped Rp limit (cfg.ramp, docs/drivers/charging-policy.md §15): with that limiting off, the policy finds what the source
- * and the cable hold by itself, one step at a time, demand-driven, and remembers for the boot where they did not. 2026-11-12 on the
+ * and the cable hold by itself, one step at a time, demand-driven, with a bounded cool-down after a failed step. 2026-11-12 on the
  * Mac's port (CDP, Rp 3.0 A): 900 mA in -> the bus at 5.05 V and 897 mA, 1600 mA in -> 4.89 V and 1594 mA (about 0.21 Ohm from
  * the source to the charger), so 3 A would leave about 4.6 V. */
 #define RAMP_HOLD_MS 10000u      /* a step taken is held this long, */
@@ -396,7 +396,7 @@ static void forget(PianoChargeState *s, uint64_t now)
     s->wedge_checks = 0;
     s->wedge_since_ms = 0;
     s->rp_taken_ms = 0;   /* the trust itself and its strikes are about the source and stay */
-    ramp_restart(s);      /* the steps start again from the row; this boot's ceiling is about the source and stays */
+    ramp_restart(s);      /* start from the row; the failed step's ceiling and retry deadline stay */
     kick_reset(s, 1);     /* a stop of the restart that may be in force is s->disabled's: lifted by the enable's rules */
 }
 
@@ -626,14 +626,15 @@ static void ramp_wait(PianoChargeState *s, PianoChargePlan *p, uint8_t wait)
     if (!(s->ramp_waits_shown & bit)) {s->ramp_waits_shown |= bit; p->events |= PIANO_CHG_EV_RAMP_WAIT;}
 }
 
-/* One step back from the step wanted now, and that is the ceiling for the rest of the boot (it only goes down). */
-static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int32_t bus_mv)
+/* One step back immediately. A boot-time transient must not pin this source for the rest of the boot. */
+static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int32_t bus_mv, uint64_t now)
 {
     const uint32_t back = piano_charge_ramp_back(s->ramp_ma, s->ramp_row_ma);
     s->ramp_back_why = why;
     s->ramp_back_from_ma = s->ramp_ma;
     s->ramp_back_mv = bus_mv;
     if (!s->ramp_ceiling_ma || back < s->ramp_ceiling_ma) s->ramp_ceiling_ma = back;
+    s->ramp_retry_ms = now + PIANO_CHG_RAMP_RETRY_MS;
     s->ramp_ma = back;
     s->ramp_step_ms = 0;
     s->ramp_decisions = 0;
@@ -650,11 +651,19 @@ static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int3
  * RAMP_UP_MV under it and the bus current is within max(100 mA, an eighth) of the limit it is held to (the step, or the firmware's
  * own 0x2029 once that has settled below the step: 1750-1800 under 2000 on the Mac's port, chg-ramp): the system and the battery
  * take what it gives, so more is of use, and the source has just shown it holds this much. A lower target applies at once. A sag
- * below RP_SAG_MV under a step above the row, or the firmware refusing a step three times: one step back and this boot's ceiling (a
- * quick detach: in detached()). Returns the input limit to plan. */
+ * below RP_SAG_MV under a step above the row, or the firmware refusing a step three times: one step back and a temporary ceiling (a
+ * quick detach: in detached()). After the cool-down the same guards authorize each retry. Returns the input limit to plan. */
 static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, uint64_t now, uint32_t row,
                      uint32_t target)
 {
+    if (s->ramp_ceiling_ma && now >= s->ramp_retry_ms) {
+        s->ramp_ceiling_ma = 0;
+        s->ramp_retry_ms = 0;
+        s->ramp_waits_shown = 0;
+        /* A refused higher value may still own want[] while the lower value was already taken: plan_icl returned without a
+         * new write. Give only the input slot a new bounded attempt; keep ACK state and pending writes intact. */
+        s->tries[PIANO_CHG_S_ICL] = s->mismatch[PIANO_CHG_S_ICL] = s->rewrites[PIANO_CHG_S_ICL] = 0;
+    }
     p->ramp_target_ma = target;
     p->ramp_ceiling_ma = s->ramp_ceiling_ma;
     if (s->ramp_ceiling_ma && target > s->ramp_ceiling_ma) target = umax(s->ramp_ceiling_ma, row);
@@ -664,7 +673,7 @@ static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoCharg
         s->ramp_ma = row;
         s->ramp_taken_ms = s->ramp_step_ms = 0;
         p->ramp_ma = row;
-        ramp_wait(s, p, PIANO_CHG_RAMP_TOP);
+        ramp_wait(s, p, s->ramp_ceiling_ma ? PIANO_CHG_RAMP_COOLING : PIANO_CHG_RAMP_TOP);
         return row;
     }
     if (s->ramp_ma < row) {s->ramp_ma = row; ramp_moved(s);}      /* the start (or a higher row) */
@@ -685,14 +694,14 @@ static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoCharg
         const int sag = taken && (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < RP_SAG_MV;
         const int refused = !taken && s->want[PIANO_CHG_S_ICL] == s->ramp_ma && s->tries[PIANO_CHG_S_ICL] >= TRIES;
         if (sag || refused) {
-            ramp_back(s, p, sag ? PIANO_CHG_BACK_SAG : PIANO_CHG_BACK_REFUSED, in->bus_mv);
+            ramp_back(s, p, sag ? PIANO_CHG_BACK_SAG : PIANO_CHG_BACK_REFUSED, in->bus_mv, now);
             p->ramp_ma = s->ramp_ma;
             p->ramp_wait = PIANO_CHG_RAMP_WRITING;
             return s->ramp_ma;
         }
     }
     uint8_t wait;
-    if (s->ramp_ma >= target) wait = PIANO_CHG_RAMP_TOP;
+    if (s->ramp_ma >= target) wait = s->ramp_ceiling_ma ? PIANO_CHG_RAMP_COOLING : PIANO_CHG_RAMP_TOP;
     else if (!taken) wait = PIANO_CHG_RAMP_WRITING;
     else if (now < s->ramp_taken_ms + RAMP_HOLD_MS || s->ramp_decisions < RAMP_HOLD_DECISIONS) wait = PIANO_CHG_RAMP_HOLDING;
     else if (!(in->valid & PIANO_CHG_IN_BUS) || in->bus_mv < RAMP_UP_MV) wait = PIANO_CHG_RAMP_BUS_LOW;
@@ -1158,9 +1167,9 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
             s->rp_distrust = 1;
             p->events |= PIANO_CHG_EV_RP_DISTRUST;
         }
-        /* stepped: gone within 30 s of a step up above the row (planned or taken): that step was one too many, for the boot */
+        /* stepped: gone within 30 s of a step up above the row (planned or taken): back off before retrying */
         if (s->ramp_ma > s->ramp_row_ma && s->ramp_step_ms && now < s->ramp_step_ms + RP_QUICK_MS)
-            ramp_back(s, p, PIANO_CHG_BACK_DETACH, (in->valid & PIANO_CHG_IN_BUS) ? in->bus_mv : 0);
+            ramp_back(s, p, PIANO_CHG_BACK_DETACH, (in->valid & PIANO_CHG_IN_BUS) ? in->bus_mv : 0, now);
     }
     s->rp_taken_ms = 0;
     ramp_restart(s);
