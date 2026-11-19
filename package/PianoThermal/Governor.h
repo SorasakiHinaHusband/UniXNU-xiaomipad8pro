@@ -51,6 +51,38 @@ inline const char *profileName(Profile p)
   return p == Profile::saver ? "Power Saver" : p == Profile::balanced ? "Balanced" : "by the power source";
 }
 
+constexpr uint32_t kAndroidBaseKhz[] = {2400000, 2438400};
+constexpr uint32_t kAndroidNextKhz[] = {2745600, 2649600};
+
+inline bool androidCpuArmed(CpuMode mode, uint32_t cap0Mhz, uint32_t cap1Mhz)
+{
+  return mode == CpuMode::govern && cap0Mhz == 2400 && cap1Mhz == 2438;
+}
+
+inline bool androidCpuRequestValid(int value) { return value == 0 || value == 1; }
+inline int androidCpuLpmValue(unsigned bits, uint64_t value) { return bits == 32 && value <= 1 ? int(value) : -1; }
+
+struct AndroidCpuInput {
+  bool armed, requested, domains, valid, boost, sleeping;
+  PowerSource source;
+  Profile profile;
+  int lpm;   // -1: unavailable or invalid PianoPolicy property
+};
+
+struct AndroidCpuSelection {
+  bool enabled;
+  PowerSource power;
+};
+
+inline AndroidCpuSelection androidCpuSelection(const AndroidCpuInput &in)
+{
+  PowerSource power = profilePower(in.source, in.profile);
+  if (in.armed && (in.source != PowerSource::external || in.lpm == 1)) power = PowerSource::battery;
+  const bool enabled = in.armed && in.requested && in.domains && in.valid && !in.boost && !in.sleeping &&
+      in.source == PowerSource::external && power == PowerSource::external && in.lpm == 0;
+  return {enabled, power};
+}
+
 // A system sleep (docs/power.md 4, PianoPowerContract.h): off parks the thread (no SCMI request, no TSENS read in flight) and, with
 // piano-thermal-sleep-mask=1, masks the threshold interrupts (piano_thermal_suspend_prepare); on puts back what that off masked
 // (piano_thermal_suspend_finish), then the thread runs again (its first zone update follows at once). A second off, or an on
@@ -125,6 +157,7 @@ class Governor {
   {
     mode_ = mode;
     config_ = config;
+    androidCapKhz_ = 0;
     count_ = uint8_t(count > kMax ? kMax : count ? count : 1);
     for (unsigned i = 0; i < count_; ++i) khz_[i] = khz[i];
     sustained_ = uint8_t(sustained < count_ ? sustained : count_ - 1u);
@@ -222,7 +255,7 @@ class Governor {
       const unsigned l = fastestAtMost(khz);
       if (l < top) top = l;
     };
-    clampTo(config_.capKhz);
+    clampTo(androidCapKhz_ ? androidCapKhz_ : config_.capKhz);
     if (mode_ == CpuMode::govern) clampTo(power == PowerSource::external ? config_.externalKhz : config_.batteryKhz);
     if (limit_ < top) top = limit_;
     return top;
@@ -249,6 +282,8 @@ class Governor {
   uint32_t khz(unsigned i) const { return i < count_ ? khz_[i] : 0; }
   CpuMode mode() const { return mode_; }
   const GovernorConfig &config() const { return config_; }
+  // The caller has checked the paired opt-in gate. Preserve thermal and load history.
+  void selectAndroidCap(uint32_t khz) { androidCapKhz_ = mode_ == CpuMode::govern ? khz : 0; }
   // Force the bookkeeping to what the domain really is at (a refused or failed LEVEL_SET, a LEVEL_GET that disagrees).
   void setLevel(unsigned i)
   {
@@ -273,6 +308,7 @@ class Governor {
   static constexpr unsigned kMax = 32;
   CpuMode mode_ = CpuMode::off;
   GovernorConfig config_{};
+  uint32_t androidCapKhz_ = 0;
   uint32_t khz_[kMax] = {};
   uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0;
   uint32_t lowTicks_ = 0;

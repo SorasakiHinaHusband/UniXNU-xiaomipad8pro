@@ -931,6 +931,85 @@ static void printMap()
     }
 }
 
+static void testAndroidCpuStep()
+{
+  const uint32_t little[] = {384000, 1785600, 2400000, 2745600, 3532800};
+  const uint32_t prime[] = {1017600, 1958400, 2438400, 2649600, 4089600, 4320000};
+  CHECK(!androidCpuArmed(CpuMode::fixed, 2400, 2438));
+  CHECK(!androidCpuArmed(CpuMode::govern, 2300, 2438));
+  CHECK(androidCpuArmed(CpuMode::govern, 2400, 2438));
+  CHECK(androidCpuRequestValid(0) && androidCpuRequestValid(1) && !androidCpuRequestValid(2) && !androidCpuRequestValid(-1));
+  CHECK(androidCpuLpmValue(32, 0) == 0 && androidCpuLpmValue(32, 1) == 1);
+  CHECK(androidCpuLpmValue(0, 0) < 0 && androidCpuLpmValue(64, 1) < 0 && androidCpuLpmValue(32, 2) < 0);
+
+  GovernorConfig config{};
+  config.capKhz = capKhz(2400);
+  config.batteryKhz = 1785999;
+  config.externalKhz = 3532999;
+  Governor g;
+  g.init(CpuMode::govern, config, little, 5, 4, 2);
+  AndroidCpuInput in{true, false, true, true, false, false, PowerSource::external, Profile::bySource, 0};
+  auto selection = [&] {
+    const auto s = androidCpuSelection(in);  // Profile 0 with PianoPolicy's independently published LPM input.
+    g.selectAndroidCap(s.enabled ? kAndroidNextKhz[0] : 0);
+    return s;
+  };
+  CHECK(!selection().enabled && g.ceiling(PowerSource::external) == 2);
+  in.requested = true;
+  CHECK(selection().enabled && g.tick(tick(1000, PowerSource::external)) == 3);
+  in.lpm = 1;
+  auto selected = selection();
+  CHECK(!selected.enabled && g.enforce(selected.power) == 1);
+  in.lpm = 0;
+  CHECK(selection().enabled);
+  for (unsigned t = 0; t < 3; ++t) g.tick(tick(1000, PowerSource::external));
+  CHECK(g.level() == 3);
+  in.requested = false;
+  CHECK(!selection().enabled && g.enforce(PowerSource::external) == 2);
+  in.requested = true;
+  in.lpm = -1;
+  CHECK(!selection().enabled);
+  in.lpm = 0;
+  in.source = PowerSource::battery;
+  in.profile = Profile::balanced;
+  selected = selection();
+  CHECK(!selected.enabled && selected.power == PowerSource::battery);
+  in.armed = false;
+  CHECK(selection().power == PowerSource::external);  // unchanged legacy profile behavior
+  in.armed = true;
+  in.source = PowerSource::external;
+  in.boost = true;
+  CHECK(!selection().enabled);
+  in.boost = false;
+  in.sleeping = true;
+  CHECK(!selection().enabled);
+  in.sleeping = false;
+  in.valid = false;
+  CHECK(!selection().enabled);
+  in.valid = true;
+  in.domains = false;
+  CHECK(!selection().enabled);
+  in.domains = true;
+  in.profile = Profile::saver;
+  selected = selection();
+  CHECK(!selected.enabled && selected.power == PowerSource::battery);
+  in.profile = Profile::bySource;
+  g.thermal(cut(), 1000);
+  CHECK(selection().enabled && g.ceiling(PowerSource::external) == 0 && g.limit() == 0);
+  config.capKhz = capKhz(2438);
+  config.externalKhz = 2438999;
+  g.init(CpuMode::govern, config, prime, 6, 4, 2);
+  g.selectAndroidCap(kAndroidNextKhz[1]);
+  CHECK(g.khz(g.ceiling(PowerSource::external)) == 2438400);   // explicit source cap wins
+  config.externalKhz = 0;
+  g.init(CpuMode::govern, config, prime, 6, 2, 2);
+  g.selectAndroidCap(kAndroidNextKhz[1]);
+  CHECK(g.khz(g.ceiling(PowerSource::external)) == 2438400);   // firmware sustained cap wins
+  g.init(CpuMode::govern, config, prime, 6, 4, 2);
+  g.selectAndroidCap(kAndroidNextKhz[1]);
+  CHECK(g.khz(g.tick(tick(1000, PowerSource::external))) == 2649600);
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 1 && !strcmp(argv[1], "--map")) {
@@ -944,6 +1023,7 @@ int main(int argc, char **argv)
   testScmi();
   testLoadWindow();
   testGovernor();
+  testAndroidCpuStep();
   testBoost();
   testProfileAndSleep();
   testCluster();

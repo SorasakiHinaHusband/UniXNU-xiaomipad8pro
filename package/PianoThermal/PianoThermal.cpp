@@ -62,6 +62,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 #include "Cluster.h"
 #include "Governor.h"
 #include <PianoPowerContract.h>
@@ -73,6 +76,7 @@
 #include "Tsens.h"
 
 using namespace pianothermal;
+SYSCTL_DECL(_machdep);
 
 extern "C" {
 // PianoA830 (listed before this kext; tooling/k27/kext/PianoThermal.json names it as a library). Both are lock-free no-ops while
@@ -102,6 +106,7 @@ struct Args {
   uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, fastTempC, clockMs, gpuMhz, hotC,
       releaseC, cutC;
   bool capGiven[2];
+  bool android, androidArmed;
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
 pianodisplay::Follow gDisplay;
@@ -157,6 +162,9 @@ void readArgs()
     gArgs.cap[d] = clampU(v, 300, 5000);
     gArgs.capGiven[d] = given || bothGiven;
   }
+  gArgs.android = bootArg("piano-cpufreq-android", 0) == 1;
+  gArgs.androidArmed = gArgs.android && gArgs.capGiven[0] && gArgs.capGiven[1] &&
+      androidCpuArmed(CpuMode(gArgs.cpufreq), gArgs.cap[0], gArgs.cap[1]);
   gArgs.bat[0] = bootArg("piano-cpufreq-bat0", kSaver[0]);
   gArgs.bat[1] = bootArg("piano-cpufreq-bat1", kSaver[1]);
   gArgs.ac[0] = bootArg("piano-cpufreq-ac0", kBalanced[0]);
@@ -422,17 +430,60 @@ void measureClocks(uint32_t mhz[kMaxCpus], bool on[kMaxCpus])
 }
 
 // ------------------------------------------------------------------------------------------------------------- power source
+IOService *copyService(const char *name)
+{
+  OSDictionary *match = IOService::serviceMatching(name);
+  IOService *service = match ? IOService::copyMatchingService(match) : nullptr;
+  OSSafeReleaseNULL(match);
+  return service;
+}
+
 PowerSource readPowerSource()
 {
-  OSDictionary *match = IOService::serviceMatching("IOPMPowerSource");
-  if (!match) return PowerSource::unknown;
-  IOService *ps = IOService::copyMatchingService(match);
-  match->release();
+  IOService *ps = copyService("IOPMPowerSource");
   if (!ps) return PowerSource::unknown;
   PowerSource r = PowerSource::unknown;
   if (OSBoolean *b = OSDynamicCast(OSBoolean, ps->getProperty("ExternalConnected"))) r = b->isTrue() ? PowerSource::external : PowerSource::battery;
   ps->release();
   return r;
+}
+
+uint32_t gAndroidRequested;
+struct sysctl_oid gAndroidOid;
+
+int sysctlAndroidCpu(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
+{
+  if (!kauth_cred_issuser(kauth_cred_get())) return EPERM;
+  if (req->newptr && req->newlen != sizeof(int)) return EINVAL;
+  int value = int(__atomic_load_n(&gAndroidRequested, __ATOMIC_ACQUIRE));
+  const int status = sysctl_handle_int(oid, &value, 0, req);
+  if (status || !req->newptr) return status;
+  if (!androidCpuRequestValid(value)) return EINVAL;
+  __atomic_store_n(&gAndroidRequested, uint32_t(value), __ATOMIC_RELEASE);
+  return 0;
+}
+
+void registerAndroidCpu()
+{
+  gAndroidOid.oid_parent = &sysctl__machdep_children;
+  gAndroidOid.oid_number = OID_AUTO;
+  gAndroidOid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+  gAndroidOid.oid_name = "piano_cpufreq_android";
+  gAndroidOid.oid_handler = sysctlAndroidCpu;
+  gAndroidOid.oid_fmt = "I";
+  gAndroidOid.oid_descr = "Root-only opt-in CPU ceiling step on external power";
+  gAndroidOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gAndroidOid);
+}
+
+// Probe an absent publisher at most once per second and drop a detached service.
+void refreshService(IOService *&service, const char *name, uint64_t now, uint64_t &next)
+{
+  if (service && service->isInactive()) OSSafeReleaseNULL(service);
+  if (!service && now >= next) {
+    service = copyService(name);
+    next = now + 1000000000ull;
+  }
 }
 
 // PianoA830's reversible GPU ceiling (kHz, 0 clears) through its registered service, no link dependency: true when PianoA830 took it
@@ -537,6 +588,9 @@ class PianoThermal : public IOService {
   void cpuTick(const Monitor &m, bool slow, bool loadTick);
   void cpuApply(unsigned d, unsigned want, uint64_t now);
   void cpuReport(uint64_t spanNs);
+  void cpuAndroidInputs(uint64_t now);
+  void cpuAndroidReport(const AndroidCpuInput &in, const AndroidCpuSelection &selection, bool slow);
+  void cpuAndroidSuspend();
 
   Monitor monitor_;
   Policy policy_;
@@ -560,6 +614,14 @@ class PianoThermal : public IOService {
   PowerSource power_ = PowerSource::unknown;
   uint64_t powerAtNs_ = 0;
   bool cpuOk_ = false;
+  IOService *androidPolicy_ = nullptr, *androidPower_ = nullptr;
+  uint64_t androidPolicyLookup_ = 0, androidPowerLookup_ = 0, androidInputsAt_ = 0;
+  int androidLpm_ = -1;
+  bool androidActive_ = false, androidDomains_ = false;
+  int androidPhase_ = -1;
+  uint32_t androidRequestKey_[kDomains] = {};
+  int32_t androidRequestStatus_[kDomains] = {};
+  bool androidRequestedLevel_[kDomains] = {};
   // piano-cpufreq-boost: its end (uptime ns, 0 off) and, per domain, whether it has ended / its level was reached (one line each)
   uint64_t boostEndNs_ = 0;
   // the boost's own thermal back-off (Governor.h BoostBackoff): its state, the heat end (uptime ns, 0 = not by heat; the
@@ -639,6 +701,11 @@ void PianoThermal::pollWait(uint32_t ms)
 bool PianoThermal::park()
 {
   IOLockLock(sleepLock_);
+  if (sleepWanted_ && androidActive_) {
+    IOLockUnlock(sleepLock_);
+    cpuAndroidSuspend();
+    IOLockLock(sleepLock_);
+  }
   const bool parking = sleepWanted_;
   if (parking) {
     threadParked_ = true;
@@ -717,6 +784,10 @@ bool PianoThermal::start(IOService *provider)
   // piano-thermal-irq=1 uses the threshold interrupts, so a sleep masks them (the hooks: lower only while it is live, as Linux)
   sleep_ = SleepPlan(gArgs.sleepMask != 0 || irq::hookLevel() != 0);
   registerService();
+  if (gArgs.androidArmed) registerAndroidCpu();
+  else if (gArgs.android)
+    note("PianoCpuAndroidV1 refused arm: mode=%u configured_cap_mhz=%u,%u explicit=%u,%u",
+         gArgs.cpufreq, gArgs.cap[0], gArgs.cap[1], gArgs.capGiven[0], gArgs.capGiven[1]);
   if (gArgs.clock == 1) gDisplay.start(nullptr, nullptr);   // the clock line waits while the display is off
   adc::hookStart(this, adc::hookLevel(), gArgs.logS, gArgs.delay);   // B6 (PianoThermalAdc.cpp): nothing without piano-thermal-adc
   thread_t t = nullptr;
@@ -981,6 +1052,17 @@ void PianoThermal::cpuStart()
     }
   }
   cpuOk_ = domainOk_[0] || domainOk_[1];
+  if (gArgs.androidArmed) {
+    androidDomains_ = true;
+    for (unsigned d = 0; d < kDomains; ++d) {
+      const Governor &g = governor_[d];
+      const bool known = domainOk_[d] && domain_[d].canSet &&
+          g.khz(g.fastestAtMost(kAndroidBaseKhz[d])) == kAndroidBaseKhz[d] &&
+          g.khz(g.fastestAtMost(kAndroidNextKhz[d])) == kAndroidNextKhz[d];
+      androidDomains_ &= known;
+      if (!known) note("PianoCpuAndroidV1 refused domain=%u required_khz=%u,%u", d, kAndroidBaseKhz[d], kAndroidNextKhz[d]);
+    }
+  }
   power_ = readPowerSource();
   powerAtNs_ = nowNs();
   if (mode >= CpuMode::fixed) note("cpufreq: power source: %s", powerName(power_));
@@ -1013,6 +1095,11 @@ void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
   Governor &g = governor_[d];
   if (want == set_[d]) return;
   const int32_t r = scmi::levelSet(channel_, domain_[d], d, want);
+  if (gArgs.androidArmed) {
+    androidRequestedLevel_[d] = true;
+    androidRequestKey_[d] = domain_[d].levels[want].key;
+    androidRequestStatus_[d] = r;
+  }
   if (r) {
     if (++refusals_[d] <= 3 || refusals_[d] % 100 == 0)
       note("[%us] cpufreq: domain %u: %u MHz refused (%d, %s; %u refusals)", upS(), d, domain_[d].levels[want].khz / 1000, r,
@@ -1030,11 +1117,92 @@ void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
   ++changes_[d];
 }
 
+void PianoThermal::cpuAndroidInputs(uint64_t now)
+{
+  if (androidInputsAt_ && now - androidInputsAt_ < uint64_t(gArgs.tickMs) * 1000000ull) return;
+  androidInputsAt_ = now;
+  refreshService(androidPower_, "IOPMPowerSource", now, androidPowerLookup_);
+  OSObject *external = androidPower_ ? androidPower_->copyProperty("ExternalConnected") : nullptr;
+  OSBoolean *connected = OSDynamicCast(OSBoolean, external);
+  const PowerSource source = !connected ? PowerSource::unknown : connected->isTrue() ? PowerSource::external : PowerSource::battery;
+  if (source != power_) note("[%us] cpufreq: power source: %s -> %s", upS(), powerName(power_), powerName(source));
+  power_ = source;
+  OSSafeReleaseNULL(external);
+
+  refreshService(androidPolicy_, "PianoPolicy", now, androidPolicyLookup_);
+  OSObject *lpm = androidPolicy_ ? androidPolicy_->copyProperty("piano-policy-lpm") : nullptr;
+  OSNumber *number = OSDynamicCast(OSNumber, lpm);
+  androidLpm_ = number ? androidCpuLpmValue(number->numberOfBits(), number->unsigned64BitValue()) : -1;
+  OSSafeReleaseNULL(lpm);
+}
+
+void PianoThermal::cpuAndroidReport(const AndroidCpuInput &in, const AndroidCpuSelection &selection, bool slow)
+{
+  const int phase = int(in.requested) | int(selection.enabled) << 1 | int(in.source) << 2 | int(in.profile) << 4 |
+      (in.lpm + 1) << 6 | int(in.boost) << 8 | int(in.valid) << 9 | int(in.domains) << 10 | int(in.sleeping) << 11;
+  if (!slow && phase == androidPhase_) return;
+  androidPhase_ = phase;
+  uint32_t selected[kDomains] = {}, sustained[kDomains] = {}, thermal[kDomains] = {};
+  for (unsigned d = 0; d < kDomains; ++d) {
+    if (boot_[d] < 0) continue;
+    const Governor &g = governor_[d];
+    const unsigned limit = in.boost ? g.boostLevel(capKhz(gArgs.boostCap), boostCapLevel_[d]) : g.ceiling(selection.power);
+    selected[d] = g.khz(limit);
+    sustained[d] = g.khz(g.sustained());
+    thermal[d] = g.khz(g.limit());
+  }
+  note("PianoCpuAndroidV1 enabled=%u requested=%u source=%s profile=%u lpm=%u lpm_valid=%u boost=%u valid=%u base_khz=2400000,2438400 "
+       "selected_khz=%u,%u sustained_khz=%u,%u thermal_limit=%u,%u",
+       selection.enabled, in.requested, in.source == PowerSource::external ? "external" : in.source == PowerSource::battery ? "battery" : "unknown",
+       unsigned(in.profile), unsigned(in.lpm == 1), in.lpm >= 0, in.boost, in.valid,
+       selected[0], selected[1], sustained[0], sustained[1], thermal[0], thermal[1]);
+  for (unsigned d = 0; d < kDomains && !channel_.lastError; ++d) {
+    if (!domainOk_[d]) continue;
+    int actual = -1;
+    const int32_t status = scmi::levelGet(channel_, domain_[d], d, actual);
+    const bool known = !status && actual >= 0;
+    note("PianoCpuAndroidV1 scmi domain=%u get_key=%u get_known=%u get_status=%d actual_khz=%u "
+         "request_key=%u request_valid=%u request_status=%d changes=%u refusals=%u",
+         d, known ? domain_[d].levels[actual].key : 0u, known, status, known ? domain_[d].levels[actual].khz : 0u,
+         androidRequestKey_[d], androidRequestedLevel_[d], androidRequestStatus_[d], changes_[d], refusals_[d]);
+  }
+}
+
+void PianoThermal::cpuAndroidSuspend()
+{
+  androidActive_ = false;
+  const Profile profile = Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE));
+  const AndroidCpuInput in{true, __atomic_load_n(&gAndroidRequested, __ATOMIC_ACQUIRE) == 1,
+      domainOk_[0] && domainOk_[1], false, false, true, PowerSource::unknown, profile, androidLpm_};
+  const auto selection = androidCpuSelection(in);
+  const uint64_t now = nowNs();
+  for (unsigned d = 0; d < kDomains && !channel_.lastError; ++d) {
+    if (!domainOk_[d]) continue;
+    Governor &g = governor_[d];
+    g.selectAndroidCap(0);
+    cpuApply(d, g.enforce(selection.power), now);
+  }
+  cpuAndroidReport(in, selection, false);
+}
+
+bool freshCpuThermal(const Monitor &m, unsigned cluster)
+{
+  const Controller &k = kMap[cluster];
+  const uint32_t mask = ((2u << k.cpuLast) - 1) & ~((1u << k.cpuFirst) - 1);
+  return (m.freshMask(cluster) & mask) != 0;
+}
+
 // Every sensor poll: the thermal limit (fixed and governor modes) and, at most once per piano-cpufreq-tick-ms (governor) or at
 // once (fixed), the level; report mode asks LEVEL_GET at the log cadence only (slow).
 void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
 {
-  if (!cpuOk_) return;
+  if (!cpuOk_) {
+    if (gArgs.androidArmed && androidPhase_ < 0) {
+      const AndroidCpuInput in{true, false, false, false, false, false, PowerSource::unknown, Profile::bySource, -1};
+      cpuAndroidReport(in, androidCpuSelection(in), false);
+    }
+    return;
+  }
   if (channel_.lastError) {
     note("[%us] cpufreq: the SCMI channel failed (%d, %s): no more messages this boot; the clusters stay where they are", upS(),
          channel_.lastError, scmi::statusName(channel_.lastError));
@@ -1042,13 +1210,14 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     return;
   }
   const uint64_t now = nowNs();
-  if (now - powerAtNs_ >= 10000000000ull) {
+  if (gArgs.androidArmed) cpuAndroidInputs(now);
+  else if (now - powerAtNs_ >= 10000000000ull) {
     const PowerSource p = readPowerSource();
     if (p != power_ && gArgs.cpufreq == 3) note("[%us] cpufreq: power source: %s -> %s", upS(), powerName(power_), powerName(p));
     power_ = p;
     powerAtNs_ = now;
   }
-  const PowerSource power = profilePower(power_, Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE)));
+  const Profile profile = Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE));
   // The boost's own thermal back-off (2026-11-15, ufs5r3): one decision per poll on the hottest CPU reading, before the
   // domains and only while the boost is live (a step lowers every domain's boost cap level at once; the heat end shortens the
   // boost so each domain's boostStep takes its over transition on this same poll). The cap only steps down: a cooler spell
@@ -1077,7 +1246,19 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   // A load decision needs a busy figure: none on the first reading (it only starts the window), after the clock measurement, or
   // when no core of the domain could be read. Before 2026-11-12 such a tick counted as 0 % busy, a step toward the slowest level.
   const bool critical = gArgs.level >= 2 && policy_.state() == State::critical;
+  const ThermalInput thermal[kDomains] = {clusterThermal(m, 0, gTrips, critical), clusterThermal(m, 1, gTrips, critical)};
+  const AndroidCpuInput in{
+    gArgs.androidArmed, gArgs.androidArmed && __atomic_load_n(&gAndroidRequested, __ATOMIC_ACQUIRE) == 1,
+    androidDomains_ && domainOk_[0] && domainOk_[1],
+    gArgs.androidArmed && thermal[0].valid && thermal[1].valid && !thermal[0].cut && !thermal[1].cut &&
+        freshCpuThermal(m, 0) && freshCpuThermal(m, 1),
+    boostEndNs_ && !(boostEnded_[0] && boostEnded_[1]), false, power_, profile, androidLpm_,
+  };
+  const AndroidCpuSelection selection = androidCpuSelection(in);
+  const PowerSource power = selection.power;
+  androidActive_ = selection.enabled;
   for (unsigned d = 0; d < kDomains; ++d) {
+    if (gArgs.androidArmed) governor_[d].selectAndroidCap(selection.enabled ? kAndroidNextKhz[d] : 0);
     if (!domainOk_[d]) continue;
     Governor &g = governor_[d];
     // piano-cpufreq-boost: the sustained level (the thermal limit and the boost's own sticky thermal cap on top, in every mode)
@@ -1086,7 +1267,7 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
         ? boostStep(now / 1000000ull, (boostHotEndNs_ ? boostHotEndNs_ : boostEndNs_) / 1000000ull, boostEnded_[d])
         : BoostStep::none;
     if (step != BoostStep::none) {
-      g.thermal(clusterThermal(m, d, gTrips, critical), now / 1000000ull);
+      g.thermal(thermal[d], now / 1000000ull);
       if (step == BoostStep::boost) {
         const unsigned want = g.boostLevel(capKhz(gArgs.boostCap), boostCapLevel_[d]);
         cpuApply(d, want, now);
@@ -1131,7 +1312,7 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       continue;
     }
     const unsigned limitBefore = g.limit();
-    if (g.thermal(clusterThermal(m, d, gTrips, critical), now / 1000000ull) && g.limit() < limitBefore && g.limit() == 0)
+    if (g.thermal(thermal[d], now / 1000000ull) && g.limit() < limitBefore && g.limit() == 0)
       ++cuts_[d];
     if (g.limit() < g.count() - 1u) ++limitedPolls_[d];
     if (busy[d] >= 0) {
@@ -1143,6 +1324,11 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
         loadTick && busy[d] >= 0 && g.mode() == CpuMode::govern ? g.tick({uint32_t(busy[d]), power}) : g.enforce(power);
     cpuApply(d, want, now);
   }
+  if (gArgs.androidArmed && !in.boost) {
+    for (unsigned d = 0; d < kDomains; ++d)
+      androidActive_ |= boot_[d] >= 0 && governor_[d].khz(set_[d]) > kAndroidBaseKhz[d];
+  }
+  if (gArgs.androidArmed) cpuAndroidReport(in, selection, slow);
 }
 
 void PianoThermal::cpuReport(uint64_t spanNs)
@@ -1150,7 +1336,8 @@ void PianoThermal::cpuReport(uint64_t spanNs)
   if (!cpuOk_ && !channel_.messages) return;
   const uint64_t now = nowNs();
   const Profile profile = Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE));
-  const PowerSource power = profilePower(power_, profile);
+  const AndroidCpuInput in{gArgs.androidArmed, false, false, false, false, false, power_, profile, androidLpm_};
+  const PowerSource power = androidCpuSelection(in).power;
   for (unsigned d = 0; d < kDomains; ++d) {
     if (boot_[d] < 0) continue;
     const scmi::Domain &dom = domain_[d];
@@ -1240,6 +1427,7 @@ void PianoThermal::run()
   for (;;) {
     if (park()) {   // back from a system sleep: the power source read again at the next CPU tick, the zones now
       powerAtNs_ = 0;
+      androidInputsAt_ = 0;
       note("[%us] wake %u: polling again", upS(), sleep_.wakes());
     }
     const uint64_t workStart = mach_absolute_time();   // this poll's own work, up to the wait: noteSelf, left out of busy
@@ -1316,6 +1504,7 @@ void PianoThermal::run()
     absolutetime_to_nanoseconds(mach_absolute_time() - workStart, &workNs);
     noteSelf(workNs);
     // the base relaxed at rest (piano-thermal-irq)
-    pollWait(pollPeriodMs(tier, irq::hookBase(base), gArgs.warmMs, gArgs.fastMs, gArgs.clockMs));
+    const uint32_t wait = pollPeriodMs(tier, irq::hookBase(base), gArgs.warmMs, gArgs.fastMs, gArgs.clockMs);
+    pollWait(gArgs.androidArmed && wait > gArgs.tickMs ? gArgs.tickMs : wait);
   }
 }
