@@ -58,6 +58,10 @@ struct Generation {
 };
 
 int main() {
+    assert(!SurfaceResidencyEnabled(""));
+    assert(!SurfaceResidencyEnabled("piano-surface-residency=0 other=1"));
+    assert(!SurfaceResidencyEnabled("other-piano-surface-residency=1 piano-surface-residency=10 "));
+    assert(SurfaceResidencyEnabled("other=1\tpiano-surface-residency=1 reset=1"));
     FakeGpu gpu;
     auto pixels = std::make_shared<unsigned>(42);
     auto restore = [&]() -> std::shared_ptr<Generation> {

@@ -34,12 +34,13 @@
  @property(nonatomic,strong) NBAsked *asked;   // its bytes in gAskedBytes[0] while it lives; nil: not counted
  @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
  - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
-@@ -1148,6 +1165,20 @@
+@@ -1148,6 +1165,21 @@
  @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
  - (void)countUse;
  @end
-+static const bool gSurfaceResidency=[](){const char *enabled=getenv("PIANO_SURFACE_RESIDENCY");
-+ return (enabled && !strcmp(enabled,"1")) || access("/private/var/ngpu/debug/surface-residency",F_OK)==0;}();
++static const bool gSurfaceResidency=[](){
++ char args[4096]={};size_t size=sizeof(args)-1;
++ return !sysctlbyname("kern.bootargs",args,&size,nullptr,0) && SurfaceResidencyEnabled(args);}();
 +static NSHashTable<NBTexture *> *gResidentTextures;
 +static std::mutex gResidentTexturesLock;
 +static std::atomic<uint64_t> gResidencyEvicted,gResidencyRestored,gResidencyRefused;

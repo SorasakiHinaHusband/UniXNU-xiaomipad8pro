@@ -1,9 +1,22 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <utility>
+
+inline bool SurfaceResidencyEnabled(const char *args) {
+    constexpr char enabled[] = "piano-surface-residency=1";
+    for (const char *at = args; *at;) {
+        at += std::strspn(at, " \t");
+        const size_t length = std::strcspn(at, " \t");
+        if (length == sizeof enabled - 1 && !std::strncmp(at, enabled, length))
+            return true;
+        at += length;
+    }
+    return false;
+}
 
 template<class Generation> class SurfaceResidency {
     std::mutex lock_;

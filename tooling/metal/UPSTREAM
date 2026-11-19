@@ -56,7 +56,7 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   complete runtime backing counts, GPU pressure notification to frontend/runtime, and one capacity-only retry after allocation
   locks unwind. The opt-in client-mem marker enables periodic frontend/backend census records. Real live ownership, fences,
   leases and the terminal WindowServer capture failure boundary are unchanged; this is not a terminal-OOM capture fallback.
-  0007-pressure-surface-residency.patch and SurfaceResidency.h (ours, MIT): opt-in pressure drops idle shader-read IOSurface
+  0007-pressure-surface-residency.patch and SurfaceResidency.h (ours, MIT): piano-surface-residency=1 lets pressure drop idle shader-read IOSurface
   texture generations; the original IOSurface supplies content on the next bind. Commands lease a generation until completion;
   writes, views, CPU access and indirect handles pin it. The runtime, Turnip retire queue and kernel still own actual BO cleanup.
 Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is

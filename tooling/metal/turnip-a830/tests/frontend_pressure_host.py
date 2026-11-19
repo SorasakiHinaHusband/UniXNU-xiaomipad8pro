@@ -57,7 +57,7 @@ if args.syntax:
     full.write_bytes(args.frontend.read_bytes())
     if 'class HeldImportPolicy' not in full.read_text():
         subprocess.run(['patch', '-s', str(full), str(patch)], check=True)
-    if 'PIANO_SURFACE_RESIDENCY' not in full.read_text():
+    if 'SurfaceResidencyEnabled(args)' not in full.read_text():
         residency_patch = patch.with_name('0007-pressure-surface-residency.patch')
         subprocess.run(['patch', '-s', str(full), str(residency_patch)], check=True)
     flags = args.flags.read_text().splitlines()
