@@ -41,6 +41,7 @@
 //                               switches to manual, piano-backlight-auto=0/1 as a property leaves / enters again. Without it nothing
 //                               of this runs (docs/drivers/backlight.md, sensors.md 5a.4)
 //   piano-backlight-native=1    publish the macOS SDR brightness adapter (level 2, with piano-backlight-keys=0)
+//   piano-backlight-android=1   opt in to the bounded Android-reference SDR adapter on compatible ICs
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -79,7 +80,7 @@ namespace {
 
 struct Args {
   uint32_t level, percent, percentGiven, floor, lid, keys, flags, halfUs, swap, autoAllowed;
-  bool native;
+  bool native, android;
 };
 Args gArgs;
 
@@ -106,6 +107,7 @@ void readArgs()
   gArgs.swap = bootArg("piano-backlight-swap", 0);
   gArgs.autoAllowed = bootArg("piano-backlight-auto", 0) == 1;
   gArgs.native = gArgs.level >= 2 && gArgs.keys == 0 && bootArg("piano-backlight-native", 0) == 1;
+  gArgs.android = gArgs.native && bootArg("piano-backlight-android", 0) == 1;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -290,6 +292,7 @@ struct Pending {
   uint32_t ambientCalls;
   int32_t sleep;             // setPowerState: -1 none, 1 off (a system sleep), 0 on (the wake)
   int32_t native = -1;       // newest absolute request, encoded as signed 16.16 nits
+  int32_t reference = -1;    // newest root A/B selection
 };
 IOLock *gLock;
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
@@ -297,6 +300,7 @@ Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "
 uint32_t gSleepAsked, gSleepTaken;
 bool gServing, gDarkForSleep;
 bool gNativeReady;
+uint32_t gNativeMin, gNativeMax;  // fixed schema, initialized by the worker under gLock
 LogLimit gNativeRejectionLog{8, 10000};  // protected by gLock
 
 class NativeProperties {
@@ -354,6 +358,14 @@ class PianoBacklight : public IOService {
   int32_t fNativeRequest = -1;
   uint32_t fNativeErrors = 0;
   bool fNativePublished = false;
+  bool fReference = true;
+  uint32_t fRevision = 0, fNativePublishedRevision = 0;
+  struct AndroidApply {
+    const char *source = nullptr;
+    uint32_t milliNits = 0, errors = 0;
+    uint16_t dbv = 0, code = 0;
+    bool pendingLogged = false;
+  } fAndroidApply;
   LogLimit fNativeApplyLog{24, 10000};
   int fDisplayProperty = -1;   // NativeGopDisplay's piano-display-power as last read (-1: none yet)
   bool fDisplayKnown = false, fDisplayOn = true;
@@ -367,6 +379,8 @@ class PianoBacklight : public IOService {
   IOService *sibling(const char *className);
   void publishState();
   void publishNativeState();
+  void publishAndroidModel();
+  void publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code);
   IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
  public:
@@ -404,6 +418,7 @@ bool PianoBacklight::start(IOService *provider)
   c.lidWatch = gArgs.lid == 1;
   c.readFlags = gArgs.flags == 1;
   c.autoAllowed = gArgs.level >= 2 && gArgs.autoAllowed;
+  c.android = gArgs.android;
   fCtl.configure(c);
   gLock = IOLockAlloc();
   thread_t thread = nullptr;
@@ -569,9 +584,16 @@ IOService *PianoBacklight::sibling(const char *className)
 
 void PianoBacklight::serve()
 {
+  const NativeBrightness schema(fCtl.floor(), fCtl.ceiling());
   IOLockLock(gLock);
+  gNativeMin = schema.minFixed();
+  gNativeMax = schema.maxFixed();
   gServing = true;
   IOLockUnlock(gLock);
+  if (schema.bounded()) {
+    fRevision = 1;
+    publishAndroidModel();
+  }
   if (gArgs.native) {
     publishNativeState();
     if (!fNativePublished) registerService(kIOServiceAsynchronous);
@@ -602,6 +624,7 @@ void PianoBacklight::serve()
     gPending.any = gPending.display = gPending.ambient = false;
     gPending.steps = 0;
     gPending.percent = gPending.automatic = gPending.sleep = -1;
+    gPending.reference = -1;
     const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
 
@@ -625,13 +648,21 @@ void PianoBacklight::serve()
       fApi = p.api;
       fCtl.display(p.on, p.system, p.api);
     }
+    if (p.reference >= 0 && fReference != bool(p.reference)) {
+      fReference = bool(p.reference);
+      ++fRevision;
+      fAndroidApply = {};
+      publishAndroidModel();
+    }
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
     if (p.native >= 0) {
       uint16_t code = 0;
-      if (NativeBrightness(fCtl.floor()).decode(uint32_t(p.native), code)) {
+      uint16_t dbv = 0;
+      if (NativeBrightness(fCtl.floor(), fCtl.ceiling(), fRevision && fReference).decode(uint32_t(p.native), code, &dbv)) {
         fNativeRequest = p.native;
         fNativeErrors = fCtl.errors();
+        if (fRevision) fAndroidApply = {"native", pa_sdr_millinits(uint32_t(p.native)), fNativeErrors, dbv, code};
         fCtl.manualCode(code, kNativeRequest);
       }
     }
@@ -658,13 +689,14 @@ void PianoBacklight::serve()
 
 void PianoBacklight::publishNativeState()
 {
-  const NativeBrightness adapter(fCtl.floor());
+  const NativeBrightness adapter(fCtl.floor(), fCtl.ceiling(), fRevision && fReference);
   uint16_t code = 0;
   const bool applied = adapter.applied(fCtl, code);
-  if (applied && (!fNativePublished || code != fNativeCode)) {
+  if (applied && (!fNativePublished || code != fNativeCode || fRevision != fNativePublishedRevision)) {
     NativeProperties params(*this);
     if (adapter.parameters(params, code)) {
       fNativeCode = code;
+      fNativePublishedRevision = fRevision;
       if (!fNativePublished) {
         NativeProperties calibration(*this);
         if (adapter.calibration(calibration) && setProperty("piano-backlight-native-implementation", kNativeMarker)) {
@@ -673,7 +705,11 @@ void PianoBacklight::publishNativeState()
           IOLockUnlock(gLock);
           fNativePublished = setProperty("backlight-control", true);  // matching flag comes last
           if (fNativePublished) {
-            note("%s ready: nominal SDR %u..500 nits, floor=%u code=%u", kNativeMarker, adapter.minNits(), fCtl.floor(), code);
+            if (adapter.bounded())
+              note("%s ready: Android-reference SDR %u..600000 millinits, floor=%u code=%u",
+                   kNativeMarker, adapter.milliNits(fCtl.floor()), fCtl.floor(), code);
+            else
+              note("%s ready: nominal SDR %u..500 nits, floor=%u code=%u", kNativeMarker, adapter.minNits(), fCtl.floor(), code);
             registerService(kIOServiceAsynchronous);
           } else {
             IOLockLock(gLock);
@@ -686,6 +722,7 @@ void PianoBacklight::publishNativeState()
       }
     }
   }
+  publishAndroidApply(adapter, applied, code);
   if (fNativeRequest >= 0) {
     uint32_t dropped;
     if (fNativeApplyLog.allow(nowMs(), &dropped))
@@ -698,6 +735,37 @@ void PianoBacklight::publishNativeState()
     IOLockLock(gLock);
     gNativeReady = false;
     IOLockUnlock(gLock);
+  }
+}
+
+void PianoBacklight::publishAndroidModel()
+{
+  const NativeBrightness adapter(fCtl.floor(), fCtl.ceiling(), fReference);
+  setProperty(kReferenceProperty, uint64_t(fReference), 32);
+  note("%s model=%s schema=600 min_millinits=%u max_millinits=600000 code_min=%u code_max=1952 map_crc=%08x revision=%u",
+       kAndroidMarker, fReference ? "reference" : "linear", adapter.milliNits(fCtl.floor()), fCtl.floor(), PA_SDR_MAP_CRC, fRevision);
+}
+
+void PianoBacklight::publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code)
+{
+  auto &request = fAndroidApply;
+  if (!request.source) return;
+  if (request.code != fCtl.code()) {
+    request = {};  // superseded by another control request
+    return;
+  }
+  const unsigned errors = fCtl.errors() - request.errors;
+  if (applied && code == request.code) {
+    note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u applied_millinits=%u errors=%u",
+         kAndroidMarker, request.source, fRevision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+         adapter.milliNits(code), errors);
+    request = {};
+  } else if (!request.pendingLogged || !fCtl.controlling()) {
+    note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u result=%s errors=%u",
+         kAndroidMarker, request.source, fRevision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+         fCtl.controlling() ? "pending" : "failed", errors);
+    request.pendingLogged = true;
+    if (!fCtl.controlling()) request = {};
   }
 }
 
@@ -825,10 +893,11 @@ IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value
   const bool authorized = nativeWriter(admin, platform, platform ? cs_identity_get(process) : nullptr);
   OSNumber *number = OSDynamicCast(OSNumber, value);
   const uint64_t fixed = number ? number->unsigned64BitValue() : 0;
-  uint16_t code = 0;
-  const bool valid = properties.getCount() == 1 && number && (number->numberOfBits() == 32 || number->numberOfBits() == 64)
-      && NativeBrightness(uint16_t(gArgs.floor)).decode(fixed, code);
   IOLockLock(gLock);
+  const uint32_t min = gServing ? gNativeMin : NativeBrightness(uint16_t(gArgs.floor)).minFixed();
+  const uint32_t max = gServing ? gNativeMax : NativeBrightness(uint16_t(gArgs.floor)).maxFixed();
+  const bool valid = properties.getCount() == 1 && number && (number->numberOfBits() == 32 || number->numberOfBits() == 64)
+      && fixed >= min && fixed <= max;
   const IOReturn result = !authorized ? kIOReturnNotPrivileged : !valid ? kIOReturnBadArgument
       : !gNativeReady ? kIOReturnNotReady : kIOReturnSuccess;
   uint32_t dropped;
@@ -849,6 +918,20 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
   if (!d || gArgs.level < 2 || !gLock) return kIOReturnUnsupported;
   if (OSObject *native = d->getObject(kNativeRequest)) return enqueueNative(*d, native);
   if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return kIOReturnNotPrivileged;
+  if (OSObject *reference = d->getObject(kReferenceProperty)) {
+    OSNumber *number = OSDynamicCast(OSNumber, reference);
+    if (d->getCount() != 1 || !number || number->unsigned64BitValue() > 1) return kIOReturnBadArgument;
+    IOLockLock(gLock);
+    const bool supported = gServing && gNativeMax == PA_SDR_MAX_FIXED;
+    const bool ready = gNativeReady;
+    if (supported && ready) {
+      gPending.reference = int32_t(number->unsigned32BitValue());
+      gPending.any = true;
+      IOLockWakeup(gLock, &gPending, false);
+    }
+    IOLockUnlock(gLock);
+    return !supported ? kIOReturnUnsupported : !ready ? kIOReturnNotReady : kIOReturnSuccess;
+  }
   OSNumber *percent = OSDynamicCast(OSNumber, d->getObject("piano-backlight-percent"));
   OSNumber *steps = OSDynamicCast(OSNumber, d->getObject("piano-backlight-step"));
   OSObject *automatic = gArgs.autoAllowed ? d->getObject(pianoauto::kArgAuto) : nullptr;   // OSNumber 0/1 or OSBoolean

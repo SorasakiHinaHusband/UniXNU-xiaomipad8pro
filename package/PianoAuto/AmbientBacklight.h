@@ -47,10 +47,11 @@ enum class Mode : uint8_t { off, manual, automatic };
 class Ambient {
  public:
   // allowed: piano-backlight-auto=1; floor: piano-backlight-min; exponential: BL_CFG1's mapping; maxOffset: the ladder's length - 1.
-  void configure(bool allowed, uint16_t floor, bool exponential, int maxOffset)
+  void configure(bool allowed, uint16_t floor, bool exponential, int maxOffset, uint16_t ceiling = kAmbientFullScale)
   {
     allowed_ = allowed;
     floor_ = floor < 1 ? 1 : floor > kAmbientFullScale ? kAmbientFullScale : floor;
+    ceiling_ = ceiling;
     exponential_ = exponential;
     maxOffset_ = maxOffset < 0 ? 0 : maxOffset > 40 ? 40 : maxOffset;
     mode_ = allowed ? Mode::manual : Mode::off;
@@ -128,7 +129,11 @@ class Ambient {
   uint32_t lastLux() const { return lux_; }
   uint32_t targets() const { return targets_; }
   // The curve's code for the last target, shifted by the offset: floor..2047.
-  uint16_t code() const { return shift(codeForPermille(have_ ? permille_ : 0, floor_), offset_, floor_, exponential_); }
+  uint16_t code() const
+  {
+    const uint16_t target = codeForPermille(have_ ? permille_ : 0, floor_);
+    return shift(target > ceiling_ ? ceiling_ : target, offset_, floor_, exponential_, ceiling_);
+  }
 
   static uint16_t clampCode(int64_t v, uint16_t floor)
   {
@@ -142,17 +147,18 @@ class Ambient {
   }
   // code shifted by offset steps: linear mapping x 2^(offset/3) (Ktz8866.h Steps' factors, the same rounding), exponential mapping
   // + offset/16 of the range above the floor; clamped to floor..2047.
-  static uint16_t shift(uint16_t code, int offset, uint16_t floor, bool exponential)
+  static uint16_t shift(uint16_t code, int offset, uint16_t floor, bool exponential, uint16_t ceiling = kAmbientFullScale)
   {
     const uint32_t k = uint32_t(offset < 0 ? -offset : offset);
     if (exponential) {
-      const int64_t step = (int64_t(k) * (kAmbientFullScale - floor) + 8) / 16;
-      return clampCode(offset < 0 ? int64_t(code) - step : int64_t(code) + step, floor);
+      const int64_t step = (int64_t(k) * (ceiling - floor) + 8) / 16;
+      const int64_t next = offset < 0 ? int64_t(code) - step : int64_t(code) + step;
+      return clampCode(next > ceiling ? ceiling : next, floor);
     }
     static constexpr uint64_t kCubeRoots[3] = {1000000, 1259921, 1587401};   // 2^(0/3), 2^(1/3), 2^(2/3) x 10^6
     const uint64_t factor = kCubeRoots[k % 3] << (k / 3);                      // k <= 40: below 2^35
     const uint64_t v = offset < 0 ? (uint64_t(code) * 1000000 + factor / 2) / factor : (uint64_t(code) * factor + 500000) / 1000000;
-    return clampCode(int64_t(v > kAmbientFullScale ? kAmbientFullScale : v), floor);
+    return clampCode(int64_t(v > ceiling ? ceiling : v), floor);
   }
 
  private:
@@ -171,7 +177,7 @@ class Ambient {
 
   bool allowed_ = false, exponential_ = false, have_ = false, userManual_ = false, fault_ = false;
   Mode mode_ = Mode::off;
-  uint16_t floor_ = 128;
+  uint16_t floor_ = 128, ceiling_ = kAmbientFullScale;
   int maxOffset_ = 12, offset_ = 0;
   uint32_t permille_ = 0, lux_ = 0, targets_ = 0;
 };

@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include "../PianoAuto/AmbientBacklight.h"
+#include "../PianoAuto/AndroidBrightness.h"
 #ifdef KERNEL
 #include <libkern/libkern.h>
 #else
@@ -74,12 +75,13 @@ inline uint32_t rampUs(uint8_t nibble) { return nibble ? 1000u << ((nibble & 15)
 // Exponential mapping: the IC's codes are already perceptual, so 16 equal steps from the floor to full scale.
 class Steps {
  public:
-  void build(uint16_t floor, bool exponential)
+  void build(uint16_t floor, bool exponential, uint16_t ceiling = kFullScale)
   {
     n_ = 0;
     floor_ = floor;
+    ceiling_ = ceiling;
     if (exponential) {
-      for (unsigned i = 0; i <= 16; ++i) code_[n_++] = uint16_t(floor + (uint32_t(kFullScale - floor) * i + 8) / 16);
+      for (unsigned i = 0; i <= 16; ++i) code_[n_++] = uint16_t(floor + (uint32_t(ceiling - floor) * i + 8) / 16);
       return;
     }
     static constexpr uint64_t kCubeRoots[3] = {1000000, 1259921, 1587401};   // 2^(0/3), 2^(1/3), 2^(2/3) x 10^6
@@ -87,7 +89,7 @@ class Steps {
     unsigned m = 0;
     for (unsigned k = 0; m + 1 < kMax; ++k) {
       const uint64_t divisor = kCubeRoots[k % 3] << (k / 3);
-      const uint16_t v = uint16_t((uint64_t(kFullScale) * 1000000 + divisor / 2) / divisor);
+      const uint16_t v = uint16_t((uint64_t(ceiling) * 1000000 + divisor / 2) / divisor);
       if (v <= floor) break;
       down[m++] = v;
     }
@@ -99,7 +101,7 @@ class Steps {
   {
     for (unsigned i = 0; i < n_; ++i)
       if (code_[i] > code) return code_[i];
-    return code > kFullScale ? kFullScale : code;
+    return code > ceiling_ ? ceiling_ : code;
   }
   uint16_t down(uint16_t code) const
   {
@@ -116,6 +118,7 @@ class Steps {
   uint16_t code_[kMax] = {};
   unsigned n_ = 0;
   uint16_t floor_ = 0;
+  uint16_t ceiling_ = kFullScale;
 };
 
 // ------------------------------------------------------------------------------------------------------------- log rate limit
@@ -171,6 +174,7 @@ struct Config {
   bool lidWatch = false;       // piano-backlight-lid=1: the cover's hall sensor closed -> backlight off
   bool readFlags = false;      // piano-backlight-flags=1: the survey reads FLAG (0x0f), which clears its latched faults
   bool autoAllowed = false;    // piano-backlight-auto=1: ambient targets taken (automatic brightness)
+  bool android = false;        // use the bounded SDR range if both ICs support the reference mapping
   unsigned errorLimit = 8;     // consecutive failed accesses before control stops (the ICs stay as they are)
 };
 
@@ -217,11 +221,24 @@ class Controller {
     const IcState &p = ic_[0], &q = ic_[1];
     exponential_ = !(p.reg[kRegCfg1] & kCfg1LinearMap);
     if ((p.reg[kRegCfg1] ^ q.reg[kRegCfg1]) & kCfg1LinearMap) note("the ICs map codes differently (BL_CFG1 0x%02x, 0x%02x): steps follow the primary's", p.reg[kRegCfg1], q.reg[kRegCfg1]);
-    steps_.build(cfg_.floor, exponential_);
-    ambient_.configure(cfg_.autoAllowed, cfg_.floor, exponential_, int(steps_.count()) - 1);
+    if (cfg_.android) {
+      constexpr uint8_t mode = kCfg1LinearMap | kCfg1PwmEnable;
+      const bool compatible = p.answered && q.answered && !((p.reg[kRegCfg1] | q.reg[kRegCfg1]) & mode)
+          && (p.reg[kRegEn] & kEnSinks) == (q.reg[kRegEn] & kEnSinks)
+          && p.reg[kRegIfs] == q.reg[kRegIfs] && (p.reg[kRegOpt2] & 3) == (q.reg[kRegOpt2] & 3);
+      note("Android SDR %s: primary/secondary BL_CFG1 %#x/%#x sinks %#x/%#x IFS %#x/%#x current-limit %#x/%#x",
+           compatible ? "supported" : "unsupported", p.reg[kRegCfg1], q.reg[kRegCfg1], p.reg[kRegEn] & kEnSinks,
+           q.reg[kRegEn] & kEnSinks, p.reg[kRegIfs], q.reg[kRegIfs], p.reg[kRegOpt2] & 3, q.reg[kRegOpt2] & 3);
+      if (compatible) {
+        ceiling_ = PA_SDR_MAX_CODE;
+        if (cfg_.floor < PA_SDR_MIN_CODE) cfg_.floor = PA_SDR_MIN_CODE;
+      }
+    }
+    steps_.build(cfg_.floor, exponential_, ceiling_);
+    ambient_.configure(cfg_.autoAllowed, cfg_.floor, exponential_, int(steps_.count()) - 1, ceiling_);
     code_ = p.foundCode;
     if (p.foundCode != q.foundCode) note("the ICs hold different codes (%u, %u): both get the primary's", p.foundCode, q.foundCode);
-    const uint32_t target = cfg_.bootPercent ? codeForPercent(cfg_.bootPercent, cfg_.floor) : 0;
+    const uint16_t target = cfg_.bootPercent ? levelCode(cfg_.bootPercent) : 0;
     if (!target)
       note("boot level: as found, code %u (%u %%)", code_, percentOf(code_));
     else if (cfg_.bootForce || code_ > target || code_ < cfg_.floor) {
@@ -231,6 +248,7 @@ class Controller {
     } else {
       note("boot level: found code %u (%u %%), not above %u (%u %%): kept", code_, percentOf(code_), target, percentOf(uint16_t(target)));
     }
+    if (ceiling_ != kFullScale) code_ = code_ < cfg_.floor ? cfg_.floor : code_ > ceiling_ ? ceiling_ : code_;
     if (!p.foundLit || !q.foundLit) note("found the backlight OFF (BL_EN 0x%02x, 0x%02x): it is turned on with code %u", p.reg[kRegEn], q.reg[kRegEn], code_);
     note("control: ON, %s mapping, %u steps from %u to %u, floor %u; display off -> BL_EN cleared, on -> code then BL_EN; lid %s",
          exponential_ ? "exponential" : "linear", steps_.count(), steps_.at(0), steps_.at(steps_.count() - 1), cfg_.floor,
@@ -307,13 +325,13 @@ class Controller {
   }
   void percent(uint32_t p, const char *source)
   {
-    const uint16_t next = codeForPercent(p, cfg_.floor);
+    const uint16_t next = levelCode(p);
     if (control_) limited("level %u %% from %s: code %u -> %u", p, source, code_, next);
     manualCode(next, source);
   }
   void manualCode(uint16_t next, const char *source)
   {
-    if (!control_ || next < cfg_.floor || next > kFullScale) return;
+    if (!control_ || next < cfg_.floor || next > ceiling_) return;
     if (ambient_.automatic()) note("automatic brightness: off, a level was set by %s (piano-backlight-auto=1 as a property: on again)", source);
     ambient_.manual();
     code_ = next;
@@ -387,6 +405,7 @@ class Controller {
   bool lit(unsigned i) const { return ic_[i].lit; }
   uint16_t code() const { return code_; }
   uint16_t floor() const { return cfg_.floor; }
+  uint16_t ceiling() const { return ceiling_; }
   bool exponential() const { return exponential_; }
   const IcState &ic(unsigned i) const { return ic_[i]; }
   bool pending() const
@@ -399,6 +418,11 @@ class Controller {
   uint32_t writes() const { return writes_; }
 
  private:
+  uint16_t levelCode(uint32_t percent) const
+  {
+    const uint16_t code = codeForPercent(percent, cfg_.floor);
+    return code > ceiling_ ? ceiling_ : code;
+  }
   bool ok(unsigned i) const { return ic_[i].answered && idIsKtz8866(ic_[i].reg[kRegId]); }
   void readSurvey(unsigned i, uint8_t reg)
   {
@@ -416,8 +440,8 @@ class Controller {
   // The code into one IC: LSB, MSB (which makes it take effect), both read back.
   bool writeCode(unsigned i, uint16_t code)
   {
-    if (code < cfg_.floor || code > kFullScale) {
-      note("refused: code %u outside %u..%u", code, cfg_.floor, kFullScale);
+    if (code < cfg_.floor || code > ceiling_) {
+      note("refused: code %u outside %u..%u", code, cfg_.floor, ceiling_);
       return false;
     }
     const uint8_t lsb = uint8_t(code & 7), msb = uint8_t(code >> 3);
@@ -572,7 +596,7 @@ class Controller {
   bool rawSeen_ = false, rawOn_ = false;
   uint32_t rawSystem_ = 0, rawApi_ = 0;
   int lid_ = -1;
-  uint16_t code_ = 0;
+  uint16_t code_ = 0, ceiling_ = kFullScale;
   uint32_t errors_ = 0, failedAttempts_ = 0, writes_ = 0;
 };
 

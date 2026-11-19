@@ -887,6 +887,84 @@ static void testNativeBrightness()
   CHECK(ctl.autoActive() && adapter.applied(ctl, applied) && applied != 1500);
 }
 
+static void testAndroidBrightness()
+{
+  CHECK(sizeof pa_sdr_points / sizeof pa_sdr_points[0] == 613);
+  uint32_t crc = ~0u;
+  for (const auto &pair : pa_sdr_points) {
+    CHECK(pa_sdr_code_at_dbv(pair[0]) == pair[1]);
+    for (uint16_t word : pair)
+      for (unsigned i = 0; i < 16; ++i) {
+        const uint32_t carry = (crc ^ word) & 1;
+        crc = (crc >> 1) ^ (carry ? 0xedb88320u : 0);
+        word >>= 1;
+      }
+  }
+  CHECK(~crc == PA_SDR_MAP_CRC);
+  for (uint16_t dbv = PA_SDR_MIN_DBV; dbv <= PA_SDR_MAX_DBV; ++dbv) {
+    const uint16_t code = pa_sdr_code_at_dbv(dbv);
+    CHECK(code >= PA_SDR_MIN_CODE && code <= PA_SDR_MAX_CODE);
+    CHECK(code >= pa_sdr_code_at_dbv(dbv - 1));
+    CHECK(pa_sdr_code(pa_sdr_fixed_for_code(code)) == code);
+  }
+  CHECK(pa_sdr_millinits(pa_sdr_fixed_for_code(347)) == 4492);  // DBV 15..16 midpoint
+  CHECK(pa_sdr_fixed_for_code(1952) == 600u << 16);
+  for (uint16_t floor : {128, 921}) {
+    const uint16_t lo = floor < PA_SDR_MIN_CODE ? uint16_t(PA_SDR_MIN_CODE) : floor;
+    const NativeBrightness ref(lo, PA_SDR_MAX_CODE, true), control(lo, PA_SDR_MAX_CODE, false);
+    CHECK(ref.minFixed() == control.minFixed());
+    CHECK(ref.milliNits(lo) > (floor == 128 ? 2000u : 25000u));
+    CHECK(ref.milliNits(lo) < (floor == 128 ? 2400u : 27000u));
+    for (const auto &adapter : {ref, control}) {
+      uint16_t code = 0;
+      CHECK(!adapter.decode(adapter.minFixed() - 1, code));
+      CHECK(adapter.decode(adapter.minFixed(), code) && code == lo);
+      CHECK(adapter.decode(600u << 16, code) && code == PA_SDR_MAX_CODE);
+      CHECK(!adapter.decode((600u << 16) + 1, code));
+      NativePropertyRecord params, calibration;
+      CHECK(adapter.parameters(params, 1500) && adapter.calibration(calibration));
+      CHECK((params.ranges.at("brightness") == std::vector<uint32_t>{lo, PA_SDR_MAX_CODE, 1500}));
+      CHECK((params.ranges.at("BrightnessMilliNits") ==
+             std::vector<uint32_t>{adapter.milliNits(lo), 600000, adapter.milliNits(1500)}));
+      const auto &samples = calibration.blobs.at("backlight-marketing-table");
+      CHECK(uint32_t(samples[0]) == adapter.minFixed() && samples[2] == 600 << 16);
+      CHECK((calibration.blobs.at("LmaxProduct") == std::vector<int32_t>{600 << 16}));
+      CHECK(calibration.numbers.at("lMinPanel") == adapter.minFixed());
+      for (uint16_t i = lo + 1; i <= PA_SDR_MAX_CODE; ++i)
+        CHECK(adapter.milliNits(i) >= adapter.milliNits(i - 1));
+    }
+    uint16_t curved = 0, linear = 0;
+    CHECK(ref.decode(100u << 16, curved) && control.decode(100u << 16, linear));
+    CHECK(curved > 1300 && curved < 1400 && linear < curved);
+  }
+  for (unsigned mismatch = 0; mismatch < 5; ++mismatch) {
+    Model model;
+    for (unsigned i = 0; i < 2; ++i) {
+      model.reg[i][kRegCfg1] &= ~(kCfg1LinearMap | kCfg1PwmEnable);
+      model.setFound(i, 2047, true);
+    }
+    if (mismatch == 1) model.reg[1][kRegCfg1] |= kCfg1LinearMap;
+    if (mismatch == 2) model.reg[0][kRegCfg1] |= kCfg1PwmEnable;
+    if (mismatch == 3) model.reg[1][kRegEn] ^= 1;
+    if (mismatch == 4) model.reg[1][kRegIfs] ^= 0x08;
+    Controller ctl(model);
+    Config cfg = config(0);
+    cfg.android = cfg.autoAllowed = true;
+    ctl.configure(cfg);
+    CHECK(ctl.survey() && ctl.start());
+    CHECK(ctl.floor() == (mismatch ? 128 : PA_SDR_MIN_CODE));
+    CHECK(ctl.ceiling() == (mismatch ? 2047 : PA_SDR_MAX_CODE));
+    CHECK(ctl.code() == ctl.ceiling());
+    ctl.ambient(1000, 12000, "test");
+    ctl.step(10, "test");
+    CHECK(ctl.code() == ctl.ceiling());
+    ctl.percent(100, "test");
+    ctl.manualCode(2047, "test");
+    CHECK(ctl.code() == ctl.ceiling());
+    for (const auto &write : model.writes()) CHECK(writable(write.reg));
+  }
+}
+
 int main()
 {
   testI2c();
@@ -902,6 +980,7 @@ int main()
   testAmbient();
   testAmbientReadbackFault();
   testNativeBrightness();
+  testAndroidBrightness();
   if (failures) {
     std::printf("backlight_host: %d FAILED\n", failures);
     return 1;
