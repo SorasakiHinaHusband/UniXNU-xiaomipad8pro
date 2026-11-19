@@ -1783,18 +1783,20 @@ static void storeAccount (volatile uint64_t *ops, volatile uint64_t *ticks, uint
   const uint64_t spent = mach_absolute_time () - t0;
   __atomic_fetch_add (ops, 1, __ATOMIC_RELAXED);
   __atomic_fetch_add (ticks, spent, __ATOMIC_RELAXED);
-  uint64_t seen = native_ufs_store_max_ticks;
+  uint64_t seen = __atomic_load_n (&native_ufs_store_max_ticks, __ATOMIC_RELAXED);
   while (spent > seen && !__atomic_compare_exchange_n (&native_ufs_store_max_ticks, &seen, spent, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
 }
 
-extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
+// Tracked calls let direct Data quarantine exactly those buffers that can still DMA after a timeout.
+extern "C" int native_ufs_store_read_tracked (uint64_t rel, uint32_t blocks, void *dst, bool *live)
 {
+  if (live) *live = false;
   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
   const uint64_t t0 = mach_absolute_time ();
   int ok = 1;
   while (blocks) {
     uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
-    if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst) != kIOReturnSuccess) { ok = 0; break; }
+    if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst, live) != kIOReturnSuccess) { ok = 0; break; }
     dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -1803,15 +1805,21 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
   return ok;
 }
 
-static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua)
+extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
 {
+  return native_ufs_store_read_tracked (rel, blocks, dst, nullptr);
+}
+
+static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua, bool *live = nullptr)
+{
+  if (live) *live = false;
   if (storeMode () != 2 || !gStoreRegionBlocks || !src || !blocks || rel >= gStoreRegionBlocks ||
       blocks > gStoreRegionBlocks - rel) return 0;
   const uint64_t t0 = mach_absolute_time ();
   int ok = 1;
   while (blocks) {
     uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
-    if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src, fua) != kIOReturnSuccess) { ok = 0; break; }
+    if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src, fua, live) != kIOReturnSuccess) { ok = 0; break; }
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -1824,6 +1832,11 @@ static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua)
 extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void *src)
 {
   return storeWrite (rel, blocks, src, true);
+}
+
+extern "C" int native_ufs_store_write_tracked (uint64_t rel, uint32_t blocks, const void *src, bool *live)
+{
+  return storeWrite (rel, blocks, src, true, live);
 }
 
 // No forced unit access: the device may keep the blocks in its volatile write cache until native_ufs_store_sync. For a

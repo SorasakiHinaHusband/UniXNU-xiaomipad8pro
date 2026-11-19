@@ -316,7 +316,8 @@ static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBy
   const uint8_t *rsp = slot.ucd + kRspOffset;
   *scsiStatus = (uint32_t (rsp[6]) << 8) | rsp[7];
   gRootDiagnostic.scsi = *scsiStatus;
-  gRootDiagnostic.residual = loadBe32 (rsp + 12);
+  const uint32_t residual = loadBe32 (rsp + 12);
+  gRootDiagnostic.residual = residual;
   unsigned length = (unsigned (rsp[10]) << 8) | rsp[11];
   if (length) {
     unsigned senseLength = (unsigned (rsp[32]) << 8) | rsp[33];
@@ -327,7 +328,7 @@ static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBy
     else if (senseLength >= 4 && ((sense[0] & 0x7f) == 0x72 || (sense[0] & 0x7f) == 0x73))
       gRootDiagnostic.sense = (uint32_t (sense[1] & 15) << 16) | (uint32_t (sense[2]) << 8) | sense[3];
   }
-  if (!*scsiStatus && ((rsp[1] & 0x60) || gRootDiagnostic.residual)) return hostProtocolError (6);
+  if (!*scsiStatus && ((rsp[1] & 0x60) || residual)) return hostProtocolError (6);
   IOReturn result = *scsiStatus == 0 ? kIOReturnSuccess : kIOReturnNotReady;
   gRootDiagnostic.result = static_cast<uint32_t> (result);
   return result;
@@ -503,8 +504,9 @@ static unsigned hostBuildPrds (const void *buffer, uint64_t bytes, UfsPrd *prd)
 
 // Read `blocks` 4096-byte blocks of LUN `lun` starting at `lba` into dst: one command of up to kXferMax straight into dst when it
 // qualifies for zero copy, else commands of up to kDataMax through the slot's data area.
-static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
+static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst, bool *live = nullptr)
 {
+  if (live) *live = false;
   if (!gHost.ready || !dst || !blocks || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
   }
@@ -515,7 +517,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     const uint32_t step = blocks > kXferMax / 4096 ? kXferMax / 4096 : kDataMax / 4096;
     for (uint32_t done = 0; done < blocks; done += step) {
       const uint32_t chunk = blocks - done > step ? step : blocks - done;
-      IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096);
+      IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096, live);
       if (status != kIOReturnSuccess) return status;
     }
     return kIOReturnSuccess;
@@ -531,7 +533,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   uint32_t scsi = 0;
   IOReturn status;
   for (unsigned attempt = 0;; ++attempt) {
-    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prds ? prd : nullptr, prds, prds ? dst : nullptr);
+    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prds ? prd : nullptr, prds, prds ? dst : nullptr, false, prds ? live : nullptr);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
   if (status == kIOReturnSuccess && !prds) {
@@ -663,8 +665,9 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 }
 
 // WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
-static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false, bool *live = nullptr)
 {
+  if (live) *live = false;
   if (!gHost.ready || !src || !blocks || blocks > kXferMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
@@ -673,7 +676,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   if (!prds && blocks > kDataMax / 4096) {
     for (uint32_t done = 0; done < blocks; done += kDataMax / 4096) {
       const uint32_t chunk = blocks - done > kDataMax / 4096 ? kDataMax / 4096 : blocks - done;
-      IOReturn status = hostWrite4k (lun, lba + done, chunk, static_cast<const uint8_t *> (src) + uint64_t (done) * 4096, fua);
+      IOReturn status = hostWrite4k (lun, lba + done, chunk, static_cast<const uint8_t *> (src) + uint64_t (done) * 4096, fua, live);
       if (status != kIOReturnSuccess) return status;
     }
     return kIOReturnSuccess;
@@ -681,13 +684,21 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
   gRootDiagnostic.lba = lba;
-  if (!prds) memcpy (slot.data, src, blocks * 4096U);
+  if (!prds) {
+    // A tracked store writer may have waited for this slot across another command's fatal timeout.
+    // Check ownership before putting anything in the bounce area.
+    if (live && !hostClearUcd (slot)) {
+      hostSlotGive (slot, pooled);
+      return kIOReturnNotReady;
+    }
+    memcpy (slot.data, src, blocks * 4096U);
+  }
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
   IOReturn status;
   for (unsigned attempt = 0;; ++attempt) {
-    status = hostScsiDir (slot, 0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi, prds ? prd : nullptr, prds, prds ? src : nullptr);
+    status = hostScsiDir (slot, 0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi, prds ? prd : nullptr, prds, prds ? src : nullptr, false, prds ? live : nullptr);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
   hostSlotGive (slot, pooled);
