@@ -185,7 +185,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
             const IOReturn off=drained==kIOReturnSuccess?strictOff(asleep):drained;
             __atomic_store_n(&safeOff_,off==kIOReturnSuccess,__ATOMIC_RELEASE);
             loseLocked(cause,A830SRunning,cause,result);
-            if(off!=kIOReturnSuccess && unsafe_)unsafe_(unsafeContext_);
+            if(off!=kIOReturnSuccess && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::DeclareLostOffFailed);
         } else {
             rops_.gate(rops_.context,A830GateRecovering,cause);
             power_->beginRecovery();
@@ -198,7 +198,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
                 power_->latchQualification();
                 const bool safe=ops_.gmuForceOff(ops_.context)==kIOReturnSuccess;
                 __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
-                if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::RestartReoffFailed);
+                if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::DeclareLostOffFailed);
             }
             loseLocked(cause,A830SRunning,cause,result);
         }

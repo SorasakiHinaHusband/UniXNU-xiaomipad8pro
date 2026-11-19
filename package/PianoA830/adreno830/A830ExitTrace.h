@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 enum class A830ExitContext : uint32_t { Guard=1, Dcvs, Power, Hfi, Operator };
-enum class A830ExitOrigin : uint32_t { Raw105=1, ProtectionDeadline, StrictOffFailed, RestartReoffFailed };
+enum class A830ExitOrigin : uint32_t { Raw105=1, ProtectionDeadline, StrictOffFailed, RestartReoffFailed, DeclareLostOffFailed };
 enum class A830ExitVote : uint32_t { None, BoardHold, Low160, RestartM9, Recovery342 };
 enum class A830ExitStage : uint32_t {
     Ready=1, Permit, BoardHold, BoardRelease, First, Request,

@@ -260,7 +260,11 @@ public:
     bool qualificationBlocked() const {return __atomic_load_n(&qualificationBlocked_,__ATOMIC_SEQ_CST);}
     void parkQualification() {__atomic_store_n(&qualificationParked_,true,__ATOMIC_RELEASE);}
     uint8_t qualificationCap() const {return uint8_t(__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE));}
-    uint8_t qualificationEffectiveCap() {uint8_t level=7,bus=6;limitQualification(level,bus);return level;}
+    uint8_t qualificationEffectiveCap(A830ExitContext source=A830ExitContext::Power) {
+        uint8_t level=7,bus=6;
+        limitQualification(level,bus,source);
+        return level;
+    }
     void checkQualification(A830ExitContext source=A830ExitContext::Power) {
         if(qualificationCheck_)qualificationCheck_(qualificationContext_,env_.nowNs(env_.context),source);
     }

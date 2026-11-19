@@ -2657,7 +2657,7 @@ void qualificationThread(void *)
         if(event) {
             const auto &t=gQualification.thermal();
             qualLog("R3b EVENT at-us=%llu event=%u step=%u board-cap=%u effective=%u raw=%d filtered=%d reason=%u failed-us=%llu",
-                now/1000,t.events,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(),t.raw,t.filter16/16,gQualification.reason(),gQualification.failedAt()/1000);
+                now/1000,t.events,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(A830ExitContext::Guard),t.raw,t.filter16/16,gQualification.reason(),gQualification.failedAt()/1000);
         }
         lastReason=gQualification.reason();
         if(!gQualification.r3b() || now>=logAt || event) {
@@ -2671,7 +2671,7 @@ void qualificationThread(void *)
                 auto &t=gQualification.thermal();
                 qualLog("R3b THERM at-us=%llu seq=%llu reads=%u min-valid=%x gap-us=%llu peaks=%d,%d,%d,%d,%d,%d,%d,%d raw=%d filtered=%d trend=%d step=%u board-cap=%u effective=%u downs=%u ups=%u healthy=%u",
                     now/1000,t.sequence,t.reads,t.minValid,t.maxGap/1000,t.peaks[0],t.peaks[1],t.peaks[2],t.peaks[3],t.peaks[4],t.peaks[5],t.peaks[6],t.peaks[7],
-                    t.raw,t.filter16/16,t.trend,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(),t.downs,t.ups,t.healthy);
+                    t.raw,t.filter16/16,t.trend,t.step,t.boardCap,g830.power_state.qualificationEffectiveCap(A830ExitContext::Guard),t.downs,t.ups,t.healthy);
                 t.resetPeaks();
             }
         logAt=now+1000000000ull;
@@ -2684,7 +2684,7 @@ void qualificationService(void *,uint64_t now) {
     const uint64_t at=__atomic_load_n(&gQualificationInjectAt,__ATOMIC_ACQUIRE);
     if(at && now>=at && __atomic_exchange_n(&gQualificationInjectAt,0ull,__ATOMIC_ACQ_REL)) {
         if(gQualification.high() && g830.power_state.votedLevel()>3 &&
-           (!gQualification.r3b() || g830.power_state.qualificationEffectiveCap()>3) && g830.hfi.armDropAck()) {
+           (!gQualification.r3b() || g830.power_state.qualificationEffectiveCap(A830ExitContext::Dcvs)>3) && g830.hfi.armDropAck()) {
             qualLog("R3a injection armed from ACK level=%u at-us=%llu",g830.power_state.votedLevel(),nowUs());
             g830.dcvs.forceQualificationVote();
         } else qualLog("R3a injection refused: high ACK/permit missing at deadline");
