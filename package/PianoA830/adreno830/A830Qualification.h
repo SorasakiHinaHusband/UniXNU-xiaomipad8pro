@@ -46,13 +46,14 @@ public:
         uint64_t expected=0;
         const bool first=__atomic_compare_exchange_n(&firstFailure_,&expected,now<<3|reason,false,
                                                      __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+        const uint8_t cap=first && r3b_?power_->qualificationCap():0;
         __atomic_store_n(&high_,false,__ATOMIC_RELEASE);
         if(reason==A830QualSensor || reason==A830QualGpuHot || (r3b_ && reason==A830QualBoardHot))
             power_->setQualificationCeiling(1,2);
         if(r3b_ && first) {
             const uint64_t opened=openedAt();
             a830ExitTrace.firstCause(now,reason,source,opened,opened?opened+windowNs_:0,
-                                     __atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE),power_->qualificationCap());
+                                     __atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE),cap);
         }
         if(r3b_ && reason!=A830QualVote) {
             if(first)recovery_->requestQualificationLow(reason,now);
@@ -161,8 +162,8 @@ private:
         uint8_t cap=hardBoard?1:uint8_t(thermal_.published());
         if(!high() && cap>3)cap=3;
         const uint8_t buses[]={0,2,2,3,4,4,4,6};
-        power_->setQualificationCeiling(cap,buses[cap]);
         if(thermal_.events&12)a830ExitTrace.board(thermal_.boardCap,now,cap);
+        power_->setQualificationCeiling(cap,buses[cap]);
         if(deadlineMissed(now) && unsafe_)unsafe_(nullptr,A830ExitOrigin::ProtectionDeadline);
     }
     bool r3b_=false;

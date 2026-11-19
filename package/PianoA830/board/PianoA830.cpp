@@ -105,7 +105,7 @@ static int exitTraceSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req
   if(req->newptr || !kauth_cred_issuser(kauth_cred_get()))return EPERM;
   const uint64_t boot=a830ExitTrace.boot();
   if(!boot)return EAGAIN;
-  if(!req->oldptr) {req->oldidx=(A830ExitTrace::Capacity+1)*160+160;return 0;}
+  if(!req->oldptr) {req->oldidx=(A830ExitTrace::Capacity+2)*224;return 0;}
   const uint32_t head=a830ExitTrace.head();
   const uint32_t end=head<A830ExitTrace::Capacity?head:A830ExitTrace::Capacity;
   A830ExitTrace::Record row,terminal;
@@ -114,7 +114,7 @@ static int exitTraceSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req
   // Do not output a successful partial snapshot if a producer reserved a slot but has not committed it.
   for(uint32_t seq=1;seq<=end;++seq)
     if(!a830ExitTrace.copy(seq,row))return EAGAIN;
-  char line[160];
+  char line[224];
   int n=snprintf(line,sizeof line,"R3DXLOG-v1 record-bytes=%u boot=%llu next=%u lost=%u\n",
                  unsigned(sizeof row),boot,head+1,head-end-unsigned(appendTerminal));
   int err=SYSCTL_OUT(req,line,n);
