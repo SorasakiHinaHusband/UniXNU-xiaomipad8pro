@@ -29,7 +29,7 @@ This does not change the terminal WindowServer capture failure boundary.
  static NSString *nbMiB(uint64_t bytes) {return [NSString stringWithFormat:@"%.1fM",bytes/1048576.0];}
  // A four-character code as text ('444v'), or its hex when a byte is not printable.
  static NSString *fourCC(uint32_t code) {
-@@ -1185,102 +1186,217 @@
+@@ -1185,102 +1186,236 @@
  // caller-owned no-copy buffers do not enter this cache.
  static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
  static std::mutex gSurfaceImportLock;
@@ -214,6 +214,25 @@ This does not change the terminal WindowServer capture failure boundary.
 +   if(gNoHoldImports.load() && !raised){if(gDevice)(void)nmb_device_hold_back_memory(gDevice,false);gNoHoldImports=false;}
 +   trimHeldImports(false);
 +   if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,raised?0:2000);
++   // Opt-in every-process census, toggled live by the qualification spec. The
++   // unified log keeps the full record; stderr's ordinary rate limit still applies.
++   if(gDevice && access("/private/var/ngpu/debug/client-mem",F_OK)==0) {
++    uint64_t mc[10]={};nmb_device_memory_counts(gDevice,mc);
++    NBNOTE(@"native-metal: ws-oom2 census held=%llu count=%llu dropped=%llu made=%llu released=%llu retries=%llu recovered=%llu mc=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
++     (unsigned long long)gHeldImportBytes.load(),(unsigned long long)gHeldImportCount.load(),(unsigned long long)gHeldImportsDropped.load(),
++     (unsigned long long)gSurfaceImportsMade.load(),(unsigned long long)gSurfaceImportsReleased.load(),
++     (unsigned long long)gCapacityRetries.load(),(unsigned long long)gCapacityRecovered.load(),
++     (unsigned long long)mc[0],(unsigned long long)mc[1],(unsigned long long)mc[2],(unsigned long long)mc[3],(unsigned long long)mc[4],
++     (unsigned long long)mc[5],(unsigned long long)mc[6],(unsigned long long)mc[7],(unsigned long long)mc[8],(unsigned long long)mc[9]);
++    static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++    static auto counts=turnip?(bool (*)(uint64_t *))dlsym(turnip,"tu_darwin_capacity_counts"):nullptr;
++    uint64_t bc[14]={};
++    if(counts && counts(bc))NBNOTE(@"native-metal: ws-oom2 backend va=%llu/%llu largest=%llu holes=%llu heap=%llu/%llu cached=%llu pending=%llu retries=%llu wins=%llu asked=%llu seen=%llu failure=%lld version=%llu",
++     (unsigned long long)bc[0],(unsigned long long)bc[1],(unsigned long long)bc[2],(unsigned long long)bc[3],
++     (unsigned long long)bc[4],(unsigned long long)bc[5],(unsigned long long)bc[6],(unsigned long long)bc[7],
++     (unsigned long long)bc[8],(unsigned long long)bc[9],(unsigned long long)bc[10],(unsigned long long)bc[11],
++     (long long)bc[12],(unsigned long long)bc[13]);
++   }
 +  });
    dispatch_activate(timer);
   });
@@ -316,7 +335,7 @@ This does not change the terminal WindowServer capture failure boundary.
  }
  // PVRTC (PowerVR's compressed formats, MTLPixelFormatPVRTC_* 160-167) has no Vulkan format on Adreno, and metal2vulkan keeps such a
  // texture's blocks for copies only: every command that samples it is refused (GFXBench's T-Rex drew nothing, half its command
-@@ -1504,7 +1620,7 @@
+@@ -1504,7 +1639,7 @@
  }
  static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
   NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -325,7 +344,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
   NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
-@@ -1535,8 +1651,8 @@
+@@ -1535,8 +1670,8 @@
   uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
   size_t computed[4];   // myron: a 'b3a8' surface without plane rows
   if(!chromaRow && b3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
@@ -336,7 +355,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!handle)return nil;
   NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
-@@ -1571,7 +1687,7 @@
+@@ -1571,7 +1706,7 @@
  }
  - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -345,7 +364,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!handle){NBLOG(@"native-metal: linear texture refused: %@",lastError());return nil;}
   NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
   texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
-@@ -4455,7 +4571,7 @@
+@@ -4455,7 +4590,7 @@
   return (MTLPurgeableState)answer;
  }
  - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
@@ -354,7 +373,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
   buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
-@@ -4466,7 +4582,7 @@
+@@ -4466,7 +4601,7 @@
  }
  - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -363,7 +382,7 @@ This does not change the terminal WindowServer capture failure boundary.
   // An automatic heap promises its textures no shared memory, only a place: one the heap cannot take is made on its own, so the caller
   // (Core Image's intermediate images, iconservicesagent, i-33765e1ad) gets a texture instead of nil, which it dereferenced. A placement
   // heap's texture aliases the memory at its offset; that one stays refused.
-@@ -4481,7 +4597,7 @@
+@@ -4481,7 +4616,7 @@
          (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
          (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
    if(offset!=UINT64_MAX)return nil;
@@ -372,7 +391,7 @@ This does not change the terminal WindowServer capture failure boundary.
    if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
    NBTexture *own=[NBTexture new];own.handle=handle;countAskedTexture(own,descriptor);nmb_texture_describe(handle,&descriptor);own.descriptor=descriptor;
    if(isPvrtc(d.pixelFormat))own.pvrtc=(uint32_t)d.pixelFormat;
-@@ -4618,7 +4734,7 @@
+@@ -4618,7 +4753,7 @@
  - (NSUInteger)maxTextureDimensionCube {return (NSUInteger)gTurnipLimits[7];}
  - (NSUInteger)maxTextureBufferWidth {return (NSUInteger)gTurnipLimits[9];}
  - (uint64_t)recommendedMaxWorkingSetSize {return gTurnipLimits[3];}
@@ -381,7 +400,7 @@ This does not change the terminal WindowServer capture failure boundary.
  - (BOOL)hasUnifiedMemory {return YES;}
  - (BOOL)respondsToSelector:(SEL)selector {
   if(selector==sel_registerName("targetDeviceInfo"))return NO;   // the inherited _MTLDevice one, NULL without IOGPU
-@@ -4680,7 +4796,7 @@
+@@ -4680,7 +4815,7 @@
  }
  - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
   if(!d)return nil;
@@ -390,7 +409,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
   NBLOG(@"native-metal: heap %lu bytes type %ld options %lx -> %llu",(unsigned long)d.size,(long)d.type,(unsigned long)d.resourceOptions,nmb_heap_size(handle));
   NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;
-@@ -4730,7 +4846,7 @@
+@@ -4730,7 +4865,7 @@
  }
  - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
  - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
@@ -399,7 +418,7 @@ This does not change the terminal WindowServer capture failure boundary.
   // UniXNU-piano (0003): the length and the limit with a refusal; a large buffer on the console.
   if(!handle){NBLOG(@"native-metal: buffer of %@ (options %lx, maxBufferLength %@) refused: %@",nbMiB(length),(unsigned long)options,
    nbMiB(nmb_device_max_buffer_length(gDevice)),lastError());return nil;}
-@@ -4742,20 +4858,21 @@
+@@ -4742,20 +4877,21 @@
  }
  - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
   if(!bytes)return nil;
@@ -429,7 +448,7 @@ This does not change the terminal WindowServer capture failure boundary.
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
   return (id<MTLBuffer>)buffer;
  }
-@@ -4766,7 +4883,7 @@
+@@ -4766,7 +4902,7 @@
    std::max<uint64_t>(descriptor.array_length,1)*std::max<uint64_t>(descriptor.samples,1);
   uint64_t layout[2]={0,0};
   if(texels>=(uint64_t(16)<<20)){NmbTextureDescriptor asked=descriptor;if(!nmb_device_heap_texture_size_and_align(gDevice,&asked,layout))layout[0]=0;}
@@ -438,7 +457,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(handle && layout[0]>=kLargeAllocationBytes)
    NBNOTE(@"native-metal: texture %llux%llux%llu fmt %llu L%llu s%llu a%llu: made, %@ by the runtime's layout (maxBufferLength %@)",
     (unsigned long long)descriptor.width,(unsigned long long)descriptor.height,(unsigned long long)descriptor.depth,
-@@ -4812,7 +4929,7 @@
+@@ -4812,7 +4948,7 @@
    refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);
    noteSurfaceTexture(false,4,d,surface,plane,start-(uintptr_t)base,row,0,[@"import: " stringByAppendingString:lastError()]);return nil;}
   NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
@@ -447,7 +466,7 @@ This does not change the terminal WindowServer capture failure boundary.
   if(!texture){
    refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);
    noteSurfaceTexture(false,5,d,surface,plane,start-(uintptr_t)base,row,made,lastError());return nil;}
-@@ -5517,6 +5634,14 @@
+@@ -5517,6 +5653,14 @@
   row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
    (unsigned long long)gNoCopyMade.load(),
    (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());

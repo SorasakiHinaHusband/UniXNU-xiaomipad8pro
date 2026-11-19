@@ -15,10 +15,13 @@
 #include <thread>
 #include <vector>
 #include <notify.h>
+#include <dlfcn.h>
+#include <unistd.h>
 
 struct NmbDevice {};
 struct NmbBuffer {void *context;void (*release)(void *,void *,uint64_t);void *base;uint64_t bytes;};
 static NmbDevice mockDevice,*gDevice=&mockDevice;
+static std::string gLoaderPath;
 static thread_local std::string mockError;
 static std::atomic<uint64_t> mockNow{1000000},mockImports{0},mockMade{0},mockReleased{0},mockAttempts{0};
 static std::atomic<int> failImports{0};

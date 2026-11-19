@@ -14,6 +14,9 @@ import subprocess
 root = Path(__file__).resolve().parents[4]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--out', type=Path, default=root / 'out/frontend-pressure-host')
+parser.add_argument('--syntax', action='store_true', help='also syntax-check the full staged frontend with patch 0006')
+parser.add_argument('--frontend', type=Path, default=root / 'out/turnip-a830/plugin/frontend.mm')
+parser.add_argument('--flags', type=Path, default=root / 'out/turnip-a830/plugin/flags')
 args = parser.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
 patch = Path(__file__).resolve().parents[1] / 'frontend/0006-frontend-bounded-import-reclaim.patch'
@@ -43,3 +46,13 @@ subprocess.run(['xcrun', 'clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-g'
                 '-I', str(args.out), str(Path(__file__).with_suffix('.mm')),
                 '-framework', 'Foundation', '-framework', 'IOSurface', '-o', str(binary)], check=True)
 subprocess.run([str(binary)], timeout=30, check=True)
+if args.syntax:
+    full = args.out.resolve() / 'frontend-full.mm'
+    assert full != args.frontend.resolve(), 'never mutate the staged frontend'
+    full.write_bytes(args.frontend.read_bytes())
+    if 'class HeldImportPolicy' not in full.read_text():
+        subprocess.run(['patch', '-s', str(full), str(patch)], check=True)
+    flags = args.flags.read_text().splitlines()
+    flags[flags.index('-c')] = '-fsyntax-only'
+    subprocess.run(flags + [str(full)], check=True)
+    print('PASS full frontend: arm64e Objective-C++ syntax and patch application')
