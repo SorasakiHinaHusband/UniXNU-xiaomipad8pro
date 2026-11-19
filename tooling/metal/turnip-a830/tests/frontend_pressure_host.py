@@ -46,15 +46,24 @@ subprocess.run(['xcrun', 'clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-g'
                 '-I', str(args.out), str(Path(__file__).with_suffix('.mm')),
                 '-framework', 'Foundation', '-framework', 'IOSurface', '-o', str(binary)], check=True)
 subprocess.run([str(binary)], timeout=30, check=True)
+residency = args.out / 'surface_residency_host'
+subprocess.run(['xcrun', 'clang++', '-std=c++17', '-g', '-O1', '-Wall', '-Wextra', '-Werror',
+                '-fsanitize=address,undefined', '-I', str(patch.parent),
+                str(Path(__file__).with_name('surface_residency_host.cpp')), '-o', str(residency)], check=True)
+subprocess.run([str(residency)], timeout=30, check=True)
 if args.syntax:
     full = args.out.resolve() / 'frontend-full.mm'
     assert full != args.frontend.resolve(), 'never mutate the staged frontend'
     full.write_bytes(args.frontend.read_bytes())
     if 'class HeldImportPolicy' not in full.read_text():
         subprocess.run(['patch', '-s', str(full), str(patch)], check=True)
+    if 'PIANO_SURFACE_RESIDENCY' not in full.read_text():
+        residency_patch = patch.with_name('0007-pressure-surface-residency.patch')
+        subprocess.run(['patch', '-s', str(full), str(residency_patch)], check=True)
     flags = args.flags.read_text().splitlines()
     flags[flags.index('-c')] = '-fsyntax-only'
-    result = subprocess.run(flags + [str(full)], capture_output=True, text=True)
+    flags[flags.index('-isysroot') + 1] = subprocess.check_output(['xcrun', '--show-sdk-path'], text=True).strip()
+    result = subprocess.run(flags + ['-I', str(patch.parent), str(full)], capture_output=True, text=True)
     (args.out / 'frontend-syntax.log').write_text(result.stdout + result.stderr)
     if result.returncode:
         raise SystemExit(result.stderr[-4000:])
