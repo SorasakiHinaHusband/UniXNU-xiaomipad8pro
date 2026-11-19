@@ -18,10 +18,10 @@
 #include "AudioBoard.h"
 #include "AudioDspLink.h"
 #include "AudioLive.h"
-#include "AudioVa.h"
 #include "AudioPcm.h"
 #include "AudioPower.h"
 #include <sys/sysctl.h>
+#include <sys/kauth.h>
 SYSCTL_DECL(_machdep);
 #include "AudioSession.h"
 
@@ -325,6 +325,80 @@ void registerGain()
     gGainOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gGainOid);
 }
+// Route writes are requests only. The worker publishes applied settings and
+// the stopped boundary. The raw window's arm and copy share a user-side lock;
+// the worker fills only armed backing and publishes it once, immutably.
+enum MicRouteOid {MicRouteValue, MicRouteDiag, MicRouteRecord, MicRouteState, MicRoutePcm, MicRouteCount};
+struct sysctl_oid gMicRouteOid[MicRouteCount];
+IOLock *gMicRecordLock;
+AudioMicWindow *gMicWindow;
+
+int micRouteControl(struct sysctl_oid *oidp, void *, int selector, struct sysctl_req *req)
+{
+    if (!gLive || !gLive->cfg.mic) return ENXIO;
+    const AudioMicRouteStatus s = audio_live_mic_route_status(gShared);
+    if (selector == MicRouteState) {
+        if (req->newptr) return EPERM;
+        char line[160];
+        const int n = snprintf(line, sizeof line, "request %d applied %d gen %u diag-request %d diag-applied %d stopped %d armed %d recorded %d",
+                               s.requested, s.applied, s.generation, s.diag_requested, s.diag_applied, s.stopped, s.armed, s.recorded);
+        return SYSCTL_OUT(req, line, size_t(n) + 1);
+    }
+    if (selector == MicRoutePcm) {
+        if (req->newptr || !kauth_cred_issuser(kauth_cred_get())) return EPERM;
+        IOLockLock(gMicRecordLock);
+        const AudioMicWindow *w = audio_live_mic_window(gLive);
+        int err = 0;
+        if (w) {
+            err = SYSCTL_OUT(req, w, offsetof(AudioMicWindow, period));
+            if (!err) err = SYSCTL_OUT(req, w->period, w->periods * sizeof w->period[0]);
+            if (!err) err = SYSCTL_OUT(req, w->pcm, w->frames * 2u * sizeof w->pcm[0]);
+        }
+        IOLockUnlock(gMicRecordLock);
+        return err;
+    }
+    if (selector == MicRouteRecord && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
+    int value = selector == MicRouteValue ? s.requested : selector == MicRouteDiag ? s.diag_requested : s.armed;
+    int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (selector == MicRouteRecord) {
+        IOLockLock(gMicRecordLock);
+        if (value == 1 && !gMicWindow && s.stopped && s.diag_applied)
+            gMicWindow = static_cast<AudioMicWindow *>(IOMallocData(sizeof(AudioMicWindow)));
+        err = audio_live_mic_record(gLive, value, gMicWindow);
+        IOLockUnlock(gMicRecordLock);
+    } else {
+        err = audio_live_mic_request(gShared, selector == MicRouteDiag, value);
+    }
+    if (!err) liveWake();
+    piano_audio_log("mic-route1: submit %s value %d result %d", oidp->oid_name, value, err);
+    return err;
+}
+
+void registerMicRoute()
+{
+    static const char *const names[] = {
+        "piano_audio_mic_route", "piano_audio_mic_route_diag", "piano_audio_mic_route_record",
+        "piano_audio_mic_route_state", "piano_audio_mic_route_pcm",
+    };
+    gMicRecordLock = IOLockAlloc();
+    if (!gMicRecordLock) piano_audio_log("mic-route1: pre-mix diagnostic lock allocation failed");
+    for (int i = 0; i < MicRouteCount; ++i) {
+        if (!gMicRecordLock && (i == MicRouteRecord || i == MicRoutePcm)) continue;
+        sysctl_oid &oid = gMicRouteOid[i];
+        oid.oid_parent = &sysctl__machdep_children;
+        oid.oid_number = OID_AUTO;
+        const unsigned type = i == MicRouteState ? CTLTYPE_STRING : i == MicRoutePcm ? CTLTYPE_OPAQUE : CTLTYPE_INT;
+        oid.oid_kind = int(type | (i < MicRouteState ? CTLFLAG_RW : CTLFLAG_RD) | CTLFLAG_LOCKED | CTLFLAG_OID2);
+        oid.oid_name = names[i];
+        oid.oid_arg2 = i;
+        oid.oid_handler = micRouteControl;
+        oid.oid_fmt = i == MicRouteState ? "A" : i == MicRoutePcm ? "S,AudioMicWindow" : "I";
+        oid.oid_version = SYSCTL_OID_VERSION;
+        sysctl_register_oid(&oid);
+    }
+}
+
 int ledgerRead(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
     if (req->newptr) return EPERM;
@@ -370,6 +444,9 @@ void liveRun(const PianoAudioLevelArgs *a)
     if (a->liveGain) lc.gain = a->liveGain;
     if (a->liveCeilingDb) lc.ceiling = audio_ceiling_db(a->liveCeilingDb);
     if (a->liveIdleMs) lc.idle_ms = a->liveIdleMs;
+    lc.mic_route = a->micRoute;
+    lc.mic_diag = a->micRouteDiag;
+    lc.mic_route_apply = pianoaudio::boardSetMicRoute;
     gLive = IOMallocType(AudioLive);
     if (!gLive || audio_live_init(gLive, &lc, &gSession, gShared)) {
         piano_audio_log("live: levels 8-10 not run: %s", gLive ? "the session did not hand the hardware over" : "no memory");
@@ -381,6 +458,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     if (gLive->ledger) {bzero(gLive->ledger,sizeof(AudioLedger)); registerLedger();}
     else {piano_audio_log("sleep-contract1: ledger allocation failed; readiness gate held"); return;}
     if (lc.level >= 9) registerGain();
+    if (lc.mic) registerMicRoute();
     piano_audio_power_ready();
     uint32_t handled=0;
     uint8_t in[AUDIO_INBOX_BYTES];
@@ -517,7 +595,7 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
     ops.clock_ms = [](void *) -> uint32_t {return nowMs();};
     ops.log = sessionLog;
     ops.send = sessionSend;
-    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu, AUDIO_MIC_ROUTE_LEGACY, a->micGain};
+    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu, a->micRoute, a->micGain};
     pianoaudio::boardSetup(ops, b);
     audio_session_init(&gSession, &c, &ops, c.dsp ? &gLink.guard : nullptr);
     // A budget well beyond what the levels need (level 6's silence and level 7's walk are seconds; every command is answered or

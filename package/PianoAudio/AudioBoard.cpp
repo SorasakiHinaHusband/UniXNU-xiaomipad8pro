@@ -355,8 +355,8 @@ const AudioVaPinIo kLpiIo = {nullptr, lpiRead, lpiWrite};
 
 void vaRouteLog(const char *event, int route, const AudioVaReadback &r, int result)
 {
-  piano_audio_log("mic-route1: %s request %d applied %d gen %u DEC0 DMIC%u DEC1 DMIC2 mono %s mux0 %#x mux1 %#x src0 %#x src1 %#x pair-mask %#x ctl01 %#x ctl23 %#x ctl45 %#x ctl67 %#x pins %u result %d",
-                  event, route, route, gMicRouteGeneration, audio_mic_dec0(route), audio_mic_mono_name(route), r.mux[0], r.mux[1],
+  piano_audio_log("mic-route1: %s applied %d gen %u DEC0 DMIC%u DEC1 DMIC2 mono %s mux0 %#x mux1 %#x src0 %#x src1 %#x pair-mask %#x ctl01 %#x ctl23 %#x ctl45 %#x ctl67 %#x pins %u result %d",
+                  event, route, gMicRouteGeneration, audio_mic_dec0(route), audio_mic_mono_name(route), r.mux[0], r.mux[1],
                   r.src[0], r.src[1], audio_va_pair_mask(route), r.ctl[0], r.ctl[1], r.ctl[2], r.ctl[3], gLpiCount, result);
 }
 

@@ -17,6 +17,7 @@ struct PianoAudioLevelArgs {
   uint32_t lpassRead, presetAny, mic, silenceMs;
   uint32_t tone, toneMask, toneMs, gapMs, toneGain;
   uint32_t i2cSwap, i2cHalfUs, smmu;
+  int micRoute, micRouteDiag;         // signed route and opt-in pre-mix diagnostic
   uint32_t liveGain, liveCeilingDb, liveIdleMs, micGain;   // levels 8-10 (0: the level's default)
 };
 // Runs until the levels are done (levels 4-7 bounded; levels 8-10 for the rest of the boot, until PianoPower's health stops

@@ -21,6 +21,7 @@
 //      ../AudioSequence.c ../PianoAudioReach.c ../PianoGpr.c ../AudioSafety.c ../AudioDspLink.c -lm && ./a.out
 #include <math.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -379,6 +380,7 @@ static void dsp_read(const GprPacket *p)
 }
 
 // The DSP's capture: a square wave of +-8000 on DEC0 and +-4000 on DEC1 (96 samples a cycle): the mono mix is +-6000.
+static int g_route_fixture;
 static void fill_capture(unsigned slot, uint32_t bytes, uint32_t offset)
 {
     uint8_t *base = g_dma + AUDIO_DMA_MIC + slot * AUDIO_MIC_PERIOD_BYTES;
@@ -387,7 +389,7 @@ static void fill_capture(unsigned slot, uint32_t bytes, uint32_t offset)
     w.cap_bytes += bytes;
     for (uint32_t i = 0; i < bytes / 4; ++i, ++w.cap_k) {
         const int hi = w.cap_k % 96 < 48;
-        pcm[2 * i] = (int16_t)(hi ? 8000 : -8000);
+        pcm[2 * i] = g_route_fixture ? (hi ? INT16_MAX : INT16_MIN) : (int16_t)(hi ? 8000 : -8000);
         pcm[2 * i + 1] = (int16_t)(hi ? 4000 : -4000);
     }
 }
@@ -1032,6 +1034,92 @@ static void testMic(void)
     CHECK(!w.violations && live.mic_starts == 0 && w.mic_frames == 0);
 }
 
+static AudioMicWindow route_window;
+static unsigned route_applies;
+
+static void route_apply(int route, uint32_t generation)
+{
+    CHECK(!w.va_on && !w.va_votes && !w.va_mclk && !w.map_mic && !w.in_running);
+    CHECK(generation == ++route_applies);
+    CHECK(route == (generation == 1 ? 4 : -1));
+}
+
+static void route_config(AudioLiveConfig *c)
+{
+    c->mic_route = 4;
+    c->mic_route_apply = route_apply;
+}
+
+static void mic_route_controls(uint32_t t)
+{
+    const AudioMicRouteStatus s = audio_live_mic_route_status(&sh);
+    if (t == 100 && !w.out_running) {
+        CHECK(s.requested == 4 && s.applied == 4 && s.generation == 1 && s.stopped && !s.diag_applied);
+        CHECK(audio_live_mic_request(&sh, 0, 3) == EINVAL && audio_live_mic_request(&sh, 1, -1) == EINVAL);
+        CHECK(audio_live_mic_record(&live, 1, &route_window) == EPERM && !audio_live_mic_window(&live));
+        w.sound_on = 1;
+        w.amplitude = 10000;
+        device(1, 1);
+        /* HAL started, even before the owner sends its first graph command. */
+        CHECK(audio_live_mic_request(&sh, 0, -1) == EBUSY);
+    }
+    if (t == 500 && w.in_running) {
+        CHECK(!s.stopped && live.mic_state == LiveRunning && w.va_on);
+        CHECK(audio_live_mic_request(&sh, 0, -1) == EBUSY && audio_live_mic_request(&sh, 1, 1) == EBUSY);
+        CHECK(audio_live_mic_record(&live, 1, &route_window) == EBUSY);
+        CHECK(live.mic_pcm[2].clipped > 0 && live.mic_pcm[2].clipped == live.mic_pcm[0].clipped);
+        CHECK(!live.mic_pcm[1].clipped && sh.input_hal.pcm.clipped > 0);
+        CHECK(live.mic_settle && !audio_live_mic_window(&live));  /* opt-in even with an active recording */
+        device(1, 0);
+        CHECK(audio_live_mic_request(&sh, 0, -1) == EBUSY);
+    }
+    if (t == 4000 && s.stopped && s.requested == 4) {
+        CHECK(live.mic_state == LiveDown && !w.va_on && !w.va_mclk && !w.va_votes && !w.map_mic);
+        CHECK(live.spk_state == LiveRunning && w.sound_periods > 100);
+        CHECK(audio_live_mic_request(&sh, 0, -1) == 0 && audio_live_mic_request(&sh, 1, 1) == 0);
+        const AudioMicRouteStatus queued = audio_live_mic_route_status(&sh);
+        CHECK(queued.requested == -1 && queued.applied == 4 && queued.diag_requested && !queued.diag_applied);
+        CHECK(queued.generation == 1 && audio_live_mic_record(&live, 1, &route_window) == EBUSY);
+        w.wake = 1;
+    }
+    if (t == 4100 && !w.in_running) {
+        CHECK(s.stopped && s.generation == 2 && s.applied == -1 && s.diag_applied);
+        CHECK(audio_live_mic_record(&live, 1, &route_window) == 0 && !audio_live_mic_window(&live));
+        CHECK(audio_live_mic_route_status(&sh).armed);
+        device(1, 1);
+    }
+    if (t == 12500 && w.in_running) {
+        CHECK(live.mic_state == LiveRunning && live.spk_state == LiveRunning && w.va_on);
+        CHECK(live.mic_pcm[2].peak == 18384 && !live.mic_pcm[2].clipped);
+        CHECK(live.mic_pcm[0].clipped && !sh.input_hal.pcm.clipped);
+        const AudioMicWindow *raw = audio_live_mic_window(&live);
+        CHECK(raw == &route_window && raw->magic == AUDIO_MIC_DIAG_MAGIC);
+        CHECK(raw->generation == 2 && raw->run == 2 && raw->route == -1);
+        CHECK(raw->periods <= AUDIO_MIC_DIAG_PERIODS && raw->frames <= AUDIO_MIC_DIAG_FRAMES);
+        CHECK(raw->frames > 7 * 48000u && raw->end_ms - raw->start_ms <= AUDIO_MIC_DIAG_MS + 10);
+        CHECK(raw->period[0].arrival_ms - raw->start_ms >= AUDIO_LIVE_MIC_SETTLE_MS);
+        CHECK(raw->pcm[1] == 4000 || raw->pcm[1] == -4000);
+        CHECK(raw->pcm[0] == INT16_MAX || raw->pcm[0] == INT16_MIN);
+        device(0, 0);
+    }
+    if (t == 16000 && s.recorded) {
+        CHECK(s.stopped && audio_live_mic_record(&live, 0, &route_window) == 0);
+        CHECK(!audio_live_mic_window(&live));
+    }
+}
+
+static void testMicRoutes(void)
+{
+    const struct Scenario sc = {10, 160, 20, 0, 16500, AudioPortsUbuntu, 1, mic_route_controls};
+    g_route_fixture = 1;
+    g_setup = route_config;
+    route_applies = 0;
+    run(&sc);
+    g_route_fixture = 0;
+    CHECK(live.mic_starts == 2 && live.spk_starts == 1 && w.va_calls == 4 && !w.violations);
+    CHECK(route_applies == 2 && logged("mic release: run 2 down 1 va 0"));
+}
+
 // A full queue every third send: everything still in order, nothing lost.
 static void testQueueFull(void)
 {
@@ -1342,6 +1430,7 @@ int main(void)
     testPlanFailures();
     testMicClock();
     testMic();
+    testMicRoutes();
     testInputControlsAndWrap();
     testMicShortRestart();
     testQueueFull();

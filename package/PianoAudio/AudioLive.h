@@ -30,6 +30,7 @@
 #include "AudioLedger.h"
 #include "AudioSession.h"
 #include "AudioCapture.h"
+#include "AudioVa.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -62,6 +63,7 @@ extern "C" {
 typedef struct {
     AudioRing out;                       /* stereo: the Speaker's engine writes, the live thread reads */
     AudioRing in;                        /* mono: the live thread writes, the Mic's engine reads */
+    uint64_t mic_control;                /* requested/applied route, generation and input/release gate */
     int want_out, want_in;               /* the devices run (the transport's running()) */
     int accepting;                       /* the speaker stream takes the ring now (else play() drops: nothing would read it) */
     int input_primed;                    /* consumer owns; reserve reached after graph start */
@@ -113,6 +115,8 @@ typedef struct {
     uint32_t status_ms;                  /* the amplifiers' status while they play */
     uint32_t answer_ms;                  /* each DSP command's answer */
     int mic;                             /* level 10: the Mic's capture path (0: the Mic stays silent) */
+    int mic_route, mic_diag;
+    void (*mic_route_apply)(int route, uint32_t generation); /* owner only; no MMIO */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -131,6 +135,28 @@ typedef struct {
     const char *name;
     uint8_t pkt[GPR_MAX_PACKET];
 } AudioLivePlan;
+
+/* Optional single pre-mix window, armed explicitly for the next capture run.
+ * Format: eight LE u32 (magic "PMR1", generation, run, signed route, start/end
+ * owner ms, frame/period counts), then periods and interleaved LE S16 stereo. */
+#define AUDIO_MIC_DIAG_MS 8000u
+#define AUDIO_MIC_DIAG_PERIODS (AUDIO_MIC_DIAG_MS / 10u)
+#define AUDIO_MIC_DIAG_FRAMES (AUDIO_MIC_DIAG_PERIODS * AUDIO_PERIOD_FRAMES)
+#define AUDIO_MIC_DIAG_MAGIC 0x31524d50u
+typedef struct {
+    uint32_t arrival_ms, frames, dsp_time_lo, dsp_time_hi;
+} AudioMicPeriod;
+typedef struct {
+    uint32_t magic, generation, run;
+    int32_t route;
+    uint32_t start_ms, end_ms, frames, periods;
+    AudioMicPeriod period[AUDIO_MIC_DIAG_PERIODS];
+    int16_t pcm[AUDIO_MIC_DIAG_FRAMES * 2u];
+} AudioMicWindow;
+typedef struct {
+    int requested, applied, diag_requested, diag_applied, stopped, armed, recorded;
+    uint32_t generation;
+} AudioMicRouteStatus;
 
 typedef struct {
     AudioLiveConfig cfg;
@@ -177,7 +203,10 @@ typedef struct {
     AudioLiveDrift mic_drift;
     int16_t mono[AUDIO_PERIOD_FRAMES + 1];
     uint32_t mic_starts, mic_periods, mic_drops, mic_repeats, mic_full;
-    int va_on;
+    int va_on, mic_route;
+    uint32_t mic_route_generation;
+    AudioMicWindow *mic_window;           /* backing, published at the first explicit arm, kept for the boot */
+    AudioMicWindow *mic_recording;        /* owner only while capturing into the backing */
     /* Reset per DSP capture start, independent of a HAL open/close window. */
     AudioCapturePcm mic_pcm[3];            /* DEC0, DEC1, mono before settling/control */
     uint64_t mic_frames, mic_settle, mic_full_frames, mic_tail_frames;
@@ -211,6 +240,14 @@ void audio_live_sleep(AudioLive *l, uint32_t generation);
 int audio_live_parked(AudioLive *l);  /* 1 safe, 0 draining, -1 unsafe */
 int audio_live_rearm(AudioLive *l);
 void audio_live_sleep_fail(AudioLive *l); /* owner-thread safe mute, retain all uncertain backing */
+AudioMicRouteStatus audio_live_mic_route_status(const AudioLiveShared *sh);
+/* Positive BSD errno; no hardware access. A change cancels any armed/completed
+ * window. The owner serializes apply with StartIO via the shared control word. */
+int audio_live_mic_request(AudioLiveShared *sh, int diagnostic, int value);
+/* Serialize arm/discard and snapshot copies in the caller. Backing, when arming,
+ * must remain allocated for the life of the live worker. */
+int audio_live_mic_record(AudioLive *l, int on, AudioMicWindow *backing);
+const AudioMicWindow *audio_live_mic_window(const AudioLive *l);
 void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now_ms);
 const char *audio_live_state(int state);
 

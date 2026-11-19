@@ -292,7 +292,7 @@ static int va_off(const ArSeq *s) {const ArMicPlan *p = mic(s); return p->va_off
 static const ArStep kMicLive[] = {
     VA_STEPS,
     MIC_DEVICE_STEPS,
-    {"VA macro DMIC0/DMIC2 into DEC0/DEC1", 0, 0, 0, va_on, 0, 0, 0, va_off, 0},
+    {"VA macro DMIC route into DEC0/DEC1", 0, 0, 0, va_on, 0, 0, 0, va_off, 0},
     MIC_START_STEPS,
 };
 

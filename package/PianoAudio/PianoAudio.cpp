@@ -47,6 +47,7 @@
 #include <stdarg.h>
 #include "AudioSurvey.h"
 #include "AudioLog.h"
+#include "AudioVa.h"
 #include "AudioPcm.h"
 #include "AudioPower.h"
 #include <PianoPowerContract.h>
@@ -113,6 +114,17 @@ void readArgs()
   l.liveCeilingDb = bootArg("piano-audio-ceiling", 0); // 1..40 dB below full scale, level 9 and up; 0: the level's own
   l.liveIdleMs = bootArg("piano-audio-idle", 0);
   l.micGain = bootArg("piano-audio-mic-gain", 0);
+  int route = AUDIO_MIC_ROUTE_LEGACY, diag = 0;
+  if (PE_parse_boot_argn("piano-audio-mic-route", &route, sizeof route) && !audio_mic_route_valid(route)) {
+    piano_audio_log("mic-route1: invalid boot route %d; using legacy -1", route);
+    route = AUDIO_MIC_ROUTE_LEGACY;
+  }
+  if (PE_parse_boot_argn("piano-audio-mic-route-diag", &diag, sizeof diag) && diag != 0 && diag != 1) {
+    piano_audio_log("mic-route1: invalid boot diag %d; using 0", diag);
+    diag = 0;
+  }
+  l.micRoute = route;
+  l.micRouteDiag = diag;
   gArgs.volume = bootArg("piano-audio-volume", 100);
 }
 

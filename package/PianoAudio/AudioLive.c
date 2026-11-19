@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* Levels 8-10, the macOS devices on the DSP: see AudioLive.h. */
 #include "AudioLive.h"
+#include <sys/errno.h>
 #include "PianoGpr.h"
 
 #define LOG(l, ...) do {if ((l)->ops.log) (l)->ops.log((l)->ops.ctx, __VA_ARGS__);} while (0)
@@ -96,8 +97,81 @@ void audio_live_shared_init(AudioLiveShared *sh, int16_t *out_storage, int16_t *
     sh->input_q15 = AUDIO_Q15_ONE;
 }
 
+/* Requested and applied each encode route+1 in three bits and the diagnostic
+ * enable in bit 3. HAL StartIO, owner release and control requests share a
+ * linearization point. The owner alone writes applied settings and generation. */
+enum {
+    MicDiag = 1u << 3, MicSetting = 0xfu, MicAppliedShift = 4,
+    MicGraphReleased = 1u << 8, MicEngineRunning = 1u << 9,
+    MicWindowArmed = 1u << 10, MicWindowReady = 1u << 11, MicWindowStop = 1u << 12, MicGenerationShift = 32,
+};
+
+static uint64_t mic_control(const AudioLiveShared *sh)
+{
+    return __atomic_load_n(&sh->mic_control, __ATOMIC_ACQUIRE);
+}
+
+static int mic_control_update(AudioLiveShared *sh, uint64_t *old, uint64_t next)
+{
+    return __atomic_compare_exchange_n(&sh->mic_control, old, next, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static int mic_stopped(uint64_t control)
+{
+    return (control & (MicGraphReleased | MicEngineRunning)) == MicGraphReleased;
+}
+
+AudioMicRouteStatus audio_live_mic_route_status(const AudioLiveShared *sh)
+{
+    const uint64_t control = mic_control(sh), active = control >> MicAppliedShift;
+    return (AudioMicRouteStatus){
+        (int)(control & 7u) - 1, (int)(active & 7u) - 1, !!(control & MicDiag), !!(active & MicDiag),
+        mic_stopped(control), !!(control & MicWindowArmed), !!(control & MicWindowReady), (uint32_t)(control >> MicGenerationShift),
+    };
+}
+
+int audio_live_mic_request(AudioLiveShared *sh, int diagnostic, int value)
+{
+    if (diagnostic ? (value != 0 && value != 1) : !audio_mic_route_valid(value)) return EINVAL;
+    uint64_t old = mic_control(sh);
+    do {
+        if (!mic_stopped(old)) return EBUSY;
+        const uint64_t mask = diagnostic ? MicDiag : 7u;
+        const uint64_t setting = diagnostic ? (uint64_t)value * MicDiag : (uint64_t)(value + 1);
+        if ((old & mask) == setting) return 0;
+        const uint64_t next = (old & ~(mask | MicWindowArmed | MicWindowReady)) | setting;
+        if (mic_control_update(sh, &old, next)) return 0;
+    } while (1);
+}
+
+int audio_live_mic_record(AudioLive *l, int on, AudioMicWindow *backing)
+{
+    if (on != 0 && on != 1) return EINVAL;
+    uint64_t old = mic_control(l->sh);
+    do {
+        if (!mic_stopped(old)) return EBUSY;
+        if (on) {
+            const unsigned setting = old & MicSetting;
+            if (setting != ((old >> MicAppliedShift) & MicSetting)) return EBUSY;
+            if (!(setting & MicDiag)) return EPERM;
+            if (!backing) return ENOMEM;
+            AudioMicWindow *allocated = __atomic_load_n(&l->mic_window, __ATOMIC_ACQUIRE);
+            if (allocated && allocated != backing) return EINVAL;
+            __atomic_store_n(&l->mic_window, backing, __ATOMIC_RELEASE);
+        }
+        const uint64_t next = (old & ~(uint64_t)(MicWindowArmed | MicWindowReady | MicWindowStop)) | (on ? MicWindowArmed : 0);
+        if (mic_control_update(l->sh, &old, next)) return 0;
+    } while (1);
+}
+
+const AudioMicWindow *audio_live_mic_window(const AudioLive *l)
+{
+    return (mic_control(l->sh) & MicWindowReady) ? __atomic_load_n(&l->mic_window, __ATOMIC_ACQUIRE) : 0;
+}
+
 void audio_live_running(AudioLiveShared *sh, int output, int input)
 {
+    if (input) __atomic_fetch_or(&sh->mic_control, MicEngineRunning, __ATOMIC_ACQ_REL);
     if (input && !load(&sh->want_in)) {
         zero(&sh->input_hal, sizeof sh->input_hal); /* engine stopped */
         store(&sh->input_primed, 0);
@@ -114,7 +188,9 @@ void audio_live_running(AudioLiveShared *sh, int output, int input)
         __atomic_add_fetch(&sh->epoch, 1u, __ATOMIC_RELEASE);
     }
     store(&sh->want_out, output ? 1 : 0);
+    if (!input && load(&sh->want_in)) __atomic_fetch_or(&sh->mic_control, MicWindowStop, __ATOMIC_ACQ_REL);
     store(&sh->want_in, input ? 1 : 0);
+    if (!input) __atomic_fetch_and(&sh->mic_control, ~(uint64_t)MicEngineRunning, __ATOMIC_ACQ_REL);
 }
 
 uint32_t audio_live_play(AudioLiveShared *sh, const int16_t *stereo, uint32_t frames, uint32_t now_ms, int *wake)
@@ -211,6 +287,7 @@ void audio_live_defaults(AudioLiveConfig *c, uint32_t level)
     c->status_ms = AUDIO_LIVE_STATUS_MS;
     c->answer_ms = AUDIO_ANSWER_MS;
     c->mic = c->level >= 10;
+    c->mic_route = AUDIO_MIC_ROUTE_LEGACY;
 }
 
 const char *audio_live_state(int state)
@@ -747,11 +824,51 @@ static void spk_tick(AudioLive *l, uint32_t now)
 }
 
 /* ------------------------------------------------------------------------------------------------ the mic path (level 10) */
+static void mic_route_applied(AudioLive *l, unsigned setting, uint32_t generation)
+{
+    l->mic_route = (int)(setting & 7u) - 1;
+    l->mic_route_generation = generation;
+    if (l->cfg.mic_route_apply) l->cfg.mic_route_apply(l->mic_route, generation);
+    LOG(l, "mic-route1: apply request %d applied %d gen %u diag %u mono %s",
+        l->mic_route, l->mic_route, generation, !!(setting & MicDiag), audio_mic_mono_name(l->mic_route));
+}
+
+static void mic_apply_pending(AudioLive *l)
+{
+    uint64_t old = mic_control(l->sh);
+    while (mic_stopped(old)) {
+        const unsigned requested = old & MicSetting;
+        if (requested == ((old >> MicAppliedShift) & MicSetting)) return;
+        const uint32_t generation = (uint32_t)(old >> MicGenerationShift) + 1;
+        const uint64_t next = ((uint32_t)old & ~(MicSetting << MicAppliedShift)) |
+                              (requested << MicAppliedShift) | ((uint64_t)generation << MicGenerationShift);
+        if (mic_control_update(l->sh, &old, next)) {
+            mic_route_applied(l, requested, generation);
+            return;
+        }
+    }
+}
+
+static void mic_window_end(AudioLive *l, const char *event, uint32_t now)
+{
+    AudioMicWindow *w = l->mic_recording;
+    if (!w) return;
+    w->end_ms = now;
+    l->mic_recording = 0;
+    uint64_t old = mic_control(l->sh);
+    uint64_t next;
+    do {
+        next = (old & ~(uint64_t)MicWindowArmed) | (w->frames ? MicWindowReady : 0);
+    } while (!mic_control_update(l->sh, &old, next));
+    LOG(l, "mic-route1: window %s gen %u run %u route %d start-ms %u end-ms %u frames %u periods %u",
+        event, w->generation, w->run, w->route, w->start_ms, now, w->frames, w->periods);
+}
+
 static int live_va_on(void *owner)
 {
     AudioLive *l = owner;
     const int r = l->ops.va_mic ? l->ops.va_mic(l->ops.ctx, 1) : -1;
-    LOG(l, "live: mic: the VA macro's DMIC path %s", r ? "FAILED" : "on: DMIC0 -> DEC0, DMIC2 -> DEC1, 2.4 MHz, 48 kHz");
+    LOG(l, "live: mic: the VA macro's DMIC path %s gen %u", r ? "FAILED" : "on", l->mic_route_generation);
     if (!r) l->va_on = 1;
     return r;
 }
@@ -762,12 +879,23 @@ static int live_va_off(void *owner)
     if (!l->va_on) return 0;
     const int r = l->ops.va_mic ? l->ops.va_mic(l->ops.ctx, 0) : 0;
     l->va_on = 0;
-    LOG(l, "live: mic: the VA macro's DMIC path off%s", r ? " (with an error)" : "");
+    LOG(l, "live: mic: the VA macro's DMIC path off gen %u result %d", l->mic_route_generation, r);
     return r;
 }
 
 static void mic_begin(AudioLive *l)
 {
+    const uint64_t control = __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
+    if (control & MicWindowArmed) {
+        AudioMicWindow *w = __atomic_load_n(&l->mic_window, __ATOMIC_ACQUIRE);
+        w->magic = AUDIO_MIC_DIAG_MAGIC;
+        w->generation = l->mic_route_generation;
+        w->run = l->mic_starts + 1;
+        w->route = l->mic_route;
+        w->start_ms = w->end_ms = w->periods = w->frames = 0;
+        l->mic_recording = w;
+        if (control & MicWindowStop) mic_window_end(l, "input-stop", l->now);
+    }
     zero(l->mic_pcm, sizeof l->mic_pcm);
     l->mic_frames = l->mic_settle = l->mic_full_frames = l->mic_tail_frames = 0;
     l->mic_first_read = l->mic_first_pcm = 0;
@@ -783,6 +911,8 @@ static void mic_begin(AudioLive *l)
     unsigned count;
     const ArStep *steps = ar_mic_live_steps(&count);
     l->mic_starts++;
+    const AudioMicRouteStatus route = audio_live_mic_route_status(l->sh);
+    LOG(l, "mic-route1: start request %d applied %d gen %u run %u", route.requested, route.applied, route.generation, l->mic_starts);
     LOG(l, "live: mic: the Mic device runs: the capture plan (start %u)", l->mic_starts);
     plan_start(l, &l->mplan, "microphone", steps, count, 0x9000 + (l->sleep_generation << 16), &l->micplan);
     l->mic_state = LiveStarting;
@@ -795,6 +925,7 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->mic_ending = l->cap_unsent = l->cap_error = 0;
     l->mic_reason = 0;
     l->mic_at = now;
+    if (l->mic_recording) l->mic_recording->start_ms = now;
     l->mic_diag_at = now;
     l->mic_idle_at = 0;
     if (ar_pump_init_capture(&l->cap, base, l->mplan.seq.handle, l->ports->data, AUDIO_MIC_SLOTS, AUDIO_MIC_PERIOD_BYTES,
@@ -807,8 +938,8 @@ static void capture_begin(AudioLive *l, uint32_t now)
     store(&l->sh->capturing, !l->sleeping);
     store(&l->sh->input_fault, 0);
     l->mic_state = LiveRunning;
-    LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mixed to mono; the first %u ms dropped",
-        AUDIO_LIVE_MIC_DEPTH, AUDIO_LIVE_MIC_SETTLE_MS);
+    LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mono %s gen %u; the first %u ms dropped",
+        AUDIO_LIVE_MIC_DEPTH, audio_mic_mono_name(l->mic_route), l->mic_route_generation, AUDIO_LIVE_MIC_SETTLE_MS);
     LOG(l, "live: mic: mic-clock2:prime-target:fixed-center reserve %u band %u ring %u",
         AUDIO_LIVE_MIC_TARGET, AUDIO_LIVE_SLIP_BAND, AUDIO_LIVE_MIC_RING);
     LOG(l, "live: mic: mic-clock3:queue-margin center %u trough %u batch-bias %u band %u transport-latency %u",
@@ -829,15 +960,30 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
     if (!l->mic_first_read) l->mic_first_read = now - l->mic_at + 1;
     l->mic_frames += frames;
     if (settle) l->mic_settle += frames;
+    AudioMicWindow *w = l->mic_recording;
+    if (w && (mic_control(l->sh) & MicWindowStop)) {mic_window_end(l, "input-stop", now); w = 0;}
+    if (w && now - w->start_ms >= AUDIO_MIC_DIAG_MS) {mic_window_end(l, "limit", now); w = 0;}
+    uint32_t raw_frames = 0;
+    int16_t *raw = 0;
+    if (w && !settle && frames) {
+        raw_frames = AUDIO_MIC_DIAG_FRAMES - w->frames;
+        if (raw_frames > frames) raw_frames = frames;
+        raw = w->pcm + w->frames * 2u;
+        w->period[w->periods++] = (AudioMicPeriod){now, raw_frames, (uint32_t)a->timestamp, (uint32_t)(a->timestamp >> 32)};
+        w->frames += raw_frames;
+    }
+    const int legacy = audio_live_mic_route_status(l->sh).applied == AUDIO_MIC_ROUTE_LEGACY;
     for (uint32_t i = 0; i < frames; ++i) {
         const int16_t a0 = (int16_t)(src[4 * i] | src[4 * i + 1] << 8), a1 = (int16_t)(src[4 * i + 2] | src[4 * i + 3] << 8);
-        const int16_t mono = (int16_t)(((int32_t)a0 + a1) / 2);
+        const int16_t mono = legacy ? (int16_t)(((int32_t)a0 + a1) / 2) : a0;
+        if (i < raw_frames) {raw[2 * i] = a0; raw[2 * i + 1] = a1;}
         audio_capture_sample(&l->mic_pcm[0], a0);
         audio_capture_sample(&l->mic_pcm[1], a1);
         audio_capture_sample(&l->mic_pcm[2], mono);
         if ((a0 || a1) && !l->mic_first_pcm) l->mic_first_pcm = now - l->mic_at + 1;
         l->mono[i] = settle ? 0 : mono;
     }
+    if (w && (w->frames == AUDIO_MIC_DIAG_FRAMES || w->periods == AUDIO_MIC_DIAG_PERIODS)) mic_window_end(l, "limit", now);
     l->mic_periods++;
     AudioRing *r = &l->sh->in;
     const uint32_t fill = audio_ring_fill(r);
@@ -900,6 +1046,7 @@ static void mic_fault(AudioLive *l, int reason, uint32_t now)
 {
     store(&l->sh->input_fault, 1);
     store(&l->sh->capturing, 0);
+    mic_window_end(l, "fault", now);
     audio_live_mic_report(l, "fault", now);
     l->mic_reason = reason;
     LOG(l, "live: mic: STOPPED: %s after %u ms (%u periods sent, %u returned, %u late, %u errors, last status %#x): undoing the plan",
@@ -914,7 +1061,9 @@ static void capture_tick(AudioLive *l, uint32_t now)
     if (!r && l->held) r = AudioGuardQuiet;
     if (r && l->sleeping) {l->sleep_failed=1; return;}
     if (r) {mic_fault(l, r, now); return;}
+    if (l->mic_recording && now - l->mic_recording->start_ms >= AUDIO_MIC_DIAG_MS) mic_window_end(l, "limit", now);
     if (l->sleeping) l->mic_ending = 1;
+    if (l->mic_recording && (mic_control(l->sh) & MicWindowStop)) mic_window_end(l, "input-stop", now);
     if (now - l->mic_diag_at >= 1000) {audio_live_mic_report(l, "tick", now); l->mic_diag_at = now;}
     if (load(&l->sh->want_in)) l->mic_idle_at = 0;
     else if (!l->mic_idle_at) l->mic_idle_at = now ? now : 1;
@@ -945,7 +1094,9 @@ static void mic_tick(AudioLive *l, uint32_t now)
     if (!l->cfg.mic) return;
     switch (l->mic_state) {
     case LiveDown:
-        if (l->sleeping || l->held || l->aborting || !load(&l->sh->want_in)) return;
+        if (l->sleeping || l->aborting) return;
+        mic_apply_pending(l);
+        if (l->held || !load(&l->sh->want_in)) return;
         mic_begin(l);
         break;
     case LiveRunning:
@@ -964,6 +1115,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
             ar_seq_step_name(&l->mplan.seq, l->mplan.seq.failed_step), l->mplan.seq.error_status);
         l->mplan.active = 0;
         l->mic_state = LiveOff;
+        mic_window_end(l, "setup-failed", now);
         store(&l->sh->input_fault, 1);
         return;
     }
@@ -975,14 +1127,18 @@ static void mic_tick(AudioLive *l, uint32_t now)
         else if (reason && reason != AudioGuardLate && reason != AudioGuardQuiet) l->mic_state = LiveOff;
         else l->mic_state = LiveDown;
         LOG(l, "live: mic: %s", l->mic_state == LiveOff ? "the mic path is OFF for this boot" : "down");
-        LOG(l, "mic release: run %u down %d va %d retired-handle %#x undo-errors %u", l->mic_starts, down, l->va_on,
-            l->mplan.seq.handle, l->mplan.seq.undo_errors);
+        LOG(l, "mic release: run %u down %d va %d retired-handle %#x undo-errors %u route %d gen %u", l->mic_starts, down, l->va_on,
+            l->mplan.seq.handle, l->mplan.seq.undo_errors, l->mic_route, l->mic_route_generation);
+        if (l->mic_state == LiveDown && !l->va_on && !l->sleeping && !l->aborting)
+            __atomic_fetch_or(&l->sh->mic_control, MicGraphReleased, __ATOMIC_RELEASE);
     }
 }
 
 /* ------------------------------------------------------------------------------------------------ the whole */
 static void finish(AudioLive *l, uint32_t now)
 {
+    mic_window_end(l, "finish", now);
+    __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)(MicGraphReleased | MicWindowArmed), __ATOMIC_ACQ_REL);
     store(&l->sh->accepting, 0);
     store(&l->sh->capturing, 0);
     audio_amps_hold(l->amps);
@@ -1040,6 +1196,13 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     l->sh = sh;
     __atomic_store_n(&sh->amp_gain_requested, l->cfg.gain, __ATOMIC_RELEASE);
     store(&sh->input_fault, !l->cfg.mic);
+    if (l->cfg.mic) {
+        const int route = audio_mic_route_valid(c->mic_route) ? c->mic_route : AUDIO_MIC_ROUTE_LEGACY;
+        const unsigned setting = (unsigned)(route + 1) | (c->mic_diag == 1 ? MicDiag : 0);
+        mic_route_applied(l, setting, 1);
+        __atomic_fetch_or(&sh->mic_control, MicGraphReleased | setting | (setting << MicAppliedShift) |
+                          (1ull << MicGenerationShift), __ATOMIC_RELEASE);
+    }
     return 0;
 }
 
@@ -1161,6 +1324,7 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
         return;
     }
     /* soft: each plan's undo commands; the owner ticks on until both are down (or stops hard) */
+    __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
     l->aborting = 1;
     if (l->splan.active && l->splan.seq.state != ArSeqDown && l->splan.seq.state != ArSeqFailed) {
         ar_seq_abort(&l->splan.seq, ArSeqErrAbort, 0);
@@ -1179,6 +1343,9 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
 void audio_live_sleep(AudioLive *l, uint32_t generation)
 {
     if (l->sleeping) return;
+    __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
+    mic_window_end(l, "sleep", l->now);
+    __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicWindowArmed, __ATOMIC_ACQ_REL);
     l->sleeping=1; l->sleep_quiet=0; l->sleep_generation=generation;
     store(&l->sh->accepting,0); store(&l->sh->capturing,0);
     /* Starting plans finish their existing command sequence; only then is the
@@ -1221,12 +1388,15 @@ int audio_live_rearm(AudioLive *l)
     drift_reset(&l->spk_drift); drift_reset(&l->mic_drift);
     l->status_poll_active=0; l->stream_unsent=l->cap_unsent=0;
     l->sleeping=l->parked=0;
+    if (l->cfg.mic) __atomic_fetch_or(&l->sh->mic_control, MicGraphReleased, __ATOMIC_RELEASE);
     ledger(l,AlRearm,0,0,0,0,0);
     return 0;
 }
 
 void audio_live_sleep_fail(AudioLive *l)
 {
+    __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
+    mic_window_end(l, "sleep-failed", l->now);
     l->sleeping=1; l->sleep_failed=1;
     store(&l->sh->accepting,0); store(&l->sh->capturing,0);
     if (!l->sleep_safe) {
