@@ -82,6 +82,8 @@ def retry(action, read, deadline, timeout):
             return read(min(timeout, remaining))
         except FetchError as exc:
             print(f'fetch {action} attempt {attempt}/{ATTEMPTS}: {exc}', file=sys.stderr)
+            if attempt < ATTEMPTS:
+                time.sleep(max(0, min(attempt, 3, deadline - time.monotonic())))
     raise FetchError(f'{action} retry/deadline exhausted')
 
 
@@ -119,8 +121,8 @@ def resume(stream, checkpoint, size, tablet_sha):
                 or not isinstance(offset, int) or not 0 <= offset <= size
                 or (offset != size and offset % CHUNK_SIZE)):
             raise FetchError('checkpoint differs from current tablet file')
-        for length in range(0, offset, CHUNK_SIZE):
-            piece = stream.read(min(CHUNK_SIZE, offset - length))
+        for position in range(0, offset, CHUNK_SIZE):
+            piece = stream.read(min(CHUNK_SIZE, offset - position))
             digest.update(piece)
         if stream.tell() != offset or digest.hexdigest() != state['prefix_sha']:
             raise FetchError('checkpoint prefix length or SHA-256 mismatch')
@@ -131,7 +133,7 @@ def resume(stream, checkpoint, size, tablet_sha):
 
 def fetch(transport, source, destination, expected, timeout):
     size, tablet_sha = retry('metadata', lambda t: get_metadata(transport, source, t),
-                             time.monotonic() + 6 * timeout, timeout)
+                             time.monotonic() + ATTEMPTS * (timeout + 3), timeout)
     if expected is not None and expected != tablet_sha:
         raise FetchError('tablet SHA-256 differs from the backup receipt')
     seconds = budget(size)
