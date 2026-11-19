@@ -55,9 +55,19 @@ inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows2G[NativeAdre
 #ifdef ADRENO830_MACOS
 /* UniXNU-piano (2026-11-12): macOS's 16 GiB table. The first macOS desktop (run attend4, 24 clients) had WindowServer at 1153 MiB of
  * its 1.5 GiB window and iconservicesagent at 490 MiB of its 512 MiB large one, while no small client passed 77 MiB of its 448: slot 0
- * is now 3.5 GiB (0x20000000 up to 4 GiB), slots 1-3 768 MiB from 4 GiB, slots 4-31 320 MiB each (5 up to 8 GiB, 12 from 8 GiB, 11
- * from 12 GiB, the last up to 0x3FFFFE000, 896 MiB). No window crosses a multiple of 4 GiB; slot 9 starts on 8 GiB and slot 21 on
- * 12 GiB, the space under each line nobody's. */
+ * is now 3.5 GiB (0x20000000 up to 4 GiB), slots 1-3 are 768 MiB, and slots 4-28 are 320 MiB. The tail slot is reserved for one
+ * VideoToolbox decoder connection: 1536 MiB minus the 8 KiB aperture guard, sized for eight 4K RGhA/x420 frame pairs.
+ * No window crosses a multiple of 4 GiB. */
+inline constexpr unsigned NativeAdrenoDecoderSlot=29;
+inline constexpr char NativeAdrenoDecoderSigningId[]="com.apple.coremedia.videodecoder";
+static inline bool NativeAdrenoDecoderClient(bool platform_binary,const char *signing_id)
+{
+    if(!platform_binary || !signing_id)return false;
+    for(unsigned i=0;i<sizeof NativeAdrenoDecoderSigningId;++i) {
+        if(signing_id[i]!=NativeAdrenoDecoderSigningId[i])return false;
+    }
+    return true;
+}
 inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdrenoMaxClients]={
     {0x20000000ull,0xE0000000ull},{0x100000000ull,0x30000000ull},{0x130000000ull,0x30000000ull},{0x160000000ull,0x30000000ull},
     {0x190000000ull,0x14000000ull},{0x1A4000000ull,0x14000000ull},{0x1B8000000ull,0x14000000ull},{0x1CC000000ull,0x14000000ull},
@@ -66,7 +76,7 @@ inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdr
     {0x28C000000ull,0x14000000ull},{0x2A0000000ull,0x14000000ull},{0x2B4000000ull,0x14000000ull},{0x2C8000000ull,0x14000000ull},
     {0x2DC000000ull,0x14000000ull},{0x300000000ull,0x14000000ull},{0x314000000ull,0x14000000ull},{0x328000000ull,0x14000000ull},
     {0x33C000000ull,0x14000000ull},{0x350000000ull,0x14000000ull},{0x364000000ull,0x14000000ull},{0x378000000ull,0x14000000ull},
-    {0x38C000000ull,0x14000000ull},{0x3A0000000ull,0x14000000ull},{0x3B4000000ull,0x14000000ull},{0x3C8000000ull,0x37FFE000ull}};
+    {0x38C000000ull,0x14000000ull},{0x3A0000000ull,0x5FFFE000ull}};
 #else
 inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdrenoMaxClients]={
     {0x20000000ull,0x60000000ull},
@@ -101,11 +111,12 @@ static_assert(NativeAdrenoClientWindowsValid(NativeAdrenoClientWindows4G,0x20000
               NativeAdrenoClientWindowsValid(NativeAdrenoClientWindows16G,0x20000000ull,0x3FFFFE000ull) &&
               NativeAdrenoClientWindows4G[11].start+NativeAdrenoClientWindows4G[11].bytes==0xFFFFE000ull &&
               NativeAdrenoClientWindows4G[0].bytes==0x60000000ull && !NativeAdrenoClientWindows4G[12].bytes &&
-              NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].start+NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].bytes==
-              0x3FFFFE000ull &&
 #ifdef ADRENO830_MACOS
               NativeAdrenoClientWindows16G[0].bytes==0xE0000000ull &&   /* UniXNU-piano */
+              NativeAdrenoClientWindows16G[NativeAdrenoDecoderSlot].bytes==(1536ull<<20)-8192 &&
 #else
+              NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].start+NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].bytes==
+              0x3FFFFE000ull &&
               NativeAdrenoClientWindows16G[0].bytes==0x60000000ull &&
 #endif
               NativeAdrenoLargeSlots<NativeAdrenoMaxClients && NativeAdrenoMaxClients<=32,"client windows");
@@ -239,14 +250,27 @@ static inline unsigned NativeAdrenoListedSmallKeep(const NativeAdrenoClientWindo
 {
     return windows==NativeAdrenoClientWindows16G?unsigned(NativeAdrenoListedSmallKeep16G):unsigned(NativeAdrenoListedSmallKeep4G);
 }
+static inline bool NativeAdrenoIsDecoderSlot(const NativeAdrenoClientWindow *windows,unsigned slot)
+{
+#ifdef ADRENO830_MACOS
+    return windows==NativeAdrenoClientWindows16G && slot==NativeAdrenoDecoderSlot;
+#else
+    (void)windows;(void)slot;
+    return false;
+#endif
+}
 static inline unsigned NativeAdrenoClientSlotFor(bool render_server,bool large,bool listed,const NativeAdrenoClientWindow *windows,
-    const bool taken[NativeAdrenoMaxClients])
+    const bool taken[NativeAdrenoMaxClients],bool decoder=false)
 {
     if(!windows || !taken)return NativeAdrenoMaxClients;
     if(render_server && windows[0].bytes && !taken[0])return 0;
     unsigned first_large=NativeAdrenoMaxClients,first_small=NativeAdrenoMaxClients,small_free=0;
     for(unsigned s=1;s<NativeAdrenoMaxClients;++s) {
         if(!windows[s].bytes || taken[s])continue;
+        if(NativeAdrenoIsDecoderSlot(windows,s)) {
+            if(decoder)return s;
+            continue;
+        }
         if(s<=NativeAdrenoLargeSlots) {if(first_large==NativeAdrenoMaxClients)first_large=s;}
         else {if(first_small==NativeAdrenoMaxClients)first_small=s;++small_free;}
     }
@@ -273,7 +297,8 @@ static inline bool NativeAdrenoSlotLogDue(NativeAdrenoSlotLog *log,uint64_t now_
 static inline unsigned NativeAdrenoClientSmallFree(const NativeAdrenoClientWindow *windows,const bool taken[NativeAdrenoMaxClients])
 {
     unsigned free=0;
-    for(unsigned s=NativeAdrenoLargeSlots+1;windows && taken && s<NativeAdrenoMaxClients;++s)if(windows[s].bytes && !taken[s])++free;
+    for(unsigned s=NativeAdrenoLargeSlots+1;windows && taken && s<NativeAdrenoMaxClients;++s)
+        if(windows[s].bytes && !taken[s] && !NativeAdrenoIsDecoderSlot(windows,s))++free;
     return free;
 }
 static inline void NativeAdrenoSlotLine(char *line,const char *name,char kind,unsigned small_free,unsigned keep,uint32_t skipped,

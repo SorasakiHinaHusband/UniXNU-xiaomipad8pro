@@ -398,15 +398,21 @@ int main()
         for(unsigned i=7;i<=8;++i)taken[i]=false;   /* 6-8 free, three small ones: still none for an app */
         CHECK(NativeAdrenoClientSlotFor(false,false,false,w4,taken)==NativeAdrenoMaxClients);
         taken[5]=false;CHECK(NativeAdrenoClientSlotFor(false,false,false,w4,taken)==5);   /* four: the first */
-        /* The 16 GiB table: apps take 24 of the 28 small slots, the posters the last four and then the large ones. */
+        /* The 16 GiB table: apps leave the last four ordinary windows and the large ones to listed clients. */
+#ifdef ADRENO830_MACOS
+        constexpr unsigned small_end=NativeAdrenoDecoderSlot;
+#else
+        constexpr unsigned small_end=NativeAdrenoMaxClients;
+#endif
         for(auto &t:taken)t=false;
         taken[0]=true;count=0;
         for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,false,w16,taken))<NativeAdrenoMaxClients;taken[s]=true)order[count++]=s;
-        CHECK(count==NativeAdrenoMaxClients-1-NativeAdrenoLargeSlots-NativeAdrenoListedSmallKeep16G && order[0]==4 &&
-              order[count-1]==NativeAdrenoMaxClients-1-NativeAdrenoListedSmallKeep16G);
+        CHECK(count==small_end-1-NativeAdrenoLargeSlots-NativeAdrenoListedSmallKeep16G && order[0]==4 &&
+              order[count-1]==small_end-1-NativeAdrenoListedSmallKeep16G);
         count=0;
         for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,true,w16,taken))<NativeAdrenoMaxClients;taken[s]=true)order[count++]=s;
-        CHECK(count==NativeAdrenoListedSmallKeep16G+NativeAdrenoLargeSlots && order[0]==28 && order[3]==31 && order[4]==1);
+        CHECK(count==NativeAdrenoListedSmallKeep16G+NativeAdrenoLargeSlots && order[0]==small_end-4 &&
+              order[3]==small_end-1 && order[4]==1);
         for(unsigned i=1;i<=NativeAdrenoLargeSlots;++i)taken[i]=false;
         CHECK(NativeAdrenoClientSlotFor(false,true,true,w16,taken)==1 && NativeAdrenoClientSlotFor(true,false,true,w16,taken)==1 &&
               NativeAdrenoClientSlotFor(false,false,false,w16,taken)==NativeAdrenoMaxClients);

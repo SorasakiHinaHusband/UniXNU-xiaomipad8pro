@@ -30,6 +30,9 @@
 #include "NativeAdrenoPublish.h"
 #ifdef ADRENO830_MACOS
 #include "NativeAdrenoMapLines.h"   /* UniXNU-piano */
+#include <sys/codesign.h>
+#include <sys/proc.h>
+#include <sys/ubc.h>
 #else
 struct NativeAdrenoFailureSnapshot {};
 #endif
@@ -556,6 +559,14 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
     const bool render_server=!kernel && isRenderServer(name_,sizeof name_);
     const bool large=!kernel && NativeAdrenoListNamesProcess(NativeAdrenoLargeClientList,name_,sizeof name_);
     const bool listed=!kernel && NativeAdrenoListNamesProcess(NativeAdrenoSandboxGrantList,name_,sizeof name_);
+    bool decoder=false;
+#ifdef ADRENO830_MACOS
+    if(!kernel && g.windows==NativeAdrenoClientWindows16G) {
+        proc_t process=current_proc();
+        if(process && csproc_get_platform_binary(process))
+            decoder=NativeAdrenoDecoderClient(true,cs_identity_get(process));
+    }
+#endif
     IOLockLock(g.lock);
     /* An orphan whose jobs completed goes first: its slot (the render server's own slot 0 after a crash) and its memory. */
     if(anyOrphan())reapOrphans();
@@ -569,7 +580,7 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
         if(kernel)slot=g.kernel_client || g.kernel_orphan?NativeAdrenoMaxClients:0;
         else {
             for(unsigned i=0;i<NativeAdrenoMaxClients;++i)taken[i]=!slotFree(i);
-            slot=NativeAdrenoClientSlotFor(render_server,large,listed,g.windows,taken);
+            slot=NativeAdrenoClientSlotFor(render_server,large,listed,g.windows,taken,decoder);
         }
         if(slot==NativeAdrenoMaxClients && !attempt)reapOrphans();   /* a slot an orphan held may be free now */
     }

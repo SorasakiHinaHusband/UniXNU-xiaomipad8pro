@@ -49,8 +49,8 @@ static void windows()
     CHECK(NativeAdrenoClientWindowsEnd(w)==0x3FFFFE000ull && NativeAdrenoClientWindowsStayBelowLines(w));
     CHECK(w[0].start==0x20000000ull && w[0].start+w[0].bytes==0x100000000ull);   /* the render server: 3.5 GiB up to 4 GiB */
     for(unsigned s=1;s<=NativeAdrenoLargeSlots;++s)CHECK(w[s].bytes==0x30000000ull && w[s].start==0x100000000ull+(s-1)*0x30000000ull);
-    for(unsigned s=NativeAdrenoLargeSlots+1;s<NativeAdrenoMaxClients;++s) {
-        CHECK(w[s].bytes==(s+1<NativeAdrenoMaxClients?0x14000000ull:0x37FFE000ull));
+    for(unsigned s=NativeAdrenoLargeSlots+1;s<=NativeAdrenoDecoderSlot;++s) {
+        CHECK(w[s].bytes==(s<NativeAdrenoDecoderSlot?320ull<<20:(1536ull<<20)-8192));
         CHECK(w[s].start>=w[s-1].start+w[s-1].bytes && w[s].start>>32==(w[s].start+w[s].bytes-1)>>32);
         CHECK(NativeAdrenoClientSlotAt(w,w[s].start)==s && NativeAdrenoClientSlotAt(w,w[s].start+w[s].bytes-1)==s);
     }
@@ -58,13 +58,28 @@ static void windows()
     CHECK(NativeAdrenoClientSlotAt(w,0x1F4000000ull)==NativeAdrenoMaxClients && NativeAdrenoClientSlotAt(w,0x2F0000000ull)==NativeAdrenoMaxClients);
     CHECK(NativeAdrenoClientSlotAt(w,0x20000000ull)==0 && NativeAdrenoClientSlotAt(w,0xFFFFF000ull)==0 &&
           NativeAdrenoClientSlotAt(w,0x100000000ull)==1 && NativeAdrenoClientSlotAt(w,0x3FFFFE000ull)==NativeAdrenoMaxClients);
-    /* The slot choice is the table's: the render server slot 0, the large class 1-3, apps 24 small ones, the listed the last four. */
+    CHECK(NativeAdrenoDecoderClient(true,NativeAdrenoDecoderSigningId));
+    CHECK(!NativeAdrenoDecoderClient(false,NativeAdrenoDecoderSigningId));
+    CHECK(!NativeAdrenoDecoderClient(true,"VTDecoderXPCService"));
+    CHECK(!NativeAdrenoDecoderClient(true,"com.apple.coremedia.videodecoder.other"));
+    CHECK(!NativeAdrenoDecoderClient(true,nullptr));
+    CHECK(!w[30].bytes && !w[31].bytes);
+    /* The render server, large clients and listed clients cannot borrow the decoder window. */
     bool taken[NativeAdrenoMaxClients]={};
     CHECK(NativeAdrenoClientSlotFor(true,false,true,w,taken)==0 && NativeAdrenoClientSlotFor(false,true,true,w,taken)==1);
+    CHECK(NativeAdrenoClientSlotFor(false,false,false,w,taken,true)==NativeAdrenoDecoderSlot);
+    CHECK(NativeAdrenoClientSlotFor(false,false,false,NativeAdrenoClientWindows4G,taken,true)==4);
+    taken[NativeAdrenoDecoderSlot]=true;
+    CHECK(NativeAdrenoClientSlotFor(false,false,false,w,taken,true)==4);
+    taken[NativeAdrenoDecoderSlot]=false;
     taken[0]=true;
     unsigned count=0,last=0;
     for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,false,w,taken))<NativeAdrenoMaxClients;taken[s]=true) {++count;last=s;}
-    CHECK(count==NativeAdrenoMaxClients-1-NativeAdrenoLargeSlots-NativeAdrenoListedSmallKeep16G && last==27);
+    CHECK(count==21 && last==24 && NativeAdrenoClientSmallFree(w,taken)==4);
+    for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,true,w,taken))<NativeAdrenoMaxClients;taken[s]=true) {
+        CHECK(s!=NativeAdrenoDecoderSlot);
+    }
+    CHECK(NativeAdrenoClientSlotFor(false,false,false,w,taken,true)==NativeAdrenoDecoderSlot);
     /* The windows' sum: the client range less the gaps under the 8 and 12 GiB lines (slot 0 ends on 4 GiB, no gap there). */
     uint64_t total=0;
     for(unsigned s=0;s<NativeAdrenoMaxClients;++s)total+=w[s].bytes;
