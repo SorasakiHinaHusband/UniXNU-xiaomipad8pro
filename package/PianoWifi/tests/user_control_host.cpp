@@ -11,6 +11,22 @@ int main()
 {
   WifiUserControl u;
   CHECK(u.allowed(u.read()));
+  // Sleep preparation can disconnect without changing logical radio power.
+  // Wake re-applies ON rather than supplying a new SET20. Keep the accepted
+  // profile reachable, but do not bypass a teardown which is still pending.
+  const uint32_t sleepLeave = u.disconnect();
+  CHECK(WifiUserControl::power(u.read()) && !u.allowed(u.read()));
+  u.setPower(true);
+  CHECK(u.pending(sleepLeave) && !u.allowed(u.read()));
+  u.stopped(sleepLeave);
+  CHECK(u.allowed(u.read()));
+  const uint32_t completedLeave = u.disconnect();
+  u.stopped(completedLeave);
+  CHECK(!u.allowed(u.read())); // ordinary leave stays idle until a command
+  const uint32_t wakeOn = u.setPower(true);
+  CHECK(WifiUserControl::serial(wakeOn) == WifiUserControl::serial(completedLeave));
+  CHECK(u.allowed(wakeOn) && !u.radioStop());
+  CHECK(u.setPower(true) == wakeOn); // repeated ON has no further effect
   for (unsigned cycle = 0; cycle < 3; ++cycle) {
     const uint32_t leave = u.disconnect();
     CHECK(!u.allowed(u.read()) && u.pending(leave) && WifiUserControl::power(leave));

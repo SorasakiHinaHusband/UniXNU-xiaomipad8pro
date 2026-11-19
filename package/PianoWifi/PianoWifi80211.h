@@ -658,6 +658,10 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
       if (e) {
         a.error = e;
         note80211("%s: ASSOCIATE refused: the validated profile could not be handed to level 7 (errno %d)", fIfName, e);
+      } else {
+        char caller[32] = {};
+        proc_selfname(caller, sizeof caller);
+        note80211("PianoWifiSET20SourceV1 accepted caller=%s", !strcmp(caller, "airportd") ? "airportd" : "other");
       }
     } else if (a.error) {
       if (a.associationHeaderValid) {

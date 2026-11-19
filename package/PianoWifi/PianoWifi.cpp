@@ -317,7 +317,33 @@ void readArgs()
   gArgs.l8stats = bootArg("piano-wifi-l8stats", 1);
   // piano-wifi-phy=N (boot 10r): the most wanted PHY of a join: 0 legacy (every level up to 10q: TCP about 24 Mbit/s, the 54 Mbit/s
   // rate's ceiling), 1 HT, 2 HT and VHT; what the network offers decides the rest (WifiHtVht.h). The root-only sysctl
-  // machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
+  // A root diagnostic asks the worker for one involuntary-loss simulation. It
+// never changes user intent (unlike SET22), and never accesses WMI here.
+volatile uint32_t gLinkDropRequested;
+int sysctlLinkDrop(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = int(__atomic_load_n(&gLinkDropRequested, __ATOMIC_ACQUIRE));
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  if (req->newlen != sizeof incoming) return EINVAL;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (incoming < 0 || incoming > 1) return EINVAL;
+  if (gArgs.level < 8 || !gArgs.rejoin) return ENOTSUP;
+  if (incoming) {
+    struct piano_wifi_assoc_snapshot snapshot = {};
+    if (piano_wifi_assoc_snapshot(&snapshot) || !snapshot.authorized) return ENOTCONN;
+    uint32_t empty = 0;
+    if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, 1u, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
+  } else __atomic_store_n(&gLinkDropRequested, 0u, __ATOMIC_RELEASE);
+  note("PianoWifiUsable2 link-loss probe %s", incoming ? "requested" : "cancelled");
+  return 0;
+}
+struct sysctl_oid gOidLinkDrop;
+
+// machdep.piano_wifi_phy changes it at run time and makes the station join again with it.
   gArgs.phy = bootArg("piano-wifi-phy", 0);
   if (gArgs.phy > 2) gArgs.phy = 0;
   // piano-wifi-rxba=N (boot 10s, WifiBa.h): the access point's block-ack requests (it asks for them on an HT or VHT association,
@@ -3425,11 +3451,16 @@ extern "C" int piano_wifi_user_control(uint32_t operation)
   uint32_t w;
   if (operation == PIANO_WIFI_USER_LEAVE) w = gUserControl.disconnect();
   else if (operation <= PIANO_WIFI_USER_ON) {
+    const uint32_t before = gUserControl.read();
     if (!gBootPower.setPower(gUserControl, operation == PIANO_WIFI_USER_ON)) {
       note("PianoWifiBootPowerGuardV1 unarmed OFF acknowledged: owner stays ON, no physical stop");
       return 0;
     }
     w = gUserControl.read();
+    if (operation == PIANO_WIFI_USER_ON && WifiUserControl::power(before) &&
+        !(before & WifiUserControl::kJoin) && (w & WifiUserControl::kJoin))
+      note("PianoWifiWakeJoinIntentV1 ON restored retained-profile permission serial %u; teardown gate %u",
+           WifiUserControl::serial(w), gUserControl.pending(w) ? 1u : 0u);
   }
   else return EINVAL;
   note("PianoWifiPowerLifecycleV1 request %s serial %u: power %u, join %u, cycle %u",
@@ -3486,6 +3517,15 @@ void registerPsSysctl()
   gOidPowerExplicit.oid_descr = "write 1 as root to allow physical Wi-Fi OFF explicitly (one-way per boot)";
   gOidPowerExplicit.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gOidPowerExplicit);
+  gOidLinkDrop.oid_parent = &sysctl__machdep_children;
+  gOidLinkDrop.oid_number = OID_AUTO;
+  gOidLinkDrop.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidLinkDrop.oid_name = "piano_wifi_link_drop";
+  gOidLinkDrop.oid_handler = sysctlLinkDrop;
+  gOidLinkDrop.oid_fmt = "I";
+  gOidLinkDrop.oid_descr = "root one-shot simulated link loss: 1 request, 0 cancel; worker consumes when authorized";
+  gOidLinkDrop.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidLinkDrop);
   note("PianoWifiBootPowerGuardV1 piano-wifi-boot-on=%u: unarmed OFF %s; only explicit root arm enables physical OFF",
        gBootPower.enabled ? 1u : 0u, gBootPower.enabled ? "acknowledged with radio ON" : "unrestricted");
   __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
@@ -5552,10 +5592,14 @@ int level7(IOService *owner)
     }
     phyTurn(now, stopping);
     baTurn(now, stopping);
-    if (gArgs.dropTest && !gDropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
-        gSta.step == kStaAssociated) {
-      gDropDone = true;   // once a boot (a restart's pass does not drop again)
+    const bool timedDrop = gArgs.dropTest && !gDropDone && firstOpenAt &&
+                           now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000;
+    if (!stopping && gSta.step == kStaAssociated && gSta.authorized &&
+        (timedDrop || __atomic_load_n(&gLinkDropRequested, __ATOMIC_ACQUIRE))) {
+      const bool requestedDrop = __atomic_exchange_n(&gLinkDropRequested, 0u, __ATOMIC_ACQ_REL) != 0;
+      if (timedDrop) gDropDone = true;   // once a boot (a restart's pass does not drop again)
       dropThisJoin = true;
+      if (requestedDrop) note("PianoWifiUsable2 link-loss probe consumed: authorized station teardown, user intent unchanged");
       note("level 7: the drop test (piano-wifi-droptest=%u): the station leaves its association now (our deauthentication); "
            "the rejoin follows",
            gArgs.dropTest);

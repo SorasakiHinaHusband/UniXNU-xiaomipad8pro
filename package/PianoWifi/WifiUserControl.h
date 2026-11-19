@@ -35,7 +35,9 @@ struct WifiUserControl {
   uint32_t setPower(bool on) {
     uint32_t old = read(), next;
     do {
-      if (power(old) == on) return old;
+      // ON also resumes joins after the sleep-preparation SET22. Logical
+      // power may already be ON; pending teardown/cycle bits still gate it.
+      if (power(old) == on && (!on || (old & kJoin))) return old;
       next = on ? (old | kPower | kJoin) : ((old + kSerial) & ~(kPower | kJoin)) | kCycle;
     } while (!__atomic_compare_exchange_n(&word, &old, next, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
     return next;
