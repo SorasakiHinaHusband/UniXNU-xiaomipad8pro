@@ -1970,7 +1970,7 @@ void PianoPower::policyLine(char *line, size_t size)
 {
   const PianoChargePlan &p = fLink.plan;
   const PianoChargeConfig &c = fLink.cfg;
-  static const char *const kWhy[] = {"row", "Rp", "9 V row", "connector hot", "charger hot"};
+  static const char *const kWhy[] = {"row", "Rp", "9 V row", "connector hot", "charger hot", "5 V RDO"};
   static const char *const kHv[] = {"5 V", "9 V asked", "9 V", "9 V blocked"};
   static const char *const kOff[] = {"", " (battery health limit)", " (battery too hot)", " (battery too cold)", " (asleep)",
                                     " (admin inhibit)", " (gauge data unavailable)", " (safety fault)", " (firmware inhibit)"};
@@ -1979,7 +1979,7 @@ void PianoPower::policyLine(char *line, size_t size)
   snprintf(line, size,
            "policy: %s, input limit %u mA (%s%s), charge current %u mA, %s, %s%s, hold %s; %u decisions, %u writes queued, %u "
            "refused, %u relinks; Rp %s; battery health %s",
-           piano_charge_class_name(p.cls), p.icl_ma, kWhy[p.icl_why < 5 ? p.icl_why : 0], rp, p.fcc_ma, kHv[p.hv < 4 ? p.hv : 0],
+           piano_charge_class_name(p.cls), p.icl_ma, kWhy[p.icl_why < 6 ? p.icl_why : 0], rp, p.fcc_ma, kHv[p.hv < 4 ? p.hv : 0],
            p.charge ? "charging" : "not charging", kOff[p.why_off <= PIANO_CHG_OFF_FIRMWARE ? p.why_off : 0], fLink.hold ? "on" : "off", fLink.decisions,
            fLink.queuedTotal, fLink.refusedTotal, fLink.resyncs,
            !c.rp ? "not trusted" : fLink.st.rp_distrust ? "DISTRUSTED (a sag or quick detaches)" : "trusted",
@@ -2130,8 +2130,10 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
   if (pl.ramp_used_ma && pl.ramp_used_ma != (e & PIANO_CHG_EV_RAMP_STEP ? pl.ramp_from_ma : pl.ramp_ma))
     snprintf(used, sizeof used, " (the firmware's own limit 0x2029 %u mA)", pl.ramp_used_ma);
   if (e & PIANO_CHG_EV_RAMP_STEP)
-    note("policy: input steps: up %u -> %u mA (towards %u mA, Rp %u mA): it held %d mV with %d mA taken%s", pl.ramp_from_ma, pl.ramp_ma,
-         pl.ramp_target_ma, in.rp_ma, in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1, used);
+    note("policy: input steps: up %u -> %u mA (towards %u mA, %s %u mA): it held %d mV with %d mA taken%s", pl.ramp_from_ma, pl.ramp_ma,
+         pl.ramp_target_ma, pl.icl_why == PIANO_CHG_ICL_CONTRACT_5V ? "5 V RDO" : "Rp",
+         pl.icl_why == PIANO_CHG_ICL_CONTRACT_5V ? in.contract_ma : in.rp_ma,
+         in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1, used);
   if (e & PIANO_CHG_EV_RAMP_WAIT) {
     char ceiling[40] = "";
     if (pl.ramp_ceiling_ma) snprintf(ceiling, sizeof ceiling, ", this boot's ceiling %u mA", pl.ramp_ceiling_ma);

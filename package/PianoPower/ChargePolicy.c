@@ -577,6 +577,19 @@ static int conn_allows_rp(const PianoChargeInput *in, const PianoChargeState *s)
     return !s->conn_hot && (v1 || v2) && (!v1 || c1 < CONN_COOL_C) && (!v2 || c2 < CONN_COOL_C);
 }
 
+static int strict_contract(const PianoChargeInput *in);
+
+/* At fixed 5 V the selected RDO, rather than an MCA offer or Rp, authorizes PD current. Keep the same opt-in ceiling,
+ * connector check and measured steps as the non-PD path. Voltage withdrawal must finish before this budget is used. */
+static uint32_t contract_5v_budget(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s)
+{
+    if (!c->strict_contract || c->hv || !ramped(c) || !strict_contract(in) ||
+        !(in->valid & PIANO_CHG_IN_SOURCE) || in->contract_protocol != 1 || in->contract_mv != 5000 ||
+        !(in->valid & PIANO_CHG_IN_BUS) || in->bus_mv < ONLINE_MV || in->bus_mv >= HV_5V_MAX_MV ||
+        s->contract_transition || s->contract_mode_change || volt_raised(s)) return 0;
+    return umin(in->contract_ma, rp_cap(c));
+}
+
 /* The 5 V input limit of a class: its row (a PD source's 5 V offer), or with cfg.rp (and with_rp) the Type-C current. */
 static uint32_t icl_at_5v(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, int cls,
                           int with_rp)
@@ -585,6 +598,11 @@ static uint32_t icl_at_5v(const PianoChargeConfig *c, const PianoChargeInput *in
     const uint32_t row = umin(piano_charge_icl_5v(cls, piano_charge_pdo_5v_ma(in->pdo, pdos)), icl_cap(c));
     p->icl_why = PIANO_CHG_ICL_ROW;
     p->rp_ma = 0;
+    const uint32_t contract_ma = with_rp && is_pd(cls) ? contract_5v_budget(c, in, s) : 0;
+    if (contract_ma > row) {
+        const uint32_t target = conn_allows_rp(in, s) ? contract_ma : umin(contract_ma, RAMP_BC12_MA);
+        if (target > row) {p->icl_why = PIANO_CHG_ICL_CONTRACT_5V; return target;}
+    }
     if (!with_rp || !c->rp || s->rp_distrust || !(in->valid & PIANO_CHG_IN_TYPEC) || !in->typec_source) return row;
     uint32_t rp = piano_charge_icl_rp(cls, row, in->rp_ma, rp_cap(c));
     if (rp <= row) return row;
@@ -1434,7 +1452,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         p->rp_ma = 0;
     } else {
         icl = icl_at_5v(c, in, s, p, cls, 1);
-        if (ramped(c) && p->icl_why == PIANO_CHG_ICL_RP) {
+        if (ramped(c) && (p->icl_why == PIANO_CHG_ICL_RP || p->icl_why == PIANO_CHG_ICL_CONTRACT_5V)) {
             /* stepped from the row; the row is computed after the Rp target so that icl_why and rp_ma stay the Rp's */
             const uint8_t why = p->icl_why;
             const uint32_t rp_ma = p->rp_ma;
@@ -1451,7 +1469,8 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         if (!icl) icl = PIANO_CHG_ICL_DEFAULT;
         if (is_pd(cls)) {
             const int contract = strict_contract(in);
-            icl = contract ? umin(icl, umin(in->contract_ma, PIANO_CHG_ICL_CAP)) : PIANO_CHG_ICL_DEFAULT;
+            const uint32_t cap = p->icl_why == PIANO_CHG_ICL_CONTRACT_5V ? piano_charge_icl_max(c) : PIANO_CHG_ICL_CAP;
+            icl = contract ? umin(icl, umin(in->contract_ma, cap)) : PIANO_CHG_ICL_DEFAULT;
         }
         if (s->contract_transition) icl = umin(icl, s->transition_ma);
         if (!gauge_fresh(in, now) || !t.valid) icl = umin(icl, PIANO_CHG_ICL_DEFAULT);

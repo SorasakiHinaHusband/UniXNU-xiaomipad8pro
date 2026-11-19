@@ -105,7 +105,8 @@ typedef struct {
                             * only while a connector reads below 50 degC; a sag, a quick detach or a refusal lowers this boot's
                             * ceiling by one step. 0: the Rp limit at once, within icl_cap_ma, and a sag ends the trust */
     uint16_t rp_cap_ma;    /* the stepped Rp limit's ceiling (0: icl_cap_ma; at most PIANO_CHG_RP_ABS_MAX); only with ramp */
-    uint8_t strict_contract; /* production buck session: current UCSI contract and safety gates required for HV */
+    uint8_t strict_contract; /* production buck session: current UCSI contract and safety gates required for HV;
+                             * hv=0 with rp+ramp also steps fixed5V PD up to the actual RDO current, within rp_cap_ma */
     uint8_t admin_stop;    /* explicit administrator inhibit; owner bounds its lease, never a synthetic SOC */
     uint8_t kick;          /* the charging restart (piano-power-kick, docs §17): a charger that keeps the battery at 0 mA with input to
                             * spare gets 0x2003 = 0 and then 1 (at most three times per attach, two minutes apart) */
@@ -307,7 +308,8 @@ enum {
 enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP,
       PIANO_CHG_OFF_ADMIN, PIANO_CHG_OFF_STALE, PIANO_CHG_OFF_FAULT, PIANO_CHG_OFF_FIRMWARE};
 /* where the input limit came from (plan.icl_why) */
-enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR};
+enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR,
+      PIANO_CHG_ICL_CONTRACT_5V};
 
 enum {PIANO_CHG_FALLBACK_NONE = 0, PIANO_CHG_FALLBACK_NO_CONTRACT, PIANO_CHG_FALLBACK_SAFETY,
       PIANO_CHG_FALLBACK_GAUGE, PIANO_CHG_FALLBACK_HEALTH, PIANO_CHG_FALLBACK_MODE,

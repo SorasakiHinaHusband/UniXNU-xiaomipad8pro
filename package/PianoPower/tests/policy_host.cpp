@@ -184,7 +184,10 @@ struct Sim {
       slots |= 1u << w.slot;
       if (w.property == PIANO_CHG_ICL) CHECK(w.value <= piano_charge_icl_max(&cfg) && w.value <= PIANO_CHG_RP_ABS_MAX);
       if (w.property == PIANO_CHG_ICL && w.value > (cfg.icl_cap_ma ? cfg.icl_cap_ma : PIANO_CHG_ICL_CAP))
-        CHECK(cfg.rp && cfg.ramp && plan.icl_why == PIANO_CHG_ICL_RP);   // above the cap only a stepped Rp limit
+        CHECK(cfg.rp && cfg.ramp && (plan.icl_why == PIANO_CHG_ICL_RP ||
+              (plan.icl_why == PIANO_CHG_ICL_CONTRACT_5V && cfg.strict_contract && !cfg.hv &&
+               (in.valid & PIANO_CHG_IN_CONTRACT) && in.contract_protocol == 1 && in.contract_mv == 5000 &&
+               w.value <= in.contract_ma)));   // above the cap only a measured 5 V step with source authority
       if (w.property == PIANO_CHG_FCC) CHECK(w.value <= (cfg.fcc_cap_ma ? cfg.fcc_cap_ma : PIANO_CHG_FCC_CAP));
       // a stop only from battery health, or as the charging restart's first write (its start, in the plan that starts it)
       if (w.property == PIANO_CHG_ENABLE && w.value == 0) CHECK(cfg.limit || (cfg.kick && (plan.kick_events & PIANO_CHG_KICK_EV_START)));
@@ -1611,6 +1614,106 @@ struct StrictSim : Sim {
   void run(unsigned n = 12) {while (n--) step();}
 };
 
+static void testDailyFiveVoltBudget()
+{
+  // Installed snapshot: SDP, no PD/RDO/PDOs, Rp3A, hv0, healthy26%, FCC1500, ICL/AICL500, 4848mV/497mA.
+  // Connector temperatures are fixture values: the saved snapshot publishes validity/age but not their readings.
+  PianoChargeConfig cfg;
+  piano_charge_config_default(&cfg);
+  cfg.strict_contract = cfg.limit = cfg.rp = cfg.ramp = 1;
+  cfg.rp_cap_ma = 3000;
+  PianoChargeInput in{};
+  in.now_ms = 6230870; in.generation = 1; in.valid = 65535;
+  in.type = PIANO_CHG_T_SDP; in.typec_source = 1; in.rp_ma = 3000;
+  in.bus_mv = 4848; in.ibus_ma = 497; in.icl_ma = in.aicl_ma = 500;
+  in.enable = 1; in.fv_raw = 5200; in.safety = PIANO_CHG_SAFE_ALL;
+  in.soc_min_pct = in.soc_max_pct = 26; in.t_warm_dc = 344; in.t_cool_dc = 317;
+  in.tbat_c = 34; in.t_ntc_dc = 330; in.t_chgr_dc = 360; in.t_conn1_dc = in.t_conn2_dc = 320;
+  in.vbat_max_mv = 3742; in.ibat_ma = -742;
+  for (bool retainedCeiling : {false, true}) {
+    PianoChargeState st;
+    piano_charge_init(&st);
+    PianoChargeInput x = in;
+    PianoChargePlan p{};
+    for (unsigned i = 0; i < 40; ++i) {
+      x.now_ms += 5000; x.gauge_ms = x.now_ms - 19526;
+      if (retainedCeiling) st.ramp_ceiling_ma = 500;
+      piano_charge_decide(&cfg, &x, &st, &p);
+      CHECK(p.fallback == PIANO_CHG_FALLBACK_MODE && !p.transition);
+      CHECK(p.fcc_ma == 1500 && p.charge && !st.hold);
+      CHECK(p.icl_why == PIANO_CHG_ICL_RP);
+      if (retainedCeiling) CHECK(p.icl_ma == 500 && p.ramp_target_ma == 3000);
+      for (unsigned j = 0; j < p.writes; ++j) {
+        const auto &w = p.write[j];
+        CHECK(piano_charge_write_allowed(&cfg, w.property, w.value, w.bytes));
+        CHECK(w.property != PIANO_CHG_PD_FIXED && w.property != PIANO_CHG_PPS);
+        piano_charge_ack(&st, w.property, w.value, 0);
+        if (w.property == PIANO_CHG_ICL) x.icl_ma = x.aicl_ma = int32_t(w.value);
+      }
+      x.ibus_ma = x.icl_ma - 3;
+    }
+    CHECK(p.icl_ma == (retainedCeiling ? 500u : 3000u));
+  }
+  auto dailyPd = [](StrictSim &s) {
+    s.cfg.hv = 0; s.cfg.rp = s.cfg.ramp = 1; s.cfg.rp_cap_ma = 3000;
+    s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+    s.loadMa = 3000; s.soc = 26;
+  };
+  {
+    StrictSim s; dailyPd(s);
+    s.type = PIANO_CHG_T_SDP; s.contractValid = s.sourceValid = false;
+    for (unsigned i = 0; i < 20 && s.icl < 1500; ++i) s.step();
+    CHECK(s.icl == 1500);
+    s.busMv = 4490; s.step(); // a real sag at the first step creates precisely the hidden500 ceiling
+    CHECK(s.st.ramp_ceiling_ma == 500 && s.icl == 500);
+    s.busMv = 4848; s.run(20); CHECK(s.icl == 500 && s.fcc == 1500);
+    CHECK(piano_charge_config_transaction(&s.cfg,1,80,75,1,0) == 0);
+    s.run(20); CHECK(s.icl == 500); // changing mode is not an ICL reset
+    s.wakes++; s.run(20); CHECK(s.icl == 500);
+    s.source = s.typecSource = false; s.step();
+    s.source = s.typecSource = true; s.run(20); CHECK(s.icl == 500); // a replacement source inherits the boot ceiling
+  }
+  {
+    StrictSim s; dailyPd(s); s.run(20);
+    CHECK(s.icl == 3000 && s.fcc == 1500 && s.busMv == 5000 && !s.plan.transition);
+    CHECK(s.plan.icl_why == PIANO_CHG_ICL_CONTRACT_5V && !s.plan.rp_ma);
+    s.soc = 80; s.step(); CHECK(s.enable == 0 && s.st.hold && s.icl == 3000);
+    s.soc = 76; s.step(); CHECK(s.enable == 0 && s.st.hold);
+    s.soc = 75; s.step(); CHECK(s.enable == 1 && !s.st.hold);
+    s.contractMa = 1200; s.step(); CHECK(s.icl <= 1200); // actual RDO wins immediately
+    s.contractValid = false; s.step(); CHECK(s.icl <= 100); // PDO/Rp alone cannot grant PD draw
+  }
+  for (unsigned gate = 0; gate < 11; ++gate) {
+    StrictSim s; dailyPd(s);
+    switch (gate) {
+    case 0: s.contractValid = false; break;
+    case 1: s.sourceValid = false; break;
+    case 2: s.contractLink++; break;
+    case 3: s.notifyPending = true; break;
+    case 4: s.protocol = 2; break;
+    case 5: s.bothGauges = false; break;
+    case 6: s.safe &= ~PIANO_CHG_SAFE_LPD_DRY; break;
+    case 7: s.safe &= ~PIANO_CHG_SAFE_DTPT; break;
+    case 8: s.conn1Dc = 600; break;
+    case 9: s.chgrDc = 850; s.boardValid |= PIANO_CHG_IN_CHGR; break;
+    case 10: s.cfg.ramp = 0; break;
+    }
+    s.run(20); CHECK(s.icl <= 1500 && s.busMv == 5000);
+  }
+  {
+    StrictSim s; dailyPd(s); s.boardValid = 0; s.run(20); CHECK(s.icl <= 1500);
+    s.boardValid = PIANO_CHG_IN_CONN1; s.conn1Dc = 510;
+    s.run(20); CHECK(s.icl <= 1500);
+    s.conn1Dc = 310; s.run(20); CHECK(s.icl == 3000);
+    s.st.ramp_ceiling_ma = 2000; s.step(); CHECK(s.icl == 2000); // never discard a recorded ramp failure
+  }
+  {
+    StrictSim s; dailyPd(s); s.contractMa = 2200; s.run(20); CHECK(s.icl == 2200);
+    s.safe &= ~PIANO_CHG_SAFE_CP_OFF; s.run(20); CHECK(s.icl == 2200); // CP gate remains specific to HV
+    s.cfg.admin_stop = 1; s.step(); CHECK(s.enable == 0 && s.plan.why_off == PIANO_CHG_OFF_ADMIN);
+  }
+}
+
 static void testContractSession()
 {
   // An idle UCSI notification may be a delayedACK rather than a connector change. Inspect CCI behind100mA, without renewing a storm.
@@ -1872,6 +1975,7 @@ static void testRam13GaugeLoss()
 
 int main()
 {
+  testDailyFiveVoltBudget();
   testContractSession();
   testAtomicHealth();
   testRam13GaugeLoss();
