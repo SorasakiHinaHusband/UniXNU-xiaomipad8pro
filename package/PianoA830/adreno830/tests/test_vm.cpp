@@ -228,7 +228,16 @@ static void scattered()
     CHECK(!s.vm.map(&middle,0,0x802000,3,0,2,&b) && s.vm.spanCount()==6 && s.vm.lastResult().completed_spans==4);
     CHECK(!s.vm.describe(b,&iova,&bytes,&permissions) && iova==0x802000 && bytes==4*4096 && permissions==3);
     CHECK(s.vm.handleAt(0x803000)==b && !s.vm.handleAt(0x806000));
+#ifdef ADRENO830_MACOS
+    CHECK(s.vm.largestClientHole(0x800000,0x10000)==0x7000);
+    CHECK(s.vm.largestClientHole(0x803000,0x3000)==0);
+    CHECK(s.vm.largestClientHole(0x804000,0x4000)==0x2000);
+#endif
     CHECK(!s.vm.unmap(b) && s.vm.spanCount()==2 && s.vm.lastResult().completed_spans==4);
+#ifdef ADRENO830_MACOS
+    CHECK(s.vm.largestClientHole(0x800000,0x10000)==0x7000);
+    CHECK(s.vm.largestClientHole(0x803000,0x5000)==0x5000);
+#endif
     CHECK(!s.vm.map(&middle,0,0x80a000,3,0,2,&b) && s.vm.spanCount()==6);
     CHECK(!s.vm.unmap(a) && s.vm.spanCount()==5);
     CHECK(!s.vm.map(&first,0,0x800000,3,0,2,&a) && s.vm.spanCount()==6);

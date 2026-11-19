@@ -405,6 +405,23 @@ size_t NativeAdrenoVm::rangeAt(uint64_t iova) const
     }
     return low;
 }
+#ifdef ADRENO830_MACOS
+uint64_t NativeAdrenoVm::largestClientHole(uint64_t start,uint64_t bytes) const
+{
+    const uint64_t end=start+bytes;
+    if(!bytes || end<=start)return 0;
+    VM_LOCKED;
+    if(!attached_ || poisoned_)return 0;
+    uint64_t cursor=start,largest=0;
+    const size_t spans=spanCount();
+    for(size_t i=rangeAt(start);i<spans && ranges_[i].iova<end;++i) {
+        const auto &range=ranges_[i];
+        if(range.iova>cursor && range.iova-cursor>largest)largest=range.iova-cursor;
+        cursor=range.iova+range.bytes;
+    }
+    return cursor<end && end-cursor>largest?end-cursor:largest;
+}
+#endif
 /* The n ranges just past the table's end (one mapping's spans, consecutive in IOVA and all in one gap) take their sorted place. */
 void NativeAdrenoVm::insert(size_t n,unsigned upper)
 {

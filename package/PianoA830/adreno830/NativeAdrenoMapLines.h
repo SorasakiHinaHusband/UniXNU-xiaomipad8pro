@@ -24,6 +24,24 @@
 
 enum : unsigned {NativeAdrenoMapLineBytes=150};
 
+struct NativeAdrenoResidencyRecord {
+    char name[20]{};
+    unsigned connection=0;
+    int pid=0;
+    NativeAdrenoResidencyUsage usage{};
+
+    int line(char *text,size_t size,unsigned slot,const char *state,uint64_t window,uint64_t hole) const
+    {
+        if(!connection)return 0;
+        using U64=unsigned long long;
+        return snprintf(text,size,
+            "residency slot=%u connection=%u pid=%d name=%s state=%s window=%llu resident=%llu peak-resident=%llu "
+            "imports=%llu peak-imports=%llu import-bytes=%llu peak-import-bytes=%llu largest-vm-hole=%llu",
+            slot,connection,pid,name,state,U64(window),U64(usage.resident_bytes),U64(usage.peak_resident_bytes),
+            U64(usage.imports),U64(usage.peak_imports),U64(usage.import_bytes),U64(usage.peak_import_bytes),U64(hole));
+    }
+};
+
 /* Captured by the wrapper under the connection lock. VM fields came from mapClient's locked output;
  * global backing counters are independent relaxed samples, not a whole-device atomic census. */
 struct NativeAdrenoFailureSnapshot {

@@ -351,7 +351,7 @@ int main()
         CHECK(NativeAdrenoClientSlotAt(w4,0x1FFFF000)==NativeAdrenoMaxClients && NativeAdrenoClientSlotAt(w4,0x20000000)==0);
         for(unsigned i=0;i<Windows4G;++i)
             CHECK(NativeAdrenoClientSlotAt(w4,w4[i].start)==i && NativeAdrenoClientSlotAt(w4,w4[i].start+w4[i].bytes-1)==i);
-        for(unsigned i=0;i<NativeAdrenoMaxClients;++i)
+        for(unsigned i=0;i<NativeAdrenoMaxClients && w16[i].bytes;++i)
             CHECK(NativeAdrenoClientSlotAt(w16,w16[i].start)==i && NativeAdrenoClientSlotAt(w16,w16[i].start+w16[i].bytes-1)==i);
         CHECK(NativeAdrenoClientSlotAt(w4,0x7FFFFFFF)==0 && NativeAdrenoClientSlotAt(w4,0x80000000)==1 &&
             NativeAdrenoClientSlotAt(w4,0xC1FFFFFF)==3 && NativeAdrenoClientSlotAt(w4,0xC2000000)==4 &&
@@ -944,6 +944,8 @@ int main()
         {
             NativeAdrenoMapUsage u{};p.client.mapUsage(&u);
             CHECK(u.objects==1 && u.spans==1 && u.bytes==4096 && !p.client.lastMapRefusal().why);
+            const auto residency=p.client.residencyUsage();
+            CHECK(residency.resident_bytes==4096 && residency.peak_resident_bytes==4096);
             ++macosChecks;
         }
 #endif
@@ -977,6 +979,8 @@ int main()
         {
             NativeAdrenoMapUsage u{};p.client.mapUsage(&u);   /* UniXNU-piano: the unmap took it away */
             CHECK(!u.objects && !u.spans && !u.bytes);
+            const auto residency=p.client.residencyUsage();
+            CHECK(!residency.resident_bytes && residency.peak_resident_bytes==4096);
             ++macosChecks;
         }
 #endif
@@ -1341,6 +1345,9 @@ int main()
             NativeAdrenoSizeUsage sizes{};p.client.sizeUsage(&sizes);
             CHECK(sizes.count[0]==3 && sizes.bytes[0]==16384+65536 && !sizes.count[1] && !sizes.count[2] && !sizes.count[3]);
             CHECK(sizes.count[4]==1 && sizes.bytes[4]==3*4096);
+            const auto residency=p.client.residencyUsage();
+            CHECK(residency.imports==1 && residency.peak_imports==1);
+            CHECK(residency.import_bytes==3*4096 && residency.peak_import_bytes==3*4096);
         }
 #endif
         /* The second BO's release fails (its descriptor refuses complete()): it stays live and keeps its bytes. */
@@ -1354,6 +1361,9 @@ int main()
         p.client.usage(&pool,&other,&imported);CHECK(!pool && other==8192 && !imported);
 #ifdef ADRENO830_MACOS
         {NativeAdrenoSizeUsage sizes{};p.client.sizeUsage(&sizes);CHECK(sizes.count[0]==1 && sizes.bytes[0]==8192 && !sizes.count[4]);}
+        const auto residency=p.client.residencyUsage();
+        CHECK(!residency.imports && !residency.import_bytes);
+        CHECK(residency.peak_imports==1 && residency.peak_import_bytes==3*4096);
 #endif
         CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnBusy && p.client.liveObjects()==1);   /* an orphan's retry: the same */
         ++blocks;

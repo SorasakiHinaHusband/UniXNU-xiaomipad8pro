@@ -162,10 +162,24 @@ struct CoreBox {
     NativeAdrenoStatus status;
     char name[20];   /* the process that opened it (kept for an orphan: the MEM row names who holds the memory) */
     uint32_t quiet_s=0;   /* seconds of native_adreno_client_tick without a call (under g.lock): the slot refusal's table */
+#ifdef ADRENO830_MACOS
+    unsigned slot=NativeAdrenoMaxClients,connection=0;
+    int pid=0;
+    NativeAdrenoResidencyRecord residency() const
+    {
+        NativeAdrenoResidencyRecord record{};
+        strlcpy(record.name,name,sizeof record.name);
+        record.connection=connection;record.pid=pid;record.usage=core.residencyUsage();
+        return record;
+    }
+#endif
 };
 struct Slot {
     AGXDeviceUserClient *connection;   /* live connection */
     CoreBox *orphan;                   /* a closed connection's core that still holds objects */
+#ifdef ADRENO830_MACOS
+    NativeAdrenoResidencyRecord last_closed;   /* kept until the next close in this slot */
+#endif
 };
 struct Published {
     bool published=false;
@@ -407,11 +421,34 @@ void reapOrphans()
     for(unsigned i=0;i<count;++i) {
         CoreBox *box=*orphans[i];
         if(box->core.releaseAll(&g.clock,0)!=kIOReturnSuccess)continue;
+#ifdef ADRENO830_MACOS
+        if(box->slot<NativeAdrenoMaxClients)g.slots[box->slot].last_closed=box->residency();
+#endif
         *orphans[i]=nullptr;
         delete box;
         ++g.closed;
     }
 }
+}
+
+extern "C" int native_adreno_residency_line(unsigned slot,bool closed,char *line,size_t size)
+{
+#ifdef ADRENO830_MACOS
+    if(slot>=NativeAdrenoMaxClients || !g.lock)return 0;
+    IOLockLock(g.lock);
+    const Slot &entry=g.slots[slot];
+    const NativeAdrenoClientWindow window=g.windows?g.windows[slot]:NativeAdrenoClientWindow{};
+    const CoreBox *box=closed?nullptr:slotBox(slot);
+    const NativeAdrenoResidencyRecord record=closed?entry.last_closed:box?box->residency():NativeAdrenoResidencyRecord{};
+    const char *state=closed?"closed":entry.orphan?"orphan":"live";
+    /* Holding the registry lock keeps the VM window paired with this connection. The VM walk takes only the VM lock. */
+    const uint64_t hole=box && g.vm?g.vm->largestClientHole(window.start,window.bytes):0;
+    IOLockUnlock(g.lock);
+    return record.line(line,size,slot,state,window.bytes,hole);
+#else
+    (void)slot;(void)closed;(void)line;(void)size;
+    return 0;
+#endif
 }
 
 void nativeAdrenoMailboxPoller(void *,wait_result_t)
@@ -616,6 +653,11 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
         if(kernel)g.kernel_client=this;
         else g.slots[slot].connection=this;
         ++g.opened;
+#ifdef ADRENO830_MACOS
+        if(!kernel) {
+            box_->slot=slot;box_->connection=g.opened;box_->pid=proc_selfpid();
+        }
+#endif
         unsigned live=0;
         for(unsigned s=0;s<NativeAdrenoMaxClients;++s)if(g.slots[s].connection)++live;
         if(live>native_adreno_slot_pressure[0])native_adreno_slot_pressure[0]=live;
@@ -687,7 +729,12 @@ IOReturn AGXDeviceUserClient::clientClose()
                  * that keeps its slot until a later attempt (a mount that finds no slot, the end of a recovery) releases everything. */
                 if(kernel_)g.kernel_orphan=box_;else if(slot_<NativeAdrenoMaxClients)g.slots[slot_].orphan=box_;
                 box_=nullptr;
-            } else ++g.closed;
+            } else {
+                ++g.closed;
+#ifdef ADRENO830_MACOS
+                if(!kernel_ && slot_<NativeAdrenoMaxClients)g.slots[slot_].last_closed=box_->residency();
+#endif
+            }
             native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
             if(NativeAdrenoClientRecord *record=kernel_?nullptr:clientRecord(name_)) {
                 record->closes=record->closes+1;record->slot=0xff;

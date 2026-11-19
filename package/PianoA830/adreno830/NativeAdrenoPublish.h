@@ -587,6 +587,9 @@ uint32_t native_adreno_coherent_imports(void);
  * entry is slot*3 + method index, row is 0..9. Returns 0 for an empty entry; no driver locks are taken by the reader. */
 enum : unsigned {NativeAdrenoFailureEntries=NativeAdrenoMaxClients*3,NativeAdrenoFailureRows=10};
 int native_adreno_failure_line(unsigned entry,unsigned row,char *line,size_t size);
+/* Active/orphan connection or the last completed connection in each slot. Byte counts are in bytes, including the VM hole. */
+enum : unsigned {NativeAdrenoResidencyLineBytes=384};
+int native_adreno_residency_line(unsigned slot,bool closed,char *line,size_t size);
 /* Connections opened and closed so far, and the published service (null before S9). */
 uint32_t native_adreno_publish_stats(uint32_t *closed);
 IOService *native_adreno_published_service(void);

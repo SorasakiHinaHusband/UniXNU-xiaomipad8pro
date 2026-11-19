@@ -40,6 +40,12 @@ static void failureSnapshots()
     CHECK(!first.remember(s,7,159,NativeAdrenoMethodBoMap,kIOReturnNoResources));
     CHECK(first.line(line,sizeof line,0)>0 && std::strstr(line,"pid=2399 slot=2") && std::strstr(line,"n=18446744073709551615"));
     CHECK(first.line(line,sizeof line,1)>0 && std::strstr(line,"import-readonly-descriptor") && !std::strstr(line,"overwritten"));
+    NativeAdrenoResidencyRecord residency{"1234567890123456789",UINT32_MAX,2147483647,
+        {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX}};
+    char residency_line[NativeAdrenoResidencyLineBytes];
+    const int n=residency.line(residency_line,sizeof(residency_line)-1,31,"closed",UINT64_MAX,UINT64_MAX);
+    CHECK(n>0 && size_t(n)<sizeof(residency_line)-1);
+    CHECK(std::strstr(residency_line,"largest-vm-hole=18446744073709551615"));
 }
 
 static void windows()

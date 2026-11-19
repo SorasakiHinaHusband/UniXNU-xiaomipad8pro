@@ -250,6 +250,8 @@ public:
     NativeAdrenoVmResult lastResult() const {return result_;}
     unsigned bank() const {return bank_;}
 #ifdef ADRENO830_MACOS
+    /* Largest unmapped extent of a published client window. The client windows exclude the VM's reserved regions. */
+    uint64_t largestClientHole(uint64_t start,uint64_t bytes) const;
     /* UniXNU-piano: the last refused map's reason (BoMap's console detail), the table's range capacity. */
     NativeAdrenoVmRefusal lastRefusal() const {return refusal_;}
     size_t spanCapacity() const {return capacity_;}

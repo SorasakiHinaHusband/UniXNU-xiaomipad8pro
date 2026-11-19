@@ -85,6 +85,10 @@ enum NativeAdrenoAllocWhy : uint8_t {
     NativeAdrenoAllocWhyImport,        /* a bytes, b status, c the import's stage (native_adreno_import_stage), d the address */
 };
 struct NativeAdrenoAllocRefusal {uint8_t why;uint32_t method;uint64_t a,b,c,d,e;NativeAdrenoMemoryFailure failure{};};
+struct NativeAdrenoResidencyUsage {
+    uint64_t resident_bytes=0,peak_resident_bytes=0,import_bytes=0,peak_import_bytes=0;
+    uint64_t imports=0,peak_imports=0;
+};
 #endif
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
@@ -121,6 +125,7 @@ class NativeAdrenoUserClient final {
 #ifdef ADRENO830_MACOS
     /* UniXNU-piano: the live mappings (relaxed atomics, written under the connection's lock) and the last BoMap refusal. */
     uint64_t mapped_objects_=0,mapped_spans_=0,mapped_bytes_=0;
+    uint64_t peak_mapped_bytes_=0,peak_import_bytes_=0,imports_=0,peak_imports_=0;
     /* UniXNU-piano (2026-11-12): the live objects by size class (account() adds and takes away; relaxed atomics, as the bytes above). */
     uint64_t size_count_[NativeAdrenoSizeClasses]={},size_bytes_[NativeAdrenoSizeClasses]={};
     NativeAdrenoMapRefusal map_refusal_{};
@@ -222,6 +227,8 @@ public:
     /* UniXNU-piano: the mappings this connection holds (any thread, relaxed reads) and why its last BoMap was refused (read by the
      * IOKit wrapper right after that call, under the connection's lock). */
     void mapUsage(NativeAdrenoMapUsage *) const;
+    /* GPU-mapped bytes and published import handles (including scanout), with lifetime high-water marks. */
+    NativeAdrenoResidencyUsage residencyUsage() const;
     /* UniXNU-piano (2026-11-12): the live objects by size class (NativeAdrenoSizeUsage), for the console's va/sizes lines. */
     void sizeUsage(NativeAdrenoSizeUsage *) const;
     NativeAdrenoMapRefusal lastMapRefusal() const {return map_refusal_;}

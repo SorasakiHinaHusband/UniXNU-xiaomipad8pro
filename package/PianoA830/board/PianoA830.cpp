@@ -1148,6 +1148,18 @@ int sysctlGpuRefusals(struct sysctl_oid *,void *,int,struct sysctl_req *req)
       any=true;
     }
   }
+  for(unsigned slot=0;slot<NativeAdrenoMaxClients;++slot) {
+    for(unsigned closed=0;closed<2;++closed) {
+      char line[NativeAdrenoResidencyLineBytes];
+      const int count=native_adreno_residency_line(slot,closed!=0,line,sizeof(line)-1);
+      if(count<=0)continue;
+      const size_t bytes=size_t(count)<sizeof(line)-1?size_t(count):sizeof(line)-2;
+      line[bytes]='\n';
+      const int error=SYSCTL_OUT(req,line,bytes+1);
+      if(error)return error;
+      any=true;
+    }
+  }
   return any?SYSCTL_OUT(req,"",1):SYSCTL_OUT(req,"none\n",6);
 }
 void registerGpuRefusals()
@@ -1156,7 +1168,7 @@ void registerGpuRefusals()
   oid.oid_parent=&sysctl__machdep_children;oid.oid_number=OID_AUTO;
   oid.oid_kind=int(CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2);
   oid.oid_name="piano_gpu_refusals";oid.oid_handler=sysctlGpuRefusals;oid.oid_fmt="A";
-  oid.oid_descr="First GPU capacity refusal per slot and method; immutable, read only";
+  oid.oid_descr="First GPU capacity refusals and per-connection residency high water";
   oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&oid);
 }
 } // namespace

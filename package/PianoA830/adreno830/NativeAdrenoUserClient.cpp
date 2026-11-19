@@ -142,7 +142,15 @@ void NativeAdrenoUserClient::account(const Entry &entry,bool add)
     const uint64_t bytes=memory.bytes(),now=__atomic_load_n(counter,__ATOMIC_RELAXED);
     __atomic_store_n(counter,add?now+bytes:now>=bytes?now-bytes:0,__ATOMIC_RELAXED);
 #ifdef ADRENO830_MACOS
-    const unsigned cls=NativeAdrenoSizeClass(bytes,memory.imported() || memory.scanout());
+    if(counter==&import_bytes_) {
+        const uint64_t count=__atomic_load_n(&imports_,__ATOMIC_RELAXED);
+        __atomic_store_n(&imports_,add?count+1:count?count-1:0,__ATOMIC_RELAXED);
+        if(add && count+1>__atomic_load_n(&peak_imports_,__ATOMIC_RELAXED))
+            __atomic_store_n(&peak_imports_,count+1,__ATOMIC_RELAXED);
+        if(add && now+bytes>__atomic_load_n(&peak_import_bytes_,__ATOMIC_RELAXED))
+            __atomic_store_n(&peak_import_bytes_,now+bytes,__ATOMIC_RELAXED);
+    }
+    const unsigned cls=NativeAdrenoSizeClass(bytes,counter==&import_bytes_);
     const uint64_t count=__atomic_load_n(&size_count_[cls],__ATOMIC_RELAXED),held=__atomic_load_n(&size_bytes_[cls],__ATOMIC_RELAXED);
     __atomic_store_n(&size_count_[cls],add?count+1:count?count-1:0,__ATOMIC_RELAXED);
     __atomic_store_n(&size_bytes_[cls],add?held+bytes:held>=bytes?held-bytes:0,__ATOMIC_RELAXED);
@@ -158,6 +166,15 @@ void NativeAdrenoUserClient::noteMapped(const Entry &entry,bool add)
         __atomic_store_n(counter,add?now+by:now>=by?now-by:0,__ATOMIC_RELAXED);
     };
     step(&mapped_objects_,1);step(&mapped_spans_,spans);step(&mapped_bytes_,bytes);
+    const uint64_t mapped=__atomic_load_n(&mapped_bytes_,__ATOMIC_RELAXED);
+    if(add && mapped>__atomic_load_n(&peak_mapped_bytes_,__ATOMIC_RELAXED))
+        __atomic_store_n(&peak_mapped_bytes_,mapped,__ATOMIC_RELAXED);
+}
+NativeAdrenoResidencyUsage NativeAdrenoUserClient::residencyUsage() const
+{
+    return {__atomic_load_n(&mapped_bytes_,__ATOMIC_RELAXED),__atomic_load_n(&peak_mapped_bytes_,__ATOMIC_RELAXED),
+        __atomic_load_n(&import_bytes_,__ATOMIC_RELAXED),__atomic_load_n(&peak_import_bytes_,__ATOMIC_RELAXED),
+        __atomic_load_n(&imports_,__ATOMIC_RELAXED),__atomic_load_n(&peak_imports_,__ATOMIC_RELAXED)};
 }
 void NativeAdrenoUserClient::mapUsage(NativeAdrenoMapUsage *out) const
 {
@@ -237,6 +254,8 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     __atomic_store_n(&pool_bytes_,uint64_t(0),__ATOMIC_RELAXED);__atomic_store_n(&other_bytes_,uint64_t(0),__ATOMIC_RELAXED);
     __atomic_store_n(&import_bytes_,uint64_t(0),__ATOMIC_RELAXED);
 #ifdef ADRENO830_MACOS
+    mapped_bytes_=mapped_objects_=mapped_spans_=0;
+    peak_mapped_bytes_=peak_import_bytes_=imports_=peak_imports_=0;
     for(unsigned i=0;i<NativeAdrenoSizeClasses;++i)
         {__atomic_store_n(&size_count_[i],uint64_t(0),__ATOMIC_RELAXED);__atomic_store_n(&size_bytes_[i],uint64_t(0),__ATOMIC_RELAXED);}
 #endif
