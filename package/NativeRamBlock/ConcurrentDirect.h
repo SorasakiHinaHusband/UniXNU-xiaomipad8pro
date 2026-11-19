@@ -55,7 +55,7 @@ struct DirectAdmission {
     if (previous) previous->next = request.next; else head = request.next;
     if (tail == &request) tail = previous;
     --waiting;
-    env.wake();
+    if (waiting || !online) env.wake();
     return slot;
   }
 
@@ -63,7 +63,7 @@ struct DirectAdmission {
     if (liveDMA) quarantined |= 1U << slot;
     active[slot] = nullptr;
     --inflight;
-    env.wake();
+    if (waiting || fenced || !online) env.wake();
   }
 
   // Admission stays closed until the owner reopens it. Wait releases the gate so requests can finish.

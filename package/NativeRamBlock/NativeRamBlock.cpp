@@ -252,7 +252,7 @@ class NativeRamBlock : public IOBlockStorageDevice {
     bool write(uint64_t b, uint32_t n, const void *s) {
       if (!traceBitmap) {
         const bool ok = native_ufs_store_write(b, n, s);
-        if (ok && b && b <= runtimeBitmap) ++*bitmapPublications;
+        if (ok && b && b <= runtimeBitmap) __atomic_fetch_add(bitmapPublications, 1, __ATOMIC_RELAXED);
         return ok;
       }
       storeTraceIo('w', b, n, traceBitmap, false, false, nullptr);
@@ -819,7 +819,7 @@ IOReturn NativeRamBlock::serveExperiment(IOMemoryDescriptor *buffer, uint64_t of
 
   if (serial) {
     admission.peak = 1;
-    if (store.liveDMA) admission.quarantined |= 1;
+    if (store.liveDMA && !store.liveBitmap) admission.quarantined |= 1;
     if (store.liveBitmap) keepLegacyBitmap = true;
     if (write && actual) __atomic_store_n(&native_data_persist_present, overlay.present, __ATOMIC_RELAXED);
     env.unlock();
@@ -976,6 +976,9 @@ void NativeRamBlock::stop(IOService *provider)
     if (commitGate) {
       __atomic_store_n(&online, false, __ATOMIC_RELAXED);
       admission.stop(env);
+    } else if (!storeAttached) {
+      // Prevent the publish thread from setting up new admission during an early stop.
+      __atomic_store_n(&online, false, __ATOMIC_RELAXED);
     }
     env.unlock();
   }

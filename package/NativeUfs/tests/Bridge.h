@@ -64,7 +64,12 @@ static IOReturn recordTransport (IOReturn result, uint32_t ocs)
 static uint32_t hostCompletionCount (unsigned) { return 0; }
 static bool hostInterruptMode () { return false; }
 static void hostWaitCompletion (unsigned, uint32_t, uint64_t) { IODelay (2); }
-static uint64_t hostDmaAddress (const void *) { return 0; }   // no zero copy in the host model
+// Map a test stage when requested. The default tests still use the slot bounce area.
+static const void *gTestDmaStage;
+static uint64_t hostDmaAddress (const void *p)
+{
+  return p == gTestDmaStage ? gHost.phys + (static_cast<const uint8_t *> (p) - memory) : 0;
+}
 // native-ufs-perf's accounting off (the kext's default): the command path's spans and depth hooks do nothing.
 static uint64_t hostPerfNow () { return 0; }
 static void hostPerfSpan (unsigned, uint64_t, uint64_t) {}
@@ -114,6 +119,7 @@ static void ufs_test_reset (Callback cb, uint64_t physical)
   hostSlotsInit (kRegionSlots, nullptr);
   gHostPanic = false;
   gOutstanding = 0;
+  gTestDmaStage = nullptr;
   gSlotWaitHead = gSlotWaitTail = nullptr;
   gSlotsBusy = 0;
   gHostHeld = false;
