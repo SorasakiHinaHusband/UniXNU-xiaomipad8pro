@@ -16,10 +16,12 @@ This does not change the terminal WindowServer capture failure boundary.
  #include <algorithm>
  #include <array>
  #include <memory>
-@@ -966,7 +967,9 @@
+@@ -964,9 +965,9 @@
+   if(nbLine<=8)fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");\
+   else if(!(nbLine&(nbLine-1)))fprintf(stderr,"%s: [#%u] %.130s\n",getprogname(),nbLine,nbText.UTF8String?:"?");}}while(0)
  static constexpr uint64_t kLargeAllocationBytes=uint64_t(64)<<20;
- // Device memory the runtime allocated so far (nmb_device_memory_counts word 5): the difference across a call is what it allocated for
- // that call (and for any other thread of the process meanwhile).
+-// Device memory the runtime allocated so far (nmb_device_memory_counts word 5): the difference across a call is what it allocated for
+-// that call (and for any other thread of the process meanwhile).
 -static uint64_t runtimeAllocatedBytes() {uint64_t mc[10]={};return gDevice && nmb_device_memory_counts(gDevice,mc)?mc[5]:0;}
 +// Current backing held by the runtime: occupied pools + empty pools + dedicated + imports.
 +// Word 1 is a subset of word 0; word 5 is cumulative allocations, not current residency.
@@ -27,7 +29,7 @@ This does not change the terminal WindowServer capture failure boundary.
  static NSString *nbMiB(uint64_t bytes) {return [NSString stringWithFormat:@"%.1fM",bytes/1048576.0];}
  // A four-character code as text ('444v'), or its hex when a byte is not printable.
  static NSString *fourCC(uint32_t code) {
-@@ -1185,102 +1188,215 @@
+@@ -1185,102 +1186,217 @@
  // caller-owned no-copy buffers do not enter this cache.
  static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
  static std::mutex gSurfaceImportLock;
@@ -92,6 +94,7 @@ This does not change the terminal WindowServer capture failure boundary.
 +static bool importCapacityError(const char *error) {
 + if(!error)return false;
 + const std::string e(error);
++ if(e.find("DeviceLost")!=std::string::npos || e.find("DEVICE_LOST")!=std::string::npos)return false;
 + // Exact runtime/Vulkan capacity tags only: shape, unsupported and DeviceLost errors must not retry.
 + return e.find("OutOfMemory(Device)")!=std::string::npos || e.find("OutOfMemory(Host)")!=std::string::npos ||
 +  e.find("VK_ERROR_OUT_OF_DEVICE_MEMORY")!=std::string::npos || e.find("VK_ERROR_OUT_OF_HOST_MEMORY")!=std::string::npos ||
@@ -136,6 +139,7 @@ This does not change the terminal WindowServer capture failure boundary.
 +// Queue-confined. Runtime calls below hold no frontend mutex. Synchronous allocation recovery runs only AFTER
 +// the failed runtime allocation has returned (and released its Memory/host-import locks).
 +static ImportPressureWindow gImportPressure;
++static uint64_t gLastGpuReclaimRequestUs=0; // shared by all allocation wrapper instantiations, queue-confined
 +static bool gInGpuReclaim=false; // queue-confined; custom no-copy deallocators may reenter Metal
 +static void reclaimGpuMemory(const char *reason) {
 + if(gInGpuReclaim)return;
@@ -226,8 +230,8 @@ This does not change the terminal WindowServer capture failure boundary.
 + if(dispatch_get_specific(&gImportPressureQueueKey) && gInGpuReclaim)return handle;
 + const std::string why=nmb_last_error();
 + dispatch_block_t recover=^{
-+  static uint64_t lastRequest=0;const uint64_t now=nowUs();
-+  if(!lastRequest || now-lastRequest>=1000000){lastRequest=now;gGpuReclaimRequested++;notify_post("org.unixnu.piano.gpu-reclaim");}
++  const uint64_t now=nowUs();
++  if(!gLastGpuReclaimRequestUs || now-gLastGpuReclaimRequestUs>=1000000){gLastGpuReclaimRequestUs=now;gGpuReclaimRequested++;notify_post("org.unixnu.piano.gpu-reclaim");}
 +  reclaimGpuMemory("allocation");
 + };
 + if(dispatch_get_specific(&gImportPressureQueueKey))recover();else dispatch_sync(importPressureQueue(),recover);
