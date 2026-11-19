@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -94,11 +95,11 @@ static size_t nmb_device_release_kept_memory(NmbDevice *){native_bridge_metal_tr
 static NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *,void *base,uint64_t bytes,uint64_t,void (*release)(void *,void *,uint64_t),void *context) {
  mockAttempts++;
  native_bridge_metal_trim_surface_imports(); // exercises actual allocation-outside-import-lock requirement
- if(failImports.load()>0){failImports--;mockError="no-copy buffer: OutOfMemory(Device)";return nullptr;}
  {
   std::unique_lock<std::mutex> lock(barrierLock);
-  if(racing){arrived++;barrierCV.notify_all();barrierCV.wait(lock,[]{return arrived==2;});}
+  if(racing){arrived++;barrierCV.notify_all();barrierCV.wait(lock,[]{return !racing;});}
  }
+ if(failImports.load()>0){failImports--;mockError="no-copy buffer: OutOfMemory(Device)";return nullptr;}
  mockMade++;mockImports+=bytes;return new NmbBuffer{context,release,base,bytes};
 }
 static void nmb_buffer_release(NmbBuffer *buffer) {
@@ -161,7 +162,38 @@ static void noCopyTests() {
  failImports=2;attempts=mockAttempts;
  @autoreleasepool {assert(![device newBufferWithBytesNoCopy:page length:sizeof page options:0 deallocator:deallocator]);}
  assert(mockAttempts==attempts+2 && callbacks==1 && gNoCopyMade==1 && gNoCopyReleased==1);
+ @autoreleasepool {
+  NBBuffer *first=(NBBuffer *)[device newBufferWithBytesNoCopy:page length:sizeof page options:0 deallocator:deallocator];
+  NBBuffer *second=(NBBuffer *)[device newBufferWithBytesNoCopy:page length:sizeof page options:0 deallocator:deallocator];
+  assert(first.handle && second.handle && first.handle!=second.handle && mockImports==8192 && callbacks==1);
+ }
+ assert(callbacks==3 && mockImports==0);
  puts("PASS actual no-copy method: failed attempts never invoke caller deallocator; successful context releases once");
+}
+struct ImportResult {NBBuffer *buffer;NSString *error;};
+static void concurrentImports(IOSurfaceRef surface,ImportResult (&results)[2]) {
+ const auto joined=gSurfaceImportJoined.load();
+ {
+  std::lock_guard<std::mutex> lock(barrierLock);racing=true;arrived=0;
+ }
+ auto import=[&](unsigned index){@autoreleasepool{
+  NSString *failure=nil;
+  results[index].buffer=surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096,&failure);
+  results[index].error=failure;
+ }};
+ std::thread first(import,0);
+ {
+  std::unique_lock<std::mutex> lock(barrierLock);
+  assert(barrierCV.wait_for(lock,std::chrono::seconds(5),[]{return arrived==1;}));
+ }
+ std::thread second(import,1);
+ const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+ while(gSurfaceImportJoined==joined && std::chrono::steady_clock::now()<deadline)
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+ {
+  std::lock_guard<std::mutex> lock(barrierLock);assert(gSurfaceImportJoined==joined+1 && arrived==1);racing=false;
+ }
+ barrierCV.notify_all();first.join();second.join();
 }
 static void importTests() {
  IOSurfaceRef surface=makeSurface();const CFIndex retains=CFGetRetainCount(surface);uint64_t released=mockReleased;
@@ -176,18 +208,29 @@ static void importTests() {
  failImports=2;uint64_t attempts=mockAttempts;
  @autoreleasepool {assert(!surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096));}
  assert(mockAttempts==attempts+2 && CFGetRetainCount(surface)==retains && gSurfaceImportFailures==1);
- // Actual double-checked publish on two concurrent misses. Both callers must get one live winner; loser release is outside lock.
  dispatch_sync(importPressureQueue(),^{gNoHoldImports=false;});
- struct Result {NBBuffer *buffer;};Result results[2];
- racing=true;arrived=0;released=mockReleased;uint64_t made=mockMade;
- std::thread first([&]{@autoreleasepool{results[0].buffer=surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096);}});
- std::thread second([&]{@autoreleasepool{results[1].buffer=surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096);}});
- first.join();second.join();racing=false;
+ ImportResult results[2]={};released=mockReleased;uint64_t made=mockMade;
+ attempts=mockAttempts;concurrentImports(surface,results);
  assert(results[0].buffer && results[0].buffer==results[1].buffer);
- assert(mockMade==made+2 && mockReleased==released+1 && gHeldImportCount==1 && gHeldImportBytes==4096);
- trimHeldImports(true);assert(gHeldImportCount==0 && mockReleased==released+1); // live callers still own winner
+ assert(mockAttempts==attempts+1 && mockMade==made+1 && mockReleased==released && gHeldImportCount==1 && gHeldImportBytes==4096);
+ trimHeldImports(true);assert(gHeldImportCount==0 && mockReleased==released);
  results[0].buffer=nil;results[1].buffer=nil;
- assert(mockReleased==released+2 && CFGetRetainCount(surface)==retains && mockImports==0);
+ assert(mockReleased==released+1 && CFGetRetainCount(surface)==retains && mockImports==0);
+ failImports=2;attempts=mockAttempts;concurrentImports(surface,results);
+ assert(!results[0].buffer && !results[1].buffer && mockAttempts==attempts+2);
+ assert([results[0].error isEqualToString:@"no-copy buffer: OutOfMemory(Device)"] && [results[0].error isEqualToString:results[1].error]);
+ assert(CFGetRetainCount(surface)==retains && mockImports==0);
+ assert(gNoHoldImports);
+ attempts=mockAttempts;const auto hits=gSurfaceImportHits.load();
+ for(unsigned frame=0;frame<4;frame++) {
+  @autoreleasepool {
+   NBBuffer *first=surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096);
+   NBBuffer *second=surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096);
+   assert(first && first==second && mockImports==4096);
+  }
+  assert(CFGetRetainCount(surface)==retains && mockImports==0 && gHeldImportCount==0);
+ }
+ assert(mockAttempts==attempts+4 && gSurfaceImportHits==hits+4);
  // Optional cache ownership alone is sufficient for a pressure reclaim to return measured current backing.
  dispatch_sync(importPressureQueue(),^{gNoHoldImports=false;});
  @autoreleasepool {assert(surfaceBuffer(surface,IOSurfaceGetBaseAddress(surface),4096));}
@@ -196,6 +239,6 @@ static void importTests() {
  dispatch_sync(importPressureQueue(),^{reclaimGpuMemory("held-only-test");});
  assert(gHeldImportCount==0 && mockImports==0 && gGpuReclaimFreed==freed+4096 && gNoHoldImports);
  CFRelease(surface);assert(gSurfaceImportsMade==gSurfaceImportsReleased);
- puts("PASS actual imports: retain-per-attempt, failure cleanup, racing publication, losing handle cleanup, live ownership, release outside lock");
+ puts("PASS actual imports: concurrent same-surface calls allocate once, share the retry result, and release outside the lock");
 }
 int main(){@autoreleasepool{policyTests();retryTests();noCopyTests();importTests();}return 0;}
