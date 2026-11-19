@@ -429,7 +429,7 @@ int main()
          * seconds, "~" for an orphan, names cut to 10 characters, what the rate limit dropped. */
         bool held[NativeAdrenoMaxClients]={};
         for(unsigned s=0;s<9;++s)held[s]=true;
-        CHECK(NativeAdrenoClientSmallFree(w4,held)==3 && NativeAdrenoClientSmallFree(w16,held)==23 && NativeAdrenoClientSmallFree(w2,held)==0 &&
+        CHECK(NativeAdrenoClientSmallFree(w4,held)==3 && NativeAdrenoClientSmallFree(w16,held)==small_end-9 && NativeAdrenoClientSmallFree(w2,held)==0 &&
               NativeAdrenoClientSmallFree(nullptr,held)==0 && NativeAdrenoListedSmallKeep(w4)==3 && NativeAdrenoListedSmallKeep(w16)==4 &&
               NativeAdrenoClientSlotFor(false,false,false,w4,held)==NativeAdrenoMaxClients);
         NativeAdrenoSlotHolder holders[NativeAdrenoMaxClients]={};
