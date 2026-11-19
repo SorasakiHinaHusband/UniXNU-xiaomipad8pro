@@ -25,13 +25,18 @@ void pause(void *v) {++((Fixture*)v)->pauses;}
 int main() {
  for(int mode=0;mode<3;++mode) {
   Fixture f; auto stop=f.owner.disconnect(); f.owner.stopped(stop);
-  for(int n=0;n<1000;++n) {f.owner.setPower(true); assert(!f.owner.allowed(f.owner.read()));}
+  assert(!f.owner.allowed(f.owner.read()));
+  // Reapplied ON restores permission, but cannot publish the cold-boot profile.
+  const auto on=f.owner.setPower(true);
+  assert(f.owner.allowed(on) && f.owner.serial(on)==f.owner.serial(stop));
+  for(int n=0;n<1000;++n) assert(f.owner.setPower(true)==on);
+  assert(!f.gen && !f.calls);
   f.fail=mode==1; f.missing=mode==2;
   piano_boot_join_transport t={&f,ready,receipt,associate,pause};
   assert(piano_boot_join(&t,10)==(mode==0?0:mode==1?2:3)); assert(f.calls==1);
   if(!mode)assert(f.owner.allowed(f.owner.read()));
   stop=f.owner.disconnect(); f.owner.stopped(stop);
-  for(int n=0;n<1000;++n)assert(!f.owner.allowed(f.owner.read()));
+  assert(!f.owner.allowed(f.owner.read()));
  }
  Fixture f; piano_boot_join_transport t={&f,ready,receipt,associate,pause};
  assert(piano_boot_join(&t,1)==1 && f.calls==0);
