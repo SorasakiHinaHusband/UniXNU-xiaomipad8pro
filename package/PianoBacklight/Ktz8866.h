@@ -307,11 +307,15 @@ class Controller {
   }
   void percent(uint32_t p, const char *source)
   {
-    if (!control_) return;
+    const uint16_t next = codeForPercent(p, cfg_.floor);
+    if (control_) limited("level %u %% from %s: code %u -> %u", p, source, code_, next);
+    manualCode(next, source);
+  }
+  void manualCode(uint16_t next, const char *source)
+  {
+    if (!control_ || next < cfg_.floor || next > kFullScale) return;
     if (ambient_.automatic()) note("automatic brightness: off, a level was set by %s (piano-backlight-auto=1 as a property: on again)", source);
     ambient_.manual();
-    const uint16_t next = codeForPercent(p, cfg_.floor);
-    limited("level %u %% from %s: code %u -> %u", p, source, code_, next);
     code_ = next;
     apply();
   }

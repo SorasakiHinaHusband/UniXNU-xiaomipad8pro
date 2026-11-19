@@ -40,6 +40,7 @@
 //                               the brightness keys then shift the curve by the steps (kept for the boot); piano-backlight-percent
 //                               switches to manual, piano-backlight-auto=0/1 as a property leaves / enters again. Without it nothing
 //                               of this runs (docs/drivers/backlight.md, sensors.md 5a.4)
+//   piano-backlight-native=1    publish the macOS SDR brightness adapter (level 2, with piano-backlight-keys=0)
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -47,6 +48,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -56,8 +58,11 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <sys/codesign.h>
+#include <sys/proc.h>
 #include "BitI2c.h"
 #include "Ktz8866.h"
+#include "NativeBrightness.h"
 #include <IOKit/IOMessage.h>
 #include "PianoBacklightClient.h"
 #include <PianoPowerContract.h>
@@ -73,6 +78,7 @@ namespace {
 
 struct Args {
   uint32_t level, percent, percentGiven, floor, lid, keys, flags, halfUs, swap, autoAllowed;
+  bool native;
 };
 Args gArgs;
 
@@ -98,6 +104,7 @@ void readArgs()
   gArgs.halfUs = clampArg(bootArg("piano-backlight-halfbit", 5), 2, 50);
   gArgs.swap = bootArg("piano-backlight-swap", 0);
   gArgs.autoAllowed = bootArg("piano-backlight-auto", 0) == 1;
+  gArgs.native = gArgs.level >= 2 && gArgs.keys == 0 && bootArg("piano-backlight-native", 0) == 1;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -281,12 +288,51 @@ struct Pending {
   int32_t automatic;         // the property piano-backlight-auto: -1 none, 0 off, 1 on
   uint32_t ambientCalls;
   int32_t sleep;             // setPowerState: -1 none, 1 off (a system sleep), 0 on (the wake)
+  int32_t native = -1;       // newest absolute request, encoded as signed 16.16 nits
 };
 IOLock *gLock;
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
 // The thread's answer to a sleep request: the requests taken, and whether the ICs were dark after the last one.
 uint32_t gSleepAsked, gSleepTaken;
 bool gServing, gDarkForSleep;
+bool gNativeReady;
+LogLimit gNativeRejectionLog{8, 10000};  // protected by gLock
+
+class NativeProperties {
+ public:
+  explicit NativeProperties(IOService &service) : service_(service), fields_(OSDictionary::withCapacity(6)) {}
+  ~NativeProperties() { OSSafeReleaseNULL(fields_); }
+
+  bool range(const char *key, uint32_t min, uint32_t max, uint32_t value)
+  {
+    OSDictionary *range = OSDictionary::withCapacity(3);
+    const bool ok = fields_ && range && put(range, "min", min) && put(range, "max", max)
+        && put(range, "value", value) && fields_->setObject(key, range);
+    OSSafeReleaseNULL(range);
+    return ok;
+  }
+  bool number(const char *key, uint32_t value) { return put(fields_, key, value); }
+  bool scalar(const char *key, uint32_t value) { return service_.setProperty(key, uint64_t(value), 32); }
+  bool data(const char *key, const void *bytes, unsigned size)
+  {
+    OSData *data = OSData::withBytes(bytes, size);
+    const bool ok = data && service_.setProperty(key, data);
+    OSSafeReleaseNULL(data);
+    return ok;
+  }
+  bool commit(const char *key) { return fields_ && service_.setProperty(key, fields_); }
+
+ private:
+  static bool put(OSDictionary *dict, const char *key, uint32_t value)
+  {
+    OSNumber *number = OSNumber::withNumber(uint64_t(value), 32);
+    const bool ok = dict && number && dict->setObject(key, number);
+    OSSafeReleaseNULL(number);
+    return ok;
+  }
+  IOService &service_;
+  OSDictionary *fields_;
+};
 
 }  // namespace
 
@@ -302,6 +348,12 @@ class PianoBacklight : public IOService {
   uint64_t fPublished[23] = {};
   bool fHavePublished = false;
   uint64_t fNextLookupMs = 0;
+  uint64_t fNextNativeMs = 0;
+  uint16_t fNativeCode = 0;
+  int32_t fNativeRequest = -1;
+  uint32_t fNativeErrors = 0;
+  bool fNativePublished = false;
+  LogLimit fNativeApplyLog{24, 10000};
   int fDisplayProperty = -1;   // NativeGopDisplay's piano-display-power as last read (-1: none yet)
   bool fDisplayKnown = false, fDisplayOn = true;
   uint32_t fSystem = 0, fApi = 0;
@@ -313,6 +365,8 @@ class PianoBacklight : public IOService {
   void poll(uint64_t now, bool lidOnly);
   IOService *sibling(const char *className);
   void publishState();
+  void publishNativeState();
+  IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
  public:
   using IOService::callPlatformFunction;
@@ -358,7 +412,7 @@ bool PianoBacklight::start(IOService *provider)
     return true;
   }
   thread_deallocate(thread);
-  registerService();   // NativeGopDisplay (piano-backlight>=2) and the key producers find the service by its class
+  if (!gArgs.native) registerService();   // Native mode first prepares its initial properties on the worker.
   if (gArgs.level >= 2) note("system sleep: in the power tree (%#x): off clears BL_EN on both ICs, on restores it", pianopower::join(this));
   return true;
 }
@@ -407,6 +461,7 @@ void PianoBacklight::run()
   if (!surveyPins()) {
     piano_backlight_stage = -1;
     note("FAILED at step 1: no usable bus; nothing written");
+    if (gArgs.native) registerService();
     return;
   }
   const bool both = fCtl.survey();
@@ -427,6 +482,7 @@ void PianoBacklight::run()
   if (!fCtl.start()) {
     piano_backlight_stage = -2;
     publishState();
+    if (gArgs.native) registerService();
     return;
   }
   publishState();
@@ -515,16 +571,33 @@ void PianoBacklight::serve()
   IOLockLock(gLock);
   gServing = true;
   IOLockUnlock(gLock);
+  if (gArgs.native) {
+    publishNativeState();
+    if (!fNativePublished) registerService(kIOServiceAsynchronous);
+  }
   uint64_t nextPoll = 0, nextSlow = 0, nextAlive = nowMs() + 60000;
   for (;;) {
     Pending p;
     IOLockLock(gLock);
     if (!gPending.any) {
+      const uint64_t now = nowMs();
+      const uint64_t wait = gPending.native < 0 ? 250 : fNextNativeMs > now ? fNextNativeMs - now : 0;
       uint64_t deadline = 0;
-      clock_interval_to_deadline(250, kMillisecondScale, &deadline);
-      IOLockSleepDeadline(gLock, &gPending, deadline, THREAD_UNINT);
+      if (wait) {
+        clock_interval_to_deadline(uint32_t(wait), kMillisecondScale, &deadline);
+        IOLockSleepDeadline(gLock, &gPending, deadline, THREAD_UNINT);
+      }
     }
     p = gPending;
+    if (p.native >= 0) {
+      const uint64_t now = nowMs();
+      if (now < fNextNativeMs) {
+        p.native = -1;
+      } else {
+        gPending.native = -1;
+        fNextNativeMs = now + kNativeApplyIntervalMs;
+      }
+    }
     gPending.any = gPending.display = gPending.ambient = false;
     gPending.steps = 0;
     gPending.percent = gPending.automatic = gPending.sleep = -1;
@@ -553,6 +626,14 @@ void PianoBacklight::serve()
     }
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
+    if (p.native >= 0) {
+      uint16_t code = 0;
+      if (NativeBrightness(fCtl.floor()).decode(uint32_t(p.native), code)) {
+        fNativeRequest = p.native;
+        fNativeErrors = fCtl.errors();
+        fCtl.manualCode(code, kNativeRequest);
+      }
+    }
     if (p.automatic >= 0) fCtl.automatic(p.automatic == 1, "setProperties");
     if (p.ambient) fCtl.ambient(p.target, p.lux, p.ambientSource);
     const uint64_t now = nowMs();
@@ -564,12 +645,58 @@ void PianoBacklight::serve()
       if (slow) fCtl.retry();
     }
     publishState();
+    if (gArgs.native) publishNativeState();
     if (now >= nextAlive) {
       nextAlive = now + 600000;
       note("alive: %s, code %u (%u %%), %s; %u writes, %u failed accesses; calls: display %u, steps %u", fCtl.controlling() ? "controlling" : "NOT controlling",
            fCtl.code(), percentOf(fCtl.code()), fCtl.lit(0) && fCtl.lit(1) ? "lit" : fCtl.lit(0) || fCtl.lit(1) ? "HALF lit" : "dark",
            fCtl.writes(), fCtl.errors(), p.displayCalls, p.stepCalls);
     }
+  }
+}
+
+void PianoBacklight::publishNativeState()
+{
+  const NativeBrightness adapter(fCtl.floor());
+  uint16_t code = 0;
+  const bool applied = adapter.applied(fCtl, code);
+  if (applied && (!fNativePublished || code != fNativeCode)) {
+    NativeProperties params(*this);
+    if (adapter.parameters(params, code)) {
+      fNativeCode = code;
+      if (!fNativePublished) {
+        NativeProperties calibration(*this);
+        if (adapter.calibration(calibration) && setProperty("piano-backlight-native-implementation", kNativeMarker)) {
+          IOLockLock(gLock);
+          gNativeReady = true;
+          IOLockUnlock(gLock);
+          fNativePublished = setProperty("backlight-control", true);  // matching flag comes last
+          if (fNativePublished) {
+            note("%s ready: nominal SDR %u..500 nits, floor=%u code=%u", kNativeMarker, adapter.minNits(), fCtl.floor(), code);
+            registerService(kIOServiceAsynchronous);
+          } else {
+            IOLockLock(gLock);
+            gNativeReady = false;
+            IOLockUnlock(gLock);
+          }
+        }
+      } else {
+        messageClients(kIOMessageServicePropertyChange);
+      }
+    }
+  }
+  if (fNativeRequest >= 0) {
+    uint32_t dropped;
+    if (fNativeApplyLog.allow(nowMs(), &dropped))
+      note("%s source=%s requested16=%d result=%s applied_millinits=%u primary=%u secondary=%u errors=%u skipped=%u",
+           kNativeMarker, kNativeRequest, fNativeRequest, applied && fNativeCode == code ? "applied" : "pending",
+           adapter.milliNits(fNativeCode), fCtl.ic(0).code, fCtl.ic(1).code, fCtl.errors() - fNativeErrors, dropped);
+    fNativeRequest = -1;
+  }
+  if (fNativePublished && !fCtl.controlling()) {
+    IOLockLock(gLock);
+    gNativeReady = false;
+    IOLockUnlock(gLock);
   }
 }
 
@@ -626,6 +753,7 @@ IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, v
   const bool display = name && name->isEqualTo(kFunctionDisplay), step = name && name->isEqualTo(kFunctionStep);
   const bool ambient = name && name->isEqualTo(kFunctionAmbient);
   if (!display && !step && !ambient) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+  if (step && gArgs.native) return kIOReturnUnsupported;
   if (ambient && (gArgs.level < 2 || !gArgs.autoAllowed)) return kIOReturnUnsupported;
   if (!gLock) return kIOReturnNotReady;
   IOLockLock(gLock);
@@ -687,10 +815,38 @@ IOReturn PianoBacklight::setPowerState(unsigned long state, IOService *)
 
 // An administrator's request (IORegistryEntrySetCFProperties): "piano-backlight-percent" = 0..100 of the range, "piano-backlight-step"
 // = a signed number of steps. Level 2 only.
+IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value)
+{
+  if (!gArgs.native) return kIOReturnUnsupported;
+  const bool admin = IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+  proc_t process = current_proc();
+  const bool platform = process && csproc_get_platform_binary(process);
+  const bool authorized = nativeWriter(admin, platform, platform ? cs_identity_get(process) : nullptr);
+  OSNumber *number = OSDynamicCast(OSNumber, value);
+  const uint64_t fixed = number ? number->unsigned64BitValue() : 0;
+  uint16_t code = 0;
+  const bool valid = properties.getCount() == 1 && number && (number->numberOfBits() == 32 || number->numberOfBits() == 64)
+      && NativeBrightness(uint16_t(gArgs.floor)).decode(fixed, code);
+  IOLockLock(gLock);
+  const IOReturn result = !authorized ? kIOReturnNotPrivileged : !valid ? kIOReturnBadArgument
+      : !gNativeReady ? kIOReturnNotReady : kIOReturnSuccess;
+  uint32_t dropped;
+  const bool logRefusal = result != kIOReturnSuccess && gNativeRejectionLog.allow(nowMs(), &dropped);
+  if (result == kIOReturnSuccess) {
+    gPending.native = int32_t(fixed);
+    gPending.any = true;
+    IOLockWakeup(gLock, &gPending, false);
+  }
+  IOLockUnlock(gLock);
+  if (logRefusal) note("%s source=%s refused=%#x pid=%d skipped=%u", kNativeMarker, kNativeRequest, result, proc_selfpid(), dropped);
+  return result;
+}
+
 IOReturn PianoBacklight::setProperties(OSObject *properties)
 {
   OSDictionary *d = OSDynamicCast(OSDictionary, properties);
   if (!d || gArgs.level < 2 || !gLock) return kIOReturnUnsupported;
+  if (OSObject *native = d->getObject(kNativeRequest)) return enqueueNative(*d, native);
   if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return kIOReturnNotPrivileged;
   OSNumber *percent = OSDynamicCast(OSNumber, d->getObject("piano-backlight-percent"));
   OSNumber *steps = OSDynamicCast(OSNumber, d->getObject("piano-backlight-step"));

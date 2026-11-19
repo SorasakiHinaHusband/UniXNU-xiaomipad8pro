@@ -7,10 +7,12 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. backlight_host.cpp -o /tmp/backlight_host && /tmp/backlight_host
 #include "BitI2c.h"
 #include "Ktz8866.h"
+#include "NativeBrightness.h"
 #include "PianoBacklightClient.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -797,6 +799,94 @@ static void testAmbientReadbackFault()
   checkWhitelist(m, 128);
 }
 
+struct NativePropertyRecord {
+  std::map<std::string, std::vector<uint32_t>> ranges;
+  std::map<std::string, uint32_t> numbers, scalars;
+  std::map<std::string, std::vector<int32_t>> blobs;
+  std::string name;
+  bool range(const char *key, uint32_t min, uint32_t max, uint32_t value)
+  {
+    ranges[key] = {min, max, value};
+    return true;
+  }
+  bool number(const char *key, uint32_t value) { numbers[key] = value; return true; }
+  bool scalar(const char *key, uint32_t value) { scalars[key] = value; return true; }
+  bool data(const char *key, const void *bytes, unsigned size)
+  {
+    CHECK(size % sizeof(int32_t) == 0);
+    const auto *values = static_cast<const int32_t *>(bytes);
+    blobs[key] = {values, values + size / sizeof(int32_t)};
+    return true;
+  }
+  bool commit(const char *key) { name = key; return true; }
+};
+
+static void testNativeBrightness()
+{
+  for (const uint16_t floor : {32, 128, 921, 1024}) {
+    const NativeBrightness adapter(floor);
+    uint16_t code = 0;
+    uint32_t prior = 0;
+    for (uint16_t expected = floor; expected <= kFullScale; ++expected) {
+      const uint32_t value = adapter.milliNits(expected);
+      CHECK(value > prior);
+      CHECK(adapter.decode((uint64_t(value) * 65536 + 500) / 1000, code) && code == expected);
+      prior = value;
+    }
+    CHECK(prior == 500000);
+    CHECK(!adapter.decode((adapter.minNits() << 16) - 1, code));
+    CHECK(!adapter.decode((500u << 16) + 1, code));
+    CHECK(!adapter.decode(uint32_t(-65536), code));
+    CHECK(!adapter.decode((1ull << 32) | (500u << 16), code));
+    NativePropertyRecord params, calibration;
+    CHECK(adapter.parameters(params, 1400));
+    CHECK(params.name == "IODisplayParameters" && params.ranges.size() == 2);
+    CHECK((params.ranges.at("brightness") == std::vector<uint32_t>{floor, 2047, 1400}));
+    CHECK((params.ranges.at("BrightnessMilliNits") ==
+           std::vector<uint32_t>{1000 * adapter.minNits(), 500000, adapter.milliNits(1400)}));
+    CHECK(adapter.calibration(calibration) && calibration.name == "backlight-calibration-parameters");
+    const auto &samples = calibration.blobs.at("backlight-marketing-table");
+    CHECK(samples.size() == 3 && samples[0] > 0 && samples[0] < samples[1] && samples[1] < samples[2]);
+    CHECK(calibration.blobs.at("LmaxProduct").size() == 1 && calibration.blobs.at("LmaxProduct")[0] == samples[2]);
+    CHECK(calibration.scalars.at("LminProduct") == adapter.minNits() && calibration.scalars.at("LmidProduct") == adapter.midNits());
+    CHECK(calibration.numbers.size() == 6 && calibration.numbers.at("lMidPanel") == uint32_t(samples[1]));
+  }
+  CHECK(nativeWriter(false, true, "com.apple.WindowServer"));
+  CHECK(nativeWriter(true, false, nullptr));
+  CHECK(!nativeWriter(false, false, "com.apple.WindowServer"));
+  CHECK(!nativeWriter(false, true, "com.apple.WindowServer.other"));
+  CHECK(!nativeWriter(false, true, nullptr));
+
+  Model m;
+  Controller ctl(m);
+  Config cfg;
+  cfg.autoAllowed = true;
+  ctl.configure(cfg);
+  CHECK(ctl.survey() && ctl.start());
+  const NativeBrightness adapter(cfg.floor);
+  ctl.ambient(450, 200, "test");
+  CHECK(ctl.autoActive());
+  uint16_t applied = 0;
+  CHECK(adapter.applied(ctl, applied));
+  const uint16_t previous = applied;
+  m.deaf[1] = true;
+  ctl.manualCode(1600, kNativeRequest);
+  CHECK(!ctl.ambientState().requested());
+  CHECK(ctl.ic(0).code == 1600 && ctl.ic(1).code == previous);
+  CHECK(!adapter.applied(ctl, applied) && applied == previous);
+  m.deaf[1] = false;
+  ctl.retry();
+  CHECK(adapter.applied(ctl, applied) && applied == 1600 && !ctl.autoActive());
+  ctl.sleep(true);
+  ctl.manualCode(1500, kNativeRequest);
+  CHECK(!adapter.applied(ctl, applied) && applied == 1600);
+  ctl.sleep(false);
+  CHECK(adapter.applied(ctl, applied) && applied == 1500);
+  ctl.automatic(true, "test");
+  ctl.ambient(550, 500, "test");
+  CHECK(ctl.autoActive() && adapter.applied(ctl, applied) && applied != 1500);
+}
+
 int main()
 {
   testI2c();
@@ -811,6 +901,7 @@ int main()
   testKeys();
   testAmbient();
   testAmbientReadbackFault();
+  testNativeBrightness();
   if (failures) {
     std::printf("backlight_host: %d FAILED\n", failures);
     return 1;
