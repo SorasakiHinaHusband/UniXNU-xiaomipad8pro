@@ -1423,6 +1423,44 @@ static void testGauge()
   const PackReading restored = combinePacks(sample, 2);
   CHECK(restored.ok && restored.packs == 2 && restored.fullMah == 8634 && restored.remainingMah == 3440);
   CHECK(restored.socPct == 40 && restored.charging && !restored.full);
+
+  // A later whole-snapshot pass can encounter another corrupt register.
+  // Command-local recovery avoids rereading already credible words.
+  Gauge later;
+  fillGauge(later, 4120, 530, 72, 3000, 4290, 379, 0);
+  later.replies[kGaugeVoltage] = {4120, 0xffff, 4120};
+  later.replies[kGaugeSoc] = {0xffff, 72};
+  I2cBus laterBus(later.io());
+  const GaugeReading local = readGauge(laterBus);
+  CHECK(local.ok && local.socPct == 72 && local.voltageMv == 4120);
+  CHECK(local.wordRetryMask == (1u << 3) && local.wordRereads == 1 && later.replyAt[kGaugeVoltage] == 1);
+
+  // Multiple independent corrupt words, including current -1 as valid data.
+  Gauge scattered;
+  fillGauge(scattered, 4120, -1, 72, 3000, 4290, 379, 0);
+  scattered.replies[kGaugeSoc] = {0xffff, 72};
+  scattered.replies[kGaugeVoltage] = {0xffff, 4120};
+  I2cBus scatterBus(scattered.io());
+  const GaugeReading repaired = readGauge(scatterBus);
+  CHECK(repaired.ok && repaired.socPct == 72 && repaired.voltageMv == 4120 && repaired.currentMa == -1);
+  CHECK(repaired.wordRetryMask == ((1u << 0) | (1u << 3)));
+  CHECK(repaired.wordRetryValid == repaired.wordRetryMask && repaired.wordRereads == 2);
+  CHECK(scattered.reads == 12 && scattered.replyAt[kGaugeSoc] == 2 && scattered.replyAt[kGaugeVoltage] == 2);
+
+  Gauge persistent;
+  fillGauge(persistent, 4120, 530, 65535, 3000, 4290, 379, 0);
+  I2cBus persistentBus(persistent.io());
+  const GaugeReading stillBad = readGauge(persistentBus);
+  CHECK(!stillBad.ok && stillBad.socPct == 65535 && stillBad.failedCommand == 0xff);
+  CHECK(stillBad.wordRetryMask == (1u << 3) && !stillBad.wordRetryValid && stillBad.wordRereads == 2);
+  CHECK(persistent.reads == 22);   // One word reread per pass, two full passes; never unbounded.
+
+  Gauge interrupted;
+  fillGauge(interrupted, 4120, 530, 65535, 3000, 4290, 379, 0);
+  interrupted.nackReadNumber = 5;   // The SOC reobservation cannot be treated as a credible sample.
+  I2cBus interruptedBus(interrupted.io());
+  const GaugeReading noAck = readGaugeOnce(interruptedBus);
+  CHECK(!noAck.ok && noAck.error == I2cResult::nackAddress && noAck.failedCommand == kGaugeSoc);
 }
 
 // ------------------------------------------------------------------------------------------------------------ MCA model

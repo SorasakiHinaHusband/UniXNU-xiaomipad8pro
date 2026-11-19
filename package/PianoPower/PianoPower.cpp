@@ -318,6 +318,10 @@ GaugeReading readBus(GaugeBus &b)
   GaugeReading g = readGauge(bus);
   givePin(b.sda);
   givePin(b.scl);
+  if (g.wordRereads)
+    IOLog("PianoPower: GaugeWordReobserveV1 pack=%s first=%#x/%u tried=%#x credible=%#x reads=%u final-valid=%u soc=%d mv=%d error=%u failed=%#x\n",
+          b.name, g.firstRetryCommand, g.firstRetryValue, g.wordRetryMask, g.wordRetryValid, g.wordRereads,
+          unsigned(g.ok), g.socPct, g.voltageMv, unsigned(g.error), g.failedCommand);
   return g;
 }
 

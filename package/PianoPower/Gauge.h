@@ -191,9 +191,24 @@ struct GaugeReading {
   int designMah = 0;      // 0 when the gauge did not answer it (read on its own: it never invalidates the reading)
   int tempDeciC = 0;      // tenths of a degree Celsius
   uint16_t status = 0;
+  uint16_t wordRetryMask = 0, wordRetryValid = 0;
+  unsigned wordRereads = 0;
+  uint8_t firstRetryCommand = 0;
+  uint16_t firstRetryValue = 0;
 };
 
 inline int16_t asSigned(uint16_t v) { return int16_t(v); }
+
+inline bool gaugeWordCredible(uint8_t command, uint16_t value)
+{
+  switch (command) {
+    case kGaugeVoltage: return value >= 2500 && value <= 5000;
+    case kGaugeSoc: return value <= 100;
+    case kGaugeTemperature: return value > 2332 && value < 3632;
+    case kGaugeRemaining: case kGaugeFull: case kGaugeStatus: case kGaugeCycles: return value != 0xffff;
+    default: return true;   // Signed current -1 is a real reading, not an all-ones sentinel.
+  }
+}
 
 inline GaugeReading readGaugeOnce(I2cBus &bus)
 {
@@ -206,6 +221,25 @@ inline GaugeReading readGaugeOnce(I2cBus &bus)
     if (g.error != I2cResult::ok) {
       g.failedCommand = kOrder[i];
       return g;
+    }
+    if (!gaugeWordCredible(kOrder[i], v[i])) {
+      // An ACK is not a plausibility check. Reobserve this command before a
+      // whole new snapshot exposes all the other words to another bad read.
+      // readWord supplies a fresh command pointer, STOP and bus-free interval.
+      if (!g.wordRetryMask) {g.firstRetryCommand = kOrder[i]; g.firstRetryValue = v[i];}
+      const uint16_t bit = uint16_t(1u << i);
+      g.wordRetryMask |= bit;
+      g.wordRereads++;
+      uint16_t next = 0;
+      const I2cResult error = bus.readWord(kGaugeAddress, kOrder[i], &next);
+      if (error == I2cResult::ok) {
+        v[i] = next;
+        if (gaugeWordCredible(kOrder[i], next)) g.wordRetryValid |= bit;
+      } else {
+        g.error = error;
+        g.failedCommand = kOrder[i];
+        return g;
+      }
     }
   }
   g.voltageMv = v[0];
@@ -241,7 +275,15 @@ inline GaugeReading readGauge(I2cBus &bus)
   // Capacity/flags are independent of the voltage, SOC and temperature gate.
   // Keep a credible core reading if its reread failed; publication still has
   // its own capacity guard. A failed core reading is never made valid here.
-  return next.ok || !first.ok ? next : first;
+  GaugeReading result = next.ok || !first.ok ? next : first;
+  result.wordRetryMask = first.wordRetryMask | next.wordRetryMask;
+  result.wordRetryValid = first.wordRetryValid | next.wordRetryValid;
+  result.wordRereads = first.wordRereads + next.wordRereads;
+  if (first.wordRetryMask) {
+    result.firstRetryCommand = first.firstRetryCommand;
+    result.firstRetryValue = first.firstRetryValue;
+  }
+  return result;
 }
 
 struct PackReading {
