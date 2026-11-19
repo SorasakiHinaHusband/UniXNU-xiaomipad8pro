@@ -162,12 +162,7 @@ This does not change the terminal WindowServer capture failure boundary.
  static void watchImportPressure() {
   static dispatch_once_t once;
   dispatch_once(&once,^{
-+  dispatch_queue_t queue=importPressureQueue();
-+  // notify deliveries are asynchronous; peer failures can reclaim this process without reentering a runtime Memory lock.
-+  static int token;
-+  const int status=notify_register_dispatch("org.unixnu.piano.gpu-reclaim",&token,queue,^(int){gGpuReclaimDelivered++;reclaimGpuMemory("notify");});
-+  if(status!=NOTIFY_STATUS_OK)NBLOG(@"native-metal: gpu-reclaim notify registration failed %d",status);
-   dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
+-  dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
 -   DISPATCH_MEMORYPRESSURE_NORMAL|DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
 -  if(!source)return;
 -  // The runtime's kept empty blocks (fork patch 0013) and its spare and kept blocks (bridge patch 0021) go too, as Metal's resource
@@ -182,6 +177,12 @@ This does not change the terminal WindowServer capture failure boundary.
 -   if(gDevice){gTrimmedBlocks+=nmb_device_trim_memory(gDevice,0);(void)nmb_device_release_kept_memory(gDevice);}
 -  });
 -  dispatch_activate(source);
++  dispatch_queue_t queue=importPressureQueue();
++  // notify deliveries are asynchronous; peer failures can reclaim this process without reentering a runtime Memory lock.
++  static int token;
++  const int status=notify_register_dispatch("org.unixnu.piano.gpu-reclaim",&token,queue,^(int){gGpuReclaimDelivered++;reclaimGpuMemory("notify");});
++  if(status!=NOTIFY_STATUS_OK)NBLOG(@"native-metal: gpu-reclaim notify registration failed %d",status);
++  static dispatch_source_t source;source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
 +   DISPATCH_MEMORYPRESSURE_NORMAL|DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,queue);
 +  if(source) {
 +   dispatch_source_set_event_handler(source,^{
@@ -204,7 +205,7 @@ This does not change the terminal WindowServer capture failure boundary.
   dispatch_once(&once,^{
 -  dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
 +  watchImportPressure();
-+  dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,importPressureQueue());
++  static dispatch_source_t timer;timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,importPressureQueue());
    if(!timer)return;
    dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
 -  dispatch_source_set_event_handler(timer,^{if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);});
