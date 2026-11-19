@@ -16,14 +16,16 @@ enum A830QualInhibit : uint32_t {A830QualGpuInvalid=1,A830QualBoardInvalid=2,A83
     A830QualBoardOver=8,A830QualNeedRounds=16};
 class A830Qualification {
 public:
-    void init(A830PowerState *power,A830Recovery *recovery,bool r3b=false,void (*unsafe)(void *)=nullptr,
+    void init(A830PowerState *power,A830Recovery *recovery,bool r3b=false,void (*unsafe)(void *,A830ExitOrigin)=nullptr,
               bool residency607=false) {
         power_=power;recovery_=recovery;r3b_=r3b;unsafe_=unsafe;power_->setQualificationCeiling(3,3);
         // Bound the residency run from permit open, allowing the four thermally guarded up-steps before timing level 7.
         windowNs_=r3b && residency607?625000000000ull:602000000000ull;
         if(r3b) {
             recovery_->qualificationR3b();
-            power_->qualificationGuard([](void *p,uint64_t now) {static_cast<A830Qualification *>(p)->checkLease(now);},this);
+            power_->qualificationGuard([](void *p,uint64_t now,A830ExitContext source) {
+                static_cast<A830Qualification *>(p)->checkLease(now,source);
+            },this);
         }
     }
     bool r3b() const {return r3b_;}
@@ -39,7 +41,7 @@ public:
     uint32_t reason() const {return uint32_t(__atomic_load_n(&firstFailure_,__ATOMIC_ACQUIRE)&7);}
     uint64_t failedAt() const {return __atomic_load_n(&firstFailure_,__ATOMIC_ACQUIRE)>>3;}
     uint64_t openedAt() const {return __atomic_load_n(&openedAt_,__ATOMIC_ACQUIRE);}
-    void fault(uint32_t reason,uint64_t now) {
+    void fault(uint32_t reason,uint64_t now,A830ExitContext source=A830ExitContext::Guard) {
         // One publication for the incident and its timestamp. A later real HFI fault still needs recovery.
         uint64_t expected=0;
         const bool first=__atomic_compare_exchange_n(&firstFailure_,&expected,now<<3|reason,false,
@@ -47,6 +49,11 @@ public:
         __atomic_store_n(&high_,false,__ATOMIC_RELEASE);
         if(reason==A830QualSensor || reason==A830QualGpuHot || (r3b_ && reason==A830QualBoardHot))
             power_->setQualificationCeiling(1,2);
+        if(r3b_ && first) {
+            const uint64_t opened=openedAt();
+            a830ExitTrace.firstCause(now,reason,source,opened,opened?opened+windowNs_:0,
+                                     __atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE),power_->qualificationCap());
+        }
         if(r3b_ && reason!=A830QualVote) {
             if(first)recovery_->requestQualificationLow(reason,now);
             return;
@@ -93,13 +100,13 @@ public:
         // After the boot latch, cool readings may still reach 342; unknown/hot must always be able to reach 160.
         power_->setQualificationCeiling(!gpuOk || gpuHot?1:high()?7:3,!gpuOk || gpuHot?2:high()?6:3);
     }
-    void checkLease(uint64_t now) {
+    void checkLease(uint64_t now,A830ExitContext source=A830ExitContext::Guard) {
         const uint64_t at=__atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE);
         if(r3b_ && high() && openedAt() && now>=openedAt() && now-openedAt()>=windowNs_)
-            fault(A830QualExpired,now);
+            fault(A830QualExpired,now,source);
         else if(__atomic_load_n(&high_,__ATOMIC_ACQUIRE) && (r3b_?(now<at || now-at>A830R3bThermal::Lease):(now>=at && now-at>=2500000000ull)))
-            fault(A830QualSensor,now);
-        else if(power_->qualificationLatched() && !reason())fault(A830QualVote,now);
+            fault(A830QualSensor,now,source);
+        else if(power_->qualificationLatched() && !reason())fault(A830QualVote,now,source);
         if(r3b_ && openedAt() && (now<at || now-at>A830R3bThermal::Lease))power_->setQualificationCeiling(1,2);
     }
     void sample(uint64_t now,const Sm8750TsensSample &gpu) {
@@ -108,12 +115,12 @@ public:
             for(unsigned i=0;i<8;++i) {
                 if(gpu.deci[i]<-400 || gpu.deci[i]>1250)valid=false;
                 if(gpu.valid&(1u<<i)) {
-                    if(gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr);break;}
+                    if(gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr,A830ExitOrigin::Raw105);break;}
                     if(gpu.deci[i]>=850)hot=true;
                 }
             }
-            if(!reason() && hot)fault(A830QualGpuHot,now);
-            else if(high() && !valid)fault(A830QualSensor,now);
+            if(!reason() && hot)fault(A830QualGpuHot,now,A830ExitContext::Dcvs);
+            else if(high() && !valid)fault(A830QualSensor,now,A830ExitContext::Dcvs);
             return; // no filter/cap update here: the sole 100 ms owner does that in tickR3b
         }
         if(!openedAt())return;
@@ -127,7 +134,7 @@ public:
 private:
     void tickR3b(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard) {
         // Last protection runs before any board call/log/fault path can stall.
-        for(unsigned i=0;i<8;++i)if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr);break;}
+        for(unsigned i=0;i<8;++i)if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr,A830ExitOrigin::Raw105);break;}
         checkLease(now); // never renew a missing guard's expired lease
         thermal_.tick(now,gpu,board,boardOk,high());
         __atomic_store_n(&heartbeatAt_,now,__ATOMIC_RELEASE);
@@ -147,6 +154,7 @@ private:
         }
         if(!openedAt() && __atomic_load_n(&armed_,__ATOMIC_ACQUIRE) && ready() && !power_->qualificationLatched()) {
             __atomic_store_n(&openedAt_,now,__ATOMIC_RELEASE);__atomic_store_n(&high_,true,__ATOMIC_RELEASE);
+            a830ExitTrace.add(A830ExitStage::Permit,0,now+windowNs_,0,0,0,now);
         }
         const uint64_t end=openedAt()+windowNs_;
         power_->setQualificationLease(now+A830R3bThermal::Lease<end?now+A830R3bThermal::Lease:end);
@@ -154,10 +162,11 @@ private:
         if(!high() && cap>3)cap=3;
         const uint8_t buses[]={0,2,2,3,4,4,4,6};
         power_->setQualificationCeiling(cap,buses[cap]);
-        if(deadlineMissed(now) && unsafe_)unsafe_(nullptr);
+        if(thermal_.events&12)a830ExitTrace.board(thermal_.boardCap,now,cap);
+        if(deadlineMissed(now) && unsafe_)unsafe_(nullptr,A830ExitOrigin::ProtectionDeadline);
     }
     bool r3b_=false;
-    void (*unsafe_)(void *)=nullptr;
+    void (*unsafe_)(void *,A830ExitOrigin)=nullptr;
     A830R3bThermal thermal_{};
     A830PowerState *power_=nullptr;
     A830Recovery *recovery_=nullptr;

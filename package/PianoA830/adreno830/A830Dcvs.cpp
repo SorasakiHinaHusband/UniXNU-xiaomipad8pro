@@ -171,7 +171,7 @@ uint8_t A830Dcvs::ceiling() const
     const uint8_t ceiling=min8(knobCeiling_,thermalCeiling_);
 #endif
     uint8_t limited=ceiling,bus=busOf(ceiling);
-    power_->limitQualification(limited,bus);
+    power_->limitQualification(limited,bus,A830ExitContext::Dcvs);
     return limited?limited:1;
 }
 
@@ -526,7 +526,7 @@ uint8_t A830Dcvs::wanted(uint64_t now) const
 
 void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille)
 {
-    power_->limitQualification(level,bus);
+    power_->limitQualification(level,bus,A830ExitContext::Dcvs);
     if(!level || level>table_.count)return;
     if(stopped_)return;              /* annibale: an unacknowledged vote ended the changes (the target stays level_) */
     power_->setTarget(level,bus);    /* sent as HFI M9 if the GMU starts before this vote goes out */
@@ -547,7 +547,7 @@ void A830Dcvs::vote(uint64_t now,uint8_t level,uint8_t bus,uint32_t busyPermille
     if(active) {
         // Recheck the independent heartbeat's cap after acquiring the mutex.
         uint8_t boundedBus=bus;
-        power_->limitQualification(level,boundedBus);
+        power_->limitQualification(level,boundedBus,A830ExitContext::Dcvs);
         if(boundedBus!=bus) {bus=boundedBus;bw=annibale_?uint32_t(bus):bus|A830_HFI_BW_NO_AB;}
         if(!power_->qualificationBlocked())result=ops_.perfVote(ops_.context,level,bw);
         else {power_->unlock();return;}

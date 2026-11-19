@@ -15,7 +15,7 @@ enum class A830ExitStage : uint32_t {
     HfiWait, HfiLocked, EnqueueBegin, Enqueued, MatchingAck, VoteResult, LowResult, Open,
     DrainBegin, DrainEnd, StrictBegin, QuiesceBegin, QuiesceEnd, StrictEnd,
     Cm3Begin, Cm3End, GxBegin, GxEnd, RsccBegin, RsccEnd, RestartBegin, RestartEnd,
-    Terminal
+    Terminal, StrictHwError
 };
 
 class A830ExitTrace {
@@ -28,6 +28,7 @@ public:
     static_assert(sizeof(Record)==48,"exit record ABI");
 
     void start(uint64_t (*clock)(void *),void *context) {
+        if(boot())return;
         clock_=clock;
         context_=context;
         __atomic_store_n(&boot_,clock(context),__ATOMIC_RELEASE);
@@ -43,7 +44,7 @@ public:
                     uint64_t heartbeat,uint32_t cap) {
         if(!boot())return;
         __atomic_store_n(&first_,now<<3|reason,__ATOMIC_RELEASE);
-        add(A830ExitStage::First,uint32_t(source),opened,deadline,heartbeat,
+        add(A830ExitStage::First,uint32_t(source)<<8|reason,opened,deadline,heartbeat,
             ack()|(uint64_t(cap)<<48),now);
     }
     void board(bool hold,uint64_t now,uint32_t cap) {
@@ -75,7 +76,6 @@ public:
         // Preserve the beginning of this one-shot transaction even if stages outnumber the slots.
         // Dropped sequence numbers are visible in head(). Slots are written once and never reused.
         if(seq>Capacity)return;
-        publish(slots_[seq-1],seq,{at?at:clock_(context_),a,b,c,d,uint32_t(stage),status});
         switch(stage) {
         case A830ExitStage::PowerLocked: case A830ExitStage::CxEnd: case A830ExitStage::HfiLocked:
         case A830ExitStage::Enqueued: case A830ExitStage::MatchingAck: case A830ExitStage::VoteResult:
@@ -86,6 +86,7 @@ public:
             break;
         default: break;
         }
+        publish(slots_[seq-1],seq,{at?at:clock_(context_),a,b,c,d,uint32_t(stage),status});
     }
     void terminal(A830ExitOrigin origin,uint64_t protectionAt,bool safeLow,bool safeOff) {
         if(!boot() || __atomic_exchange_n(&terminalClaimed_,true,__ATOMIC_ACQ_REL))return;

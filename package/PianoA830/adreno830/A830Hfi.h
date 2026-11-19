@@ -3,6 +3,7 @@
 #define A830_HFI_H
 #include <IOKit/IOTypes.h>
 #include <stdint.h>
+#include "A830ExitTrace.h"
 #include "A830Regs.h"
 #include "A830Votes.h"
 
@@ -217,13 +218,13 @@ private:
     enum Outcome {Continue,Matched,Fatal};
 
     IOReturn transact(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,unsigned message,
-                      bool tolerate,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);
+                      bool tolerate,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false,A830ExitVote trace=A830ExitVote::None);
     IOReturn exchange(uint8_t id,const uint32_t *payload,uint32_t dwords,A830HfiAck *ack,uint16_t step,unsigned message,
-                      bool tolerate,bool *pushed,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);   /* transact without the annibale late drain */
+                      bool tolerate,bool *pushed,uint32_t timeoutUs,bool dropAck,A830ExitVote trace);   /* transact without the annibale late drain */
     uint32_t drainLateLocked(uint32_t microseconds);
     IOReturn startLocked(const A830VoteTables &tables,const A830HfiStartOptions &options);
     IOReturn acdLocked(const A830VoteTables &tables);
-    IOReturn perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false);
+    IOReturn perfVoteLocked(uint8_t level,uint32_t bw,uint16_t step,unsigned message,uint32_t timeoutUs=A830_T_HFI_ACK_US,bool dropAck=false,A830ExitVote trace=A830ExitVote::None);
     IOReturn voteLocked(uint8_t level,uint32_t bw);   /* perfVote/perfVoteBw: pending while stopped, checks, unchanged */
     IOReturn push(uint32_t header,const uint32_t *payload,uint32_t dwords);
     int pop(unsigned queue,Message *message);          /* 1 message, 0 empty, -1 corrupt */

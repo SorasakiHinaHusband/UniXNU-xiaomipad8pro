@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef A830_POWER_STATE_H
 #define A830_POWER_STATE_H
+#include "A830ExitTrace.h"
 #include <IOKit/IOTypes.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -254,16 +255,18 @@ public:
     void holdQualificationLow(bool hold) {__atomic_store_n(&qualificationLow_,hold,__ATOMIC_RELEASE);}
     bool qualificationLatched() const {return __atomic_load_n(&qualificationSticky_,__ATOMIC_ACQUIRE);}
     void setQualificationExternal(uint8_t level,uint8_t bus) {__atomic_store_n(&qualificationExternal_,uint32_t(level)|uint32_t(bus)<<8,__ATOMIC_RELEASE);}
-    void qualificationGuard(void (*check)(void *,uint64_t),void *context) {qualificationCheck_=check;qualificationContext_=context;}
+    void qualificationGuard(void (*check)(void *,uint64_t,A830ExitContext),void *context) {qualificationCheck_=check;qualificationContext_=context;}
     void blockQualification(bool block) {if(qualificationCheck_)__atomic_store_n(&qualificationBlocked_,block,__ATOMIC_SEQ_CST);}
     bool qualificationBlocked() const {return __atomic_load_n(&qualificationBlocked_,__ATOMIC_SEQ_CST);}
     void parkQualification() {__atomic_store_n(&qualificationParked_,true,__ATOMIC_RELEASE);}
     uint8_t qualificationCap() const {return uint8_t(__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE));}
     uint8_t qualificationEffectiveCap() {uint8_t level=7,bus=6;limitQualification(level,bus);return level;}
-    void checkQualification() {if(qualificationCheck_)qualificationCheck_(qualificationContext_,env_.nowNs(env_.context));}
+    void checkQualification(A830ExitContext source=A830ExitContext::Power) {
+        if(qualificationCheck_)qualificationCheck_(qualificationContext_,env_.nowNs(env_.context),source);
+    }
     void setQualificationLease(uint64_t until) {__atomic_store_n(&qualificationLease_,until,__ATOMIC_RELEASE);}
-    void limitQualification(uint8_t &level,uint8_t &bus) {
-        checkQualification();
+    void limitQualification(uint8_t &level,uint8_t &bus,A830ExitContext source=A830ExitContext::Power) {
+        checkQualification(source);
         if(__atomic_load_n(&qualificationParked_,__ATOMIC_ACQUIRE) ||
            __atomic_load_n(&qualificationLow_,__ATOMIC_ACQUIRE)) {level=1;bus=2;return;}
         const uint32_t cap=__atomic_load_n(&qualificationCap_,__ATOMIC_ACQUIRE);
@@ -349,7 +352,7 @@ private:
     uint64_t lastActivity_=0,sleptAt_=0,idleSince_=0,nextSlumberRow_=0;
     uint32_t seenSubmitted_=0;
     uint8_t targetLevel_=2,targetBus_=2,submitLevel_=0,submitBus_=0,touchLevel_=0,touchBus_=0;
-    void (*qualificationCheck_)(void *,uint64_t)=nullptr;
+    void (*qualificationCheck_)(void *,uint64_t,A830ExitContext)=nullptr;
     void *qualificationContext_=nullptr;
     uint32_t qualificationCap_=0;
     uint32_t qualificationExternal_=0;

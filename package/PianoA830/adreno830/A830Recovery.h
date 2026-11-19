@@ -119,7 +119,7 @@ public:
     const A830HangSnapshot &snapshot() const {return snapshot_;}
     const A830RecoveryStats &stats() const {return stats_;}
     const A830RecoveryConfig &config() const {return config_;}
-    void qualification(void (*unsafe)(void *),void *context) {qualification_=true;unsafe_=unsafe;unsafeContext_=context;}
+    void qualification(void (*unsafe)(void *,A830ExitOrigin),void *context) {qualification_=true;unsafe_=unsafe;unsafeContext_=context;}
     // No power or HFI mutex: the independent heartbeat may close the actual submit ring.
     void closeQualification(uint8_t cause=A830FaultHfi);
     void qualificationR3b() {qualificationR3b_=true;}
@@ -170,7 +170,7 @@ private:
     uint32_t lowRequest_=0;
     bool safeOff_=false;
     bool qualificationSafeLow_=false;
-    void (*unsafe_)(void *)=nullptr;
+    void (*unsafe_)(void *,A830ExitOrigin)=nullptr;
     void *unsafeContext_=nullptr;
     uint64_t history_[4]={};            /* start times of the recent recoveries */
     /* watchdog */

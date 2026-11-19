@@ -9,7 +9,7 @@ static A830Recovery recovery;
 static A830Dcvs dcvs;
 static A830Qualification qual;
 static unsigned unsafe;
-static void halt(void *) {++unsafe;}
+static void halt(void *,A830ExitOrigin) {++unsafe;}
 static uint32_t raw=Sm8750TsensValidBit|450;
 static uint32_t tempRead(void *,uint32_t) {return raw;}
 static Sm8750TsensIo tsens={nullptr,tempRead};

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "A830Gmu.h"
+#include "A830ExitTrace.h"
 #include "A830Profile.h"
 #include "Adreno830Status.h"
 #include <IOKit/IOLib.h>
@@ -884,13 +885,16 @@ IOReturn A830Gmu::forceOffStrict(int (*gxVote)(void *,int),void *cookie)
     if((result=gmuPut(A8XX_GMUAO_AHB_FENCE_STATUS_CLR,A830_AHB_FENCE_STATUS_CLR_VALUE,Fence))!=kIOReturnSuccess ||
        (result=gmuPut(A8XX_GMUAO_AHB_FENCE_CTRL,A830_AHB_FENCE_CTRL_ALLOW,Fence))!=kIOReturnSuccess ||
        (result=gmuWait(A8XX_GMUAO_AHB_FENCE_CTRL,UINT32_MAX,A830_AHB_FENCE_CTRL_ALLOW,Fence))!=kIOReturnSuccess)return result;
+    a830ExitTrace.stage(A830ExitStage::Cm3Begin);
     if((result=gmuPut(A8XX_GMUCX_CM3_SYSRESET,A830_GMU_CM3_SYSRESET_ASSERT,Reset))!=kIOReturnSuccess ||
        (result=gmuWait(A8XX_GMUCX_CM3_SYSRESET,UINT32_MAX,A830_GMU_CM3_SYSRESET_ASSERT,Reset))!=kIOReturnSuccess)return result;
+    a830ExitTrace.stage(A830ExitStage::Cm3End);
     booted_=false;
     if((result=gbif(A8XX_GBIF_HALT_ARB,Arbiter))!=kIOReturnSuccess)return result;
     uint32_t gx=0;
     constexpr uint32_t off=A8XX_GMUCX_GFX_PWR_CLK_STATUS_GX_OFF;
     const uint32_t status=gmuReg(A8XX_GMUCX_GFX_PWR_CLK_STATUS);
+    a830ExitTrace.stage(A830ExitStage::GxBegin);
     if(!rd(A830GmuWindowGmu,status,&gx) || gx==UINT32_MAX)
         return fail(Gx,A830ReasonReadback,status,gx,off,kIOReturnIOError);
     if((gx&off)!=off) {
@@ -906,7 +910,10 @@ IOReturn A830Gmu::forceOffStrict(int (*gxVote)(void *,int),void *cookie)
         const int unvote=gxVote(cookie,0);
         if(unvote)return fail(GxVote,A830ReasonReadback,0,uint32_t(unvote),0,kIOReturnIOError);
     }
+    a830ExitTrace.stage(A830ExitStage::GxEnd,0,gx);
+    a830ExitTrace.stage(A830ExitStage::RsccBegin);
     if((result=rsccSleep(true))!=kIOReturnSuccess) {failure_.step=Rscc;return result;}
+    a830ExitTrace.stage(A830ExitStage::RsccEnd);
     if((result=gmuWait(A8XX_GMUCX_GFX_PWR_CLK_STATUS,off,off,Gx))!=kIOReturnSuccess ||
        (result=wait(A830GmuWindowGmu,GxCfgGdscr,GxPowerDownComplete,GxPowerDownComplete,0,GxCollapse))!=kIOReturnSuccess)
         return result;

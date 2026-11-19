@@ -50,7 +50,7 @@
 extern "C" __attribute__((weak)) void adreno830_qualification_note(const char *) {}
 extern "C" bool adreno830_qualification_log_ready();
 extern "C" __attribute__((weak)) bool adreno830_qualification_board(piano_gpu_temps *) {return false;}
-extern "C" __attribute__((weak)) void adreno830_qualification_unsafe() {}
+extern "C" __attribute__((weak)) void adreno830_qualification_unsafe(A830ExitOrigin,uint64_t,bool,bool) {}
 
 #ifndef ADRENO830_HOST_TEST
 #include <IOKit/IOLib.h>
@@ -201,7 +201,10 @@ void qualLog(const char *format,...) {
     if(n<0 || unsigned(n)>=sizeof line)line[0]=0; // the export counts a rejected record; never certify a truncated tail
     adreno830_qualification_note(line);
 }
-void qualificationUnsafe(void *) {adreno830_qualification_unsafe();} // no logger, allocation, power or HFI lock on the emergency path
+void qualificationUnsafe(void *,A830ExitOrigin origin) {
+    adreno830_qualification_unsafe(origin,g830.recovery.protectionAt(),
+                                    g830.recovery.qualificationSafeLow(),g830.recovery.safeOff());
+} // no logger, allocation, power or HFI lock on the emergency path
 /* The cmd-db snapshot: 128 KiB, static storage (never a stack object: XNU kernel stacks are 16 KiB, ARCHITECTURE 4.1.1). */
 #if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
 /* UniXNU-piano (k27 native kext): a one-time heap allocation instead (Sm8750Rpmh.h allows either). The k27 kernel collection places a
@@ -2202,13 +2205,16 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
 bool qualificationCxAccessible()
 {
     uint32_t gdsc=0,ahb=0,clock=0;
-    return g830.power_state.cxOn() && mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc) &&
+    a830ExitTrace.stage(A830ExitStage::CxBegin);
+    const bool accessible=g830.power_state.cxOn() && mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc) &&
         !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GDS_HW_CTRL,&gdsc) && gdsc!=UINT32_MAX &&
         (gdsc&SM8750_GDSC_PWR_ON) &&
         !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_AHB_CBCR,&ahb) && ahb!=UINT32_MAX &&
         (ahb&SM8750_CBCR_ENABLE) &&
         !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GMU_CBCR,&clock) && clock!=UINT32_MAX &&
         (!(clock&SM8750_CBCR_CLK_OFF) || SM8750_CBCR_NOC_FSM_STATUS(clock)==SM8750_CBCR_NOC_FSM_ON);
+    a830ExitTrace.stage(A830ExitStage::CxEnd,accessible?0u:uint32_t(kIOReturnNotReady),gdsc,ahb,clock);
+    return accessible;
 }
 
 IOReturn opGmuForceOff(void *)
@@ -2218,6 +2224,8 @@ IOReturn opGmuForceOff(void *)
     if(gQualification.r3b()) {
         r=qualificationCxAccessible()?g830.gmu.forceOffStrict(A830GmuGxVoteStrict,&g830.gx_voter):kIOReturnNotReady;
         const auto &f=g830.gmu.failure();
+        if(r!=kIOReturnSuccess && r!=kIOReturnNotReady)
+            a830ExitTrace.stage(A830ExitStage::StrictHwError,uint32_t(r),f.step,f.reg,f.value,f.expect);
         qualLog("R3b3 strict result=%x step=%u reg=%llx value=%llx want=%llx at-us=%llu",
             unsigned(r),r==kIOReturnSuccess?0:f.step,f.reg,f.value,f.expect,nowUs());
     } else {
@@ -2620,7 +2628,7 @@ void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
     if(gQualification.r3b()) {requested=uint8_t(g830.hfi.stats().last_level);bus=uint8_t(g830.hfi.stats().last_bw);}
     qualLog("R3a vote-unknown request=%08x seq=%u requested=%u/%u oldACK=%u/%u error=%x reason=%u at-us=%llu",
         h.hdr,A830_HFI_HDR_SEQ(h.hdr),requested,bus,g830.power_state.votedLevel(),g830.power_state.votedBus(),unsigned(error),h.reason,nowUs());
-    gQualification.fault(A830QualVote,nowUs()*1000);
+    gQualification.fault(A830QualVote,nowUs()*1000,A830ExitContext::Dcvs);
 }
 void qualificationThread(void *)
 {
@@ -2644,7 +2652,7 @@ void qualificationThread(void *)
             __atomic_store_n(&gQualificationExitTest,test-2,__ATOMIC_RELEASE);
         }
         gQualification.tick(now,gpu,board,ok,injectTrip);
-        if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr);
+        if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr,A830ExitOrigin::ProtectionDeadline);
         const bool event=gQualification.r3b() && (gQualification.thermal().events || gQualification.reason()!=lastReason);
         if(event) {
             const auto &t=gQualification.thermal();
@@ -2672,7 +2680,7 @@ void qualificationThread(void *)
     }
 }
 void qualificationService(void *,uint64_t now) {
-    gQualification.checkLease(now);
+    gQualification.checkLease(now,A830ExitContext::Dcvs);
     const uint64_t at=__atomic_load_n(&gQualificationInjectAt,__ATOMIC_ACQUIRE);
     if(at && now>=at && __atomic_exchange_n(&gQualificationInjectAt,0ull,__ATOMIC_ACQ_REL)) {
         if(gQualification.high() && g830.power_state.votedLevel()>3 &&
@@ -2745,12 +2753,13 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
         d->recovery.qualification(qualificationUnsafe,nullptr);
         const bool residency607=qualificationResidency(b);
         gQualification.init(&d->power_state,&d->recovery,config.qualificationR3b,qualificationUnsafe,residency607);
+        if(config.qualificationR3b)a830ExitTrace.start(d->power_env.nowNs,d->power_env.context);
         if(residency607)qualLog("R3b residency qualification window-s=625 floor-mhz=607");
         if(config.qualificationR3b)qualLog("R3b CONFIG R3b-607-v1 soft=800 cool=750 hard=850 halt=1050 floor=3 guard-ms=100 lease-ms=250 down-ms=500 up-ms=2000 board-hold=62000,37000 board-release=60000,35000 board-hard=65000,40000");
         d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;
         if(config.qualificationR3b) {
             d->hfi.qualificationLimiter([](void *p,uint8_t &level,uint8_t &bus) {
-                static_cast<A830PowerState *>(p)->limitQualification(level,bus);
+                static_cast<A830PowerState *>(p)->limitQualification(level,bus,A830ExitContext::Hfi);
             },&d->power_state);
             ops.qualificationAck=[](void *,uint8_t &level,uint8_t &bus) {level=g830.hfi.currentLevel();bus=g830.hfi.currentBus();};
         }

@@ -81,7 +81,8 @@ extern "C" void adreno830_qualification_note(const char *line) {
   }
   IOLog("PianoA830: %s\n",line); // convenience only; qualification evidence comes from the read-only export
 }
-extern "C" void adreno830_qualification_unsafe() {
+extern "C" void adreno830_qualification_unsafe(A830ExitOrigin origin,uint64_t protectionAt,bool safeLow,bool safeOff) {
+  a830ExitTrace.terminal(origin,protectionAt,safeLow,safeOff);
   // Native 0070 uses the SMC conduit (k27 0069). A graceful halt can wait on the very power mutex/HFI
   // whose deadline expired. Only this unconfirmed-GX emergency bypasses filesystem and IOKit shutdown.
   register uint64_t function __asm__("x0")=0x84000008u; // PSCI SYSTEM_OFF
@@ -99,6 +100,38 @@ extern "C" bool adreno830_qualification_board(piano_gpu_temps *out) {
 SYSCTL_DECL(_machdep);
 static struct sysctl_oid gQual607Oid;
 static struct sysctl_oid gQualLogOid;
+static struct sysctl_oid gExitTraceOid;
+static int exitTraceSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+  if(req->newptr || !kauth_cred_issuser(kauth_cred_get()))return EPERM;
+  const uint64_t boot=a830ExitTrace.boot();
+  if(!boot)return EAGAIN;
+  if(!req->oldptr) {req->oldidx=(A830ExitTrace::Capacity+1)*160+160;return 0;}
+  const uint32_t head=a830ExitTrace.head();
+  const uint32_t end=head<A830ExitTrace::Capacity?head:A830ExitTrace::Capacity;
+  A830ExitTrace::Record row,terminal;
+  const uint32_t terminalSeq=a830ExitTrace.copyTerminal(terminal);
+  const bool appendTerminal=terminalSeq>end && terminalSeq<=head;
+  // Do not output a successful partial snapshot if a producer reserved a slot but has not committed it.
+  for(uint32_t seq=1;seq<=end;++seq)
+    if(!a830ExitTrace.copy(seq,row))return EAGAIN;
+  char line[160];
+  int n=snprintf(line,sizeof line,"R3DXLOG-v1 record-bytes=%u boot=%llu next=%u lost=%u\n",
+                 unsigned(sizeof row),boot,head+1,head-end-unsigned(appendTerminal));
+  int err=SYSCTL_OUT(req,line,n);
+  const auto writeRecord=[&](uint32_t seq,const A830ExitTrace::Record &r) {
+    const int bytes=snprintf(line,sizeof line,"R3DXREC seq=%u at=%llu stage=%u status=%u a=%llx b=%llx c=%llx d=%llx commit=%u\n",
+                             seq,r.at,r.stage,r.status,r.a,r.b,r.c,r.d,seq);
+    return SYSCTL_OUT(req,line,bytes);
+  };
+  for(uint32_t seq=1;!err && seq<=end;++seq) {
+    if(!a830ExitTrace.copy(seq,row))return EAGAIN;
+    err=writeRecord(seq,row);
+  }
+  if(!err && appendTerminal)err=writeRecord(terminalSeq,terminal);
+  n=snprintf(line,sizeof line,"R3DXEND next=%u",head+1);
+  if(!err)err=SYSCTL_OUT(req,line,n+1);
+  return err;
+}
 static int qualLogSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
   if(req->newptr)return EPERM;
   if(!adreno830_qualification_log_ready())return ENOMEM;
@@ -147,6 +180,13 @@ static void registerQual607(bool record) {
   gQualLogOid.oid_name="piano_gpu_qual607_log";gQualLogOid.oid_handler=qualLogSysctl;gQualLogOid.oid_fmt="A";
   gQualLogOid.oid_descr="C5LOG-v1 bounded read-only qualification records";
   gQualLogOid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gQualLogOid);
+  bzero(&gExitTraceOid,sizeof gExitTraceOid);
+  gExitTraceOid.oid_parent=&sysctl__machdep_children;gExitTraceOid.oid_number=OID_AUTO;
+  gExitTraceOid.oid_kind=int(CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  gExitTraceOid.oid_name="piano_gpu_r3b_exit";
+  gExitTraceOid.oid_handler=exitTraceSysctl;gExitTraceOid.oid_fmt="A";
+  gExitTraceOid.oid_descr="R3DXLOG-v1 bounded R3b exit stages";
+  gExitTraceOid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&gExitTraceOid);
 }
 #include <PianoDisplayFollow.h>
 

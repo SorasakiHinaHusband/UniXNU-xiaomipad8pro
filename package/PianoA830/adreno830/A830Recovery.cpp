@@ -66,6 +66,7 @@ void A830Recovery::requestQualificationLow(uint32_t reason,uint64_t now,bool dro
     power_->latchQualification();
     __atomic_store_n(&protectionAt_,now,__ATOMIC_RELEASE);
     __atomic_store_n(&qualificationSafeLow_,false,__ATOMIC_RELEASE);
+    a830ExitTrace.stage(A830ExitStage::Request,reason,now,now+5000000000ull,1|(2u<<8),dropAck);
     __atomic_store_n(&lowRequest_,reason|(dropAck?0x100u:0),__ATOMIC_RELEASE);
     env_.wake(env_.context);
 }
@@ -106,7 +107,9 @@ void A830Recovery::report(uint8_t cause,uint64_t detail)
 IOReturn A830Recovery::runPending()
 {
     if(!pending())return kIOReturnSuccess;
+    a830ExitTrace.stage(A830ExitStage::PowerWait);
     power_->lock();
+    a830ExitTrace.stage(A830ExitStage::PowerLocked);
     const uint32_t request=__atomic_load_n(&lowRequest_,__ATOMIC_ACQUIRE);
     IOReturn low=kIOReturnSuccess;
     if(__atomic_load_n(&pendingCause_,__ATOMIC_ACQUIRE)==Publishing) {
@@ -114,9 +117,11 @@ IOReturn A830Recovery::runPending()
         return kIOReturnSuccess;
     }
     if(request && !faultPending() && !lost()) {
+        a830ExitTrace.stage(A830ExitStage::LowBegin,request);
         stage("low-begin");
         if(qualificationAsleep() && !(request&0x100u)) {
             power_->pinQualificationWake();
+            a830ExitTrace.stage(A830ExitStage::LowDeferred);
             stage("low-deferred");
         } else if(power_->phase()==A830PowerActive && rops_.qualificationLowVote) {
             low=rops_.qualificationLowVote(rops_.context,(request&0x100u)!=0);
@@ -124,10 +129,14 @@ IOReturn A830Recovery::runPending()
                 power_->setTarget(1,2);
                 power_->noteVoted(1,2);
                 power_->holdQualificationLow(false);
+                a830ExitTrace.stage(A830ExitStage::LowResult,0,1,2);
                 stage("low-confirmed");
             }
         } else low=kIOReturnNotReady;
-        if(low!=kIOReturnSuccess)stage("low-failed",low);
+        if(low!=kIOReturnSuccess) {
+            a830ExitTrace.stage(A830ExitStage::LowResult,uint32_t(low));
+            stage("low-failed",low);
+        }
     }
     const uint8_t cause=__atomic_load_n(&pendingCause_,__ATOMIC_ACQUIRE);
     IOReturn result=kIOReturnSuccess;
@@ -141,6 +150,8 @@ IOReturn A830Recovery::runPending()
     } else if(request && !lost() && cause!=Publishing) {
         __atomic_store_n(&qualificationSafeLow_,true,__ATOMIC_RELEASE);
         power_->blockQualification(false);
+        a830ExitTrace.stage(A830ExitStage::Open,0,qualificationSafeLow(),safeOff());
+        a830ExitTrace.opened(power_->votedLevel()==1 && power_->votedBus()==2);
     }
     if(request)__atomic_store_n(&lowRequest_,0u,__ATOMIC_RELEASE);
     power_->unlock();
@@ -187,7 +198,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
                 power_->latchQualification();
                 const bool safe=ops_.gmuForceOff(ops_.context)==kIOReturnSuccess;
                 __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
-                if(!safe && unsafe_)unsafe_(unsafeContext_);
+                if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::RestartReoffFailed);
             }
             loseLocked(cause,A830SRunning,cause,result);
         }
@@ -318,18 +329,22 @@ void A830Recovery::minimalSnapshot(uint8_t cause,uint64_t detail)
 
 IOReturn A830Recovery::strictOff(bool provenAsleep)
 {
+    a830ExitTrace.stage(A830ExitStage::StrictBegin,0,provenAsleep);
     stage("strict-begin");
     IOReturn result=kIOReturnSuccess;
     if(!provenAsleep) {
         result=kIOReturnNotReady;
         if(power_->cxOn() && rops_.qualificationQuiesce) {
+            a830ExitTrace.stage(A830ExitStage::QuiesceBegin);
             result=rops_.qualificationQuiesce(rops_.context);
+            a830ExitTrace.stage(A830ExitStage::QuiesceEnd,uint32_t(result));
             if(result==kIOReturnSuccess) {
                 stage("strict-quiesced");
                 result=ops_.gmuForceOff(ops_.context);
             }
         }
     }
+    a830ExitTrace.stage(A830ExitStage::StrictEnd,uint32_t(result));
     stage("strict-end",result);
     return result;
 }
@@ -346,7 +361,9 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     if(qualification_)closeQualification(cause);
     else rops_.gate(rops_.context,A830GateRecovering,cause);
     const bool asleep=qualificationR3b_ && qualificationAsleep();
+    a830ExitTrace.stage(A830ExitStage::DrainBegin,0,cause,detail);
     const IOReturn drained=power_->beginRecovery();
+    a830ExitTrace.stage(A830ExitStage::DrainEnd,uint32_t(drained));
     if(qualificationR3b_)minimalSnapshot(cause,detail);
     else {
         capture(cause,detail,&snapshot_);
@@ -369,7 +386,7 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
             stage("strict-unsafe",off);
             ++stats_.failures;
             loseLocked(cause,A830SGmu,0,off);
-            if(unsafe_)unsafe_(unsafeContext_);
+            if(unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::StrictOffFailed);
             return off;
         }
         power_->setRsccSlept(true);
@@ -383,7 +400,7 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         else if(qualification_) {
             ++stats_.failures;
             loseLocked(cause,A830SGmu,0,off);
-            if(unsafe_)unsafe_(unsafeContext_);
+            if(unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::StrictOffFailed);
             return off;
         }
     }
@@ -393,13 +410,15 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     if(qualification_)power_->setTarget(1,2);
     __atomic_store_n(&safeOff_,false,__ATOMIC_RELEASE);
     uint16_t step=0,subStep=0;
+    a830ExitTrace.stage(A830ExitStage::RestartBegin,0,level,bus);
     const IOReturn result=power_->bringUp(level,bus,!power_->cxOn(),&step,&subStep,showProgress,&progress);
+    a830ExitTrace.stage(A830ExitStage::RestartEnd,uint32_t(result),step,subStep);
     if(result!=kIOReturnSuccess) {
         if(qualification_) {
             const IOReturn off=qualificationR3b_?strictOff(false):ops_.gmuForceOff(ops_.context);
             const bool safe=off==kIOReturnSuccess;
             __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
-            if(!safe && unsafe_)unsafe_(unsafeContext_);
+            if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::RestartReoffFailed);
         }
         /* "GPU LOST S<stage of the failing step>.<its own step>": e.g. S6.41 for a CP_ME_INIT that never finished. */
         ++stats_.failures;
@@ -420,6 +439,8 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     if(qualificationR3b_)power_->holdQualificationLow(false);
     power_->blockQualification(false);
     rops_.gate(rops_.context,A830GateOpen,cause);
+    a830ExitTrace.stage(A830ExitStage::Open,0,qualificationSafeLow(),safeOff());
+    a830ExitTrace.opened(true);
     __atomic_store_n(&qualificationClosed_,false,__ATOMIC_RELEASE);
     adreno830_status_running();
     __atomic_store_n(&running_,false,__ATOMIC_RELEASE);
