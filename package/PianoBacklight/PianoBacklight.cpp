@@ -60,6 +60,7 @@
 #include <stdarg.h>
 #include <sys/codesign.h>
 #include <sys/proc.h>
+#include <sys/ubc.h>
 #include "BitI2c.h"
 #include "Ktz8866.h"
 #include "NativeBrightness.h"

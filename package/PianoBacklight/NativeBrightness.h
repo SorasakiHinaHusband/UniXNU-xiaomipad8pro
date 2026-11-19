@@ -61,7 +61,7 @@ class NativeBrightness {
 
   template <typename Sink> bool calibration(Sink &sink) const
   {
-    const int32_t table[] = {int32_t(minNits() << 16), int32_t(midNits() << 16), 500 << 16};
+    const uint32_t table[] = {minNits() << 16, midNits() << 16, 500u << 16};
     return sink.number("lMinProduct", table[0]) && sink.number("lMidProduct", table[1])
         && sink.number("lMaxProduct", table[2]) && sink.number("lMinPanel", table[0])
         && sink.number("lMidPanel", table[1]) && sink.number("lMaxPanel", table[2])
