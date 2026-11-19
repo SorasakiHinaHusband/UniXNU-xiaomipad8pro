@@ -38,7 +38,7 @@ Against 0001-0011. No address-window or VM-backing change.
     notify_post(DARWIN_RECLAIM_NOTIFICATION);
  }
 
-@@ -1055,32 +1055,167 @@
+@@ -1055,32 +1055,168 @@
   * (darwin_ask_reclaim), each one reaps this process's own freed BOs. False: give up (five waits, or a whole series failed less than a
   * second ago). */
  static uint64_t darwin_retry_failed_ns;   /* when the last whole series failed; 0 after one that succeeded */
@@ -168,6 +168,7 @@ Against 0001-0011. No address-window or VM-backing change.
 + * retire state until the snapshot finishes; finish removes it before freeing.
 + * Fields: VA used/total/largest/holes, heap used/total, cached bytes,
 + * pending count, retries/wins, reclaim asked/seen, latched failure, version. */
++extern "C" __attribute__((visibility("default"))) bool tu_darwin_capacity_counts(uint64_t out[14]);
 +extern "C" __attribute__((visibility("default"))) bool
 +tu_darwin_capacity_counts(uint64_t out[14])
 +{
@@ -219,7 +220,7 @@ Against 0001-0011. No address-window or VM-backing change.
     static uint64_t outcomes[2];
     p_atomic_set(&darwin_retry_failed_ns, made ? 0 : os_time_get_nano());
     if (made) {
-@@ -1093,7 +1228,7 @@
+@@ -1093,7 +1229,7 @@
     while (mark < n)
        mark *= 10;
     if (mark == n)
@@ -228,7 +229,7 @@ Against 0001-0011. No address-window or VM-backing change.
                  "(%llu time%s)", made ? "made" : "still none", retries, retries == 1 ? "" : "s", (unsigned long long)n,
                  n == 1 ? "" : "s");
  }
-@@ -1251,22 +1386,20 @@
+@@ -1251,22 +1387,20 @@
     }
 
     unsigned retries = 0;   /* 0009 */
@@ -259,7 +260,7 @@ Against 0001-0011. No address-window or VM-backing change.
 
        NativeAdrenoAbiBoAlloc alloc = {.bytes = alloc_size, .align_log2 = 12, .contiguous = 0};
        NativeAdrenoAbiBoAllocReply reply = {};
-@@ -1274,25 +1407,14 @@
+@@ -1274,25 +1408,14 @@
        if (kr != KERN_SUCCESS) {
           if (!lazy_vma)
              darwin_free_iova(dev, iova, alloc_size);
@@ -290,7 +291,7 @@ Against 0001-0011. No address-window or VM-backing change.
 
        NativeAdrenoAbiBoMap map = {
           .handle = reply.handle,
-@@ -1304,8 +1426,16 @@
+@@ -1304,8 +1427,16 @@
        NativeAdrenoAbiBoMapReply mapped = {};
        kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
        if (kr != KERN_SUCCESS) {
@@ -309,7 +310,7 @@ Against 0001-0011. No address-window or VM-backing change.
        handle = reply.handle;
        if (lazy_vma)   /* its address now goes with the BO (darwin_bo_finish), not with the VMA */
           lazy_vma->msm.backs_lazy_bo = true;
-@@ -1361,23 +1491,44 @@
+@@ -1361,23 +1492,44 @@
     VkResult collected = darwin_collect_retired(dev);
     if (collected != VK_SUCCESS)
        return collected;
@@ -370,7 +371,7 @@ Against 0001-0011. No address-window or VM-backing change.
     }
 
     uint32_t gem_handle = (uint32_t)reply.handle;
-@@ -2041,10 +2192,18 @@
+@@ -2041,10 +2193,18 @@
     out_vma->flags = flags;
     out_vma->msm.size = size;
     out_vma->msm.backs_lazy_bo = false;

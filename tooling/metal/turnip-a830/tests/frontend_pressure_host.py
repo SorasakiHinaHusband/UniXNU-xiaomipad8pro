@@ -54,5 +54,8 @@ if args.syntax:
         subprocess.run(['patch', '-s', str(full), str(patch)], check=True)
     flags = args.flags.read_text().splitlines()
     flags[flags.index('-c')] = '-fsyntax-only'
-    subprocess.run(flags + [str(full)], check=True)
+    result = subprocess.run(flags + [str(full)], capture_output=True, text=True)
+    (args.out / 'frontend-syntax.log').write_text(result.stdout + result.stderr)
+    if result.returncode:
+        raise SystemExit(result.stderr[-4000:])
     print('PASS full frontend: arm64e Objective-C++ syntax and patch application')
