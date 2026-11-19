@@ -1130,6 +1130,37 @@ extern "C" bool piano_a830_llcc_island_ready(void)
   return pianollcc::ready(kLlccAny);
 }
 
+// Read-only first capacity-refusal snapshots survive process exit and bypass IOLog format-address decoding.
+namespace {
+int sysctlGpuRefusals(struct sysctl_oid *,void *,int,struct sysctl_req *req)
+{
+  if(req->newptr)return EPERM;
+  bool any=false;
+  for(unsigned entry=0;entry<NativeAdrenoFailureEntries;++entry) {
+    for(unsigned row=0;row<NativeAdrenoFailureRows;++row) {
+      char line[160];
+      const int count=native_adreno_failure_line(entry,row,line,sizeof(line)-1);
+      if(count<=0)break;
+      const size_t bytes=size_t(count)<sizeof(line)-1?size_t(count):sizeof(line)-2;
+      line[bytes]='\n';
+      const int error=SYSCTL_OUT(req,line,bytes+1);
+      if(error)return error;
+      any=true;
+    }
+  }
+  return any?SYSCTL_OUT(req,"",1):SYSCTL_OUT(req,"none\n",6);
+}
+void registerGpuRefusals()
+{
+  static struct sysctl_oid oid;
+  oid.oid_parent=&sysctl__machdep_children;oid.oid_number=OID_AUTO;
+  oid.oid_kind=int(CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  oid.oid_name="piano_gpu_refusals";oid.oid_handler=sysctlGpuRefusals;oid.oid_fmt="A";
+  oid.oid_descr="First GPU capacity refusal per slot and method; immutable, read only";
+  oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&oid);
+}
+} // namespace
+
 // ---- the GPU's ceiling slots (PianoGpuCeiling.h) ---------------------------------------------------------------------------------
 namespace {
 IOLock *gCeilingLock;
@@ -1510,6 +1541,7 @@ bool PianoA830::start(IOService *provider)
   nanoseconds_to_absolutetime(10ull * 1000000000ull, &gRowEvery);
   setProperty("piano-gpu", gLevel, 32);
   gService = this;
+  registerGpuRefusals();
   gCeilingLock = IOLockAlloc();
   setProperty("piano-gpu-ceiling-clients", pianogpu::kCeilingClients, 32);   // docs/policy.md §5.3: one slot per caller
   suspendConfigure(gLevel);

@@ -853,6 +853,11 @@ int main()
         NativeAdrenoAbiBoMap map{allocated.handle,Base,3,0,2,0};
         NativeAdrenoAbiBoMapReply mapped{};
         CHECK(p.client.dispatch(NativeAdrenoMethodBoMap,&map,sizeof(map),&mapped,sizeof(mapped),&ringclock)==kIOReturnSuccess);
+#ifdef ADRENO830_MACOS
+        CHECK(p.client.mapBo(&map,&mapped)==kIOReturnBusy && p.client.lastMapRefusal().why==NativeAdrenoMapWhyMapped);
+        CHECK(p.client.dispatch(NativeAdrenoMethodBoMap,&map,sizeof(map)-1,&mapped,sizeof(mapped),&ringclock)==kIOReturnBadArgument &&
+              p.client.lastMapRefusal().why==NativeAdrenoMapWhyNone);
+#endif
         NativeAdrenoAbiSubmit submit{};
         submit.buffer_count=1;submit.buffers[0]={allocated.handle,Base,2048};
         NativeAdrenoAbiSubmitReply reply{};

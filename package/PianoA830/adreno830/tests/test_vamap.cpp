@@ -16,6 +16,32 @@
 #define CHECK(x) do {++checks;if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 static unsigned checks;
 
+static void failureSnapshots()
+{
+    NativeAdrenoFailureSnapshot s{};s.captured=true;s.sequence=UINT64_MAX;
+    s.alloc={NativeAdrenoAllocWhyImport,NativeAdrenoMethodBoImport,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+    s.alloc.failure={"import-readonly-descriptor",kIOReturnNoMemory};
+    s.map={NativeAdrenoMapWhyVm,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,
+        {NativeAdrenoVmWhySpans,UINT64_MAX,UINT64_MAX,UINT64_MAX,nullptr,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX},true};
+    s.usage={UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+    s.objects=s.capacity=s.pool=s.other=s.imports=UINT64_MAX;
+    s.backing={UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+    char line[NativeAdrenoMapLineBytes];
+    for(uint32_t method:{uint32_t(NativeAdrenoMethodBoAlloc),uint32_t(NativeAdrenoMethodBoImport),uint32_t(NativeAdrenoMethodBoMap)})
+        for(unsigned row=0;row<NativeAdrenoFailureLines;++row) {
+            const int n=NativeAdrenoFailureLine(line,sizeof line,row,s,31,2147483647,method,kIOReturnNoMemory);
+            CHECK(n>0 && size_t(n)<sizeof line && std::strstr(line,"refusal n=18446744073709551615"));
+        }
+    NativeAdrenoFailureRecord first{};
+    CHECK(!first.line(line,sizeof line,0) && !line[0]);
+    CHECK(!first.remember(s,2,2399,NativeAdrenoMethodBoImport,kIOReturnBadArgument));
+    CHECK(first.remember(s,2,2399,NativeAdrenoMethodBoImport,kIOReturnNoMemory));
+    s.sequence=2;s.alloc.failure.stage="overwritten";
+    CHECK(!first.remember(s,7,159,NativeAdrenoMethodBoMap,kIOReturnNoResources));
+    CHECK(first.line(line,sizeof line,0)>0 && std::strstr(line,"pid=2399 slot=2") && std::strstr(line,"n=18446744073709551615"));
+    CHECK(first.line(line,sizeof line,1)>0 && std::strstr(line,"import-readonly-descriptor") && !std::strstr(line,"overwritten"));
+}
+
 static void windows()
 {
     const NativeAdrenoClientWindow *w=NativeAdrenoClientWindowsFor(0x20000000ull+0x3DFFFE000ull);
@@ -171,7 +197,7 @@ static void eventCounts()
 int main()
 {
 #ifdef ADRENO830_MACOS
-    windows();
+    failureSnapshots();windows();
     refusalLines();
     allocLines();
     accounting();

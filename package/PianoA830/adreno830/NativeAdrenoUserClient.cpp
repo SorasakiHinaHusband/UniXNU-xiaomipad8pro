@@ -759,6 +759,7 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
 {
 #ifdef ADRENO830_MACOS
     if(method==NativeAdrenoMethodBoAlloc)alloc_refusal_={};
+    if(method==NativeAdrenoMethodBoMap)map_refusal_={};
 #endif
 
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);

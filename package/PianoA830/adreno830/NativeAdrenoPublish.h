@@ -558,6 +558,10 @@ uint32_t native_adreno_coherent_imports(void);
  * after the pin and before the GPU can see them, so lines the zero fill or the pages' last owner left dirty are gone before the first GPU
  * write (ARCHITECTURE 4.14.1). A change of that order must take this property away. */
 #define NativeAdrenoImportCleanKey "NativeAdrenoImportClean"
+/* Immutable first capacity refusal for each slot and method (BoAlloc/BoImport/BoMap), independent of unified-log decoding.
+ * entry is slot*3 + method index, row is 0..9. Returns 0 for an empty entry; no driver locks are taken by the reader. */
+enum : unsigned {NativeAdrenoFailureEntries=NativeAdrenoMaxClients*3,NativeAdrenoFailureRows=10};
+int native_adreno_failure_line(unsigned entry,unsigned row,char *line,size_t size);
 /* Connections opened and closed so far, and the published service (null before S9). */
 uint32_t native_adreno_publish_stats(uint32_t *closed);
 IOService *native_adreno_published_service(void);
