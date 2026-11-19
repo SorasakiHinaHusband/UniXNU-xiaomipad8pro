@@ -18,6 +18,7 @@
 #include "AudioBoard.h"
 #include "AudioDspLink.h"
 #include "AudioLive.h"
+#include "AudioVa.h"
 #include "AudioPcm.h"
 #include "AudioPower.h"
 #include <sys/sysctl.h>
@@ -516,7 +517,7 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
     ops.clock_ms = [](void *) -> uint32_t {return nowMs();};
     ops.log = sessionLog;
     ops.send = sessionSend;
-    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu, a->micGain};
+    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu, AUDIO_MIC_ROUTE_LEGACY, a->micGain};
     pianoaudio::boardSetup(ops, b);
     audio_session_init(&gSession, &c, &ops, c.dsp ? &gLink.guard : nullptr);
     // A budget well beyond what the levels need (level 6's silence and level 7's walk are seconds; every command is answered or

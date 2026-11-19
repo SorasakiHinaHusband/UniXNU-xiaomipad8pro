@@ -6,7 +6,7 @@
 //   SMMU   the stream-match groups, S2CRs and bypass banks of the DSP's PCM streams 0x1001, 0x1081, 0x1041, 0x1061 (SmmuStream.h)
 //   DRAM   the first 128 KiB of PianoAudio's slice of the DSP-addressable memory (PianoDspMemory.h), mapped write-combined
 //   LPASS  level 10 only, while the DSP's PRM holds the VA votes and mclk: the VA macro's DMIC path (its first page) and the LPI
-//          TLMM's DMIC pins gpio6-9 (their function while the Mic captures, then as found) (AudioVa.h)
+//          TLMM's selected DMIC pins (input route while the Mic captures, then as found) (AudioVa.h)
 // and loads only of the VA macro's identity and the LPI DMIC pins (level 4, while the DSP's votes hold) and of the ESP (NativeUfs).
 // Nothing here touches GCC, RPMh, AOSS, the PAS calls or the DSP.
 #include <IOKit/IOLib.h>
@@ -321,7 +321,10 @@ bool dmaSetup(AudioSessionOps &ops)
 // ------------------------------------------------------------------------------- level 10: the VA macro's DMIC path
 // Called by the capture plan's local step only while the PRM votes and the VA mclk hold (AudioSession.h va_mic).
 Region gVa, gLpi[AUDIO_VA_PINS];
-uint32_t gLpiCfg[AUDIO_VA_PINS], gLpiValue[AUDIO_VA_PINS];
+AudioVaPin gLpiPins[AUDIO_VA_PINS];
+AudioVaPinState gLpiState[AUDIO_VA_PINS];
+unsigned gLpiCount;
+uint32_t gMicRouteGeneration;
 bool gVaOn;
 uint32_t vaRead(void *, uint32_t off) { return rd32(gVa.va + off); }
 void vaWrite(void *, uint32_t off, uint32_t v)
@@ -342,60 +345,74 @@ void vaUnmap()
   for (Region &r : gLpi) unmapRegion(r);
 }
 
-void lpiRestore()
+uint32_t lpiRead(void *, unsigned pin, unsigned off) { return rd32(gLpi[pin].va + off); }
+void lpiWrite(void *, unsigned pin, unsigned off, uint32_t value)
 {
-  for (unsigned k = 0; k < AUDIO_VA_PINS; ++k) {
-    if (!gLpi[k].va) continue;
-    wr32(gLpi[k].va + 4, gLpiValue[k] & 2u);
-    wr32(gLpi[k].va, gLpiCfg[k]);
-    dsb();
+  wr32(gLpi[pin].va + off, value);
+  dsb();
+}
+const AudioVaPinIo kLpiIo = {nullptr, lpiRead, lpiWrite};
+
+void vaRouteLog(const char *event, int route, const AudioVaReadback &r, int result)
+{
+  piano_audio_log("mic-route1: %s request %d applied %d gen %u DEC0 DMIC%u DEC1 DMIC2 mono %s mux0 %#x mux1 %#x src0 %#x src1 %#x pair-mask %#x ctl01 %#x ctl23 %#x ctl45 %#x ctl67 %#x pins %u result %d",
+                  event, route, route, gMicRouteGeneration, audio_mic_dec0(route), audio_mic_mono_name(route), r.mux[0], r.mux[1],
+                  r.src[0], r.src[1], audio_va_pair_mask(route), r.ctl[0], r.ctl[1], r.ctl[2], r.ctl[3], gLpiCount, result);
+}
+
+void lpiLog(const char *event)
+{
+  for (unsigned i = 0; i < gLpiCount; ++i) {
+    const AudioVaPinState &p = gLpiState[i];
+    piano_audio_log("mic-route1: pin %s gen %u gpio%u cfg %#x value %#x saved-cfg %#x saved-value %#x",
+                    event, gMicRouteGeneration, gLpiPins[i].gpio, p.cfg, p.value, p.old_cfg, p.old_value);
   }
 }
 
 int vaMic(void *, int on)
 {
-  const AudioVaPin *pins = audio_va_pins();
+  const int route = gArgs.micRoute;
+  AudioVaReadback rb = {};
   if (!on) {
     if (!gVaOn) return 0;
-    audio_va_off(&kVaIo);
-    lpiRestore();
-    piano_audio_log("mic: the VA macro's DMIC path off, LPI gpio6-9 given back (CFG %08x %08x %08x %08x)", rd32(gLpi[0].va), rd32(gLpi[1].va),
-                    rd32(gLpi[2].va), rd32(gLpi[3].va));
+    const int result = audio_va_off(&kVaIo, route, &rb);
+    const unsigned pins = audio_va_pin_restore(&kLpiIo, gLpiState, gLpiCount);
+    vaRouteLog("off", route, rb, result);
+    lpiLog("restore");
+    piano_audio_log("mic-route1: restore gen %u pin-errors %u", gMicRouteGeneration, pins);
     vaUnmap();
     gVaOn = false;
-    return 0;
+    return result || pins ? -1 : 0;
   }
-  if (!gVa.va && !mapRegion(gVa, kVaMacro, 0x1000, kIOMapInhibitCache)) {
-    piano_audio_log("mic: the VA macro does not map");
+  gLpiCount = audio_va_pins(route, gLpiPins);
+  if (!gLpiCount) return -1;
+  if (!mapRegion(gVa, kVaMacro, 0x1000, kIOMapInhibitCache)) {
+    piano_audio_log("mic-route1: map failed gen %u VA macro", gMicRouteGeneration);
+    vaUnmap();
     return -1;
   }
-  for (unsigned k = 0; k < AUDIO_VA_PINS; ++k) {
-    if (!gLpi[k].va && !mapRegion(gLpi[k], lpiPin(pins[k].gpio), 0x1000, kIOMapInhibitCache)) {
-      piano_audio_log("mic: LPI gpio%u does not map", pins[k].gpio);
+  for (unsigned i = 0; i < gLpiCount; ++i) {
+    if (!mapRegion(gLpi[i], lpiPin(gLpiPins[i].gpio), 0x1000, kIOMapInhibitCache)) {
+      piano_audio_log("mic-route1: map failed gen %u gpio%u", gMicRouteGeneration, gLpiPins[i].gpio);
       vaUnmap();
       return -1;
     }
-    gLpiCfg[k] = rd32(gLpi[k].va);
-    gLpiValue[k] = rd32(gLpi[k].va + 4);
   }
-  for (unsigned k = 0; k < AUDIO_VA_PINS; ++k) {   // as the LPI pin driver applies a state: the output value first, then CFG
-    if (pins[k].drive) wr32(gLpi[k].va + 4, pins[k].value);
-    wr32(gLpi[k].va, pins[k].cfg);
-    dsb();
-  }
+  const unsigned pinErrors = audio_va_pin_apply(&kLpiIo, gLpiPins, gLpiState, gLpiCount);
+  lpiLog("claim");
   const unsigned gain = gArgs.micGain && gArgs.micGain <= AUDIO_VA_GAIN_MAX ? gArgs.micGain : AUDIO_VA_GAIN_DEFAULT;
-  if (audio_va_on(&kVaIo, gain)) {
-    piano_audio_log("mic: the VA macro does not take its clock (MCLK enable reads back 0): the DMIC path not set, the pins given back");
-    lpiRestore();
+  const int result = pinErrors ? -1 : audio_va_on(&kVaIo, gain, route, &rb);
+  if (result) {
+    if (result < -1) vaRouteLog("failed-readback", route, rb, result);
+    const unsigned restoreErrors = audio_va_pin_restore(&kLpiIo, gLpiState, gLpiCount);
+    lpiLog("restore");
+    piano_audio_log("mic-route1: setup failed gen %u pin-errors %u va-result %d restore-errors %u",
+                    gMicRouteGeneration, pinErrors, result, restoreErrors);
     vaUnmap();
     return -1;
   }
   gVaOn = true;
-  piano_audio_log("mic: LPI gpio6-9 to dmic1/dmic2 (CFG %08x %08x %08x %08x, as found %08x %08x %08x %08x); VA macro: TX0 CTL %08x CFG0 %08x VOL "
-                  "%08x, TX1 CTL %08x CFG0 %08x, DMIC CTL %08x %08x, gain %u (%+d dB)", rd32(gLpi[0].va), rd32(gLpi[1].va), rd32(gLpi[2].va),
-                  rd32(gLpi[3].va), gLpiCfg[0], gLpiCfg[1], gLpiCfg[2], gLpiCfg[3], vaRead(nullptr, VA_TX_CTL(0)), vaRead(nullptr, VA_TX_CFG0(0)),
-                  vaRead(nullptr, VA_TX_VOL(0)), vaRead(nullptr, VA_TX_CTL(1)), vaRead(nullptr, VA_TX_CFG0(1)), vaRead(nullptr, VA_DMIC01_CTL),
-                  vaRead(nullptr, VA_DMIC23_CTL), gain, int(gain) - 84);
+  vaRouteLog("on", route, rb, 0);
   return 0;
 }
 
@@ -552,6 +569,12 @@ void boardSetup(AudioSessionOps &ops, const BoardArgs &args)
     dmaSetup(ops);
   }
   if (args.level >= 10) ops.va_mic = vaMic;
+}
+
+void boardSetMicRoute(int route, uint32_t generation)
+{
+  gArgs.micRoute = route;
+  gMicRouteGeneration = generation;
 }
 
 void boardTeardown()
