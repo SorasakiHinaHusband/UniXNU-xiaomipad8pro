@@ -158,16 +158,21 @@ uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, 
     return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 2);
 }
 
-uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+uint32_t ar_open_playback_stream_to(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t downstream_iid)
 {
     static const Sg sg = {AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
     static const Container c = {AR_SG_PLAY, POS_STREAM};
     static const Module m[] = {{AR_MOD_WR_SHMEM, AR_IID_PLAY_SHMEM, 0, 1}, {AR_MOD_PCM_DEC, AR_IID_PLAY_DEC, 1, 1},
                                {AR_MOD_PCM_CNV, AR_IID_PLAY_CNV, 1, 1}, {AR_MOD_LOG, AR_IID_PLAY_LOG, 1, 1}};
     /* WR_SH's output port is 1: Ubuntu's piano fix (with 0 the kernel dropped this link and the DSP refused GRAPH_OPEN). */
-    static const Link l[] = {{AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC}, {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV}, {AR_IID_PLAY_CNV, AR_IID_PLAY_LOG},
-                             {AR_IID_PLAY_LOG, AR_IID_SPK_LOG}};
+    const Link l[] = {{AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC}, {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV}, {AR_IID_PLAY_CNV, AR_IID_PLAY_LOG},
+                      {AR_IID_PLAY_LOG, downstream_iid}};
     return graph_open(out, capacity, port, token, &sg, &c, m, 4, l, 4);
+}
+
+uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+{
+    return ar_open_playback_stream_to(out, capacity, port, token, AR_IID_SPK_LOG);
 }
 
 uint32_t ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
@@ -444,6 +449,10 @@ int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a)
         if (p.payload_bytes < 4) return ArBad;
         a->handle = le32(d);
         return ArMapped;
+    case AR_OP_RSP_GET_CFG:
+        if (p.payload_bytes < 4) return ArBad;
+        a->status = le32(d);
+        return ArGetCfgDone;
     case AR_OP_WRITE_DONE:
         if (p.payload_bytes < 16) return ArBad;
         a->address = le32(d) | (uint64_t)le32(d + 4) << 32; a->handle = le32(d + 8); a->status = le32(d + 12);
