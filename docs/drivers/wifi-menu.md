@@ -500,7 +500,7 @@ must log what actually arrives and tolerate harmless reordering. The sequence to
 | Security compatibility | SET 2 AUTH_TYPE, SET 46 RSN_IE | accept and record them per generation; **never require them as a separate preamble** — the association buffer already carries security and authentication parameters | requests confirmed; separate-call order inferred |
 | Join | **SET 20 ASSOCIATE** (§8.2) | validate, clear stale visible state, allocate a generation, start the join asynchronously, return success only for acceptance | request and length confirmed |
 | Progress | GET 13 STATE (0 INIT, 1 SCAN, 2 AUTH, 3 ASSOC, 4 RUN), GET 21 ASSOCIATE_RESULT (0 pending, 1 success, 2 failure, 9 timeout, 21 bad key; the numbers are prior art) | keep the 802.11 association and the port authorization distinct: ASSOC with a pending result while the WPA handshake runs, RUN only once authorized | state values prior art; polling order inferred |
-| 802.11 association ends | **event 9 ASSOC_DONE** (§8.3) | where Apple's supplicant runs WPA, post after the 802.11 result while STATE is still ASSOC so the handshake can start; where ours runs WPA, hold the public completion until it authorizes | event code confirmed; payload and timing inferred |
+| 802.11 association ends | **event 9 ASSOC_DONE** (§8.3) | the BSD notice can precede WPA authorization. GET 21 stays pending through the private handshake and returns success after authorization | BSD layout and GET 21 waiter checked on 27.3 |
 | WPA2 handshake | EAPOL through enX, then **SET 3 CIPHER_KEY** (§8.2) | route EAPOL before authorization, translate and install the keys, keep ordinary data blocked | mechanism confirmed on 27.3; the exact call interleaving inferred |
 | Security complete | **event 20 RSN_HANDSHAKE_DONE** | first try: once, after both keys and port authorization | code confirmed; payload and cardinality inferred |
 | Connected | **2 SSID_CHANGED, 3 BSSID_CHANGED, 4 LINK_CHANGED up**, STATE=RUN | publish the snapshot before posting; requests 1/9/4/16/103 agree with it; then allow DHCP and data | consumers confirmed; the final order inferred |
@@ -584,7 +584,7 @@ A stays as the fallback and the A/B control.
 
 **Entry gate:** the adoption question is settled on the tablet first (wm2's mode sweep, §6.2–§6.3): until CoreWiFi reports our
 interface in `wdutil` and CoreWLAN scans through, M2 cannot be validated. The gate also requires the logging of §7, host
-fixtures for the exact 656/148/16/264/540/32-byte candidates and for malformed lengths/IEs (each inferred fixture marked with its
+fixtures for the exact 656/148/16/264/32-byte records and for malformed lengths/IEs (each inferred fixture marked with its
 provenance so a tablet observation replaces it without rewriting the state machine), and the Ethernet path kept as a run-time
 A/B control (`piano-wifi-apple80211`, §5); Apple-directed auto-join and our profile auto-join are mutually exclusive per
 generation.
@@ -600,7 +600,7 @@ generation.
   stale SSID/BSSID; anything airportd initiates by itself (a DISASSOCIATE, its own association) is logged and handled
   deliberately, not hidden as a display success.
 - **M2b-A — menu-directed open, then PSK, with our supplicant.** Open first: DISASSOCIATE and ASSOCIATE with no credential,
-  asynchronous join, the pending/success/failure result through request 21, the ASSOC_DONE candidate, immediate peer
+  asynchronous join, the pending/success/failure result through request 21, the ASSOC_DONE notice, immediate peer
   authorization, connected getters and events — this validates the whole public join state machine without EAPOL or keys. Then
   WPA2-PSK: the credential handoff of §8.4A, public success delayed until AUTHORIZE, passphrase and PMK forms only with anything
   else rejected; switching, cancellation, timeout, wrong-key failure, duplicate completion and stale-generation callbacks are
@@ -623,11 +623,11 @@ These share one image/boot once M2b-A reaches the tablet (this section was writt
 
 1. Did the menu use the 656-byte ASSOCIATE directly, call `Apple80211Associate2`, or send a different length?
 2. Did AUTH_TYPE and RSN_IE arrive as separate sets, inline only, or both?
-3. Was ASSOC_DONE consumed with the 540-byte payload, and was request 21 polled before or after it?
+3. Did the empty BSD ASSOC_DONE notice post successfully before the link/SSID/BSSID events, and did GET 21 report the terminal result?
 4. Did airportd start eapolclient for PSK right after the 802.11 association, only after LINK_CHANGED, or not at all?
 5. For the PTK and GTK CIPHER_KEY, what were flags, index, cipher and RSC length (metadata only)?
 6. Was RSN_HANDSHAKE_DONE required once, after each key, or ignored in favour of EAP status plus link and state?
-7. Did LINK_CHANGED need the 32-byte inline payload, an empty event plus GET 156, or either?
+7. Did the 32-byte LINK_CHANGED payload and GET 156 agree on link up and link down?
 
 ### 7.8 wm3c: the override in its production form
 
