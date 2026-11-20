@@ -62,6 +62,10 @@ struct World {
     unsigned queue_gaps, max_monitor_reads;
     int clock_on, va_votes, va_mclk, dev_started, str_started, mic_started, cap_started, mic_prepared, cap_prepared;
     int map_spk, map_mic;
+    // the speaker-protection pair (AudioSpkProt.h)
+    int vi_open, vi_started, prot_dev_open, re25_sets, oob_cfgs;
+    unsigned vbat_sets, live_gets;
+    uint32_t vbat_uv;
     unsigned stream_dones;
     uint8_t slot_copy[AUDIO_SPK_SLOTS][AUDIO_SPK_PERIOD_BYTES];
     int slot_busy[AUDIO_SPK_SLOTS];
@@ -121,6 +125,11 @@ static int g_mic_clock;
 static uint64_t g_mic_missing;
 static unsigned g_wakes;
 static int g_mark;
+// speaker protection: the synthetic private files the session's ops carry, and the gauge's voltage
+static uint8_t g_spk_file[8192], g_spk_re25[16];
+static uint32_t g_spk_bytes, g_re25_bytes = 16, g_re25_q12[4] = {27000, 27500, 28000, 28500};
+static int g_spk, g_spk_files, g_live_header_bad;
+static uint32_t g_battery_uv = 4012000;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
 
 static void violate(const char *what)
@@ -225,6 +234,7 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
         if (reg == FS19XX_REG_PWRCTRL && !(v & (FS19XX_PWRCTRL_PWDN | FS19XX_PWRCTRL_I2CR))) {
             w.power_ups++;
             if (!w.clock_on || !w.dev_started || !w.str_started) violate("an amplifier powered up without the bit clock and both graphs");
+            if (w.prot_dev_open && !w.vi_started) violate("an amplifier powered up on the protected graph without the V/I graph");
         }
         if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT)) {
             w.unmutes++;
@@ -268,9 +278,32 @@ static struct Answer *queue(uint64_t due_us, const GprPacket *r, const uint32_t 
     return a;
 }
 
+// An out-of-band payload: the command header names an address in the slice (the region mapped at DMA_PHYS).
+static const uint8_t *oob_payload(const GprPacket *p)
+{
+    const uint8_t *d = p->payload;
+    if (p->payload_bytes != 16 || !le32(d + 8) || (p->opcode != AR_OP_GRAPH_OPEN && p->opcode != AR_OP_SET_CFG && p->opcode != AR_OP_GET_CFG))
+        return 0;
+    const uint64_t a = le32(d) | (uint64_t)le32(d + 4) << 32;
+    if (a >> 32 != 1 || (uint32_t)a < DMA_PHYS + AUDIO_DMA_PARAM || (uint32_t)a + le32(d + 12) > DMA_PHYS + AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ||
+        a % 32 || le32(d + 8) != H_SPK) {
+        violate("an out-of-band payload outside the parameter area or another map");
+        return 0;
+    }
+    return g_dma + ((uint32_t)a - DMA_PHYS);
+}
+
 static void describe(const GprPacket *p, char *s, unsigned size)
 {
     const uint8_t *d = p->payload;
+    const uint8_t *o = oob_payload(p);
+    if (o) {
+        if (p->opcode == AR_OP_GRAPH_OPEN) snprintf(s, size, "OPEN %#x", le32(o + 20));
+        else if (p->opcode == AR_OP_SET_CFG) snprintf(s, size, "CFG %#x %#x oob", le32(o), le32(o + 4));
+        else snprintf(s, size, "GET %#x %#x", le32(o), le32(o + 4));
+        return;
+    }
+    if (p->opcode == AR_OP_SET_CFG && le32(d + 16) == SPK_IID_SP_RX) {snprintf(s, size, "CFG 0x4046 %#x", le32(d + 20)); return;}
     switch (p->opcode) {
     case AR_OP_PRM_REQUEST:
         if (le32(d + 20) == 0x08001032u) snprintf(s, size, "PRM VOTE %u", le32(d + 32));
@@ -424,6 +457,28 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         if (!strcmp(line, "PRM REQ 0x30c 19200000")) w.va_mclk = 1;
         if (!strcmp(line, "PRM REL 0x30c")) {if (w.va_on) violate("the VA mclk released under the DMIC path"); w.va_mclk = 0;}
         if (!strcmp(line, "START 0x4005")) {if (!w.clock_on) violate("the device graph started without the bit clock"); w.dev_started = 1;}
+        // the protection pair: the V/I graph opened and started before the speaker graph, stopped and closed after it
+        if (!strcmp(line, "OPEN 0xb00000d5")) w.vi_open = 1;
+        if (!strcmp(line, "START 0xb00000d5")) {if (!w.clock_on || !w.vi_open) violate("the V/I graph started without the bit clock"); w.vi_started = 1;}
+        if (!strcmp(line, "OPEN 0xb0000002")) {if (!w.vi_started) violate("the speaker graph opened before the V/I graph ran"); w.prot_dev_open = 1;}
+        if (!strcmp(line, "START 0xb0000002")) {
+            if (!w.clock_on || !w.vi_started) violate("the protected speaker graph started without the clock or the V/I graph");
+            if (!w.re25_sets) violate("the protected speaker graph started without Re25");
+            w.dev_started = 1;
+        }
+        if (!strcmp(line, "STOP 0xb0000002")) {if (any_powered()) violate("a speaker graph stopped with an amplifier powered up"); w.dev_started = 0;}
+        if (!strcmp(line, "STOP 0xb00000d5")) {if (w.dev_started || w.prot_dev_open) violate("the V/I graph stopped under the speaker graph"); w.vi_started = 0;}
+        if (!strcmp(line, "CLOSE 0xb0000002")) w.prot_dev_open = 0;
+        if (!strcmp(line, "CLOSE 0xb00000d5")) {if (w.vi_started) violate("the V/I graph closed while running"); w.vi_open = 0;}
+        if (!strcmp(line, "CFG 0x4046 0x10001fa7")) {
+            w.re25_sets++;
+            if (le32(p.payload + 24) != 36 || le32(p.payload + 32) != 0x00040000u) violate("a Re25 that is not 36 bytes for four channels");
+        }
+        if (!strcmp(line, "CFG 0x4046 0x10001fb5")) {
+            w.vbat_sets++; w.vbat_uv = le32(p.payload + 36);
+            if (!w.dev_started || le32(p.payload + 32) != 1) violate("a battery voltage outside the running protected graph");
+        }
+        if (strstr(line, " oob") && p.opcode == AR_OP_SET_CFG) w.oob_cfgs++;
         if (!strcmp(line, "START 0x4001")) {w.str_started = 1; w.stream_dones = 0;}
         if (!strcmp(line, "STOP 0x4001") || !strcmp(line, "STOP 0x4005")) {
             if (any_powered()) violate("a speaker graph stopped with an amplifier powered up");
@@ -450,6 +505,24 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         return 0;
     }
     if (p.opcode == AR_OP_MEM_UNMAP && !status) {if (le32(p.payload) == H_SPK) w.map_spk--; else w.map_mic--;}
+    if (p.opcode == AR_OP_GET_CFG && !status) {
+        // the live data: the header kept, four channels {Re (Re25 + 2 %), temperature, 0, f0 Q8, Q, 0}
+        uint8_t *o = (uint8_t *)(uintptr_t)oob_payload(&p);
+        if (!o || !w.dev_started) violate("a live-data GET outside the running protected graph");
+        else {
+            if (le32(o) != SPK_IID_SP_RX || le32(o + 4) != SPK_PID_LIVE || le32(o + 8) != SPK_LIVE_BYTES) violate("a live-data GET of another header");
+            for (unsigned c = 0; c < 4; ++c) {
+                const uint32_t words[6] = {g_re25_q12[c] * 102u / 100u, 31u + c, 0, (800u + 10u * c) * 256u, 3u + c, 0};
+                for (unsigned k = 0; k < 6; ++k) for (unsigned b = 0; b < 4; ++b) o[16 + 24 * c + 4 * k + b] = (uint8_t)(words[k] >> (8 * b));
+            }
+            if (g_live_header_bad) o[4] ^= 1;
+        }
+        w.live_gets++;
+        r.opcode = AR_OP_RSP_GET_CFG;
+        const uint32_t ok = 0;
+        queue(due, &r, &ok, 1)->plan = 1;
+        return 0;
+    }
     r.opcode = p.opcode == AR_OP_PRM_REQUEST ? AR_OP_PRM_REQUEST_DONE : p.opcode == AR_OP_PRM_RELEASE ? AR_OP_PRM_RELEASE_DONE : GPR_OP_BASIC_RESULT;
     const uint32_t words[2] = {p.opcode, status};
     queue(due, &r, words, 2)->plan = 1;
@@ -458,6 +531,7 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
 
 // ---------------------------------------------------------------------------------------------------- the owner's side
 static void lpass_read(void *ctx) {(void)ctx;}
+static uint32_t battery_uv(void *ctx) {(void)ctx; return g_battery_uv;}
 static int tdm_pins(void *ctx, int on) {(void)ctx; w.pins_on = on; return 0;}
 static int smmu(void *ctx) {(void)ctx; return 0;}
 static void publish(void *ctx) {(void)ctx;}
@@ -612,6 +686,13 @@ static void run(const struct Scenario *sc)
     memset(g_dma, 0, sizeof g_dma);
     ops.dma = dma; ops.dma_phys = DMA_PHYS; ops.dma_bytes = sizeof g_dma; ops.publish = publish;
     ops.va_mic = va_mic;
+    if (g_spk_files) {
+        ops.spk_params = g_spk_file; ops.spk_params_bytes = g_spk_bytes;
+        ops.spk_re25 = g_spk_re25; ops.spk_re25_bytes = g_re25_bytes;
+    } else {
+        ops.spk_why = "not staged (test)";
+    }
+    ops.battery_uv = battery_uv;
     audio_session_init(&session, &c, &ops, &guard);
     uint64_t next = 0;
     while (!session.finished && w.now_us < 60000000ull) {
@@ -636,6 +717,7 @@ static void run(const struct Scenario *sc)
     if (sc->gain) lc.gain = sc->gain;
     if (sc->ceiling_db) lc.ceiling = audio_ceiling_db(sc->ceiling_db);
     if (sc->idle_ms) lc.idle_ms = sc->idle_ms;
+    lc.spk_prot = g_spk;
     if (g_setup) g_setup(&lc);
     audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
     CHECK(audio_live_init(&live, &lc, &session, &sh) == 0);
@@ -688,6 +770,7 @@ static void run(const struct Scenario *sc)
     CHECK(!w.pins_on && !w.va_on);
     for (unsigned i = 0; i < sizeof g_dma; ++i) if (g_dma[i]) {CHECK(!"the buffer is not zeroed at the end"); break;}
     if (!w.off) CHECK(!w.clock_on && !w.va_votes && !w.va_mclk && !w.map_spk && !w.map_mic && !w.dev_started && !w.str_started);
+    if (!w.off) CHECK(!w.vi_open && !w.vi_started && !w.prot_dev_open);
     g_setup = 0;
 }
 
@@ -1442,6 +1525,215 @@ static void testMicClock(void)
     g_ppm = 0; g_mic_clock = 0;
 }
 
+
+// ---- speaker protection (AudioSpkProt.h): SYNTHETIC private files (no ACDB byte, no calibration value of any unit)
+static void spk_files(void)
+{
+    static const struct {uint32_t iid, pid, size, v;} e[] = {
+        {0x40ee, 0x11111601, 4, 1}, {0x45c2, 0x0800106a, 4, 1}, {0x4587, 0x08001026, 4, 1}, {0x4023, 0x0800106a, 4, 2},
+        {0x4046, 0x11111611, 4, 1}, {0x4046, 0x10001fc2, 8, 0x5a}, {0x4046, 0x10001fb0, 6180, 0xa5}, {0x418e, 0x080014fc, 12, 0x11},
+    };
+    uint32_t at = 16;
+    const uint32_t head[4] = {SPK_PARAMS_MAGIC, 1, N(e), 0};
+    memcpy(g_spk_file, head, sizeof head);
+    for (unsigned i = 0; i < N(e); ++i) {
+        const uint32_t h[3] = {e[i].iid, e[i].pid, e[i].size};
+        memcpy(g_spk_file + at, h, sizeof h);
+        at += 12;
+        for (uint32_t b = 0; b < e[i].size; ++b) g_spk_file[at + b] = e[i].size == 4 ? (uint8_t)(b ? 0 : e[i].v) : (uint8_t)(e[i].v ^ b);
+        at += (e[i].size + 3u) & ~3u;
+    }
+    g_spk_bytes = at;
+    memcpy(g_spk_re25, g_re25_q12, 16);
+    g_re25_bytes = 16;
+    g_spk_files = 1;
+}
+static void spk_reset(void) {g_spk = g_spk_files = g_live_header_bad = 0; g_battery_uv = 4012000; g_fail = 0; g_drop = 0; g_kind = 0;}
+
+static const char *kProtUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000", "OPEN 0xb00000d5", "CFG 0x45c2", "CFG 0x40ee",
+                                "PREPARE 0xb00000d5", "START 0xb00000d5", "OPEN 0xb0000002", "CFG 0x4023", "CFG 0x4023",
+                                "CFG 0x4046 0x10001fb0 oob", "CFG 0x4046 0x10001fa7", "OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004",
+                                "PREPARE 0xb0000002", "PREPARE 0x4001", "START 0xb0000002", "START 0x4001"};
+static const char *kProtDown[] = {"STOP 0x4001", "STOP 0xb0000002", "CLOSE 0x4001", "CLOSE 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5",
+                                  "UNMAP 0x55", "PRM REL 0x202"};
+static unsigned monitor_rounds(unsigned *at)
+{
+    unsigned rounds = 0;
+    while (*at + 1 < w.ncmd && !strcmp(w.cmd[*at], "CFG 0x4046 0x10001fb5") && !strcmp(w.cmd[*at + 1], "GET 0x4046 0x10001fab")) {*at += 2; ++rounds;}
+    return rounds;
+}
+static unsigned find_cmd(const char *line, unsigned from)
+{
+    for (unsigned i = from; i < w.ncmd; ++i) if (!strcmp(w.cmd[i], line)) return i;
+    return w.ncmd;
+}
+
+static void testProtection(void)
+{
+    spk_reset(); spk_files(); g_spk = 1;
+    const struct Scenario sc = {9, 231, 1, 0, 12000, AudioPortsUbuntu, 1, burst};
+    run(&sc);
+    CHECK(!w.violations && live.prot_ready && live.prot_starts == 1 && live.spk_starts == 1 && !live.prot_fallbacks);
+    unsigned at = expect(live_from(), kProtUp, N(kProtUp));
+    // the monitor while the stream ran (about 5 s): the battery voltage then the live data, every 2 s, the first at once
+    const unsigned rounds = monitor_rounds(&at);
+    CHECK(rounds >= 2 && rounds <= 4 && w.vbat_sets == rounds && w.live_gets == rounds && w.vbat_uv == 4012000 && live.live_reads == rounds);
+    at = expect(at, kProtDown, N(kProtDown));
+    CHECK(at == w.ncmd && w.re25_sets == 1 && w.oob_cfgs == 1);
+    // the sound played as on the passthrough graph: gain 231 at most, the ceiling, the fades, the amplifiers' order
+    CHECK(w.sound_periods > 170 && w.sound_periods < 205 && w.peak <= AUDIO_CEILING_MAX && power_ups_after_session() == 4 && w.unmutes == 4);
+    CHECK(logged("PianoSpeakerProtV1: ready: 8 ACDB parameters (6220 bytes)") && logged("PianoSpeakerProtV1: start 1: the stock protection pair"));
+    CHECK(logged("PianoSpeakerProtV1: up: SP_RX protects") && logged("PianoSpeakerProtV1 live ch0 slot 0 r0 6.723 ohm (102.0% of Re25) f0 800 Hz q 3 t 31"));
+    CHECK(logged("PianoSpeakerProtV1 live ch3 slot 3 r0 7.097 ohm (102.0% of Re25) f0 830 Hz q 6 t 34") && logged("vbat 4012000 uV"));
+    CHECK(live.live_data.f0[0] == 800u * 256u && live.live_data.re[3] == 28500u * 102u / 100u);
+    CHECK(logged("live: plan speaker-protection: 21 steps") && !logged("live: plan speaker-protection monitor"));   // the monitor is quiet
+    // level 10: the Mic alongside, one command at a time over the three plans (the model flags two in flight)
+    const struct Scenario sc10 = {10, 0, 0, 0, 10000, AudioPortsUbuntu, 1, both};
+    run(&sc10);
+    CHECK(!w.violations && live.prot_starts == 1 && live.mic_starts == 1 && w.live_gets >= 1 && w.mic_ok > 48000u * 3);
+    // sheng's and SunUEFI's ports
+    struct Scenario ports = sc;
+    ports.ports = AudioPortsSheng; run(&ports); CHECK(!w.violations && live.prot_starts == 1 && w.live_gets >= 2);
+    ports.ports = AudioPortsSun; run(&ports); CHECK(!w.violations && live.prot_starts == 1 && w.live_gets >= 2);
+    // no battery voltage from the gauge: none sent, the live data still read
+    g_battery_uv = 0;
+    run(&sc);
+    CHECK(!w.violations && w.vbat_sets == 0 && w.live_gets >= 2 && logged("no battery voltage from PianoPower's gauge") && !live.prot_fallbacks);
+    spk_reset();
+}
+
+// A protection plan step refused or unanswered: everything it did undone, then the passthrough plan in the same boot, which plays.
+static void testProtPlanFallback(void)
+{
+    for (unsigned k = 0; k < N(kProtUp); ++k)
+        for (int drop = 0; drop < 2; ++drop) {
+            spk_reset(); spk_files(); g_spk = 1;
+            g_fail = kProtUp[k]; g_drop = drop;
+            const struct Scenario sc = {9, 0, 1, 0, 9000, AudioPortsUbuntu, 0, steady};
+            run(&sc);
+            CHECK(!w.violations && live.prot_starts == 1 && live.prot_fallbacks == 1 && live.prot_failed && !logged("the plan failed at"));
+            CHECK(logged("PianoSpeakerProtV1: FALLBACK to passthrough") && logged("everything it did is undone"));
+            const unsigned open = find_cmd("OPEN 0x4005", live_from());
+            CHECK(open < w.ncmd && open > 0 && count_cmd("START 0xb0000002", live_from()) == (k >= N(kProtUp) - 2 ? 1u : 0u));
+            expect(open - 1, kSpkUp, N(kSpkUp));
+            CHECK(w.sound_periods > 300 && w.power_ups == 4 && live.spk_starts == 2);
+        }
+    spk_reset();
+}
+
+// While the pair runs: a monitor command refused or lost, live data under another header, a refused or late period: the pair
+// undone, the passthrough graph back in the same boot; an amplifier fault stays what it was (off for the boot).
+static void testProtRunningFallback(void)
+{
+    static const struct {const char *fail; int drop, kind, header;} cases[] = {
+        {"GET 0x4046 0x10001fab", 0, 0, 0}, {"GET 0x4046 0x10001fab", 1, 0, 0}, {"CFG 0x4046 0x10001fb5", 0, 0, 0},
+        {"CFG 0x4046 0x10001fb5", 1, 0, 0}, {0, 0, 0, 1}, {0, 0, 1, 0}, {0, 0, 3, 0},
+    };
+    for (unsigned i = 0; i < N(cases); ++i) {
+        spk_reset(); spk_files(); g_spk = 1;
+        g_fail = cases[i].fail; g_drop = cases[i].drop; g_kind = cases[i].kind; g_live_header_bad = cases[i].header;
+        const struct Scenario sc = {9, 0, 1, 0, 9000, AudioPortsUbuntu, 0, cases[i].kind ? fault : steady};
+        run(&sc);
+        CHECK(!w.violations && live.prot_starts == 1 && live.prot_fallbacks == 1 && live.prot_failed && live.spk_starts == 2);
+        CHECK(!logged("the speaker path is OFF for this boot") || logged("stopped by the owner"));   // only the owner's stop at the end
+        CHECK(logged("PianoSpeakerProtV1: FALLBACK to passthrough") && logged("the pair is undone"));
+        if (cases[i].fail || cases[i].header) CHECK(logged("PianoSpeakerProtV1: monitor:"));
+        if (cases[i].header) CHECK(logged("live data under another header") && logged("the answer's header is not the live data's"));
+        if (cases[i].kind == 1) CHECK(logged("WRITE_DONE refused") && logged("a refused period or command"));
+        if (cases[i].kind == 3) CHECK(logged("a late period") && live.late_stops == 0);
+        // the pair's down order, then the passthrough plan, which plays
+        const unsigned open = find_cmd("OPEN 0x4005", live_from());
+        CHECK(open < w.ncmd && count_cmd("CLOSE 0xb00000d5", live_from()) == 1 && find_cmd("CLOSE 0xb00000d5", live_from()) < open);
+        expect(open - 1, kSpkUp, N(kSpkUp));
+        CHECK(w.sound_periods > 250);
+    }
+    // an amplifier whose status changes on the pair: off for the boot as on the passthrough graph (a safety stop, not the DSP's)
+    spk_reset(); spk_files(); g_spk = 1; g_kind = 2;
+    const struct Scenario sc = {9, 0, 1, 0, 8000, AudioPortsUbuntu, 0, fault};
+    run(&sc);
+    CHECK(!w.violations && live.spk_state == LiveOff && !live.prot_fallbacks && logged("stopped by amplifier status") && !any_powered());
+    spk_reset();
+}
+
+// The private files: missing or mismatched, the speaker plays through the passthrough graph from the start; the boot argument off.
+static void testProtFiles(void)
+{
+    const struct Scenario sc = {9, 0, 1, 0, 6000, AudioPortsUbuntu, 1, burst};
+    spk_reset(); g_spk = 1;   // asked for, no files
+    run(&sc);
+    CHECK(!w.violations && !live.prot_ready && !live.prot_starts && logged("PianoSpeakerProtV1: OFF: not staged (test); the speaker plays"));
+    CHECK(logged("PianoSpeakerProtV1: asked for, but not staged (test): the passthrough graph"));
+    expect(live_from(), kSpkUp, N(kSpkUp));
+    spk_reset(); spk_files(); g_spk = 1; g_spk_file[0] ^= 1;   // not a PSPK file
+    run(&sc);
+    CHECK(!w.violations && !live.prot_ready && logged("OFF: spk-prot.bin: not a PSPK file") && count_cmd("OPEN 0x4005", live_from()) == 1);
+    spk_reset(); spk_files(); g_spk = 1; g_re25_bytes = 15;
+    run(&sc);
+    CHECK(!w.violations && !live.prot_ready && logged("OFF: spk-re25.bin: missing or not 16 bytes") && count_cmd("OPEN 0x4005", live_from()) == 1);
+    spk_reset(); spk_files(); g_spk = 1; g_spk_file[16 + 12 + 4 + 12] = 2;   // the V/I source's lane is not lane 0
+    run(&sc);
+    CHECK(!w.violations && !live.prot_ready && logged("format or lane that is not the driver's"));
+    spk_reset(); spk_files();   // the files there, the boot argument off: ready, not used
+    run(&sc);
+    CHECK(!w.violations && live.prot_ready && !live.prot_starts && logged("off (piano-audio-spk=0") && count_cmd("OPEN 0x4005", live_from()) == 1);
+    CHECK(!logged("PianoSpeakerProtV1: asked for"));
+    CHECK(audio_live_spk_select(&sh, 2) == -1 && audio_live_spk_select(&sh, -1) == -1);
+    spk_reset();
+}
+
+// The run-time switch while the speaker is down: on for the first start, off for the second; after a fallback a new request
+// clears it.
+static void spk_switch(uint32_t t)
+{
+    if (t == 200 && !w.out_running) device(1, 0);
+    w.amplitude = 16000;
+    w.sound_on = (t >= 500 && t < 1500) || (t >= 7000 && t < 8000);
+    if (t == 100 && g_mark == 0) {g_mark = 1; CHECK(audio_live_spk_select(&sh, 1) == 0);}
+    if (t == 6000 && g_mark == 1) {g_mark = 2; CHECK(live.spk_state == LiveDown && audio_live_spk_select(&sh, g_kind) == 0);}
+}
+static void testProtSwitch(void)
+{
+    spk_reset(); spk_files(); g_mark = 0; g_kind = 0;
+    const struct Scenario sc = {9, 0, 1, 0, 12000, AudioPortsUbuntu, 1, spk_switch};
+    run(&sc);
+    CHECK(!w.violations && g_mark == 2 && live.spk_starts == 2 && live.prot_starts == 1);
+    CHECK(count_cmd("START 0xb0000002", live_from()) == 1 && count_cmd("START 0x4005", live_from()) == 1);
+    CHECK(find_cmd("START 0xb0000002", live_from()) < find_cmd("START 0x4005", live_from()));
+    // a fallback at the first start (the speaker graph refused), then a new request: the second start is protected again
+    spk_reset(); spk_files(); g_mark = 0; g_kind = 1; g_fail = "OPEN 0xb0000002";
+    run(&sc);
+    CHECK(!w.violations && g_mark == 2 && live.prot_fallbacks == 1 && live.prot_starts == 2 && !live.prot_failed);
+    CHECK(count_cmd("START 0xb0000002", live_from()) == 1 && count_cmd("START 0x4005", live_from()) == 1 && logged("a new request: the fallback"));
+    CHECK(find_cmd("START 0x4005", live_from()) < find_cmd("START 0xb0000002", live_from()));
+    spk_reset();
+}
+
+// Sleep with the pair up: the monitor stops, the pair is undone in order, parked; after the wake the pair comes back.
+static unsigned prot_stage;
+static void prot_sleep(uint32_t t)
+{
+    if (!w.out_running) device(1, 0);
+    w.sound_on = 1; w.amplitude = 12000;
+    if (prot_stage == 0 && t >= 3000 && live.spk_state == LiveRunning) {prot_stage = 1; g_mark = (int)w.ncmd; audio_live_sleep(&live, 1);}
+    if (prot_stage == 1 && live.parked) {
+        CHECK(audio_live_parked(&live) == 1 && !w.vi_open && !w.vi_started && !w.prot_dev_open && !w.map_spk && !w.clock_on && !any_powered());
+        unsigned at = (unsigned)g_mark;
+        while (at < w.ncmd && strcmp(w.cmd[at], kProtDown[0])) ++at;   // a monitor command in flight may come first
+        CHECK(expect(at, kProtDown, N(kProtDown)) == w.ncmd);
+        CHECK(audio_live_rearm(&live) == 0);
+        prot_stage = 2;
+    }
+    if (prot_stage == 2 && live.spk_state == LiveRunning && live.prot_active) prot_stage = 3;
+}
+static void testProtSleep(void)
+{
+    spk_reset(); spk_files(); g_spk = 1; prot_stage = 0;
+    const struct Scenario sc = {9, 0, 1, 0, 10000, AudioPortsUbuntu, 0, prot_sleep};
+    run(&sc);
+    CHECK(!w.violations && prot_stage == 3 && live.prot_starts == 2 && !live.prot_fallbacks && !live.sleep_failed);
+    spk_reset();
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1476,6 +1768,12 @@ int main(void)
     testFailSafeMute();
     testLedgerOverflow();
     testEpochStarts();
+    testProtection();
+    testProtPlanFallback();
+    testProtRunningFallback();
+    testProtFiles();
+    testProtSwitch();
+    testProtSleep();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }
