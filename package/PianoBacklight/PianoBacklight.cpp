@@ -608,8 +608,8 @@ void PianoBacklight::serve()
   gNativeMax = schema.maxFixed();
   gServing = true;
   IOLockUnlock(gLock);
-  if (schema.bounded()) {
-    fRevision = 1;
+  fRevision = schema.initialRevision();
+  if (fRevision) {
     fSensorsSeq = 0;
     publishAndroidModel();
   }
@@ -753,10 +753,15 @@ void PianoBacklight::publishNativeState()
   publishAndroidApply(adapter, applied, code);
   if (fNativeRequest >= 0) {
     uint32_t dropped;
-    if (fNativeApplyLog.allow(nowMs(), &dropped))
-      note("%s source=%s requested16=%d result=%s applied_millinits=%u primary=%u secondary=%u errors=%u skipped=%u",
-           kNativeMarker, kNativeRequest, fNativeRequest, applied && fNativeCode == code ? "applied" : "pending",
-           adapter.milliNits(fNativeCode), fCtl.ic(0).code, fCtl.ic(1).code, fCtl.errors() - fNativeErrors, dropped);
+    if (fNativeApplyLog.allow(nowMs(), &dropped)) {
+      if (applied && !fCtl.pwmQualified())
+        note("%s source=%s requested16=%d result=pwm-unqualified primary=%u secondary=%u errors=%u skipped=%u",
+             kNativeMarker, kNativeRequest, fNativeRequest, fCtl.ic(0).code, fCtl.ic(1).code, fCtl.errors() - fNativeErrors, dropped);
+      else
+        note("%s source=%s requested16=%d result=%s applied_millinits=%u primary=%u secondary=%u errors=%u skipped=%u",
+             kNativeMarker, kNativeRequest, fNativeRequest, applied && fNativeCode == code ? "applied" : "pending",
+             adapter.milliNits(fNativeCode), fCtl.ic(0).code, fCtl.ic(1).code, fCtl.errors() - fNativeErrors, dropped);
+    }
     fNativeRequest = -1;
   }
   if (fNativePublished && !fCtl.controlling()) {
@@ -826,9 +831,14 @@ void PianoBacklight::publishAndroidApply(const NativeBrightness &adapter, bool a
   }
   const unsigned errors = fCtl.errors() - request.errors;
   if (applied && code == request.code) {
-    note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u applied_millinits=%u errors=%u",
-         kAndroidMarker, request.source, request.revision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
-         adapter.milliNits(code), errors);
+    if (fCtl.pwmQualified())
+      note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u applied_millinits=%u errors=%u",
+           kAndroidMarker, request.source, request.revision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+           adapter.milliNits(code), errors);
+    else
+      note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u result=pwm-unqualified errors=%u",
+           kAndroidMarker, request.source, request.revision, request.milliNits, request.dbv, request.code, fCtl.ic(0).code, fCtl.ic(1).code,
+           errors);
     request = {};
   } else if (!request.pendingLogged || !fCtl.controlling()) {
     note("%s source=%s revision=%u requested_millinits=%u dbv=%u target_code=%u primary=%u secondary=%u result=%s errors=%u",
@@ -875,11 +885,7 @@ void PianoBacklight::publishState()
   if (!gArgs.autoAllowed) return;
   if (fRevision) {
     NativeProperties snapshot(*this);
-    if (snapshot.number("curve", fReference) && snapshot.number("revision", fRevision)
-        && snapshot.number("floor", fCtl.floor()) && snapshot.number("target", uint32_t(a.lastTarget()))
-        && snapshot.number("lux", a.lastLux()) && snapshot.number("valid", a.valid())
-        && snapshot.number("fault", fCtl.autoFault()))
-      snapshot.commit(pianoauto::kPropertyAmbientSnapshot);
+    publishAmbientSnapshot(snapshot, fCtl, fRevision, fReference);
   }
   setProperty("piano-backlight-implementation", "sens-ab1:session-valid:dual-readback");
   setProperty(pianoauto::kPropertyAuto, fCtl.autoActive());

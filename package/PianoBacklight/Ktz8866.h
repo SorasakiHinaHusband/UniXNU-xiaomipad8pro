@@ -49,6 +49,7 @@ enum : uint8_t {
 constexpr uint8_t kSurveyRegs[] = {kRegId, kRegCfg1, kRegCfg2, kRegBrtLsb, kRegBrtMsb, kRegEn, kRegLcd1, kRegLcd2, kRegLcd3,
                                    kRegBoost, kRegOutp, kRegOutn, kRegOpt1, kRegOpt2, kRegPwmLsb, kRegPwmMsb, kRegRamp, kRegIfs};
 constexpr uint8_t kEnSoftReset = 0x80, kEnBacklight = 0x40, kEnSinks = 0x3f, kCfg1LinearMap = 0x08, kCfg1PwmEnable = 0x01;
+constexpr uint8_t kQualifiedPwmCfg1 = 0x53, kQualifiedPwmIfs = 0xd9;
 constexpr uint16_t kFullScale = 2047;
 constexpr unsigned kIcs = 2;
 constexpr const char *kIcName[kIcs] = {"primary", "secondary"};
@@ -179,7 +180,7 @@ struct Config {
 };
 
 struct IcState {
-  bool answered = false;              // every survey read was acknowledged
+  bool answered = false;              // every required survey read was acknowledged
   uint8_t reg[kRegCount] = {};
   bool have[kRegCount] = {};
   bool lit = false;                   // BL_EN as last read or written
@@ -214,6 +215,7 @@ class Controller {
   bool start()
   {
     if (!ok(0) || !ok(1)) {
+      if (cfg_.android) pwmContract("unqualified", "survey", "boot", ++pwmChecks_);
       note("control: OFF, %s did not answer as a KTZ8866 (both ICs are needed: one alone would light half the panel); read only",
            ok(0) ? "the secondary" : ok(1) ? "the primary" : "neither IC");
       return false;
@@ -222,10 +224,7 @@ class Controller {
     exponential_ = !(p.reg[kRegCfg1] & kCfg1LinearMap);
     if ((p.reg[kRegCfg1] ^ q.reg[kRegCfg1]) & kCfg1LinearMap) note("the ICs map codes differently (BL_CFG1 0x%02x, 0x%02x): steps follow the primary's", p.reg[kRegCfg1], q.reg[kRegCfg1]);
     if (cfg_.android) {
-      constexpr uint8_t mode = kCfg1LinearMap | kCfg1PwmEnable;
-      const bool compatible = p.answered && q.answered && !((p.reg[kRegCfg1] | q.reg[kRegCfg1]) & mode)
-          && (p.reg[kRegEn] & kEnSinks) == (q.reg[kRegEn] & kEnSinks)
-          && !((p.reg[kRegIfs] ^ q.reg[kRegIfs]) & 0xf8) && (p.reg[kRegOpt2] & 3) == (q.reg[kRegOpt2] & 3);
+      const bool compatible = androidCompatible();
       note("Android SDR %s: primary/secondary BL_CFG1 %#x/%#x sinks %#x/%#x IFS %#x/%#x current-limit %#x/%#x",
            compatible ? "supported" : "unsupported", p.reg[kRegCfg1], q.reg[kRegCfg1], p.reg[kRegEn] & kEnSinks,
            q.reg[kRegEn] & kEnSinks, p.reg[kRegIfs], q.reg[kRegIfs], p.reg[kRegOpt2] & 3, q.reg[kRegOpt2] & 3);
@@ -282,6 +281,7 @@ class Controller {
     if (asleep == asleep_) return;
     asleep_ = asleep;
     if (asleep) ambient_.invalidate();
+    else if (pwmFull_) pwmWakePending_ = true;
     note("system %s: %s", asleep ? "sleep" : "wake",
          asleep ? "the backlight off on both ICs (BL_EN cleared, the code kept; HWEN untouched)"
          : wantLit() ? "the backlight as before the sleep" : "the backlight stays off (the display or the lid wants it so)");
@@ -374,7 +374,7 @@ class Controller {
     const uint32_t t = uint32_t(ambient_.lastTarget());
     summary_.minPermille = t < summary_.minPermille ? t : summary_.minPermille;
     summary_.maxPermille = t > summary_.maxPermille ? t : summary_.maxPermille;
-    if (next != code_) {
+    if (next != code_ || pwmFull_) {
       code_ = next;
       quiet_ = true;
       apply();
@@ -406,6 +406,8 @@ class Controller {
   uint16_t code() const { return code_; }
   uint16_t floor() const { return cfg_.floor; }
   uint16_t ceiling() const { return ceiling_; }
+  // Boot selects the schema. A later failed PWM witness only disqualifies the luminance receipt.
+  bool pwmQualified() const { return pwmQualified_; }
   bool exponential() const { return exponential_; }
   const IcState &ic(unsigned i) const { return ic_[i]; }
   bool pending() const
@@ -428,9 +430,67 @@ class Controller {
   {
     IcState &s = ic_[i];
     uint8_t v = 0;
-    s.have[reg] = s.answered && ics_.read(i, reg, &v);   // after a failed read the IC is not asked again
+    s.have[reg] = s.answered && ics_.read(i, reg, &v);   // after a required read fails the IC is not asked again
     s.reg[reg] = v;
-    if (!s.have[reg]) s.answered = false;
+    // In the candidate mode this survey value is diagnostic. A fresh duty check at start gates SDR, not legacy control.
+    const bool pwmDiagnostic = cfg_.android && s.reg[kRegCfg1] == kQualifiedPwmCfg1
+        && (reg == kRegPwmLsb || reg == kRegPwmMsb);
+    if (!s.have[reg] && !pwmDiagnostic) s.answered = false;
+  }
+  bool pwmContract(const char *contract, const char *reason, const char *context, unsigned check)
+  {
+    const bool supported = !reason;
+    note("PianoBacklightPWMV1 contract=%s supported=%u reason=%s context=%s check=%u",
+         contract, unsigned(supported), supported ? "ok" : reason, context, check);
+    return supported;
+  }
+  bool androidCompatible()
+  {
+    const uint8_t *p = ic_[0].reg, *q = ic_[1].reg;
+    if ((p[kRegCfg1] | q[kRegCfg1]) & kCfg1PwmEnable) {
+      pwmFull_ = checkFullPwm("boot");
+      ics_.done();
+      return pwmFull_;
+    }
+    const bool exponential = !((p[kRegCfg1] | q[kRegCfg1]) & kCfg1LinearMap);
+    const bool matchingCurrent = (p[kRegEn] & kEnSinks) == (q[kRegEn] & kEnSinks)
+        && !((p[kRegIfs] ^ q[kRegIfs]) & 0xf8) && (p[kRegOpt2] & 3) == (q[kRegOpt2] & 3);
+    return pwmContract("exp-pwm-off", !exponential ? "mode" : !matchingCurrent ? "current" : nullptr, "boot", ++pwmChecks_);
+  }
+  static uint16_t pwmCode(uint8_t lsb, uint8_t msb) { return uint16_t(lsb | ((msb & 7) << 8)); }
+  bool readPwm(unsigned i, uint16_t &raw)
+  {
+    uint8_t lsb = 0, msb = 0;
+    if (!ics_.read(i, kRegPwmLsb, &lsb) || !ics_.read(i, kRegPwmMsb, &msb)) return false;
+    raw = pwmCode(lsb, msb);
+    return true;
+  }
+  bool checkFullPwm(const char *context)
+  {
+    const unsigned check = ++pwmChecks_;
+    bool valid = true, stable = true, full = true, mode = true, current = true;
+    for (unsigned i = 0; i < kIcs; ++i) {
+      const IcState &s = ic_[i];
+      uint8_t cfg1 = 0, en = 0, ifs = 0, opt2 = 0;
+      const bool configRead = ics_.read(i, kRegCfg1, &cfg1) && ics_.read(i, kRegEn, &en)
+          && ics_.read(i, kRegIfs, &ifs) && ics_.read(i, kRegOpt2, &opt2);
+      uint16_t raw = 0, again = 0;
+      const bool first = readPwm(i, raw);
+      const bool second = readPwm(i, again);
+      const bool dutyRead = first && second;
+      const bool same = dutyRead && raw == again;
+      valid &= configRead && dutyRead;
+      stable &= same;
+      full &= raw == kFullScale;
+      mode &= cfg1 == kQualifiedPwmCfg1;
+      current &= (en & kEnSinks) == kEnSinks && ifs == kQualifiedPwmIfs && (opt2 & 3) == 3;
+      note("PianoBacklightPWMV1 ic=%s cfg1=%02x pwm_raw=%04x duty_permille=%u stable=%u valid=%u context=%s check=%u pwm_again=%04x code=%u sinks=%02x ifs=%02x limit=%u",
+           kIcName[i], cfg1, raw, unsigned(raw) * 1000 / kFullScale, unsigned(same), unsigned(configRead && dutyRead),
+           context, check, again, s.code, en & kEnSinks, ifs, opt2 & 3);
+    }
+    const char *reason = !valid ? "pwm-read" : !mode ? "mode" : !current ? "current"
+                       : !stable ? "pwm-unstable" : !full ? "pwm-not-full" : nullptr;
+    return pwmContract("exp-pwm-full", reason, context, check);
   }
   bool access(unsigned i, bool okay)
   {
@@ -504,6 +564,10 @@ class Controller {
         else short_ = true;
       }
     }
+    if (pwmFull_ && want) {
+      pwmQualified_ = !short_ && checkFullPwm(pwmWakePending_ ? "wake" : "apply");
+      if (!short_) pwmWakePending_ = false;
+    }
     ics_.done();
     if (!short_) {
       failedAttempts_ = 0;
@@ -526,7 +590,7 @@ class Controller {
     static constexpr uint16_t kCurrentRampMs[16] = {0, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 576, 640};
     static constexpr uint16_t kLimitA[4] = {12, 16, 20, 25};
     const uint8_t c1 = r[kRegCfg1], ramp = uint8_t((r[kRegCfg2] >> 3) & 15), ifs = uint8_t(r[kRegIfs] >> 3), f = r[kRegFlag];
-    const unsigned pwmCode = unsigned(r[kRegPwmMsb] & 7) << 8 | r[kRegPwmLsb];
+    const unsigned duty = pwmCode(r[kRegPwmLsb], r[kRegPwmMsb]);
     note("survey %s: ID 0x%02x (%s, device field %u); BL_CFG1 0x%02x: OVP %u.%u V, %s, %s mapping, PWM input %s%s; BL_CFG2 0x%02x: "
          "current ramp %u %s; code %u (%u %%, LSB 0x%02x MSB 0x%02x); BL_EN 0x%02x: backlight %s, sinks 0x%02x%s",
          kIcName[i], r[kRegId], idIsKtz8866(r[kRegId]) ? "KTZ8866" : "NOT a KTZ8866", (r[kRegId] >> 3) & 7, c1, kOvp[c1 >> 5] / 10,
@@ -540,11 +604,11 @@ class Controller {
                f & 0x08 ? " OUTP short" : "", f & 0x04 ? " OUTN short" : "", f & 0x02 ? " BL OVP" : "", f & 0x01 ? " BL OCP" : "");
     note("survey %s: LCD bias 0x09 0x%02x (LCD_EN %u, OUTP %u, OUTN %u, external enables %u), 0x0a 0x%02x, 0x0b 0x%02x, REG 0x0c 0x%02x, "
          "OUTP 0x0d 0x%02x, OUTN 0x0e 0x%02x (read only, never written); BL_OPTION1 0x%02x, BL_OPTION2 0x%02x (current limit %u.%u A); "
-         "ramps 0x14 0x%02x (on %u us, off %u us); 0x15 0x%02x (full scale %u.%u mA per sink); PWM input code %u%s",
+         "ramps 0x14 0x%02x (on %u us, off %u us); 0x15 0x%02x (full scale %u.%u mA per sink); PWM input code %u%s%s",
          kIcName[i], r[kRegLcd1], r[kRegLcd1] >> 7, (r[kRegLcd1] >> 2) & 1, (r[kRegLcd1] >> 1) & 1, r[kRegLcd1] & 1, r[kRegLcd2],
          r[kRegLcd3], r[kRegBoost], r[kRegOutp], r[kRegOutn], r[kRegOpt1], r[kRegOpt2], kLimitA[r[kRegOpt2] & 3] / 10,
          kLimitA[r[kRegOpt2] & 3] % 10, r[kRegRamp], rampUs(r[kRegRamp] >> 4), rampUs(r[kRegRamp] & 15), r[kRegIfs], (52 + 8 * ifs) / 10,
-         (52 + 8 * ifs) % 10, pwmCode, line);
+         (52 + 8 * ifs) % 10, duty, s.have[kRegPwmLsb] && s.have[kRegPwmMsb] ? "" : " (read incomplete)", line);
   }
 
   void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)))
@@ -598,6 +662,8 @@ class Controller {
   int lid_ = -1;
   uint16_t code_ = 0, ceiling_ = kFullScale;
   uint32_t errors_ = 0, failedAttempts_ = 0, writes_ = 0;
+  bool pwmFull_ = false, pwmQualified_ = true, pwmWakePending_ = false;
+  unsigned pwmChecks_ = 0;
 };
 
 }  // namespace pianobacklight

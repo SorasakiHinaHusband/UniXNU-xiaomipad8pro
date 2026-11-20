@@ -31,6 +31,7 @@ class NativeBrightness {
     : floor_(floor), max_(max), reference_(reference) {}
 
   bool bounded() const { return max_ == PA_SDR_MAX_CODE; }
+  uint32_t initialRevision() const { return bounded() ? 1 : 0; }
   uint32_t minFixed() const
   {
     return bounded() ? pa_sdr_floor_fixed(floor_) : ((500u * floor_ + kFullScale / 2) / kFullScale) << 16;
@@ -100,6 +101,16 @@ class NativeBrightness {
   uint16_t floor_, max_;
   bool reference_;
 };
+
+// The ALS consumer takes these fields together when selecting a curve and starting a fresh session.
+template <typename Sink> bool publishAmbientSnapshot(Sink &sink, const Controller &ctl, uint32_t revision, bool reference)
+{
+  const pianoauto::Ambient &a = ctl.ambientState();
+  return revision && sink.number("curve", reference) && sink.number("revision", revision)
+      && sink.number("floor", ctl.floor()) && sink.number("target", uint32_t(a.lastTarget()))
+      && sink.number("lux", a.lastLux()) && sink.number("valid", a.valid())
+      && sink.number("fault", ctl.autoFault()) && sink.commit(pianoauto::kPropertyAmbientSnapshot);
+}
 
 }  // namespace pianobacklight
 #endif

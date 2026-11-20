@@ -1028,25 +1028,36 @@ static void testPwmContract()
         if (w.ic == i) writes.push_back(w);
       CHECK(writes == expected);
       CHECK(ctl.ic(i).codeReadbacks == 1 && ctl.ic(i).enableReadbacks == 1);
-      std::vector<uint8_t> pwmReads;
-      for (const auto &a : m.trace)
-        if (a.ic == i && !a.write && (a.reg == kRegPwmLsb || a.reg == kRegPwmMsb)) pwmReads.push_back(a.reg);
-      CHECK(pwmReads.size() >= 4);
-      for (size_t r = 0; r < pwmReads.size(); ++r)
-        CHECK(pwmReads[r] == (r % 2 ? kRegPwmMsb : kRegPwmLsb));
+      unsigned pairs = 0;
+      for (size_t r = 0; r + 1 < m.trace.size(); ++r) {
+        const auto &a = m.trace[r];
+        if (a.ic != i || a.write || a.reg != kRegPwmLsb) continue;
+        const auto &b = m.trace[r + 1];
+        CHECK(b.ic == i && !b.write && b.reg == kRegPwmMsb);
+        ++pairs;
+      }
+      CHECK(pairs >= 2);
     }
     checkWhitelist(m, ctl.floor());
 
-    // Same bounded-schema gate used by serve() to start the versioned producer/consumer handoff.
+    // The same bounded-schema gate and snapshot used by serve() and publishState().
     const NativeBrightness schema(ctl.floor(), ctl.ceiling());
-    const uint32_t revision = schema.bounded() ? 1 : 0;
+    const uint32_t revision = schema.initialRevision();
+    NativePropertyRecord snapshot;
+    CHECK(publishAmbientSnapshot(snapshot, ctl, revision, true));
+    CHECK(snapshot.name == pianoauto::kPropertyAmbientSnapshot);
+    CHECK((snapshot.numbers == std::map<std::string, uint32_t>{
+      {"curve", 1}, {"revision", 1}, {"floor", ctl.floor()}, {"target", uint32_t(-1)}, {"lux", 0}, {"valid", 0}, {"fault", 0},
+    }));
     NativeBrightness reference(ctl.floor(), ctl.ceiling(), true);
     uint16_t code = 0;
     CHECK(revision == 1 && schema.maxFixed() == 600u << 16);
-    const pianoauto::AmbientVersion sample{1, revision, 1};
+    const pianoauto::AmbientVersion sample{1, snapshot.numbers["revision"], snapshot.numbers["curve"]};
     CHECK(sample.newer(revision, 1, 0));
     CHECK(!sample.newer(revision + 1, 1, 0) && !sample.newer(revision, 0, 0) && !sample.newer(revision, 1, 1));
     CHECK(ctl.ambient(1000, 12000, "fresh reference ALS") && ctl.autoActive() && ctl.code() == 1952);
+    CHECK(publishAmbientSnapshot(snapshot, ctl, revision, true));
+    CHECK(snapshot.numbers["target"] == 1000 && snapshot.numbers["lux"] == 12000 && snapshot.numbers["valid"] == 1);
     CHECK(reference.decode(100u << 16, code) && code == pa_sdr_code(100u << 16));
     ctl.manualCode(code, kNativeRequest);
     CHECK(!ctl.ambientState().requested() && !ctl.autoActive());
@@ -1058,13 +1069,28 @@ static void testPwmContract()
     setPwm(m, 1, 2046);
     ctl.sleep(false);
     CHECK(m.logged("contract=exp-pwm-full supported=0 reason=pwm-not-full context=wake"));
+    CHECK(!ctl.pwmQualified());
     CHECK(ctl.floor() == (floor == 128 ? 178 : 921) && ctl.ceiling() == 1952);
     m.readReplies[{0, kRegPwmMsb}] = {-1};
     ctl.percent(75, "test");
     CHECK(m.logged("contract=exp-pwm-full supported=0 reason=pwm-read context=apply"));
+    CHECK(!ctl.pwmQualified());
     setPwm(m, 1, 2047);
     ctl.percent(76, "test");
     CHECK(m.lines.back().find("contract=exp-pwm-full supported=1 reason=ok context=apply") != std::string::npos);
+    CHECK(ctl.pwmQualified());
+    m.reg[1][kRegCfg1] = 0x57;
+    ctl.percent(76, "same code");
+    CHECK(!ctl.pwmQualified() && m.logged("supported=0 reason=mode context=apply"));
+    CHECK(m.reg[1][kRegCfg1] == 0x57 && ctl.ceiling() == 1952);
+    m.reg[1][kRegCfg1] = 0x53;
+    ctl.display(true, 1, 1);
+    ctl.display(false, 1, 0);
+    ctl.sleep(true);
+    ctl.sleep(false);
+    CHECK(!m.logged("supported=1 reason=ok context=wake"));
+    ctl.display(true, 1, 1);
+    CHECK(ctl.pwmQualified() && m.logged("supported=1 reason=ok context=wake"));
     CHECK(!m.inBurst);
     for (const auto &line : m.lines)
       if (line.find("PianoBacklightPWMV1") == 0)
@@ -1097,8 +1123,9 @@ static void testPwmRefusal()
       ctl->sleep(false);
     }
     const NativeBrightness fallback(actual.floor(), actual.ceiling()), old(expected.floor(), expected.ceiling());
-    NativePropertyRecord a, b, ca, cb;
-    CHECK(!fallback.bounded() && fallback.maxFixed() == 500u << 16);
+    NativePropertyRecord a, b, ca, cb, snapshot;
+    CHECK(fallback.initialRevision() == 0 && fallback.maxFixed() == 500u << 16);
+    CHECK(!publishAmbientSnapshot(snapshot, actual, fallback.initialRevision(), true) && snapshot.numbers.empty());
     CHECK(fallback.parameters(a, actual.code()) && old.parameters(b, expected.code()));
     CHECK(fallback.calibration(ca) && old.calibration(cb));
     CHECK(a.name == b.name && a.ranges == b.ranges && ca.name == cb.name);
@@ -1123,6 +1150,9 @@ static void testPwmRefusal()
     m = qualifiedPwmPair();
     m.readReplies[{1, kRegPwmMsb}] = {0xff, 0xff, -1};   // survey and first sample succeed
     check(m, floor, "supported=0 reason=pwm-read context=boot", "stable=0 valid=0 context=boot");
+    m = qualifiedPwmPair();
+    m.readReplies[{1, kRegCfg1}] = {0x53, 0x57};   // fresh check supersedes the survey
+    check(m, floor, "supported=0 reason=mode context=boot");
     for (uint8_t wrongMode : {0x52, 0x57, 0x5b, 0x73}) {
       m = qualifiedPwmPair();
       m.reg[1][kRegCfg1] = wrongMode;
@@ -1148,6 +1178,15 @@ static void testPwmRefusal()
   ctl.configure(cfg);
   CHECK(ctl.survey() && ctl.start() && ctl.ceiling() == 1952);
   CHECK(m.logged("contract=exp-pwm-off supported=1 reason=ok context=boot"));
+
+  Model unavailable = qualifiedPwmPair();
+  unavailable.readReplies[{1, kRegPwmMsb}] = {-1, -1, -1};
+  Controller fallback(unavailable);
+  fallback.configure(cfg);
+  CHECK(fallback.survey() && fallback.start() && fallback.ceiling() == 2047 && fallback.floor() == 128);
+  CHECK(unavailable.logged("supported=0 reason=pwm-read context=boot"));
+  CHECK(unavailable.code(0) == 2047 && unavailable.code(1) == 2047 && !fallback.pending());
+  checkWhitelist(unavailable, fallback.floor());
 }
 
 int main()
