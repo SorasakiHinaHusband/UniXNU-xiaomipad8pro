@@ -881,6 +881,13 @@ static void testNativeBrightness()
     CHECK(fresh.classify(200 << 16, 101000) == NativeIntent::kFollow);
     CHECK(fresh.classify(100 << 16, 105000) == NativeIntent::kUserMove);
     CHECK(std::strcmp(kNativeOverride, "force-brightness-control") == 0);
+    auto bitsOf = [](double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; };   // 2026-11-21: the swap record's double
+    CHECK(nitsFixedFromDouble(bitsOf(13.3572)) == int32_t(13.3572 * 65536));
+    CHECK(nitsFixedFromDouble(bitsOf(448.484)) == int32_t(448.484 * 65536));
+    CHECK(nitsFixedFromDouble(bitsOf(600.0)) == 600 << 16 && nitsFixedFromDouble(bitsOf(0.5)) == 1 << 15);
+    CHECK(nitsFixedFromDouble(bitsOf(0.0)) == 0 && nitsFixedFromDouble(bitsOf(-5.0)) == 0);
+    CHECK(nitsFixedFromDouble(bitsOf(1e12)) == INT32_MAX && nitsFixedFromDouble(bitsOf(1e-12)) == 0);
+    CHECK(nitsFixedFromDouble(0x7ff8000000000000ull) == 0 && nitsFixedFromDouble(0x7ff0000000000000ull) == 0);
   }
   CHECK(nativeWriter(true, false, nullptr));
   CHECK(!nativeWriter(false, false, "com.apple.WindowServer"));

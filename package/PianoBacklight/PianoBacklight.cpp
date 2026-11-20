@@ -299,6 +299,7 @@ struct Pending {
 };
 IOLock *gLock;
 uint32_t gNativeDark;   // WindowServer's requests <= 0 (dark ramps), taken and dropped
+uint32_t gSwapNits;     // 2026-11-21: requests from the swap record (NativeGopDisplay)
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
 // The thread's answer to a sleep request: the requests taken, and whether the ICs were dark after the last one.
 uint32_t gSleepAsked, gSleepTaken;
@@ -392,6 +393,7 @@ class PianoBacklight : public IOService {
   void restartAmbient();
   void setAutomatic(bool on);
   void nativeSettle(const char *why);
+  IOReturn enqueueSwapNits(int64_t asked);
   void applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version);
   IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
@@ -699,8 +701,8 @@ void PianoBacklight::serve()
       ++fNativeMoves;
       if (autoOwns) fNativeTookAuto = true;
       if (autoOwns || fNativeMoves % 25 == 1)
-        note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark): %s", p.native,
-             fNativeMoves, fNativeFollowed, gNativeDark, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
+        note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark, %u from the swap): %s", p.native,
+             fNativeMoves, fNativeFollowed, gNativeDark, gSwapNits, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
     }
     if (p.native >= 0) {
       uint16_t code = 0;
@@ -942,6 +944,7 @@ IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, v
 {
   const bool display = name && name->isEqualTo(kFunctionDisplay), step = name && name->isEqualTo(kFunctionStep);
   const bool ambient = name && name->isEqualTo(kFunctionAmbient);
+  if (name && name->isEqualTo(kFunctionNits)) return enqueueSwapNits(int64_t(int32_t(uintptr_t(p1))));
   if (!display && !step && !ambient) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
   if (step && gArgs.native) return kIOReturnUnsupported;
   if (ambient && (gArgs.level < 2 || !gArgs.autoAllowed)) return kIOReturnUnsupported;
@@ -1047,6 +1050,30 @@ IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value
   }
   IOLockUnlock(gLock);
   if (logRefusal) note("%s source=%s refused=%#x pid=%d skipped=%u", kNativeMarker, kNativeRequest, result, proc_selfpid(), dropped);
+  return result;
+}
+
+// 2026-11-21: WindowServer's brightness as the swap carries it (NativeGopDisplay, kernel caller): the stream brightness-nits gets.
+IOReturn PianoBacklight::enqueueSwapNits(int64_t asked)
+{
+  if (!gArgs.native || !gLock) return kIOReturnUnsupported;
+  IOLockLock(gLock);
+  const uint32_t min = gServing ? gNativeMin : NativeBrightness(uint16_t(gArgs.floor)).minFixed();
+  const uint32_t max = gServing ? gNativeMax : NativeBrightness(uint16_t(gArgs.floor)).maxFixed();
+  const uint64_t fixed = asked <= 0 ? 0 : asked < int64_t(min) ? min : asked > int64_t(max) ? max : uint64_t(asked);
+  IOReturn result = kIOReturnSuccess;
+  if (!gNativeReady) {
+    result = kIOReturnNotReady;
+  } else if (!fixed) {
+    ++gNativeDark;
+  } else {
+    gPending.native = int32_t(fixed);
+    if (gNativeMax == PA_SDR_MAX_FIXED) gPending.nativeOrder = ++gControlOrder;
+    gPending.any = true;
+    ++gSwapNits;
+    IOLockWakeup(gLock, &gPending, false);
+  }
+  IOLockUnlock(gLock);
   return result;
 }
 

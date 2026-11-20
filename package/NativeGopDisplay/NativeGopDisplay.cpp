@@ -152,6 +152,12 @@ static constexpr size_t kSwapLayerSourceRect = 17;
 static constexpr size_t kSwapLayerDestRect = 81;
 static constexpr size_t kSwapNext = 4040;
 static constexpr size_t kSwapPrev = 4048;
+// 2026-11-21 (BRIGHTNESS-SLIDER.md): the swap's brightness in the client's record (27.3 IOMobileFramebuffer kern_SwapSetBrightness
+// 0x1b5ed92d8 stores 1 at ctx+0x3cc and the nits, a double, at ctx+0x3d6; the record starts at ctx+0x18, as SwapDirtyRegion's
+// ctx+0x2f0/+0x344 are the family's rec+0x2d8/+0x32c): flag byte rec+0x3b4, packed double rec+0x3be (s_swap_submit reads rec+0x452).
+static constexpr bool kRecBrightnessKnown = true;
+static constexpr size_t kRecBrightnessSet = 0x3b4;
+static constexpr size_t kRecBrightnessNits = 0x3be;
 static constexpr size_t kNotifyAsyncReference = 24;
 static constexpr size_t kNotifyMask = 120;
 static constexpr size_t kNotifyLastTime = 128;
@@ -201,6 +207,8 @@ static constexpr size_t kSwapLayerSourceRect = 17;
 static constexpr size_t kSwapLayerDestRect = 81;
 static constexpr size_t kSwapNext = 3384;          // TAILQ entry of the queue
 static constexpr size_t kSwapPrev = 3392;
+static constexpr bool kRecBrightnessKnown = false;   // the 27.0.1 record's layout was not read
+static constexpr size_t kRecBrightnessSet = 0, kRecBrightnessNits = 0;
 // IOMFBNotifyRequest
 static constexpr size_t kNotifyAsyncReference = 24;   // OSAsyncReference64 of the user client
 static constexpr size_t kNotifyMask = 120;            // which swap info words the client wants; bit 31: as 32-bit halves
@@ -502,6 +510,9 @@ private:
     uint32_t fAuditShown, fAuditWanted, fAuditBad, fAuditCount;
     void publishDisplayPower(bool on);
     void backlightCallout(bool on);
+    void swapBrightness(const uint8_t *rec);   // 2026-11-21: the swap's nits to PianoBacklight
+    int32_t fSwapNitsLast = -1;
+    uint32_t fSwapNitsSent = 0;
     // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
     // without the argument nothing of this runs): the copy thread hands a swap's surface, after the GPU fence wait, to PianoDpu's
     // "PianoDpuFlip" (package/PianoDpu/PianoDpuFlipClient.h), found by class like the GPU; refused, it copies the surface as before
@@ -1419,6 +1430,8 @@ IOReturn NativeGopDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, 
 {
     if (rec)
         fSubmitTime[reinterpret_cast<const uint32_t *>(rec)[38] % 16] = mach_absolute_time();
+    if (rec && fBacklightCallout)
+        swapBrightness(reinterpret_cast<const uint8_t *>(rec));
     return IOMobileFramebufferLegacy::swap_submit(rec, client, out);
 }
 
@@ -1490,6 +1503,47 @@ void NativeGopDisplay::publishDisplayPower(bool on)
 
 // piano-backlight=2: every call, with both power states as they are (PianoBacklight logs their raw values, so an intermediate state
 // WindowServer might use for dimming shows up), only records a request there: nothing waits for the backlight's I2C.
+// The double as signed 16.16 with integer operations only (kernel code; the same as PianoBacklight's nitsFixedFromDouble, whose
+// host test covers it): 0 for a negative, zero, NaN or infinite value, saturated at INT32_MAX.
+static inline int32_t swapNitsFixed(uint64_t bits)
+{
+    const uint32_t exponent = uint32_t(bits >> 52) & 0x7ffu;
+    if ((bits >> 63) || exponent == 0 || exponent == 0x7ffu)
+        return 0;
+    const uint64_t mantissa = (bits & ((uint64_t(1) << 52) - 1)) | (uint64_t(1) << 52);
+    const int shift = int(exponent) - 1075 + 16;
+    if (shift >= 0)
+        return shift > 10 ? INT32_MAX : (mantissa << shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa << shift);
+    return shift <= -64 ? 0 : (mantissa >> -shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa >> -shift);
+}
+
+// 2026-11-21: a swap that carries WindowServer's brightness (CoreBrightness's slider, keys and ramps) hands the nits, as 16.16,
+// to PianoBacklight, which clamps, tells the user's moves from the ramps and applies them (BRIGHTNESS-SLIDER.md).
+void NativeGopDisplay::swapBrightness(const uint8_t *rec)
+{
+    if (!kRecBrightnessKnown || !(rec[kRecBrightnessSet] & 1))
+        return;
+    uint64_t bits = 0;
+    memcpy(&bits, rec + kRecBrightnessNits, sizeof bits);
+    const int32_t fixed = swapNitsFixed(bits);
+    if (fixed == fSwapNitsLast)
+        return;
+    fSwapNitsLast = fixed;
+    if (!fBacklight) {
+        OSDictionary *match = IOService::serviceMatching("PianoBacklight");
+        IOService *backlight = match ? IOService::copyMatchingService(match) : nullptr;
+        if (match)
+            match->release();
+        if (!backlight)
+            return;
+        fBacklight = backlight;
+    }
+    const IOReturn r = fBacklight->callPlatformFunction("PianoBacklightNits", false, reinterpret_cast<void *>(uintptr_t(uint32_t(fixed))),
+                                                        nullptr, nullptr, nullptr);
+    if (++fSwapNitsSent <= 8 || fSwapNitsSent % 64 == 0)
+        GOPLOG("PianoSwapBrightnessV1 swap brightness 16.16 %d to PianoBacklight: %#x (%u sent)\n", fixed, r, fSwapNitsSent);
+}
+
 void NativeGopDisplay::backlightCallout(bool on)
 {
     if (!fBacklight) {

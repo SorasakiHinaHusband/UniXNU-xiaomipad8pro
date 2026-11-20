@@ -59,6 +59,18 @@ class NativeIntent {
   bool armed_ = false;
 };
 
+// 2026-11-21: an IEEE-754 double (the swap record's nits) as signed 16.16 without floating point (kernel code): 0 for a negative,
+// zero, NaN or infinite value, saturated at INT32_MAX.
+inline int32_t nitsFixedFromDouble(uint64_t bits)
+{
+  const uint32_t exponent = uint32_t(bits >> 52) & 0x7ffu;
+  if ((bits >> 63) || exponent == 0 || exponent == 0x7ffu) return 0;
+  const uint64_t mantissa = (bits & ((uint64_t(1) << 52) - 1)) | (uint64_t(1) << 52);
+  const int shift = int(exponent) - 1075 + 16;   // value * 65536 = mantissa * 2^(exponent - 1075 + 16)
+  if (shift >= 0) return shift > 10 ? INT32_MAX : (mantissa << shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa << shift);
+  return shift <= -64 ? 0 : (mantissa >> -shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa >> -shift);
+}
+
 // Nominal SDR slider scale. The endpoints model the safe code range, not a panel luminance measurement.
 class NativeBrightness {
  public:
