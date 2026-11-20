@@ -1079,12 +1079,35 @@ static void testFailures()
     m.begin(fastOptions());
     CHECK(m.run() == kStaDone && !m.sta.peerMapped && m.hasReport(kStaRepPeerMap, 0xffffffffu) && m.sta.aid == 5);
   }
-  {   // the firmware's kickout while associated
+  {   // the firmware's kickout while associated, piano-wifi-kickout-ends=1: the association ends
+    Model m;
+    m.networks();
+    m.kickoutAfterUpMs = 300;
+    StaOptions o = fastOptions();
+    o.kickoutEnds = true;
+    m.begin(o);
+    CHECK(m.run() == kStaDone && m.sta.disconnect == kStaDiscKickout && m.sta.disconnectReason == 1 && m.peerDeleted);
+    CHECK(!m.hasReport(kStaRepKickoutKept, 1));
+  }
+  {   // 2026-11-20: by default the kickout is reported and the association kept (the hold's own end follows)
     Model m;
     m.networks();
     m.kickoutAfterUpMs = 300;
     m.begin(fastOptions());
-    CHECK(m.run() == kStaDone && m.sta.disconnect == kStaDiscKickout && m.sta.disconnectReason == 1 && m.peerDeleted);
+    CHECK(m.run() == kStaDone && m.sta.disconnect == kStaDiscNone && m.sta.kickouts == 1 && m.sta.lastKickoutReason == 1);
+    CHECK(m.hasReport(kStaRepKickoutKept, 1) && m.peerDeleted);
+  }
+  {   // 2026-11-20: a rejoin after an end that was not ours: one scan of our own first (its number 0), then the usual join
+    Model m;
+    m.networks();
+    m.deauthAfterUpMs = 100;
+    StaOptions o = fastOptions();
+    o.scanFirst = true;
+    m.begin(o);
+    for (unsigned i = 0; i < 20 && m.sta.step != kStaRescan; ++i) m.turn();
+    CHECK(m.sta.step == kStaRescan && m.scans == 1 && !m.peerCreated);
+    CHECK(m.run() == kStaDone && m.sta.assocAnswered && m.scans == 1 && m.sta.scanFirstDone && m.sta.rescansDone == 0);
+    CHECK(m.hasReport(kStaRepScanPlan, 0));
   }
   {   // a stop during the authentication (a suspend): the teardown with short waits, nothing left behind
     Model m;

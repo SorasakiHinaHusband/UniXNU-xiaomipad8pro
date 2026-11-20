@@ -136,7 +136,7 @@ struct Args {
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
   uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS, phy, apple80211;
-  uint32_t rxba, reoPool;
+  uint32_t rxba, reoPool, kickoutEnds;
 };
 Args gArgs;
 
@@ -331,6 +331,8 @@ void readArgs()
   gArgs.rxba = bootArg("piano-wifi-rxba", kBaModeAccept);
   if (gArgs.rxba > kBaModeAcceptAmsdu) gArgs.rxba = kBaModeAccept;
   gArgs.reoPool = bootArg("piano-wifi-reopool", 1) ? 1 : 0;
+  // piano-wifi-kickout-ends=1 (2026-11-20, WIFI-DEAF-REJOIN.md): the firmware's kickout ends the association, as before
+  gArgs.kickoutEnds = bootArg("piano-wifi-kickout-ends", 0) ? 1 : 0;
   // piano-wifi-bgscan=S (review of ee9980a, #3): a background scan every S s while associated, its list published for the
   // menu's snapshot; by default 120 with the menu binding on (piano-wifi-apple80211=1), 0 (only a fast pass's one) without.
   gArgs.apple80211 = bootArg("piano-wifi-apple80211", 0);
@@ -340,6 +342,10 @@ void readArgs()
 }
 
 uint64_t nowMs();
+
+// 2026-11-20 (WIFI-DEAF-REJOIN.md): how the last association ended when it was not ours (StaDisconnect; 0: ours or none). The
+// next join then scans before its choice.
+uint32_t gRejoinScanCause = 0;
 
 // ---- the ladder's stack (boots 10c, 10d and 10d-ctl, 2026-11-14) ----
 // The ladder's thread has XNU's 16 KiB kernel stack. Level 6 inlined two whole-object resets (Link and HttRx, about 12 KiB of
@@ -3944,6 +3950,10 @@ void staReport(void *, uint32_t what, uint32_t a, uint32_t b)
     note(a ? "level 7: the peer's association confirmed after %u ms"
            : "level 7: the peer's association not confirmed within %u ms (the join goes on)", b);
     return;
+  case kStaRepKickoutKept:
+    note("level 7: PianoWifiKickoutKeptV1 the firmware's kickout (reason %u, %u in this association): reported, the association "
+         "kept (ath12k reports it as low ack; a dead link ends by the beacon miss)", a, b);
+    return;
   case kStaRepDisconnect:
     note("level 7: the association ended: %s, reason %u (%s), %u ms after the station came up", staDisconnectName(a), b,
          (a == kStaDiscDeauth || a == kStaDiscDisassoc) ? dot11ReasonName(uint16_t(b)) : "the firmware's code",
@@ -5651,6 +5661,11 @@ int level7(IOService *owner)
          poolQueues ? "fresh memory of the pool" : (joins % 2 == 0 ? "the second block" : "the first block"));
   profileBeforeJoin(joins == 1 ? "at the join's start" : "before the rejoin");
   o.phy = __atomic_load_n(&gPhyWanted, __ATOMIC_ACQUIRE);
+  o.kickoutEnds = gArgs.kickoutEnds != 0;
+  o.scanFirst = gRejoinScanCause != 0;
+  if (o.scanFirst)
+    note("level 7: PianoWifiRejoinScanV1 join %u: the last association ended by %s (not ours): one scan of our own before the "
+         "choice", joins, staDisconnectName(gRejoinScanCause));
   staBeginOnce(o, env, nowMs());
   gLink.hook = staHook;
   uint32_t generation = 0;
@@ -5782,6 +5797,9 @@ int level7(IOService *owner)
   }
   const uint64_t finishedAt = nowMs();
   recordAppleJoin(generation, 2, finishedAt);
+  // an end that was not ours (the firmware's beacon miss, the access point's deauthentication or disassociation, a kickout with
+  // piano-wifi-kickout-ends=1) makes the next join scan first; any other end clears it
+  gRejoinScanCause = (!userStopped && !dropThisJoin) ? gSta.disconnect : 0;
   if (gArgs.level >= 8) level8Follow(nowMs());
   if (userStopped) {
     if (gUserControl.radioStop()) stoppedOnRequest = true;
