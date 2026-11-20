@@ -10,12 +10,22 @@ struct piano_boot_join_transport {
   int (*associate)(void *);
   void (*pause)(void *);
 };
+enum { PianoBootJoinSkipped = 4 };
+
 static int piano_boot_join(struct piano_boot_join_transport *t, unsigned limit)
 {
-  while (limit-- && !t->ready(t->context)) t->pause(t->context);
-  if (!t->ready(t->context)) return 1;
+  int ready = 0;
+  for (unsigned n = 0; n < limit; ++n) {
+    ready = t->ready(t->context);
+    if (ready) break;
+    t->pause(t->context);
+  }
+  if (ready < 0) return PianoBootJoinSkipped;
+  if (!ready) return 1;
   const uint32_t before = t->receipt(t->context);
-  if (!t->associate(t->context)) return 2;
+  const int joined = t->associate(t->context);
+  if (joined < 0) return PianoBootJoinSkipped;
+  if (!joined) return 2;
   // A successful Apple API return alone is insufficient: require a new SET20.
   for (unsigned n = 0; n < 30; ++n) {
     const uint32_t after = t->receipt(t->context);

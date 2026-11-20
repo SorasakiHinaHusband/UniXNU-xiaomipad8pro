@@ -686,12 +686,13 @@ suppresses retries until another SET20; power-off cancels scans, drains station 
 Power-on reloads the firmware through the existing restart path and permits the retained profile to reconnect. A stop serial
 keeps quick off/on and leave/join requests from skipping teardown. Existing saved profiles are retained.
 
-`piano-wifi-boot-on=1` is the safe default: an unarmed SET19 OFF is acknowledged with the owner still ON, no stop serial and
-no physical power change. Startup ON requests, automatic joins and daemon restarts do not release this guard. For explicit
-OFF, root first writes `sysctl machdep.piano_wifi_power_explicit=1`, then uses the normal menu or command-line power control;
-the arm is one-way for this boot. Before that arm, the menu's OFF is acknowledged while the radio remains ON.
-`piano-wifi-boot-on=0` enables unrestricted SET19 behavior, including saved startup OFF. Neither SET19 nor SET20 carries
-a user-origin bit, so a join cannot safely substitute for that explicit arm. This fallback is pending tablet qualification.
+The daily ESP sets `piano-wifi-native-boot=1`. With this mode, SET19 OFF uses the physical stop path and airportd owns
+the first association. After the airportd kick, the userland helper checks or adds the native saved profile, then gives
+airportd time to auto-join. If the radio is on and no association has been requested, the helper may ask CoreWLAN to join once.
+
+RAM diagnostics default to `piano-wifi-boot-on=1`. An unarmed SET19 OFF returns `EBUSY`, leaving GET19 ON without a
+stop serial or accepted POWER_CHANGED event. To test physical OFF, use `piano-wifi-boot-on=0` or write
+`sysctl machdep.piano_wifi_power_explicit=1` as root before using the menu. This arm lasts for the boot.
 
 The 27.3 `networksetup` text `Off (forced)` is a separate SystemConfiguration existence check: zero matching AirPort service
 or interface dictionaries returns that text before CoreWLAN power is read. It is not a GET19 or hardware-switch value.

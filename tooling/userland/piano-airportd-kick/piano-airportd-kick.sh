@@ -8,7 +8,8 @@
 # runs), and says what airportd is before and after, each line with the time.
 # The gate: the kernel argument piano-wifi-apple80211 as PianoWifi read it (its sysctl machdep.piano_wifi_apple80211: boot 10q
 # showed that an argument of the ADT's tail is not in kern.bootargs). Without it the job ends at once; when Wi-Fi does not come
-# up within 600 s it ends having done nothing. Its lines go to the console and the system log; nothing else is written.
+# up within 600 s it ends having done nothing. After the restart, publish a
+# boot-specific receipt for the CoreWLAN fallback.
 say() {
   /usr/bin/logger -t piano-airportd-kick "$*"
   echo "piano-airportd-kick: $(/bin/date +%T) $*" > /dev/console 2> /dev/null
@@ -39,4 +40,12 @@ say "launchctl kickstart -k system/com.apple.airportd (the first airportd starte
 rc=$?
 sleep 10
 say "kickstart -k returned $rc; airportd now:$(state)"
-exit 0
+[ "$rc" -eq 0 ] || exit "$rc"
+boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || exit 1
+[ -n "$boot" ] || exit 1
+receipt=$(/usr/bin/mktemp /var/run/piano-airportd-kick.XXXXXXXX) || exit 1
+if ! printf '%s\n' "$boot" > "$receipt" || ! /bin/mv -f "$receipt" /var/run/piano-airportd-kick; then
+  /bin/rm -f "$receipt"
+  exit 1
+fi
+say "PianoWifiAirportdKickV1 complete"

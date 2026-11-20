@@ -11,13 +11,12 @@
 //   psk=PASSPHRASE       for wpa2-psk: 8 to 63 printable characters, or 64 hex digits
 //   bssid=aa:bb:cc:dd:ee:ff   optional: the access point to prefer
 //   mac=02:..:..:..:..:..     optional: the station's own address (locally administered)
-// Profile bytes stay in memory. CoreWLAN owns association; the read-only kernel receipt
-// proves that its SET20 published a new profile. This RunAtLoad job exits after one
-// request and never overrides a later user disconnect.
+// After the airportd kick, daily boots provision the native saved network.
+// CoreWLAN owns any fallback association, which must publish a new SET20.
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
 #import <CoreLocation/CoreLocation.h>
-#include <sys/time.h>
+#import <Security/Security.h>
 #include "BootJoin.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -96,8 +95,245 @@ static int safe_open(const char *path)
   return fd;
 }
 
-enum { BootJoinDeadline = 480, LocationStableSeconds = 10, LocationQuerySeconds = 8 };
+enum {
+  KickWaitSeconds = 620, BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25,
+  LocationWaitSeconds = 60, LocationStableSeconds = 10, LocationQuerySeconds = 8
+};
+static const char kick_receipt[] = "/var/run/piano-airportd-kick";
 extern char **environ;
+
+static int native_boot(void)
+{
+  int value;
+  size_t size = sizeof value;
+  if (sysctlbyname("machdep.piano_wifi_native_boot", &value, &size, NULL, 0) || size != sizeof value)
+    return -1;
+  return value == 1;
+}
+
+static int kick_completed(const char *path, const char *boot)
+{
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return 0;
+  struct stat st;
+  char body[64];
+  ssize_t length = -1;
+  if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == 0 && !(st.st_mode & 077))
+    length = read(fd, body, sizeof body);
+  close(fd);
+  size_t expected = strlen(boot);
+  return expected > 0 && expected < sizeof body && length == (ssize_t)expected + 1 &&
+         body[expected] == '\n' && !memcmp(body, boot, expected);
+}
+
+static int boot_uuid(char *boot, size_t size)
+{
+  return !sysctlbyname("kern.bootsessionuuid", boot, &size, NULL, 0) && size == 37 && boot[36] == '\0';
+}
+
+// Native CoreWLAN writer used by networksetup on 27.3. The native forms are
+// used only for readback, so identifier encoding and security normalization
+// stay in CoreWiFi.
+extern OSStatus CWAddNetworkProfile(CWNetworkProfile *, SFAuthorization *);
+extern OSStatus SecTrustedApplicationCreateApplicationGroup(
+    const char *, SecCertificateRef, SecTrustedApplicationRef *);
+@interface CWFNetworkProfile : NSObject
+@property (readonly) NSData *SSID;
+@property (readonly) uint64_t supportedSecurityTypes;
+@property (readonly, getter=isSystemMode) BOOL systemMode;
+@property (readonly, getter=isAutoJoinDisabled) BOOL autoJoinDisabled;
+@property (readonly) NSDate *networkDisabledUntilDate;
+@property (readonly) NSString *identifier;
+- (instancetype)initWithExternalForm:(NSDictionary *)form;
+@end
+@interface CWNetworkProfile (PianoNativeProfile)
+- (CWFNetworkProfile *)coreWiFiNetworkProfile;
+@end
+@interface CWFKeyValueStore : NSObject
+- (instancetype)initWithType:(NSInteger)type identifier:(NSString *)identifier;
+- (void)activate;
+- (NSDictionary *)dictionaryRepresentation;
+@end
+
+enum saved_profile { SavedReady = 0, SavedUnavailable = 1, SavedPreserved = 2 };
+enum known_profile { KnownUnavailable, KnownAbsent, KnownMatches, KnownPreserve };
+
+static enum known_profile known_profile_state(NSDictionary *records, NSData *ssid, uint64_t mask, BOOL exact)
+{
+  if (!records) return KnownUnavailable;
+  NSUInteger count = 0;
+  BOOL matches = NO;
+  Class type = NSClassFromString(@"CWFNetworkProfile");
+  if (!type) return KnownUnavailable;
+  for (NSString *key in records) {
+    if (![key hasPrefix:@"wifi.network.ssid."] || ![records[key] isKindOfClass:NSDictionary.class]) continue;
+    CWFNetworkProfile *profile = [[type alloc] initWithExternalForm:records[key]];
+    if (![profile.SSID isEqualToData:ssid]) continue;
+    ++count;
+    const uint64_t security = profile.supportedSecurityTypes;
+    matches = [profile.identifier isEqualToString:key] && profile.isSystemMode && !profile.isAutoJoinDisabled &&
+              [profile.networkDisabledUntilDate timeIntervalSinceNow] <= 0 &&
+              (exact ? security == mask : (security & mask) == mask);
+  }
+  return !count ? KnownAbsent : count == 1 && matches ? KnownMatches : KnownPreserve;
+}
+
+static CWFKeyValueStore *known_store(void)
+{
+  CWFKeyValueStore *store = [[NSClassFromString(@"CWFKeyValueStore") alloc]
+      initWithType:1 identifier:@"com.apple.wifi.known-networks"];
+  [store activate];
+  return store;
+}
+
+// Create only. A preexisting owner credential, including one appearing
+// between lookup and creation, stays untouched.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static OSStatus add_system_credential(SecKeychainRef keychain, NSData *ssid, NSData *password)
+{
+  const char *applications[] = {NULL, "/usr/libexec/airportd"};
+  NSMutableArray *trusted = [NSMutableArray array];
+  for (unsigned i = 0; i < sizeof applications / sizeof applications[0]; ++i) {
+    SecTrustedApplicationRef app = NULL;
+    OSStatus status = SecTrustedApplicationCreateFromPath(applications[i], &app);
+    if (status != errSecSuccess) return status;
+    [trusted addObject:CFBridgingRelease(app)];
+  }
+  SecTrustedApplicationRef group = NULL;
+  OSStatus status = SecTrustedApplicationCreateApplicationGroup("AirPort", NULL, &group);
+  if (status != errSecSuccess) return status;
+  [trusted addObject:CFBridgingRelease(group)];
+  SecAccessRef access = NULL;
+  status = SecAccessCreate(CFSTR("AirPort"), (__bridge CFArrayRef)trusted, &access);
+  if (status != errSecSuccess) return status;
+  const char service[] = "AirPort", kind[] = "AirPort network password";
+  SecKeychainAttribute attributes[] = {
+    { kSecServiceItemAttr, sizeof service - 1, (void *)service },
+    { kSecAccountItemAttr, (UInt32)ssid.length, (void *)ssid.bytes },
+    { kSecLabelItemAttr, (UInt32)ssid.length, (void *)ssid.bytes },
+    { kSecDescriptionItemAttr, sizeof kind - 1, (void *)kind }
+  };
+  SecKeychainAttributeList list = { sizeof attributes / sizeof attributes[0], attributes };
+  status = SecKeychainItemCreateFromContent(kSecGenericPasswordItemClass, &list, (UInt32)password.length,
+                                           password.bytes, keychain, access, NULL);
+  CFRelease(access);
+  return status;
+}
+
+static enum saved_profile ensure_system_credential(NSData *ssid, NSString *password)
+{
+  if (SecKeychainSetUserInteractionAllowed(false) != errSecSuccess) return SavedUnavailable;
+  SecKeychainRef keychain = NULL;
+  if (SecKeychainOpen("/Library/Keychains/System.keychain", &keychain) != errSecSuccess) return SavedUnavailable;
+  OSStatus status = SecKeychainUnlock(keychain, 0, NULL, false);
+  NSString *stored = nil;
+  if (status == errSecSuccess) status = CWKeychainFindWiFiPassword(kCWKeychainDomainSystem, ssid, &stored);
+  if (status == errSecItemNotFound) {
+    status = add_system_credential(keychain, ssid, [password dataUsingEncoding:NSUTF8StringEncoding]);
+    if (status == errSecSuccess || status == errSecDuplicateItem)
+      status = CWKeychainFindWiFiPassword(kCWKeychainDomainSystem, ssid, &stored);
+  }
+  CFRelease(keychain);
+  if (status != errSecSuccess) return SavedUnavailable;
+  return [stored isEqualToString:password] ? SavedReady : SavedPreserved;
+}
+#pragma clang diagnostic pop
+
+static enum saved_profile provision(const struct piano_wifi_profile *p)
+{
+  NSData *ssid = [NSData dataWithBytes:p->ssid length:p->ssid_len];
+  CWMutableNetworkProfile *profile = [CWMutableNetworkProfile networkProfile];
+  profile.ssidData = ssid;
+  profile.security = p->psk_len ? kCWSecurityWPA2Personal : kCWSecurityNone;
+  CWFNetworkProfile *native = [profile coreWiFiNetworkProfile];
+  const uint64_t submitted = native.supportedSecurityTypes;
+  const uint64_t compatible = p->psk_len ? 0x10 : submitted; // native WPA2 support
+  if (![native.SSID isEqualToData:ssid] || !compatible || (submitted & compatible) != compatible)
+    return SavedUnavailable;
+
+  CWFKeyValueStore *store = known_store();
+  enum known_profile known = known_profile_state([store dictionaryRepresentation], ssid, compatible, NO);
+  if (known == KnownUnavailable) return SavedUnavailable;
+  if (known == KnownPreserve) {
+    timeline("native known=preserved");
+    return SavedPreserved;
+  }
+  if (p->psk_len) {
+    NSString *password = [[NSString alloc] initWithBytes:p->psk length:p->psk_len encoding:NSUTF8StringEncoding];
+    const enum saved_profile credential = ensure_system_credential(ssid, password);
+    timeline("native system_credential=%s", credential == SavedReady ? "verified" :
+             credential == SavedPreserved ? "preserved" : "unavailable");
+    if (credential != SavedReady) return credential;
+  } else {
+    timeline("native system_credential=not-required");
+  }
+  if (known == KnownMatches) {
+    timeline("native known=existing-verified");
+    return SavedReady;
+  }
+  if (CWAddNetworkProfile(profile, nil) != errSecSuccess) {
+    timeline("native known=add-failed");
+    return SavedUnavailable;
+  }
+  store = known_store();
+  for (unsigned attempt = 0; attempt < 8; ++attempt) {
+    if (known_profile_state([store dictionaryRepresentation], ssid, submitted, YES) == KnownMatches) {
+      timeline("native known=added-verified");
+      return SavedReady;
+    }
+    if (attempt < 7) sleep(1);
+  }
+  timeline("native known=readback-failed");
+  return SavedUnavailable;
+}
+
+static int provision_from_stdin(void)
+{
+  char boot[64];
+  if (native_boot() != 1 || !boot_uuid(boot, sizeof boot) || !kick_completed(kick_receipt, boot))
+    return SavedUnavailable;
+  alarm(ProvisionDeadline);
+  // The parent sends a validated regular file via stdin; read directly so
+  // stdio does not keep an extra copy of the secret.
+  uint8_t bytes[4097];
+  size_t length = 0;
+  ssize_t n;
+  do {
+    n = read(STDIN_FILENO, bytes + length, sizeof bytes - length);
+    if (n > 0) length += (size_t)n;
+  } while (length < sizeof bytes && (n > 0 || (n < 0 && errno == EINTR)));
+  struct piano_wifi_profile p = {};
+  const char *problem = !length || length == sizeof bytes || n < 0 ? "read" :
+                        piano_wifi_profile_parse(bytes, (uint32_t)length, &p);
+  wipe(bytes, sizeof bytes);
+  int result = SavedUnavailable;
+  if (!problem) {
+    @autoreleasepool { result = provision(&p); }
+  }
+  piano_wifi_profile_wipe(&p);
+  return result;
+}
+
+static enum saved_profile provision_from_file(char *executable, int fd)
+{
+  posix_spawn_file_actions_t actions;
+  if (lseek(fd, 0, SEEK_SET) < 0 || posix_spawn_file_actions_init(&actions)) return SavedUnavailable;
+  char *args[] = { executable, "--provision-stdin", NULL };
+  pid_t pid;
+  int error = posix_spawn_file_actions_adddup2(&actions, fd, STDIN_FILENO);
+  if (!error) error = posix_spawn(&pid, executable, &actions, NULL, args, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (error) return SavedUnavailable;
+  int status;
+  pid_t waited;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited != pid || !WIFEXITED(status)) return SavedUnavailable;
+  const int result = WEXITSTATUS(status);
+  return result == SavedReady ? SavedReady : result == SavedPreserved ? SavedPreserved : SavedUnavailable;
+}
 
 struct location_readiness {
   pid_t pid;
@@ -167,9 +403,23 @@ static int location_ready(struct location_readiness *state, char *executable, un
   return 0;
 }
 
+static int location_allows_join(struct location_readiness *state, char *executable,
+                                unsigned attempt, uint64_t since_kick)
+{
+  if (since_kick >= LocationWaitSeconds) {
+    timeline("location attempt=%u result=deadline-fallback", attempt);
+    return 1;
+  }
+  // A synchronous child gets its own alarm. Avoid starting one that could
+  // carry the location wait beyond the deadline.
+  return since_kick <= LocationWaitSeconds - LocationQuerySeconds &&
+         location_ready(state, executable, attempt);
+}
+
 struct apple_join {
   const struct piano_wifi_profile *profile;
   char *executable;
+  uint64_t kick_time;
   struct location_readiness location;
   CWInterface *interface;
   CWNetwork *network;
@@ -192,24 +442,20 @@ static uint32_t receipt(void *unused)
   timeline("SET20 poll generation=%u", generation);
   return generation;
 }
+
+static int native_join_seen(struct apple_join *a)
+{
+  if (!receipt(NULL) && !a->interface.ssidData.length) return 0;
+  timeline("fallback skipped=association-present-or-requested");
+  return 1;
+}
+
 static int ready(void *context)
 {
   struct apple_join *a = context;
   const unsigned attempt = ++a->readiness_attempt;
-  if (a->network) {
-    timeline("ready attempt=%u result=cached-match", attempt);
-    return 1;
-  }
-  // Match the installed pre-G5 boot-settle boundary, after airportd startup cleanup.
-  struct timeval boot = {}; size_t n = sizeof boot;
-  if (sysctlbyname("kern.boottime", &boot, &n, NULL, 0)) {
-    timeline("settle attempt=%u result=read-error errno=%d", attempt, errno);
-    return 0;
-  }
-  const time_t uptime = time(NULL) - boot.tv_sec;
-  timeline("settle attempt=%u uptime=%lld ready=%d", attempt, (long long)uptime, uptime >= 120);
-  if (uptime < 120) return 0;
-  if (!location_ready(&a->location, a->executable, attempt)) return 0;
+  const uint64_t since_kick = monotonic_seconds() - a->kick_time;
+  if (since_kick < NativeJoinGraceSeconds) return 0;
   timeline("interface attempt=%u begin", attempt);
   a->interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
   timeline("interface attempt=%u present=%d", attempt, a->interface != nil);
@@ -217,7 +463,12 @@ static int ready(void *context)
   timeline("power attempt=%u begin", attempt);
   const BOOL powered = a->interface.powerOn;
   timeline("power attempt=%u on=%d", attempt, powered);
-  if (!powered) return 0;
+  if (!powered) {
+    timeline("fallback skipped=powered-off");
+    return -1;
+  }
+  if (native_join_seen(a)) return -1;
+  if (!location_allows_join(&a->location, a->executable, attempt, since_kick)) return 0;
   NSData *name = [NSData dataWithBytes:a->profile->ssid length:a->profile->ssid_len];
   NSError *error = nil;
   timeline("scan attempt=%u begin", attempt);
@@ -243,6 +494,7 @@ static int ready(void *context)
 static int associate(void *context)
 {
   struct apple_join *a = context;
+  if (!a->interface.powerOn || native_join_seen(a)) return -1;
   const struct piano_wifi_profile *p = a->profile;
   NSString *password = p->psk_len ? [[NSString alloc] initWithBytes:p->psk length:p->psk_len encoding:NSUTF8StringEncoding] : nil;
   NSError *error = nil;
@@ -269,11 +521,13 @@ int main(int argc, char **argv)
     return 0;
   }
   const char *path = argc > 1 ? argv[1] : PIANO_WIFI_PROFILE_PATH;
-  timeline("start");
   if (geteuid() != 0) {
     fprintf(stderr, "piano-wifi-join: run as root\n");
     return finish(1, "root");
   }
+  if (argc == 2 && !strcmp(argv[1], "--provision-stdin"))
+    return provision_from_stdin();
+  timeline("start");
   // No PianoWifi in this boot (or not at a level that joins): nothing to do. launchd may start this before the kext has
   // registered its sysctl, so it is looked for during 30 s before that conclusion.
   size_t probe = 0;
@@ -288,11 +542,32 @@ int main(int argc, char **argv)
   timeline("profile open=%s", fd == -2 ? "missing" : fd < 0 ? "refused" : "ok");
   if (fd == -2) return finish(0, "profile-missing");
   if (fd < 0) return finish(1, "profile-open");
+  char boot[64];
+  if (!boot_uuid(boot, sizeof boot)) {
+    close(fd);
+    return finish(1, "boot-uuid");
+  }
+  unsigned wait = 0;
+  while (wait < KickWaitSeconds && !kick_completed(kick_receipt, boot)) {
+    sleep(1);
+    ++wait;
+  }
+  if (wait == KickWaitSeconds) {
+    close(fd);
+    return finish(1, "airportd-kick-timeout");
+  }
+  const uint64_t kick_time = monotonic_seconds();
+  timeline("airportd kick=complete");
+  const int native = native_boot();
+  if (native < 0) {
+    close(fd);
+    return finish(1, "boot-mode");
+  }
   static char text[4097];
-  const ssize_t got = read(fd, text, sizeof text - 1);
+  const ssize_t got = pread(fd, text, sizeof text, 0);
   timeline("profile read=%s errno=%d", got > 0 ? "ok" : got == 0 ? "empty" : "error", got < 0 ? errno : 0);
-  close(fd);
-  if (got <= 0) {
+  if (got <= 0 || got == sizeof text) {
+    close(fd);
     wipe(text, sizeof text);
     return finish(1, "profile-read");
   }
@@ -303,6 +578,7 @@ int main(int argc, char **argv)
   timeline("profile parse=%s", problem ? "refused" : "ok");
   wipe(text, sizeof text);
   if (problem) {
+    close(fd);
     fprintf(stderr, "piano-wifi-join: the profile is not usable: %s; nothing handed over\n", problem);
     piano_wifi_profile_wipe(&p);
     return finish(1, "profile-parse");
@@ -318,11 +594,38 @@ int main(int argc, char **argv)
   timeline("readiness deadline_seconds=%u alarm_logging=%d", BootJoinDeadline, handler == 0);
   int rc;
   @autoreleasepool {
-    struct apple_join a = { .profile = &p, .executable = argv[0] };
-    struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
-    rc = piano_boot_join(&transport, BootJoinDeadline / 2);
+    enum saved_profile saved = SavedUnavailable;
+    if (native) {
+      CWInterface *interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
+      if (interface && !interface.powerOn) {
+        timeline("fallback skipped=powered-off");
+        saved = SavedPreserved;
+      } else {
+        saved = provision_from_file(argv[0], fd);
+        if (saved == SavedUnavailable) {
+          timeline("native provisioning=retry");
+          // Give the System keychain time to initialize on the first boot.
+          while (monotonic_seconds() - kick_time < 20) sleep(1);
+          if (interface && !interface.powerOn) saved = SavedPreserved;
+          else saved = provision_from_file(argv[0], fd);
+        }
+        timeline("native provisioning=%s", saved == SavedReady ? "verified" :
+                 saved == SavedPreserved ? "preserved" : "unavailable");
+      }
+    } else {
+      timeline("native provisioning=ram-probe");
+    }
+    close(fd);
+    if (saved == SavedPreserved) {
+      rc = PianoBootJoinSkipped;
+    } else {
+      struct apple_join a = { .profile = &p, .executable = argv[0], .kick_time = kick_time };
+      struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
+      rc = piano_boot_join(&transport, BootJoinDeadline / 2);
+    }
   }
   piano_wifi_profile_wipe(&p);
+  if (rc == PianoBootJoinSkipped) return finish(0, "fallback-skipped");
   if (rc) {
     fprintf(stderr, "piano-wifi-join: boot transaction failed stage %d; no retry\n", rc);
     static const char *const stage[] = { "complete", "readiness", "associate", "SET20" };

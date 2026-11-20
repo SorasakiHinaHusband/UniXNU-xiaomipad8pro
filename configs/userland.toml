@@ -336,12 +336,12 @@ mode = "0755"
 
 [[unit]]
 name = "piano-wifi-join"
-about = "one supported CoreWLAN boot association from the root-only Piano profile after AirPort readiness; requires a fresh SET20 receipt; never retries a later user disconnect"
+about = "native Wi-Fi profile provisioning on daily boots and one CoreWLAN fallback after the airportd kick; requires a fresh SET20 receipt"
 default_on = true
 
 [[unit.file]]
 source = "tooling/native/piano-wifi-join/piano-wifi-join.m"
-frameworks = ["Foundation", "CoreWLAN", "CoreLocation"]
+frameworks = ["Foundation", "CoreWLAN", "CoreLocation", "Security"]
 cflags = ["-fobjc-arc"]
 inputs = ["tooling/native/piano-wifi-join/BootJoin.h", "package/PianoWifi/WifiProfile.h"]
 build = "cc"

@@ -10,14 +10,103 @@ from pathlib import Path
 W = Path(__file__).resolve().parents[3]
 
 class BootJoinTests(unittest.TestCase):
+    def test_native_profile_idempotence(self):
+        # A real CoreWiFi external-form round trip backed by a synthetic store.
+        # The test never opens the host's Keychain or sends airportd a write.
+        source = r'''
+#import <Foundation/Foundation.h>
+#import <CoreWLAN/CoreWLAN.h>
+#include <assert.h>
+static NSDictionary *records;
+static unsigned adds;
+@interface FixtureStore : NSObject
+- (instancetype)initWithType:(NSInteger)type identifier:(NSString *)identifier;
+- (void)activate;
+- (NSDictionary *)dictionaryRepresentation;
+@end
+@implementation FixtureStore
+- (instancetype)initWithType:(NSInteger)type identifier:(NSString *)identifier {
+  assert(type == 1 && [identifier isEqualToString:@"com.apple.wifi.known-networks"]);
+  return [super init];
+}
+- (void)activate {}
+- (NSDictionary *)dictionaryRepresentation { return records; }
+@end
+static Class fixture_class(NSString *name) {
+  return [name isEqualToString:@"CWFKeyValueStore"] ? FixtureStore.class : NSClassFromString(name);
+}
+#define NSClassFromString fixture_class
+#define CWAddNetworkProfile fixture_add
+#define main production_main
+#include "tooling/native/piano-wifi-join/piano-wifi-join.m"
+#undef main
+@interface CWFNetworkProfile (Fixture)
+@property (readonly) NSDictionary *externalForm;
+- (void)setSystemMode:(BOOL)on;
+- (void)setAutoJoinDisabled:(BOOL)disabled;
+@end
+OSStatus fixture_add(CWNetworkProfile *legacy, SFAuthorization *authorization) {
+  assert(!authorization);
+  ++adds;
+  CWFNetworkProfile *profile = [legacy coreWiFiNetworkProfile];
+  [profile setSystemMode:YES];
+  NSMutableDictionary *next = [records mutableCopy];
+  next[profile.identifier] = profile.externalForm;
+  records = next;
+  return errSecSuccess;
+}
+int main(void) {
+  @autoreleasepool {
+    struct piano_wifi_profile p;
+    const char input[] = "ssid=fixture-network\nsecurity=open\n";
+    assert(!piano_wifi_profile_parse((const uint8_t *)input,sizeof input-1,&p));
+    NSData *ssid = [NSData dataWithBytes:p.ssid length:p.ssid_len];
+    NSString *key = @"wifi.network.ssid.fixture-network";
+    NSString *other = @"wifi.network.ssid.fixture-other";
+    records = @{other:@{}};
+    assert(provision(&p) == SavedReady && adds == 1 && records.count == 2 && records[other]);
+    assert(provision(&p) == SavedReady && adds == 1);
+    CWFNetworkProfile *native = [[fixture_class(@"CWFNetworkProfile") alloc] initWithExternalForm:records[key]];
+    assert([native.identifier isEqualToString:key] && native.isSystemMode);
+    [native setAutoJoinDisabled:YES];
+    records = @{key:native.externalForm};
+    assert(provision(&p) == SavedPreserved && adds == 1);
+    [native setAutoJoinDisabled:NO];
+    records = @{key:native.externalForm, other:native.externalForm};
+    assert(provision(&p) == SavedPreserved && adds == 1);
+    records = nil;
+    assert(provision(&p) == SavedUnavailable && adds == 1);
+    piano_wifi_profile_wipe(&p);
+    CWMutableNetworkProfile *legacy = [CWMutableNetworkProfile networkProfile];
+    legacy.ssidData = ssid;
+    legacy.security = kCWSecurityWPA2Personal;
+    native = [legacy coreWiFiNetworkProfile];
+    [native setSystemMode:YES];
+    assert(native.supportedSecurityTypes == 0x50);
+    records = @{key:native.externalForm};
+    assert(known_profile_state(records,ssid,0x50,YES) == KnownMatches);
+    assert(known_profile_state(records,ssid,0x10,NO) == KnownMatches);
+    assert(known_profile_state(records,ssid,0x10,YES) == KnownPreserve);
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            (path / 'test.m').write_text(source)
+            subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-I', str(W),
+                            str(path / 'test.m'), '-framework', 'Foundation', '-framework', 'CoreWLAN',
+                            '-framework', 'CoreLocation', '-framework', 'Security', '-o', str(path / 'test')],
+                           check=True, capture_output=True)
+            subprocess.run([str(path / 'test')], check=True, capture_output=True)
+
     def test_real_owner_and_one_shot_transport(self):
         source = r'''
 #include "package/PianoWifi/WifiUserControl.h"
 #include "tooling/native/piano-wifi-join/BootJoin.h"
 #include <cassert>
 using namespace pianowifi;
-struct Fixture { WifiUserControl owner; int polls=0,calls=0,pauses=0; unsigned gen=0; bool fail=false,missing=false; };
-int ready(void *v) {return ++((Fixture*)v)->polls >= 4;}
+struct Fixture { WifiUserControl owner; int polls=0,calls=0,pauses=0; unsigned gen=0; bool fail=false,missing=false,skip=false; };
+int ready(void *v) {auto &f=*(Fixture*)v; return f.skip ? -1 : ++f.polls >= 4;}
 uint32_t receipt(void *v) {return ((Fixture*)v)->gen;}
 int associate(void *v) {auto &f=*(Fixture*)v; ++f.calls; assert(f.polls>=4); if(f.fail)return 0;
   assert(f.owner.join()); if(!f.missing)++f.gen; return 1;}
@@ -40,6 +129,8 @@ int main() {
  }
  Fixture f; piano_boot_join_transport t={&f,ready,receipt,associate,pause};
  assert(piano_boot_join(&t,1)==1 && f.calls==0);
+ f.skip=true;
+ assert(piano_boot_join(&t,10)==PianoBootJoinSkipped && f.calls==0);
 }
 '''
         with tempfile.TemporaryDirectory() as d:
@@ -62,6 +153,12 @@ static int fixture_fstat(int fd, struct stat *s) {int e=fstat(fd,s);if(!e)s->st_
 #include <assert.h>
 int main(int argc,char **argv) {
  (void)argc; int fd=safe_open(argv[1]); assert(fd>=0); close(fd);
+ char boot[64]; assert(boot_uuid(boot,sizeof boot));
+ FILE *marker=fopen(argv[1],"w"); assert(marker && fprintf(marker,"%s\n",boot)>0); fclose(marker);
+ assert(kick_completed(argv[1],boot));
+ assert(!kick_completed(argv[1],"01234567-0000-0000-0000-000000000000"));
+ assert(!kick_completed(argv[2],boot) && !kick_completed(argv[3],boot));
+ chmod(argv[1],0644); assert(!kick_completed(argv[1],boot)); chmod(argv[1],0600);
  chmod(argv[1],0644); assert(safe_open(argv[1])<0); chmod(argv[1],0600);
  assert(safe_open(argv[2])==-2); assert(safe_open(argv[3])<0);
  struct piano_wifi_profile p; const char *good="ssid=fixture\nsecurity=wpa2-psk\npsk=fixture-only\n";
@@ -72,7 +169,7 @@ int main(int argc,char **argv) {
         with tempfile.TemporaryDirectory() as d:
             path=Path(d); path.chmod(0o700); profile=path/'profile';profile.write_text('fixture\n');profile.chmod(0o600)
             (path/'link').symlink_to(profile);(path/'test.m').write_text(source)
-            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-framework','CoreLocation','-o',str(path/'test')],check=True,capture_output=True)
+            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-framework','CoreLocation','-framework','Security','-o',str(path/'test')],check=True,capture_output=True)
             subprocess.run([str(path/'test'),str(profile),str(path/'missing'),str(path/'link')],check=True,capture_output=True)
 
     def test_location_readiness_gates_the_scan(self):
@@ -124,6 +221,11 @@ int main(void) {
   assert(!check(&state, 401, 102, 102, 1, "/usr/bin/false"));
   assert(!check(&state, 402, 102, 102, 1, "/usr/bin/true"));
   assert(check(&state, 412, 102, 102, 1, "/usr/bin/true"));
+  struct apple_join a = { .kick_time = 400 };
+  assert(!ready(&a)); /* grace precedes any real CoreWLAN call */
+  reads = 0;
+  assert(!location_allows_join(&state, "/usr/bin/false", 1, 59) && reads == 0);
+  assert(location_allows_join(&state, "/usr/bin/false", 2, 60) && reads == 0);
 }
 '''
         with tempfile.TemporaryDirectory() as d:
@@ -131,7 +233,7 @@ int main(void) {
             (path / 'test.m').write_text(source)
             subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-I', str(W), str(path / 'test.m'),
                             '-framework', 'Foundation', '-framework', 'CoreWLAN',
-                            '-framework', 'CoreLocation', '-o', str(path / 'test')],
+                            '-framework', 'CoreLocation', '-framework', 'Security', '-o', str(path / 'test')],
                            check=True, capture_output=True)
             subprocess.run([str(path / 'test')], check=True, capture_output=True)
 
