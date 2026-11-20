@@ -771,11 +771,23 @@ int main()
     CHECK(a.error == 0 && (a.effects & kDoScanStarted) && r.st.scanRequests == 1);
     // The user-client/raw-get loop returns 0 for each complete record, then exactly 5 at the list end.  The tail after the
     // information elements is zeroed even though the caller prefilled it with a marker.
+    {   // DRIVER_AVAILABLE (event 55): the 0xf8-byte record, available at +8, inside the single-mbuf kernel event
+      DriverAvailability availability = {};
+      availability.available = 1;
+      const auto payload = bsdEventPayload(kEvDriverAvailable, LinkEvent{}, false, nullptr, &availability);
+      CHECK(payload.size == 0xf8 && static_cast<const uint8_t *>(payload.data)[8] == 1 &&
+            static_cast<const uint8_t *>(payload.data)[4] == 0);
+      CHECK(kBsdEventHeaderSize + kBsdEventNameSize + payload.size == kBsdEventMaxSize);
+      CHECK(bsdEventPayload(kEvDriverAvailable, LinkEvent{}, false).size == 0);
+    }
     std::memset(r.user.mem.data(), 0, kScanResultBytes27);
+    r.st.nowNs = 0x1122334455667788ull;
     std::memcpy(r.user.mem.data() + 0x88c, "request-7", 10);
     a = r.ask(false, kScanResult, kScanResultBytes27);
     CHECK(a.error == 0 && a.wrote == kScanResultBytes27);
-    for (uint32_t i = 0x8c + 47; i < kScanResultBytes27; ++i) CHECK(r.at(i)[0] == 0);
+    for (uint32_t i = 0x8c + 47; i < kScanResultBytes27; ++i)
+      CHECK(r.at(i)[0] == ((i >= kScanResultTimestampAt && i < kScanResultTimestampAt + 8)
+                               ? uint8_t(0x1122334455667788ull >> (8 * (i - kScanResultTimestampAt))) : 0));
     ScanResult got;
     std::memcpy(&got, r.at(0), sizeof got);
     CHECK(got.version == 1 && got.channel.channel == 36 && (got.channel.flags & kChan5GHz) && got.rssi == -48 && got.noise == -95);

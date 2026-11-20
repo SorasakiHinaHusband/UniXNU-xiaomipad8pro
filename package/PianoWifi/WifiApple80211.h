@@ -118,6 +118,7 @@ enum : uint32_t {
   kEvAssocDone = 9,
   kEvScanDone = 10,
   kEvScanCacheUpdated = 15,
+  kEvDriverAvailable = 55,
 };
 
 // Link-changed event4 and GET156: 27.3 airportd/CoreWiFi consume the same 32 bytes.
@@ -153,12 +154,28 @@ struct Power {
 };
 static_assert(sizeof(Power) == 24, "power");
 
-inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus, const Power *power = nullptr)
+// DRIVER_AVAILABLE (BSD event 55). 27.3 airportd's _bsd_80211_event_callback (0x1000723f0) reads the u32 at +8 as `available` (flags at
+// +4, reason at +0x10, subreason at +0x14) into its device node's isDriverAvailable byte; __allowAutoJoinWithTrigger refuses every
+// auto-join ("driver not available", DriverUnavailable) while it is 0, and a node found through interfaceAdded starts at 0 (owner
+// R4, LOCATIOND-AIRPORTD-R4.md). Apple's family posts a 0xf8-byte record; flags stay 0 so no trap/minidump fields are parsed.
+struct DriverAvailability {
+  uint32_t version, flags, available, unused0, reason, subreason;
+  uint8_t unused1[0xf8 - 24];
+};
+static_assert(sizeof(DriverAvailability) == 0xf8 && __builtin_offsetof(DriverAvailability, available) == 8 &&
+              __builtin_offsetof(DriverAvailability, reason) == 0x10 && __builtin_offsetof(DriverAvailability, subreason) == 0x14,
+              "27.3 driver availability layout");
+static_assert(kBsdEventHeaderSize + kBsdEventNameSize + sizeof(DriverAvailability) <= kBsdEventMaxSize,
+              "driver availability kernel event fits");
+
+inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus, const Power *power = nullptr,
+                                       const DriverAvailability *availability = nullptr)
 {
   if (code == kEvLinkChanged) return {&link, sizeof link};
-  // POWER_CHANGED keeps the power structure the POWER get answers (24 bytes, well inside the BSD limit): v13.1 posted it and the
-  // CoreWLAN scan/join worked; without it (v13.1b) the boot helper's scan never returned (inst-v131bram1, 2026-11-20).
+  // POWER_CHANGED keeps the power structure the POWER get answers (24 bytes, well inside the BSD limit). (The v13.1b boot helper's
+  // stall once blamed on its absence was the locationd wait: LOCATIOND-SSID.md.)
   if (code == kEvPowerChanged && power) return {power, sizeof *power};
+  if (code == kEvDriverAvailable && availability) return {availability, sizeof *availability};
   if (code == kEvScanDone && scanStatus) return {kBsdScanDoneStatus, sizeof kBsdScanDoneStatus};
   return {nullptr, 0};
 }
@@ -316,6 +333,11 @@ struct ScanResult {
   uint8_t elements[1024];        // 0x8c
 };
 constexpr uint32_t kScanResultBytes27 = 2280;   // what airportd asks with (its SCAN_RESULT and CURRENT_NETWORK buffers)
+// The record's TIMESTAMP: IO80211's __addScanResultToList (0x1c4644e48) puts the u64 at 0x8d0 under "TIMESTAMP"; CoreWiFi's
+// -[NSDictionary(ScanRecord) timestamp] takes it as is and -[CWFScanResult age] is (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) -
+// timestamp) / 1000000 ms, which airportd's auto-join compares with its maxAge (20000 ms). Nanoseconds of mach_continuous_time.
+constexpr uint32_t kScanResultTimestampAt = 0x8d0;
+static_assert(kScanResultTimestampAt + 8 <= kScanResultBytes27, "timestamp inside the record");
 static_assert(sizeof(ScanResult) == 1164 && __builtin_offsetof(ScanResult, rssi) == 0x16 &&
               __builtin_offsetof(ScanResult, bssid) == 0x1c && __builtin_offsetof(ScanResult, ssidLength) == 0x60 &&
               __builtin_offsetof(ScanResult, ageMs) == 0x84 && __builtin_offsetof(ScanResult, elementsLength) == 0x8a &&
@@ -435,6 +457,13 @@ inline uint32_t buildElements(const Bss &b, uint8_t *out, uint32_t capacity)
 // The bytes of a filled result to copy out.  27.3's caller asks for 0x8e8 bytes and parses fields in the tail, so both ioctl and
 // user-client paths must return the full record even though our named struct contains only the common 1164-byte prefix.
 inline uint32_t resultBytes(const ScanResult &) { return kScanResultBytes27; }
+
+// The full record's TIMESTAMP (the caller's buffer holds kScanResultBytes27): the time the record is handed out. The list is the
+// last completed scan's (refreshed at every SCAN_REQ from the published list), so its age as airportd counts it starts here.
+inline void stampScanResult(uint8_t *record, uint64_t nowNs)
+{
+  for (unsigned i = 0; i < 8; ++i) record[kScanResultTimestampAt + i] = uint8_t(nowNs >> (8 * i));
+}
 
 inline void fillScanResult(ScanResult &r, const Bss &b)
 {
@@ -598,6 +627,7 @@ struct State {
   uint32_t accept = kAcceptDefault;   // kAccept*: how requests without a layout of ours are answered (a runtime switch, M1b)
   uint32_t acceptedUnknown = 0;   // requests answered only because of `accept`
   uint32_t sheng = 0;             // kSheng*: the UniXNU-sheng binding bits above (a runtime switch)
+  uint64_t nowNs = 0;             // the request's time (mach_continuous_time in ns): the scan records' TIMESTAMP
 };
 
 // A successful SET19 must notify even when it repeats the boot-on state:
@@ -1103,6 +1133,7 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
         b.rates[0] = uint8_t(s.association.rate > 63 ? 126 : s.association.rate * 2);
       }
       ScanResult *r = reinterpret_cast<ScanResult *>(scratch); fillScanResult(*r, b);
+      stampScanResult(scratch, s.nowNs);
       a.error = copyOut(rq, io, r, resultBytes(*r), a); }
     return a;
   case kAuthType:
@@ -1158,6 +1189,7 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     }
     ScanResult *r = reinterpret_cast<ScanResult *>(scratch);
     fillScanResult(*r, s.scan.bss[s.cursor]);
+    stampScanResult(scratch, s.nowNs);
     a.error = copyOut(rq, io, r, resultBytes(*r), a);
     if (a.error) return a;   // the cursor stays where it is: a faulted record is asked for again (review 2026-11-14 F9)
     ++s.cursor;

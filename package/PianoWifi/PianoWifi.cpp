@@ -2747,6 +2747,7 @@ Dp gDp;                             // level 8: the data path's rings (WifiDp.h)
 bool gDpPlanned;
 Link gLink;
 volatile bool gLinkRunning;         // the ladder's thread is inside level 6 or 7: the power hook asks it to stop instead of racing
+volatile uint32_t gRadioUsable;     // 1 from a pass's level 6 hand-off to level 7 until chip-down or level 7's end (DRIVER_AVAILABLE)
 volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
 const char *volatile gStopWhy = "a stop";   // what asked (stopRadio's caller: "suspend", "shutdown")
 bool profileOwnMac(uint8_t *mac);   // level 7's join profile (below): the station's address, when it names one
@@ -4053,6 +4054,12 @@ uint8_t gL8Out[kStaOutBytes + 64];   // a command of level 8's own (a key is 25 
 // snapshot instead of reaching into the supplicant's mutable objects.  It is
 // intentionally a read-only, best-effort view: the front end polls it and
 // emits kev transitions when the association generation changes.
+extern "C" int piano_wifi_radio_usable(void)
+{
+  return __atomic_load_n(&gRadioUsable, __ATOMIC_SEQ_CST) && WifiUserControl::power(gUserControl.read()) &&
+         !gUserControl.radioStop() ? 1 : 0;
+}
+
 extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
 {
   if (!out) return EINVAL;
@@ -5379,6 +5386,7 @@ __attribute__((noinline)) void baTurn(uint64_t now, bool stopping)
 // nothing may reach the endpoint's registers any more).
 void chipDown(PowerState &power, const Options &opt)
 {
+  __atomic_store_n(&gRadioUsable, 0u, __ATOMIC_SEQ_CST);
   if (gWin[kWinTlmm].va) safeOff(gHw, power, opt);
   const bool held = gChipHeld;
   if (held) chipPut();
@@ -5849,6 +5857,7 @@ int level7(IOService *owner)
   gSta.ssidLength = 0;
   linkTeardown();
   gLinkRunning = false;
+  __atomic_store_n(&gRadioUsable, 0u, __ATOMIC_SEQ_CST);
   // A stop that a suspend or a shutdown asked for is the level's normal end, not its failure (boot 10i's "FAILED at stage
   // 718" was the restart that ended the run).
   gL7EndedOnRequest = stoppedOnRequest && !gChipDead;
@@ -6450,6 +6459,7 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   }
   if (gLink.step == kLinkHandOff) {
     // ---- level 7 -------------------------------------------------------------------------------------------------------
+    if (gArgs.level >= 7) __atomic_store_n(&gRadioUsable, 1u, __ATOMIC_SEQ_CST);   // scans and joins are served from here
     reportStack("level 7 begins");
     e.level = 7;
     // Its own hard deadline: the profile's wait, its scans, the join's steps and the watch, with room for the teardown. A
