@@ -13,6 +13,9 @@ constexpr char kNativeRequest[] = "brightness-nits";
 constexpr char kAndroidMarker[] = "PianoBacklightAndroidV1";
 constexpr char kReferenceProperty[] = "piano-backlight-reference";
 constexpr uint32_t kNativeApplyIntervalMs = 50;
+// 2026-11-20 (BRIGHTNESS-SLIDER.md): BrightnessControl's -[BCAppleBacklightBrtControl setNits:error:] works for a non-DFR panel
+// only when this registry property (OSData, first byte non-zero) is on the backlight service or a parent.
+constexpr char kNativeOverride[] = "force-brightness-control";
 
 inline bool nativeWriter(bool administrator, bool platform, const char *identity)
 {
@@ -23,6 +26,38 @@ inline bool nativeWriter(bool administrator, bool platform, const char *identity
     if (!kNativeIdentity[i]) return true;
   }
 }
+
+// 2026-11-20 (BRIGHTNESS-SLIDER.md): WindowServer sends the panel's brightness with every swap that changes it, CoreBrightness's
+// own ramps (the power-on ramp, a dim) included. A request is the user's move only when it leaves the settled value by more
+// than 2 % after the settle time (from the first request, a display power-on or a wake); the rest follow.
+class NativeIntent {
+ public:
+  static constexpr uint64_t kSettleMs = 4000;
+  enum Kind : uint8_t { kFollow = 0, kUserMove = 1 };
+  void reset(uint64_t nowMs)
+  {
+    anchor_ = -1;
+    settleUntil_ = nowMs + kSettleMs;
+    armed_ = true;
+  }
+  Kind classify(int64_t fixed, uint64_t nowMs)
+  {
+    if (!armed_) reset(nowMs);   // the first request ever starts the settle time
+    if (anchor_ < 0 || nowMs < settleUntil_) {
+      anchor_ = fixed;
+      return kFollow;
+    }
+    const int64_t d = fixed > anchor_ ? fixed - anchor_ : anchor_ - fixed;
+    if (d * 50 <= anchor_) return kFollow;
+    anchor_ = fixed;
+    return kUserMove;
+  }
+
+ private:
+  int64_t anchor_ = -1;
+  uint64_t settleUntil_ = 0;
+  bool armed_ = false;
+};
 
 // Nominal SDR slider scale. The endpoints model the safe code range, not a panel luminance measurement.
 class NativeBrightness {

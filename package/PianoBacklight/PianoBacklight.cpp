@@ -298,6 +298,7 @@ struct Pending {
   uint64_t nativeOrder = 0, autoOrder = 0;
 };
 IOLock *gLock;
+uint32_t gNativeDark;   // WindowServer's requests <= 0 (dark ramps), taken and dropped
 Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
 // The thread's answer to a sleep request: the requests taken, and whether the ICs were dark after the last one.
 uint32_t gSleepAsked, gSleepTaken;
@@ -362,6 +363,9 @@ class PianoBacklight : public IOService {
   int32_t fNativeRequest = -1;
   uint32_t fNativeErrors = 0;
   bool fNativePublished = false;
+  NativeIntent fIntent;                     // 2026-11-20: the user's moves among WindowServer's stream
+  bool fNativeTookAuto = false;             // a move ended automatic mode (a power-on or a wake gives it back)
+  uint32_t fNativeFollowed = 0, fNativeMoves = 0, fNativeDropped = 0;
   bool fReference = true;
   uint32_t fRevision = 0, fNativePublishedRevision = 0;
   struct AndroidApply {
@@ -387,6 +391,7 @@ class PianoBacklight : public IOService {
   void publishAndroidApply(const NativeBrightness &adapter, bool applied, uint16_t code);
   void restartAmbient();
   void setAutomatic(bool on);
+  void nativeSettle(const char *why);
   void applyAmbient(int32_t permille, uint32_t lux, const char *source, const pianoauto::AmbientVersion &version);
   IOReturn enqueueNative(OSDictionary &properties, OSObject *value);
 
@@ -650,6 +655,7 @@ void PianoBacklight::serve()
     const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
 
+    if (p.sleep == 0 && fCtl.asleep()) nativeSettle("a wake");
     if (p.sleep >= 0) {
       const bool wasAsleep = fCtl.asleep();
       fCtl.sleep(p.sleep == 1);
@@ -667,6 +673,7 @@ void PianoBacklight::serve()
 
     if (p.display) {
       fDisplayKnown = true;
+      if (p.on && !fDisplayOn) nativeSettle("a display power-on");
       fDisplayOn = p.on;
       fSystem = p.system;
       fApi = p.api;
@@ -683,6 +690,18 @@ void PianoBacklight::serve()
     if (p.automatic >= 0 && !autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
+    const NativeIntent::Kind intent = p.native >= 0 ? fIntent.classify(p.native, nowMs()) : NativeIntent::kFollow;
+    const bool autoOwns = p.native >= 0 && gArgs.autoAllowed && fCtl.ambientState().requested();
+    if (p.native >= 0 && intent == NativeIntent::kFollow && autoOwns) {
+      ++fNativeFollowed;   // CoreBrightness's own value while automatic mode owns the panel: kept as the settled value only
+      p.native = -1;
+    } else if (p.native >= 0 && intent == NativeIntent::kUserMove) {
+      ++fNativeMoves;
+      if (autoOwns) fNativeTookAuto = true;
+      if (autoOwns || fNativeMoves % 25 == 1)
+        note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark): %s", p.native,
+             fNativeMoves, fNativeFollowed, gNativeDark, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
+    }
     if (p.native >= 0) {
       uint16_t code = 0;
       uint16_t dbv = 0;
@@ -731,6 +750,11 @@ void PianoBacklight::publishNativeState()
           IOLockLock(gLock);
           gNativeReady = true;
           IOLockUnlock(gLock);
+          static const uint8_t kOne = 1;
+          if (OSData *force = OSData::withBytes(&kOne, 1)) {   // BCAppleBacklightBrtControl's _override (read at its init)
+            setProperty(kNativeOverride, force);
+            force->release();
+          }
           fNativePublished = setProperty("backlight-control", true);  // matching flag comes last
           if (fNativePublished) {
             if (adapter.bounded())
@@ -789,6 +813,19 @@ void PianoBacklight::restartAmbient()
   fCtl.invalidateAmbient(false);
   if (fAndroidApply.source && !strcmp(fAndroidApply.source, "ambient")) fAndroidApply = {};
   publishAndroidModel();
+}
+
+// A display power-on or a wake: WindowServer's next values settle again (its power-on ramp is not a move), and automatic mode
+// comes back when a move had ended it.
+void PianoBacklight::nativeSettle(const char *why)
+{
+  if (!gArgs.native) return;
+  fIntent.reset(nowMs());
+  if (fNativeTookAuto && gArgs.autoAllowed) {
+    fNativeTookAuto = false;
+    setAutomatic(true);
+    note("PianoBacklightNativeIntentV1 automatic mode again after %s (the slider's level held until then)", why);
+  }
 }
 
 void PianoBacklight::setAutomatic(bool on)
@@ -986,17 +1023,23 @@ IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value
   const bool platform = process && csproc_get_platform_binary(process);
   const bool authorized = nativeWriter(admin, platform, platform ? cs_identity_get(process) : nullptr);
   OSNumber *number = OSDynamicCast(OSNumber, value);
-  const uint64_t fixed = number ? number->unsigned64BitValue() : 0;
+  // signed 16.16 (BrightnessControl's setNits); WindowServer's stream is clamped to the published range, its <= 0 (a dark ramp)
+  // taken and dropped (2026-11-20, BRIGHTNESS-SLIDER.md)
+  const unsigned bits = number ? number->numberOfBits() : 0;
+  const int64_t asked = !number ? 0 : bits == 32 ? int64_t(int32_t(uint32_t(number->unsigned64BitValue())))
+                                                 : int64_t(number->unsigned64BitValue());
   IOLockLock(gLock);
   const uint32_t min = gServing ? gNativeMin : NativeBrightness(uint16_t(gArgs.floor)).minFixed();
   const uint32_t max = gServing ? gNativeMax : NativeBrightness(uint16_t(gArgs.floor)).maxFixed();
-  const bool valid = properties.getCount() == 1 && number && (number->numberOfBits() == 32 || number->numberOfBits() == 64)
-      && fixed >= min && fixed <= max;
+  const bool valid = properties.getCount() == 1 && number && (bits == 32 || bits == 64);
+  const uint64_t fixed = asked <= 0 ? 0 : asked < int64_t(min) ? min : asked > int64_t(max) ? max : uint64_t(asked);
   const IOReturn result = !authorized ? kIOReturnNotPrivileged : !valid ? kIOReturnBadArgument
       : !gNativeReady ? kIOReturnNotReady : kIOReturnSuccess;
   uint32_t dropped;
   const bool logRefusal = result != kIOReturnSuccess && gNativeRejectionLog.allow(nowMs(), &dropped);
-  if (result == kIOReturnSuccess) {
+  if (result == kIOReturnSuccess && !fixed) {
+    ++gNativeDark;   // a dark ramp's value: nothing to apply (the display's power takes the backlight down)
+  } else if (result == kIOReturnSuccess) {
     gPending.native = int32_t(fixed);
     if (gNativeMax == PA_SDR_MAX_FIXED) gPending.nativeOrder = ++gControlOrder;
     gPending.any = true;

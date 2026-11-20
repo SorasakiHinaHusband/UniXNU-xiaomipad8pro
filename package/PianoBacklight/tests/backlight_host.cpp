@@ -865,6 +865,23 @@ static void testNativeBrightness()
     CHECK(calibration.numbers.size() == 6 && calibration.numbers.at("lMidPanel") == uint32_t(samples[1]));
   }
   CHECK(nativeWriter(false, true, "com.apple.WindowServer"));
+  {   // 2026-11-20: WindowServer's stream: settle, follow, the user's move
+    NativeIntent i;
+    i.reset(1000);
+    CHECK(i.classify(10 << 16, 1100) == NativeIntent::kFollow);    // the power-on ramp, inside the settle time
+    CHECK(i.classify(140 << 16, 3000) == NativeIntent::kFollow);
+    CHECK(i.classify(141 << 16, 6000) == NativeIntent::kFollow);   // < 2 % of the settled 140
+    CHECK(i.classify(100 << 16, 6100) == NativeIntent::kUserMove);
+    CHECK(i.classify(99 << 16, 6150) == NativeIntent::kFollow);    // the drag goes on from its new place
+    CHECK(i.classify(60 << 16, 6200) == NativeIntent::kUserMove);
+    i.reset(7000);
+    CHECK(i.classify(140 << 16, 7100) == NativeIntent::kFollow);
+    NativeIntent fresh;   // never reset: the first request starts the settle time
+    CHECK(fresh.classify(50 << 16, 100000) == NativeIntent::kFollow);
+    CHECK(fresh.classify(200 << 16, 101000) == NativeIntent::kFollow);
+    CHECK(fresh.classify(100 << 16, 105000) == NativeIntent::kUserMove);
+    CHECK(std::strcmp(kNativeOverride, "force-brightness-control") == 0);
+  }
   CHECK(nativeWriter(true, false, nullptr));
   CHECK(!nativeWriter(false, false, "com.apple.WindowServer"));
   CHECK(!nativeWriter(false, true, "com.apple.WindowServer.other"));
