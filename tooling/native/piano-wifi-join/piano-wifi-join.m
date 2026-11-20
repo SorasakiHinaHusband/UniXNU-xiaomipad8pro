@@ -446,6 +446,12 @@ static int ready(void *context)
   const unsigned attempt = ++a->readiness_attempt;
   const uint64_t since_kick = monotonic_seconds() - a->kick_time;
   if (since_kick < NativeJoinGraceSeconds) return 0;
+  // airportd's own auto-join (DRIVER_AVAILABLE, scan TIMESTAMP, ASSOCIATE outcome) usually joins first: the kernel receipt needs no
+  // CoreWLAN or CoreLocation call, so it is read before the CoreLocation gate, whose query can stay unanswered for minutes.
+  if (receipt(NULL)) {
+    timeline("fallback skipped=association-present-or-requested");
+    return -1;
+  }
   if (!a->location_passed) {
     if (!location_ready(&a->location, a->executable, attempt)) return 0;
     a->location_passed = 1;
