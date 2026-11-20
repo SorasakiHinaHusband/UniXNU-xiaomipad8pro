@@ -293,9 +293,11 @@ const PianoPcmTransport kDsp = {"dsp", nullptr, AUDIO_LIVE_OUTPUT_LATENCY, AUDIO
 void liveSummary(const AudioLive &l, char *line, size_t size)
 {
     snprintf(line, size, "level %u: speaker %s (%u starts, %u periods, %u with sound, %u underruns, %u slips), mic %s (%u starts, %u periods); "
-             "frames offered %llu, taken %llu, dropped %llu", l.cfg.level, audio_live_state(l.spk_state), l.spk_starts, l.periods,
-             l.sound_periods, l.underruns, l.drops + l.repeats, audio_live_state(l.mic_state), l.mic_starts, l.mic_periods,
-             (unsigned long long)l.sh->offered, (unsigned long long)l.sh->taken, (unsigned long long)l.sh->dropped);
+             "frames offered %llu, taken %llu, dropped %llu; speaker protection %s (%u starts, %u fallbacks, %u live reads)", l.cfg.level,
+             audio_live_state(l.spk_state), l.spk_starts, l.periods, l.sound_periods, l.underruns, l.drops + l.repeats,
+             audio_live_state(l.mic_state), l.mic_starts, l.mic_periods, (unsigned long long)l.sh->offered, (unsigned long long)l.sh->taken,
+             (unsigned long long)l.sh->dropped, !l.prot_ready ? "not ready" : l.prot_active ? "active" : l.prot_failed ? "fallen back" :
+             __atomic_load_n(&l.sh->spk_prot, __ATOMIC_ACQUIRE) ? "on" : "off", l.prot_starts, l.prot_fallbacks, l.live_reads);
 }
 
 uint32_t liveWord(const AudioLive &l)
@@ -314,6 +316,51 @@ int gainControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
     if (audio_live_gain_select(gShared, unsigned(value))) return EINVAL;
     piano_audio_log("aud-gain231-v1: requested gain %d (worker applies; active readback follows)", value);
     return 0;
+}
+// Speaker protection (AudioSpkProt.h): machdep.piano_audio_spk asks for the protection pair (1) or the passthrough graph (0) from the
+// next start of the speaker path (it is down after idle_ms without sound); a new request also clears a fallback of this boot.
+// machdep.piano_audio_spk_state is the worker's view, one line (read only; plain words and counters, no calibration value).
+struct sysctl_oid gSpkOid, gSpkStateOid;
+int spkControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || !gShared) return ENXIO;
+    int value = __atomic_load_n(&gShared->spk_prot, __ATOMIC_ACQUIRE);
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (value == 1 && !gLive->prot_ready) return ENOENT;   // the private files are missing or mismatched (the log says which)
+    if (audio_live_spk_select(gShared, value)) return EINVAL;
+    piano_audio_log("PianoSpeakerProtV1: request %d (taken at the next start of the speaker path)", value);
+    liveWake();
+    return 0;
+}
+int spkState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+    if (req->newptr) return EPERM;
+    if (!gLive || !gShared) return ENXIO;
+    const AudioLive &l = *gLive;
+    char line[300];
+    const int n = snprintf(line, sizeof line, "request %d ready %d active %d failed %d starts %u fallbacks %u live-reads %u vbat-sends %u "
+                           "vbat-uv %u speaker %s why %s", __atomic_load_n(&gShared->spk_prot, __ATOMIC_ACQUIRE), l.prot_ready, l.prot_active,
+                           l.prot_failed, l.prot_starts, l.prot_fallbacks, l.live_reads, l.vbat_sends, l.vbat_uv, audio_live_state(l.spk_state),
+                           l.prot_why ? l.prot_why : "-");
+    return SYSCTL_OUT(req, line, size_t(n < int(sizeof line) ? n : int(sizeof line) - 1) + 1);
+}
+void registerSpk()
+{
+    bzero(&gSpkOid, sizeof gSpkOid);
+    gSpkOid.oid_parent = &sysctl__machdep_children; gSpkOid.oid_number = OID_AUTO;
+    gSpkOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gSpkOid.oid_name = "piano_audio_spk"; gSpkOid.oid_handler = spkControl;
+    gSpkOid.oid_fmt = "I"; gSpkOid.oid_descr = "Speaker protection from the next speaker start: 1 the FSADSP pair, 0 passthrough";
+    gSpkOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gSpkOid);
+    bzero(&gSpkStateOid, sizeof gSpkStateOid);
+    gSpkStateOid.oid_parent = &sysctl__machdep_children; gSpkStateOid.oid_number = OID_AUTO;
+    gSpkStateOid.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gSpkStateOid.oid_name = "piano_audio_spk_state"; gSpkStateOid.oid_handler = spkState;
+    gSpkStateOid.oid_fmt = "A"; gSpkStateOid.oid_descr = "PianoSpeakerProtV1: request, readiness, fallbacks, live reads";
+    gSpkStateOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gSpkStateOid);
 }
 void registerGain()
 {
@@ -447,6 +494,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_route = a->micRoute;
     lc.mic_diag = a->micRouteDiag;
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
+    lc.spk_prot = a->spk ? 1 : 0;
     gLive = IOMallocType(AudioLive);
     if (!gLive || audio_live_init(gLive, &lc, &gSession, gShared)) {
         piano_audio_log("live: levels 8-10 not run: %s", gLive ? "the session did not hand the hardware over" : "no memory");
@@ -458,6 +506,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     if (gLive->ledger) {bzero(gLive->ledger,sizeof(AudioLedger)); registerLedger();}
     else {piano_audio_log("sleep-contract1: ledger allocation failed; readiness gate held"); return;}
     if (lc.level >= 9) registerGain();
+    registerSpk();
     if (lc.mic) registerMicRoute();
     piano_audio_power_ready();
     uint32_t handled=0;
