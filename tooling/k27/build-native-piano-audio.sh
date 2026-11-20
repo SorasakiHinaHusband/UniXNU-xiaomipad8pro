@@ -46,6 +46,7 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/gpr_host.c" "$P/PianoGpr.c" -o "$T/gpr_host"
 "${C[@]}" "$P/tests/audioreach_host.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/audioreach_host"
 "${C[@]}" "$P/tests/sequence_host.c" "$P/AudioSequence.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/sequence_host"
+"${C[@]}" "$P/tests/spkprot_host.c" "$P/AudioSpkProt.c" "$P/AudioSequence.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/spkprot_host"
 "${C[@]}" "$P/tests/fs19xx_host.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -o "$T/fs19xx_host"
 "${C[@]}" "$P/tests/amps_host.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -o "$T/amps_host"
 "${C[@]}" "$P/tests/pcm_host.c" "$P/AudioSafety.c" -lm -o "$T/pcm_host"
@@ -55,14 +56,14 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/session_host.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -o "$T/session_host"
 "${C[@]}" "$P/tests/preset_host.c" "$P/AudioPreset.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/FatVolume.c" -o "$T/preset_host"
-"${C[@]}" "$P/tests/live_host.c" "$P/AudioLive.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
+"${C[@]}" "$P/tests/live_host.c" "$P/AudioLive.c" "$P/AudioSpkProt.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/live_host"
-"${C[@]}" "$P/tests/mic_fifo_host.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
+"${C[@]}" "$P/tests/mic_fifo_host.c" "$P/AudioSpkProt.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/mic_fifo_host"
 "${C[@]}" "$P/tests/va_host.c" "$P/AudioVa.c" -o "$T/va_host"
-"${C[@]}" "$P/tests/prime_host.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
+"${C[@]}" "$P/tests/prime_host.c" "$P/AudioSpkProt.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -o "$T/prime_host"
-for t in gpr_host audioreach_host sequence_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host prime_host mic_fifo_host va_host; do
+for t in gpr_host audioreach_host sequence_host spkprot_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host prime_host mic_fifo_host va_host; do
   "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }
 done
 # The preset loader on a FAT32 image with 4096-byte sectors, one per cluster, as build-esp.py makes the ESP (mtools).
@@ -102,13 +103,36 @@ if [ -n "$PRESET" ] && [ "$(basename "$PRESET")" != fs19xx.fsm ]; then
   [ -f "$PRESET" ] || { echo "Error: PIANO_AUDIO_PRESET=$PRESET is missing" >&2; exit 1; }
   mkdir -p "$O/preset"; cp "$PRESET" "$O/preset/fs19xx.fsm"; PRESET=$O/preset/fs19xx.fsm
 fi
+# Speaker protection's two private files (docs/drivers/audio.md section 12; package/PianoAudio/AudioSpkProt.h): the owner's ACDB
+# parameters and this unit's Re25, both made by tooling/audio/spk-prot-extract.py from the owner's own copies. When both are on this
+# Mac (PIANO_AUDIO_SPK_PARAMS / PIANO_AUDIO_SPK_RE25, else private/audio/spk-prot.bin and spk-re25.bin; PIANO_AUDIO_SPK=0 builds
+# without them) they are pinned as PRIVATE files (firmware.py stage with a bare FILE: size and SHA-256 taken here, never printed or
+# committed) and staged in the ignored out/firmware/PianoAudio/, from where a RAM image's addon and build-esp.py carry them. A kext
+# built with these pins accepts only these two files: it is this unit's, never a published image's. Without them the kext is built
+# the same with no pin, and piano-audio-spk=1 logs "PianoSpeakerProtV1: OFF" and plays through the passthrough graph.
+SPK_PARAMS=${PIANO_AUDIO_SPK_PARAMS:-$D/private/audio/spk-prot.bin}
+SPK_RE25=${PIANO_AUDIO_SPK_RE25:-$D/private/audio/spk-re25.bin}
+SPK=()
+rm -rf "$O/spk"
+if [ "${PIANO_AUDIO_SPK:-1}" != 0 ] && [ -f "$SPK_PARAMS" ] && [ -f "$SPK_RE25" ]; then
+  mkdir -p "$O/spk"
+  cp "$SPK_PARAMS" "$O/spk/spk-prot.bin"; cp "$SPK_RE25" "$O/spk/spk-re25.bin"   # the pins' names, whatever the copies are called
+  SPK=("$O/spk/spk-prot.bin" "$O/spk/spk-re25.bin")
+  printf '#pragma once\n#define PIANO_AUDIO_SPK_FILES 1\n' > "$O/gen/PianoAudioSpkFiles.h"
+  echo "PianoAudio: speaker protection's private files pinned and staged (private: this unit's kext, never published)" >&2
+else
+  printf '#pragma once\n#define PIANO_AUDIO_SPK_FILES 0\n' > "$O/gen/PianoAudioSpkFiles.h"
+  rm -f "$D/out/firmware/PianoAudio/spk-prot.bin" "$D/out/firmware/PianoAudio/spk-re25.bin"
+  echo "PianoAudio: no speaker-protection private files ($(basename "$SPK_PARAMS"), $(basename "$SPK_RE25")): built without them" \
+    "(passthrough only)" >&2
+fi
 python3 "$D/tooling/persist/firmware.py" stage --kext PianoAudio --header "$O/gen/PianoAudioFirmwarePins.h" \
-  --source "$O/gen/PianoAudioFirmware.c" "${PRESET:-$O/preset/fs19xx.fsm}=4348:$PRESET_SHA"
-rm -rf "$O/preset"
+  --source "$O/gen/PianoAudioFirmware.c" "${PRESET:-$O/preset/fs19xx.fsm}=4348:$PRESET_SHA" ${SPK[@]+"${SPK[@]}"}
+rm -rf "$O/preset" "$O/spk"
 python3 "$D/tooling/k27/build-native-kext.py" PianoAudio "$P/PianoAudio.cpp" "$P/AudioDsp.cpp" "$P/AudioBoard.cpp" "$P/PianoAudioDevice.cpp" \
   "$D/tooling/k27/NativeKextGlue.cpp" "$P/PianoGpr.c" "$P/PianoAudioReach.c" "$P/AudioSequence.c" "$P/Fs19xx.c" "$P/AudioSha256.c" \
   "$P/AudioSafety.c" "$P/AudioDspLink.c" "$P/AudioPcm.c" "$P/AudioAmps.c" "$P/AudioSession.c" "$P/AudioPreset.c" "$P/FatVolume.c" \
-  "$P/AudioLive.c" "$P/AudioVa.c" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" "$D/package/common/PianoFirmwareZlib.c" \
+  "$P/AudioLive.c" "$P/AudioSpkProt.c" "$P/AudioVa.c" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" "$D/package/common/PianoFirmwareZlib.c" \
   "$O/gen/PianoAudioFirmware.c" -I "$P" -I "$D/package/common" -I "$O/gen" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
