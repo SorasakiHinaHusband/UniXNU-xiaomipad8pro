@@ -288,9 +288,15 @@ int main()
     for (bool scanStatus : {false, true}) {
       for (const uint32_t code : {kEvPowerChanged, kEvSsidChanged, kEvBssidChanged, kEvLinkChanged,
                                   kEvAssocDone, kEvScanDone, kEvScanCacheUpdated}) {
-        const auto payload = bsdEventPayload(code, link, scanStatus);
+        Power power = {};
+        power.version = 1; power.radios = 1; power.state[0] = 1;
+        const auto payload = bsdEventPayload(code, link, scanStatus, code == kEvPowerChanged ? &power : nullptr);
         CHECK(kBsdEventHeaderSize + kBsdEventNameSize + payload.size <= kBsdEventMaxSize);
-        if (code == kEvLinkChanged) {
+        if (code == kEvPowerChanged) {
+          const uint8_t powerBytes[] = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+          CHECK(payload.size == sizeof powerBytes && std::memcmp(payload.data, powerBytes, sizeof powerBytes) == 0);
+          CHECK(bsdEventPayload(code, link, scanStatus).size == 0);
+        } else if (code == kEvLinkChanged) {
           CHECK(payload.size == sizeof linkBytes && std::memcmp(payload.data, linkBytes, sizeof linkBytes) == 0);
         } else if (code == kEvScanDone && scanStatus) {
           CHECK(payload.size == sizeof scanBytes && std::memcmp(payload.data, scanBytes, sizeof scanBytes) == 0);

@@ -806,7 +806,16 @@ void PianoWifi80211::postEvent(uint32_t code, const pianowifi::a80211::LinkEvent
   }
   char name[kBsdEventNameSize] = {};
   memcpy(name, fIfName, sizeof name);
-  const auto payload = bsdEventPayload(code, link, code == kEvScanDone && (ucMode() & kUcEventPayloads));
+  Power power = {};
+  if (code == kEvPowerChanged) {
+    power.version = 1;
+    power.radios = 1;
+    IOLockLock(fLock);
+    power.state[0] = fState->power ? 1 : 0;
+    IOLockUnlock(fLock);
+  }
+  const auto payload = bsdEventPayload(code, link, code == kEvScanDone && (ucMode() & kUcEventPayloads),
+                                       code == kEvPowerChanged ? &power : nullptr);
   struct kev_msg m = {};
   m.vendor_code = KEV_VENDOR_APPLE;
   m.kev_class = kEventClass;

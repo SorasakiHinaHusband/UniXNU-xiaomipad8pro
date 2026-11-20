@@ -148,9 +148,17 @@ struct BsdEventPayload {
 // Power/SSID/BSSID are change notices and their values come from GETs.
 // Keep ASSOC_DONE in the BSD sequence as a notice. 27.3 airportd's BSD
 // callback has no event-9 payload parser and reads the join result via GET21.
-inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus)
+struct Power {
+  uint32_t version, radios, state[4];
+};
+static_assert(sizeof(Power) == 24, "power");
+
+inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus, const Power *power = nullptr)
 {
   if (code == kEvLinkChanged) return {&link, sizeof link};
+  // POWER_CHANGED keeps the power structure the POWER get answers (24 bytes, well inside the BSD limit): v13.1 posted it and the
+  // CoreWLAN scan/join worked; without it (v13.1b) the boot helper's scan never returned (inst-v131bram1, 2026-11-20).
+  if (code == kEvPowerChanged && power) return {power, sizeof *power};
   if (code == kEvScanDone && scanStatus) return {kBsdScanDoneStatus, sizeof kBsdScanDoneStatus};
   return {nullptr, 0};
 }
@@ -315,10 +323,7 @@ static_assert(sizeof(ScanResult) == 1164 && __builtin_offsetof(ScanResult, rssi)
 
 // POWER: {version, radios, state per radio}; 24 bytes on 27.3 as in sheng's. The set reads state[0]; airportd's set first gets the
 // radio count, so radios must not be 0.
-struct Power {
-  uint32_t version, radios, state[4];
-};
-static_assert(sizeof(Power) == 24, "power");
+
 
 // PHY_MODE: {version, supported modes, the active mode}.
 struct PhyMode {
