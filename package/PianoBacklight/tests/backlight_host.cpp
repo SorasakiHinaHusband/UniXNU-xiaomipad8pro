@@ -179,7 +179,13 @@ struct Model final : Ics {
   bool present[kIcs] = {true, true};
   bool deaf[kIcs] = {false, false};   // writes acknowledged, not taken
   int failWrites[kIcs] = {0, 0};   // the next N writes of the IC are not acknowledged (-1: all)
-  struct Access { unsigned ic; bool write; uint8_t reg, value; };
+  struct Access {
+    unsigned ic;
+    bool write;
+    uint8_t reg, value;
+    bool operator==(const Access &) const = default;
+  };
+  std::map<std::pair<unsigned, uint8_t>, std::vector<int>> readReplies;   // per-register overrides, -1 for NACK
   std::vector<Access> trace;
   std::vector<std::string> lines;
   bool inBurst = false;
@@ -191,6 +197,13 @@ struct Model final : Ics {
     inBurst = true;
     if (!present[ic]) return false;
     *v = reg[ic][r];
+    auto reply = readReplies.find({ic, r});
+    if (reply != readReplies.end() && !reply->second.empty()) {
+      const int next = reply->second.front();
+      reply->second.erase(reply->second.begin());
+      if (next < 0) return false;
+      *v = uint8_t(next);
+    }
     if (r == kRegFlag) reg[ic][r] = 0;   // cleared by the read
     trace.push_back({ic, false, r, *v});
     return true;
@@ -971,6 +984,172 @@ static void testAndroidBrightness()
   }
 }
 
+static void setPwm(Model &m, unsigned ic, uint16_t duty)
+{
+  m.reg[ic][kRegPwmLsb] = uint8_t(duty);
+  m.reg[ic][kRegPwmMsb] = uint8_t(0xf8 | (duty >> 8));   // reserved high bits are outside PWM2DIG
+}
+
+static Model qualifiedPwmPair()
+{
+  Model m;
+  for (unsigned i = 0; i < kIcs; ++i) {
+    m.reg[i][kRegCfg1] = 0x53;
+    m.reg[i][kRegIfs] = 0xd9;
+    m.setFound(i, 2047, false);
+    setPwm(m, i, 2047);
+  }
+  return m;
+}
+
+static void testPwmContract()
+{
+  for (uint16_t floor : {128, 921}) {
+    Model m = qualifiedPwmPair();
+    Controller ctl(m);
+    Config cfg = config(0);
+    cfg.floor = floor;
+    cfg.android = cfg.autoAllowed = true;
+    ctl.configure(cfg);
+    CHECK(ctl.survey() && m.writes().empty());
+    m.trace.clear();
+    CHECK(ctl.start() && ctl.floor() == (floor == 128 ? 178 : 921) && ctl.ceiling() == 1952);
+    CHECK(m.code(0) == 1952 && m.code(1) == 1952 && !ctl.pending());
+    CHECK(m.reg[0][kRegCfg1] == 0x53 && m.reg[1][kRegCfg1] == 0x53);
+    CHECK(m.logged("ic=primary cfg1=53 pwm_raw=07ff duty_permille=1000 stable=1 valid=1 context=boot"));
+    CHECK(m.logged("ic=secondary cfg1=53 pwm_raw=07ff duty_permille=1000 stable=1 valid=1 context=boot"));
+    CHECK(m.logged("contract=exp-pwm-full supported=1 reason=ok context=boot"));
+    for (unsigned i = 0; i < kIcs; ++i) {
+      const std::vector<Model::Access> expected = {
+        {i, true, kRegBrtLsb, 0}, {i, true, kRegBrtMsb, 244}, {i, true, kRegEn, 0x7f},
+      };
+      std::vector<Model::Access> writes;
+      for (const auto &w : m.writes())
+        if (w.ic == i) writes.push_back(w);
+      CHECK(writes == expected);
+      CHECK(ctl.ic(i).codeReadbacks == 1 && ctl.ic(i).enableReadbacks == 1);
+      std::vector<uint8_t> pwmReads;
+      for (const auto &a : m.trace)
+        if (a.ic == i && !a.write && (a.reg == kRegPwmLsb || a.reg == kRegPwmMsb)) pwmReads.push_back(a.reg);
+      CHECK(pwmReads.size() >= 4);
+      for (size_t r = 0; r < pwmReads.size(); ++r)
+        CHECK(pwmReads[r] == (r % 2 ? kRegPwmMsb : kRegPwmLsb));
+    }
+    checkWhitelist(m, ctl.floor());
+
+    // Same bounded-schema gate used by serve() to start the versioned producer/consumer handoff.
+    const NativeBrightness schema(ctl.floor(), ctl.ceiling());
+    const uint32_t revision = schema.bounded() ? 1 : 0;
+    NativeBrightness reference(ctl.floor(), ctl.ceiling(), true);
+    uint16_t code = 0;
+    CHECK(revision == 1 && schema.maxFixed() == 600u << 16);
+    const pianoauto::AmbientVersion sample{1, revision, 1};
+    CHECK(sample.newer(revision, 1, 0));
+    CHECK(!sample.newer(revision + 1, 1, 0) && !sample.newer(revision, 0, 0) && !sample.newer(revision, 1, 1));
+    CHECK(ctl.ambient(1000, 12000, "fresh reference ALS") && ctl.autoActive() && ctl.code() == 1952);
+    CHECK(reference.decode(100u << 16, code) && code == pa_sdr_code(100u << 16));
+    ctl.manualCode(code, kNativeRequest);
+    CHECK(!ctl.ambientState().requested() && !ctl.autoActive());
+    CHECK(m.logged("contract=exp-pwm-full supported=1 reason=ok context=apply"));
+    CHECK(ctl.automatic(true, "test") && !ctl.autoActive());
+    CHECK(ctl.ambient(800, 3000, "fresh reference ALS") && ctl.autoActive());
+    ctl.sleep(true);
+    CHECK(!ctl.autoActive() && !ctl.ambientState().valid());
+    setPwm(m, 1, 2046);
+    ctl.sleep(false);
+    CHECK(m.logged("contract=exp-pwm-full supported=0 reason=pwm-not-full context=wake"));
+    CHECK(ctl.floor() == (floor == 128 ? 178 : 921) && ctl.ceiling() == 1952);
+    m.readReplies[{0, kRegPwmMsb}] = {-1};
+    ctl.percent(75, "test");
+    CHECK(m.logged("contract=exp-pwm-full supported=0 reason=pwm-read context=apply"));
+    setPwm(m, 1, 2047);
+    ctl.percent(76, "test");
+    CHECK(m.lines.back().find("contract=exp-pwm-full supported=1 reason=ok context=apply") != std::string::npos);
+    CHECK(!m.inBurst);
+    for (const auto &line : m.lines)
+      if (line.find("PianoBacklightPWMV1") == 0)
+        CHECK(line.size() + sizeof("PianoBacklight: \n") < 200);
+  }
+}
+
+static void testPwmRefusal()
+{
+  // Each refusal must leave the same register writes, applied codes and published schema as Android mode disabled.
+  auto check = [](Model m, uint16_t floor, const char *reason, const char *receipt = nullptr) {
+    Model legacy = m;
+    Controller actual(m), expected(legacy);
+    Config cfg = config(0, false, true);
+    cfg.floor = floor;
+    cfg.autoAllowed = true;
+    expected.configure(cfg);
+    cfg.android = true;
+    actual.configure(cfg);
+    for (Controller *ctl : {&actual, &expected}) {
+      CHECK(ctl->survey());
+      CHECK(ctl->start() && ctl->floor() == floor && ctl->ceiling() == 2047);
+      ctl->step(-2, "test");
+      ctl->ambient(450, 400, "test");
+      ctl->step(1, "test");
+      ctl->lid(0);
+      ctl->percent(35, "test");
+      ctl->lid(1);
+      ctl->sleep(true);
+      ctl->sleep(false);
+    }
+    const NativeBrightness fallback(actual.floor(), actual.ceiling()), old(expected.floor(), expected.ceiling());
+    NativePropertyRecord a, b, ca, cb;
+    CHECK(!fallback.bounded() && fallback.maxFixed() == 500u << 16);
+    CHECK(fallback.parameters(a, actual.code()) && old.parameters(b, expected.code()));
+    CHECK(fallback.calibration(ca) && old.calibration(cb));
+    CHECK(a.name == b.name && a.ranges == b.ranges && ca.name == cb.name);
+    CHECK(ca.numbers == cb.numbers && ca.blobs == cb.blobs && ca.scalars == cb.scalars);
+    CHECK(m.writes() == legacy.writes() && std::memcmp(m.reg, legacy.reg, sizeof m.reg) == 0);
+    CHECK(actual.errors() == expected.errors() && !m.inBurst);
+    CHECK(m.logged(reason));
+    if (receipt) CHECK(m.logged(receipt));
+  };
+  for (uint16_t floor : {128, 921}) {
+    Model m = qualifiedPwmPair();
+    setPwm(m, 0, 2046);
+    check(m, floor, "supported=0 reason=pwm-not-full context=boot", "pwm_raw=07fe duty_permille=999 stable=1 valid=1");
+    setPwm(m, 1, 2046);
+    check(m, floor, "supported=0 reason=pwm-not-full context=boot");
+    setPwm(m, 0, 0);
+    setPwm(m, 1, 0);
+    check(m, floor, "supported=0 reason=pwm-not-full context=boot", "pwm_raw=0000 duty_permille=0 stable=1 valid=1");
+    m = qualifiedPwmPair();
+    m.readReplies[{0, kRegPwmLsb}] = {0xff, 0xfe, 0xff};   // survey full, fresh pair changes
+    check(m, floor, "supported=0 reason=pwm-unstable context=boot", "stable=0 valid=1 context=boot");
+    m = qualifiedPwmPair();
+    m.readReplies[{1, kRegPwmMsb}] = {0xff, 0xff, -1};   // survey and first sample succeed
+    check(m, floor, "supported=0 reason=pwm-read context=boot", "stable=0 valid=0 context=boot");
+    for (uint8_t wrongMode : {0x52, 0x57, 0x5b, 0x73}) {
+      m = qualifiedPwmPair();
+      m.reg[1][kRegCfg1] = wrongMode;
+      check(m, floor, "supported=0 reason=mode context=boot");
+    }
+    for (uint8_t reg : {kRegEn, kRegIfs, kRegOpt2}) {
+      m = qualifiedPwmPair();
+      m.reg[1][reg] ^= 1;
+      check(m, floor, "supported=0 reason=current context=boot");
+    }
+    m = qualifiedPwmPair();
+    m.reg[0][kRegIfs] = m.reg[1][kRegIfs] = 0xf9;
+    check(m, floor, "supported=0 reason=current context=boot");
+  }
+  Model m = qualifiedPwmPair();
+  for (unsigned i = 0; i < kIcs; ++i) {
+    m.reg[i][kRegCfg1] = 0x52;
+    setPwm(m, i, 0);
+  }
+  Controller ctl(m);
+  Config cfg = config(0);
+  cfg.android = true;
+  ctl.configure(cfg);
+  CHECK(ctl.survey() && ctl.start() && ctl.ceiling() == 1952);
+  CHECK(m.logged("contract=exp-pwm-off supported=1 reason=ok context=boot"));
+}
+
 int main()
 {
   testI2c();
@@ -987,6 +1166,8 @@ int main()
   testAmbientReadbackFault();
   testNativeBrightness();
   testAndroidBrightness();
+  testPwmContract();
+  testPwmRefusal();
   if (failures) {
     std::printf("backlight_host: %d FAILED\n", failures);
     return 1;
