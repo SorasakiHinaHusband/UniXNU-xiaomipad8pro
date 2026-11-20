@@ -87,6 +87,7 @@ class PianoWifi80211 : public IO80211Controller {
   char fIfName[16] = {};
   unsigned fAttachTries = 0;
   bool fSubtypeTaken = false, fRegistered = false, fSysctl = false;
+  int fAirportdPid = 0;
   // counters (under fLock)
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
@@ -124,6 +125,7 @@ class PianoWifi80211 : public IO80211Controller {
   errno_t apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *io = nullptr);
   void refreshScanLocked();
   void postEvent(uint32_t code, const void *payload = nullptr, uint32_t length = 0);
+  void postDriverAvailable();
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
@@ -507,6 +509,7 @@ void PianoWifi80211::attachStep()
   postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
   postEvent(pianowifi::a80211::kEvSsidChanged);
   postEvent(pianowifi::a80211::kEvBssidChanged);
+  postDriverAvailable();
   arm(fReportCall, 5000);   // the first summary soon (who matched the controller), then every minute
 }
 
@@ -642,11 +645,8 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
     if (type == kScanReq) scanReqInfo(rq, io, directed, scanType);
   }
   Answer a = handle(*fState, kIdentity, set, rq, io, fScratch);
-  const bool first = fSeen->first(type, set, length, a.error);
   ++fRequests;
-  if (a.error == kErrUnsupported) ++fUnknown;
   const uint32_t networks = fState->scan.count, cursor = fState->cursor;
-  const bool power = fState->power;
   IOLockUnlock(fLock);
   if (set && type == kAssociate) {
     if (a.associationProfile) {
@@ -673,6 +673,18 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
       }
     }
   }
+  if (a.effects & (kDoPowerChanged | kDoDisassociate)) {
+    a.error = piano_wifi_user_control((a.effects & kDoDisassociate) ? PIANO_WIFI_USER_LEAVE :
+                                     a.powerOn ? PIANO_WIFI_USER_ON : PIANO_WIFI_USER_OFF);
+    const bool powerSetAccepted = !a.error && (a.effects & kDoPowerChanged);
+    if (powerSetAccepted)
+      note80211("PianoWifiPowerAckV2 SET19 %s accepted: coherent power notification", a.powerOn ? "on" : "off");
+    syncAssociation(true, powerSetAccepted);
+  }
+  IOLockLock(fLock);
+  const bool first = fSeen->first(type, set, length, a.error);
+  if (a.error == kErrUnsupported) ++fUnknown;
+  IOLockUnlock(fLock);
   if (first) {
     char extra[64] = "";
     if (scanSet) snprintf(extra, sizeof extra, "; %u network(s)%s", unsigned(networks), directed ? ", a directed scan" : "");
@@ -683,15 +695,18 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
               requestName(type), unsigned(length), int(value), a.error, unsigned(a.wrote), unsigned(rq.length), int(rq.value), extra,
               a.accepted ? " [accept mode]" : "");
   }
-  if (a.effects & (kDoPowerChanged | kDoDisassociate)) {
-    a.error = piano_wifi_user_control((a.effects & kDoDisassociate) ? PIANO_WIFI_USER_LEAVE :
-                                     power ? PIANO_WIFI_USER_ON : PIANO_WIFI_USER_OFF);
-    // The coherent GET view and event baseline come from the same owner.
-    // This also restores the old state if the owner refused the operation.
-    const bool powerSetAccepted = !a.error && (a.effects & kDoPowerChanged);
-    if (powerSetAccepted)
-      note80211("PianoWifiPowerAckV2 SET19 %s accepted: coherent power notification", power ? "on" : "off");
-    syncAssociation(true, powerSetAccepted);
+  if (!set && type == kPower && !a.error) {
+    char caller[32] = {};
+    proc_selfname(caller, sizeof caller);
+    if (!strcmp(caller, "airportd")) {
+      const int pid = proc_selfpid();
+      if (__atomic_exchange_n(&fAirportdPid, pid, __ATOMIC_ACQ_REL) != pid) {
+        setProperty("piano-wifi-airportd-adopted", uint64_t(pid), 32);
+        note80211("PianoWifiAirportdAvailabilityV1 adopted pid %d via GET19", pid);
+        // The daemon may have subscribed after the first availability event.
+        if (fRegistered) postDriverAvailable();
+      }
+    }
   }
   // Every scan request and every list end, with a serial and the asking process (ADOPTION.md 6.1 item 3): that is how a
   // client's scan through airportd — CoreWLAN's, which came back empty in 15 ms — is told from airportd's own scheduled ones.
@@ -846,8 +861,14 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
   }
   if (code == pianowifi::a80211::kEvPowerChanged) note80211("PianoWifiPowerLifecycleV1 event1 power changed bytes %u -> %d", unsigned(length), e);
   if (first || e || code == pianowifi::a80211::kEvAssocDone || code == pianowifi::a80211::kEvSsidChanged ||
-      code == pianowifi::a80211::kEvBssidChanged)
+      code == pianowifi::a80211::kEvBssidChanged || code == pianowifi::a80211::kEvDriverAvailable)
     note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
+}
+
+void PianoWifi80211::postDriverAvailable()
+{
+  const pianowifi::a80211::DriverAvailableEvent event;
+  postEvent(pianowifi::a80211::kEvDriverAvailable, &event, sizeof event);
 }
 
 // One completion per accepted scan: an earlier one still waiting is posted at once (thread_call_cancel is true only for a call

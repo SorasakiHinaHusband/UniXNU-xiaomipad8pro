@@ -143,7 +143,7 @@ struct PowerRig : Rig {
     Answer a = ask(true, type, length);
     if (!a.error && (a.effects & (kDoPowerChanged | kDoDisassociate))) {
       if (a.effects & kDoDisassociate) owner.disconnect();
-      else if (!bootGuard.setPower(owner, st.power)) a.error = EBUSY;
+      else if (!bootGuard.setPower(owner, a.powerOn)) a.error = EBUSY;
       publish(!a.error && (a.effects & kDoPowerChanged) != 0);
     }
     return a;
@@ -260,6 +260,9 @@ int main()
           events.codes[2] == 2 && events.codes[3] == 3);
     CHECK(associationEvents(open, open, false).count == 0);
     CHECK(kEvPowerChanged == 1);
+    const DriverAvailableEvent available;
+    CHECK(kEvDriverAvailable == 55 && sizeof available == 284 && available.version == 1 &&
+          available.available == 1 && available.flags == 0x20 && available.detail[0] == 0);
   }
 
   // ---- the layouts: the request and the answers' fixed sizes and offsets
@@ -454,7 +457,8 @@ int main()
     r.put32(4, 1);
     r.put32(8, 0);
     a = r.ask(true, kPower, 24);
-    CHECK(a.error == 0 && (a.effects & kDoPowerChanged) && !r.st.power && r.st.powerSets == 1);
+    CHECK(a.error == 0 && (a.effects & kDoPowerChanged) && !a.powerOn && r.st.power && r.st.powerSets == 1);
+    observeAssociation(r.st, Association{}, a.powerOn, true);
     a = r.ask(false, kPower, 24);
     CHECK(r.u32(8) == 0);
     a = r.ask(true, kScanReq, 0x80);
@@ -464,7 +468,8 @@ int main()
     CHECK(r.ask(false, kState, 0, false).error == 0 && r.rq.value == int32_t(kStateInit));
     r.put32(8, 1);
     a = r.ask(true, kPower, 24);
-    CHECK(a.error == 0 && r.st.power && (a.effects & kDoPowerChanged));
+    CHECK(a.error == 0 && a.powerOn && !r.st.power && (a.effects & kDoPowerChanged));
+    observeAssociation(r.st, Association{}, a.powerOn, true);
     a = r.ask(true, kScanReq, 0x80);
     CHECK(a.error == 0 && (a.effects & kDoScanStarted));
     // a short buffer: what fits of the answer
@@ -478,6 +483,7 @@ int main()
     Rig r;
     r.put32(0, 1); r.put32(4, 1); r.put32(8, 0);
     CHECK(r.ask(true, kPower, 24).error == 0);
+    observeAssociation(r.st, Association{}, false, true);
     CHECK(r.associate().error == kErrPowerOff);
     CHECK(!r.st.power);
     r.put32(0, 2); r.put32(8, 1);
@@ -640,7 +646,19 @@ int main()
     CHECK(a.error == 0 && a.wrote >= offsetof(ScanResult, elements) && r.u32(8) == 36);
     ScanResult joined;
     std::memcpy(&joined, r.at(0), sizeof joined);
-    CHECK(joined.ssidLength == 4 && std::memcmp(joined.ssid, "test", 4) == 0 && joined.bssid[5] == 0x55);
+    CHECK(joined.ssidLength == 4 && std::memcmp(joined.ssid, "test", 4) == 0 && joined.bssid[5] == 0x55 &&
+          joined.rssi == -47 && (joined.capability & 0x11) == 0x11);
+    auto &candidate = r.st.scan.bss[0];
+    std::memcpy(candidate.bssid, bssid, sizeof bssid);
+    candidate.rsnLength = 4;
+    candidate.rsn[0] = 48;
+    candidate.rsn[1] = 2;
+    candidate.rsn[2] = 1;
+    candidate.beaconInterval = 125;
+    r.st.scan.count = 1;
+    CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
+    std::memcpy(&joined, r.at(0), sizeof joined);
+    CHECK(joined.beaconInterval == 125 && joined.rssi == -47 && joined.elements[joined.elementsLength - 4] == 48);
     CHECK(r.associate().error == 0 && r.ask(true, kDisassociate, 0).error == 0);
   }
 

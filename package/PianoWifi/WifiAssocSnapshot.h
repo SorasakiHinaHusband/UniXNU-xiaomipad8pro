@@ -39,7 +39,8 @@ struct piano_wifi_assoc_snapshot {
 int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out);
 
 enum { PIANO_WIFI_USER_OFF = 0, PIANO_WIFI_USER_ON = 1, PIANO_WIFI_USER_LEAVE = 2 };
-// Nonblocking intent only. The radio worker owns WMI, DMA and physical power.
+// Leave and ON publish intent. OFF waits for bounded hardware confirmation
+// from the radio worker, which owns WMI, DMA and physical power.
 int piano_wifi_user_control(uint32_t operation);
 
 #ifdef __cplusplus

@@ -843,11 +843,12 @@ inline uint32_t staAppleAssociateResult(const Sta &s, bool newRequest = false)
 {
   if (newRequest) return 0;
   if (s.stopAsked) return 2;
-  if (!s.assocAnswered) return 0;
-  if (s.assocStatus != kDot11StatusSuccess)
+  if (s.nextCandidate) return 0;
+  if (s.error && (s.step == kStaTeardown || staFinished(s)))
     return s.error == kStaErrTimeout || s.error == kStaErrNoAnswer ? 9u : 2u;
-  if (s.rsn && !s.authorized) return 0;
-  return s.disconnect || !s.vdevUp ? 2u : 1u;
+  if (!s.assocAnswered) return 0;
+  if (s.assocStatus != kDot11StatusSuccess || s.disconnect) return 2u;
+  return s.vdevUp && s.authorized ? 1u : 0u;
 }
 
 // An event of the firmware's message interface: true when it was the join's (the owner then gives it to nobody else).

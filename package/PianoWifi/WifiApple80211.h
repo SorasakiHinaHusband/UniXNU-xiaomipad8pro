@@ -118,7 +118,18 @@ enum : uint32_t {
   kEvAssocDone = 9,
   kEvScanDone = 10,
   kEvScanCacheUpdated = 15,
+  kEvDriverAvailable = 55,
 };
+
+// 27.3's BSD driver-availability callback reads the first seven words.
+// CoreWiFi also reads the reason string at 0x1c and trap sequence at 0xf4.
+struct DriverAvailableEvent {
+  uint32_t version = 1, flags = 0x20, available = 1; // firmware loaded
+  uint32_t eventId = 0, reason = 0, subreason = 0, minorReason = 0;
+  uint8_t detail[256] = {};
+};
+static_assert(__builtin_offsetof(DriverAvailableEvent, available) == 8 &&
+              __builtin_offsetof(DriverAvailableEvent, detail) == 0x1c, "27.3 availability event layout");
 
 // Link-changed event4 and GET156: 27.3 airportd/CoreWiFi consume the same 32 bytes.
 struct LinkEvent {
@@ -552,7 +563,7 @@ inline AssociationEvents associationEvents(const Association &old, const Associa
   const auto transition = associationTransition(old, next);
   const bool down = associationLinkDownEvent(old, next);
   const bool completion = transition.assocDone ||
-                          (old.result != next.result && next.result && (!down || !voluntary));
+                          (old.result != next.result && next.result && (!down || (!voluntary && !old.authorized)));
   if (completion) events.codes[events.count++] = kEvAssocDone;
   if (transition.connected || down) {
     events.codes[events.count++] = kEvLinkChanged;
@@ -636,6 +647,7 @@ struct Answer {
   uint32_t wrote = 0;      // bytes copied out (the log line's "wrote")
   bool accepted = false;   // answered by an accept mode, not by a handler of ours
   bool associationProfile = false;  // SET 20 parsed into associationProfileData below
+  bool powerOn = false;            // requested SET19 state, published only by the owner
   uint32_t associationProblem = kAssociateProblemNone;
   uint32_t associationLayout = 0;
   uint32_t associationHeader0 = 0;
@@ -893,7 +905,7 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       if (rq.length < sizeof p) { a.error = kErrInval; return a; }
       if ((a.error = copyIn(rq, io, &p, sizeof p))) return a;
       if (p.version != 1 || p.radios != 1 || p.state[0] > 1) { a.error = kErrInval; return a; }
-      s.power = p.state[0] != 0;
+      a.powerOn = p.state[0] != 0;
       ++s.powerSets;
       a.effects |= kDoPowerChanged;
       return a;
@@ -1069,10 +1081,21 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     return a;
   case kCurrentNetwork:
     if (!s.association.associated) { a.error = kErrNotAssociated; return a; }
-    { Bss b = {}; for (unsigned i = 0; i < 6; ++i) b.bssid[i] = s.association.bssid[i];
+    { Bss b = {};
+      for (uint32_t i = 0; i < s.scan.count; ++i) {
+        const Bss &candidate = s.scan.bss[i];
+        bool same = true;
+        for (unsigned j = 0; j < 6; ++j) same = same && candidate.bssid[j] == s.association.bssid[j];
+        if (same) { b = candidate; break; }
+      }
+      for (unsigned i = 0; i < 6; ++i) b.bssid[i] = s.association.bssid[i];
       b.ssidLength = s.association.ssidLength; for (unsigned i = 0; i < b.ssidLength; ++i) b.ssid[i] = s.association.ssid[i];
       b.channel = s.association.channel; b.freq = s.association.frequency; b.rssi = s.association.rssi;
-      b.rateCount = 1; b.rates[0] = uint8_t(s.association.rate > 127 ? 127 : s.association.rate * 2);
+      if (s.association.authType == 2) b.capability |= 0x11; // ESS + privacy even after cache clear
+      if (!b.rateCount) {
+        b.rateCount = 1;
+        b.rates[0] = uint8_t(s.association.rate > 63 ? 126 : s.association.rate * 2);
+      }
       ScanResult *r = reinterpret_cast<ScanResult *>(scratch); fillScanResult(*r, b);
       a.error = copyOut(rq, io, r, resultBytes(*r), a); }
     return a;
