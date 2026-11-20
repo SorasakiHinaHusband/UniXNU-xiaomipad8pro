@@ -457,18 +457,19 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         if (!strcmp(line, "PRM REQ 0x30c 19200000")) w.va_mclk = 1;
         if (!strcmp(line, "PRM REL 0x30c")) {if (w.va_on) violate("the VA mclk released under the DMIC path"); w.va_mclk = 0;}
         if (!strcmp(line, "START 0x4005")) {if (!w.clock_on) violate("the device graph started without the bit clock"); w.dev_started = 1;}
-        // the protection pair: the V/I graph opened and started before the speaker graph, stopped and closed after it
-        if (!strcmp(line, "OPEN 0xb00000d5")) w.vi_open = 1;
+        // the protection pair (round 2, Android's order): the speaker graph (SP_RX, SP_TX's control peer) opened before the V/I
+        // graph; V/I started before the speaker graph and stopped after it
+        if (!strcmp(line, "OPEN 0xb00000d5")) {if (!w.prot_dev_open) violate("the V/I graph opened before the speaker graph"); w.vi_open = 1;}
         if (!strcmp(line, "START 0xb00000d5")) {if (!w.clock_on || !w.vi_open) violate("the V/I graph started without the bit clock"); w.vi_started = 1;}
-        if (!strcmp(line, "OPEN 0xb0000002")) {if (!w.vi_started) violate("the speaker graph opened before the V/I graph ran"); w.prot_dev_open = 1;}
+        if (!strcmp(line, "OPEN 0xb0000002")) w.prot_dev_open = 1;
         if (!strcmp(line, "START 0xb0000002")) {
             if (!w.clock_on || !w.vi_started) violate("the protected speaker graph started without the clock or the V/I graph");
             if (!w.re25_sets) violate("the protected speaker graph started without Re25");
             w.dev_started = 1;
         }
         if (!strcmp(line, "STOP 0xb0000002")) {if (any_powered()) violate("a speaker graph stopped with an amplifier powered up"); w.dev_started = 0;}
-        if (!strcmp(line, "STOP 0xb00000d5")) {if (w.dev_started || w.prot_dev_open) violate("the V/I graph stopped under the speaker graph"); w.vi_started = 0;}
-        if (!strcmp(line, "CLOSE 0xb0000002")) w.prot_dev_open = 0;
+        if (!strcmp(line, "STOP 0xb00000d5")) {if (w.dev_started) violate("the V/I graph stopped under the running speaker graph"); w.vi_started = 0;}
+        if (!strcmp(line, "CLOSE 0xb0000002")) {if (w.vi_open) violate("the speaker graph closed before the V/I graph"); w.prot_dev_open = 0;}
         if (!strcmp(line, "CLOSE 0xb00000d5")) {if (w.vi_started) violate("the V/I graph closed while running"); w.vi_open = 0;}
         if (!strcmp(line, "CFG 0x4046 0x10001fa7")) {
             w.re25_sets++;
@@ -1553,11 +1554,11 @@ static void spk_files(void)
 }
 static void spk_reset(void) {g_spk = g_spk_files = g_live_header_bad = 0; g_battery_uv = 4012000; g_fail = 0; g_drop = 0; g_kind = 0;}
 
-static const char *kProtUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000", "OPEN 0xb00000d5", "CFG 0x45c2", "CFG 0x40ee",
-                                "PREPARE 0xb00000d5", "START 0xb00000d5", "OPEN 0xb0000002", "CFG 0x4023", "CFG 0x4023",
+static const char *kProtUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000", "OPEN 0xb0000002", "CFG 0x4023", "CFG 0x4023",
                                 "CFG 0x4046 0x10001fb0 oob", "CFG 0x4046 0x10001fa7", "OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004",
+                                "OPEN 0xb00000d5", "CFG 0x45c2", "CFG 0x40ee", "PREPARE 0xb00000d5", "START 0xb00000d5",
                                 "PREPARE 0xb0000002", "PREPARE 0x4001", "START 0xb0000002", "START 0x4001"};
-static const char *kProtDown[] = {"STOP 0x4001", "STOP 0xb0000002", "CLOSE 0x4001", "CLOSE 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5",
+static const char *kProtDown[] = {"STOP 0x4001", "STOP 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5", "CLOSE 0x4001", "CLOSE 0xb0000002",
                                   "UNMAP 0x55", "PRM REL 0x202"};
 static unsigned monitor_rounds(unsigned *at)
 {
