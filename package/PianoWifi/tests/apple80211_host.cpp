@@ -125,14 +125,13 @@ struct PowerRig : Rig {
   WifiBootPower bootGuard;
   PowerRig() { bootGuard.enabled = false; } // existing unrestricted-lifecycle replays
   unsigned powerEvents = 0, downEvents = 0;
-  Power eventPower{};
   void publish(bool acceptedPowerSet = false) {
     const bool on = WifiUserControl::power(owner.read());
     const bool notify = powerEventRequired(st, on, acceptedPowerSet);
     Association next = st.association;
     if (!owner.allowed(owner.read())) { next = {}; next.result = 2; }
     const Association old = observeAssociation(st, next, on, true);
-    if (notify) { ++powerEvents; eventPower = {1, 1, {on ? 1u : 0u, 0, 0, 0}}; }
+    if (notify) ++powerEvents;
     if (associationLinkDownEvent(old, next)) {
       ++downEvents;
       st.linkEvent = {};
@@ -217,7 +216,7 @@ int main()
     for (unsigned cycle = 0; cycle < 3; ++cycle) {
       r.setPowerRecord(false);
       CHECK(!r.control(kPower, sizeof(Power)).error && !r.getPower());
-      CHECK(r.owner.radioStop() && r.eventPower.state[0] == 0);
+      CHECK(r.owner.radioStop());
       r.owner.radioOff(r.owner.read());
       r.setPowerRecord(true);
       CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower());
@@ -231,9 +230,8 @@ int main()
   CHECK(!useIfnet2Old(2));
   CHECK(useIfnet2Old(kIfnet2Old));
 
-  // The menu event contract: ASSOC_DONE is visible while WPA2 is still
-  // waiting for the private port, and the link/SSID/BSSID transition follows
-  // only after AUTHORIZE.  A disconnect emits one down transition.
+  // ASSOC_DONE may precede WPA2 authorization. The public link/SSID/BSSID
+  // transition waits for authorization. A disconnect emits one down transition.
   {
     Association old = {}, pending = {}, open = {};
     pending.associated = true;
@@ -263,10 +261,44 @@ int main()
     events = associationEvents(failed, failedAgain, false);
     CHECK(events.count == 4 && events.codes[0] == 9); // another generation can fail between polls
     CHECK(associationEvents(open, open, false).count == 0);
-    CHECK(kEvPowerChanged == 1);
-    const DriverAvailableEvent available;
-    CHECK(kEvDriverAvailable == 55 && sizeof available == 284 && available.version == 1 &&
-          available.available == 1 && available.flags == 0x20 && available.detail[0] == 0);
+    events = associationEvents(old, open, false);
+    CHECK(events.count == 4 && events.codes[0] == 9 && events.codes[1] == 4 &&
+          events.codes[2] == 2 && events.codes[3] == 3);
+    events = associationEvents(open, failed, false);
+    CHECK(events.count == 3 && events.codes[0] == 4 && events.codes[1] == 2 && events.codes[2] == 3);
+  }
+
+  // Post-size checks include both BSD vectors and the 24-byte kernel header.
+  {
+    CHECK(kBsdEventHeaderSize == 24 && kBsdEventNameSize == 16 && kBsdEventMaxSize == 288);
+    CHECK(kEventClass == 6 && kEventSubclass == 1 && kEvPowerChanged == 1);
+    LinkEvent link = {};
+    link.down = 1;
+    link.rssi = -65;
+    link.snr = 0x1234;
+    link.noise = 0x5678;
+    link.involuntary = 1;
+    link.reason = 0x11223344;
+    link.subreason = 0x55667788;
+    const uint8_t linkBytes[] = {
+      1, 0, 0, 0, 0xbf, 0xff, 0xff, 0xff, 0x34, 0x12, 0x78, 0x56, 0, 0, 0, 0,
+      1, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0,
+    };
+    const uint8_t scanBytes[] = {1, 0, 0, 0, 0, 0, 0, 0};
+    for (bool scanStatus : {false, true}) {
+      for (const uint32_t code : {kEvPowerChanged, kEvSsidChanged, kEvBssidChanged, kEvLinkChanged,
+                                  kEvAssocDone, kEvScanDone, kEvScanCacheUpdated}) {
+        const auto payload = bsdEventPayload(code, link, scanStatus);
+        CHECK(kBsdEventHeaderSize + kBsdEventNameSize + payload.size <= kBsdEventMaxSize);
+        if (code == kEvLinkChanged) {
+          CHECK(payload.size == sizeof linkBytes && std::memcmp(payload.data, linkBytes, sizeof linkBytes) == 0);
+        } else if (code == kEvScanDone && scanStatus) {
+          CHECK(payload.size == sizeof scanBytes && std::memcmp(payload.data, scanBytes, sizeof scanBytes) == 0);
+        } else {
+          CHECK(payload.size == 0 && payload.data == nullptr);
+        }
+      }
+    }
   }
 
   // ---- the layouts: the request and the answers' fixed sizes and offsets
@@ -357,17 +389,16 @@ int main()
       r.setPowerRecord(true);
       CHECK(!r.control(19, 24).error);
       CHECK(r.getPower() && r.powerEvents == bootSet + 1);
-      CHECK(r.eventPower.version == 1 && r.eventPower.radios == 1 && r.eventPower.state[0] == 1);
     }
     r.publish(); r.publish(); // timer/polls cannot duplicate the SET notification
     CHECK(r.powerEvents == 2);
     r.setPowerRecord(false);
     CHECK(!r.control(19, 24).error && !r.getPower() && r.owner.radioStop());
-    CHECK(r.powerEvents == 3 && r.eventPower.state[0] == 0 && r.eventPower.radios == 1);
+    CHECK(r.powerEvents == 3);
     r.owner.radioOff(r.owner.read()); // quiesced DMA and physical power-down
     r.setPowerRecord(true);
     CHECK(!r.control(19, 24).error && r.getPower() && r.owner.allowed(r.owner.read()));
-    CHECK(r.powerEvents == 4 && r.eventPower.state[0] == 1);
+    CHECK(r.powerEvents == 4);
     r.put32(0, 2); // a refused SET cannot generate an acknowledgement
     CHECK(r.control(19, 24).error == kErrInval && r.getPower() && r.powerEvents == 4);
     for (int32_t leave : {22, 29}) {
@@ -406,7 +437,7 @@ int main()
       oldBoot.owner.radioOff(oldBoot.owner.read());
       oldBoot.publish();
       CHECK(!oldBoot.getPower() && !oldBoot.owner.allowed(oldBoot.owner.read()));
-      CHECK(oldBoot.powerEvents == 2 && oldBoot.eventPower.state[0] == 0);
+      CHECK(oldBoot.powerEvents == 2);
 
       PowerRig fixedBoot;
       for (unsigned daemon = 0; daemon < 2; ++daemon) {
@@ -433,7 +464,7 @@ int main()
       }
       r.publish();
       CHECK(r.getPower() && r.owner.allowed(r.owner.read()) && !r.owner.radioStop());
-      CHECK(r.powerEvents == 2 && r.eventPower.state[0] == 1);
+      CHECK(r.powerEvents == 2);
     }
     // A single persisted OFF must survive polls and worker completion forever;
     // administrative UP is an initialization default, not a periodic override.
@@ -447,7 +478,7 @@ int main()
       CHECK(!persistedOff.owner.join());
       CHECK(persistedOff.ask(true, kScanReq, 0).error == kErrPowerOff);
     }
-    CHECK(persistedOff.powerEvents == 1 && persistedOff.eventPower.state[0] == 0);
+    CHECK(persistedOff.powerEvents == 1);
     std::puts("boot power replay: DOWN/OFF twice, UP/ON twice, persisted OFF and drained OFF->ON passed");
   }
 

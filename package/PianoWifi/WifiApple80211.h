@@ -118,18 +118,7 @@ enum : uint32_t {
   kEvAssocDone = 9,
   kEvScanDone = 10,
   kEvScanCacheUpdated = 15,
-  kEvDriverAvailable = 55,
 };
-
-// 27.3's BSD driver-availability callback reads the first seven words.
-// CoreWiFi also reads the reason string at 0x1c and trap sequence at 0xf4.
-struct DriverAvailableEvent {
-  uint32_t version = 1, flags = 0x20, available = 1; // firmware loaded
-  uint32_t eventId = 0, reason = 0, subreason = 0, minorReason = 0;
-  uint8_t detail[256] = {};
-};
-static_assert(__builtin_offsetof(DriverAvailableEvent, available) == 8 &&
-              __builtin_offsetof(DriverAvailableEvent, detail) == 0x1c, "27.3 availability event layout");
 
 // Link-changed event4 and GET156: 27.3 airportd/CoreWiFi consume the same 32 bytes.
 struct LinkEvent {
@@ -144,6 +133,27 @@ struct LinkEvent {
 static_assert(sizeof(LinkEvent) == 32 && __builtin_offsetof(LinkEvent, involuntary) == 0x10 &&
               __builtin_offsetof(LinkEvent, reason) == 0x14 && __builtin_offsetof(LinkEvent, subreason) == 0x18,
               "27.3 link event layout");
+
+constexpr uint32_t kBsdEventHeaderSize = 24, kBsdEventNameSize = 16;
+constexpr uint32_t kBsdEventMaxSize = 288; // MLEN in the pinned 27.3 kernel
+constexpr uint32_t kBsdScanDoneStatus[] = {1, 0}; // diagnostic {version, status}
+static_assert(kBsdEventHeaderSize + kBsdEventNameSize + sizeof(LinkEvent) <= kBsdEventMaxSize, "link kernel event fits");
+static_assert(kBsdEventHeaderSize + kBsdEventNameSize + sizeof(kBsdScanDoneStatus) <= kBsdEventMaxSize, "scan kernel event fits");
+
+struct BsdEventPayload {
+  const void *data;
+  uint32_t size;
+};
+
+// Power/SSID/BSSID are change notices and their values come from GETs.
+// Keep ASSOC_DONE in the BSD sequence as a notice. 27.3 airportd's BSD
+// callback has no event-9 payload parser and reads the join result via GET21.
+inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus)
+{
+  if (code == kEvLinkChanged) return {&link, sizeof link};
+  if (code == kEvScanDone && scanStatus) return {kBsdScanDoneStatus, sizeof kBsdScanDoneStatus};
+  return {nullptr, 0};
+}
 
 // SET 20 carries one of two fixed association records.  The field meanings and offsets are
 // confirmed by the 27.3 Apple80211Associate2 parser and by the Pad 6 Pro binding (PAD6P0125;
@@ -176,15 +186,6 @@ static_assert(sizeof(AssociateRequestLegacy) == 592 && offsetof(AssociateRequest
               "legacy association layout");
 static_assert(sizeof(AssociateRequest27) == 656 && offsetof(AssociateRequest27, network) == 0x10,
               "modern association layout");
-
-// Modern Apple80211Associate2 completion.  The 27.3 event consumer accepts this 540-byte
-// record; the first attempt slot carries the BSSID, result at 0x214 and validity at 0x218.
-struct AssociateEvent27 {
-  uint8_t attempts[10][52];
-  uint32_t reserved[2], reason, result, has_result;
-};
-static_assert(sizeof(AssociateEvent27) == 540 && offsetof(AssociateEvent27, result) == 0x214 &&
-              offsetof(AssociateEvent27, has_result) == 0x218, "modern association event");
 
 enum : uint32_t {
   kAssociateProblemNone = 0,
@@ -503,7 +504,6 @@ constexpr bool useIfnet2Old(uint32_t mode) { return (mode & kIfnet2Old) != 0; }
 struct Association {
   bool associated = false;
   bool authorized = false;
-  bool modern = false;             // the accepted SET 20 used the 656-byte request
   uint8_t ssid[kSsidMax] = {};
   uint8_t ssidLength = 0;
   uint8_t bssid[6] = {};
@@ -956,7 +956,6 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       a.associationLayout = rq.length;
       (void)parseAssociate(rq, io, a);
       if (a.associationProfile) {
-        s.association.modern = rq.length == sizeof(AssociateRequest27);
         a.error = 0;
       }
       return a;

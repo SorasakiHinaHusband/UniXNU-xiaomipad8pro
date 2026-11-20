@@ -541,25 +541,20 @@ are credential forms, not key algorithms. PTK before GTK is the normal handshake
 it, not request timing; a group key that arrives first waits for pairwise completion. The peer address is a consistency check.
 Ignore the WoW fields for now; wipe the whole request and every temporary key copy after use.
 
-### 8.3 Events and their first payload candidates
+### 8.3 BSD event layouts
 
-- **ASSOC_DONE (9)** — code confirmed. First candidate: the 540-byte form our sheng binding uses for a 656-byte association
-  (ten 52-byte attempt records from `0x000`, reason at `0x210`, result at `0x214`, result-valid at `0x218`): zero it, put the
-  attempted BSSID in the first attempt record, set the result with valid=1, fill the reason when known. **Inferred from 24A446**,
-  not a recovered 27.3 layout; keep request 21 correct even if the daemon ignores the event's payload.
-- **LINK_CHANGED (4)** — our 32-byte inline candidate (down byte at `0`, RSSI at `4`, SNR at `8`, noise at `0xa`, reason at
-  `0x14`) is the size M1 already posts; its 27.3 semantics are **inferred** — leave reason and the disconnect flags zero unless
-  known. GET 156 is implemented only as a companion: the two prior-art models disagree about the disconnect flag's meaning, so
-  neither is proof.
+- **ASSOC_DONE (9)** carries an empty payload on the BSD socket. The 27.3 airportd callback has no dispatch case for code 9.
+  Its join waiter polls GET 21 for the result. The 540-byte candidate from the 24A446 sheng port exceeded the 248 bytes available
+  after the pinned kernel's 24-byte BSD event header and 16-byte interface name.
+- **LINK_CHANGED (4)** carries 32 bytes and GET 156 returns the same record. The 27.3 callback requires exactly 32 bytes and
+  reads down at `0`, involuntary at `0x10`, reason at `0x14` and subreason at `0x18`.
 - **RSN_HANDSHAKE_DONE (20)** — code confirmed; an empty payload is the first candidate; post once after the group key plus peer
   authorization and instrument whether airportd/CoreWLAN act on it (the historical driver sometimes emitted one per key and
   sometimes none, which cannot settle our cardinality).
 - **SSID_CHANGED (2) / BSSID_CHANGED (3)** — empty payload; the values are read through requests 1 and 9.
-- For every transition update the driver's snapshot and the BSD link state **before** posting: up = SSID, BSSID, LINK up; down =
-  LINK down, SSID, BSSID, and the getters then answer no network. Signal-quality updates while up may reuse LINK_CHANGED without
-  flapping the link. Which single event repaints the menu is **inferred** — the plan satisfies the whole coherent set (a
-  successful join result, RSN completion for PSK, an active link, RUN, agreeing current-network getters) rather than one guessed
-  event.
+- **POWER_CHANGED (1)** carries an empty payload, as in the 27.3 family's successful SET 19 path. airportd reads back GET 19.
+- Publish the driver snapshot and BSD link state before the notifications. On authorization the driver sends 9, 4, 2, 3.
+  On leave it sends 4, 2, 3 and the getters answer no network. An initial WPA2 association may emit 9 before authorization.
 
 ### 8.4 Two ways WPA2 can run
 
