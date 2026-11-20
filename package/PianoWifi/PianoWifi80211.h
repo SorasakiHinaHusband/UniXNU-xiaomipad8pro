@@ -485,16 +485,6 @@ void PianoWifi80211::attachStep()
             "type %u, family %u, subfamily %u; IOInterfaceName %s", fIfName, unsigned(ifnet_unit(ifp)),
             fAttachTries * kAttachTickMs, unsigned(ifnet_type(ifp)), unsigned(ifnet_family(ifp)), unsigned(ifnet_subfamily(ifp)),
             named ? "the family's" : "set here");
-  postEvent(pianowifi::a80211::kEvPowerChanged);
-  pianowifi::a80211::LinkEvent down = {};
-  down.down = 1;
-  postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
-  // sheng bit 0x2: their post_link_down sends SSID_CHANGED and BSSID_CHANGED beside every LINK_CHANGED (WifiNet.cpp:195-197) —
-  // the two codes the framework's state machine waits for beside the link's own.
-  if (shengMode() & pianowifi::a80211::kShengEvents) {
-    postEvent(pianowifi::a80211::kEvSsidChanged);
-    postEvent(pianowifi::a80211::kEvBssidChanged);
-  }
   if (fUcMode & pianowifi::a80211::kUcControllerName) {
     // The lookup user space makes by IOInterfaceName takes any class: with these the controller can be what it finds and opens.
     setProperty("IOInterfaceName", fIfName);
@@ -504,12 +494,19 @@ void PianoWifi80211::attachStep()
   }
   if (fUcMode & pianowifi::a80211::kUcOffer) applyInterfaceBinding(true);
   else if (shengMode() & pianowifi::a80211::kShengInterfaceBinding) applyInterfaceBinding(true);
-  setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   noteIdentity("at the filter's attach");
   registerService();
   fRegistered = true;
+  setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   note80211("%s: the controller is registered (class chain PianoWifi80211 < IO80211Controller < PianoWifiEthernet): airportd's "
             "IOKit match may fire", fIfName);
+  // Publish the completed binding before sending the initial BSD notifications.
+  postEvent(pianowifi::a80211::kEvPowerChanged);
+  pianowifi::a80211::LinkEvent down = {};
+  down.down = 1;
+  postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
+  postEvent(pianowifi::a80211::kEvSsidChanged);
+  postEvent(pianowifi::a80211::kEvBssidChanged);
   arm(fReportCall, 5000);   // the first summary soon (who matched the controller), then every minute
 }
 
@@ -848,7 +845,9 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
               unsigned(link.down), link.involuntary ? 0u : 1u, unsigned(link.reason), unsigned(length), e);
   }
   if (code == pianowifi::a80211::kEvPowerChanged) note80211("PianoWifiPowerLifecycleV1 event1 power changed bytes %u -> %d", unsigned(length), e);
-  if (first || e) note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
+  if (first || e || code == pianowifi::a80211::kEvAssocDone || code == pianowifi::a80211::kEvSsidChanged ||
+      code == pianowifi::a80211::kEvBssidChanged)
+    note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
 }
 
 // One completion per accepted scan: an earlier one still waiting is posted at once (thread_call_cancel is true only for a call
@@ -1076,7 +1075,6 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   syncRunning(next.authorized);
   if (powerChanged) postEvent(kEvPowerChanged);
   if (!changed) { IOLockUnlock(fSyncLock); return; }
-  const auto transition = associationTransition(old, next);
   auto assocDone = [&](const Association &a) {
     if (a.modern) {
       // A separate event record, serialized by fSyncLock, so the ioctl caller's
@@ -1095,20 +1093,12 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   // ASSOC_DONE is deliberately first: it is the airportd hand-off point and
   // precedes the private supplicant's EAPOL exchange.  The public link events
   // are emitted only after AUTHORIZE, so configd cannot start DHCP early.
-  if (transition.assocDone) assocDone(next);
-  if (transition.connected) {
-    link.down = 0;
-    if (ssidChanged) postEvent(kEvSsidChanged);
-    if (bssidChanged) postEvent(kEvBssidChanged);
-    postEvent(kEvLinkChanged, &link, sizeof link);
-  } else if (associationLinkDownEvent(old, next)) {
-    link.down = 1;
-    postEvent(kEvLinkChanged, &link, sizeof link);
-    if (next.result && !transition.assocDone && !raw.user_stop) assocDone(next);
-    postEvent(kEvSsidChanged);
-    postEvent(kEvBssidChanged);
-  } else if (resultChanged && next.associated && !transition.assocDone) {
-    assocDone(next);
+  const auto events = associationEvents(old, next, raw.user_stop);
+  for (unsigned i = 0; i < events.count; ++i) {
+    const uint32_t code = events.codes[i];
+    if (code == kEvAssocDone) assocDone(next);
+    else if (code == kEvLinkChanged) postEvent(code, &link, sizeof link);
+    else postEvent(code);
   }
   note80211("%s: association state %s (channel %u, rssi %d, rate %u; events emitted)", fIfName,
             next.associated ? (next.authorized ? "authorized" : "associated") : "idle", unsigned(next.channel), int(next.rssi),

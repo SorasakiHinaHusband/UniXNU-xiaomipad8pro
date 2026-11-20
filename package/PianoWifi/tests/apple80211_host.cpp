@@ -239,12 +239,27 @@ int main()
     pending.associated = true;
     auto t = associationTransition(old, pending);
     CHECK(t.assocDone && !t.connected && !t.disconnected);
+    auto events = associationEvents(old, pending, false);
+    CHECK(events.count == 1 && events.codes[0] == 9);
     open = pending;
     open.authorized = true;
+    open.result = 1;
     t = associationTransition(pending, open);
     CHECK(!t.assocDone && t.connected && !t.disconnected);
+    events = associationEvents(pending, open, false);
+    CHECK(events.count == 4 && events.codes[0] == 9 && events.codes[1] == 4 &&
+          events.codes[2] == 2 && events.codes[3] == 3);
     t = associationTransition(open, Association{});
     CHECK(!t.assocDone && !t.connected && t.disconnected);
+    Association failed;
+    failed.result = 2;
+    events = associationEvents(open, failed, true);
+    CHECK(events.count == 3 && events.codes[0] == 4 && events.codes[1] == 2 && events.codes[2] == 3);
+    events = associationEvents(old, failed, false);
+    CHECK(events.count == 4 && events.codes[0] == 9 && events.codes[1] == 4 &&
+          events.codes[2] == 2 && events.codes[3] == 3);
+    CHECK(associationEvents(open, open, false).count == 0);
+    CHECK(kEvPowerChanged == 1);
   }
 
   // ---- the layouts: the request and the answers' fixed sizes and offsets
@@ -485,7 +500,12 @@ int main()
     CHECK(r.ask(false, kOpMode, 0, false).error == 0 && r.rq.value == int32_t(kOpModeStation));
     CHECK(r.ask(false, kPhyMode, 12).error == 0 && r.u32(4) == kPhySupported && r.u32(8) == 0);
     CHECK(r.ask(false, kNoise, 52).error == 0 && int32_t(r.u32(12)) == -95 && int32_t(r.u32(28)) == -95);
-    for (int32_t t : {kRssi, kChannel, kSsid, kBssid, kCurrentNetwork, kRate}) CHECK(r.ask(false, t, 1164).error == kErrNotAssociated);
+    for (int32_t t : {1, 9, 4, 16, 103})
+      CHECK(r.ask(false, t, 1164).error == 2);
+    for (int32_t t : {96, 97, 115, 469, 490, 575}) {
+      CHECK(r.ask(false, t, 16).error == 102);
+      CHECK(r.ask(true, t, 16).error == 102);
+    }
     CHECK(r.ask(false, kAssociateResult, 0, false).error == 0 && r.rq.value == 0);
     Answer a = r.ask(false, kCountryCode, 3);
     CHECK(a.error == 0 && std::memcmp(r.at(0), "XX", 3) == 0 && r.rq.length == 3);

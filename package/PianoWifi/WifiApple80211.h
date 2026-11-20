@@ -467,7 +467,7 @@ constexpr uint32_t kAcceptDefault = kAcceptInfraEnumerated;
 enum : uint32_t {
   kShengMedium = 0x1,    // SIOCGIFMEDIA answers IEEE 802.11 auto ("the framework lists wireless interfaces by this media
                          // type"): the medium dictionary carries kIOMediumIEEE80211Auto and it is the selected medium
-  kShengEvents = 0x2,    // the event set: SSID_CHANGED and BSSID_CHANGED posted with every LINK_CHANGED (their post_link_down)
+  kShengEvents = 0x2,    // retained boot-argument bit; link and identity events are unconditional
   kShengCaps46 = 0x4,    // CARD_CAPABILITIES bit 46: "the framework's scan waits for the scan-done event, up to 20 s, only
                          // with this bit; without it the results are read the moment the request returns"
   kShengUcKernel = 0x8,  // a user-client request's data rides inside the structure itself (a kernel buffer): byte replies
@@ -539,6 +539,27 @@ inline bool associationLinkDownEvent(const Association &old, const Association &
 {
   return associationTransition(old, next).disconnected ||
          (!next.associated && next.result != 0 && old.result != next.result);
+}
+
+struct AssociationEvents {
+  uint32_t codes[4] = {};
+  unsigned count = 0;
+};
+
+inline AssociationEvents associationEvents(const Association &old, const Association &next, bool voluntary)
+{
+  AssociationEvents events;
+  const auto transition = associationTransition(old, next);
+  const bool down = associationLinkDownEvent(old, next);
+  const bool completion = transition.assocDone ||
+                          (old.result != next.result && next.result && (!down || !voluntary));
+  if (completion) events.codes[events.count++] = kEvAssocDone;
+  if (transition.connected || down) {
+    events.codes[events.count++] = kEvLinkChanged;
+    events.codes[events.count++] = kEvSsidChanged;
+    events.codes[events.count++] = kEvBssidChanged;
+  }
+  return events;
 }
 
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
