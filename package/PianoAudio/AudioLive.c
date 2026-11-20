@@ -274,7 +274,7 @@ int audio_live_gain_select(AudioLiveShared *sh, unsigned gain)
 
 int audio_live_spk_select(AudioLiveShared *sh, int on)
 {
-    if (on != 0 && on != 1) return -1;
+    if (!spk_request_valid(on)) return -1;   /* 0, or an odd mask of SPK_VAR_* (round 2) */
     store(&sh->spk_prot, on);
     __atomic_add_fetch(&sh->spk_prot_gen, 1u, __ATOMIC_ACQ_REL);
     return 0;
@@ -573,6 +573,7 @@ static void spk_begin(AudioLive *l, uint32_t now)
     if (l->prot_active) {
         const char *why = 0;
         l->spk->plan.base = l->speaker;
+        l->spk->plan.variant = (uint32_t)load(&l->sh->spk_prot) & SPK_VAR_ALL & ~1u;
         if (spk_plan_init(&l->spk->plan, &l->spk->prot, l->ops.dma + AUDIO_DMA_PARAM, l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ?
                           AUDIO_DMA_PARAM_BYTES : 0, &why)) {
             l->prot_active = 0;
@@ -585,9 +586,12 @@ static void spk_begin(AudioLive *l, uint32_t now)
     if (l->prot_active) {
         if (l->ops.publish) l->ops.publish(l->ops.ctx);   /* the out-of-band payloads before the first command names them */
         l->prot_starts++;
-        LOG(l, PROT ": start %u: the stock protection pair: V/I graph %#x first, then %#x with SP_RX %#x linked to SP_TX %#x; %u ACDB "
-            "parameters (%u bytes) in %u packets, %u out of band; Re25 x4; gain cap %u", l->prot_starts, SPK_SG_VI, SPK_SG_DEV,
-            SPK_IID_SP_RX, SPK_IID_SP_TX, l->spk->prot.count, l->spk->prot.bytes, l->spk->plan.chunks, l->spk->plan.oob_chunks, live_gain_cap(l));
+        char variant[128];
+        LOG(l, PROT ": start %u: the stock protection pair: V/I graph %#x and %#x with SP_RX %#x linked to SP_TX %#x; %u ACDB "
+            "parameters (%u not sent) in %u packets, %u out of band; Re25 x4; gain cap %u", l->prot_starts, SPK_SG_VI, SPK_SG_DEV,
+            SPK_IID_SP_RX, SPK_IID_SP_TX, l->spk->prot.count - l->spk->plan.skipped, l->spk->plan.skipped, l->spk->plan.chunks,
+            l->spk->plan.oob_chunks, live_gain_cap(l));
+        LOG(l, PROT ": variant %u: %s (round 2)", l->spk->plan.variant | 1u, spk_variant_text(l->spk->plan.variant, variant, sizeof variant));
         LOG(l, "live: speaker: sound from the Speaker device: the speaker-protection plan (start %u)", l->spk_starts);
         plan_start(l, &l->splan, "speaker-protection", l->spk->plan.steps, l->spk->plan.count, 0x8000 + (l->sleep_generation << 16), &l->spk->plan);
     } else {
@@ -1399,7 +1403,7 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
         why = "no private files (PianoAudio/spk-prot.bin and spk-re25.bin)";
     }
     l->prot_why = l->prot_ready ? 0 : why;
-    store(&sh->spk_prot, c->spk_prot ? 1 : 0);
+    store(&sh->spk_prot, spk_request_valid(c->spk_prot) ? c->spk_prot : 0);
     l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
     if (l->prot_ready)
         LOG(l, PROT ": ready: %u ACDB parameters (%u bytes) of the V/I and speaker graphs, Re25 for four channels; %s", l->spk->prot.count,

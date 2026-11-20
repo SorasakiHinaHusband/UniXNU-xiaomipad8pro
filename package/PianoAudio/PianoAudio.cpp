@@ -50,6 +50,7 @@
 #include "AudioVa.h"
 #include "AudioPcm.h"
 #include "AudioPower.h"
+#include "AudioSpkProt.h"
 #include <PianoPowerContract.h>
 
 using namespace pianoaudio;
@@ -114,7 +115,8 @@ void readArgs()
   l.liveCeilingDb = bootArg("piano-audio-ceiling", 0); // 1..40 dB below full scale, level 9 and up; 0: the level's own
   l.liveIdleMs = bootArg("piano-audio-idle", 0);
   l.micGain = bootArg("piano-audio-mic-gain", 0);
-  l.spk = bootArg("piano-audio-spk", 0) == 1 ? 1 : 0;   // speaker protection (levels 8-10; machdep.piano_audio_spk at run time)
+  l.spk = bootArg("piano-audio-spk", 0);   // 0, or 1 + the round-2 variant bits (AudioSpkProt.h SPK_VAR_*)
+  if (!spk_request_valid(int(l.spk))) l.spk = 0;   // speaker protection (levels 8-10; machdep.piano_audio_spk at run time)
   l.micRoute = AUDIO_MIC_ROUTE_LEGACY;
   l.micRouteDiag = 0;
   char routeArg[32], diagArg[32];

@@ -149,7 +149,7 @@ is selectable. The Mic still receives mono with the first 100 ms silenced.
 | `piano-audio-ceiling=DB` | 6 | level 9 and up: full scale lands DB dB below full scale (1..40; 1 = -1 dBFS, the highest); level 8 is fixed at -20 dBFS |
 | `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
 | `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
-| `piano-audio-spk=1` | 0 | levels 8-10: the speaker path opens the stock speaker-protection pair (FSADSP SP_RX/SP_TX with V/I feedback) instead of the passthrough device graph, with the two private files (section 12); missing or mismatched files, or any FSADSP error, keep or bring the speaker back on the passthrough graph in the same boot. `machdep.piano_audio_spk` (root, 0/1) changes it from the next start of the speaker path; `machdep.piano_audio_spk_state` reads the state |
+| `piano-audio-spk=1` | 0 | levels 8-10: the speaker path opens the stock speaker-protection pair (FSADSP SP_RX/SP_TX with V/I feedback) instead of the passthrough device graph, with the two private files (section 12); missing or mismatched files, or any FSADSP error, keep or bring the speaker back on the passthrough graph in the same boot. `machdep.piano_audio_spk` (root, 0, or odd: 1 + the round-2 variant bits of section 12) changes it from the next start of the speaker path; `machdep.piano_audio_spk_state` reads the state |
 | `piano-audio-mic-gain=G` | 124 | level 10: the VA decimators' gain, Ubuntu's UCM control (0..124, 84 = 0 dB, 124 = +40 dB) |
 | `piano-audio-mic-route=-1\|0\|2\|4\|6` | -1 | level 10: DEC0 DMIC and mono source. -1 selects legacy DMIC0/DMIC2 mean. 4 selects the main/top mic. |
 | `piano-audio-mic-route-diag=0\|1` | 0 | Allow a root operator to arm one bounded stereo window before the mono selection. |
@@ -826,7 +826,7 @@ At 231, family 0x29 VOLCTRL must read 0xe7c0; at 192 it must read 0xc0c0. Temper
 Use one boot, the same fixed-level source and system volume 100 for both captures; report microphone dBFS and their
 difference, clipping and microphone gain/AGC limits alongside driver underruns and amplifier faults.
 
-## 12. Speaker protection (piano-audio-spk=1; host-tested 2026-11-21, not yet run on the tablet)
+## 12. Speaker protection (piano-audio-spk=1; first tablet run 2026-11-21: START of the V/I graph refused, round 2 below)
 
 The analysis: `private/host-checks/20261121-audio-spk/ANALYSIS.md` (private). Code: `package/PianoAudio/AudioSpkProt.{h,c}` (graphs,
 packets, the plan, the private files' format and checks) and the speaker path of `AudioLive.c`.
@@ -866,6 +866,20 @@ stays what it was (the path off for the boot).
 `PIANO_AUDIO_SPK_RE25`; `PIANO_AUDIO_SPK=0` builds without): a RAM image's addon and `build-esp.py` then carry them
 (`EFI/UniXNU/firmware/PianoAudio/`). A kext with these pins accepts only this unit's files: never publish such an image. Without them
 the kext has no pin and `piano-audio-spk=1` logs OFF. `python3 tooling/audio/spk-prot-extract.py --self-test` tests the tool.
+
+**Round 1 on the tablet (spk-prot1, v13.1k RAM, 2026-11-21).** The DSP accepted the PRM bit clock, the map, the V/I GRAPH_OPEN
+(out of band, with the vendor modules and the IMCL link), the V/I endpoint, its parameters and PREPARE; it refused GRAPH_START of
+the V/I graph with status 0x1. The fallback undid everything and the speaker played on the passthrough graph at the same level.
+Two candidate gates (analysis section 7): the order (Android opens the speaker graph, SP_RX being SP_TX's control peer, before it
+starts V/I; round 1 started V/I before the speaker graph existed) and the clock owner (both TDM endpoints get the ACDB's
+`PARAM_ID_HW_INTF_CLK_CFG` {default id, default rate, attribute 4 = invert couple-no, default root}, while the CPU also requested
+the same bit clock with attribute 1).
+
+**Round 2.** The default order is Android's: clock; map; open speaker graph, its endpoint, parameters and Re25; the stream; open
+V/I, endpoint, parameters; prepare and start V/I; prepare speaker and stream; start speaker and stream; amplifiers. The request
+(`piano-audio-spk`, `machdep.piano_audio_spk`) is a bit mask, odd = protection: +2 no CPU bit-clock request (the endpoints own it),
++4 the CPU request with attribute 4, +8 HW_INTF_CLK_CFG not sent (the CPU owns a non-inverted clock), +16 the round-1 order (the
+control); +2 and +4 exclude each other. `PianoSpeakerProtV1: variant N: ...` names the variant at each start.
 
 **Unverified on the hardware:** whether the DSP accepts a GRAPH_OPEN built outside the stock graph services with the vendor modules
 and the cross-graph control link; out-of-band commands from our map (the address form is the one the WRITEs already use); whether TX

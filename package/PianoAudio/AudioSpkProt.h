@@ -119,14 +119,34 @@ typedef struct {
 /* After the GET's answer: 0 and the four channels, or -1 (the DSP's header names another parameter, another size or an error). */
 int spk_live_parse(const uint8_t slot[SPK_LIVE_SLOT], SpkLive *out);
 
-/* ---- the plan: the passthrough speaker plan's shape with the protection pair, as one ArSeq:
- *   bit clock; map [periods | parameter area]; open V/I (oob); V/I endpoint; V/I parameters; prepare V/I; start V/I;
- *   open speaker (oob); speaker endpoint and MFC; speaker parameters (in band, oob for the big ones); Re25; open the stream (to the
- *   MFC); its shared memory format, decoder/converter, logger; prepare speaker, prepare stream; start speaker, start stream;
+/* ---- the plan: the passthrough speaker plan's shape with the protection pair, as one ArSeq (Android's order, round 2):
+ *   bit clock (not with +2); map [periods | parameter area]; open speaker (oob); speaker endpoint and MFC; speaker parameters (in
+ *   band, oob for the big ones); Re25; open the stream (to the MFC); its shared memory format, decoder/converter, logger; open V/I
+ *   (oob); V/I endpoint; V/I parameters; prepare V/I; start V/I; prepare speaker, prepare stream; start speaker, start stream;
  *   amplifiers on.
- * Undone in reverse: amplifiers off, stop stream, stop speaker, close stream, close speaker, stop V/I, close V/I, unmap, clock. */
+ * Undone in reverse: amplifiers off, stop stream, stop speaker, stop V/I, close V/I, close stream, close speaker, unmap, clock.
+ * +16 (the round-1 control): bit clock; map; open V/I .. start V/I; open speaker .. Re25; the stream; prepare, start; amplifiers. */
 #define SPK_MAX_CHUNKS 24u
 #define SPK_MAX_STEPS 56u
+/* Round 2 (2026-11-21, spk-prot1: the DSP refused START of the V/I graph, status 0x1, after accepting its open, endpoint,
+ * parameters and prepare; private/.../20261121-audio-spk ANALYSIS.md section 7). The default order is now Android's: the speaker
+ * graph (SP_RX, the IMCL link's peer) is opened and configured before the V/I graph is opened; V/I is prepared and started before
+ * the speaker graph is prepared and started. The request (piano-audio-spk, machdep.piano_audio_spk) is a bit mask, odd = protection:
+ *   +2 no CPU bit-clock request: the endpoints own the clock through the ACDB's HW_INTF_CLK_CFG (attribute 4, inverted), as Android;
+ *   +4 the CPU request with attribute 4 (CLOCK_ATTRIBUTE_INVERT_COUPLE_NO), agreeing with HW_INTF_CLK_CFG;
+ *   +8 HW_INTF_CLK_CFG is not sent: the CPU owns a non-inverted clock (attribute 1), as the passthrough graph;
+ *   +16 the round-1 order (V/I opened and started before the speaker graph is opened), the control.
+ * +2 and +4 exclude each other. */
+#define SPK_VAR_ENDPOINT_CLOCK 2u
+#define SPK_VAR_INVERT_CLOCK 4u
+#define SPK_VAR_NO_CLK_CFG 8u
+#define SPK_VAR_VI_FIRST 16u
+#define SPK_VAR_ALL 31u
+#define SPK_PID_HW_INTF_CLK 0x0800113Cu
+/* 1 for a valid request: 0 (passthrough) or an odd mask within SPK_VAR_ALL without both +2 and +4. */
+int spk_request_valid(int request);
+/* The variant as words for the log ("Android order, endpoint clock", ...): a static string per mask bit set, written into buf. */
+const char *spk_variant_text(uint32_t variant, char *buf, unsigned cap);
 typedef struct {
     uint8_t vi, oob;
     uint16_t first, count;              /* in band: order[first .. first + count) */
@@ -144,8 +164,10 @@ typedef struct {
     ArStep steps[SPK_MAX_STEPS];
     int8_t step_chunk[SPK_MAX_STEPS];
     unsigned count;
+    uint32_t variant;                   /* the request's mask (SPK_VAR_*); set by the caller with base, before spk_plan_init */
+    unsigned skipped;                   /* the file's parameters this variant does not send (HW_INTF_CLK_CFG with +8) */
 } SpkPlan;
-/* base must be filled first (ar_speaker_defaults and the period buffer, as the passthrough plan). Lays the steps out and writes every
+/* base and variant must be filled first (ar_speaker_defaults and the period buffer, as the passthrough plan). Lays the steps out and writes every
  * out-of-band payload into area (the parameter area as the CPU sees it, area_bytes long; the owner publishes it to the DSP before
  * the plan runs). 0, or -1 with *why. */
 int spk_plan_init(SpkPlan *p, const SpkProt *prot, uint8_t *area, uint32_t area_bytes, const char **why);

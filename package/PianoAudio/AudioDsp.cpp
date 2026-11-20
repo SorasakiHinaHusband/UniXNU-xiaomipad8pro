@@ -317,7 +317,8 @@ int gainControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
     piano_audio_log("aud-gain231-v1: requested gain %d (worker applies; active readback follows)", value);
     return 0;
 }
-// Speaker protection (AudioSpkProt.h): machdep.piano_audio_spk asks for the protection pair (1) or the passthrough graph (0) from the
+// Speaker protection (AudioSpkProt.h): machdep.piano_audio_spk asks for the protection pair (odd: 1, or 1 + the round-2 variant
+// bits SPK_VAR_*) or the passthrough graph (0) from the
 // next start of the speaker path (it is down after idle_ms without sound); a new request also clears a fallback of this boot.
 // machdep.piano_audio_spk_state is the worker's view, one line (read only; plain words and counters, no calibration value).
 struct sysctl_oid gSpkOid, gSpkStateOid;
@@ -327,7 +328,7 @@ int spkControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
     int value = __atomic_load_n(&gShared->spk_prot, __ATOMIC_ACQUIRE);
     const int err = sysctl_handle_int(oidp, &value, 0, req);
     if (err || !req->newptr) return err;
-    if (value == 1 && !gLive->prot_ready) return ENOENT;   // the private files are missing or mismatched (the log says which)
+    if ((value & 1) && !gLive->prot_ready) return ENOENT;   // the private files are missing or mismatched (the log says which)
     if (audio_live_spk_select(gShared, value)) return EINVAL;
     piano_audio_log("PianoSpeakerProtV1: request %d (taken at the next start of the speaker path)", value);
     liveWake();
@@ -494,7 +495,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_route = a->micRoute;
     lc.mic_diag = a->micRouteDiag;
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
-    lc.spk_prot = a->spk ? 1 : 0;
+    lc.spk_prot = int(a->spk);   // 0, or the round-2 mask (AudioSpkProt.h SPK_VAR_*), checked by PianoAudio.cpp and AudioLive
     static AudioLiveSpk *spkState;   // kept for the boot, as gLive
     if (!spkState) spkState = IOMallocType(AudioLiveSpk);
     if (spkState) bzero(spkState, sizeof *spkState);

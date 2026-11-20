@@ -364,8 +364,16 @@ uint64_t spk_plan_address(const SpkPlan *p, uint32_t offset)
     return base + p->param_offset + offset;
 }
 
-static uint32_t clock_on(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_clock(o, c, s->prm_port, t, AR_CLK_SEC_TDM_IBIT, AR_TDM_BIT_CLOCK);}
-static uint32_t clock_off(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_clock(o, c, s->prm_port, t, AR_CLK_SEC_TDM_IBIT, 0);}
+/* the CPU's bit-clock request: attribute 1 (couple no), or 4 (invert, couple no) with +4, as the ACDB's HW_INTF_CLK_CFG asks */
+static uint32_t clock_attribute(const ArSeq *s) {return (((const SpkPlan *)s->context)->variant & SPK_VAR_INVERT_CLOCK) ? 4u : 1u;}
+static uint32_t clock_on(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t)
+{
+    return ar_prm_clock_attr(o, c, s->prm_port, t, AR_CLK_SEC_TDM_IBIT, AR_TDM_BIT_CLOCK, clock_attribute(s));
+}
+static uint32_t clock_off(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t)
+{
+    return ar_prm_clock_attr(o, c, s->prm_port, t, AR_CLK_SEC_TDM_IBIT, 0, clock_attribute(s));
+}
 static uint32_t map_region(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t)
 {
     const SpkPlan *p = plan(s);
@@ -432,9 +440,37 @@ static int add(SpkPlan *p, const char *name, ArBuild build, uint32_t opcode, int
 static const char *const kChunkNames[2][2] = {{"speaker parameters (in band)", "speaker parameter (out of band)"},
                                               {"V/I parameters (in band)", "V/I parameter (out of band)"}};
 
+int spk_request_valid(int request)
+{
+    if (request == 0) return 1;
+    if (request < 0 || (request & 1) == 0 || ((uint32_t)request & ~SPK_VAR_ALL)) return 0;
+    return ((uint32_t)request & (SPK_VAR_ENDPOINT_CLOCK | SPK_VAR_INVERT_CLOCK)) != (SPK_VAR_ENDPOINT_CLOCK | SPK_VAR_INVERT_CLOCK);
+}
+
+const char *spk_variant_text(uint32_t variant, char *buf, unsigned cap)
+{
+    const char *order = (variant & SPK_VAR_VI_FIRST) ? "round-1 order (V/I first)" : "Android order";
+    const char *clock = (variant & SPK_VAR_ENDPOINT_CLOCK) ? "endpoint-owned clock (no CPU request)"
+                        : (variant & SPK_VAR_INVERT_CLOCK) ? "CPU clock attribute 4 (inverted)" : "CPU clock attribute 1";
+    const char *cfg = (variant & SPK_VAR_NO_CLK_CFG) ? "HW_INTF_CLK_CFG not sent" : "HW_INTF_CLK_CFG sent";
+    unsigned n = 0;
+    const char *part[3] = {order, clock, cfg};
+    if (!buf || !cap) return "";
+    for (unsigned k = 0; k < 3; ++k) {
+        if (k && n + 2 < cap) {buf[n++] = ','; buf[n++] = ' ';}
+        for (const char *c = part[k]; *c && n + 1 < cap; ++c) buf[n++] = *c;
+    }
+    buf[n] = 0;
+    return buf;
+}
+
+/* a parameter this variant does not send: the endpoints' HW_INTF_CLK_CFG with +8 */
+static int skipped(const SpkPlan *p, const SpkParam *e) {return (p->variant & SPK_VAR_NO_CLK_CFG) && e->pid == SPK_PID_HW_INTF_CLK;}
+
 int spk_plan_init(SpkPlan *p, const SpkProt *prot, uint8_t *area, uint32_t area_bytes, const char **why)
 {
     p->prot = prot;
+    p->skipped = 0;
     p->region_bytes = AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES;
     p->param_offset = AUDIO_DMA_PARAM;
     p->chunks = p->vi_chunks = p->oob_chunks = p->count = 0;
@@ -445,12 +481,15 @@ int spk_plan_init(SpkPlan *p, const SpkProt *prot, uint8_t *area, uint32_t area_
         (uint64_t)(uint32_t)address + p->region_bytes > 0x100000000ull)
         return fail(why, "the region is not DSP-addressable");
     /* the order: per graph (V/I first), the parameters that fit in band, then those that go out of band */
+    if (!spk_request_valid((int)(p->variant | 1u))) return fail(why, "an invalid variant");
     unsigned n = 0;
+    for (unsigned i = 0; i < prot->count; ++i) p->skipped += (unsigned)skipped(p, &prot->e[i]);
     for (int g = 1; g <= 2; ++g)
         for (int big = 0; big < 2; ++big)
             for (unsigned i = 0; i < prot->count; ++i)
-                if (spk_iid_graph(prot->e[i].iid) == g && (PARAM_HEADER + align8(prot->e[i].size) > SPK_INBAND_MAX) == big) p->order[n++] = (uint8_t)i;
-    if (n != prot->count) return fail(why, "a parameter of no graph");
+                if (!skipped(p, &prot->e[i]) && spk_iid_graph(prot->e[i].iid) == g &&
+                    (PARAM_HEADER + align8(prot->e[i].size) > SPK_INBAND_MAX) == big) p->order[n++] = (uint8_t)i;
+    if (n + p->skipped != prot->count) return fail(why, "a parameter of no graph");
     /* the parameter area: both opens, the live slot, then every out-of-band parameter */
     uint32_t at = 0;
     p->vi_open = at;
@@ -493,24 +532,31 @@ int spk_plan_init(SpkPlan *p, const SpkProt *prot, uint8_t *area, uint32_t area_
     p->staged = at;
     /* the steps */
     int r = 0;
-    r |= add(p, "tdm bit clock 6.144 MHz", clock_on, AR_OP_PRM_REQUEST, ArPrmDone, 0, clock_off, AR_OP_PRM_RELEASE, ArPrmDone, 0, 1, -1);
+    if (!(p->variant & SPK_VAR_ENDPOINT_CLOCK))
+        r |= add(p, "tdm bit clock 6.144 MHz", clock_on, AR_OP_PRM_REQUEST, ArPrmDone, 0, clock_off, AR_OP_PRM_RELEASE, ArPrmDone, 0, 1, -1);
     r |= add(p, "map the periods and the parameter area", map_region, AR_OP_MEM_MAP, ArMapped, 0, unmap_region, AR_OP_MEM_UNMAP,
              ArBasicResult, 0, 0, -1);
-    r |= CMD_UNDO(p, "open V/I graph b00000d5 (out of band)", open_vi, AR_OP_GRAPH_OPEN, close_vi, AR_OP_GRAPH_CLOSE);
-    r |= CMD(p, "V/I TDM source: interface, format, lane 0, V/I channels", vi_endpoint, AR_OP_SET_CFG);
-    for (unsigned k = 0; k < p->chunks; ++k)
-        if (p->chunk[k].vi) r |= add(p, kChunkNames[1][p->chunk[k].oob], chunk_cmd, AR_OP_SET_CFG, ArBasicResult, 0, 0, 0, 0, 0, 0, (int)k);
-    r |= CMD(p, "prepare V/I", prep_vi, AR_OP_GRAPH_PREPARE);
-    r |= CMD_UNDO(p, "start V/I (before the speaker)", start_vi, AR_OP_GRAPH_START, stop_vi, AR_OP_GRAPH_STOP);
-    r |= CMD_UNDO(p, "open speaker graph b0000002 (out of band)", open_dev, AR_OP_GRAPH_OPEN, close_dev, AR_OP_GRAPH_CLOSE);
-    r |= CMD(p, "speaker TDM sink: interface, format, lane 1; MFC 4 x 32-bit", dev_endpoint, AR_OP_SET_CFG);
-    for (unsigned k = 0; k < p->chunks; ++k)
-        if (!p->chunk[k].vi) r |= add(p, kChunkNames[0][p->chunk[k].oob], chunk_cmd, AR_OP_SET_CFG, ArBasicResult, 0, 0, 0, 0, 0, 0, (int)k);
-    r |= CMD(p, "Re25 to SP_RX", re25_cmd, AR_OP_SET_CFG);
-    r |= CMD_UNDO(p, "open playback stream graph (to the MFC)", open_str, AR_OP_GRAPH_OPEN, close_str, AR_OP_GRAPH_CLOSE);
-    r |= CMD(p, "stream shared memory format", str_shmem, AR_OP_SET_CFG);
-    r |= CMD(p, "stream decoder and converter", str_pcm, AR_OP_SET_CFG);
-    r |= CMD(p, "stream logger", str_log, AR_OP_SET_CFG);
+    const int vi_first = (p->variant & SPK_VAR_VI_FIRST) != 0;
+    for (int round = 0; round < 2; ++round) {
+        if (round == vi_first) {   /* Android's order: the speaker graph (SP_RX, the IMCL peer) and the stream opened first */
+            r |= CMD_UNDO(p, "open speaker graph b0000002 (out of band)", open_dev, AR_OP_GRAPH_OPEN, close_dev, AR_OP_GRAPH_CLOSE);
+            r |= CMD(p, "speaker TDM sink: interface, format, lane 1; MFC 4 x 32-bit", dev_endpoint, AR_OP_SET_CFG);
+            for (unsigned k = 0; k < p->chunks; ++k)
+                if (!p->chunk[k].vi) r |= add(p, kChunkNames[0][p->chunk[k].oob], chunk_cmd, AR_OP_SET_CFG, ArBasicResult, 0, 0, 0, 0, 0, 0, (int)k);
+            r |= CMD(p, "Re25 to SP_RX", re25_cmd, AR_OP_SET_CFG);
+            r |= CMD_UNDO(p, "open playback stream graph (to the MFC)", open_str, AR_OP_GRAPH_OPEN, close_str, AR_OP_GRAPH_CLOSE);
+            r |= CMD(p, "stream shared memory format", str_shmem, AR_OP_SET_CFG);
+            r |= CMD(p, "stream decoder and converter", str_pcm, AR_OP_SET_CFG);
+            r |= CMD(p, "stream logger", str_log, AR_OP_SET_CFG);
+        } else {
+            r |= CMD_UNDO(p, "open V/I graph b00000d5 (out of band)", open_vi, AR_OP_GRAPH_OPEN, close_vi, AR_OP_GRAPH_CLOSE);
+            r |= CMD(p, "V/I TDM source: interface, format, lane 0, V/I channels", vi_endpoint, AR_OP_SET_CFG);
+            for (unsigned k = 0; k < p->chunks; ++k)
+                if (p->chunk[k].vi) r |= add(p, kChunkNames[1][p->chunk[k].oob], chunk_cmd, AR_OP_SET_CFG, ArBasicResult, 0, 0, 0, 0, 0, 0, (int)k);
+            r |= CMD(p, "prepare V/I", prep_vi, AR_OP_GRAPH_PREPARE);
+            r |= CMD_UNDO(p, "start V/I (before the speaker)", start_vi, AR_OP_GRAPH_START, stop_vi, AR_OP_GRAPH_STOP);
+        }
+    }
     r |= CMD(p, "prepare speaker", prep_dev, AR_OP_GRAPH_PREPARE);
     r |= CMD(p, "prepare stream", prep_str, AR_OP_GRAPH_PREPARE);
     r |= CMD_UNDO(p, "start speaker (bit clock runs)", start_dev, AR_OP_GRAPH_START, stop_dev, AR_OP_GRAPH_STOP);

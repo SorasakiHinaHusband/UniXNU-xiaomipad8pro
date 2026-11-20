@@ -339,6 +339,8 @@ static const uint8_t *area_at(uint64_t address, uint32_t bytes)
     return g_area + (address - REGION_DSP - AUDIO_DMA_PARAM);
 }
 
+static uint32_t g_prm_attr;   // the last PRM clock request's attribute
+static uint32_t g_variant;    // the plan's round-2 variant (make_plan)
 static void describe(const uint8_t *b, uint32_t n)
 {
     GprPacket p;
@@ -348,7 +350,7 @@ static void describe(const uint8_t *b, uint32_t n)
     char s[64];
     if (oob) CHECK(le32(d + 8) == HANDLE);
     switch (p.opcode) {
-    case AR_OP_PRM_REQUEST: snprintf(s, sizeof s, "PRM REQ %#x %u", le32(d + 36), le32(d + 40)); break;
+    case AR_OP_PRM_REQUEST: snprintf(s, sizeof s, "PRM REQ %#x %u", le32(d + 36), le32(d + 40)); g_prm_attr = le32(d + 44); break;
     case AR_OP_PRM_RELEASE: snprintf(s, sizeof s, "PRM REL %#x", le32(d + 36)); break;
     case AR_OP_GRAPH_OPEN:
         if (oob) {
@@ -438,18 +440,25 @@ static void make_plan(const struct E *e, unsigned n)
     g_plan.base.buffer_phys = REGION_PHYS; g_plan.base.buffer_bytes = AUDIO_SPK_SLOTS * AUDIO_SPK_PERIOD_BYTES;
     g_plan.base.owner = &owner; g_plan.base.amps_on = amps_on; g_plan.base.amps_off = amps_off;
     memset(g_area, 0xcc, sizeof g_area);
+    g_plan.variant = g_variant;
     CHECK(spk_plan_init(&g_plan, &g_prot, g_area, sizeof g_area, &why) == 0);
     memset(&owner, 0, sizeof owner);
     lines = 0; g_ngot = 0;
 }
 static void start(ArSeq *s) {ar_seq_init(s, g_plan.steps, g_plan.count, AR_PORT_APM, AR_PORT_PRM, 0x8000, &g_plan);}
 
-static const char *kUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000 0x10000", "OPEN 0xb00000d5 oob", "CFG 0x45c2", "CFG 0x40ee",
+// Round 2 (spk-prot1): Android's order, the speaker graph (SP_RX) opened before the V/I graph, V/I started before the speaker.
+static const char *kUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000 0x10000", "OPEN 0xb0000002 oob", "CFG 0x4023", "CFG 0x4007",
+                            "CFG 0x4046 0x10001fb0 oob", "CFG 0x4046", "OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004",
+                            "OPEN 0xb00000d5 oob", "CFG 0x45c2", "CFG 0x40ee", "PREPARE 0xb00000d5", "START 0xb00000d5",
+                            "PREPARE 0xb0000002", "PREPARE 0x4001", "START 0xb0000002", "START 0x4001", "AMPS ON"};
+static const char *kUndo[] = {"PRM REL 0x202", "UNMAP 0x55", "CLOSE 0xb0000002", 0, 0, 0, 0, "CLOSE 0x4001", 0, 0, 0,
+                              "CLOSE 0xb00000d5", 0, 0, 0, "STOP 0xb00000d5", 0, 0, "STOP 0xb0000002", "STOP 0x4001", "AMPS OFF"};
+// +16, the round-1 control: V/I opened and started before the speaker graph is opened
+static const char *kUpViFirst[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000 0x10000", "OPEN 0xb00000d5 oob", "CFG 0x45c2", "CFG 0x40ee",
                             "PREPARE 0xb00000d5", "START 0xb00000d5", "OPEN 0xb0000002 oob", "CFG 0x4023", "CFG 0x4007",
                             "CFG 0x4046 0x10001fb0 oob", "CFG 0x4046", "OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004",
                             "PREPARE 0xb0000002", "PREPARE 0x4001", "START 0xb0000002", "START 0x4001", "AMPS ON"};
-static const char *kUndo[] = {"PRM REL 0x202", "UNMAP 0x55", "CLOSE 0xb00000d5", 0, 0, 0, "STOP 0xb00000d5", "CLOSE 0xb0000002", 0, 0, 0, 0,
-                              "CLOSE 0x4001", 0, 0, 0, 0, 0, "STOP 0xb0000002", "STOP 0x4001", "AMPS OFF"};
 _Static_assert(sizeof kUp / sizeof kUp[0] == sizeof kUndo / sizeof kUndo[0], "one undo entry per step");
 enum {kSteps = sizeof kUp / sizeof kUp[0]};
 
@@ -503,8 +512,8 @@ static void testPlan(void)
     ar_seq_stop(&s);
     drive(&s, &d);
     CHECK(s.state == ArSeqDown && s.undo_errors == 0 && owner.amps_off_calls == 1);
-    static const char *kDown[] = {"AMPS OFF", "STOP 0x4001", "STOP 0xb0000002", "CLOSE 0x4001", "CLOSE 0xb0000002", "STOP 0xb00000d5",
-                                  "CLOSE 0xb00000d5", "UNMAP 0x55", "PRM REL 0x202"};
+    static const char *kDown[] = {"AMPS OFF", "STOP 0x4001", "STOP 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5", "CLOSE 0x4001",
+                                  "CLOSE 0xb0000002", "UNMAP 0x55", "PRM REL 0x202"};
     CHECK(lines == kSteps + N(kDown));
     for (unsigned i = 0; i < N(kDown); ++i) CHECK(!strcmp(lg[kSteps + i], kDown[i]));
 }
@@ -611,6 +620,65 @@ static void testMonitor(void)
     CHECK(ar_seq_next(&s, pkt, sizeof pkt) == 0 && s.state == ArSeqFailed && s.error == ArSeqErrBuild);
 }
 
+// Round 2: the variants of one boot (AudioSpkProt.h SPK_VAR_*).
+static void run_up(const char *const *want, unsigned count)
+{
+    ArSeq s;
+    start(&s);
+    struct Dsp d = {-1, -1, 0, 0};
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && lines == count);
+    for (unsigned i = 0; i < count && i < lines; ++i) {
+        if (strcmp(lg[i], want[i])) fprintf(stderr, "variant %#x step %u: got %s want %s\n", g_variant, i, lg[i], want[i]);
+        CHECK(!strcmp(lg[i], want[i]));
+    }
+    ar_seq_stop(&s);
+    drive(&s, &d);
+    CHECK(s.state == ArSeqDown && s.undo_errors == 0);
+}
+static void testVariants(void)
+{
+    CHECK(spk_request_valid(0) && spk_request_valid(1) && spk_request_valid(3) && spk_request_valid(5) && spk_request_valid(9));
+    CHECK(spk_request_valid(17) && spk_request_valid(19) && spk_request_valid(29) && spk_request_valid(31 & ~4));
+    CHECK(!spk_request_valid(2) && !spk_request_valid(7) && !spk_request_valid(15) && !spk_request_valid(33) && !spk_request_valid(-1));
+    char text[128];
+    CHECK(strstr(spk_variant_text(0, text, sizeof text), "Android order") && strstr(text, "CPU clock attribute 1") && strstr(text, "CLK_CFG sent"));
+    CHECK(strstr(spk_variant_text(2 | 8 | 16, text, sizeof text), "round-1 order") && strstr(text, "endpoint-owned") && strstr(text, "not sent"));
+    CHECK(strlen(spk_variant_text(4, text, 12)) == 11);
+    // +16: the round-1 order, the control
+    g_variant = SPK_VAR_VI_FIRST;
+    make_plan(kStock, N(kStock));
+    CHECK(g_plan.count == kSteps && g_plan.skipped == 0);
+    run_up(kUpViFirst, kSteps);
+    CHECK(g_prm_attr == 1);
+    // +4: the CPU's request inverted
+    g_variant = SPK_VAR_INVERT_CLOCK;
+    make_plan(kStock, N(kStock));
+    run_up(kUp, kSteps);
+    CHECK(g_prm_attr == 4);
+    // +2: no CPU clock request; nothing to release either
+    g_variant = SPK_VAR_ENDPOINT_CLOCK;
+    make_plan(kStock, N(kStock));
+    CHECK(g_plan.count == kSteps - 1);
+    run_up(kUp + 1, kSteps - 1);
+    for (unsigned i = 0; i < lines; ++i) CHECK(strncmp(lg[i], "PRM", 3) != 0);
+    // +8: the two HW_INTF_CLK_CFG never reach the DSP, everything else exactly once
+    g_variant = SPK_VAR_NO_CLK_CFG;
+    make_plan(kStock, N(kStock));
+    CHECK(g_plan.skipped == 2);
+    run_up(kUp, kSteps);
+    CHECK(g_ngot == N(kStock) - 2);
+    for (unsigned k = 0; k < g_ngot; ++k) CHECK(g_got[k].pid != SPK_PID_HW_INTF_CLK);
+    // an invalid variant is refused by the plan
+    const char *why = 0;
+    SpkPlan bad;
+    memset(&bad, 0, sizeof bad);
+    bad.base = g_plan.base;
+    bad.variant = SPK_VAR_ENDPOINT_CLOCK | SPK_VAR_INVERT_CLOCK;
+    CHECK(spk_plan_init(&bad, &g_prot, g_area, sizeof g_area, &why) == -1 && strstr(why, "invalid variant"));
+    g_variant = 0;
+}
+
 int main(void)
 {
     testFiles();
@@ -619,6 +687,7 @@ int main(void)
     testFailures();
     testPacking();
     testMonitor();
+    testVariants();
     printf("PASS spkprot: %u checks\n", checks);
     return 0;
 }
