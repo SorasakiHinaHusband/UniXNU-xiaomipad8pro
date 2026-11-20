@@ -20,6 +20,12 @@
  * amplifier whose status changes while it plays, ends that path for the boot; a late period stops it (the third time for the boot).
  * Two clocks: the devices run on the host clock, the DSP on the TDM's; each ring's fill is held near its target by dropping or
  * repeating single frames (counted).
+ * Speaker protection (levels 9-10, piano-audio-spk=1 or machdep.piano_audio_spk=1 while the speaker is down; AudioSpkProt.h): the
+ * speaker plan is the stock FSADSP pair instead of the passthrough device graph, with the two private files the session's ops carry;
+ * while it runs, every SPK_MONITOR_MS the battery voltage goes to SP_RX and its live data is read and logged ("PianoSpeakerProtV1
+ * live ch..."). Any FSADSP command error (the plan, the monitor, a refused or late period on that graph) undoes the pair and the
+ * speaker comes back on the passthrough graph in the same boot ("PianoSpeakerProtV1: FALLBACK"); missing or mismatched private
+ * files leave it on the passthrough graph from the start. The amplifiers' gain cap and every safety rule above are unchanged.
  * Portable C, new code for PianoAudio: the owner ticks it with the time and PianoPower's health, feeds it what arrives and supplies
  * the hardware through the session's AudioSessionOps; the devices' threads only touch AudioLiveShared. Host-tested in
  * tests/live_host.c against models of the DSP, the amplifiers and both devices' engines in simulated time. */
@@ -30,6 +36,7 @@
 #include "AudioLedger.h"
 #include "AudioSession.h"
 #include "AudioCapture.h"
+#include "AudioSpkProt.h"
 #include "AudioVa.h"
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +92,8 @@ typedef struct {
     uint64_t offered, taken, dropped, captured, controls;
     uint32_t producer_seq, epoch, boundary_ms, producer_ms, producer_frames, producer_late_us;
     uint64_t hal_sample, hal_host, hal_write_end;
+    int spk_prot;                         /* speaker protection asked for (the boot argument, then the sysctl); taken at a start */
+    uint32_t spk_prot_gen;                /* every request: a new one clears a fallback of this boot */
 
 } AudioLiveShared;
 /* The rings' storage: AUDIO_LIVE_RING_BYTES and AUDIO_LIVE_MIC_RING_BYTES (the owner's, kept as long as sh). */
@@ -101,6 +110,8 @@ uint32_t audio_live_capture(AudioLiveShared *sh, int16_t *mono, uint32_t frames)
 void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
 /* A/B policy selector: only 192 or 231; invalid values leave the request unchanged. Level 8 still clamps to 160. */
 int audio_live_gain_select(AudioLiveShared *sh, unsigned gain);
+/* Speaker protection on (1) or off (0) from the next start of the speaker path; -1 for another value. */
+int audio_live_spk_select(AudioLiveShared *sh, int on);
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */
@@ -117,6 +128,7 @@ typedef struct {
     int mic;                             /* level 10: the Mic's capture path (0: the Mic stays silent) */
     int mic_route, mic_diag;
     void (*mic_route_apply)(int route, uint32_t generation); /* owner only; no MMIO */
+    int spk_prot;                        /* piano-audio-spk: speaker protection asked for from the first start (level 9 and up) */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -131,6 +143,7 @@ typedef struct {
 typedef struct {
     ArSeq seq;
     int active, in_flight, pending_step, pending_undo;
+    int quiet;                           /* no line per command (the protection monitor every 2 s): only errors */
     uint32_t unsent, sent_at;
     const char *name;
     uint8_t pkt[GPR_MAX_PACKET];
@@ -192,6 +205,22 @@ typedef struct {
     int16_t quad[AUDIO_PERIOD_FRAMES * 4];
     int32_t peak;
     uint32_t spk_starts, spk_stops, periods, sound_periods, underruns, skipped, drops, repeats;
+    /* ---- speaker protection (AudioSpkProt.h) */
+    SpkProt prot;                        /* the private files as parsed at init */
+    SpkPlan pplan;                       /* this start's plan (its steps live here) */
+    int prot_ready;                      /* both files valid: protection can run */
+    int prot_active;                     /* this start of the speaker path is the protection pair */
+    int prot_fallback;                   /* an FSADSP error while it ran: down, then back on the passthrough graph */
+    int prot_failed;                     /* a fallback happened: passthrough until a new request (spk_prot_gen) */
+    uint32_t prot_gen;
+    const char *prot_why;                /* why it is not ready, or the last fallback */
+    uint32_t prot_starts, prot_fallbacks;
+    AudioLivePlan xplan;                 /* the monitor: battery voltage, live data */
+    SpkMonitor mon;
+    uint32_t mon_at;
+    int mon_stopping, live_bad, vbat_noted;
+    SpkLive live_data;
+    uint32_t live_reads, vbat_sends, vbat_uv;
     /* ---- the mic path */
     AudioLivePlan mplan;
     ArMicPlan micplan;

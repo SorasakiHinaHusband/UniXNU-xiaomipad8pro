@@ -7,6 +7,7 @@
 #define LOG(l, ...) do {if ((l)->ops.log) (l)->ops.log((l)->ops.ctx, __VA_ARGS__);} while (0)
 
 static void zero(void *p, uint32_t n) {for (uint32_t i = 0; i < n; ++i) ((uint8_t *)p)[i] = 0;}
+static unsigned rd32(const uint8_t *p) {return (unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;}
 static int load(const int *p) {return __atomic_load_n(p, __ATOMIC_ACQUIRE);}
 static void store(int *p, int v) {__atomic_store_n(p, v, __ATOMIC_RELEASE);}
 
@@ -268,6 +269,14 @@ int audio_live_gain_select(AudioLiveShared *sh, unsigned gain)
     return 0;
 }
 
+int audio_live_spk_select(AudioLiveShared *sh, int on)
+{
+    if (on != 0 && on != 1) return -1;
+    store(&sh->spk_prot, on);
+    __atomic_add_fetch(&sh->spk_prot_gen, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+}
+
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute)
 {
     const int32_t gain = piano_audio_input_q15(level_percent);
@@ -311,6 +320,7 @@ static const char *op_name(uint32_t op)
     case AR_OP_GRAPH_STOP: return "GRAPH_STOP";
     case AR_OP_GRAPH_CLOSE: return "GRAPH_CLOSE";
     case AR_OP_SET_CFG: return "SET_CFG";
+    case AR_OP_GET_CFG: return "GET_CFG";
     case AR_OP_MEM_MAP: return "MEM_MAP";
     case AR_OP_MEM_UNMAP: return "MEM_UNMAP";
     case AR_OP_PRM_REQUEST: return "PRM REQUEST";
@@ -328,6 +338,7 @@ static void plan_start(AudioLive *l, AudioLivePlan *p, const char *name, const A
     p->active = 1;
     p->in_flight = 0;
     p->unsent = 0;
+    p->quiet = 0;
     LOG(l, "live: plan %s: %u steps (APM from port %#x, PRM from port %#x)", name, count, l->ports->apm, l->ports->prm);
 }
 
@@ -337,9 +348,16 @@ static int plan_settled(const AudioLivePlan *p)
            (p->seq.state == ArSeqUp || p->seq.state == ArSeqDown || p->seq.state == ArSeqFailed);
 }
 
-/* The answer timer, then the next packet of plan p, unless the other plan has one out (one command at a time over both) or
+static int plan_busy(const AudioLivePlan *p) {return p->in_flight || p->unsent;}
+/* Another plan than p has a command out or waiting to go (one command at a time over the speaker, mic and monitor plans). */
+static int others_busy(const AudioLive *l, const AudioLivePlan *p)
+{
+    return (p != &l->splan && plan_busy(&l->splan)) || (p != &l->mplan && plan_busy(&l->mplan)) || (p != &l->xplan && plan_busy(&l->xplan));
+}
+
+/* The answer timer, then the next packet of plan p, unless another plan has one out (one command at a time over all) or
  * PianoPower asks for quiet. */
-static void plan_send(AudioLive *l, AudioLivePlan *p, const AudioLivePlan *other, uint32_t now)
+static void plan_send(AudioLive *l, AudioLivePlan *p, uint32_t now)
 {
     if (!p->active || l->off || l->sleep_failed) return;
     if (p->in_flight && now - p->sent_at >= l->cfg.answer_ms) {
@@ -350,15 +368,16 @@ static void plan_send(AudioLive *l, AudioLivePlan *p, const AudioLivePlan *other
         p->in_flight = 0;
         ar_seq_timeout(&p->seq);
     }
-    if (p->in_flight || l->held || other->in_flight || other->unsent) return;
+    if (p->in_flight || l->held || others_busy(l, p)) return;
     if (!p->unsent) {
         const uint32_t n = ar_seq_next(&p->seq, p->pkt, sizeof p->pkt);
         if (!n) return;
         p->unsent = n;
         p->pending_undo = p->seq.pending_undo;
         p->pending_step = p->pending_undo ? (int)p->seq.undo_next : (int)p->seq.done;
-        LOG(l, "live: dsp: -> %s%s (%s, %u bytes, token %#x, from port %#x)", p->pending_undo ? "undo: " : "",
-            ar_seq_step_name(&p->seq, p->pending_step), op_name(p->seq.pending_opcode), n, p->seq.pending_token, p->seq.pending_port);
+        if (!p->quiet)
+            LOG(l, "live: dsp: -> %s%s (%s, %u bytes, token %#x, from port %#x)", p->pending_undo ? "undo: " : "",
+                ar_seq_step_name(&p->seq, p->pending_step), op_name(p->seq.pending_opcode), n, p->seq.pending_token, p->seq.pending_port);
     }
     if (l->ops.send(l->ops.ctx, p->pkt, p->unsent)) {l->queue_full++; return;}
     p->unsent = 0;
@@ -374,6 +393,7 @@ static int plan_receive(AudioLive *l, AudioLivePlan *p, const uint8_t *in, uint3
     if (r == ArSeqIgnored) return 0;
     p->in_flight = 0;
     const char *name = ar_seq_step_name(&p->seq, p->pending_step);
+    if (r == ArSeqAdvanced && p->quiet) return 1;
     if (r == ArSeqAdvanced) LOG(l, "live: dsp: <- %s%s: done in %u ms", p->pending_undo ? "undo: " : "", name, now - p->sent_at);
     else if (p->pending_undo) LOG(l, "live: dsp: <- undo: %s: status %#x (counted; the undoing goes on)", name, p->seq.last_status);
     else LOG(l, "live: dsp: <- %s: status %#x: undoing what was done", name, p->seq.last_status);
@@ -427,6 +447,105 @@ static int live_amps_off(void *owner)
     return bad ? -1 : 0;
 }
 
+/* ------------------------------------------------------------------------------------------------ speaker protection */
+#define PROT "PianoSpeakerProtV1"
+
+/* This start's mode: the protection pair when asked for, both files valid and no fallback since the last request. */
+static int prot_choose(AudioLive *l)
+{
+    const uint32_t gen = __atomic_load_n(&l->sh->spk_prot_gen, __ATOMIC_ACQUIRE);
+    if (gen != l->prot_gen) {
+        l->prot_gen = gen;
+        if (l->prot_failed) LOG(l, PROT ": a new request: the fallback of this boot is cleared");
+        l->prot_failed = 0;
+    }
+    if (!load(&l->sh->spk_prot)) return 0;
+    if (!l->prot_ready) {
+        LOG(l, PROT ": asked for, but %s: the passthrough graph", l->prot_why ? l->prot_why : "the private files are not there");
+        return 0;
+    }
+    if (l->prot_failed) {
+        LOG(l, PROT ": the passthrough graph (fallback after %s; a new request clears it)", l->prot_why ? l->prot_why : "an error");
+        return 0;
+    }
+    return 1;
+}
+
+/* The monitor stops sending: a command in flight completes (it cannot be recalled), nothing more goes out. */
+static void mon_stop(AudioLive *l)
+{
+    l->mon_stopping = 1;
+    if (l->xplan.active && !l->xplan.in_flight) {l->xplan.active = 0; l->xplan.unsent = 0;}
+}
+
+static void stream_fault(AudioLive *l, int reason, uint32_t now);
+
+/* After the live data's answer: the DSP's header checked, one line per channel. */
+static void live_report(AudioLive *l)
+{
+    SpkLive v;
+    const uint8_t *slot = l->ops.dma + AUDIO_DMA_PARAM + l->pplan.live_slot;
+    if (spk_live_parse(slot, &v)) {
+        if (!l->live_bad)
+            LOG(l, PROT " live: the answer's header is not the live data's (iid %#x param %#x size %u error %#x)", rd32(slot), rd32(slot + 4),
+                rd32(slot + 8), rd32(slot + 12));
+        l->live_bad = 1;
+        return;
+    }
+    l->live_data = v;
+    l->live_reads++;
+    for (unsigned c = 0; c < 4; ++c) {
+        const uint32_t mohm = (uint32_t)((uint64_t)v.re[c] * 1000u / 4096u);
+        const uint32_t pct = l->prot.re25[c] ? (uint32_t)((uint64_t)v.re[c] * 1000u / l->prot.re25[c]) : 0;
+        LOG(l, PROT " live ch%u slot %u r0 %u.%03u ohm (%u.%u%% of Re25) f0 %u Hz q %u t %u w2 %#x w5 %#x read %u vbat %u uV", c, c,
+            mohm / 1000u, mohm % 1000u, pct / 10u, pct % 10u, v.f0[c] / 256u, v.q[c], v.temp[c], v.w2[c], v.w5[c], l->live_reads, l->vbat_uv);
+    }
+}
+
+/* Every SPK_MONITOR_MS while the protected stream runs: the battery voltage (when PianoPower's gauge knows it), then the live data.
+ * A refused or unanswered command, or live data under another header: an FSADSP error, so the pair is undone (fallback). */
+static void mon_tick(AudioLive *l, uint32_t now)
+{
+    if (l->xplan.active) {
+        if (l->mon_stopping) {
+            if (!l->xplan.in_flight) {l->xplan.active = 0; l->xplan.unsent = 0;}
+            return;
+        }
+        plan_send(l, &l->xplan, now);
+        if (!plan_settled(&l->xplan)) return;
+        l->xplan.active = 0;
+        if (l->xplan.seq.state == ArSeqUp && !l->live_bad) return;
+        l->prot_why = l->live_bad ? "live data under another header" : "a monitor command refused or unanswered";
+        LOG(l, PROT ": monitor: %s (%s, status %#x): FSADSP error", l->prot_why,
+            l->live_bad ? "live data from SP_RX" : ar_seq_step_name(&l->xplan.seq, l->xplan.seq.failed_step), l->xplan.seq.error_status);
+        l->prot_fallback = 1;
+        stream_fault(l, AudioGuardDsp, now);
+        return;
+    }
+    if (!l->prot_active || l->spk_state != LiveRunning || l->spk_ending || l->mon_stopping || l->held || l->sleeping) return;
+    if (now - l->mon_at < SPK_MONITOR_MS) return;
+    l->mon_at = now;
+    const uint32_t uv = l->ops.battery_uv ? l->ops.battery_uv(l->ops.ctx) : 0;
+    l->mon.vbat_uv = uv >= 2500000u && uv <= 5000000u ? uv : 0;
+    if (l->mon.vbat_uv) {l->vbat_uv = uv; l->vbat_sends++;}
+    else if (!l->vbat_noted) {
+        l->vbat_noted = 1;
+        LOG(l, PROT ": no battery voltage from PianoPower's gauge (read %u uV): not sent; the live data still read", uv);
+    }
+    spk_live_stage(l->ops.dma + AUDIO_DMA_PARAM + l->pplan.live_slot);
+    if (l->ops.publish) l->ops.publish(l->ops.ctx);
+    l->mon.live_address = spk_plan_address(&l->pplan, l->pplan.live_slot);
+    l->mon.handle = l->splan.seq.handle;
+    unsigned count;
+    const ArStep *steps = spk_monitor_steps(l->mon.vbat_uv != 0, &count);
+    ar_seq_init(&l->xplan.seq, steps, count, l->ports->apm, l->ports->prm, 0xA000u + (l->sleep_generation << 16), &l->mon);
+    l->xplan.name = "speaker-protection monitor";
+    l->xplan.active = l->xplan.quiet = 1;
+    l->xplan.in_flight = 0;
+    l->xplan.unsent = 0;
+    plan_send(l, &l->xplan, now);
+}
+
 /* The speaker wants to play: the device runs, the master mute is off, and sound came within idle_ms. */
 static int spk_active(const AudioLive *l, uint32_t now, int *silent)
 {
@@ -446,11 +565,34 @@ static void spk_begin(AudioLive *l, uint32_t now)
     l->speaker.amps_on = live_amps_on;
     l->speaker.amps_off = live_amps_off;
     dma_zero(l, AUDIO_DMA_SPEAKER, AUDIO_SPK_SLOTS * AUDIO_SPK_PERIOD_BYTES);
-    unsigned count;
-    const ArStep *steps = ar_speaker_steps(&count);
     l->spk_starts++;
-    LOG(l, "live: speaker: sound from the Speaker device: the speaker plan (start %u)", l->spk_starts);
-    plan_start(l, &l->splan, "speaker", steps, count, 0x8000 + (l->sleep_generation << 16), &l->speaker);
+    l->prot_active = prot_choose(l);
+    if (l->prot_active) {
+        const char *why = 0;
+        l->pplan.base = l->speaker;
+        if (spk_plan_init(&l->pplan, &l->prot, l->ops.dma + AUDIO_DMA_PARAM, l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ?
+                          AUDIO_DMA_PARAM_BYTES : 0, &why)) {
+            l->prot_active = 0;
+            l->prot_failed = 1;
+            l->prot_why = why;
+            l->prot_fallbacks++;
+            LOG(l, PROT ": FALLBACK to passthrough: the plan cannot be laid out (%s)", why);
+        }
+    }
+    if (l->prot_active) {
+        if (l->ops.publish) l->ops.publish(l->ops.ctx);   /* the out-of-band payloads before the first command names them */
+        l->prot_starts++;
+        LOG(l, PROT ": start %u: the stock protection pair: V/I graph %#x first, then %#x with SP_RX %#x linked to SP_TX %#x; %u ACDB "
+            "parameters (%u bytes) in %u packets, %u out of band; Re25 x4; gain cap %u", l->prot_starts, SPK_SG_VI, SPK_SG_DEV,
+            SPK_IID_SP_RX, SPK_IID_SP_TX, l->prot.count, l->prot.bytes, l->pplan.chunks, l->pplan.oob_chunks, live_gain_cap(l));
+        LOG(l, "live: speaker: sound from the Speaker device: the speaker-protection plan (start %u)", l->spk_starts);
+        plan_start(l, &l->splan, "speaker-protection", l->pplan.steps, l->pplan.count, 0x8000 + (l->sleep_generation << 16), &l->pplan);
+    } else {
+        unsigned count;
+        const ArStep *steps = ar_speaker_steps(&count);
+        LOG(l, "live: speaker: sound from the Speaker device: the speaker plan (start %u)", l->spk_starts);
+        plan_start(l, &l->splan, "speaker", steps, count, 0x8000 + (l->sleep_generation << 16), &l->speaker);
+    }
     l->spk_state = LiveStarting;
     (void)now;
 }
@@ -482,8 +624,12 @@ static void stream_begin(AudioLive *l, uint32_t now)
     drift_reset(&l->spk_drift);
     store(&l->sh->accepting, !l->sleeping);
     l->spk_state = LiveRunning;
+    l->mon_stopping = l->live_bad = 0;
+    l->mon_at = now - SPK_MONITOR_MS;   /* the first battery voltage and live data at once */
     LOG(l, "live: speaker: stream up: 10 ms periods, %u in flight, the ring's target %u frames; ceiling %d, gain %u; %u silent periods "
         "first, the amplifiers muted", AUDIO_LIVE_DEPTH, AUDIO_LIVE_TARGET, l->chain.ceiling, l->amps->amp[0].gain, AUDIO_UNMUTE_PERIODS);
+    if (l->prot_active)
+        LOG(l, PROT ": up: SP_RX protects the four speakers; battery voltage and live data every %u ms", SPK_MONITOR_MS);
 }
 
 /* The ring's frames for one period: the drift held near the target by single frames, a stale backlog skipped. */
@@ -599,6 +745,12 @@ static void status_sample(AudioLive *l)
 static void stream_fault(AudioLive *l, int reason, uint32_t now)
 {
     store(&l->sh->accepting, 0);
+    mon_stop(l);
+    /* on the protection pair, a refused or late period is the graph's error too: undone, then the passthrough graph */
+    if (l->prot_active && (reason == AudioGuardDsp || reason == AudioGuardLate)) {
+        if (!l->prot_fallback) l->prot_why = reason == AudioGuardDsp ? "a refused period or command" : "a late period";
+        l->prot_fallback = 1;
+    }
     const unsigned bad = audio_amps_off(l->amps);
     dma_zero(l, AUDIO_DMA_SPEAKER, AUDIO_SPK_SLOTS * AUDIO_SPK_PERIOD_BYTES);
     audio_guard_trip(&l->sguard, reason);
@@ -614,6 +766,7 @@ static void stream_fault(AudioLive *l, int reason, uint32_t now)
 static void stream_end(AudioLive *l, uint32_t now)
 {
     store(&l->sh->accepting, 0);
+    mon_stop(l);
     LOG(l, "live: speaker: no sound for %u ms: down after %u ms (%u periods, %u with sound, %u underruns, %u skips, %u frames dropped, %u "
         "repeated; peak %d of ceiling %d): the plan undone, the amplifiers first", l->cfg.idle_ms, now - l->stream_at, l->pump.sent,
         l->sound_periods, l->underruns, l->skipped, l->drops, l->repeats, l->peak, l->chain.ceiling);
@@ -788,15 +941,29 @@ static void spk_tick(AudioLive *l, uint32_t now)
     default:
         break;
     }
-    plan_send(l, &l->splan, &l->mplan, now);
+    mon_tick(l, now);
+    plan_send(l, &l->splan, now);
     if (!plan_settled(&l->splan)) return;
     const int up = l->splan.seq.state == ArSeqUp;
     const int down = (l->splan.seq.state == ArSeqDown || l->splan.seq.state == ArSeqFailed) && !l->splan.seq.undo_errors;
     if (l->spk_state == LiveStarting) {
         if (up) {stream_begin(l, now); return;}
+        /* the protection pair refused (or left unanswered) a DSP step, and everything it did is undone: the passthrough graph next */
+        if (l->prot_active && l->splan.seq.error != ArSeqErrLocal && !l->splan.seq.undo_errors) {
+            l->prot_why = "a step of the protection plan failed";
+            LOG(l, PROT ": FALLBACK to passthrough: %s refused or unanswered (status %#x); everything it did is undone; the speaker "
+                "comes back on the passthrough graph", ar_seq_step_name(&l->splan.seq, l->splan.seq.failed_step), l->splan.seq.error_status);
+            l->prot_active = 0;
+            l->prot_failed = 1;
+            l->prot_fallbacks++;
+            l->splan.active = 0;
+            l->spk_state = LiveDown;
+            return;
+        }
         LOG(l, "live: speaker: the plan failed at %s (status %#x): the speaker path is OFF for this boot",
             ar_seq_step_name(&l->splan.seq, l->splan.seq.failed_step), l->splan.seq.error_status);
         l->splan.active = 0;
+        l->prot_active = 0;
         l->spk_state = LiveOff;
         audio_amps_hold(l->amps);
         return;
@@ -805,9 +972,19 @@ static void spk_tick(AudioLive *l, uint32_t now)
         l->splan.active = 0;
         l->spk_stops++;
         const int reason = l->spk_reason;
+        const int fallback = l->prot_fallback;
+        l->prot_fallback = 0;
+        l->prot_active = 0;   /* this start is over */
         if (!down) {
             LOG(l, "live: speaker: undoing the plan failed (%u undo errors): the speaker path is OFF for this boot", l->splan.seq.undo_errors);
             l->spk_state = LiveOff;
+        } else if (fallback) {
+            LOG(l, PROT ": FALLBACK to passthrough: %s on the protection pair; the pair is undone; the speaker comes back on the "
+                "passthrough graph", l->prot_why ? l->prot_why : "an FSADSP error");
+            l->prot_failed = 1;
+            l->prot_fallbacks++;
+            l->spk_state = LiveDown;
+            store(&l->sh->sound, 0);
         } else if (reason == AudioGuardLate && ++l->late_stops >= AUDIO_LIVE_LATE_STOPS) {
             LOG(l, "live: speaker: %u late stops: the speaker path is OFF for this boot", l->late_stops);
             l->spk_state = LiveOff;
@@ -1105,7 +1282,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
     default:
         break;
     }
-    plan_send(l, &l->mplan, &l->splan, now);
+    plan_send(l, &l->mplan, now);
     if (!plan_settled(&l->mplan)) return;
     const int up = l->mplan.seq.state == ArSeqUp;
     const int down = (l->mplan.seq.state == ArSeqDown || l->mplan.seq.state == ArSeqFailed) && !l->mplan.seq.undo_errors;
@@ -1145,7 +1322,8 @@ static void finish(AudioLive *l, uint32_t now)
     if (l->va_on && l->ops.va_mic) {(void)l->ops.va_mic(l->ops.ctx, 0); l->va_on = 0;}
     dma_zero(l, 0, AUDIO_DMA_BYTES);
     if (l->ops.tdm_pins) (void)l->ops.tdm_pins(l->ops.ctx, 0);
-    l->splan.active = l->mplan.active = 0;
+    l->splan.active = l->mplan.active = l->xplan.active = 0;
+    l->prot_active = 0;
     if (l->spk_state != LiveOff) l->spk_state = LiveDown;
     if (l->mic_state != LiveOff) l->mic_state = LiveDown;
     LOG(l, "live: done after %u ms: the amplifiers held in reset, the TDM pins given back; speaker %s (%u starts, %u periods, %u with "
@@ -1170,6 +1348,7 @@ static void go_off(AudioLive *l, uint32_t now)
     l->va_on = 0;   /* the VA macro and the LPI pins are clocked by the DSP's votes: not touched once it may be gone */
     plan_drop(&l->splan);
     plan_drop(&l->mplan);
+    plan_drop(&l->xplan);
     finish(l, now);
 }
 
@@ -1203,6 +1382,24 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
         __atomic_fetch_or(&sh->mic_control, MicGraphReleased | setting | (setting << MicAppliedShift) |
                           (1ull << MicGenerationShift), __ATOMIC_RELEASE);
     }
+    /* speaker protection: the private files checked once; asked for by the boot argument (the sysctl may ask later) */
+    const char *why = l->ops.spk_why;
+    if (l->ops.spk_params && l->ops.spk_re25) {
+        why = 0;
+        if (!spk_params_parse(&l->prot, l->ops.spk_params, l->ops.spk_params_bytes, &why) &&
+            !spk_re25_parse(&l->prot, l->ops.spk_re25, l->ops.spk_re25_bytes, &why))
+            l->prot_ready = 1;
+    } else if (!why) {
+        why = "no private files (PianoAudio/spk-prot.bin and spk-re25.bin)";
+    }
+    l->prot_why = l->prot_ready ? 0 : why;
+    store(&sh->spk_prot, c->spk_prot ? 1 : 0);
+    l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
+    if (l->prot_ready)
+        LOG(l, PROT ": ready: %u ACDB parameters (%u bytes) of the V/I and speaker graphs, Re25 for four channels; %s", l->prot.count,
+            l->prot.bytes, c->spk_prot ? "on from the first start (piano-audio-spk=1)" : "off (piano-audio-spk=0; machdep.piano_audio_spk=1 turns it on)");
+    else if (c->spk_prot)
+        LOG(l, PROT ": OFF: %s; the speaker plays through the passthrough graph", why);
     return 0;
 }
 
@@ -1304,6 +1501,13 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
             return;
         }
     }
+    if (l->xplan.active && l->xplan.in_flight) {
+        const int live_step = l->xplan.seq.pending_opcode == AR_OP_GET_CFG;
+        if (plan_receive(l, &l->xplan, packet, length, now_ms)) {
+            if (live_step && l->xplan.seq.error == ArSeqOk && !l->mon_stopping) live_report(l);
+            return;
+        }
+    }
     if (plan_receive(l, &l->splan, packet, length, now_ms) || plan_receive(l, &l->mplan, packet, length, now_ms)) return;
     if ((kind == ArWriteDone || kind == ArReadDone) && (l->spk_state == LiveStopping || l->mic_state == LiveStopping)) return;
     if (++l->stray <= 8)
@@ -1317,9 +1521,11 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
     store(&l->sh->accepting, 0);
     store(&l->sh->capturing, 0);
     (void)audio_amps_off(l->amps);
+    mon_stop(l);
     if (hard || l->off) {
         plan_drop(&l->splan);
         plan_drop(&l->mplan);
+        plan_drop(&l->xplan);
         finish(l, now_ms);
         return;
     }
@@ -1348,6 +1554,7 @@ void audio_live_sleep(AudioLive *l, uint32_t generation)
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicWindowArmed, __ATOMIC_ACQ_REL);
     l->sleeping=1; l->sleep_quiet=0; l->sleep_generation=generation;
     store(&l->sh->accepting,0); store(&l->sh->capturing,0);
+    mon_stop(l);   /* a monitor command in flight completes; nothing more is sent */
     /* Starting plans finish their existing command sequence; only then is the
      * ordinary stream fade/drain/undo used. Never abort a pending MEM_MAP. */
 }
@@ -1365,7 +1572,7 @@ int audio_live_parked(AudioLive *l)
     if (l->mic_state==LiveDown && !l->mplan.active && (l->mplan.seq.state==ArSeqDown || l->mplan.seq.state==ArSeqFailed) && !l->mplan.in_flight && !l->mplan.unsent) {
         l->cap_unsent=0; l->cap.in_flight=0;
     }
-    if (l->spk_state!=LiveDown || l->mic_state!=LiveDown || l->splan.in_flight || l->mplan.in_flight ||
+    if (l->spk_state!=LiveDown || l->mic_state!=LiveDown || l->splan.in_flight || l->mplan.in_flight || plan_busy(&l->xplan) ||
         l->splan.unsent || l->mplan.unsent || l->stream_unsent || l->cap_unsent || l->pump.in_flight || l->cap.in_flight) return 0;
     /* Graph stops, UNMAPs, and plan-owned TDM/VA releases have all ACKed.
      * Preserve configured amps in powered-down mute, not terminal reset. */
