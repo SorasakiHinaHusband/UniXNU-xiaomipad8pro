@@ -132,6 +132,7 @@ struct Args {
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
+  bool nativeBoot;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
   uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0, ps, psIdleMs, l8stats, bgScanS, phy, apple80211;
@@ -240,7 +241,10 @@ void readArgs()
   // piano-wifi-l7file=0: the profile only through the sysctl (by default the kext also reads the root-only profile file
   // itself while it waits, every 2 s: a RAM probe's Data may have no helper); piano-wifi-l7cands=N: how many access points of
   // the profile's name are tried in turn (4, at most 6).
-  gArgs.l7file = bootArg("piano-wifi-l7file", 1);
+  // Daily Wi-Fi starts from airportd's SET20. The file is still available to
+  // the userland helper and to kernel-only RAM probes.
+  gArgs.nativeBoot = bootArg("piano-wifi-native-boot", 0) != 0;
+  gArgs.l7file = !gArgs.nativeBoot && bootArg("piano-wifi-l7file", 1);
   gArgs.l7cands = bootArg("piano-wifi-l7cands", 4);
   if (!gArgs.l7cands || gArgs.l7cands > kStaCandidatesMax) gArgs.l7cands = 4;
   gArgs.l7frame = bootArg("piano-wifi-l7frame", kAssocFrameWaitMs);
@@ -290,7 +294,7 @@ void readArgs()
   // piano-wifi-crashtest=S: a test, S s after the port first opens on a pass a restart began, the chip is asked once for its
   // crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one boot shows a crash's restart.
   gArgs.restart = bootArg("piano-wifi-restart", gArgs.level >= 8 ? 1 : 0);
-  gBootPower.enabled = bootArg("piano-wifi-boot-on", 1) != 0;
+  gBootPower.enabled = bootArg("piano-wifi-boot-on", gArgs.nativeBoot ? 0 : 1) != 0;
   gArgs.restartCap = bootArg("piano-wifi-restarts", 6);
   if (!gArgs.restartCap || gArgs.restartCap > 100) gArgs.restartCap = 6;
   gArgs.crashTest = bootArg("piano-wifi-crashtest", 0);
@@ -3412,6 +3416,13 @@ int sysctlApple80211(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 struct sysctl_oid gOidApple80211;
 
+int sysctlNativeBoot(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  int value = gArgs.nativeBoot ? 1 : 0;
+  return SYSCTL_OUT(req, &value, sizeof value);
+}
+struct sysctl_oid gOidNativeBoot;
+
 }  // namespace
 
 // The Apple80211 front end lives in PianoWifiEthernet.cpp.  SET 20 is parsed there
@@ -3453,8 +3464,8 @@ extern "C" int piano_wifi_user_control(uint32_t operation)
   else if (operation <= PIANO_WIFI_USER_ON) {
     const uint32_t before = gUserControl.read();
     if (!gBootPower.setPower(gUserControl, operation == PIANO_WIFI_USER_ON)) {
-      note("PianoWifiBootPowerGuardV1 unarmed OFF acknowledged: owner stays ON, no physical stop");
-      return 0;
+      note("PianoWifiBootPowerGuardV1 unarmed OFF refused: owner stays ON, no physical stop");
+      return EBUSY;
     }
     w = gUserControl.read();
     if (operation == PIANO_WIFI_USER_ON && WifiUserControl::power(before) &&
@@ -3504,6 +3515,17 @@ void registerPhySysctls()
   gOidApple80211.oid_descr = "the kernel argument piano-wifi-apple80211 as PianoWifi read it";
   gOidApple80211.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gOidApple80211);
+  gOidNativeBoot.oid_parent = &sysctl__machdep_children;
+  gOidNativeBoot.oid_number = OID_AUTO;
+  gOidNativeBoot.oid_kind = int(CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidNativeBoot.oid_name = "piano_wifi_native_boot";
+  gOidNativeBoot.oid_handler = sysctlNativeBoot;
+  gOidNativeBoot.oid_fmt = "I";
+  gOidNativeBoot.oid_descr = "airportd owns boot association and the native saved profile";
+  gOidNativeBoot.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gOidNativeBoot);
+  note("PianoWifiNativeBootV1 airportd_owner=%u profile_file=%u",
+       gArgs.nativeBoot ? 1u : 0u, gArgs.l7file ? 1u : 0u);
 }
 
 void registerPsSysctl()
@@ -3527,7 +3549,7 @@ void registerPsSysctl()
   gOidLinkDrop.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gOidLinkDrop);
   note("PianoWifiBootPowerGuardV1 piano-wifi-boot-on=%u: unarmed OFF %s; only explicit root arm enables physical OFF",
-       gBootPower.enabled ? 1u : 0u, gBootPower.enabled ? "acknowledged with radio ON" : "unrestricted");
+       gBootPower.enabled ? 1u : 0u, gBootPower.enabled ? "refused" : "unrestricted");
   __atomic_store_n(&gPsWanted, gArgs.ps, __ATOMIC_RELEASE);
   gOidPs.oid_parent = &sysctl__machdep_children;
   gOidPs.oid_number = OID_AUTO;

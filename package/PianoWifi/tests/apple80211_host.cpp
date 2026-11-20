@@ -8,6 +8,7 @@
 #include "WifiApple80211.h"
 #include "PianoWifiUcTransport.h"
 #include "WifiUserControl.h"
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -139,11 +140,11 @@ struct PowerRig : Rig {
     }
   }
   Answer control(int32_t type, uint32_t length) {
-    const Answer a = ask(true, type, length);
+    Answer a = ask(true, type, length);
     if (!a.error && (a.effects & (kDoPowerChanged | kDoDisassociate))) {
       if (a.effects & kDoDisassociate) owner.disconnect();
-      else bootGuard.setPower(owner, st.power);
-      publish((a.effects & kDoPowerChanged) != 0);
+      else if (!bootGuard.setPower(owner, st.power)) a.error = EBUSY;
+      publish(!a.error && (a.effects & kDoPowerChanged) != 0);
     }
     return a;
   }
@@ -194,23 +195,23 @@ int main()
     const uint32_t initial = r.owner.read();
     for (unsigned daemon = 0; daemon < 3; ++daemon) {
       r.setPowerRecord(false);
-      CHECK(!r.control(kPower, sizeof(Power)).error);
+      CHECK(r.control(kPower, sizeof(Power)).error == EBUSY);
       CHECK(r.getPower() && r.owner.read() == initial && !r.owner.radioStop());
-      CHECK(r.eventPower.radios == 1 && r.eventPower.state[0] == 1);
+      CHECK(r.powerEvents == daemon);
       r.setPowerRecord(true);
       CHECK(!r.control(kPower, sizeof(Power)).error && !r.bootGuard.isArmed());
     }
-    CHECK(r.powerEvents == 6 && r.downEvents == 0);
+    CHECK(r.powerEvents == 3 && r.downEvents == 0);
     r.setPowerRecord(false);
     r.put32(0, 2); // invalid payload cannot mutate/arm the guard
     CHECK(r.control(kPower, sizeof(Power)).error == kErrInval);
-    CHECK(!r.bootGuard.isArmed() && r.owner.read() == initial && r.powerEvents == 6);
+    CHECK(!r.bootGuard.isArmed() && r.owner.read() == initial && r.powerEvents == 3);
     // Automatic SET20 cannot prove user power intent. Joining must leave the
     // guard in place; only an explicit root write arms real OFF.
     if (!explicitArm) CHECK(!r.associate().error && r.owner.join());
     CHECK(!r.bootGuard.isArmed());
     r.setPowerRecord(false);
-    CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower() && !r.owner.radioStop());
+    CHECK(r.control(kPower, sizeof(Power)).error == EBUSY && r.getPower() && !r.owner.radioStop());
     r.bootGuard.arm();
     CHECK(r.bootGuard.isArmed());
     for (unsigned cycle = 0; cycle < 3; ++cycle) {

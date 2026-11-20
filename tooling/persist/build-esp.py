@@ -123,7 +123,8 @@ PROFILES = {
                  # docs/drivers/gpu-userspace.md: a long full-panel pass at the login transition is no hang (2 s was too short)
                  'piano-gpu-hang-ms=10000',
                  # the desk images' input drivers (tooling/k27/build-desktop-images.sh PROFILE), each a level that ran on the tablet
-                 'piano-keyboard=2', 'piano-keyboard-gestures=1', 'piano-backlight=2', 'piano-backlight-keys=1', 'piano-touch=2'],
+                 'piano-keyboard=2', 'piano-keyboard-gestures=1', 'piano-backlight=2', 'piano-backlight-keys=1', 'piano-touch=2',
+                 'piano-wifi-native-boot=1'],
         'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3',
                   'com.unixnu.driver.PianoKeyboard', 'com.unixnu.driver.PianoTouch', 'com.unixnu.driver.PianoBacklight'],
@@ -159,7 +160,7 @@ CHARGING = {
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
 NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid', 'piano-power-policy', 'piano-power-rp',
                    'piano-thermal', 'piano-thermal-adc', 'piano-gpu-hang-ms', 'piano-keyboard', 'piano-keyboard-gestures',
-                   'piano-backlight', 'piano-backlight-keys', 'piano-touch')
+                   'piano-backlight', 'piano-backlight-keys', 'piano-touch', 'piano-wifi-native-boot')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 # Set only by their own options (--replace-data, --flatten-data; data-persist is always 2 here), so the intent is explicit and recorded.
 STORE_ARGS = ('data-persist', 'data-store-replace', 'data-store-flatten')
