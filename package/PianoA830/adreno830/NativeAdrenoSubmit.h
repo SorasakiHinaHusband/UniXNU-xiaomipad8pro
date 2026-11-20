@@ -38,6 +38,29 @@ struct NativeAdrenoSubmitStats {
     uint32_t busy,retries,abandoned,sweeps;   /* Busy answers, NativeAdrenoSubmitRetry answers, jobs dropped by recover(), on-demand retires */
     size_t references_held,references_retired,peak_jobs;
 };
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-21, 20261121-ws-crash: "WindowServer slot 0 Submit -> BadArgument" said nothing of which check refused): why a
+ * submission was refused, for the console's line after its "call failed" line (NativeAdrenoSubmitRefusalLine). index is the refused
+ * entry of the request (UINT32_MAX: none) with its handle, iova and bytes; mapped and mapped_bytes the mapping or object the entry was
+ * checked against (0: none found); a and b named per code. The user-client core fills what it checks itself and the entry's BO handle,
+ * submit() (its refusal argument) the VM's view: there handle is the VM's mapping handle. */
+enum NativeAdrenoSubmitWhy : uint8_t {
+    NativeAdrenoSubmitWhyNone,
+    NativeAdrenoSubmitWhyNotOpen,     /* the connection is closed, or the submit object not attached or poisoned */
+    NativeAdrenoSubmitWhyCount,       /* a buffer_count, b reserved: no entry, more than the most, or reserved nonzero */
+    NativeAdrenoSubmitWhyQueue,       /* a the queue: not one of the connection's open queues */
+    NativeAdrenoSubmitWhyWaitFence,   /* a the wait_fence: never issued */
+    NativeAdrenoSubmitWhyBytes,       /* the entry's bytes 0, not a multiple of 4 or past the largest IB */
+    NativeAdrenoSubmitWhyHandle,      /* the entry's handle is no live object of the connection; a the next handle it gives out */
+    NativeAdrenoSubmitWhyNotMapped,   /* a live object that is not GPU-mapped (mapped_bytes its size), or the VM's mapping is unknown or
+                                       * not wholly mapped */
+    NativeAdrenoSubmitWhyRange,       /* the IB is not inside its mapping [mapped, +mapped_bytes) or the mapping is not GPU-readable (a
+                                       * its permissions) */
+    NativeAdrenoSubmitWhyQueueFull,   /* no job slot or no ring room, or a recovery holds the ring */
+    NativeAdrenoSubmitWhyOther,       /* a device reference, the submission's maintenance or the ring refused (status) */
+};
+struct NativeAdrenoSubmitRefusal {uint8_t why;uint32_t index,count;uint64_t handle,iova,bytes,mapped,mapped_bytes,a,b;IOReturn status;};
+#endif
 /* The M10 lock split (ARCHITECTURE 5.4): the publish shell installs IOLock hooks; without hooks nothing is serialised here (host
  * tests, or a caller that serialises everything itself). Ring covers this object's job slots and every submission into the ring
  * (held for microseconds; never while sleeping). Memory covers the BO pool behind NativeAdrenoMemory, which the user-client cores
@@ -114,9 +137,14 @@ public:
      * context (nonzero) is the submitting client's GPU context: NativeAdrenoRing::useContext runs under the Ring lock right before
      * the words, so a client switch carries the ring's context entry exactly in front of that client's submission. source
      * (NativeAdrenoRingSourceRender for the render server's connections, else External) goes with the words to the ring's stamp:
-     * the queue meter's attribution (ARCHITECTURE 4.13.5); it changes nothing else. */
+     * the queue meter's attribution (ARCHITECTURE 4.13.5); it changes nothing else. UniXNU-piano: refusal (optional) receives why
+     * a refused submission was refused (NativeAdrenoSubmitRefusal; untouched on success). */
     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,uint32_t *fence,uint32_t *retry_fence=nullptr,
-        uint32_t context=0,uint32_t source=NativeAdrenoRingSourceExternal);
+        uint32_t context=0,uint32_t source=NativeAdrenoRingSourceExternal
+#ifdef ADRENO830_MACOS
+        ,NativeAdrenoSubmitRefusal *refusal=nullptr
+#endif
+        );
     bool queueOutstanding(uint32_t queue) const;
     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. The waits poll with the clock's idle hook

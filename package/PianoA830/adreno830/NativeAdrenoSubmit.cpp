@@ -14,6 +14,22 @@ namespace {
 /* Ring fences are 32-bit sequence numbers: a is at or after b. */
 bool atOrAfter(uint32_t a,uint32_t b) {return a-b<0x80000000u;}
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-21): submit()'s refusal reason into its record (null: none), the status returned unchanged. */
+static IOReturn refuseSubmit(NativeAdrenoSubmitRefusal *out,uint8_t why,IOReturn status,size_t index=UINT32_MAX,
+    const NativeAdrenoSubmitBuffer *buffer=nullptr,uint64_t mapped=0,uint64_t mapped_bytes=0,uint64_t a=0)
+{
+    if(out)*out={why,uint32_t(index),0,buffer?buffer->handle:0,buffer?buffer->iova:0,buffer?uint64_t(buffer->bytes):0,mapped,mapped_bytes,
+                 a,0,status};
+    return status;
+}
+#define SUBMIT_REFUSE(why,status) refuseSubmit(refusal,NativeAdrenoSubmitWhy##why,status)
+#define SUBMIT_REFUSE_ENTRY(why,status,i,buffer,mapped,mapped_bytes,a) \
+    refuseSubmit(refusal,NativeAdrenoSubmitWhy##why,status,i,&(buffer),mapped,mapped_bytes,a)
+#else
+#define SUBMIT_REFUSE(why,status) (status)
+#define SUBMIT_REFUSE_ENTRY(why,status,i,buffer,mapped,mapped_bytes,a) (status)
+#endif
 
 IOReturn NativeAdrenoSubmit::poison()
 {
@@ -122,21 +138,27 @@ size_t NativeAdrenoSubmit::outstanding() const
     return outstandingLocked();
 }
 IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,uint32_t queue,uint32_t *fence,
-    uint32_t *retry_fence,uint32_t context,uint32_t source)
+    uint32_t *retry_fence,uint32_t context,uint32_t source
+#ifdef ADRENO830_MACOS
+    ,NativeAdrenoSubmitRefusal *refusal
+#endif
+    )
 {
-    if(!fence)return kIOReturnBadArgument;
+    if(!fence)return SUBMIT_REFUSE(Other,kIOReturnBadArgument);
     *fence=0;
     if(retry_fence)*retry_fence=0;
-    if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+    if(!buffers || !count || count>SubmitMaxBuffers)return SUBMIT_REFUSE(Count,kIOReturnBadArgument);
     const uint32_t range=queue/NativeAdrenoSubmitRangeQueues;
-    if(range>=NativeAdrenoSubmitRanges)return kIOReturnBadArgument;
+    if(range>=NativeAdrenoSubmitRanges)return SUBMIT_REFUSE(Queue,kIOReturnBadArgument);
     NativeAdrenoSubmitGuard ring_lock(this,NativeAdrenoSubmitLockRing);
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!attached_ || poisoned_)return SUBMIT_REFUSE(NotOpen,kIOReturnNotReady);
     if(halted_) {
         /* A recovery holds the ring: a caller with work in flight waits for its fence (the recovery completes it), any other sleeps. */
-        if(rangeOutstandingLocked(range*NativeAdrenoSubmitRangeQueues,NativeAdrenoSubmitRangeQueues)) {++stats_.busy;return kIOReturnBusy;}
+        if(rangeOutstandingLocked(range*NativeAdrenoSubmitRangeQueues,NativeAdrenoSubmitRangeQueues)) {
+            ++stats_.busy;return SUBMIT_REFUSE(QueueFull,kIOReturnBusy);
+        }
         ++stats_.retries;
-        return NativeAdrenoSubmitRetry;
+        return SUBMIT_REFUSE(QueueFull,NativeAdrenoSubmitRetry);
     }
     /* Every buffer is validated against the live VM before any reference: the IB check is the one thing the submit path keeps. */
     uint64_t *handles=scratch_handles_;size_t handle_count=0;
@@ -144,14 +166,15 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     static_assert(sizeof(scratch_words_)/sizeof(scratch_words_[0])>=SubmitMaxBuffers*(1+SubmitIbWords),"ring words");
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
-        if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)return kIOReturnBadArgument;
+        if(!buffer.handle)return SUBMIT_REFUSE_ENTRY(NotMapped,kIOReturnBadArgument,i,buffer,0,0,0);
+        if(!buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)return SUBMIT_REFUSE_ENTRY(Bytes,kIOReturnBadArgument,i,buffer,0,0,0);
         uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
         const IOReturn status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
-        if(status)return status;
+        if(status)return SUBMIT_REFUSE_ENTRY(NotMapped,status,i,buffer,iova,bytes,permissions);
         if(!(permissions&ArmSmmu4KRead) || buffer.iova<iova || buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova))
-            return kIOReturnBadArgument;
+            return SUBMIT_REFUSE_ENTRY(Range,kIOReturnBadArgument,i,buffer,iova,bytes,permissions);
         uint32_t header=0;
-        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success)return poison();
+        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success)return SUBMIT_REFUSE(Other,poison());
         words[word_count++]=header;
         words[word_count++]=(uint32_t)buffer.iova;
         words[word_count++]=(uint32_t)(buffer.iova>>32);
@@ -166,19 +189,19 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(!job) {
         ++stats_.sweeps;
         const IOReturn swept=retireCompletedLocked();
-        if(swept)return swept;
+        if(swept)return SUBMIT_REFUSE(Other,swept);
         job=slotLocked(range);
     }
     if(!job) {
         /* The range's reserved slot holds the range's own job: the caller has work in flight and waits for its oldest fence. */
         ++stats_.busy;
-        return kIOReturnBusy;
+        return SUBMIT_REFUSE(QueueFull,kIOReturnBusy);
     }
     for(size_t i=0;i<handle_count;++i) {
         const IOReturn status=vm_->holdJob(handles[i]);
         if(status) {
             dropReferences(handles,i);
-            return status;
+            return SUBMIT_REFUSE(Other,status);
         }
         ++stats_.references_held;
     }
@@ -186,7 +209,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     IOReturn status=vm_->cleanForSubmission();
     if(status) {
         dropReferences(handles,handle_count);
-        return status;
+        return SUBMIT_REFUSE(Other,status);
     }
     if(context)ring_->useContext(context);
     uint32_t value=0;
@@ -194,12 +217,14 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(status==kIOReturnBusy) {
         /* No room in the ring now. Room comes back as the CP consumes: the oldest outstanding submission's fence is the event. */
         dropReferences(handles,handle_count);
-        if(rangeOutstandingLocked(range*NativeAdrenoSubmitRangeQueues,NativeAdrenoSubmitRangeQueues)) {++stats_.busy;return kIOReturnBusy;}
+        if(rangeOutstandingLocked(range*NativeAdrenoSubmitRangeQueues,NativeAdrenoSubmitRangeQueues)) {
+            ++stats_.busy;return SUBMIT_REFUSE(QueueFull,kIOReturnBusy);
+        }
         /* The ring completes in order: the next fence to complete is the one after the CP's completed fence. */
         const uint32_t done=completedValue(),newest=ring_->lastSubmitted();
         if(retry_fence)*retry_fence=atOrAfter(done,newest)?newest:done+1;
         ++stats_.retries;
-        return NativeAdrenoSubmitRetry;
+        return SUBMIT_REFUSE(QueueFull,NativeAdrenoSubmitRetry);
     }
     if(status) {
         /* A poisoned ring may already have consumed the WPTR write, so the referenced buffers cannot be retired here: the job is
@@ -208,11 +233,11 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             job->fence=0;job->queue=queue;job->count=(uint32_t)handle_count;job->active=true;
             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
             ++stats_.poisoned_jobs;
-            return poison();
+            return SUBMIT_REFUSE(Other,poison());
         }
         /* kIOReturnNoResources: not even the drained ring takes it (only a larger submission than this object builds). */
         dropReferences(handles,handle_count);
-        return status;
+        return SUBMIT_REFUSE(Other,status);
     }
     job->fence=value;job->queue=queue;job->count=(uint32_t)handle_count;job->active=true;
     /* Whose job this fence is, for a page fault's attribution (rangesInFlight): kept after the job retires. */
