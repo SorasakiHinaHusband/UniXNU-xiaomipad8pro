@@ -92,6 +92,7 @@ class PianoWifi80211 : public IO80211Controller {
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
   uint32_t fEventCodesLogged = 0;
+  uint32_t fPolledGeneration = 0, fPolledResult = 0;
   volatile uint32_t fCallsArmed = 0, fCallsInside = 0;   // thread calls armed / inside their callback (review F4)
   uint32_t fUcMode = 0;            // kUc*: the user-client switches (docs/drivers/wifi-menu.md section 7)
   uint64_t fUcOpens = 0, fUcRefused = 0, fUcSelectors = 0;   // newUserClient calls answered / refused, selectors served
@@ -125,7 +126,7 @@ class PianoWifi80211 : public IO80211Controller {
   errno_t apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *io = nullptr);
   void refreshScanLocked();
   void postEvent(uint32_t code, const void *payload = nullptr, uint32_t length = 0);
-  void postDriverAvailable();
+  void postDriverAvailable(bool firmwareLoaded);
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
@@ -509,7 +510,7 @@ void PianoWifi80211::attachStep()
   postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
   postEvent(pianowifi::a80211::kEvSsidChanged);
   postEvent(pianowifi::a80211::kEvBssidChanged);
-  postDriverAvailable();
+  postDriverAvailable(true);
   arm(fReportCall, 5000);   // the first summary soon (who matched the controller), then every minute
 }
 
@@ -645,9 +646,18 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
     if (type == kScanReq) scanReqInfo(rq, io, directed, scanType);
   }
   Answer a = handle(*fState, kIdentity, set, rq, io, fScratch);
+  const uint32_t generation = fState->association.generation, result = fState->association.result;
+  const bool traceJoin = !set && type == kAssociateResult && !a.error && generation &&
+                         (generation != fPolledGeneration || result != fPolledResult);
+  if (traceJoin) {
+    fPolledGeneration = generation;
+    fPolledResult = result;
+  }
   ++fRequests;
   const uint32_t networks = fState->scan.count, cursor = fState->cursor;
+  const bool powered = fState->power;
   IOLockUnlock(fLock);
+  if (traceJoin) note80211("PianoWifiAppleJoinV1 GET21 generation %u result %u", generation, result);
   if (set && type == kAssociate) {
     if (a.associationProfile) {
       const int e = piano_wifi_net_menu_join_profile(&a.associationProfileData);
@@ -704,7 +714,7 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
         setProperty("piano-wifi-airportd-adopted", uint64_t(pid), 32);
         note80211("PianoWifiAirportdAvailabilityV1 adopted pid %d via GET19", pid);
         // The daemon may have subscribed after the first availability event.
-        if (fRegistered) postDriverAvailable();
+        postDriverAvailable(powered);
       }
     }
   }
@@ -865,9 +875,10 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
     note80211("%s: event %u (%u payload bytes) posted -> %d", fIfName, unsigned(code), unsigned(length), e);
 }
 
-void PianoWifi80211::postDriverAvailable()
+void PianoWifi80211::postDriverAvailable(bool firmwareLoaded)
 {
-  const pianowifi::a80211::DriverAvailableEvent event;
+  pianowifi::a80211::DriverAvailableEvent event;
+  if (!firmwareLoaded) event.flags = 0;
   postEvent(pianowifi::a80211::kEvDriverAvailable, &event, sizeof event);
 }
 
@@ -1049,7 +1060,10 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   if (!fState || !fSyncLock) return;
   IOLockLock(fSyncLock);
   struct piano_wifi_assoc_snapshot raw = {};
-  if (piano_wifi_assoc_snapshot(&raw) != 0) { IOLockUnlock(fSyncLock); return; }
+  if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) {
+    IOLockUnlock(fSyncLock);
+    return;
+  }
   Association next = {};
   next.associated = raw.associated != 0;
   next.authorized = raw.authorized != 0;
@@ -1065,6 +1079,7 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   next.cipher = raw.cipher;
   next.opMode = raw.op_mode ? raw.op_mode : kOpModeStation;
   next.result = raw.associate_result;
+  next.generation = raw.join_generation;
   next.state = raw.state;
   Association old = {};
   bool powerChanged = false;
@@ -1086,7 +1101,8 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   stateChanged = old.state != next.state;
   for (unsigned i = 0; i < 6; ++i) bssidChanged = bssidChanged || old.bssid[i] != next.bssid[i];
   ssidChanged = old.ssidLength != next.ssidLength || memcmp(old.ssid, next.ssid, pianowifi::kSsidMax) != 0;
-  changed = associatedChanged || authorizedChanged || resultChanged || stateChanged || bssidChanged || ssidChanged ||
+  changed = associatedChanged || authorizedChanged || resultChanged || old.generation != next.generation ||
+            stateChanged || bssidChanged || ssidChanged ||
             old.channel != next.channel || old.rssi != next.rssi;
   IOLockUnlock(fLock);
   if (!emit) { IOLockUnlock(fSyncLock); return; }

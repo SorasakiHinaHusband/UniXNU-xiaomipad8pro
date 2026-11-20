@@ -4058,19 +4058,21 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   if (!out) return EINVAL;
   bzero(out, sizeof *out);
   out->version = PIANO_WIFI_ASSOC_SNAPSHOT_VERSION;
-  const uint32_t user = gUserControl.read();
-  // Keep GET19 and the power event at ON until the worker confirms physical OFF.
-  out->power = (gArgs.level >= 2 && (WifiUserControl::power(user) || (user & WifiUserControl::kCycle))) ? 1 : 0;
+  uint32_t user;
   WifiJoinRequest request;
   uint32_t stationGeneration = 0;
   if (gProfileLock) {
     IOLockLock(gProfileLock);
+    user = gUserControl.read();
     request = gJoinRequest;
     stationGeneration = gStaProfileGeneration;
     IOLockUnlock(gProfileLock);
-  }
+  } else user = gUserControl.read();
+  // Keep GET19 and the power event at ON until the worker confirms physical OFF.
+  out->power = (gArgs.level >= 2 && (WifiUserControl::power(user) || (user & WifiUserControl::kCycle))) ? 1 : 0;
   const bool nativeStation = request.consumed && request.generation == stationGeneration;
   const uint32_t nativeResult = request.result(nowMs());
+  out->join_generation = request.generation;
   out->user_stop = !gUserControl.allowed(user) || (request.nativeOwner && !nativeStation && nativeResult != 9);
   out->op_mode = 1;
   out->state = 0;
@@ -5779,7 +5781,10 @@ int level7(IOService *owner)
     note("PianoWifiPowerLifecycleV1 station stopped serial %u: down %u, peer %u, stop %u",
          WifiUserControl::serial(userStop), gSta.downSent ? 1u : 0u, gSta.peerDeleted ? 1u : 0u,
          gSta.vdevStopped ? 1u : 0u);
-    if (!stoppedOnRequest) continue;
+    if (!stoppedOnRequest) {
+      if (!joinRequest().canStart(nowMs())) note("PianoWifiAppleJoinV1 station idle: waiting for another SET20");
+      continue;
+    }
   }
   gLink.hook = nullptr;
   if (!why && !stoppedOnRequest && joinRequest().nativeOwner) {
@@ -6534,18 +6539,18 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     const uint32_t idleUser = gUserControl.read();
     if (gUserControl.pending(idleUser) && !(idleUser & WifiUserControl::kCycle))
       gUserControl.stopped(idleUser);  // level7/its station have ended
-    if (gUserControl.radioStop()) {
+    if (gUserControl.radioStop() && (!userParked || (idleUser & WifiUserControl::kCycle))) {
       if (chipOn) { chipDown(power, opt); chipOn = false; }
       const uint32_t user = gUserControl.read();
       const bool off = gWin[kWinTlmm].va && wifiOffPins(gHw);
-      if (off) gUserControl.radioOff(user);
-      if (off && !userParked) {
+      if (off && (!userParked || (user & WifiUserControl::kCycle))) {
         note("PianoWifiPowerLifecycleV1 radio off: WLAN_EN low, PERST asserted, scans stopped serial %u",
              WifiUserControl::serial(user));
         setProperty("piano-wifi-user-radio", "off: WLAN_EN low, scans stopped");
       } else if (!off && !userParked) {
         note("PianoWifiPowerLifecycleV1 radio off readback failed serial %u", WifiUserControl::serial(user));
       }
+      if (off) gUserControl.radioOff(user);
       userParked = true;
     }
     if (userParked && WifiUserControl::power(gUserControl.read()) && !gUserControl.radioStop() &&

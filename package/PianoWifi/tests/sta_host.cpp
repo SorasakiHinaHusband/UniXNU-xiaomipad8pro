@@ -1136,6 +1136,18 @@ static void testFailures()
 // replacement join is allowed, for three cycles on the same control state.
 static void testUserStopCycles()
 {
+  Sta wpa;
+  wpa.rsn = true;
+  wpa.step = kStaAssociated;
+  wpa.assocAnswered = true;
+  wpa.assocStatus = kDot11StatusSuccess;
+  wpa.vdevUp = true;
+  CHECK(staAppleAssociateResult(wpa) == 0);
+  wpa.authorized = true; // the worker supplies this after the four-way handshake
+  CHECK(staAppleAssociateResult(wpa) == 1);
+  wpa.disconnect = kStaDiscDeauth;
+  CHECK(staAppleAssociateResult(wpa) == 2);
+
   WifiUserControl user;
   for (unsigned i = 0; i < 3; ++i) {
     Model m;
@@ -1166,6 +1178,7 @@ static void testUserStopCycles()
   m.networks(); m.answerAuth = false; m.begin(fastOptions());
   for (unsigned n = 0; n < 15000 && m.sta.step != kStaTeardown; ++n) m.turn();
   CHECK(m.sta.step == kStaTeardown && m.sta.nextCandidate);
+  CHECK(staAppleAssociateResult(m.sta) == 0);
   const uint32_t phase = m.sta.tdPhase;
   staStop(m.sta, m.now, 50);
   CHECK(m.sta.stopAsked && m.sta.tdPhase == phase);

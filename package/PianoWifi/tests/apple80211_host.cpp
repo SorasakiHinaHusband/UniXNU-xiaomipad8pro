@@ -258,6 +258,10 @@ int main()
     events = associationEvents(old, failed, false);
     CHECK(events.count == 4 && events.codes[0] == 9 && events.codes[1] == 4 &&
           events.codes[2] == 2 && events.codes[3] == 3);
+    Association failedAgain = failed;
+    failedAgain.generation = 2;
+    events = associationEvents(failed, failedAgain, false);
+    CHECK(events.count == 4 && events.codes[0] == 9); // another generation can fail between polls
     CHECK(associationEvents(open, open, false).count == 0);
     CHECK(kEvPowerChanged == 1);
     const DriverAvailableEvent available;

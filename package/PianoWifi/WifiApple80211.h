@@ -516,6 +516,7 @@ struct Association {
   uint8_t cipher = 0;
   uint8_t opMode = kOpModeStation;
   uint32_t result = 0;
+  uint32_t generation = 0;
   uint32_t state = kStateInit;
 };
 
@@ -549,7 +550,7 @@ inline AssociationTransition associationTransition(const Association &old, const
 inline bool associationLinkDownEvent(const Association &old, const Association &next)
 {
   return associationTransition(old, next).disconnected ||
-         (!next.associated && next.result != 0 && old.result != next.result);
+         (!next.associated && next.result != 0 && (old.result != next.result || old.generation != next.generation));
 }
 
 struct AssociationEvents {
@@ -563,7 +564,8 @@ inline AssociationEvents associationEvents(const Association &old, const Associa
   const auto transition = associationTransition(old, next);
   const bool down = associationLinkDownEvent(old, next);
   const bool completion = transition.assocDone ||
-                          (old.result != next.result && next.result && (!down || (!voluntary && !old.authorized)));
+                          ((old.result != next.result || old.generation != next.generation) && next.result &&
+                           (!down || (!voluntary && !old.authorized)));
   if (completion) events.codes[events.count++] = kEvAssocDone;
   if (transition.connected || down) {
     events.codes[events.count++] = kEvLinkChanged;
