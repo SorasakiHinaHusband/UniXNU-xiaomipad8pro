@@ -251,6 +251,9 @@ typedef struct {
     uint32_t mic_first_read, mic_first_pcm, mic_diag_at;
     /* ---- the exchange */
     uint32_t sends, queue_full, received, stray, timeouts;
+    /* 2026-11-21 duplex-obs1 (private DUPLEX.txt sections 8.4 and 9): the speaker refill's DSP queue depth and send cadence per
+     * 2 s window while the speaker plays, with the Mic's state; instrumentation only, no timing change */
+    uint32_t dx_ticks, dx_starved, dx_low, dx_depth_min, dx_gap_max, dx_last_send, dx_last_log, dx_qfull_base, dx_mic_ticks;
     int sleeping, parked, sleep_failed, sleep_quiet, sleep_safe;
     uint32_t sleep_generation, ledger_epoch, ledger_out, done_batch;
     uint32_t monitor_start, monitor_end, monitor_field;

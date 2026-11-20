@@ -862,6 +862,7 @@ static void testLevel8(int ports)
     CHECK(live.underruns <= 1 && live.skipped <= 1 && live.drops == 0 && live.repeats == 0);   // equal clocks: nothing slips
     // down 3 s after the sound ended (no sound for idle_ms), the amplifiers powered down then, not held (the path comes back)
     CHECK(logged("live: speaker: no sound for 3000 ms") && logged("the amplifiers unmuted, the sound fades in"));
+    CHECK(logged("duplex-obs1: window") && logged("duplex-obs1: speaker down") && !logged("DSP queue depth min 0, 0 ticks at 0, 0 at <= 1, largest gap between WRITE sends 0 ms"));
     CHECK(logged("live: level 8: the Speaker on the DSP: playing gain 160"));
 }
 

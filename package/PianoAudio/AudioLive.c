@@ -770,8 +770,22 @@ static void stream_fault(AudioLive *l, int reason, uint32_t now)
     l->spk_state = LiveStopping;
 }
 
+/* duplex-obs1: one line per window, then a new window */
+static void dx_report(AudioLive *l, uint32_t now, const char *why)
+{
+    if (l->dx_ticks)
+        LOG(l, "duplex-obs1: %s: %u ms, %u refill ticks (%u with the Mic up), DSP queue depth min %u, %u ticks at 0, %u at <= 1, "
+            "largest gap between WRITE sends %u ms, %u queue-full", why, now - l->dx_last_log, l->dx_ticks, l->dx_mic_ticks,
+            l->dx_depth_min, l->dx_starved, l->dx_low, l->dx_gap_max, l->queue_full - l->dx_qfull_base);
+    l->dx_ticks = l->dx_starved = l->dx_low = l->dx_gap_max = l->dx_mic_ticks = 0;
+    l->dx_depth_min = AUDIO_LIVE_DEPTH;
+    l->dx_qfull_base = l->queue_full;
+    l->dx_last_log = now;
+}
+
 static void stream_end(AudioLive *l, uint32_t now)
 {
+    dx_report(l, now, "speaker down");
     store(&l->sh->accepting, 0);
     mon_stop(l);
     LOG(l, "live: speaker: no sound for %u ms: down after %u ms (%u periods, %u with sound, %u underruns, %u skips, %u frames dropped, %u "
@@ -872,6 +886,15 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         l->stream_unsent = 0;
         l->sends++;
     }
+    if (l->spk_primed && l->unmuted) {   /* duplex-obs1: the DSP's queue as this refill finds it */
+        const uint32_t depth = (uint32_t)l->pump.in_flight;
+        if (!l->dx_ticks && !l->dx_last_log) l->dx_last_log = now;
+        if (!l->dx_ticks || depth < l->dx_depth_min) l->dx_depth_min = depth;
+        l->dx_ticks++;
+        l->dx_mic_ticks += l->mic_state == LiveRunning;
+        l->dx_starved += depth == 0;
+        l->dx_low += depth <= 1;
+    }
     uint32_t burst = AUDIO_LIVE_DEPTH - l->pump.in_flight;
     const uint32_t lead_before = audio_ring_fill(&l->sh->out), prime_before = l->prime_left;
     const uint32_t sent_before = l->pump.sent;
@@ -887,6 +910,11 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
     }
     if (l->spk_primed && prime_before && l->pump.sent != sent_before)
         ledger(l, AlLead, lead_before, audio_ring_fill(&l->sh->out), 0, 0, 0);
+    if (l->pump.sent != sent_before) {   /* duplex-obs1: the cadence of WRITE sends */
+        if (l->dx_last_send && l->unmuted && now - l->dx_last_send > l->dx_gap_max) l->dx_gap_max = now - l->dx_last_send;
+        l->dx_last_send = now;
+    }
+    if (l->dx_ticks && now - l->dx_last_log >= 2000u) dx_report(l, now, l->mic_state == LiveRunning ? "window, Mic up" : "window");
     if (l->spk_ending && !l->stream_unsent && !l->pump.in_flight) stream_end(l, now);
     /* Refill first. Twenty-four synchronous I2C reads here used to block the
      * four-period queue, then trim its recovered FIFO backlog to two periods.
