@@ -17,14 +17,27 @@ class BootJoinTests(unittest.TestCase):
             calls = path / 'calls'
             marker = path / 'marker'
             scripts = {
-                'sysctl': 'case "$2" in\n  machdep.*) echo 1 ;;\n  *) echo fixture-boot ;;\nesac',
-                'ioreg': """echo '"piano-wifi-apple80211-answering"'
-echo '"BSD Name" = "en0"'""",
+                'sysctl': f"""case "$2" in
+  machdep.piano_wifi_native_boot) test -e '{path / 'diagnostic'}' && echo 0 || echo 1 ;;
+  machdep.*) echo 1 ;;
+  *) echo fixture-boot ;;
+esac""",
+                'ioreg': f"""echo '"piano-wifi-apple80211-answering"'
+echo '"BSD Name" = "en0"'
+if test -e '{path / 'adopted'}'; then
+  printf '"piano-wifi-airportd-adopted" = %s\n' "$(cat '{path / 'adopted'}')"
+fi""",
                 'launchctl': f"""echo "$*" >> '{calls}'
 case "$1 $2" in
-  'kickstart -k') test ! -e '{path / 'fail-kick'}' ;;
+  'kickstart -k'|'kickstart system/com.apple.airportd')
+    test ! -e '{path / 'fail-kick'}' || exit 1
+    echo 43 > '{path / 'pid'}'
+    test -e '{path / 'fail-adoption'}' || echo 43 > '{path / 'adopted'}'
+    ;;
   'kickstart system/com.unixnu.piano-wifi-join') test -f '{marker}' ;;
-  'print system/com.apple.airportd') echo '   pid = 42' ;;
+  'print system/com.apple.airportd')
+    test -f '{path / 'pid'}' && printf '   pid = %s\n' "$(cat '{path / 'pid'}')"
+    ;;
   *) exit 1 ;;
 esac""",
             }
@@ -45,18 +58,45 @@ esac""",
                 source = source.replace(original, str(replacement))
             script = path / 'kick.sh'
             script.write_text(source)
+            (path / 'diagnostic').touch()
+            subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True)
+            self.assertFalse(calls.exists())
+            self.assertFalse(marker.exists())
+            (path / 'diagnostic').unlink()
+            (path / 'pid').write_text('42\n')
+            (path / 'adopted').write_text('41\n')  # stale evidence from an earlier daemon
             (path / 'fail-kick').touch()
             self.assertNotEqual(subprocess.run(['/bin/sh', str(script)], capture_output=True).returncode, 0)
             self.assertFalse(marker.exists())
             self.assertNotIn('kickstart system/com.unixnu.piano-wifi-join', calls.read_text())
             (path / 'fail-kick').unlink()
             calls.unlink()
+            (path / 'fail-adoption').touch()
+            result = subprocess.run(['/bin/sh', str(script)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('adoption-timeout mode=restarted', result.stdout)
+            self.assertFalse(marker.exists())
+            (path / 'fail-adoption').unlink()
+            calls.unlink()
             result = subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True, text=True)
             self.assertIn('PianoWifiAirportdKickV1 helper=started', result.stdout)
+            self.assertIn('complete mode=restarted pid=43', result.stdout)
             self.assertEqual(marker.read_text(), 'fixture-boot\n')
             subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True)
             self.assertEqual([line for line in calls.read_text().splitlines() if line.startswith('kickstart ')],
                              ['kickstart -k system/com.apple.airportd', 'kickstart system/com.unixnu.piano-wifi-join'])
+            marker.unlink()
+            calls.unlink()
+            result = subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True, text=True)
+            self.assertIn('complete mode=observed pid=43', result.stdout)
+            self.assertNotIn('kickstart -k', calls.read_text())
+            marker.unlink()
+            calls.unlink()
+            (path / 'pid').unlink()
+            result = subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True, text=True)
+            self.assertIn('complete mode=started pid=43', result.stdout)
+            self.assertIn('kickstart system/com.apple.airportd', calls.read_text())
+            self.assertNotIn('kickstart -k', calls.read_text())
 
     def test_native_profile_idempotence(self):
         # A real CoreWiFi external-form round trip backed by a synthetic store.
@@ -64,9 +104,11 @@ esac""",
         source = r'''
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
+#import <Security/Security.h>
 #include <assert.h>
 static NSDictionary *records;
-static unsigned adds;
+static NSString *credential;
+static unsigned adds, credentialAdds;
 @interface FixtureStore : NSObject
 - (instancetype)initWithType:(NSInteger)type identifier:(NSString *)identifier;
 - (void)activate;
@@ -83,8 +125,56 @@ static unsigned adds;
 static Class fixture_class(NSString *name) {
   return [name isEqualToString:@"CWFKeyValueStore"] ? FixtureStore.class : NSClassFromString(name);
 }
+static OSStatus fixture_interaction(Boolean allowed) {
+  assert(!allowed);
+  return errSecSuccess;
+}
+static OSStatus fixture_open(const char *path, SecKeychainRef *keychain) {
+  assert(!strcmp(path, "/Library/Keychains/System.keychain"));
+  *keychain = (SecKeychainRef)CFRetain(kCFNull);
+  return errSecSuccess;
+}
+static OSStatus fixture_unlock(SecKeychainRef keychain, UInt32 n, const void *password, Boolean usePassword) {
+  assert(keychain && !n && !password && !usePassword);
+  return errSecSuccess;
+}
+static OSStatus fixture_find(CWKeychainDomain domain, NSData *ssid, NSString **password) {
+  assert(domain == kCWKeychainDomainSystem && ssid.length);
+  *password = credential;
+  return credential ? errSecSuccess : errSecItemNotFound;
+}
+static OSStatus fixture_trust(const char *path, SecTrustedApplicationRef *app) {
+  assert(!path || !strcmp(path, "/usr/libexec/airportd"));
+  *app = (SecTrustedApplicationRef)CFRetain(kCFNull);
+  return errSecSuccess;
+}
+static OSStatus fixture_group(const char *group, SecCertificateRef cert, SecTrustedApplicationRef *app) {
+  assert(!strcmp(group, "AirPort") && !cert);
+  return fixture_trust(NULL, app);
+}
+static OSStatus fixture_access(CFStringRef title, CFArrayRef apps, SecAccessRef *access) {
+  assert(CFEqual(title, CFSTR("AirPort")) && CFArrayGetCount(apps) == 3);
+  *access = (SecAccessRef)CFRetain(kCFNull);
+  return errSecSuccess;
+}
+static OSStatus fixture_create(SecItemClass type, const SecKeychainAttributeList *attrs, UInt32 length,
+                               const void *bytes, SecKeychainRef keychain, SecAccessRef access,
+                               SecKeychainItemRef *item) {
+  assert(type == kSecGenericPasswordItemClass && attrs->count == 4 && keychain && access && !item);
+  ++credentialAdds;
+  credential = [[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding];
+  return errSecSuccess;
+}
 #define NSClassFromString fixture_class
 #define CWAddNetworkProfile fixture_add
+#define SecKeychainSetUserInteractionAllowed fixture_interaction
+#define SecKeychainOpen fixture_open
+#define SecKeychainUnlock fixture_unlock
+#define CWKeychainFindWiFiPassword fixture_find
+#define SecTrustedApplicationCreateFromPath fixture_trust
+#define SecTrustedApplicationCreateApplicationGroup fixture_group
+#define SecAccessCreate fixture_access
+#define SecKeychainItemCreateFromContent fixture_create
 #define main production_main
 #include "tooling/native/piano-wifi-join/piano-wifi-join.m"
 #undef main
@@ -135,6 +225,14 @@ int main(void) {
     assert(known_profile_state(records,ssid,0x50,YES) == KnownMatches);
     assert(known_profile_state(records,ssid,0x10,NO) == KnownMatches);
     assert(known_profile_state(records,ssid,0x10,YES) == KnownPreserve);
+    const char wpa[] = "ssid=fixture-network\nsecurity=wpa2-psk\npsk=fixture-only\n";
+    assert(!piano_wifi_profile_parse((const uint8_t *)wpa, sizeof wpa-1, &p));
+    records = @{};
+    assert(provision(&p) == SavedReady && adds == 2 && credentialAdds == 1 && records.count == 1);
+    assert(provision(&p) == SavedReady && adds == 2 && credentialAdds == 1);
+    credential = @"owner-replacement";
+    assert(provision(&p) == SavedPreserved && adds == 2 && credentialAdds == 1);
+    piano_wifi_profile_wipe(&p);
   }
 }
 '''
@@ -143,7 +241,7 @@ int main(void) {
             (path / 'test.m').write_text(source)
             subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-I', str(W),
                             str(path / 'test.m'), '-framework', 'Foundation', '-framework', 'CoreWLAN',
-                            '-framework', 'CoreLocation', '-framework', 'Security', '-o', str(path / 'test')],
+                            '-framework', 'Security', '-o', str(path / 'test')],
                            check=True, capture_output=True)
             subprocess.run([str(path / 'test')], check=True, capture_output=True)
 
@@ -217,71 +315,77 @@ int main(int argc,char **argv) {
         with tempfile.TemporaryDirectory() as d:
             path=Path(d); path.chmod(0o700); profile=path/'profile';profile.write_text('fixture\n');profile.chmod(0o600)
             (path/'link').symlink_to(profile);(path/'test.m').write_text(source)
-            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-framework','CoreLocation','-framework','Security','-o',str(path/'test')],check=True,capture_output=True)
+            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation','-framework','CoreWLAN','-framework','Security','-o',str(path/'test')],check=True,capture_output=True)
             subprocess.run([str(path/'test'),str(profile),str(path/'missing'),str(path/'link')],check=True,capture_output=True)
 
-    def test_location_readiness_gates_the_scan(self):
+    def test_fallback_scans_after_grace_without_location(self):
         source = r'''
-#include <libproc.h>
-#include <stdio.h>
-#include <time.h>
+#import <Foundation/Foundation.h>
+#import <CoreWLAN/CoreWLAN.h>
 #include <assert.h>
-static int pid_before, pid_after, reads, count;
+#include <sys/sysctl.h>
+#include <time.h>
 static uint64_t seconds;
-static int fixture_list(void *buffer, int size) {
-  if (!buffer) return count;
-  assert(size >= count * (int)sizeof(pid_t));
-  pid_t *pids = buffer;
-  for (int i = 0; i < count; ++i) pids[i] = (reads ? pid_after : pid_before) + i;
-  ++reads;
-  return count;
+static unsigned accesses, scans;
+static BOOL powered = YES, alreadyRequested;
+@interface FixtureClient : NSObject
++ (instancetype)sharedWiFiClient;
+- (CWInterface *)interfaceWithName:(NSString *)name;
+@end
+@implementation FixtureClient
++ (instancetype)sharedWiFiClient { return [self new]; }
+- (CWInterface *)interfaceWithName:(NSString *)name {
+  assert([name isEqualToString:@"en0"]);
+  ++accesses;
+  return (CWInterface *)self;
 }
-static int fixture_name(int pid, void *buffer, uint32_t size) {
-  (void)pid;
-  return snprintf(buffer, size, "locationd");
+- (BOOL)powerOn { return powered; }
+- (NSData *)ssidData { return nil; }
+- (NSSet<CWNetwork *> *)scanForNetworksWithSSID:(NSData *)ssid error:(NSError **)error {
+  assert(ssid.length == 7 && error);
+  ++scans;
+  return [NSSet set];
 }
+@end
 static uint64_t fixture_clock(clockid_t clock) {
   (void)clock;
   return seconds * 1000000000ULL;
 }
-#define proc_listallpids fixture_list
-#define proc_name fixture_name
+static int fixture_sysctl(const char *name, void *old, size_t *len, void *new, size_t newlen) {
+  (void)name; (void)new; (void)newlen;
+  const char *line = alreadyRequested ? "set (generation 9): source apple-set20" : "not set";
+  assert(*len > strlen(line));
+  strcpy(old, line);
+  return 0;
+}
+#define CWWiFiClient FixtureClient
 #define clock_gettime_nsec_np fixture_clock
+#define sysctlbyname fixture_sysctl
 #define main production_main
 #include "tooling/native/piano-wifi-join/piano-wifi-join.m"
 #undef main
-static int check(struct location_readiness *state, uint64_t at, int before,
-                 int after, int candidates, char *query) {
-  seconds = at; pid_before = before; pid_after = after; count = candidates; reads = 0;
-  return location_ready(state, query, 1);
-}
 int main(void) {
-  struct location_readiness state = {};
-  assert(!check(&state, 120, 0, 0, 0, "/usr/bin/true"));
-  assert(!check(&state, 370, 100, 100, 1, "/usr/bin/true"));
-  assert(!check(&state, 379, 101, 101, 1, "/usr/bin/true"));
-  assert(!check(&state, 388, 101, 101, 1, "/usr/bin/true"));
-  assert(reads == 1);
-  assert(!check(&state, 389, 101, 102, 1, "/usr/bin/true"));
-  assert(reads == 2);
-  assert(!check(&state, 390, 102, 102, 2, "/usr/bin/true"));
-  assert(!check(&state, 391, 102, 102, 1, "/usr/bin/true"));
-  assert(!check(&state, 401, 102, 102, 1, "/usr/bin/false"));
-  assert(!check(&state, 402, 102, 102, 1, "/usr/bin/true"));
-  assert(check(&state, 412, 102, 102, 1, "/usr/bin/true"));
-  struct apple_join a = { .kick_time = 400 };
-  assert(!ready(&a)); /* grace precedes any real CoreWLAN call */
-  reads = 0;
-  assert(!location_allows_join(&state, "/usr/bin/false", 1, 59) && reads == 0);
-  assert(location_allows_join(&state, "/usr/bin/false", 2, 60) && reads == 0);
+  @autoreleasepool {
+    struct piano_wifi_profile profile = {.ssid_len = 7};
+    struct apple_join a = { .profile = &profile, .kick_time = 100 };
+    seconds = 134;
+    assert(ready(&a) == 0 && accesses == 0 && scans == 0);
+    seconds = 135;
+    assert(ready(&a) == 0 && accesses == 1 && scans == 1);
+    alreadyRequested = YES;
+    assert(ready(&a) == -1 && scans == 1);
+    alreadyRequested = NO;
+    powered = NO;
+    assert(ready(&a) == -1 && scans == 1);
+  }
 }
 '''
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)
             (path / 'test.m').write_text(source)
-            subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-I', str(W), str(path / 'test.m'),
-                            '-framework', 'Foundation', '-framework', 'CoreWLAN',
-                            '-framework', 'CoreLocation', '-framework', 'Security', '-o', str(path / 'test')],
+            subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-I', str(W),
+                            str(path / 'test.m'), '-framework', 'Foundation', '-framework', 'CoreWLAN',
+                            '-framework', 'Security', '-o', str(path / 'test')],
                            check=True, capture_output=True)
             subprocess.run([str(path / 'test')], check=True, capture_output=True)
 

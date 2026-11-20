@@ -681,14 +681,15 @@ grant, clears the request-kind table so every kind is logged again). Host tests:
 
 ## 10. User disconnect and radio power (2026-11-17, tablet qualification pending)
 
-The native binding now connects power (IOC19), disassociate (IOC22), and deauth (IOC29) to the radio worker. A user leave
-suppresses retries until another SET20; power-off cancels scans, drains station teardown, disables DMA and parks WLAN_EN.
-Power-on reloads the firmware through the existing restart path and permits the retained profile to reconnect. A stop serial
-keeps quick off/on and leave/join requests from skipping teardown. Existing saved profiles are retained.
+The native binding connects power (IOC19), disassociate (IOC22), and deauth (IOC29) to the radio worker. Power OFF cancels
+scans, drains station teardown and waits for the worker to verify the WLAN_EN and PERST# output states. Power ON reloads
+the firmware. A stop serial keeps quick off/on and leave/join requests from skipping teardown. Each native station attempt
+requires a fresh SET20, including after wake or link loss.
 
 The daily ESP sets `piano-wifi-native-boot=1`. With this mode, SET19 OFF uses the physical stop path and airportd owns
-the first association. After the airportd kick, the userland helper checks or adds the native saved profile, then gives
-airportd time to auto-join. If the radio is on and no association has been requested, the helper may ask CoreWLAN to join once.
+association. After airportd adopts the interface, the userland helper checks or adds the native saved profile, then gives
+airportd time to auto-join. If the radio is on and no association has been requested, the helper can ask CoreWLAN to join once.
+The startup job kicks airportd only when the running PID fails to adopt the registered interface, or starts it if it is absent.
 
 RAM diagnostics default to `piano-wifi-boot-on=1`. An unarmed SET19 OFF returns `EBUSY`, leaving GET19 ON without a
 stop serial or accepted POWER_CHANGED event. To test physical OFF, use `piano-wifi-boot-on=0` or write
@@ -705,10 +706,10 @@ POWER_CHANGED1 follows every accepted SET19, including an already-on request, af
 station mode remains1 while off. This preserves airportd's power initialization and client notification even when the
 requested value did not change. The BSD cache-update notification is15: 27.3 airportd interprets11 as a country change,
 clears its scan cache and starts autojoin. These BSD numbers must not be inferred from the framework's internal event list.
-AppleAssociate2 polls GET21 rather than waiting for
-event9: a canceled join returns terminal2, and a new accepted profile generation returns pending0 before the worker consumes
-it. This prevents the previous station's retained success/failure from completing the new request. Current GET state and last-notified state are
-separate, so a poll cannot consume an event before it is posted. Association-event storage is separate from request scratch.
+Driver availability is BSD event55 and carries the adapter's availability record. The driver sends it after registration and
+again when a new airportd PID first reads GET19. Each SET20 generation starts at GET21 result0. Authorization gives result1,
+cancellation or a failed station gives result2, and the 9.5 s deadline gives result9. A poll advances the getter state while
+the event baseline remains at the last notification. Association-event storage is separate from request scratch.
 
 Host coverage includes three station teardown cycles in firmware order, power/leave intent races, ABI validation and
 GET-before-notification ordering. This is source/model validation; real disconnect, physical off/on and automatic

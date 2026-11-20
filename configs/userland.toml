@@ -336,12 +336,12 @@ mode = "0755"
 
 [[unit]]
 name = "piano-wifi-join"
-about = "native Wi-Fi profile provisioning on daily boots and one CoreWLAN fallback after the airportd kick; requires a fresh SET20 receipt"
+about = "native Wi-Fi profile provisioning and one CoreWLAN fallback after airportd adopts the interface; fallback requires a fresh SET20"
 default_on = true
 
 [[unit.file]]
 source = "tooling/native/piano-wifi-join/piano-wifi-join.m"
-frameworks = ["Foundation", "CoreWLAN", "CoreLocation", "Security"]
+frameworks = ["Foundation", "CoreWLAN", "Security"]
 cflags = ["-fobjc-arc"]
 inputs = ["tooling/native/piano-wifi-join/BootJoin.h", "package/PianoWifi/WifiProfile.h"]
 build = "cc"
@@ -357,7 +357,7 @@ mode = "0644"
 
 [[unit]]
 name = "piano-airportd-kick"
-about = "airportd started (launchctl kickstart, once) when PianoWifi80211 answers the apple80211 requests and launchd's IO80211Controller match has not started it within 10 s (docs/drivers/wifi-menu.md section 5); does nothing without the kernel argument piano-wifi-apple80211=1 (the controller never appears); a script, no Mach-O"
+about = "waits for airportd to adopt PianoWifi80211 on native Wi-Fi boots; kicks the daemon only if adoption stalls, then starts the Wi-Fi helper"
 default_on = true
 
 [[unit.file]]

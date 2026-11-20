@@ -11,16 +11,14 @@
 //   psk=PASSPHRASE       for wpa2-psk: 8 to 63 printable characters, or 64 hex digits
 //   bssid=aa:bb:cc:dd:ee:ff   optional: the access point to prefer
 //   mac=02:..:..:..:..:..     optional: the station's own address (locally administered)
-// After the airportd kick, daily boots provision the native saved network.
+// After airportd adopts the interface, daily boots provision the native saved network.
 // CoreWLAN owns any fallback association, which must publish a new SET20.
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
-#import <CoreLocation/CoreLocation.h>
 #import <Security/Security.h>
 #include "BootJoin.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <libproc.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -96,8 +94,7 @@ static int safe_open(const char *path)
 }
 
 enum {
-  BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25,
-  LocationWaitSeconds = 60, LocationStableSeconds = 10, LocationQuerySeconds = 8
+  BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25
 };
 static const char kick_receipt[] = "/var/run/piano-airportd-kick";
 extern char **environ;
@@ -335,92 +332,14 @@ static enum saved_profile provision_from_file(char *executable, int fd)
   return result == SavedReady ? SavedReady : result == SavedPreserved ? SavedPreserved : SavedUnavailable;
 }
 
-struct location_readiness {
-  pid_t pid;
-  uint64_t since;
-};
-
-static pid_t location_service_pid(void)
-{
-  const int estimated = proc_listallpids(NULL, 0);
-  if (estimated <= 0) return 0;
-  const int capacity = estimated + 64;
-  pid_t *pids = calloc((size_t)capacity, sizeof *pids);
-  if (!pids) return 0;
-  const int count = proc_listallpids(pids, capacity * sizeof *pids);
-  pid_t result = 0;
-  for (int i = 0; i < count && count < capacity; ++i) {
-    char name[64];
-    if (pids[i] <= 0 || proc_name(pids[i], name, sizeof name) <= 0 || strcmp(name, "locationd")) continue;
-    if (result) {
-      result = 0;
-      break;
-    }
-    result = pids[i];
-  }
-  free(pids);
-  return result;
-}
-
-static int location_query_result(char *executable)
-{
-  // Isolate the synchronous CoreLocation call from our CoreWLAN client.
-  // The child sets its own alarm and checks only the global switch.
-  char *args[] = { executable, "--location-query", NULL };
-  pid_t pid;
-  if (posix_spawn(&pid, executable, NULL, NULL, args, environ)) return 0;
-  int status;
-  pid_t waited;
-  do {
-    waited = waitpid(pid, &status, 0);
-  } while (waited < 0 && errno == EINTR);
-  return waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
 static uint64_t monotonic_seconds(void)
 {
   return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / NSEC_PER_SEC;
 }
 
-static int location_ready(struct location_readiness *state, char *executable, unsigned attempt)
-{
-  const uint64_t now = monotonic_seconds();
-  const pid_t pid = location_service_pid();
-  if (pid != state->pid) {
-    state->pid = pid;
-    state->since = now;
-  }
-  if (!pid || now - state->since < LocationStableSeconds) {
-    timeline("location attempt=%u stable=0 present=%d", attempt, pid != 0);
-    return 0;
-  }
-
-  const int returned = location_query_result(executable);
-  const int same_pid = pid == location_service_pid();
-  timeline("location attempt=%u stable=1 query_returned=%d same_pid=%d", attempt, returned, same_pid);
-  if (returned && same_pid) return 1;
-  state->pid = 0;
-  return 0;
-}
-
-static int location_allows_join(struct location_readiness *state, char *executable,
-                                unsigned attempt, uint64_t since_kick)
-{
-  if (since_kick >= LocationWaitSeconds) {
-    timeline("location attempt=%u result=deadline-fallback", attempt);
-    return 1;
-  }
-  // A synchronous child gets its own alarm. Avoid starting one that could
-  // carry the location wait beyond the deadline.
-  return since_kick <= LocationWaitSeconds - LocationQuerySeconds &&
-         location_ready(state, executable, attempt);
-}
-
 struct apple_join {
   const struct piano_wifi_profile *profile;
-  char *executable;
   uint64_t kick_time;
-  struct location_readiness location;
   CWInterface *interface;
   CWNetwork *network;
   unsigned readiness_attempt;
@@ -468,7 +387,6 @@ static int ready(void *context)
     return -1;
   }
   if (native_join_seen(a)) return -1;
-  if (!location_allows_join(&a->location, a->executable, attempt, since_kick)) return 0;
   NSData *name = [NSData dataWithBytes:a->profile->ssid length:a->profile->ssid_len];
   NSError *error = nil;
   timeline("scan attempt=%u begin", attempt);
@@ -510,16 +428,6 @@ static void pause_join(void *unused) { (void)unused; sleep(2); }
 
 int main(int argc, char **argv)
 {
-  if (argc == 2 && !strcmp(argv[1], "--location-query")) {
-    alarm(LocationQuerySeconds);
-    @autoreleasepool {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-      (void)[CLLocationManager locationServicesEnabled];
-#pragma clang diagnostic pop
-    }
-    return 0;
-  }
   const char *path = argc > 1 ? argv[1] : PIANO_WIFI_PROFILE_PATH;
   if (geteuid() != 0) {
     fprintf(stderr, "piano-wifi-join: run as root\n");
@@ -548,9 +456,9 @@ int main(int argc, char **argv)
     return finish(1, "airportd-kick-missing");
   }
   const uint64_t kick_time = monotonic_seconds();
-  timeline("airportd kick=complete");
+  timeline("airportd adoption=confirmed");
   const int native = native_boot();
-  if (native < 0) {
+  if (native != 1) {
     close(fd);
     return finish(1, "boot-mode");
   }
@@ -585,32 +493,28 @@ int main(int argc, char **argv)
   timeline("readiness deadline_seconds=%u alarm_logging=%d", BootJoinDeadline, handler == 0);
   int rc;
   @autoreleasepool {
-    enum saved_profile saved = SavedUnavailable;
-    if (native) {
-      CWInterface *interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
-      if (interface && !interface.powerOn) {
-        timeline("fallback skipped=powered-off");
-        saved = SavedPreserved;
-      } else {
-        saved = provision_from_file(argv[0], fd);
-        if (saved == SavedUnavailable) {
-          timeline("native provisioning=retry");
-          // Give the System keychain time to initialize on the first boot.
-          while (monotonic_seconds() - kick_time < 20) sleep(1);
-          if (interface && !interface.powerOn) saved = SavedPreserved;
-          else saved = provision_from_file(argv[0], fd);
-        }
-        timeline("native provisioning=%s", saved == SavedReady ? "verified" :
-                 saved == SavedPreserved ? "preserved" : "unavailable");
-      }
+    enum saved_profile saved = SavedPreserved;
+    CWInterface *interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
+    if (interface && !interface.powerOn) {
+      timeline("fallback skipped=powered-off");
     } else {
-      timeline("native provisioning=ram-probe");
+      saved = provision_from_file(argv[0], fd);
+      if (saved == SavedUnavailable) {
+        timeline("native provisioning=retry");
+        // Give the System keychain time to initialize on the first boot.
+        while (monotonic_seconds() - kick_time < 20) sleep(1);
+        if (interface && !interface.powerOn) saved = SavedPreserved;
+        else
+        saved = provision_from_file(argv[0], fd);
+      }
+      timeline("native provisioning=%s", saved == SavedReady ? "verified" :
+               saved == SavedPreserved ? "preserved" : "unavailable");
     }
     close(fd);
     if (saved == SavedPreserved) {
       rc = PianoBootJoinSkipped;
     } else {
-      struct apple_join a = { .profile = &p, .executable = argv[0], .kick_time = kick_time };
+      struct apple_join a = { .profile = &p, .kick_time = kick_time };
       struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
       rc = piano_boot_join(&transport, BootJoinDeadline / 2);
     }
