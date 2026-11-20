@@ -873,7 +873,7 @@ void PianoWifi80211::postDriverAvailable(bool available, const char *why)
 void PianoWifi80211::syncDriverAvailable(bool force, const char *why)
 {
   if (!__atomic_load_n(&fAirportdPid, __ATOMIC_ACQUIRE)) return;
-  const bool usable = piano_wifi_radio_usable() != 0;
+  const bool usable = piano_wifi_assoc_radio_usable() != 0;
   IOLockLock(fLock);
   const int posted = fDriverAvailablePosted;
   IOLockUnlock(fLock);

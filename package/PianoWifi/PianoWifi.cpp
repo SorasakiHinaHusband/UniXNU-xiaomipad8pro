@@ -4054,7 +4054,7 @@ uint8_t gL8Out[kStaOutBytes + 64];   // a command of level 8's own (a key is 25 
 // snapshot instead of reaching into the supplicant's mutable objects.  It is
 // intentionally a read-only, best-effort view: the front end polls it and
 // emits kev transitions when the association generation changes.
-extern "C" int piano_wifi_radio_usable(void)
+extern "C" int piano_wifi_assoc_radio_usable(void)
 {
   return __atomic_load_n(&gRadioUsable, __ATOMIC_SEQ_CST) && WifiUserControl::power(gUserControl.read()) &&
          !gUserControl.radioStop() ? 1 : 0;

@@ -41,7 +41,7 @@ int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out);
 
 // 1 while the radio can scan and join (a pass reached level 7, the chip is up and the user power is ON), else 0: the front end
 // posts it to airportd as DRIVER_AVAILABLE (BSD event 55).
-int piano_wifi_radio_usable(void);
+int piano_wifi_assoc_radio_usable(void);
 
 enum { PIANO_WIFI_USER_OFF = 0, PIANO_WIFI_USER_ON = 1, PIANO_WIFI_USER_LEAVE = 2 };
 // Leave and ON publish intent. OFF waits for bounded hardware confirmation
