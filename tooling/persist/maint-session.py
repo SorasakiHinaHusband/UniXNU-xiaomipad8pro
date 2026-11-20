@@ -1981,11 +1981,159 @@ def esp_final(s):
     write_esp(s, s.a.esp_final)
 
 
+def gpt_set_attr_bit(blob, blob_lba, header_lba, number, bit, bs=B):
+    """Return a copy of blob (bs-byte blocks starting at LBA blob_lba) with attribute bit `bit` set in partition entry `number`
+    (1-based) of the GPT whose header is at LBA header_lba, and that header's entry-array CRC and header CRC recomputed. Nothing else
+    changes: no protective MBR, no other header field, no other entry (sgdisk -A rewrites the protective MBR on save, 2026-11-20)."""
+    import zlib
+    out = bytearray(blob)
+    h = (header_lba - blob_lba) * bs
+    if out[h:h + 8] != b'EFI PART':
+        raise Stop(f'no GPT header at LBA {header_lba}')
+    hsize, = struct.unpack_from('<I', out, h + 12)
+    entries_lba, count, esize = struct.unpack_from('<QII', out, h + 72)
+    e = (entries_lba - blob_lba) * bs
+    if not (0 < number <= count) or e < 0 or e + count * esize > len(out):
+        raise Stop(f'entry {number} or the entry array (LBA {entries_lba}, {count} x {esize}) is outside the copy')
+    a = e + (number - 1) * esize + 48
+    attrs, = struct.unpack_from('<Q', out, a)
+    struct.pack_into('<Q', out, a, attrs | (1 << bit))
+    struct.pack_into('<I', out, h + 88, zlib.crc32(bytes(out[e:e + count * esize])) & 0xffffffff)
+    struct.pack_into('<I', out, h + 16, 0)
+    struct.pack_into('<I', out, h + 16, zlib.crc32(bytes(out[h:h + hsize])) & 0xffffffff)
+    return bytes(out)
+
+
+def gpt_backup_header_with(header_block, entries):
+    """The backup GPT header block with its entry-array CRC set from `entries` and its header CRC recomputed (nothing else)."""
+    import zlib
+    out = bytearray(header_block)
+    if out[:8] != b'EFI PART':
+        raise Stop('no backup GPT header')
+    hsize, = struct.unpack_from('<I', out, 12)
+    struct.pack_into('<I', out, 88, zlib.crc32(bytes(entries)) & 0xffffffff)
+    struct.pack_into('<I', out, 16, 0)
+    struct.pack_into('<I', out, 16, zlib.crc32(bytes(out[:hsize])) & 0xffffffff)
+    return bytes(out)
+
+
+def lun4_layout(s, number):
+    """boot_a's LUN: disk node, size in blocks, and the backup copy's layout read from the verified backups (the backup header is the
+    last LBA; its entry array can start BEFORE the 5 backed-up LBAs: on piano LUN 4 it is at total-7, 3 blocks)."""
+    old_p = (s.dir / 'lun4-gpt-primary.img').read_bytes()
+    old_b = (s.dir / 'lun4-gpt-backup.img').read_bytes()
+    bh = old_b[4 * B:5 * B]
+    ph = old_p[B:2 * B]
+    pe, pc, ps = struct.unpack_from('<QII', ph, 72)
+    my, alt = struct.unpack_from('<QQ', bh, 24)
+    be, bc, bs_ = struct.unpack_from('<QII', bh, 72)
+    return old_p, old_b, bh, (pe, pc, ps), (my, alt), (be, bc, bs_)
+
+
+@step('slot-success-crc', 'maintenance, WRITE LUN 4 GPT (boot_a attribute bit 54 and the two CRCs only, both copies)',
+      writes='LUN 4 GPT: backup entry array + backup header, then primary header + entries (bit 54 of boot_a and CRCs only)')
+def slot_success_crc(s):
+    """Like slot-success, without sgdisk (sgdisk -A rewrites the protective MBR and its rollback misses the backup entry array, which
+    on LUN 4 starts 2 blocks before the 5 backed-up LBAs; 2026-11-20). From the verified backups: bit 54 of boot_a's entry set in the
+    primary entry array, its CRC and the primary header CRC recomputed; the backup entry array = the new primary entries, the backup
+    header's two CRCs recomputed. Written backup entries, backup header, then primary (LBA 1-5), each read back against the computed
+    bytes; the protective MBR (LBA 0) is never written. Never set_active."""
+    if s.execute and (s.state.get('abl') or {}).get('slot-successful:a') == 'yes':
+        s.log('  info  slot A is already marked successful: nothing to do')
+        return
+    boot_a = s.nodes['boot_a']
+    disk = re.sub(r'\d+$', '', boot_a)
+    part = s.shell(f'cat /sys/class/block/{boot_a}/partition')
+    number = int(part.strip().splitlines()[-1]) if part else 0
+    s.shell(f'sgdisk -i {number or "<n>"} /dev/{disk}')
+    s.backup('lun4-gpt-primary', disk, 0, 6, B, f'{disk} LBA 0-5 (boot_a\'s LUN, primary GPT)')
+    blocks = s.shell(f'blockdev --getsize64 /dev/{disk}')
+    total = int(blocks.strip().splitlines()[-1]) // B if blocks else 0
+    s.backup('lun4-gpt-backup', disk, total - 5 if total else '<last-5>', 5, B, f'{disk} last 5 LBAs (backup GPT)')
+    if not s.execute:
+        s.log(f'  WRITE computed: backup entries (from its header), backup header (last LBA), primary LBA 1-5; bit 54 of entry <n> + CRCs')
+        return
+    old_p, old_b, bh, (pe, pc, ps), (my, alt), (be, bc, bs_) = lun4_layout(s, number)
+    nblk = (pc * ps + B - 1) // B
+    s.need(pe == 2 and (pc, ps) == (bc, bs_) and my == total - 1 and alt == 1 and be + nblk <= total - 1 and 0 < number <= pc,
+           f'LUN 4 GPT layout: primary entries LBA {pe}, backup header LBA {my} of {total}, backup entries LBA {be} ({nblk} blocks)')
+    s.backup('lun4-gpt-backup-entries', disk, be, nblk, B, f'{disk} LBA {be}+{nblk} (backup entry array, as found)')
+    new_p = gpt_set_attr_bit(old_p, 0, 1, number, 54)
+    entries = new_p[pe * B:pe * B + pc * ps]
+    index = number - 1
+    allowed_p = set(range(B + 16, B + 20)) | set(range(B + 88, B + 92)) | set(range(2 * B + index * 128 + 48, 2 * B + index * 128 + 56))
+    diff_p = {i for i in range(len(old_p)) if old_p[i] != new_p[i]}
+    s.need(diff_p and diff_p <= allowed_p, f'computed primary: {len(diff_p)} bytes differ, all in entry {number}\'s attributes and the '
+           f'two CRCs (protective MBR untouched)')
+    new_bh = gpt_backup_header_with(bh, entries)
+    new_be = new_p[pe * B:(pe + nblk) * B]
+    pieces = (('lun4-gpt-backup-entries-bit54', new_be, be), ('lun4-gpt-backup-header-bit54', new_bh, total - 1),
+              ('lun4-gpt-primary-bit54', new_p[B:], 1))
+    for key, data, seek in pieces:
+        path = s.dir / f'{key}.img'
+        path.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        s.serve({f'{key}.img': path})
+        if s.write(f'{key} -> /dev/{disk} at block {seek} of {B} bytes ({len(data) // B} blocks)'):
+            s.job(f'restore-{key}', 'restore', f'{key}.img', disk, seek, B, s.a.http_port, timeout=3600)
+        got = s.region_sha(disk, seek, len(data) // B, B, name=f'check-{key}')
+        s.need(got == digest, f'{key} written: read back {got[:16]} = computed {digest[:16]}')
+    s.save(slot_success_written=True)
+    v = s.shell(f'partx -u /dev/{disk}; sgdisk -A {number}:show /dev/{disk}; sgdisk -v /dev/{disk}')
+    s.need('No problems found' in (v or '') and 'ERROR' not in (v or '') and "don't match" not in (v or ''),
+           'sgdisk -v: both headers and both partition tables OK')
+    attrs = int.from_bytes(new_p[2 * B + index * 128 + 48:2 * B + index * 128 + 56], 'little')
+    s.need(attrs >> 54 & 1 == 1, f'boot_a attributes {attrs:#x}: bit 54 set')
+
+
+@step('lun4-backup-entries-repair', 'maintenance, WRITE LUN 4 backup GPT entry array (= the verified primary entries)',
+      writes='LUN 4 backup entry array (3 blocks before the backed-up 5)')
+def lun4_backup_entries_repair(s):
+    """Repair after the 2026-11-20 13:5x slot-success rollback: sgdisk had written the backup entry array at LBA total-7..total-5, the
+    rollback restored only total-5..total-1, so the backup table no longer matches its header CRC. The original backup entries equal
+    the primary entries (the backed-up backup header's entry CRC = crc32(primary entries)): write the primary entry array from the
+    verified primary backup over the backup entry array (after a backup of what is there now), read back, sgdisk -v clean."""
+    boot_a = s.nodes['boot_a']
+    disk = re.sub(r'\d+$', '', boot_a)
+    blocks = s.shell(f'blockdev --getsize64 /dev/{disk}')
+    total = int(blocks.strip().splitlines()[-1]) // B if blocks else 0
+    s.require_backup('lun4-gpt-primary')
+    s.require_backup('lun4-gpt-backup')
+    if not s.execute:
+        s.log('  WRITE primary entries -> backup entry array LBA (from the backup header)')
+        return
+    import zlib
+    old_p, old_b, bh, (pe, pc, ps), (my, alt), (be, bc, bs_) = lun4_layout(s, 0)
+    nblk = (pc * ps + B - 1) // B
+    entries = old_p[pe * B:pe * B + pc * ps]
+    bcrc, = struct.unpack_from('<I', bh, 88)
+    s.need(pe == 2 and (pc, ps) == (bc, bs_) and my == total - 1 and alt == 1 and be + nblk <= total - 1,
+           f'LUN 4 GPT layout: backup header LBA {my} of {total}, backup entries LBA {be} ({nblk} blocks)')
+    s.need(bcrc == zlib.crc32(entries) & 0xffffffff, f'backup header entry CRC {bcrc:#x} = crc32(primary entries): the original backup '
+           f'entries are the primary entries')
+    s.backup('lun4-gpt-backup-entries-before-repair', disk, be, nblk, B, f'{disk} LBA {be}+{nblk} (backup entry array before repair)')
+    data = old_p[pe * B:(pe + nblk) * B]
+    key = 'lun4-gpt-backup-entries-repair'
+    path = s.dir / f'{key}.img'
+    path.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    s.serve({f'{key}.img': path})
+    if s.write(f'{key} -> /dev/{disk} at block {be} of {B} bytes ({nblk} blocks)'):
+        s.job(f'restore-{key}', 'restore', f'{key}.img', disk, be, B, s.a.http_port, timeout=3600)
+    got = s.region_sha(disk, be, nblk, B, name=f'check-{key}')
+    s.need(got == digest, f'{key} written: read back {got[:16]} = primary entries {digest[:16]}')
+    v = s.shell(f'partx -u /dev/{disk}; sgdisk -v /dev/{disk}')
+    s.need('No problems found' in (v or '') and 'ERROR' not in (v or '') and "don't match" not in (v or ''),
+           'sgdisk -v: both headers and both partition tables OK')
+
+
 @step('slot-success', 'maintenance, WRITE LUN 4 GPT (boot_a attribute bit 54 only)', writes='LUN 4 GPT entry of boot_a')
 def slot_success(s):
     """Only when abl-check found slot-successful:a = no: set bit 54 of boot_a's GPT entry (piano-slot-success's single-bit
     write), after verified NAS backups of both GPT copies of boot_a's LUN. Read back: the new primary copy may differ from its
     backup only in that entry's attribute field and the two CRCs. Never set_active."""
+    raise Stop('slot-success (sgdisk -A) is retired: sgdisk rewrites LUN 4\'s protective MBR and its rollback misses the backup entry '
+               'array (2026-11-20); use slot-success-crc')
     if s.execute and (s.state.get('abl') or {}).get('slot-successful:a') == 'yes':
         s.log('  info  slot A is already marked successful: nothing to do')
         return
@@ -2022,6 +2170,19 @@ def slot_back(s):
     disk = re.sub(r'\d+$', '', s.nodes['boot_a'])
     e = s.require_backup('lun4-gpt-backup')
     s.restore('lun4-gpt-backup', disk, (e or {}).get('skip', '<last-5>'), B)
+    s.restore('lun4-gpt-primary', disk, 0, B)
+    s.shell(f'partx -u /dev/{disk}; sgdisk -v /dev/{disk}')
+
+
+@rollback('slot-success-crc')
+def slot_crc_back(s):
+    """LUN 4's GPT as backed up by slot-success-crc: the backup entry array (lun4-gpt-backup-entries, before the 5 LBAs), the backup
+    copy's 5 LBAs (lun4-gpt-backup), then the primary (lun4-gpt-primary); each read back."""
+    map_nodes(s)
+    disk = re.sub(r'\d+$', '', s.nodes['boot_a'])
+    for key in ('lun4-gpt-backup-entries', 'lun4-gpt-backup'):
+        e = s.require_backup(key)
+        s.restore(key, disk, (e or {}).get('skip', '<lba>'), B)
     s.restore('lun4-gpt-primary', disk, 0, B)
     s.shell(f'partx -u /dev/{disk}; sgdisk -v /dev/{disk}')
 
