@@ -1951,5 +1951,25 @@ extern "C" void native_adreno_note_hang_snapshot(const A830HangSnapshot *s)
         s->pipeHwFault[0],s->pipeIntStatus[0],s->pipeStatus[0],s->pipeProtect[0],s->pipeHwFault[1],s->pipeIntStatus[1],s->smmuFsr[0],
         (unsigned long long)s->smmuFar[0]);
     boot_progress_gpu_event(line);
+    /* 2026-11-21 (WS-CRASH-WALLPAPER.md): whose windows the IB1, IB2 and FAR are in, and who holds a window now ("-": a window nobody
+     * holds), so a fault in a window with no client names the reference's owner. */
+    {
+        const uint64_t at[3]={s->ib1Base,s->ib2Base,s->smmuFar[0]};
+        unsigned slot[3];
+        char who[3][20];
+        /* try only: the recovery may run while a thread holds g.lock and waits on it; without the lock no names (\"?\") */
+        const bool locked=IOLockTryLock(g.lock);
+        for(unsigned i=0;i<3;++i) {
+            slot[i]=NativeAdrenoClientSlotAt(g.published?g.windows:nullptr,at[i]);
+            const CoreBox *box=locked && slot[i]<NativeAdrenoMaxClients?slotBox(slot[i]):nullptr;
+            strlcpy(who[i],box?box->name:!locked?"?":slot[i]<NativeAdrenoMaxClients?"-":"kernel/none",sizeof who[i]);
+        }
+        int used=snprintf(line,sizeof line,"hang snapshot slots: IB1 %u %s, IB2 %u %s, FAR %u %s; held:",slot[0],who[0],slot[1],who[1],
+            slot[2],who[2]);
+        for(unsigned s2=0;locked && s2<NativeAdrenoMaxClients && used>0 && size_t(used)<sizeof line;++s2)
+            if(const CoreBox *box=slotBox(s2))used+=snprintf(line+used,sizeof line-size_t(used)," %u:%.10s",s2,box->name);
+        if(locked)IOLockUnlock(g.lock);
+    }
+    boot_progress_gpu_event(line);
 }
 #endif
