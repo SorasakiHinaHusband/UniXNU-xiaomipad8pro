@@ -341,7 +341,7 @@ default_on = true
 
 [[unit.file]]
 source = "tooling/native/piano-wifi-join/piano-wifi-join.m"
-frameworks = ["Foundation", "CoreWLAN", "Security"]
+frameworks = ["Foundation", "CoreWLAN", "Security", "CoreLocation"]
 cflags = ["-fobjc-arc"]
 inputs = ["tooling/native/piano-wifi-join/BootJoin.h", "package/PianoWifi/WifiProfile.h"]
 build = "cc"

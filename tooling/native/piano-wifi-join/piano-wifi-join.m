@@ -16,9 +16,11 @@
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
 #import <Security/Security.h>
+#import <CoreLocation/CoreLocation.h>
 #include "BootJoin.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -94,7 +96,8 @@ static int safe_open(const char *path)
 }
 
 enum {
-  BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25
+  BootJoinDeadline = 480, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25,
+  LocationStableSeconds = 10, LocationQuerySeconds = 8
 };
 static const char kick_receipt[] = "/var/run/piano-airportd-kick";
 extern char **environ;
@@ -337,9 +340,77 @@ static uint64_t monotonic_seconds(void)
   return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / NSEC_PER_SEC;
 }
 
+// airportd answers a non-entitled client's GET SSID only through a synchronous CoreLocation proxy. After boot locationd can die
+// and respawn every ~3 s (EXC_ARM_PAC_FAIL, LOCATIOND-SSID.md), and that call then blocks for a random time. Before the first
+// CoreWLAN call: one live locationd PID for LocationStableSeconds, and a CoreLocation query that returns in a child of its own.
+struct location_readiness {
+  pid_t pid;
+  uint64_t since;
+};
+
+static pid_t location_service_pid(void)
+{
+  const int estimated = proc_listallpids(NULL, 0);
+  if (estimated <= 0) return 0;
+  const int capacity = estimated + 64;
+  pid_t *pids = calloc((size_t)capacity, sizeof *pids);
+  if (!pids) return 0;
+  const int count = proc_listallpids(pids, capacity * sizeof *pids);
+  pid_t result = 0;
+  for (int i = 0; i < count && count < capacity; ++i) {
+    char name[64];
+    if (pids[i] <= 0 || proc_name(pids[i], name, sizeof name) <= 0 || strcmp(name, "locationd")) continue;
+    if (result) {
+      result = 0;
+      break;
+    }
+    result = pids[i];
+  }
+  free(pids);
+  return result;
+}
+
+static int location_query_result(char *executable)
+{
+  // Isolate the synchronous CoreLocation call from our CoreWLAN client.
+  // The child sets its own alarm and checks only the global switch.
+  char *args[] = { executable, "--location-query", NULL };
+  pid_t pid;
+  if (posix_spawn(&pid, executable, NULL, NULL, args, environ)) return 0;
+  int status;
+  pid_t waited;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  return waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int location_ready(struct location_readiness *state, char *executable, unsigned attempt)
+{
+  const uint64_t now = monotonic_seconds();
+  const pid_t pid = location_service_pid();
+  if (pid != state->pid) {
+    state->pid = pid;
+    state->since = now;
+  }
+  if (!pid || now - state->since < LocationStableSeconds) {
+    timeline("location attempt=%u stable=0 present=%d", attempt, pid != 0);
+    return 0;
+  }
+  const int returned = location_query_result(executable);
+  const int same_pid = pid == location_service_pid();
+  timeline("location attempt=%u stable=1 query_returned=%d same_pid=%d", attempt, returned, same_pid);
+  if (returned && same_pid) return 1;
+  state->pid = 0;
+  return 0;
+}
+
 struct apple_join {
   const struct piano_wifi_profile *profile;
   uint64_t kick_time;
+  char *executable;
+  struct location_readiness location;
+  int location_passed;
   CWInterface *interface;
   CWNetwork *network;
   unsigned readiness_attempt;
@@ -375,6 +446,10 @@ static int ready(void *context)
   const unsigned attempt = ++a->readiness_attempt;
   const uint64_t since_kick = monotonic_seconds() - a->kick_time;
   if (since_kick < NativeJoinGraceSeconds) return 0;
+  if (!a->location_passed) {
+    if (!location_ready(&a->location, a->executable, attempt)) return 0;
+    a->location_passed = 1;
+  }
   timeline("interface attempt=%u begin", attempt);
   a->interface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:@"en0"];
   timeline("interface attempt=%u present=%d", attempt, a->interface != nil);
@@ -435,6 +510,16 @@ int main(int argc, char **argv)
   }
   if (argc == 2 && !strcmp(argv[1], "--provision-stdin"))
     return provision_from_stdin();
+  if (argc == 2 && !strcmp(argv[1], "--location-query")) {
+    alarm(LocationQuerySeconds);
+    @autoreleasepool {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      (void)[CLLocationManager locationServicesEnabled];
+#pragma clang diagnostic pop
+    }
+    return 0;
+  }
   timeline("start");
   // No PianoWifi in this boot (or not at a level that joins): nothing to do. launchd may start this before the kext has
   // registered its sysctl, so it is looked for during 30 s before that conclusion.
@@ -514,7 +599,7 @@ int main(int argc, char **argv)
     if (saved == SavedPreserved) {
       rc = PianoBootJoinSkipped;
     } else {
-      struct apple_join a = { .profile = &p, .kick_time = kick_time };
+      struct apple_join a = { .profile = &p, .kick_time = kick_time, .executable = argv[0] };
       struct piano_boot_join_transport transport = { &a, ready, receipt, associate, pause_join };
       rc = piano_boot_join(&transport, BootJoinDeadline / 2);
     }
