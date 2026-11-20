@@ -71,6 +71,7 @@ class PianoWifi80211 : public IO80211Controller {
                                                   // answered at once, the daemon asks again straight away)
   static constexpr unsigned kReportMs = 60000;
   static constexpr unsigned kAssociationTickMs = 250;
+  static constexpr unsigned kAssociateWaitMs = 8000, kAssociateWaitStepMs = 20;   // ASSOCIATE's bounded wait for an outcome
   static constexpr uint32_t kScanLinesMax = 400;   // two lines a scan: about 200 scans, the first half hour of a boot
 
   IOLock *fLock = nullptr;
@@ -128,6 +129,7 @@ class PianoWifi80211 : public IO80211Controller {
   void postEvent(uint32_t code, const pianowifi::a80211::LinkEvent &link = {});
   void postDriverAvailable(bool available, const char *why);
   void syncDriverAvailable(bool force, const char *why);
+  void waitAssociationOutcome();
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
@@ -670,6 +672,7 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
         char caller[32] = {};
         proc_selfname(caller, sizeof caller);
         note80211("PianoWifiSET20SourceV1 accepted caller=%s", !strcmp(caller, "airportd") ? "airportd" : "other");
+        waitAssociationOutcome();
       }
     } else if (a.error) {
       if (a.associationHeaderValid) {
@@ -879,6 +882,36 @@ void PianoWifi80211::syncDriverAvailable(bool force, const char *why)
   IOLockUnlock(fLock);
   if (!force && posted == (usable ? 1 : 0)) return;
   postDriverAvailable(usable, force ? why : usable ? "the radio reached level 7" : "the radio went down");
+}
+
+// ASSOCIATE returns when the join has an outcome (AUTOJOIN-ON.md, wifi-aj2 2026-11-20): airportd logs SET20's return as "Join
+// SUCCEEDED" and runs its next queued auto-join request at once (retry, login, hotspot, known-network-added triggers). Our station
+// needs about a second (device, peer, authentication, association, the 4-way port) before the network is current, so that request
+// saw no current network, passed airportd's AlreadyAssoc gate, and its own association began with "Will disassociate due to new
+// association request": every join was cut ~170 ms in (generations 4..11+ after a toggle). Waiting here, outside every lock, until
+// the station is authorized, failed, superseded or powered off (bounded) lets the next request find the network current.
+void PianoWifi80211::waitAssociationOutcome()
+{
+  struct piano_wifi_assoc_snapshot raw = {};
+  if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) return;
+  const uint32_t generation = raw.join_generation;
+  uint64_t start = 0, now = 0, elapsedNs = 0;
+  clock_get_uptime(&start);
+  const char *outcome = "timeout";
+  for (;;) {
+    IOSleep(kAssociateWaitStepMs);
+    bzero(&raw, sizeof raw);
+    if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) { outcome = "no snapshot"; break; }
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now - start, &elapsedNs);
+    if (raw.join_generation != generation) { outcome = "superseded"; break; }
+    if (!raw.power) { outcome = "power off"; break; }
+    if (raw.authorized) { outcome = "authorized"; break; }
+    if (raw.associate_result == 2 || raw.associate_result == 9) { outcome = raw.associate_result == 9 ? "timed out" : "failed"; break; }
+    if (elapsedNs >= uint64_t(kAssociateWaitMs) * 1000000ull) { outcome = raw.associated ? "associated, not yet authorized" : "timeout"; break; }
+  }
+  note80211("%s: PianoWifiAssociateWaitV1 generation %u: %s after %llu ms", fIfName, unsigned(generation), outcome,
+            (unsigned long long)(elapsedNs / 1000000ull));
 }
 
 // One completion per accepted scan: an earlier one still waiting is posted at once (thread_call_cancel is true only for a call
