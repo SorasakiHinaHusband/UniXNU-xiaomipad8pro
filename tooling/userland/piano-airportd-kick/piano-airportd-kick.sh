@@ -9,7 +9,7 @@
 # The gate: the kernel argument piano-wifi-apple80211 as PianoWifi read it (its sysctl machdep.piano_wifi_apple80211: boot 10q
 # showed that an argument of the ADT's tail is not in kern.bootargs). Without it the job ends at once; when Wi-Fi does not come
 # up within 600 s it ends having done nothing. After the restart, publish a
-# boot-specific receipt for the CoreWLAN fallback.
+# boot-specific receipt and start the CoreWLAN fallback.
 say() {
   /usr/bin/logger -t piano-airportd-kick "$*"
   echo "piano-airportd-kick: $(/bin/date +%T) $*" > /dev/console 2> /dev/null
@@ -19,6 +19,10 @@ case "$(/usr/sbin/sysctl -n machdep.piano_wifi_apple80211 2> /dev/null)" in
 [1-9]*) ;;
 *) exit 0 ;;
 esac
+boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || exit 1
+[ -n "$boot" ] || exit 1
+marker=/var/run/piano-airportd-kick
+[ "$(/bin/cat "$marker" 2>/dev/null)" != "$boot" ] || exit 0
 # the controller answers and its interface has a name (the BSD name on PianoWifi80211's interface child)
 bsd=""
 i=0
@@ -41,11 +45,22 @@ rc=$?
 sleep 10
 say "kickstart -k returned $rc; airportd now:$(state)"
 [ "$rc" -eq 0 ] || exit "$rc"
-boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || exit 1
-[ -n "$boot" ] || exit 1
 receipt=$(/usr/bin/mktemp /var/run/piano-airportd-kick.XXXXXXXX) || exit 1
-if ! printf '%s\n' "$boot" > "$receipt" || ! /bin/mv -f "$receipt" /var/run/piano-airportd-kick; then
+if ! printf '%s\n' "$boot" > "$receipt" || ! /bin/mv -f "$receipt" "$marker"; then
   /bin/rm -f "$receipt"
   exit 1
 fi
 say "PianoWifiAirportdKickV1 complete"
+# On first provisioning, the staged job may still be getting registered.
+# kickstart without -k will never interrupt an already running fallback.
+i=0
+while [ "$i" -lt 30 ]; do
+  if /bin/launchctl kickstart system/com.unixnu.piano-wifi-join >/dev/null 2>&1; then
+    say "PianoWifiAirportdKickV1 helper=started"
+    exit 0
+  fi
+  sleep 1
+  i=$((i + 1))
+done
+say "PianoWifiAirportdKickV1 helper=unavailable"
+exit 1

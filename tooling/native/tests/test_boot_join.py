@@ -10,6 +10,54 @@ from pathlib import Path
 W = Path(__file__).resolve().parents[3]
 
 class BootJoinTests(unittest.TestCase):
+    def test_airportd_kick_starts_fallback_once(self):
+        source = (W / 'tooling/userland/piano-airportd-kick/piano-airportd-kick.sh').read_text()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            calls = path / 'calls'
+            marker = path / 'marker'
+            scripts = {
+                'sysctl': 'case "$2" in\n  machdep.*) echo 1 ;;\n  *) echo fixture-boot ;;\nesac',
+                'ioreg': """echo '"piano-wifi-apple80211-answering"'
+echo '"BSD Name" = "en0"'""",
+                'launchctl': f"""echo "$*" >> '{calls}'
+case "$1 $2" in
+  'kickstart -k') test ! -e '{path / 'fail-kick'}' ;;
+  'kickstart system/com.unixnu.piano-wifi-join') test -f '{marker}' ;;
+  'print system/com.apple.airportd') echo '   pid = 42' ;;
+  *) exit 1 ;;
+esac""",
+            }
+            for name, script in scripts.items():
+                tool = path / name
+                tool.write_text(f'#!/bin/sh\n{script}\n')
+                tool.chmod(0o755)
+            for original, replacement in {
+                '/usr/sbin/sysctl': path / 'sysctl',
+                '/usr/sbin/ioreg': path / 'ioreg',
+                '/bin/launchctl': path / 'launchctl',
+                '/var/run/piano-airportd-kick': marker,
+                '/dev/console': path / 'console',
+                '/usr/bin/logger': '/usr/bin/true',
+                'sleep ': '/usr/bin/true ',
+            }.items():
+                self.assertIn(original, source)
+                source = source.replace(original, str(replacement))
+            script = path / 'kick.sh'
+            script.write_text(source)
+            (path / 'fail-kick').touch()
+            self.assertNotEqual(subprocess.run(['/bin/sh', str(script)], capture_output=True).returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertNotIn('kickstart system/com.unixnu.piano-wifi-join', calls.read_text())
+            (path / 'fail-kick').unlink()
+            calls.unlink()
+            result = subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True, text=True)
+            self.assertIn('PianoWifiAirportdKickV1 helper=started', result.stdout)
+            self.assertEqual(marker.read_text(), 'fixture-boot\n')
+            subprocess.run(['/bin/sh', str(script)], check=True, capture_output=True)
+            self.assertEqual([line for line in calls.read_text().splitlines() if line.startswith('kickstart ')],
+                             ['kickstart -k system/com.apple.airportd', 'kickstart system/com.unixnu.piano-wifi-join'])
+
     def test_native_profile_idempotence(self):
         # A real CoreWiFi external-form round trip backed by a synthetic store.
         # The test never opens the host's Keychain or sends airportd a write.

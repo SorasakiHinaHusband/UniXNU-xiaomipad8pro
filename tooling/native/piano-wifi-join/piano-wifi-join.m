@@ -96,7 +96,7 @@ static int safe_open(const char *path)
 }
 
 enum {
-  KickWaitSeconds = 620, BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25,
+  BootJoinDeadline = 180, NativeJoinGraceSeconds = 35, ProvisionDeadline = 25,
   LocationWaitSeconds = 60, LocationStableSeconds = 10, LocationQuerySeconds = 8
 };
 static const char kick_receipt[] = "/var/run/piano-airportd-kick";
@@ -543,18 +543,9 @@ int main(int argc, char **argv)
   if (fd == -2) return finish(0, "profile-missing");
   if (fd < 0) return finish(1, "profile-open");
   char boot[64];
-  if (!boot_uuid(boot, sizeof boot)) {
+  if (!boot_uuid(boot, sizeof boot) || !kick_completed(kick_receipt, boot)) {
     close(fd);
-    return finish(1, "boot-uuid");
-  }
-  unsigned wait = 0;
-  while (wait < KickWaitSeconds && !kick_completed(kick_receipt, boot)) {
-    sleep(1);
-    ++wait;
-  }
-  if (wait == KickWaitSeconds) {
-    close(fd);
-    return finish(1, "airportd-kick-timeout");
+    return finish(1, "airportd-kick-missing");
   }
   const uint64_t kick_time = monotonic_seconds();
   timeline("airportd kick=complete");

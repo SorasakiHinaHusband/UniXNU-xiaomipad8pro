@@ -10,8 +10,6 @@
   <array>
     <string>/usr/local/libexec/piano-wifi-join</string>
   </array>
-  <key>RunAtLoad</key>
-  <true/>
   <key>StandardOutPath</key>
   <string>/private/var/log/piano-wifi-join.log</string>
   <key>StandardErrorPath</key>
