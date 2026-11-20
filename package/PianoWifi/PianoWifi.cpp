@@ -4623,6 +4623,8 @@ void level8Status(uint64_t now, const char *why)
        "exceptions %u (push %u, error %u); refill tail %u",
        why, st.rxRecycled, st.rxRecycleFull, st.relEntries, st.relDelivered, st.relRecycled, st.relOther, st.excEntries,
        st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
+  note("level 8 %s: PianoWifiRxRecycleV1 exceptions %u: link descriptors %u (foreign %u), buffers posted again %u, not ours %u",
+       why, st.excEntries, st.excLinks, st.excLinkForeign, st.excBufRecycled, st.excBufOther);
   note("level 8 %s: sent %u frames (%u bytes, %u EAPOL); completions %u (acked %u, not %u, last reason %u, firmware %u, "
        "other %u, bad cookie %u)",
        why, st.txFrames, st.txBytes, st.txEapol, st.txCompletions, st.txAcked, st.txNotAcked, st.lastTxReason, st.txFwReleased,
