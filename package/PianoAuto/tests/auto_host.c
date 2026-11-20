@@ -281,13 +281,15 @@ static void test_rotate(void)
 
 static void test_android_als(void)
 {
-    const uint32_t lux[] = {82, 771, 1202, 2058, 5100, 8900, 11165};
-    const uint32_t nits[] = {101, 178, 236, 343, 465, 560, 600};
+    const uint32_t lux[] = {2, 4, 6, 8, 10, 15, 20, 25, 30, 82, 771, 1202, 2058, 5100, 8900, 11165};
+    const uint32_t nits[] = {6, 15, 21, 27, 36, 52, 71, 87, 97, 101, 178, 236, 343, 465, 560, 600};
     for (unsigned i = 0; i < sizeof lux / sizeof lux[0]; ++i)
         CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, lux[i]) == pa_sdr_permille(pa_sdr_code(nits[i] << 16)));
-    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 921, 0) == pa_sdr_permille(921));
-    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, 41) ==
-          pa_sdr_permille(pa_sdr_code((pa_sdr_fixed_for_code(178) + (101u << 16) + 1) / 2)));
+    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 921, 0) == pa_sdr_permille(921));   /* never below the lit floor */
+    /* 2026-11-21: 0 lux is Android's 3.5 nits (above the 178 floor's 2.29), 1 lux 4.5; 56 lux halfway between 30 (97) and 82 (101) */
+    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, 0) == pa_sdr_permille(pa_sdr_code(7u << 15)) && pa_sdr_code(7u << 15) > 178);
+    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, 1) == pa_sdr_permille(pa_sdr_code(9u << 15)));
+    CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, 56) == pa_sdr_permille(pa_sdr_code(99u << 16)));
     CHECK(ps_als_target_permille(PS_ALS_REFERENCE, 178, 99999) == pa_sdr_permille(1952));
     CHECK(ps_als_target_permille(PS_ALS_LEGACY, 921, 200) == ps_als_curve_permille(200));
 
