@@ -118,6 +118,13 @@ int32_t audio_volume_q15(int percent);
 int32_t audio_ceiling_db(unsigned db);
 
 /* ---- the live paths */
+/* Speaker protection's larger state (the parsed private files and this start's plan with its steps): the owner's allocation, kept
+ * for the boot (inside AudioLive it would take that past the kernel's 16 KiB typed allocation). */
+typedef struct {
+    SpkProt prot;
+    SpkPlan plan;
+} AudioLiveSpk;
+
 typedef struct {
     uint32_t level;                      /* 8, 9 or 10 (others are clamped) */
     unsigned gain;                       /* the amplifiers' gain while playing: at most 160 at level 8, FS19XX_GAIN_CAP from 9 */
@@ -128,7 +135,8 @@ typedef struct {
     int mic;                             /* level 10: the Mic's capture path (0: the Mic stays silent) */
     int mic_route, mic_diag;
     void (*mic_route_apply)(int route, uint32_t generation); /* owner only; no MMIO */
-    int spk_prot;                        /* piano-audio-spk: speaker protection asked for from the first start (level 9 and up) */
+    int spk_prot;                        /* piano-audio-spk: speaker protection asked for from the first start */
+    AudioLiveSpk *spk_state;             /* its state, the owner's (zeroed, kept for the boot); null: passthrough only */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -206,8 +214,7 @@ typedef struct {
     int32_t peak;
     uint32_t spk_starts, spk_stops, periods, sound_periods, underruns, skipped, drops, repeats;
     /* ---- speaker protection (AudioSpkProt.h) */
-    SpkProt prot;                        /* the private files as parsed at init */
-    SpkPlan pplan;                       /* this start's plan (its steps live here) */
+    AudioLiveSpk *spk;                   /* the private files as parsed at init, this start's plan (cfg.spk_state) */
     int prot_ready;                      /* both files valid: protection can run */
     int prot_active;                     /* this start of the speaker path is the protection pair */
     int prot_fallback;                   /* an FSADSP error while it ran: down, then back on the passthrough graph */

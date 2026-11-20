@@ -495,6 +495,10 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_diag = a->micRouteDiag;
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
     lc.spk_prot = a->spk ? 1 : 0;
+    static AudioLiveSpk *spkState;   // kept for the boot, as gLive
+    if (!spkState) spkState = IOMallocType(AudioLiveSpk);
+    if (spkState) bzero(spkState, sizeof *spkState);
+    lc.spk_state = spkState;
     gLive = IOMallocType(AudioLive);
     if (!gLive || audio_live_init(gLive, &lc, &gSession, gShared)) {
         piano_audio_log("live: levels 8-10 not run: %s", gLive ? "the session did not hand the hardware over" : "no memory");

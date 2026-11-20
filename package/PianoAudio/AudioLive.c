@@ -5,6 +5,9 @@
 #include "PianoGpr.h"
 
 #define LOG(l, ...) do {if ((l)->ops.log) (l)->ops.log((l)->ops.ctx, __VA_ARGS__);} while (0)
+/* The kext allocates both with IOMallocType, whose typed zones end at 16 KiB: a host build fails here first. */
+_Static_assert(sizeof(AudioLive) <= 16u * 1024u, "AudioLive exceeds IOMallocType's 16 KiB");
+_Static_assert(sizeof(AudioLiveSpk) <= 16u * 1024u, "AudioLiveSpk exceeds IOMallocType's 16 KiB");
 
 static void zero(void *p, uint32_t n) {for (uint32_t i = 0; i < n; ++i) ((uint8_t *)p)[i] = 0;}
 static unsigned rd32(const uint8_t *p) {return (unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;}
@@ -484,7 +487,7 @@ static void stream_fault(AudioLive *l, int reason, uint32_t now);
 static void live_report(AudioLive *l)
 {
     SpkLive v;
-    const uint8_t *slot = l->ops.dma + AUDIO_DMA_PARAM + l->pplan.live_slot;
+    const uint8_t *slot = l->ops.dma + AUDIO_DMA_PARAM + l->spk->plan.live_slot;
     if (spk_live_parse(slot, &v)) {
         if (!l->live_bad)
             LOG(l, PROT " live: the answer's header is not the live data's (iid %#x param %#x size %u error %#x)", rd32(slot), rd32(slot + 4),
@@ -496,7 +499,7 @@ static void live_report(AudioLive *l)
     l->live_reads++;
     for (unsigned c = 0; c < 4; ++c) {
         const uint32_t mohm = (uint32_t)((uint64_t)v.re[c] * 1000u / 4096u);
-        const uint32_t pct = l->prot.re25[c] ? (uint32_t)((uint64_t)v.re[c] * 1000u / l->prot.re25[c]) : 0;
+        const uint32_t pct = l->spk->prot.re25[c] ? (uint32_t)((uint64_t)v.re[c] * 1000u / l->spk->prot.re25[c]) : 0;
         LOG(l, PROT " live ch%u slot %u r0 %u.%03u ohm (%u.%u%% of Re25) f0 %u Hz q %u t %u w2 %#x w5 %#x read %u vbat %u uV", c, c,
             mohm / 1000u, mohm % 1000u, pct / 10u, pct % 10u, v.f0[c] / 256u, v.q[c], v.temp[c], v.w2[c], v.w5[c], l->live_reads, l->vbat_uv);
     }
@@ -532,9 +535,9 @@ static void mon_tick(AudioLive *l, uint32_t now)
         l->vbat_noted = 1;
         LOG(l, PROT ": no battery voltage from PianoPower's gauge (read %u uV): not sent; the live data still read", uv);
     }
-    spk_live_stage(l->ops.dma + AUDIO_DMA_PARAM + l->pplan.live_slot);
+    spk_live_stage(l->ops.dma + AUDIO_DMA_PARAM + l->spk->plan.live_slot);
     if (l->ops.publish) l->ops.publish(l->ops.ctx);
-    l->mon.live_address = spk_plan_address(&l->pplan, l->pplan.live_slot);
+    l->mon.live_address = spk_plan_address(&l->spk->plan, l->spk->plan.live_slot);
     l->mon.handle = l->splan.seq.handle;
     unsigned count;
     const ArStep *steps = spk_monitor_steps(l->mon.vbat_uv != 0, &count);
@@ -569,8 +572,8 @@ static void spk_begin(AudioLive *l, uint32_t now)
     l->prot_active = prot_choose(l);
     if (l->prot_active) {
         const char *why = 0;
-        l->pplan.base = l->speaker;
-        if (spk_plan_init(&l->pplan, &l->prot, l->ops.dma + AUDIO_DMA_PARAM, l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ?
+        l->spk->plan.base = l->speaker;
+        if (spk_plan_init(&l->spk->plan, &l->spk->prot, l->ops.dma + AUDIO_DMA_PARAM, l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ?
                           AUDIO_DMA_PARAM_BYTES : 0, &why)) {
             l->prot_active = 0;
             l->prot_failed = 1;
@@ -584,9 +587,9 @@ static void spk_begin(AudioLive *l, uint32_t now)
         l->prot_starts++;
         LOG(l, PROT ": start %u: the stock protection pair: V/I graph %#x first, then %#x with SP_RX %#x linked to SP_TX %#x; %u ACDB "
             "parameters (%u bytes) in %u packets, %u out of band; Re25 x4; gain cap %u", l->prot_starts, SPK_SG_VI, SPK_SG_DEV,
-            SPK_IID_SP_RX, SPK_IID_SP_TX, l->prot.count, l->prot.bytes, l->pplan.chunks, l->pplan.oob_chunks, live_gain_cap(l));
+            SPK_IID_SP_RX, SPK_IID_SP_TX, l->spk->prot.count, l->spk->prot.bytes, l->spk->plan.chunks, l->spk->plan.oob_chunks, live_gain_cap(l));
         LOG(l, "live: speaker: sound from the Speaker device: the speaker-protection plan (start %u)", l->spk_starts);
-        plan_start(l, &l->splan, "speaker-protection", l->pplan.steps, l->pplan.count, 0x8000 + (l->sleep_generation << 16), &l->pplan);
+        plan_start(l, &l->splan, "speaker-protection", l->spk->plan.steps, l->spk->plan.count, 0x8000 + (l->sleep_generation << 16), &l->spk->plan);
     } else {
         unsigned count;
         const ArStep *steps = ar_speaker_steps(&count);
@@ -1384,10 +1387,13 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     }
     /* speaker protection: the private files checked once; asked for by the boot argument (the sysctl may ask later) */
     const char *why = l->ops.spk_why;
-    if (l->ops.spk_params && l->ops.spk_re25) {
+    l->spk = c->spk_state;
+    if (!l->spk) {
+        why = "no memory for its state";
+    } else if (l->ops.spk_params && l->ops.spk_re25) {
         why = 0;
-        if (!spk_params_parse(&l->prot, l->ops.spk_params, l->ops.spk_params_bytes, &why) &&
-            !spk_re25_parse(&l->prot, l->ops.spk_re25, l->ops.spk_re25_bytes, &why))
+        if (!spk_params_parse(&l->spk->prot, l->ops.spk_params, l->ops.spk_params_bytes, &why) &&
+            !spk_re25_parse(&l->spk->prot, l->ops.spk_re25, l->ops.spk_re25_bytes, &why))
             l->prot_ready = 1;
     } else if (!why) {
         why = "no private files (PianoAudio/spk-prot.bin and spk-re25.bin)";
@@ -1396,8 +1402,8 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     store(&sh->spk_prot, c->spk_prot ? 1 : 0);
     l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
     if (l->prot_ready)
-        LOG(l, PROT ": ready: %u ACDB parameters (%u bytes) of the V/I and speaker graphs, Re25 for four channels; %s", l->prot.count,
-            l->prot.bytes, c->spk_prot ? "on from the first start (piano-audio-spk=1)" : "off (piano-audio-spk=0; machdep.piano_audio_spk=1 turns it on)");
+        LOG(l, PROT ": ready: %u ACDB parameters (%u bytes) of the V/I and speaker graphs, Re25 for four channels; %s", l->spk->prot.count,
+            l->spk->prot.bytes, c->spk_prot ? "on from the first start (piano-audio-spk=1)" : "off (piano-audio-spk=0; machdep.piano_audio_spk=1 turns it on)");
     else if (c->spk_prot)
         LOG(l, PROT ": OFF: %s; the speaker plays through the passthrough graph", why);
     return 0;

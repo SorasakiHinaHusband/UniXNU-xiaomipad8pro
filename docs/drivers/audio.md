@@ -859,7 +859,7 @@ stays what it was (the path off for the boot).
 
 | File | Made by | Content |
 |---|---|---|
-| `PianoAudio/spk-prot.bin` | `tooling/audio/spk-prot-extract.py params ACDB OUT` from the owner's `odm/etc/acdbdata/Mi/Mi_acdb_cal.acdb` | 'PSPK', version 1, count, 0; per parameter u32 instance, u32 parameter id, u32 size, data padded to 4 (27 parameters, 6400 bytes for this ACDB) |
+| `PianoAudio/spk-prot.bin` | `tooling/audio/spk-prot-extract.py params ACDB OUT` from the owner's `odm/etc/acdbdata/Mi/Mi_acdb_cal.acdb` | 'PSPK', version 1, count, 0; per parameter u32 instance, u32 parameter id, u32 size, data padded to 4 (27 parameters, 6438 bytes, 6780-byte file for this ACDB; the 6180-byte SP_RX configuration out of band, the rest in two packets of 360 and 480 bytes) |
 | `PianoAudio/spk-re25.bin` | `tooling/audio/spk-prot-extract.py re25 fsalgo_rdc.bin OUT` from the owner's persist copy | 16 bytes: four u32 Re25 in Q12 (ohm x 4096), CH0..CH3 = TDM slots 0..3 |
 
 `tooling/k27/build-native-piano-audio.sh` pins and stages both when they are in `private/audio/` (or `PIANO_AUDIO_SPK_PARAMS`,

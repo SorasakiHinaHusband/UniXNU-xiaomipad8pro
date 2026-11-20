@@ -717,7 +717,10 @@ static void run(const struct Scenario *sc)
     if (sc->gain) lc.gain = sc->gain;
     if (sc->ceiling_db) lc.ceiling = audio_ceiling_db(sc->ceiling_db);
     if (sc->idle_ms) lc.idle_ms = sc->idle_ms;
+    static AudioLiveSpk spk_state;
+    memset(&spk_state, 0, sizeof spk_state);
     lc.spk_prot = g_spk;
+    lc.spk_state = &spk_state;
     if (g_setup) g_setup(&lc);
     audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
     CHECK(audio_live_init(&live, &lc, &session, &sh) == 0);
