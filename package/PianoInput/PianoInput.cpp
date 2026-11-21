@@ -47,6 +47,7 @@
 #include "HidReports.h"
 #include "PowerKey.h"
 #include <PianoPowerContract.h>
+#include <PianoPerfInput.h>   // the input boost's event to PianoThermal (2026-11-22)
 #include <PianoDisplayFollow.h>
 
 using namespace pianoinput;
@@ -545,8 +546,13 @@ IOReturn PianoInput::setPowerState(unsigned long state, IOService *)
   return pianopower::kAckNow;
 }
 
+namespace {
+pianoperf::InputNotifier gPerfInput;   // PianoThermal's input boost (PianoPerfInput.h)
+}
+
 void PianoInput::send(uint8_t keys)
 {
+  gPerfInput.notify(pianoperf::kButtons);
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(&keys, kButtonsReportBytes, kIODirectionNone);
   const IOReturn rc = report ? fButtons->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);

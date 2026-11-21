@@ -123,6 +123,8 @@ struct Args {
   bool android, androidArmed;
   // the stock-level policy (Perf.h)
   uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC;
+  // the launch and input boosts (Perf.h; 2026-11-22 01:02) and the silicon gate of bursts and boosts
+  uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC;
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
 pianodisplay::Follow gDisplay;
@@ -203,6 +205,18 @@ void readArgs()
   gArgs.burstGapMs = clampU(bootArg("piano-cpufreq-burst-gap-ms", 500), 0, 60000);
   gArgs.skin = bootArg("piano-cpufreq-skin", 1) ? 1 : 0;
   gArgs.skinLimitC = clampU(bootArg("piano-cpufreq-skin-boost-limit", 48), 30, 60);
+  gArgs.boosts = bootArg("piano-cpufreq-boosts", 1) ? 1 : 0;
+  gArgs.launchMhz[0] = clampU(bootArg("piano-cpufreq-launch0", 2745), 0, 5000);
+  gArgs.launchMhz[1] = clampU(bootArg("piano-cpufreq-launch1", 4089), 0, 5000);
+  gArgs.launchMs = clampU(bootArg("piano-cpufreq-launch-ms", 1500), 0, 5000);
+  gArgs.inputMhz[0] = clampU(bootArg("piano-cpufreq-input0", 1152), 0, 5000);
+  gArgs.inputMhz[1] = clampU(bootArg("piano-cpufreq-input1", 1958), 0, 5000);
+  gArgs.inputMs = clampU(bootArg("piano-cpufreq-input-ms", 200), 0, 5000);
+  gArgs.gpuLaunchMhz = clampU(bootArg("piano-cpufreq-gpu-launch-mhz", 443), 0, 1100);
+  gArgs.gpuInputMhz = clampU(bootArg("piano-cpufreq-gpu-input-mhz", 0), 0, 1100);
+  gArgs.launchWatch = bootArg("piano-cpufreq-launch-watch", 1) ? 1 : 0;
+  gArgs.gateOpenC = clampU(bootArg("piano-cpufreq-gate-open", 75), 40, 95);
+  gArgs.gateEndC = clampU(bootArg("piano-cpufreq-gate-end", 85), 40, 95);
   // Poll tiers (Cluster.h pollTier): 10 ms near a trip (Linux: 10 ms while passive), 250 ms from 70 C, the base below.
   gArgs.fastMs = clampU(bootArg("piano-thermal-fast-ms", 10), 5, 1000);
   gArgs.warmMs = clampU(bootArg("piano-thermal-warm-ms", 250), 10, 10000);
@@ -541,9 +555,12 @@ int sysctlPerfState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   if (req->newptr) return EPERM;
   char buf[1600];
   const uint64_t now = nowNs();
-  int at = snprintf(buf, sizeof buf, "perf=%u tick_ms=%u skin_mC=%d skin_valid=%u skin_inputs=%#x uptime_ms=%llu",
+  int at = snprintf(buf, sizeof buf, "perf=%u tick_ms=%u skin_mC=%d skin_valid=%u skin_inputs=%#x uptime_ms=%llu boost=%u "
+                    "launches=%u inputs=%u launch_boosts=%u input_boosts=%u launch_boost_ms=%llu input_boost_ms=%llu gpu_boost=%u/%u/%u",
                     __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE), __atomic_load_n(&gPerfTickMs, __ATOMIC_ACQUIRE), gSkinMilli,
-                    gSkinValid, gSkinUsed, (unsigned long long)(now / 1000000ull));
+                    gSkinValid, gSkinUsed, (unsigned long long)(now / 1000000ull), __atomic_load_n(&gBoost, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&gLaunches, __ATOMIC_RELAXED), __atomic_load_n(&gInputs, __ATOMIC_RELAXED), gBoostStarts[2],
+                    gBoostStarts[1], (unsigned long long)gBoostMs[2], (unsigned long long)gBoostMs[1], gGpuCalls, gGpuTaken, gGpuState);
   for (unsigned d = 0; d < kDomains && __atomic_load_n(&gPerfReady, __ATOMIC_ACQUIRE); ++d) {
     const PerfDomain &pd = gPd[d];
     if (!pd.count) continue;
@@ -584,6 +601,101 @@ void registerPerf()
 }
 
 uint32_t curTickMs() { return __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE) ? __atomic_load_n(&gPerfTickMs, __ATOMIC_ACQUIRE) : gArgs.tickMs; }
+
+// ------------------------------------------------------------------------------------------------------------- boosts (Perf.h)
+// The launch boost's event: an exec of an app bundle's executable (a KAUTH_SCOPE_FILEOP listener); the input boost's: a HID report
+// of PianoTouch, PianoKeyboard, PianoDwc3 or PianoInput (PianoPerfInput.h: callPlatformFunction("piano-perf-input", source) on this
+// service). Both only stamp a time and wake the thread when no boost of that kind holds; the thread applies them.
+// machdep.piano_cpufreq_boost (root, 0/1; boot default piano-cpufreq-boosts) switches them for a same-boot A/B.
+uint32_t gBoost = 1;
+uint64_t gLaunchNs, gInputNs;
+uint32_t gLaunches, gInputs, gInputBy[5], gLaunchIgnored;
+char gLastApp[40];
+uint64_t gBoostMs[3];               // ms the CPU spent boosted, by perf::BoostKind
+uint32_t gBoostStarts[3];
+uint32_t gGpuCalls, gGpuTaken, gGpuState;   // gGpuState: 0 not asked yet, 1 taken, 2 unsupported (no more calls), 3 no PianoA830
+kauth_listener_t gLaunchListener;
+struct sysctl_oid gBoostOid;
+void (*gKick)(void);                // the thread's wake-up (set in start)
+
+int sysctlBoost(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
+{
+  if (req->newptr && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
+  if (req->newptr && req->newlen != sizeof(int)) return EINVAL;
+  int value = int(__atomic_load_n(&gBoost, __ATOMIC_ACQUIRE));
+  const int status = sysctl_handle_int(oid, &value, 0, req);
+  if (status || !req->newptr) return status;
+  if (value != 0 && value != 1) return EINVAL;
+  __atomic_store_n(&gBoost, uint32_t(value), __ATOMIC_RELEASE);
+  return 0;
+}
+
+void perfInputEvent(uint32_t source)
+{
+  const uint64_t now = nowNs();
+  const uint64_t before = __atomic_exchange_n(&gInputNs, now, __ATOMIC_ACQ_REL);
+  __atomic_fetch_add(&gInputs, 1u, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&gInputBy[source < 5 ? source : 0], 1u, __ATOMIC_RELAXED);
+  if ((!before || now - before > uint64_t(gArgs.inputMs) * 1000000ull) && gKick) gKick();
+}
+
+int launchListener(kauth_cred_t, void *, kauth_action_t action, uintptr_t, uintptr_t arg1, uintptr_t, uintptr_t)
+{
+  if (action != KAUTH_FILEOP_EXEC || !arg1) return KAUTH_RESULT_DEFER;
+  const char *path = reinterpret_cast<const char *>(arg1);
+  if (!perf::isAppLaunchPath(path)) return KAUTH_RESULT_DEFER;
+  char name[sizeof gLastApp];
+  perf::appName(path, name, sizeof name);
+  memcpy(gLastApp, name, sizeof gLastApp);   // for the log only; a racing writer can only mix two names
+  __atomic_store_n(&gLaunchNs, nowNs(), __ATOMIC_RELEASE);
+  __atomic_fetch_add(&gLaunches, 1u, __ATOMIC_RELAXED);
+  if (gKick) gKick();
+  return KAUTH_RESULT_DEFER;
+}
+
+// PianoA830's boost hook (CPU-PERF.md section 7): callPlatformFunction("piano-gpu-boost", floor MHz, duration ms, reason) on its
+// service; kIOReturnUnsupported ends the calls for this boot.
+const OSSymbol *gGpuBoostSym;
+void gpuBoost(uint32_t mhz, uint32_t ms, uint32_t reason)
+{
+  if (gGpuState == 2) return;
+  if (!gGpuBoostSym) gGpuBoostSym = OSSymbol::withCStringNoCopy("piano-gpu-boost");
+  OSDictionary *match = IOService::serviceMatching("PianoA830");
+  IOService *gpu = match ? IOService::copyMatchingService(match) : nullptr;
+  OSSafeReleaseNULL(match);
+  ++gGpuCalls;
+  if (!gpu || !gGpuBoostSym) {
+    if (gGpuState != 3) note("boost: piano-gpu-boost %u MHz %u ms: no PianoA830 service (the GPU is not boosted)", mhz, ms);
+    gGpuState = 3;
+    OSSafeReleaseNULL(gpu);
+    return;
+  }
+  const IOReturn r = gpu->callPlatformFunction(gGpuBoostSym, false, reinterpret_cast<void *>(uintptr_t(mhz)),
+                                               reinterpret_cast<void *>(uintptr_t(ms)), reinterpret_cast<void *>(uintptr_t(reason)), nullptr);
+  gpu->release();
+  if (r == kIOReturnSuccess) {
+    if (gGpuState != 1 || gGpuTaken < 3) note("boost: piano-gpu-boost %u MHz for %u ms (reason %u): taken by PianoA830", mhz, ms, reason);
+    gGpuState = 1;
+    ++gGpuTaken;
+  } else {
+    note("boost: piano-gpu-boost %u MHz for %u ms (reason %u): PianoA830 answered %#x: %s", mhz, ms, reason, r,
+         r == kIOReturnUnsupported ? "not implemented, no more GPU boost calls this boot" : "refused");
+    if (r == kIOReturnUnsupported) gGpuState = 2;
+  }
+}
+
+void registerBoost()
+{
+  gBoostOid.oid_parent = &sysctl__machdep_children;
+  gBoostOid.oid_number = OID_AUTO;
+  gBoostOid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+  gBoostOid.oid_name = "piano_cpufreq_boost";
+  gBoostOid.oid_handler = sysctlBoost;
+  gBoostOid.oid_fmt = "I";
+  gBoostOid.oid_descr = "the launch and input boosts of piano_cpufreq_perf >= 1: 0 off, 1 on; root writes";
+  gBoostOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gBoostOid);
+}
 
 // Probe an absent publisher at most once per second and drop a detached service.
 void refreshService(IOService *&service, const char *name, uint64_t now, uint64_t &next)
@@ -748,6 +860,14 @@ class PianoThermal : public IOService {
   int32_t skinIn_[perf::kSkinInputs] = {};
   uint32_t skinInMask_ = 0, perfSeen_ = 9, perfChanges_ = 0;
   void cpuPerfReport();
+  // boosts: per cluster whether the last decision applied one (the silicon gate's hysteresis), the kind in force, the launch
+  // event last handed to the GPU, the time of the last poll (boosted ms), the GPU boost's end (for a cancel under Power Saver)
+  bool boostOn_[kDomains] = {};
+  perf::BoostKind boostKind_ = perf::BoostKind::none;
+  uint64_t gpuLaunchSeen_ = 0, gpuInputAt_ = 0, gpuUntilNs_ = 0, boostTickNs_ = 0, boostNs_[3] = {};
+ public:
+  void kick();
+ private:
   // system sleep: the thread parks between kOff and kOn (SleepPlan says what each does)
   IOLock *sleepLock_ = nullptr;
   SleepPlan sleep_;
@@ -765,11 +885,33 @@ class PianoThermal : public IOService {
 
 OSDefineMetaClassAndStructors(PianoThermal, IOService)
 
+namespace {
+PianoThermal *gSelfThermal;
+void kickThermal()
+{
+  if (gSelfThermal) gSelfThermal->kick();
+}
+}
+
+// An input or launch event: end the thread's wait now (a spurious wake-up only runs one more poll).
+void PianoThermal::kick()
+{
+  if (!sleepLock_) return;
+  IOLockLock(sleepLock_);
+  IOLockWakeup(sleepLock_, &sleepWanted_, false);
+  IOLockUnlock(sleepLock_);
+}
+
 // "piano-thermal-suspend-prepare" (param1: int *, the result, may be null) and "piano-thermal-suspend-finish": the suspend hooks
 // above for a caller that does not link against this kext.
 IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2,
                                             void *param3, void *param4)
 {
+  // PianoPerfInput.h: an input kext's HID report (param1 = the source); lock-free, any thread context but interrupts
+  if (functionName && functionName->isEqualTo("piano-perf-input")) {
+    perfInputEvent(uint32_t(uintptr_t(param1)));
+    return kIOReturnSuccess;
+  }
   if (functionName && functionName->isEqualTo("piano-thermal-suspend-prepare")) {
     const int r = piano_thermal_suspend_prepare();
     if (param1) *static_cast<int *>(param1) = r;
@@ -900,6 +1042,13 @@ bool PianoThermal::start(IOService *provider)
   // piano-thermal-irq=1 uses the threshold interrupts, so a sleep masks them (the hooks: lower only while it is live, as Linux)
   sleep_ = SleepPlan(gArgs.sleepMask != 0 || irq::hookLevel() != 0);
   registerService();
+  gSelfThermal = this;
+  gKick = &kickThermal;
+  if (gArgs.cpufreq == 3 && gArgs.launchWatch) {
+    gLaunchListener = kauth_listen_scope(KAUTH_SCOPE_FILEOP, launchListener, nullptr);
+    note("boost: launch events: %s", gLaunchListener ? "a KAUTH_SCOPE_FILEOP listener (exec of an app bundle's executable)"
+                                                     : "kauth_listen_scope FAILED: no launch boost");
+  }
   if (gArgs.androidArmed) registerAndroidCpu();
   else if (gArgs.android)
     note("PianoCpuAndroidV1 refused arm: mode=%u configured_cap_mhz=%u,%u explicit=%u,%u",
@@ -1178,6 +1327,13 @@ void PianoThermal::cpuStart()
     __atomic_store_n(&gPerf, gArgs.perf, __ATOMIC_RELEASE);
     __atomic_store_n(&gPerfReady, 1u, __ATOMIC_RELEASE);
     registerPerf();
+    __atomic_store_n(&gBoost, gArgs.boosts, __ATOMIC_RELEASE);
+    registerBoost();
+    note("boost: machdep.piano_cpufreq_boost now %u: launch %u / %u MHz (floor and ceiling) for %u ms, input %u / %u MHz floor for %u "
+         "ms after the last HID report, GPU floor %u MHz at a launch%s; only with perf policy >= 1 on Balanced, below %u C skin, and "
+         "while the cluster's hottest cpu zone is under %u C (an open boost ends at %u C) and its thermal limit is not active",
+         gArgs.boosts, gArgs.launchMhz[0], gArgs.launchMhz[1], gArgs.launchMs, gArgs.inputMhz[0], gArgs.inputMhz[1], gArgs.inputMs,
+         gArgs.gpuLaunchMhz, gArgs.gpuInputMhz ? " and on input" : "", gArgs.skinLimitC, gArgs.gateOpenC, gArgs.gateEndC);
     note("cpufreq: perf policy (machdep.piano_cpufreq_perf, now %u): 1 = caps by PianoPolicy's profile whatever the source, skin steps "
          "%s (virtual skin of the board thermistors, %s), burst %u / %u MHz for <= %u ms at a load onset (gap %u ms, none from %u C "
          "skin), tick %u ms (machdep.piano_cpufreq_perf_tick_ms), downs held %u ms; 0 = caps by the measured source, hard caps %u / "
@@ -1425,6 +1581,12 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     gSkinValid = skin_.valid;
     gSkinUsed = skin_.used;
   }
+  // The launch / input boost in force (Perf.h): only with perf policy >= 1, machdep.piano_cpufreq_boost, the Balanced caps (not
+  // Power Saver) and the skin under its boost limit; the silicon gate below decides per cluster.
+  const uint64_t launchNs = __atomic_load_n(&gLaunchNs, __ATOMIC_ACQUIRE), inputNs = __atomic_load_n(&gInputNs, __ATOMIC_ACQUIRE);
+  const bool boostsAllowed = perfMode && __atomic_load_n(&gBoost, __ATOMIC_ACQUIRE) && power == PowerSource::external &&
+      !(skin_.valid && skin_.milliC >= int32_t(gArgs.skinLimitC) * 1000);
+  const perf::BoostKind bk = boostsAllowed ? perf::boostAt(now, launchNs, gArgs.launchMs, inputNs, gArgs.inputMs) : perf::BoostKind::none;
   androidActive_ = selection.enabled;
   for (unsigned d = 0; d < kDomains; ++d) {
     if (gArgs.androidArmed) governor_[d].selectAndroidCap(selection.enabled ? kAndroidNextKhz[d] : 0);
@@ -1490,6 +1652,12 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       if (uint32_t(busy[d]) > busyMax_[d]) busyMax_[d] = uint32_t(busy[d]);
     }
     if (g.mode() == CpuMode::govern) {
+      // The silicon gate of bursts and boosts (perf-cpu1: a burst from the skin cap straight to 4089.6 MHz on a zone already at
+      // 78-87 C read 101.9 C one poll later): none opens while the cluster's hottest cpu zone is at piano-cpufreq-gate-open (75 C)
+      // or its thermal limit holds, an open one ends at piano-cpufreq-gate-end (85 C).
+      const int32_t hottest = thermal[d].valid ? thermal[d].hotExcessDeci + (gTrips.hotDeci ? gTrips.hotDeci : 1050) : 9999;
+      const bool gateOk = g.limit() >= g.count() - 1u &&
+          hottest < int32_t(boostOn_[d] || burst_[d].open() ? gArgs.gateEndC : gArgs.gateOpenC) * 10;
       if (perfMode) {
         const uint32_t skinKhz = gArgs.skin && !beyond ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
                                                                             d ? perf::kCluster1Steps : perf::kCluster0Steps,
@@ -1502,15 +1670,32 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
           bc.windowMs = gArgs.burstMs;
           bc.gapMs = gArgs.burstGapMs;
           bc.limitMilli = int32_t(gArgs.skinLimitC) * 1000;
-          burst_[d].tick(bc, now / 1000000ull, g.rawWant() > g.ceilingFor(power, skinKhz), power == PowerSource::external,
+          burst_[d].tick(bc, now / 1000000ull, g.rawWant() > g.ceilingFor(power, skinKhz), power == PowerSource::external && gateOk,
                          skin_.valid, skin_.milliC);
+        } else if (burst_[d].open() && !gateOk) {
+          perf::BurstConfig bc;
+          bc.khz = burstKhz;
+          burst_[d].tick(bc, now / 1000000ull, true, false, skin_.valid, skin_.milliC);   // the gate closes it at once
         }
+        // the boost: a floor (launch: floor and ceiling, the stock min = max pin) under the thermal limit
+        uint32_t boostFloor = 0, boostCap = 0;
+        if (bk != perf::BoostKind::none && gateOk) {
+          const uint32_t mhz = bk == perf::BoostKind::launch ? gArgs.launchMhz[d] : gArgs.inputMhz[d];
+          boostFloor = mhz * 1000u;
+          if (bk == perf::BoostKind::launch) boostCap = capKhz(mhz);
+        }
+        boostOn_[d] = boostFloor != 0;
+        g.setBoostFloor(boostFloor);
         g.setDownTicks(perf::downTicksFor(gArgs.perfDownMs, curTickMs()));
+        uint32_t perfKhz = beyond ? (burst_[d].open() ? burstKhz : 0) : perf::perfCapKhz(skinKhz, burst_[d].open(), burstKhz);
+        if (boostCap && perfKhz && boostCap > perfKhz) perfKhz = boostCap;
         if (beyond)   // no skin table: the sustained ceiling, the burst over it while open (unless the firmware refused that)
-          g.setRuntimeCaps(false, 0, burst_[d].open() ? burstKhz : 0, burst_[d].open() && !gAboveRefused[d]);
+          g.setRuntimeCaps(false, 0, perfKhz, burst_[d].open() && !gAboveRefused[d]);
         else
-          g.setRuntimeCaps(false, 0, perf::perfCapKhz(skinKhz, burst_[d].open(), burstKhz));
+          g.setRuntimeCaps(false, 0, perfKhz);
       } else {
+        boostOn_[d] = false;
+        g.setBoostFloor(0);
         g.setDownTicks(3);
         g.setRuntimeCaps(true, capKhz(gArgs.legacyCap[d]), 0);
       }
@@ -1523,6 +1708,32 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     gPd[d].step = skinCap_[d].step();
     gPd[d].bursts = burst_[d].windows();
     gPd[d].burstMs = burst_[d].openMs(now / 1000000ull);
+  }
+  // boost bookkeeping and the GPU's side (PianoA830 "piano-gpu-boost": a launch once per exec, input at most every 250 ms when
+  // piano-cpufreq-gpu-input-mhz is given, a cancel when the boosts stop being allowed while one may still run)
+  {
+    const bool any = boostOn_[0] || boostOn_[1];
+    const perf::BoostKind applied = any ? bk : perf::BoostKind::none;
+    if (applied != perf::BoostKind::none && applied != boostKind_) ++gBoostStarts[unsigned(applied)];
+    if (boostTickNs_ && now > boostTickNs_ && boostKind_ != perf::BoostKind::none) {
+      boostNs_[unsigned(boostKind_)] += now - boostTickNs_;
+      gBoostMs[unsigned(boostKind_)] = boostNs_[unsigned(boostKind_)] / 1000000ull;
+    }
+    boostTickNs_ = now;
+    boostKind_ = applied;
+    if (bk == perf::BoostKind::launch && launchNs != gpuLaunchSeen_ && gArgs.gpuLaunchMhz) {
+      gpuLaunchSeen_ = launchNs;
+      gpuBoost(gArgs.gpuLaunchMhz, gArgs.launchMs, 1);
+      gpuUntilNs_ = now + uint64_t(gArgs.launchMs) * 1000000ull;
+    } else if (bk == perf::BoostKind::input && gArgs.gpuInputMhz && now - gpuInputAt_ >= 250000000ull) {
+      gpuInputAt_ = now;
+      gpuBoost(gArgs.gpuInputMhz, gArgs.inputMs, 2);
+      gpuUntilNs_ = now + uint64_t(gArgs.inputMs) * 1000000ull;
+    }
+    if (!boostsAllowed && gpuUntilNs_ > now && gGpuState == 1) {
+      gpuBoost(0, 0, 0);
+      gpuUntilNs_ = 0;
+    }
   }
   if (gArgs.androidArmed && !in.boost) {
     for (unsigned d = 0; d < kDomains; ++d)
@@ -1614,6 +1825,12 @@ void PianoThermal::cpuPerfReport()
               governor_[d].perfKhz() / 1000, burst_[d].windows(), (unsigned long long)burst_[d].openMs(nowMs));
   }
   note("%s", line);
+  note("[%us] boost: %s; launches %u (last %s, %u not apps), input reports %u (touch %u, keyboard %u, pointer %u, buttons %u); "
+       "boosted: launch %u x %llu ms, input %u x %llu ms; GPU boost calls %u, taken %u (%s)", upS(),
+       __atomic_load_n(&gBoost, __ATOMIC_ACQUIRE) ? "on" : "off (machdep.piano_cpufreq_boost=0)", __atomic_load_n(&gLaunches, __ATOMIC_RELAXED),
+       gLastApp[0] ? gLastApp : "-", gLaunchIgnored, __atomic_load_n(&gInputs, __ATOMIC_RELAXED), gInputBy[1], gInputBy[2], gInputBy[3],
+       gInputBy[4], gBoostStarts[2], (unsigned long long)gBoostMs[2], gBoostStarts[1], (unsigned long long)gBoostMs[1], gGpuCalls,
+       gGpuTaken, gGpuState == 1 ? "PianoA830 takes it" : gGpuState == 2 ? "PianoA830: unsupported" : gGpuState == 3 ? "no PianoA830" : "not asked yet");
 }
 
 // ------------------------------------------------------------------------------------------------------------- the thread
@@ -1662,7 +1879,7 @@ void PianoThermal::run()
     const uint64_t workStart = mach_absolute_time();   // this poll's own work, up to the wait: noteSelf, left out of busy
     if (governing) base = curTickMs();
     const uint64_t before = nowNs();
-    const bool sensorsDue = first || tier == Poll::fast || base >= 100 || before - lastSensors >= 100000000ull;
+    const bool sensorsDue = first || tier != Poll::base || base >= 100 || before - lastSensors >= 100000000ull;
     if (sensorsDue) {
       monitor_.poll(kTsensIo);
       lastSensors = before;

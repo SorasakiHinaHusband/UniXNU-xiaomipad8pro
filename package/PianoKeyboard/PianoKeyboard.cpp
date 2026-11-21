@@ -119,6 +119,8 @@
 #include <IOKit/IOMessage.h>
 #include <libkern/c++/OSBoolean.h>
 #include <PianoPowerContract.h>
+#include <PianoPerfInput.h>   // the input boost's event to PianoThermal (2026-11-22)
+namespace { pianoperf::InputNotifier gPerfInput; }   // PianoThermal's input boost (PianoPerfInput.h)
 
 using namespace pianokeyboard;
 
@@ -1116,6 +1118,7 @@ IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
 {
   PianoKeyboardHID *hid = fHid[kind == Kind::keyboard ? 0 : 1];
   if (!hid) return kIOReturnNotReady;
+  gPerfInput.notify(kind == Kind::keyboard ? pianoperf::kKeyboard : pianoperf::kPointer);
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);

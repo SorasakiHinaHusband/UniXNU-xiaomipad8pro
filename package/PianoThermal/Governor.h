@@ -159,7 +159,7 @@ class Governor {
     config_ = config;
     androidCapKhz_ = 0;
     hardSet_ = above_ = false;
-    hardKhz_ = perfKhz_ = 0;
+    hardKhz_ = perfKhz_ = boostFloorKhz_ = 0;
     rawWant_ = 0;
     count_ = uint8_t(count > kMax ? kMax : count ? count : 1);
     for (unsigned i = 0; i < count_; ++i) khz_[i] = khz[i];
@@ -248,6 +248,14 @@ class Governor {
     if (mode_ != CpuMode::govern) return level_;
     const unsigned top = ceiling(power);
     if (level_ > top) level_ = uint8_t(top);
+    if (boostFloorKhz_) {   // a boost floor applies at once, not at the next load decision (never above the ceiling)
+      const unsigned b = floorLevel() < top ? floorLevel() : top;
+      if (level_ < b) {
+        level_ = uint8_t(b);
+        lowTicks_ = 0;
+        pending_ = 0;
+      }
+    }
     return level_;
   }
 
@@ -280,7 +288,15 @@ class Governor {
   void setDownTicks(uint32_t n) { config_.downTicks = n ? n : 1; }
   unsigned rawWant() const { return rawWant_; }
   uint32_t perfKhz() const { return perfKhz_; }
-  unsigned floorLevel() const { return config_.floorKhz ? slowestAtLeast(config_.floorKhz) : 0; }
+  unsigned floorLevel() const
+  {
+    const unsigned f = config_.floorKhz ? slowestAtLeast(config_.floorKhz) : 0;
+    const unsigned b = boostFloorKhz_ ? slowestAtLeast(boostFloorKhz_) : 0;
+    return b > f ? b : f;
+  }
+  // The launch / input boost's floor (Perf.h; kHz, 0 none): the slowest level at or above it, under the ceiling.
+  void setBoostFloor(uint32_t khz) { boostFloorKhz_ = mode_ == CpuMode::govern ? khz : 0; }
+  uint32_t boostFloorKhz() const { return boostFloorKhz_; }
   // piano-cpufreq-boost=S (2026-11-14, boot time): the level while the boot boost lasts, in every mode (report included): the
   // sustained level, or the fastest at or under capKhz when one is given (piano-cpufreq-boost-cap), never above the thermal limit
   // nor the boost's own sticky thermal cap maxLevel (the back-off below; count() - 1 = none).
@@ -330,7 +346,7 @@ class Governor {
   GovernorConfig config_{};
   uint32_t androidCapKhz_ = 0;
   bool hardSet_ = false, above_ = false;
-  uint32_t hardKhz_ = 0, perfKhz_ = 0;
+  uint32_t hardKhz_ = 0, perfKhz_ = 0, boostFloorKhz_ = 0;
   uint32_t khz_[kMax] = {};
   uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0, rawWant_ = 0;
   uint32_t lowTicks_ = 0;

@@ -142,6 +142,64 @@ inline uint32_t downTicksFor(uint32_t downMs, uint32_t tickMs)
   return n ? n : 1;
 }
 
+// ------------------------------------------------------------------------------------------------- the launch and input boosts
+// (owner 2026-11-22 01:02: short boosts as on Android; CPU-PERF.md section 7). The stock perf HAL's hints on this SoC
+// (perfboostsconfig.xml, Target sun): first app launch 0x1081 = cpu0-5 min = max 2745.6 MHz, cpu6-7 min = max 4089.6 MHz for
+// 1.5 s, sched_boost 1, GPU min_pwrlevel 9 (443 MHz) .. max_pwrlevel 2 (967 MHz), kgsl touch_wake; next launch 0x1082 the same
+// for 0.4 s; animation 0x1083 the CPU pin for 0.4 s; scroll / drag 0x1080 / 0x1087 sched_boost 2 and WALT adaptive floors
+// (0.6-0.8 / 1.0-1.3 GHz) while the gesture lasts. macOS gives the kernel no such hints, so the events are our own: an exec of an
+// app bundle's executable (a kauth file-operation listener) for the launch, and any HID report our input kexts send
+// (PianoPerfInput.h) for the input boost.
+
+// The executable of an app bundle: ".app/Contents/MacOS/" in the path, and not an XPC service or a framework's helper.
+inline bool isAppLaunchPath(const char *p)
+{
+  if (!p) return false;
+  auto has = [p](const char *needle) {
+    for (const char *s = p; *s; ++s) {
+      const char *a = s, *b = needle;
+      while (*a && *b && *a == *b) ++a, ++b;
+      if (!*b) return true;
+    }
+    return false;
+  };
+  return has(".app/Contents/MacOS/") && !has("/XPCServices/") && !has(".framework/");
+}
+
+// The short name of the app (the bundle's last path component without ".app") into out, for the log.
+inline void appName(const char *p, char *out, unsigned size)
+{
+  if (!size) return;
+  out[0] = 0;
+  if (!p) return;
+  const char *end = nullptr;
+  for (const char *s = p; *s; ++s)
+    if (s[0] == '.' && s[1] == 'a' && s[2] == 'p' && s[3] == 'p' && s[4] == '/') end = s;
+  if (!end) return;
+  const char *start = end;
+  while (start > p && start[-1] != '/') --start;
+  unsigned n = 0;
+  while (start < end && n + 1 < size) out[n++] = *start++;
+  out[n] = 0;
+}
+
+enum class BoostKind : uint8_t { none = 0, input = 1, launch = 2 };
+inline const char *boostName(BoostKind k) { return k == BoostKind::launch ? "launch" : k == BoostKind::input ? "input" : "none"; }
+
+// Which boost holds at nowNs: a launch within launchMs of its exec, else an input event within inputMs of the last one. An event
+// stamped a little after nowNs (written by another thread after this one read the clock) counts as now.
+inline BoostKind boostAt(uint64_t nowNs, uint64_t launchNs, uint32_t launchMs, uint64_t inputNs, uint32_t inputMs)
+{
+  auto within = [nowNs](uint64_t at, uint32_t ms) {
+    if (!at || !ms) return false;
+    if (at >= nowNs) return true;
+    return nowNs - at < uint64_t(ms) * 1000000ull;
+  };
+  if (within(launchNs, launchMs)) return BoostKind::launch;
+  if (within(inputNs, inputMs)) return BoostKind::input;
+  return BoostKind::none;
+}
+
 }  // namespace pianothermal::perf
 
 #endif

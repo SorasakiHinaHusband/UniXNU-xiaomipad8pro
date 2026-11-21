@@ -1143,6 +1143,64 @@ static void testPerf()
   CHECK(g2.limit() == 14 && g2.khz(g2.ceiling(PowerSource::external)) == 4204800);
 }
 
+// The launch / input boosts (Perf.h, 2026-11-22): the exec path filter, the app name, which boost holds, and the Governor's floor.
+static void testBoosts()
+{
+  using namespace pianothermal::perf;
+  CHECK(isAppLaunchPath("/System/Applications/Calculator.app/Contents/MacOS/Calculator"));
+  CHECK(isAppLaunchPath("/Applications/Safari.app/Contents/MacOS/Safari"));
+  CHECK(!isAppLaunchPath("/usr/bin/open"));
+  CHECK(!isAppLaunchPath("/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"));
+  CHECK(!isAppLaunchPath("/Applications/X.app/Contents/XPCServices/Y.xpc/Contents/MacOS/Y"));
+  CHECK(!isAppLaunchPath(nullptr));
+  char n[40];
+  appName("/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", n, sizeof n);
+  CHECK(!strcmp(n, "Activity Monitor"));
+  appName("/usr/bin/true", n, sizeof n);
+  CHECK(!n[0]);
+  appName("/Applications/A.app/Contents/MacOS/A", n, 2);
+  CHECK(!strcmp(n, "A"));
+  // launch wins over input; windows end; an event stamped after now counts as now
+  CHECK(boostAt(10000000000ull, 9000000000ull, 1500, 9990000000ull, 200) == BoostKind::launch);
+  CHECK(boostAt(10600000000ull, 9000000000ull, 1500, 10500000000ull, 200) == BoostKind::input);
+  CHECK(boostAt(10800000000ull, 9000000000ull, 1500, 10500000000ull, 200) == BoostKind::none);
+  CHECK(boostAt(10000000000ull, 10000000500ull, 1500, 0, 200) == BoostKind::launch);
+  CHECK(boostAt(10000000000ull, 0, 1500, 0, 200) == BoostKind::none);
+  CHECK(boostAt(10000000000ull, 9000000000ull, 0, 0, 200) == BoostKind::none);
+  // the Governor's boost floor: applied at once by enforce, under the ceiling and the thermal limit, gone when cleared
+  const uint32_t ncc1[] = {1017600, 1209600, 1401600, 1689600, 1958400, 2246400, 2438400, 2649600, 2841600, 3072000, 3283200,
+                           3513600, 3801600, 4089600, 4204800, 4320000};
+  GovernorConfig gc;
+  gc.batteryKhz = capKhz(1958);
+  gc.externalKhz = capKhz(4089);
+  Governor g;
+  g.init(CpuMode::govern, gc, ncc1, 16, 13, 0);
+  g.setRuntimeCaps(false, 0, 3072000);
+  CHECK(g.khz(g.enforce(PowerSource::external)) == 1017600);
+  g.setBoostFloor(1958000);
+  CHECK(g.khz(g.enforce(PowerSource::external)) == 1958400);              // the input floor at once
+  CHECK(g.khz(g.tick({0, PowerSource::external})) == 1958400);            // an idle decision keeps it
+  g.setRuntimeCaps(false, 0, capKhz(4089));
+  g.setBoostFloor(4089000);
+  CHECK(g.khz(g.enforce(PowerSource::external)) == 4089600);              // the launch pin
+  g.setRuntimeCaps(false, 0, 1689600);
+  CHECK(g.khz(g.enforce(PowerSource::external)) == 1689600);              // a lower ceiling wins over the floor
+  g.setBoostFloor(0);
+  g.setRuntimeCaps(false, 0, 3072000);
+  g.setDownTicks(2);
+  CHECK(g.khz(g.tick({0, PowerSource::external})) == 1689600);
+  CHECK(g.khz(g.tick({0, PowerSource::external})) == 1017600);            // without the floor it falls after the hold
+  ThermalInput hot{true, 1, 1, false};
+  g.setBoostFloor(4089000);
+  g.setRuntimeCaps(false, 0, capKhz(4089));
+  for (uint64_t ms = 0; ms < 60; ms += 10) g.thermal(hot, 1 + ms);
+  CHECK(g.khz(g.enforce(PowerSource::external)) == g.khz(g.limit()) && g.limit() < 13);   // the thermal limit caps the pin
+  Governor legacy;
+  legacy.init(CpuMode::fixed, gc, ncc1, 16, 13, 0);
+  legacy.setBoostFloor(4089000);
+  CHECK(legacy.boostFloorKhz() == 0);                                     // not in fixed mode
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 1 && !strcmp(argv[1], "--map")) {
@@ -1162,6 +1220,7 @@ int main(int argc, char **argv)
   testCluster();
   testInterruptsAndPolling();
   testPerf();
+  testBoosts();
   if (failures) {
     std::printf("thermal_host: %d FAILED\n", failures);
     return 1;
