@@ -7,8 +7,10 @@
 //   mt-int   one thread per online CPU, each SCALE x 50 M steps of st-int's chain; the time until the last one ends
 //   burst    the UI-like case: N times (sleep GAP ms, then a fixed small job of SCALE x 4 M steps), each job's latency; a slow ramp of
 //            the clock shows here first (p50/p90/max)
-//   launch APP  open -a APP and the time until a window of APP (layer 0, > 50 x 50) is on screen (CGWindowList; no AppleEvents,
-//            no TCC), then (--close) SIGTERM to that app
+//   launch APP  open -a APP (or --exec PATH: that executable directly, no LaunchServices) and the time until a window of APP
+//            (layer 0, > 50 x 50) is on screen (CGWindowList; no AppleEvents, no TCC), then (--close) SIGTERM to that app
+//   now      CPUBENCH_NOW mach_s=<CACurrentMediaTime's base: mach_absolute_time in s> (aligns host actions with PianoGpuBench's
+//            frame times, which are in the same base)
 // Lines: "CPUBENCH test=NAME ms=N ..." per test, "CPUBENCH_BURST ...", "CPUBENCH_LAUNCH app=... ms=...", "CPUBENCH_END rc=N".
 // Build (mini): clang -O2 -arch arm64 -mmacosx-version-min=14.0 -framework CoreFoundation -framework CoreGraphics -o piano-cpubench
 // piano-cpubench.c (the linker signs it ad hoc).
@@ -137,7 +139,7 @@ static pid_t pidOf(const char *name)
   return -1;
 }
 
-static int launch(const char *app, double timeoutMs, int kill_)
+static int launch(const char *app, double timeoutMs, int kill_, const char *exe)
 {
   if (hasWindow(app, -1) < 0) {
     printf("CPUBENCH_LAUNCH app=%s ms=-1 why=no_window_list\n", app);
@@ -150,13 +152,15 @@ static int launch(const char *app, double timeoutMs, int kill_)
   const double t0 = nowMs();
   pid_t pid;
   char *argv[] = {"/usr/bin/open", "-a", (char *)app, NULL};
-  if (posix_spawn(&pid, "/usr/bin/open", NULL, NULL, argv, environ)) {
+  char *xargv[] = {(char *)exe, NULL};
+  if (exe ? posix_spawn(&pid, exe, NULL, NULL, xargv, environ) : posix_spawn(&pid, "/usr/bin/open", NULL, NULL, argv, environ)) {
     printf("CPUBENCH_LAUNCH app=%s ms=-1 why=spawn\n", app);
     return 2;
   }
   int st = 0, opened = 0, polls = 0;
   double openMs = -1, procMs = -1, ms = -1;
   pid_t ap = -1;
+  if (exe) opened = 1;   // the app itself: never waited for here
   while (nowMs() - t0 < timeoutMs) {
     if (!opened && waitpid(pid, &st, WNOHANG) == pid) {
       opened = 1;
@@ -171,8 +175,8 @@ static int launch(const char *app, double timeoutMs, int kill_)
     usleep(4000);
   }
   if (!opened) waitpid(pid, &st, 0);
-  printf("CPUBENCH_LAUNCH app=%s ms=%.1f process_ms=%.1f open_rc_ms=%.1f polls=%d pid=%d%s\n", app, ms, procMs, openMs, polls, ap,
-         ms < 0 ? " why=timeout" : "");
+  printf("CPUBENCH_LAUNCH app=%s ms=%.1f process_ms=%.1f open_rc_ms=%.1f polls=%d pid=%d via=%s t0_mach_s=%.6f%s\n", app, ms, procMs,
+         openMs, polls, ap, exe ? "exec" : "open", t0 / 1000.0, ms < 0 ? " why=timeout" : "");
   if (kill_ && ap > 0) {
     kill(ap, SIGTERM);
     for (int i = 0; i < 200 && pidOf(app) > 0; ++i) usleep(10000);
@@ -186,7 +190,7 @@ int main(int argc, char **argv)
   const char *test = argc > 1 ? argv[1] : "all";
   double scale = 1.0, gapMs = 250, timeoutMs = 20000;
   int n = 30, kill_ = 0, reps = 1;
-  const char *q = "ui", *app = NULL;
+  const char *q = "ui", *app = NULL, *exe = NULL;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
     else if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
@@ -195,12 +199,17 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) timeoutMs = atof(argv[++i]);
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--close")) kill_ = 1;
+    else if (!strcmp(argv[i], "--exec") && i + 1 < argc) exe = argv[++i];
     else if (!app && argv[i][0] != '-') app = argv[i];
   }
   if (scale <= 0 || scale > 100 || n < 1 || n > 1000 || reps < 1 || reps > 20) {
     fprintf(stderr, "usage: piano-cpubench all|st-int|st-fp|mt-int|burst|launch APP [--scale S] [--n N] [--gap-ms MS] [--qos ui|default|bg] "
                     "[--reps R] [--close]\n");
     return 64;
+  }
+  if (!strcmp(test, "now")) {
+    printf("CPUBENCH_NOW mach_s=%.6f\n", nowMs() / 1000.0);
+    return 0;
   }
   qos(q);
   printf("CPUBENCH_START test=%s scale=%.2f qos=%s cpus=%d\n", test, scale, q, ncpu());
@@ -257,7 +266,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "launch needs an application name\n");
         return 64;
       }
-      rc |= launch(app, timeoutMs, kill_);
+      rc |= launch(app, timeoutMs, kill_, exe);
     }
   }
   printf("CPUBENCH_END rc=%d\n", rc);
