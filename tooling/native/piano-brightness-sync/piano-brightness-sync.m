@@ -65,6 +65,24 @@ static int bootArg(const char *word)
   return found;
 }
 
+/* 2026-11-21 (miplay1): the boot line is split (the line plus the ADT's /chosen tail), so kern.bootargs does not show
+ * piano-backlight-native=1 / piano-backlight-auto=1 to user space and the daemon stayed inert. Ask the kext: native when it publishes
+ * its native implementation, automatic-capable when it publishes piano-backlight-auto-requested; the boot arguments still count. */
+static int kextReady(void)
+{
+  io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PianoBacklight"));
+  int ok = 0;
+  if (s) {
+    CFTypeRef a = IORegistryEntryCreateCFProperty(s, CFSTR("piano-backlight-native-implementation"), kCFAllocatorDefault, 0);
+    CFTypeRef b = IORegistryEntryCreateCFProperty(s, CFSTR("piano-backlight-auto-requested"), kCFAllocatorDefault, 0);
+    ok = a && b;
+    if (a) CFRelease(a);
+    if (b) CFRelease(b);
+    IOObjectRelease(s);
+  }
+  return ok || (bootArg("piano-backlight-native=1") && bootArg("piano-backlight-auto=1"));
+}
+
 static id<PianoDisplayServicesClient> client(void)
 {
   if (gClient) return gClient;
@@ -182,7 +200,7 @@ static int check(void)
   const int automatic = flag(s, CFSTR("piano-backlight-auto-active")), lit = flag(s, CFSTR("piano-backlight-lit"));
   const int64_t cb = coreBrightness();
   printf("boot_args=%s\npanel_millinits=%u\nautomatic=%s\nlit=%s\ncorebrightness_millinits=%lld\nin_step=%s\n",
-         bootArg("piano-backlight-native=1") && bootArg("piano-backlight-auto=1") ? "yes" : "no", panel, automatic ? "yes" : "no",
+         kextReady() ? "yes" : "no", panel, automatic ? "yes" : "no",
          lit ? "yes" : "no", cb, cb >= 0 && panel && pbs_matches((uint32_t)cb, panel) ? "yes" : "no");
   struct pbs_state probe = {.level = panel, .level_since = 0};
   const enum pbs_action a = pbs_decide(&probe, PBS_SETTLE_MS, panel, automatic, lit, cb);
@@ -200,8 +218,8 @@ int main(int argc, const char **argv)
       fprintf(stderr, "usage: piano-brightness-sync --run | --check\n");
       return 64;
     }
-    if (!bootArg("piano-backlight-native=1") || !bootArg("piano-backlight-auto=1")) {
-      os_log(gLog, "inert: no piano-backlight-native=1 and piano-backlight-auto=1");
+    if (!kextReady()) {
+      os_log(gLog, "inert: PianoBacklight is not native with automatic brightness");
       return 0;
     }
     if (geteuid()) {
