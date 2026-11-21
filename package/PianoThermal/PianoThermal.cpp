@@ -124,7 +124,7 @@ struct Args {
   // the stock-level policy (Perf.h)
   uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC;
   // the launch and input boosts (Perf.h; 2026-11-22 01:02) and the silicon gate of bursts and boosts
-  uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC;
+  uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC, gateQuietMs;
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
 pianodisplay::Follow gDisplay;
@@ -215,8 +215,9 @@ void readArgs()
   gArgs.gpuLaunchMhz = clampU(bootArg("piano-cpufreq-gpu-launch-mhz", 443), 0, 1100);
   gArgs.gpuInputMhz = clampU(bootArg("piano-cpufreq-gpu-input-mhz", 0), 0, 1100);
   gArgs.launchWatch = bootArg("piano-cpufreq-launch-watch", 1) ? 1 : 0;
-  gArgs.gateOpenC = clampU(bootArg("piano-cpufreq-gate-open", 75), 40, 95);
-  gArgs.gateEndC = clampU(bootArg("piano-cpufreq-gate-end", 85), 40, 95);
+  gArgs.gateOpenC = clampU(bootArg("piano-cpufreq-gate-open", 0), 0, 110);
+  gArgs.gateEndC = clampU(bootArg("piano-cpufreq-gate-end", 0), 0, 110);
+  gArgs.gateQuietMs = clampU(bootArg("piano-cpufreq-gate-quiet-ms", 300), 0, 5000);
   // Poll tiers (Cluster.h pollTier): 10 ms near a trip (Linux: 10 ms while passive), 250 ms from 70 C, the base below.
   gArgs.fastMs = clampU(bootArg("piano-thermal-fast-ms", 10), 5, 1000);
   gArgs.warmMs = clampU(bootArg("piano-thermal-warm-ms", 250), 10, 10000);
@@ -235,6 +236,13 @@ void readArgs()
   if (gArgs.hotC && gArgs.hotC < 40) gArgs.hotC = 40;
   gArgs.releaseC = clampU(bootArg("piano-cpufreq-release", 0), 0, 118);
   gArgs.cutC = clampU(bootArg("piano-cpufreq-cut", 0), 0, 125);
+  // The silicon gate of bursts and boosts follows the ceiling unless given (perf-cpu2): open below ceiling - 15 C, end at ceiling - 5 C
+  // (90 C: 75 / 85; Android's 95 C trip: 80 / 90); with the stock trips (hot 0) 90 / 100.
+  {
+    const uint32_t ceil = gArgs.hotC ? gArgs.hotC : 105;
+    if (!gArgs.gateOpenC) gArgs.gateOpenC = ceil - 15;
+    if (!gArgs.gateEndC) gArgs.gateEndC = ceil - 5;
+  }
   buildTrips();
 }
 
@@ -866,6 +874,12 @@ class PianoThermal : public IOService {
   // boosts: per cluster whether the last decision applied one (the silicon gate's hysteresis), the kind in force, the launch
   // event last handed to the GPU, the time of the last poll (boosted ms), the GPU boost's end (for a cancel under Power Saver)
   bool boostOn_[kDomains] = {};
+  // the readings of each cluster's cpu zones per report window: how many and how long at or above 90 / 95 / 105 C, the highest, and
+  // when the last reading at the gate's opening temperature came (the gate opens only after piano-cpufreq-gate-quiet-ms without one)
+  uint32_t hotN_[kDomains][3] = {};
+  uint64_t hotNs_[kDomains][3] = {}, hotSeenNs_[kDomains] = {}, hotAccNs_ = 0;
+  int32_t hotMax_[kDomains] = {-1000, -1000};
+  void hotAccount(uint64_t now);
   perf::BoostKind boostKind_ = perf::BoostKind::none;
   uint64_t gpuLaunchSeen_ = 0, gpuInputAt_ = 0, boostTickNs_ = 0, boostNs_[3] = {};
  public:
@@ -1334,9 +1348,9 @@ void PianoThermal::cpuStart()
     registerBoost();
     note("boost: machdep.piano_cpufreq_boost now %u: launch %u / %u MHz (floor and ceiling) for %u ms, input %u / %u MHz floor for %u "
          "ms after the last HID report, GPU floor %u MHz at a launch%s; only with perf policy >= 1 on Balanced, below %u C skin, and "
-         "while the cluster's hottest cpu zone is under %u C (an open boost ends at %u C) and its thermal limit is not active",
+         "while the cluster's hottest cpu zone is under %u C with none there in the last %u ms (an open boost ends at %u C) and its thermal limit is not active",
          gArgs.boosts, gArgs.launchMhz[0], gArgs.launchMhz[1], gArgs.launchMs, gArgs.inputMhz[0], gArgs.inputMhz[1], gArgs.inputMs,
-         gArgs.gpuLaunchMhz, gArgs.gpuInputMhz ? " and on input" : "", gArgs.skinLimitC, gArgs.gateOpenC, gArgs.gateEndC);
+         gArgs.gpuLaunchMhz, gArgs.gpuInputMhz ? " and on input" : "", gArgs.skinLimitC, gArgs.gateOpenC, gArgs.gateQuietMs, gArgs.gateEndC);
     note("cpufreq: perf policy (machdep.piano_cpufreq_perf, now %u): 1 = caps by PianoPolicy's profile whatever the source, skin steps "
          "%s (virtual skin of the board thermistors, %s), burst %u / %u MHz for <= %u ms at a load onset (gap %u ms, none from %u C "
          "skin), tick %u ms (machdep.piano_cpufreq_perf_tick_ms), downs held %u ms; 0 = caps by the measured source, hard caps %u / "
@@ -1659,8 +1673,10 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       // 78-87 C read 101.9 C one poll later): none opens while the cluster's hottest cpu zone is at piano-cpufreq-gate-open (75 C)
       // or its thermal limit holds, an open one ends at piano-cpufreq-gate-end (85 C).
       const int32_t hottest = thermal[d].valid ? thermal[d].hotExcessDeci + (gTrips.hotDeci ? gTrips.hotDeci : 1050) : 9999;
+      const bool gateOpen = boostOn_[d] || burst_[d].open();
       const bool gateOk = g.limit() >= g.count() - 1u &&
-          hottest < int32_t(boostOn_[d] || burst_[d].open() ? gArgs.gateEndC : gArgs.gateOpenC) * 10;
+          hottest < int32_t(gateOpen ? gArgs.gateEndC : gArgs.gateOpenC) * 10 &&
+          (gateOpen || !hotSeenNs_[d] || now - hotSeenNs_[d] >= uint64_t(gArgs.gateQuietMs) * 1000000ull);
       if (perfMode) {
         const uint32_t skinKhz = gArgs.skin && !beyond ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
                                                                             d ? perf::kCluster1Steps : perf::kCluster0Steps,
@@ -1776,6 +1792,12 @@ void PianoThermal::cpuReport(uint64_t spanNs)
                profile == Profile::bySource ? "" : profileName(profile), g.khz(g.limit()) / 1000, (unsigned long long)limitedPolls_[d],
                cuts_[d]);
     note("%s", line);
+    if (hotMax_[d] > -1000)
+      note("[%us] hot d%u: cpu zones at or above 90 / 95 / 105 C: %u / %u / %u readings, %llu / %llu / %llu ms; max %s C", upS(), d,
+           hotN_[d][0], hotN_[d][1], hotN_[d][2], (unsigned long long)(hotNs_[d][0] / 1000000ull),
+           (unsigned long long)(hotNs_[d][1] / 1000000ull), (unsigned long long)(hotNs_[d][2] / 1000000ull), Deci(hotMax_[d]).s);
+    for (unsigned i = 0; i < 3; ++i) hotN_[d][i] = 0, hotNs_[d][i] = 0;
+    hotMax_[d] = -1000;
     changes_[d] = 0;
     busySum_[d] = busyTicks_[d] = 0;
     busyMax_[d] = 0;
@@ -1798,6 +1820,27 @@ void PianoThermal::cpuReport(uint64_t spanNs)
     }
     setProperty("CpuFreq", dict);
     dict->release();
+  }
+}
+
+// Every fresh sensor poll: each cluster's hottest cpu zone into the window's 90 / 95 / 105 C counts and times, and the gate's
+// last-hot time.
+void PianoThermal::hotAccount(uint64_t now)
+{
+  const uint64_t dt = hotAccNs_ && now > hotAccNs_ ? now - hotAccNs_ : 0;
+  hotAccNs_ = now;
+  for (unsigned d = 0; d < kDomains; ++d) {
+    const ThermalInput in = clusterThermal(monitor_, d, gTrips, false);
+    if (!in.valid) continue;
+    const int32_t hottest = in.hotExcessDeci + (gTrips.hotDeci ? gTrips.hotDeci : 1050);
+    if (hottest > hotMax_[d]) hotMax_[d] = hottest;
+    if (hottest >= int32_t(gArgs.gateOpenC) * 10) hotSeenNs_[d] = now;
+    static const int32_t kLines[3] = {900, 950, 1050};
+    for (unsigned i = 0; i < 3; ++i)
+      if (hottest >= kLines[i]) {
+        ++hotN_[d][i];
+        hotNs_[d][i] += dt;
+      }
   }
 }
 
@@ -1882,6 +1925,7 @@ void PianoThermal::run()
     if (sensorsDue) {
       monitor_.poll(kTsensIo);
       lastSensors = before;
+      if (gArgs.cpufreq == 3) hotAccount(nowNs());
     }
     const uint64_t now = nowNs();
     if (sensorsDue) irq::hookPolled(monitor_, now / 1000000ull);
