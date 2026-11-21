@@ -113,6 +113,7 @@ struct Adreno830Board {
                            kopt;} knobs;                /* pagani-gpu-kopt bits (NativeAdrenoKopt*) */
     uint32_t qualification_r3b;                   /* explicit bounded R3b-607 mode; no daily default */
     uint32_t qualification_exit_test;
+    uint32_t qualification_daily;                 /* pagani-gpu-daily=1: the R3b guard as the daily policy (auto-armed, no expiry) */
     uint32_t system_diag;                            /* pagani-diag: not a knob of this driver (no flag bit, no table row, 0 when absent) */
 };
 static_assert(sizeof(Adreno830Board::Adreno830Knobs)==Adreno830KnobCount*sizeof(uint32_t),"one word per knob, in Adreno830Knob order");
@@ -191,6 +192,8 @@ static inline void Adreno830ParseKnobs(Adreno830Board *board,bool (*get)(void *c
     (void)get(cookie,"pagani-gpu-r3b",&board->qualification_r3b);
     board->qualification_exit_test=0;
     (void)get(cookie,"pagani-gpu-r3b-exit-test",&board->qualification_exit_test);
+    board->qualification_daily=0;
+    (void)get(cookie,"pagani-gpu-daily",&board->qualification_daily);
     board->system_diag=0;
     (void)get(cookie,Adreno830SystemDiagName,&board->system_diag);
     /* pagani-gpu-ddr-floor defaults to the boot level, explicit or not: the host DDR vote is not lowered unless asked. */

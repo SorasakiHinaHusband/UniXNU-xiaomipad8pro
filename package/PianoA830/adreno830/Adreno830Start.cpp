@@ -2727,6 +2727,10 @@ void qualificationThread(void *)
             __atomic_store_n(&gQualificationExitTest,test-2,__ATOMIC_RELEASE);
         }
         gQualification.tick(now,gpu,board,ok,injectTrip);
+        static bool dailyOpenLogged;
+        if(gQualification.isDaily() && !dailyOpenLogged && gQualification.openedAt()) {
+            dailyOpenLogged=true;qualLog("R3b DAILY open at-us=%llu",gQualification.openedAt()/1000);
+        }
         if(gQualification.deadlineMissed(now))qualificationUnsafe(nullptr,A830ExitOrigin::ProtectionDeadline);
         const bool event=gQualification.r3b() && (gQualification.thermal().events || gQualification.reason()!=lastReason);
         if(event) {
@@ -2782,6 +2786,10 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
         return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_exit_test,1,kIOReturnBadArgument);
     if(b->qualification_r3b && (!config.qualification607 || b->qualification_r3b!=1))
         return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_r3b,1,kIOReturnBadArgument);
+    /* pagani-gpu-daily=1 only on the R3b line with the governor's own floor (160 MHz): not with the exit test or the 607 residency */
+    if(b->qualification_daily && (b->qualification_daily!=1 || !config.qualificationR3b || b->qualification_exit_test ||
+       qualificationResidency(b) || b->knobs.dcvs_min_mhz!=160))
+        return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_daily,1,kIOReturnBadArgument);
     config.governor=b->knobs.dcvs!=0;
     // Use the 342 MHz control without a load generator; thermal and sticky limits still apply.
     config.minMhz=b->qualification_exit_test?342:b->knobs.dcvs_min_mhz;
@@ -2830,6 +2838,10 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
         gQualification.init(&d->power_state,&d->recovery,config.qualificationR3b,qualificationUnsafe,residency607);
         if(config.qualificationR3b)a830ExitTrace.start(d->power_env.nowNs,d->power_env.context);
         if(residency607)qualLog("R3b residency qualification window-s=625 floor-mhz=607");
+        if(b->qualification_daily) {
+            gQualification.daily();
+            qualLog("R3b DAILY v1 auto-arm=1 window=none floor-mhz=%u max-mhz=%u",unsigned(config.minMhz),unsigned(config.maxMhz));
+        }
         if(config.qualificationR3b)qualLog("R3b CONFIG R3b-607-v1 soft=800 cool=750 hard=850 halt=1050 floor=3 guard-ms=100 lease-ms=250 down-ms=500 up-ms=2000 board-hold=62000,37000 board-release=60000,35000 board-hard=65000,40000");
         if(config.qualificationR3b)qualLog("R3b CXGATE v2 ahb=enable-or-running gmu=clk-or-noc gdsc=pwr-on");
         d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;

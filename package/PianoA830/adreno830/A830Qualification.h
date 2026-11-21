@@ -29,6 +29,13 @@ public:
         }
     }
     bool r3b() const {return r3b_;}
+    /* Daily mode (pagani-gpu-daily=1, gpu/daily1): the same guard as the daily frequency policy. The permit arms itself once the
+     * guard is ready (two fresh board rounds, GPU and board sensors healthy and cool) and has no expiry; every limit of the R3b
+     * contract stays: the soft ladder, the board hold, the hard exits (raw 85 C, board 65/40 C, sensor/lease, an unacknowledged
+     * vote) through the low transaction, raw 105 C to the unsafe exit. A hard exit still ends high levels for the boot (<= 342). */
+    static constexpr uint64_t DailyWindowNs=1000000000000000000ull;   /* about 31.7 years: no expiry within a boot */
+    void daily() {daily_=true;windowNs_=DailyWindowNs;}
+    bool isDaily() const {return daily_;}
     A830R3bThermal &thermal() {return thermal_;}
     uint64_t thermalSnapshot() const {return thermal_.published();}
     bool ready() const {return __atomic_load_n(&ready_,__ATOMIC_ACQUIRE);}
@@ -153,6 +160,8 @@ private:
             else if(!thermal_.healthy)fault(A830QualSensor,now);
             else if(now-openedAt()>=windowNs_)fault(A830QualExpired,now);
         }
+        if(daily_ && !openedAt() && ready() && !reason() && !power_->qualificationLatched())
+            __atomic_store_n(&armed_,true,__ATOMIC_RELEASE);   // daily: the permit arms itself (no operator, no sysctl)
         if(!openedAt() && __atomic_load_n(&armed_,__ATOMIC_ACQUIRE) && ready() && !power_->qualificationLatched()) {
             __atomic_store_n(&openedAt_,now,__ATOMIC_RELEASE);__atomic_store_n(&high_,true,__ATOMIC_RELEASE);
             a830ExitTrace.add(A830ExitStage::Permit,0,now+windowNs_,0,0,0,now);
@@ -166,7 +175,7 @@ private:
         power_->setQualificationCeiling(cap,buses[cap]);
         if(deadlineMissed(now) && unsafe_)unsafe_(nullptr,A830ExitOrigin::ProtectionDeadline);
     }
-    bool r3b_=false;
+    bool r3b_=false,daily_=false;
     void (*unsafe_)(void *,A830ExitOrigin)=nullptr;
     A830R3bThermal thermal_{};
     A830PowerState *power_=nullptr;
