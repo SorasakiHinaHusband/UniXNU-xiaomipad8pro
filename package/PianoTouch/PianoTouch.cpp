@@ -79,6 +79,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
+#include <PianoGpuBoost.h>   // boost342: each report handed to macOS asks PianoA830 for its input boost (50 ms apart)
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
@@ -1220,12 +1221,15 @@ IOReturn PianoTouch::setProperties(OSObject *properties)
   return kIOReturnSuccess;
 }
 
+static pianogpuboost::InputBoostSender gGpuBoost;   // zero-initialised: PianoA830's piano-gpu-boost (PianoGpuBoost.h)
+
 void PianoTouch::sendBytes(const uint8_t *bytes, unsigned length)
 {
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? fHid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
   ++fSent;
+  if (rc == kIOReturnSuccess) gGpuBoost.note();
   if (rc != kIOReturnSuccess && (++fSendErrors <= 5 || fSendErrors % 1000 == 0)) note("HID: handleReport %#x (%u failures)", rc, fSendErrors);
 }
 

@@ -37,6 +37,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
+#include <PianoGpuBoost.h>   // boost342: each report handed to macOS asks PianoA830 for its input boost (50 ms apart)
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -2315,6 +2316,8 @@ OSDefineMetaClassAndStructors(PianoUsbHID, IOHIDDevice)
 namespace {
 IONotifier *gHidPublished;
 
+static pianogpuboost::InputBoostSender gGpuBoost;   // zero-initialised: PianoA830's piano-gpu-boost (PianoGpuBoost.h)
+
 bool hidSend(uint8_t kind, const uint8_t *bytes, unsigned length)
 {
   PianoUsbHID *hid = gHidDevice[kind];
@@ -2322,6 +2325,7 @@ bool hidSend(uint8_t kind, const uint8_t *bytes, unsigned length)
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
+  if (rc == kIOReturnSuccess) gGpuBoost.note();
   if (rc != kIOReturnSuccess && ++gHid.sendErrors <= 5) {
     char line[96];
     snprintf(line, sizeof line, "hid: %s handleReport %#x", kHidProducts[kind], rc);

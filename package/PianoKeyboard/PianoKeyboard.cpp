@@ -96,6 +96,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
+#include <PianoGpuBoost.h>   // boost342: each report handed to macOS asks PianoA830 for its input boost (50 ms apart)
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/hid/IOHIDDevice.h>
@@ -1109,6 +1110,8 @@ void PianoKeyboard::ledRequest(void *self, uint8_t leds)
   }
 }
 
+static pianogpuboost::InputBoostSender gGpuBoost;   // zero-initialised: PianoA830's piano-gpu-boost (PianoGpuBoost.h)
+
 IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
 {
   PianoKeyboardHID *hid = fHid[kind == Kind::keyboard ? 0 : 1];
@@ -1117,6 +1120,7 @@ IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
   const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
   ++fSent;
+  if (rc == kIOReturnSuccess) gGpuBoost.note();
   if (rc != kIOReturnSuccess && (++fSendErrors <= 5 || fSendErrors % 1000 == 0))
     note("%s: handleReport %#x (%u failures)", deviceInfo(kind).product, rc, fSendErrors);
   return rc;
