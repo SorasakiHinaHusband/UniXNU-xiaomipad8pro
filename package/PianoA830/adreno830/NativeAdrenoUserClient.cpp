@@ -33,9 +33,15 @@ extern "C" int proc_selfpid(void);
 /* UniXNU-piano (2026-11-12): a BoAlloc's or BoImport's refusal records why (NativeAdrenoAllocWhy, lastAllocRefusal) the same way. */
 #define ALLOC_REFUSE(why,method,status,a,b,c) refuseAlloc(NativeAdrenoAllocWhy##why,NativeAdrenoMethod##method,status,a,b,c)
 extern "C" volatile uint32_t native_adreno_import_stage;   /* NativeAdrenoMemory.cpp: where the last import stopped */
+/* UniXNU-piano (2026-11-21): a Submit's own refusal records why (NativeAdrenoSubmitWhy, lastSubmitRefusal); an entry's with its figures. */
+#define SUBMIT_REFUSE(why,status,a) refuseSubmit(NativeAdrenoSubmitWhy##why,status,UINT32_MAX,nullptr,0,0,a)
+#define SUBMIT_REFUSE_ENTRY(why,status,i,wire,mapped,mapped_bytes,a) \
+    refuseSubmit(NativeAdrenoSubmitWhy##why,status,i,&(wire),mapped,mapped_bytes,a)
 #else
 #define MAP_REFUSE(why,status,a,b,c,d) (status)
 #define ALLOC_REFUSE(why,method,status,a,b,c) (status)
+#define SUBMIT_REFUSE(why,status,a) (status)
+#define SUBMIT_REFUSE_ENTRY(why,status,i,wire,mapped,mapped_bytes,a) (status)
 #endif
 namespace {
 unsigned gImportNext;
@@ -655,30 +661,54 @@ IOReturn NativeAdrenoUserClient::validateWaitFence(uint64_t fence) const
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     NativeAdrenoAbiSubmitReply *reply,const NativeAdrenoRingClock *)
 {
-    if(!request || !reply)return kIOReturnBadArgument;
+#ifdef ADRENO830_MACOS
+    submit_refusal_={};submit_refusal_.index=UINT32_MAX;
+#endif
+    if(!request || !reply)return SUBMIT_REFUSE(Other,kIOReturnBadArgument,0);
+#ifdef ADRENO830_MACOS
+    submit_refusal_.count=request->buffer_count;
+#endif
     reply->fence=0;retry_fence_=0;
-    if(!open_)return kIOReturnNotReady;
+    if(!open_)return SUBMIT_REFUSE(NotOpen,kIOReturnNotReady,0);
     if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
-        request->reserved)return kIOReturnBadArgument;
+        request->reserved)return SUBMIT_REFUSE(Count,kIOReturnBadArgument,request->reserved);
     if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active)
-        return kIOReturnBadArgument;
+        return SUBMIT_REFUSE(Queue,kIOReturnBadArgument,request->queue);
     /* No CPU wait for an earlier fence (ARCHITECTURE 4.13.3): the one ring completes in order and every framed submission starts with
      * the BR/BV sync and a cache flush, so an issued fence is already satisfied by ring order. Only a fence never issued is refused. */
     const IOReturn waitable=validateWaitFence(request->wait_fence);
-    if(waitable)return waitable;
+    if(waitable)return SUBMIT_REFUSE(WaitFence,waitable,request->wait_fence);
     NativeAdrenoSubmitBuffer *buffers=submit_buffers_;
     for(uint32_t i=0;i<request->buffer_count;++i) {
         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
-        if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;
+        if(!wire.bytes || (wire.bytes&3))return SUBMIT_REFUSE_ENTRY(Bytes,kIOReturnBadArgument,i,wire,0,0,0);
         Entry *entry=find(wire.handle);
-        if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
+        if(!entry)return SUBMIT_REFUSE_ENTRY(Handle,kIOReturnBadArgument,i,wire,0,0,next_handle_);
+        if(!entry->mapped_state)return SUBMIT_REFUSE_ENTRY(NotMapped,kIOReturnBadArgument,i,wire,0,entry->memory.bytes(),0);
         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
     }
     uint32_t fence=0,retry=0;
     used_=true;
+#ifdef ADRENO830_MACOS
+    NativeAdrenoSubmitRefusal refused{};
+#endif
     const IOReturn status=submit_->submit(buffers,request->buffer_count,queue_base_+static_cast<uint32_t>(request->queue),&fence,&retry,
-        context_,source_);
+        context_,source_
+#ifdef ADRENO830_MACOS
+        ,&refused
+#endif
+        );
     if(status==NativeAdrenoSubmitRetry)retry_fence_=retry;
+#ifdef ADRENO830_MACOS
+    if(status) {
+        /* The submit object's view: its entry carries the VM's mapping handle, the request's BO handle goes back in (b keeps the VM's). */
+        const uint32_t index=refused.index;
+        submit_refusal_=refused;submit_refusal_.count=request->buffer_count;
+        if(!refused.why)submit_refusal_.why=NativeAdrenoSubmitWhyOther;
+        submit_refusal_.status=status;
+        if(index<request->buffer_count) {submit_refusal_.b=refused.handle;submit_refusal_.handle=request->buffers[index].handle;}
+    }
+#endif
     if(status)return status;
     reply->fence=fence;
     return kIOReturnSuccess;
@@ -779,6 +809,7 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
 #ifdef ADRENO830_MACOS
     if(method==NativeAdrenoMethodBoAlloc)alloc_refusal_={};
     if(method==NativeAdrenoMethodBoMap)map_refusal_={};
+    if(method==NativeAdrenoMethodSubmit)submit_refusal_={};
 #endif
 
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);

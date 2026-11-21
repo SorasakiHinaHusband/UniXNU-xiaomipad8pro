@@ -213,6 +213,42 @@ static void eventCounts()
     CHECK(NativeAdrenoEventNote(&table,"",3,0)==1 && !NativeAdrenoEventNote(&table,"",3,0));   /* no process: never restarts */
     CHECK(table.keys[0].pid==98 && table.keys[1].pid==0 && !table.others);
 }
+
+/* 2026-11-21 (20261121-ws-crash: "WindowServer[102] slot 0 Submit -> BadArgument" said nothing more): a Submit's reason
+ * (lastSubmitRefusal), the entry's figures for the entry checks, every reason within the ring's line at its widest. */
+static void submitLines()
+{
+    char line[NativeAdrenoMapLineBytes];
+    const IOReturn bad=IOReturn(0xe00002c2u);
+    auto says=[&](const NativeAdrenoSubmitRefusal &r,const char *text) {
+        NativeAdrenoSubmitRefusalLine(line,sizeof line,r);
+        if(std::strcmp(line,text))std::fprintf(stderr,"got  \"%s\"\nwant \"%s\"\n",line,text);
+        return !std::strcmp(line,text) && std::strlen(line)<NativeAdrenoMapLineBytes;
+    };
+    CHECK(says({NativeAdrenoSubmitWhyHandle,3,12,0,0x5d5b1000,8028,0,0,0x4d2,0,bad},
+               "submit refused: handle unknown: entry 3/12 handle 0 iova 0x5d5b1000 bytes 8028 (not mapped), no live object, next handle 0x4d2"));
+    CHECK(says({NativeAdrenoSubmitWhyNotMapped,1,2,0x56,0x21000000,64,0,16384,0,0,bad},
+               "submit refused: not mapped: entry 1/2 handle 0x56 iova 0x21000000 bytes 64 (not mapped), object of 16 KiB"));
+    CHECK(says({NativeAdrenoSubmitWhyNotMapped,1,2,0x56,0x21000000,64,0,0,0,0x99,bad},
+               "submit refused: not mapped: entry 1/2 handle 0x56 iova 0x21000000 bytes 64 (not mapped), VM mapping 0x99: 0xe00002c2 BadArgument"));
+    CHECK(says({NativeAdrenoSubmitWhyRange,0,1,0x55,0x5d5b1000,8192,0x5d5b0000,0x1000,3,0x99,bad},
+               "submit refused: range: entry 0/1 handle 0x55 iova 0x5d5b1000 bytes 8192 (mapped 0x5d5b0000+0x1000), permissions 0x3"));
+    CHECK(says({NativeAdrenoSubmitWhyBytes,5,6,0x57,0x21000000,6,0,0,0,0,bad},
+               "submit refused: bytes: entry 5/6 handle 0x57 iova 0x21000000 bytes 6 (mapping not looked up)"));
+    CHECK(says({NativeAdrenoSubmitWhyCount,UINT32_MAX,0,0,0,0,0,0,0,0,bad},"submit refused: count: 0 buffers (1..128), reserved 0"));
+    CHECK(says({NativeAdrenoSubmitWhyQueue,UINT32_MAX,4,0,0,0,0,0,9,0,bad},
+               "submit refused: queue: 9 is not an open queue of this connection (4 buffers)"));
+    CHECK(says({NativeAdrenoSubmitWhyWaitFence,UINT32_MAX,1,0,0,0,0,0,3,0,bad},
+               "submit refused: wait fence: 3 was never issued (0xe00002c2 BadArgument, 1 buffers)"));
+    CHECK(says({NativeAdrenoSubmitWhyOther,UINT32_MAX,7,0,0,0,0,0,0,0,IOReturn(0xe00002bdu)},
+               "submit refused: other: 0xe00002bd NoMemory (7 buffers)"));
+    for(uint8_t why=NativeAdrenoSubmitWhyNone;why<=NativeAdrenoSubmitWhyOther;++why)
+        for(uint32_t index:{0u,UINT32_MAX-1,UINT32_MAX}) {
+            NativeAdrenoSubmitRefusal r{why,index,UINT32_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,bad};
+            NativeAdrenoSubmitRefusalLine(line,sizeof line,r);
+            CHECK(std::strlen(line)<NativeAdrenoMapLineBytes && !std::strncmp(line,"submit refused: ",16));
+        }
+}
 #endif
 
 int main()
@@ -220,12 +256,13 @@ int main()
 #ifdef ADRENO830_MACOS
     failureSnapshots();windows();
     refusalLines();
+    submitLines();
     allocLines();
     accounting();
     sizeLines();
     eventCounts();
     std::printf("PASS: macOS GPU address space: the 16 GiB windows (3.5 GiB render server, 768 MiB large, 320 MiB small, none across 4 GiB), "
-                "BoMap, BoAlloc and BoImport refusal lines for every reason within the ring's line, the address-space totals and "
+                "BoMap, BoAlloc, BoImport and Submit refusal lines for every reason within the ring's line, the address-space totals and "
                 "per-connection lines, the objects by size, failure counts per process (%u checks)\n",checks);
 #else
     std::printf("PASS: macOS GPU address space: nothing in the upstream pass\n");

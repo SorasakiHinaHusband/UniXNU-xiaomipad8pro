@@ -125,6 +125,24 @@ IOReturn NativeAdrenoRing::ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dword
     *dwords=ring_[(rptr-1)&mask]&0xfffffu;
     return kIOReturnSuccess;
 }
+#ifdef ADRENO830_MACOS
+IOReturn NativeAdrenoRing::ibHolding(uint32_t rptr,uint64_t address,uint64_t *iova,uint32_t *dwords) const
+{
+    if(!ring_ || !iova || !dwords)return kIOReturnBadArgument;
+    *iova=0;*dwords=0;
+    const uint32_t words=(uint32_t)(ring_bytes_/4),mask=words-1;
+    for(uint32_t back=4;back<=words;++back) {
+        const uint32_t at=(rptr-back)&mask,header=ring_[at];
+        if((header>>28)!=7u || ((header>>16)&0x7fu)!=A8XX_PM4_CP_INDIRECT_BUFFER || (header&0x3fffu)!=3)continue;
+        const uint64_t start=(uint64_t)ring_[(at+2)&mask]<<32|ring_[(at+1)&mask];
+        const uint32_t size=ring_[(at+3)&mask]&0xfffffu;
+        if(address<start || address-start>=4ull*size)continue;
+        *iova=start;*dwords=size;
+        return kIOReturnSuccess;
+    }
+    return kIOReturnUnsupported;
+}
+#endif
 IOReturn NativeAdrenoRing::stallState(uint32_t *out)
 {
     if(!out)return kIOReturnBadArgument;

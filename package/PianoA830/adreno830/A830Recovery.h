@@ -44,6 +44,10 @@ struct A830HangSnapshot {
     uint64_t detail;
 };
 
+/* One pipe's IB1 and IB2 (CP_IB1/IB2_BASE and _REM_SIZE through CP_APERTURE_CNTL_HOST): base and the dwords left. A830Recovery::readIbs
+ * fills it, for the hang snapshot (BR) and the fault detail (UniXNU-piano, 2026-11-21: BR and BV at the poll that finds a CB0 fault). */
+struct A830IbState {uint64_t ib1Base,ib2Base;uint32_t ib1Rem,ib2Rem;};
+
 /* The gate of the ABI shell (NativeAdrenoPublish/UserClient). */
 enum A830Gate : uint8_t {A830GateOpen,A830GateRecovering,A830GateLost};
 
@@ -131,6 +135,9 @@ public:
     uint32_t haltGbif(bool gx);
     /* Capture the global registers (GX ones only when GFX_PWR_CLK_STATUS says GX is on). */
     void capture(uint8_t cause,uint64_t detail,A830HangSnapshot *out);
+    /* A pipe's (A8XX_PIPE_BR, A8XX_PIPE_BV) IB1/IB2 through the readPipe hook; the caller holds GX up (GX registers). A read that
+     * fails leaves its field 0; without the hook (before init) everything is 0. Any thread context (readPipe takes the MMIO lock). */
+    void readIbs(uint8_t pipe,A830IbState *out) const;
 
 private:
     static constexpr uint8_t Publishing=A830FaultCount;

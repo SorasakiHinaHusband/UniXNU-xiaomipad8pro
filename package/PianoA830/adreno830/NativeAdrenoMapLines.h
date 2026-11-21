@@ -227,6 +227,63 @@ static inline void NativeAdrenoAllocRefusalLine(char *line,size_t size,const Nat
     }
 }
 
+/* The detail of a refused Submit (2026-11-21, 20261121-ws-crash: "WindowServer[102] slot 0 Submit -> BadArgument" named no check;
+ * NativeAdrenoUserClient::lastSubmitRefusal): the check, and for an entry "entry <i>/<n> handle <BO handle> iova <iova> bytes <bytes>
+ * (mapped <iova>+<bytes> | not mapped)" with what that check adds. The boot_progress_gpu_event prefix makes it "gpu submit refused: ...". */
+static inline const char *NativeAdrenoSubmitWhyText(uint8_t why)
+{
+    switch(why) {
+    case NativeAdrenoSubmitWhyNotOpen: return "not open";
+    case NativeAdrenoSubmitWhyCount: return "count";
+    case NativeAdrenoSubmitWhyQueue: return "queue";
+    case NativeAdrenoSubmitWhyWaitFence: return "wait fence";
+    case NativeAdrenoSubmitWhyBytes: return "bytes";
+    case NativeAdrenoSubmitWhyHandle: return "handle unknown";
+    case NativeAdrenoSubmitWhyNotMapped: return "not mapped";
+    case NativeAdrenoSubmitWhyRange: return "range";
+    case NativeAdrenoSubmitWhyQueueFull: return "queue full";
+    case NativeAdrenoSubmitWhyOther: return "other";
+    default: return "no reason recorded";
+    }
+}
+static inline int NativeAdrenoSubmitRefusalLine(char *line,size_t size,const NativeAdrenoSubmitRefusal &r)
+{
+    if(!line || !size)return 0;
+    typedef unsigned long long u64;
+    const char *what=NativeAdrenoSubmitWhyText(r.why),*code=NativeAdrenoReturnName(r.status);
+    char status[40];
+    snprintf(status,sizeof status,"%#x%s%s",unsigned(r.status),code?" ":"",code?code:"");
+    if(r.index==UINT32_MAX) {
+        switch(r.why) {
+        case NativeAdrenoSubmitWhyCount:
+            return snprintf(line,size,"submit refused: count: %u buffers (1..%u), reserved %#llx",r.count,unsigned(NativeAdrenoAbiMaxBuffers),
+                            u64(r.a));
+        case NativeAdrenoSubmitWhyQueue:
+            return snprintf(line,size,"submit refused: queue: %llu is not an open queue of this connection (%u buffers)",u64(r.a),r.count);
+        case NativeAdrenoSubmitWhyWaitFence:
+            return snprintf(line,size,"submit refused: wait fence: %llu was never issued (%s, %u buffers)",u64(r.a),status,r.count);
+        default:
+            return snprintf(line,size,"submit refused: %s: %s (%u buffers)",what,status,r.count);
+        }
+    }
+    char mapping[48],tail[56]="";
+    if(r.why==NativeAdrenoSubmitWhyRange || (r.mapped && r.mapped_bytes))
+        snprintf(mapping,sizeof mapping,"mapped %#llx+%#llx",u64(r.mapped),u64(r.mapped_bytes));
+    else snprintf(mapping,sizeof mapping,"%s",r.why==NativeAdrenoSubmitWhyBytes?"mapping not looked up":"not mapped");
+    switch(r.why) {
+    case NativeAdrenoSubmitWhyHandle: snprintf(tail,sizeof tail,", no live object, next handle %#llx",u64(r.a));break;
+    case NativeAdrenoSubmitWhyNotMapped:
+        if(r.b)snprintf(tail,sizeof tail,", VM mapping %#llx: %s",u64(r.b),status);
+        else snprintf(tail,sizeof tail,", object of %llu KiB",u64(r.mapped_bytes>>10));
+        break;
+    case NativeAdrenoSubmitWhyRange: snprintf(tail,sizeof tail,", permissions %#llx",u64(r.a));break;
+    case NativeAdrenoSubmitWhyBytes: break;
+    default: snprintf(tail,sizeof tail,", %s",status);break;
+    }
+    return snprintf(line,size,"submit refused: %s: entry %u/%u handle %#llx iova %#llx bytes %llu (%s)%s",what,r.index,r.count,u64(r.handle),
+                    u64(r.iova),u64(r.bytes),mapping,tail);
+}
+
 /* The VM's totals: "va/map: VM <records>/<max> records, <ranges>/<capacity> ranges (<permille/10>%), <MiB> MiB mapped; pool <used>/<size>
  * MiB, <MiB> MiB outside it". */
 static inline void NativeAdrenoVaTotalsLine(char *line,size_t size,uint64_t objects,uint64_t max_objects,uint64_t spans,uint64_t capacity,

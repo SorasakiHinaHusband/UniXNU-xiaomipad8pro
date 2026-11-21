@@ -47,7 +47,7 @@ struct NativeAdrenoSubmitStats {
 enum NativeAdrenoSubmitWhy : uint8_t {
     NativeAdrenoSubmitWhyNone,
     NativeAdrenoSubmitWhyNotOpen,     /* the connection is closed, or the submit object not attached or poisoned */
-    NativeAdrenoSubmitWhyCount,       /* a buffer_count, b reserved: no entry, more than the most, or reserved nonzero */
+    NativeAdrenoSubmitWhyCount,       /* count the buffer_count, a reserved: no entry, more than the most, or reserved nonzero */
     NativeAdrenoSubmitWhyQueue,       /* a the queue: not one of the connection's open queues */
     NativeAdrenoSubmitWhyWaitFence,   /* a the wait_fence: never issued */
     NativeAdrenoSubmitWhyBytes,       /* the entry's bytes 0, not a multiple of 4 or past the largest IB */

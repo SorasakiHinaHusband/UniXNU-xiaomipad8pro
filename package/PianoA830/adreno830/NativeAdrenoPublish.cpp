@@ -35,6 +35,7 @@
 #include <sys/ubc.h>
 #else
 struct NativeAdrenoFailureSnapshot {};
+struct NativeAdrenoSubmitRefusal {};
 #endif
 #include "NativeAdrenoMeter.h"
 #include "Adreno830Status.h"
@@ -277,7 +278,7 @@ void eventTail(char *out,size_t size,IOReturn status,uint32_t count)
 #endif
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
 static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,
-    NativeAdrenoFailureSnapshot *snapshot=nullptr);
+    NativeAdrenoFailureSnapshot *snapshot=nullptr,NativeAdrenoSubmitRefusal *refusal=nullptr);
 
 /* The two sandbox gates IOServiceOpen applies after newUserClient (XNU IOUserClient.cpp is_io_service_open_extended): the MACF open check on
  * the client object and the sandbox's filter resolver. They are run here for the caller too, only to record which one refuses it. */
@@ -369,7 +370,8 @@ class AGXDeviceUserClient : public IOUserClient {
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
     IOReturn locked(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,NativeAdrenoFailureSnapshot *failure=nullptr);
     IOReturn waitFence(const void *input,size_t input_size,void *output,size_t output_size);
-    IOReturn submit(const void *input,size_t input_size,void *output,size_t output_size);
+    /* refusal (optional, UniXNU-piano): why the core refused the last try (lastSubmitRefusal, copied under the connection lock). */
+    IOReturn submit(const void *input,size_t input_size,void *output,size_t output_size,NativeAdrenoSubmitRefusal *refusal=nullptr);
     IOReturn importBo(const void *input,size_t input_size,void *output,size_t output_size,NativeAdrenoFailureSnapshot *failure=nullptr);
 public:
     void setHandoffOnly() {handoffOnly_=true;}
@@ -385,7 +387,8 @@ public:
         }
         return sum;
     }
-    friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,NativeAdrenoFailureSnapshot *);
+    friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,NativeAdrenoFailureSnapshot *,
+        NativeAdrenoSubmitRefusal *);
     friend void nativeAdrenoMailboxPoller(void *,wait_result_t);
     IOReturn clientClose() APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
@@ -970,13 +973,20 @@ IOReturn AGXDeviceUserClient::waitFence(const void *input,size_t input_size,void
 /* Submit (ARCHITECTURE 5.4): the core's submission under the connection lock; a caller with nothing in flight whose submission finds the
  * ring full (or the ring halted by a recovery) is never told Busy at once: the connection lock is dropped, the thread sleeps on the
  * fence that frees room (in the ring's completion wait), and the submission is made again, for at most 200 ms. */
-IOReturn AGXDeviceUserClient::submit(const void *input,size_t input_size,void *output,size_t output_size)
+IOReturn AGXDeviceUserClient::submit(const void *input,size_t input_size,void *output,size_t output_size,
+    NativeAdrenoSubmitRefusal *refusal)
 {
+#ifndef ADRENO830_MACOS
+    (void)refusal;
+#endif
     static uint32_t sampled;
     const bool sample=!(__atomic_fetch_add(&sampled,1,__ATOMIC_RELAXED)&255);
     const uint64_t t0=sample?nowUs():0;
     const IOReturn status=NativeAdrenoSubmitWithRetry(
         [&](uint32_t *retry_fence)->IOReturn {
+#ifdef ADRENO830_MACOS
+            if(refusal)*refusal={};   /* only the last try's refusal is reported */
+#endif
             if(lost())return NativeAdrenoReturnNotResponding;
             if(!lock_)return kIOReturnNotReady;
             /* M13 (ARCHITECTURE 4.17): a submission holds the GPU awake; under P1/P2 acquire() wakes it from slumber, under
@@ -992,6 +1002,10 @@ IOReturn AGXDeviceUserClient::submit(const void *input,size_t input_size,void *o
             IOReturn result=live_ && !closing_?box_->core.dispatch(NativeAdrenoMethodSubmit,input,input_size,output,output_size,&g.clock):
                 kIOReturnNotReady;
             if(result==NativeAdrenoSubmitRetry)*retry_fence=box_->core.retryFence();
+#ifdef ADRENO830_MACOS
+            /* Call-owned, under the lock: another thread's Submit on this connection replaces the core's record. */
+            if(refusal)*refusal=result && live_ && !closing_?box_->core.lastSubmitRefusal():NativeAdrenoSubmitRefusal{};
+#endif
             IOLockUnlock(lock_);
             if(power)power->release();
             if(result==kIOReturnSuccess) {
@@ -1079,7 +1093,7 @@ IOReturn AGXDeviceUserClient::importBo(const void *input,size_t input_size,void 
     return status;
 }
 static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,
-    NativeAdrenoFailureSnapshot *snapshot)
+    NativeAdrenoFailureSnapshot *snapshot,NativeAdrenoSubmitRefusal *refusal)
 {
     /* The call meter: the whole call as its caller sees it, the waits for the connection's lock, a full ring's sleep and the teardown of a
      * freed BO's CPU view included; the waits are counted apart as well (ARCHITECTURE 8.8). */
@@ -1119,7 +1133,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     }
     IOReturn status;
     if(method==NativeAdrenoMethodWaitFence)status=connection->waitFence(input,input_size,output,output_size);
-    else if(method==NativeAdrenoMethodSubmit)status=connection->submit(input,input_size,output,output_size);
+    else if(method==NativeAdrenoMethodSubmit)status=connection->submit(input,input_size,output,output_size,refusal);
     else {
         status=connection->locked(method,input,input_size,output,output_size,snapshot);
         if(method==NativeAdrenoMethodBoMap && !status && !connection->kernel_ && connection->lock_) {
@@ -1181,8 +1195,9 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
     return runCore(this,method,input,input_size,output,output_size);
 #else
     NativeAdrenoFailureSnapshot snapshot{};
+    NativeAdrenoSubmitRefusal refused{};   /* 2026-11-21: a refused Submit's check (lastSubmitRefusal), call-owned */
     const IOReturn status=method==NativeAdrenoMethodBoImport?importBo(input,input_size,output,output_size,&snapshot):
-        runCore(this,method,input,input_size,output,output_size,&snapshot);
+        runCore(this,method,input,input_size,output,output_size,&snapshot,&refused);
     /* UniXNU-piano: a failed call (but the answers Turnip expects, NativeAdrenoCallRoutine) on the console: the process, its slot, the ABI
      * method and the IOReturn, the first time per process, method and status and then every decade. */
     if(!NativeAdrenoCallRoutine(method,status))
@@ -1193,6 +1208,12 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
             eventTail(tail,sizeof tail,status,count);
             snprintf(line,sizeof line,"call failed: %s[%d] slot %u %s -> %#x%s",name_,proc_selfpid(),slot_,what,unsigned(status),tail);
             boot_progress_gpu_event(line);
+            /* 2026-11-21 (20261121-ws-crash): which check refused a Submit, under the same key and decade rule as its line above. */
+            if(method==NativeAdrenoMethodSubmit && refused.why) {
+                char detail[NativeAdrenoMapLineBytes];
+                NativeAdrenoSubmitRefusalLine(detail,sizeof detail,refused);
+                boot_progress_gpu_event(detail);
+            }
             /* Every field is call-owned; never read core.last*Refusal() after releasing its lock. */
             if(snapshot.captured) {
                 for(unsigned row=0;row<NativeAdrenoFailureLines;++row) {
@@ -1971,5 +1992,114 @@ extern "C" void native_adreno_note_hang_snapshot(const A830HangSnapshot *s)
         if(locked)IOLockUnlock(g.lock);
     }
     boot_progress_gpu_event(line);
+}
+/* UniXNU-piano (2026-11-21, 20261121-ws-crash CROSS-WINDOW.txt 4(a) D2): a CB0 fault's detail, at the bottom half that found it (after its
+ * "fault cb0" line; the first A830SmmuFaultLines of a boot, NativeAdrenoStatus.h), in "fault detail <n>/<lines>:" lines: the fences and
+ * whose jobs are in flight now; where BR's and BV's IB1/IB2 stand (and whose windows those are); for FAR and FAR - 4 GiB (a +4 GiB carry
+ * from a slot-0 address lands in slot 1) the window's holder, the mapping over the address and the nearest one below it (start, KiB,
+ * kind, age in map handles, gap); whether the 32 command dwords at each IB's read position hold FAR's or FAR - 4 GiB's page as a qword
+ * (its dword index: a command-stream literal). An IB1's read position is its start + 4 * (size - left), with the size from its ring
+ * packet (NativeAdrenoRing::ibHolding); an IB2's (its packet is in the IB1) is its base. Locks: the Ring lock (rangesInFlight) and the
+ * VM's (locate, peekWords) inside their calls, then g.lock only tried for the names (the hang snapshot's rule): without it "?". */
+extern "C" void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *d)
+{
+    if(!d || !__atomic_load_n(&g.published,__ATOMIC_ACQUIRE) || !g.submit || !g.vm || !g.ring)return;
+    typedef unsigned long long u64;
+    const uint64_t far=d->far,low=far>>32?far-(UINT64_C(1)<<32):0;   /* FAR - 4 GiB (0: FAR is below 4 GiB) */
+    uint32_t ranges=0;
+    const bool known=g.submit->rangesInFlight(d->completed,d->issued,&ranges)==kIOReturnSuccess;
+    NativeAdrenoVmPlace over[2]{},below[2]{};
+    const uint64_t at[2]={far,low};
+    for(unsigned i=0;i<2;++i)if(at[i])(void)g.vm->locate(at[i],&over[i],&below[i]);
+    const uint64_t next=g.vm->nextHandle();
+    /* [pipe][IB1, IB2]: the read position and the dword index of FAR's page (far) and FAR - 4 GiB's (low); -1 none, -2 not read. */
+    struct Scan {uint64_t pos;int far,low;};
+    Scan scan[2][2]{};
+    for(unsigned pipe=0;d->ibs && pipe<2;++pipe)
+        for(unsigned ib=0;ib<2;++ib) {
+            Scan &s=scan[pipe][ib];
+            s.far=s.low=-2;
+            const uint64_t base=ib?d->ib2[pipe]:d->ib1[pipe];
+            const uint32_t left=ib?d->ib2_rem[pipe]:d->ib1_rem[pipe];
+            if(!base)continue;
+            s.pos=base;
+            uint64_t start=0;uint32_t size=0;
+            if(!ib && g.ring->ibHolding(d->rptr,base,&start,&size)==kIOReturnSuccess && start==base && left<=size)
+                s.pos=base+4ull*(size-left);
+            uint32_t words[32];
+            if(g.vm->peekWords(s.pos&~UINT64_C(3),words,32)!=kIOReturnSuccess)continue;
+            s.far=s.low=-1;
+            for(int k=0;k+1<32;++k) {
+                const uint64_t q=(uint64_t(words[k+1])<<32|words[k])&~UINT64_C(0xfff);
+                if(s.far<0 && q==(far&~UINT64_C(0xfff)))s.far=k;
+                if(s.low<0 && low && q==(low&~UINT64_C(0xfff)))s.low=k;
+            }
+        }
+    const NativeAdrenoClientWindow *windows=g.published?g.windows:nullptr;
+    static const char *const kinds[]={"none","own","pool","imp","scan"};
+    enum : unsigned {Lines=5};
+    char lines[Lines][NativeAdrenoMapLineBytes]={};
+    const bool locked=IOLockTryLock(g.lock);
+    {
+        /* "<slot>:<name>" of a window (its holder now), "<slot>:-" for a window nobody holds, "none" outside every window. */
+        const auto holder=[&](char *out,size_t size,unsigned slot) {
+            const CoreBox *box=locked && slot<NativeAdrenoMaxClients?slotBox(slot):nullptr;
+            if(slot>=NativeAdrenoMaxClients)snprintf(out,size,"none");
+            else snprintf(out,size,"%u:%.12s",slot,box?box->name:!locked?"?":"-");
+        };
+        const auto place=[&](char *out,size_t size,const NativeAdrenoVmPlace &p,uint64_t gap) {
+            if(!p.handle) {snprintf(out,size,"none");return;}
+            const int used=snprintf(out,size,"%#llx+%lluK %s a%llu",u64(p.iova),u64((p.bytes+1023)>>10),kinds[p.kind<5?p.kind:0],
+                u64(next-p.handle));
+            if(gap && used>0 && size_t(used)<size)snprintf(out+used,size-size_t(used)," gap %#llx",u64(gap));
+        };
+        const unsigned n=d->index,of=d->lines;
+        int used=snprintf(lines[0],sizeof lines[0],"fault detail %u/%u: fences done %u issued %u; in flight",n,of,d->completed,d->issued);
+        if(!known)used+=snprintf(lines[0]+used,sizeof lines[0]-size_t(used)," ? (no fence history)");
+        else if(!ranges)used+=snprintf(lines[0]+used,sizeof lines[0]-size_t(used)," none");
+        for(unsigned s=0;known && s<NativeAdrenoMaxClients && used>0 && size_t(used)<sizeof lines[0];++s)
+            if(ranges&(1u<<s)) {
+                char who[20];
+                const CoreBox *box=locked?slotBox(s):nullptr;
+                snprintf(who,sizeof who,"%.12s",box?box->name:!locked?"?":s?"-":"kernel");
+                used+=snprintf(lines[0]+used,sizeof lines[0]-size_t(used)," %u:%s",s,who);
+            }
+        if(d->ibs) {
+            const auto slotOf=[&](uint64_t address,char *out,size_t size) {
+                const unsigned slot=NativeAdrenoClientSlotAt(windows,address);
+                if(slot<NativeAdrenoMaxClients)snprintf(out,size,"s%u",slot);else snprintf(out,size,"s-");
+            };
+            char s[4][8];
+            slotOf(d->ib1[0],s[0],sizeof s[0]);slotOf(d->ib2[0],s[1],sizeof s[1]);slotOf(d->ib1[1],s[2],sizeof s[2]);
+            slotOf(d->ib2[1],s[3],sizeof s[3]);
+            snprintf(lines[1],sizeof lines[1],"fault detail %u/%u: BR IB1 %#llx+%u %s IB2 %#llx+%u %s, BV IB1 %#llx+%u %s IB2 %#llx+%u %s, "
+                "RPTR %u",n,of,u64(d->ib1[0]),d->ib1_rem[0],s[0],u64(d->ib2[0]),d->ib2_rem[0],s[1],u64(d->ib1[1]),d->ib1_rem[1],s[2],
+                u64(d->ib2[1]),d->ib2_rem[1],s[3],d->rptr);
+        } else snprintf(lines[1],sizeof lines[1],"fault detail %u/%u: IBs not read (GX not up)",n,of);
+        for(unsigned i=0;i<2;++i) {
+            if(!at[i])continue;
+            char who[24],o[64],b[72];
+            holder(who,sizeof who,NativeAdrenoClientSlotAt(windows,at[i]));
+            place(o,sizeof o,over[i],0);
+            place(b,sizeof b,below[i],below[i].handle?at[i]-(below[i].iova+below[i].bytes):0);
+            snprintf(lines[2+i],sizeof lines[2+i],"fault detail %u/%u: %s %#llx in %s: over %s; below %s",n,of,i?"FAR-4G":"FAR",u64(at[i]),
+                who,o,b);
+        }
+        if(d->ibs) {
+            const auto hit=[](char *out,size_t size,int k) {
+                if(k==-2)snprintf(out,size,"?");else if(k<0)snprintf(out,size,"-");else snprintf(out,size,"@%d",k);
+            };
+            char h[2][2][2][8];
+            for(unsigned p=0;p<2;++p)for(unsigned ib=0;ib<2;++ib) {
+                hit(h[p][ib][0],sizeof h[p][ib][0],scan[p][ib].far);
+                hit(h[p][ib][1],sizeof h[p][ib][1],low?scan[p][ib].low:-1);
+            }
+            snprintf(lines[4],sizeof lines[4],"fault detail %u/%u: words FAR/FAR-4G: BR IB1 @%#llx %s/%s IB2 @%#llx %s/%s; BV IB1 @%#llx %s/%s "
+                "IB2 @%#llx %s/%s",n,of,u64(scan[0][0].pos),h[0][0][0],h[0][0][1],u64(scan[0][1].pos),h[0][1][0],h[0][1][1],
+                u64(scan[1][0].pos),h[1][0][0],h[1][0][1],u64(scan[1][1].pos),h[1][1][0],h[1][1][1]);
+        }
+    }
+    if(locked)IOLockUnlock(g.lock);
+    for(unsigned i=0;i<Lines;++i)if(lines[i][0])boot_progress_gpu_event(lines[i]);
 }
 #endif

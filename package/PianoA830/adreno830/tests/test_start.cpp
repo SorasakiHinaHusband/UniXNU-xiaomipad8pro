@@ -1001,6 +1001,14 @@ extern "C" bool native_adreno_note_page_fault(uint64_t far,uint32_t completed,ui
     return true;
 }
 extern "C" uint32_t native_adreno_coherent_imports(void) {return 1;}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-21): the GPU bank's fault lines go to the event lines (boot_progress_gpu_event) whatever the diagnostic mode, each
+ * with its detail (native_adreno_note_fault_detail, the publish shell's). */
+static std::vector<std::string> eventLines;
+static std::vector<NativeAdrenoFaultDetail> detailsNoted;
+extern "C" void boot_progress_gpu_event(const char *text) {eventLines.push_back(text);}
+extern "C" void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *detail) {detailsNoted.push_back(*detail);}
+#endif
 IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &io,const A830PowerEnv &env,const A830PowerOps &ops)
 {
 #ifdef ADRENO830_MACOS
@@ -1065,6 +1073,7 @@ void A830Recovery::report(uint8_t cause,uint64_t)
     if(reportPends)__atomic_store_n(&pendingCause_,cause,__ATOMIC_RELEASE);
 }
 IOReturn A830Recovery::recover(uint8_t cause,uint64_t) {recoveredCause=cause;return hit("A830Recovery::recover");}
+void A830Recovery::readIbs(uint8_t,A830IbState *out) const {if(out)*out={};hit("A830Recovery::readIbs");}
 IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,const A830PowerIo &,const A830PowerEnv &,
                         const A830DcvsOps &ops,A830PowerState *power,A830Recovery *recovery,const Sm8750TsensIo *)
 {
@@ -1299,6 +1308,19 @@ int main()
             for(const std::string &line:logLines)lines+=line.rfind("gpu fault cb",0)==0;
             return lines;
         };
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano (2026-11-21): the GPU bank's first A830SmmuFaultLines faults of the boot are event lines without pagani-diag or
+         * the log (the two above among them), each with its detail (fences now; no power state in these doubles: no IBs read); the
+         * other banks' keep the diagnostic rule. */
+        const auto faultEvents=[] {
+            unsigned lines=0;
+            for(const std::string &line:eventLines)lines+=line.rfind("fault cb0 far 0x2000",0)==0;
+            return lines;
+        };
+        CHECK(faultEvents()==2 && detailsNoted.size()==2 && detailsNoted[0].far==0x20001000 && detailsNoted[0].index==1 &&
+              detailsNoted[1].far==0x20002000 && detailsNoted[1].index==2 && detailsNoted[1].lines==A830SmmuFaultLines &&
+              !detailsNoted[1].ibs && !called("A830Recovery::readIbs"));
+#endif
         logOn=1;adreno830_status_mode(2);logLines.clear();
         faultsToDrain={cb0};
         smmuConfigSeen.platform.fault_notify(smmuConfigSeen.platform.cookie);
@@ -1308,15 +1330,29 @@ int main()
         faultsToDrain={cb0,cb2,polled};
         smmuConfigSeen.platform.fault_notify(smmuConfigSeen.platform.cookie);
         hostEntered->function(hostEntered->argument);
+#ifdef ADRENO830_MACOS
+        CHECK(faultLines()==1 && faultEvents()==5 && detailsNoted.size()==5);
+#else
         CHECK(faultLines()==3);
+#endif
         faultsToDrain.assign(A830SmmuFaultLines,polled);
         smmuConfigSeen.platform.fault_notify(smmuConfigSeen.platform.cookie);
         hostEntered->function(hostEntered->argument);
+#ifdef ADRENO830_MACOS
+        CHECK(faultLines()==1 && faultEvents()==A830SmmuFaultLines && detailsNoted.size()==A830SmmuFaultLines &&
+              detailsNoted.back().index==A830SmmuFaultLines && faultsNoted.size()==1+2+A830SmmuFaultLines);
+#else
         CHECK(faultLines()==A830SmmuFaultLines+1);
+#endif
         faultsToDrain.assign(A830SmmuFaultLines,cb2);
         smmuConfigSeen.platform.fault_notify(smmuConfigSeen.platform.cookie);
         hostEntered->function(hostEntered->argument);
+#ifdef ADRENO830_MACOS
+        CHECK(faultLines()==A830SmmuFaultLines && faultEvents()==A830SmmuFaultLines);
+        eventLines.clear();detailsNoted.clear();
+#else
         CHECK(faultLines()==2*A830SmmuFaultLines);
+#endif
         adreno830_status_diag(false);adreno830_status_mode(0);logOn=0;logLines.clear();faultsNoted.clear();
     }
     /* A second start in the same boot is refused and changes nothing. */

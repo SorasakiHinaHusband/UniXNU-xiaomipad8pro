@@ -75,6 +75,8 @@ extern "C" __attribute__((weak)) void adreno830_qualification_unsafe(A830ExitOri
 /* UniXNU-piano (macOS 27): the publish shell's definition (NativeAdrenoPublish.cpp) replaces this weak default, which the host tests
  * that link the orchestrator without the shell take: no snapshot line. */
 extern "C" __attribute__((weak)) void native_adreno_note_hang_snapshot(const A830HangSnapshot *) {}
+/* The same for a CB0 fault's detail lines (2026-11-21, NativeAdrenoStatus.h). */
+extern "C" __attribute__((weak)) void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *) {}
 /* The idle policy's board hooks (A830Idle.h): mode 0 and no line without the board (the host tests). */
 extern "C" __attribute__((weak)) void adreno830_board_idle(A830IdleConfig *) {}
 extern "C" __attribute__((weak)) void adreno830_board_idle_event(const A830IdleEvent *) {}
@@ -939,10 +941,46 @@ void smmuFences(void *,uint32_t *completed,uint32_t *issued)
 /* The SMMU fault bottom half (ARCHITECTURE 4.12.3): CB0 faults go to the publish shell, which charges the connection whose window
  * holds FAR and counts how the jobs in flight at the fault (the fences the top half read) compare with it; CB2 faults and
  * unattributed ones are only counted (smmu_faults, by A830Smmu). */
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-21, 20261121-ws-crash CROSS-WINDOW.txt 4(a) D2): the hardware half of a CB0 fault's detail, taken by the bottom
+ * half that found it: the fences now and, while GX is up (accessBegin: never wakes the GPU, never blocks), BR's and BV's IB1/IB2
+ * through the hang snapshot's reads (A830Recovery::readIbs) and the BR ring read pointer. The publish shell adds the owners and the
+ * command words (native_adreno_note_fault_detail). */
+void noteFaultDetail(const A830SmmuFault &fault,uint32_t index)
+{
+    NativeAdrenoFaultDetail d{};
+    d.far=fault.far;d.index=index;d.lines=A830SmmuFaultLines;
+    d.completed=g830.fence.completed();d.issued=g830.ring.lastSubmitted();
+    A830PowerState *power=adreno830_power_state();
+    if(power && power->accessBegin(true)) {
+        for(unsigned pipe=0;pipe<2;++pipe) {
+            A830IbState ibs{};
+            g830.recovery.readIbs(uint8_t(A8XX_PIPE_BR+pipe),&ibs);
+            d.ib1[pipe]=ibs.ib1Base;d.ib1_rem[pipe]=ibs.ib1Rem;d.ib2[pipe]=ibs.ib2Base;d.ib2_rem[pipe]=ibs.ib2Rem;
+        }
+        uint32_t rptr=0;
+        if(readDword(A8XX_CP_RB_RPTR,&rptr))d.rptr=rptr;
+        power->accessEnd(true);
+        d.ibs=true;
+    }
+    native_adreno_note_fault_detail(&d);
+}
+#endif
 void smmuFaultSink(void *,const A830SmmuFault &fault)
 {
     const bool gpu=fault.cb==g830.board->cb_gpu;
     if(gpu)native_adreno_note_page_fault(fault.far,fault.completed,fault.issued,fault.sampled!=0);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-21): the GPU bank's first A830SmmuFaultLines faults of a boot on the console whatever the diagnostic mode
+     * (FSYNR0/1 say read or write and which GPU client, the SID which stream), each followed by its detail lines. */
+    if(gpu && g830.fault_lines[1]<A830SmmuFaultLines) {
+        char line[A830SmmuFaultLineBytes];
+        A830SmmuFaultLine(line,fault);
+        boot_progress_gpu_event(line+4);   /* "gpu fault cb0 ...": the event line brings its own "gpu " */
+        noteFaultDetail(fault,++g830.fault_lines[1]);
+        return;
+    }
+#endif
     if(g830.fault_lines[gpu]<A830SmmuFaultLines && adreno830_status_diag_lines()) {
         char line[A830SmmuFaultLineBytes];
         A830SmmuFaultLine(line,fault);

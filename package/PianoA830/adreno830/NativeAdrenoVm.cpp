@@ -919,6 +919,31 @@ uint64_t NativeAdrenoVm::handleAt(uint64_t iova) const
     }
     return 0;
 }
+#ifdef ADRENO830_MACOS
+IOReturn NativeAdrenoVm::locate(uint64_t iova,NativeAdrenoVmPlace *over,NativeAdrenoVmPlace *below) const
+{
+    if(over)*over={};
+    if(below)*below={};
+    if(!attached_ || !mappings_)return kIOReturnNotReady;
+    VM_LOCKED;
+    if(!mappings_)return kIOReturnNotReady;
+    const auto place=[](const Mapping &m)->NativeAdrenoVmPlace {
+        const NativeAdrenoMemory &o=*m.memory;
+        const uint8_t kind=o.scanout()?NativeAdrenoVmKindScanout:o.imported()?NativeAdrenoVmKindImport:
+                           o.pooled()?NativeAdrenoVmKindPool:NativeAdrenoVmKindOwn;
+        return {m.handle,m.iova,o.bytes(),kind};
+    };
+    uint64_t highest=0;
+    for(size_t i=0;i<high_;++i) {
+        const Mapping &m=mappings_[i];
+        if(!m.memory)continue;
+        const uint64_t bytes=m.memory->bytes();
+        if(iova>=m.iova && iova-m.iova<bytes) {if(over)*over=place(m);continue;}
+        if(m.iova<iova && m.iova+bytes>highest) {highest=m.iova+bytes;if(below)*below=place(m);}
+    }
+    return kIOReturnSuccess;
+}
+#endif
 IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
 {
     if(!out || !attached_)return kIOReturnBadArgument;

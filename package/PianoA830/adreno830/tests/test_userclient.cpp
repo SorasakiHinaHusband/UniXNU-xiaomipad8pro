@@ -245,6 +245,51 @@ int main()
         CHECK(p.client.submit(&future,&reply,&ringclock)==kIOReturnBadArgument && cp.regs[0x0807]==wptr);
         CHECK(p.client.validateWaitFence(0)==kIOReturnSuccess && p.client.validateWaitFence(2)==kIOReturnSuccess &&
             p.client.validateWaitFence(3)==kIOReturnBadArgument);
+#ifdef ADRENO830_MACOS
+        {
+            /* UniXNU-piano (2026-11-21, 20261121-ws-crash): a refused Submit names its check (lastSubmitRefusal): the wait fence, an
+             * entry's bytes, an unknown handle, an object never mapped (its size), an IB past its mapping (the submit object's check,
+             * with the request's BO handle put back and the VM's mapping handle in b), the count and the queue; none reaches the ring. */
+            NativeAdrenoSubmitRefusal r=p.client.lastSubmitRefusal();
+            CHECK(r.why==NativeAdrenoSubmitWhyWaitFence && r.a==(UINT64_C(1)<<32|1) && r.count==1 && r.index==UINT32_MAX);
+            NativeAdrenoAbiSubmit bad=submit;bad.buffers[0].bytes=6;
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument);
+            r=p.client.lastSubmitRefusal();
+            CHECK(r.why==NativeAdrenoSubmitWhyBytes && !r.index && r.handle==handle && r.iova==Base && r.bytes==6);
+            bad=submit;bad.buffer_count=2;bad.buffers[1]={handle+1000,Base,64};
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument);
+            r=p.client.lastSubmitRefusal();
+            CHECK(r.why==NativeAdrenoSubmitWhyHandle && r.index==1 && r.count==2 && r.handle==handle+1000 && r.a>handle);
+            NativeAdrenoAbiBoAlloc plain{4096,12,0};NativeAdrenoAbiBoAllocReply made{};
+            CHECK(p.client.allocBo(&plain,&made)==kIOReturnSuccess);
+            bad=submit;bad.buffers[0]={made.handle,Base,64};
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument);
+            r=p.client.lastSubmitRefusal();
+            CHECK(r.why==NativeAdrenoSubmitWhyNotMapped && r.handle==made.handle && r.mapped_bytes==4096 && !r.mapped && !r.b);
+            NativeAdrenoAbiBoFree drop{made.handle};
+            CHECK(p.client.freeBo(&drop)==kIOReturnSuccess);
+            bad=submit;bad.buffers[0].iova=Base+8192-64;bad.buffers[0].bytes=128;   /* past the end of the 8 KiB BO */
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument);
+            r=p.client.lastSubmitRefusal();
+            CHECK(r.why==NativeAdrenoSubmitWhyRange && !r.index && r.count==1 && r.handle==handle && r.mapped==Base &&
+                  r.mapped_bytes==8192 && r.b && r.b!=handle+1000 && r.status==kIOReturnBadArgument);
+            bad=submit;bad.buffer_count=0;
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument &&
+                  p.client.lastSubmitRefusal().why==NativeAdrenoSubmitWhyCount && !p.client.lastSubmitRefusal().count);
+            bad=submit;bad.queue=7;
+            CHECK(p.client.submit(&bad,&reply,&ringclock)==kIOReturnBadArgument &&
+                  p.client.lastSubmitRefusal().why==NativeAdrenoSubmitWhyQueue && p.client.lastSubmitRefusal().a==7);
+            CHECK(cp.regs[0x0807]==wptr);
+            /* A fault's detail (NativeAdrenoVm::locate): the mapping over an address and the nearest one below another. */
+            NativeAdrenoVmPlace over{},below{};
+            CHECK(p.vm.locate(Base+100,&over,&below)==kIOReturnSuccess && over.handle && over.iova==Base && over.bytes==8192 &&
+                  over.kind!=NativeAdrenoVmKindNone && over.kind!=NativeAdrenoVmKindImport && over.handle<p.vm.nextHandle());
+            const uint64_t mapping=over.handle;
+            CHECK(p.vm.locate(Base+3*8192,&over,&below)==kIOReturnSuccess && !over.handle && below.handle==mapping && below.iova==Base &&
+                  below.bytes==8192);
+            macosChecks+=11;
+        }
+#endif
         complete(2);
         wait.timeout_ns=UINT64_C(1000000);
         CHECK(p.client.waitFence(&wait,&ringclock)==kIOReturnSuccess);
@@ -1606,7 +1651,7 @@ int main()
         "the page fault charged to its FAR window's connection whatever was in flight (nobody for the kernel range), the jobs in flight "
         "only counted against it (alike, apart, undecided, polled)\n",attribution);
 #ifdef ADRENO830_MACOS
-    std::printf("PASS: BoMap refusal records and mapping figures (UniXNU-piano): %u checks (every request refusal's reason, already mapped, "
+    std::printf("PASS: BoMap and Submit refusal records and mapping figures (UniXNU-piano): %u checks (every request refusal's reason, already mapped, "
                 "outside the window with its figures, mapped/unmapped counts; the per-object limit as the window, BoAlloc's and BoImport's "
                 "refusal reasons, a 288 MiB BO)\n",macosChecks);
 #endif

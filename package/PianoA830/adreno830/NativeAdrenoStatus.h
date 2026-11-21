@@ -52,6 +52,22 @@ extern "C" {
  * found): the jobs in flight between them are compared with the FAR window and counted (M14 P0, NativeAdrenoFaultVerdictFor,
  * native_adreno_fault_attribution), never charged. */
 bool native_adreno_note_page_fault(uint64_t far,uint32_t completed,uint32_t issued,bool sampled);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-21, 20261121-ws-crash CROSS-WINDOW.txt 4(a) D2): the state at the bottom half that found a CB0 fault (the poll:
+ * up to a tick after the fault, FAR is sticky and the GPU kept running), for its "gpu fault detail" lines: the fences now and, when GX
+ * was up (ibs), BR's [0] and BV's [1] IB1/IB2 base and dwords left and the BR ring read pointer. index: the fault's line number this
+ * boot (1..lines). native_adreno_note_fault_detail adds whose jobs are in flight, what is mapped at FAR and FAR - 4 GiB and what the
+ * command words at the IBs hold; it prints only, after native_adreno_note_page_fault, in the same thread context. */
+struct NativeAdrenoFaultDetail {
+    uint64_t far;
+    uint32_t index,lines,completed,issued;
+    bool ibs;
+    uint32_t rptr;
+    uint64_t ib1[2],ib2[2];
+    uint32_t ib1_rem[2],ib2_rem[2];
+};
+void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *detail);
+#endif
 /* Global device loss, hang class only (RBBM HANG_DETECT, CP_HW_ERROR, the 2 s software watchdog, GMU CM3 fault / watchdog bite,
  * the WPTR fenced write failing 200 times; ARCHITECTURE 4.13.4): every connection's faults += 1, every later submission fails with
  * kIOReturnNotResponding, waiters return it, and newUserClient refuses new GPU connections. reason is an A830Reason (recorded).

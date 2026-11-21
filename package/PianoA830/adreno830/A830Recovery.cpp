@@ -286,16 +286,9 @@ void A830Recovery::capture(uint8_t cause,uint64_t detail,A830HangSnapshot *out)
         s.cpRlError[0]=rd(A830PowerWinGpu,gpuReg(A8XX_CP_RL_ERROR_DETAILS_0));
         s.cpRlError[1]=rd(A830PowerWinGpu,gpuReg(A8XX_CP_RL_ERROR_DETAILS_1));
         if(rops_.readPipe) {
-            uint32_t lo=0,hi=0;
-            if(rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB1_BASE,&lo)==kIOReturnSuccess &&
-               rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB1_BASE_HI,&hi)==kIOReturnSuccess)
-                s.ib1Base=uint64_t(hi)<<32|lo;
-            rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB1_REM_SIZE,&s.ib1Rem);
-            lo=hi=0;
-            if(rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB2_BASE,&lo)==kIOReturnSuccess &&
-               rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB2_BASE_HI,&hi)==kIOReturnSuccess)
-                s.ib2Base=uint64_t(hi)<<32|lo;
-            rops_.readPipe(rops_.context,A8XX_PIPE_BR,A8XX_CP_IB2_REM_SIZE,&s.ib2Rem);
+            A830IbState br{};
+            readIbs(A8XX_PIPE_BR,&br);
+            s.ib1Base=br.ib1Base;s.ib1Rem=br.ib1Rem;s.ib2Base=br.ib2Base;s.ib2Rem=br.ib2Rem;
         }
     }
     *out=s;
@@ -304,6 +297,23 @@ void A830Recovery::capture(uint8_t cause,uint64_t detail,A830HangSnapshot *out)
     adreno830_status.value=uint64_t(s.int0Status)<<32|s.rbbmStatus;
     adreno830_status.expect=uint64_t(s.lastSubmitted)<<32|s.fence;
     if(s.aoStatus)adreno830_status_sticky(A830StickyGmuAo,s.aoStatus);
+}
+
+void A830Recovery::readIbs(uint8_t pipe,A830IbState *out) const
+{
+    if(!out)return;
+    *out={};
+    if(!rops_.readPipe)return;
+    uint32_t lo=0,hi=0;
+    if(rops_.readPipe(rops_.context,pipe,A8XX_CP_IB1_BASE,&lo)==kIOReturnSuccess &&
+       rops_.readPipe(rops_.context,pipe,A8XX_CP_IB1_BASE_HI,&hi)==kIOReturnSuccess)
+        out->ib1Base=uint64_t(hi)<<32|lo;
+    rops_.readPipe(rops_.context,pipe,A8XX_CP_IB1_REM_SIZE,&out->ib1Rem);
+    lo=hi=0;
+    if(rops_.readPipe(rops_.context,pipe,A8XX_CP_IB2_BASE,&lo)==kIOReturnSuccess &&
+       rops_.readPipe(rops_.context,pipe,A8XX_CP_IB2_BASE_HI,&hi)==kIOReturnSuccess)
+        out->ib2Base=uint64_t(hi)<<32|lo;
+    rops_.readPipe(rops_.context,pipe,A8XX_CP_IB2_REM_SIZE,&out->ib2Rem);
 }
 
 void A830Recovery::loseLocked(uint8_t cause,uint8_t stage,uint16_t step,IOReturn result)

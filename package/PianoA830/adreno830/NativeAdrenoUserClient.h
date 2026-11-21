@@ -137,6 +137,16 @@ class NativeAdrenoUserClient final {
     IOReturn refuseAlloc(uint8_t why,uint32_t method,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0)
     {alloc_refusal_={why,method,a,b,c,d,e};return status;}
     IOReturn refuseAllocMemory(uint64_t bytes,IOReturn status);
+    /* UniXNU-piano (2026-11-21): the last Submit refusal (NativeAdrenoSubmitRefusal): this object's own checks, or the submit object's
+     * with the entry's BO handle put back in (its VM mapping handle in b). count is the request's buffer_count. */
+    NativeAdrenoSubmitRefusal submit_refusal_{};
+    IOReturn refuseSubmit(uint8_t why,IOReturn status,uint32_t index=UINT32_MAX,const NativeAdrenoAbiSubmitBuffer *wire=nullptr,
+        uint64_t mapped=0,uint64_t mapped_bytes=0,uint64_t a=0,uint64_t b=0)
+    {
+        submit_refusal_={why,index,submit_refusal_.count,wire?wire->handle:0,wire?wire->iova:0,wire?wire->bytes:0,mapped,mapped_bytes,a,b,
+                         status};
+        return status;
+    }
 #endif
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
@@ -234,6 +244,8 @@ public:
     NativeAdrenoMapRefusal lastMapRefusal() const {return map_refusal_;}
     /* UniXNU-piano (2026-11-12): why the last BoAlloc or BoImport was refused (read as lastMapRefusal is). */
     NativeAdrenoAllocRefusal lastAllocRefusal() const {return alloc_refusal_;}
+    /* UniXNU-piano (2026-11-21): why the last Submit was refused (why None: it was not, or before any check; read as lastMapRefusal is). */
+    NativeAdrenoSubmitRefusal lastSubmitRefusal() const {return submit_refusal_;}
     /* The largest BO or import this connection can use, Query's max_bo_bytes: its GPU window (a larger object could never be mapped),
      * page aligned, at most NativeAdrenoMemoryMaxBytes; NativeAdrenoMemoryMaxBytes without a window. Upstream: 256 MiB
      * (NativeAdrenoAbiMaxBoBytesShift) whatever the window. */

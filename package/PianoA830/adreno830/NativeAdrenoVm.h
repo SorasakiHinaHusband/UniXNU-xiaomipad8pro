@@ -63,6 +63,12 @@ struct NativeAdrenoVmRefusal {
     /* mapClient's per-call snapshot, copied while the shared VM lock is held. */
     uint64_t objects=0,spans=0,capacity=0,bytes=0,keep_objects=0,keep_spans=0;
 };
+/* UniXNU-piano (2026-11-21, a CB0 fault's detail): a live mapping as locate() found it: its map handle (0: none; handles count up, so
+ * nextHandle() - handle is its age in maps), GPU start and bytes, and what backs it: an own BO (or a kernel buffer), a pooled BO, a
+ * task's pages (import) or the hand-off scanout. */
+enum NativeAdrenoVmKind : uint8_t {NativeAdrenoVmKindNone,NativeAdrenoVmKindOwn,NativeAdrenoVmKindPool,NativeAdrenoVmKindImport,
+                                   NativeAdrenoVmKindScanout};
+struct NativeAdrenoVmPlace {uint64_t handle,iova,bytes;uint8_t kind;};
 #endif
 /* Mappings refused for the render server's reserve: [0] for objects, [1] for table ranges. */
 extern "C" volatile uint32_t native_adreno_vm_reserve_refused[2];
@@ -255,6 +261,9 @@ public:
     /* UniXNU-piano: the last refused map's reason (BoMap's console detail), the table's range capacity. */
     NativeAdrenoVmRefusal lastRefusal() const {return refusal_;}
     size_t spanCapacity() const {return capacity_;}
+    /* UniXNU-piano (2026-11-21): the mapping over iova (*over) and the one with the highest end at or below iova (*below), either null;
+     * handle 0 where there is none. One walk over the mappings under the VM's lock (a fault's detail, never a hot path). */
+    IOReturn locate(uint64_t iova,NativeAdrenoVmPlace *over,NativeAdrenoVmPlace *below) const;
 #endif
 };
 #endif

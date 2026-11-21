@@ -199,6 +199,13 @@ public:
     /* The CP_INDIRECT_BUFFER packet that ends just before ring index rptr (what a thread whose read pointer is rptr executes):
      * its GPU address and size in dwords. kIOReturnUnsupported when the words there are not that packet. */
     IOReturn ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-21, a CB0 fault's detail): the nearest CP_INDIRECT_BUFFER packet before ring index rptr, walking back over
+     * the whole ring, whose buffer [iova, + 4 * dwords) holds address: the IB a pipe's CP_IB1_BASE stands in (CP_IB1_REM_SIZE is what is
+     * left of it). Reads the words without the ring lock (a diagnostic: a packet being written may be missed or half new).
+     * kIOReturnUnsupported when no packet does. */
+    IOReturn ibHolding(uint32_t rptr,uint64_t address,uint64_t *iova,uint32_t *dwords) const;
+#endif
     bool attached() const {return attached_;}
     bool poisoned() const {return poisoned_;}
     uint32_t outstanding() const {return seqno_-__atomic_load_n(&completed_,__ATOMIC_ACQUIRE);}
