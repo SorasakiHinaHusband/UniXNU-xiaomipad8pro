@@ -295,6 +295,10 @@ So the daemon decides, and the kernel stops guessing from the stream:
   back-off.
 - CoreBrightness's level when the daemon first reads it (its restore) is the baseline, never a move, and so is the level after a
   corebrightnessd restart. In manual mode and while dark the daemon only follows CoreBrightness's level.
+- Round 3 (slider3): automatic mode that WindowServer's stream ended while no lease held is given back when the lease arrives
+  (`Handover`). This covers CoreBrightness's restore or an EDR ramp at the login window before the daemon runs. A display power-on
+  or wake, a reported move or an explicit `piano-backlight-auto` clears it. slider3's "move at login" was two real brightness-up
+  keys: desk-login's `seq 1 0` is `1 0` on macOS (fixed). CoreBrightness's level did not change at the login itself.
 - The daemon wakes on PianoBacklight's property-change messages (it publishes each new request, `piano-backlight-native-requested`,
   at most every 100 ms) and once every 30 s.
 

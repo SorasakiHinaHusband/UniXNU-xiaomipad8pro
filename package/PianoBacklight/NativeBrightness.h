@@ -43,6 +43,27 @@ constexpr char kNativeMoved[] = "piano-backlight-moved";
 constexpr char kNativeRequested[] = "piano-backlight-native-requested";
 constexpr uint32_t kManagedMaxS = 600;
 
+// Round 3 (slider3: the boot's stream ended automatic mode at the login window before the daemon held its lease): automatic mode
+// that the stream ended while no lease held is given back when a lease arrives. A display power-on or wake, a reported move or an
+// explicit piano-backlight-auto clears that (the user's or the system's word wins).
+class Handover {
+ public:
+  void streamEndedAuto(bool managed)
+  {
+    if (!managed) pending_ = true;
+  }
+  void cleared() { pending_ = false; }
+  bool leaseArrived()
+  {
+    const bool give = pending_;
+    pending_ = false;
+    return give;
+  }
+
+ private:
+  bool pending_ = false;
+};
+
 class Lease {
  public:
   void set(uint32_t seconds, uint64_t nowMs) { until_ = seconds ? nowMs + uint64_t(seconds > kManagedMaxS ? kManagedMaxS : seconds) * 1000 : 0; }

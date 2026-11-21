@@ -136,7 +136,11 @@ for attempt in 1 2; do
   "${INPUT[@]}" key shift >/dev/null
   # 11-19: the daily v12 profile has auto-brightness with no RAM floor; at 0 lux the login window sits at 6 % (code 128), too
   # dark for the C920 lit check. Brightness-up keys are a normal user action and only raise the panel (DESK_LOGIN_BRIGHTEN=0 off).
-  for _ in $(seq 1 "${DESK_LOGIN_BRIGHTEN:-6}"); do "${INPUT[@]}" key brightnessup >/dev/null 2>&1 || true; sleep 0.3; done
+  # 11-21 slider3: not "seq 1 N": macOS's BSD seq counts down, so "seq 1 0" is "1 0" and DESK_LOGIN_BRIGHTEN=0 sent two keys.
+  brighten=${DESK_LOGIN_BRIGHTEN:-6}; case $brighten in ''|*[!0-9]*) brighten=6 ;; esac
+  sent=0
+  while [ "$sent" -lt "$brighten" ]; do "${INPUT[@]}" key brightnessup >/dev/null 2>&1 || true; sleep 0.3; sent=$((sent + 1)); done
+  echo "desk-login: $sent brightness-up key(s) sent (DESK_LOGIN_BRIGHTEN=${DESK_LOGIN_BRIGHTEN:-default 6})"
   touch "$scratch/wake"
   echo "desk-login: non-text wake sent for attempt $attempt"
   frame_deadline=$(( $(date +%s) + 20 ))

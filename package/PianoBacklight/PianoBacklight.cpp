@@ -375,6 +375,7 @@ class PianoBacklight : public IOService {
   NativeIntent fIntent;                     // 2026-11-20: the user's moves among WindowServer's stream
   uint32_t fSyncPublished = ~0u;            // 2026-11-21: fIntent's sync counters as last published (syncs + echoes + missed)
   Lease fManaged;                           // piano-brightness-sync's lease: the stream does not end automatic mode
+  Handover fHandover;                       // automatic mode the stream ended before a lease: given back when one arrives
   int fManagedPublished = -1;
   int32_t fLastNative = -1;                 // the newest request seen, taken or dropped (16.16), and when
   uint64_t fLastNativeMs = 0;
@@ -706,6 +707,7 @@ void PianoBacklight::serve()
       restartAmbient();
     }
     const bool autoAfterNative = !fRevision || (p.native >= 0 && p.autoOrder > p.nativeOrder);
+    if (p.automatic >= 0) fHandover.cleared();   // an explicit piano-backlight-auto is the last word
     if (p.automatic >= 0 && !autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
@@ -735,6 +737,7 @@ void PianoBacklight::serve()
       // what WindowServer asked last (the level with its EDR headroom) when it is fresh, else the reported level
       const int32_t level = fLastNative >= 0 && nowMs() - fLastNativeMs < 3000 ? fLastNative : p.moved;
       if (autoOwns) fNativeTookAuto = true;
+      fHandover.cleared();
       note("PianoBacklightNativeIntentV1 a move to requested16=%d (reported by piano-brightness-sync: CoreBrightness's level %d; %u reported, "
            "%u moves): %s", level, p.moved, fDaemonMoves, fNativeMoves, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
       fIntent.moved(level);
@@ -747,7 +750,10 @@ void PianoBacklight::serve()
         p.native = -1;
       } else if (intent == NativeIntent::kUserMove) {
         ++fNativeMoves;
-        if (c.endsAuto) fNativeTookAuto = true;
+        if (c.endsAuto) {
+          fNativeTookAuto = true;
+          fHandover.streamEndedAuto(managed);
+        }
         if (c.endsAuto || fNativeMoves % 25 == 1)
           note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark, %u from the swap): %s", p.native,
                fNativeMoves, fNativeFollowed, gNativeDark, gSwapNits, c.endsAuto ? "automatic mode ends until a display power-on or a wake" : "manual");
@@ -774,6 +780,12 @@ void PianoBacklight::serve()
         fManagedPublished = on;
         setProperty(kNativeManaged, bool(on));
         changed = true;
+        if (on && fHandover.leaseArrived() && fNativeTookAuto && gArgs.autoAllowed) {
+          fNativeTookAuto = false;
+          setAutomatic(true);
+          note("PianoBacklightNativeIntentV1 automatic mode again: WindowServer's stream ended it before piano-brightness-sync "
+               "watched (CoreBrightness's restore or an EDR ramp)");
+        }
       }
       if (fLastNative != fRequestedPublished && nowMs() - fRequestedPublishedMs >= 100) {
         fRequestedPublished = fLastNative;
@@ -892,6 +904,7 @@ void PianoBacklight::nativeSettle(const char *why)
 {
   if (!gArgs.native) return;
   fIntent.reset(nowMs());
+  fHandover.cleared();
   if (fNativeTookAuto && gArgs.autoAllowed) {
     fNativeTookAuto = false;
     setAutomatic(true);

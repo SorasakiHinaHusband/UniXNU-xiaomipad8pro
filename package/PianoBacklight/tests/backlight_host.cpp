@@ -952,6 +952,21 @@ static void testNativeBrightness()
       lease.set(100000, 0);
       CHECK(lease.active(kManagedMaxS * 1000 - 1) && !lease.active(kManagedMaxS * 1000));
       CHECK(std::strcmp(kNativeManaged, "piano-backlight-managed") == 0 && std::strcmp(kNativeMoved, "piano-backlight-moved") == 0);
+      // round 3 (slider3 boot: CoreBrightness's default 150 x EDR 1.2 ended automatic mode at the login window before the lease):
+      // given back when the lease arrives; not after a display power-on, a reported move or an explicit setting cleared it
+      Handover h;
+      NativeIntent boot;
+      boot.reset(0);
+      CHECK(boot.classify(int64_t(150.0 * 65536), 100) == NativeIntent::kFollow);
+      const StreamChoice e = streamChoice(boot.classify(int64_t(171.45 * 65536), 9000), true, false, false);
+      CHECK(e.endsAuto);
+      h.streamEndedAuto(false);
+      CHECK(h.leaseArrived() && !h.leaseArrived());   // once
+      h.streamEndedAuto(true);                         // ended while a lease held (only a reported move can): never given back
+      CHECK(!h.leaseArrived());
+      h.streamEndedAuto(false);
+      h.cleared();                                     // a display power-on, a reported move or piano-backlight-auto
+      CHECK(!h.leaseArrived());
     }
     CHECK(std::strcmp(kNativeOverride, "force-brightness-control") == 0);
     auto bitsOf = [](double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; };   // 2026-11-21: the swap record's double
