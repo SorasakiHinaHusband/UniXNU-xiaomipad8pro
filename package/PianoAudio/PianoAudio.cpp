@@ -117,6 +117,7 @@ void readArgs()
   l.micGain = bootArg("piano-audio-mic-gain", 0);
   l.spk = bootArg("piano-audio-spk", 0);   // 0, or 1 + the round-2 variant bits (AudioSpkProt.h SPK_VAR_*)
   if (!spk_request_valid(int(l.spk))) l.spk = 0;   // speaker protection (levels 8-10; machdep.piano_audio_spk at run time)
+  l.ageOld = bootArg("piano-audio-age", 1) == 0 ? 1 : 0;   // duplex-age1: 1 (default) the signed sound age, 0 the old test (A/B)
   l.duplexHold = bootArg("piano-audio-duplex-hold", 0);   // duplex-hold1 A/B: 0 off, 1 the two LPASS votes, 3 also the VA mclk
   if (!ar_hold_valid(int(l.duplexHold))) l.duplexHold = 0;   // level 10 (machdep.piano_audio_duplex_hold at run time)
   l.micRoute = AUDIO_MIC_ROUTE_LEGACY;

@@ -390,6 +390,30 @@ void registerHold()
     gHoldOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gHoldOid);
 }
+// duplex-age1 (A/B switch, private DUPLEX-R3.md): machdep.piano_audio_age 1 the signed sound age (the fix, default), 0 the old unsigned
+// test that faded a playing speaker out and in whenever the engine stamped its sound a millisecond after the worker's tick.
+struct sysctl_oid gAgeOid;
+int ageControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || !gShared) return ENXIO;
+    int value = __atomic_load_n(&gShared->age_signed, __ATOMIC_ACQUIRE);
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (audio_live_age_select(gShared, value)) return EINVAL;
+    piano_audio_log("duplex-age1: request %d (%s sound age from the next tick)", value, value ? "signed" : "the OLD unsigned");
+    return 0;
+}
+void registerAge()
+{
+    bzero(&gAgeOid, sizeof gAgeOid);
+    gAgeOid.oid_parent = &sysctl__machdep_children; gAgeOid.oid_number = OID_AUTO;
+    gAgeOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gAgeOid.oid_name = "piano_audio_age"; gAgeOid.oid_handler = ageControl;
+    gAgeOid.oid_fmt = "I";
+    gAgeOid.oid_descr = "duplex-age1 A/B: 1 signed sound age (default), 0 the old unsigned test";
+    gAgeOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gAgeOid);
+}
 void registerGain()
 {
     bzero(&gGainOid, sizeof gGainOid);
@@ -523,6 +547,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_diag = a->micRouteDiag;
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
     lc.spk_prot = int(a->spk);   // 0, or the round-2 mask (AudioSpkProt.h SPK_VAR_*), checked by PianoAudio.cpp and AudioLive
+    lc.age_old = int(a->ageOld);   // duplex-age1 A/B control
     lc.duplex_hold = int(a->duplexHold);   // duplex-hold1: 0, 1 or 3 (checked by PianoAudio.cpp and AudioLive)
     static AudioLiveSpk *spkState;   // kept for the boot, as gLive
     if (!spkState) spkState = IOMallocType(AudioLiveSpk);
@@ -540,6 +565,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     else {piano_audio_log("sleep-contract1: ledger allocation failed; readiness gate held"); return;}
     if (lc.level >= 9) registerGain();
     registerSpk();
+    registerAge();
     if (lc.mic) {registerMicRoute(); registerHold();}
     piano_audio_power_ready();
     uint32_t handled=0;

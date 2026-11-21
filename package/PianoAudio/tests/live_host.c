@@ -606,7 +606,7 @@ static void engine(void)
         }
         if (w.sound_on && w.amplitude && !w.first_sound_offered_us) w.first_sound_offered_us = w.now_us;
         int wake = 0;
-        CHECK(audio_live_play(&sh, buf, period, now_ms(), &wake) == period);
+        CHECK(audio_live_play(&sh, buf, period, now_ms() + g_play_ahead_ms, &wake) == period);
         if (wake) {
             w.wake = 1;
             w.wakes++;
@@ -647,6 +647,8 @@ static void device(int out, int in)
 }
 
 // ---------------------------------------------------------------------------------------------------- the runs
+static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
+static int g_age_old;              // duplex-age1: the old unsigned sound-age test (A/B control)
 struct Scenario {
     uint32_t level;
     unsigned gain;
@@ -744,6 +746,7 @@ static void run(const struct Scenario *sc)
     static AudioLiveSpk spk_state;
     memset(&spk_state, 0, sizeof spk_state);
     lc.spk_prot = g_spk;
+    lc.age_old = g_age_old;
     lc.spk_state = &spk_state;
     if (g_setup) g_setup(&lc);
     audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
@@ -1910,6 +1913,23 @@ static void testHoldSleep(void)
     CHECK(pm_cycle == 3 && !w.violations && !live.sleep_failed && live.hold_starts == 4 && !live.hold_failures && w.prm_while_playing == 0);
 }
 
+// duplex-age1 (private DUPLEX-R3.md): the engine thread stamps sound_at with its own clock, up to a few ms after the worker's tick
+// read now. The old unsigned age wrapped and faded a playing speaker out and in; the signed age keeps it playing.
+static void testSoundAge(void)
+{
+    const struct Scenario sc = {9, 231, 1, 0, 6000, AudioPortsUbuntu, 1, steady};
+    g_play_ahead_ms = 2; g_age_old = 1;
+    run(&sc);
+    CHECK(!w.violations && live.ahead_total > 0 && live.fades_silent_total > 0 && logged("duplex-age1 OLD unsigned"));
+    g_age_old = 0;
+    run(&sc);
+    CHECK(!w.violations && live.ahead_total > 0 && live.fades_silent_total == 0 && logged("duplex-age1 signed"));
+    CHECK(audio_live_age_select(&sh, 0) == 0 && audio_live_age_select(&sh, 1) == 0 && audio_live_age_select(&sh, 2) == -1);
+    g_play_ahead_ms = 0;
+    run(&sc);   // the producer on the worker's clock: nothing ahead, nothing faded
+    CHECK(!w.violations && live.ahead_total == 0 && live.fades_silent_total == 0);
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1951,6 +1971,7 @@ int main(void)
     testProtSwitch();
     testProtSleep();
     testProtectedGain();
+    testSoundAge();
     testDuplexHold();
     testHoldSleep();
     printf("PASS live: %u checks\n", checks);

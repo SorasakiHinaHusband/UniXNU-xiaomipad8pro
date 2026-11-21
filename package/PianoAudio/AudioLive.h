@@ -77,6 +77,7 @@ typedef struct {
     int capturing;                       /* the Mic's ring is fed now */
     int sound;                           /* a period with a non-zero sample came while the speaker path was down */
     uint32_t sound_at;                   /* the time of the last such period (ms) */
+    int age_signed;                      /* duplex-age1 (private DUPLEX-R3.md): 1 the sound age is signed (the fix), 0 the old unsigned test */
     int have_sound;
     int have_pcm;                        /* nonzero PCM actually accepted in this output epoch */
     uint32_t output_head;                /* StartIO's producer boundary; only the consumer discards older PCM */
@@ -114,6 +115,8 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
 int audio_live_gain_select(AudioLiveShared *sh, unsigned gain);
 /* Speaker protection on (1) or off (0) from the next start of the speaker path; -1 for another value. */
 int audio_live_spk_select(AudioLiveShared *sh, int on);
+/* duplex-age1: 1 the signed sound age (default), 0 the old unsigned test (A/B control); applies from the next worker tick. */
+int audio_live_age_select(AudioLiveShared *sh, int signed_age);
 /* duplex-hold1, an A/B switch (default 0: unchanged). 1: the LPASS macro and digital codec votes, 3: those and the VA (TX core)
  * mclk, requested by a plan of their own BEFORE the first path (speaker or Mic) starts and released only after both are down, so
  * that a Mic start or stop while the speaker plays changes no PRM resource; the Mic's plan then skips the held steps. Taken when
@@ -145,6 +148,7 @@ typedef struct {
     int spk_prot;                        /* piano-audio-spk: speaker protection asked for from the first start */
     AudioLiveSpk *spk_state;             /* its state, the owner's (zeroed, kept for the boot); null: passthrough only */
     int duplex_hold;                     /* piano-audio-duplex-hold: audio_live_hold_select's mask from the first start (0 off) */
+    int age_old;                         /* piano-audio-age=0: the old unsigned sound-age test (A/B control); default the signed one */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -269,6 +273,8 @@ typedef struct {
     /* 2026-11-21 duplex-obs1 (private DUPLEX.txt sections 8.4 and 9): the speaker refill's DSP queue depth and send cadence per
      * 2 s window while the speaker plays, with the Mic's state; instrumentation only, no timing change */
     uint32_t dx_ticks, dx_starved, dx_low, dx_depth_min, dx_gap_max, dx_last_send, dx_last_log, dx_qfull_base, dx_mic_ticks;
+    uint32_t dx_ahead, dx_fades, dx_fades_silent;   /* duplex-age1: sound stamped after this tick's now; fade-outs (silent ones) */
+    uint32_t ahead_total, fades_silent_total;      /* the same for the whole boot (not reset per window) */
     int sleeping, parked, sleep_failed, sleep_quiet, sleep_safe;
     uint32_t sleep_generation, ledger_epoch, ledger_out, done_batch;
     uint32_t monitor_start, monitor_end, monitor_field;

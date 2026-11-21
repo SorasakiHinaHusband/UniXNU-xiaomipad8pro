@@ -272,6 +272,13 @@ int audio_live_gain_select(AudioLiveShared *sh, unsigned gain)
     return 0;
 }
 
+int audio_live_age_select(AudioLiveShared *sh, int signed_age)
+{
+    if (signed_age != 0 && signed_age != 1) return -1;
+    __atomic_store_n(&sh->age_signed, signed_age, __ATOMIC_RELEASE);
+    return 0;
+}
+
 int audio_live_spk_select(AudioLiveShared *sh, int on)
 {
     if (!spk_request_valid(on)) return -1;   /* 0, or an odd mask of SPK_VAR_* (round 2) */
@@ -628,12 +635,23 @@ static void mon_tick(AudioLive *l, uint32_t now)
 }
 
 /* The speaker wants to play: the device runs, the master mute is off, and sound came within idle_ms. */
-static int spk_active(const AudioLive *l, uint32_t now, int *silent)
+/* duplex-age1 (private DUPLEX-R3.md): the engine thread stamps sound_at with its own clock, so it can be a millisecond AFTER the now
+ * this tick read (the inbox drain between them grows with the Mic's READ_DONEs). The old unsigned now - at then wrapped to about
+ * 4.29e9: a playing speaker counted as silent and faded out and back in (20 ms dips while the Mic ran). Signed age; the old test
+ * stays selectable (machdep.piano_audio_age=0) as the A/B control. */
+static int sound_old(const AudioLive *l, uint32_t now, uint32_t from)
+{
+    if (!__atomic_load_n(&l->sh->age_signed, __ATOMIC_ACQUIRE)) return now - from >= l->cfg.idle_ms;
+    return (int32_t)(now - from) >= (int32_t)l->cfg.idle_ms;
+}
+
+static int spk_active(AudioLive *l, uint32_t now, int *silent)
 {
     const AudioLiveShared *sh = l->sh;
     const int have = load(&sh->have_sound);
     const uint32_t at = __atomic_load_n(&sh->sound_at, __ATOMIC_ACQUIRE);
-    *silent = !have || now - at >= l->cfg.idle_ms;
+    if (have && (int32_t)(now - at) < 0) {l->dx_ahead++; l->ahead_total++;}
+    *silent = !have || sound_old(l, now, at);
     return !l->sleeping && load(&sh->want_out) && !(l->cfg.level >= 9 && load(&sh->muted)) && !*silent;
 }
 
@@ -863,9 +881,12 @@ static void dx_report(AudioLive *l, uint32_t now, const char *why)
 {
     if (l->dx_ticks)
         LOG(l, "duplex-obs1: %s: %u ms, %u refill ticks (%u with the Mic up), DSP queue depth min %u, %u ticks at 0, %u at <= 1, "
-            "largest gap between WRITE sends %u ms, %u queue-full", why, now - l->dx_last_log, l->dx_ticks, l->dx_mic_ticks,
-            l->dx_depth_min, l->dx_starved, l->dx_low, l->dx_gap_max, l->queue_full - l->dx_qfull_base);
+            "largest gap between WRITE sends %u ms, %u queue-full; duplex-age1 %s: sound stamped ahead %u, fades %u (%u as silent)", why,
+            now - l->dx_last_log, l->dx_ticks, l->dx_mic_ticks, l->dx_depth_min, l->dx_starved, l->dx_low, l->dx_gap_max,
+            l->queue_full - l->dx_qfull_base, __atomic_load_n(&l->sh->age_signed, __ATOMIC_ACQUIRE) ? "signed" : "OLD unsigned",
+            l->dx_ahead, l->dx_fades, l->dx_fades_silent);
     l->dx_ticks = l->dx_starved = l->dx_low = l->dx_gap_max = l->dx_mic_ticks = 0;
+    l->dx_ahead = l->dx_fades = l->dx_fades_silent = 0;
     l->dx_depth_min = AUDIO_LIVE_DEPTH;
     l->dx_qfull_base = l->queue_full;
     l->dx_last_log = now;
@@ -905,7 +926,7 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
     case SpkQuiet:
         if (l->spk_mode == SpkQuiet && !active) {
             const uint32_t from = l->hold_from_sound && load(&l->sh->have_sound) ? __atomic_load_n(&l->sh->sound_at, __ATOMIC_ACQUIRE) : l->quiet_at;
-            if (l->sleeping || now - from >= l->cfg.idle_ms || (!load(&l->sh->want_out) && !load(&l->sh->have_sound))) l->spk_ending = 1;
+            if (l->sleeping || sound_old(l, now, from) || (!load(&l->sh->want_out) && !load(&l->sh->have_sound))) l->spk_ending = 1;
             break;
         }
         l->spk_ending = 0;
@@ -946,6 +967,9 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
         break;
     case SpkPlaying:
         if (active && l->spk_primed && spk_same_epoch(l)) break;
+        l->dx_fades++;
+        l->dx_fades_silent += silent != 0;
+        l->fades_silent_total += silent != 0;
         audio_chain_fade(&l->chain, -1);
         l->spk_mode = SpkFading;
         l->hold_from_sound = silent;
@@ -1531,6 +1555,7 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     }
     l->prot_why = l->prot_ready ? 0 : why;
     store(&sh->spk_prot, spk_request_valid(c->spk_prot) ? c->spk_prot : 0);
+    __atomic_store_n(&sh->age_signed, c->age_old ? 0 : 1, __ATOMIC_RELEASE);   /* duplex-age1: signed unless piano-audio-age=0 */
     l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
     store(&sh->duplex_hold, ar_hold_valid(c->duplex_hold) ? c->duplex_hold : 0);
     l->hold_gen = __atomic_load_n(&sh->duplex_hold_gen, __ATOMIC_ACQUIRE);
