@@ -690,7 +690,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     uint32_t fence=0,retry=0;
     used_=true;
 #ifdef ADRENO830_MACOS
-    NativeAdrenoSubmitRefusal refused{};
+    NativeAdrenoSubmitRefusal refused{};refused.index=UINT32_MAX;
 #endif
     const IOReturn status=submit_->submit(buffers,request->buffer_count,queue_base_+static_cast<uint32_t>(request->queue),&fence,&retry,
         context_,source_
