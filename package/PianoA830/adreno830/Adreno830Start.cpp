@@ -8,6 +8,7 @@
 #include "Adreno830Status.h"
 #include "A830Profile.h"
 #include "A830Regs.h"
+#include "A830CxGate.h"
 #include "A830Votes.h"
 #include "A830Smmu.h"
 #include "A830GmuFirmware.h"
@@ -2243,8 +2244,9 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
     return scope.end(kIOReturnSuccess);
 }
 /* The last CX gate check's words, for the low-failed console line (the exit journal holds them too, but it dies with a reset;
- * gpu-r3d-c's console delivered lines at +1.9 and +2.8 ms after the expiry). flags: bit0 cxOn, bit1 the three windows mapped,
- * bit2/3/4 the GDSC/AHB/CX_GMU read answered, bit8 accessible; seq counts the checks, at-us is when the last one ran. */
+ * gpu-r3d-c's console delivered lines at +1.9 and +2.8 ms after the expiry). flags (A830CxGate.h): bit0 cxOn, bit1 the three
+ * windows mapped, bit2/3/4 the GDSC/AHB/CX_GMU read answered, bit5 AHB on only by its running clock (ENABLE clear, CLK_OFF clear),
+ * bit8 accessible; seq counts the checks, at-us is when the last one ran. */
 static uint32_t gCxLastGdsc,gCxLastAhb,gCxLastClock,gCxLastFlags,gCxLastSeq;
 static uint64_t gCxLastAtUs;
 bool qualificationCxAccessible()
@@ -2254,24 +2256,27 @@ bool qualificationCxAccessible()
     const bool cxOn=g830.power_state.cxOn(),
         windows=mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc);
     uint32_t flags=(cxOn?1u:0u)|(windows?2u:0u);
-    /* The same predicate in the same order (short-circuit: a word not reached stays 0 and its read bit clear). */
+    /* In order, short-circuit (a word not reached stays 0 and its read bit clear). AHB_CBCR counts as on when its clock runs, by
+     * our enable or another voter's (A830CxGate.h: gpu-607d1 read 08000000 at the expiry, ENABLE clear with the clock running,
+     * and the ENABLE-only test sent the exit strict and then unsafe). */
     bool accessible=cxOn && windows;
     if(accessible) {
         const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GDS_HW_CTRL,&gdsc) && gdsc!=UINT32_MAX;
-        flags|=read?4u:0u;
+        flags|=read?A830CxFlagReadGdsc:0u;
         accessible=read && (gdsc&SM8750_GDSC_PWR_ON);
     }
     if(accessible) {
         const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_AHB_CBCR,&ahb) && ahb!=UINT32_MAX;
-        flags|=read?8u:0u;
-        accessible=read && (ahb&SM8750_CBCR_ENABLE);
+        flags|=read?A830CxFlagReadAhb:0u;
+        accessible=read && a830CxAhbOn(ahb);
+        flags|=accessible && a830CxAhbByRunningClock(ahb)?A830CxFlagAhbRunning:0u;
     }
     if(accessible) {
         const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GMU_CBCR,&clock) && clock!=UINT32_MAX;
-        flags|=read?16u:0u;
-        accessible=read && (!(clock&SM8750_CBCR_CLK_OFF) || SM8750_CBCR_NOC_FSM_STATUS(clock)==SM8750_CBCR_NOC_FSM_ON);
+        flags|=read?A830CxFlagReadCxGmu:0u;
+        accessible=read && a830CxGmuOn(clock);
     }
-    flags|=accessible?0x100u:0u;
+    flags|=accessible?A830CxFlagAccessible:0u;
     gCxLastGdsc=gdsc;gCxLastAhb=ahb;gCxLastClock=clock;gCxLastFlags=flags;gCxLastAtUs=nowUs();++gCxLastSeq;
     a830ExitTrace.stage(A830ExitStage::CxEnd,accessible?0u:uint32_t(kIOReturnNotReady),gdsc,ahb,clock);
     return accessible;
@@ -2826,6 +2831,7 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
         if(config.qualificationR3b)a830ExitTrace.start(d->power_env.nowNs,d->power_env.context);
         if(residency607)qualLog("R3b residency qualification window-s=625 floor-mhz=607");
         if(config.qualificationR3b)qualLog("R3b CONFIG R3b-607-v1 soft=800 cool=750 hard=850 halt=1050 floor=3 guard-ms=100 lease-ms=250 down-ms=500 up-ms=2000 board-hold=62000,37000 board-release=60000,35000 board-hard=65000,40000");
+        if(config.qualificationR3b)qualLog("R3b CXGATE v2 ahb=enable-or-running gmu=clk-or-noc gdsc=pwr-on");
         d->hfi.qualification(true);ops.qualificationFault=qualificationVoteFault;
         if(config.qualificationR3b) {
             d->hfi.qualificationLimiter([](void *p,uint8_t &level,uint8_t &bus) {
