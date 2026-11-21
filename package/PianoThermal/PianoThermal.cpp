@@ -532,6 +532,14 @@ struct PerfDomain {
   uint64_t totalNs[scmi::kMaxLevels];
 };
 PerfDomain gPd[kDomains];
+// the boosts' shared state (written by the launch listener, the input platform function and the thread; section below)
+uint32_t gBoost = 1;
+uint64_t gLaunchNs, gInputNs;
+uint32_t gLaunches, gInputs, gInputBy[5], gLaunchIgnored;
+char gLastApp[40];
+uint64_t gBoostMs[3];               // ms the CPU spent boosted, by perf::BoostKind
+uint32_t gBoostStarts[3];
+uint32_t gGpuCalls, gGpuTaken, gGpuState;   // gGpuState: 0 not asked yet, 1 taken, 2 unsupported (no more calls), 3 no PianoA830
 bool gAboveRefused[kDomains];   // a level above sustained was refused: mode 2's burst stays at sustained for the boot
 int32_t gSkinMilli;
 uint32_t gSkinValid, gSkinUsed, gPerfReady;
@@ -607,13 +615,6 @@ uint32_t curTickMs() { return __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE) ? __atom
 // of PianoTouch, PianoKeyboard, PianoDwc3 or PianoInput (PianoPerfInput.h: callPlatformFunction("piano-perf-input", source) on this
 // service). Both only stamp a time and wake the thread when no boost of that kind holds; the thread applies them.
 // machdep.piano_cpufreq_boost (root, 0/1; boot default piano-cpufreq-boosts) switches them for a same-boot A/B.
-uint32_t gBoost = 1;
-uint64_t gLaunchNs, gInputNs;
-uint32_t gLaunches, gInputs, gInputBy[5], gLaunchIgnored;
-char gLastApp[40];
-uint64_t gBoostMs[3];               // ms the CPU spent boosted, by perf::BoostKind
-uint32_t gBoostStarts[3];
-uint32_t gGpuCalls, gGpuTaken, gGpuState;   // gGpuState: 0 not asked yet, 1 taken, 2 unsupported (no more calls), 3 no PianoA830
 kauth_listener_t gLaunchListener;
 struct sysctl_oid gBoostOid;
 void (*gKick)(void);                // the thread's wake-up (set in start)
