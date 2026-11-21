@@ -150,6 +150,7 @@ is selectable. The Mic still receives mono with the first 100 ms silenced.
 | `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
 | `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
 | `piano-audio-spk=1` | 0 | levels 8-10: the speaker path opens the stock speaker-protection pair (FSADSP SP_RX/SP_TX with V/I feedback) instead of the passthrough device graph, with the two private files (section 12); missing or mismatched files, or any FSADSP error, keep or bring the speaker back on the passthrough graph in the same boot. `machdep.piano_audio_spk` (root, 0, or odd: 1 + the round-2 variant bits of section 12) changes it from the next start of the speaker path; `machdep.piano_audio_spk_state` reads the state |
+| `piano-audio-duplex-hold=0\|1\|3` | 0 | level 10, an A/B switch for the duplex stutter (section 13): 1 holds the LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, in a plan of their own from before the first path (speaker or Mic) starts until both are down; the Mic's plan then skips them. `machdep.piano_audio_duplex_hold` (root) changes it, taken when both paths are down and one starts. 0: unchanged |
 | `piano-audio-mic-gain=G` | 124 | level 10: the VA decimators' gain, Ubuntu's UCM control (0..124, 84 = 0 dB, 124 = +40 dB) |
 | `piano-audio-mic-route=-1\|0\|2\|4\|6` | -1 | level 10: DEC0 DMIC and mono source. -1 selects legacy DMIC0/DMIC2 mean. 4 selects the main/top mic. |
 | `piano-audio-mic-route-diag=0\|1` | 0 | Allow a root operator to arm one bounded stereo window before the mono selection. |
@@ -884,3 +885,21 @@ control); +2 and +4 exclude each other. `PianoSpeakerProtV1: variant N: ...` nam
 **Unverified on the hardware:** whether the DSP accepts a GRAPH_OPEN built outside the stock graph services with the vendor modules
 and the cross-graph control link; out-of-band commands from our map (the address form is the one the WRITEs already use); whether TX
 needs its own PRM clock (inferred no); the live-data scaling of t and Q; the channel order of Re25 (inferred TDM slot order).
+
+## 13. Duplex: the Mic's PRM votes while the speaker plays (duplex-hold1, 2026-11-21; host-tested, not yet on the tablet)
+
+With the Mic started while the speaker plays, the speaker dips (C920, 20 ms windows, down to -26 dB) for as long as the Mic's graph
+stays up, also with the direct Mic probe (no coreaudiod input); the host's DSP queue never runs empty. The analysis (private
+`host-checks/20261121-audio-duplex/DUPLEX-VOTES.txt`) ranks first, inferred: the Mic plan's three PRM requests (the LPASS macro vote,
+the digital codec vote, the TX core mclk 19.2 MHz) are the only LPASS-wide resources a Mic start changes, and off they arrive while
+the TDM bit clock already runs. The A/B switch `piano-audio-duplex-hold` / `machdep.piano_audio_duplex_hold` (0 off, the default;
+1 the two votes; 3 the votes and the mclk) brings them up in their own plan ("duplex-hold") before the first path begins, so they
+precede the speaker's TDM clock, and releases them (mclk, then the votes) only once both paths are down; the Mic's capture plan then
+skips the held steps (`ar_mic_live_steps_held`), so a Mic start or stop while the speaker plays sends no PRM command. One owner per
+vote: a Mic run that started before the request keeps its own votes and the speaker's start logs "not applied". A refused hold
+falls back to the plain plans (no hold until a new request; for the boot if its undo failed). Every speaker start logs
+`duplex-hold1: speaker start N: hold H (requested R, Mic S): ...`, every Mic start `duplex-hold1: Mic start N: hold H, speaker S: ...`.
+The single DSP/bus owner, one command at a time over all plans, the reverse unwind and every speaker-safety rule are unchanged; the
+hold is released before a sleep parks. Host tests: `tests/sequence_host.c` (testHeldPlans), `tests/live_host.c` (testDuplexHold,
+testHoldSleep: B and C order, 1 and 3, a late request, a refused hold, the owner's stop, sleep cycles, level 9 inert; the DSP model
+flags a second owner of a vote and counts PRM commands while the speaker stream runs: 6 off, 2 with 1, 0 with 3).
