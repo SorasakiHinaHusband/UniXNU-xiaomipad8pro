@@ -449,10 +449,11 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
       result = liveCall(_connection, kPianoCameraLiveRelease, &release, sizeof release, NULL, 0);
       if (valid && !result && atomic_load(&_running)) {
         _lastReadSequence = frame.sequence;
-        const CMTime source = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(frame.sofTicks), NSEC_PER_SEC,
-                                                kCMTimeRoundingMethod_RoundHalfAwayFromZero);
-        const uint64_t sourceNs = CMTIME_IS_NUMERIC(source) && source.value > 0 ? (uint64_t)source.value : 0;
-        [self acceptSource:pb sequence:frame.sequence drops:frame.drops sourceNs:sourceNs];
+        // The source's age is counted from its arrival here, not from the sensor's start of frame: the rear's SOF-to-arrival
+        // latency (readout plus a 73 ms average, 143 ms worst CPU ISP pass) alone reaches the 250 ms limit, so an SOF age declared a
+        // stall before nearly every rear frame and each resume flagged a discontinuity (inst-v131w: 122 stalls, 77 discontinuities
+        // in 10 s, no movie written). A stall now means what it says: no new frame for 250 ms.
+        [self acceptSource:pb sequence:frame.sequence drops:frame.drops sourceNs:clock_gettime_nsec_np(CLOCK_UPTIME_RAW)];
       } else atomic_fetch_add(&_captureDropped, 1);
       if (pb) CVPixelBufferRelease(pb);
       if (result) {

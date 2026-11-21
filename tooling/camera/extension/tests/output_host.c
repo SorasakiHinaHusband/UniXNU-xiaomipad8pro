@@ -110,6 +110,22 @@ static void cadence(void)
   assert(!pianoOutputSourceFresh(999, 1000));
   assert(pianoOutputSourceFresh(source + PIANO_OUTPUT_MAX_SOURCE_AGE_NS, source));
   assert(!pianoOutputSourceFresh(source + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + 1, source));
+  // The rear on the tablet (inst-v131w): a new converted frame every 66-143 ms (the CPU ISP pass). Counted from arrival, a 30 fps
+  // output never sees a stale source; counted from the start of frame (about 140-250 ms earlier) it went stale before most arrivals.
+  {
+    static const uint64_t gaps_ms[] = {73, 66, 143, 80, 70, 120, 66, 90, 143, 73};
+    uint64_t arrival = UINT64_C(2000000000), next = arrival, stale = 0, staleSof = 0;
+    size_t k = 0;
+    for (uint64_t tick = 0; tick < 300; ++tick) {
+      const uint64_t now = UINT64_C(2000000000) + tick * UINT64_C(1000000000) / 30;
+      while (next <= now) { arrival = next; next += gaps_ms[k++ % 10] * UINT64_C(1000000); }
+      if (!pianoOutputSourceFresh(now, arrival)) ++stale;
+      const uint64_t sof = arrival - UINT64_C(140000000) - (k % 3) * UINT64_C(50000000);
+      if (!pianoOutputSourceFresh(now, sof)) ++staleSof;
+    }
+    assert(stale == 0);
+    assert(staleSof > 30);
+  }
 }
 
 static void discontinuity(void)
