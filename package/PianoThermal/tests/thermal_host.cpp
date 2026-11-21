@@ -14,6 +14,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
 #include "Cluster.h"
 #include "Governor.h"
+#include "Perf.h"
 #include "Policy.h"
 #include "Scmi.h"
 #include "Tsens.h"
@@ -1038,6 +1039,93 @@ static void testAndroidCpuStep()
   }
 }
 
+// The stock-level policy (Perf.h, 2026-11-22): the virtual skin, the step tables with hysteresis, the onset burst, and the
+// Governor's runtime caps (machdep.piano_cpufreq_perf 0 = the v13.1x caps, 1 = profile + perf cap).
+static void testPerf()
+{
+  using namespace pianothermal::perf;
+  // virtual skin: all five at 30 C -> 30 C + 1.6; battery missing -> invalid; only battery + msm -> their weights renormalised
+  int32_t in[kSkinInputs] = {30000, 30000, 30000, 30000, 30000};
+  Skin s = virtualSkin(in, 0x1f);
+  CHECK(s.valid && s.milliC == 30000 * 943 / 1000 + 1600 && s.used == 0x1f);
+  CHECK(!virtualSkin(in, 0x1e).valid);                     // no battery
+  CHECK(!virtualSkin(in, (1u << kSkinBattery) | (1u << kSkinWifi)).valid);   // no skin thermistor
+  int32_t mix[kSkinInputs] = {30000, 0, 0, 0, 40000};
+  s = virtualSkin(mix, (1u << kSkinBattery) | (1u << kSkinMsm));
+  CHECK(s.valid && s.milliC == int32_t(int64_t(500 * 30000 + 232 * 40000) * 943 / (732 * 1000)) + 1600);
+  int32_t stock[kSkinInputs] = {35000, 38000, 36000, 40000, 42000};   // the stock arithmetic: weighted sum / 1000 + 1.6 C
+  CHECK(virtualSkin(stock, 0x1f).milliC == (500 * 35000 + 131 * 38000 - 9 * 36000 + 89 * 40000 + 232 * 42000) / 1000 + 1600);
+  // step tables: below 15 C no cap; 15 C -> 2745.6 / 3072; up the triggers at once, down only under the clear point
+  SkinCap c0, c1;
+  CHECK(c0.update(kCluster0, kCluster0Steps, true, 14000) == 0 && c0.step() == -1);
+  CHECK(c0.update(kCluster0, kCluster0Steps, true, 15000) == 2745600);
+  CHECK(c1.update(kCluster1, kCluster1Steps, true, 30000) == 3072000);
+  CHECK(c1.update(kCluster1, kCluster1Steps, true, 34000) == 2649600);
+  CHECK(c1.update(kCluster1, kCluster1Steps, true, 33000) == 2649600);   // above the 32 C clear point: held
+  CHECK(c1.update(kCluster1, kCluster1Steps, true, 31900) == 3072000);
+  CHECK(c0.update(kCluster0, kCluster0Steps, true, 48500) == 748800 && c0.step() == int(kCluster0Steps) - 1);
+  CHECK(c0.update(kCluster0, kCluster0Steps, false, 0) == 748800);       // no reading: the step stays
+  SkinCap cold;
+  CHECK(cold.update(kCluster1, kCluster1Steps, false, 0) == 3072000);    // no reading from the start: the first step, not "no cap"
+  CHECK(c0.update(kCluster0, kCluster0Steps, true, 36000) == 2400000);   // 48.5 -> 36: down to the step whose clear point holds (37 C, clear 35)
+  CHECK(c0.update(kCluster0, kCluster0Steps, true, 34900) == 2745600);
+  // the tables are ordered and every clear point under its trigger
+  for (unsigned i = 0; i < kCluster0Steps; ++i) CHECK(kCluster0[i].clrMilli < kCluster0[i].trigMilli && (!i || kCluster0[i].trigMilli > kCluster0[i - 1].trigMilli));
+  for (unsigned i = 0; i < kCluster1Steps; ++i) CHECK(kCluster1[i].clrMilli < kCluster1[i].trigMilli && (!i || kCluster1[i].trigMilli > kCluster1[i - 1].trigMilli));
+  // burst: opens at an onset only, ends after the window, needs the gap and a new onset; never from the skin limit; not on saver
+  BurstConfig bc;
+  bc.khz = 4089999;
+  Burst b;
+  CHECK(!b.tick(bc, 0, false, true, true, 30000));
+  CHECK(b.tick(bc, 20, true, true, true, 30000) && b.windows() == 1);    // onset
+  CHECK(b.tick(bc, 1000, true, true, true, 30000));
+  CHECK(!b.tick(bc, 1520, true, true, true, 30000));                     // 1.5 s: over
+  CHECK(!b.tick(bc, 3000, true, true, true, 30000));                     // sustained load: no new onset, no new burst
+  CHECK(!b.tick(bc, 3020, false, true, true, 30000));
+  CHECK(b.tick(bc, 3040, true, true, true, 30000) && b.windows() == 2);  // a new onset after the gap
+  CHECK(!b.tick(bc, 3060, false, true, true, 30000));                    // the load went: closed
+  CHECK(!b.tick(bc, 3080, true, true, true, 30000));                     // an onset inside the 500 ms gap: refused
+  CHECK(!b.tick(bc, 3700, false, true, true, 30000) && b.tick(bc, 3720, true, true, true, 30000));
+  CHECK(!b.tick(bc, 3740, true, true, true, 48000));                     // the skin limit closes it
+  Burst saver;
+  CHECK(!saver.tick(bc, 0, false, false, true, 30000) && !saver.tick(bc, 20, true, false, true, 30000));
+  CHECK(perfCapKhz(3072000, false, 4089999) == 3072000 && perfCapKhz(3072000, true, 4089999) == 4089999);
+  CHECK(perfCapKhz(0, true, 4089999) == 0 && perfCapKhz(1017600, true, 4089999) == 4089999);
+  CHECK(downTicksFor(100, 20) == 5 && downTicksFor(300, 100) == 3 && downTicksFor(0, 20) == 1 && downTicksFor(110, 20) == 6);
+  // the Governor's runtime caps on NCC1's table: v13.1x = hard 2438.4 on power; perf = profile caps + the perf cap
+  const uint32_t ncc1[] = {1017600, 1209600, 1401600, 1689600, 1958400, 2246400, 2438400, 2649600, 2841600, 3072000, 3283200,
+                           3513600, 3801600, 4089600, 4204800, 4320000};
+  GovernorConfig gc;
+  gc.batteryKhz = capKhz(1958);
+  gc.externalKhz = capKhz(4089);
+  gc.hispeedKhz = 1800000;
+  Governor g;
+  g.init(CpuMode::govern, gc, ncc1, 16, 13, 0);
+  g.setRuntimeCaps(true, capKhz(2438), 0);
+  CHECK(g.khz(g.ceiling(PowerSource::external)) == 2438400 && g.khz(g.ceiling(PowerSource::battery)) == 1958400);
+  g.setRuntimeCaps(false, 0, perfCapKhz(3072000, false, capKhz(4089)));
+  CHECK(g.khz(g.ceiling(PowerSource::external)) == 3072000);
+  g.setRuntimeCaps(false, 0, perfCapKhz(3072000, true, capKhz(4089)));
+  CHECK(g.khz(g.ceiling(PowerSource::external)) == 4089600 && g.khz(g.ceiling(PowerSource::battery)) == 1958400);
+  CHECK(g.khz(g.ceilingFor(PowerSource::external, 3072000)) == 3072000);
+  // a burst of load from the floor: hispeed at once, the burst ceiling next; the raw want says "more than the 3072 ceiling"
+  g.setRuntimeCaps(false, 0, 3072000);
+  g.setDownTicks(5);
+  CHECK(g.khz(g.tick({1000, PowerSource::external})) == 1958400);
+  CHECK(g.khz(g.tick({1000, PowerSource::external})) == 2649600);
+  CHECK(g.khz(g.tick({1000, PowerSource::external})) == 3072000 && g.rawWant() > g.ceilingFor(PowerSource::external, 3072000));
+  // downs held 5 ticks
+  for (int i = 0; i < 4; ++i) CHECK(g.khz(g.tick({0, PowerSource::external})) == 3072000);
+  CHECK(g.khz(g.tick({0, PowerSource::external})) == 1017600);
+  // the thermal limit stays on top of the burst
+  ThermalInput hot{true, 1, 1, false};
+  g.setRuntimeCaps(false, 0, capKhz(4089));
+  g.thermal(hot, 1000);
+  CHECK(g.limit() == 14 && g.khz(g.ceiling(PowerSource::external)) == 4089600);   // limit 14 = 4204.8 >= sustained: no change yet
+  for (uint64_t ms = 1010; ms < 1100; ms += 10) g.thermal(hot, ms);
+  CHECK(g.khz(g.ceiling(PowerSource::external)) < 4089600);
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 1 && !strcmp(argv[1], "--map")) {
@@ -1056,6 +1144,7 @@ int main(int argc, char **argv)
   testProfileAndSleep();
   testCluster();
   testInterruptsAndPolling();
+  testPerf();
   if (failures) {
     std::printf("thermal_host: %d FAILED\n", failures);
     return 1;

@@ -158,6 +158,9 @@ class Governor {
     mode_ = mode;
     config_ = config;
     androidCapKhz_ = 0;
+    hardSet_ = false;
+    hardKhz_ = perfKhz_ = 0;
+    rawWant_ = 0;
     count_ = uint8_t(count > kMax ? kMax : count ? count : 1);
     for (unsigned i = 0; i < count_; ++i) khz_[i] = khz[i];
     sustained_ = uint8_t(sustained < count_ ? sustained : count_ - 1u);
@@ -216,6 +219,7 @@ class Governor {
       if (want < hs) want = hs;
     }
     if (want < bottom) want = bottom;
+    rawWant_ = uint8_t(want);   // before the ceiling: the perf burst's "wanted more" (Perf.h)
     if (want > top) want = top;
     if (want > level_) {
       level_ = uint8_t(want);
@@ -247,7 +251,10 @@ class Governor {
     return level_;
   }
 
-  unsigned ceiling(PowerSource power) const
+  unsigned ceiling(PowerSource power) const { return ceilingFor(power, perfKhz_); }
+  // The ceiling with perfKhz as the perf cap (0: none): sustained, the hard cap (the runtime one when set, else piano-cpufreq-cap0/1),
+  // the power cap, the perf cap (Perf.h: the skin step table or the burst), the thermal limit.
+  unsigned ceilingFor(PowerSource power, uint32_t perfKhz) const
   {
     unsigned top = sustained_;
     auto clampTo = [&](uint32_t khz) {
@@ -255,11 +262,22 @@ class Governor {
       const unsigned l = fastestAtMost(khz);
       if (l < top) top = l;
     };
-    clampTo(androidCapKhz_ ? androidCapKhz_ : config_.capKhz);
+    clampTo(androidCapKhz_ ? androidCapKhz_ : hardSet_ ? hardKhz_ : config_.capKhz);
     if (mode_ == CpuMode::govern) clampTo(power == PowerSource::external ? config_.externalKhz : config_.batteryKhz);
+    if (mode_ == CpuMode::govern) clampTo(perfKhz);
     if (limit_ < top) top = limit_;
     return top;
   }
+  // machdep.piano_cpufreq_perf (PianoThermal.cpp): hardSet replaces the boot cap with hardKhz (0: none); perfKhz the perf cap.
+  void setRuntimeCaps(bool hardSet, uint32_t hardKhz, uint32_t perfKhz)
+  {
+    hardSet_ = hardSet;
+    hardKhz_ = hardKhz;
+    perfKhz_ = mode_ == CpuMode::govern ? perfKhz : 0;
+  }
+  void setDownTicks(uint32_t n) { config_.downTicks = n ? n : 1; }
+  unsigned rawWant() const { return rawWant_; }
+  uint32_t perfKhz() const { return perfKhz_; }
   unsigned floorLevel() const { return config_.floorKhz ? slowestAtLeast(config_.floorKhz) : 0; }
   // piano-cpufreq-boost=S (2026-11-14, boot time): the level while the boot boost lasts, in every mode (report included): the
   // sustained level, or the fastest at or under capKhz when one is given (piano-cpufreq-boost-cap), never above the thermal limit
@@ -309,8 +327,10 @@ class Governor {
   CpuMode mode_ = CpuMode::off;
   GovernorConfig config_{};
   uint32_t androidCapKhz_ = 0;
+  bool hardSet_ = false;
+  uint32_t hardKhz_ = 0, perfKhz_ = 0;
   uint32_t khz_[kMax] = {};
-  uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0;
+  uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0, rawWant_ = 0;
   uint32_t lowTicks_ = 0;
   uint64_t downAtMs_ = 0, upAtMs_ = 0, coolSinceMs_ = 0;
   bool cooling_ = false;

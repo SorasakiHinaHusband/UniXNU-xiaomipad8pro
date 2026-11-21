@@ -44,6 +44,7 @@
 //   piano-policy-lid=1      act on the cover (clamshell, clamshell sleep, AC adaptor). Only once the hall polarity is verified
 //                           (docs/drivers/keyboard.md 10.3) and with piano-keyboard-lid=0 (else PianoKeyboard tells the clamshell)
 //   piano-policy-profile=0  no PianoThermal profile, no GPU ceiling            piano-policy-gpu-mhz=M  Power Saver's GPU ceiling (342)
+//   piano-policy-profile=2  Low Power Mode is the only switch: without it Balanced (PianoThermal profile 2) on battery too
 //   piano-policy-powerkey=0 the power key stays macOS's                       piano-policy-kbd=0  no display wake by gpio95
 //   piano-policy-kbd-holdoff=MS  the display off at least MS before gpio95 counts (1000)
 //   piano-policy-lpm=1      Low Power Mode on from boot (machdep.piano_policy_lpm starts at 1): an unattended test's switch
@@ -327,6 +328,7 @@ bool PianoPolicy::start(IOService *provider)
   note("sleep-contract1: AC lid demand-sleep %s (real AC preserved)", fConfig.lidSleepAC ? "opted in" : "off");
   fConfig.lidConflict = gArgs.keyboardLid != 0;
   fConfig.profile = gArgs.profile != 0;
+  fConfig.lpmOnly = gArgs.profile == 2;
   fConfig.gpuKhz = gArgs.gpuMhz * 1000u;
   fConfig.gpuNeeded = gArgs.gpuMaxGiven;
   fConfig.thermalOwnsGpu = gArgs.thermal >= 2;
@@ -345,7 +347,7 @@ bool PianoPolicy::start(IOService *provider)
   note("start: piano-policy=%u (%s), cover %s, profile %s, GPU ceiling %u MHz (%s), power key %s, keyboard wake %s (hold-off %u ms)",
        gArgs.level, fConfig.act ? "acting" : "decisions only: nothing sent",
        !fConfig.lid ? "not acted on (piano-policy-lid=0)" : fConfig.lidConflict ? "NOT acted on: piano-keyboard-lid is set" : "acted on",
-       fConfig.profile ? "on" : "off", gArgs.gpuMhz,
+       fConfig.lpmOnly ? "on (Low Power Mode is the only switch)" : fConfig.profile ? "on" : "off", gArgs.gpuMhz,
        !gArgs.gpuMhz ? "none" : fConfig.gpuNeeded ? "PianoA830's own maximum is above it" : "a no-op: PianoA830's own maximum is 342 MHz",
        fConfig.powerKey ? "on" : "off", fConfig.keyboard ? "on" : "off", fConfig.holdoffMs);
   const char *const state = fSleepOn ? "on" : "off (piano-sleep=1 turns it on)";

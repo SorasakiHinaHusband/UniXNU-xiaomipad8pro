@@ -374,6 +374,36 @@ static void profile()
   CHECK(s.find("profile:") == std::string::npos && s.find("gpu:") == std::string::npos);
 }
 
+// piano-policy-profile=2 (2026-11-22): Low Power Mode is the only switch: Balanced (PianoThermal profile 2) on battery and on power
+// without it, Power Saver with it, the GPU ceiling only with it; PianoThermal's governor then caps by that profile, not the source.
+static void lpmOnly()
+{
+  Config c = actLid();
+  c.lpmOnly = true;
+  c.gpuNeeded = true;
+  Engine e(c);
+  Inputs in = base();   // on battery
+  CHECK(view(c, in, true).profile == Profile::balanced);
+  std::string s = run(e, in);                // the first step tells PianoThermal Balanced, no GPU ceiling on battery
+  CHECK(s.find("profile:2") != std::string::npos && s.find("gpu:") == std::string::npos);
+  in.lpm = true;
+  CHECK(view(c, in, true).profile == Profile::saver);
+  CHECK(run(e, in) == "profile:1 gpu:342000");
+  in.lpm = false;
+  CHECK(run(e, in) == "profile:2 gpu:0");
+  in.power = Power::external;
+  CHECK(run(e, in).find("profile:") == std::string::npos);   // the source changes nothing
+  in.power = Power::battery;
+  CHECK(run(e, in).find("profile:") == std::string::npos);
+  // PianoThermal's side: profile 2 = the external caps whatever the source; 1 = the battery caps.
+  using pianothermal::PowerSource;
+  CHECK(pianothermal::profilePower(PowerSource::battery, pianothermal::Profile(2)) == PowerSource::external);
+  CHECK(pianothermal::profilePower(PowerSource::external, pianothermal::Profile(1)) == PowerSource::battery);
+  // Without lpmOnly the old rule stays (on battery: Power Saver, nothing sent at boot).
+  Engine old(actLid());
+  CHECK(run(old, base()).find("profile:") == std::string::npos);
+}
+
 static void profileUnsupported()
 {
   // PianoThermal without "piano-thermal-profile": asked once, then never again; a missing service is asked again.
@@ -678,6 +708,7 @@ int main()
   keyboard();
   displayEventsTick();
   profile();
+  lpmOnly();
   profileUnsupported();
   thermalSharedSlot();
   ownGpuSlot();
