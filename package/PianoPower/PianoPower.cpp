@@ -102,7 +102,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, b4pd, unsuspend, ps, psFloor, psInject, board, ucsi;
+  uint32_t level, period, gauge, write, hv, b4pd, unsuspend, ps, psFloor, psInject, board, ucsi, pdoMca;
   bool psGuard;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
@@ -136,6 +136,9 @@ void readArgs()
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
   gArgs.board = bootArg("piano-power-board", 1);   // the stock board configuration at level 2 with writes (PianoMca.h)
   gArgs.ucsi = bootArg("piano-power-ucsi", 1);     // policy: periodic/event status observer; otherwise legacy per-generation probe
+  // policy + observer: a PD sink snapshot takes its source list from the charger firmware (0x21011) when the PPM offers no PDO
+  // details (this tablet's UCSI 1.1 PPM: bmOptionalFeatures 0); without it no PD source ever gets a contract (ChargeContract.h)
+  gArgs.pdoMca = bootArg("piano-power-pdo-mca", 0);
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -355,6 +358,9 @@ class PianoPower : public IOService {
   uint64_t fContractRefresh = 0;
   bool fContractWasFresh = false;
   uint32_t fContractSeenGeneration = 0;
+  // piano-power-pdo-mca: the firmware list offered, and the contracts it made, each logged on change (bounded)
+  uint32_t fPdoOfferLogs = 0, fPdoOfferLoggedN = 0xffffffffu, fPdoContractLogs = 0, fPdoContractLoggedRdo = 0;
+  uint32_t fPdoContractLoggedGen = 0;
   IOLock *fConfigLock = nullptr;
   struct ChargeRequest {uint32_t enabled, stop, resume, mode, inhibit, revision;} fConfigRequest{};
   bool fConfigPending = false;
@@ -427,6 +433,8 @@ class PianoPower : public IOService {
   static constexpr uint32_t kQuietCapMs = 60000;
   void pumpMca(uint64_t now);
   void logMcaEvents();
+  void offerFirmwarePdos();
+  void logFirmwareContract();
   void mcaLine(char *line, size_t size);
   void diagLine(char *line, size_t size);
   void diagPortLine(char *line, size_t size, bool board);
@@ -541,6 +549,11 @@ bool PianoPower::start(IOService *provider)
                                                    : " (battery health off: 0x2003 is never written 0)"),
          gArgs.hv > 2 ? 2u : gArgs.hv, gArgs.hv ? " (9 V asked from a PD source 15 s after the attach)" : "");
     if (gArgs.unsuspend) note("piano-power-unsuspend=1 is the built-in policy's: not used with piano-power-policy=1");
+    note("piano-power-pdo-mca=%u: %s [PianoPdoFirmwareV1]", gArgs.pdoMca && gArgs.ucsi ? 1u : 0u,
+         gArgs.pdoMca && gArgs.ucsi
+             ? "a PD sink status without UCSI source PDOs takes the charger firmware's source list (0x21011, PD state SNK_Ready, "
+               "vSafe5V first, fixed ascending before PPS) with a second agreeing status read; RDO, opmode and role stay UCSI's"
+             : "a PD contract needs UCSI source PDOs (this PPM offers none: PD sources stay without a contract)");
   }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
@@ -687,6 +700,13 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("UCSIMessageIn0", c.message_in[0]); n("UCSIMessageIn1", c.message_in[1]);
   n("UCSIMessageIn2", c.message_in[2]); n("UCSIMessageIn3", c.message_in[3]);
   n("ContractTimeouts", c.timeouts); n("ContractFailures", c.failures);
+  n("SourcePDOOrigin", c.pdo_origin); n("FirmwarePDOFallback", c.pdo_fallback); n("FirmwarePDOOffer", c.offer_n);
+  n("FirmwarePDOOffers", c.offers); n("FirmwarePDORejects", c.offer_rejects); n("FirmwarePDOWithdrawals", c.offer_withdrawals);
+  for (unsigned i = 0; i < 7; ++i) {
+    char key[24];
+    snprintf(key, sizeof key, "FirmwarePDO%u", i + 1);
+    n(key, i < c.offer_n ? (uint64_t(c.offer_pdo[i][0]) << 32 | uint64_t(c.offer_pdo[i][1]) << 16 | c.offer_pdo[i][2]) : 0);
+  }
   n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
   n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
   n("VoltagePending", s.contract_transition || (s.pending & (1u << PIANO_CHG_S_VOLT)));
@@ -1588,6 +1608,7 @@ void PianoPower::startCharger()
   piano_mca_allow_unsuspend(&fMca, gArgs.unsuspend != 0);
   piano_mca_allow_board(&fMca, gArgs.board != 0);
   piano_contract_init(&fContract);
+  piano_contract_allow_firmware_pdos(&fContract, fPolicyOn && gArgs.ucsi && gArgs.pdoMca);
   piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0 && !fPolicyOn);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   if (fPolicyOn) {
@@ -1663,6 +1684,51 @@ void PianoPower::logMcaEvents()
     note("mca: write %s (%#x) = %u: %s (%d)", what, m.last_property, m.last_value,
          m.last_result == 0 ? "ok" : m.last_result == -60 ? "no answer" : "refused by the firmware", m.last_result);
   }
+}
+
+// piano-power-pdo-mca: after each finished cycle, the charger firmware's decoded source list of this cycle, offered only while the
+// same cycle read PD state SNK_Ready (ChargeContract.h decides whether a PD sink status may use it).
+void PianoPower::offerFirmwarePdos()
+{
+  const PianoMca &m = fMca;
+  const bool ready = piano_mca_has(&m, McaPdos) && piano_mca_has(&m, McaPdState) && m.value[McaPdState] == 2 && m.pdos;
+  const uint32_t rejects = fContract.offer_rejects, withdrawals = fContract.offer_withdrawals;
+  piano_contract_offer_pdos(&fContract, m.pdo, ready ? m.pdos : 0, ready);
+  const uint32_t n = fContract.offer_n;
+  if ((n == fPdoOfferLoggedN && rejects == fContract.offer_rejects && withdrawals == fContract.offer_withdrawals) ||
+      fPdoOfferLogs >= 24) return;
+  fPdoOfferLogs++;
+  fPdoOfferLoggedN = n;
+  char line[200];
+  unsigned at = 0;
+  line[0] = 0;
+  for (unsigned i = 0; i < n && i < 7; ++i) {
+    const int k = snprintf(line + at, sizeof line - at, "%s%u-%u mV %u mA", i ? ", " : "", fContract.offer_pdo[i][0],
+                           fContract.offer_pdo[i][1], fContract.offer_pdo[i][2]);
+    if (k <= 0 || unsigned(k) >= sizeof line - at) break;
+    at += unsigned(k);
+  }
+  note("ucsi: firmware source list offered (%u objects%s): %s; %u rejected, %u withdrawn [PianoPdoFirmwareV1]", n,
+       ready ? "" : ", not SNK_Ready", n ? line : "none", fContract.offer_rejects, fContract.offer_withdrawals);
+}
+
+void PianoPower::logFirmwareContract()
+{
+  const PianoChargeContract &c = fContract;
+  if (fPdoContractLogs >= 32) return;
+  const uint32_t rdo = c.valid ? c.rdo : 0;
+  if (rdo == fPdoContractLoggedRdo && c.generation == fPdoContractLoggedGen) return;
+  fPdoContractLoggedRdo = rdo;
+  fPdoContractLoggedGen = c.generation;
+  fPdoContractLogs++;
+  if (!c.valid) {
+    note("ucsi: no PD contract (connected %u, sink %u, PD %u, RDO %#x, %u source objects, error %d, generation %u)", c.connected,
+         c.sink, c.pd, c.rdo, c.pdos, int(c.last_error), c.generation);
+    return;
+  }
+  note("ucsi: PD contract from the %s source list: object %u, %s %u mV %u mA (source %u mA), RDO %#x, generation %u",
+       c.pdo_origin == PIANO_CONTRACT_PDO_FIRMWARE ? "firmware's" : "UCSI", c.object,
+       c.protocol == PIANO_CONTRACT_PPS ? "PPS" : "fixed", c.mv, c.ma, c.source_ma, c.rdo, c.generation);
 }
 
 void PianoPower::pumpMca(uint64_t now)
@@ -1786,6 +1852,7 @@ void PianoPower::serviceMca(uint64_t now)
         fLink.requestDecision();
       }
       if (cr == 2 || cr < 0) fLink.requestDecision();
+      if (cr == 2 && fContract.pdo_fallback) logFirmwareContract();
       continue;
     }
     if (piano_usbc_relay_receive(data, length)) continue;   // the UCSI client's traffic (UsbcRelay.h): not PianoMca's
@@ -1835,6 +1902,7 @@ void PianoPower::serviceMca(uint64_t now)
       if (piano_port_publish(data, length) && nowMs() - t0 > 20)
         note("port events: the clients took %llu ms (the charger waited)", (unsigned long long)(nowMs() - t0));
     }
+    if (r == McaCycleDone && fContract.pdo_fallback) offerFirmwarePdos();
     if (r == McaCycleDone) {
       char line[520];
       if (fMca.cycles == 1) {

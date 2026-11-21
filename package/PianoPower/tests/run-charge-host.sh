@@ -12,6 +12,9 @@ done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/contract_link_host.cpp" \
   "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/contract_link_host"
 "$T/contract_link_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/pdo_firmware_host.cpp" \
+  "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/pdo_firmware_host"
+"$T/pdo_firmware_host"
 "$T/contract_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_init_host.cpp" -o "$T/contract_init_host"
 "$T/contract_init_host"
