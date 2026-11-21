@@ -22,6 +22,7 @@ struct PianoAudioLevelArgs {
   uint32_t spk;                       // piano-audio-spk: speaker protection from the first start (odd: 1 + SPK_VAR_* bits, AudioSpkProt.h); 0 passthrough
   uint32_t ageOld;                    // piano-audio-age=0: duplex-age1's A/B control (the old unsigned sound-age test)
   uint32_t duplexHold;                // piano-audio-duplex-hold: duplex-hold1's mask (AudioLive.h audio_live_hold_select: 0 off, 1, 3)
+  uint32_t miplay;                    // piano-audio-miplay: MIPLAY inside the protection plan (AudioSpkProt.h spk_miplay_valid; 0 off)
 };
 // Runs until the levels are done (levels 4-7 bounded; levels 8-10 for the rest of the boot, until PianoPower's health stops
 // them); the summary for the log and ioreg. 0 when every level that ran passed.

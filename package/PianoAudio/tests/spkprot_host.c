@@ -10,8 +10,16 @@
 //   - the plan against a DSP model that reads every out-of-band payload from the parameter area: the order (V/I opened and started
 //     before the speaker graph, Re25 after the speaker parameters, the stream linked to the MFC), every parameter sent exactly once
 //     (in band or out of band), the stop in exact reverse; a refusal and a missing answer at every step undo exactly what was done;
-//   - the monitor's two commands and the live slot.
+//   - the monitor's two commands and the live slot;
+//   - MIPLAY (piano-audio-miplay): its private file accepted and refused as documented; its GRAPH_OPEN decoded block by block (the
+//     stock container, the twelve modules in order, the ports, the fifteen links with the one into the speaker MFC, no control link)
+//     at both perf modes; the driver's configuration (the MFC 0x4351's output and channel mixer, the rotation, the pregain) byte for
+//     byte; the request's encoding and words; the pregain from the master gain; the plan with MIPLAY against the DSP model (MIPLAY
+//     opened after the speaker graph and before the stream, which links to SYNC 0x4375:6; prepared and started between the speaker
+//     and the stream; every file parameter once; the stop in exact reverse); a refusal or a lost answer at every step undone exactly;
+//     the clock and order variants with MIPLAY; the monitor with the pregain.
 //   cc -std=c11 -Wall -Wextra -Werror spkprot_host.c ../AudioSpkProt.c ../AudioSequence.c ../PianoAudioReach.c ../PianoGpr.c && ./a.out
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -321,14 +329,14 @@ static int amps_off(void *o) {struct Owner *w = o; w->amps_off_calls++; note("AM
 
 // Every parameter the DSP received (iid, pid, size, a checksum of the data), from in-band and out-of-band SET_CFGs.
 struct Got {uint32_t iid, pid, size, sum; int oob;};
-static struct Got g_got[128];
+static struct Got g_got[512];
 static unsigned g_ngot;
 static uint32_t sum(const uint8_t *d, uint32_t n) {uint32_t s = 0; for (uint32_t i = 0; i < n; ++i) s = s * 31 + d[i]; return s;}
 static void record(const uint8_t *b, uint32_t n, int oob)
 {
     uint32_t pid[64], at[64], size[64];
     const unsigned k = blocks(b, n, pid, at, size);
-    for (unsigned i = 0; i < k && g_ngot < 128; ++i)
+    for (unsigned i = 0; i < k && g_ngot < 512; ++i)
         g_got[g_ngot++] = (struct Got){le32(b + at[i] - 16), pid[i], size[i], sum(b + at[i], size[i]), oob};
 }
 
@@ -341,6 +349,12 @@ static const uint8_t *area_at(uint64_t address, uint32_t bytes)
 
 static uint32_t g_prm_attr;   // the last PRM clock request's attribute
 static uint32_t g_variant;    // the plan's round-2 variant (make_plan)
+static uint32_t g_miplay;     // the plan's MIPLAY request (make_plan)
+static unsigned g_mip_perf;   // the perf mode the MIPLAY open of the plan being driven must carry
+static uint32_t g_str_to, g_str_port;   // the stream open's last link: its target and input port
+static uint8_t g_mipcfg[GPR_MAX_PACKET];   // the driver's MIPLAY configuration as the DSP got it
+static uint32_t g_mipcfg_n;
+static void check_mip_open(const uint8_t *b, uint32_t n, unsigned perf);
 static void describe(const uint8_t *b, uint32_t n)
 {
     GprPacket p;
@@ -356,9 +370,11 @@ static void describe(const uint8_t *b, uint32_t n)
         if (oob) {
             const uint64_t a = le32(d) | (uint64_t)le32(d + 4) << 32;
             const uint8_t *o = area_at(a, le32(d + 12));
-            check_open(o, le32(d + 12), le32(o + 20) == SPK_SG_VI);
+            if (le32(o + 20) == SPK_SG_MIP) check_mip_open(o, le32(d + 12), g_mip_perf);
+            else check_open(o, le32(d + 12), le32(o + 20) == SPK_SG_VI);
             snprintf(s, sizeof s, "OPEN %#x oob", le32(o + 20));
         } else {
+            g_str_to = le32(b + n - 12); g_str_port = le32(b + n - 8);
             snprintf(s, sizeof s, "OPEN %#x", le32(d + 36));
         }
         break;
@@ -374,6 +390,11 @@ static void describe(const uint8_t *b, uint32_t n)
             snprintf(s, sizeof s, "CFG %#x %#x oob", le32(o), le32(o + 4));
         } else {
             CHECK(le32(d + 8) == 0 && le32(d + 12) == p.payload_bytes - 16);
+            if (le32(d + 16) == SPK_IID_MIP_MFC_IN && le32(d + 20) == 0x08001024 && le32(d + 24) == 12 && le32(d + 52) == SPK_PID_CHMIXER) {
+                memcpy(g_mipcfg, b, n); g_mipcfg_n = n;   // the driver's own MIPLAY configuration: not a file parameter
+                snprintf(s, sizeof s, "CFG 0x4351 mip");
+                break;
+            }
             if (le32(d + 20) != 0x0800101B && le32(d + 20) != SPK_PID_RE25 && le32(d + 20) != SPK_PID_VBAT && le32(d + 16) != AR_IID_PLAY_SHMEM &&
                 le32(d + 16) != AR_IID_PLAY_DEC && le32(d + 16) != AR_IID_PLAY_LOG)
                 record(d + 16, p.payload_bytes - 16, 0);
@@ -427,6 +448,7 @@ static void drive(ArSeq *s, struct Dsp *d)
 
 static SpkProt g_prot;
 static SpkPlan g_plan;
+static SpkMip g_mip;
 static struct Owner owner;
 static void make_plan(const struct E *e, unsigned n)
 {
@@ -441,6 +463,7 @@ static void make_plan(const struct E *e, unsigned n)
     g_plan.base.owner = &owner; g_plan.base.amps_on = amps_on; g_plan.base.amps_off = amps_off;
     memset(g_area, 0xcc, sizeof g_area);
     g_plan.variant = g_variant;
+    g_plan.mip = &g_mip; g_plan.miplay = g_miplay; g_plan.preg = 0;
     CHECK(spk_plan_init(&g_plan, &g_prot, g_area, sizeof g_area, &why) == 0);
     memset(&owner, 0, sizeof owner);
     lines = 0; g_ngot = 0;
@@ -462,21 +485,22 @@ static const char *kUpViFirst[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000 0x1
 _Static_assert(sizeof kUp / sizeof kUp[0] == sizeof kUndo / sizeof kUndo[0], "one undo entry per step");
 enum {kSteps = sizeof kUp / sizeof kUp[0]};
 
-static void expect_unwind(unsigned from, int upto, int skip_last_unmap)
+static void expect_unwind_of(const char *const *undo, unsigned from, int upto, int skip_last_unmap)
 {
     unsigned at = from;
     for (int i = upto - 1; i >= 0; --i) {
-        if (!kUndo[i] || !strcmp(kUndo[i], "AMPS OFF")) {
-            if (kUndo[i] && owner.amps_on_calls) {CHECK(at < lines && !strcmp(lg[at], "AMPS OFF")); ++at;}
+        if (!undo[i] || !strcmp(undo[i], "AMPS OFF")) {
+            if (undo[i] && owner.amps_on_calls) {CHECK(at < lines && !strcmp(lg[at], "AMPS OFF")); ++at;}
             continue;
         }
-        if (skip_last_unmap && i == upto - 1 && !strcmp(kUndo[i], "UNMAP 0x55")) continue;   // no handle came back
-        if (at >= lines || strcmp(lg[at], kUndo[i])) fprintf(stderr, "undo %u: got %s want %s\n", at, at < lines ? lg[at] : "-", kUndo[i]);
-        CHECK(at < lines && !strcmp(lg[at], kUndo[i]));
+        if (skip_last_unmap && i == upto - 1 && !strcmp(undo[i], "UNMAP 0x55")) continue;   // no handle came back
+        if (at >= lines || strcmp(lg[at], undo[i])) fprintf(stderr, "undo %u: got %s want %s\n", at, at < lines ? lg[at] : "-", undo[i]);
+        CHECK(at < lines && !strcmp(lg[at], undo[i]));
         ++at;
     }
     CHECK(at == lines);
 }
+static void expect_unwind(unsigned from, int upto, int skip_last_unmap) {expect_unwind_of(kUndo, from, upto, skip_last_unmap);}
 
 static void testPlan(void)
 {
@@ -591,7 +615,7 @@ static void testPacking(void)
 static void testMonitor(void)
 {
     make_plan(kStock, N(kStock));
-    SpkMonitor m = {4012000, spk_plan_address(&g_plan, g_plan.live_slot), HANDLE};
+    SpkMonitor m = {.vbat_uv = 4012000, .live_address = spk_plan_address(&g_plan, g_plan.live_slot), .handle = HANDLE};
     unsigned count;
     const ArStep *steps = spk_monitor_steps(1, &count);
     CHECK(count == 2);
@@ -679,6 +703,348 @@ static void testVariants(void)
     g_variant = 0;
 }
 
+// ------------------------------------------------------------------------------------------------------------------ MIPLAY
+// A synthetic MIPLAY file: the shape of the stock calibration (the twelve modules, a 2488-byte and a 704-byte parameter), made-up
+// parameter ids for the DAP and made-up values; the pregain's id is synthetic too.
+#define SYN_PREG 0x00030001u
+static struct E g_me[80];
+static unsigned g_nme;
+static uint8_t g_mfile[16384];
+static uint32_t g_mbytes;
+static void me(uint32_t iid, uint32_t pid, uint32_t size) {g_me[g_nme++] = (struct E){iid, pid, size, 0};}
+static void make_mip_entries(void)
+{
+    g_nme = 0;
+    me(0x4026, 0x08001026, 4); me(0x4026, 0x08001031, 12); me(0x4026, 0x08001313, 4);
+    me(0x4351, 0x0800101f, 40); me(0x4351, 0x08001024, 8); me(0x4351, 0x0800104d, 12); me(0x4372, 0x08001026, 4);
+    me(0x4373, 0x08001016, 4); me(0x4373, 0x08001050, 36); me(0x4377, 0x0800101f, 56); me(0x4377, 0x08001024, 16);
+    me(0x437e, 0x08001035, 4); me(0x437e, 0x08001038, 16); me(0x4461, 0x1000a100, 4);
+    me(0x411f, 0x08001026, 4); me(0x411f, SYN_PREG, 4); me(0x411f, 0x00030002, 2488); me(0x411f, 0x00030003, 408); me(0x411f, 0x00030004, 200);
+    for (unsigned i = 0; i < 40; ++i) me(0x411f, 0x00031000 + i, 4 + 4 * (i % 3));
+    me(0x4bc4, 0x1000a150, 4); me(0x41d9, 0x1000ad01, 6); me(0x4bdf, 0x10014002, 144); me(0x4bdf, 0x10014003, 704);
+}
+static uint32_t build_mip(const struct E *e, unsigned n, uint32_t magic, uint32_t version, uint32_t preg)
+{
+    const uint32_t bytes = build(g_mfile, e, n, magic, version);
+    put32(g_mfile + 12, preg);
+    return bytes;
+}
+static void load_mip(void)
+{
+    const char *why = 0;
+    make_mip_entries();
+    g_mbytes = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 1, SYN_PREG);
+    CHECK(spk_mip_parse(&g_mip, g_mfile, g_mbytes, &why) == 0 && g_mip.have && g_mip.count == g_nme && g_mip.preg_pid == SYN_PREG);
+}
+
+static void testMipFile(void)
+{
+    SpkMip m;
+    const char *why = 0;
+    load_mip();
+    CHECK(g_mip.dap == 45 && g_mip.e[16].size == 2488 && g_mip.e[16].data[0] == (uint8_t)(0xa5 ^ 16));
+    uint32_t n = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 1, 0);
+    CHECK(spk_mip_parse(&m, g_mfile, n, &why) == 0 && !m.preg_pid);                            // no pregain named: fine
+    CHECK(spk_mip_parse(&m, 0, 0, &why) && strstr(why, "spk-dolby.bin: missing") && !m.have);
+    n = build_mip(g_me, g_nme, SPK_PARAMS_MAGIC, 1, SYN_PREG); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "PMIP"));
+    n = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 2, SYN_PREG); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "version"));
+    n = build_mip(g_me, 0, SPK_MIP_MAGIC, 1, 0); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "count"));
+    n = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 1, SYN_PREG);
+    CHECK(spk_mip_parse(&m, g_mfile, n - 4, &why) && strstr(why, "size"));
+    CHECK(spk_mip_parse(&m, g_mfile, n + 4, &why) && strstr(why, "after the last"));
+    put32(g_mfile + 8, g_nme + 1); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "truncated"));
+    put32(g_mfile + 8, SPK_MIP_MAX_ENTRIES + 1); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "count"));
+    struct E e[80];
+    memcpy(e, g_me, sizeof g_me);
+    e[3].iid = SPK_IID_MFC;   // the speaker graph's MFC: not MIPLAY's
+    n = build_mip(e, g_nme, SPK_MIP_MAGIC, 1, SYN_PREG); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "not in the MIPLAY"));
+    memcpy(e, g_me, sizeof g_me); e[5] = e[4];
+    n = build_mip(e, g_nme, SPK_MIP_MAGIC, 1, SYN_PREG); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "twice"));
+    memcpy(e, g_me, sizeof g_me); e[16].size = SPK_MAX_PARAM + 1;
+    n = build_mip(e, g_nme, SPK_MIP_MAGIC, 1, SYN_PREG); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "size"));
+    n = build_mip(g_me, 14, SPK_MIP_MAGIC, 1, 0); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "no parameter of the Dolby DAP"));
+    n = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 1, 0x00030003); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "pregain"));   // 408 bytes
+    n = build_mip(g_me, g_nme, SPK_MIP_MAGIC, 1, 0x00039999); CHECK(spk_mip_parse(&m, g_mfile, n, &why) && strstr(why, "pregain"));   // not there
+    CHECK(spk_mip_iid(0x411f) && spk_mip_iid(0x4375) && spk_mip_iid(0x4377) && !spk_mip_iid(0x4032) && !spk_mip_iid(0x4012) && !spk_mip_iid(0x45b8));
+    load_mip();
+}
+
+static void check_mip_open(const uint8_t *b, uint32_t n, unsigned perf)
+{
+    uint32_t pid[64], at[64], size[64];
+    CHECK(blocks(b, n, pid, at, size) == 5);   // no control link
+    static const uint32_t kOrder[5] = {0x08001001, 0x08001000, 0x08001002, 0x08001003, 0x08001004};
+    for (unsigned k = 0; k < 5; ++k) CHECK(pid[k] == kOrder[k] && le32(b + at[k] - 16) == AR_APM_IID);
+    const uint8_t *s = b + at[0];
+    CHECK(size[0] == 48 && le32(s) == 1 && le32(s + 4) == SPK_SG_MIP && le32(s + 8) == 3);
+    CHECK(le32(s + 12) == 0x0800100E && le32(s + 20) == perf && le32(s + 24) == 0x0800100F && le32(s + 32) == 2);
+    CHECK(le32(s + 36) == 0x08001010 && le32(s + 44) == 0xffffffffu);
+    const uint8_t *c = b + at[1];   // the stock container: specialized, per stream per device, 40 KiB stack, peer heap 2
+    CHECK(size[1] == 100 && le32(c) == 1 && le32(c + 4) == SPK_CONT_MIP && le32(c + 8) == 7);
+    CHECK(le32(c + 12) == 0x08001011 && le32(c + 20) == 1 && le32(c + 24) == 0x0B001000 && le32(c + 28) == 0x08001012 && le32(c + 36) == 2);
+    CHECK(le32(c + 40) == 0x08001013 && le32(c + 48) == 40960 && le32(c + 52) == 0x08001014 && le32(c + 60) == 2);
+    CHECK(le32(c + 64) == 0x08001174 && le32(c + 72) == 1 && le32(c + 76) == 0x080010CB && le32(c + 84) == 0xffffffffu);
+    CHECK(le32(c + 88) == 0x0800124D && le32(c + 96) == 2);
+    static const uint32_t kMods[12][4] = {
+        {0x0700101A, 0x4026, 1, 1}, {0x07001015, 0x4351, 1, 1}, {0x0700101A, 0x4372, 1, 1}, {0x07001010, 0x4373, 4, 1},
+        {0x07001038, 0x4375, 3, 4}, {0x07001015, 0x4377, 1, 1}, {0x0700101B, 0x437e, 1, 1}, {0x1000a100, 0x4461, 1, 1},
+        {0x100108db, 0x411f, 1, 1}, {0x1000a150, 0x4bc4, 1, 1}, {0x1000ad00, 0x41d9, 1, 1}, {0x10014000, 0x4bdf, 1, 1},
+    };
+    const uint8_t *m = b + at[2];
+    CHECK(size[2] == 16 + 12 * 8 && le32(m) == 1 && le32(m + 4) == SPK_SG_MIP && le32(m + 8) == SPK_CONT_MIP && le32(m + 12) == 12);
+    const uint8_t *pp = b + at[3];
+    CHECK(size[3] == 4 + 12 * 24 && le32(pp) == 12);
+    for (unsigned i = 0; i < 12; ++i) {
+        CHECK(le32(m + 16 + 8 * i) == kMods[i][0] && le32(m + 20 + 8 * i) == kMods[i][1]);
+        const uint8_t *x = pp + 4 + 24 * i;
+        CHECK(le32(x) == kMods[i][1] && le32(x + 4) == 1 && le32(x + 8) == 0x08001015 && le32(x + 16) == kMods[i][2] && le32(x + 20) == kMods[i][3]);
+    }
+    // the chain end to end: SYNC's four outputs into SAL, then one path to MFC 0x4377 and from it into the speaker graph's MFC
+    static const uint32_t kLinks[15][4] = {
+        {0x4026, 1, 0x4351, 2}, {0x4375, 5, 0x4373, 2}, {0x4375, 7, 0x4373, 4}, {0x4375, 9, 0x4373, 6}, {0x4373, 1, 0x4026, 2},
+        {0x4375, 0xb, 0x4373, 8}, {0x4372, 1, 0x437e, 2}, {0x437e, 1, 0x4377, 2}, {0x4461, 1, 0x4372, 2}, {0x4bc4, 1, 0x4461, 2},
+        {0x411f, 1, 0x41d9, 2}, {0x41d9, 1, 0x4bc4, 2}, {0x4351, 1, 0x4bdf, 2}, {0x4bdf, 1, 0x411f, 2}, {0x4377, 1, 0x4032, 2},
+    };
+    const uint8_t *l = b + at[4];
+    CHECK(size[4] == 4 + 15 * 16 && le32(l) == 15);
+    for (unsigned i = 0; i < 15; ++i) for (unsigned k = 0; k < 4; ++k) CHECK(le32(l + 4 + 16 * i + 4 * k) == kLinks[i][k]);
+}
+
+static void testMipPackets(void)
+{
+    uint8_t buf[2048], pkt[GPR_MAX_PACKET];
+    for (unsigned perf = 1; perf <= 2; ++perf) {
+        const uint32_t n = spk_mip_open_payload(buf, sizeof buf, perf);
+        CHECK(n == 64 + 120 + 128 + 312 + 264 && n > SPK_INBAND_MAX);   // out of band
+        check_mip_open(buf, n, perf);
+        CHECK(!spk_mip_open_payload(buf, n - 1, perf));
+    }
+    CHECK(!spk_mip_open_payload(buf, sizeof buf, 0) && !spk_mip_open_payload(buf, sizeof buf, 3));
+    // the driver's configuration: MFC 0x4351 {48000, 24, 2, FL FR}; its channel mixer, one table 4 -> 2 taking FL and RS; the
+    // rotation; the pregain
+    GprPacket p;
+    uint32_t pid[64], at[64], size[64];
+    uint32_t n = spk_mip_config(pkt, sizeof pkt, AR_PORT_APM, 11, 1, SYN_PREG, -96);
+    CHECK(n && gpr_decode(pkt, n, &p) == GprOk && p.opcode == AR_OP_SET_CFG && le32(p.payload + 12) == p.payload_bytes - 16);
+    const uint8_t *b = p.payload + 16;
+    CHECK(blocks(b, p.payload_bytes - 16, pid, at, size) == 4);
+    CHECK(le32(b + at[0] - 16) == 0x4351 && pid[0] == 0x08001024 && size[0] == 12 && le32(b + at[0]) == 48000 && le16(b + at[0] + 4) == 24);
+    CHECK(le16(b + at[0] + 6) == 2 && le16(b + at[0] + 8) == AR_CH_FL && le16(b + at[0] + 10) == AR_CH_FR);
+    static const uint16_t kMixer[18] = {1, 0, 2, 4, 1, 2, 1, 2, 4, 5, 16384, 0, 0, 0, 0, 0, 0, 16384};
+    CHECK(le32(b + at[1] - 16) == 0x4351 && pid[1] == SPK_PID_CHMIXER && size[1] == 36);
+    for (unsigned i = 0; i < 18; ++i) CHECK(le16(b + at[1] + 2 * i) == kMixer[i]);
+    // read as [output][input] and as [input][output], the coefficients take L (FL) and R (RS) to the two outputs
+    const uint8_t *co = b + at[1] + 20;
+    CHECK(le16(co + 2 * (0 * 4 + 0)) == 16384 && le16(co + 2 * (1 * 4 + 3)) == 16384);   // [out][in]: FL <- FL, FR <- RS
+    CHECK(le16(co + 2 * (0 * 2 + 0)) == 16384 && le16(co + 2 * (3 * 2 + 1)) == 16384);   // [in][out]: FL -> FL, RS -> FR
+    CHECK(le32(b + at[2] - 16) == 0x4bc4 && pid[2] == SPK_PID_MIP_ROTATION && size[2] == 4 && le32(b + at[2]) == 1);
+    CHECK(le32(b + at[3] - 16) == 0x411f && pid[3] == SYN_PREG && size[3] == 4 && (int32_t)le32(b + at[3]) == -96);
+    n = spk_mip_config(pkt, sizeof pkt, AR_PORT_APM, 11, 3, 0, 0);   // no pregain parameter: three blocks
+    CHECK(n && gpr_decode(pkt, n, &p) == GprOk && blocks(p.payload + 16, p.payload_bytes - 16, pid, at, size) == 3 && le32(p.payload + 16 + at[2]) == 3);
+    CHECK(!spk_mip_config(pkt, sizeof pkt, 1, 1, 4, SYN_PREG, 0) && !spk_mip_config(pkt, sizeof pkt, 1, 1, 0, SYN_PREG, 1));
+    CHECK(!spk_mip_config(pkt, sizeof pkt, 1, 1, 0, SYN_PREG, SPK_PREG_MUTE - 1) && spk_mip_config(pkt, sizeof pkt, 1, 1, 0, SYN_PREG, SPK_PREG_MUTE));
+    n = spk_preg(pkt, sizeof pkt, AR_PORT_APM, 12, SYN_PREG, -2080);
+    CHECK(n == 24 + 16 + 24 && gpr_decode(pkt, n, &p) == GprOk && le32(p.payload + 16) == 0x411f && le32(p.payload + 20) == SYN_PREG);
+    CHECK(le32(p.payload + 24) == 4 && (int32_t)le32(p.payload + 32) == -2080);
+    CHECK(!spk_preg(pkt, sizeof pkt, 1, 1, 0, 0) && !spk_preg(pkt, sizeof pkt, 1, 1, SYN_PREG, 5));
+    // the stream into SYNC's port 6; ports must be even inputs
+    n = ar_open_playback_stream_to_port(pkt, sizeof pkt, AR_PORT_APM, 3, SPK_IID_MIP_SYNC, SPK_MIP_STREAM_PORT);
+    CHECK(n && le32(pkt + n - 20) == AR_IID_PLAY_LOG && le32(pkt + n - 16) == 1 && le32(pkt + n - 12) == 0x4375 && le32(pkt + n - 8) == 6);
+    CHECK(!ar_open_playback_stream_to_port(pkt, sizeof pkt, 1, 3, 0x4375, 5) && !ar_open_playback_stream_to_port(pkt, sizeof pkt, 1, 3, 0x4375, 0));
+    // the request
+    static const int kValid[] = {0, 1, 2, 5, 6, 17, 18, 21, 22, 33, 49, 65, 70};
+    static const int kInvalid[] = {-1, 3, 4, 7, 8, 9, 16, 20, 81, 128, 1 + 8};
+    for (unsigned i = 0; i < N(kValid); ++i) CHECK(spk_miplay_valid(kValid[i]));
+    for (unsigned i = 0; i < N(kInvalid); ++i) CHECK(!spk_miplay_valid(kInvalid[i]));
+    CHECK(spk_miplay_perf(6) == 2 && spk_miplay_rotation(1) == 1 && spk_miplay_rotation(17) == 0 && spk_miplay_rotation(65) == 3);
+    char text[96];
+    CHECK(!strcmp(spk_miplay_text(1, text, sizeof text), "perf 1, pregain fixed 0 dB, rotation 1 (Android's)"));
+    CHECK(!strcmp(spk_miplay_text(2 + 4 + 48, text, sizeof text), "perf 2, pregain following the master volume, rotation 2"));
+    CHECK(!strcmp(spk_miplay_text(0, text, sizeof text), "off") && strlen(spk_miplay_text(1, text, 8)) == 7);
+    // the pregain from the master gain: 20 log10(q15 / 32768) x 16
+    CHECK(spk_preg_q4(32767) == 0 && spk_preg_q4(40000) == 0 && spk_preg_q4(16384) == -96 && spk_preg_q4(8192) == -193);
+    CHECK(spk_preg_q4(23170) == -48 && spk_preg_q4(3277) == -320 && spk_preg_q4(1) == -1445 && spk_preg_q4(0) == SPK_PREG_MUTE);
+    CHECK(spk_preg_q4(-5) == SPK_PREG_MUTE);
+    for (int32_t q = 1; q < 32767; q += 97) {   // monotonic and within 0.06 dB of the exact value everywhere
+        const double exact = 320.0 * log10((double)q / 32768.0);
+        CHECK(fabs(spk_preg_q4(q) - exact) <= 0.51 && spk_preg_q4(q) <= spk_preg_q4(q + 97));
+    }
+}
+
+// The plan with MIPLAY: built as the plan without it, with MIPLAY's steps where AudioSpkProt.h says.
+static const char *g_up[SPK_MAX_STEPS], *g_undo[SPK_MAX_STEPS];
+static char g_upbuf[SPK_MAX_STEPS][48];
+static unsigned g_nup;
+static void up(const char *line, const char *undo) {g_up[g_nup] = line; g_undo[g_nup++] = undo;}
+static void make_mip_expect(void)
+{
+    g_nup = 0;
+    for (unsigned i = 0; i < 7; ++i) up(kUp[i], kUndo[i]);   // the clock, the map, the speaker graph, its parameters, Re25
+    up("OPEN 0xb000019f oob", "CLOSE 0xb000019f");
+    for (unsigned k = 0; k < g_plan.chunks; ++k) {
+        const SpkChunk *c = &g_plan.chunk[k];
+        if (c->graph != 3) continue;
+        const SpkParam *e = &g_mip.e[g_plan.order[c->first]];
+        if (c->oob) snprintf(g_upbuf[g_nup], sizeof g_upbuf[0], "CFG %#x %#x oob", e->iid, e->pid);
+        else snprintf(g_upbuf[g_nup], sizeof g_upbuf[0], "CFG %#x", e->iid);
+        up(g_upbuf[g_nup], 0);
+    }
+    up("CFG 0x4351 mip", 0);
+    for (unsigned i = 7; i < 16; ++i) up(kUp[i], kUndo[i]);   // the stream, the V/I graph prepared and started
+    up("PREPARE 0xb0000002", 0); up("PREPARE 0xb000019f", 0); up("PREPARE 0x4001", 0);
+    up("START 0xb0000002", "STOP 0xb0000002"); up("START 0xb000019f", "STOP 0xb000019f"); up("START 0x4001", "STOP 0x4001");
+    up("AMPS ON", "AMPS OFF");
+}
+static void make_mip_plan(uint32_t request)
+{
+    load_mip();
+    g_miplay = request;
+    g_mip_perf = spk_miplay_perf(request);
+    make_plan(kStock, N(kStock));
+    g_miplay = 0;
+    make_mip_expect();
+}
+
+static void testMipPlan(void)
+{
+    make_mip_plan(1);
+    CHECK(g_plan.miplay == 1 && g_plan.mip_open_bytes == 888 && g_plan.mip_open == 1312 && g_plan.live_slot == 2208);
+    CHECK(g_plan.count == g_nup && g_plan.mip_chunks >= 6 && g_plan.oob_chunks == 3 && g_plan.staged <= AUDIO_DMA_PARAM_BYTES);
+    ArSeq s;
+    start(&s);
+    struct Dsp d = {-1, -1, 0, 0};
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && lines == g_nup);
+    for (unsigned i = 0; i < g_nup; ++i) {
+        if (strcmp(lg[i], g_up[i])) fprintf(stderr, "MIPLAY step %u: got %s want %s\n", i, lg[i], g_up[i]);
+        CHECK(!strcmp(lg[i], g_up[i]));
+    }
+    CHECK(g_str_to == SPK_IID_MIP_SYNC && g_str_port == SPK_MIP_STREAM_PORT);   // the stream into SYNC's port 6
+    // every parameter of both files reached the DSP exactly once, unchanged; the big ones out of band
+    CHECK(g_ngot == N(kStock) + g_nme);
+    for (unsigned i = 0; i < g_nme; ++i) {
+        unsigned seen = 0;
+        for (unsigned k = 0; k < g_ngot; ++k)
+            if (g_got[k].iid == g_mip.e[i].iid && g_got[k].pid == g_mip.e[i].pid) {
+                ++seen;
+                CHECK(g_got[k].size == g_mip.e[i].size && g_got[k].sum == sum(g_mip.e[i].data, g_mip.e[i].size));
+                CHECK(g_got[k].oob == (g_mip.e[i].size > 456));
+            }
+        CHECK(seen == 1);
+    }
+    // the driver's configuration came after every MIPLAY parameter: rotation 1, the pregain fixed 0 dB
+    GprPacket p;
+    uint32_t pid[64], at[64], size[64];
+    CHECK(g_mipcfg_n && gpr_decode(g_mipcfg, g_mipcfg_n, &p) == GprOk && blocks(p.payload + 16, p.payload_bytes - 16, pid, at, size) == 4);
+    CHECK(le32(p.payload + 16 + at[2]) == 1 && pid[3] == SYN_PREG && le32(p.payload + 16 + at[3]) == 0);
+    ar_seq_stop(&s);
+    drive(&s, &d);
+    CHECK(s.state == ArSeqDown && s.undo_errors == 0 && owner.amps_off_calls == 1);
+    static const char *kDown[] = {"AMPS OFF", "STOP 0x4001", "STOP 0xb000019f", "STOP 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5",
+                                  "CLOSE 0x4001", "CLOSE 0xb000019f", "CLOSE 0xb0000002", "UNMAP 0x55", "PRM REL 0x202"};
+    CHECK(lines == g_nup + N(kDown));
+    for (unsigned i = 0; i < N(kDown); ++i) CHECK(!strcmp(lg[g_nup + i], kDown[i]));
+    // perf 2, the pregain and another rotation in the configuration
+    make_mip_plan(2 + 4 + 16 * 3);
+    g_plan.preg = -321;
+    const char *why = 0;
+    CHECK(spk_plan_init(&g_plan, &g_prot, g_area, sizeof g_area, &why) == 0);
+    start(&s);
+    d = (struct Dsp){-1, -1, 0, 0};
+    lines = 0; g_ngot = 0;
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && gpr_decode(g_mipcfg, g_mipcfg_n, &p) == GprOk && blocks(p.payload + 16, p.payload_bytes - 16, pid, at, size) == 4);
+    CHECK(le32(p.payload + 16 + at[2]) == 2 && (int32_t)le32(p.payload + 16 + at[3]) == -321);
+    // the plan without MIPLAY is the one before: no MIPLAY command, the stream into the MFC
+    make_plan(kStock, N(kStock));
+    CHECK(g_plan.count == kSteps && !g_plan.mip_open_bytes && !g_plan.mip_chunks);
+    start(&s);
+    d = (struct Dsp){-1, -1, 0, 0};
+    drive(&s, &d);
+    for (unsigned i = 0; i < kSteps; ++i) CHECK(!strcmp(lg[i], kUp[i]));
+    CHECK(g_str_to == SPK_IID_MFC && g_str_port == 2);
+    // refused layouts: MIPLAY without a valid file, an invalid request, a pregain out of range
+    SpkPlan bad;
+    memset(&bad, 0, sizeof bad);
+    bad.base = g_plan.base;
+    bad.miplay = 1;
+    CHECK(spk_plan_init(&bad, &g_prot, g_area, sizeof g_area, &why) == -1 && strstr(why, "MIPLAY"));
+    bad.mip = &g_mip; bad.miplay = 3;
+    CHECK(spk_plan_init(&bad, &g_prot, g_area, sizeof g_area, &why) == -1 && strstr(why, "MIPLAY"));
+    bad.miplay = 1; bad.preg = 1;
+    CHECK(spk_plan_init(&bad, &g_prot, g_area, sizeof g_area, &why) == -1 && strstr(why, "pregain"));
+    bad.preg = 0;
+    CHECK(spk_plan_init(&bad, &g_prot, g_area, sizeof g_area, &why) == 0 && bad.mip_open_bytes == 888);
+}
+
+// MIPLAY's plan: a refusal and a lost answer at every DSP step undo exactly what was done, MIPLAY's close and stop included.
+static void testMipFailures(void)
+{
+    make_mip_plan(1);
+    const unsigned steps = g_nup;
+    for (int timeout = 0; timeout < 2; ++timeout)
+        for (int k = 0; k + 1 < (int)steps; ++k) {
+            make_mip_plan(1);
+            ArSeq s;
+            start(&s);
+            struct Dsp d = {timeout ? -1 : k, timeout ? k : -1, 0x0b, 0};
+            drive(&s, &d);
+            CHECK(s.state == ArSeqFailed && s.failed_step == k && owner.amps_on_calls == 0 && owner.amps_off_calls == 0);
+            for (int i = 0; i <= k; ++i) CHECK(!strcmp(lg[i], g_up[i]));
+            expect_unwind_of(g_undo, (unsigned)k + 1, timeout ? k + 1 : k, timeout);
+        }
+    // the variants with MIPLAY: no CPU clock (+2), the round-1 order (+16): MIPLAY stays between the speaker graph and the stream
+    g_variant = SPK_VAR_ENDPOINT_CLOCK;
+    make_mip_plan(1);
+    CHECK(g_plan.count == g_nup - 1);
+    run_up(g_up + 1, g_nup - 1);
+    g_variant = SPK_VAR_VI_FIRST | SPK_VAR_ENDPOINT_CLOCK;
+    make_mip_plan(1);
+    ArSeq s;
+    start(&s);
+    struct Dsp d = {-1, -1, 0, 0};
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && !strcmp(lg[1], "OPEN 0xb00000d5 oob") && !strcmp(lg[5], "START 0xb00000d5") && !strcmp(lg[6], "OPEN 0xb0000002 oob"));
+    unsigned mip = 0, str = 0;
+    for (unsigned i = 0; i < lines; ++i) {
+        if (!strcmp(lg[i], "OPEN 0xb000019f oob")) mip = i;
+        if (!strcmp(lg[i], "OPEN 0x4001")) str = i;
+    }
+    CHECK(mip > 6 && str > mip && !strcmp(lg[str - 1], "CFG 0x4351 mip"));
+    g_variant = 0;
+}
+
+// The monitor: the pregain first when it changed, in every combination with the battery voltage.
+static void testMipMonitor(void)
+{
+    make_mip_plan(5);
+    SpkMonitor m = {.vbat_uv = 4012000, .live_address = spk_plan_address(&g_plan, g_plan.live_slot), .handle = HANDLE, .preg_pid = SYN_PREG,
+                    .preg = -200};
+    static const char *kWant[4][3] = {{"GET 0x4046 0x10001fab"}, {"CFG 0x4046", "GET 0x4046 0x10001fab"},
+                                      {"CFG 0x411f", "GET 0x4046 0x10001fab"}, {"CFG 0x411f", "CFG 0x4046", "GET 0x4046 0x10001fab"}};
+    for (int c = 0; c < 4; ++c) {
+        unsigned count;
+        const ArStep *steps = spk_monitor_plan(c & 1, c >> 1, &count);
+        CHECK(count == 1u + (unsigned)(c & 1) + (unsigned)(c >> 1));
+        ArSeq s;
+        lines = 0;
+        ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0xa000, &m);
+        struct Dsp d = {-1, -1, 0, 0};
+        drive(&s, &d);
+        CHECK(s.state == ArSeqUp && lines == count);
+        for (unsigned i = 0; i < count; ++i) CHECK(!strcmp(lg[i], kWant[c][i]));
+    }
+    // a refused pregain fails the monitor (the owner's fallback)
+    unsigned count;
+    const ArStep *steps = spk_monitor_plan(1, 1, &count);
+    ArSeq s;
+    ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0xa000, &m);
+    struct Dsp d = {0, -1, 0x12, 0};
+    drive(&s, &d);
+    CHECK(s.state == ArSeqFailed && s.failed_step == 0 && s.error_status == 0x12);
+    CHECK(!strcmp(ar_seq_step_name(&s, 0), "Dolby pregain to the DAP (MIPLAY)"));
+}
+
 int main(void)
 {
     testFiles();
@@ -688,6 +1054,11 @@ int main(void)
     testPacking();
     testMonitor();
     testVariants();
+    testMipFile();
+    testMipPackets();
+    testMipPlan();
+    testMipFailures();
+    testMipMonitor();
     printf("PASS spkprot: %u checks\n", checks);
     return 0;
 }

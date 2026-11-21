@@ -91,9 +91,10 @@ typedef struct {uint32_t id, position;} Container;
 typedef struct {uint32_t module, iid, inputs, outputs;} Module;
 typedef struct {uint32_t from, to;} Link;
 
-/* One subgraph with one container (all the board topology uses). Every link goes from output port 1 to input port 2. */
+/* One subgraph with one container (all the board topology uses). Every link goes from output port 1 to input port 2, but the last
+ * one to last_port when that is not 0. */
 static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const Sg *sg, const Container *c,
-                           const Module *m, unsigned modules, const Link *l, unsigned links)
+                           const Module *m, unsigned modules, const Link *l, unsigned links, uint32_t last_port)
 {
     W w;
     begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_GRAPH_OPEN);
@@ -126,7 +127,9 @@ static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint3
     param_end(&w, at);
     at = param_begin(&w, AR_APM_IID, PARAM_MODULE_CONN);
     put32(&w, links);
-    for (unsigned i = 0; i < links; ++i) {put32(&w, l[i].from); put32(&w, OUT_PORT); put32(&w, l[i].to); put32(&w, IN_PORT);}
+    for (unsigned i = 0; i < links; ++i) {
+        put32(&w, l[i].from); put32(&w, OUT_PORT); put32(&w, l[i].to); put32(&w, i + 1 == links && last_port ? last_port : IN_PORT);
+    }
     param_end(&w, at);
     cmd_payload_end(&w, cmd);
     return finish(&w);
@@ -155,11 +158,18 @@ uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, 
     static const Container c = {AR_SG_SPEAKER, POS_STREAM};
     static const Module m[] = {{AR_MOD_LOG, AR_IID_SPK_LOG, 1, 1}, {AR_MOD_MFC, AR_IID_SPK_MFC, 1, 1}, {AR_MOD_TDM_SINK, AR_IID_SPK_TDM, 1, 0}};
     static const Link l[] = {{AR_IID_SPK_LOG, AR_IID_SPK_MFC}, {AR_IID_SPK_MFC, AR_IID_SPK_TDM}};
-    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 2);
+    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 2, 0);
 }
 
 uint32_t ar_open_playback_stream_to(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t downstream_iid)
 {
+    return ar_open_playback_stream_to_port(out, capacity, port, token, downstream_iid, IN_PORT);
+}
+
+uint32_t ar_open_playback_stream_to_port(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t downstream_iid,
+                                         uint32_t downstream_port)
+{
+    if (downstream_port < IN_PORT || downstream_port % 2u) return 0;   /* input ports are even */
     static const Sg sg = {AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
     static const Container c = {AR_SG_PLAY, POS_STREAM};
     static const Module m[] = {{AR_MOD_WR_SHMEM, AR_IID_PLAY_SHMEM, 0, 1}, {AR_MOD_PCM_DEC, AR_IID_PLAY_DEC, 1, 1},
@@ -167,7 +177,7 @@ uint32_t ar_open_playback_stream_to(uint8_t *out, uint32_t capacity, uint32_t po
     /* WR_SH's output port is 1: Ubuntu's piano fix (with 0 the kernel dropped this link and the DSP refused GRAPH_OPEN). */
     const Link l[] = {{AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC}, {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV}, {AR_IID_PLAY_CNV, AR_IID_PLAY_LOG},
                       {AR_IID_PLAY_LOG, downstream_iid}};
-    return graph_open(out, capacity, port, token, &sg, &c, m, 4, l, 4);
+    return graph_open(out, capacity, port, token, &sg, &c, m, 4, l, 4, downstream_port);
 }
 
 uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
@@ -181,7 +191,7 @@ uint32_t ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint
     static const Container c = {AR_SG_MIC, POS_GLOBAL_DEV};
     static const Module m[] = {{AR_MOD_CODEC_DMA_SOURCE, AR_IID_MIC_DMA, 0, 1}, {AR_MOD_LOG, AR_IID_MIC_LOG, 1, 1}};
     static const Link l[] = {{AR_IID_MIC_DMA, AR_IID_MIC_LOG}};
-    return graph_open(out, capacity, port, token, &sg, &c, m, 2, l, 1);
+    return graph_open(out, capacity, port, token, &sg, &c, m, 2, l, 1, 0);
 }
 
 uint32_t ar_open_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
@@ -192,7 +202,7 @@ uint32_t ar_open_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, 
                                {AR_MOD_PCM_ENC, AR_IID_CAP_ENC, 1, 1}, {AR_MOD_RD_SHMEM, AR_IID_CAP_SHMEM, 1, 0}};
     static const Link l[] = {{AR_IID_MIC_LOG, AR_IID_CAP_LOG}, {AR_IID_CAP_LOG, AR_IID_CAP_MFC}, {AR_IID_CAP_MFC, AR_IID_CAP_CNV},
                              {AR_IID_CAP_CNV, AR_IID_CAP_ENC}, {AR_IID_CAP_ENC, AR_IID_CAP_SHMEM}};
-    return graph_open(out, capacity, port, token, &sg, &c, m, 5, l, 5);
+    return graph_open(out, capacity, port, token, &sg, &c, m, 5, l, 5, 0);
 }
 
 static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)

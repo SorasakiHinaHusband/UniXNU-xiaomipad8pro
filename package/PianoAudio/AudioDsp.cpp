@@ -339,12 +339,30 @@ int spkState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
     if (req->newptr) return EPERM;
     if (!gLive || !gShared) return ENXIO;
     const AudioLive &l = *gLive;
-    char line[300];
+    char line[480];
     const int n = snprintf(line, sizeof line, "request %d ready %d active %d failed %d starts %u fallbacks %u live-reads %u vbat-sends %u "
-                           "vbat-uv %u speaker %s why %s", __atomic_load_n(&gShared->spk_prot, __ATOMIC_ACQUIRE), l.prot_ready, l.prot_active,
+                           "vbat-uv %u speaker %s why %s; miplay request %d ready %d active %d failed %d starts %u fallbacks %u "
+                           "preg %d preg-updates %u why %s", __atomic_load_n(&gShared->spk_prot, __ATOMIC_ACQUIRE), l.prot_ready, l.prot_active,
                            l.prot_failed, l.prot_starts, l.prot_fallbacks, l.live_reads, l.vbat_sends, l.vbat_uv, audio_live_state(l.spk_state),
-                           l.prot_why ? l.prot_why : "-");
+                           l.prot_why ? l.prot_why : "-", __atomic_load_n(&gShared->miplay, __ATOMIC_ACQUIRE), l.mip_ready, l.mip_active,
+                           l.mip_failed, l.mip_starts, l.mip_fallbacks, int(l.preg_sent), l.preg_updates, l.mip_why ? l.mip_why : "-");
     return SYSCTL_OUT(req, line, size_t(n < int(sizeof line) ? n : int(sizeof line) - 1) + 1);
+}
+// MIPLAY (AudioSpkProt.h): machdep.piano_audio_miplay asks for the Dolby/MiSound subgraph inside the protection plan from its next start
+// (0 off; 1 or 2 the perf mode; +4 the DAP's pregain follows the master volume; +16 x (r + 1) the rotation r); a new request also clears a
+// MIPLAY fallback of this boot. Its state is in machdep.piano_audio_spk_state ("miplay ...").
+struct sysctl_oid gMiplayOid;
+int miplayControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || !gShared) return ENXIO;
+    int value = __atomic_load_n(&gShared->miplay, __ATOMIC_ACQUIRE);
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (value && !gLive->mip_ready) return ENOENT;   // its private file is missing or mismatched (the log says which)
+    if (audio_live_miplay_select(gShared, value)) return EINVAL;
+    piano_audio_log("PianoMiplayV1: request %d (taken at the next start of the protection plan)", value);
+    liveWake();
+    return 0;
 }
 void registerSpk()
 {
@@ -362,6 +380,14 @@ void registerSpk()
     gSpkStateOid.oid_fmt = "A"; gSpkStateOid.oid_descr = "PianoSpeakerProtV1: request, readiness, fallbacks, live reads";
     gSpkStateOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gSpkStateOid);
+    bzero(&gMiplayOid, sizeof gMiplayOid);
+    gMiplayOid.oid_parent = &sysctl__machdep_children; gMiplayOid.oid_number = OID_AUTO;
+    gMiplayOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gMiplayOid.oid_name = "piano_audio_miplay"; gMiplayOid.oid_handler = miplayControl;
+    gMiplayOid.oid_fmt = "I";
+    gMiplayOid.oid_descr = "MIPLAY (Dolby) inside speaker protection from its next start: 0 off, 1/2 perf mode, +4 pregain tracked, +16(r+1) rotation r";
+    gMiplayOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gMiplayOid);
 }
 // duplex-hold1 (A/B switch, private DUPLEX-VOTES.txt; AudioLive.h audio_live_hold_select): machdep.piano_audio_duplex_hold 0 off, 1 the
 // LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, held by their own plan from before the first path starts until both
@@ -548,6 +574,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
     lc.spk_prot = int(a->spk);   // 0, or the round-2 mask (AudioSpkProt.h SPK_VAR_*), checked by PianoAudio.cpp and AudioLive
     lc.age_old = int(a->ageOld);   // duplex-age1 A/B control
+    lc.miplay = int(a->miplay);   // MIPLAY: 0, or AudioSpkProt.h's request (checked by PianoAudio.cpp and AudioLive)
     lc.duplex_hold = int(a->duplexHold);   // duplex-hold1: 0, 1 or 3 (checked by PianoAudio.cpp and AudioLive)
     static AudioLiveSpk *spkState;   // kept for the boot, as gLive
     if (!spkState) spkState = IOMallocType(AudioLiveSpk);

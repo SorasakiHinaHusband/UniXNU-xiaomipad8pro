@@ -287,6 +287,14 @@ int audio_live_spk_select(AudioLiveShared *sh, int on)
     return 0;
 }
 
+int audio_live_miplay_select(AudioLiveShared *sh, int request)
+{
+    if (!spk_miplay_valid(request)) return -1;   /* 0, or AudioSpkProt.h's MIPLAY request */
+    store(&sh->miplay, request);
+    __atomic_add_fetch(&sh->miplay_gen, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+}
+
 int audio_live_hold_select(AudioLiveShared *sh, int mask)
 {
     if (!ar_hold_valid(mask)) return -1;   /* 0, 1 (the votes) or 3 (the votes and the mclk) */
@@ -559,6 +567,54 @@ static int prot_choose(AudioLive *l)
     return 1;
 }
 
+/* ------------------------------------------------------------------------------------------------ MIPLAY (AudioSpkProt.h) */
+#define MIP "PianoMiplayV1"
+
+/* This start's MIPLAY request (the protection pair is this start's): 0 with *off saying why not. */
+static uint32_t mip_choose(AudioLive *l, const char **off)
+{
+    const uint32_t gen = __atomic_load_n(&l->sh->miplay_gen, __ATOMIC_ACQUIRE);
+    if (gen != l->mip_gen) {
+        l->mip_gen = gen;
+        if (l->mip_failed) LOG(l, MIP ": a new request: the MIPLAY fallback of this boot is cleared");
+        l->mip_failed = 0;
+    }
+    const int r = load(&l->sh->miplay);
+    if (!r) {*off = 0; return 0;}
+    if (!l->mip_ready) {*off = l->mip_why ? l->mip_why : "no MIPLAY file"; return 0;}
+    if (l->mip_failed) {*off = "a MIPLAY fallback of this boot (see above; a new request clears it)"; return 0;}
+    return (uint32_t)r;
+}
+
+/* The DAP's pregain for this request now: fixed 0 dB, or the master volume (level 9 and up) in 1/16 dB, the floor when muted. */
+static int32_t mip_preg(const AudioLive *l, uint32_t request)
+{
+    if (!request || !(request & SPK_MIP_PREG_TRACKED) || l->cfg.level < 9) return 0;
+    if (load(&l->sh->muted)) return SPK_PREG_MUTE;
+    return spk_preg_q4(__atomic_load_n(&l->sh->volume_q15, __ATOMIC_ACQUIRE));
+}
+
+/* One line per speaker start: MIPLAY's state for it. */
+static void mip_report(AudioLive *l, const char *off)
+{
+    char words[96];
+    const int request = load(&l->sh->miplay);
+    if (l->mip_active) {
+        const SpkPlan *p = &l->spk->plan;
+        unsigned params = 0;
+        for (unsigned k = 0; k < p->chunks; ++k) params += p->chunk[k].graph == 3 ? p->chunk[k].count : 0u;
+        LOG(l, MIP ": speaker start %u: MIPLAY ON (request %u: %s): Dolby DAP %#x in MIPLAY %#x between the stream and MFC %#x; %u "
+            "parameters (%u of the DAP) in %u packets; pregain %d/16 dB%s", l->spk_starts, l->mip_request,
+            spk_miplay_text(l->mip_request, words, sizeof words), SPK_IID_DAP, SPK_SG_MIP, SPK_IID_MFC, params, l->spk->mip.dap, p->mip_chunks,
+            p->preg, l->spk->mip.preg_pid ? "" : " (the file names no pregain parameter: none sent)");
+    } else if (!request) {
+        LOG(l, MIP ": speaker start %u: MIPLAY off (request 0)", l->spk_starts);
+    } else {
+        LOG(l, MIP ": speaker start %u: MIPLAY off (request %d asked for: %s)", l->spk_starts, request,
+            off ? off : "MIPLAY runs only inside the protection plan, which is not this start's");
+    }
+}
+
 /* The monitor stops sending: a command in flight completes (it cannot be recalled), nothing more goes out. */
 static void mon_stop(AudioLive *l)
 {
@@ -602,7 +658,16 @@ static void mon_tick(AudioLive *l, uint32_t now)
         plan_send(l, &l->xplan, now);
         if (!plan_settled(&l->xplan)) return;
         l->xplan.active = 0;
-        if (l->xplan.seq.state == ArSeqUp && !l->live_bad) return;
+        if (l->xplan.seq.state == ArSeqUp && !l->live_bad) {
+            if (l->mon_preg) {
+                l->preg_sent = l->mon.preg;
+                l->preg_updates++;
+                LOG(l, MIP ": pregain %d/16 dB (the master volume) to the DAP", l->preg_sent);
+            }
+            l->mon_preg = 0;
+            return;
+        }
+        l->mon_preg = 0;
         l->prot_why = l->live_bad ? "live data under another header" : "a monitor command refused or unanswered";
         LOG(l, PROT ": monitor: %s (%s, status %#x): FSADSP error", l->prot_why,
             l->live_bad ? "live data from SP_RX" : ar_seq_step_name(&l->xplan.seq, l->xplan.seq.failed_step), l->xplan.seq.error_status);
@@ -624,8 +689,14 @@ static void mon_tick(AudioLive *l, uint32_t now)
     if (l->ops.publish) l->ops.publish(l->ops.ctx);
     l->mon.live_address = spk_plan_address(&l->spk->plan, l->spk->plan.live_slot);
     l->mon.handle = l->splan.seq.handle;
+    /* MIPLAY with the pregain following the volume: a changed pregain goes first */
+    l->mon_preg = 0;
+    if (l->mip_active && (l->mip_request & SPK_MIP_PREG_TRACKED) && l->spk->mip.preg_pid) {
+        const int32_t want = mip_preg(l, l->mip_request);
+        if (want != l->preg_sent) {l->mon.preg = want; l->mon.preg_pid = l->spk->mip.preg_pid; l->mon_preg = 1;}
+    }
     unsigned count;
-    const ArStep *steps = spk_monitor_steps(l->mon.vbat_uv != 0, &count);
+    const ArStep *steps = spk_monitor_plan(l->mon.vbat_uv != 0, l->mon_preg, &count);
     ar_seq_init(&l->xplan.seq, steps, count, l->ports->apm, l->ports->prm, 0xA000u + (l->sleep_generation << 16), &l->mon);
     l->xplan.name = "speaker-protection monitor";
     l->xplan.active = l->xplan.quiet = 1;
@@ -676,12 +747,31 @@ static void spk_begin(AudioLive *l, uint32_t now)
             "not applied: a Mic run started before the request holds its own votes");
     }
     l->prot_active = prot_choose(l);
+    l->mip_active = 0;
+    l->mip_request = 0;
+    const char *mip_off = 0;
     if (l->prot_active) {
         const char *why = 0;
+        uint8_t *area = l->ops.dma + AUDIO_DMA_PARAM;
+        const uint32_t area_bytes = l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ? AUDIO_DMA_PARAM_BYTES : 0;
         l->spk->plan.base = l->speaker;
         l->spk->plan.variant = (uint32_t)load(&l->sh->spk_prot) & SPK_VAR_ALL & ~1u;
-        if (spk_plan_init(&l->spk->plan, &l->spk->prot, l->ops.dma + AUDIO_DMA_PARAM, l->ops.dma_bytes >= AUDIO_DMA_PARAM + AUDIO_DMA_PARAM_BYTES ?
-                          AUDIO_DMA_PARAM_BYTES : 0, &why)) {
+        l->spk->plan.mip = &l->spk->mip;
+        l->spk->plan.miplay = mip_choose(l, &mip_off);
+        l->spk->plan.preg = mip_preg(l, l->spk->plan.miplay);
+        int bad = spk_plan_init(&l->spk->plan, &l->spk->prot, area, area_bytes, &why);
+        if (bad && l->spk->plan.miplay) {   /* MIPLAY's layout: the protection plan without it */
+            l->mip_why = why;
+            l->mip_failed = 1;
+            l->mip_fallbacks++;
+            LOG(l, MIP ": FALLBACK to the protection plan without MIPLAY: the plan cannot be laid out with it (%s)", why);
+            mip_off = "a MIPLAY fallback of this boot (see above; a new request clears it)";
+            l->spk->plan.miplay = 0;
+            l->spk->plan.preg = 0;
+            why = 0;
+            bad = spk_plan_init(&l->spk->plan, &l->spk->prot, area, area_bytes, &why);
+        }
+        if (bad) {
             l->prot_active = 0;
             l->prot_failed = 1;
             l->prot_why = why;
@@ -692,17 +782,23 @@ static void spk_begin(AudioLive *l, uint32_t now)
     if (l->prot_active) {
         if (l->ops.publish) l->ops.publish(l->ops.ctx);   /* the out-of-band payloads before the first command names them */
         l->prot_starts++;
+        l->mip_request = l->spk->plan.miplay;
+        l->mip_active = l->mip_request != 0;
+        l->mip_starts += (uint32_t)l->mip_active;
+        l->preg_sent = l->spk->plan.preg;
         char variant[128];
         LOG(l, PROT ": start %u: the stock protection pair: V/I graph %#x and %#x with SP_RX %#x linked to SP_TX %#x; %u ACDB "
             "parameters (%u not sent) in %u packets, %u out of band; Re25 x4; gain cap %u", l->prot_starts, SPK_SG_VI, SPK_SG_DEV,
             SPK_IID_SP_RX, SPK_IID_SP_TX, l->spk->prot.count - l->spk->plan.skipped, l->spk->plan.skipped, l->spk->plan.chunks,
             l->spk->plan.oob_chunks, live_gain_cap(l));
         LOG(l, PROT ": variant %u: %s (round 2)", l->spk->plan.variant | 1u, spk_variant_text(l->spk->plan.variant, variant, sizeof variant));
+        mip_report(l, mip_off);
         LOG(l, "live: speaker: sound from the Speaker device: the speaker-protection plan (start %u)", l->spk_starts);
         plan_start(l, &l->splan, "speaker-protection", l->spk->plan.steps, l->spk->plan.count, 0x8000 + (l->sleep_generation << 16), &l->spk->plan);
     } else {
         unsigned count;
         const ArStep *steps = ar_speaker_steps(&count);
+        mip_report(l, 0);
         LOG(l, "live: speaker: sound from the Speaker device: the speaker plan (start %u)", l->spk_starts);
         plan_start(l, &l->splan, "speaker", steps, count, 0x8000 + (l->sleep_generation << 16), &l->speaker);
     }
@@ -743,6 +839,9 @@ static void stream_begin(AudioLive *l, uint32_t now)
         "first, the amplifiers muted", AUDIO_LIVE_DEPTH, AUDIO_LIVE_TARGET, l->chain.ceiling, l->amps->amp[0].gain, AUDIO_UNMUTE_PERIODS);
     if (l->prot_active)
         LOG(l, PROT ": up: SP_RX protects the four speakers; battery voltage and live data every %u ms", SPK_MONITOR_MS);
+    if (l->mip_active)
+        LOG(l, MIP ": up: the Dolby DAP runs in MIPLAY %#x%s", SPK_SG_MIP, (l->mip_request & SPK_MIP_PREG_TRACKED) && l->spk->mip.preg_pid ?
+            "; its pregain follows the master volume (checked with the monitor)" : "");
 }
 
 /* The ring's frames for one period: the drift held near the target by single frames, a stale backlog skipped. */
@@ -1098,6 +1197,19 @@ static void spk_tick(AudioLive *l, uint32_t now)
     if (l->spk_state == LiveStarting) {
         if (up) {stream_begin(l, now); return;}
         /* the protection pair refused (or left unanswered) a DSP step, and everything it did is undone: the passthrough graph next */
+        if (l->prot_active && l->mip_active && l->splan.seq.error != ArSeqErrLocal && !l->splan.seq.undo_errors) {
+            l->mip_why = "a step of the protection plan with MIPLAY failed";
+            LOG(l, MIP ": FALLBACK to the protection plan without MIPLAY: %s refused or unanswered (status %#x); everything it did is "
+                "undone; the speaker comes back on the protection plan", ar_seq_step_name(&l->splan.seq, l->splan.seq.failed_step),
+                l->splan.seq.error_status);
+            l->mip_active = 0;
+            l->mip_failed = 1;
+            l->mip_fallbacks++;
+            l->prot_active = 0;
+            l->splan.active = 0;
+            l->spk_state = LiveDown;
+            return;
+        }
         if (l->prot_active && l->splan.seq.error != ArSeqErrLocal && !l->splan.seq.undo_errors) {
             l->prot_why = "a step of the protection plan failed";
             LOG(l, PROT ": FALLBACK to passthrough: %s refused or unanswered (status %#x); everything it did is undone; the speaker "
@@ -1122,11 +1234,22 @@ static void spk_tick(AudioLive *l, uint32_t now)
         l->spk_stops++;
         const int reason = l->spk_reason;
         const int fallback = l->prot_fallback;
+        const int mip = l->mip_active;
         l->prot_fallback = 0;
         l->prot_active = 0;   /* this start is over */
+        l->mip_active = 0;
         if (!down) {
             LOG(l, "live: speaker: undoing the plan failed (%u undo errors): the speaker path is OFF for this boot", l->splan.seq.undo_errors);
             l->spk_state = LiveOff;
+        } else if (fallback && mip) {
+            l->mip_why = l->prot_why ? l->prot_why : "an error";
+            l->prot_why = 0;
+            LOG(l, MIP ": FALLBACK to the protection plan without MIPLAY: %s on the protection pair with MIPLAY; all of it is undone; the "
+                "speaker comes back on the protection plan", l->mip_why);
+            l->mip_failed = 1;
+            l->mip_fallbacks++;
+            l->spk_state = LiveDown;
+            store(&l->sh->sound, 0);
         } else if (fallback) {
             LOG(l, PROT ": FALLBACK to passthrough: %s on the protection pair; the pair is undone; the speaker comes back on the "
                 "passthrough graph", l->prot_why ? l->prot_why : "an FSADSP error");
@@ -1555,6 +1678,18 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     }
     l->prot_why = l->prot_ready ? 0 : why;
     store(&sh->spk_prot, spk_request_valid(c->spk_prot) ? c->spk_prot : 0);
+    /* MIPLAY: its private file checked once; asked for by the boot argument (the sysctl may ask later) */
+    l->mip_why = l->ops.spk_dolby_why;
+    if (!l->spk) {
+        l->mip_why = "no memory for its state";
+    } else if (l->ops.spk_dolby) {
+        l->mip_why = 0;
+        if (!spk_mip_parse(&l->spk->mip, l->ops.spk_dolby, l->ops.spk_dolby_bytes, &l->mip_why)) l->mip_ready = 1;
+    } else if (!l->mip_why) {
+        l->mip_why = "no private file (PianoAudio/spk-dolby.bin)";
+    }
+    store(&sh->miplay, spk_miplay_valid(c->miplay) ? c->miplay : 0);
+    l->mip_gen = __atomic_load_n(&sh->miplay_gen, __ATOMIC_ACQUIRE);
     __atomic_store_n(&sh->age_signed, c->age_old ? 0 : 1, __ATOMIC_RELEASE);   /* duplex-age1: signed unless piano-audio-age=0 */
     l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
     store(&sh->duplex_hold, ar_hold_valid(c->duplex_hold) ? c->duplex_hold : 0);
@@ -1566,6 +1701,16 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
             l->spk->prot.bytes, c->spk_prot ? "on from the first start (piano-audio-spk=1)" : "off (piano-audio-spk=0; machdep.piano_audio_spk=1 turns it on)");
     else if (c->spk_prot)
         LOG(l, PROT ": OFF: %s; the speaker plays through the passthrough graph", why);
+    {
+        char words[96];
+        const int request = load(&sh->miplay);
+        if (l->mip_ready)
+            LOG(l, MIP ": ready: %u parameters (%u bytes) of MIPLAY %#x, %u of them the Dolby DAP's; request %d (%s; piano-audio-miplay, "
+                "machdep.piano_audio_miplay changes it, taken at the next start of the protection plan)", l->spk->mip.count, l->spk->mip.bytes,
+                SPK_SG_MIP, l->spk->mip.dap, request, spk_miplay_text((uint32_t)request, words, sizeof words));
+        else if (request)
+            LOG(l, MIP ": OFF: %s; the protection plan runs without MIPLAY", l->mip_why);
+    }
     return 0;
 }
 

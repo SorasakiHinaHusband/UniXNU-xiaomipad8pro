@@ -6,7 +6,8 @@
 #   sheng's), tests/audioreach_host.c (piano's APM/PRM packets), tests/sequence_host.c (one command at a time, the reverse unwind, the
 #   speaker, PRM and microphone plans, the period pump), tests/fs19xx_host.c (the amplifiers against a register model: probe, a
 #   synthetic preset container, the safety filter, the power sequences, status; the preset's SHA-256 identity), tests/amps_host.c
-#   (the four as a group: reset sequence, all or none, test gain, mute-first shutdown), tests/pcm_host.c (the speaker-safety chain:
+#   (the four as a group: reset sequence, all or none, test gain, mute-first shutdown), tests/spkprot_host.c (speaker protection's and
+#   MIPLAY's files, packets and plans), tests/pcm_host.c (the speaker-safety chain:
 #   slots, DC blocker, ceiling, fades, test tone, the walk, guard; the PCM ring), tests/dsplink_host.c (level 2: the DSP guard on
 #   PianoPower's health, the inbox, the APM readiness exchange, the GPR port sets), tests/session_host.c (levels 4-7 against a DSP
 #   model and the amplifiers' model in simulated time: the order of every command, speaker safety at every write and buffer, every
@@ -32,7 +33,8 @@
 # No DSP firmware or topology is needed or read.
 #   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes, its KC base), K27_OBJ (default k27-native-obj), CC/CXX
 #                (host compilers for the tests, default cc/c++), K27_KERNEL (for the import check; skipped when absent), KC_BASE,
-#                PIANO_AUDIO_PRESET (the owner's stock fs19xx.fsm)
+#                PIANO_AUDIO_PRESET (the owner's stock fs19xx.fsm), PIANO_AUDIO_SPK_PARAMS / PIANO_AUDIO_SPK_RE25 / PIANO_AUDIO_SPK_DOLBY
+#                (the private files below)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
@@ -90,6 +92,8 @@ diff <(tail -n +4 "$P/BitI2c.h" | sed 's/namespace pianoaudio/namespace pianokey
   <(tail -n +2 "$D/package/PianoKeyboard/BitI2c.h") > /dev/null \
   || { echo "Error: package/PianoAudio/BitI2c.h has drifted from package/PianoKeyboard/BitI2c.h" >&2; exit 1; }
 python3 "$D/package/common/tests/run-firmware-tests.py"   # the shared run-time firmware loader (docs/kc-space.md 6)
+python3 -I "$D/tooling/audio/spk-prot-extract.py" --self-test    # the private files' tools, on synthetic data
+python3 -I "$D/tooling/audio/spk-dolby-extract.py" --self-test
 # The preset's pin. The pin's path is PianoAudio/<the file's name>: a copy under another name is staged through fs19xx.fsm.
 PRESET_SHA=ab060b8476065bd789f327f7f8e724a2e17d94e93a85e2e8aa4b4954ce88b90e
 grep -q "${PRESET_SHA:0:8}" "$P/AudioSha256.c" || { echo "Error: the preset's pin and AudioSha256.c disagree" >&2; exit 1; }
@@ -112,6 +116,11 @@ fi
 # the same with no pin, and piano-audio-spk=1 logs "PianoSpeakerProtV1: OFF" and plays through the passthrough graph.
 SPK_PARAMS=${PIANO_AUDIO_SPK_PARAMS:-$D/private/audio/spk-prot.bin}
 SPK_RE25=${PIANO_AUDIO_SPK_RE25:-$D/private/audio/spk-re25.bin}
+# MIPLAY's private file (AudioSpkProt.h; docs/drivers/audio.md section 12.1): the owner's ACDB calibration of the Dolby/MiSound subgraph
+# with the Dolby tuning of the owner's dax-default.xml, made by tooling/audio/spk-dolby-extract.py (PIANO_AUDIO_SPK_DOLBY, else
+# private/audio/spk-dolby.bin), pinned and staged the same way, only together with the two protection files (MIPLAY runs only inside
+# the protection plan). Without it piano-audio-miplay logs "PianoMiplayV1: OFF" and the protection plan runs without MIPLAY.
+SPK_DOLBY=${PIANO_AUDIO_SPK_DOLBY:-$D/private/audio/spk-dolby.bin}
 SPK=()
 rm -rf "$O/spk"
 if [ "${PIANO_AUDIO_SPK:-1}" != 0 ] && [ -f "$SPK_PARAMS" ] && [ -f "$SPK_RE25" ]; then
@@ -120,9 +129,19 @@ if [ "${PIANO_AUDIO_SPK:-1}" != 0 ] && [ -f "$SPK_PARAMS" ] && [ -f "$SPK_RE25" 
   SPK=("$O/spk/spk-prot.bin" "$O/spk/spk-re25.bin")
   printf '#pragma once\n#define PIANO_AUDIO_SPK_FILES 1\n' > "$O/gen/PianoAudioSpkFiles.h"
   echo "PianoAudio: speaker protection's private files pinned and staged (private: this unit's kext, never published)" >&2
+  if [ -f "$SPK_DOLBY" ]; then
+    cp "$SPK_DOLBY" "$O/spk/spk-dolby.bin"
+    SPK+=("$O/spk/spk-dolby.bin")
+    printf '#define PIANO_AUDIO_DOLBY_FILE 1\n' >> "$O/gen/PianoAudioSpkFiles.h"
+    echo "PianoAudio: MIPLAY's private file pinned and staged (private: this unit's kext, never published)" >&2
+  else
+    printf '#define PIANO_AUDIO_DOLBY_FILE 0\n' >> "$O/gen/PianoAudioSpkFiles.h"
+    rm -f "$D/out/firmware/PianoAudio/spk-dolby.bin"
+    echo "PianoAudio: no MIPLAY private file ($(basename "$SPK_DOLBY")): built without it (protection without MIPLAY)" >&2
+  fi
 else
-  printf '#pragma once\n#define PIANO_AUDIO_SPK_FILES 0\n' > "$O/gen/PianoAudioSpkFiles.h"
-  rm -f "$D/out/firmware/PianoAudio/spk-prot.bin" "$D/out/firmware/PianoAudio/spk-re25.bin"
+  printf '#pragma once\n#define PIANO_AUDIO_SPK_FILES 0\n#define PIANO_AUDIO_DOLBY_FILE 0\n' > "$O/gen/PianoAudioSpkFiles.h"
+  rm -f "$D/out/firmware/PianoAudio/spk-prot.bin" "$D/out/firmware/PianoAudio/spk-re25.bin" "$D/out/firmware/PianoAudio/spk-dolby.bin"
   echo "PianoAudio: no speaker-protection private files ($(basename "$SPK_PARAMS"), $(basename "$SPK_RE25")): built without them" \
     "(passthrough only)" >&2
 fi

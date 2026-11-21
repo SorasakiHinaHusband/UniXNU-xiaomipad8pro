@@ -26,6 +26,11 @@
  * live ch..."). Any FSADSP command error (the plan, the monitor, a refused or late period on that graph) undoes the pair and the
  * speaker comes back on the passthrough graph in the same boot ("PianoSpeakerProtV1: FALLBACK"); missing or mismatched private
  * files leave it on the passthrough graph from the start. The amplifiers' gain cap and every safety rule above are unchanged.
+ * MIPLAY (piano-audio-miplay or machdep.piano_audio_miplay, default 0 off; AudioSpkProt.h): inside the protection plan only, the stock
+ * Dolby/MiSound subgraph between the stream and the speaker graph's MFC, with the private file spk-dolby.bin. Every speaker start logs
+ * its MIPLAY state ("PianoMiplayV1: speaker start N: MIPLAY ..."); any error of a start or a run with MIPLAY (a plan step, the
+ * monitor, a refused or late period) undoes it all and the speaker comes back on the protection plan without MIPLAY
+ * ("PianoMiplayV1: FALLBACK ..."), until a new request; the protection plan's own fallback to passthrough is unchanged.
  * Portable C, new code for PianoAudio: the owner ticks it with the time and PianoPower's health, feeds it what arrives and supplies
  * the hardware through the session's AudioSessionOps; the devices' threads only touch AudioLiveShared. Host-tested in
  * tests/live_host.c against models of the DSP, the amplifiers and both devices' engines in simulated time. */
@@ -97,6 +102,8 @@ typedef struct {
     uint32_t spk_prot_gen;                /* every request: a new one clears a fallback of this boot */
     int duplex_hold;                      /* duplex-hold1 asked for (AR_HOLD_* mask: the boot argument, then the sysctl) */
     uint32_t duplex_hold_gen;             /* every request: a new one clears a failure of this boot */
+    int miplay;                           /* MIPLAY asked for (spk_miplay_valid: the boot argument, then the sysctl); taken at a start */
+    uint32_t miplay_gen;                  /* every request: a new one clears a MIPLAY fallback of this boot */
 
 } AudioLiveShared;
 /* The rings' storage: AUDIO_LIVE_RING_BYTES and AUDIO_LIVE_MIC_RING_BYTES (the owner's, kept as long as sh). */
@@ -115,6 +122,9 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
 int audio_live_gain_select(AudioLiveShared *sh, unsigned gain);
 /* Speaker protection on (1) or off (0) from the next start of the speaker path; -1 for another value. */
 int audio_live_spk_select(AudioLiveShared *sh, int on);
+/* MIPLAY (AudioSpkProt.h spk_miplay_valid: 0 off, 1 or 2 the perf mode, +4 the pregain following the volume, +16 x (r + 1) the
+ * rotation r) from the next start of the protection plan; -1 for another value. */
+int audio_live_miplay_select(AudioLiveShared *sh, int request);
 /* duplex-age1: 1 the signed sound age (default), 0 the old unsigned test (A/B control); applies from the next worker tick. */
 int audio_live_age_select(AudioLiveShared *sh, int signed_age);
 /* duplex-hold1, an A/B switch (default 0: unchanged). 1: the LPASS macro and digital codec votes, 3: those and the VA (TX core)
@@ -133,6 +143,7 @@ int32_t audio_ceiling_db(unsigned db);
 typedef struct {
     SpkProt prot;
     SpkPlan plan;
+    SpkMip mip;                          /* MIPLAY's private file as parsed at init */
 } AudioLiveSpk;
 
 typedef struct {
@@ -149,6 +160,7 @@ typedef struct {
     AudioLiveSpk *spk_state;             /* its state, the owner's (zeroed, kept for the boot); null: passthrough only */
     int duplex_hold;                     /* piano-audio-duplex-hold: audio_live_hold_select's mask from the first start (0 off) */
     int age_old;                         /* piano-audio-age=0: the old unsigned sound-age test (A/B control); default the signed one */
+    int miplay;                          /* piano-audio-miplay: audio_live_miplay_select's request from the first start (0 off) */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -240,6 +252,16 @@ typedef struct {
     int mon_stopping, live_bad, vbat_noted;
     SpkLive live_data;
     uint32_t live_reads, vbat_sends, vbat_uv;
+    /* ---- MIPLAY (AudioSpkProt.h), inside the protection pair */
+    int mip_ready;                       /* its private file is valid */
+    int mip_active;                      /* this start of the protection pair has MIPLAY */
+    int mip_failed;                      /* a MIPLAY fallback happened: none until a new request (miplay_gen) */
+    uint32_t mip_request;                /* this start's request (spk_miplay_valid) */
+    uint32_t mip_gen;
+    const char *mip_why;                 /* why it is not ready, or the last fallback */
+    uint32_t mip_starts, mip_fallbacks, preg_updates;
+    int32_t preg_sent;                   /* the DAP's pregain the DSP has (1/16 dB) */
+    int mon_preg;                        /* the monitor round in flight carries a pregain update */
     /* ---- the mic path */
     AudioLivePlan mplan;
     ArMicPlan micplan;

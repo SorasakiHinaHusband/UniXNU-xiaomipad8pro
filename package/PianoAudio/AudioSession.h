@@ -102,6 +102,11 @@ typedef struct {
     uint32_t spk_re25_bytes;
     const char *spk_why;
     uint32_t (*battery_uv)(void *ctx);
+    /* MIPLAY (AudioSpkProt.h, piano-audio-miplay): its private file spk-dolby.bin as the loader checked it against its pin (null: not
+     * there, spk_dolby_why says why); without it the protection plan runs without MIPLAY. */
+    const uint8_t *spk_dolby;
+    uint32_t spk_dolby_bytes;
+    const char *spk_dolby_why;
 } AudioSessionOps;
 
 enum {AudioLevelNotRun = 0, AudioLevelPassed = 1, AudioLevelFailed = 2, AudioLevelSkipped = 3};

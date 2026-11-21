@@ -67,6 +67,10 @@ struct World {
     // the speaker-protection pair (AudioSpkProt.h)
     int vi_open, vi_started, prot_dev_open, re25_sets, oob_cfgs;
     unsigned vbat_sets, live_gets;
+    // MIPLAY (AudioSpkProt.h): its graph's state, the driver's configuration and the monitor's pregain updates
+    int str_open, mip_open, mip_started, mip_rotation;
+    unsigned mip_cfgs, preg_sets;
+    int32_t mip_preg, preg_last;
     uint32_t vbat_uv;
     unsigned stream_dones;
     uint8_t slot_copy[AUDIO_SPK_SLOTS][AUDIO_SPK_PERIOD_BYTES];
@@ -131,6 +135,11 @@ static int g_mark;
 static uint8_t g_spk_file[8192], g_spk_re25[16];
 static uint32_t g_spk_bytes, g_re25_bytes = 16, g_re25_q12[4] = {27000, 27500, 28000, 28500};
 static int g_spk, g_spk_files, g_live_header_bad;
+// MIPLAY: the synthetic private file, the request
+static uint8_t g_mip_file[8192];
+static uint32_t g_mip_bytes;
+static int g_miplay, g_mip_files;
+#define SYN_PREG 0x00030001u
 static uint32_t g_battery_uv = 4012000;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
 static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
@@ -504,7 +513,43 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
             if (!w.dev_started || le32(p.payload + 32) != 1) violate("a battery voltage outside the running protected graph");
         }
         if (strstr(line, " oob") && p.opcode == AR_OP_SET_CFG) w.oob_cfgs++;
-        if (!strcmp(line, "START 0x4001")) {w.str_started = 1; w.stream_dones = 0;}
+        // MIPLAY: opened after the speaker graph and before the stream (which then links to SYNC 0x4375:6), started after the speaker
+        // graph and before the stream, stopped and closed in reverse; the driver's configuration and the pregain only in its life
+        if (!strcmp(line, "OPEN 0xb000019f")) {
+            if (!w.prot_dev_open || w.str_open) violate("MIPLAY opened without the speaker graph or after the stream");
+            w.mip_open = 1;
+        }
+        if (!strcmp(line, "START 0xb000019f")) {
+            if (!w.dev_started || w.str_started || !w.mip_cfgs) violate("MIPLAY started out of order or unconfigured");
+            w.mip_started = 1;
+        }
+        if (!strcmp(line, "STOP 0xb000019f")) {if (w.str_started) violate("MIPLAY stopped under the running stream"); w.mip_started = 0;}
+        if (!strcmp(line, "CLOSE 0xb000019f")) {if (w.str_open || w.mip_started) violate("MIPLAY closed before the stream or running"); w.mip_open = 0;}
+        if (!strcmp(line, "STOP 0xb0000002") && w.mip_started) violate("the speaker graph stopped under running MIPLAY");
+        if (!strcmp(line, "CLOSE 0xb0000002") && w.mip_open) violate("the speaker graph closed under MIPLAY");
+        if (!strcmp(line, "OPEN 0x4001")) {
+            const uint32_t to = le32(b + n - 12), port = le32(b + n - 8);
+            if (w.mip_open != (to == SPK_IID_MIP_SYNC && port == SPK_MIP_STREAM_PORT)) violate("the stream linked past MIPLAY or into it without it");
+            w.str_open = 1;
+        }
+        if (!strcmp(line, "CLOSE 0x4001")) w.str_open = 0;
+        if (p.opcode == AR_OP_SET_CFG && p.payload_bytes > 72 && le32(p.payload + 16) == SPK_IID_MIP_MFC_IN && le32(p.payload + 20) == 0x08001024 &&
+            le32(p.payload + 24) == 12 && le32(p.payload + 52) == SPK_PID_CHMIXER) {
+            if (!w.mip_open || w.mip_started) violate("MIPLAY's configuration outside its open, unstarted graph");
+            if (le32(p.payload + 32) != 48000 || le32(p.payload + 36) != (24u | 2u << 16)) violate("MIPLAY's MFC not 48 kHz / 24 bit / 2 ch");
+            w.mip_cfgs++;
+            w.mip_rotation = (int)le32(p.payload + 16 + 32 + 56 + 16);
+            w.mip_preg = p.payload_bytes > 16 + 32 + 56 + 24 ? (int32_t)le32(p.payload + 16 + 32 + 56 + 24 + 16) : 0;
+        }
+        if (p.opcode == AR_OP_SET_CFG && p.payload_bytes == 40 && le32(p.payload + 16) == SPK_IID_DAP && le32(p.payload + 20) == SYN_PREG) {
+            if (!w.mip_started) violate("a pregain update outside running MIPLAY");
+            w.preg_sets++;
+            w.preg_last = (int32_t)le32(p.payload + 32);
+        }
+        if (!strcmp(line, "START 0x4001")) {
+            if (w.mip_open && !w.mip_started) violate("the stream started before MIPLAY");
+            w.str_started = 1; w.stream_dones = 0;
+        }
         if (!strcmp(line, "STOP 0x4001") || !strcmp(line, "STOP 0x4005")) {
             if (any_powered()) violate("a speaker graph stopped with an amplifier powered up");
             if (line[10] == '1') w.str_started = 0; else w.dev_started = 0;
@@ -718,6 +763,8 @@ static void run(const struct Scenario *sc)
     } else {
         ops.spk_why = "not staged (test)";
     }
+    if (g_mip_files) {ops.spk_dolby = g_mip_file; ops.spk_dolby_bytes = g_mip_bytes;}
+    else ops.spk_dolby_why = "not staged (test)";
     ops.battery_uv = battery_uv;
     audio_session_init(&session, &c, &ops, &guard);
     uint64_t next = 0;
@@ -746,6 +793,7 @@ static void run(const struct Scenario *sc)
     static AudioLiveSpk spk_state;
     memset(&spk_state, 0, sizeof spk_state);
     lc.spk_prot = g_spk;
+    lc.miplay = g_miplay;
     lc.age_old = g_age_old;
     lc.spk_state = &spk_state;
     if (g_setup) g_setup(&lc);
@@ -800,7 +848,7 @@ static void run(const struct Scenario *sc)
     CHECK(!w.pins_on && !w.va_on);
     for (unsigned i = 0; i < sizeof g_dma; ++i) if (g_dma[i]) {CHECK(!"the buffer is not zeroed at the end"); break;}
     if (!w.off) CHECK(!w.clock_on && !w.va_votes && !w.va_mclk && !w.map_spk && !w.map_mic && !w.dev_started && !w.str_started);
-    if (!w.off) CHECK(!w.vi_open && !w.vi_started && !w.prot_dev_open);
+    if (!w.off) CHECK(!w.vi_open && !w.vi_started && !w.prot_dev_open && !w.mip_open && !w.mip_started && !w.str_open);
     g_setup = 0;
 }
 
@@ -1579,7 +1627,7 @@ static void spk_files(void)
     g_re25_bytes = 16;
     g_spk_files = 1;
 }
-static void spk_reset(void) {g_spk = g_spk_files = g_live_header_bad = 0; g_battery_uv = 4012000; g_fail = 0; g_drop = 0; g_kind = 0;}
+static void spk_reset(void) {g_spk = g_spk_files = g_live_header_bad = 0; g_battery_uv = 4012000; g_fail = 0; g_drop = 0; g_kind = 0; g_miplay = g_mip_files = 0;}
 
 static const char *kProtUp[] = {"PRM REQ 0x202 6144000", "MAP 0x19da00000", "OPEN 0xb0000002", "CFG 0x4023", "CFG 0x4023",
                                 "CFG 0x4046 0x10001fb0 oob", "CFG 0x4046 0x10001fa7", "OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004",
@@ -1683,6 +1731,229 @@ static void testProtRunningFallback(void)
     const struct Scenario sc = {9, 0, 1, 0, 8000, AudioPortsUbuntu, 0, fault};
     run(&sc);
     CHECK(!w.violations && live.spk_state == LiveOff && !live.prot_fallbacks && logged("stopped by amplifier status") && !any_powered());
+    spk_reset();
+}
+
+// ---- MIPLAY (AudioSpkProt.h): a SYNTHETIC private file (made-up DAP parameter ids and values; no ACDB or Dolby byte)
+static void mip_files(void)
+{
+    static const struct {uint32_t iid, pid, size;} e[] = {
+        {0x4026, 0x08001026, 4}, {0x4351, 0x0800101f, 40}, {0x4351, 0x08001024, 8}, {0x4373, 0x08001016, 4}, {0x4377, 0x08001024, 16},
+        {0x411f, 0x08001026, 4}, {0x411f, 0x00030002, 2488}, {0x411f, 0x00030003, 408}, {0x411f, SYN_PREG, 4}, {0x411f, 0x00030004, 200},
+        {0x411f, 0x00030005, 8}, {0x411f, 0x00030006, 4}, {0x4bc4, 0x1000a150, 4}, {0x41d9, 0x1000ad01, 6}, {0x4bdf, 0x10014003, 704},
+    };
+    uint32_t at = 16;
+    const uint32_t head[4] = {SPK_MIP_MAGIC, 1, N(e), SYN_PREG};
+    memcpy(g_mip_file, head, sizeof head);
+    for (unsigned i = 0; i < N(e); ++i) {
+        const uint32_t h[3] = {e[i].iid, e[i].pid, e[i].size};
+        memcpy(g_mip_file + at, h, sizeof h);
+        at += 12;
+        for (uint32_t b = 0; b < e[i].size; ++b) g_mip_file[at + b] = (uint8_t)(i * 13 + b);
+        for (uint32_t b = e[i].size; b < ((e[i].size + 3u) & ~3u); ++b) g_mip_file[at + b] = 0;
+        at += (e[i].size + 3u) & ~3u;
+    }
+    g_mip_bytes = at;
+    g_mip_files = 1;
+}
+// The MIPLAY start's commands after the speaker graph's Re25 up to its open, and from the stream's open to the stream's start.
+static const char *kMipStream[] = {"OPEN 0x4001", "CFG 0x6001", "CFG 0x6002", "CFG 0x6004", "OPEN 0xb00000d5", "CFG 0x45c2", "CFG 0x40ee",
+                                   "PREPARE 0xb00000d5", "START 0xb00000d5", "PREPARE 0xb0000002", "PREPARE 0xb000019f", "PREPARE 0x4001",
+                                   "START 0xb0000002", "START 0xb000019f", "START 0x4001"};
+static const char *kMipDown[] = {"STOP 0x4001", "STOP 0xb000019f", "STOP 0xb0000002", "STOP 0xb00000d5", "CLOSE 0xb00000d5", "CLOSE 0x4001",
+                                 "CLOSE 0xb000019f", "CLOSE 0xb0000002", "UNMAP 0x55", "PRM REL 0x202"};
+// A start with MIPLAY from at: the protection plan's head, MIPLAY's open, its parameters and the driver's configuration (last), the
+// stream and the rest. Returns the index after the stream's start.
+static unsigned expect_mip_start(unsigned at)
+{
+    at = expect(at, kProtUp, 7);   // to Re25
+    at = expect(at, (const char *const[]){"OPEN 0xb000019f"}, 1);
+    const unsigned cfgs = live.spk->plan.mip_chunks + 1;
+    for (unsigned i = 0; i < cfgs; ++i) CHECK(at + i < w.ncmd && !strncmp(w.cmd[at + i], "CFG 0x4", 7));
+    CHECK(!strcmp(w.cmd[at + cfgs - 1], "CFG 0x4351"));   // the driver's own configuration last
+    return expect(at + cfgs, kMipStream, N(kMipStream));
+}
+
+static void testMiplay(void)
+{
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1;
+    const struct Scenario sc = {9, 231, 1, 0, 12000, AudioPortsUbuntu, 1, burst};
+    run(&sc);
+    CHECK(!w.violations && live.prot_starts == 1 && live.mip_ready && live.mip_starts == 1 && !live.mip_fallbacks && !live.prot_fallbacks);
+    unsigned at = expect_mip_start(live_from());
+    const unsigned rounds = monitor_rounds(&at);
+    CHECK(rounds >= 2 && w.preg_sets == 0);   // the pregain fixed: no update
+    at = expect(at, kMipDown, N(kMipDown));
+    CHECK(at == w.ncmd && w.mip_cfgs == 1 && w.mip_rotation == 1 && w.mip_preg == 0 && w.oob_cfgs == 3);
+    CHECK(w.sound_periods > 170 && w.sound_periods < 205 && w.peak <= AUDIO_CEILING_MAX && power_ups_after_session() == 4);
+    CHECK(logged("PianoMiplayV1: ready: 15 parameters (3902 bytes) of MIPLAY 0xb000019f, 7 of them the Dolby DAP's; request 1 (perf 1, "
+                 "pregain fixed 0 dB, rotation 1 (Android's)"));
+    CHECK(logged("PianoMiplayV1: speaker start 1: MIPLAY ON (request 1: perf 1, pregain fixed 0 dB, rotation 1 (Android's)): Dolby DAP 0x411f "
+                 "in MIPLAY 0xb000019f between the stream and MFC 0x4032; 15 parameters (7 of the DAP)"));
+    CHECK(logged("PianoMiplayV1: up: the Dolby DAP runs in MIPLAY 0xb000019f") && logged("PianoSpeakerProtV1: up: SP_RX protects"));
+    // off by default with the file there: the protection plan exactly as before
+    spk_reset(); spk_files(); mip_files(); g_spk = 1;
+    run(&sc);
+    at = expect(live_from(), kProtUp, N(kProtUp));
+    CHECK(!w.violations && live.mip_ready && !live.mip_starts && !w.mip_cfgs && logged("PianoMiplayV1: speaker start 1: MIPLAY off (request 0)"));
+    // asked for without the file: the protection plan without MIPLAY
+    spk_reset(); spk_files(); g_spk = 1; g_miplay = 1;
+    run(&sc);
+    expect(live_from(), kProtUp, N(kProtUp));
+    CHECK(!w.violations && !live.mip_ready && logged("PianoMiplayV1: OFF: not staged (test); the protection plan runs without MIPLAY"));
+    CHECK(logged("PianoMiplayV1: speaker start 1: MIPLAY off (request 1 asked for: not staged (test))"));
+    // asked for without protection: passthrough, MIPLAY off
+    spk_reset(); spk_files(); mip_files(); g_miplay = 2;
+    run(&sc);
+    expect(live_from(), kSpkUp, N(kSpkUp));
+    CHECK(!w.violations && !live.mip_starts && logged("MIPLAY off (request 2 asked for: MIPLAY runs only inside the protection plan"));
+    // perf 2, rotation 3 (+16 x 4) on another clock variant (piano-audio-spk=5): the same order (the model has no endpoint clock)
+    spk_reset(); spk_files(); mip_files(); g_spk = 5; g_miplay = 2 + 64;
+    run(&sc);
+    CHECK(!w.violations && live.mip_starts == 1 && w.mip_rotation == 3 && count_cmd("START 0xb000019f", live_from()) == 1);
+    CHECK(logged("PianoSpeakerProtV1: variant 5") && logged("MIPLAY ON (request 66: perf 2, pregain fixed 0 dB, rotation 3)"));
+    expect_mip_start(live_from());
+    // a damaged file: refused at init, the protection plan without MIPLAY
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1; g_mip_file[16] = 0x12;   // the first entry's instance: not MIPLAY's
+    run(&sc);
+    expect(live_from(), kProtUp, N(kProtUp));
+    CHECK(!w.violations && !live.mip_ready && logged("PianoMiplayV1: OFF: spk-dolby.bin: a module that is not in the MIPLAY graph"));
+    CHECK(audio_live_miplay_select(&sh, 3) == -1 && audio_live_miplay_select(&sh, 8) == -1 && audio_live_miplay_select(&sh, 0) == 0);
+    spk_reset();
+}
+
+// Any step of a start with MIPLAY refused or unanswered: all of it undone, then the protection plan without MIPLAY (not the
+// passthrough graph), which plays; a new request clears the fallback.
+static void testMiplayPlanFallback(void)
+{
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1;
+    const struct Scenario sc = {9, 0, 1, 0, 9000, AudioPortsUbuntu, 0, steady};
+    run(&sc);
+    CHECK(!w.violations && live.mip_starts == 1);
+    // the start's DSP commands (a refused WRITE and the monitor elsewhere)
+    static char lines[96][40];
+    unsigned n = 0;
+    for (unsigned i = live_from(); i < w.ncmd && n < 96; ++i) {
+        if (!strcmp(w.cmd[i], "CFG 0x4046 0x10001fb5") || !strncmp(w.cmd[i], "GET", 3)) break;
+        int dup = 0;
+        for (unsigned k = 0; k < n; ++k) dup |= !strcmp(lines[k], w.cmd[i]);
+        if (!dup) snprintf(lines[n++], sizeof lines[0], "%s", w.cmd[i]);
+    }
+    CHECK(n > 20 && !strcmp(lines[n - 1], "START 0x4001"));
+    for (unsigned k = 0; k < n; ++k)
+        for (int drop = 0; drop < 2; ++drop) {
+            spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1;
+            g_fail = lines[k]; g_drop = drop;
+            run(&sc);
+            if (w.violations || live.mip_fallbacks != 1 || live.prot_starts != 2 || live.prot_fallbacks)
+                fprintf(stderr, "MIPLAY fallback at %s (drop %d): violations %u, %s\n", lines[k], drop, w.violations, w.violation);
+            CHECK(!w.violations && live.mip_fallbacks == 1 && live.mip_failed && live.prot_starts == 2 && !live.prot_fallbacks && !live.prot_failed);
+            CHECK(logged("PianoMiplayV1: FALLBACK to the protection plan without MIPLAY") && logged("everything it did is undone"));
+            CHECK(logged("PianoMiplayV1: speaker start 2: MIPLAY off (request 1 asked for: a MIPLAY fallback of this boot"));
+            // the second start is the protection plan as before, and plays
+            unsigned second = live_from() + 1;
+            while (second < w.ncmd && strcmp(w.cmd[second], kProtUp[0])) ++second;
+            expect(second, kProtUp, N(kProtUp));
+            CHECK(count_cmd("START 0xb000019f", second) == 0 && w.sound_periods > 250 && live.spk_starts == 2);
+        }
+    spk_reset();
+}
+
+// While a start with MIPLAY runs: a refused period, a monitor command refused, live data under another header, a late period: all
+// undone, then the protection plan without MIPLAY. Live data that stay wrong (the header case: the model keeps answering so) fail the
+// protection plan too: then its own fallback, the passthrough graph (the second level).
+static void testMiplayRunningFallback(void)
+{
+    static const struct {const char *fail; int kind, header;} cases[] = {{0, 1, 0}, {"GET 0x4046 0x10001fab", 0, 0}, {0, 0, 1}, {0, 3, 0}};
+    for (unsigned i = 0; i < N(cases); ++i) {
+        const unsigned levels = cases[i].header ? 2u : 1u;
+        spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1;
+        g_fail = cases[i].fail; g_kind = cases[i].kind; g_live_header_bad = cases[i].header;
+        const struct Scenario sc = {9, 0, 1, 0, 9000, AudioPortsUbuntu, 0, cases[i].kind ? fault : steady};
+        run(&sc);
+        CHECK(!w.violations && live.mip_fallbacks == 1 && live.prot_starts == 2 && live.prot_fallbacks == levels - 1 && live.spk_starts == 1 + levels);
+        if (levels == 2) CHECK(logged("PianoSpeakerProtV1: FALLBACK to passthrough") && count_cmd("START 0x4005", live_from()) == 1);
+        CHECK(logged("PianoMiplayV1: FALLBACK to the protection plan without MIPLAY") && logged("on the protection pair with MIPLAY"));
+        const unsigned down = find_cmd("STOP 0xb000019f", live_from());
+        CHECK(down < w.ncmd && find_cmd("CLOSE 0xb000019f", down) < w.ncmd && count_cmd("START 0xb000019f", live_from()) == 1);
+        CHECK(w.sound_periods > 200 && live.late_stops == 0);
+    }
+    spk_reset();
+}
+
+// The pregain following the volume (request 5): the start carries the volume's pregain, the monitor sends the new one after a change.
+static int g_preg_fail;
+static void preg_volume(uint32_t t)
+{
+    steady(t);
+    if (t == 2400 && g_preg_fail) {w.fail_match = "CFG 0x411f"; w.fail_after = w.ncmd; w.fail_seen = 0;}   // the monitor's, not the plan's
+    if (t == 2500) {audio_live_control(&sh, 50, -1); w.wake = 1;}
+}
+static void testMiplayPregain(void)
+{
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 5;
+    const struct Scenario sc = {9, 0, 1, 0, 9000, AudioPortsUbuntu, 0, preg_volume};
+    run(&sc);
+    CHECK(!w.violations && live.mip_starts == 1 && w.mip_preg == 0 && w.preg_sets == 1);
+    CHECK(w.preg_last == spk_preg_q4(audio_volume_q15(50)) && w.preg_last < -100 && live.preg_sent == w.preg_last && live.preg_updates == 1);
+    char want[96];
+    snprintf(want, sizeof want, "PianoMiplayV1: pregain %d/16 dB (the master volume) to the DAP", w.preg_last);
+    CHECK(logged(want) && logged("its pregain follows the master volume") && !live.mip_fallbacks);
+    // a refused pregain: a monitor error, MIPLAY's fallback
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 5; g_preg_fail = 1;
+    run(&sc);
+    g_preg_fail = 0;
+    CHECK(!w.violations && live.mip_fallbacks == 1 && live.prot_starts == 2 && !live.prot_fallbacks && logged("Dolby pregain to the DAP (MIPLAY)"));
+    CHECK(logged("PianoMiplayV1: FALLBACK to the protection plan without MIPLAY: a monitor command refused or unanswered"));
+    spk_reset();
+}
+
+// The run-time switch while the speaker is down: MIPLAY from the next start; after a fallback a new request clears it.
+static void mip_switch(uint32_t t)
+{
+    if (t == 200 && !w.out_running) device(1, 0);
+    w.amplitude = 16000;
+    w.sound_on = (t >= 500 && t < 1500) || (t >= 7000 && t < 8000);
+    if (t == 6000 && g_mark == 0) {g_mark = 1; CHECK(live.spk_state == LiveDown && audio_live_miplay_select(&sh, 1) == 0);}
+}
+static void testMiplaySwitch(void)
+{
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_mark = 0;
+    const struct Scenario sc = {9, 0, 1, 0, 12000, AudioPortsUbuntu, 1, mip_switch};
+    run(&sc);
+    CHECK(!w.violations && g_mark == 1 && live.spk_starts == 2 && live.prot_starts == 2 && live.mip_starts == 1);
+    CHECK(logged("speaker start 1: MIPLAY off (request 0)") && logged("speaker start 2: MIPLAY ON (request 1"));
+    // a MIPLAY fallback at the first start, then a new request: the second start has MIPLAY again
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1; g_mark = 0; g_fail = "OPEN 0xb000019f";
+    run(&sc);
+    CHECK(!w.violations && live.mip_fallbacks == 1 && live.mip_starts == 2 && !live.mip_failed && logged("a new request: the MIPLAY fallback"));
+    CHECK(count_cmd("START 0xb000019f", live_from()) == 1);
+    spk_reset();
+}
+
+// Sleep with MIPLAY up: undone in order and parked; after the wake MIPLAY comes back.
+static unsigned mip_stage;
+static void mip_sleep(uint32_t t)
+{
+    if (!w.out_running) device(1, 0);
+    w.sound_on = 1; w.amplitude = 12000;
+    if (mip_stage == 0 && t >= 3000 && live.spk_state == LiveRunning) {mip_stage = 1; g_mark = (int)w.ncmd; audio_live_sleep(&live, 1);}
+    if (mip_stage == 1 && live.parked) {
+        CHECK(audio_live_parked(&live) == 1 && !w.mip_open && !w.mip_started && !w.prot_dev_open && !w.map_spk && !any_powered());
+        unsigned at = (unsigned)g_mark;
+        while (at < w.ncmd && strcmp(w.cmd[at], kMipDown[0])) ++at;
+        CHECK(expect(at, kMipDown, N(kMipDown)) == w.ncmd);
+        CHECK(audio_live_rearm(&live) == 0);
+        mip_stage = 2;
+    }
+    if (mip_stage == 2 && live.spk_state == LiveRunning && live.mip_active) mip_stage = 3;
+}
+static void testMiplaySleep(void)
+{
+    spk_reset(); spk_files(); mip_files(); g_spk = 1; g_miplay = 1; mip_stage = 0;
+    const struct Scenario sc = {9, 0, 1, 0, 10000, AudioPortsUbuntu, 0, mip_sleep};
+    run(&sc);
+    CHECK(!w.violations && mip_stage == 3 && live.mip_starts == 2 && !live.mip_fallbacks && !live.sleep_failed);
     spk_reset();
 }
 
@@ -1971,6 +2242,12 @@ int main(void)
     testProtSwitch();
     testProtSleep();
     testProtectedGain();
+    testMiplay();
+    testMiplayPlanFallback();
+    testMiplayRunningFallback();
+    testMiplayPregain();
+    testMiplaySwitch();
+    testMiplaySleep();
     testSoundAge();
     testDuplexHold();
     testHoldSleep();

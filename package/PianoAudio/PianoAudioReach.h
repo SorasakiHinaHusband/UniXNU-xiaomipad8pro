@@ -118,6 +118,10 @@ uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port,
 /* The same stream subgraph, its last module linked to input port 2 of downstream_iid (the passthrough device's logger AR_IID_SPK_LOG,
  * or the speaker-protection device graph's MFC: AudioSpkProt.h). */
 uint32_t ar_open_playback_stream_to(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t downstream_iid);
+/* The same, linked to input port downstream_port (even, >= 2) of downstream_iid: the MIPLAY subgraph's SYNC takes the deep-buffer
+ * stream on its port 6 (AudioSpkProt.h). */
+uint32_t ar_open_playback_stream_to_port(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t downstream_iid,
+                                         uint32_t downstream_port);
 /* The decoder's (interleaved) and the converter's (deinterleaved unpacked) output formats. */
 uint32_t ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const ArFormat *f);
 uint32_t ar_config_playback_logger(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);

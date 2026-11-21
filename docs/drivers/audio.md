@@ -150,6 +150,7 @@ is selectable. The Mic still receives mono with the first 100 ms silenced.
 | `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
 | `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
 | `piano-audio-spk=1` | 0 | levels 8-10: the speaker path opens the stock speaker-protection pair (FSADSP SP_RX/SP_TX with V/I feedback) instead of the passthrough device graph, with the two private files (section 12); missing or mismatched files, or any FSADSP error, keep or bring the speaker back on the passthrough graph in the same boot. `machdep.piano_audio_spk` (root, 0, or odd: 1 + the round-2 variant bits of section 12) changes it from the next start of the speaker path; `machdep.piano_audio_spk_state` reads the state |
+| `piano-audio-miplay=R` | 0 | levels 8-10, inside speaker protection only: the stock Dolby/MiSound MIPLAY subgraph between the stream and the speaker graph's MFC, with its private file (section 12.1). R: 0 off; 1 perf mode 1 (Android's), 2 perf mode 2; +4 the Dolby pregain follows the master volume (else fixed 0 dB); +16 x (r + 1) the rotation r (0..3; else Android's 1). Any MIPLAY error brings the speaker back on the protection plan without it. `machdep.piano_audio_miplay` (root) changes it from the next start of the protection plan; its state is in `machdep.piano_audio_spk_state` |
 | `piano-audio-duplex-hold=0\|1\|3` | 0 | level 10, an A/B switch for the duplex stutter (section 13): 1 holds the LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, in a plan of their own from before the first path (speaker or Mic) starts until both are down; the Mic's plan then skips them. `machdep.piano_audio_duplex_hold` (root) changes it, taken when both paths are down and one starts. 0: unchanged |
 | `piano-audio-mic-gain=G` | 124 | level 10: the VA decimators' gain, Ubuntu's UCM control (0..124, 84 = 0 dB, 124 = +40 dB) |
 | `piano-audio-mic-route=-1\|0\|2\|4\|6` | -1 | level 10: DEC0 DMIC and mono source. -1 selects legacy DMIC0/DMIC2 mean. 4 selects the main/top mic. |
@@ -885,6 +886,48 @@ control); +2 and +4 exclude each other. `PianoSpeakerProtV1: variant N: ...` nam
 **Unverified on the hardware:** whether the DSP accepts a GRAPH_OPEN built outside the stock graph services with the vendor modules
 and the cross-graph control link; out-of-band commands from our map (the address form is the one the WRITEs already use); whether TX
 needs its own PRM clock (inferred no); the live-data scaling of t and Q; the channel order of Re25 (inferred TDM slot order).
+
+### 12.1 MIPLAY: the stock Dolby/MiSound post-processing (piano-audio-miplay; host-tested, not yet on the tablet)
+
+The analysis: `private/host-checks/20261121-audio-tuning/TUNING.md` (private). Android's speaker sound for media comes from Dolby DAP
+running in the ADSP inside the deep-buffer graph's device post-processing subgraph MIPLAY 0xb000019f; its tuning is the speaker
+tuning of Xiaomi's Dolby XML, which the Dolby HAL turns into DAP parameters and writes into the ACDB before the graph opens (so it
+reaches the DSP with the subgraph's calibration). PianoAudio has had no MIPLAY at all. With `piano-audio-miplay` (default 0: the
+protection plan exactly as before) the protection plan (`AudioSpkProt.h`) opens it between our stream and the speaker graph's MFC:
+our stream -> SYNC 0x4375:6 -> SAL -> LOG -> MFC 0x4351 -> Xiaomi 0x4bdf -> Dolby DAP 0x411f (2 in, 4 out) -> Xiaomi 0x41d9 -> MiSound
+rotation 0x4bc4 -> MiSound 0x4461 -> LOG -> VOL -> MFC 0x4377 (4 ch) -> MFC 0x4032 (speaker graph), one container, the stock ACDB's
+graph data. Order: MIPLAY opened (out of band, 888 bytes) after the speaker graph's Re25, then its calibration (in band, the two big
+parameters out of band), then the driver's own configuration in one SET_CFG: the MFC 0x4351's output 48 kHz / 24 bit / FL FR (PAL's
+values), its channel mixer (one 4 -> 2 table taking our four-channel stream's FL and RS, which carry L and R), the MiSound rotation
+(`0x1000a151`, the rotation tag's rows: u32 0..3; Android's 1) and the DAP's pregain; then the stream, linked to SYNC's port 6; MIPLAY
+prepared and started after the speaker graph and before the stream; everything undone in reverse. No clock, endpoint or amplifier
+change: the endpoints' clock ownership of the protection plan (variant 3), the gain cap and every safety rule are unchanged; the one
+DSP owner sends one command at a time as before.
+
+The pregain (+4): fixed 0 dB, or the master volume's attenuation (20 log10 of the Q15 gain, in 1/16 dB; -2080 muted), sent at the
+start and, when the volume changed, ahead of the protection monitor's battery voltage every 2 s.
+
+**Logs.** `PianoMiplayV1: ready: ...` or `OFF: <why>` at the start of levels 8-10; one line per speaker start: `PianoMiplayV1: speaker
+start N: MIPLAY ON (request R: perf P, pregain ..., rotation K): ...` or `... MIPLAY off (request 0)` / `off (request R asked for:
+<why>)`; `PianoMiplayV1: up: ...` when the stream runs; `PianoMiplayV1: pregain X/16 dB ...` per update. **Fallback:** any error of
+a start or a run with MIPLAY (a refused or unanswered plan step, a monitor command, a refused or late period) undoes all of it and the
+speaker comes back on the protection plan without MIPLAY (`PianoMiplayV1: FALLBACK to the protection plan without MIPLAY: ...`), until
+a new request; an error of that plan then falls back to passthrough as before.
+
+**The private file** `PianoAudio/spk-dolby.bin` (never committed; PRIVATE pin): made by `tooling/audio/spk-dolby-extract.py build ACDB
+DAX MAP OUT [--profile Music]` from the owner's `Mi_acdb_cal.acdb` and `odm/etc/dolby/dax-default.xml` with a private map (the Dolby
+FourCC -> DAP parameter table and the XML element of each); 'PMIP', version 1, count, the DAP's pregain parameter id, then the
+entries as in spk-prot.bin: every parameter of MIPLAY's default calibration (131, 5894 bytes for this ACDB; 7484-byte file) with the
+DAP's replaced by the profile's speaker values (Music: 75 speaker and 13 global). `verify ... --profile Movie` rebuilds the profile the
+Android reference log ran and compares it with what the HAL sent (values, committed lengths); `--self-test` tests the tool on synthetic
+data. `tooling/k27/build-native-piano-audio.sh` pins and stages it with the protection files (`PIANO_AUDIO_SPK_DOLBY`, else
+`private/audio/spk-dolby.bin`). Host tests: `tests/spkprot_host.c` (the file, the open, the configuration, the plan, every failure
+unwind, the monitor) and `tests/live_host.c` (testMiplay*: order and model rules, off by default, no file, no protection, every plan
+step's fallback, the running fallbacks, the pregain, the switch, sleep).
+
+**Unverified on the hardware:** that the DSP accepts MIPLAY's GRAPH_OPEN, calibration and START outside the stock graph services (no
+licence step is inferred); the output matrix's DSP form ([15, 4, 48 coefficients], inferred from the low-latency ACDB's own); perf 2;
+the pregain's meaning (an indication or a gain); the rotation value against the channel order; the added latency.
 
 ## 13. Duplex: the Mic's PRM votes while the speaker plays (duplex-hold1, 2026-11-21; host-tested, not yet on the tablet)
 
