@@ -172,6 +172,7 @@ recommendation: C for input devices, A kept open for audio if the owner accepts 
 | `piano-bt-blind=1` | 0 | vote a rail whose PMIC state could not be read (PianoWifi's `piano-wifi-blind`) |
 | `piano-bt-addr=0` | 1 | keep the NVM's default address even when the ADT has the unit's own |
 | `piano-bt-stop=N` | 0 | return after step N (201..205, 301..306, 400..412); the state of that step stays (a sleep still takes it down) |
+| `piano-bt-lemask=1` | 0 | level 5: OR LE Data Length Change (bit 6) and LE PHY Update Complete (bit 11) into the host's LE Set Event Mask (§8.5); root changes it at run time with `machdep.piano_bt_lemask` (applies to bluetoothd's next HCI start) |
 
 ## 7. Build, kernel collection
 
@@ -605,6 +606,24 @@ PianoBluetooth: stage 499: the ladder reached its level
 Record: the version words, the board id (selects the NVM file), the build label, the HCI/LMP versions, `first reset` (answered or not),
 the read time of the rampatch, the counts. A `FAILED at step N (...; last opcode .... status .. hardware error ..)` line names the
 step, the command and the controller's answer.
+
+### 8.5 LE link ready (2026-11-21, host-tested; tablet result pending)
+
+The owner's LE connects of 2026-11-20 completed (LE Connection Complete, the remote version and features read) and then sat in
+bluetoothd's `ready-state: LE_READY_WAIT_FOR_LENGTH` until a supervision timeout or a local cancel; GATT, SMP and HID never started.
+The 27.3 bluetoothd (26C5035r) picks its LE event mask by chipset: a type-zero (third-party) controller gets `0x1f`, which the
+path-A runtime extends to `0x101f` (Extended Advertising Report); every other chipset gets a mask with bits 5, 6, 9 and 11. Its
+LE link-ready state machine is the same for all: after the remote features it waits for `LE Data Length Change` when both sides
+support data length extension (and for `LE PHY Update Complete` when both support 2M), and it sends neither LE Set Data Length nor
+LE Set PHY itself during link set-up: it relies on the controller's own procedures (it wrote the suggested default 251/2120 and the
+default PHY 2M). Both events are masked for type zero, so the wait never ends. Linux sets both bits for this chip's features
+(`hci_le_set_event_mask_sync`), which is why LE devices work under Ubuntu.
+
+`piano-bt-lemask=1` ORs both bits into every LE Set Event Mask that enables LE Connection Complete, in the H4 stream from
+bluetoothd to the controller (`HciH4.h` `H4LeMaskPatcher`, stateful across writes, no other byte touched). The kext logs each mask
+(`bt-lemask1: LE event mask 000000000000101f -> 000000000000185f`) and counts the link events it relays (`piano-bt-h4-le-connections`,
+`-le-length-changes`, `-le-phy-updates`, `-disconnections`; the first 32 logged with status, handle and reason, never an address).
+Note that bluetoothd's own HCI trace shows the mask before the patch.
 
 ## 9. Fallback
 

@@ -136,6 +136,105 @@ class H4Decoder {
   Stats stats_;
 };
 
+// The host's LE event mask, patched in the host-to-controller byte stream (piano-bt-lemask; docs/drivers/bluetooth.md, "LE link
+// ready"). The 27.3 bluetoothd sends a type-zero controller the LE event mask 0x1f (our runtime patch adds 0x1000), which masks LE
+// Data Length Change (bit 6) and LE PHY Update Complete (bit 11). Its link-ready state machine still waits for them after the
+// remote features (LE_READY_WAIT_FOR_LENGTH, then _WAIT_FOR_PHY): an LE link connects and never reaches GATT. The patcher ORs both
+// bits into an LE Set Event Mask (0x2001, 8 parameter bytes) that enables LE Connection Complete (bit 0) and leaves every other byte
+// of the stream as it is. It is stateful, so a command split across writes is patched too; it never shifts or drops a byte. A byte
+// that cannot start a packet is passed on and counted (the host's stream is well formed; the controller answers such a byte).
+class H4LeMaskPatcher {
+ public:
+  static constexpr uint16_t kOpcode = 0x2001;
+  static constexpr uint8_t kAdd0 = 0x40;   // bit 6: LE Data Length Change
+  static constexpr uint8_t kAdd1 = 0x08;   // bit 11: LE PHY Update Complete
+  struct Seen {
+    uint64_t from = 0, to = 0;   // the host's mask and the one sent
+  };
+  struct Stats {
+    uint64_t masks = 0, patched = 0, resyncs = 0;
+  };
+
+  // Patches data[0..n) in place when enabled. sink(seen) is called once per complete LE Set Event Mask command.
+  template <class Sink> void patch(uint8_t *data, size_t n, bool enabled, Sink &&sink)
+  {
+    for (size_t i = 0; i < n; ++i) {
+      uint8_t &b = data[i];
+      if (!type_) {
+        if (isIbs(b)) continue;
+        header_ = headerLength(b);
+        if (!header_) {
+          ++stats_.resyncs;
+          continue;
+        }
+        type_ = b;
+        have_ = 0;
+        mask_ = false;
+        continue;
+      }
+      if (have_ < header_) {
+        hdr_[have_++] = b;
+        if (have_ < header_) continue;
+        remain_ = payloadLength();
+        if (type_ == kH4Command && le16(hdr_) == kOpcode && hdr_[2] == 8) {
+          mask_ = true;
+          enabled_ = enabled;
+          seen_ = Seen{};
+          at_ = 0;
+        }
+        if (!remain_) type_ = 0;
+        continue;
+      }
+      if (mask_) {
+        seen_.from |= uint64_t(b) << (8 * at_);
+        if (at_ == 0) add_ = enabled_ && (b & 0x01);
+        if (add_ && at_ == 0) b = uint8_t(b | kAdd0);
+        if (add_ && at_ == 1) b = uint8_t(b | kAdd1);
+        seen_.to |= uint64_t(b) << (8 * at_);
+        ++at_;
+      }
+      if (--remain_ == 0) {
+        if (mask_) {
+          ++stats_.masks;
+          if (seen_.to != seen_.from) ++stats_.patched;
+          sink(seen_);
+        }
+        type_ = 0;
+      }
+    }
+  }
+  const Stats &stats() const { return stats_; }
+
+ private:
+  static size_t headerLength(uint8_t type)
+  {
+    switch (type) {
+    case kH4Command: return 3;
+    case kH4Acl: return 4;
+    case kH4Sco: return 3;
+    case kH4Iso: return 4;
+    default: return 0;   // events do not travel from the host
+    }
+  }
+  size_t payloadLength() const
+  {
+    switch (type_) {
+    case kH4Command: return hdr_[2];
+    case kH4Acl: return le16(hdr_ + 2);
+    case kH4Sco: return hdr_[2];
+    case kH4Iso: return le16(hdr_ + 2) & 0x3fffu;
+    default: return 0;
+    }
+  }
+  uint8_t hdr_[4] = {};
+  uint8_t type_ = 0;
+  size_t header_ = 0, have_ = 0, remain_ = 0;
+  bool mask_ = false, enabled_ = false, add_ = false;
+  unsigned at_ = 0;
+  Seen seen_;
+  Stats stats_;
+};
+
 // Events: [code][parameter length][parameters].
 struct CommandComplete {
   uint8_t ncmd = 0;

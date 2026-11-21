@@ -3,7 +3,8 @@
 //   GeniUart.h  what level 1 loads and when (GCC/TLMM always; the wrapper and SE6 only with all five branches running, never a FIFO
 //               window; the SMMU stream scan), the decoders (RCG and DFS rates, FIFO geometry, serial clock), the clock plan for
 //               115200 and 3.2 Mbit/s on both QUP generations, the UART set-up plan, FIFO word packing and the RX status decode
-//   HciH4.h     the encoder and the byte-stream decoder (split packets, IBS bytes between packets, resynchronisation, oversized)
+//   HciH4.h     the encoder and the byte-stream decoder (split packets, IBS bytes between packets, resynchronisation, oversized);
+//               the LE event mask patcher (bluetoothd's own command order, split at every offset, look-alike ACL payload, switch)
 //   QcaCodec.h  the commands' bytes, the reply parsers, the file names, the NVM tag patcher and its bounds, the download plan, and
 //               the whole set-up sequence against a simulated controller, with faults (no answer at the new speed, a missing board
 //               NVM, no NVM at all, a hardware error during the download, a failing reset, a malformed version, a stop request)
@@ -272,6 +273,90 @@ static void testH4()
   CHECK(parseCommandStatus(st, 6, cs) && cs.status == 0x0c && cs.opcode == 0xfc48);
   const uint8_t bad[5] = {0x0e, 0x04, 0x01, 0x03, 0x0c};
   CHECK(!parseCommandComplete(bad, 5, cc));   // its length byte says 4 parameters, only 3 are there
+}
+
+// ------------------------------------------------------------------------------------------------------------ LE event mask patch
+static std::vector<uint8_t> leMaskStream()
+{
+  // bluetoothd's own order on 11-20 (pklg): Set Event Mask 0x0c01 (also 8 bytes), Page 2, LE Set Event Mask 0x101f, an ACL packet
+  // whose payload looks like an LE Set Event Mask, an IBS byte, the sleep mask 0x61a7b (bits already there), a mask without LE
+  // Connection Complete, an LE Set Event Mask with a wrong length (left alone), a 300-byte ACL packet, a SCO and an ISO packet.
+  std::vector<uint8_t> s = {0x01, 0x01, 0x0c, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f,
+                            0x01, 0x63, 0x0c, 0x08, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+                            0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x02, 0x40, 0x00, 0x0c, 0x00, 0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0xfd,
+                            0x01, 0x01, 0x20, 0x08, 0x7b, 0x1a, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x01, 0x01, 0x20, 0x08, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x01, 0x01, 0x20, 0x07, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x02, 0x41, 0x20, 0x2c, 0x01};
+  for (unsigned i = 0; i < 300; ++i) s.push_back(i % 7 ? 0x01 : 0x20);
+  const uint8_t tail[] = {0x03, 0x05, 0x00, 0x02, 0xaa, 0xbb, 0x05, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01,
+                          0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  s.insert(s.end(), tail, tail + sizeof tail);
+  return s;
+}
+
+static void testLeMask()
+{
+  const std::vector<uint8_t> in = leMaskStream();
+  // Disabled: nothing changes; every LE Set Event Mask with 8 bytes is still reported (four of them).
+  {
+    H4LeMaskPatcher p;
+    std::vector<uint8_t> s = in;
+    std::vector<H4LeMaskPatcher::Seen> seen;
+    p.patch(s.data(), s.size(), false, [&](const H4LeMaskPatcher::Seen &x) { seen.push_back(x); });
+    CHECK(s == in && seen.size() == 4 && p.stats().masks == 4 && p.stats().patched == 0 && p.stats().resyncs == 0);
+    CHECK(seen.size() == 4 && seen[0].from == 0x101f && seen[0].to == 0x101f && seen[1].from == 0x061a7b);
+  }
+  // Enabled, whole and split at every offset: 0x101f -> 0x185f (twice), 0x61a7b and 0x1002 unchanged, no other byte touched.
+  for (size_t cut = 0; cut <= in.size(); ++cut) {
+    H4LeMaskPatcher p;
+    std::vector<uint8_t> s = in;
+    std::vector<H4LeMaskPatcher::Seen> seen;
+    auto sink = [&](const H4LeMaskPatcher::Seen &x) { seen.push_back(x); };
+    p.patch(s.data(), cut, true, sink);
+    p.patch(s.data() + cut, s.size() - cut, true, sink);
+    std::vector<size_t> diff;
+    for (size_t i = 0; i < s.size(); ++i)
+      if (s[i] != in[i]) diff.push_back(i);
+    const size_t first = 28, last = in.size() - 8;   // the two 0x101f masks' first parameter bytes
+    const bool ok = diff.size() == 4 && diff[0] == first && diff[1] == first + 1 && diff[2] == last && diff[3] == last + 1 &&
+                    s[first] == 0x5f && s[first + 1] == 0x18 && s[last] == 0x5f && s[last + 1] == 0x18;
+    const bool reports = seen.size() == 4 && seen[0].from == 0x101f && seen[0].to == 0x185f && seen[1].from == seen[1].to &&
+                         seen[1].to == 0x061a7b && seen[2].from == 0x1002 && seen[2].to == 0x1002 && seen[3].from == 0x101f && seen[3].to == 0x185f;
+    if (!ok || !reports || p.stats().patched != 2) {
+      std::printf("FAIL le mask split at %zu: %zu diff(s)\n", cut, diff.size());
+      ++failures;
+      break;
+    }
+  }
+  // Byte by byte, enabled: the same result.
+  {
+    H4LeMaskPatcher p;
+    std::vector<uint8_t> s = in;
+    unsigned reports = 0;
+    for (size_t i = 0; i < s.size(); ++i) p.patch(s.data() + i, 1, true, [&](const H4LeMaskPatcher::Seen &) { ++reports; });
+    CHECK(reports == 4 && p.stats().patched == 2 && s[28] == 0x5f && s[29] == 0x18);
+  }
+  // A switch between two commands takes effect at the next mask; one inside a command does not split it.
+  {
+    H4LeMaskPatcher p;
+    uint8_t a[] = {0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    p.patch(a, 6, false, [](const H4LeMaskPatcher::Seen &) {});
+    p.patch(a + 6, sizeof a - 6, true, [](const H4LeMaskPatcher::Seen &) {});
+    CHECK(a[4] == 0x1f && a[5] == 0x10);
+    uint8_t b[] = {0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    p.patch(b, sizeof b, true, [](const H4LeMaskPatcher::Seen &) {});
+    CHECK(b[4] == 0x5f && b[5] == 0x18 && p.stats().patched == 1);
+  }
+  // A junk byte between packets is counted and passed on; framing resumes at the next indicator.
+  {
+    H4LeMaskPatcher p;
+    uint8_t c[] = {0x99, 0x01, 0x01, 0x20, 0x08, 0x1f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    p.patch(c, sizeof c, true, [](const H4LeMaskPatcher::Seen &) {});
+    CHECK(c[0] == 0x99 && c[5] == 0x5f && c[6] == 0x18 && p.stats().resyncs == 1);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------------------ QCA codec
@@ -575,6 +660,7 @@ int main()
   testClockPlan();
   testUartPlan();
   testH4();
+  testLeMask();
   testCodec();
   testSetup();
   testRcgTable();
