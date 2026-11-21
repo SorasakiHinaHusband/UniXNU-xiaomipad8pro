@@ -653,8 +653,10 @@ int launchListener(kauth_cred_t, void *, kauth_action_t action, uintptr_t, uintp
   return KAUTH_RESULT_DEFER;
 }
 
-// PianoA830's boost hook (CPU-PERF.md section 7): callPlatformFunction("piano-gpu-boost", floor MHz, duration ms, reason) on its
-// service; kIOReturnUnsupported ends the calls for this boot.
+// PianoA830's boost hook (gpu/boost342 PianoGpuBoost.h; CPU-PERF.md section 7): callPlatformFunction("piano-gpu-boost", param1 =
+// a floor in MHz (> 16; 0 = PianoA830's own input boost, 1..16 a GMU level), param2 = the hold in ms, param3 = our reason (ignored
+// there)) on its service; requests combine (the highest floor until the latest end), every ceiling wins; kIOReturnUnsupported
+// (PianoA830 without piano-gpu-boost=1, or a PianoA830 before boost342) ends the calls for this boot.
 const OSSymbol *gGpuBoostSym;
 void gpuBoost(uint32_t mhz, uint32_t ms, uint32_t reason)
 {
@@ -1709,8 +1711,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     gPd[d].bursts = burst_[d].windows();
     gPd[d].burstMs = burst_[d].openMs(now / 1000000ull);
   }
-  // boost bookkeeping and the GPU's side (PianoA830 "piano-gpu-boost": a launch once per exec, input at most every 250 ms when
-  // piano-cpufreq-gpu-input-mhz is given, a cancel when the boosts stop being allowed while one may still run)
+  // boost bookkeeping and the GPU's side (PianoA830 "piano-gpu-boost": a launch once per exec, input at most every 250 ms only when
+  // piano-cpufreq-gpu-input-mhz is given: the input kexts already ask PianoA830 themselves on gpu/boost342)
   {
     const bool any = boostOn_[0] || boostOn_[1];
     const perf::BoostKind applied = any ? bk : perf::BoostKind::none;
@@ -1730,10 +1732,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       gpuBoost(gArgs.gpuInputMhz, gArgs.inputMs, 2);
       gpuUntilNs_ = now + uint64_t(gArgs.inputMs) * 1000000ull;
     }
-    if (!boostsAllowed && gpuUntilNs_ > now && gGpuState == 1) {
-      gpuBoost(0, 0, 0);
-      gpuUntilNs_ = 0;
-    }
+    // No cancel: PianoA830's ceilings (Power Saver's 342 MHz slot, its thermal guard) always win over a boost floor, and its
+    // param1 0 means "the input boost", not "stop" (gpu/boost342's PianoGpuBoost.h).
   }
   if (gArgs.androidArmed && !in.boost) {
     for (unsigned d = 0; d < kDomains; ++d)
