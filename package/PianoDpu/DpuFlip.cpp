@@ -14,7 +14,8 @@
 //   piano-dpu-underrun=0  an underrun does not revert (default 1)
 //   piano-dpu-latch=MS    the latch timeout (default 50, 10..500)
 //   piano-dpu-clean-threads=N  the clean of a flip (the same DC CVAC over the same lines, then DSB) split over N threads, 1..8
-//                         (default 1: the flip's thread alone, as before); a band whose thread does not start is cleaned by the flip's
+//                         (default 1: the flip's thread alone, as before); a band whose thread does not start is cleaned by the flip's;
+//                         at piano-dpu-flip=4 also machdep.piano_dpu_clean_threads (root writes 1..8 at run time: one boot compares)
 //   piano-dpu-cadence=S   a "cadence N:" line every S s of flips: latched-flip intervals, the clean, the latch wait (default 0: off)
 //   piano-dpu-watch=S     the fault/underrun check while a surface is on the panel (default 10, 0 off; nothing wakes while the boot
 //                         framebuffer is)
@@ -30,6 +31,7 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <sys/sysctl.h>
 #include "DpuFlip.h"
 #include "DpuFlipKernel.h"
 #include "../common/PianoIrq.h"
@@ -95,6 +97,40 @@ void cleanBandMain(void *arg, wait_result_t)
   thread_terminate(current_thread());
 }
 uint64_t gCleanSplits = 0, gCleanInline = 0;
+uint32_t *gCleanThreadsLive[2] = {};   // the Hw's and the flipper's copies (the summary prints the flipper's)
+int cleanThreadsSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+  int value = gCleanThreadsLive[0] ? int(__atomic_load_n(gCleanThreadsLive[0], __ATOMIC_ACQUIRE)) : 1;
+  const int err = sysctl_handle_int(oidp, &value, 0, req);
+  if (err || !req->newptr) return err;
+  if (value < 1) value = 1;
+  if (value > int(kMaxCleanThreads)) value = int(kMaxCleanThreads);
+  if (!gCleanLock) value = 1;
+  for (uint32_t *p : gCleanThreadsLive)
+    if (p) __atomic_store_n(p, uint32_t(value), __ATOMIC_RELEASE);
+  note("clean threads now %d (machdep.piano_dpu_clean_threads)", value);
+  return 0;
+}
+struct sysctl_oid gCleanThreadsOid;
+bool gCleanThreadsRegistered = false;
+// Registered once at piano-dpu-flip=4 for the boot (a kext of the collection is never unloaded).
+void registerCleanThreadsSysctl(uint32_t *hw, uint32_t *cfg)
+{
+  gCleanThreadsLive[0] = hw;
+  gCleanThreadsLive[1] = cfg;
+  if (gCleanThreadsRegistered) return;
+  bzero(&gCleanThreadsOid, sizeof gCleanThreadsOid);
+  gCleanThreadsOid.oid_parent = &sysctl__machdep_children;
+  gCleanThreadsOid.oid_number = OID_AUTO;
+  gCleanThreadsOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gCleanThreadsOid.oid_name = "piano_dpu_clean_threads";
+  gCleanThreadsOid.oid_handler = cleanThreadsSysctl;
+  gCleanThreadsOid.oid_fmt = "I";
+  gCleanThreadsOid.oid_descr = "PianoDpu flip clean threads (1..8)";
+  gCleanThreadsOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gCleanThreadsOid);
+  gCleanThreadsRegistered = true;
+}
 void cleanSplit(const uint8_t *p, size_t n, unsigned threads)
 {
   if (threads > kMaxCleanThreads) threads = kMaxCleanThreads;
@@ -377,7 +413,8 @@ class KernelHw {
   {
     Cookie *c = static_cast<Cookie *>(cookie);
     if (!c->alias || offset + bytes > c->alias->getLength()) return false;
-    cleanSplit(reinterpret_cast<const uint8_t *>(c->alias->getVirtualAddress() + offset), size_t(bytes), cleanThreads);
+    cleanSplit(reinterpret_cast<const uint8_t *>(c->alias->getVirtualAddress() + offset), size_t(bytes),
+               __atomic_load_n(&cleanThreads, __ATOMIC_ACQUIRE));
     return true;
   }
   void surfaceRelease(void *cookie)
@@ -530,12 +567,13 @@ void flipRun(IOService *owner, const Survey &s, const SmmuSurvey &m, uint32_t sm
   cfg.cleanThreads = bootArg("piano-dpu-clean-threads", 1);
   if (cfg.cleanThreads < 1) cfg.cleanThreads = 1;
   if (cfg.cleanThreads > kMaxCleanThreads) cfg.cleanThreads = kMaxCleanThreads;
-  if (cfg.cleanThreads > 1 && !gCleanLock) gCleanLock = IOLockAlloc();
+  if ((cfg.cleanThreads > 1 || cfg.level == 4) && !gCleanLock) gCleanLock = IOLockAlloc();   // level 4: the sysctl may raise it
   if (!gCleanLock) cfg.cleanThreads = 1;
   cfg.cadenceS = bootArg("piano-dpu-cadence", 0);
   if (cfg.cadenceS > 3600) cfg.cadenceS = 3600;
   gHw.cleanPolicy = cfg.clean;
   gHw.cleanThreads = cfg.cleanThreads;
+  if (cfg.level == 4) registerCleanThreadsSysctl(&gHw.cleanThreads, &cfg.cleanThreads);
   stage(6, "B1b: zero-copy flips (docs/drivers/dpu.md section 8)");
   note("B1b: piano-dpu-flip=%u irq=%u clean=%u flush=%#x underrun=%u latch=%u ms watch=%u s smmu=%u clean-threads=%u cadence=%u s", cfg.level,
        cfg.irq, cfg.clean, cfg.flush, cfg.underrun, cfg.latchMs, cfg.watchS, smmuLevel, cfg.cleanThreads, cfg.cadenceS);
