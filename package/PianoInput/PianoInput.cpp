@@ -48,6 +48,7 @@
 #include "PowerKey.h"
 #include <PianoPowerContract.h>
 #include <PianoPerfInput.h>   // the input boost's event to PianoThermal (2026-11-22)
+namespace { pianoperf::InputNotifier gPerfInput; }   // PianoThermal's input boost (PianoPerfInput.h)
 #include <PianoDisplayFollow.h>
 
 using namespace pianoinput;
@@ -544,10 +545,6 @@ IOReturn PianoInput::setPowerState(unsigned long state, IOService *)
   IOLockWakeup(fLock, &fSleepWanted, false);
   IOLockUnlock(fLock);
   return pianopower::kAckNow;
-}
-
-namespace {
-pianoperf::InputNotifier gPerfInput;   // PianoThermal's input boost (PianoPerfInput.h)
 }
 
 void PianoInput::send(uint8_t keys)
