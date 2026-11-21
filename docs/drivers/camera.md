@@ -386,6 +386,14 @@ Research of 2026-11-12 (public documentation and developer reports, sources at t
   apps that ask), frame durations 1/30..1/15 s, host-time clock; samples sent with `send(_:discontinuity:hostTimeInNanoseconds:)`
   from an IOSurface-backed pool. There is no position property: Front/Back come from the names only (`AVCaptureDevice.position` stays
   unspecified).
+- **Movie recording (2026-11-21).** The only `avc1` encoder on this system (VideoToolbox's software H.264) returns its first frame
+  after 14-15 inputs and holds them meanwhile. With a 4-buffer delivery pool QuickTime's "High" recording got 4 frames and then none
+  ("Cannot Record"); the pools now let a client hold 24 (`kPianoDeliveryBuffers`, allocated on demand: at most 10.6 MB per stream for
+  640x480 `420v`, 34.7/72.0 MB only if a client holds 24 native front/rear frames). A dropped-sample discontinuity is sent only for a
+  format/duration change or a stall past the 250 ms source age (`pianoOutputDiscontinuity`): kernel source drops (8-10 % on the rear)
+  are covered by repeating the latest frame, and flagging each of them made the capture graph restart its compressor and cut the
+  movie's timeline into pieces. `PianoCameraCapture --movie DIR SECONDS` records an H.264 movie from each camera's 640x480 `420v`
+  format with `AVCaptureMovieFileOutput` (what QuickTime does) and checks the file: codec, duration, one media segment, frames.
 - **C5, before any camera code: a test-pattern extension** (no kernel): the trust-cached host app runs with the install
   entitlement; `systemextensionsctl developer on` succeeds; sysextd's log accepts the empty-team extension and its category; the
   approval appears and `systemextensionsctl list` shows it activated; the job `CMIOExtension.<id>` runs in `user/262` without sandbox

@@ -38,8 +38,8 @@ static os_log_t gLog;
   CMTime _duration, _maxDuration;
   CVPixelBufferRef _latest;
   uint64_t _latestSequence, _latestDrops, _latestSourceNs;
-  uint64_t _frame, _dropped, _repeated, _sourceFrames, _staleTicks;
-  uint64_t _lastPublishedSequence, _lastPresentationTicks, _lastPresentationNs, _lastDropCount;
+  uint64_t _frame, _dropped, _repeated, _sourceFrames, _staleTicks, _discontinuities;
+  uint64_t _lastPublishedSequence, _lastPresentationTicks, _lastPresentationNs, _lastDropCount, _firstDropCount;
   BOOL _configurationChanged, _stalled;
   // Capture queue owns the RAW lease, ISP buffers and these capture counters.
   io_connect_t _connection;
@@ -250,6 +250,12 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   return status == kIOReturnSuccess;
 }
 
+// The one place a sample leaves the extension (the host tests observe the flags here).
+- (void)deliverSample:(CMSampleBufferRef)sample discontinuity:(CMIOExtensionStreamDiscontinuityFlags)flags hostTime:(uint64_t)ns
+{
+  [_stream sendSampleBuffer:sample discontinuity:flags hostTimeInNanoseconds:ns];
+}
+
 - (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
 {
   if (ticks <= _lastPresentationTicks) { ++_dropped; return; }
@@ -273,11 +279,16 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   }
   if (error) { ++_dropped; return; }
   const uint64_t interval = (uint64_t)llround(CMTimeGetSeconds(_duration) * NSEC_PER_SEC);
-  const BOOL gap = _configurationChanged || (_lastPresentationNs &&
-                   (drops != _lastDropCount || (uint64_t)ns.value - _lastPresentationNs > interval * 2));
-  if (gap) os_log(gLog, "camera cadence gap sensor=%u seq=%llu delta_ns=%llu source_drops=%llu format_change=%u",
-                  _sensor, sequence, _lastPresentationNs ? (uint64_t)ns.value - _lastPresentationNs : 0, drops,
-                  _configurationChanged);
+  // Kernel source drops no longer flag a discontinuity (the latest frame is repeated instead): only a format/duration change or a
+  // stall does (pianoOutputDiscontinuity), so a movie recording keeps one continuous timeline.
+  const BOOL gap = pianoOutputDiscontinuity(_configurationChanged, _lastPresentationNs, (uint64_t)ns.value, interval);
+  if (!_frame) _firstDropCount = drops;
+  if (gap) {
+    ++_discontinuities;
+    os_log(gLog, "camera discontinuity sensor=%u seq=%llu delta_ns=%llu source_drops=%llu format_change=%u",
+           _sensor, sequence, _lastPresentationNs ? (uint64_t)ns.value - _lastPresentationNs : 0, drops - _firstDropCount,
+           _configurationChanged);
+  }
   _lastPresentationTicks = ticks;
   _lastPresentationNs = ns.value;
   _lastDropCount = drops;
@@ -285,17 +296,18 @@ static BOOL ioResult(IOReturn status, NSError **outError)
   const BOOL repeated = _sensor && sequence == _lastPublishedSequence;
   _lastPublishedSequence = sequence;
   if (repeated) ++_repeated;
-  [_stream sendSampleBuffer:sample
-              discontinuity:gap ? CMIOExtensionStreamDiscontinuityFlagSampleDropped : CMIOExtensionStreamDiscontinuityFlagNone
-       hostTimeInNanoseconds:ns.value];
+  [self deliverSample:sample
+        discontinuity:gap ? CMIOExtensionStreamDiscontinuityFlagSampleDropped : CMIOExtensionStreamDiscontinuityFlagNone
+             hostTime:(uint64_t)ns.value];
   CFRelease(sample);
   if (++_frame == 1)
-    os_log(gLog, "camera first sample sensor=%u index=%lu seq=%llu pts_ns=%lld", _sensor,
-           (unsigned long)_activeFormat, sequence, ns.value);
+    os_log(gLog, "camera first sample sensor=%u index=%lu seq=%llu pts_ns=%lld pool=%u", _sensor,
+           (unsigned long)_activeFormat, sequence, ns.value, (unsigned)kPianoDeliveryBuffers);
   if (_frame % 30 == 0)
-    os_log(gLog, "camera output sensor=%u index=%lu sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu duration=%lld/%d",
+    os_log(gLog, "camera output sensor=%u index=%lu sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu "
+           "source_drops=%llu discontinuities=%llu duration=%lld/%d",
            _sensor, (unsigned long)_activeFormat, _frame, _sourceFrames, _repeated, _dropped, _staleTicks,
-           _duration.value, _duration.timescale);
+           _lastDropCount - _firstDropCount, _discontinuities, _duration.value, _duration.timescale);
 }
 
 static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshold)
@@ -320,8 +332,9 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
     }
     return;
   }
-  // Bounded BGRA working/native pools plus a four-buffer 420v delivery pool.
-  CVPixelBufferRef pb = borrowPixel(_outputPools[_activeFormat], 4);
+  // Bounded BGRA working/native pools and the 420v delivery pool, each up to kPianoDeliveryBuffers held by the client at once
+  // (an H.264 compressor holds about 15 before its first output; for index 1 the BGRA buffer is only this tick's working copy).
+  CVPixelBufferRef pb = borrowPixel(_outputPools[_activeFormat], kPianoDeliveryBuffers);
   if (!pb) { ++_dropped; return; }
   if (!CVPixelBufferLockBaseAddress(pb, 0)) {
     BOOL initialized = YES;
@@ -336,7 +349,7 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
     }
     CVPixelBufferRef delivered = pb;
     if (initialized && _activeFormat == 1) {
-      delivered = borrowPixel(_compatPool, 4);
+      delivered = borrowPixel(_compatPool, kPianoDeliveryBuffers);
       initialized = delivered && !CVPixelBufferLockBaseAddress(delivered, 0);
       if (initialized) {
         initialized = pianoOutputBGRAto420v(CVPixelBufferGetBaseAddress(pb), kPianoCompatWidth, kPianoCompatHeight,
@@ -498,8 +511,9 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   _lastReadSequence = _ispTotal = _ispMax = _converted = 0;
   atomic_store(&_captureDropped, 0);
   dispatch_sync(_outputQueue, ^{
-    self->_frame = self->_dropped = self->_repeated = self->_sourceFrames = self->_staleTicks = 0;
+    self->_frame = self->_dropped = self->_repeated = self->_sourceFrames = self->_staleTicks = self->_discontinuities = 0;
     self->_lastPublishedSequence = self->_lastPresentationTicks = self->_lastPresentationNs = self->_lastDropCount = 0;
+    self->_firstDropCount = 0;
     self->_latestSequence = self->_latestDrops = self->_latestSourceNs = 0;
     self->_stalled = self->_configurationChanged = NO;
   });
@@ -555,8 +569,10 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   dispatch_sync(_outputQueue, ^{
     if (self->_latest) CVPixelBufferRelease(self->_latest);
     self->_latest = NULL;
-    os_log(gLog, "camera output stop sensor=%u sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu",
-           self->_sensor, self->_frame, self->_sourceFrames, self->_repeated, self->_dropped, self->_staleTicks);
+    os_log(gLog, "camera output stop sensor=%u sent=%llu sources=%llu repeated=%llu dropped=%llu stale_ticks=%llu "
+           "source_drops=%llu discontinuities=%llu",
+           self->_sensor, self->_frame, self->_sourceFrames, self->_repeated, self->_dropped, self->_staleTicks,
+           self->_lastDropCount - self->_firstDropCount, self->_discontinuities);
   });
   [self closeLive];
   os_log(gLog, "camera stream stop sensor=%u result=%#x state=%u clean=%u guard=%u smmu=%#x capture_dropped=%llu kernel_drops=%llu converted=%llu isp_avg_ns=%llu isp_max_ns=%llu",

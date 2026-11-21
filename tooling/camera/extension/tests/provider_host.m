@@ -9,8 +9,14 @@
 
 @interface OutputProbe : PianoStreamSource
 @property(nonatomic, strong) NSMutableArray<NSDictionary *> *observations;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *flags;
 @end
 @implementation OutputProbe
+- (void)deliverSample:(CMSampleBufferRef)sample discontinuity:(CMIOExtensionStreamDiscontinuityFlags)flags hostTime:(uint64_t)ns
+{
+  @synchronized (self) { [self.flags addObject:@(flags)]; }
+  [super deliverSample:sample discontinuity:flags hostTime:ns];
+}
 - (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
 {
   [super publish:pb ticks:ticks sequence:sequence drops:drops];
@@ -71,6 +77,54 @@
     [self acceptSource:pb sequence:sequence drops:0 sourceNs:(uint64_t)timestamp.value];
     CVPixelBufferRelease(pb);
     usleep(66667);
+  }
+}
+@end
+
+// The front source at 15 fps whose kernel drop counter changes with every frame (the rear drops 8-10 % on the tablet), then a
+// 450 ms stall (past the 250 ms source age), then four more frames.
+@interface DroppingSource : SyntheticSource
+@end
+@implementation DroppingSource
+- (void)readLive
+{
+  usleep(50000);
+  for (uint64_t sequence = 1; sequence <= 10; ++sequence) {
+    if (sequence == 7) usleep(450000);
+    CVPixelBufferRef pb = NULL;
+    assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
+                               (__bridge CFDictionaryRef)@{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}}, &pb));
+    assert(!CVPixelBufferLockBaseAddress(pb, 0));
+    uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
+    const size_t stride = CVPixelBufferGetBytesPerRow(pb);
+    for (unsigned y = 0; y < 459; ++y)
+      for (unsigned x = 0; x < 816; ++x) {
+        uint8_t *pixel = bytes + y * stride + x * 4;
+        pixel[0] = (uint8_t)sequence; pixel[1] = pixel[2] = 37; pixel[3] = 255;
+      }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CMTime timestamp = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(mach_absolute_time()), NSEC_PER_SEC,
+                                         kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+    [self acceptSource:pb sequence:sequence drops:sequence * 3 sourceNs:(uint64_t)timestamp.value];
+    CVPixelBufferRelease(pb);
+    usleep(66667);
+  }
+}
+@end
+
+// A client that keeps the last HOLD delivered buffers, as VideoToolbox's software H.264 encoder keeps ~15 inputs before its first
+// output (verify-1: with a 4-buffer pool it got 4 frames, then nothing).
+@interface HoldingProbe : OutputProbe
+@property(nonatomic) NSUInteger hold;
+@property(nonatomic, strong) NSMutableArray *held;
+@end
+@implementation HoldingProbe
+- (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
+{
+  [super publish:pb ticks:ticks sequence:sequence drops:drops];
+  @synchronized (self) {
+    [self.held addObject:(__bridge id)pb];
+    while (self.held.count > self.hold) [self.held removeObjectAtIndex:0];
   }
 }
 @end
@@ -154,6 +208,7 @@ static void timer(void)
 {
   OutputProbe *source = [[OutputProbe alloc] initWithWidth:1280 height:720 sensor:0];
   source.observations = [NSMutableArray array];
+  source.flags = [NSMutableArray array];
   for (unsigned round = 0; round < 3; ++round) {
     assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
     assert([source startStreamAndReturnError:NULL]);
@@ -177,7 +232,79 @@ static void timer(void)
       else { ++native; assert([frame[@"width"] unsignedIntValue] == 1280 && [frame[@"height"] unsignedIntValue] == 720); }
     }
     assert(compat >= 8 && native >= 2);
+    // the two live format changes of the round, and nothing else, break the timeline
+    unsigned flagged = 0;
+    for (NSNumber *flag in source.flags) flagged += flag.unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagSampleDropped;
+    assert(source.flags.count == source.observations.count && flagged == 2);
     [source.observations removeAllObjects];
+    [source.flags removeAllObjects];
+  }
+}
+
+static void encoderHold(void)
+{
+  for (unsigned index = 0; index < 2; ++index) {
+    HoldingProbe *source = [[HoldingProbe alloc] initWithWidth:1280 height:720 sensor:0];
+    source.observations = [NSMutableArray array];
+    source.flags = [NSMutableArray array];
+    source.held = [NSMutableArray array];
+    source.hold = 18;
+    assert(set(source, @(index), CMTimeMake(1, index ? 30 : 15), CMTimeMake(1, index ? 30 : 15)));
+    assert([source startStreamAndReturnError:NULL]);
+    usleep(index ? 1200000 : 2000000);
+    assert([source stopStreamAndReturnError:NULL]);
+    NSUInteger sent = source.observations.count;
+    printf("encoder hold index=%u: %lu frames delivered while the client held the last 18\n", index, (unsigned long)sent);
+    assert(sent >= 26);   // 30 or 15 fps; with the old 4-buffer bound this stopped at 4
+    for (NSNumber *flag in source.flags) assert(flag.unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagNone);
+    [source.held removeAllObjects];
+  }
+}
+
+static void droppingTimeline(void)
+{
+  DroppingSource *source = [[DroppingSource alloc] initWithWidth:816 height:459 sensor:kPianoCameraFront];
+  source.observations = [NSMutableArray array];
+  source.flags = [NSMutableArray array];
+  assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
+  assert([source startStreamAndReturnError:NULL]);
+  usleep(1500000);
+  assert([source stopStreamAndReturnError:NULL]);
+  unsigned flagged = 0, firstAfterStall = 0;
+  for (NSUInteger i = 0; i < source.flags.count; ++i) {
+    if (source.flags[i].unsignedIntValue != CMIOExtensionStreamDiscontinuityFlagSampleDropped) continue;
+    ++flagged;
+    firstAfterStall = [source.observations[i][@"sequence"] unsignedIntValue];
+  }
+  // the kernel drop counter changed on every frame: no break for it; one break after the 450 ms stall, at its first frame
+  printf("dropping source: %lu samples, %u discontinuity at sequence %u\n", (unsigned long)source.flags.count, flagged, firstAfterStall);
+  assert(source.flags.count == source.observations.count && source.flags.count >= 20 && flagged == 1 && firstAfterStall == 7);
+}
+
+static void poolMemory(void)
+{
+  // the memory a client can pin through each bounded pool (IOSurface allocations, page rounded)
+  const struct { int w, h; OSType type; const char *what; } pools[] = {
+    {640, 480, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "640x480 420v (index 1, the apps)"},
+    {816, 459, kCVPixelFormatType_32BGRA, "816x459 BGRA (front native)"},
+    {1020, 768, kCVPixelFormatType_32BGRA, "1020x768 BGRA (rear native)"},
+  };
+  for (unsigned p = 0; p < 3; ++p) {
+    CVPixelBufferPoolRef pool = NULL;
+    NSDictionary *attrs = @{(id)kCVPixelBufferWidthKey: @(pools[p].w), (id)kCVPixelBufferHeightKey: @(pools[p].h),
+                            (id)kCVPixelBufferPixelFormatTypeKey: @(pools[p].type), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    assert(!CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attrs, &pool));
+    CVPixelBufferRef held[kPianoDeliveryBuffers];
+    size_t bytes = 0;
+    for (unsigned i = 0; i < kPianoDeliveryBuffers; ++i) {
+      held[i] = borrowPixel(pool, kPianoDeliveryBuffers);
+      assert(held[i]);
+      bytes += IOSurfaceGetAllocSize(CVPixelBufferGetIOSurface(held[i]));
+    }
+    assert(!borrowPixel(pool, kPianoDeliveryBuffers));
+    printf("pool bound %s: %u buffers, %.1f MB at most\n", pools[p].what, (unsigned)kPianoDeliveryBuffers, bytes / 1048576.0);
+    for (unsigned i = 0; i < kPianoDeliveryBuffers; ++i) CVPixelBufferRelease(held[i]);
+    CVPixelBufferPoolRelease(pool);
   }
 }
 
@@ -219,7 +346,10 @@ int main(void)
     boundedPools();
     timer();
     repeatedAndStalled();
-    puts("camera provider metadata/transitions/pattern/cancellation/repeats/stall/pool-bounds PASS");
+    encoderHold();
+    droppingTimeline();
+    poolMemory();
+    puts("camera provider metadata/transitions/pattern/cancellation/repeats/stall/pool-bounds/encoder-hold/drop-timeline PASS");
   }
   return 0;
 }

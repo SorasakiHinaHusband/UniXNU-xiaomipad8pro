@@ -11,7 +11,9 @@
               the system layer: a Metal plugin bundle already in place (the base's) taken over with a copy kept, given back when its
               unit goes, never taken over when that copy cannot be made
 3. pmset      piano-pmset-defaults.sh with a pmset stand-in: both sources, keys this model lacks, a battery that appears later,
-              the owner's timers first, the owner's change after a partial run, once and only once
+              the owner's timers first, the owner's change after a partial run, once and only once;
+              piano-keyboard-type.sh with the real defaults(1): the four keys into an absent file, nothing on the second run, the
+              owner's other keyboards and an owner's own type for one of ours kept, a non-dictionary refused and left as it was
 4. trust      add_trust: one module first with the missing CDHashes only; none when all are there (byte for byte the input)
 5. cdhash     stage-soft-metal.py's cdhash against codesign's CDHash for a fresh ad hoc (linker-signed) binary
 6. seed       stage.py on a 64 MiB APFS image made here with hdiutil (packed as a DBRDISK1 seed): the staged files, modes and
@@ -493,6 +495,59 @@ def pmset_tests(tmp):
               f'{tag}: the owner\'s change after a partial run is kept')
 
 
+KEYBOARDS = ('20555-6900-0', '20564-6900-0', '20565-6900-0', '4178-6900-0')
+
+
+def keyboard_tests(tmp):
+    print('3b. keyboard types')
+    script = HERE / 'piano-keyboard-type.sh'
+    # under /tmp: this Mac's cfprefsd accepts a write to a path in the per-user temporary directory (/var/folders) and drops it
+    tmp = Path(tempfile.mkdtemp(prefix='userland-kb-', dir='/tmp'))
+    for shell in SHELLS:
+        tag = Path(shell).name
+        case = 0
+
+        def rig(plist=None):
+            nonlocal case
+            case += 1   # a fresh path per case: cfprefsd caches a domain by its path
+            base = tmp / f'kb-{tag}-{case}'
+            write(base / 'bin/logger', '#!/bin/sh\nexit 0\n', 0o755)
+            prefs = base / 'root/Library/Preferences/com.apple.keyboardtype.plist'
+            prefs.parent.mkdir(parents=True)
+            if plist is not None:
+                prefs.write_bytes(plistlib.dumps(plist))
+            env = {**os.environ, 'PATH': f'{base / "bin"}:{os.environ["PATH"]}', 'PIANO_USERLAND_ROOT': str(base / 'root')}
+            return prefs, env
+
+        def run(env):
+            r = sh([shell, str(script)], timeout=120, env=env, capture_output=True, text=True)
+            return r.returncode, r.stdout
+
+        def types(prefs):
+            r = sh(['defaults', 'read', str(prefs.with_suffix('')), 'keyboardtype'], timeout=60, capture_output=True, text=True)
+            return dict(re.findall(r'"?([0-9-]+)"? = ([0-9]+);', r.stdout)) if r.returncode == 0 else None
+
+        prefs, env = rig()
+        code, out = run(env)
+        check(code == 0 and types(prefs) == {k: '40' for k in KEYBOARDS} and 'added ' + ' '.join(KEYBOARDS) in out,
+              f'{tag}: no file: the four keyboards added as 40 (ANSI)')
+        before = types(prefs)
+        code, out = run(env)
+        check(code == 0 and 'all four keyboards known already' in out and types(prefs) == before, f'{tag}: the second run changes nothing')
+        prefs, env = rig({'keyboardtype': {'1452-591-0': 41, '20555-6900-0': 43}, 'other': 'kept'})
+        code, out = run(env)
+        got = types(prefs)
+        check(code == 0 and got == {'1452-591-0': '41', '20555-6900-0': '43', **{k: '40' for k in KEYBOARDS[1:]}} and
+              'already known: 20555-6900-0' in out, f'{tag}: the owner\'s other keyboard and own type for the cover kept, three added')
+        r = sh(['defaults', 'read', str(prefs.with_suffix('')), 'other'], timeout=60, capture_output=True, text=True)
+        check(r.stdout.strip() == 'kept', f'{tag}: every other key of the file kept')
+        prefs, env = rig({'keyboardtype': 'not a dictionary'})
+        original = prefs.read_bytes()
+        code, out = run(env)
+        check(code == 1 and 'could not be added' in out and prefs.read_bytes() == original, f'{tag}: a non-dictionary refused, file unchanged')
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---- 4-7: trust cache, cdhash, seed, live ------------------------------------------------------------------------------------
 
 def trust_cache(hash_lists):
@@ -819,6 +874,7 @@ def main():
         manifest_tests(tmp / 'm1')
         installer_tests(tmp / 'i')
         pmset_tests(tmp / 'p')
+        keyboard_tests(tmp / 'k')
         if quick:
             print('(--quick: parts 4-7 skipped)')
         elif k27_tree(required=False) is None:

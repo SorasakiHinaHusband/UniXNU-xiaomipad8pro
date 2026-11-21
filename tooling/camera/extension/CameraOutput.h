@@ -9,6 +9,22 @@
 enum { kPianoNativeFps = 15, kPianoCompatMaxFps = 30, kPianoCompatWidth = 640, kPianoCompatHeight = 480 };
 #define PIANO_OUTPUT_MAX_SOURCE_AGE_NS UINT64_C(250000000)
 
+// Buffers a client may hold from one delivery pool at once. The only avc1 encoder on this system (VideoToolbox's software H.264)
+// returns its first frame after 14-15 inputs and keeps them until then; a capture graph queues a few more. With 4 the encoder
+// starved: 4 frames sent, every later tick found the pool empty (QuickTime "High" could not record). Pools allocate on demand:
+// at most 24 x 0.46 MB per stream for 640x480 420v, 24 x 1.5/3.1 MB only if a client holds that many native front/rear frames.
+enum { kPianoDeliveryBuffers = 24 };
+
+// A dropped-sample discontinuity tells the client its timeline breaks (QuickTime restarts its compressor and cuts the movie's edit
+// list). Only a real format/duration change or a stall flags one: kernel source drops are covered by repeating the latest frame,
+// and an output gap counts as a stall only past the source age limit plus one frame interval.
+static inline int pianoOutputDiscontinuity(int formatChanged, uint64_t lastNs, uint64_t nowNs, uint64_t intervalNs)
+{
+  if (formatChanged) return 1;
+  if (!lastNs || nowNs <= lastNs) return 0;
+  return nowNs - lastNs > PIANO_OUTPUT_MAX_SOURCE_AGE_NS + intervalNs;
+}
+
 typedef struct {
   uint32_t width, height, minFps, maxFps;
 } PianoOutputFormat;

@@ -24,3 +24,10 @@ xcrun --sdk macosx clang++ -arch arm64 -mmacosx-version-min=15.0 -std=c++17 -O1 
   -framework Foundation -framework CoreMediaIO -framework CoreMedia -framework CoreVideo \
   -framework IOSurface -framework IOKit -framework CoreGraphics -framework ImageIO
 "$work/compat-frame-host" "$work"
+
+# The movie probe's file check (PianoCameraCapture --movie) on movies written here; no camera is opened.
+xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0 -O1 -g \
+  -Wall -Wextra -Werror -Wno-unused-parameter -Wno-deprecated-declarations -fobjc-arc -fsanitize=address,undefined \
+  movie_host.m -o "$work/movie-host" \
+  -framework AppKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreImage -framework CoreGraphics
+"$work/movie-host"

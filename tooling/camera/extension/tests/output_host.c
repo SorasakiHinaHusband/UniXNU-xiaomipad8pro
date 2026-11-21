@@ -112,6 +112,23 @@ static void cadence(void)
   assert(!pianoOutputSourceFresh(source + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + 1, source));
 }
 
+static void discontinuity(void)
+{
+  const uint64_t i30 = UINT64_C(1000000000) / 30, i15 = UINT64_C(1000000000) / 15, t = UINT64_C(5000000000);
+  // The first sample, a regular cadence and a skipped tick or two (a dropped source or a pool miss) keep the timeline.
+  assert(!pianoOutputDiscontinuity(0, 0, t, i30));
+  assert(!pianoOutputDiscontinuity(0, t, t + i30, i30) && !pianoOutputDiscontinuity(0, t, t + 3 * i30, i30));
+  assert(!pianoOutputDiscontinuity(0, t, t + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + i30, i30));
+  // A stall past the source age limit plus one interval, or any format/duration change, breaks it.
+  assert(pianoOutputDiscontinuity(0, t, t + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + i30 + 1, i30));
+  assert(pianoOutputDiscontinuity(0, t, t + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + i15 + 1, i15));
+  assert(!pianoOutputDiscontinuity(0, t, t + PIANO_OUTPUT_MAX_SOURCE_AGE_NS + i15, i15));
+  assert(pianoOutputDiscontinuity(1, 0, t, i30) && pianoOutputDiscontinuity(1, t, t + i30, i30));
+  // Clock errors never invent a stall.
+  assert(!pianoOutputDiscontinuity(0, t, t, i30) && !pianoOutputDiscontinuity(0, t, t - 1, i30));
+  assert(kPianoDeliveryBuffers >= 24);
+}
+
 int main(void)
 {
   PianoOutputFormat native = pianoOutputFormat(816, 459, 0), compat = pianoOutputFormat(816, 459, 1);
@@ -131,7 +148,8 @@ int main(void)
   geometry(1280, 720, 640, 480, 0, 60, 640, 360);
   geometry(1, 1000, 640, 480, 319, 0, 1, 480);
   cadence();
+  discontinuity();
   nv12();
-  puts("camera output geometry/durations/freshness/cadence PASS");
+  puts("camera output geometry/durations/freshness/cadence/discontinuity PASS");
   return 0;
 }

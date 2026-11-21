@@ -94,12 +94,39 @@ static BOOL applyTargets(id front, BOOL explicitSelection, PianoHistoryReader re
   return complete;
 }
 
-static BOOL checkTargets(PianoHistoryReader read)
+// QuickTime Player keeps its recording window's own camera choice beside the AVFoundation history (APPS3-SELECT.md section 8-9);
+// that choice is the camera it opens. Photo Booth keeps none.
+typedef id (^PianoAppReader)(NSString *domain, NSString *key);
+
+static NSString *appChoiceKey(NSString *domain)
+{
+  return [domain isEqual:@"com.apple.QuickTimePlayerX"] ?
+      @"MGDeviceRecordingDocumentViewControllerVideoDeviceSelectionUniqueID" : nil;
+}
+
+// What each app opens: its own saved choice first (QuickTime), else the front history entry. No recorded choice at all means the
+// app takes the discovery order, which lists the front first (the provider adds Front, then Rear; with the pattern camera off):
+// ready, reported as such. Any recorded choice of another camera, or an unreadable history layout, is not ready.
+static BOOL checkTargets(PianoHistoryReader read, PianoAppReader app)
 {
   BOOL ready = YES;
   for (NSString *domain in targetDomains()) {
-    BOOL front = historyIsFront(read(historyKey(domain)));
-    report(domain, front ? "front-ready" : "front-not-selected");
+    id history = read(historyKey(domain));
+    NSString *key = appChoiceKey(domain);
+    id choice = key && app ? app(domain, key) : nil;
+    const char *action;
+    BOOL front = NO;
+    if ([choice isKindOfClass:NSString.class] && [choice length]) {
+      front = [choice caseInsensitiveCompare:PIANO_FRONT_ID] == NSOrderedSame;
+      action = front ? "front-ready-app-choice" : "other-camera-app-choice";
+    } else if (historyIsFront(history)) {
+      front = YES; action = "front-ready";
+    } else if (!history || (validHistory(history) && ![history count])) {
+      front = YES; action = "front-ready-default-order";
+    } else {
+      action = validHistory(history) ? "front-not-selected" : "unknown-layout";
+    }
+    report(domain, action);
     ready &= front;
   }
   return ready;
@@ -220,7 +247,10 @@ int main(int argc, const char **argv)
     };
     @try {
       if (check) {
-        BOOL ready = checkTargets(read); puts(ready ? "CMIO_CAMERA_FRONT_READY" : "CMIO_CAMERA_FRONT_NOT_READY");
+        PianoAppReader app = ^id(NSString *domain, NSString *key) {
+          return CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)domain));
+        };
+        BOOL ready = checkTargets(read, app); puts(ready ? "CMIO_CAMERA_FRONT_READY" : "CMIO_CAMERA_FRONT_NOT_READY");
         return ready ? 0 : 1;
       }
       AVCaptureDevice *front = discoverFront();

@@ -180,10 +180,179 @@ static BOOL capture(AVCaptureDevice *device, int seconds, NSString *file)
     return ok;
 }
 
+// --movie: what QuickTime's New Movie Recording at "High" does, without its window: AVCaptureMovieFileOutput with H.264 from the
+// 640x480 420v format (index 1, the one the stock apps use), then the written file read back. verify-1 (2026-11-21): the software
+// H.264 encoder needs ~15 inputs before its first output; with a 4-buffer delivery pool nothing was written.
+@interface MovieSink : NSObject <AVCaptureFileOutputRecordingDelegate>
+@property(atomic) BOOL started, finished, complete;
+@property(atomic) long code;
+@end
+
+@implementation MovieSink
+- (void)captureOutput:(AVCaptureFileOutput *)output didStartRecordingToOutputFileAtURL:(NSURL *)url
+      fromConnections:(NSArray<AVCaptureConnection *> *)connections
+{
+    self.started = YES;
+}
+- (void)captureOutput:(AVCaptureFileOutput *)output didFinishRecordingToOutputFileAtURL:(NSURL *)url
+      fromConnections:(NSArray<AVCaptureConnection *> *)connections error:(NSError *)error
+{
+    self.code = error ? (long)error.code : 0;
+    self.complete = !error || [error.userInfo[AVErrorRecordingSuccessfullyFinishedKey] boolValue];
+    self.finished = YES;
+}
+@end
+
+static void spin(NSTimeInterval seconds, BOOL (^done)(void))
+{
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ((!done || !done()) && [until timeIntervalSinceNow] > 0)
+        [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+}
+
+// The written movie: duration, codec, the video track's edit segments (QuickTime's cut timeline showed as 15 segments) and the
+// number of compressed samples, read with AVFoundation.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static BOOL movieFile(NSString *file, int seconds, const char *label, long code, BOOL complete)
+{
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:file error:NULL];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:file] options:nil];
+    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    double duration = CMTimeGetSeconds(asset.duration), media = 0;
+    NSUInteger segments = 0, empty = 0, frames = 0;
+    FourCharCode codec = 0;
+    if (track) {
+        CMFormatDescriptionRef description = (__bridge CMFormatDescriptionRef)track.formatDescriptions.firstObject;
+        if (description) codec = CMFormatDescriptionGetMediaSubType(description);
+        for (AVAssetTrackSegment *segment in track.segments) {
+            ++segments;
+            if (segment.empty) ++empty; else media += CMTimeGetSeconds(segment.timeMapping.target.duration);
+        }
+        NSError *error = nil;
+        AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&error];
+        AVAssetReaderTrackOutput *samples = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:nil];
+        if (reader && [reader canAddOutput:samples]) {
+            [reader addOutput:samples];
+            if ([reader startReading]) {
+                CMSampleBufferRef sample;
+                while ((sample = [samples copyNextSampleBuffer])) {
+                    frames += (NSUInteger)MAX(0, CMSampleBufferGetNumSamples(sample));
+                    CFRelease(sample);
+                }
+            }
+        }
+    }
+    const char c[5] = {(char)(codec >> 24), (char)(codec >> 16), (char)(codec >> 8), (char)codec, 0};
+    const BOOL ok = complete && track && codec == kCMVideoCodecType_H264 && duration >= seconds - 1 && segments - empty == 1 &&
+                    media >= 0.9 * duration && frames >= (NSUInteger)seconds * 10;
+    printf("MOVIE %s %s file=%s bytes=%llu duration=%.2f codec=%s segments=%lu empty=%lu media=%.2f frames=%lu fps=%.1f error=%ld\n",
+           label, ok ? "PASS" : "FAIL", file.lastPathComponent.UTF8String, [attributes[NSFileSize] unsignedLongLongValue], duration,
+           codec ? c : "none", (unsigned long)segments, (unsigned long)empty, media, (unsigned long)frames,
+           duration > 0 ? frames / duration : 0, code);
+    return ok;
+}
+#pragma clang diagnostic pop
+
+static BOOL movie(AVCaptureDevice *device, int seconds, NSString *file, const char *label)
+{
+    if (!device) { printf("MOVIE %s FAIL no device\n", label); return NO; }
+    AVCaptureDeviceFormat *compat = nil;
+    for (AVCaptureDeviceFormat *format in device.formats) {
+        CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        if (size.width == 640 && size.height == 480 &&
+            CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+            compat = format;
+    }
+    NSError *error = nil;
+    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+    AVCaptureSession *session = [AVCaptureSession new];
+    AVCaptureMovieFileOutput *output = [AVCaptureMovieFileOutput new];
+    if (!compat || !input || ![session canAddInput:input] || ![session canAddOutput:output]) {
+        printf("MOVIE %s FAIL configuration format=%d input=%d code=%ld\n", label, compat != nil, input != nil, (long)error.code);
+        return NO;
+    }
+    [session beginConfiguration];
+    if ([session canSetSessionPreset:AVCaptureSessionPresetHigh]) session.sessionPreset = AVCaptureSessionPresetHigh;
+    [session addInput:input];
+    [session addOutput:output];
+    if (![device lockForConfiguration:&error]) {
+        [session commitConfiguration];
+        printf("MOVIE %s FAIL format lock code=%ld\n", label, (long)error.code);
+        return NO;
+    }
+    device.activeFormat = compat;
+    device.activeVideoMinFrameDuration = CMTimeMake(1, 30);
+    device.activeVideoMaxFrameDuration = CMTimeMake(1, 30);
+    [device unlockForConfiguration];
+    [session commitConfiguration];
+    AVCaptureConnection *connection = [output connectionWithMediaType:AVMediaTypeVideo];
+    if (!connection) {
+        printf("MOVIE %s FAIL no video connection on the movie output\n", label);
+        return NO;
+    }
+    @try {
+        [output setOutputSettings:@{AVVideoCodecKey: AVVideoCodecTypeH264} forConnection:connection];
+    } @catch (NSException *exception) {
+        printf("MOVIE %s FAIL H.264 output settings refused\n", label);
+        return NO;
+    }
+    [session startRunning];
+    spin(5, ^BOOL { return session.isRunning; });
+    [NSFileManager.defaultManager removeItemAtPath:file error:NULL];
+    MovieSink *sink = [MovieSink new];
+    printf("movie begin %s 640x480 420v 30 fps H.264 %d s running=%d\n", label, seconds, session.isRunning);
+    [output startRecordingToOutputFileURL:[NSURL fileURLWithPath:file] recordingDelegate:sink];
+    spin(10, ^BOOL { return sink.started || sink.finished; });
+    const BOOL started = sink.started;
+    if (started) spin(seconds, ^BOOL { return sink.finished; });
+    const double recorded = CMTimeGetSeconds(output.recordedDuration);
+    [output stopRecording];
+    spin(30, ^BOOL { return sink.finished; });
+    [session stopRunning];
+    printf("movie end %s started=%d finished=%d recorded=%.2f code=%ld\n", label, started, sink.finished, recorded, sink.code);
+    if (!sink.finished || ![NSFileManager.defaultManager fileExistsAtPath:file]) {
+        printf("MOVIE %s FAIL no movie written\n", label);
+        return NO;
+    }
+    return movieFile(file, seconds, label, sink.code, sink.complete);
+}
+
+static int movies(NSString *directory, int seconds)
+{
+    NSString *log = [directory stringByAppendingPathComponent:@"movie.txt"];
+    if (!freopen(log.fileSystemRepresentation, "w", stdout)) return 2;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+    printf("movie client started uid=%u camera authorization=%ld\n", geteuid(), (long)status);
+    // A probe never asks: without a standing Camera grant it fails instead of putting a prompt on the owner's screen.
+    if (status != AVAuthorizationStatusAuthorized) { puts("MOVIE CLIENT FAIL authorization"); return 1; }
+    NSArray *devices = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:
+                        @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal]
+                        mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified].devices;
+    AVCaptureDevice *front = nil, *rear = nil;
+    for (AVCaptureDevice *device in devices) {
+        if ([device.uniqueID caseInsensitiveCompare:PIANO_FRONT_ID] == NSOrderedSame) front = device;
+        if ([device.uniqueID caseInsensitiveCompare:PIANO_REAR_ID] == NSOrderedSame) rear = device;
+    }
+    BOOL a = movie(front, seconds, [directory stringByAppendingPathComponent:@"front.mov"], "front");
+    BOOL b = movie(rear, seconds, [directory stringByAppendingPathComponent:@"rear.mov"], "rear");
+    printf("MOVIE CLIENT %s front=%d rear=%d\n", a && b ? "PASS" : "FAIL", a, b);
+    return a && b ? 0 : 1;
+}
+
 int main(int argc, const char **argv)
 {
     @autoreleasepool {
-        if (argc != 2 || geteuid() == 0) return 2;
+        if (geteuid() == 0) return 2;
+        if (argc == 4 && !strcmp(argv[1], "--movie")) {
+            int seconds = atoi(argv[3]);
+            if (seconds < 2 || seconds > 60) return 2;
+            return movies([NSString stringWithUTF8String:argv[2]], seconds);
+        }
+        if (argc != 2) return 2;
         if (!strcmp(argv[1], "--inventory")) { inventory(); return 0; }
         NSString *directory = [NSString stringWithUTF8String:argv[1]];
         NSString *log = [directory stringByAppendingPathComponent:@"capture.txt"];
