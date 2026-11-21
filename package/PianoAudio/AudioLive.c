@@ -267,7 +267,7 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute)
 
 int audio_live_gain_select(AudioLiveShared *sh, unsigned gain)
 {
-    if (gain != 192u && gain != 231u) return -1;
+    if (gain != 192u && gain != 231u && gain != FS19XX_GAIN_CAP_PROTECTED) return -1;   /* 243: applied only under protection */
     __atomic_store_n(&sh->amp_gain_requested, gain, __ATOMIC_RELEASE);
     return 0;
 }
@@ -423,7 +423,11 @@ static void dma_zero(AudioLive *l, uint32_t offset, uint32_t bytes)
 }
 
 /* ------------------------------------------------------------------------------------------------ the speaker path */
-static unsigned live_gain_cap(const AudioLive *l) {return l->cfg.level >= 9 ? FS19XX_GAIN_CAP : AUDIO_AMPS_TEST_GAIN;}
+/* 231 on the passthrough graph; 243 (Android's) only while this start is the stock protection pair (Fs19xx.h, AudioSpkProt.h) */
+static unsigned live_gain_cap(const AudioLive *l)
+{
+    return l->cfg.level < 9 ? AUDIO_AMPS_TEST_GAIN : l->prot_active ? FS19XX_GAIN_CAP_PROTECTED : FS19XX_GAIN_CAP;
+}
 static int spk_epoch_lead(const AudioLive *l) {return __atomic_load_n(&l->sh->output_frames, __ATOMIC_ACQUIRE) != 480u;}
 static uint32_t spk_prefill(const AudioLive *l) {return spk_epoch_lead(l) ? AUDIO_LIVE_START_FRAMES : AUDIO_LIVE_TARGET;}
 static int spk_same_epoch(const AudioLive *l) {return __atomic_load_n(&l->sh->epoch, __ATOMIC_ACQUIRE) == l->ledger_epoch;}
@@ -1395,7 +1399,8 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     if (l->cfg.level < 8) l->cfg.level = 8;
     if (l->cfg.level > 10) l->cfg.level = 10;
     if (l->cfg.level < 10) l->cfg.mic = 0;
-    const unsigned cap = l->cfg.level >= 9 ? FS19XX_GAIN_CAP : AUDIO_AMPS_TEST_GAIN;
+    /* the request may be 243 (applied only under protection, live_gain_cap); 231 is what the passthrough graph plays */
+    const unsigned cap = l->cfg.level >= 9 ? FS19XX_GAIN_CAP_PROTECTED : AUDIO_AMPS_TEST_GAIN;
     if (l->cfg.gain > cap) l->cfg.gain = cap;
     const int32_t ceiling = l->cfg.level >= 9 ? AUDIO_CEILING_MAX : AUDIO_CEILING_TEST;
     if (l->cfg.ceiling <= 0 || l->cfg.ceiling > ceiling) l->cfg.ceiling = ceiling;

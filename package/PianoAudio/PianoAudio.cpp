@@ -23,7 +23,7 @@
 //   piano-audio=8  levels 4-6 (and 7 with piano-audio-tone=1), then for the rest of the boot the macOS Speaker on the DSP (AudioLive.h:
 //                  the dsp transport; the speaker plan comes up with the first sound and goes down after piano-audio-idle ms without
 //                  one): at this level gain 160 and full scale at -20 dBFS. Sound comes out of the speakers.
-//   piano-audio=9  also the daily level: piano-audio-gain=G (default 231, never above 231), piano-audio-ceiling=DB (full scale at -DB
+//   piano-audio=9  also the daily level: piano-audio-gain=G (default 231; 243 is applied only while speaker protection runs, else 231), piano-audio-ceiling=DB (full scale at -DB
 //                  dBFS, 1..40, default 6), piano-audio-volume=P (the kernel's master volume, percent, default 100) and the Speaker
 //                  device's properties piano-audio-volume / piano-audio-mute.
 //   piano-audio=10 also the Mic: the capture plan with the VA macro's DMIC path (piano-audio-mic-gain=G, 0..124, default 124 = +40 dB).

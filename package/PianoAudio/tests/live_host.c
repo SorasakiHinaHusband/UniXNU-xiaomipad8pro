@@ -227,9 +227,12 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
         const uint8_t reg = out[0];
         const uint16_t v = (uint16_t)(out[1] << 8 | out[2]);
         const int unmuted = !(a->reg[FS19XX_REG_DACCTRL] & FS19XX_DACCTRL_MUTE_BIT);
-        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP) violate("an amplifier gain above 231");
-        if (reg == FS19XX_REG_VOLCTRL && unmuted && (v >> 8) > w.gain_cap) violate("an unmuted amplifier's gain above the level's cap");
-        if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT) && (a->reg[FS19XX_REG_VOLCTRL] >> 8) > w.gain_cap)
+        // 2026-11-21: 243 (Android's) only while the protection pair's speaker graph is open; 231 otherwise; never above 243
+        const unsigned cap_now = w.gain_cap == FS19XX_GAIN_CAP && w.prot_dev_open ? FS19XX_GAIN_CAP_PROTECTED : w.gain_cap;
+        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_HARD_LIMIT) violate("an amplifier gain above 243");
+        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP && !w.prot_dev_open) violate("an amplifier gain above 231 without the protection pair");
+        if (reg == FS19XX_REG_VOLCTRL && unmuted && (v >> 8) > cap_now) violate("an unmuted amplifier's gain above the level's cap");
+        if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT) && (a->reg[FS19XX_REG_VOLCTRL] >> 8) > cap_now)
             violate("an amplifier unmuted at a gain above the level's cap");
         if (reg == FS19XX_REG_PWRCTRL && !(v & (FS19XX_PWRCTRL_PWDN | FS19XX_PWRCTRL_I2CR))) {
             w.power_ups++;
@@ -1739,6 +1742,28 @@ static void testProtSleep(void)
     spk_reset();
 }
 
+// 2026-11-21: gain 243 (Android's) only under protection: the pair plays at 243, the passthrough graph at 231 for the same request,
+// and a fallback while playing at 243 comes back on the passthrough graph at 231 (the simulator's rules: no VOLCTRL above 231
+// unless the protected speaker graph is open, never above 243).
+static void testProtectedGain(void)
+{
+    spk_reset(); spk_files(); g_spk = 1;
+    const struct Scenario sc = {9, 243, 1, 0, 9000, AudioPortsUbuntu, 1, burst};
+    run(&sc);
+    CHECK(!w.violations && live.prot_starts == 1 && !live.prot_fallbacks && logged("powered up MUTED, gain 243 (-4.5 dB)"));
+    CHECK(logged("gain cap 243") && !logged("powered up MUTED, gain 231"));
+    spk_reset();   // passthrough, the same request: 231
+    run(&sc);
+    CHECK(!w.violations && live.prot_starts == 0 && logged("powered up MUTED, gain 231 (-9.0 dB)") && !logged("powered up MUTED, gain 243"));
+    spk_reset(); spk_files(); g_spk = 1;   // a monitor command refused while playing at 243: the passthrough graph at 231
+    g_fail = "GET 0x4046 0x10001fab";
+    const struct Scenario sf = {9, 243, 1, 0, 9000, AudioPortsUbuntu, 0, steady};
+    run(&sf);
+    CHECK(!w.violations && live.prot_fallbacks == 1 && logged("powered up MUTED, gain 243") && logged("powered up MUTED, gain 231"));
+    CHECK(audio_live_gain_select(&sh, 243) == 0 && audio_live_gain_select(&sh, 244) == -1 && audio_live_gain_select(&sh, 255) == -1);
+    spk_reset();
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1779,6 +1804,7 @@ int main(void)
     testProtFiles();
     testProtSwitch();
     testProtSleep();
+    testProtectedGain();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }

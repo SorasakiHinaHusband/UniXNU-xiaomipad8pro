@@ -369,7 +369,7 @@ void registerGain()
     gGainOid.oid_parent = &sysctl__machdep_children; gGainOid.oid_number = OID_AUTO;
     gGainOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
     gGainOid.oid_name = "piano_audio_gain"; gGainOid.oid_handler = gainControl;
-    gGainOid.oid_fmt = "I"; gGainOid.oid_descr = "Daily FS19xx A/B request: 192 or 231; aud-gain231-v1";
+    gGainOid.oid_fmt = "I"; gGainOid.oid_descr = "Daily FS19xx request: 192, 231, or 243 (applied only under speaker protection, else 231); aud-gain231-v1";
     gGainOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gGainOid);
 }

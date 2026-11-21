@@ -145,7 +145,7 @@ is selectable. The Mic still receives mono with the first 100 ms silenced.
 | Boot arg | Default | Effect |
 |---|---|---|
 | `piano-audio=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey; 2: also the DSP link (§8.2); 3: also the macOS devices on the null transport (§8.3); 4: also the LPASS clocks (§8.4); 5: also the amplifiers, powered down (§8.5; without the DSP link level 5 runs alone); 6: also the graphs with silence (§8.6); 7: also the tone walk, only with `piano-audio-tone=1` (§8.7); 8: levels 4-6 (7 with the tone), then the macOS Speaker on the DSP for the rest of the boot, gain 160, full scale at -20 dBFS (§8.9); 9: also the daily level; 10: also the Mic; > 10: runs 1-10 |
-| `piano-audio-gain=G` | 160 / 231 | levels 8-10: capped at 160 at level 8, default/cap 231 (-9 dB) from level 9; daily profile explicitly uses `piano-audio-gain=231 piano-audio-ceiling=1` |
+| `piano-audio-gain=G` | 160 / 231 | levels 8-10: capped at 160 at level 8, default/cap 231 (-9 dB) from level 9 (243 = -4.5 dB is accepted and applied only while speaker protection runs, section 12); daily profile explicitly uses `piano-audio-gain=231 piano-audio-ceiling=1` |
 | `piano-audio-ceiling=DB` | 6 | level 9 and up: full scale lands DB dB below full scale (1..40; 1 = -1 dBFS, the highest); level 8 is fixed at -20 dBFS |
 | `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
 | `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
@@ -813,12 +813,12 @@ its previous trim policy and is not enabled by that image.
 
 ### Daily amplifier gain policy (host verified; tablet A/B pending)
 
-The daily gain default and hard limit are 231, matching the pinned third-party UCM/kernel policy above.
+The daily gain default is 231, matching the pinned third-party UCM/kernel policy above. 2026-11-21: 243 (-4.5 dB, Android's FSM_Volume) is applied only while the stock speaker protection pair is the speaker's graph (section 12; `live_gain_cap`), and every passthrough start, including the one after a protection fallback, re-caps at 231. The core's hard limit is 243 (`FS19XX_GAIN_HARD_LIMIT`, a build error above it); preset writes stay capped at 231 by the filter.
 This removes 14.625 dB of amplifier attenuation relative to the former 192 cap; acoustic improvement is inferred until measured.
 The limit is not a proven long-term safety threshold. Level 7/8 tests retain gain 160, their tone limits and watchdog;
 the PCM ceiling (at most -1 dBFS), DC blocker, fades, all-group mute/off and DSP/bus fault shutdown remain in force.
 
-`machdep.piano_audio_gain` selects only 192 or 231 at runtime (root writes; other values return EINVAL).
+`machdep.piano_audio_gain` selects 192, 231 or 243 at runtime (root writes; other values return EINVAL); 243 plays only under protection, 231 otherwise.
 It reports the requested policy. The audio worker applies one amplifier write per slice after PCM refill, then obtains
 the normal sliced status snapshot. `aud-gain231-v1: active` reports all four VOLCTRL/gain/status readbacks on first
 active playback and after a change, bounded to eight group snapshots per boot. No I2C runs on the sysctl thread.
