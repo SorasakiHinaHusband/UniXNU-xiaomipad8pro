@@ -20,6 +20,7 @@ struct PianoAudioLevelArgs {
   int micRoute, micRouteDiag;         // signed route and opt-in pre-mix diagnostic
   uint32_t liveGain, liveCeilingDb, liveIdleMs, micGain;   // levels 8-10 (0: the level's default)
   uint32_t spk;                       // piano-audio-spk: speaker protection from the first start (odd: 1 + SPK_VAR_* bits, AudioSpkProt.h); 0 passthrough
+  uint32_t duplexHold;                // piano-audio-duplex-hold: duplex-hold1's mask (AudioLive.h audio_live_hold_select: 0 off, 1, 3)
 };
 // Runs until the levels are done (levels 4-7 bounded; levels 8-10 for the rest of the boot, until PianoPower's health stops
 // them); the summary for the log and ioreg. 0 when every level that ran passed.

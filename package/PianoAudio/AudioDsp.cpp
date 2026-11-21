@@ -363,6 +363,33 @@ void registerSpk()
     gSpkStateOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gSpkStateOid);
 }
+// duplex-hold1 (A/B switch, private DUPLEX-VOTES.txt; AudioLive.h audio_live_hold_select): machdep.piano_audio_duplex_hold 0 off, 1 the
+// LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, held by their own plan from before the first path starts until both
+// are down; taken when both paths are down and one starts. Each speaker start logs "duplex-hold1: speaker start N: hold H ...".
+struct sysctl_oid gHoldOid;
+int holdControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || !gShared) return ENXIO;
+    int value = __atomic_load_n(&gShared->duplex_hold, __ATOMIC_ACQUIRE);
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (audio_live_hold_select(gShared, value)) return EINVAL;
+    piano_audio_log("duplex-hold1: request %d (taken when both paths are down and one starts; speaker %s, Mic %s)", value,
+                    audio_live_state(gLive->spk_state), audio_live_state(gLive->mic_state));
+    liveWake();
+    return 0;
+}
+void registerHold()
+{
+    bzero(&gHoldOid, sizeof gHoldOid);
+    gHoldOid.oid_parent = &sysctl__machdep_children; gHoldOid.oid_number = OID_AUTO;
+    gHoldOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gHoldOid.oid_name = "piano_audio_duplex_hold"; gHoldOid.oid_handler = holdControl;
+    gHoldOid.oid_fmt = "I";
+    gHoldOid.oid_descr = "duplex-hold1 A/B: 0 off, 1 hold the LPASS macro+dcodec votes, 3 also the VA mclk, from before the first path to both down";
+    gHoldOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gHoldOid);
+}
 void registerGain()
 {
     bzero(&gGainOid, sizeof gGainOid);
@@ -496,6 +523,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.mic_diag = a->micRouteDiag;
     lc.mic_route_apply = pianoaudio::boardSetMicRoute;
     lc.spk_prot = int(a->spk);   // 0, or the round-2 mask (AudioSpkProt.h SPK_VAR_*), checked by PianoAudio.cpp and AudioLive
+    lc.duplex_hold = int(a->duplexHold);   // duplex-hold1: 0, 1 or 3 (checked by PianoAudio.cpp and AudioLive)
     static AudioLiveSpk *spkState;   // kept for the boot, as gLive
     if (!spkState) spkState = IOMallocType(AudioLiveSpk);
     if (spkState) bzero(spkState, sizeof *spkState);
@@ -512,7 +540,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     else {piano_audio_log("sleep-contract1: ledger allocation failed; readiness gate held"); return;}
     if (lc.level >= 9) registerGain();
     registerSpk();
-    if (lc.mic) registerMicRoute();
+    if (lc.mic) {registerMicRoute(); registerHold();}
     piano_audio_power_ready();
     uint32_t handled=0;
     uint8_t in[AUDIO_INBOX_BYTES];

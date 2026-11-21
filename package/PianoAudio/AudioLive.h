@@ -94,6 +94,8 @@ typedef struct {
     uint64_t hal_sample, hal_host, hal_write_end;
     int spk_prot;                         /* speaker protection asked for (the boot argument, then the sysctl); taken at a start */
     uint32_t spk_prot_gen;                /* every request: a new one clears a fallback of this boot */
+    int duplex_hold;                      /* duplex-hold1 asked for (AR_HOLD_* mask: the boot argument, then the sysctl) */
+    uint32_t duplex_hold_gen;             /* every request: a new one clears a failure of this boot */
 
 } AudioLiveShared;
 /* The rings' storage: AUDIO_LIVE_RING_BYTES and AUDIO_LIVE_MIC_RING_BYTES (the owner's, kept as long as sh). */
@@ -112,6 +114,11 @@ void audio_live_control(AudioLiveShared *sh, int volume_percent, int mute);
 int audio_live_gain_select(AudioLiveShared *sh, unsigned gain);
 /* Speaker protection on (1) or off (0) from the next start of the speaker path; -1 for another value. */
 int audio_live_spk_select(AudioLiveShared *sh, int on);
+/* duplex-hold1, an A/B switch (default 0: unchanged). 1: the LPASS macro and digital codec votes, 3: those and the VA (TX core)
+ * mclk, requested by a plan of their own BEFORE the first path (speaker or Mic) starts and released only after both are down, so
+ * that a Mic start or stop while the speaker plays changes no PRM resource; the Mic's plan then skips the held steps. Taken when
+ * both paths are down and one starts (never while the Mic holds its own votes: no second owner of one vote); -1 for another value. */
+int audio_live_hold_select(AudioLiveShared *sh, int mask);
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */
@@ -137,6 +144,7 @@ typedef struct {
     void (*mic_route_apply)(int route, uint32_t generation); /* owner only; no MMIO */
     int spk_prot;                        /* piano-audio-spk: speaker protection asked for from the first start */
     AudioLiveSpk *spk_state;             /* its state, the owner's (zeroed, kept for the boot); null: passthrough only */
+    int duplex_hold;                     /* piano-audio-duplex-hold: audio_live_hold_select's mask from the first start (0 off) */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -243,6 +251,13 @@ typedef struct {
     uint32_t mic_route_generation;
     AudioMicWindow *mic_window;           /* backing, published at the first explicit arm, kept for the boot */
     AudioMicWindow *mic_recording;        /* owner only while capturing into the backing */
+    /* ---- duplex-hold1 (audio_live_hold_select): the held VA clocks, their plan and this boot's record */
+    AudioLivePlan hplan;
+    unsigned hold_mask;                   /* what hplan holds (or brings up) now; 0: no hold plan */
+    unsigned mic_held;                    /* the mask this Mic run's plan skipped (0: it holds its own votes) */
+    int hold_failed;                      /* a hold plan failed: 1 none until a new request (duplex_hold_gen), 2 none for the boot */
+    int hold_demand;                      /* a path waited for the hold in this tick (it begins at the next: keep the hold) */
+    uint32_t hold_gen, hold_starts, hold_failures;
     /* Reset per DSP capture start, independent of a HAL open/close window. */
     AudioCapturePcm mic_pcm[3];            /* DEC0, DEC1, mono before settling/control */
     uint64_t mic_frames, mic_settle, mic_full_frames, mic_tail_frames;

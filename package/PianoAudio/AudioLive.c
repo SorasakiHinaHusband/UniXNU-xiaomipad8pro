@@ -280,6 +280,14 @@ int audio_live_spk_select(AudioLiveShared *sh, int on)
     return 0;
 }
 
+int audio_live_hold_select(AudioLiveShared *sh, int mask)
+{
+    if (!ar_hold_valid(mask)) return -1;   /* 0, 1 (the votes) or 3 (the votes and the mclk) */
+    store(&sh->duplex_hold, mask);
+    __atomic_add_fetch(&sh->duplex_hold_gen, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+}
+
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute)
 {
     const int32_t gain = piano_audio_input_q15(level_percent);
@@ -352,10 +360,11 @@ static int plan_settled(const AudioLivePlan *p)
 }
 
 static int plan_busy(const AudioLivePlan *p) {return p->in_flight || p->unsent;}
-/* Another plan than p has a command out or waiting to go (one command at a time over the speaker, mic and monitor plans). */
+/* Another plan than p has a command out or waiting to go (one command at a time over the speaker, mic, monitor and hold plans). */
 static int others_busy(const AudioLive *l, const AudioLivePlan *p)
 {
-    return (p != &l->splan && plan_busy(&l->splan)) || (p != &l->mplan && plan_busy(&l->mplan)) || (p != &l->xplan && plan_busy(&l->xplan));
+    return (p != &l->splan && plan_busy(&l->splan)) || (p != &l->mplan && plan_busy(&l->mplan)) || (p != &l->xplan && plan_busy(&l->xplan)) ||
+           (p != &l->hplan && plan_busy(&l->hplan));
 }
 
 /* The answer timer, then the next packet of plan p, unless another plan has one out (one command at a time over all) or
@@ -420,6 +429,71 @@ static void dma_zero(AudioLive *l, uint32_t offset, uint32_t bytes)
     volatile uint64_t *d = (volatile uint64_t *)(void *)(l->ops.dma + offset);
     for (uint32_t i = 0; i < bytes / 8u; ++i) d[i] = 0;
     if (l->ops.publish) l->ops.publish(l->ops.ctx);
+}
+
+/* ------------------------------------------------------------------------------------------------ duplex-hold1 (A/B switch) */
+/* The VA clocks (the LPASS macro and digital codec votes, with 3 also the TX core mclk) in a plan of their own: up before the first
+ * path begins, down once both paths are down, so a Mic start or stop while the speaker plays requests or releases no PRM resource
+ * (private DUPLEX-VOTES.txt). One owner per vote: never brought up while a Mic run holds its own votes. Off (0) by default. */
+#define HOLD "duplex-hold1"
+static int path_idle(int state) {return state == LiveDown || state == LiveOff;}
+
+/* Before a path begins (who: "speaker" or "Mic"). 1: begin now (the hold is up, not asked for, or not possible); 0: wait for it. */
+static int hold_gate(AudioLive *l, const char *who)
+{
+    if (l->hold_mask) {
+        if (l->hplan.seq.state == ArSeqUp && plan_settled(&l->hplan)) return 1;
+        l->hold_demand = 1;   /* coming up (or going down): wait; hold_tick keeps it for this path once up */
+        return 0;
+    }
+    if (!l->cfg.mic) return 1;   /* only the Mic's plan requests these clocks */
+    const uint32_t gen = __atomic_load_n(&l->sh->duplex_hold_gen, __ATOMIC_ACQUIRE);
+    if (gen != l->hold_gen) {
+        l->hold_gen = gen;
+        if (l->hold_failed == 1) LOG(l, HOLD ": a new request: the failure of this boot is cleared");
+        if (l->hold_failed == 1) l->hold_failed = 0;   /* 2 (an undo failed: a vote may still be held) stays for the boot */
+    }
+    const int want = load(&l->sh->duplex_hold);
+    if (!want || l->hold_failed) return 1;
+    if (!path_idle(l->mic_state) && !l->mic_held) return 1;   /* this Mic run holds its own votes: no second owner */
+    unsigned count;
+    const ArStep *steps = ar_va_hold_steps((unsigned)want, &count);
+    if (!steps) return 1;
+    l->hold_mask = (unsigned)want;
+    l->hold_demand = 1;
+    l->hold_starts++;
+    LOG(l, HOLD ": hold %d up before the %s starts (hold start %u): %s; the speaker %s", want, who, l->hold_starts,
+        want == (int)(AR_HOLD_VOTES | AR_HOLD_MCLK) ? "the LPASS macro and digital codec votes, then the VA mclk 19.2 MHz" :
+        "the LPASS macro and digital codec votes (the Mic's plan still requests the mclk)",
+        path_idle(l->spk_state) ? "is down (the votes come before its TDM clock)" : "plays (requested while it plays, as without the hold)");
+    plan_start(l, &l->hplan, "duplex-hold", steps, count, 0xB000u + (l->sleep_generation << 16), 0);
+    return 0;
+}
+
+/* Every tick after both paths': the hold's next command, its end, and its release once neither path needs it. */
+static void hold_tick(AudioLive *l, uint32_t now)
+{
+    const int demand = l->hold_demand;   /* a path waited for the hold in this tick: it begins at the next */
+    l->hold_demand = 0;
+    if (!l->hold_mask) return;
+    plan_send(l, &l->hplan, now);
+    if (!plan_settled(&l->hplan)) return;
+    if (l->hplan.seq.state == ArSeqUp) {
+        if (demand || !path_idle(l->spk_state) || l->splan.active || !path_idle(l->mic_state) || l->mplan.active) return;
+        LOG(l, HOLD ": both paths down: the held clocks released (hold %u)", l->hold_mask);
+        ar_seq_stop(&l->hplan.seq);
+        plan_send(l, &l->hplan, now);
+        return;
+    }
+    if (l->hplan.seq.state == ArSeqFailed || l->hplan.seq.undo_errors) {
+        l->hold_failed = l->hplan.seq.undo_errors ? 2 : 1;
+        l->hold_failures++;
+        LOG(l, HOLD ": the hold plan failed at %s (status %#x, %u undo errors): no hold %s; the paths start as without it",
+            ar_seq_step_name(&l->hplan.seq, l->hplan.seq.failed_step), l->hplan.seq.error_status, l->hplan.seq.undo_errors,
+            l->hold_failed == 2 ? "for this boot" : "until a new request");
+    }
+    l->hplan.active = 0;
+    l->hold_mask = 0;
 }
 
 /* ------------------------------------------------------------------------------------------------ the speaker path */
@@ -573,6 +647,16 @@ static void spk_begin(AudioLive *l, uint32_t now)
     l->speaker.amps_off = live_amps_off;
     dma_zero(l, AUDIO_DMA_SPEAKER, AUDIO_SPK_SLOTS * AUDIO_SPK_PERIOD_BYTES);
     l->spk_starts++;
+    {
+        const int requested = load(&l->sh->duplex_hold);
+        LOG(l, HOLD ": speaker start %u: hold %u (requested %d, Mic %s%s): %s", l->spk_starts, l->hold_mask, requested,
+            audio_live_state(l->mic_state), !path_idle(l->mic_state) && l->mic_held ? " on the hold" : "",
+            l->hold_mask ? "the VA clocks are held from before this TDM clock until both paths are down; a Mic start or stop changes no PRM resource" :
+            !requested ? "off: the Mic's plan requests and releases its own votes and mclk" :
+            !l->cfg.mic ? "not applied: no Mic path at this level" :
+            l->hold_failed ? "not applied: a hold plan failed (see above)" :
+            "not applied: a Mic run started before the request holds its own votes");
+    }
     l->prot_active = prot_choose(l);
     if (l->prot_active) {
         const char *why = 0;
@@ -969,6 +1053,8 @@ static void spk_tick(AudioLive *l, uint32_t now)
         if (l->sleeping || l->held || l->aborting || !load(&l->sh->want_out) || (l->cfg.level >= 9 && load(&l->sh->muted))) return;
         int silent = 0;
         const int active = spk_active(l, now, &silent);
+        if (!active && !load(&l->sh->sound)) return;
+        if (!hold_gate(l, "speaker")) return;   /* duplex-hold1: the held clocks first (the sound flag stays for the next tick) */
         const int fresh = __atomic_exchange_n(&l->sh->sound, 0, __ATOMIC_ACQ_REL);
         if (!active && !fresh) return;
         spk_begin(l, now);
@@ -1125,11 +1211,16 @@ static void mic_begin(AudioLive *l)
     l->micplan.va_off = live_va_off;
     dma_zero(l, AUDIO_DMA_MIC, AUDIO_MIC_SLOTS * AUDIO_MIC_PERIOD_BYTES);
     unsigned count;
-    const ArStep *steps = ar_mic_live_steps(&count);
+    /* duplex-hold1: on a held prefix (hold_gate let this start through only with the hold up) the plan skips those steps */
+    l->mic_held = l->hold_mask && l->hplan.seq.state == ArSeqUp ? l->hold_mask : 0;
+    const ArStep *steps = l->mic_held ? ar_mic_live_steps_held(l->mic_held, &count) : ar_mic_live_steps(&count);
     l->mic_starts++;
     const AudioMicRouteStatus route = audio_live_mic_route_status(l->sh);
     LOG(l, "mic-route1: start request %d applied %d gen %u run %u", route.requested, route.applied, route.generation, l->mic_starts);
     LOG(l, "live: mic: the Mic device runs: the capture plan (start %u)", l->mic_starts);
+    LOG(l, HOLD ": Mic start %u: hold %u, speaker %s: %s", l->mic_starts, l->mic_held, audio_live_state(l->spk_state),
+        l->mic_held == (AR_HOLD_VOTES | AR_HOLD_MCLK) ? "no PRM request (the votes and the mclk are held)" :
+        l->mic_held ? "the mclk requested, the votes held" : "the votes and the mclk requested by this plan");
     plan_start(l, &l->mplan, "microphone", steps, count, 0x9000 + (l->sleep_generation << 16), &l->micplan);
     l->mic_state = LiveStarting;
 }
@@ -1313,6 +1404,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
         if (l->sleeping || l->aborting) return;
         mic_apply_pending(l);
         if (l->held || !load(&l->sh->want_in)) return;
+        if (!hold_gate(l, "Mic")) return;   /* duplex-hold1: the held clocks first */
         mic_begin(l);
         break;
     case LiveRunning:
@@ -1361,7 +1453,8 @@ static void finish(AudioLive *l, uint32_t now)
     if (l->va_on && l->ops.va_mic) {(void)l->ops.va_mic(l->ops.ctx, 0); l->va_on = 0;}
     dma_zero(l, 0, AUDIO_DMA_BYTES);
     if (l->ops.tdm_pins) (void)l->ops.tdm_pins(l->ops.ctx, 0);
-    l->splan.active = l->mplan.active = l->xplan.active = 0;
+    l->splan.active = l->mplan.active = l->xplan.active = l->hplan.active = 0;
+    l->hold_mask = 0;
     l->prot_active = 0;
     if (l->spk_state != LiveOff) l->spk_state = LiveDown;
     if (l->mic_state != LiveOff) l->mic_state = LiveDown;
@@ -1388,6 +1481,7 @@ static void go_off(AudioLive *l, uint32_t now)
     plan_drop(&l->splan);
     plan_drop(&l->mplan);
     plan_drop(&l->xplan);
+    plan_drop(&l->hplan);
     finish(l, now);
 }
 
@@ -1438,6 +1532,10 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     l->prot_why = l->prot_ready ? 0 : why;
     store(&sh->spk_prot, spk_request_valid(c->spk_prot) ? c->spk_prot : 0);
     l->prot_gen = __atomic_load_n(&sh->spk_prot_gen, __ATOMIC_ACQUIRE);
+    store(&sh->duplex_hold, ar_hold_valid(c->duplex_hold) ? c->duplex_hold : 0);
+    l->hold_gen = __atomic_load_n(&sh->duplex_hold_gen, __ATOMIC_ACQUIRE);
+    LOG(l, HOLD ": request %d from the boot argument (0 off, 1 the two LPASS votes, 3 also the VA mclk; machdep.piano_audio_duplex_hold "
+        "changes it, taken when both paths are down)%s", load(&sh->duplex_hold), l->cfg.mic ? "" : "; no Mic path at this level: inert");
     if (l->prot_ready)
         LOG(l, PROT ": ready: %u ACDB parameters (%u bytes) of the V/I and speaker graphs, Re25 for four channels; %s", l->spk->prot.count,
             l->spk->prot.bytes, c->spk_prot ? "on from the first start (piano-audio-spk=1)" : "off (piano-audio-spk=0; machdep.piano_audio_spk=1 turns it on)");
@@ -1492,9 +1590,10 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
     } else if (!l->sleep_failed) {
         spk_tick(l, now_ms);
         mic_tick(l, now_ms);
+        hold_tick(l, now_ms);
     }
     if (l->aborting && l->spk_state != LiveStarting && l->spk_state != LiveRunning && l->spk_state != LiveStopping &&
-        l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping)
+        l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping && !l->hold_mask)
         finish(l, now_ms);
     if (l->finished) return 0;
     if (l->sleep_failed) audio_live_sleep_fail(l);
@@ -1502,6 +1601,7 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
     l->done_batch = 0;
     if (l->spk_state == LiveRunning || l->mic_state == LiveRunning) return 5;   /* 40 ms queued at the DSP: a refill within 5 ms */
     if (l->spk_state == LiveStarting || l->spk_state == LiveStopping || l->mic_state == LiveStarting || l->mic_state == LiveStopping) return 2;
+    if (l->hold_mask) return 2;   /* duplex-hold1: the hold plan moves (or is up with both paths about to start or down) */
     return AUDIO_LIVE_IDLE_TICK_MS;
 }
 
@@ -1551,7 +1651,8 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
             return;
         }
     }
-    if (plan_receive(l, &l->splan, packet, length, now_ms) || plan_receive(l, &l->mplan, packet, length, now_ms)) return;
+    if (plan_receive(l, &l->splan, packet, length, now_ms) || plan_receive(l, &l->mplan, packet, length, now_ms) ||
+        plan_receive(l, &l->hplan, packet, length, now_ms)) return;
     if ((kind == ArWriteDone || kind == ArReadDone) && (l->spk_state == LiveStopping || l->mic_state == LiveStopping)) return;
     if (++l->stray <= 8)
         LOG(l, "live: dsp: a packet nobody waits for: opcode %#x token %#x to port %#x%s", a.opcode, a.token, a.dst_port, kind == ArBad ? " (malformed)" : "");
@@ -1569,6 +1670,7 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
         plan_drop(&l->splan);
         plan_drop(&l->mplan);
         plan_drop(&l->xplan);
+        plan_drop(&l->hplan);
         finish(l, now_ms);
         return;
     }
@@ -1585,7 +1687,8 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
         l->mic_state = LiveStopping;
         l->mic_reason = AudioGuardOwner;
     }
-    if (l->spk_state != LiveStopping && l->mic_state != LiveStopping) finish(l, now_ms);
+    /* duplex-hold1: a hold is released by hold_tick once both paths are down (never before the Mic's own undo touched the VA macro) */
+    if (l->spk_state != LiveStopping && l->mic_state != LiveStopping && !l->hold_mask) finish(l, now_ms);
 }
 
 
@@ -1605,7 +1708,7 @@ void audio_live_sleep(AudioLive *l, uint32_t generation)
 int audio_live_parked(AudioLive *l)
 {
     if (!l->sleeping || l->sleep_failed || l->finished || l->off || l->spk_state==LiveOff || l->mic_state==LiveOff || l->timeouts ||
-        l->splan.seq.undo_errors || l->mplan.seq.undo_errors) return -1;
+        l->splan.seq.undo_errors || l->mplan.seq.undo_errors || l->hold_failed == 2) return -1;
     if (l->parked) return 1;
     /* A prior quiet-stop may have already ACKed STOP/UNMAP. Its old pump
      * bookkeeping is no longer ownership; never clear an active plan. */
@@ -1616,7 +1719,8 @@ int audio_live_parked(AudioLive *l)
         l->cap_unsent=0; l->cap.in_flight=0;
     }
     if (l->spk_state!=LiveDown || l->mic_state!=LiveDown || l->splan.in_flight || l->mplan.in_flight || plan_busy(&l->xplan) ||
-        l->splan.unsent || l->mplan.unsent || l->stream_unsent || l->cap_unsent || l->pump.in_flight || l->cap.in_flight) return 0;
+        l->splan.unsent || l->mplan.unsent || l->stream_unsent || l->cap_unsent || l->pump.in_flight || l->cap.in_flight ||
+        l->hold_mask || plan_busy(&l->hplan)) return 0;   /* duplex-hold1: the held clocks released first */
     /* Graph stops, UNMAPs, and plan-owned TDM/VA releases have all ACKed.
      * Preserve configured amps in powered-down mute, not terminal reset. */
     if (audio_amps_off(l->amps) || l->amps->reset_errors || l->amps->off_errors) return -1;

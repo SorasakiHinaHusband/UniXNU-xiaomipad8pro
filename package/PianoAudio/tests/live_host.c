@@ -61,6 +61,8 @@ struct World {
     uint64_t play_until_us, cap_until_us;
     unsigned queue_gaps, max_monitor_reads;
     int clock_on, va_votes, va_mclk, dev_started, str_started, mic_started, cap_started, mic_prepared, cap_prepared;
+    int vote_on[4];                   // per hardware core: one owner (a second request of a held vote is a violation)
+    unsigned prm_while_playing;       // duplex-hold1: PRM requests/releases of the VA clocks while the speaker stream graph runs
     int map_spk, map_mic;
     // the speaker-protection pair (AudioSpkProt.h)
     int vi_open, vi_started, prot_dev_open, re25_sets, oob_cfgs;
@@ -455,10 +457,28 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
     if (!status) {
         if (!strcmp(line, "PRM REQ 0x202 6144000")) w.clock_on = 1;
         if (!strcmp(line, "PRM REL 0x202")) {if (w.dev_started || w.str_started) violate("the bit clock released under running graphs"); w.clock_on = 0;}
-        if (!strncmp(line, "PRM VOTE", 8)) w.va_votes++;
-        if (!strncmp(line, "PRM UNVOTE", 10)) w.va_votes--;
-        if (!strcmp(line, "PRM REQ 0x30c 19200000")) w.va_mclk = 1;
+        if (!strncmp(line, "PRM VOTE", 8)) {
+            const unsigned v = (unsigned)atoi(line + 9) & 3u;
+            if (w.vote_on[v]) violate("an LPASS vote requested while held (two owners)");
+            w.vote_on[v] = 1;
+            w.va_votes++;
+        }
+        if (!strncmp(line, "PRM UNVOTE", 10)) {
+            const unsigned v = (unsigned)atoi(line + 11) & 3u;
+            if (!w.vote_on[v]) violate("an LPASS vote released that is not held");
+            if (w.va_mclk) violate("an LPASS vote released under the VA mclk");
+            w.vote_on[v] = 0;
+            w.va_votes--;
+        }
+        if (!strcmp(line, "PRM REQ 0x30c 19200000")) {
+            if (w.va_mclk) violate("the VA mclk requested while held (two owners)");
+            if (w.va_votes != 2) violate("the VA mclk requested without both votes");
+            w.va_mclk = 1;
+        }
         if (!strcmp(line, "PRM REL 0x30c")) {if (w.va_on) violate("the VA mclk released under the DMIC path"); w.va_mclk = 0;}
+        if (w.str_started && (!strncmp(line, "PRM VOTE", 8) || !strncmp(line, "PRM UNVOTE", 10) || !strncmp(line, "PRM REQ 0x30c", 13) ||
+                              !strcmp(line, "PRM REL 0x30c")))
+            w.prm_while_playing++;
         if (!strcmp(line, "START 0x4005")) {if (!w.clock_on) violate("the device graph started without the bit clock"); w.dev_started = 1;}
         // the protection pair (round 2, Android's order): the speaker graph (SP_RX, SP_TX's control peer) opened before the V/I
         // graph; V/I started before the speaker graph and stopped after it
@@ -1764,6 +1784,132 @@ static void testProtectedGain(void)
     spk_reset();
 }
 
+// ---- duplex-hold1 (2026-11-21, private DUPLEX-VOTES.txt): the A/B switch that holds the VA clocks from before the first path to
+// both down. Off: unchanged (a Mic start or stop while the speaker plays requests or releases the two votes and the mclk); 3: no
+// PRM request or release of them while the speaker stream runs; 1: only the mclk moves then. One owner per vote in every case.
+static int g_hold;
+static void hold_config(AudioLiveConfig *c) {c->duplex_hold = g_hold;}
+static const char *kHoldUp[] = {"PRM VOTE 1", "PRM VOTE 2", "PRM REQ 0x30c 19200000"};
+static const char *kHoldDown[] = {"PRM REL 0x30c", "PRM UNVOTE 2", "PRM UNVOTE 1"};
+// B: the speaker plays from 100 ms; the Mic starts at 2000 while it plays and stops at 5000 (its graph down at 8000, the speaker
+// still playing); the sound ends at 9000, the device stops at 9500 (the speaker down at about 12000)
+static void dx_b(uint32_t t)
+{
+    if (t == 100) device(1, 0);
+    if (t == 2000) device(1, 1);
+    if (t == 5000) device(1, 0);
+    if (t == 9500) device(0, 0);
+    w.amplitude = 12000;
+    w.sound_on = t >= 100 && t < 9000;
+}
+// C: the Mic first (100 ms), the speaker from 1000; the Mic stops at 4000 (down at 7000 while the speaker plays)
+static void dx_c(uint32_t t)
+{
+    if (t == 100) device(0, 1);
+    if (t == 1000) device(1, 1);
+    if (t == 4000) device(1, 0);
+    if (t == 9500) device(0, 0);
+    w.amplitude = 12000;
+    w.sound_on = t >= 1000 && t < 9000;
+}
+// The request comes while a Mic run holds its own votes: not applied to the speaker's start; the next Mic start (the speaker
+// playing) brings the hold up, then everything is released once both are down.
+static void dx_late(uint32_t t)
+{
+    if (t == 100) device(0, 1);
+    if (t == 1000) CHECK(audio_live_hold_select(&sh, 3) == 0 && live.mic_state == LiveRunning && !live.mic_held);
+    if (t == 1500) device(1, 1);
+    if (t == 3000) device(1, 0);
+    if (t == 7000) device(1, 1);
+    if (t == 9000) device(1, 0);
+    if (t == 9500) device(0, 0);
+    w.amplitude = 12000;
+    w.sound_on = t >= 1500 && t < 9000;
+}
+static void testDuplexHold(void)
+{
+    CHECK(audio_live_hold_select(&sh, 2) == -1 && audio_live_hold_select(&sh, 4) == -1 && audio_live_hold_select(&sh, -1) == -1 &&
+          audio_live_hold_select(&sh, 7) == -1);
+    struct Scenario sc = {10, 0, 0, 0, 16000, AudioPortsUbuntu, 1, dx_b};
+    // off (the control): the Mic's three requests at its start and three releases at its end, all while the speaker plays
+    g_hold = 0; g_setup = hold_config;
+    run(&sc);
+    CHECK(!w.violations && live.spk_starts == 1 && live.mic_starts == 1 && live.hold_starts == 0 && w.prm_while_playing == 6);
+    CHECK(logged("duplex-hold1: speaker start 1: hold 0 (requested 0, Mic down): off"));
+    CHECK(logged("duplex-hold1: Mic start 1: hold 0, speaker running: the votes and the mclk requested by this plan"));
+    // 3 from the boot argument: the votes and the mclk before the speaker's TDM clock, none while it plays, released after both
+    g_hold = 3; g_setup = hold_config;
+    run(&sc);
+    CHECK(!w.violations && live.spk_starts == 1 && live.mic_starts == 1 && live.hold_starts == 1 && w.prm_while_playing == 0);
+    unsigned at = expect(live_from(), kHoldUp, N(kHoldUp));
+    at = expect(at, kSpkUp, N(kSpkUp));
+    CHECK(count_cmd("PRM VOTE 1", live_from()) == 1 && count_cmd("PRM REQ 0x30c 19200000", live_from()) == 1);
+    CHECK(count_cmd("VA ON", 0) == 1 && count_cmd("VA OFF", 0) == 1 && count_cmd("START 0x4003", 0) == 1 && count_cmd("STOP 0x4003", 0) == 1);
+    CHECK(find_cmd("PRM REL 0x202", at) < find_cmd("PRM REL 0x30c", at) && expect(w.ncmd - N(kHoldDown), kHoldDown, N(kHoldDown)) == w.ncmd);
+    CHECK(logged("duplex-hold1: hold 3 up before the speaker starts (hold start 1)") && logged("is down (the votes come before its TDM clock)"));
+    CHECK(logged("duplex-hold1: speaker start 1: hold 3 (requested 3, Mic down): the VA clocks are held"));
+    CHECK(logged("duplex-hold1: Mic start 1: hold 3, speaker running: no PRM request"));
+    CHECK(logged("duplex-hold1: both paths down: the held clocks released (hold 3)") && w.mic_ok > 48000u * 2);
+    // 1: the votes held, the Mic's plan requests and releases only the mclk (twice while the speaker plays)
+    g_hold = 1; g_setup = hold_config;
+    run(&sc);
+    CHECK(!w.violations && live.hold_starts == 1 && w.prm_while_playing == 2 && count_cmd("PRM VOTE 1", live_from()) == 1);
+    at = expect(live_from(), kHoldUp, 2);
+    CHECK(!strcmp(w.cmd[at], "PRM REQ 0x202 6144000") && find_cmd("PRM REQ 0x30c 19200000", at) > find_cmd("START 0x4001", at));
+    CHECK(!strcmp(w.cmd[w.ncmd - 1], "PRM UNVOTE 1") && !strcmp(w.cmd[w.ncmd - 2], "PRM UNVOTE 2") && logged("Mic start 1: hold 1, speaker running: the mclk requested"));
+    // the owner's stop with both paths and the hold up: the paths undone first, the hold last, nothing left held
+    g_hold = 3; g_setup = hold_config;
+    sc.end_ms = 4000;
+    run(&sc);
+    CHECK(!w.violations && live.finished && expect(w.ncmd - N(kHoldDown), kHoldDown, N(kHoldDown)) == w.ncmd);
+    CHECK(find_cmd("CLOSE 0x4008", live_from()) < w.ncmd - N(kHoldDown) && find_cmd("PRM REL 0x202", live_from()) < w.ncmd - N(kHoldDown));
+    sc.end_ms = 16000;
+    // C (the Mic first) with 3: the hold, then the Mic's plan without PRM steps; the speaker joins; the Mic's end while it plays
+    // releases nothing
+    g_hold = 3; g_setup = hold_config;
+    sc.hook = dx_c;
+    run(&sc);
+    CHECK(!w.violations && live.hold_starts == 1 && w.prm_while_playing == 0 && live.mic_starts == 1 && live.spk_starts == 1);
+    at = expect(live_from(), kHoldUp, N(kHoldUp));
+    CHECK(!strcmp(w.cmd[at], "OPEN 0x4008") && logged("hold 3 up before the Mic starts") && logged("(requested 3, Mic running on the hold)"));
+    CHECK(expect(w.ncmd - N(kHoldDown), kHoldDown, N(kHoldDown)) == w.ncmd);
+    // the request while a Mic run holds its own votes: not applied (one owner), then up at the next Mic start
+    g_hold = 0; g_setup = hold_config;
+    sc.hook = dx_late;
+    run(&sc);
+    CHECK(!w.violations && live.mic_starts == 2 && live.spk_starts == 1 && live.hold_starts == 1);
+    CHECK(logged("speaker start 1: hold 0 (requested 3, Mic running): not applied: a Mic run started before the request"));
+    CHECK(logged("hold 3 up before the Mic starts (hold start 1): the LPASS macro and digital codec votes, then the VA mclk 19.2 MHz; the speaker plays"));
+    CHECK(logged("Mic start 2: hold 3, speaker running: no PRM request") && expect(w.ncmd - N(kHoldDown), kHoldDown, N(kHoldDown)) == w.ncmd);
+    // the hold refused: no hold for this boot's request, both paths start as without it (the Mic's plan with its own votes)
+    g_hold = 3; g_setup = hold_config; g_fail = "PRM VOTE 2";
+    sc.hook = dx_b;
+    run(&sc);
+    g_fail = 0;
+    CHECK(!w.violations && live.hold_failures == 1 && live.hold_failed == 1 && live.spk_starts == 1 && live.mic_starts == 1);
+    CHECK(logged("duplex-hold1: the hold plan failed at LPASS digital codec vote") && logged("hold 0 (requested 3, Mic down): not applied: a hold plan failed"));
+    CHECK(!strcmp(w.cmd[live_from()], "PRM VOTE 1") && !strcmp(w.cmd[live_from() + 1], "PRM VOTE 2") && !strcmp(w.cmd[live_from() + 2], "PRM UNVOTE 1"));
+    CHECK(!strcmp(w.cmd[live_from() + 3], "PRM REQ 0x202 6144000") && w.prm_while_playing == 6);
+    // level 9 (no Mic path): inert, the speaker plan exactly as without it
+    g_hold = 3; g_setup = hold_config;
+    sc = (struct Scenario){9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, burst};
+    run(&sc);
+    CHECK(!w.violations && live.hold_starts == 0 && logged("no Mic path at this level: inert") && logged("not applied: no Mic path at this level"));
+    at = expect(live_from(), kSpkUp, N(kSpkUp));
+    CHECK(expect(at, kSpkDown, N(kSpkDown)) == w.ncmd);
+    g_hold = 0;
+}
+// Sleep and wake with the hold up: parked with nothing held, the hold back first after the wake (testSleepCycles' checks).
+static void hold_sleep_config(AudioLiveConfig *c) {c->duplex_hold = 3;}
+static void testHoldSleep(void)
+{
+    pm_cycle = pm_stage = 0;
+    g_setup = hold_sleep_config;
+    const struct Scenario sc = {10, 160, 6, 0, 10000, AudioPortsUbuntu, 0, sleep_cycles};
+    run(&sc);
+    CHECK(pm_cycle == 3 && !w.violations && !live.sleep_failed && live.hold_starts == 4 && !live.hold_failures && w.prm_while_playing == 0);
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -1805,6 +1951,8 @@ int main(void)
     testProtSwitch();
     testProtSleep();
     testProtectedGain();
+    testDuplexHold();
+    testHoldSleep();
     printf("PASS live: %u checks\n", checks);
     return 0;
 }
