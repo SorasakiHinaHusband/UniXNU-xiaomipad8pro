@@ -50,6 +50,13 @@
 ["adt"."chosen"."bytes"]
 # configs/k27-adt.toml's note: 27's Image4 kext seeds its nonce magazine from it (no boot manifest: zeros, SHA-384 size).
 "boot-manifest-hash" = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# An empty system-configuration table (docs/identity.md section 9). Without /defaults ean-storage-present and with
+# kern.hv_vmm_present 0, libMobileGestalt's only syscfg source reads this property first; when it is absent it waits up to 5 s,
+# once in every process, for an AppleDiagnosticDataAccessReadOnly service (a NOR-flash driver: piano has none), and AppKit asks
+# for it in every app's NSApplication init (the hardware accent color): the 5.0 s before every app's first window. The table:
+# a 24-byte header (magic 'SCfg' little-endian, size 24, max size 24, version 0, flags 0) with zero entries; MobileGestalt's
+# sysconfig dictionary stays empty, as it was after the wait.
+"syscfg-v2-data" = "676643531800000018000000000000000000000000000000"
 
 ["adt"."chosen"."asmb"."u64"]
 "lp-sip0" = 2

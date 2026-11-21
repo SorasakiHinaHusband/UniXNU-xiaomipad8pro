@@ -238,3 +238,47 @@ PIANO_VMM_PRESENT=0`, `NativeAES vs IOAESAccelerator: 0 problem slots`, 26 nativ
 | `ram-desk-dev-aes-k114c-netdb` | k114c | staged, as desk-dev before | `0e61978a0bb61cc2...` |
 | `ram-desk-dev-aes-vma2` | vma2 | staged | `f2eb4c849585fcfc...` |
 | `ram-desk-dev-aes-dump` | the loop's dump image | - | `b37c9c421a2a34d1...` |
+
+## 9. The 5 s wait before every app's first window (2026-11-22) and its cause, MobileGestalt's syscfg source
+
+**Seen (the installed v13.1x, a Calculator launch under a whole-system spindump with its unified log):** every app needs 5.3-5.9 s
+to its first window. The main thread spends 5.0 s in `-[NSApplication init]` → `+[NSAppearance _aquaAppearance]` →
+`NSColorGetUserAccentColor` → `NSUserAccentColorGetHardwareAccentColorName` → `MGCopyAnswer("DeviceEnclosureColor")`, parked in
+`dispatch_semaphore_wait`; libMobileGestalt logs `Unable to read diagnostic data from service`, then exactly 5.00 s later
+`giving up waiting for match - runloop result is 3` (kCFRunLoopRunTimedOut) and `copySyscfgDictionary(void) enumeration of
+<private> failed`.
+
+**The path (27.3's libMobileGestalt: symbols, strings and the functions on this path; no code copied).** The enclosure color is
+a syscfg key, so MobileGestalt builds its per-process sysconfig dictionary (`copySyscfgDictionary`, cached per process after the
+first call). Its source list ("MGSysConfigPolicy") is the EAN one only with `/defaults ean-storage-present` (the NVMe EAN of a
+real Apple-silicon Mac); otherwise the default policy has a single source, `DAAD` (diagnostic data access), plus `vmpv`
+(`/chosen syscfg-vmpv-data`) when `kern.hv_vmm_present` is 1. `DAAD` reads, in order:
+
+1. `IODeviceTree:/chosen` `syscfg-v2-data` (data);
+2. the property `AppleDiagnosticDataSysCfg` of an `AppleDiagnosticDataAccess` or `AppleDiagnosticDataAccessReadOnly` service;
+3. unless `kern.hv_vmm_present` is 1: `IOServiceAddMatchingNotification(kIOMatchedNotification,
+   IOServiceMatching("AppleDiagnosticDataAccessReadOnly"))` on a private run loop mode, `CFRunLoopRunInMode(5.0 s)`, the caller
+   blocked on a semaphore, then step 2 again.
+
+On a real Mac 27.3's `AppleDiagnosticDataAccessReadOnly` kext matches an `AppleARMNORFlashDevice` named
+`diagnostic-data,format1` (or an `AppleNANDConfigAccess`); piano has neither, so step 3 always times out: once in every process
+that asks for a syscfg-backed key, and AppKit asks in every app's `NSApplication` init. By the code the VM-era images never
+paid it (`vmm-present` 1 skips step 3; not measured on a VM-era boot): it came with the truthful `vmm-present` 0.
+
+**The fix: `configs/k273-adt.toml` `/chosen syscfg-v2-data`**, a valid empty table (the 24-byte header: magic `SCfg`, size, max
+size, version, flags, entry count 0; MobileGestalt checks the magic and that the entries fit). Step 1 then answers at once, the
+dictionary is the same empty one it was after the timeout, and `DeviceEnclosureColor` is absent as before (the default accent
+color). One answer changes on purpose: the MobileGestalt key that returns the raw syscfg blob now returns this 24-byte table
+instead of nothing. Not changed here (they cost no time: their log lines carry the same millisecond): `/product product-id`
+(`invalid product id '(null)'`: MobileGestalt's device map wants 20 bytes), `/arm-io soc-generation` (read also by DeviceIdentity,
+MobileActivation and the ISP media-capture plug-ins: a value there is its own change), and `/usr/lib/libMobileGestaltExtensions.dylib`
+(`couldn't load support library`: not in 27.3's shared cache, the same on every Mac).
+
+MobileGestalt has two more waits of the same kind (5 s each, outside a VM): an `IONetworkController` whose parent is `wlan`,
+`sdio` or `marconi-wifi` with `local-mac-address` (the Wi-Fi address key), and `AppleOLYHAL` with `vendor-id` (the Wi-Fi module
+vendor). No app launch asked for them on the tablet; `giving up waiting for match` in a whole boot's log shows whether anything does.
+
+**The boot's check:** `ioreg -p IODeviceTree -n chosen -r -d 1 | grep syscfg-v2-data` shows the property; in `log show` of a launch
+window no `giving up waiting for match`, no `Unable to read diagnostic data from service`, no `enumeration of ... failed`
+(`No persisted cache on this platform.`, logged by every process's first MobileGestalt call, is the known-positive); the time to
+the first window drops by about 5 s. `tooling/adt/check-syscfg.py ADT` checks an ADT file's table on the host.
