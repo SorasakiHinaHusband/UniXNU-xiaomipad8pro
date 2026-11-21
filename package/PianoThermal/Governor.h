@@ -158,7 +158,7 @@ class Governor {
     mode_ = mode;
     config_ = config;
     androidCapKhz_ = 0;
-    hardSet_ = false;
+    hardSet_ = above_ = false;
     hardKhz_ = perfKhz_ = 0;
     rawWant_ = 0;
     count_ = uint8_t(count > kMax ? kMax : count ? count : 1);
@@ -256,7 +256,7 @@ class Governor {
   // the power cap, the perf cap (Perf.h: the skin step table or the burst), the thermal limit.
   unsigned ceilingFor(PowerSource power, uint32_t perfKhz) const
   {
-    unsigned top = sustained_;
+    unsigned top = above_ && perfKhz > khz_[sustained_] ? count_ - 1u : sustained_;   // above sustained only for mode 2's burst
     auto clampTo = [&](uint32_t khz) {
       if (!khz) return;
       const unsigned l = fastestAtMost(khz);
@@ -269,11 +269,13 @@ class Governor {
     return top;
   }
   // machdep.piano_cpufreq_perf (PianoThermal.cpp): hardSet replaces the boot cap with hardKhz (0: none); perfKhz the perf cap.
-  void setRuntimeCaps(bool hardSet, uint32_t hardKhz, uint32_t perfKhz)
+  // aboveSustained: the perf cap may lift the ceiling over the firmware's sustained level (machdep.piano_cpufreq_perf=2's burst).
+  void setRuntimeCaps(bool hardSet, uint32_t hardKhz, uint32_t perfKhz, bool aboveSustained = false)
   {
     hardSet_ = hardSet;
     hardKhz_ = hardKhz;
     perfKhz_ = mode_ == CpuMode::govern ? perfKhz : 0;
+    above_ = mode_ == CpuMode::govern && aboveSustained;
   }
   void setDownTicks(uint32_t n) { config_.downTicks = n ? n : 1; }
   unsigned rawWant() const { return rawWant_; }
@@ -327,7 +329,7 @@ class Governor {
   CpuMode mode_ = CpuMode::off;
   GovernorConfig config_{};
   uint32_t androidCapKhz_ = 0;
-  bool hardSet_ = false;
+  bool hardSet_ = false, above_ = false;
   uint32_t hardKhz_ = 0, perfKhz_ = 0;
   uint32_t khz_[kMax] = {};
   uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0, rawWant_ = 0;

@@ -1124,6 +1124,23 @@ static void testPerf()
   CHECK(g.limit() == 14 && g.khz(g.ceiling(PowerSource::external)) == 4089600);   // limit 14 = 4204.8 >= sustained: no change yet
   for (uint64_t ms = 1010; ms < 1100; ms += 10) g.thermal(hot, ms);
   CHECK(g.khz(g.ceiling(PowerSource::external)) < 4089600);
+  // mode 2: over sustained only while asked, still under the power cap and the thermal limit
+  GovernorConfig g2c = gc;
+  g2c.externalKhz = capKhz(4320);
+  Governor g2;
+  g2.init(CpuMode::govern, g2c, ncc1, 16, 13, 0);
+  g2.setRuntimeCaps(false, 0, 0, false);
+  CHECK(g2.khz(g2.ceiling(PowerSource::external)) == 4089600);
+  g2.setRuntimeCaps(false, 0, capKhz(4320), false);
+  CHECK(g2.khz(g2.ceiling(PowerSource::external)) == 4089600);   // not asked: sustained stays the top
+  g2.setRuntimeCaps(false, 0, capKhz(4320), true);
+  CHECK(g2.khz(g2.ceiling(PowerSource::external)) == 4320000);
+  CHECK(g2.khz(g2.ceiling(PowerSource::battery)) == 1958400);
+  g2.setRuntimeCaps(true, capKhz(2438), capKhz(4320), true);
+  CHECK(g2.khz(g2.ceiling(PowerSource::external)) == 2438400);   // a hard cap still wins
+  g2.setRuntimeCaps(false, 0, capKhz(4320), true);
+  g2.thermal(hot, 5000);
+  CHECK(g2.limit() == 14 && g2.khz(g2.ceiling(PowerSource::external)) == 4204800);
 }
 
 int main(int argc, char **argv)

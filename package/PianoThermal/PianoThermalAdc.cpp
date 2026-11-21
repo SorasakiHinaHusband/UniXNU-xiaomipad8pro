@@ -418,6 +418,24 @@ uint32_t hookLevel()
   return v > 2 ? 2 : v;
 }
 
+bool hookSkin(int32_t milliC[perf::kSkinInputs], uint32_t &validMask)
+{
+  validMask = 0;
+  Snapshot s;
+  if (!gHook.level || !readSnapshot(s) || s.state != PIANO_BOARD_TEMPS_RUNNING) return false;
+  const uint64_t nowUs = nowNs() / 1000;
+  for (unsigned i = 0; i < perf::kSkinInputs; ++i) {
+    milliC[i] = 0;
+    const int c = channelIndex(perf::kSkinChannel[i]);
+    if (c < 0 || !(s.validMask & (1u << c))) continue;
+    const uint64_t ageMs = nowUs > s.atUs[c] ? (nowUs - s.atUs[c]) / 1000 : 0;
+    if (ageMs > uint64_t(kFreshPeriods) * s.periodMs) continue;
+    milliC[i] = s.milliC[c];
+    validMask |= 1u << i;
+  }
+  return true;
+}
+
 void hookStart(IOService *svc, uint32_t level, uint32_t periodS, uint32_t delayS)
 {
   gStartNs = nowNs();
@@ -448,24 +466,6 @@ bool hookGpuTemps(void *param1)
   Snapshot s;
   if (!readSnapshot(s)) s = Snapshot();
   return fillGpuTemps(s, nowNs() / 1000, static_cast<piano_gpu_temps *>(param1));
-}
-
-bool hookSkin(int32_t milliC[perf::kSkinInputs], uint32_t &validMask)
-{
-  validMask = 0;
-  Snapshot s;
-  if (!gHook.level || !readSnapshot(s) || s.state != PIANO_BOARD_TEMPS_RUNNING) return false;
-  const uint64_t nowUs = nowNs() / 1000;
-  for (unsigned i = 0; i < perf::kSkinInputs; ++i) {
-    milliC[i] = 0;
-    const int c = channelIndex(perf::kSkinChannel[i]);
-    if (c < 0 || !(s.validMask & (1u << c))) continue;
-    const uint64_t ageMs = nowUs > s.atUs[c] ? (nowUs - s.atUs[c]) / 1000 : 0;
-    if (ageMs > uint64_t(kFreshPeriods) * s.periodMs) continue;
-    milliC[i] = s.milliC[c];
-    validMask |= 1u << i;
-  }
-  return true;
 }
 
 }  // namespace pianothermal::adc

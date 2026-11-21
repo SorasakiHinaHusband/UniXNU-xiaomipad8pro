@@ -51,6 +51,9 @@
 // machdep.piano_cpufreq_perf_tick_ms (piano-cpufreq-perf-tick-ms, 20) with downs held piano-cpufreq-perf-down-ms (100), the
 // sensors still read every 100 ms (10 ms near a trip). 0 = the policy before it: the caps by the measured power source, the hard
 // caps piano-cpufreq-legacy-cap0/1 (2400 / 2438: the v13.1x daily line's piano-cpufreq-cap0/1), the 100 ms tick, 3 ticks down.
+// 2 = beyond stock: as 1 without the skin table (the sustained levels 3532.8 / 4089.6 as ceilings) and the onset burst up to
+// piano-cpufreq-burst-max0/1 (3532 / 4320 MHz; above the firmware's sustained level only while a burst is open; a refused level
+// above sustained turns that off for the boot without counting toward the 20 refusals).
 // Both keep the thermal limit (piano-cpufreq-hot, 90 C) on top. machdep.piano_cpufreq_state (read only): the mode, tick, skin and
 // per cluster the level, the ceiling and the residency per level since boot (ms), for before/after windows from user space.
 #include <IOKit/IOService.h>
@@ -119,7 +122,7 @@ struct Args {
   bool capGiven[2];
   bool android, androidArmed;
   // the stock-level policy (Perf.h)
-  uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMs, burstGapMs, skin, skinLimitC;
+  uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC;
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
 pianodisplay::Follow gDisplay;
@@ -187,13 +190,15 @@ void readArgs()
   gArgs.hispeed[0] = bootArg("piano-cpufreq-hispeed0", 1500);
   gArgs.hispeed[1] = bootArg("piano-cpufreq-hispeed1", 1800);
   gArgs.tickMs = clampU(bootArg("piano-cpufreq-tick-ms", 100), 20, 1000);
-  gArgs.perf = bootArg("piano-cpufreq-perf", 0) ? 1 : 0;
+  gArgs.perf = clampU(bootArg("piano-cpufreq-perf", 0), 0, 2);
   gArgs.perfTickMs = clampU(bootArg("piano-cpufreq-perf-tick-ms", 20), 20, 1000);
   gArgs.perfDownMs = clampU(bootArg("piano-cpufreq-perf-down-ms", 100), 0, 5000);
   gArgs.legacyCap[0] = clampU(bootArg("piano-cpufreq-legacy-cap0", 2400), 300, 5000);
   gArgs.legacyCap[1] = clampU(bootArg("piano-cpufreq-legacy-cap1", 2438), 300, 5000);
   gArgs.burst[0] = clampU(bootArg("piano-cpufreq-burst0", 2745), 0, 5000);
   gArgs.burst[1] = clampU(bootArg("piano-cpufreq-burst1", 4089), 0, 5000);
+  gArgs.burstMax[0] = clampU(bootArg("piano-cpufreq-burst-max0", 3532), 0, 5000);
+  gArgs.burstMax[1] = clampU(bootArg("piano-cpufreq-burst-max1", 4320), 0, 5000);
   gArgs.burstMs = clampU(bootArg("piano-cpufreq-burst-ms", 1500), 0, 10000);
   gArgs.burstGapMs = clampU(bootArg("piano-cpufreq-burst-gap-ms", 500), 0, 60000);
   gArgs.skin = bootArg("piano-cpufreq-skin", 1) ? 1 : 0;
@@ -513,6 +518,7 @@ struct PerfDomain {
   uint64_t totalNs[scmi::kMaxLevels];
 };
 PerfDomain gPd[kDomains];
+bool gAboveRefused[kDomains];   // a level above sustained was refused: mode 2's burst stays at sustained for the boot
 int32_t gSkinMilli;
 uint32_t gSkinValid, gSkinUsed, gPerfReady;
 struct sysctl_oid gPerfOid, gPerfTickOid, gPerfStateOid;
@@ -525,7 +531,7 @@ int sysctlPerfInt(struct sysctl_oid *oid, void *, int which, struct sysctl_req *
   int value = int(__atomic_load_n(slot, __ATOMIC_ACQUIRE));
   const int status = sysctl_handle_int(oid, &value, 0, req);
   if (status || !req->newptr) return status;
-  if (which ? (value < 20 || value > 1000) : (value != 0 && value != 1)) return EINVAL;
+  if (which ? (value < 20 || value > 1000) : (value < 0 || value > 2)) return EINVAL;
   __atomic_store_n(slot, uint32_t(value), __ATOMIC_RELEASE);
   return 0;
 }
@@ -569,7 +575,8 @@ void registerPerf()
     sysctl_register_oid(&oid);
   };
   fill(gPerfOid, "piano_cpufreq_perf", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2, sysctlPerfInt, 0, "I",
-       "CPU policy: 0 before 2026-11-22 (v13.1x caps), 1 stock-level (profile caps, skin steps, burst, fast tick); root writes");
+       "CPU policy: 0 before 2026-11-22 (v13.1x caps), 1 stock-level (profile caps, skin steps, burst, fast tick), 2 beyond stock "
+       "(no skin table, burst to 4320); root writes");
   fill(gPerfTickOid, "piano_cpufreq_perf_tick_ms", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2, sysctlPerfInt, 1, "I",
        "load decision period of piano_cpufreq_perf=1 (20..1000 ms); root writes");
   fill(gPerfStateOid, "piano_cpufreq_state", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2, sysctlPerfState, 0, "A",
@@ -739,7 +746,7 @@ class PianoThermal : public IOService {
   perf::Burst burst_[kDomains];
   perf::Skin skin_{};
   int32_t skinIn_[perf::kSkinInputs] = {};
-  uint32_t skinInMask_ = 0, perfSeen_ = 2, perfChanges_ = 0;
+  uint32_t skinInMask_ = 0, perfSeen_ = 9, perfChanges_ = 0;
   void cpuPerfReport();
   // system sleep: the thread parks between kOff and kOn (SleepPlan says what each does)
   IOLock *sleepLock_ = nullptr;
@@ -1178,6 +1185,8 @@ void PianoThermal::cpuStart()
          gArgs.perf, gArgs.skin ? "on" : "off", adc::hookLevel() ? "piano-thermal-adc on" : "piano-thermal-adc OFF: no skin reading, "
          "the first step's cap", gArgs.burst[0], gArgs.burst[1], gArgs.burstMs, gArgs.burstGapMs, gArgs.skinLimitC, gArgs.perfTickMs,
          gArgs.perfDownMs, gArgs.legacyCap[0], gArgs.legacyCap[1], gArgs.tickMs, tripsText());
+    note("cpufreq: perf policy 2 = beyond stock: as 1 without the skin table (sustained ceilings), the onset burst up to %u / %u MHz "
+         "(over sustained only while open)", gArgs.burstMax[0], gArgs.burstMax[1]);
   }
   if (gArgs.androidArmed) {
     androidDomains_ = true;
@@ -1222,6 +1231,13 @@ void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
   Governor &g = governor_[d];
   if (want == set_[d]) return;
   const int32_t r = scmi::levelSet(channel_, domain_[d], d, want);
+  if (r && want > domain_[d].sustained && !gAboveRefused[d]) {   // mode 2's burst: the firmware does not take levels over sustained
+    gAboveRefused[d] = true;
+    note("[%us] cpufreq: domain %u: %u MHz (above sustained) refused (%d, %s): bursts stay at sustained for this boot", upS(), d,
+         domain_[d].levels[want].khz / 1000, r, scmi::statusName(r));
+    g.setLevel(set_[d]);
+    return;
+  }
   if (gArgs.androidArmed) {
     androidRequestedLevel_[d] = true;
     androidRequestKey_[d] = domain_[d].levels[want].key;
@@ -1389,12 +1405,14 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   // The stock-level policy (Perf.h, machdep.piano_cpufreq_perf): its power is PianoPolicy's profile whatever the source (Low Power
   // Mode = Power Saver = the battery caps, else Balanced = the power caps); mode 0 keeps the measured source as before 2026-11-22
   // (the v13.1x line never had a profile: piano-policy-profile=0).
-  const bool perfMode = gArgs.cpufreq == 3 && __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE) != 0;
-  if (perfMode != (perfSeen_ == 1)) {
-    if (perfSeen_ != 2) ++perfChanges_;
-    perfSeen_ = perfMode ? 1 : 0;
-    note("[%us] cpufreq: perf policy %u (%s), tick %u ms", upS(), perfSeen_,
-         perfMode ? "stock-level: profile caps, skin steps, onset burst" : "before 2026-11-22: source caps, hard caps", curTickMs());
+  const uint32_t perfNow = gArgs.cpufreq == 3 ? __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE) : 0;
+  const bool perfMode = perfNow != 0, beyond = perfNow == 2;
+  if (perfNow != perfSeen_) {
+    if (perfSeen_ != 9) ++perfChanges_;
+    perfSeen_ = perfNow;
+    note("[%us] cpufreq: perf policy %u (%s), tick %u ms", upS(), perfNow,
+         perfNow == 2 ? "beyond stock: profile caps, no skin table, onset burst to the burst maximum"
+         : perfNow ? "stock-level: profile caps, skin steps, onset burst" : "before 2026-11-22: source caps, hard caps", curTickMs());
   }
   const PowerSource power = perfMode ? profilePower(power_, profile) : gArgs.androidArmed ? selection.power : power_;
   if (perfMode && loadTick) {
@@ -1473,13 +1491,14 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     }
     if (g.mode() == CpuMode::govern) {
       if (perfMode) {
-        const uint32_t skinKhz = gArgs.skin ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
-                                                                 d ? perf::kCluster1Steps : perf::kCluster0Steps, skin_.valid,
-                                                                 skin_.milliC)
-                                            : 0;
+        const uint32_t skinKhz = gArgs.skin && !beyond ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
+                                                                            d ? perf::kCluster1Steps : perf::kCluster0Steps,
+                                                                            skin_.valid, skin_.milliC)
+                                                       : 0;
+        const uint32_t burstKhz = capKhz(beyond ? gArgs.burstMax[d] : gArgs.burst[d]);
         if (loadTick) {
           perf::BurstConfig bc;
-          bc.khz = capKhz(gArgs.burst[d]);
+          bc.khz = burstKhz;
           bc.windowMs = gArgs.burstMs;
           bc.gapMs = gArgs.burstGapMs;
           bc.limitMilli = int32_t(gArgs.skinLimitC) * 1000;
@@ -1487,7 +1506,10 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
                          skin_.valid, skin_.milliC);
         }
         g.setDownTicks(perf::downTicksFor(gArgs.perfDownMs, curTickMs()));
-        g.setRuntimeCaps(false, 0, perf::perfCapKhz(skinKhz, burst_[d].open(), capKhz(gArgs.burst[d])));
+        if (beyond)   // no skin table: the sustained ceiling, the burst over it while open (unless the firmware refused that)
+          g.setRuntimeCaps(false, 0, burst_[d].open() ? burstKhz : 0, burst_[d].open() && !gAboveRefused[d]);
+        else
+          g.setRuntimeCaps(false, 0, perf::perfCapKhz(skinKhz, burst_[d].open(), burstKhz));
       } else {
         g.setDownTicks(3);
         g.setRuntimeCaps(true, capKhz(gArgs.legacyCap[d]), 0);
@@ -1573,10 +1595,10 @@ void PianoThermal::cpuReport(uint64_t spanNs)
 // bursts (windows, ms open) since boot.
 void PianoThermal::cpuPerfReport()
 {
-  const bool perfMode = __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE) != 0;
+  const uint32_t perfNow = __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE);
   char line[480];
-  int at = snprintf(line, sizeof line, "[%us] perf: policy %u (%s), tick %u ms, %u mode changes; skin ", upS(), perfMode ? 1u : 0u,
-                    perfMode ? "stock-level" : "before 2026-11-22", curTickMs(), perfChanges_);
+  int at = snprintf(line, sizeof line, "[%us] perf: policy %u (%s), tick %u ms, %u mode changes; skin ", upS(), perfNow,
+                    perfNow == 2 ? "beyond stock" : perfNow ? "stock-level" : "before 2026-11-22", curTickMs(), perfChanges_);
   if (skin_.valid) at = catf(line, sizeof line, at, "%d.%d C", skin_.milliC / 1000, (skin_.milliC % 1000 + 1000) % 1000 / 100);
   else at = catf(line, sizeof line, at, "no reading");
   at = catf(line, sizeof line, at, " (");
