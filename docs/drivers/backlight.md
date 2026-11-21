@@ -263,3 +263,30 @@ The automatic-light loop rejects nonfinite and negative nonzero ALS values befor
 PianoSensors publishes the immutable `piano-sensors-light` snapshot (target, lux, session, seq, valid, fault) for the backlight consumer, plus diagnostic numeric validity, raw IEEE bits, accuracy status, valid/invalid counts and sample timestamps. The consumer gate reads explicit requested/control properties rather than inferring intent from an old target.
 
 For each of `primary` and `secondary`, PianoBacklight publishes `piano-backlight-<ic>-code`, `-lit`, `-enable`, `-readbacks`, `-enable-readbacks` and `-errors`. Applied code moves only after both brightness registers read back correctly. Aggregate `-control`, `-errors` and `-writes` are also published, including after a one-sided retry or control failure. No additional register polling is introduced. These are implementation/host-test contracts; daily automatic brightness still requires real lux changes and same-boot tablet readbacks.
+
+### CoreBrightness follows the automatic level (2026-11-21)
+
+The Control Center / menu-bar slider reads `DisplayServicesGetBrightness`, that is corebrightnessd's `CBDisplayModuleSKL` level.
+On macOS 27.3 that level never comes from the panel (decoded 27.3 cache). `-[CBDisplayModuleSKL initialiseSDR]` starts at 150 nits,
+then takes the capabilities' `DefaultNitsLevel` (SkyLight fills it only for external HDR displays), then the
+`DisplayPreferences/<display UUID>/BrightnessLevelNits` preference. After that only CoreBrightness's own commits change it: the
+slider, the keys, its own automatic mode (that needs the AOP light sensor node `IODeviceTree:/arm-io/aop/iop-aop-nub/als`).
+WindowServer's BrightnessControl reads our `IODisplayParameters` once, at its start. QuartzCore's IOMFB brightness callback only
+carries a bool. So while PianoBacklight's automatic mode set the panel, the slider showed CoreBrightness's stale preference.
+On the installed boot of 11-21 11:42 that was 600 nits ("full") while the panel was at 26 nits, then at the automatic level.
+
+`piano-brightness-sync` (userland, a root LaunchDaemon) closes the loop from the panel side. It acts only while
+`piano-backlight-auto-active` and `piano-backlight-lit` are true and the panel's level (`IODisplayParameters` `BrightnessMilliNits`)
+has been unchanged for 1 s. If CoreBrightness's `DisplayNitsKey` (DisplayServicesClient) is more than 3 % and 0.2 nit away, the
+daemon first writes root's `piano-backlight-sync` (signed 16.16 nits) to PianoBacklight, then sets `DisplayNitsKey`. CoreBrightness
+converts the value with its own slider mapping, commits it once, notifies the slider and stores the preference. Syncs are at least
+2 s apart; a level CoreBrightness does not take is tried three times, then backed off for a minute. PianoBacklight's `NativeIntent`
+counts WindowServer's requests after an announcement as follows: the commit that comes back is CoreBrightness taking the panel's
+level, never the user's move. That window closes at the first request within 3 % of the announced level, or after 600 ms.
+The user's own level (a move ends automatic mode until a display power-on or a wake) and a dark panel are never touched.
+
+Witnesses: console `PianoBacklightSyncV1 CoreBrightness is given requested16=N (...; S syncs, E echoes followed, M missed)`; ioreg
+`piano-backlight-sync-count`, `-echoes`, `-missed`; the daemon's `/private/var/db/piano-userland/brightness-sync/status`
+(`syncs=`, `taken=`, `failed=`); `piano-brightness-sync --check` (`panel_millinits`, `corebrightness_millinits`, `in_step`).
+Host tests: `backlight_host` (`NativeIntent` with announced syncs), `make -C tooling/native/piano-brightness-sync test`
+(`SyncPolicy.h`).

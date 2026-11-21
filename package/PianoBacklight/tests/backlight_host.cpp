@@ -880,6 +880,33 @@ static void testNativeBrightness()
     CHECK(fresh.classify(50 << 16, 100000) == NativeIntent::kFollow);
     CHECK(fresh.classify(200 << 16, 101000) == NativeIntent::kFollow);
     CHECK(fresh.classify(100 << 16, 105000) == NativeIntent::kUserMove);
+    {   // 2026-11-21 (SLIDER-INIT.md): an announced sync; CoreBrightness's commit of the panel's level is its echo, not a move
+      NativeIntent s;
+      s.reset(0);
+      CHECK(s.classify(600 << 16, 100) == NativeIntent::kFollow);       // CoreBrightness's stale preference at boot (600 nits)
+      CHECK(s.classify(600 << 16, 9000) == NativeIntent::kFollow);
+      s.expect(26 << 16, 10000);                                        // the daemon gives it the automatic level, 26 nits
+      CHECK(s.classify(26 << 16, 10030) == NativeIntent::kFollow);      // the echo: 600 -> 26 is not the user's move
+      CHECK(s.syncs() == 1 && s.echoes() == 1 && s.missed() == 0);
+      CHECK(s.classify(int64_t(26.3 * 65536), 11000) == NativeIntent::kFollow);   // the anchor moved to the echo
+      CHECK(s.classify(80 << 16, 12000) == NativeIntent::kUserMove);   // the user's drag still counts after the window
+      s.expect(10 << 16, 20000);                                        // a ramp to the echo: all follows, the window closes there
+      CHECK(s.classify(60 << 16, 20010) == NativeIntent::kFollow);
+      CHECK(s.classify(30 << 16, 20020) == NativeIntent::kFollow);
+      CHECK(s.classify(int64_t(10.2 * 65536), 20030) == NativeIntent::kFollow && s.echoes() == 2);
+      CHECK(s.classify(30 << 16, 20040) == NativeIntent::kUserMove);   // closed by the echo: a move again at once
+      s.expect(50 << 16, 30000);                                        // no echo within the window
+      CHECK(s.classify(50 << 16, 30000 + NativeIntent::kExpectMs) == NativeIntent::kUserMove);   // 30 -> 50 after the window
+      CHECK(s.missed() == 1 && s.echoes() == 2 && s.syncs() == 3);
+      s.expect(40 << 16, 40000);
+      s.expect(41 << 16, 40100);                                        // replaced before its echo: the first one is missed
+      CHECK(s.missed() == 2 && s.syncs() == 5);
+      CHECK(s.classify(41 << 16, 40150) == NativeIntent::kFollow && s.echoes() == 3);
+      NativeIntent cold;   // never reset: a sync before any request still makes its echo a follow
+      cold.expect(5 << 16, 50000);
+      CHECK(cold.classify(5 << 16, 50010) == NativeIntent::kFollow && cold.echoes() == 1);
+      CHECK(std::strcmp(kNativeSync, "piano-backlight-sync") == 0);
+    }
     CHECK(std::strcmp(kNativeOverride, "force-brightness-control") == 0);
     auto bitsOf = [](double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; };   // 2026-11-21: the swap record's double
     CHECK(nitsFixedFromDouble(bitsOf(13.3572)) == int32_t(13.3572 * 65536));

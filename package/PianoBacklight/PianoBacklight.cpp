@@ -40,7 +40,9 @@
 //                               the brightness keys then shift the curve by the steps (kept for the boot); piano-backlight-percent
 //                               switches to manual, piano-backlight-auto=0/1 as a property leaves / enters again. Without it nothing
 //                               of this runs (docs/drivers/backlight.md, sensors.md 5a.4)
-//   piano-backlight-native=1    publish the macOS SDR brightness adapter (level 2, with piano-backlight-keys=0)
+//   piano-backlight-native=1    publish the macOS SDR brightness adapter (level 2, with piano-backlight-keys=0); root's
+//                               "piano-backlight-sync" (16.16 nits) announces that piano-brightness-sync gives CoreBrightness the
+//                               panel's level: WindowServer's next request (its echo) is not taken for the user's move
 //   piano-backlight-android=1   opt in to the bounded Android-reference SDR adapter on compatible ICs
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -296,6 +298,7 @@ struct Pending {
   pianoauto::AmbientVersion ambientVersion{};
   bool ambientFault = false;
   uint64_t nativeOrder = 0, autoOrder = 0;
+  int32_t sync = -1;         // 2026-11-21: piano-brightness-sync's announced level (signed 16.16 nits), -1 none
 };
 IOLock *gLock;
 uint32_t gNativeDark;   // WindowServer's requests <= 0 (dark ramps), taken and dropped
@@ -365,6 +368,7 @@ class PianoBacklight : public IOService {
   uint32_t fNativeErrors = 0;
   bool fNativePublished = false;
   NativeIntent fIntent;                     // 2026-11-20: the user's moves among WindowServer's stream
+  uint32_t fSyncPublished = ~0u;            // 2026-11-21: fIntent's sync counters as last published (syncs + echoes + missed)
   bool fNativeTookAuto = false;             // a move ended automatic mode (a power-on or a wake gives it back)
   uint32_t fNativeFollowed = 0, fNativeMoves = 0, fNativeDropped = 0;
   bool fReference = true;
@@ -653,6 +657,7 @@ void PianoBacklight::serve()
     gPending.percent = gPending.sleep = -1;
     if (p.automatic >= 0) gPending.automatic = -1;
     gPending.reference = -1;
+    gPending.sync = -1;
     gPending.ambientFault = false;
     const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
@@ -692,7 +697,19 @@ void PianoBacklight::serve()
     if (p.automatic >= 0 && !autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
+    if (p.sync >= 0) {   // before this round's request: the echo may already be in it
+      fIntent.expect(p.sync, nowMs());
+      if (fIntent.syncs() <= 8 || fIntent.syncs() % 25 == 0)
+        note("PianoBacklightSyncV1 CoreBrightness is given requested16=%d (panel code %u, %s; %u syncs, %u echoes followed, %u missed)",
+             p.sync, fCtl.code(), fCtl.autoActive() ? "automatic" : "not automatic", fIntent.syncs(), fIntent.echoes(), fIntent.missed());
+    }
     const NativeIntent::Kind intent = p.native >= 0 ? fIntent.classify(p.native, nowMs()) : NativeIntent::kFollow;
+    if (gArgs.native && fIntent.syncs() + fIntent.echoes() + fIntent.missed() != fSyncPublished) {
+      fSyncPublished = fIntent.syncs() + fIntent.echoes() + fIntent.missed();
+      setProperty("piano-backlight-sync-count", uint64_t(fIntent.syncs()), 32);
+      setProperty("piano-backlight-sync-echoes", uint64_t(fIntent.echoes()), 32);
+      setProperty("piano-backlight-sync-missed", uint64_t(fIntent.missed()), 32);
+    }
     const bool autoOwns = p.native >= 0 && gArgs.autoAllowed && fCtl.ambientState().requested();
     if (p.native >= 0 && intent == NativeIntent::kFollow && autoOwns) {
       ++fNativeFollowed;   // CoreBrightness's own value while automatic mode owns the panel: kept as the settled value only
@@ -1083,6 +1100,24 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
   if (!d || gArgs.level < 2 || !gLock) return kIOReturnUnsupported;
   if (OSObject *native = d->getObject(kNativeRequest)) return enqueueNative(*d, native);
   if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return kIOReturnNotPrivileged;
+  if (OSObject *sync = d->getObject(kNativeSync)) {   // 2026-11-21: piano-brightness-sync announces the level it gives CoreBrightness
+    OSNumber *number = OSDynamicCast(OSNumber, sync);
+    const unsigned bits = number ? number->numberOfBits() : 0;
+    const int64_t asked = !number ? -1 : bits == 32 ? int64_t(int32_t(uint32_t(number->unsigned64BitValue())))
+                                                    : int64_t(number->unsigned64BitValue());
+    if (!gArgs.native) return kIOReturnUnsupported;
+    if (d->getCount() != 1 || !number || (bits != 32 && bits != 64)) return kIOReturnBadArgument;
+    IOLockLock(gLock);
+    const bool ready = gServing && gNativeReady;
+    const bool inRange = asked >= int64_t(gNativeMin) && asked <= int64_t(gNativeMax);
+    if (ready && inRange) {
+      gPending.sync = int32_t(asked);
+      gPending.any = true;
+      IOLockWakeup(gLock, &gPending, false);
+    }
+    IOLockUnlock(gLock);
+    return !ready ? kIOReturnNotReady : !inRange ? kIOReturnBadArgument : kIOReturnSuccess;
+  }
   if (OSObject *reference = d->getObject(kReferenceProperty)) {
     OSNumber *number = OSDynamicCast(OSNumber, reference);
     if (d->getCount() != 1 || !number || number->unsigned64BitValue() > 1) return kIOReturnBadArgument;

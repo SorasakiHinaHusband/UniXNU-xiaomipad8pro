@@ -27,12 +27,21 @@ inline bool nativeWriter(bool administrator, bool platform, const char *identity
   }
 }
 
+// 2026-11-21 (SLIDER-INIT.md): CoreBrightness never reads the panel back (its level starts from its BrightnessLevelNits preference
+// and changes only by its own commits), so piano-brightness-sync gives it the automatic level through DisplayServicesClient's
+// DisplayNitsKey. The daemon announces each such sync first (root, this property, signed 16.16 nits); the commit that follows is
+// CoreBrightness taking the panel's own level, not the user's move.
+constexpr char kNativeSync[] = "piano-backlight-sync";
+
 // 2026-11-20 (BRIGHTNESS-SLIDER.md): WindowServer sends the panel's brightness with every swap that changes it, CoreBrightness's
 // own ramps (the power-on ramp, a dim) included. A request is the user's move only when it leaves the settled value by more
 // than 2 % after the settle time (from the first request, a display power-on or a wake); the rest follow.
+// 2026-11-21: after an announced sync (expect()), requests follow until one within 3 % of the announced level arrives (the echo:
+// the window closes there) or kExpectMs pass (no echo: counted as missed).
 class NativeIntent {
  public:
   static constexpr uint64_t kSettleMs = 4000;
+  static constexpr uint64_t kExpectMs = 600;
   enum Kind : uint8_t { kFollow = 0, kUserMove = 1 };
   void reset(uint64_t nowMs)
   {
@@ -40,9 +49,29 @@ class NativeIntent {
     settleUntil_ = nowMs + kSettleMs;
     armed_ = true;
   }
+  void expect(int64_t fixed, uint64_t nowMs)
+  {
+    if (expect_ >= 0) ++missed_;   // a newer sync replaces one whose echo never came
+    expect_ = fixed;
+    expectUntil_ = nowMs + kExpectMs;
+    ++syncs_;
+  }
   Kind classify(int64_t fixed, uint64_t nowMs)
   {
     if (!armed_) reset(nowMs);   // the first request ever starts the settle time
+    if (expect_ >= 0 && nowMs < expectUntil_) {
+      anchor_ = fixed;
+      const int64_t e = fixed > expect_ ? fixed - expect_ : expect_ - fixed;
+      if (e * 100 <= expect_ * 3) {
+        expect_ = -1;
+        ++echoes_;
+      }
+      return kFollow;
+    }
+    if (expect_ >= 0) {
+      expect_ = -1;
+      ++missed_;
+    }
     if (anchor_ < 0 || nowMs < settleUntil_) {
       anchor_ = fixed;
       return kFollow;
@@ -52,10 +81,14 @@ class NativeIntent {
     anchor_ = fixed;
     return kUserMove;
   }
+  uint32_t syncs() const { return syncs_; }
+  uint32_t echoes() const { return echoes_; }
+  uint32_t missed() const { return missed_; }
 
  private:
-  int64_t anchor_ = -1;
-  uint64_t settleUntil_ = 0;
+  int64_t anchor_ = -1, expect_ = -1;
+  uint64_t settleUntil_ = 0, expectUntil_ = 0;
+  uint32_t syncs_ = 0, echoes_ = 0, missed_ = 0;
   bool armed_ = false;
 };
 

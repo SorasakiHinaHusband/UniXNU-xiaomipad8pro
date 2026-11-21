@@ -304,6 +304,26 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-wifi-controls.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-brightness-sync"
+about = "CoreBrightness follows PianoBacklight's automatic level (the Control Center slider shows the panel's real brightness): announces each sync to the kext (piano-backlight-sync), then sets DisplayNitsKey; never touches the user's level; inert without piano-backlight-native=1 and piano-backlight-auto=1"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-brightness-sync/piano-brightness-sync.m"
+build = "cc"
+arch = "arm64"
+cflags = ["-fobjc-arc"]
+frameworks = ["Foundation", "IOKit"]
+dest = "/usr/local/libexec/piano-brightness-sync"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-brightness-sync/com.unixnu.piano-brightness-sync.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-brightness-sync.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-wifi-supplicant"
 about = "the WPA2-Personal key handshake of PianoWifi's station over its 802.1X port (docs/drivers/wifi.md section 13.7): reads the root-only join profile, answers the four-way and group handshakes, hands the keys to the kext and opens the port; logs states and lengths only"
 default_on = true
