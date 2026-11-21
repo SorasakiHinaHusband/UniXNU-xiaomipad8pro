@@ -140,7 +140,9 @@ typedef struct {
      * relink; the offer does not. pdo_origin is PIANO_CONTRACT_PDO_* of the
      * published valid snapshot (0 when invalid). */
     uint8_t pdo_fallback, pdo_origin, offer_n, offer_misses;
-    uint32_t offer_pdo[7][3], offers, offer_rejects, offer_withdrawals;
+    uint16_t offer_pdo[7][3];        /* mV, mV, mA: all within 21000 */
+    uint16_t offers;                 /* the counters saturate */
+    uint8_t offer_rejects, offer_withdrawals;
 } PianoChargeContract;
 enum {PIANO_CONTRACT_PDO_NONE = 0, PIANO_CONTRACT_PDO_UCSI = 1, PIANO_CONTRACT_PDO_FIRMWARE = 2};
 
@@ -206,7 +208,7 @@ static inline void piano_contract_allow_firmware_pdos(PianoChargeContract *c, in
     if (!allow) { c->offer_n = c->offer_misses = 0; }
 }
 static inline void piano_contract_drop_offer(PianoChargeContract *c) {
-    if (c->offer_n) ++c->offer_withdrawals;
+    if (c->offer_n && c->offer_withdrawals < 255) ++c->offer_withdrawals;
     c->offer_n = c->offer_misses = 0;
     if (c->valid && c->pdo_origin == PIANO_CONTRACT_PDO_FIRMWARE) c->wanted = 1;
 }
@@ -218,17 +220,20 @@ static inline void piano_contract_drop_offer(PianoChargeContract *c) {
 static inline void piano_contract_offer_pdos(PianoChargeContract *c, const uint32_t pdo[][3], unsigned n, int ready) {
     uint32_t raw[7]; unsigned i, k; int same;
     if (!c->pdo_fallback) return;
-    if (ready && n && !piano_contract_firmware_pdos(pdo, n, raw)) { ++c->offer_rejects; ready = 0; }
+    if (ready && n && !piano_contract_firmware_pdos(pdo, n, raw)) {
+        if (c->offer_rejects < 255) ++c->offer_rejects;
+        ready = 0;
+    }
     if (!ready || !n) {
         if (c->offer_misses < 255) ++c->offer_misses;
         if (c->offer_misses >= 2) piano_contract_drop_offer(c);
         return;
     }
-    c->offer_misses = 0; ++c->offers;
+    c->offer_misses = 0; if (c->offers < 65535) ++c->offers;
     same = c->offer_n == n;
     for (i = 0; same && i != n; ++i) for (k = 0; k != 3; ++k) if (c->offer_pdo[i][k] != pdo[i][k]) same = 0;
     if (same) return;
-    for (i = 0; i != 7; ++i) for (k = 0; k != 3; ++k) c->offer_pdo[i][k] = i < n ? pdo[i][k] : 0;
+    for (i = 0; i != 7; ++i) for (k = 0; k != 3; ++k) c->offer_pdo[i][k] = (uint16_t)(i < n ? pdo[i][k] : 0);
     c->offer_n = (uint8_t)n;
     c->wanted = 1;
 }
@@ -349,8 +354,9 @@ static inline void piano_contract_publish(PianoChargeContract *c, uint64_t now_m
     if (c->stage_connected && c->stage_sink && c->stage_pd) {
         if (c->stage_pdos) origin = PIANO_CONTRACT_PDO_UCSI;
         else if (c->pdo_fallback && !(c->features & 16u) && c->offer_n) {
-            uint32_t raw[7] = {0};
-            unsigned n = piano_contract_firmware_pdos((const uint32_t (*)[3])c->offer_pdo, c->offer_n, raw);
+            uint32_t raw[7] = {0}, list[7][3] = {{0}}; unsigned n, k;
+            for (i = 0; i != 7; ++i) for (k = 0; k != 3; ++k) list[i][k] = c->offer_pdo[i][k];
+            n = piano_contract_firmware_pdos((const uint32_t (*)[3])list, c->offer_n, raw);
             for (i = 0; i != n; ++i) c->stage_pdo[i] = raw[i];
             c->stage_pdos = (uint8_t)n;
             if (n) origin = PIANO_CONTRACT_PDO_FIRMWARE;

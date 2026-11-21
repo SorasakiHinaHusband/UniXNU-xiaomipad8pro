@@ -359,8 +359,8 @@ class PianoPower : public IOService {
   bool fContractWasFresh = false;
   uint32_t fContractSeenGeneration = 0;
   // piano-power-pdo-mca: the firmware list offered, and the contracts it made, each logged on change (bounded)
-  uint32_t fPdoOfferLogs = 0, fPdoOfferLoggedN = 0xffffffffu, fPdoContractLogs = 0, fPdoContractLoggedRdo = 0;
-  uint32_t fPdoContractLoggedGen = 0;
+  uint8_t fPdoOfferLogs = 0, fPdoOfferLoggedN = 0xff, fPdoContractLogs = 0, fPdoContractLoggedValid = 0xff;
+  uint32_t fPdoContractLoggedRdo = 0;
   IOLock *fConfigLock = nullptr;
   struct ChargeRequest {uint32_t enabled, stop, resume, mode, inhibit, revision;} fConfigRequest{};
   bool fConfigPending = false;
@@ -1694,7 +1694,7 @@ void PianoPower::offerFirmwarePdos()
   const bool ready = piano_mca_has(&m, McaPdos) && piano_mca_has(&m, McaPdState) && m.value[McaPdState] == 2 && m.pdos;
   const uint32_t rejects = fContract.offer_rejects, withdrawals = fContract.offer_withdrawals;
   piano_contract_offer_pdos(&fContract, m.pdo, ready ? m.pdos : 0, ready);
-  const uint32_t n = fContract.offer_n;
+  const uint8_t n = fContract.offer_n;
   if ((n == fPdoOfferLoggedN && rejects == fContract.offer_rejects && withdrawals == fContract.offer_withdrawals) ||
       fPdoOfferLogs >= 24) return;
   fPdoOfferLogs++;
@@ -1703,8 +1703,8 @@ void PianoPower::offerFirmwarePdos()
   unsigned at = 0;
   line[0] = 0;
   for (unsigned i = 0; i < n && i < 7; ++i) {
-    const int k = snprintf(line + at, sizeof line - at, "%s%u-%u mV %u mA", i ? ", " : "", fContract.offer_pdo[i][0],
-                           fContract.offer_pdo[i][1], fContract.offer_pdo[i][2]);
+    const int k = snprintf(line + at, sizeof line - at, "%s%u-%u mV %u mA", i ? ", " : "", unsigned(fContract.offer_pdo[i][0]),
+                           unsigned(fContract.offer_pdo[i][1]), unsigned(fContract.offer_pdo[i][2]));
     if (k <= 0 || unsigned(k) >= sizeof line - at) break;
     at += unsigned(k);
   }
@@ -1716,10 +1716,11 @@ void PianoPower::logFirmwareContract()
 {
   const PianoChargeContract &c = fContract;
   if (fPdoContractLogs >= 32) return;
+  // one line per change of validity or RDO (a renegotiation, a new source)
   const uint32_t rdo = c.valid ? c.rdo : 0;
-  if (rdo == fPdoContractLoggedRdo && c.generation == fPdoContractLoggedGen) return;
+  if (rdo == fPdoContractLoggedRdo && c.valid == fPdoContractLoggedValid) return;
   fPdoContractLoggedRdo = rdo;
-  fPdoContractLoggedGen = c.generation;
+  fPdoContractLoggedValid = c.valid;
   fPdoContractLogs++;
   if (!c.valid) {
     note("ucsi: no PD contract (connected %u, sink %u, PD %u, RDO %#x, %u source objects, error %d, generation %u)", c.connected,
