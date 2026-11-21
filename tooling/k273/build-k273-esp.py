@@ -3,6 +3,7 @@
 
   build-k273-esp.py [--base ESP.json] [--entry macos-27.3] [--name esp-k273-only] [--out out/persistent]
                     [--expect-seed HEX] [--expect-store-lba N] [--expect-store-part NAME] [--diag-reset-after SECS]
+                    [--firmware-dir DIR]
 
 The base is an ESP build record (default: the installed one, OUT/installed.json's image; normally esp-dual33d-k273d.json of
 tooling/k273/build-dual-esp.py) and its image beside it. Its 27.3 entry (--entry) is carried over byte for byte: the entry's four
@@ -22,6 +23,12 @@ payload file and the line must be the base's, byte for byte, and no entry may us
 opens a store without native-ufs-root-part names linux_rootfs by default). The record (OUT/NAME.json) is a build-esp.py-style
 record whose seed and store are the 27.3 store's: maint-session.py checks the store on that partition at that LBA (bound to it,
 of that seed) before it writes the ESP, and rootfs-clear accepts only an ESP of such a record on the tablet.
+
+A firmware file the collection pins and the base lacks is refused, unless --firmware-dir DIR (out/firmware's layout: DIR/<pin path>,
+e.g. out/firmware/PianoAudio/spk-prot.bin) holds it: then it is added from there, its size and SHA-256 checked against the pin. A
+private pin's file (this unit's own data) is checked against the pin's hash all the same, which is never printed or recorded: the
+record marks it 'private' as it marks a private base file. Only missing files are added; a base file that is not the pin's stays a
+refusal, and without --firmware-dir nothing changes.
 
 A base entry whose line is already split (piano-boot-args=SET, k27 0066: its piano-* arguments live in the base ADT's
 /chosen/piano-boot-args-SET) is reassembled before anything else: the whole arguments are the base's line without the selector plus
@@ -116,7 +123,12 @@ def main():
     p.add_argument('--split', action='store_true', help='move the piano-* arguments into the ADT (k27 0066) even when the line fits')
     p.add_argument('--diag-reset-after', type=int, default=240, metavar='SECS',
                    help='the -diag entry\'s reset (only built when its line stays under 1000 bytes)')
+    p.add_argument('--firmware-dir', type=Path, metavar='DIR',
+                   help='pinned firmware the base lacks, added from DIR/<pin path> (out/firmware\'s layout), size and SHA-256 '
+                        'checked against the pin (a private pin\'s hash checked, never shown or recorded)')
     a = p.parse_args()
+    if a.firmware_dir is not None and not a.firmware_dir.is_dir():
+        raise SystemExit(f'--firmware-dir {a.firmware_dir}: not a directory')
 
     out = a.out
     if a.base:
@@ -272,10 +284,20 @@ def main():
         # -- firmware the 27.3 collection pins; other non-payload files stay; the 27.0.1 payload goes --------------------------
         # non-payload files only: the payload is staged above (with --kc/--adt/--trust/--seed and the ADT tail) and must not be
         # overwritten by the base's (2026-11-14: esp-k273-v2 573187af... was built so: the base's payload under the new line)
-        carried, dropped, fw = {}, [], []
+        carried, dropped, fw, added = {}, [], [], {}
         pins = firmware.kc_pins(kc)
         pinned = {f'{firmware.ESP_DIR}/{pin["path"]}': pin for pin in pins}
         for path, pin in pinned.items():
+            if path not in files and a.firmware_dir is not None:
+                # --firmware-dir: the missing pinned file from DIR/<pin path>, checked as the RAM image builder checks a staged
+                # copy (firmware.staged: size, then the pin's SHA-256, a private pin's too; no hash in any message)
+                found, why = firmware.staged([pin], a.firmware_dir)
+                if why:
+                    raise SystemExit(f'{a.entry}\'s collection pins {path}, which {base_img.name} lacks; in --firmware-dir: '
+                                     f'{why[0][1]}' + (' (a private pin: no hash shown)' if pin['private'] else ''))
+                added[path] = found[0][1]
+                fw.append(pin)
+                continue
             if path not in files:
                 raise SystemExit(f'{a.entry}\'s collection pins {path}, which {base_img.name} lacks')
             if not pin['private'] and (len(files[path]) != pin['size'] or h(files[path]) != pin['sha256']):
@@ -293,6 +315,9 @@ def main():
         for path in carried.values():
             (stage / path).parent.mkdir(parents=True, exist_ok=True)
             (stage / path).write_bytes(files[path])
+        for path, data in added.items():   # --firmware-dir: never over a base file (only paths the base lacks)
+            (stage / path).parent.mkdir(parents=True, exist_ok=True)
+            (stage / path).write_bytes(data)
 
         # -- the menu ------------------------------------------------------------------------------------------------------
         k_entry = {k: entry[k] for k in ('id', 'title', 'type', 'path', 'initrd', 'args')}
@@ -356,6 +381,9 @@ def main():
     for path in carried.values():
         if new['files'].get(path) != files[path]:
             problems.append(f'{path} changed')
+    for path, data in added.items():
+        if new['files'].get(path) != data:
+            problems.append(f'{path} is not the file checked in --firmware-dir byte for byte')
     for role, given in overrides.items():   # the image holds what was given (the ADT: plus the tail when split)
         if role == 'adt' and split:
             continue
@@ -394,7 +422,9 @@ def main():
         'overrides': overrides, 'arg_edits': {'add': edits, 'drop': list(a.drop_arg)}, 'boot_args_split': split,
         'base_split_rebuilt': base_split,
         'firmware': {'files': [{'path': f'{firmware.ESP_DIR}/{pin["path"]}', 'bytes': pin['size'], 'private': pin['private'],
-                                'sha256': None if pin['private'] else pin['sha256'], 'placed': True, 'problem': None} for pin in fw]},
+                                'sha256': None if pin['private'] else pin['sha256'], 'placed': True, 'problem': None} for pin in fw],
+                     # only with --firmware-dir: the pinned files the base lacked, added from there (checked against their pins)
+                     **({'added_from_firmware_dir': sorted(added)} if added else {})},
         'seed': seed,
         'store': store,
         'data_store': {'seed': seed['identity_sha256'], 'partition': part, 'first_lba': lba, 'bound': True, 'replace': None,
@@ -412,7 +442,9 @@ def main():
           f'{seed["identity_sha256"][:16]}; entries {[e["id"] for e in entries]} + actions'
           + ('' if diag_info['included'] else f'; no -diag entry ({diag_info["why"]})')
           + ('' if not base_split else f'; the split base reassembled ({base_split["full_bytes"]} B) and split again')
-          + f'; dropped {len(dropped)} files of the base (the other payloads)')
+          + f'; dropped {len(dropped)} files of the base (the other payloads)'
+          + ('' if not added else f'; added {len(added)} pinned firmware file(s) the base lacks from --firmware-dir '
+             f'({sum(1 for path in added if pinned[path]["private"])} private)'))
 
 
 if __name__ == '__main__':
