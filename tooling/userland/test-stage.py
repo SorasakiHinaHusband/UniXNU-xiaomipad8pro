@@ -545,6 +545,10 @@ def keyboard_tests(tmp):
         original = prefs.read_bytes()
         code, out = run(env)
         check(code == 1 and 'could not be added' in out and prefs.read_bytes() == original, f'{tag}: a non-dictionary refused, file unchanged')
+        prefs, env = rig()
+        shutil.rmtree(prefs.parent)
+        code, out = run(env)
+        check(code == 1 and 'nothing written' in out and not prefs.exists(), f'{tag}: no Library/Preferences: refused, nothing written')
     shutil.rmtree(tmp, ignore_errors=True)
 
 

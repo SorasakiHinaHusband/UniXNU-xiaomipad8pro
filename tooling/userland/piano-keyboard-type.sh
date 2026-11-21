@@ -26,6 +26,10 @@ say() {
 # has KEY: the key is in the keyboardtype dictionary (read through cfprefsd, as loginwindow reads it)
 has() { defaults read "$DOMAIN" keyboardtype 2> /dev/null | grep -Eq "^[[:space:]]*\"?$1\"?[[:space:]]*="; }
 
+# on_disk KEY: the key in the file itself (cfprefsd writes it out; a write it could not store still reads back through it)
+on_disk() { plutil -extract "keyboardtype.$1" raw -o - "$DOMAIN.plist" > /dev/null 2>&1; }
+
+[ -d "$R/Library/Preferences" ] || { say "no $R/Library/Preferences: nothing written"; exit 1; }
 added= kept=
 for k in $KEYS; do
   if has "$k"; then
@@ -37,6 +41,14 @@ for k in $KEYS; do
     exit 1
   fi
   added="$added $k"
+done
+for k in $added; do
+  n=0
+  until on_disk "$k"; do
+    n=$((n + 1))
+    [ "$n" -lt 10 ] || { say "$k reads back but is not in $DOMAIN.plist: not stored"; exit 1; }
+    sleep 1
+  done
 done
 if [ -n "$added" ]; then
   say "added$added as type $TYPE (ANSI)${kept:+; already known:$kept}"
