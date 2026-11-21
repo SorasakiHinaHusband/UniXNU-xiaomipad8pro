@@ -42,7 +42,10 @@
 //                               of this runs (docs/drivers/backlight.md, sensors.md 5a.4)
 //   piano-backlight-native=1    publish the macOS SDR brightness adapter (level 2, with piano-backlight-keys=0); root's
 //                               "piano-backlight-sync" (16.16 nits) announces that piano-brightness-sync gives CoreBrightness the
-//                               panel's level: WindowServer's next request (its echo) is not taken for the user's move
+//                               panel's level: WindowServer's next request (its echo) is not taken for the user's move;
+//                               root's "piano-backlight-managed" (a lease, seconds) hands the user's moves to the daemon (the
+//                               stream then never ends automatic mode: EDR ramps and CoreBrightness's restore arrive there too),
+//                               "piano-backlight-moved" (16.16) is the move it saw in CoreBrightness's own level
 //   piano-backlight-android=1   opt in to the bounded Android-reference SDR adapter on compatible ICs
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -299,6 +302,8 @@ struct Pending {
   bool ambientFault = false;
   uint64_t nativeOrder = 0, autoOrder = 0;
   int32_t sync = -1;         // 2026-11-21: piano-brightness-sync's announced level (signed 16.16 nits), -1 none
+  int32_t managed = -1;      // its lease in seconds (0 ends it), -1 none
+  int32_t moved = -1;        // the user's move it saw in CoreBrightness's level (16.16), -1 none
 };
 IOLock *gLock;
 uint32_t gNativeDark;   // WindowServer's requests <= 0 (dark ramps), taken and dropped
@@ -369,6 +374,13 @@ class PianoBacklight : public IOService {
   bool fNativePublished = false;
   NativeIntent fIntent;                     // 2026-11-20: the user's moves among WindowServer's stream
   uint32_t fSyncPublished = ~0u;            // 2026-11-21: fIntent's sync counters as last published (syncs + echoes + missed)
+  Lease fManaged;                           // piano-brightness-sync's lease: the stream does not end automatic mode
+  int fManagedPublished = -1;
+  int32_t fLastNative = -1;                 // the newest request seen, taken or dropped (16.16), and when
+  uint64_t fLastNativeMs = 0;
+  int32_t fRequestedPublished = -1;
+  uint64_t fRequestedPublishedMs = 0;
+  uint32_t fManagedDrops = 0, fDaemonMoves = 0;
   bool fNativeTookAuto = false;             // a move ended automatic mode (a power-on or a wake gives it back)
   uint32_t fNativeFollowed = 0, fNativeMoves = 0, fNativeDropped = 0;
   bool fReference = true;
@@ -657,7 +669,7 @@ void PianoBacklight::serve()
     gPending.percent = gPending.sleep = -1;
     if (p.automatic >= 0) gPending.automatic = -1;
     gPending.reference = -1;
-    gPending.sync = -1;
+    gPending.sync = gPending.managed = gPending.moved = -1;
     gPending.ambientFault = false;
     const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
@@ -703,6 +715,12 @@ void PianoBacklight::serve()
         note("PianoBacklightSyncV1 CoreBrightness is given requested16=%d (panel code %u, %s; %u syncs, %u echoes followed, %u missed)",
              p.sync, fCtl.code(), fCtl.autoActive() ? "automatic" : "not automatic", fIntent.syncs(), fIntent.echoes(), fIntent.missed());
     }
+    if (p.managed >= 0) fManaged.set(uint32_t(p.managed), nowMs());
+    const bool managed = fManaged.active(nowMs());
+    if (p.native >= 0) {
+      fLastNative = p.native;
+      fLastNativeMs = nowMs();
+    }
     const NativeIntent::Kind intent = p.native >= 0 ? fIntent.classify(p.native, nowMs()) : NativeIntent::kFollow;
     if (gArgs.native && fIntent.syncs() + fIntent.echoes() + fIntent.missed() != fSyncPublished) {
       fSyncPublished = fIntent.syncs() + fIntent.echoes() + fIntent.missed();
@@ -710,16 +728,30 @@ void PianoBacklight::serve()
       setProperty("piano-backlight-sync-echoes", uint64_t(fIntent.echoes()), 32);
       setProperty("piano-backlight-sync-missed", uint64_t(fIntent.missed()), 32);
     }
-    const bool autoOwns = p.native >= 0 && gArgs.autoAllowed && fCtl.ambientState().requested();
-    if (p.native >= 0 && intent == NativeIntent::kFollow && autoOwns) {
-      ++fNativeFollowed;   // CoreBrightness's own value while automatic mode owns the panel: kept as the settled value only
-      p.native = -1;
-    } else if (p.native >= 0 && intent == NativeIntent::kUserMove) {
+    const bool autoOwns = gArgs.autoAllowed && fCtl.ambientState().requested();
+    if (p.moved >= 0) {   // the user moved CoreBrightness's level (piano-brightness-sync saw DisplayNitsKey change)
+      ++fDaemonMoves;
       ++fNativeMoves;
+      // what WindowServer asked last (the level with its EDR headroom) when it is fresh, else the reported level
+      const int32_t level = fLastNative >= 0 && nowMs() - fLastNativeMs < 3000 ? fLastNative : p.moved;
       if (autoOwns) fNativeTookAuto = true;
-      if (autoOwns || fNativeMoves % 25 == 1)
-        note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark, %u from the swap): %s", p.native,
-             fNativeMoves, fNativeFollowed, gNativeDark, gSwapNits, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
+      note("PianoBacklightNativeIntentV1 a move to requested16=%d (reported by piano-brightness-sync: CoreBrightness's level %d; %u reported, "
+           "%u moves): %s", level, p.moved, fDaemonMoves, fNativeMoves, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
+      fIntent.moved(level);
+      p.native = level;
+    } else if (p.native >= 0) {
+      const StreamChoice c = streamChoice(intent, autoOwns, managed, false);
+      if (!c.apply) {
+        ++fNativeFollowed;   // CoreBrightness's own value while automatic mode owns the panel: kept as the settled value only
+        if (intent == NativeIntent::kUserMove) ++fManagedDrops;   // the restore, an EDR ramp or the user: the daemon tells them apart
+        p.native = -1;
+      } else if (intent == NativeIntent::kUserMove) {
+        ++fNativeMoves;
+        if (c.endsAuto) fNativeTookAuto = true;
+        if (c.endsAuto || fNativeMoves % 25 == 1)
+          note("PianoBacklightNativeIntentV1 a move to requested16=%d (%u moves, %u followed, %u dark, %u from the swap): %s", p.native,
+               fNativeMoves, fNativeFollowed, gNativeDark, gSwapNits, c.endsAuto ? "automatic mode ends until a display power-on or a wake" : "manual");
+      }
     }
     if (p.native >= 0) {
       uint16_t code = 0;
@@ -730,6 +762,26 @@ void PianoBacklight::serve()
         if (fRevision) fAndroidApply = {"native", fRevision, pa_sdr_millinits(uint32_t(p.native)), fNativeErrors, dbv, code};
         fCtl.manualCode(code, kNativeRequest);
       }
+    }
+    if (gArgs.native) {   // what the daemon watches: its lease and the newest request (at most every 100 ms, the last one always)
+      const int on = managed ? 1 : 0;
+      bool changed = false;
+      if (on != fManagedPublished) {
+        if (on || fManagedPublished == 1)
+          note("PianoBacklightManagedV1 %s (%u moves reported, %u stream changes left to it while automatic)",
+               on ? "piano-brightness-sync watches CoreBrightness's level: the stream no longer ends automatic mode"
+                  : "the lease ended: WindowServer's stream decides again", fDaemonMoves, fManagedDrops);
+        fManagedPublished = on;
+        setProperty(kNativeManaged, bool(on));
+        changed = true;
+      }
+      if (fLastNative != fRequestedPublished && nowMs() - fRequestedPublishedMs >= 100) {
+        fRequestedPublished = fLastNative;
+        fRequestedPublishedMs = nowMs();
+        setProperty(kNativeRequested, uint64_t(uint32_t(fLastNative)), 32);
+        changed = true;
+      }
+      if (changed) messageClients(kIOMessageServicePropertyChange);
     }
     if (p.automatic >= 0 && autoAfterNative) setAutomatic(p.automatic == 1);
     if (p.ambientFault) fCtl.invalidateAmbient(true);
@@ -1112,6 +1164,27 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
     const bool inRange = asked >= int64_t(gNativeMin) && asked <= int64_t(gNativeMax);
     if (ready && inRange) {
       gPending.sync = int32_t(asked);
+      gPending.any = true;
+      IOLockWakeup(gLock, &gPending, false);
+    }
+    IOLockUnlock(gLock);
+    return !ready ? kIOReturnNotReady : !inRange ? kIOReturnBadArgument : kIOReturnSuccess;
+  }
+  OSObject *managedObject = d->getObject(kNativeManaged), *movedObject = d->getObject(kNativeMoved);
+  if (managedObject || movedObject) {   // round 2: the daemon's lease (seconds) or the user's move it saw (16.16)
+    OSNumber *number = OSDynamicCast(OSNumber, managedObject ? managedObject : movedObject);
+    const unsigned bits = number ? number->numberOfBits() : 0;
+    const int64_t asked = !number ? -1 : bits == 32 ? int64_t(int32_t(uint32_t(number->unsigned64BitValue())))
+                                                    : int64_t(number->unsigned64BitValue());
+    if (!gArgs.native) return kIOReturnUnsupported;
+    if (d->getCount() != 1 || !number || (bits != 32 && bits != 64)) return kIOReturnBadArgument;
+    IOLockLock(gLock);
+    const bool ready = gServing && gNativeReady;
+    const bool inRange = managedObject ? asked >= 0 && asked <= int64_t(kManagedMaxS)
+                                       : asked >= int64_t(gNativeMin) && asked <= int64_t(gNativeMax);
+    if (ready && inRange) {
+      if (managedObject) gPending.managed = int32_t(asked);
+      else gPending.moved = int32_t(asked);
       gPending.any = true;
       IOLockWakeup(gLock, &gPending, false);
     }

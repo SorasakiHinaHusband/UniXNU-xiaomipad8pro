@@ -907,6 +907,52 @@ static void testNativeBrightness()
       CHECK(cold.classify(5 << 16, 50010) == NativeIntent::kFollow && cold.echoes() == 1);
       CHECK(std::strcmp(kNativeSync, "piano-backlight-sync") == 0);
     }
+    {   // round 2 (SLIDER-INIT.md): the restore and EDR ramps reach the stream like moves; with the daemon's lease they do not end
+        // automatic mode, the daemon's report does
+      auto run = [](NativeIntent &n, bool managed, const std::vector<double> &nits, uint64_t t0) {
+        bool ended = false;
+        for (size_t k = 0; k < nits.size(); ++k) {
+          const StreamChoice c = streamChoice(n.classify(int64_t(nits[k] * 65536), t0 + 17 * k), true, managed, false);
+          ended = ended || c.endsAuto;
+          if (c.apply && !c.endsAuto) return true;   // never while automatic owns the panel
+        }
+        return ended;
+      };
+      // installed 14:07: the restore 431.949 (first value), then sdr x EDR headroom 1.04185 / 1.0668
+      const std::vector<double> installed = {431.949, 450.025, 460.818};
+      // slider2: an EDR fade over the SDR level 347.65, 0.99545 per step from 417.18 (desk-login's last key level)
+      std::vector<double> fade = {417.18};
+      while (fade.back() > 347.7) fade.push_back(fade.back() * 0.99545);
+      NativeIntent a, b, c2, d;
+      a.reset(0);
+      CHECK(run(a, false, installed, 10000));    // no lease: the EDR step ends automatic mode (what the installed boot did)
+      b.reset(0);
+      CHECK(!run(b, true, installed, 10000));    // the lease: dropped, automatic mode kept
+      c2.reset(0);
+      CHECK(c2.classify(int64_t(417.18 * 65536), 100) == NativeIntent::kFollow);
+      CHECK(run(c2, false, fade, 20000));        // slider2: the fade ended automatic mode
+      d.reset(0);
+      CHECK(d.classify(int64_t(417.18 * 65536), 100) == NativeIntent::kFollow);
+      CHECK(!run(d, true, fade, 20000));
+      // the daemon's report ends automatic mode (and applies) with or without the stream's opinion; manual always applies
+      const StreamChoice r = streamChoice(NativeIntent::kFollow, true, true, true);
+      CHECK(r.apply && r.endsAuto);
+      const StreamChoice m = streamChoice(NativeIntent::kUserMove, false, true, false);
+      CHECK(m.apply && !m.endsAuto);
+      const StreamChoice f = streamChoice(NativeIntent::kFollow, true, false, false);
+      CHECK(!f.apply && !f.endsAuto);
+      d.moved(200 << 16);                        // the stream goes on from the reported level
+      CHECK(d.classify(201 << 16, 30000) == NativeIntent::kFollow);
+      Lease lease;
+      CHECK(!lease.active(0));
+      lease.set(120, 1000);
+      CHECK(lease.active(120999) && !lease.active(121000));
+      lease.set(0, 5000);
+      CHECK(!lease.active(5000));
+      lease.set(100000, 0);
+      CHECK(lease.active(kManagedMaxS * 1000 - 1) && !lease.active(kManagedMaxS * 1000));
+      CHECK(std::strcmp(kNativeManaged, "piano-backlight-managed") == 0 && std::strcmp(kNativeMoved, "piano-backlight-moved") == 0);
+    }
     CHECK(std::strcmp(kNativeOverride, "force-brightness-control") == 0);
     auto bitsOf = [](double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; };   // 2026-11-21: the swap record's double
     CHECK(nitsFixedFromDouble(bitsOf(13.3572)) == int32_t(13.3572 * 65536));

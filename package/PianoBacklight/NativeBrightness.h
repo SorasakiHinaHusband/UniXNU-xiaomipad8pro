@@ -32,6 +32,25 @@ inline bool nativeWriter(bool administrator, bool platform, const char *identity
 // DisplayNitsKey. The daemon announces each such sync first (root, this property, signed 16.16 nits); the commit that follows is
 // CoreBrightness taking the panel's own level, not the user's move.
 constexpr char kNativeSync[] = "piano-backlight-sync";
+// 2026-11-21 (SLIDER-INIT.md round 2): WindowServer's swap brightness is CoreBrightness's SDR level times the EDR headroom
+// (installed 14:07:31: sdr 431.949 x headroom 1.04185 = 450.025), and CoreBrightness's restore and EDR ramps arrive there like a
+// slider move: both runs ended automatic mode that way. While piano-brightness-sync holds this lease (root, seconds, 0 ends it), the
+// stream never ends automatic mode here; the daemon watches CoreBrightness's own SDR level (DisplayNitsKey, untouched by EDR) and
+// reports the user's move with kNativeMoved (16.16: that level). The newest request is published (kNativeRequested) so the daemon
+// wakes on every commit that reaches the panel.
+constexpr char kNativeManaged[] = "piano-backlight-managed";
+constexpr char kNativeMoved[] = "piano-backlight-moved";
+constexpr char kNativeRequested[] = "piano-backlight-native-requested";
+constexpr uint32_t kManagedMaxS = 600;
+
+class Lease {
+ public:
+  void set(uint32_t seconds, uint64_t nowMs) { until_ = seconds ? nowMs + uint64_t(seconds > kManagedMaxS ? kManagedMaxS : seconds) * 1000 : 0; }
+  bool active(uint64_t nowMs) const { return nowMs < until_; }
+
+ private:
+  uint64_t until_ = 0;
+};
 
 // 2026-11-20 (BRIGHTNESS-SLIDER.md): WindowServer sends the panel's brightness with every swap that changes it, CoreBrightness's
 // own ramps (the power-on ramp, a dim) included. A request is the user's move only when it leaves the settled value by more
@@ -81,6 +100,12 @@ class NativeIntent {
     anchor_ = fixed;
     return kUserMove;
   }
+  // piano-brightness-sync reported the user's move to this level: the stream goes on from there.
+  void moved(int64_t fixed)
+  {
+    anchor_ = fixed;
+    expect_ = -1;
+  }
   uint32_t syncs() const { return syncs_; }
   uint32_t echoes() const { return echoes_; }
   uint32_t missed() const { return missed_; }
@@ -91,6 +116,19 @@ class NativeIntent {
   uint32_t syncs_ = 0, echoes_ = 0, missed_ = 0;
   bool armed_ = false;
 };
+
+// What one request does (round 2): apply it to the panel, and whether it ends automatic mode (until a display power-on or a wake).
+// reported: piano-brightness-sync's kNativeMoved; managed: its lease holds; owns: automatic mode was requested.
+struct StreamChoice {
+  bool apply, endsAuto;
+};
+inline StreamChoice streamChoice(NativeIntent::Kind intent, bool owns, bool managed, bool reported)
+{
+  if (reported) return {true, owns};
+  if (!owns) return {true, false};                                   // manual: the stream is the level
+  if (intent == NativeIntent::kUserMove && !managed) return {true, true};   // no daemon: the stream's rule (2 % after the settle)
+  return {false, false};                                             // automatic owns the panel: dropped
+}
 
 // 2026-11-21: an IEEE-754 double (the swap record's nits) as signed 16.16 without floating point (kernel code): 0 for a negative,
 // zero, NaN or infinite value, saturated at INT32_MAX.

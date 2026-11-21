@@ -275,18 +275,32 @@ WindowServer's BrightnessControl reads our `IODisplayParameters` once, at its st
 carries a bool. So while PianoBacklight's automatic mode set the panel, the slider showed CoreBrightness's stale preference.
 On the installed boot of 11-21 11:42 that was 600 nits ("full") while the panel was at 26 nits, then at the automatic level.
 
-`piano-brightness-sync` (userland, a root LaunchDaemon) closes the loop from the panel side. It acts only while
-`piano-backlight-auto-active` and `piano-backlight-lit` are true and the panel's level (`IODisplayParameters` `BrightnessMilliNits`)
-has been unchanged for 1 s. If CoreBrightness's `DisplayNitsKey` (DisplayServicesClient) is more than 3 % and 0.2 nit away, the
-daemon first writes root's `piano-backlight-sync` (signed 16.16 nits) to PianoBacklight, then sets `DisplayNitsKey`. CoreBrightness
-converts the value with its own slider mapping, commits it once, notifies the slider and stores the preference. Syncs are at least
-2 s apart; a level CoreBrightness does not take is tried three times, then backed off for a minute. PianoBacklight's `NativeIntent`
-counts WindowServer's requests after an announcement as follows: the commit that comes back is CoreBrightness taking the panel's
-level, never the user's move. That window closes at the first request within 3 % of the announced level, or after 600 ms.
-The user's own level (a move ends automatic mode until a display power-on or a wake) and a dark panel are never touched.
+`piano-brightness-sync` (userland, a root LaunchDaemon) keeps the two in agreement.
 
-Witnesses: console `PianoBacklightSyncV1 CoreBrightness is given requested16=N (...; S syncs, E echoes followed, M missed)`; ioreg
-`piano-backlight-sync-count`, `-echoes`, `-missed`; the daemon's `/private/var/db/piano-userland/brightness-sync/status`
-(`syncs=`, `taken=`, `failed=`); `piano-brightness-sync --check` (`panel_millinits`, `corebrightness_millinits`, `in_step`).
-Host tests: `backlight_host` (`NativeIntent` with announced syncs), `make -C tooling/native/piano-brightness-sync test`
-(`SyncPolicy.h`).
+Round 2 (slider2 and the installed boot of 14:06): WindowServer's swap brightness, the value PianoBacklight sees, is CoreBrightness's
+SDR level times the EDR headroom. `commitBrightness sdr: 431.949, headroom: 1.04185` became `swap brightness: 450.025`. So
+CoreBrightness's restore at start and EDR ramps arrive in the stream like slider moves, and both runs lost automatic mode that way.
+Restores and EDR ramps leave CoreBrightness's own level (`DisplayNitsKey`) alone; only the user's moves and our syncs change it.
+So the daemon decides, and the kernel stops guessing from the stream:
+
+- The daemon holds the lease, root's `piano-backlight-managed` (120 s, renewed while corebrightnessd answers). While it holds,
+  `NativeIntent` never ends automatic mode from WindowServer's stream; without the daemon the old rule stays (2 % after the settle).
+- While automatic mode owns the lit panel (`piano-backlight-auto-requested`), a `DisplayNitsKey` change the daemon did not cause is
+  the user's move. It reports it as `piano-backlight-moved` (16.16). PianoBacklight ends automatic mode until the next display power-on
+  or wake, and applies WindowServer's newest request (the level with its headroom).
+- Once the automatic level (`IODisplayParameters` `BrightnessMilliNits`) has been unchanged for 1 s and CoreBrightness is more than
+  3 % and 0.2 nit away, the daemon announces the sync (`piano-backlight-sync`), sets `DisplayNitsKey` and reads it back. CoreBrightness
+  converts the value with its own slider mapping, commits it once, notifies the slider and stores the preference. The next restore then
+  lands on the panel's level. Syncs are at least 2 s apart; a level CoreBrightness does not take gets three tries, then a minute's
+  back-off.
+- CoreBrightness's level when the daemon first reads it (its restore) is the baseline, never a move, and so is the level after a
+  corebrightnessd restart. In manual mode and while dark the daemon only follows CoreBrightness's level.
+- The daemon wakes on PianoBacklight's property-change messages (it publishes each new request, `piano-backlight-native-requested`,
+  at most every 100 ms) and once every 30 s.
+
+Witnesses: console `PianoBacklightManagedV1 ...`, `PianoBacklightSyncV1 CoreBrightness is given requested16=N (...)`,
+`PianoBacklightNativeIntentV1 a move ... (reported by piano-brightness-sync ...)`; ioreg `piano-backlight-managed`,
+`piano-backlight-sync-count`, `-echoes`, `-missed`; the daemon's `/private/var/db/piano-userland/brightness-sync/status` (`syncs=`,
+`taken=`, `moves=`, `failed=`); `piano-brightness-sync --check` (`panel_millinits`, `corebrightness_millinits`, `managed`, `in_step`).
+Host tests: `backlight_host` (`NativeIntent` with announced syncs, the lease and `streamChoice` on both runs' streams),
+`make -C tooling/native/piano-brightness-sync test` (`SyncPolicy.h`).

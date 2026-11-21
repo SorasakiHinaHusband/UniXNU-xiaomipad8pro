@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
-// piano-brightness-sync: CoreBrightness follows PianoBacklight's automatic level, so the Control Center / menu-bar brightness
-// slider shows the panel's real brightness (2026-11-21, SLIDER-INIT.md; docs/drivers/backlight.md).
+// piano-brightness-sync: CoreBrightness and PianoBacklight's automatic mode agree on the panel's level, so the Control Center /
+// menu-bar brightness slider shows the real brightness and only the user's own moves end automatic mode (2026-11-21, SLIDER-INIT.md;
+// docs/drivers/backlight.md).
 //
-// Why: corebrightnessd takes its level from its BrightnessLevelNits preference at start (-[CBDisplayModuleSKL initialiseSDR]:
-// loadNitsFromCapabilitiesTo:, then loadNitsFromPreferencesTo:) and changes it only by its own commits; nothing on macOS 27.3 reads
-// a built-in panel's level back. PianoBacklight's automatic mode moves the panel in the kernel, so the slider showed CoreBrightness's
-// stale value (full, while the panel was at 2-26 nits) until the user touched it.
+// Why: corebrightnessd takes its level from its BrightnessLevelNits preference at start (-[CBDisplayModuleSKL initialiseSDR]) and
+// changes it only by its own commits; nothing on macOS 27.3 reads a built-in panel's level back. WindowServer's swap brightness,
+// which PianoBacklight sees, is that level times the EDR headroom, so CoreBrightness's restore and EDR ramps looked like slider moves
+// there and ended automatic mode (slider2; the installed boot of 14:06).
 //
-// What: while PianoBacklight's automatic mode owns the lit panel and its level (IODisplayParameters BrightnessMilliNits) has settled,
-// a CoreBrightness level (DisplayServicesClient DisplayNitsKey) more than 3 % away is replaced by the panel's: first announced to
-// PianoBacklight (root's "piano-backlight-sync", 16.16 nits: WindowServer's commit that follows is CoreBrightness taking the panel's
-// level, never the user's move), then set as DisplayNitsKey (CoreBrightness: getUserBrightnessForNits, updateUserBrightness:commit:
-// YES; the slider is notified and the preference stored). The user's own level (a move ends automatic mode) and a dark panel are
-// never touched. Woken by PianoBacklight's property-change messages, plus one check every 30 s; no polling loop.
+// What: the daemon holds PianoBacklight's lease (root's "piano-backlight-managed", renewed while corebrightnessd answers): the stream
+// then never ends automatic mode. It watches CoreBrightness's own level (DisplayServicesClient DisplayNitsKey: EDR leaves it alone)
+//   - a change it did not cause while automatic mode owns the panel is the user's move: "piano-backlight-moved" (16.16) ends
+//     automatic mode until the next display power-on or wake, as the slider always did;
+//   - once the automatic level has settled 1 s and CoreBrightness is more than 3 % away, it gives CoreBrightness the panel's level:
+//     announced first ("piano-backlight-sync", 16.16), then set as DisplayNitsKey (getUserBrightnessForNits, updateUserBrightness:
+//     commit:YES: the slider is notified and the preference stored, so the next restore lands on the panel's level), then read back.
+// CoreBrightness's restore at its start is the baseline, never a move. Woken by PianoBacklight's property-change messages (it publishes
+// each new request, "piano-backlight-native-requested"), plus one check every 30 s; no polling loop.
 //
-//   piano-brightness-sync --run     the LaunchDaemon (root); exits 0 at once without piano-backlight-native=1 and piano-backlight-auto=1
+//   piano-brightness-sync --run     the LaunchDaemon (root); exits 0 when PianoBacklight is not native with automatic brightness
 //   piano-brightness-sync --check   read only: the panel's level and flags, CoreBrightness's level, the decision
-// Status: /private/var/db/piano-userland/brightness-sync/status (syncs, taken, failed, the last values).
+// Status: /private/var/db/piano-userland/brightness-sync/status (syncs, taken, moves, failed, the last values).
 #import <Foundation/Foundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOMessage.h>
@@ -37,6 +41,8 @@
 - (BOOL)setProperty:(id)value withKey:(NSString *)key;
 @end
 
+enum { kLeaseS = 120, kRenewMs = 40000, kKextWaitMs = 300000, kAutoWaitMs = 15000 };
+
 static os_log_t gLog;
 static io_service_t gBacklight;
 static io_object_t gInterest;
@@ -44,8 +50,9 @@ static IONotificationPortRef gPort;
 static CFRunLoopTimerRef gTimer;
 static id<PianoDisplayServicesClient> gClient;
 static struct pbs_state gState;
-static unsigned gSyncs, gTaken, gFailed;
+static unsigned gSyncs, gTaken, gFailed, gMoves;
 static uint32_t gLastSynced;
+static uint64_t gStartMs, gMatchedMs, gLeaseMs;
 static NSString *const kStatusDir = @"/private/var/db/piano-userland/brightness-sync";
 
 static uint64_t nowMs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
@@ -65,22 +72,20 @@ static int bootArg(const char *word)
   return found;
 }
 
-/* 2026-11-21 (miplay1): the boot line is split (the line plus the ADT's /chosen tail), so kern.bootargs does not show
- * piano-backlight-native=1 / piano-backlight-auto=1 to user space and the daemon stayed inert. Ask the kext: native when it publishes
- * its native implementation, automatic-capable when it publishes piano-backlight-auto-requested; the boot arguments still count. */
-static int kextReady(void)
+static int has(io_service_t s, CFStringRef key)
 {
-  io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PianoBacklight"));
-  int ok = 0;
-  if (s) {
-    CFTypeRef a = IORegistryEntryCreateCFProperty(s, CFSTR("piano-backlight-native-implementation"), kCFAllocatorDefault, 0);
-    CFTypeRef b = IORegistryEntryCreateCFProperty(s, CFSTR("piano-backlight-auto-requested"), kCFAllocatorDefault, 0);
-    ok = a && b;
-    if (a) CFRelease(a);
-    if (b) CFRelease(b);
-    IOObjectRelease(s);
-  }
-  return ok || (bootArg("piano-backlight-native=1") && bootArg("piano-backlight-auto=1"));
+  CFTypeRef v = s ? IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0) : NULL;
+  if (v) CFRelease(v);
+  return v != NULL;
+}
+
+// 6d5c8131 (miplay1): the boot line is split (the line plus the ADT's /chosen tail), so kern.bootargs may lack piano-backlight-native/
+// auto; the kext's own properties say it: native when it publishes its native implementation, automatic-capable when it publishes
+// piano-backlight-auto-requested (from its first publication, shortly after it registers). The boot arguments still count.
+static int kextReady(io_service_t s)
+{
+  return (has(s, CFSTR("piano-backlight-native-implementation")) && has(s, CFSTR("piano-backlight-auto-requested"))) ||
+         (bootArg("piano-backlight-native=1") && bootArg("piano-backlight-auto=1"));
 }
 
 static id<PianoDisplayServicesClient> client(void)
@@ -121,12 +126,18 @@ static int flag(io_service_t s, CFStringRef key)
   return on;
 }
 
+static kern_return_t tell(NSString *key, int64_t value)
+{
+  NSDictionary *d = @{key: @(value)};
+  return IORegistryEntrySetCFProperties(gBacklight, (__bridge CFDictionaryRef)d);
+}
+
 static void writeStatus(uint32_t panel, int64_t cb, const char *result)
 {
   mkdir("/private/var/db/piano-userland", 0755);
   mkdir(kStatusDir.fileSystemRepresentation, 0755);
-  NSString *text = [NSString stringWithFormat:@"syncs=%u taken=%u failed=%u last_panel_millinits=%u last_corebrightness_millinits=%lld "
-                                               @"last_result=%s policy=sync1\n", gSyncs, gTaken, gFailed, panel, cb, result];
+  NSString *text = [NSString stringWithFormat:@"syncs=%u taken=%u moves=%u failed=%u last_panel_millinits=%u last_corebrightness_millinits=%lld "
+                                               @"last_result=%s policy=sync2\n", gSyncs, gTaken, gMoves, gFailed, panel, cb, result];
   [text writeToFile:[kStatusDir stringByAppendingPathComponent:@"status"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 }
 
@@ -138,27 +149,56 @@ static void arm(double seconds)
 
 static void evaluate(void)
 {
-  if (!gBacklight) return;
+  if (!gBacklight) {
+    if (nowMs() - gStartMs > kKextWaitMs) {
+      os_log(gLog, "inert: no PianoBacklight within %u s", kKextWaitMs / 1000);
+      exit(0);
+    }
+    return;
+  }
+  if (!kextReady(gBacklight)) {   // its first publication comes shortly after it registers
+    if (nowMs() - gMatchedMs > kAutoWaitMs) {
+      os_log(gLog, "inert: PianoBacklight is not native with automatic brightness");
+      exit(0);
+    }
+    arm(1.0);
+    return;
+  }
   const uint32_t panel = panelMilliNits(gBacklight);
-  const int automatic = flag(gBacklight, CFSTR("piano-backlight-auto-active")), lit = flag(gBacklight, CFSTR("piano-backlight-lit"));
-  const int64_t cb = automatic && lit ? coreBrightness() : -1;
+  const int owned = flag(gBacklight, CFSTR("piano-backlight-auto-requested"));
+  const int active = flag(gBacklight, CFSTR("piano-backlight-auto-active")), lit = flag(gBacklight, CFSTR("piano-backlight-lit"));
+  const int64_t cb = coreBrightness();
+  if (cb >= 0 && (!gLeaseMs || nowMs() - gLeaseMs >= kRenewMs)) {   // the lease only while CoreBrightness can be watched
+    const kern_return_t r = tell(@"piano-backlight-managed", kLeaseS);
+    if (!gLeaseMs || r != KERN_SUCCESS) os_log(gLog, "lease %u s: %#x", kLeaseS, r);
+    gLeaseMs = r == KERN_SUCCESS ? nowMs() : 0;
+  }
   if (gLastSynced && cb >= 0 && pbs_matches((uint32_t)cb, gLastSynced)) {   // the last sync was taken
     ++gTaken;
-    os_log(gLog, "CoreBrightness took %.3f nits (%u syncs, %u taken)", gLastSynced / 1000.0, gSyncs, gTaken);
+    if (gTaken <= 8 || gTaken % 25 == 0) os_log(gLog, "CoreBrightness took %.3f nits (%u syncs, %u taken)", gLastSynced / 1000.0, gSyncs, gTaken);
     writeStatus(panel, cb, "taken");
     gLastSynced = 0;
   }
-  const enum pbs_action action = pbs_decide(&gState, nowMs(), panel, automatic, lit, cb);
-  if (action == PBS_SYNC) {
+  const enum pbs_action action = pbs_decide(&gState, nowMs(), panel, owned, active, lit, cb);
+  if (action == PBS_MOVED) {
+    ++gMoves;
+    const kern_return_t told = tell(@"piano-backlight-moved", pbs_fixed((uint32_t)cb));
+    os_log(gLog, "move %u: the user set CoreBrightness to %.3f nits while automatic mode owned the panel (%.3f): reported %#x", gMoves,
+           cb / 1000.0, panel / 1000.0, told);
+    if (told != KERN_SUCCESS) ++gFailed;
+    writeStatus(panel, cb, told == KERN_SUCCESS ? "moved" : "move-refused");
+    arm(1.0);
+  } else if (action == PBS_SYNC) {
     ++gSyncs;
-    NSDictionary *announce = @{@"piano-backlight-sync": @(pbs_fixed(panel))};
-    const kern_return_t told = IORegistryEntrySetCFProperties(gBacklight, (__bridge CFDictionaryRef)announce);
+    const kern_return_t told = tell(@"piano-backlight-sync", pbs_fixed(panel));
     const BOOL set = told == KERN_SUCCESS && [client() setProperty:@((float)(panel / 1000.0)) withKey:@"DisplayNitsKey"];
+    const int64_t after = set ? coreBrightness() : -1;
+    pbs_synced(&gState, after >= 0 ? after : set ? -1 : cb);   // a refused set leaves CoreBrightness where it was
     if (set) gLastSynced = panel; else ++gFailed;
     if (gSyncs <= 8 || gSyncs % 25 == 0 || !set)
-      os_log(gLog, "sync %u: CoreBrightness %.3f -> the panel's %.3f nits (automatic): announce %#x, set %d", gSyncs, cb / 1000.0,
-             panel / 1000.0, told, set);
-    writeStatus(panel, cb, set ? "set" : told != KERN_SUCCESS ? "announce-refused" : "set-refused");
+      os_log(gLog, "sync %u: CoreBrightness %.3f -> the panel's %.3f nits (automatic): announce %#x, set %d, now %.3f", gSyncs, cb / 1000.0,
+             panel / 1000.0, told, set, after / 1000.0);
+    writeStatus(panel, after >= 0 ? after : cb, set ? "set" : told != KERN_SUCCESS ? "announce-refused" : "set-refused");
     arm(1.5);
   } else if (action == PBS_WAIT) {
     arm(1.0);
@@ -170,7 +210,7 @@ static void interest(void *refcon, io_service_t service, natural_t type, void *a
   (void)refcon;
   (void)service;
   (void)argument;
-  if (type == kIOMessageServicePropertyChange) arm(PBS_SETTLE_MS / 1000.0 + 0.1);
+  if (type == kIOMessageServicePropertyChange) arm(0.1);   // a new request (maybe the user's) or a new automatic level
 }
 
 static void matched(void *refcon, io_iterator_t it)
@@ -182,10 +222,11 @@ static void matched(void *refcon, io_iterator_t it)
       continue;
     }
     gBacklight = s;
+    gMatchedMs = nowMs();
     const kern_return_t r = IOServiceAddInterestNotification(gPort, s, kIOGeneralInterest, interest, NULL, &gInterest);
-    os_log(gLog, "PianoBacklight found (interest %#x): CoreBrightness follows its automatic level", r);
+    os_log(gLog, "PianoBacklight found (interest %#x): CoreBrightness and automatic mode are kept in agreement", r);
     writeStatus(panelMilliNits(s), -1, "started");
-    arm(2.0);
+    arm(1.0);
   }
 }
 
@@ -197,14 +238,18 @@ static int check(void)
     return 69;
   }
   const uint32_t panel = panelMilliNits(s);
-  const int automatic = flag(s, CFSTR("piano-backlight-auto-active")), lit = flag(s, CFSTR("piano-backlight-lit"));
+  const int owned = flag(s, CFSTR("piano-backlight-auto-requested"));
+  const int active = flag(s, CFSTR("piano-backlight-auto-active")), lit = flag(s, CFSTR("piano-backlight-lit"));
   const int64_t cb = coreBrightness();
-  printf("boot_args=%s\npanel_millinits=%u\nautomatic=%s\nlit=%s\ncorebrightness_millinits=%lld\nin_step=%s\n",
-         kextReady() ? "yes" : "no", panel, automatic ? "yes" : "no",
-         lit ? "yes" : "no", cb, cb >= 0 && panel && pbs_matches((uint32_t)cb, panel) ? "yes" : "no");
-  struct pbs_state probe = {.level = panel, .level_since = 0};
-  const enum pbs_action a = pbs_decide(&probe, PBS_SETTLE_MS, panel, automatic, lit, cb);
-  printf("decision=%s\n", a == PBS_SYNC ? "sync" : a == PBS_WAIT ? "wait" : "idle");
+  printf("boot_args=%s\npanel_millinits=%u\nautomatic=%s\nrequested=%s\nmanaged=%s\nlit=%s\ncorebrightness_millinits=%lld\nin_step=%s\n",
+         kextReady(s) ? "yes" : "no", panel, active ? "yes" : "no", owned ? "yes" : "no",
+         flag(s, CFSTR("piano-backlight-managed")) ? "yes" : "no", lit ? "yes" : "no", cb,
+         cb >= 0 && panel && pbs_matches((uint32_t)cb, panel) ? "yes" : "no");
+  struct pbs_state probe;
+  pbs_init(&probe);
+  probe.level = panel;
+  const enum pbs_action a = pbs_decide(&probe, PBS_SETTLE_MS, panel, owned, active, lit, cb);
+  printf("decision=%s\n", a == PBS_SYNC ? "sync" : a == PBS_WAIT ? "wait" : a == PBS_MOVED ? "moved" : "idle");
   IOObjectRelease(s);
   return 0;
 }
@@ -218,14 +263,12 @@ int main(int argc, const char **argv)
       fprintf(stderr, "usage: piano-brightness-sync --run | --check\n");
       return 64;
     }
-    if (!kextReady()) {
-      os_log(gLog, "inert: PianoBacklight is not native with automatic brightness");
-      return 0;
-    }
     if (geteuid()) {
-      fprintf(stderr, "piano-brightness-sync --run: root only (piano-backlight-sync)\n");
+      fprintf(stderr, "piano-brightness-sync --run: root only (piano-backlight-managed, -moved, -sync)\n");
       return 77;
     }
+    pbs_init(&gState);
+    gStartMs = nowMs();
     gPort = IONotificationPortCreate(kIOMainPortDefault);
     io_iterator_t it = IO_OBJECT_NULL;
     if (!gPort || IOServiceAddMatchingNotification(gPort, kIOFirstMatchNotification, IOServiceMatching("PianoBacklight"), matched,

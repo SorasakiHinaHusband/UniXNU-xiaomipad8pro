@@ -305,7 +305,7 @@ mode = "0644"
 
 [[unit]]
 name = "piano-brightness-sync"
-about = "CoreBrightness follows PianoBacklight's automatic level (the Control Center slider shows the panel's real brightness): announces each sync to the kext (piano-backlight-sync), then sets DisplayNitsKey; never touches the user's level; inert without piano-backlight-native=1 and piano-backlight-auto=1"
+about = "CoreBrightness and PianoBacklight's automatic mode agree (the Control Center slider shows the panel's real brightness): holds the kext's lease, reports the user's moves seen in CoreBrightness's level, syncs CoreBrightness to the settled automatic level; inert unless PianoBacklight is native with automatic brightness"
 default_on = true
 
 [[unit.file]]
