@@ -81,13 +81,13 @@ IOLock *gCleanLock = nullptr;
 struct CleanBandWork {
   const uint8_t *p;
   size_t n;
-  volatile unsigned *pending;
+  unsigned *pending;   // under gCleanLock
 };
 void cleanBandMain(void *arg, wait_result_t)
 {
   CleanBandWork *w = static_cast<CleanBandWork *>(arg);
   cleanRange(w->p, w->n);
-  volatile unsigned *pending = w->pending;   // w lives on the waiting thread's stack: not touched after the count
+  unsigned *pending = w->pending;   // w lives on the waiting thread's stack: not touched after the count
   IOLockLock(gCleanLock);
   --*pending;
   IOLockWakeup(gCleanLock, (event_t)pending, false);
@@ -109,7 +109,7 @@ void cleanSplit(const uint8_t *p, size_t n, unsigned threads)
   const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t(line) - 1);
   const uint64_t bytes = reinterpret_cast<uintptr_t>(p) + n - start;
   CleanBandWork work[kMaxCleanThreads];
-  volatile unsigned pending = 0;
+  unsigned pending = 0;   // under gCleanLock
   for (unsigned i = 1; i < threads; ++i) {
     const Band b = cleanBand(bytes, i, threads, line);
     work[i] = CleanBandWork{reinterpret_cast<const uint8_t *>(start + b.begin), size_t(b.end - b.begin), &pending};
