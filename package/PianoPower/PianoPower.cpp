@@ -1609,6 +1609,7 @@ void PianoPower::startCharger()
   piano_mca_allow_board(&fMca, gArgs.board != 0);
   piano_contract_init(&fContract);
   piano_contract_allow_firmware_pdos(&fContract, fPolicyOn && gArgs.ucsi && gArgs.pdoMca);
+  piano_mca_clamp_pdos(&fMca, fPolicyOn && gArgs.ucsi && gArgs.pdoMca);
   piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0 && !fPolicyOn);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   if (fPolicyOn) {

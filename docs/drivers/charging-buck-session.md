@@ -116,7 +116,9 @@ gets a second, agreeing status read and the list is re-encoded as standard
 source PDO words in object order (fixed: 50 mV / 10 mA; PPS: 100 mV / 50 mA,
 rounded inward). The list must start with vSafe5V, keep fixed objects strictly
 ascending and before any APDO, and stay within 5 A / 21 V; anything else is
-rejected. RDO, PD opmode, sink and connection still come from UCSI alone, and
+rejected. With the option the codec also keeps a list whose object exceeds 5 A within its PD
+field (a 67 W 3.3-11 V 6.1 A APDO) and reads that object as 5 A; today one such object
+discards the whole list. RDO, PD opmode, sink and connection still come from UCSI alone, and
 the RDO must fit its object. A connection or opmode change drops the offer;
 two cycles without a ready list withdraw it. A PPM that does offer PDO details
 keeps its own list. All later gates (transition barrier, 15 s wait, VBUS

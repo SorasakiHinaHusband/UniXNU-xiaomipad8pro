@@ -303,7 +303,50 @@ static void sessionBoundaries() {
   CHECK(!o.contract.offer_n && !o.contract.offers);
 }
 
+// The codec's read of 0x21011 itself: one whole cycle against a firmware that answers every request.
+static bool codecCycle(PianoMca &m, const uint32_t list[][3], unsigned n, int32_t pdState) {
+  piano_mca_refresh(&m);
+  for (unsigned guard = 0; guard < 400; ++guard) {
+    uint8_t req[PIANO_MCA_REQUEST_BYTES] = {}, resp[PIANO_MCA_RESPONSE_BYTES] = {};
+    if (!piano_mca_next(&m, req)) return false;
+    for (unsigned i = 0; i < 12; ++i) resp[i] = req[i];
+    const uint32_t property = piano_contract_u32(req + 12), seq = piano_contract_u32(req + 16);
+    piano_contract_put32(resp + 12, property); piano_contract_put32(resp + 20, seq);
+    if (piano_contract_u32(req + 8) == PIANO_MCA_OP_READ) {
+      if (property == PIANO_MCA_PDOS)
+        for (unsigned i = 0; i < n; ++i) for (unsigned k = 0; k < 3; ++k) piano_contract_put32(resp + 24 + 12 * i + 4 * k, list[i][k]);
+      else if (property == PIANO_MCA_PD_STATE) piano_contract_put32(resp + 24, uint32_t(pdState));
+      else if (property == PIANO_MCA_BUS_VOLTAGE) piano_contract_put32(resp + 24, 5000000);
+      else if (property == PIANO_MCA_REAL_TYPE) piano_contract_put32(resp + 24, PIANO_MCA_TYPE_PD);
+    }
+    if (piano_mca_receive(&m, resp, sizeof resp) == McaCycleDone) return true;
+  }
+  return false;
+}
+
+static void codecList() {
+  const uint32_t xiaomi[3][3] = {{5000, 5000, 3000}, {9000, 9000, 3000}, {3300, 11000, 6100}};
+  const uint32_t garbage[2][3] = {{5000, 5000, 3000}, {3300, 11000, 7000}};
+  for (int clamp = 0; clamp < 2; ++clamp) {
+    PianoMca m{};
+    piano_mca_init(&m, 1, 1); piano_mca_use_external_policy(&m, 1, 1, 0); piano_mca_allow_board(&m, 0);
+    piano_mca_clamp_pdos(&m, clamp); piano_mca_link(&m, 1);
+    CHECK(codecCycle(m, xiaomi, 3, 2));
+    CHECK(piano_mca_has(&m, McaPdState) && m.value[McaPdState] == 2);
+    if (!clamp) CHECK(!piano_mca_has(&m, McaPdos) && !m.pdos);   // today: one 6.1 A object discards the whole list
+    else {
+      CHECK(piano_mca_has(&m, McaPdos) && m.pdos == 3 && m.pdo[2][0] == 3300 && m.pdo[2][1] == 11000 && m.pdo[2][2] == 5000);
+      PianoChargeContract c{}; piano_contract_init(&c); piano_contract_allow_firmware_pdos(&c, 1);
+      piano_contract_offer_pdos(&c, m.pdo, m.pdos, 1);
+      CHECK(c.offer_n == 3 && c.offer_pdo[2][2] == 5000 && !c.offer_rejects);
+    }
+    CHECK(codecCycle(m, garbage, 2, 2));
+    CHECK(!piano_mca_has(&m, McaPdos) && !m.pdos);   // beyond any PD current field: still not a list
+  }
+}
+
 int main() {
+  codecList();
   baselineWithoutFallback();
   fixedNineThenPps();
   fiveVoltContract();

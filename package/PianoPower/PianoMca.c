@@ -232,6 +232,7 @@ void piano_mca_ucsi_timeout(PianoMca *m)
 }
 
 void piano_mca_allow_ucsi(PianoMca *m, int allow) {m->ucsi_allowed = allow != 0;}
+void piano_mca_clamp_pdos(PianoMca *m, int on) {m->pdo_clamp = on != 0;}
 
 /* ---- the policy ---- */
 uint32_t piano_mca_icl_for(int type, uint32_t pdo5v_ma)
@@ -604,8 +605,11 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         m->pdos = 0;
         int good = have >= 7 * 12;
         for (unsigned i = 0; good && i < 7; ++i) {
-            const uint32_t lo = le32(payload + 12 * i), hi = le32(payload + 12 * i + 4), ma = le32(payload + 12 * i + 8);
+            const uint32_t lo = le32(payload + 12 * i), hi = le32(payload + 12 * i + 4);
+            uint32_t ma = le32(payload + 12 * i + 8);
             if (!lo && !hi && !ma) break;
+            /* a 67 W PPS object (e.g. 3.3-11 V 6.1 A) is still the source's list: at most 5 A of it is ever used */
+            if (m->pdo_clamp && ma > 5000 && ma <= (lo == hi ? 10230u : 6350u)) ma = 5000;
             if (lo < 3300 || hi < lo || hi > 21000 || !ma || ma > 5000) {good = 0; break;}
             m->pdo[m->pdos][0] = lo; m->pdo[m->pdos][1] = hi; m->pdo[m->pdos][2] = ma;
             m->pdos++;

@@ -156,6 +156,7 @@ typedef struct {
     /* the last 0x800a answer that matched nothing (McaIgnored): opcode, property, sequence, and the sequence then in flight */
     uint32_t ignored_answers, ignored_opcode, ignored_property, ignored_seq, ignored_retcode, ignored_in_flight;
     uint8_t unsuspend_allowed, unsuspend_tries;
+    uint8_t pdo_clamp;               /* piano-power-pdo-mca: a source object above 5 A (within its PD field) reads as 5 A */
     uint8_t board_allowed, board_done, board_tries;   /* the board configuration: bit 0 CP state, 1 OTG, 2 CID */
     uint8_t icl_tries, fcc_tries, enable_tries;
     uint32_t icl_want, fcc_want;     /* what the last cycle wanted (tries restart when it changes) */
@@ -190,6 +191,9 @@ uint32_t piano_mca_pan_next(PianoMca *m, uint8_t out[PIANO_MCA_PAN_REQUEST_BYTES
 uint32_t piano_mca_ucsi_next(PianoMca *m, uint8_t out[PIANO_MCA_UCSI_REQUEST_BYTES]);
 void piano_mca_ucsi_timeout(PianoMca *m);
 void piano_mca_allow_ucsi(PianoMca *m, int allow);
+/* The source list (0x21011) as the PD source contract's firmware list (piano-power-pdo-mca): an object's current above 5 A but
+ * within its PD field (fixed 10.23 A, PPS 6.35 A) is taken as 5 A instead of discarding the whole list; nothing else changes. */
+void piano_mca_clamp_pdos(PianoMca *m, int on);
 /* A message from the channel (any of the three owners); returns a Mca* result. */
 int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length);
 /* The owner's timer gave up on the request (or the port request) in flight. */
