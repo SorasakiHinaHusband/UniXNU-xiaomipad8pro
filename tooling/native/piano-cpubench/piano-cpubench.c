@@ -8,7 +8,7 @@
 //   burst    the UI-like case: N times (sleep GAP ms, then a fixed small job of SCALE x 4 M steps), each job's latency; a slow ramp of
 //            the clock shows here first (p50/p90/max)
 //   launch APP  open -a APP and the time until a window of APP (layer 0, > 50 x 50) is on screen (CGWindowList; no AppleEvents,
-//            no TCC), then (--kill) SIGTERM to that app
+//            no TCC), then (--close) SIGTERM to that app
 // Lines: "CPUBENCH test=NAME ms=N ..." per test, "CPUBENCH_BURST ...", "CPUBENCH_LAUNCH app=... ms=...", "CPUBENCH_END rc=N".
 // Build (mini): clang -O2 -arch arm64 -mmacosx-version-min=14.0 -framework CoreFoundation -framework CoreGraphics -o piano-cpubench
 // piano-cpubench.c (the linker signs it ad hoc).
@@ -194,12 +194,12 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[i], "--qos") && i + 1 < argc) q = argv[++i];
     else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) timeoutMs = atof(argv[++i]);
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--kill")) kill_ = 1;
+    else if (!strcmp(argv[i], "--close")) kill_ = 1;
     else if (!app && argv[i][0] != '-') app = argv[i];
   }
   if (scale <= 0 || scale > 100 || n < 1 || n > 1000 || reps < 1 || reps > 20) {
     fprintf(stderr, "usage: piano-cpubench all|st-int|st-fp|mt-int|burst|launch APP [--scale S] [--n N] [--gap-ms MS] [--qos ui|default|bg] "
-                    "[--reps R] [--kill]\n");
+                    "[--reps R] [--close]\n");
     return 64;
   }
   qos(q);
