@@ -1341,6 +1341,10 @@ static void testCadence()
   r.f.cadenceReport(true);
   CHECK(r.hw.said("cadence 1:") || r.hw.said("cadence 2:"));
   CHECK(r.hw.said("p50 8500 "));
+  CHECK(r.hw.said(" cpu: clean p50 ") && r.hw.said("; arrive p50 "));
+  // each line well under the console's 256-byte line ("PianoDpu: " + the note), the run of gpu-hz120-1 lost the tail of a longer one
+  for (const std::string &n : r.hw.notes)
+    if (n.find("cadence ") != std::string::npos) CHECK(n.size() + 10 < 240);
   for (int i = 0; i < 60; ++i) {
     r.hw.advance(10000);
     PianoDpuFlipRequest q = req(i & 1 ? &b : &a);
