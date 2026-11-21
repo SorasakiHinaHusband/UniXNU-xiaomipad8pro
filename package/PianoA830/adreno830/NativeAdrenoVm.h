@@ -38,8 +38,12 @@ enum : size_t {NativeAdrenoVmRenderReserveObjects=8192,NativeAdrenoVmRenderReser
 #ifdef ADRENO830_MACOS
 /* UniXNU-piano (2026-11-12): the table's range capacity, twice upstream's 262144: 2 GiB of BOs even when every page is its own span. The
  * first macOS desktop (run attend4: 24 Metal clients, 701 MiB of own BOs past a 1024 MiB pool, the render server's surfaces imported)
- * ran out of ranges: WindowServer's BoMap answered NoResources, WindowServer aborted. 20 MiB of records, allocated once at attach. */
-enum : size_t {NativeAdrenoVmMaxSpans=524288};
+ * ran out of ranges: WindowServer's BoMap answered NoResources, WindowServer aborted. 20 MiB of records, allocated once at attach.
+ * 2026-11-22 (gpu/table1, GPU-DAILY.md "gpu-daily3 result"): 1048576, 4 GiB of scattered pages: a 45 min heavy session filled the
+ * 524288 (3.0 GB mapped, 1.8 GB of it outside the 1024 MiB pool at one 4 KiB range per page), every map was refused and WindowServer
+ * died at a display wake. 40 MiB of records (40-byte ArmSmmu4KRange), one IONewData at attach; NativeAdrenoGpuContext falls back to
+ * NativeAdrenoVmFallbackSpans when that allocation fails, so a short kernel data range never costs the GPU. */
+enum : size_t {NativeAdrenoVmMaxSpans=1048576,NativeAdrenoVmFallbackSpans=524288};
 /* Why a map was refused (NativeAdrenoVm::lastRefusal, NativeAdrenoUserClient::lastMapRefusal): the code and up to three figures, named
  * per code where it is set; memory is the object the refusal was about (a caller checks it is its own). */
 enum NativeAdrenoVmWhy : uint8_t {

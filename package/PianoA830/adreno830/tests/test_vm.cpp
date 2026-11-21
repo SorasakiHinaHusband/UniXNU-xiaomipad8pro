@@ -748,7 +748,11 @@ int main()
         CHECK(exposed(t,NativeAdrenoVmMaxSpans)==kIOReturnSuccess && t.vm.spanCapacity()==NativeAdrenoVmMaxSpans &&
               t.vm.freeSpans()==NativeAdrenoVmMaxSpans);
         release(t);
-        refusalChecks+=2;
+        /* gpu/table1: the fallback capacity NativeAdrenoGpuContext asks when the full table's records are not found */
+        Fixture u;
+        CHECK(exposed(u,NativeAdrenoVmFallbackSpans)==kIOReturnSuccess && u.vm.spanCapacity()==NativeAdrenoVmFallbackSpans);
+        release(u);
+        refusalChecks+=3;
     }
 #endif
     transactions();
@@ -772,7 +776,7 @@ int main()
     const unsigned threaded=concurrent();
 #ifdef ADRENO830_MACOS
     std::printf("PASS: VM refusal reasons (UniXNU-piano): %u checks (the aperture, the request, a reserved window, an overlap, table ranges "
-        "told apart from records, the render server's reserves; 524288 ranges taken, not one more)\n",refusalChecks);
+        "told apart from records, the render server's reserves; 1048576 ranges taken, not one more)\n",refusalChecks);
 #endif
     std::printf("PASS: VM over the A830 programmer: attach proves regions and routes once, %u map/unmap rounds under pending faults "
         "never poison, per-buffer fence unmap, 64-bit TLBIVAL, 4 GiB (2053), 2 GiB (1027) and 16 GiB (8209, BOs across and past 4 GiB) apertures with reserved windows, "

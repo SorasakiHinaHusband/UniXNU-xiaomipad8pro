@@ -123,7 +123,7 @@ IOReturn NativeAdrenoVm::attachCommon(const ArmSmmu4KIo *io,ArmSmmu4KContextConf
     if(attached_ || ranges_ || poisoned_)return kIOReturnBusy;
     if(!io || !io->read32 || !io->write32 || !io->write64 || !io->barrier || !context || (!lower && !upper) || !capacity ||
 #ifdef ADRENO830_MACOS
-        capacity>NativeAdrenoVmMaxSpans ||   /* UniXNU-piano: 524288 */
+        capacity>NativeAdrenoVmMaxSpans ||   /* UniXNU-piano: 1048576 (gpu/table1) */
 #else
         capacity>262144 ||
 #endif

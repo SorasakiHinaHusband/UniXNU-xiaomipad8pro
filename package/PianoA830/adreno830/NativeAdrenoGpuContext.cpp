@@ -99,8 +99,10 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
          * was already refusing mappings at 12 clients (vmr 37, records or ranges: the line did not tell them apart then), with 98304 spans
          * left past the render server's reserve. */
 #ifdef ADRENO830_MACOS
-        /* UniXNU-piano: 524288 (NativeAdrenoVmMaxSpans): the first macOS desktop ran out of the 262144. */
+        /* UniXNU-piano: NativeAdrenoVmMaxSpans (1048576; 524288 until gpu/table1): the first macOS desktop ran out of the 262144, a long
+         * heavy session out of the 524288. Its 40 MiB of records not found: the 20 MiB table as before (the va/map line shows which). */
         status=vm_.attach(smmu_.binding(),&lower,nullptr,NativeAdrenoVmMaxSpans,262144);
+        if(status==kIOReturnNoMemory)status=vm_.attach(smmu_.binding(),&lower,nullptr,NativeAdrenoVmFallbackSpans,262144);
 #else
         status=vm_.attach(smmu_.binding(),&lower,nullptr,262144,262144);
 #endif
