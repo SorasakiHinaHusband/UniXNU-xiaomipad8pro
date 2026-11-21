@@ -209,6 +209,7 @@ implement the cover-open-only and keyboard-only-when-open rules.
 | `piano-policy=N` | 0 | 0 inert (no probe); 1 decisions logged, nothing sent; 2 act |
 | `piano-policy-lid=1` | 0 | act on the cover (clamshell, clamshell sleep, AC adaptor); only after the hall polarity is verified, and with `piano-keyboard-lid=0` |
 | `piano-policy-profile=0` | 1 | no PianoThermal profile, no GPU ceiling |
+| `piano-policy-profile=2` | 1 | Low Power Mode is the only switch (2026-11-22): on = Power Saver (PianoThermal profile 1, the GPU ceiling), off = Balanced (profile 2) on battery too, no GPU ceiling |
 | `piano-policy-gpu-mhz=M` | 342 | Power Saver's GPU ceiling (160..1100; 0 none); sent only when `piano-gpu-dcvs-max` (above M) or `piano-gpu-maxlevel` is given |
 | `piano-policy-powerkey=0` | 1 | the power key stays macOS's |
 | `piano-policy-kbd=0` | 1 | no display wake by gpio95 |

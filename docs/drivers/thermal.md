@@ -748,3 +748,36 @@ Failure meanings:
    deep state depends on the PDC (not programmed here) and the sleep driver.
 7. Not done: per-crossing windows (Linux's set_trips moves the window to the next trip; here the window is fixed and only the masks
    change), the critical interrupt, and an interrupt-driven near-trip tier (the 10 ms polls above 95 C stay).
+
+## 14. The stock-level CPU policy: `machdep.piano_cpufreq_perf` (2026-11-22)
+
+The owner's priority of 2026-11-21 (performance first: CPU clocks and DVFS behaviour at the stock Android levels, under the same
+thermal limits) and of 2026-11-22 (macOS Low Power Mode is the one performance switch). `Perf.h` (portable, host-tested in
+`thermal_host` testPerf), selected at run time by the root sysctl `machdep.piano_cpufreq_perf` (boot default `piano-cpufreq-perf`,
+0), only with `piano-cpufreq=3`:
+
+| policy | power caps | hard cap | skin step table | burst | load decisions |
+|---|---|---|---|---|---|
+| 0 (before) | by the measured power source | `piano-cpufreq-legacy-cap0/1` (2400 / 2438: the v13.1x line's cap0/1) | none | none | 100 ms, 3 ticks down |
+| 1 (stock-level) | by PianoPolicy's profile whatever the source (Balanced / Power Saver) | `piano-cpufreq-cap0/1` when given | on (`piano-cpufreq-skin`) | to 2745 / 4089 MHz (`-burst0/1`) | `machdep.piano_cpufreq_perf_tick_ms` (20), downs held `piano-cpufreq-perf-down-ms` (100) |
+| 2 (beyond stock) | as 1 | as 1 | off (the sustained 3532.8 / 4089.6 ceilings) | to 3532 / 4320 MHz (`-burst-max0/1`), over sustained only while open | as 1 |
+
+- **Virtual skin**: the stock thermal daemon's sensor from the board thermistors of §12 (batt 500, quiet 131, charger -9, wifi 89,
+  msm 232 per mille of 1000, + 1.6 C); a missing input scales the present ones up to the full weight; valid only with the battery
+  and one skin thermistor. Readings are the ADC's last round (`piano-thermal-adc-s`, 30 s).
+- **Skin step table** (the stock normal scene): cpu0-5 2745.6 MHz from 15 C, 2400 at 37 C, 1996.8 at 39, 1555.2 at 41-44,
+  1363.2 at 45, 960 at 46, 748.8 at 48; cpu6-7 3072 from 15 C, 2649.6 at 34, 1958.4 at 37-39, 1689.6 at 39.5, 1401.6 at 40,
+  1017.6 at 44; each step leaves only under its own clear point. No reading = the first step, never "no cap".
+- **Burst**: macOS gives the kernel no launch/animation hint, so a burst opens at a load onset (the governor wanted more than its
+  ceiling on this decision and not on the one before), lasts at most `piano-cpufreq-burst-ms` (1500), the next one needs a new onset
+  and `piano-cpufreq-burst-gap-ms` (500); none from the skin boost limit (`piano-cpufreq-skin-boost-limit`, 48 C) and none on Power
+  Saver. A sustained load stays on the table's cap.
+- The thermal limit (§8 item 8: 90 C ceiling, 10 ms steps) stays on top in every policy. The sensors are still read every 100 ms
+  outside the fast tier when the decisions run every 20 ms.
+- A level above sustained refused by the firmware (policy 2) turns that off for the boot without counting toward the 20 refusals.
+- Lines: `cpufreq: perf policy (machdep.piano_cpufreq_perf, now N): ...` at start, `[Ns] cpufreq: perf policy N (...)` per change,
+  `[Ns] perf: policy N (...), tick N ms, ...; skin NN.N C (batt .. quiet .. charger .. wifi .. msm ..); c0 step i cap N MHz, perf cap
+  N MHz, N bursts N ms; c1 ...` every 30 s. `machdep.piano_cpufreq_state` (read only): the mode, the tick, the skin and per cluster
+  the level, ceiling, perf cap, step, bursts and the residency per level since boot (ms), for before/after windows from user space.
+- PianoPolicy `piano-policy-profile=2` (docs/policy.md): Low Power Mode on = Power Saver (profile 1, the GPU ceiling), off =
+  Balanced (profile 2) whatever the power source.
