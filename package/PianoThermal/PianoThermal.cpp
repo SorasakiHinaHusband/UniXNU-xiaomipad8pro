@@ -866,7 +866,7 @@ class PianoThermal : public IOService {
   // event last handed to the GPU, the time of the last poll (boosted ms), the GPU boost's end (for a cancel under Power Saver)
   bool boostOn_[kDomains] = {};
   perf::BoostKind boostKind_ = perf::BoostKind::none;
-  uint64_t gpuLaunchSeen_ = 0, gpuInputAt_ = 0, gpuUntilNs_ = 0, boostTickNs_ = 0, boostNs_[3] = {};
+  uint64_t gpuLaunchSeen_ = 0, gpuInputAt_ = 0, boostTickNs_ = 0, boostNs_[3] = {};
  public:
   void kick();
  private:
@@ -1726,11 +1726,9 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     if (bk == perf::BoostKind::launch && launchNs != gpuLaunchSeen_ && gArgs.gpuLaunchMhz) {
       gpuLaunchSeen_ = launchNs;
       gpuBoost(gArgs.gpuLaunchMhz, gArgs.launchMs, 1);
-      gpuUntilNs_ = now + uint64_t(gArgs.launchMs) * 1000000ull;
     } else if (bk == perf::BoostKind::input && gArgs.gpuInputMhz && now - gpuInputAt_ >= 250000000ull) {
       gpuInputAt_ = now;
       gpuBoost(gArgs.gpuInputMhz, gArgs.inputMs, 2);
-      gpuUntilNs_ = now + uint64_t(gArgs.inputMs) * 1000000ull;
     }
     // No cancel: PianoA830's ceilings (Power Saver's 342 MHz slot, its thermal guard) always win over a boost floor, and its
     // param1 0 means "the input boost", not "stop" (gpu/boost342's PianoGpuBoost.h).
