@@ -133,6 +133,7 @@ static uint32_t g_spk_bytes, g_re25_bytes = 16, g_re25_q12[4] = {27000, 27500, 2
 static int g_spk, g_spk_files, g_live_header_bad;
 static uint32_t g_battery_uv = 4012000;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
+static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
 
 static void violate(const char *what)
 {
@@ -647,7 +648,6 @@ static void device(int out, int in)
 }
 
 // ---------------------------------------------------------------------------------------------------- the runs
-static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
 static int g_age_old;              // duplex-age1: the old unsigned sound-age test (A/B control)
 struct Scenario {
     uint32_t level;
