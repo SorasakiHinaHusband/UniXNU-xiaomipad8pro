@@ -37,6 +37,7 @@
 #include <stdio.h>
 #endif
 #include "DpuSmmu.h"
+#include "DpuCadence.h"
 #include "PianoDpuFlipClient.h"
 
 namespace pianodpu {
@@ -199,6 +200,8 @@ struct Config {
   uint32_t minuteMs = 60000;  // level 3: the second fault check
   uint32_t summaryS = 60;     // the rate-limited summary line
   uint32_t detailFlips = 8;   // flips logged one by one
+  uint32_t cadenceS = 0;      // piano-dpu-cadence=S (default 0 off): a "cadence N:" line every S s of flips (DpuCadence.h)
+  uint32_t cleanThreads = 1;  // piano-dpu-clean-threads=N (1..8, default 1): the clean of a flip split over N threads (DpuFlip.cpp)
 };
 
 enum class State : uint8_t { off, ready, failed };
@@ -206,6 +209,23 @@ enum class State : uint8_t { off, ready, failed };
 struct Latch {
   bool ok = false;
   uint32_t us = 0, irqs = 0, slices = 0, flush = 0;
+};
+
+// piano-dpu-cadence: what a period of flips showed (the 120 Hz analysis, private notes GPU-120.md: the interval between two latched
+// flips of new surfaces is the presented cadence; the CPU part before the flush decides whether one period of 8.333 ms is enough).
+struct Cadence {
+  Hist interval, clean, latch, work;
+  uint64_t lastLatchUs = 0, windowStartUs = 0, flips = 0, reshows = 0, gaps = 0, lines = 0;
+  static constexpr uint64_t kGapUs = 100000;   // a longer interval is idle, not a cadence: counted, not in the histogram
+  void reset(uint64_t now)
+  {
+    interval.clear();
+    clean.clear();
+    latch.clear();
+    work.clear();
+    windowStartUs = now;
+    flips = reshows = gaps = 0;
+  }
 };
 
 struct Stats {
@@ -238,6 +258,7 @@ class Flipper {
   uint32_t mdssBefore = 0;    // MDSS HW_INTR_STATUS after the DPU's enables went off: another block holds the line when not 0
   const char *failure = nullptr;
   Stats st;
+  Cadence cad;
   uint64_t *pages = nullptr;   // kSlotPages entries, the caller's (64 KiB: not in the kext's __DATA, which the KC has little room for)
 
   // --------------------------------------------------------------------------------------------- the interrupt enables
@@ -648,6 +669,7 @@ class Flipper {
     st.cleanUs += cleanUs;
     if (s == slots.shown) {   // the surface on the panel again: the DPU fetches it every frame, the clean was all
       ++st.reshows;
+      if (cfg.cadenceS) ++cad.reshows;
       ++st.windowFlips;
       r.result = kPianoDpuFlipShown;
       r.workUs = uint32_t(hw.nowUs() - t0);
@@ -679,6 +701,7 @@ class Flipper {
     slots.shown = s;
     slots.pending = -1;
     const uint64_t work = p0 - t0;   // map + clean: the CPU's part (the latch is a wait)
+    if (cfg.cadenceS) cadenceFlip(hw.nowUs(), cleanUs, l.us, work);
     r.result = kPianoDpuFlipShown;
     r.workUs = uint32_t(work);
     ++st.flips;
@@ -736,9 +759,52 @@ class Flipper {
   }
   bool watching() const { return state == State::ready && slots.shown >= 0 && cfg.watchS; }
 
+  // piano-dpu-cadence: one latched flip of a new surface at latchedUs (just after its latch: the presented time to within the wake-up).
+  void cadenceFlip(uint64_t latchedUs, uint64_t cleanUs, uint64_t latchUs, uint64_t workUs)
+  {
+    if (!cad.windowStartUs) cad.reset(latchedUs);
+    if (cad.lastLatchUs) {
+      const uint64_t d = latchedUs - cad.lastLatchUs;
+      if (d < Cadence::kGapUs) cad.interval.add(d);
+      else ++cad.gaps;
+    }
+    cad.lastLatchUs = latchedUs;
+    ++cad.flips;
+    cad.clean.add(cleanUs);
+    cad.latch.add(latchUs);
+    cad.work.add(workUs);
+    cadenceReport(false);
+  }
+  // "cadence N:" every cfg.cadenceS s with flips in it (or force with any): the intervals' percentiles and bands, new frames per second,
+  // the CPU part's and the latch wait's percentiles. Values in us; bands <=9.5, 9.5-12.5, 12.5-18, 18-26, 26-35, >35 ms.
+  void cadenceReport(bool force)
+  {
+    const uint64_t now = hw.nowUs();
+    if (!cfg.cadenceS || !cad.windowStartUs || !cad.flips) return;
+    const uint64_t span = now - cad.windowStartUs;
+    if (!force && span < uint64_t(cfg.cadenceS) * 1000000) return;
+    uint64_t band[6];
+    cad.interval.bands(band);
+    const Hist &i = cad.interval;
+    hw.note("cadence %llu: %llu ms: %llu flips (%llu.%01llu new frames/s), %llu shown again, %llu gaps over 100 ms; interval n %llu p50 %llu p95 %llu "
+            "p99 %llu max %llu mean %llu us, bands %llu/%llu/%llu/%llu/%llu/%llu; clean p50 %llu p95 %llu; latch wait p50 %llu p95 %llu; "
+            "work p50 %llu p95 %llu p99 %llu us; threads %u",
+            (unsigned long long)++cad.lines, (unsigned long long)(span / 1000), (unsigned long long)cad.flips,
+            (unsigned long long)(span ? cad.flips * 1000000 / span : 0), (unsigned long long)(span ? cad.flips * 10000000 / span % 10 : 0),
+            (unsigned long long)cad.reshows, (unsigned long long)cad.gaps, (unsigned long long)i.n, (unsigned long long)i.pct(500),
+            (unsigned long long)i.pct(950), (unsigned long long)i.pct(990), (unsigned long long)i.maxUs,
+            (unsigned long long)(i.n ? i.sumUs / i.n : 0), (unsigned long long)band[0], (unsigned long long)band[1],
+            (unsigned long long)band[2], (unsigned long long)band[3], (unsigned long long)band[4], (unsigned long long)band[5],
+            (unsigned long long)cad.clean.pct(500), (unsigned long long)cad.clean.pct(950), (unsigned long long)cad.latch.pct(500),
+            (unsigned long long)cad.latch.pct(950), (unsigned long long)cad.work.pct(500), (unsigned long long)cad.work.pct(950),
+            (unsigned long long)cad.work.pct(990), cfg.cleanThreads);
+    cad.reset(now);
+  }
+
   // At most one line per cfg.summaryS, and only when something happened in it (or force).
   void summary(bool force)
   {
+    if (force) cadenceReport(true);
     const uint64_t now = hw.nowUs();
     if (!force && (now - st.windowStartUs < uint64_t(cfg.summaryS) * 1000000 || (!st.windowFlips && !st.windowRefused))) return;
     const uint64_t saved = st.copyUs > st.workUs ? st.copyUs - st.workUs : 0;
