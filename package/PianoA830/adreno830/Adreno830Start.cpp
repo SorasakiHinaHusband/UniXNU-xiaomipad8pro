@@ -2242,17 +2242,37 @@ IOReturn opGmuStart(void *,const A830GmuStartArgs *args,uint16_t *step)
     g830.irq.setIfpc(args->ifpc);
     return scope.end(kIOReturnSuccess);
 }
+/* The last CX gate check's words, for the low-failed console line (the exit journal holds them too, but it dies with a reset;
+ * gpu-r3d-c's console delivered lines at +1.9 and +2.8 ms after the expiry). flags: bit0 cxOn, bit1 the three windows mapped,
+ * bit2/3/4 the GDSC/AHB/CX_GMU read answered, bit8 accessible; seq counts the checks, at-us is when the last one ran. */
+static uint32_t gCxLastGdsc,gCxLastAhb,gCxLastClock,gCxLastFlags,gCxLastSeq;
+static uint64_t gCxLastAtUs;
 bool qualificationCxAccessible()
 {
     uint32_t gdsc=0,ahb=0,clock=0;
     a830ExitTrace.stage(A830ExitStage::CxBegin);
-    const bool accessible=g830.power_state.cxOn() && mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc) &&
-        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GDS_HW_CTRL,&gdsc) && gdsc!=UINT32_MAX &&
-        (gdsc&SM8750_GDSC_PWR_ON) &&
-        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_AHB_CBCR,&ahb) && ahb!=UINT32_MAX &&
-        (ahb&SM8750_CBCR_ENABLE) &&
-        !powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GMU_CBCR,&clock) && clock!=UINT32_MAX &&
-        (!(clock&SM8750_CBCR_CLK_OFF) || SM8750_CBCR_NOC_FSM_STATUS(clock)==SM8750_CBCR_NOC_FSM_ON);
+    const bool cxOn=g830.power_state.cxOn(),
+        windows=mapped(A830WinGmu) && mapped(A830WinGpu) && mapped(A830WinRscc);
+    uint32_t flags=(cxOn?1u:0u)|(windows?2u:0u);
+    /* The same predicate in the same order (short-circuit: a word not reached stays 0 and its read bit clear). */
+    bool accessible=cxOn && windows;
+    if(accessible) {
+        const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GDS_HW_CTRL,&gdsc) && gdsc!=UINT32_MAX;
+        flags|=read?4u:0u;
+        accessible=read && (gdsc&SM8750_GDSC_PWR_ON);
+    }
+    if(accessible) {
+        const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_AHB_CBCR,&ahb) && ahb!=UINT32_MAX;
+        flags|=read?8u:0u;
+        accessible=read && (ahb&SM8750_CBCR_ENABLE);
+    }
+    if(accessible) {
+        const bool read=!powerRead(nullptr,Sm8750GpuGpuCc,SM8750_GPUCC_CX_GMU_CBCR,&clock) && clock!=UINT32_MAX;
+        flags|=read?16u:0u;
+        accessible=read && (!(clock&SM8750_CBCR_CLK_OFF) || SM8750_CBCR_NOC_FSM_STATUS(clock)==SM8750_CBCR_NOC_FSM_ON);
+    }
+    flags|=accessible?0x100u:0u;
+    gCxLastGdsc=gdsc;gCxLastAhb=ahb;gCxLastClock=clock;gCxLastFlags=flags;gCxLastAtUs=nowUs();++gCxLastSeq;
     a830ExitTrace.stage(A830ExitStage::CxEnd,accessible?0u:uint32_t(kIOReturnNotReady),gdsc,ahb,clock);
     return accessible;
 }
@@ -2410,6 +2430,16 @@ bool ropQualificationGxOff(void *)
 }
 void ropQualificationStage(void *,const char *stage,IOReturn result)
 {
+    /* low-failed (the vote ran) and low-failed-phase (not Active or no vote callback: no CX check this time): the last CX gate words
+     * on the same console line, with their age; a fresh check (cx-seq moved, cx-age small) and accessible=0 names the predicate. */
+    if(!strncmp(stage,"low-failed",10)) {
+        const uint64_t now=nowUs();
+        qualLog("R3b3 exit %s result=%x at-us=%llu sticky=%u voted=%u/%u phase=%u cx gdsc=%08x ahb=%08x clock=%08x flags=%03x seq=%u "
+            "age-us=%llu",stage,unsigned(result),now,g830.power_state.qualificationLatched(),g830.power_state.votedLevel(),
+            g830.power_state.votedBus(),unsigned(g830.power_state.phase()),gCxLastGdsc,gCxLastAhb,gCxLastClock,gCxLastFlags,
+            gCxLastSeq,gCxLastSeq?now-gCxLastAtUs:0ull);
+        return;
+    }
     qualLog("R3b3 exit %s result=%x at-us=%llu sticky=%u voted=%u/%u",stage,unsigned(result),
         nowUs(),g830.power_state.qualificationLatched(),g830.power_state.votedLevel(),g830.power_state.votedBus());
 }

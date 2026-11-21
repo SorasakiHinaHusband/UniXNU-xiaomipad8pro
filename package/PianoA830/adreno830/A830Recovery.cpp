@@ -117,6 +117,7 @@ IOReturn A830Recovery::runPending()
         return kIOReturnSuccess;
     }
     if(request && !faultPending() && !lost()) {
+        bool voted=false;   /* low-failed: the vote ran; low-failed-phase: not Active or no vote callback */
         a830ExitTrace.stage(A830ExitStage::LowBegin,request);
         stage("low-begin");
         if(qualificationAsleep() && !(request&0x100u)) {
@@ -124,6 +125,7 @@ IOReturn A830Recovery::runPending()
             a830ExitTrace.stage(A830ExitStage::LowDeferred);
             stage("low-deferred");
         } else if(power_->phase()==A830PowerActive && rops_.qualificationLowVote) {
+            voted=true;
             low=rops_.qualificationLowVote(rops_.context,(request&0x100u)!=0);
             if(low==kIOReturnSuccess) {
                 power_->setTarget(1,2);
@@ -135,7 +137,7 @@ IOReturn A830Recovery::runPending()
         } else low=kIOReturnNotReady;
         if(low!=kIOReturnSuccess) {
             a830ExitTrace.stage(A830ExitStage::LowResult,uint32_t(low));
-            stage("low-failed",low);
+            stage(voted?"low-failed":"low-failed-phase",low);
         }
     }
     const uint8_t cause=__atomic_load_n(&pendingCause_,__ATOMIC_ACQUIRE);
