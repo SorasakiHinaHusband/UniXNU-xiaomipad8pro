@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LE_TEST_SERVICE @"5484D96C-B44C-4777-BFD1-8AFE8D8B5795"
@@ -18,9 +19,10 @@
 
 static void say(NSString *line)
 {
-    NSString *stamp = [NSDateFormatter localizedStringFromDate:[NSDate date] dateStyle:NSDateFormatterNoStyle
-                                                     timeStyle:NSDateFormatterMediumStyle];
-    printf("%s le-peripheral: %s\n", stamp.UTF8String, line.UTF8String);
+    char stamp[16];
+    time_t now = time(NULL);
+    strftime(stamp, sizeof stamp, "%H:%M:%S", localtime(&now));
+    printf("%s le-peripheral: %s\n", stamp, line.UTF8String);
     fflush(stdout);
 }
 
