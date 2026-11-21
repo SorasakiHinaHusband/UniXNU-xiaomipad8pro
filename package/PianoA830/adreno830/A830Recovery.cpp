@@ -47,7 +47,7 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
     config_=config;io_=io;env_=env;ops_=ops;rops_=recoveryOps;power_=power;
     snapshot_={};stats_={};
     pendingCause_=A830FaultNone;pendingDetail_=0;lost_=running_=false;
-    qualification_=qualificationClosed_=qualificationR3b_=false;protectionAt_=0;lowRequest_=0;unsafe_=nullptr;unsafeContext_=nullptr;
+    qualification_=qualificationClosed_=qualificationR3b_=daily_=false;protectionAt_=0;lowRequest_=0;unsafe_=nullptr;unsafeContext_=nullptr;
     safeOff_=false;
     qualificationSafeLow_=false;
     for(auto &start:history_)start=0;
@@ -178,7 +178,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
     power_->lock();
     if(!lost()) {
         __atomic_store_n(&running_,true,__ATOMIC_RELEASE);
-        if(qualificationR3b_) {
+        if(strictMode()) {
             const bool asleep=qualificationAsleep();
             closeQualification(cause);
             const IOReturn drained=power_->beginRecovery();
@@ -200,7 +200,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
                 power_->latchQualification();
                 const bool safe=ops_.gmuForceOff(ops_.context)==kIOReturnSuccess;
                 __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
-                if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::DeclareLostOffFailed);
+                if(!safe && unsafe_ && !daily_)unsafe_(unsafeContext_,A830ExitOrigin::DeclareLostOffFailed);
             }
             loseLocked(cause,A830SRunning,cause,result);
         }
@@ -370,13 +370,13 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     if(cause==A830FaultWatchdog)++stats_.watchdogHangs;
     if(hangClass(cause))adreno830_status_add32(&adreno830_status.hangs,1);
     /* No submission, no new connection; holders drained (a stuck one does not stop the recovery). */
-    if(qualification_)closeQualification(cause);
+    if(closesQualification(cause))closeQualification(cause);
     else rops_.gate(rops_.context,A830GateRecovering,cause);
-    const bool asleep=qualificationR3b_ && qualificationAsleep();
+    const bool asleep=strictMode() && qualificationAsleep();
     a830ExitTrace.stage(A830ExitStage::DrainBegin,0,cause,detail);
     const IOReturn drained=power_->beginRecovery();
     a830ExitTrace.stage(A830ExitStage::DrainEnd,uint32_t(drained));
-    if(qualificationR3b_)minimalSnapshot(cause,detail);
+    if(strictMode())minimalSnapshot(cause,detail);
     else {
         capture(cause,detail,&snapshot_);
         if(snapshot_.gxOn) {wr(A830PowerWinGpu,gpuReg(A8XX_RBBM_INT_0_MASK),0);io_.barrier(io_.context);}
@@ -392,7 +392,7 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         return A830ReturnNotResponding;
     }
     Progress progress={this,begin,&env_};
-    if(qualificationR3b_) {
+    if(strictMode()) {
         const IOReturn off=drained==kIOReturnSuccess?strictOff(asleep):drained;
         if(off!=kIOReturnSuccess) {
             stage("strict-unsafe",off);
@@ -409,7 +409,7 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         haltGbif(snapshot_.gxOn);
         const IOReturn off=ops_.gmuForceOff(ops_.context);
         if(off==kIOReturnSuccess) {power_->setRsccSlept(true);__atomic_store_n(&safeOff_,true,__ATOMIC_RELEASE);}
-        else if(qualification_) {
+        else if(qualification_ && !daily_) {
             ++stats_.failures;
             loseLocked(cause,A830SGmu,0,off);
             if(unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::StrictOffFailed);
@@ -427,10 +427,10 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
     a830ExitTrace.stage(A830ExitStage::RestartEnd,uint32_t(result),step,subStep);
     if(result!=kIOReturnSuccess) {
         if(qualification_) {
-            const IOReturn off=qualificationR3b_?strictOff(false):ops_.gmuForceOff(ops_.context);
+            const IOReturn off=strictMode()?strictOff(false):ops_.gmuForceOff(ops_.context);
             const bool safe=off==kIOReturnSuccess;
             __atomic_store_n(&safeOff_,safe,__ATOMIC_RELEASE);
-            if(!safe && unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::RestartReoffFailed);
+            if(!safe && unsafe_ && !daily_)unsafe_(unsafeContext_,A830ExitOrigin::RestartReoffFailed);
         }
         /* "GPU LOST S<stage of the failing step>.<its own step>": e.g. S6.41 for a CP_ME_INIT that never finished. */
         ++stats_.failures;

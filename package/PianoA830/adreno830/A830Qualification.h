@@ -34,7 +34,7 @@ public:
      * contract stays: the soft ladder, the board hold, the hard exits (raw 85 C, board 65/40 C, sensor/lease, an unacknowledged
      * vote) through the low transaction, raw 105 C to the unsafe exit. A hard exit still ends high levels for the boot (<= 342). */
     static constexpr uint64_t DailyWindowNs=1000000000000000000ull;   /* about 31.7 years: no expiry within a boot */
-    void daily() {daily_=true;windowNs_=DailyWindowNs;}
+    void daily() {daily_=true;windowNs_=DailyWindowNs;if(recovery_)recovery_->qualificationDaily();}
     bool isDaily() const {return daily_;}
     A830R3bThermal &thermal() {return thermal_;}
     uint64_t thermalSnapshot() const {return thermal_.published();}
@@ -68,6 +68,8 @@ public:
         }
         if(!r3b_)__atomic_store_n(&legacyProtectionAt_,now,__ATOMIC_RELEASE);
         if(!r3b_)recovery_->closeQualification();
+        // daily: a latch from a recovery is not a new fault, and the vote path reports its own failure (qualificationVoteFault)
+        if(daily_)return;
         recovery_->report(A830FaultHfi,reason);
     }
     // Called every second by a separate kernel thread. 600 s soak + at most 2 s for the last, dropped ACK.
@@ -136,6 +138,7 @@ public:
         else if(gpu.valid!=255 && !power_->qualificationLatched())fault(A830QualSensor,now);
     }
     bool deadlineMissed(uint64_t now) const {
+        if(daily_)return false;   // daily: no protection-deadline unsafe exit (gpu-daily1); PianoThermal's shutdown stays independent
         const uint64_t at=r3b_?recovery_->protectionAt():__atomic_load_n(&legacyProtectionAt_,__ATOMIC_ACQUIRE);
         return at && now>=at && now-at>=5000000000ull && !recovery_->safeOff() && !recovery_->qualificationSafeLow();
     }

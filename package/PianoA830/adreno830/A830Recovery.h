@@ -127,6 +127,12 @@ public:
     // No power or HFI mutex: the independent heartbeat may close the actual submit ring.
     void closeQualification(uint8_t cause=A830FaultHfi);
     void qualificationR3b() {qualificationR3b_=true;}
+    /* Daily mode (pagani-gpu-daily=1, gpu-daily2 after gpu-daily1): recovery is the daily line's. A GPU hang/watchdog/CP error
+     * keeps the guard open (no close, no latch) and restarts the GPU; no recovery uses the strict force-off; a failed force-off or
+     * restart declares the GPU lost instead of the native unsafe exit (PianoThermal's independent shutdown stays). The guard's own
+     * exits still take the low transaction (an ordinary blocking 160 MHz vote); raw 105 C stays the only native unsafe exit. */
+    void qualificationDaily() {daily_=true;}
+    bool qualificationIsDaily() const {return daily_;}
     bool safeOff() const {return __atomic_load_n(&safeOff_,__ATOMIC_ACQUIRE);}
     bool qualificationSafeLow() const {return __atomic_load_n(&qualificationSafeLow_,__ATOMIC_ACQUIRE);}
 
@@ -172,7 +178,9 @@ private:
     uint8_t pendingCause_=A830FaultNone;
     uint64_t pendingDetail_=0;
     bool lost_=false,running_=false,initialized_=false;
-    bool qualification_=false,qualificationClosed_=false,qualificationR3b_=false;
+    bool qualification_=false,qualificationClosed_=false,qualificationR3b_=false,daily_=false;
+    bool strictMode() const {return qualificationR3b_ && !daily_;}
+    bool closesQualification(uint8_t cause) const {return qualification_ && !(daily_ && A830FaultBlamesClient(cause));}
     uint64_t protectionAt_=0;
     uint32_t lowRequest_=0;
     bool safeOff_=false;

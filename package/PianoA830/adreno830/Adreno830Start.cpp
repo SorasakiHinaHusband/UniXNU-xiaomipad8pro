@@ -2286,7 +2286,7 @@ IOReturn opGmuForceOff(void *)
 {
     TraceScope scope("gmuForceOff");
     IOReturn r;
-    if(gQualification.r3b()) {
+    if(gQualification.r3b() && !gQualification.isDaily()) {
         r=qualificationCxAccessible()?g830.gmu.forceOffStrict(A830GmuGxVoteStrict,&g830.gx_voter):kIOReturnNotReady;
         const auto &f=g830.gmu.failure();
         if(r!=kIOReturnSuccess && r!=kIOReturnNotReady)
@@ -2704,6 +2704,7 @@ void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
     qualLog("R3a vote-unknown request=%08x seq=%u requested=%u/%u oldACK=%u/%u error=%x reason=%u at-us=%llu",
         h.hdr,A830_HFI_HDR_SEQ(h.hdr),requested,bus,g830.power_state.votedLevel(),g830.power_state.votedBus(),unsigned(error),h.reason,nowUs());
     gQualification.fault(A830QualVote,nowUs()*1000,A830ExitContext::Dcvs);
+    if(gQualification.isDaily())g830.recovery.report(A830FaultHfi,uint32_t(error));   // daily: fault() does not report a vote
 }
 void qualificationThread(void *)
 {
