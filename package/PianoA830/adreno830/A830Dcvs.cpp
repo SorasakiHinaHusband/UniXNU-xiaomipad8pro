@@ -74,6 +74,7 @@ IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,
     wakeUntil_=touchUntil_=lateUntil_=retryAt_=0;lateLevel_=0;lastBusyPermille_=0;
     submits_=seenSubmits_=vsyncs_=windowVsyncs_=late_=seenLate_=underrunTotal_=seenUnderruns_=0;
     lastSubmitNs_=lastVsyncNs_=lastWindow_=0;touchPrimed_=false;
+    inputFloorKhz_=config.inputFloorKhz;
     seenSeqno_=power->submittedSeqno();hookedSubmits_=0;
     nextStatus_=nextWatchdog_=0;residencyStart_=statusStart_=lastAccount_=0;statusBusyNs_=statusNs_=0;
     for(auto &ns:residencyNs_)ns=0;
@@ -519,6 +520,8 @@ uint8_t A830Dcvs::wanted(uint64_t now) const
     if(now<wakeUntil_)level=max8(level,levelAtLeast(config_.wakeBoostKhz));
     if(now<touchUntil_)level=max8(level,levelAtLeast(config_.touchBoostKhz));
     if(now<lateUntil_)level=max8(level,lateLevel_);
+    const uint32_t input=__atomic_load_n(&inputFloorKhz_,__ATOMIC_ACQUIRE);
+    if(input && now-__atomic_load_n(&lastSubmitNs_,__ATOMIC_ACQUIRE)<ms(config_.inputHoldMs))level=max8(level,levelAtLeast(input));
     level=max8(level,floor_);
     /* The ceilings win over every boost. */
     return level>ceiling()?ceiling():level;
@@ -794,6 +797,21 @@ extern "C" void adreno830_dcvs_vsync(void)
 extern "C" void adreno830_dcvs_late_frame(uint32_t late_us)
 {
     if(A830Dcvs *dcvs=__atomic_load_n(&gDcvs,__ATOMIC_ACQUIRE))dcvs->noteLateFrame(late_us);
+}
+
+extern "C" int adreno830_dcvs_set_input_floor(uint32_t mhz)
+{
+    if(mhz && (mhz<160 || mhz>1100))return -2;
+    A830Dcvs *dcvs=__atomic_load_n(&gDcvs,__ATOMIC_ACQUIRE);
+    if(!dcvs)return -1;
+    dcvs->setInputFloor(mhz*1000u);
+    return 0;
+}
+
+extern "C" uint32_t adreno830_dcvs_input_floor(void)
+{
+    A830Dcvs *dcvs=__atomic_load_n(&gDcvs,__ATOMIC_ACQUIRE);
+    return dcvs?dcvs->inputFloor()/1000u:0;
 }
 
 extern "C" void adreno830_dcvs_underruns(uint32_t total)

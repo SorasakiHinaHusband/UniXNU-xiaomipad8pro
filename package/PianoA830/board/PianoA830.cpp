@@ -1162,6 +1162,28 @@ int sysctlGpuRefusals(struct sysctl_oid *,void *,int,struct sysctl_req *req)
   }
   return any?SYSCTL_OUT(req,"",1):SYSCTL_OUT(req,"none\n",6);
 }
+// machdep.piano_gpu_input_floor (root): the DCVS input floor in MHz (0 off; 160..1100), A830Dcvs::setInputFloor. Read: the floor in force.
+int sysctlGpuInputFloor(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req)
+{
+  int value=int(adreno830_dcvs_input_floor());
+  const int err=sysctl_handle_int(oidp,&value,0,req);
+  if(err || !req->newptr)return err;
+  if(value<0)return EINVAL;
+  const int r=adreno830_dcvs_set_input_floor(uint32_t(value));
+  if(r==-2)return EINVAL;
+  if(r)return EAGAIN;
+  gpuLine("input floor %d MHz (machdep.piano_gpu_input_floor; hold 64 ms after each submission)",value);
+  return 0;
+}
+void registerGpuInputFloor()
+{
+  static struct sysctl_oid oid;
+  oid.oid_parent=&sysctl__machdep_children;oid.oid_number=OID_AUTO;
+  oid.oid_kind=int(CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  oid.oid_name="piano_gpu_input_floor";oid.oid_handler=sysctlGpuInputFloor;oid.oid_fmt="I";
+  oid.oid_descr="GPU DCVS input floor (MHz) held 64 ms after each submission; 0 off";
+  oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&oid);
+}
 void registerGpuRefusals()
 {
   static struct sysctl_oid oid;
@@ -1554,6 +1576,9 @@ bool PianoA830::start(IOService *provider)
   setProperty("piano-gpu", gLevel, 32);
   gService = this;
   registerGpuRefusals();
+  registerGpuInputFloor();
+  if (const uint32_t floorMhz = bootArg("piano-gpu-input-floor", 0))
+    gpuLine("input floor: piano-gpu-input-floor=%u MHz, held 64 ms after each submission (machdep.piano_gpu_input_floor)", floorMhz);
   gCeilingLock = IOLockAlloc();
   setProperty("piano-gpu-ceiling-clients", pianogpu::kCeilingClients, 32);   // docs/policy.md §5.3: one slot per caller
   suspendConfigure(gLevel);

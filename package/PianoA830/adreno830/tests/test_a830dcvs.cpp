@@ -1061,6 +1061,51 @@ static void testPark()
     CHECK(gDcvs.level()==1 && gDcvs.ceiling()==1);
 }
 
+/* gpu-daily2 (GPU-ANDROID.md 5): the input floor. Light composed frames (10 % busy, one submission per window) hold 342 MHz
+ * instead of the demand level 160; 64 ms without a submission ends it (the idle rule); a heavy load still climbs over it; the
+ * runtime switch turns it off and on; a ceiling below it wins. */
+static void testInputFloor()
+{
+    adreno830_profile_value=A830ProfileAnnibale;
+    A830DcvsConfig c;c.initialLevel=1;c.initialBus=2;c.maxLevel=7;c.maxMhz=607;c.maxGiven=true;c.inputFloorKhz=342000;
+    boot(c);
+    steps(100,0,false);
+    CHECK(gDcvs.level()==1 && gDcvs.ceiling()==7);
+    steps(20,100);
+    CHECK(gDcvs.level()==3);
+    steps(60,100);
+    CHECK(gDcvs.level()==3);
+    steps(6,0,false);
+    CHECK(gDcvs.level()==1);
+    step(100);
+    CHECK(gDcvs.level()>=3);
+    steps(10,100);
+    CHECK(gDcvs.level()==3);
+    steps(60,990);
+    CHECK(gDcvs.level()==7);
+    CHECK(adreno830_dcvs_set_input_floor(0)==0 && adreno830_dcvs_input_floor()==0);
+    steps(60,100);
+    CHECK(gDcvs.level()==1);
+    CHECK(adreno830_dcvs_set_input_floor(50)==-2 && adreno830_dcvs_set_input_floor(1200)==-2);
+    CHECK(adreno830_dcvs_set_input_floor(342)==0 && adreno830_dcvs_input_floor()==342);
+    steps(10,100);
+    CHECK(gDcvs.level()==3);
+#ifdef ADRENO830_MACOS
+    adreno830_dcvs_set_ceiling(222000);
+    steps(5,100);
+    CHECK(gDcvs.level()<=2);
+    adreno830_dcvs_set_ceiling(0);
+    steps(5,100);
+    CHECK(gDcvs.level()==3);
+#endif
+    /* off by default: the same light frames stay at the demand level */
+    A830DcvsConfig d=c;d.inputFloorKhz=0;
+    boot(d);
+    steps(100,0,false);
+    steps(40,100);
+    CHECK(gDcvs.level()==1);
+}
+
 int main()
 {
     /* The design profile for the cases written for it; testAnnibale switches to the annibale one (the boot default). */
@@ -1081,6 +1126,7 @@ int main()
     testServiceAndStatus();
     testAnnibale();
     testMaxLevel();
+    testInputFloor();
     adreno830_profile_value=A830ProfileDesign;
     testScreen();
     testPark();
@@ -1099,7 +1145,8 @@ int main()
                 "annibale profile: 342 MHz unless pagani-gpu-dcvs-max, 160 MHz at 70 C or unreadable until below 60 C, bw "
                 "without 0xFFFF0000, an unacknowledged vote ends the changes; pagani-gpu-maxlevel: %u ceiling cases (ramp "
                 "160/342/607/734 MHz with the DT bus, level n, the top beyond the table under ACD off, dcvs-max, thermal "
-                "hold, fixed mode, design); the screen rule through the service thread (PaganiPanel's word, dark touches "
+                "hold, fixed mode, design); the input floor (342 MHz held 64 ms after each submission, off/on at run time, under the "
+                "ceilings); the screen rule through the service thread (PaganiPanel's word, dark touches "
                 "ignored, no window polling while dark, the display's refresh tick wakes it at the touch level) (%u checks)\n",
                 compositingCases,headroomCases,heatCases,maxLevelCases,gChecks);
     return 0;

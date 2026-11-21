@@ -2791,6 +2791,9 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
        qualificationResidency(b) || b->knobs.dcvs_min_mhz!=160))
         return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->qualification_daily,1,kIOReturnBadArgument);
     config.governor=b->knobs.dcvs!=0;
+    if(b->input_floor_mhz && (b->input_floor_mhz<160 || b->input_floor_mhz>1100))
+        return refuse(f,A830S10StepDcvs,A830ReasonArgument,0,b->input_floor_mhz,1100,kIOReturnBadArgument);
+    config.inputFloorKhz=b->input_floor_mhz*1000u;
     // Use the 342 MHz control without a load generator; thermal and sticky limits still apply.
     config.minMhz=b->qualification_exit_test?342:b->knobs.dcvs_min_mhz;
     config.maxMhz=b->knobs.dcvs_max_mhz;

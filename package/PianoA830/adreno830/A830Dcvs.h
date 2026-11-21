@@ -102,6 +102,10 @@ struct A830DcvsConfig {
     uint16_t upBusyPermille=900,upJump=2,upBoostPermille=1250,upMarginPermille=1100;
     uint16_t downMarginPermille=850,downWindows=4,downWindowsAfterUp=6;
     uint32_t idleMs=64;
+    /* input floor (gpu-daily2, GPU-ANDROID.md 5): every submission holds >= inputFloorKhz until inputHoldMs after it (0 = off):
+     * a stream of composed frames (a gesture, a scroll, an animation) never starts at the floor; an idle desktop still falls to
+     * it once the idle rule (idleMs) fires. Ceilings (knob, guard, external slots such as Low Power Mode) win over it. */
+    uint32_t inputFloorKhz=0,inputHoldMs=64;
     uint32_t wakeBoostKhz=525000,wakeBoostMs=50;
     uint32_t touchBoostKhz=525000,touchHoldMs=300;
     uint16_t lateBusyPermille=500;
@@ -191,6 +195,8 @@ public:
     void forceQualificationVote() {__atomic_store_n(&forceVote_,true,__ATOMIC_RELEASE);env_.wake(env_.context);}
     void noteVsync();                   /* a display TE */
     void noteLateFrame(uint32_t lateUs);/* a swap after its target TE */
+    void setInputFloor(uint32_t khz) {__atomic_store_n(&inputFloorKhz_,khz,__ATOMIC_RELEASE);env_.wake(env_.context);}
+    uint32_t inputFloor() const {return __atomic_load_n(&inputFloorKhz_,__ATOMIC_ACQUIRE);}
     void noteUnderruns(uint32_t total); /* MDP INTF1 underrun count (cumulative) */
     void park();                        /* a reset is coming: hold the lowest level and its bus from the next tick on */
     void setAcd(bool running);          /* ACD came up or went away (ceiling) */
@@ -264,6 +270,7 @@ private:
     uint8_t sustainLevel_=1;            /* the highest level a burst reaches (A830DcvsConfig::sustainKhz) */
     uint16_t down_=0,saturated_=0;      /* qualifying windows in a row: down rule, sustain rule */
     bool raisedLast_=false,idle_=false;
+    uint32_t inputFloorKhz_=0;            /* the input floor in force (config, then machdep.piano_gpu_input_floor) */
     uint64_t wakeUntil_=0,touchUntil_=0,lateUntil_=0,retryAt_=0;
     uint8_t lateLevel_=0;
     uint32_t lastBusyPermille_=0;
@@ -291,7 +298,9 @@ extern "C" {
 /* The display's hooks (PD NativeLegacyDisplay / DpuProbe call them; the display carries weak empty defaults so it links
  * without this driver). All are interrupt-safe and do nothing before S10. */
 void adreno830_dcvs_vsync(void);                   /* each panel TE */
-void adreno830_dcvs_late_frame(uint32_t late_us);  /* a swap that missed its target TE by late_us */
+void adreno830_dcvs_late_frame(uint32_t late_us);
+int adreno830_dcvs_set_input_floor(uint32_t mhz);   /* 0 off, else 160..1100 MHz; -1 before the DCVS runs */
+uint32_t adreno830_dcvs_input_floor(void);           /* MHz in force, 0 off */  /* a swap that missed its target TE by late_us */
 void adreno830_dcvs_underruns(uint32_t total);     /* cumulative MDP INTF1 underruns (INTR_STATUS bit 26) */
 /* The submit path (NativeAdrenoUserClient/Submit): one call per submission, lock-free. */
 void adreno830_dcvs_submit(void);
