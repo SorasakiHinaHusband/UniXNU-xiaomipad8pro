@@ -114,6 +114,10 @@ struct Adreno830Board {
     uint32_t qualification_r3b;                   /* explicit bounded R3b-607 mode; no daily default */
     uint32_t qualification_exit_test;
     uint32_t qualification_daily;                 /* pagani-gpu-daily=1: the R3b guard as the daily policy (auto-armed, no expiry) */
+    /* gpu/fullopp1 (private/host-checks/20261122-gpu-fullopp/ANALYSIS.md): pagani-gpu-fullopp=1 qualifies Android's whole bin-2 curve on the
+     * R3b line (speedbin 1, tops 7..14, ACD allowed, Android's thermal table); pagani-gpu-governor=2 the KGSL-style DCVS constants. */
+    uint32_t qualification_fullopp;
+    uint32_t dcvs_governor;
     uint32_t input_floor_mhz;                     /* pagani-gpu-input-floor=M: every submission holds >= M MHz for 64 ms (0 off) */
     uint32_t system_diag;                            /* pagani-diag: not a knob of this driver (no flag bit, no table row, 0 when absent) */
 };
@@ -171,6 +175,9 @@ static inline void Adreno830KnobDefaults(Adreno830Board::Adreno830Knobs *knobs)
     *knobs={};
     knobs->stop=Adreno830StopNever;knobs->status=1;knobs->rails=1;knobs->ddr_boot=11;knobs->ddr_floor=11;knobs->actlr=0x303;
     knobs->dcvs=1;knobs->dcvs_min_mhz=160;knobs->dcvs_max_mhz=734;knobs->perf=2;knobs->va=16;
+#ifdef ADRENO830_MACOS
+    knobs->va=64;   /* UniXNU-piano (2026-11-22, GPU-SLOTS): the 64 GiB aperture, 64 client windows; falls back to 16 GiB, then 4 GiB */
+#endif
     knobs->profile=A830ProfileAnnibale;knobs->hwsched=0;knobs->trace=1;knobs->ttarget=95;knobs->kopt=NativeAdrenoKoptAll;
 }
 
@@ -195,6 +202,10 @@ static inline void Adreno830ParseKnobs(Adreno830Board *board,bool (*get)(void *c
     (void)get(cookie,"pagani-gpu-r3b-exit-test",&board->qualification_exit_test);
     board->qualification_daily=0;
     (void)get(cookie,"pagani-gpu-daily",&board->qualification_daily);
+    board->qualification_fullopp=0;
+    (void)get(cookie,"pagani-gpu-fullopp",&board->qualification_fullopp);
+    board->dcvs_governor=0;
+    (void)get(cookie,"pagani-gpu-governor",&board->dcvs_governor);
     board->input_floor_mhz=0;
     (void)get(cookie,"pagani-gpu-input-floor",&board->input_floor_mhz);
     board->system_diag=0;
