@@ -149,7 +149,7 @@ mode = "0644"
 
 [[unit]]
 name = "piano-policy-agent"
-about = "PianoPolicy's agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display sleep on a cover closed without sleep; event driven"
+about = "PianoPolicy's agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display sleep on a cover closed without sleep, the power state of background services (section 4.1); event driven"
 default_on = true
 
 [[unit.file]]
@@ -162,6 +162,17 @@ mode = "0755"
 source = "tooling/native/piano-policy-agent/com.unixnu.piano-policy-agent.plist"
 build = "copy"
 dest = "/Library/LaunchDaemons/com.unixnu.piano-policy-agent.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-slim-session"
+about = "piano-policy-agent's login hook (docs/policy.md section 4.1): an Aqua agent that posts com.unixnu.piano.slim.session once per login, so the agent applies Save to the new session's jobs"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-policy-agent/com.unixnu.piano-slim-session.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-slim-session.plist"
 mode = "0644"
 
 [[unit]]

@@ -128,13 +128,38 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
   lifted: with PianoA830's slots ours is client 1 and the lowest slot wins (§5.3), without them ours is never written over or
   cleared (a race between the read and the write is repaired by putting it back).
 - **The agent** (`tooling/native/piano-policy-agent/piano-policy-agent.sh`, root): one `notifyutil -w` on
-  `com.apple.system.lowpowermode` and `com.apple.system.powermanagement.clamshellstate`; LPM → `sysctl -w machdep.piano_policy_lpm`;
+  `com.apple.system.lowpowermode` and `com.apple.system.powermanagement.clamshellstate` (and the names of §4.1);
+  LPM → `sysctl -w machdep.piano_policy_lpm`;
   closed without sleep (root domain's `AppleClamshellCausesSleep` No) → `pmset displaysleepnow`. Stock tools, no polling.
   Installed by the userland pipeline (`configs/userland.toml`, `docs/userland.md`): `/usr/local/libexec/piano-policy-agent` and
   the LaunchDaemon `com.unixnu.piano-policy-agent.plist`, on in the installed profile, through the Data seed's boot job (a new
   seed identity, `docs/data-store.md`) or a live update. By hand from the USB root shell:
   `launchctl submit -l com.unixnu.piano-policy-agent -- /bin/sh <the script>`.
 - Nothing to power: no power-tree membership; across a suspend the thread is frozen with the rest (contract, `power.md` §4).
+
+### 4.1 The power state of background services (slim, 2026-11-22)
+
+The static list of services turned off on piano was the VM-era Data-seed trim (a 4 GiB 27.0.1 guest); natively only the labels with
+native evidence stay off (class A: watchdogd, xprotectd, mobileactivationd, PerfPowerServices, cryptexd, passd; AppSSODaemon and
+fskitd until their retest). The others are enabled again by an install step, and the agent adds a power state on top:
+- **States.** Normal: on power with Low Power Mode off, or High Power on battery. Save: Low Power Mode on, or on battery outside
+  High Power. The power source is `com.apple.system.powersources.source` (read with `pmset -g ps`), the modes the two notify names
+  above. Save is applied after 30 s of a stable wish (PD renegotiation, fast-charge flaps) and never before 120 s of uptime;
+  Normal is restored at once. A delayed Save is one sleeping child that posts `com.unixnu.piano.slim.tick` (no polling).
+- **What Save does.** For each class-C entry (`PAUSE` in the script: `MODE DOMAIN LABEL PROCESS`): `bg` = `taskpolicy -b -p` on the
+  job's pid (darwin background; `-B` in Normal), `unload` = `launchctl bootout`, then `bootstrap` in Normal. The list is **empty**:
+  dasd already defers the background tasks of the re-enabled services on battery and in Low Power Mode (they need external power
+  or follow `com.apple.system.lowpowermode`); a label comes in only with a measured idle cost that dasd leaves. Never a signal
+  (a stopped XPC server hangs its clients), never a persistent override (`launchctl disable`, `mdutil`): a crash leaves nothing off.
+- **Safety.** Every boot starts Normal (the record carries the boot's session UUID); after a restart of the agent its own actions of
+  this boot are undone first. An action that fails twice (an rc, a failed reload, a new crash report of the process within 10 min of
+  a transition) puts the label in `broken.tsv`: restored and left alone. Class A is refused even as a test entry. The file
+  `slim/off` is the kill switch (all undone, nothing applied); `piano-policy-agent --restore` undoes everything at once.
+- **Login.** The Aqua agent `com.unixnu.piano-slim-session` (unit `piano-slim-session`) posts `com.unixnu.piano.slim.session`; in
+  Save the agent applies the gui entries to the new session.
+- **State.** `/private/var/db/piano-userland/slim/`: `state` (one line: state, generation, the inputs), `log`, `applied`,
+  `fail.tsv`, `broken.tsv`; `test-pause` (test-only entries, read only while the file exists). `piano-policy-agent --status`.
+- Tests: `tooling/native/piano-policy-agent/test-piano-policy-agent.py` (the real script under sh and dash on a stub launchd).
 
 ## 5. What the other drivers must add (their owners; nothing here changes their packages)
 
