@@ -467,6 +467,22 @@ bool hookGpuTemps(void *param1)
   if (!readSnapshot(s)) s = Snapshot();
   return fillGpuTemps(s, nowNs() / 1000, static_cast<piano_gpu_temps *>(param1));
 }
+// gpu/fullopp1: the virtual skin sensor's inputs, the XO thermistor and the virtual sensor itself (the CPU policy's virtualSkin over the
+// same five readings), for PianoA830's Android thermal table.
+bool hookSkinTemps(void *param1)
+{
+  Snapshot s;
+  if (!readSnapshot(s)) s = Snapshot();
+  piano_skin_temps *t = static_cast<piano_skin_temps *>(param1);
+  if (!fillSkinTemps(s, nowNs() / 1000, t)) return false;
+  static_assert(int(PIANO_SKIN_BATTERY) == int(perf::kSkinBattery) && int(PIANO_SKIN_QUIET) == int(perf::kSkinQuiet) &&
+                    int(PIANO_SKIN_CHARGER) == int(perf::kSkinCharger) && int(PIANO_SKIN_WIFI) == int(perf::kSkinWifi) &&
+                    int(PIANO_SKIN_MSM) == int(perf::kSkinMsm),
+                "the skin API's first five are the virtual sensor's inputs in its order");
+  const perf::Skin v = perf::virtualSkin(t->milli_c, t->valid & ((1u << perf::kSkinInputs) - 1u));
+  t->virtual_milli_c = v.milliC; t->virtual_valid = v.valid ? 1u : 0u; t->virtual_used = v.used;
+  return true;
+}
 
 }  // namespace pianothermal::adc
 

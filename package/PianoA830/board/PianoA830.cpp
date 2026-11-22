@@ -1980,6 +1980,11 @@ bool PianoA830::start(IOService *provider)
     piano_a830_note("fullopp: piano-gpu-fullopp=1: Android's bin-2 curve on the R3b line (ANALYSIS gpu-fullopp); "
                     "machdep.piano_gpu_sweep_ceiling (root, test only) sets ceiling slot 2");
   }
+  if (bootArg("piano-gpu-fullopp", 0) == 1) {
+    registerGpuSweepCeiling();
+    piano_a830_note("fullopp: piano-gpu-fullopp=1: Android's bin-2 curve on the R3b line (ANALYSIS gpu-fullopp); "
+                    "machdep.piano_gpu_sweep_ceiling (root, test only) sets ceiling slot 2");
+  }
   if (const uint32_t floorMhz = bootArg("piano-gpu-input-floor", 0))
     piano_a830_note("input floor: piano-gpu-input-floor=%u MHz, held 80 ms after each submission, a 50 ms busy burst to the top (machdep.piano_gpu_input_floor)", floorMhz);
   // 2026-11-22 (private 20261122-render/ANALYSIS.md): the recovery replays innocent clients' jobs unless piano-gpu-recovery-replay=0.

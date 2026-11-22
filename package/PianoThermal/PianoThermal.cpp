@@ -127,7 +127,7 @@ struct Args {
   // the stock-level policy (Perf.h)
   uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC, hpmTop[2];
   // the launch and input boosts (Perf.h; 2026-11-22 01:02) and the silicon gate of bursts and boosts
-  uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC, gateQuietMs;
+  uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuLaunchCapMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC, gateQuietMs;
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
 pianodisplay::Follow gDisplay;
@@ -219,6 +219,8 @@ void readArgs()
   gArgs.inputMhz[1] = clampU(bootArg("piano-cpufreq-input1", 1958), 0, 5000);
   gArgs.inputMs = clampU(bootArg("piano-cpufreq-input-ms", 200), 0, 5000);
   gArgs.gpuLaunchMhz = clampU(bootArg("piano-cpufreq-gpu-launch-mhz", 443), 0, 1100);
+  // gpu/fullopp1: Android's launch hint also caps the GPU (max_pwrlevel 2 = 967 MHz for the launch); 0 = no cap (as before)
+  gArgs.gpuLaunchCapMhz = clampU(bootArg("piano-cpufreq-gpu-launch-cap-mhz", 0), 0, 1100);
   gArgs.gpuInputMhz = clampU(bootArg("piano-cpufreq-gpu-input-mhz", 0), 0, 1100);
   gArgs.launchWatch = bootArg("piano-cpufreq-launch-watch", 1) ? 1 : 0;
   gArgs.gateOpenC = clampU(bootArg("piano-cpufreq-gate-open", 0), 0, 110);
@@ -677,10 +679,10 @@ int launchListener(kauth_cred_t, void *, kauth_action_t action, uintptr_t, uintp
 
 // PianoA830's boost hook (gpu/boost342 PianoGpuBoost.h; CPU-PERF.md section 7): callPlatformFunction("piano-gpu-boost", param1 =
 // a floor in MHz (> 16; 0 = PianoA830's own input boost, 1..16 a GMU level), param2 = the hold in ms, param3 = our reason (ignored
-// there)) on its service; requests combine (the highest floor until the latest end), every ceiling wins; kIOReturnUnsupported
+// there), param4 = a cap in MHz for the hold (gpu/fullopp1: Android's launch cap; 0 none)) on its service; requests combine (the highest floor until the latest end), every ceiling wins; kIOReturnUnsupported
 // (PianoA830 without piano-gpu-boost=1, or a PianoA830 before boost342) ends the calls for this boot.
 const OSSymbol *gGpuBoostSym;
-void gpuBoost(uint32_t mhz, uint32_t ms, uint32_t reason)
+void gpuBoost(uint32_t mhz, uint32_t ms, uint32_t reason, uint32_t capMhz = 0)
 {
   if (gGpuState == 2) return;
   if (!gGpuBoostSym) gGpuBoostSym = OSSymbol::withCStringNoCopy("piano-gpu-boost");
@@ -695,7 +697,8 @@ void gpuBoost(uint32_t mhz, uint32_t ms, uint32_t reason)
     return;
   }
   const IOReturn r = gpu->callPlatformFunction(gGpuBoostSym, false, reinterpret_cast<void *>(uintptr_t(mhz)),
-                                               reinterpret_cast<void *>(uintptr_t(ms)), reinterpret_cast<void *>(uintptr_t(reason)), nullptr);
+                                               reinterpret_cast<void *>(uintptr_t(ms)), reinterpret_cast<void *>(uintptr_t(reason)),
+                                               reinterpret_cast<void *>(uintptr_t(capMhz)));
   gpu->release();
   if (r == kIOReturnSuccess) {
     if (gGpuState != 1 || gGpuTaken < 3) note("boost: piano-gpu-boost %u MHz for %u ms (reason %u): taken by PianoA830", mhz, ms, reason);
@@ -955,6 +958,8 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
     return adc::hookBoardTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
   if (functionName && functionName->isEqualTo("piano-thermal-gpu-temps"))
     return adc::hookGpuTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
+  if (functionName && functionName->isEqualTo("piano-thermal-skin-temps"))   // gpu/fullopp1: param1 = struct piano_skin_temps *
+    return adc::hookSkinTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
   // docs/policy.md 5.2: param1 = the mode (0 by the power source, 1 Power Saver, 2 Balanced). Taken by the governor (mode 3) at its
   // next tick and by the fixed level (mode 2, which has no power caps: ignored there); without CPU frequency control unsupported.
   if (functionName && functionName->isEqualTo("piano-thermal-profile")) {
@@ -1368,10 +1373,10 @@ void PianoThermal::cpuStart()
     __atomic_store_n(&gBoost, gArgs.boosts, __ATOMIC_RELEASE);
     registerBoost();
     note("boost: machdep.piano_cpufreq_boost now %u: launch %u / %u MHz (floor and ceiling) for %u ms, input %u / %u MHz floor for %u "
-         "ms after the last HID report, GPU floor %u MHz at a launch%s; only with perf policy >= 1 on Balanced, below %u C skin, and "
+         "ms after the last HID report, GPU floor %u MHz at a launch (cap %u MHz, 0 none)%s; only with perf policy >= 1 on Balanced, below %u C skin, and "
          "while the cluster's hottest cpu zone is under %u C with none there in the last %u ms (an open boost ends at %u C) and its thermal limit is not active",
          gArgs.boosts, gArgs.launchMhz[0], gArgs.launchMhz[1], gArgs.launchMs, gArgs.inputMhz[0], gArgs.inputMhz[1], gArgs.inputMs,
-         gArgs.gpuLaunchMhz, gArgs.gpuInputMhz ? " and on input" : "", gArgs.skinLimitC, gArgs.gateOpenC, gArgs.gateQuietMs, gArgs.gateEndC);
+         gArgs.gpuLaunchMhz, gArgs.gpuLaunchCapMhz, gArgs.gpuInputMhz ? " and on input" : "", gArgs.skinLimitC, gArgs.gateOpenC, gArgs.gateQuietMs, gArgs.gateEndC);
     note("cpufreq: perf policy (machdep.piano_cpufreq_perf, now %u): 1 = caps by PianoPolicy's profile whatever the source, skin steps "
          "%s (virtual skin of the board thermistors, %s), burst %u / %u MHz for <= %u ms at a load onset (gap %u ms, none from %u C "
          "skin), tick %u ms (machdep.piano_cpufreq_perf_tick_ms), downs held %u ms; 0 = caps by the measured source, hard caps %u / "
@@ -1770,7 +1775,7 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     boostKind_ = applied;
     if (bk == perf::BoostKind::launch && launchNs != gpuLaunchSeen_ && gArgs.gpuLaunchMhz) {
       gpuLaunchSeen_ = launchNs;
-      gpuBoost(gArgs.gpuLaunchMhz, gArgs.launchMs, 1);
+      gpuBoost(gArgs.gpuLaunchMhz, gArgs.launchMs, 1, gArgs.gpuLaunchCapMhz);
     } else if (bk == perf::BoostKind::input && gArgs.gpuInputMhz && now - gpuInputAt_ >= 250000000ull) {
       gpuInputAt_ = now;
       gpuBoost(gArgs.gpuInputMhz, gArgs.inputMs, 2);

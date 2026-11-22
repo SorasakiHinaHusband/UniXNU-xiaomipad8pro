@@ -64,6 +64,93 @@ static void topLevels() {
     /* the default stays 607 */
     bootB();openB();driveB(130);CHECK(qual.thermal().step==7 && dcvs.level()==7);
 }
+/* gpu/fullopp1 (private/host-checks/20261122-gpu-fullopp/ANALYSIS.md 3.3): Android's thermal table in the guard and tops up to 14 on the
+ * bin-2 table: the ladder climbs to 1100 MHz when cool; the virtual skin caps 1050 from 25 C (clear < 23) and 734 from 45 C (clear < 42);
+ * no usable skin reading caps 734; XO caps 734 from 78 C (clear < 70) and exits at 90 C; silicon steps down from 95 C and exits at 100 C;
+ * the board thermistors neither hold nor exit (gpu-daily3c latched at msm 65.4 C where Android caps at 1050). */
+static const Adreno830Level kLevels14[14]={
+    {160000,0x32,2,2,2,0,0},{222000,0x34,2,2,2,0,0},{342000,0x38,2,3,3,0,0},{389000,0x3c,2,4,6,0,0xc8285ffd},
+    {443000,0x40,2,4,6,0,0xc02e5ffd},{525000,0x50,2,4,6,0,0xc02e5ffd},{607000,0x80,4,6,8,0,0xa82e5ffd},
+    {660000,0x90,4,6,8,0,0x882c5ffd},{734000,0xc0,6,8,10,0,0xa82a5ffd},{832000,0xe0,7,10,10,0,0x882a5ffd},
+    {900000,0x100,7,10,10,0,0x882a5ffd},{967000,0x140,11,11,11,0,0x882a5ffd},{1050000,0x1a0,11,11,11,0,0xa8295ffd},
+    {1100000,0x1c0,11,11,11,0,0x88295ffd}};
+static const A830DcvsTable kTable14={kLevels14,14,kDdr,12};
+static piano_skin_temps skinOf(int32_t virtualMilli,int32_t xoMilli=40000) {
+    piano_skin_temps k={};k.version=PIANO_SKIN_TEMPS_VERSION;k.state=PIANO_BOARD_TEMPS_RUNNING;k.period_ms=5000;k.rounds=1;
+    k.valid=(1u<<PIANO_SKIN_COUNT)-1u;k.milli_c[PIANO_SKIN_XO]=xoMilli;k.virtual_milli_c=virtualMilli;k.virtual_valid=1;k.virtual_used=31;
+    return k;
+}
+static void bootFull(uint8_t top=14,uint32_t mhz=1100) {
+    A830RecoveryOps ops=gRecoveryOps;ops.qualificationLowVote=lowVote;ops.qualificationQuiesce=quiesce;
+    ops.qualificationGxOff=[](void *) {return true;};
+    dcvs=A830Dcvs{};boot(ops);qual=A830Qualification{};qual.init(&power,&recovery,true,halt,false);
+    qual.fullopp();CHECK(qual.isFullopp() && qual.setTop(top) && qual.top()==top);
+    A830DcvsConfig c;c.qualification607=true;c.qualificationR3b=true;c.maxLevel=top;c.maxMhz=mhz;c.maxGiven=true;c.acd=true;
+    c.sustainKhz=0;c.initialLevel=1;c.initialBus=2;A830DcvsOps o=gDcvsOps;
+    o.qualificationFault=voteFault;o.qualificationService=lease;o.qualificationSample=sample;o.qualificationThermal=snapshot;
+    CHECK(dcvs.init(c,kTable14,gIo,gPowerEnv,o,&power,&recovery,&tsens)==0);CHECK(dcvs.start()==0);
+}
+static void tickF(int deci,const piano_skin_temps *k,piano_gpu_temps b={}) {
+    gEnv.now+=100000000;raw=Sm8750TsensValidBit|uint32_t(deci);
+    if(!b.version)b=board(uint32_t(gEnv.now/5000000000ull)+1);
+    qual.tick(gEnv.now,gpu(),b,true,false,k);
+}
+static void driveF(unsigned n,int deci,const piano_skin_temps *k) {
+    for(unsigned i=0;i<n;++i) {tickF(deci,k);gHw.busyTicks+=A830_XO_HZ/10;dcvs.noteSubmit();dcvs.serviceTick(gEnv.now);}
+}
+static void androidProfile() {
+    {A830Qualification q;CHECK(!q.setTop(10) && !q.setTop(14));q.fullopp();CHECK(q.setTop(14) && !q.setTop(15) && !q.setTop(6));}
+    CHECK(A830Qualification::defaultBus(10)==10 && A830Qualification::defaultBus(12)==11 && A830Qualification::defaultBus(14)==11);
+    const piano_skin_temps cool=skinOf(20000);
+    bootFull();openB();
+    driveF(240,740,&cool);   /* cool: the ladder climbs one level per 2 s from 342 to the top */
+    CHECK(qual.thermal().step==14 && dcvs.level()==14 && power.qualificationCap()==14 && !qual.reason());
+    CHECK(qual.thermal().cause==A830R3bThermal::CauseNone && qual.thermal().skinValid && !qual.thermal().skin25);
+    /* the virtual skin: 25 C -> 1050 (GMU 13), held until below 23 C */
+    piano_skin_temps k=skinOf(25000);driveF(3,740,&k);
+    CHECK(qual.thermal().skinCap==13 && qual.thermal().cause==A830R3bThermal::CauseSkin25 && dcvs.level()==13 && !qual.reason());
+    k=skinOf(23000);driveF(3,740,&k);CHECK(dcvs.level()==13);
+    k=skinOf(22999);driveF(3,740,&k);CHECK(qual.thermal().skinCap==14 && dcvs.level()==14);
+    /* 45 C -> 734 (GMU 9) until below 42 C, then the 25 C cap again */
+    k=skinOf(45000);driveF(3,740,&k);CHECK(qual.thermal().skinCap==9 && qual.thermal().cause==A830R3bThermal::CauseSkin45 &&
+                                           dcvs.level()==9 && !qual.reason());
+    k=skinOf(42000);driveF(3,740,&k);CHECK(dcvs.level()==9);
+    k=skinOf(41999);driveF(3,740,&k);CHECK(qual.thermal().skinCap==13 && dcvs.level()==13);
+    /* no usable virtual reading: unknown, never cool -> 734 */
+    driveF(3,740,nullptr);CHECK(qual.thermal().skinCap==9 && qual.thermal().cause==A830R3bThermal::CauseSkinUnknown && dcvs.level()==9);
+    k=skinOf(20000);k.virtual_valid=0;driveF(3,740,&k);CHECK(qual.thermal().skinCap==9);
+    k=skinOf(20000);k.version=2;driveF(3,740,&k);CHECK(qual.thermal().skinCap==9 && !qual.reason());
+    /* XO: 78 C -> 734 until below 70 C */
+    k=skinOf(20000,78000);driveF(3,740,&k);CHECK(qual.thermal().skinCap==9 && qual.thermal().cause==A830R3bThermal::CauseXo);
+    k=skinOf(20000,70000);driveF(3,740,&k);CHECK(qual.thermal().skinCap==9);
+    k=skinOf(20000,69999);driveF(3,740,&k);CHECK(qual.thermal().skinCap==14);
+    driveF(30,740,&k);CHECK(dcvs.level()==14);
+    /* the board thermistors alone: no hold, no exit (the R3b-607 line exits at msm 65 / quiet 40) */
+    for(unsigned i=0;i<60;++i) {   /* 6 s of hot board rounds (fresh every 5 s, as PianoThermal's) */
+        auto b=board(uint32_t((gEnv.now+100000000)/5000000000ull)+1);b.milli_c[0]=70000;b.milli_c[1]=45000;tickF(740,&cool,b);
+    }
+    CHECK(!qual.reason() && !qual.thermal().boardCap && power.qualificationCap()==14 && qual.ready());
+    driveF(20,740,&cool);CHECK(dcvs.level()==14 && !qual.reason());
+    /* silicon: below tj 95 C nothing; at 95 C one level down per 500 ms; up again once below 90 C */
+    driveF(10,949,&cool);CHECK(qual.thermal().step==14 && !qual.reason());
+    driveF(1,950,&cool);CHECK(qual.thermal().step==13 && !qual.reason());
+    driveF(5,950,&cool);CHECK(qual.thermal().step==12);
+    driveF(5,950,&cool);CHECK(qual.thermal().step==11 && dcvs.level()==11 && qual.thermal().cause==A830R3bThermal::CauseLadder);
+    driveF(80,850,&cool);
+    CHECK(qual.thermal().step==14 && dcvs.level()==14);   /* the filter falls under 90 C, then 2 s per level */
+    /* exits: GPU raw 100 C */
+    tickF(1000,&cool);CHECK(qual.reason()==A830QualGpuHot && power.qualificationCap()==1);
+    bootFull();openB();driveF(240,740,&cool);CHECK(dcvs.level()==14);
+    raw=Sm8750TsensValidBit|999;qual.sample(gEnv.now,gpu());CHECK(!qual.reason());
+    raw=Sm8750TsensValidBit|1000;qual.sample(gEnv.now,gpu());CHECK(qual.reason()==A830QualGpuHot);
+    /* XO 90 C, Android's shutdown trip: the guard exit */
+    bootFull();openB();driveF(240,740,&cool);
+    k=skinOf(20000,90000);tickF(740,&k);CHECK(qual.reason()==A830QualBoardHot && power.qualificationCap()==1);
+    /* a lower top (fullopp with maxlevel 12 = 967 MHz) stops there */
+    bootFull(12,967);openB();driveF(240,740,&cool);CHECK(qual.thermal().step==12 && dcvs.level()==12);
+    /* without fullopp the same readings keep the R3b-607 rules (the board hold and exit) */
+    bootB();openB();auto b=board(100);b.milli_c[0]=65000;tickB(740,100000000,b);CHECK(qual.reason()==A830QualBoardHot);
+}
 static void residencyBudget() {
     bootB(true);
     openB();
@@ -208,7 +295,7 @@ static void failuresB() {
 #define A830_R3B_ENTRY main
 #endif
 int A830_R3B_ENTRY() {
-    pureBoundaries();topLevels();stepsAndBoard();failuresB();residencyBudget();
+    pureBoundaries();topLevels();androidProfile();stepsAndBoard();failuresB();residencyBudget();
     std::printf("PASS: R3b real policy/DCVS/power/recovery boundaries, thermal/board dwell, stale250/251, strict off/low M9/late ACK, independent105 halt, external/boost/wake/park (%u checks)\n",gChecks);
     return 0;
 }

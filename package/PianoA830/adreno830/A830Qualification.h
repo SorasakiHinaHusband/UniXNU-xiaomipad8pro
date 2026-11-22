@@ -32,15 +32,21 @@ public:
     /* gpu/daily4: the qualified ceiling, GMU level 7 (607 MHz), 8 (660) or 9 (734), with its default bus (Sm8750GpuLevels, GPU-ANDROID.md
      * table: 607 and 660 bus 6, 734 bus 8). Set once after init(), before the guard runs. */
     static constexpr uint8_t TopMin=7,TopMax=9;
+    /* gpu/fullopp1 (ANALYSIS.md 3.1): with fullopp() the top may be any bin-2 level from 7 to 14 (607 .. 1100 MHz). */
+    static constexpr uint8_t TopMaxFull=14;
     static uint8_t defaultBus(uint8_t level) {
-        static const uint8_t buses[TopMax+1]={0,2,2,3,4,4,4,6,6,8};
-        return buses[level<=TopMax?level:TopMax];
+        static const uint8_t buses[TopMaxFull+1]={0,2,2,3,4,4,4,6,6,8,10,10,11,11,11};
+        return buses[level<=TopMaxFull?level:TopMaxFull];
     }
     bool setTop(uint8_t level) {
-        if(level<TopMin || level>TopMax)return false;
+        if(level<TopMin || level>(fullopp_?TopMaxFull:TopMax))return false;
         top_=level;thermal_.top=level;return true;
     }
     uint8_t top() const {return top_;}
+    /* gpu/fullopp1: Android's thermal table in the guard (A830R3bThermal::useAndroid) and tops up to 14. Before setTop(). */
+    void fullopp() {fullopp_=true;thermal_.useAndroid();}
+    bool isFullopp() const {return fullopp_;}
+    uint64_t skinSnapshot() const {return thermal_.publishedSkin();}
     /* Daily mode (pagani-gpu-daily=1, gpu/daily1): the same guard as the daily frequency policy. The permit arms itself once the
      * guard is ready (two fresh board rounds, GPU and board sensors healthy and cool) and has no expiry; every limit of the R3b
      * contract stays: the soft ladder, the board hold, the hard exits (raw 85 C, board 65/40 C, sensor/lease, an unacknowledged
@@ -86,8 +92,9 @@ public:
     }
     // Called every second by a separate kernel thread. 600 s soak + at most 2 s for the last, dropped ACK.
     // A missing callback/service, partial VALID mask, implausible reading or stalled sample is never a permit.
-    void tick(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard=false) {
-        if(r3b_) {tickR3b(now,gpu,board,boardOk,injectBoardHard);return;}
+    void tick(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard=false,
+              const piano_skin_temps *skin=nullptr) {
+        if(r3b_) {tickR3b(now,gpu,board,boardOk,injectBoardHard,skin);return;}
         __atomic_store_n(&heartbeatAt_,now,__ATOMIC_RELEASE);
         if(power_->qualificationLatched() && !reason())fault(A830QualVote,now);
         bool gpuOk=gpu.valid==255;
@@ -138,7 +145,7 @@ public:
                 if(gpu.deci[i]<-400 || gpu.deci[i]>1250)valid=false;
                 if(gpu.valid&(1u<<i)) {
                     if(gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr,A830ExitOrigin::Raw105);break;}
-                    if(gpu.deci[i]>=850)hot=true;
+                    if(gpu.deci[i]>=thermal_.hardDeci)hot=true;
                 }
             }
             if(!reason() && hot)fault(A830QualGpuHot,now,source);
@@ -155,22 +162,25 @@ public:
         return at && now>=at && now-at>=5000000000ull && !recovery_->safeOff() && !recovery_->qualificationSafeLow();
     }
 private:
-    void tickR3b(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard) {
+    void tickR3b(uint64_t now,const Sm8750TsensSample &gpu,const piano_gpu_temps &board,bool boardOk,bool injectBoardHard,
+                 const piano_skin_temps *skin) {
         // Last protection runs before any board call/log/fault path can stall.
         for(unsigned i=0;i<8;++i)if((gpu.valid&(1u<<i)) && gpu.deci[i]>=1050 && unsafe_) {unsafe_(nullptr,A830ExitOrigin::Raw105);break;}
         checkLease(now); // never renew a missing guard's expired lease
-        thermal_.tick(now,gpu,board,boardOk,high());
+        thermal_.tick(now,gpu,board,boardOk,high(),skin);
         __atomic_store_n(&heartbeatAt_,now,__ATOMIC_RELEASE);
         bool gpuOk=gpu.valid==255;
         for(unsigned i=0;i<8;++i)if(gpu.deci[i]<-400 || gpu.deci[i]>1250)gpuOk=false;
         __atomic_store_n(&ready_,thermal_.ready,__ATOMIC_RELEASE);
         __atomic_store_n(&inhibit_,(!gpuOk?A830QualGpuInvalid:0u)|(!thermal_.healthy?A830QualBoardInvalid:0u)|
-            (thermal_.raw>=800?A830QualGpuOver:0u)|(thermal_.boardCap?A830QualBoardOver:0u)|
+            (thermal_.raw>=thermal_.softDeci?A830QualGpuOver:0u)|(thermal_.boardCap || thermal_.xoHard?A830QualBoardOver:0u)|
             (thermal_.entryRounds<2?A830QualNeedRounds:0u),__ATOMIC_RELEASE);
-        const bool hardBoard=injectBoardHard || (boardOk && board.valid==3 && board.state==PIANO_BOARD_TEMPS_RUNNING &&
+        /* gpu/fullopp1: Android's table has no board exit; its XO shutdown trip (90 C) is the only board-side hard limit. */
+        const bool hardBoard=injectBoardHard || (fullopp_?thermal_.xoHard:
+            boardOk && board.valid==3 && board.state==PIANO_BOARD_TEMPS_RUNNING &&
             (board.milli_c[0]>=65000 || board.milli_c[1]>=40000));
-        if(high() || (!reason() && ((gpuOk && thermal_.raw>=850) || hardBoard))) {
-            if(thermal_.raw>=850)fault(A830QualGpuHot,now);
+        if(high() || (!reason() && ((gpuOk && thermal_.raw>=thermal_.hardDeci) || hardBoard))) {
+            if(thermal_.raw>=thermal_.hardDeci)fault(A830QualGpuHot,now);
             else if(hardBoard)fault(A830QualBoardHot,now);
             else if(!thermal_.healthy)fault(A830QualSensor,now);
             else if(now-openedAt()>=windowNs_)fault(A830QualExpired,now);
@@ -190,7 +200,7 @@ private:
         power_->setQualificationCeiling(cap,defaultBus(cap));
         if(deadlineMissed(now) && unsafe_)unsafe_(nullptr,A830ExitOrigin::ProtectionDeadline);
     }
-    bool r3b_=false,daily_=false;
+    bool r3b_=false,daily_=false,fullopp_=false;
     uint8_t top_=7;
     void (*unsafe_)(void *,A830ExitOrigin)=nullptr;
     A830R3bThermal thermal_{};
