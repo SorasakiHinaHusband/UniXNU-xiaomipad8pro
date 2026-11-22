@@ -16,6 +16,12 @@
 // the sensor left with -1, or the user chose a level: piano-backlight-percent, or piano-backlight-auto=0 as a property); automatic.
 // A target enters automatic mode unless the user chose manual; the property piano-backlight-auto=1 requests it again (a fresh session target,
 // the offset kept).
+// 2026-11-22 (AUTO-BRIGHT.md): the user's own level while automatic mode is requested (the Control Center slider, which
+// piano-brightness-sync reports) does not leave automatic mode: adjust() makes it the curve's trim at the current target, as macOS's
+// CBAutoBrightnessModuleSKL userBrightnessCommitHandler: puts the user's nits at the current lux into its curve and stays enabled, and
+// as Android's slider shifts its automatic curve. The trim is kept for the boot like the offset (display off/on, a sleep, a manual
+// level and re-entry keep it), so "darker than automatic" holds as the room changes. Exponential mapping: codes added (the codes are
+// perceptual: about a factor 3 in luminance per 350 codes on the bounded SDR range); linear mapping: a ratio, (1024 + trim) / 1024.
 //
 // Integration in Ktz8866.h's Controller (three calls, PianoBacklight's owner):
 //   pianoauto::Ambient ambient_;                         // start(): ambient_.configure(cfg_.autoAllowed, cfg_.floor, exponential_,
@@ -38,6 +44,7 @@ constexpr const char *kPropertyAuto = "piano-backlight-auto";       // published
 constexpr const char *kPropertyRequested = "piano-backlight-auto-requested";
 constexpr const char *kPropertyValid = "piano-backlight-ambient-valid";
 constexpr const char *kPropertyOffset = "piano-backlight-offset";   // published: the user's shift in steps (signed)
+constexpr const char *kPropertyTrim = "piano-backlight-trim";       // published: the user's slider trim (signed; codes or 1/1024)
 constexpr const char *kPropertyTarget = "piano-backlight-ambient-permille";
 constexpr const char *kPropertyLux = "piano-backlight-ambient-lux";
 constexpr const char *kPropertyAmbientSnapshot = "piano-backlight-ambient";
@@ -67,7 +74,8 @@ class Ambient {
     exponential_ = exponential;
     maxOffset_ = maxOffset < 0 ? 0 : maxOffset > 40 ? 40 : maxOffset;
     mode_ = allowed ? Mode::manual : Mode::off;
-    offset_ = 0;
+    offset_ = trim_ = 0;
+    pending_ = 0;
     have_ = userManual_ = false;
     fault_ = false;
   }
@@ -87,8 +95,31 @@ class Ambient {
     if (userManual_) return false;
     have_ = true;
     mode_ = Mode::automatic;
+    if (pending_) {   // the user's level came before this session's first target: it is the trim at this one
+      trim_ = trimFor(pending_, curveCode());
+      pending_ = 0;
+    }
     return true;
   }
+
+  // The user's level (a code) while automatic mode is requested: automatic mode stays and the level becomes the trim, so code() is
+  // that level now (unless clamped) and follows the curve from there. True when code() is to be applied now; false when not requested
+  // (the caller sets the level as a manual one) or when no target of this session is there yet (the level is kept and the trim is
+  // taken at the next target; the caller shows the level meanwhile).
+  bool adjust(uint16_t user)
+  {
+    if (!requested() || fault_) return false;
+    const uint16_t level = clampCode(user > ceiling_ ? ceiling_ : user, floor_);
+    if (!have_) {
+      pending_ = level;
+      return false;
+    }
+    pending_ = 0;
+    trim_ = trimFor(level, curveCode());
+    return true;
+  }
+  int trim() const { return trim_; }
+  uint16_t pendingLevel() const { return pending_; }
 
   // A brightness step (keys, piano-backlight-step) in automatic mode: true when taken here (code() is the new code; it may be the old
   // one at an end); false when not automatic (the caller steps as it does today).
@@ -107,6 +138,7 @@ class Ambient {
   {
     if (!allowed_) return;
     userManual_ = true;
+    pending_ = 0;
     invalidate();
   }
 
@@ -116,6 +148,7 @@ class Ambient {
     if (!allowed_) return false;
     userManual_ = !on;
     if (!on) {
+      pending_ = 0;
       invalidate();
       return false;
     }
@@ -140,11 +173,30 @@ class Ambient {
   int32_t lastTarget() const { return have_ ? int32_t(permille_) : -1; }
   uint32_t lastLux() const { return lux_; }
   uint32_t targets() const { return targets_; }
-  // The curve's code for the last target, shifted by the offset: floor..2047.
-  uint16_t code() const
+  // The curve's code for the last target, shifted by the offset (the keys): floor..ceiling.
+  uint16_t curveCode() const
   {
     const uint16_t target = codeForPermille(have_ ? permille_ : 0, floor_);
     return shift(target > ceiling_ ? ceiling_ : target, offset_, floor_, exponential_, ceiling_);
+  }
+  // What is applied: the curve's code with the user's trim: floor..ceiling.
+  uint16_t code() const { return trimmed(curveCode(), trim_, floor_, exponential_, ceiling_); }
+
+  // The trim: exponential mapping codes added (bounded by the range), linear mapping (1024 + trim) / 1024 (1/1024 .. 16x).
+  static uint16_t trimmed(uint16_t code, int trim, uint16_t floor, bool exponential, uint16_t ceiling = kAmbientFullScale)
+  {
+    const int64_t v = exponential ? int64_t(code) + trim : (int64_t(code) * (1024 + trim) + 512) / 1024;
+    return clampCode(v > ceiling ? ceiling : v, floor);
+  }
+  int trimFor(uint16_t level, uint16_t curve) const
+  {
+    const int range = int(ceiling_) - int(floor_);
+    if (exponential_) {
+      const int t = int(level) - int(curve);
+      return t < -range ? -range : t > range ? range : t;
+    }
+    const int64_t ratio = (int64_t(level) * 1024 + curve / 2) / (curve ? curve : 1) - 1024;
+    return int(ratio < -1023 ? -1023 : ratio > 15 * 1024 ? 15 * 1024 : ratio);
   }
 
   static uint16_t clampCode(int64_t v, uint16_t floor)
@@ -190,7 +242,8 @@ class Ambient {
   bool allowed_ = false, exponential_ = false, have_ = false, userManual_ = false, fault_ = false;
   Mode mode_ = Mode::off;
   uint16_t floor_ = 128, ceiling_ = kAmbientFullScale;
-  int maxOffset_ = 12, offset_ = 0;
+  uint16_t pending_ = 0;   // the user's level waiting for this session's first target (0: none)
+  int maxOffset_ = 12, offset_ = 0, trim_ = 0;
   uint32_t permille_ = 0, lux_ = 0, targets_ = 0;
 };
 

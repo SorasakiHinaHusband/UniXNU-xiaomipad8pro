@@ -45,7 +45,9 @@
 //                               panel's level: WindowServer's next request (its echo) is not taken for the user's move;
 //                               root's "piano-backlight-managed" (a lease, seconds) hands the user's moves to the daemon (the
 //                               stream then never ends automatic mode: EDR ramps and CoreBrightness's restore arrive there too),
-//                               "piano-backlight-moved" (16.16) is the move it saw in CoreBrightness's own level
+//                               "piano-backlight-moved" (16.16) is the move it saw in CoreBrightness's own level: while
+//                               automatic mode is requested it stays on and the move becomes the curve's trim (2026-11-22,
+//                               published as piano-backlight-trim); in manual mode it is the level
 //   piano-backlight-android=1   opt in to the bounded Android-reference SDR adapter on compatible ICs
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -364,7 +366,7 @@ class PianoBacklight : public IOService {
   IOService *fDisplay = nullptr, *fKeyboard = nullptr, *fSensors = nullptr;   // fSensors: piano-backlight-auto=1 only
   uint64_t fSensorsSeq = ~0ull;   // PianoSensors' piano-sensors-seq as last taken
   int64_t fSensorsTarget = -2;    // its piano-sensors-light-target as last taken (-2: none yet)
-  uint64_t fPublished[24] = {};
+  uint64_t fPublished[25] = {};
   bool fHavePublished = false;
   uint64_t fNextLookupMs = 0;
   uint64_t fNextNativeMs = 0;
@@ -734,14 +736,25 @@ void PianoBacklight::serve()
     if (p.moved >= 0) {   // the user moved CoreBrightness's level (piano-brightness-sync saw DisplayNitsKey change)
       ++fDaemonMoves;
       ++fNativeMoves;
-      // what WindowServer asked last (the level with its EDR headroom) when it is fresh, else the reported level
-      const int32_t level = fLastNative >= 0 && nowMs() - fLastNativeMs < 3000 ? fLastNative : p.moved;
-      if (autoOwns) fNativeTookAuto = true;
       fHandover.cleared();
-      note("PianoBacklightNativeIntentV1 a move to requested16=%d (reported by piano-brightness-sync: CoreBrightness's level %d; %u reported, "
-           "%u moves): %s", level, p.moved, fDaemonMoves, fNativeMoves, autoOwns ? "automatic mode ends until a display power-on or a wake" : "manual");
-      fIntent.moved(level);
-      p.native = level;
+      if (autoOwns) {
+        // 2026-11-22 (AUTO-BRIGHT.md): automatic mode stays; CoreBrightness's own SDR level becomes the curve's trim (the panel shows it
+        // now and follows the room from there). The stream's EDR-scaled value is not used: automatic mode is SDR.
+        uint16_t code = 0;
+        const bool decoded = NativeBrightness(fCtl.floor(), fCtl.ceiling(), fRevision && fReference).decode(uint32_t(p.moved), code);
+        note("PianoBacklightNativeIntentV1 a move to requested16=%d (reported by piano-brightness-sync: CoreBrightness's level %d; %u reported, "
+             "%u moves): automatic mode stays, the move is the curve's trim", p.moved, p.moved, fDaemonMoves, fNativeMoves);
+        if (decoded) fCtl.userLevel(code, "piano-brightness-sync");
+        fIntent.moved(p.moved);
+        p.native = -1;
+      } else {
+        // manual: what WindowServer asked last (the level with its EDR headroom) when it is fresh, else the reported level
+        const int32_t level = fLastNative >= 0 && nowMs() - fLastNativeMs < 3000 ? fLastNative : p.moved;
+        note("PianoBacklightNativeIntentV1 a move to requested16=%d (reported by piano-brightness-sync: CoreBrightness's level %d; %u reported, "
+             "%u moves): manual", level, p.moved, fDaemonMoves, fNativeMoves);
+        fIntent.moved(level);
+        p.native = level;
+      }
     } else if (p.native >= 0) {
       const StreamChoice c = streamChoice(intent, autoOwns, managed, false);
       if (!c.apply) {
@@ -899,7 +912,7 @@ void PianoBacklight::restartAmbient()
 }
 
 // A display power-on or a wake: WindowServer's next values settle again (its power-on ramp is not a move), and automatic mode
-// comes back when a move had ended it.
+// comes back when the stream's own rule (no lease) had ended it. A reported move never ends it (2026-11-22: the curve's trim).
 void PianoBacklight::nativeSettle(const char *why)
 {
   if (!gArgs.native) return;
@@ -977,7 +990,7 @@ void PianoBacklight::publishState()
   const uint64_t state[] = {fCtl.code(), fCtl.controlling(), fCtl.wantLit(), fCtl.autoActive(), fCtl.autoFault(),
       a.requested(), a.valid(), uint64_t(uint32_t(a.lastTarget())), a.lastLux(), uint64_t(uint32_t(a.offset())), a.targets(),
       p.code, q.code, p.lit, q.lit, p.codeReadbacks, q.codeReadbacks, p.enableReadbacks, q.enableReadbacks,
-      p.errors, q.errors, fCtl.errors(), fCtl.writes(), fRevision};
+      p.errors, q.errors, fCtl.errors(), fCtl.writes(), fRevision, uint64_t(uint32_t(a.trim()))};
   static_assert(sizeof(state) == sizeof(fPublished), "backlight publication fields");
   if (fHavePublished && !memcmp(state, fPublished, sizeof(state))) return;
   memcpy(fPublished, state, sizeof(state));
@@ -1015,6 +1028,7 @@ void PianoBacklight::publishState()
   setProperty("piano-backlight-auto-active", fCtl.autoActive());
   setProperty("piano-backlight-auto-fault", fCtl.autoFault());
   setProperty(pianoauto::kPropertyOffset, uint64_t(uint32_t(int32_t(a.offset()))), 32);   // signed 32-bit
+  setProperty(pianoauto::kPropertyTrim, uint64_t(uint32_t(int32_t(a.trim()))), 32);       // signed 32-bit (2026-11-22)
   setProperty(pianoauto::kPropertyTarget, uint64_t(uint32_t(a.lastTarget())), 32);
   if (a.lastTarget() >= 0) {
     setProperty(pianoauto::kPropertyLux, uint64_t(a.lastLux()), 32);

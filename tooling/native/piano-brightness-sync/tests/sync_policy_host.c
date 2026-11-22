@@ -46,6 +46,19 @@ int main(void)
   assert(pbs_decide(&e, 10000, 2293, 1, 0, 1, 431949) == PBS_IDLE);         // requested, no target yet
   assert(A(e, 10500, 2293, 431949) == PBS_WAIT);
   assert(A(e, 11500, 2293, 431949) == PBS_SYNC);
+  // 2026-11-22 (AUTO-BRIGHT.md): the kernel keeps automatic mode after a reported move (the curve's trim). The owner's 14:47:32
+  // case: CoreBrightness at the synced 91.575 nits, Low Power Mode's eco factor takes it to 64.103 (a move), the panel follows it;
+  // in step, nothing to do; the room changes (the sensor covered): the new automatic level is synced; eco off is a move again.
+  struct pbs_state o;
+  pbs_init(&o);
+  assert(A(o, 0, 91722, 91575) == PBS_WAIT && A(o, 1000, 91722, 91575) == PBS_IDLE);   // the baseline, in step
+  assert(A(o, 2000, 91722, 64103) == PBS_MOVED && o.expected == 64103);
+  assert(A(o, 2100, 64250, 64103) == PBS_WAIT);                                         // the panel took the trim
+  assert(A(o, 3100, 64250, 64103) == PBS_IDLE);                                         // in step: no sync, no move
+  assert(A(o, 5000, 30100, 64103) == PBS_WAIT && A(o, 6000, 30100, 64103) == PBS_SYNC);  // a darker room: synced
+  pbs_synced(&o, 30080);
+  assert(A(o, 7000, 30100, 30080) == PBS_IDLE);
+  assert(A(o, 8000, 30100, 43000) == PBS_MOVED);                                        // eco off: CoreBrightness / 0.7
   // A dark panel is never touched, and the level CoreBrightness has meanwhile is the new baseline.
   struct pbs_state u;
   pbs_init(&u);
@@ -81,7 +94,7 @@ int main(void)
   assert(A(n, 71000, 90000, 600000) == PBS_SYNC && n.repeats == 1);
   // 16.16 for piano-backlight-sync / -moved: 26.16 nits, the 2.293 floor, 600 nits.
   assert(pbs_fixed(26160) == 1714422 && pbs_fixed(2293) == 150274 && pbs_fixed(600000) == 39321600);
-  puts("sync policy: restore baseline, settle, automatic ramp, tolerance, EDR, the user's move, manual, wake, dark, restart, "
-       "back-off and 16.16 passed");
+  puts("sync policy: restore baseline, settle, automatic ramp, tolerance, EDR, the user's move, automatic kept after a move, manual, "
+       "wake, dark, restart, back-off and 16.16 passed");
   return 0;
 }

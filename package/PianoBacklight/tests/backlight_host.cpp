@@ -934,9 +934,13 @@ static void testNativeBrightness()
       d.reset(0);
       CHECK(d.classify(int64_t(417.18 * 65536), 100) == NativeIntent::kFollow);
       CHECK(!run(d, true, fade, 20000));
-      // the daemon's report ends automatic mode (and applies) with or without the stream's opinion; manual always applies
+      // 2026-11-22 (AUTO-BRIGHT.md): the daemon's report never ends automatic mode: while automatic it is the curve's trim
+      // (Controller::userLevel, testUserLevel), not a level from the stream; in manual mode it is the level
       const StreamChoice r = streamChoice(NativeIntent::kFollow, true, true, true);
-      CHECK(r.apply && r.endsAuto);
+      CHECK(!r.apply && !r.endsAuto);
+      const StreamChoice rm = streamChoice(NativeIntent::kUserMove, false, true, true);
+      CHECK(rm.apply && !rm.endsAuto);
+      CHECK(!streamChoice(NativeIntent::kUserMove, true, false, true).endsAuto);
       const StreamChoice m = streamChoice(NativeIntent::kUserMove, false, true, false);
       CHECK(m.apply && !m.endsAuto);
       const StreamChoice f = streamChoice(NativeIntent::kFollow, true, false, false);
@@ -1094,6 +1098,93 @@ static void testAndroidBrightness()
     CHECK(ctl.code() == ctl.ceiling());
     for (const auto &write : model.writes()) CHECK(writable(write.reg));
   }
+}
+
+static Model qualifiedPwmPair();
+
+// 2026-11-22 (AUTO-BRIGHT.md): the owner's hands-on on the installed v13.1y3 (14:44-14:48). Automatic mode at 27 lux (651 permille,
+// code 1333 = 91.7 nits); at 14:47:32 Low Power Mode's eco factor took CoreBrightness from 91.575 to 64.103 nits, which the daemon
+// reported as a move, and automatic mode ended until the next display power-on, so covering the sensor did nothing. Now each reported
+// level keeps automatic mode and becomes the curve's trim: the panel shows it at once, and a darker or brighter room still moves it.
+static void testUserLevel()
+{
+  using pianoauto::Ambient;
+  Model m = qualifiedPwmPair();
+  Controller c(m);
+  Config cf = config(0);
+  cf.floor = PA_SDR_MIN_CODE;
+  cf.android = cf.autoAllowed = true;
+  c.configure(cf);
+  CHECK(c.survey() && c.start() && c.ceiling() == PA_SDR_MAX_CODE && c.exponential() && c.floor() == PA_SDR_MIN_CODE);
+  c.display(true, 1, 1);
+  CHECK(c.ambient(651, 27, "PianoSensors") && c.autoActive() && m.code(0) == 1333 && m.code(1) == 1333);
+  const NativeBrightness adapter(c.floor(), c.ceiling(), true);
+  auto codeOfNits = [&](double nits) {
+    uint16_t code = 0;
+    CHECK(adapter.decode(uint32_t(nits * 65536), code));
+    return code;
+  };
+  auto expected = [&](uint32_t permille) {
+    return Ambient::trimmed(Ambient::codeForPermille(permille, PA_SDR_MIN_CODE), c.ambientState().trim(), PA_SDR_MIN_CODE, true,
+                            PA_SDR_MAX_CODE);
+  };
+  // the 14:47:32 report (Low Power Mode): automatic mode stays, the panel at the reported level, the trim below the curve
+  const uint16_t eco = codeOfNits(64.103);
+  CHECK(eco < 1333 && eco > 1100);
+  CHECK(c.userLevel(eco, "piano-brightness-sync"));
+  CHECK(c.autoActive() && c.ambientState().requested() && m.code(0) == eco && m.code(1) == eco);
+  CHECK(c.ambientState().trim() == int(eco) - 1333 && m.logged("automatic mode stays"));
+  // covering the sensor (a darker room's target): the panel goes darker with the trim kept; uncovered: back to the user's level
+  CHECK(c.ambient(450, 3, "PianoSensors") && c.autoActive() && m.code(0) == expected(450) && m.code(0) < eco);
+  CHECK(c.ambient(651, 27, "PianoSensors") && m.code(0) == eco);
+  // Low Power Mode off: CoreBrightness back at 91.575 nits, reported again: the trim back near zero
+  CHECK(c.userLevel(codeOfNits(91.575), "piano-brightness-sync") && c.autoActive());
+  CHECK(c.ambientState().trim() >= -2 && c.ambientState().trim() <= 2);
+  // the slider to full in the dim room: full now, full in daylight, full again when the room is dim again
+  CHECK(c.userLevel(PA_SDR_MAX_CODE, "piano-brightness-sync") && m.code(0) == PA_SDR_MAX_CODE && c.ambientState().trim() == 1952 - 1333);
+  CHECK(c.ambient(1000, 11165, "PianoSensors") && m.code(0) == PA_SDR_MAX_CODE);
+  CHECK(c.ambient(651, 27, "PianoSensors") && m.code(0) == PA_SDR_MAX_CODE);
+  CHECK(c.ambient(200, 1, "PianoSensors") && m.code(0) == expected(200) && m.code(0) < PA_SDR_MAX_CODE);
+  // a darker preference: the slider at 20 nits; the display off/on keeps it (the first fresh target gets the trim)
+  const uint16_t dim = codeOfNits(20.0);
+  CHECK(c.userLevel(dim, "piano-brightness-sync") && m.code(0) == dim && c.autoActive());
+  const int trim = c.ambientState().trim();
+  c.display(false, 1, 0);
+  CHECK(!m.lit(0) && c.ambientState().requested() && !c.ambientState().valid());
+  c.display(true, 1, 1);
+  CHECK(c.ambient(651, 27, "fresh wake sample") && c.autoActive() && c.ambientState().trim() == trim && m.code(0) == expected(651));
+  // a level before the session's first target (right after a power-on): shown at once, its trim taken at the next target
+  c.display(false, 1, 0);
+  c.display(true, 1, 1);
+  CHECK(c.userLevel(900, "piano-brightness-sync") && m.code(0) == 900 && c.ambientState().pendingLevel() == 900);
+  CHECK(m.logged("its trim at the next target"));
+  CHECK(c.ambient(651, 27, "fresh wake sample") && c.autoActive() && m.code(0) == 900 && c.ambientState().trim() == 900 - 1333);
+  CHECK(c.ambientState().pendingLevel() == 0);
+  // the user's word: piano-backlight-auto=0 makes a reported level the manual level (the trim kept for later); =1 resumes with it
+  CHECK(c.automatic(false, "setProperties") && !c.ambientState().requested());
+  CHECK(!c.userLevel(1500, "piano-brightness-sync") && m.code(0) == 1500 && c.ambientState().trim() == 900 - 1333);
+  CHECK(c.ambient(651, 27, "PianoSensors") && m.code(0) == 1500);                           // manual: targets only recorded
+  CHECK(c.automatic(true, "setProperties") && c.ambient(651, 27, "fresh auto sample") && c.autoActive() && m.code(0) == 900);
+  // a latched sensor fault: no trim (the level is the manual one)
+  c.invalidateAmbient(true);
+  CHECK(!c.userLevel(1200, "piano-brightness-sync") && m.code(0) == 1200 && c.ambientState().trim() == 900 - 1333);
+  CHECK(!m.inBurst);
+  checkWhitelist(m, PA_SDR_MIN_CODE);
+  // the linear mapping: the trim is a ratio
+  Model l;
+  l.setFound(0, 812, true);
+  l.setFound(1, 812, true);
+  Controller lc(l);
+  Config lf = config();
+  lf.autoAllowed = true;
+  lc.configure(lf);
+  CHECK(lc.survey() && lc.start() && !lc.exponential());
+  lc.display(true, 1, 1);
+  CHECK(lc.ambient(500, 400, "test light") && l.code(0) == 1024);
+  CHECK(lc.userLevel(512, "piano-brightness-sync") && l.code(0) == 512 && lc.ambientState().trim() == -512 && lc.autoActive());
+  CHECK(lc.ambient(1000, 10000, "test light") && l.code(0) == 1024);                         // half of full scale
+  CHECK(lc.ambient(250, 50, "test light") && l.code(0) == 256);
+  checkWhitelist(l, 128);
 }
 
 static void setPwm(Model &m, unsigned ic, uint16_t duty)
@@ -1317,6 +1408,7 @@ int main()
   testAmbientReadbackFault();
   testNativeBrightness();
   testAndroidBrightness();
+  testUserLevel();
   testPwmContract();
   testPwmRefusal();
   if (failures) {

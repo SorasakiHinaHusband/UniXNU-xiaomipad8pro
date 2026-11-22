@@ -36,8 +36,8 @@ constexpr char kNativeSync[] = "piano-backlight-sync";
 // (installed 14:07:31: sdr 431.949 x headroom 1.04185 = 450.025), and CoreBrightness's restore and EDR ramps arrive there like a
 // slider move: both runs ended automatic mode that way. While piano-brightness-sync holds this lease (root, seconds, 0 ends it), the
 // stream never ends automatic mode here; the daemon watches CoreBrightness's own SDR level (DisplayNitsKey, untouched by EDR) and
-// reports the user's move with kNativeMoved (16.16: that level). The newest request is published (kNativeRequested) so the daemon
-// wakes on every commit that reaches the panel.
+// reports the user's move with kNativeMoved (16.16: that level; since 2026-11-22 the curve's trim while automatic, see streamChoice).
+// The newest request is published (kNativeRequested) so the daemon wakes on every commit that reaches the panel.
 constexpr char kNativeManaged[] = "piano-backlight-managed";
 constexpr char kNativeMoved[] = "piano-backlight-moved";
 constexpr char kNativeRequested[] = "piano-backlight-native-requested";
@@ -138,14 +138,18 @@ class NativeIntent {
   bool armed_ = false;
 };
 
-// What one request does (round 2): apply it to the panel, and whether it ends automatic mode (until a display power-on or a wake).
-// reported: piano-brightness-sync's kNativeMoved; managed: its lease holds; owns: automatic mode was requested.
+// What one request does (round 2): apply it to the panel as a level, and whether it ends automatic mode (until a display power-on or
+// a wake). reported: piano-brightness-sync's kNativeMoved; managed: its lease holds; owns: automatic mode was requested.
+// 2026-11-22 (AUTO-BRIGHT.md): a reported move no longer ends automatic mode. While automatic mode is requested it becomes the curve's
+// trim (Controller::userLevel(), from CoreBrightness's own SDR level, never the stream's EDR-scaled value), as macOS keeps its own
+// automatic brightness on and puts a slider commit into its curve. In manual mode it is the level. Only the stream's own rule without
+// the daemon (2 % after the settle, no lease) still ends automatic mode; a display power-on or a wake gives that back.
 struct StreamChoice {
   bool apply, endsAuto;
 };
 inline StreamChoice streamChoice(NativeIntent::Kind intent, bool owns, bool managed, bool reported)
 {
-  if (reported) return {true, owns};
+  if (reported) return {!owns, false};                               // automatic: the trim (userLevel), manual: the level
   if (!owns) return {true, false};                                   // manual: the stream is the level
   if (intent == NativeIntent::kUserMove && !managed) return {true, true};   // no daemon: the stream's rule (2 % after the settle)
   return {false, false};                                             // automatic owns the panel: dropped

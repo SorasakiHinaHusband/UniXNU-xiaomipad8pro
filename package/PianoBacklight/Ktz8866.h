@@ -23,7 +23,8 @@
 // Automatic brightness (Config::autoAllowed, piano-backlight-auto=1; off by default, and then nothing below changes): targets of the
 // ambient light policy (permille of the code range) set the code through package/PianoAuto/AmbientBacklight.h; the brightness keys
 // then shift the curve by this ladder's steps (the offset, kept for the boot); an explicit level (percent) switches to manual until
-// automatic(true). docs/drivers/sensors.md 5a.4, backlight.md.
+// automatic(true); the user's slider level (userLevel(), 2026-11-22) keeps automatic mode and becomes the curve's trim.
+// docs/drivers/sensors.md 5a.4, backlight.md.
 #ifndef PIANO_BACKLIGHT_KTZ8866_H
 #define PIANO_BACKLIGHT_KTZ8866_H
 #include <stdint.h>
@@ -337,6 +338,30 @@ class Controller {
     code_ = next;
     apply();
   }
+  // 2026-11-22 (AUTO-BRIGHT.md): the user's own level (the slider, reported by piano-brightness-sync). While automatic mode is
+  // requested it stays on and the level becomes the curve's trim (AmbientBacklight.h adjust()); otherwise it is a manual level, as
+  // manualCode(). True when automatic mode took it.
+  bool userLevel(uint16_t next, const char *source)
+  {
+    if (!control_ || next < cfg_.floor || next > ceiling_) return false;
+    if (!cfg_.autoAllowed || !ambient_.requested() || ambient_.faulted()) {
+      manualCode(next, source);
+      return false;
+    }
+    const int before = ambient_.trim();
+    if (ambient_.adjust(next)) {
+      const uint16_t code = ambient_.code();
+      note("automatic brightness: the user's level from %s at %u lux: trim %d -> %d, code %u -> %u (%u %%; the curve's %u); "
+           "automatic mode stays", source, ambient_.lastLux(), before, ambient_.trim(), code_, code, percentOf(code), ambient_.curveCode());
+      code_ = code;
+    } else {   // no target of this session yet: shown now, the trim is taken at the next target
+      note("automatic brightness: the user's level from %s: code %u -> %u, its trim at the next target; automatic mode stays", source,
+           code_, next);
+      code_ = next;
+    }
+    apply();
+    return true;
+  }
   // A state the ICs did not take yet (an access failed): tried again (the kext calls this periodically, every second).
   void retry()
   {
@@ -359,8 +384,8 @@ class Controller {
     }
     const uint16_t next = ambient_.code();
     if (!was)
-      note("automatic brightness: on (%s): %u lux, target %d permille, offset %d: code %u -> %u (%u %%)", source, lux, permille,
-           ambient_.offset(), code_, next, percentOf(next));
+      note("automatic brightness: on (%s): %u lux, target %d permille, offset %d, trim %d: code %u -> %u (%u %%)", source, lux, permille,
+           ambient_.offset(), ambient_.trim(), code_, next, percentOf(next));
     if (!summary_.targets) {
       summary_ = Summary{};
       summary_.since = ics_.nowMs();
@@ -647,9 +672,10 @@ class Controller {
   static constexpr uint64_t kSummaryMs = 10000;
   void summarize()
   {
-    note("ambient: %u targets in %llu s, lux %u..%u, target %u..%u permille, offset %d, code %u -> %u (%u %%)%s", summary_.targets,
+    note("ambient: %u targets in %llu s, lux %u..%u, target %u..%u permille, offset %d, trim %d, code %u -> %u (%u %%)%s", summary_.targets,
          (unsigned long long)((ics_.nowMs() - summary_.since + 500) / 1000), summary_.luxMin, summary_.luxMax, summary_.minPermille,
-         summary_.maxPermille, ambient_.offset(), summary_.from, code_, percentOf(code_), wantLit() ? "" : " (dark: applied at the next on)");
+         summary_.maxPermille, ambient_.offset(), ambient_.trim(), summary_.from, code_, percentOf(code_),
+         wantLit() ? "" : " (dark: applied at the next on)");
     summary_ = Summary{};
   }
   pianoauto::Ambient ambient_;
