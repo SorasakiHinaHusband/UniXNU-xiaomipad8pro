@@ -64,6 +64,12 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   0007-pressure-surface-residency.patch and SurfaceResidency.h (ours, MIT): piano-surface-residency=1 lets pressure drop idle shader-read IOSurface
   texture generations; the original IOSurface supplies content on the next bind. Commands lease a generation until completion;
   writes, views, CPU access and indirect handles pin it. The runtime, Turnip retire queue and kernel still own actual BO cleanup.
+  0008-frontend-windowserver-encode-thread.patch (ours, MIT: the WindowServer encode-thread handshake, gfx/ws-encode3).
+  0009-frontend-compiler-additional-arguments.patch (2026-11-22, MIT, ours: the additional compiler arguments a Metal client sets, Core
+  Image's runtime-header definitions among them; the reverted 0006 of 2026-11-18, 3be98315/afe114a5, renumbered) and
+  0010-frontend-function-reflection.patch (2026-11-22, MIT, ours: NBFunction returnType/arguments for visible functions from the
+  function's own AIR, read by tooling/metal/turnip-a830/frontend/AirSignature.h, ours, MIT; nil and one log line when the AIR states
+  none or a type outside the set qualified against Apple's Metal). Context: the same UniXNU-turnip revision.
 Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is
   this repository's package/NativeSoftMetal/NativeSoftMetalPlugin.mm reporter (2026-11-11) with chaining to the process's own handlers.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a

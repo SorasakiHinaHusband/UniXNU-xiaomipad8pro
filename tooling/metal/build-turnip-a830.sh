@@ -182,7 +182,7 @@ for p in ${FRONTEND_PATCHES[@]+"${FRONTEND_PATCHES[@]}"}; do
   patch -s "$O/plugin/frontend.mm.new" < "$p" || { echo "frontend patch $p does not apply" >&2; exit 1; }
 done
 put "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm"; rm -f "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm.new.orig"
-if stale "$O/plugin/frontend.o" "$O/plugin/frontend.mm" "$U/NativeBridgeMetalFrontend.h" "$U/bridge/NativeMetalObjects.h" "$P/frontend/SurfaceResidency.h"; then
+if stale "$O/plugin/frontend.o" "$O/plugin/frontend.mm" "$U/NativeBridgeMetalFrontend.h" "$U/bridge/NativeMetalObjects.h" "$P/frontend/SurfaceResidency.h" "$P/frontend/AirSignature.h"; then
   "${CXX[@]}" "$O/plugin/frontend.mm" -o "$O/plugin/frontend.o"
 fi
 # The abort reporter (tooling/metal/turnip-a830/abort_reporter.mm, ours: NativeSoftMetal's in the desktop's Metal clients) as a third
