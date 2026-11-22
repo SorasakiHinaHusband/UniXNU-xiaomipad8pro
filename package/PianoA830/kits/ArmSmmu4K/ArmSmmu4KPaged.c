@@ -568,10 +568,12 @@ ArmSmmu4KStatus ArmSmmu4KPagedAudit(const Space *s,const ArmSmmu4KPagedRecord *r
 }
 static void free_walk(Space *s,volatile uint64_t *table,unsigned level,uint64_t physical)
 {
+    /* Each entry is cleared before its table goes back: no page is released while a table still names it. */
     if(level<3)for(unsigned i=0,n=entries_of(s,level);i<n;++i) {
         const uint64_t entry=table[i];
         if(!entry)continue;
-        if(level==s->start_level && bit(s->foreign,i)) {table[i]=0;continue;}
+        table[i]=0;
+        if(level==s->start_level && bit(s->foreign,i))continue;
         volatile uint64_t *child=table_at(s,entry);
         if(child)free_walk(s,child,level+1,entry&PA_MASK);
     }

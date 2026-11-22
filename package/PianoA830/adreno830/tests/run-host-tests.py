@@ -21,7 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / 'tests'
 FLAGS = ['-O2', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined']
-SMMU_HOST = ['ArmSmmu4KContext', 'ArmSmmu4KProgram', 'ArmSmmu4KLive', 'ArmSmmu4KStreams']
+# ArmSmmu4K (the static builder) and ArmSmmu4KPaged (the on-demand tables, GPU-PAGED P0a): test_pagedvm compares them.
+SMMU_HOST = ['ArmSmmu4KContext', 'ArmSmmu4KProgram', 'ArmSmmu4KLive', 'ArmSmmu4KStreams', 'ArmSmmu4K', 'ArmSmmu4KPaged']
 CORE = ['NativeAdrenoMemory.cpp', 'NativeAdrenoSmmuMemory.cpp']
 SUBMIT = CORE + ['NativeAdrenoVm.cpp', 'NativeAdrenoRing.cpp', 'NativeAdrenoSubmit.cpp']
 # name: (repository sources, extra host objects, pinned PASS line or None, note). Every other test_*.c/.cpp is discovered
@@ -56,6 +57,11 @@ KNOWN = {
         'import, FIFO handle quarantine (4096) and slot encoding, ring-full retry vs Busy, M10 lock use (no Memory lock outside the '
         'pool), dispatch sizes, refusals, teardown, device info, two clients, late scope, retire, contiguous '
         'fallback, poisoned commit, CPU leases, queues, connection bytes by kind, teardown past a refused object', 'M7/M9/M10'),
+    'test_pagedvm': ([], ['smmu'],
+        'PASS: paged native4K kit: 5 PTE profiles byte-equal to ArmSmmu4KBuild at 32/36/39 bits and accepted by the live audit '
+        '(34908 leaves, 7 classes); 16 reserve/commit failure cases; 9 shared-root checks; 11 TLB plan checks; 8 audit findings; '
+        '2 churn runs (8000 operations, every table page back); gpu-daily3 peak replay 5328 objects 3068 MiB: 1565 table pages '
+        'global, 1582 per process (18 spaces), worst case 32834', 'GPU-PAGED P0a'),
     'test_timer': (['NativeAdrenoTimer.cpp'], [],
         'PASS: GMU AO counter at gmu +0x47100/+0x47104 and CP 0x8E7/0x8E8, 19 high-low-high reads (rollovers included), 12 '
         'refusals over a software counter peer', 'M6'),
