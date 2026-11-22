@@ -53,6 +53,7 @@ Standing constraints for every item:
 | B12 | **Rear torch** (PMIC flash LED; partial in Ubuntu, v1.1.1 torch control with readback check) | flashlight | SPMI writes (opt-in), a userland trigger | **T2 ran twice register-perfect, LED dark** (2026-11-15: flip4 20 mA, hands1 50 mA — 12/12 writes read back, `enables 80 03`, owner watching): registers and channel mapping exonerated (the factory tree wires the torch to channels 1+2; the vendor driver writes nothing we don't); open causes ranked in torch.md §10.3 (current far under the factory's 400 mA/ch, channel open / vreg-not-ready — the bits never sampled during the window, supply outside the peripheral). **T4 probe built** on `torch-t2-nolight`: `piano-torch-probe=1` (two windows: factory pair then spare pair, status+fault polled every 500 ms while lit, full 256-byte dumps and diffs); next: merge, one attended boot, then the owner's call on the 100 mA cap | attended |
 | B13 | **Per-unit sensor calibration** from this tablet's `persist` registry (Ubuntu's default calibration is less accurate) | accuracy of B3 | B3 | the DSP applies the calibration itself from the registry it reads: serving this unit's `persist` registry is all of it (`sensors.md` §5); first from a pack of the owner's own files (`tools/make-sensor-pack.py`, kept under the ignored `out/`/`private/`), then (level S6) a read-only ext4 reader of `persist` at run time; never written, never committed, never another unit's copy | with B3 |
 | B14 | **NPU-accelerated noise suppression** (low priority, owner 2026-11-22: after every item above, with the other NPU/DSP work at the end of the backlog) | microphone noise suppression without CPU cost | the CPU path first: macOS's own Voice Isolation (a CPU network) or a BSD-licensed CPU suppressor, shipped when it passes; then the SoC's neural accelerator (its DSP-side neural engine and model loader) | none until the CPU path is installed and its CPU cost is known | none |
+| B15 | **ADSP noise suppression** (low priority, owner 2026-11-22: future item next to B14, after the CPU suppressor ships) | microphone noise suppression on the audio DSP instead of the CPU | the capture path opens one more DSP subgraph (the same out-of-band open the speaker protection uses); either the vendor's static recorder noise-suppression module in the DSP firmware (no loader needed), or the SoC vendor's dynamic suppressors (which need the audio-PD file service for module loading first) | the CPU suppressor (RNNoise) installed; for the dynamic modules: the audio-PD file service | none |
 
 Not in scope (Ubuntu does not support them either): stylus, fingerprint, hibernation, hardware clock writes.
 
@@ -89,8 +90,8 @@ calibration data):
 - Wi-Fi: WCN7860 calibration at cold boot before a 22 dBm board TX-power cap.
 - GPU: the Adreno GMU keep-alive register fix for the fault interrupt.
 
-**Low priority, at the end with the other NPU/DSP work (owner, 2026-11-22): B14 NPU-accelerated noise suppression**; the CPU
-path (B14's "Depends on") ships first under the usual rules.
+**Low priority, at the end with the other NPU/DSP work (owner, 2026-11-22): B14 NPU-accelerated noise suppression and B15 ADSP
+noise suppression**; the CPU suppressor (RNNoise) ships first under the usual rules.
 
 **Last item (owner, 2026-11-15): drop the macOS-DroidVM build dependency**, after every hardware item above. Today the 27.3
 kernel tree is a clone of macOS-DroidVM's k27 tree (github.com/Droid-VM/macOS-DroidVM `11ac316`, via `PIANO_K27_TREE` and
