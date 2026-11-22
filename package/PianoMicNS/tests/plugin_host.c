@@ -6,10 +6,17 @@
 // device: the plug-in's device list and UID translation, the device's name, UID, transport, streams by scope, latency, rate, time
 // stamp period, the stream's direction, terminal and format, an unknown property refused; StartIO without PianoAudio's tap service
 // (this Mac has none) refused with kAudioHardwareNotRunningError. Run by tooling/k27/build-piano-micns.sh on the signed bundle.
-//   plugin_host BUNDLE
+// Built arm64e (mic-ns4, LOAD-ANALYSIS.md): on the tablet the driver service runs with pointer authentication on and dyld accepts only
+// arm64e slices ("incompatible architecture (have 'arm64', need 'arm64e')"); a third-party arm64e process on the build Mac runs the same
+// way, so this host grades the bundle as the tablet's helper does. An arm64 host would load either slice and could not see it.
+//   plugin_host BUNDLE              the bundle loads (CFBundle, as the helper's loader) and passes every check below
+//   plugin_host --refused BUNDLE    negative control: CFBundle must refuse to load the executable, and the same dlopen must fail
+//                                   with dyld's "need 'arm64e'" (the line the tablet's helper logged)
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <dlfcn.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,10 +54,36 @@ static int str_is(AudioObjectID o, AudioObjectPropertySelector s, const char *wa
     return CFStringGetCString(v, buf, sizeof buf, kCFStringEncodingUTF8) && !strcmp(buf, want);
 }
 
+#if __has_feature(ptrauth_calls)
+static const char kHostAbi[] = "arm64e";
+#else
+static const char kHostAbi[] = "arm64";
+#endif
+
+// the load error as one string (malloc'd): CFBundle's code and description plus dyld's message (the user info's debug description)
+static char *error_text(CFErrorRef err)
+{
+    if (!err) return strdup("no error");
+    CFStringRef d = CFErrorCopyDescription(err);
+    CFDictionaryRef ui = CFErrorCopyUserInfo(err);   // dyld's message is its NSDebugDescription
+    CFStringRef dbg = ui ? CFDictionaryGetValue(ui, CFSTR("NSDebugDescription")) : NULL;
+    CFStringRef all = CFStringCreateWithFormat(NULL, NULL, CFSTR("code %ld: %@ | %@"), (long)CFErrorGetCode(err), d ? d : CFSTR("-"),
+                                               dbg ? (CFTypeRef)dbg : ui ? (CFTypeRef)ui : (CFTypeRef)CFSTR("-"));
+    CFIndex size = all ? CFStringGetMaximumSizeForEncoding(CFStringGetLength(all), kCFStringEncodingUTF8) + 1 : 1;
+    char *buf = calloc(1, (size_t)size);
+    if (buf && all) CFStringGetCString(all, buf, size, kCFStringEncodingUTF8);
+    if (all) CFRelease(all);
+    if (d) CFRelease(d);
+    if (ui) CFRelease(ui);
+    return buf ? buf : strdup("no memory");
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 2) {fprintf(stderr, "usage: plugin_host BUNDLE\n"); return 2;}
-    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[1], (CFIndex)strlen(argv[1]), true);
+    int refused = argc == 3 && !strcmp(argv[1], "--refused");
+    if (argc != 2 && !refused) {fprintf(stderr, "usage: plugin_host [--refused] BUNDLE\n"); return 2;}
+    const char *path = argv[argc - 1];
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), true);
     SecStaticCodeRef code = NULL;
     CHECK(SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess);
     CHECK(SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL) == errSecSuccess);   // the driver service refuses an invalid one
@@ -58,6 +91,33 @@ int main(int argc, char **argv)
     CFPlugInRef plugin = CFPlugInCreate(NULL, url);
     CHECK(plugin != NULL);
     CFBundleRef bundle = CFPlugInGetBundle(plugin);
+    // the executable, loaded the way the helper's CFBundle loader does it (dyld grades the slice against this process)
+    CFErrorRef err = NULL;
+    Boolean loaded = CFBundleLoadExecutableAndReturnError(bundle, &err);
+    char *why = error_text(err);
+    if (err) CFRelease(err);
+    if (refused) {
+        CHECK(!loaded);
+        // CFBundle's error carries no dyld text (code 3587); its loader logs dyld's message (com.apple.CFBundle:loading "Error loading
+        // ... dlopen(..., 0x0106)"). The same dlopen, with CFBundle's flags, must give dyld's arm64e refusal.
+        CFURLRef exe = CFBundleCopyExecutableURL(bundle);
+        char exepath[PATH_MAX];
+        CHECK(exe && CFURLGetFileSystemRepresentation(exe, true, (UInt8 *)exepath, sizeof exepath));
+        CFRelease(exe);
+        void *h = dlopen(exepath, RTLD_NOW | RTLD_LOCAL | RTLD_FIRST);
+        const char *dl = h ? "loaded" : dlerror();
+        if (h || !dl || !strstr(dl, "need 'arm64e'")) {
+            fprintf(stderr, "FAIL plugin_host --refused (host %s): CFBundle: %s; dlopen: %s\n", kHostAbi, why, dl ? dl : "-");
+            return 1;
+        }
+        const char *at = strstr(dl, "(mach-o file");
+        printf("PASS plugin refused: host %s, CFBundle %.10s, dlopen %.100s\n", kHostAbi, why, at ? at : dl);
+        free(why);
+        return 0;
+    }
+    if (!loaded) {fprintf(stderr, "FAIL plugin_host (host %s): the executable did not load: %s\n", kHostAbi, why); return 1;}
+    free(why);
+    ++checks;
     CFDictionaryRef info = CFBundleGetInfoDictionary(bundle);
     CFArrayRef clients = CFDictionaryGetValue(info, CFSTR("AudioServerPlugIn_IOKitUserClients"));
     CHECK(clients && CFArrayGetCount(clients) == 1 &&
@@ -117,6 +177,7 @@ int main(int argc, char **argv)
     CHECK((*drv)->WillDoIOOperation(drv, 2, 0, kAudioServerPlugInIOOperationWriteMix, &will, &inplace) == 0 && !will);
     CHECK((*drv)->StartIO(drv, 2, 1) == kAudioHardwareNotRunningError);
     CHECK(u32(2, kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal) == 0);
-    printf("PASS plugin: %u checks (signature valid, factory, interface, properties, StartIO without a tap refused)\n", checks);
+    printf("PASS plugin: %u checks in an %s host (signature valid, loaded, factory, interface, properties, StartIO without a tap refused)\n",
+           checks, kHostAbi);
     return 0;
 }

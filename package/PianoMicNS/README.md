@@ -14,7 +14,9 @@ through the default input in Sound settings). PianoAudio's own **Mic** stays raw
 - Log: `PianoMicNS: ...` (subsystem `com.unixnu.piano.micns`): load, tap open, the first frames, every 30 s, each stop (RNNoise's
   time per block and CPU share).
 
-Build: `tooling/k27/build-piano-micns.sh` (host tests, then `out/piano-micns/PianoMicNS.driver`, arm64, ad-hoc signed; its CDHash in
-`out/piano-micns/build.json`). Install: `/Library/Audio/Plug-Ins/HAL/PianoMicNS.driver` with the userland layer, its CDHash in the
-trust cache. Measured offline on the tablet's own recording (the core path of the host test, `micns_host --wav`): pink noise 31.6 dB
-lower, speech -1.1 dB with envelope r 0.86. Provenance: `UPSTREAM`, `NOTICE`.
+Build: `tooling/k27/build-piano-micns.sh` (host tests, then `out/piano-micns/PianoMicNS.driver`, thin arm64e, ad-hoc signed; its
+CDHash in `out/piano-micns/build.json`). arm64e, not arm64: on the tablet the HAL's driver service runs with pointer authentication on
+and refuses an arm64 slice (`need 'arm64e'`), so the build's plug-in host test runs as an arm64e process, loads the arm64e bundle and
+must refuse an arm64 build of the same sources. Install: `/Library/Audio/Plug-Ins/HAL/PianoMicNS.driver` with the userland layer, its
+CDHash in the trust cache. Measured offline on the tablet's own recording (the core path of the host test, `micns_host --wav`): pink
+noise 31.6 dB lower, speech -1.1 dB with envelope r 0.86. Provenance: `UPSTREAM`, `NOTICE`.
