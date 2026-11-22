@@ -666,6 +666,11 @@ The touch part of the driver contract (`package/include/PianoPowerContract.h`, `
 
 ## 17. The multitouch path (`piano-touch-mt=1`, 2026-11-22, host-tested, not run)
 
+Left out of the daily line (lead/v131y8, 2026-11-23): `piano-touch-mt` is refused at start and `PianoTouch.json` carries no
+`PianoTouchMultitouch` personality, so no multitouch device is published; the cover touchpad comes later. The native touch
+screen (section 18) does not use this path; the test-only injection (17.4) stays behind `piano-touch-inject=1`, never in a daily
+profile.
+
 Until now the screen was a HID mouse: macOS made no magnify, rotate or swipe event and no `NSTouch` from it, and a pinch was Command +
 Wheel. With `piano-touch-mt=1` PianoTouch publishes a second HID device, a trackpad of Apple's multitouch family (`MtHid.h`), which
 macOS's own AppleMultitouchDriver (already in the native kext collection) drives with `AppleMultitouchHIDEventDriverV2` through
