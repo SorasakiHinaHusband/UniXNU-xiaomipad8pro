@@ -1198,8 +1198,9 @@ IOReturn NativeAdrenoVm::preparePaged(const NativeAdrenoVmPagedConfig &config,ui
     capacity_=NativeAdrenoVmMaxObjects;
     paged_config_=config;paged_=true;pstats_={};
     chunk_count_=chunk_pages_=0;free_head_=0;free_pages_=0;trim_count_=0;trim_all_=false;space_={};
-    IOReturn status=growTables(NativeAdrenoVmPagedSpare);
-    if(status)return undo(status);
+    const size_t first=config.table_cap_pages<NativeAdrenoVmPagedSpare?config.table_cap_pages:NativeAdrenoVmPagedSpare;
+    const IOReturn grown=growTables(first);
+    if(!free_pages_)return undo(grown?grown:kIOReturnNoMemory);   /* a short first grow is fine as long as the root has its page */
     const ArmSmmu4KPagedConfig sc={config.input_bits,config.output_bits,0,config.aperture};
     const ArmSmmu4KPagedPages pages={this,tableAllocate,tableRelease,tableCpu,tablePublish,nullptr};
     ArmSmmu4KStatus init;
