@@ -16,7 +16,8 @@
 #   at every amplifier write and every buffer played, start at the first sound and down after silence, the clocks' drift, the master
 #   volume's ramp, every fault and plan failure, the Mic's capture plan with the VA macro's DMIC path), tests/control_host.c (the IOAudio2
 #   selector-2 scalar mappings), tests/va_host.c (the VA
-#   macro's DMIC path against a register model: values, order, waits), tests/preset_host.c (the preset loader on an mtools FAT32
+#   macro's DMIC path against a register model: values, order, waits), tests/tap_host.c (the microphone tap's ABI, AudioTap.h, shared
+#   with the "Mic (noise reduced)" plug-in: layout, wrap, lapped readers), tests/preset_host.c (the preset loader on an mtools FAT32
 #   image as build-esp.py makes the ESP; skipped without mtools)
 # The copies stay byte for byte their originals but for their provenance lines (FatVolume from PianoPower, SmmuStream from PianoDwc3,
 # BitI2c from PianoKeyboard). Then the import check (PianoPower's client functions, package/include/PianoAdspContract.h, and NativeUfs's
@@ -63,9 +64,10 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/mic_fifo_host.c" "$P/AudioSpkProt.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -lm -o "$T/mic_fifo_host"
 "${C[@]}" "$P/tests/va_host.c" "$P/AudioVa.c" -o "$T/va_host"
+"${C[@]}" "$P/tests/tap_host.c" -o "$T/tap_host"
 "${C[@]}" "$P/tests/prime_host.c" "$P/AudioSpkProt.c" "$P/AudioSession.c" "$P/AudioAmps.c" "$P/Fs19xx.c" "$P/AudioSha256.c" "$P/AudioSequence.c" \
   "$P/PianoAudioReach.c" "$P/PianoGpr.c" "$P/AudioSafety.c" "$P/AudioDspLink.c" -o "$T/prime_host"
-for t in gpr_host audioreach_host sequence_host spkprot_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host prime_host mic_fifo_host va_host; do
+for t in gpr_host audioreach_host sequence_host spkprot_host fs19xx_host amps_host pcm_host control_host timing_host dsplink_host session_host live_host prime_host mic_fifo_host va_host tap_host; do
   "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }
 done
 # The preset loader on a FAT32 image with 4096-byte sectors, one per cluster, as build-esp.py makes the ESP (mtools).
@@ -148,7 +150,7 @@ fi
 python3 "$D/tooling/persist/firmware.py" stage --kext PianoAudio --header "$O/gen/PianoAudioFirmwarePins.h" \
   --source "$O/gen/PianoAudioFirmware.c" "${PRESET:-$O/preset/fs19xx.fsm}=4348:$PRESET_SHA" ${SPK[@]+"${SPK[@]}"}
 rm -rf "$O/preset" "$O/spk"
-python3 "$D/tooling/k27/build-native-kext.py" PianoAudio "$P/PianoAudio.cpp" "$P/AudioDsp.cpp" "$P/AudioBoard.cpp" "$P/PianoAudioDevice.cpp" \
+python3 "$D/tooling/k27/build-native-kext.py" PianoAudio "$P/PianoAudio.cpp" "$P/AudioDsp.cpp" "$P/AudioBoard.cpp" "$P/PianoAudioDevice.cpp" "$P/PianoAudioTap.cpp" \
   "$D/tooling/k27/NativeKextGlue.cpp" "$P/PianoGpr.c" "$P/PianoAudioReach.c" "$P/AudioSequence.c" "$P/Fs19xx.c" "$P/AudioSha256.c" \
   "$P/AudioSafety.c" "$P/AudioDspLink.c" "$P/AudioPcm.c" "$P/AudioAmps.c" "$P/AudioSession.c" "$P/AudioPreset.c" "$P/FatVolume.c" \
   "$P/AudioLive.c" "$P/AudioSpkProt.c" "$P/AudioVa.c" "$D/package/common/PianoFirmware.cpp" "$D/package/common/PianoFirmwareCore.c" "$D/package/common/PianoFirmwareZlib.c" \

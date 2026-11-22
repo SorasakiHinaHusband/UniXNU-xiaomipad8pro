@@ -13,7 +13,8 @@
  *      on the samples before they come here
  *   10 also the Mic device: the capture plan (the VA clocks, the mic graphs, the VA macro's DMIC path between their prepare and
  *      start) brought up while the device runs, the capture pump's two-channel periods mixed to mono into the Mic's ring, the
- *      first 100 ms dropped (the start transient)
+ *      first 100 ms dropped (the start transient); also while a tap client is open (AudioTap.h: "Mic (noise reduced)"), each
+ *      period's mono frames going into the tap as well
  * The rules of AudioSession.h hold here too: one DSP command at a time over both plans, each answer checked, the reverse unwind;
  * nothing new while PianoPower asks for quiet (a running stream stops, and comes back after); at any sign of trouble in PianoPower's
  * health no DSP command any more, the amplifiers muted, powered down and held in reset at once. A refused command or period, or an
@@ -41,6 +42,7 @@
 #include "AudioLedger.h"
 #include "AudioSession.h"
 #include "AudioCapture.h"
+#include "AudioTap.h"
 #include "AudioSpkProt.h"
 #include "AudioVa.h"
 #ifdef __cplusplus
@@ -104,6 +106,10 @@ typedef struct {
     uint32_t duplex_hold_gen;             /* every request: a new one clears a failure of this boot */
     int miplay;                           /* MIPLAY asked for (spk_miplay_valid: the boot argument, then the sysctl); taken at a start */
     uint32_t miplay_gen;                  /* every request: a new one clears a MIPLAY fallback of this boot */
+    /* The microphone tap (AudioTap.h): its shared header and ring (null: no tap), and how many tap clients are open; while one is,
+     * the capture plan runs as if the Mic device did, and every capture period also goes into the tap. */
+    PianoTapHeader *tap;
+    int tap_open;
 
 } AudioLiveShared;
 /* The rings' storage: AUDIO_LIVE_RING_BYTES and AUDIO_LIVE_MIC_RING_BYTES (the owner's, kept as long as sh). */
@@ -133,6 +139,9 @@ int audio_live_age_select(AudioLiveShared *sh, int signed_age);
  * both paths are down and one starts (never while the Mic holds its own votes: no second owner of one vote); -1 for another value. */
 int audio_live_hold_select(AudioLiveShared *sh, int mask);
 void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute);
+/* The tap (AudioTap.h): a client opened (+1) or closed (-1); returns the clients open now. The owner's thread then starts (or, after
+ * idle_ms with neither a tap client nor the Mic device, stops) the capture plan; the caller wakes it. */
+int audio_live_tap_client(AudioLiveShared *sh, int delta);
 int32_t audio_volume_q15(int percent);
 /* The ceiling for an attenuation of db dB below full scale (1..40; others: the level 8 ceiling, -20 dBFS). */
 int32_t audio_ceiling_db(unsigned db);

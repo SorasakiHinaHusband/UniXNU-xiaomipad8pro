@@ -594,6 +594,14 @@ void liveRun(const PianoAudioLevelArgs *a)
     registerSpk();
     registerAge();
     if (lc.mic) {registerMicRoute(); registerHold();}
+    // The microphone tap for "Mic (noise reduced)" (AudioTap.h, MIC-NS section 8): published once the capture path can run.
+    if (lc.mic && a->tap) {
+        const int tap = piano_audio_tap_publish(gShared, liveWake);
+        piano_audio_log("tap1: %s (service %s, user client %s, %u frames)", tap ? "NOT published (no memory)" : "published",
+                        PIANO_TAP_SERVICE, PIANO_TAP_USER_CLIENT, PIANO_TAP_FRAMES);
+    } else if (lc.mic) {
+        piano_audio_log("tap1: off (piano-audio-tap=0)");
+    }
     piano_audio_power_ready();
     uint32_t handled=0;
     uint8_t in[AUDIO_INBOX_BYTES];

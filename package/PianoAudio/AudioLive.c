@@ -311,6 +311,20 @@ void audio_live_input_control(AudioLiveShared *sh, int level_percent, int mute)
     __atomic_add_fetch(&sh->input_controls, 1, __ATOMIC_RELEASE);
 }
 
+int audio_live_tap_client(AudioLiveShared *sh, int delta)
+{
+    int now = __atomic_add_fetch(&sh->tap_open, delta, __ATOMIC_ACQ_REL);
+    if (now < 0) {__atomic_store_n(&sh->tap_open, 0, __ATOMIC_RELEASE); now = 0;}   /* an unmatched close: never below zero */
+    if (sh->tap) {
+        __atomic_store_n(&sh->tap->clients, (uint32_t)now, __ATOMIC_RELEASE);
+        if (delta > 0) __atomic_add_fetch(&sh->tap->opens, 1u, __ATOMIC_RELEASE);
+    }
+    return now;
+}
+
+/* The capture plan runs while the Mic device runs or a tap client is open. */
+static int mic_wanted(AudioLiveShared *sh) {return load(&sh->want_in) || (sh->tap && load(&sh->tap_open) > 0);}
+
 /* ------------------------------------------------------------------------------------------------ the configuration */
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level)
 {
@@ -1386,6 +1400,7 @@ static void capture_begin(AudioLive *l, uint32_t now)
                              AUDIO_LIVE_MIC_DEPTH, AUDIO_LATE_MS))
         l->cap_error = 1;
     l->cap.token_base += l->sleep_generation << 16;
+    if (l->sh->tap) __atomic_add_fetch(&l->sh->tap->run, 1u, __ATOMIC_RELEASE);   /* a tap reader re-anchors at a new run */
     l->sh->in.head = l->sh->in.tail = 0;   /* nobody reads it while capturing is 0 */
     drift_reset(&l->mic_drift);
     store(&l->sh->input_primed, 0);
@@ -1394,6 +1409,9 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->mic_state = LiveRunning;
     LOG(l, "live: mic: capture up: 10 ms periods of two channels, %u in flight, mono %s gen %u; the first %u ms dropped",
         AUDIO_LIVE_MIC_DEPTH, audio_mic_mono_name(l->mic_route), l->mic_route_generation, AUDIO_LIVE_MIC_SETTLE_MS);
+    if (l->sh->tap)
+        LOG(l, "live: mic: tap1: run %u clients %d mic-device %d written %llu", __atomic_load_n(&l->sh->tap->run, __ATOMIC_ACQUIRE),
+            load(&l->sh->tap_open), load(&l->sh->want_in), (unsigned long long)audio_tap_written(l->sh->tap));
     LOG(l, "live: mic: mic-clock2:prime-target:fixed-center reserve %u band %u ring %u",
         AUDIO_LIVE_MIC_TARGET, AUDIO_LIVE_SLIP_BAND, AUDIO_LIVE_MIC_RING);
     LOG(l, "live: mic: mic-clock3:queue-margin center %u trough %u batch-bias %u band %u transport-latency %u",
@@ -1438,6 +1456,11 @@ static void capture_period(AudioLive *l, const ArAnswer *a, uint32_t now)
         l->mono[i] = settle ? 0 : mono;
     }
     if (w && (w->frames == AUDIO_MIC_DIAG_FRAMES || w->periods == AUDIO_MIC_DIAG_PERIODS)) mic_window_end(l, "limit", now);
+    /* The tap (AudioTap.h): this period's mono frames as captured (the settle zeros included, before the Mic ring's slip and the
+     * Mic's level), with the Mic's level and mute for the reader to apply; only while a tap client is open. */
+    if (l->sh->tap && load(&l->sh->tap_open) > 0)
+        audio_tap_write(l->sh->tap, l->mono, frames, (uint32_t)__atomic_load_n(&l->sh->input_q15, __ATOMIC_ACQUIRE),
+                        load(&l->sh->input_muted) || load(&l->sh->input_fault), now);
     l->mic_periods++;
     AudioRing *r = &l->sh->in;
     const uint32_t fill = audio_ring_fill(r);
@@ -1519,7 +1542,7 @@ static void capture_tick(AudioLive *l, uint32_t now)
     if (l->sleeping) l->mic_ending = 1;
     if (l->mic_recording && (mic_control(l->sh) & MicWindowStop)) mic_window_end(l, "input-stop", now);
     if (now - l->mic_diag_at >= 1000) {audio_live_mic_report(l, "tick", now); l->mic_diag_at = now;}
-    if (load(&l->sh->want_in)) l->mic_idle_at = 0;
+    if (mic_wanted(l->sh)) l->mic_idle_at = 0;
     else if (!l->mic_idle_at) l->mic_idle_at = now ? now : 1;
     if (l->mic_idle_at && now - l->mic_idle_at >= l->cfg.idle_ms) l->mic_ending = 1;
     if (l->cap_unsent) {
@@ -1550,7 +1573,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
     case LiveDown:
         if (l->sleeping || l->aborting) return;
         mic_apply_pending(l);
-        if (l->held || !load(&l->sh->want_in)) return;
+        if (l->held || !mic_wanted(l->sh)) return;
         if (!hold_gate(l, "Mic")) return;   /* duplex-hold1: the held clocks first */
         mic_begin(l);
         break;

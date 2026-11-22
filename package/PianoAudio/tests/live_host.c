@@ -1197,6 +1197,101 @@ static void testMic(void)
     CHECK(!w.violations && live.mic_starts == 0 && w.mic_frames == 0);
 }
 
+// The microphone tap (AudioTap.h, "Mic (noise reduced)"): a tap client alone runs the capture plan; the Mic device can come and go
+// under it; the tap gets the same mono frames, the Mic's mute as a flag (not in the samples); after the last client closed, the plan
+// goes down idle_ms later; without a tap (sh.tap null) an open does nothing.
+static uint8_t g_tap_mem[PIANO_TAP_BYTES] __attribute__((aligned(16)));
+static PianoTapHeader *g_tap;
+static uint64_t g_tap_read, g_tap_ok, g_tap_bad, g_tap_zero;
+static uint32_t g_tap_last_run;
+static int g_tap_step, g_tap_attach;
+static uint64_t g_tap_closed_at;
+static int load_want_in(void) {return __atomic_load_n(&sh.want_in, __ATOMIC_ACQUIRE);}
+static void tap_drain(void)
+{
+    const uint64_t wr = audio_tap_written(g_tap);
+    if (wr - g_tap_read > PIANO_TAP_FRAMES) {CHECK(!"the tap reader was lapped"); g_tap_read = wr;}
+    static int16_t buf[PIANO_TAP_FRAMES];
+    const uint32_t n = (uint32_t)(wr - g_tap_read);
+    CHECK(audio_tap_read(g_tap, g_tap_read, buf, n));
+    for (uint32_t i = 0; i < n; ++i) {
+        if (buf[i] == 6000 || buf[i] == -6000) g_tap_ok++;
+        else if (buf[i]) g_tap_bad++;
+        else g_tap_zero++;
+    }
+    g_tap_read = wr;
+}
+static void tap_hook(uint32_t t)
+{
+    if (t == 0 && !sh.tap && g_tap_attach) {audio_tap_init(g_tap); sh.tap = g_tap;}
+    if (t >= 100 && g_tap_step == 0) {
+        g_tap_step = 1;
+        CHECK(audio_live_tap_client(&sh, 1) == 1);
+        if (sh.tap) CHECK(g_tap->clients == 1 && g_tap->opens == 1);
+        w.wake = 1;
+    }
+    if (!sh.tap) {
+        if (t >= 3000 && g_tap_step == 1) {g_tap_step = 2; CHECK(live.mic_state == LiveDown && live.mic_starts == 0);}
+        return;
+    }
+    if (t % 20 == 0) tap_drain();
+    if (t >= 2000 && g_tap_step == 1) {   // the tap alone: the capture runs, no Mic device
+        g_tap_step = 2;
+        CHECK(live.mic_state == LiveRunning && live.mic_starts == 1 && !w.in_running && !load_want_in());
+        CHECK(g_tap->run == 1 && g_tap_ok > 48000u && g_tap_bad == 0 && g_tap_zero >= 3840u);
+        CHECK(g_tap->magic == PIANO_TAP_MAGIC && g_tap->frames == PIANO_TAP_FRAMES && g_tap->rate == 48000u && !g_tap->muted);
+        g_tap_last_run = g_tap->run;
+        device(0, 1);   // the Mic device joins: one capture run for both
+    }
+    if (t >= 3000 && g_tap_step == 2) {g_tap_step = 3; audio_live_input_control(&sh, 50, 1);}   // the Mic muted
+    if (t >= 3200 && g_tap_step == 3) {
+        g_tap_step = 4;
+        CHECK(g_tap->muted == 1 && g_tap->gain_q15 == (uint32_t)piano_audio_input_q15(50));
+        const uint64_t ok = g_tap_ok;
+        tap_drain();
+        CHECK(g_tap_ok >= ok);   // the raw frames still flow; the reader applies the mute
+        audio_live_input_control(&sh, 100, 0);
+    }
+    if (t >= 4000 && g_tap_step == 4) {
+        g_tap_step = 5;
+        CHECK(w.mic_ok > 48000u && live.mic_starts == 1 && g_tap->run == g_tap_last_run && !g_tap->muted);
+        device(0, 0);   // the Mic device stops: the tap keeps the capture up
+    }
+    if (t >= 7500 && g_tap_step == 5) {   // longer than idle_ms after the Mic stopped
+        g_tap_step = 6;
+        CHECK(live.mic_state == LiveRunning && live.mic_starts == 1 && g_tap_bad == 0);
+        CHECK(audio_live_tap_client(&sh, -1) == 0 && g_tap->clients == 0);
+        g_tap_closed_at = audio_tap_written(g_tap);
+        w.wake = 1;
+    }
+    if (t >= 9000 && g_tap_step == 6) {g_tap_step = 7; CHECK(live.mic_state == LiveRunning);}   // the hold: idle_ms after the close
+    if (t >= 11500 && g_tap_step == 7) {
+        g_tap_step = 8;
+        CHECK(live.mic_state == LiveDown && !w.va_on && !w.map_mic);
+        CHECK(audio_tap_written(g_tap) == g_tap_closed_at);   // nothing written with no client open
+    }
+}
+static void testMicTap(void)
+{
+    g_tap = (PianoTapHeader *)(void *)g_tap_mem;
+    g_tap_read = g_tap_ok = g_tap_bad = g_tap_zero = 0;
+    g_tap_step = 0; g_tap_attach = 1;
+    struct Scenario sc = {10, 0, 0, 0, 13000, AudioPortsUbuntu, 1, tap_hook};
+    run(&sc);
+    CHECK(!w.violations && g_tap_step == 8 && live.mic_starts == 1 && live.spk_starts == 0);
+    unsigned at = expect(live_from(), kMicUp, N(kMicUp));
+    at = expect(at, kMicDown, N(kMicDown));
+    CHECK(at == w.ncmd && w.va_calls == 2);
+    CHECK(g_tap_ok > 48000u * 6u && g_tap_bad == 0 && g_tap->periods > 650u && g_tap->opens == 1 && !g_tap->refused);
+    CHECK(audio_live_tap_client(&sh, -1) == 0);   // an unmatched close stays at zero
+    // no tap in this boot (piano-audio-tap=0, or no memory): an open holds nothing up
+    g_tap_step = 0; g_tap_attach = 0;
+    sc.end_ms = 4000;
+    run(&sc);
+    CHECK(!w.violations && g_tap_step == 2 && live.mic_starts == 0);
+    sh.tap = 0;
+}
+
 static AudioMicWindow route_window;
 static unsigned route_applies;
 
@@ -2225,6 +2320,7 @@ int main(void)
     testMicClock();
     testMic();
     testMicRoutes();
+    testMicTap();
     testMicRoutePendingAndFailedRelease();
     testInputControlsAndWrap();
     testMicShortRestart();
