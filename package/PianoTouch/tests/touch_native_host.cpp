@@ -578,8 +578,19 @@ static void testInjectedScript()
   CHECK(spread0 > 0.1 && spread0 < 0.15 && spread1 > 0.42);   // 400 px -> 1400 px of 3200
 }
 
+static void testUuid()
+{
+  CHECK(screenUuidValid("01234567-89AB-CDEF-0123-456789abcdef"));
+  CHECK(!screenUuidValid(nullptr) && !screenUuidValid("") && !screenUuidValid("<main>"));
+  CHECK(!screenUuidValid("01234567-89AB-CDEF-0123-456789abcde"));     // 35 characters
+  CHECK(!screenUuidValid("01234567-89AB-CDEF-0123-456789abcdef0"));   // 37
+  CHECK(!screenUuidValid("0123456789AB-CDEF-0123-456789abcdef-"));    // dashes misplaced
+  CHECK(!screenUuidValid("01234567-89AB-CDEF-0123-456789abcdeg"));    // not hex
+}
+
 int main()
 {
+  testUuid();
   testDescriptor();
   testDriverModel();
   testTap();

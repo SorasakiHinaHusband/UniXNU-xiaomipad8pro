@@ -757,3 +757,10 @@ grown), frames lost, 90 degrees in both axes and an injected two-finger spread.
 The run (`touch-native1`): does WindowServer acquire it as the main display's digitizer, do touches reach AppKit (direct touches in a view
 that takes them; clicks, scrolling, magnify and rotation in one that does not), which axes BackBoard expects under rotation, system edge
 gestures. Without a display UUID WindowServer does not mark the display touch-capable ("DisplaySupportsTouch"); nothing found reads it.
+
+### 18.6 The display binding (touch-native1, 2026-11-23)
+touch-native1: WindowServer made a direct-touch event of every report and BackBoard took the touch screen as the main display's
+digitizer, but no touch reached an app: BackBoard files a digitizer without `displayUUID` under "<main>", and WindowServer's render
+space (BackBoard's hit test) resolves a display only from a UUID string. The event service now carries `displayUUID`:
+`piano-touch-native-uuid=U` at boot, or root writes `uuid=U` to `machdep.piano_touch_native` (the touch screen is published again; a
+service's displayUUID is read only when it appears). U is the panel's CGDisplayCreateUUIDFromDisplayID (TouchProbe prints it).

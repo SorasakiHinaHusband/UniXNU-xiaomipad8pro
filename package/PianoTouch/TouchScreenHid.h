@@ -94,6 +94,23 @@ inline uint16_t screenScale(int32_t v, int32_t size)
   return uint16_t(int64_t(v) * kScreenMax / (size - 1));
 }
 
+// A display UUID as WindowServer writes and parses one (NSUUID's string form, 8-4-4-4-12 hex digits, either case): the "displayUUID"
+// the touch screen's event service carries (piano-touch-native-uuid, or root's "uuid=" word). BackBoard files a digitizer without one
+// under "<main>", which WindowServer's render space (its hit test) cannot parse: no touch reaches an app (NATIVE-TOUCH.md section 8).
+inline bool screenUuidValid(const char *u)
+{
+  if (!u) return false;
+  for (unsigned i = 0; i < 36; ++i) {
+    const char c = u[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (c != '-') return false;
+    } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  return u[36] == 0;
+}
+
 // The report of eight slots: 49 bytes, the report ID first. Returns its length.
 inline unsigned screenReport(const ScreenSlot slots[kScreenSlots], uint8_t out[kScreenReportBytes])
 {
