@@ -764,3 +764,13 @@ digitizer, but no touch reached an app: BackBoard files a digitizer without `dis
 space (BackBoard's hit test) resolves a display only from a UUID string. The event service now carries `displayUUID`:
 `piano-touch-native-uuid=U` at boot, or root writes `uuid=U` to `machdep.piano_touch_native` (the touch screen is published again; a
 service's displayUUID is read only when it appears). U is the panel's CGDisplayCreateUUIDFromDisplayID (TouchProbe prints it).
+
+### 18.7 The binding by itself and the axes (touch-native2, 2026-11-23)
+touch-native2 delivered taps (clicks), long presses (right clicks), one-finger drags, pinches (magnify) and rotations to AppKit once the
+event service carried the display UUID. Two findings: the UUID is NativeGopDisplay's own constant IOMFBUUID for the panel, so PianoTouch
+now reads it from the panel's NativeGopDisplay (the instance without D6's `piano-dp-fake` role) at start, or from the frame thread until
+it is there (published at most 60 s late; `piano-touch-native-uuid=U` still overrides); and BackBoard applies the display's rotation to a
+digitizer's positions itself (a tap at panel (400, 1800) under 90 degrees landed at the panel's spot only in the panel's axes), so the
+native positions now default to the panel's axes (`piano-touch-native-axes=0`: the rotated desktop's). What AppKit makes of touches in a
+view without its own touch handling, by design: a pan is a left-mouse drag (scrolling comes from NSScrollView's touch scrolling), a
+two-finger single tap is nothing (a two-finger double tap is smart magnify; the secondary click is the long press).
