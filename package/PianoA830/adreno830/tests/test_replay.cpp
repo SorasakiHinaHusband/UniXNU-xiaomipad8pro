@@ -71,6 +71,7 @@ static int cacquire(void *c,volatile uint32_t *w,size_t bytes) {CHECK(c==&cp && 
 static uint64_t cnow(void *c) {CHECK(c==&cp);return clockUs;}
 static int cidle(void *c) {CHECK(c==&cp);clockUs+=1000;return 0;}
 static uint32_t ringmem[8192],fencemem[1024];
+static uint32_t replayStore[NativeAdrenoSubmitReplayStoreWords];   /* the publish shell's heap store (native_adreno_publish) */
 static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier,nullptr,nullptr,nullptr};
 static NativeAdrenoRingCache ringcache{&cp,cpublish,cacquire};
 static NativeAdrenoRingClock ringclock{&cp,cnow,cidle};
@@ -118,7 +119,9 @@ static IOReturn expose(World &p)
     if(p.object.makeWriteCombined())return kIOReturnNoMemory;
     if(p.vm.map(&p.object,0,BufferIova,3,0,2,&p.handle))return kIOReturnBadArgument;
     if(p.ring.attach(&ringio,&ringcache,ringmem,sizeof(ringmem),RingIova,fencemem,sizeof(fencemem),MemptrsIova))return kIOReturnBadArgument;
-    return p.submit.attach(&p.vm,&p.ring);
+    if(const IOReturn r=p.submit.attach(&p.vm,&p.ring))return r;
+    std::memset(replayStore,0xa5,sizeof(replayStore));
+    return p.submit.attachReplayStore(replayStore,NativeAdrenoSubmitReplayStoreWords);
 }
 /* The CP finished everything up to fence (BR and BV) and consumed the ring up to rptr. */
 static void complete(uint32_t fence,uint32_t rptr) {fencemem[1]=fence;fencemem[3]=fence;fencemem[0]=rptr;}
@@ -473,6 +476,17 @@ static void testFallbacks()
     CHECK(gShell.plan.fallback==NativeAdrenoSubmitFallbackGap && gShell.plan.culprit_range==UINT32_MAX && !gShell.plan.culprit_fence &&
           gShell.plan.restart==g3 && g2==2 && gShell.faults(HOG)==1 && gShell.faults(WS)==1);
     CHECK(!gShell.record("PianoGpuHog")->hangs);
+    /* No replay store (the shell's heap allocation failed): nothing is kept, every job in flight fails. The store attaches only while
+     * no job is outstanding, and only whole. */
+    boot();
+    CHECK(W->submit.replayStore() && W->submit.attachReplayStore(nullptr,0)==kIOReturnSuccess && !W->submit.replayStore());
+    submitJob(HOG);submitJob(WS);
+    CHECK(W->submit.attachReplayStore(replayStore,NativeAdrenoSubmitReplayStoreWords)==kIOReturnBusy);
+    CHECK(gRecovery.recover(A830FaultWatchdog,1)==kIOReturnSuccess);
+    CHECK(gShell.plan.fallback==NativeAdrenoSubmitFallbackNoStore && gShell.plan.mode==NativeAdrenoSubmitPlanFailAll &&
+          gShell.faults(WS)==1 && gShell.faults(HOG)==1 && W->submit.outstanding()==0 && W->ring.replays()==0);
+    CHECK(W->submit.attachReplayStore(replayStore,NativeAdrenoSubmitReplayStoreWords-1)==kIOReturnBadArgument &&
+          W->submit.attachReplayStore(replayStore,NativeAdrenoSubmitReplayStoreWords)==kIOReturnSuccess);
     /* Poisoned: a commit that poisoned the ring. */
     boot();
     submitJob(BENCH);

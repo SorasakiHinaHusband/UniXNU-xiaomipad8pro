@@ -1703,9 +1703,9 @@ extern "C" uint32_t native_adreno_recovery_plan(bool charge_culprit,uint32_t *re
                 plan.culprit_fence);
         if(plan.mode==NativeAdrenoSubmitPlanFailAll) {
             static const char *const why[]={"","the submit object is poisoned","a fence in flight is not a client's job",
-                                            "the jobs do not fit the ring again"};
+                                            "the jobs do not fit the ring again","no replay store"};
             if(at>0 && size_t(at)<sizeof line)
-                at+=snprintf(line+at,sizeof line-size_t(at),"; no replay (%s): jobs in flight fail:",why[plan.fallback<4?plan.fallback:0]);
+                at+=snprintf(line+at,sizeof line-size_t(at),"; no replay (%s): jobs in flight fail:",why[plan.fallback<5?plan.fallback:0]);
             for(unsigned s=0;s<NativeAdrenoMaxClients && at>0 && size_t(at)<sizeof line;++s)
                 if(plan.fault_ranges&NativeAdrenoRangeBit(s))
                     if(const CoreBox *box=slotBox(s))at+=snprintf(line+at,sizeof line-size_t(at)," %u:%s",s,box->name);
@@ -2000,6 +2000,11 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     const NativeAdrenoSubmitLocks locks={nullptr,lockHook,unlockHook};
     const IOReturn attached=submit->attachLocks(&locks);
     if(attached)return attached;
+    /* UniXNU-piano (2026-11-22): the recovery's replay store (every job slot's packets), from the heap: in the kext's static data it found
+     * no gap in the kext collection. Without it the recoveries fail every job in flight, as before (the plan line says so). */
+    static uint32_t *replayStore;
+    if(!replayStore)replayStore=static_cast<uint32_t *>(IOMallocData(NativeAdrenoSubmitReplayStoreWords*sizeof(uint32_t)));
+    if(replayStore && submit->attachReplayStore(replayStore,NativeAdrenoSubmitReplayStoreWords)!=kIOReturnSuccess)replayStore=nullptr;
     /* An unmap waits only for the buffer's own last use (NativeAdrenoVm::noteUse): the VM reads the CP's completed fence. */
     if(ring->memptrs())vm->setFenceSource(ring->memptrs()+1);
     NativeAdrenoGpuPublished *service=new NativeAdrenoGpuPublished;

@@ -90,7 +90,7 @@ IOReturn NativeAdrenoSubmit::releaseLocked(Job &job)
         if(retired)status=retired;else ++stats_.references_retired;
     }
     if(status)return poison();
-    job.active=false;job.count=0;job.fence=0;job.queue=0;job.word_count=0;job.context=0;job.source=0;
+    job.active=false;job.count=0;job.fence=0;job.queue=0;job.word_count=0;job.context=0;job.source=0;job.kept=false;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::retireCompletedLocked()
@@ -111,7 +111,7 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
     vm_=vm;ring_=ring;attached_=true;stats_={};
-    for(auto &job:jobs_) {job.active=false;job.count=0;job.fence=0;job.queue=0;job.word_count=0;job.context=0;job.source=0;}
+    for(auto &job:jobs_) {job.active=false;job.count=0;job.fence=0;job.queue=0;job.word_count=0;job.context=0;job.source=0;job.kept=false;}
     for(auto &entry:history_)entry=0;
     hold_ranges_=0;held_fence_=0;plan_=NativeAdrenoSubmitPlan{};
     return kIOReturnSuccess;
@@ -248,7 +248,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
          * kept (with no fence) until recover() after a GPU reset. */
         if(ring_->poisoned()) {
             job->fence=0;job->queue=queue;job->count=(uint32_t)handle_count;job->active=true;
-            job->word_count=0;job->context=context;job->source=source;   /* never replayed: it has no fence */
+            job->word_count=0;job->context=context;job->source=source;job->kept=false;   /* never replayed: it has no fence */
             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
             ++stats_.poisoned_jobs;
             return SUBMIT_REFUSE(Other,poison());
@@ -258,9 +258,9 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         return SUBMIT_REFUSE(Other,status);
     }
     job->fence=value;job->queue=queue;job->count=(uint32_t)handle_count;job->active=true;
-    /* The packets as the ring got them, for a recovery's replay (2 KiB at most; the ring copied them already). */
-    job->word_count=(uint32_t)word_count;job->context=context;job->source=source;
-    for(size_t i=0;i<word_count;++i)job->words[i]=words[i];
+    /* The packets as the ring got them, for a recovery's replay (2 KiB at most, into the replay store; the ring copied them already). */
+    job->word_count=(uint32_t)word_count;job->context=context;job->source=source;job->kept=store_!=nullptr;
+    if(store_) {uint32_t *kept=keptWords(*job);for(size_t i=0;i<word_count;++i)kept[i]=words[i];}
     if(hold) {hold_ranges_=0;held_fence_=value;++stats_.holds;}
     /* Whose job this fence is, for a page fault's attribution (rangesInFlight): kept after the job retires. */
     history_[value%NativeAdrenoSubmitHistory]=uint64_t(value)|uint64_t(range)<<32|uint64_t(1)<<63;
@@ -464,6 +464,9 @@ IOReturn NativeAdrenoSubmit::plan(bool charge,NativeAdrenoSubmitPlan *out)
     /* Every fence in (done, issued] must be a job of this object: the replayed jobs complete them, the last one the newest. */
     else if(p.issued-p.done!=n)p.fallback=NativeAdrenoSubmitFallbackGap;
     else {
+        for(uint32_t i=skip;i<n;++i)if(!jobs_[order[i]].kept)p.fallback=NativeAdrenoSubmitFallbackNoStore;
+    }
+    if(!p.fallback) {
         /* The words the replay writes: as the ring frames them, a context entry for the first job and at each change of context. */
         uint64_t words=0;
         uint32_t context=0;
@@ -529,7 +532,8 @@ IOReturn NativeAdrenoSubmit::replay(uint32_t *replayed)
     for(uint32_t i=0;i<n;++i) {
         const Job &job=jobs_[order[i]];
         if(job.context)ring_->useContext(job.context);
-        const IOReturn status=ring_->replayFramed(job.words,job.word_count,job.fence,after,job.source);
+        if(!job.kept) {poisoned_=true;return kIOReturnNotReady;}   /* the plan saw every one kept; a store detached since */
+        const IOReturn status=ring_->replayFramed(keptWords(job),job.word_count,job.fence,after,job.source);
         if(status) {poisoned_=true;return status;}   /* the device is lost then (A830Recovery) */
         after=job.fence;
         ++stats_.replayed;
@@ -543,6 +547,14 @@ IOReturn NativeAdrenoSubmit::armHold(NativeAdrenoRangeMask ranges)
     if(!attached_)return kIOReturnNotReady;
     if(ranges && ring_->memptrsBytes()<NativeAdrenoSubmitHoldOffset+4)return kIOReturnUnsupported;
     hold_ranges_=ranges;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::attachReplayStore(uint32_t *words,size_t count)
+{
+    NativeAdrenoSubmitGuard guard(this,NativeAdrenoSubmitLockRing);
+    if(outstandingLocked())return kIOReturnBusy;
+    if(words && count<NativeAdrenoSubmitReplayStoreWords)return kIOReturnBadArgument;
+    store_=words;
     return kIOReturnSuccess;
 }
 NativeAdrenoRangeMask NativeAdrenoSubmit::holdArmed() const

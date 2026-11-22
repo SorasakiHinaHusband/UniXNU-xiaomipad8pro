@@ -33,6 +33,9 @@ enum : uint32_t {
     NativeAdrenoSubmitHoldOffset=0x800,
     /* A job's packets as the ring got them (kept for a recovery's replay): one CP_INDIRECT_BUFFER (4 words) per buffer, the hold. */
     NativeAdrenoSubmitJobWords=NativeAdrenoSubmitMaxBuffers*4+NativeAdrenoSubmitHoldWords,
+    /* The replay store attachReplayStore() takes: every job slot's words (157 KiB on macOS, 91 KiB upstream). Outside the object, so the
+     * kext's static data stays as it was (gpu-recover2's first KC: 0x43180 bytes of __DATA found no gap in the kext collection). */
+    NativeAdrenoSubmitReplayStoreWords=NativeAdrenoSubmitJobs*NativeAdrenoSubmitJobWords,
 };
 /* UniXNU-piano (2026-11-22, private 20261122-render/ANALYSIS.md "ONE change"): a recovery's plan for the jobs in flight, made once the GPU
  * stopped (NativeAdrenoSubmit::plan). Replay (the behaviour of Linux msm recover_worker): the jobs the CP passed retire, the job the CP
@@ -40,10 +43,10 @@ enum : uint32_t {
  * and only its range is faulted; every other job in flight is replayed with its own fence (replay()). FailAll (the behaviour before):
  * restart = the last fence issued, every range with a job in flight is faulted and every job dropped; taken when the submit object is
  * poisoned, when a fence in (restart, issued] has no job here (a kernel submission: nothing could complete it), or when the jobs would
- * not fit the empty ring again. */
+ * not fit the empty ring again, or a job in flight has no kept words (no replay store attached: attachReplayStore). */
 enum : uint8_t {NativeAdrenoSubmitPlanNone,NativeAdrenoSubmitPlanReplay,NativeAdrenoSubmitPlanFailAll};
 enum : uint8_t {NativeAdrenoSubmitFallbackNone,NativeAdrenoSubmitFallbackPoisoned,NativeAdrenoSubmitFallbackGap,
-                NativeAdrenoSubmitFallbackRoom};
+                NativeAdrenoSubmitFallbackRoom,NativeAdrenoSubmitFallbackNoStore};
 struct NativeAdrenoSubmitPlan {
     uint8_t mode,fallback;
     uint32_t done,issued,restart;          /* the CP's completed fence at the plan, the last issued, the fence the CP restarts at */
@@ -128,9 +131,10 @@ class NativeAdrenoSubmit final {
         uint32_t count=0;
         bool active=false;
         uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
-        /* UniXNU-piano (2026-11-22): what the ring got (packets, the client's GPU context, the source), for a recovery's replay. */
+        /* UniXNU-piano (2026-11-22): what the ring got, for a recovery's replay: the packets (in the replay store's slice of this job
+         * slot, kept says they are there), the client's GPU context, the source. */
         uint32_t word_count=0,context=0,source=0;
-        uint32_t words[NativeAdrenoSubmitJobWords]{};
+        bool kept=false;
     } jobs_[NativeAdrenoSubmitJobs];
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
@@ -145,6 +149,8 @@ class NativeAdrenoSubmit final {
     NativeAdrenoRangeMask hold_ranges_=0;
     uint32_t held_fence_=0;
     NativeAdrenoSubmitPlan plan_{};
+    uint32_t *store_=nullptr;   /* attachReplayStore: NativeAdrenoSubmitJobWords words per job slot */
+    uint32_t *keptWords(const Job &job) const {return store_+size_t(&job-jobs_)*NativeAdrenoSubmitJobWords;}
     /* The active jobs in fence order after `from` (sequence numbers), into order[]; returns how many. */
     uint32_t orderLocked(uint32_t from,uint32_t *order) const;
     void dropAllLocked(NativeAdrenoRangeMask *ranges,IOReturn *result);
@@ -250,6 +256,11 @@ public:
      * is known (the watchdogs find it, the recovery skips it). One shot: the first held submission disarms every range. 0 disarms.
      * Unsupported when the memptrs page has no room for the hold word. */
     IOReturn armHold(NativeAdrenoRangeMask ranges);
+    /* The replay store (UniXNU-piano 2026-11-22): words[NativeAdrenoSubmitReplayStoreWords] the caller owns (the publish shell's heap
+     * allocation; a host test's array) where submit() keeps each job's packets; null detaches. Only while no job is outstanding.
+     * Without one nothing is kept and every plan falls back to failing the jobs in flight (NativeAdrenoSubmitFallbackNoStore). */
+    IOReturn attachReplayStore(uint32_t *words,size_t count);
+    bool replayStore() const {return store_!=nullptr;}
     NativeAdrenoRangeMask holdArmed() const;
     uint32_t heldFence() const;
     bool poisoned() const {return poisoned_;}
