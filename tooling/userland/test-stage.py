@@ -205,6 +205,38 @@ def manifest_tests(tmp):
     os.symlink('T', b / 'Contents/MacOS/link')
     check(refused(stage.add_gpu_bundles, load(unit_toml('a', [good_tool])), [b], match='neither a file'), 'refused: a symlink in the bundle')
     (b / 'Contents/MacOS/link').unlink()
+    # --hal-bundle (audio/ns4: PianoMicNS.driver, "Mic (noise reduced)"): a Core Audio HAL plug-in as one more unit, its signature seal
+    # included (Contents/_CodeSignature/CodeResources)
+    h = tmp / 'h/T_x.driver'
+    write(h / 'Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'T'}))
+    write(h / 'Contents/MacOS/T', b'\xcf\xfa\xed\xfe' + bytes(60), 0o644)
+    write(h / 'Contents/_CodeSignature/CodeResources', plistlib.dumps({'files': {}}))
+    plan = stage.add_hal_bundles(load(unit_toml('a', [good_tool])), [h])
+    unit = plan['units'][-1]
+    files = {f['dest']: f for f in unit['files']}
+    hroot = '/Library/Audio/Plug-Ins/HAL/T_x.driver/Contents'
+    check(unit['name'] == 'audio-t-x' and unit['on'] and
+          sorted(files) == [f'{hroot}/Info.plist', f'{hroot}/MacOS/T', f'{hroot}/_CodeSignature/CodeResources'],
+          '--hal-bundle: one unit, every file of the driver at /Library/Audio/Plug-Ins/HAL, its seal included')
+    check(files[f'{hroot}/Info.plist']['mode'] == '0644' and files[f'{hroot}/MacOS/T']['mode'] == '0755' and
+          files[f'{hroot}/_CodeSignature/CodeResources']['mode'] == '0644' and
+          files[f'{hroot}/MacOS/T']['staged'] == 'files/audio-t-x/Contents/MacOS/T' and
+          all(f['trust'] and f['kind'] == 'file' and f['owner'] == 'root:wheel' for f in files.values()),
+          '--hal-bundle: root:wheel, 0755 the Mach-O and 0644 the rest, staged below the unit, trusted, no job')
+    plan = stage.add_hal_bundles(stage.add_gpu_bundles(load(unit_toml('a', [good_tool])), [b]), [h])
+    check([u['name'] for u in plan['units']][-2:] == ['gpu-t-x', 'audio-t-x'], '--gpu-bundle and --hal-bundle together: two units')
+    check(refused(stage.add_hal_bundles, load(unit_toml('a', [good_tool])), [b], match='not a plugin bundle'),
+          'refused: --hal-bundle of a .bundle (a HAL plug-in is <name>.driver)')
+    check(refused(stage.add_hal_bundles, load(unit_toml('a', [good_tool])), [h, h], match='twice'), 'refused: the same driver twice')
+    os.symlink('T', h / 'Contents/MacOS/link')
+    check(refused(stage.add_hal_bundles, load(unit_toml('a', [good_tool])), [h], match='neither a file'), 'refused: a symlink in the driver')
+    (h / 'Contents/MacOS/link').unlink()
+    hok = [f'{hroot}/Info.plist', f'{hroot}/MacOS/T', f'{hroot}/Resources/x.dat', f'{hroot}/_CodeSignature/CodeResources']
+    hno = ['/Library/Audio/Plug-Ins/HAL/T_x.driver/Info.plist', '/Library/Audio/Plug-Ins/HAL/T_x.bundle/Contents/Info.plist',
+           f'{hroot}/MacOS/sub/x', f'{hroot}/MacOS/../../x', f'{hroot}/_CodeSignature/.hidden', '/Library/Audio/Plug-Ins/HAL/x',
+           '/Library/GPUBundles/A.bundle/Contents/_CodeSignature/CodeResources', f'{hroot}/Other/x']
+    check(all(stage.dest_kind(d) == 'file' for d in hok) and not any(stage.dest_kind(d) for d in hno),
+          'dest_kind: a HAL plug-in\'s Contents/Info.plist, MacOS/, Resources/ and _CodeSignature/ files only')
     ok = ['/Library/GPUBundles/A.bundle/Contents/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/A',
           '/Library/GPUBundles/A.bundle/Contents/Resources/x.metallib', '/usr/local/bin/x', '/usr/local/share/piano/wallpaper/x.png']
     no = ['/Library/GPUBundles/A.bundle/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/../../x',
@@ -410,6 +442,22 @@ def layer_tests(tmp, shell, tag):
     code, out = rig.run('--live')
     check(rig.root(f'{c}/MacOS/libx.dylib').read_bytes() == b'the owner\'s own' and (prev / c.lstrip('/') / 'MacOS/libx.dylib').is_file() and
           'changed since it was installed: left' in out, f'{tag}: layer: a file changed after the take-over is left, its copy kept')
+    # a HAL plug-in (--hal-bundle) as a layer unit on a root that has no such driver: the bundle's directories made, root:wheel
+    # modes as staged, nothing of the base to keep; taking the unit out takes its files out again
+    rig = Rig(tmp / f'{tag}-layer-hal', shell)
+    hc = '/Library/Audio/Plug-Ins/HAL/T.driver/Contents'
+    hal = ('audio-t', True, [(f'{hc}/Info.plist', '0644', b'<plist/>'), (f'{hc}/MacOS/T', '0755', b'exe'),
+                             (f'{hc}/_CodeSignature/CodeResources', '0644', b'<plist>seal</plist>')])
+    rig.files([cli, hal])
+    code, out = rig.run('--live')
+    check(code == 0 and rig.root(f'{hc}/MacOS/T').read_bytes() == b'exe' and
+          rig.root(f'{hc}/_CodeSignature/CodeResources').read_bytes() == b'<plist>seal</plist>' and
+          oct(rig.root(f'{hc}/MacOS/T').stat().st_mode & 0o777) == '0o755' and
+          oct(rig.root(f'{hc}/Info.plist').stat().st_mode & 0o777) == '0o644' and 'was not installed by this installer' not in out,
+          f'{tag}: HAL layer: the driver installed into new directories with its modes, nothing taken over')
+    rig.files([cli])
+    code, out = rig.run('--live')
+    check(code == 0 and not any(rig.root(d).exists() for d, _, _ in hal[2]), f'{tag}: HAL layer taken out: its files gone')
     rig = Rig(tmp / f'{tag}-layer2', shell)
     for dest, (data, mode) in base.items():
         write(rig.root(dest), data, mode)
