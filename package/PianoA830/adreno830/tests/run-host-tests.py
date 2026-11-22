@@ -62,6 +62,8 @@ KNOWN = {
         '(34908 leaves, 7 classes); 16 reserve/commit failure cases; 9 shared-root checks; 11 TLB plan checks; 8 audit findings; '
         '2 churn runs (8000 operations, every table page back); gpu-daily3 peak replay 5328 objects 3068 MiB: 1565 table pages '
         'global, 1582 per process (18 spaces), worst case 32834', 'GPU-PAGED P0a'),
+    # UniXNU-piano (2026-11-22, GPU-PAGED P0b): the pool bypass through the user client (test_userclient's fixture and doubles)
+    'test_poolbypass': (SUBMIT + ['NativeAdrenoUserClient.cpp', 'NativeAdrenoTimer.cpp'], ['smmu', 'pm4', 'proc'], None, 'GPU-PAGED P0b'),
     'test_timer': (['NativeAdrenoTimer.cpp'], [],
         'PASS: GMU AO counter at gmu +0x47100/+0x47104 and CP 0x8E7/0x8E8, 19 high-low-high reads (rollovers included), 12 '
         'refusals over a software counter peer', 'M6'),

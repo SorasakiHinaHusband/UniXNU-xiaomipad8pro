@@ -30,6 +30,7 @@
 #include "NativeAdrenoPublish.h"
 #ifdef ADRENO830_MACOS
 #include "NativeAdrenoMapLines.h"   /* UniXNU-piano */
+#include "NativeAdrenoPoolBypass.h"   /* UniXNU-piano: GPU-PAGED P0b */
 #include <sys/codesign.h>
 #include <sys/proc.h>
 #include <sys/ubc.h>
@@ -1933,6 +1934,8 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
                 (unsigned long long)(NativeAdrenoMemory::poolBytes()+bt.mapped_peak),
                 (unsigned long long)bt.allocs,(unsigned long long)bt.frees);
             boot_progress_gpu_event(totals);
+            /* GPU-PAGED P0b (NativeAdrenoPoolBypass.h): BoAllocs by path, wiring, map times, TLB invalidations, while they move */
+            if(NativeAdrenoPoolBypassSummary(totals,sizeof totals)>0)boot_progress_gpu_event(totals);
             char vaLine[NativeAdrenoMapLineBytes];
             int at=snprintf(vaLine,sizeof vaLine,"va/map:");
             for(unsigned i=0;i<listed && at>0;++i) {
@@ -2017,6 +2020,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     g.input_bits=input_bits;g.output_bits=output_bits;g.service=service;
     /* The VM's phase and kind counters count from here on (pagani-gpu-kopt bit 5): the clients' mappings, which is what they are for. */
     native_adreno_vm_now_us=NativeAdrenoKoptOn(NativeAdrenoKoptVmClock)?nowUs:nullptr;
+    native_adreno_p0b_now_us=nowUs;   /* UniXNU-piano: GPU-PAGED P0b's figures (NativeAdrenoPoolBypass.h) are timed from here on */
     __atomic_store_n(&g.published,true,__ATOMIC_RELEASE);
     service->setName("NativeAdrenoGpu");
     service->setProperty("NativeAdrenoCoherentImports",(unsigned long long)native_adreno_coherent_imports(),32);

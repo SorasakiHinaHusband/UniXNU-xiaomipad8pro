@@ -11,10 +11,29 @@ volatile uint32_t native_adreno_meter_calls[Adreno830CallKinds],native_adreno_me
 volatile uint32_t native_adreno_meter_zero[2],native_adreno_meter_contig[3],native_adreno_meter_fence;
 }
 void NativeAdrenoMemory::setKopt(uint32_t bits) {native_adreno_kopt=bits;}
+#include "NativeAdrenoPoolBypass.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
 #include <string.h>
+#ifdef ADRENO830_HOST_TEST
+#include <stdio.h>
+#else
+#include <libkern/libkern.h>   /* snprintf */
+#endif
+/* UniXNU-piano (2026-11-22, GPU-PAGED P0b): the pool bypass and its figures (NativeAdrenoPoolBypass.h). */
+extern "C" {
+volatile uint32_t native_adreno_pool_bypass=0,native_adreno_pool_bypass_flips=0;
+uint64_t (*native_adreno_p0b_now_us)(void)=nullptr;
+volatile uint64_t native_adreno_p0b_alloc[NativeAdrenoPaths][5];
+volatile uint64_t native_adreno_p0b_alloc_us[NativeAdrenoPaths][NativeAdrenoP0bTimeWords];
+volatile uint64_t native_adreno_p0b_wire_us[2][NativeAdrenoP0bTimeWords];
+volatile uint64_t native_adreno_p0b_lookup[2][3];
+volatile uint64_t native_adreno_p0b_map_us[NativeAdrenoP0bMapKinds][NativeAdrenoP0bTimeWords];
+volatile uint64_t native_adreno_p0b_map_pages[NativeAdrenoP0bMapKinds];
+volatile uint64_t native_adreno_p0b_tlbi[4];
+volatile uint64_t native_adreno_p0b_submit[3];
+}
 
 static bool userUnmapped;
 static uint64_t ownedMapped,ownedUnmapped,importBytes,mappedPeak,backingAllocs,backingFrees;
@@ -200,6 +219,96 @@ void NativeAdrenoMemory::usage(uint32_t *pool_mib,uint32_t *used_mib,uint32_t *i
     if(used_mib)*used_mib=pool.descriptor?uint32_t(pool.used>>20):0;
     if(imports)*imports=__atomic_load_n(&liveImports,__ATOMIC_RELAXED);
 }
+/* UniXNU-piano (2026-11-22, GPU-PAGED P0b): machdep.piano_gpu_paged's rows and the tick's summary (NativeAdrenoPoolBypass.h). Read
+ * without any lock: each figure is one atomic word, a row may mix a figure of this instant with one of the next. */
+namespace {
+uint64_t p0b(const volatile uint64_t *word) {return __atomic_load_n(word,__ATOMIC_RELAXED);}
+unsigned long long u(uint64_t v) {return (unsigned long long)v;}
+int p0bTimes(char *out,size_t size,const char *head,const volatile uint64_t *row)
+{
+    return snprintf(out,size,"%s n=%llu us=%llu max=%llu h=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",head,u(p0b(&row[0])),u(p0b(&row[1])),
+        u(p0b(&row[2])),u(p0b(&row[3])),u(p0b(&row[4])),u(p0b(&row[5])),u(p0b(&row[6])),u(p0b(&row[7])),u(p0b(&row[8])),u(p0b(&row[9])),
+        u(p0b(&row[10])));
+}
+/* Where the next text of a row goes and how much room it has (none once the row is full or failed). */
+char *p0bAt(char *out,size_t size,int at,size_t *room)
+{
+    *room=at>0 && size_t(at)<size?size-size_t(at):0;
+    return *room?out+at:nullptr;
+}
+int p0bMore(int at,int more) {return more>0?at+more:at;}
+const char *const p0bPathNames[NativeAdrenoPaths]={"pool","contig","user","mapped"};
+const char *const p0bMapNames[NativeAdrenoP0bMapKinds]={"pooled","outside","import"};
+}
+int NativeAdrenoPoolBypassLine(unsigned row,char *out,size_t size)
+{
+    if(!out || !size)return 0;
+    out[0]=0;
+    int n=0;
+    if(row==0) {
+        uint32_t pool_mib=0,used_mib=0;
+        NativeAdrenoMemory::usage(&pool_mib,&used_mib,nullptr);
+        const NativeAdrenoBackingTotals bt=NativeAdrenoMemory::backingTotals();
+        n=snprintf(out,size,"p0b bypass=%u flips=%u clock=%u pool=%u/%uM owned-unmapped=%lluM owned-mapped=%lluM imports=%lluM",
+            unsigned(__atomic_load_n(&native_adreno_pool_bypass,__ATOMIC_ACQUIRE)),
+            unsigned(__atomic_load_n(&native_adreno_pool_bypass_flips,__ATOMIC_RELAXED)),native_adreno_p0b_now_us?1u:0u,used_mib,pool_mib,
+            u(bt.unmapped>>20),u(bt.mapped>>20),u(bt.imports>>20));
+    } else if(row<=NativeAdrenoPaths) {
+        const unsigned path=row-1;
+        char head[96];
+        snprintf(head,sizeof head,"alloc %s kib=%llu fails=%llu fail-kib=%llu",p0bPathNames[path],u(p0b(&native_adreno_p0b_alloc[path][1])>>10),
+            u(p0b(&native_adreno_p0b_alloc[path][2])),u(p0b(&native_adreno_p0b_alloc[path][3])>>10));
+        n=p0bTimes(out,size,head,native_adreno_p0b_alloc_us[path]);
+        /* The BOs backed (a failed attempt has no time row): normally equal to the time row's count, which needs the clock. */
+        size_t room;char *at=p0bAt(out,size,n,&room);
+        if(at)n=p0bMore(n,snprintf(at,room," backed=%llu",u(p0b(&native_adreno_p0b_alloc[path][0]))));
+        at=p0bAt(out,size,n,&room);
+        if(at && path==NativeAdrenoPathPool)n=p0bMore(n,snprintf(at,room," bypassed=%llu",u(p0b(&native_adreno_p0b_alloc[path][4]))));
+    } else if(row<=NativeAdrenoPaths+2) {
+        const unsigned kind=row-NativeAdrenoPaths-1;
+        n=p0bTimes(out,size,kind?"wire kernel":"wire user",native_adreno_p0b_wire_us[kind]);
+        size_t room;char *at=p0bAt(out,size,n,&room);
+        if(at)n=p0bMore(n,snprintf(at,room," walk-us=%llu lookups=%llu spans=%llu",u(p0b(&native_adreno_p0b_lookup[kind][0])),
+            u(p0b(&native_adreno_p0b_lookup[kind][1])),u(p0b(&native_adreno_p0b_lookup[kind][2]))));
+    } else if(row<=NativeAdrenoPaths+2+NativeAdrenoP0bMapKinds) {
+        const unsigned kind=row-NativeAdrenoPaths-3;
+        char head[64];
+        snprintf(head,sizeof head,"map %s pages=%llu",p0bMapNames[kind],u(p0b(&native_adreno_p0b_map_pages[kind])));
+        n=p0bTimes(out,size,head,native_adreno_p0b_map_us[kind]);
+    } else if(row==NativeAdrenoPaths+3+NativeAdrenoP0bMapKinds) {
+        n=snprintf(out,size,"tlbi map-asid=%llu unmap-asid=%llu unmap-val=%llu val-pages=%llu",u(p0b(&native_adreno_p0b_tlbi[0])),
+            u(p0b(&native_adreno_p0b_tlbi[1])),u(p0b(&native_adreno_p0b_tlbi[2])),u(p0b(&native_adreno_p0b_tlbi[3])));
+    } else if(row==NativeAdrenoPaths+4+NativeAdrenoP0bMapKinds) {
+        n=snprintf(out,size,"submit n=%llu maintained=%llu spans=%llu",u(p0b(&native_adreno_p0b_submit[0])),
+            u(p0b(&native_adreno_p0b_submit[1])),u(p0b(&native_adreno_p0b_submit[2])));
+    } else return 0;
+    if(n<0)return 0;
+    return size_t(n)<size?n:int(size-1);
+}
+int NativeAdrenoPoolBypassSummary(char *out,size_t size)
+{
+    static uint64_t printed=~UINT64_C(0);
+    if(!out || !size)return 0;
+    out[0]=0;
+    uint64_t signature=__atomic_load_n(&native_adreno_pool_bypass,__ATOMIC_ACQUIRE);
+    for(unsigned path=0;path<NativeAdrenoPaths;++path)signature=signature*1000003u+p0b(&native_adreno_p0b_alloc[path][0])+
+        p0b(&native_adreno_p0b_alloc[path][2]);
+    for(unsigned kind=0;kind<NativeAdrenoP0bMapKinds;++kind)signature=signature*1000003u+p0b(&native_adreno_p0b_map_us[kind][0]);
+    if(signature==printed)return 0;
+    printed=signature;
+    const auto avg=[](const volatile uint64_t *row) {const uint64_t n=p0b(&row[0]);return u(n?p0b(&row[1])/n:0);};
+    const uint64_t fails=p0b(&native_adreno_p0b_alloc[0][2])+p0b(&native_adreno_p0b_alloc[1][2])+p0b(&native_adreno_p0b_alloc[2][2])+
+        p0b(&native_adreno_p0b_alloc[3][2]);
+    const int n=snprintf(out,size,"p0b: bypass=%u pool %llu/%lluM %lluus user %llu/%lluM %lluus wire %lluus map %llu/%lluus "
+        "tlbi %llu/%llu/%llu fails %llu",unsigned(__atomic_load_n(&native_adreno_pool_bypass,__ATOMIC_ACQUIRE)),
+        u(p0b(&native_adreno_p0b_alloc[NativeAdrenoPathPool][0])),u(p0b(&native_adreno_p0b_alloc[NativeAdrenoPathPool][1])>>20),
+        avg(native_adreno_p0b_alloc_us[NativeAdrenoPathPool]),u(p0b(&native_adreno_p0b_alloc[NativeAdrenoPathUser][0])),
+        u(p0b(&native_adreno_p0b_alloc[NativeAdrenoPathUser][1])>>20),avg(native_adreno_p0b_alloc_us[NativeAdrenoPathUser]),
+        avg(native_adreno_p0b_wire_us[0]),avg(native_adreno_p0b_map_us[0]),avg(native_adreno_p0b_map_us[1]),
+        u(p0b(&native_adreno_p0b_tlbi[0])),u(p0b(&native_adreno_p0b_tlbi[1])),u(p0b(&native_adreno_p0b_tlbi[2])),u(fails));
+    if(n<0)return 0;
+    return size_t(n)<size?n:int(size-1);
+}
 /* int-152: a user BO's pages changed attribute one pmap_set_cache_attributes call at a time (each walks the page's mappings, flushes the
  * TLB and cleans the page), on allocation and again on release, under the connection lock: 3 ms a BO on average and 90-130 ms for a
  * surface-sized one, while every other GPU call of every client waited. The pool is the BOs' own block and nothing else maps it, so
@@ -373,6 +482,9 @@ IOReturn NativeAdrenoMemory::allocateBacking(size_t bytes,unsigned bits,bool con
 #endif
     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
     failure_={vm?"vm-descriptor-create":"mapped-descriptor-create",kIOReturnNoMemory};
+    /* UniXNU-piano (GPU-PAGED P0b): the wiring (descriptor + prepare) and the physical walk, timed (NativeAdrenoPoolBypass.h). */
+    const unsigned p0bKind=vm?0:1;
+    uint64_t p0bClock=NativeAdrenoP0bNow();
     if(vm) {
         /* XNU's pageable/null-task factory creates a zero-fill named memory entry. prepare() faults and wires
          * those zeroed pages and applies the entry's cache mode; no cacheable aperture stores after publication. */
@@ -383,6 +495,11 @@ IOReturn NativeAdrenoMemory::allocateBacking(size_t bytes,unsigned bits,bool con
     if(!descriptor_)return kIOReturnNoMemory;
     status=descriptor_->prepare();
     if(status!=kIOReturnSuccess) {failure_={"prepare",status};descriptor_->release();descriptor_=nullptr;return status;}
+    if(p0bClock) {
+        const uint64_t now=NativeAdrenoP0bNow();
+        NativeAdrenoP0bTime(native_adreno_p0b_wire_us[p0bKind],now-p0bClock);
+        p0bClock=now;
+    }
     unmapped_=vm;write_combined_=vm && wc;
     accountBacking(bytes,vm);accounted_=true;
     prepared_=true;bytes_=bytes;mapping_=descriptor_->getBytesNoCopy();
@@ -406,6 +523,9 @@ IOReturn NativeAdrenoMemory::allocateBacking(size_t bytes,unsigned bits,bool con
             spans_[span_count_-1].bytes+=4096;
         else spans_[span_count_++]={offset,physical,4096};
     }
+    NativeAdrenoP0bAdd(&native_adreno_p0b_lookup[p0bKind][1],bytes/4096);
+    NativeAdrenoP0bAdd(&native_adreno_p0b_lookup[p0bKind][2],span_count_);
+    if(p0bClock)NativeAdrenoP0bAdd(&native_adreno_p0b_lookup[p0bKind][0],NativeAdrenoP0bNow()-p0bClock);
     failure_.stage="zero-cache";
     if(vm) {
         /* VM provided the zeros, then set WCOMB if requested. Complete zero-fill publication before the GPU sees pages.

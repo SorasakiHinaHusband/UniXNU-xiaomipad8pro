@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoMeter.h"
+#include "NativeAdrenoPoolBypass.h"   /* UniXNU-piano: GPU-PAGED P0b */
 #include <IOKit/IOLib.h>
 #include <string.h>
 
@@ -408,7 +409,14 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     if(!entry)return ALLOC_REFUSE(Objects,BoAlloc,kIOReturnNoResources,live_,entry_count_,0);
     IOReturn status=kIOReturnNoResources;
     const bool zero_outside=NativeAdrenoKoptOn(NativeAdrenoKoptPoolZero);
-    {
+    /* UniXNU-piano (2026-11-22, GPU-PAGED P0b, NativeAdrenoPoolBypass.h): with the pool bypass on, a new BO never tries the pool (nor
+     * takes the Memory lock for it) and goes to the path outside it, as a BO the pool had no room for; off, nothing changes. The path
+     * that backed the BO, its bytes and the call's time are counted. */
+    const bool bypass=NativeAdrenoPoolBypassed();
+    const uint64_t p0b_began=NativeAdrenoP0bNow();
+    unsigned p0b_path=NativeAdrenoPathPool;
+    if(bypass)NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[NativeAdrenoPathPool][4],1);
+    else {
         /* The BO pool is shared by every connection: a pooled allocation runs under the Memory lock. A client with a pool reserve
          * (setReserve: every one but the render server) leaves keep_pool_ bytes of the pool free (read under the same lock, which every
          * pool allocation and release holds). */
@@ -429,14 +437,19 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
         status=kIOReturnUnsupported;
         if(!NativeAdrenoMemory::unmappedUser() && request->contiguous==0 && contiguousAllowed(request->bytes,clock)) {
             __atomic_fetch_add(&native_adreno_meter_contig[0],1u,__ATOMIC_RELAXED);
+            p0b_path=NativeAdrenoPathContiguous;
             status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
             if(status)contiguousFailed(request->bytes,clock);
             if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
         }
         if(status) {
-            if(NativeAdrenoMemory::unmappedUser() && !request->contiguous)
+            if(NativeAdrenoMemory::unmappedUser() && !request->contiguous) {
+                p0b_path=NativeAdrenoPathUser;
                 status=entry->memory.allocateUser((size_t)request->bytes,output_bits_,(size_t)request->bytes,native_adreno_wc_enabled);
-            else status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes);
+            } else {
+                p0b_path=NativeAdrenoPathMapped;
+                status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes);
+            }
         }
     }
     /* A pooled BO's zero fill: its pages are nobody else's, so the zeros of a large BO hold up no other process's BoAlloc, BoImport or
@@ -450,6 +463,8 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
 #endif
     if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
     if(status) {
+        NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][2],1);
+        NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][3],request->bytes);
 #ifdef ADRENO830_MACOS
         const NativeAdrenoMemoryFailure failure=entry->memory.lastFailure();
         bool figures=false;uint64_t pool_free=0,pool_largest=0;   /* UniXNU-piano: the refusal's pool figures */
@@ -479,6 +494,11 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     publish(*entry);
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;
     reply->handle=entry->handle;
+    /* GPU-PAGED P0b: the path that backed it (a pooled BO says so itself; the attempt before it may have been another path's). */
+    if(entry->memory.pooled())p0b_path=NativeAdrenoPathPool;
+    NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][0],1);
+    NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][1],request->bytes);
+    if(p0b_began)NativeAdrenoP0bTime(native_adreno_p0b_alloc_us[p0b_path],NativeAdrenoP0bNow()-p0b_began);
     return kIOReturnSuccess;
 }
 void NativeAdrenoUserClient::setScanout(const NativeAdrenoScanoutMapping *mapping)

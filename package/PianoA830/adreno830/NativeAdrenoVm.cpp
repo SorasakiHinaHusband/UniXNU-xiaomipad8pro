@@ -2,6 +2,7 @@
 #include "NativeAdrenoVm.h"
 #include "NativeAdrenoVmAlias.h"
 #include "NativeAdrenoMeter.h"
+#include "NativeAdrenoPoolBypass.h"   /* UniXNU-piano: GPU-PAGED P0b */
 extern "C" volatile uint32_t native_adreno_trace_stage;
 extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
     int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
@@ -477,6 +478,7 @@ IOReturn NativeAdrenoVm::mapLocked(NativeAdrenoMemory *memory,unsigned upper,uin
 #endif
     if(!attached_ || poisoned_)return VM_REFUSE(NotReady,kIOReturnNotReady,attached_,poisoned_,0,memory);
     PhaseClock clock;
+    const uint64_t p0b_began=NativeAdrenoP0bNow();   /* UniXNU-piano: GPU-PAGED P0b's map time by backing */
     if(!memory)return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
     const bool exclusive=exclusivePages(memory,cls);
@@ -527,6 +529,7 @@ IOReturn NativeAdrenoVm::mapLocked(NativeAdrenoMemory *memory,unsigned upper,uin
         ArmSmmu4KProgramResult synced;
         const ArmSmmu4KStatus sync=ArmSmmu4KSyncContextTlb(&io_,context_offset_,context_->asid,0,budget_,&synced);
         if(sync)return fail(sync);
+        NativeAdrenoP0bAdd(&native_adreno_p0b_tlbi[0],1);
     }
     clock.lap(0,3);
     insert(spans,upper);record->mapped_spans=spans;result_.completed_spans=spans;
@@ -538,6 +541,11 @@ IOReturn NativeAdrenoVm::mapLocked(NativeAdrenoMemory *memory,unsigned upper,uin
         native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
         native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
         native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+spans;
+    }
+    {   /* GPU-PAGED P0b (NativeAdrenoPoolBypass.h): [0] pooled, [1] an own BO outside the pool, [2] an import or the scanout */
+        const unsigned p0b_kind=memory->imported() || memory->scanout()?2:memory->pooled()?0:1;
+        NativeAdrenoP0bAdd(&native_adreno_p0b_map_pages[p0b_kind],memory->bytes()/4096);
+        if(p0b_began)NativeAdrenoP0bTime(native_adreno_p0b_map_us[p0b_kind],NativeAdrenoP0bNow()-p0b_began);
     }
     record->handle=next_handle_++;*handle=record->handle;index_.insert(record->handle,(uint32_t)(record-mappings_));
     result_.complete=true;return kIOReturnSuccess;
@@ -689,6 +697,9 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
         native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
         native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
         native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+spans;
+        /* GPU-PAGED P0b: the unmap's TLB invalidation by the same rule */
+        if(kind==3) {NativeAdrenoP0bAdd(&native_adreno_p0b_tlbi[2],1);NativeAdrenoP0bAdd(&native_adreno_p0b_tlbi[3],record->memory->bytes()/4096);}
+        else NativeAdrenoP0bAdd(&native_adreno_p0b_tlbi[1],1);
     }
     unlinkMaintained(*record);
     index_.erase(record->handle);
@@ -739,10 +750,15 @@ IOReturn NativeAdrenoVm::cleanForSubmission()
     if(!attached_)return kIOReturnNotReady;
     VM_LOCKED;
     if(poisoned_)return kIOReturnNotReady;
+    uint64_t p0b_spans=0;   /* GPU-PAGED P0b: the submission's walk of physical pages */
     for(uint32_t slot=maintained_head_;slot!=UINT32_MAX;slot=mappings_[slot].next) {
         const Mapping &m=mappings_[slot];
         if(m.memory->publishForDevice(0,m.memory->bytes(),false,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+        p0b_spans+=m.memory->spanCount();
     }
+    NativeAdrenoP0bAdd(&native_adreno_p0b_submit[0],1);
+    NativeAdrenoP0bAdd(&native_adreno_p0b_submit[1],maintained_count_);
+    NativeAdrenoP0bAdd(&native_adreno_p0b_submit[2],p0b_spans);
     native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+(maintained_count_?0:1);
     return kIOReturnSuccess;
 }
