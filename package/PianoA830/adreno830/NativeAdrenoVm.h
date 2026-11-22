@@ -200,20 +200,26 @@ class NativeAdrenoVm final {
      * table change happens under the VM lock, a chunk is allocated only by growTables outside it (its own grow lock). ranges_ holds
      * one record per mapping: {iova, the mapping's slot in mappings_, the BO's bytes, attributes}. */
     bool paged_=false;
-    NativeAdrenoVmPagedConfig paged_config_{};
-    ArmSmmu4KPagedSpace space_{};
-    NativeAdrenoMemory chunks_[NativeAdrenoVmPagedMaxChunks];
-    uint16_t chunk_order_[NativeAdrenoVmPagedMaxChunks]{};   /* chunk indices sorted by physical address */
-    size_t chunk_count_=0,chunk_pages_=0;
-    uint64_t free_head_=0;
-    size_t free_pages_=0;                                    /* read without the lock as a hint (growTables) */
+    struct TrimRange {uint64_t iova,bytes;};
+    /* Everything paged mode keeps, allocated by preparePaged (the kexts' __DATA of the collection has little room: no paged state in
+     * the VM object itself, which every VM carries). */
+    struct PagedState {
+        NativeAdrenoVmPagedConfig config{};
+        ArmSmmu4KPagedSpace space{};
+        NativeAdrenoMemory chunks[NativeAdrenoVmPagedMaxChunks];
+        uint16_t order[NativeAdrenoVmPagedMaxChunks]{};   /* chunk indices sorted by physical address */
+        size_t chunk_count=0,chunk_pages=0;
+        uint64_t free_head=0;
+        size_t free_pages=0;                               /* read without the lock as a hint (growTables) */
+        TrimRange trim[NativeAdrenoVmPagedTrimRanges]{};
+        size_t trim_count=0;
+        bool trim_all=false;
+        uint64_t retired[NativeAdrenoVmPagedTrimBatch]{};
+        NativeAdrenoVmPagedStats stats{};
+        size_t short_pages=0;                              /* table pages the last refused map lacked (0: another reason) */
+    };
+    PagedState *pg_=nullptr;
     void *grow_lock_=nullptr;
-    struct TrimRange {uint64_t iova,bytes;} trim_[NativeAdrenoVmPagedTrimRanges]{};
-    size_t trim_count_=0;
-    bool trim_all_=false;
-    uint64_t retired_[NativeAdrenoVmPagedTrimBatch]{};
-    NativeAdrenoVmPagedStats pstats_{};
-    size_t paged_short_=0;                                   /* table pages the last refused map lacked (0: another reason) */
     static int tableAllocate(void *,uint64_t *,volatile uint64_t **);
     static void tableRelease(void *,uint64_t,volatile uint64_t *);
     static volatile uint64_t *tableCpu(void *,uint64_t);
