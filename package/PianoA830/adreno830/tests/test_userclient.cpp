@@ -353,7 +353,11 @@ int main()
         CHECK(w4==NativeAdrenoClientWindows4G && w2==NativeAdrenoClientWindows2G && NativeAdrenoClientWindowsFor(0)==w4 &&
               w16==NativeAdrenoClientWindows16G && NativeAdrenoClientWindowsFor(0x100000000ull)==w4 &&
               NativeAdrenoClientWindowsFor(0x100001000ull)==w16 && NativeAdrenoClientWindowsFor(0x80000000ull)==w2);
+#ifdef ADRENO830_MACOS   /* UniXNU-piano (GPU-SLOTS): sixty-four slots */
+        CHECK(NativeAdrenoMaxClients==64 && NativeAdrenoLargeSlots==3 && unsigned(NativeAdrenoMaxClients)<=unsigned(NativeAdrenoSubmitRanges));
+#else
         CHECK(NativeAdrenoMaxClients==32 && NativeAdrenoLargeSlots==3 && unsigned(NativeAdrenoMaxClients)<=unsigned(NativeAdrenoSubmitRanges));
+#endif
         enum : unsigned {Windows4G=12};
         CHECK(w4[0].start==0x20000000 && w4[0].bytes==0x60000000 && w4[1].start==0x80000000);
         for(unsigned i=1;i<Windows4G;++i) {
@@ -452,15 +456,32 @@ int main()
         for(auto &t:taken)t=false;
         taken[0]=true;count=0;
         for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,false,w16,taken))<NativeAdrenoMaxClients;taken[s]=true)order[count++]=s;
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano (GPU-SLOTS): on macOS the keep is 2 and an app then borrows the free large slots but the last one (1, 2). */
+        CHECK(NativeAdrenoListedSmallKeep(w16)==NativeAdrenoListedSmallKeepMacOS && NativeAdrenoListedSmallKeepMacOS==2);
+        CHECK(count==small_end-1-NativeAdrenoLargeSlots-NativeAdrenoListedSmallKeepMacOS+NativeAdrenoLargeSlots-unsigned(NativeAdrenoLargeKeepForList) &&
+              order[0]==4 && order[count-3]==small_end-1-NativeAdrenoListedSmallKeepMacOS && order[count-2]==1 && order[count-1]==2);
+        count=0;
+        for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,true,w16,taken))<NativeAdrenoMaxClients;taken[s]=true)order[count++]=s;
+        CHECK(count==unsigned(NativeAdrenoListedSmallKeepMacOS)+unsigned(NativeAdrenoLargeKeepForList) && order[0]==small_end-2 && order[1]==small_end-1 &&
+              order[2]==3);
+#else
         CHECK(count==small_end-1-NativeAdrenoLargeSlots-NativeAdrenoListedSmallKeep16G && order[0]==4 &&
               order[count-1]==small_end-1-NativeAdrenoListedSmallKeep16G);
         count=0;
         for(unsigned s;(s=NativeAdrenoClientSlotFor(false,false,true,w16,taken))<NativeAdrenoMaxClients;taken[s]=true)order[count++]=s;
         CHECK(count==NativeAdrenoListedSmallKeep16G+NativeAdrenoLargeSlots && order[0]==small_end-4 &&
               order[3]==small_end-1 && order[4]==1);
+#endif
         for(unsigned i=1;i<=NativeAdrenoLargeSlots;++i)taken[i]=false;
-        CHECK(NativeAdrenoClientSlotFor(false,true,true,w16,taken)==1 && NativeAdrenoClientSlotFor(true,false,true,w16,taken)==1 &&
-              NativeAdrenoClientSlotFor(false,false,false,w16,taken)==NativeAdrenoMaxClients);
+        CHECK(NativeAdrenoClientSlotFor(false,true,true,w16,taken)==1 && NativeAdrenoClientSlotFor(true,false,true,w16,taken)==1);
+#ifdef ADRENO830_MACOS   /* three large free: an app borrows one */
+        CHECK(NativeAdrenoClientSlotFor(false,false,false,w16,taken)==1);
+        taken[1]=taken[2]=true;CHECK(NativeAdrenoClientSlotFor(false,false,false,w16,taken)==NativeAdrenoMaxClients);   /* the last one kept */
+        taken[1]=taken[2]=false;
+#else
+        CHECK(NativeAdrenoClientSlotFor(false,false,false,w16,taken)==NativeAdrenoMaxClients);
+#endif
         /* The 2 GiB table has no small window: only listed processes get one of 1-3, slots 4-31 never. */
         for(auto &t:taken)t=false;
         CHECK(NativeAdrenoClientSlotFor(false,false,true,w2,taken)==1 && NativeAdrenoClientSlotFor(true,false,true,w2,taken)==0 &&
@@ -475,7 +496,12 @@ int main()
         bool held[NativeAdrenoMaxClients]={};
         for(unsigned s=0;s<9;++s)held[s]=true;
         CHECK(NativeAdrenoClientSmallFree(w4,held)==3 && NativeAdrenoClientSmallFree(w16,held)==small_end-9 && NativeAdrenoClientSmallFree(w2,held)==0 &&
-              NativeAdrenoClientSmallFree(nullptr,held)==0 && NativeAdrenoListedSmallKeep(w4)==3 && NativeAdrenoListedSmallKeep(w16)==4 &&
+              NativeAdrenoClientSmallFree(nullptr,held)==0 && NativeAdrenoListedSmallKeep(w4)==3 &&
+#ifdef ADRENO830_MACOS
+              NativeAdrenoListedSmallKeep(w16)==2 &&
+#else
+              NativeAdrenoListedSmallKeep(w16)==4 &&
+#endif
               NativeAdrenoClientSlotFor(false,false,false,w4,held)==NativeAdrenoMaxClients);
         NativeAdrenoSlotHolder holders[NativeAdrenoMaxClients]={};
         holders[0]={"backboardd",0,false};holders[1]={"WidgetRenderer_Default",12,false};holders[4]={"Maps",301,false};
@@ -490,7 +516,9 @@ int main()
         NativeAdrenoSlotHolder full[NativeAdrenoMaxClients];
         for(auto &holder:full)holder={"WidgetRenderer_Default",9999,true};
         NativeAdrenoSlotLine(slotLine,"WidgetRenderer_Defa",'a',28,4,UINT32_MAX,full);
-        CHECK(strlen(slotLine)<NativeAdrenoSlotLineBytes-1 && !strcmp(slotLine+strlen(slotLine)-20," 31:~WidgetRend/9999"));
+        char lastHolder[32];
+        snprintf(lastHolder,sizeof lastHolder," %u:~WidgetRend/9999",NativeAdrenoMaxClients-1);
+        CHECK(strlen(slotLine)<NativeAdrenoSlotLineBytes-1 && !strcmp(slotLine+strlen(slotLine)-strlen(lastHolder),lastHolder));
         /* The first address past 4 GiB (6.2): slot 5 of the 16 GiB table starts on the line, so its client's first mapping is there; a mapping's end is
          * exclusive, so one that ends at 4 GiB, or in the gap under the line, is still below. A page of a gap belongs to no client. */
 #ifndef ADRENO830_MACOS   /* UniXNU-piano: the same: slot 1 starts on 4 GiB there */

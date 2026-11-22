@@ -23,7 +23,8 @@
 enum : uint64_t {
     GpuSqeIova=0x100000, GpuAqeIova=0x180000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
     GpuScratchIova=0x302000, GpuNullGuardBytes=0x100000, GpuGmemIova=0x4000000, GpuGmemBytes=0xC00000,
-    GpuApertureBytes=0x100000000, GpuApertureBytes2G=0x80000000, GpuApertureBytes16G=0x400000000, GpuClientBase=0x20000000
+    GpuApertureBytes=0x100000000, GpuApertureBytes2G=0x80000000, GpuApertureBytes16G=0x400000000, GpuClientBase=0x20000000,
+    GpuApertureBytes64G=0x1000000000   /* UniXNU-piano (2026-11-22, GPU-SLOTS): pagani-gpu-va=64, a 36-bit input */
 };
 enum : size_t {GpuSqeBytes=0x1C000, GpuAqeBytes=0x7000, GpuRingBytes=0x8000, GpuPageBytes=0x1000};
 enum NativeAdrenoGpuBufferIndex : unsigned {
@@ -36,7 +37,8 @@ struct NativeAdrenoGpuContextConfig {
     unsigned slot,lpac_slot;        /* the surveyed GPU and LPAC slots (preferred 0 and 3) */
     uint16_t sid,lpac_sid;          /* 0, 1 */
     unsigned output_bits;           /* 0: from the programmer's IDR2 (capped at 40) */
-    uint32_t aperture_gib;          /* pagani-gpu-va: 16 (8209 table pages, a 34-bit input; else 4), 4 (2053) or 2 (1027) */
+    uint32_t aperture_gib;          /* pagani-gpu-va: 16 (8209 table pages, a 34-bit input; else 4), 4 (2053) or 2 (1027); UniXNU-piano:
+                                     * 64 (32833 table pages, 128 MiB, a 36-bit input; else 16, else 4) */
     uint32_t pool_mib;              /* pagani-gpu-pool (512); 0: no pool, every BO scattered */
     bool write_combined_pool;       /* the pool's pages write-combined once (user BOs are write-combined) */
 };
@@ -57,7 +59,7 @@ public:
     /* 4 GiB with a 32-bit input: 1 L1 + 4 L2 + 2048 L3 pages; 2 GiB: 1 + 2 + 1024; 16 GiB with a 34-bit input: 1 + 16 + 8192, 32 MiB
      * (ARCHITECTURE 4.6.1). The alias scratch holds one entry per range of the smaller compared side: never more than the VM's
      * 262144 table ranges, whatever the aperture. */
-    enum : size_t {TablePages=2053,TablePages2G=1027,TablePages16G=8209,AliasScratchEntries=size_t(1)<<19};
+    enum : size_t {TablePages=2053,TablePages2G=1027,TablePages16G=8209,TablePages64G=32833,AliasScratchEntries=size_t(1)<<19};
     NativeAdrenoGpuContext()=default;
     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
@@ -70,8 +72,9 @@ public:
     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
     NativeAdrenoSmmuContext &smmu() {return smmu_;}
     uint64_t apertureBytes() const {return aperture_;}
-    /* The input size the context was prepared with: 34 bits for the 16 GiB aperture, else 32 (the publish shell's input_bits). */
-    unsigned inputBits() const {return aperture_>GpuApertureBytes?34u:32u;}
+    /* The input size the context was prepared with: 34 bits for the 16 GiB aperture, else 32 (the publish shell's input_bits).
+     * UniXNU-piano: 36 for the 64 GiB one. */
+    unsigned inputBits() const {return aperture_>GpuApertureBytes16G?36u:aperture_>GpuApertureBytes?34u:32u;}
     uint64_t guardTable() const {return guard_.spanCount()?guard_.spans()[0].physical:0;}
     unsigned outputBits() const {return output_bits_;}
     uint32_t poolMib() const {return pool_mib_;}   /* the pool reserved (0: none) */

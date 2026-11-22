@@ -7,7 +7,8 @@
  * pinned adreno_pm4.xml domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxBuffers=(uint32_t)NativeAdrenoSubmitMaxBuffers,
     SubmitMaxIbBytes=0xfffffu*4u};
-static_assert(NativeAdrenoSubmitJobs==NativeAdrenoSubmitRanges+NativeAdrenoSubmitSharedJobs && NativeAdrenoSubmitRanges<=32,
+static_assert(NativeAdrenoSubmitJobs==NativeAdrenoSubmitRanges+NativeAdrenoSubmitSharedJobs &&
+              NativeAdrenoSubmitRanges<=sizeof(NativeAdrenoRangeMask)*8,
               "one reserved job slot per client range, the rest shared");
 
 namespace {
@@ -327,7 +328,7 @@ uint32_t NativeAdrenoSubmit::lastSubmitted() const
 {
     return attached_ && ring_?ring_->lastSubmitted():0;
 }
-IOReturn NativeAdrenoSubmit::rangesInFlight(uint32_t completed,uint32_t issued,uint32_t *ranges) const
+IOReturn NativeAdrenoSubmit::rangesInFlight(uint32_t completed,uint32_t issued,NativeAdrenoRangeMask *ranges) const
 {
     if(!ranges)return kIOReturnBadArgument;
     *ranges=0;
@@ -335,17 +336,17 @@ IOReturn NativeAdrenoSubmit::rangesInFlight(uint32_t completed,uint32_t issued,u
     if(!attached_)return kIOReturnNotReady;
     const uint32_t count=issued-completed;
     if(count>NativeAdrenoSubmitHistory)return kIOReturnUnsupported;   /* also a completed fence past the issued one */
-    uint32_t mask=0;
+    NativeAdrenoRangeMask mask=0;
     for(uint32_t i=1;i<=count;++i) {
         const uint32_t fence=completed+i;
         const uint64_t entry=history_[fence%NativeAdrenoSubmitHistory];
         if(!(entry>>63) || uint32_t(entry)!=fence)return kIOReturnUnsupported;
-        mask|=1u<<((entry>>32)&(NativeAdrenoSubmitRanges-1));
+        mask|=NativeAdrenoRangeBit(uint32_t(entry>>32)&(NativeAdrenoSubmitRanges-1));
     }
     *ranges=mask;
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::halt(uint32_t *ranges_in_flight,uint32_t *oldest_range)
+IOReturn NativeAdrenoSubmit::halt(NativeAdrenoRangeMask *ranges_in_flight,uint32_t *oldest_range)
 {
     if(ranges_in_flight)*ranges_in_flight=0;
     if(oldest_range)*oldest_range=UINT32_MAX;
@@ -354,11 +355,12 @@ IOReturn NativeAdrenoSubmit::halt(uint32_t *ranges_in_flight,uint32_t *oldest_ra
     __atomic_store_n(&halted_,true,__ATOMIC_RELEASE);
     /* Jobs the CP already passed are not lost: retire them first (a poisoned object has nothing to retire safely). */
     if(!poisoned_)(void)retireCompletedLocked();
-    uint32_t ranges=0,oldest=UINT32_MAX,distance=UINT32_MAX;
+    NativeAdrenoRangeMask ranges=0;
+    uint32_t oldest=UINT32_MAX,distance=UINT32_MAX;
     const uint32_t done=completedValue();
     for(const auto &job:jobs_) {
         if(!job.active)continue;
-        ranges|=1u<<(job.queue/NativeAdrenoSubmitRangeQueues);
+        ranges|=NativeAdrenoRangeBit(job.queue/NativeAdrenoSubmitRangeQueues);
         /* Fences are sequence numbers: the job the CP stands in is the one nearest after the completed fence. A job the CP already
          * passed (a poisoned object retires nothing) and a poisoned commit's job (fence 0, never issued) are not in flight on the CP:
          * never chosen, and with no other job there is no culprit. */
@@ -375,16 +377,16 @@ void NativeAdrenoSubmit::resume()
     NativeAdrenoSubmitGuard guard(this,NativeAdrenoSubmitLockRing);
     __atomic_store_n(&halted_,false,__ATOMIC_RELEASE);
 }
-IOReturn NativeAdrenoSubmit::recover(uint32_t *abandoned_ranges)
+IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRangeMask *abandoned_ranges)
 {
     if(abandoned_ranges)*abandoned_ranges=0;
     NativeAdrenoSubmitGuard guard(this,NativeAdrenoSubmitLockRing);
     if(!attached_)return kIOReturnNotReady;
-    uint32_t ranges=0;
+    NativeAdrenoRangeMask ranges=0;
     IOReturn result=kIOReturnSuccess;
     for(auto &job:jobs_) {
         if(!job.active)continue;
-        ranges|=1u<<(job.queue/NativeAdrenoSubmitRangeQueues);
+        ranges|=NativeAdrenoRangeBit(job.queue/NativeAdrenoSubmitRangeQueues);
         const IOReturn status=releaseLocked(job);
         if(status && !result)result=status;
         if(!status)++stats_.abandoned;

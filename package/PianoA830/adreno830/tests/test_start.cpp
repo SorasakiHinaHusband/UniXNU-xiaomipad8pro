@@ -583,22 +583,28 @@ IOReturn NativeAdrenoGmuContext::bringUp(const NativeAdrenoGmuContextConfig &con
     return config.map(config.map_cookie,&vm_);
 }
 static uint8_t buffers[GpuBufferCount][0x1c000];
-/* pagani-gpu-va=16 as the real context answers on an SMMU without a 34-bit IAS or the 32 MiB of tables: the 4 GiB aperture. */
+/* pagani-gpu-va=16 as the real context answers on an SMMU without a 34-bit IAS or the 32 MiB of tables: the 4 GiB aperture.
+ * UniXNU-piano (GPU-SLOTS): the macOS default is pagani-gpu-va=64 (DeviceInfo 0x20000000 + 0xFE0000000, a 36-bit input). */
 static bool wideFallback;
+#ifdef ADRENO830_MACOS
+static constexpr uint32_t kDefaultVa=64;static constexpr uint64_t kDefaultVaSize=0xFE0000000ull;static constexpr uint32_t kDefaultInputBits=36;
+#else
+static constexpr uint32_t kDefaultVa=16;static constexpr uint64_t kDefaultVaSize=0x3E0000000ull;static constexpr uint32_t kDefaultInputBits=34;
+#endif
 IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &config,void (*)(uint32_t),
                                          NativeAdrenoGmuContextReport *report)
 {
     CHECK(config.bank==0 && config.asid==1 && config.slot==0 && config.lpac_slot==3 && config.sid==0 && config.lpac_sid==1);
-    CHECK((config.aperture_gib==4 || config.aperture_gib==2 || config.aperture_gib==16) && config.pool_mib==512 &&
-          config.write_combined_pool);
+    CHECK((config.aperture_gib==4 || config.aperture_gib==2 || config.aperture_gib==16 || config.aperture_gib==64) &&
+          config.pool_mib==512 && config.write_combined_pool);
     if(ioScript.smmu)ioScript.smmu(smmuIoSeen,"context",config.bank);
     *report={};report->step=Ready;
     uint16_t step=0,reason=0;
     if(IOReturn r=hit("NativeAdrenoGpuContext::bringUp",&step,&reason)) {report->step=step;return r;}
     ready_=true;used_=true;output_bits_=36;pool_mib_=config.pool_mib;
-    aperture_=uint64_t(config.aperture_gib==16 && wideFallback?4:config.aperture_gib)<<30;
-    report->table_pages=aperture_>GpuApertureBytes?uint32_t(TablePages16G):aperture_<GpuApertureBytes?uint32_t(TablePages2G):
-        uint32_t(TablePages);
+    aperture_=uint64_t(config.aperture_gib>=16 && wideFallback?4:config.aperture_gib)<<30;
+    report->table_pages=aperture_>GpuApertureBytes16G?uint32_t(TablePages64G):aperture_>GpuApertureBytes?uint32_t(TablePages16G):
+        aperture_<GpuApertureBytes?uint32_t(TablePages2G):uint32_t(TablePages);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoGpuContext::buffers(NativeAdrenoGpuBuffer out[GpuBufferCount]) const
@@ -974,9 +980,9 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     const NativeAdrenoRingClock *clock,const NativeAdrenoTimer *timer,const NativeAdrenoAbiDeviceInfo *info,uint32_t input_bits,
     uint32_t output_bits)
 {
-    /* The input size follows the aperture the context built: 34 bits for the 16 GiB one, else 32. */
+    /* The input size follows the aperture the context built: 34 bits for the 16 GiB one, else 32 (UniXNU-piano: 36 for 64 GiB). */
     CHECK(vm && submit && ring && clock && clock->now_us && timer && info &&
-          input_bits==(info->va_start+info->va_size>0x100000000ull?34u:32u));
+          input_bits==(info->va_start+info->va_size>0x400000000ull?36u:info->va_start+info->va_size>0x100000000ull?34u:32u));
     publishedInfo=*info;publishedOutputBits=output_bits;publishedInputBits=input_bits;
     return hit("native_adreno_publish");
 }
@@ -1243,7 +1249,7 @@ int main()
           !called("A830SelfTest::run(cohtest)") && !lastEnv.cohtest && called("coherence-1")==1);
     CHECK(publishedInfo.chip_id==0x44050001 && publishedInfo.gmem_bytes==0xc00000 && publishedInfo.gmem_base==0x4000000 &&
           publishedInfo.uche_trap_base==0x1fffffffff000ull && publishedInfo.va_start==0x20000000 &&
-          publishedInfo.va_size==0x3e0000000ull && publishedInfo.highest_bank_bit==16 && publishedInfo.ubwc_swizzle==6 &&
+          publishedInfo.va_size==kDefaultVaSize && publishedInfo.highest_bank_bit==16 && publishedInfo.ubwc_swizzle==6 &&
           publishedInfo.macrotile_mode==1 && publishedInfo.ubwc_version==5 && publishedInfo.flags==NativeAdrenoDeviceClientIova &&
           publishedOutputBits==36);
     CHECK(lastDcvs.governor && lastDcvs.minMhz==160 && lastDcvs.maxMhz==734 && lastDcvs.fixedLevel==2 && lastDcvs.initialLevel==2 &&
@@ -1628,8 +1634,12 @@ int main()
     /* The default, pagani-gpu-va=16: the DeviceInfo and the publish shell's input size follow the aperture the GPU context built, 16 GiB
      * with a 34-bit input, or the 4 GiB it fell back to; pagani-gpu-va=4 asks for the 4 GiB one. */
     b=board13t();
-    CHECK(run(&b)==kIOReturnSuccess && publishedInfo.va_start==0x20000000 && publishedInfo.va_size==0x3E0000000ull &&
-          publishedInputBits==34);
+    CHECK(run(&b)==kIOReturnSuccess && publishedInfo.va_start==0x20000000 && publishedInfo.va_size==kDefaultVaSize &&
+          publishedInputBits==kDefaultInputBits);
+    b=board13t();b.knobs.va=16;   /* UniXNU-piano: pagani-gpu-va=16 asks for the 16 GiB one */
+    CHECK(run(&b)==kIOReturnSuccess && publishedInfo.va_size==0x3E0000000ull && publishedInputBits==34);
+    b=board13t();b.knobs.va=64;   /* and 64 for the 64 GiB one */
+    CHECK(run(&b)==kIOReturnSuccess && publishedInfo.va_size==0xFE0000000ull && publishedInputBits==36);
     b=board13t();wideFallback=true;
     CHECK(run(&b)==kIOReturnSuccess && publishedInfo.va_size==0xE0000000ull && publishedInputBits==32);
     wideFallback=false;
@@ -1753,7 +1763,7 @@ int main()
     Adreno830ParseKnobs(&b,getter,&none);
     CHECK(b.flags==(~0u&~((1u<<Adreno830KnobCount)-1u|Adreno830BoardFlagPool)) && b.knobs.stop==Adreno830StopNever &&
           b.knobs.status==1 && b.knobs.rails==1 && b.knobs.ddr_boot==11 && b.knobs.ddr_floor==11 && b.knobs.actlr==0x303 &&
-          b.knobs.dcvs==1 && b.knobs.dcvs_min_mhz==160 && b.knobs.dcvs_max_mhz==734 && b.knobs.perf==2 && b.knobs.va==16 &&
+          b.knobs.dcvs==1 && b.knobs.dcvs_min_mhz==160 && b.knobs.dcvs_max_mhz==734 && b.knobs.perf==2 && b.knobs.va==kDefaultVa &&
           b.knobs.async==0 && b.knobs.coherent==0 && b.knobs.qmp==0 && b.knobs.cohtest==0 && b.knobs.llcc==0 &&
           b.knobs.speedbin==0 && b.knobs.acd==0 && b.knobs.hfi==0 && b.knobs.diag==0 && b.pool_mib==512 &&
           b.knobs.profile==A830ProfileAnnibale && b.knobs.hwsched==0 && b.knobs.trace==1);

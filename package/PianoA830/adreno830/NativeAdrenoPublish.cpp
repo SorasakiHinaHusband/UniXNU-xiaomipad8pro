@@ -326,8 +326,10 @@ volatile uint32_t native_adreno_slot_pressure[2];
 volatile uint32_t native_adreno_fault_attribution[NativeAdrenoFaultVerdicts];
 }
 /* Every connection slot is a submit range of its own: its queues are [slot * NativeAdrenoAbiMaxQueues, + NativeAdrenoAbiMaxQueues) with
- * one reserved job slot on the ring (ARCHITECTURE 5.4), and recovery reports the ranges with work in flight as a 32-bit mask. */
-static_assert(unsigned(NativeAdrenoMaxClients)<=unsigned(NativeAdrenoSubmitRanges) && NativeAdrenoSubmitRanges<=32 &&
+ * one reserved job slot on the ring (ARCHITECTURE 5.4), and recovery reports the ranges with work in flight as a mask
+ * (NativeAdrenoRangeMask: 64 bits on macOS, 32 upstream). */
+static_assert(unsigned(NativeAdrenoMaxClients)<=unsigned(NativeAdrenoSubmitRanges) &&
+              NativeAdrenoSubmitRanges<=sizeof(NativeAdrenoRangeMask)*8 &&
               uint32_t(NativeAdrenoSubmitRangeQueues)==uint32_t(NativeAdrenoAbiMaxQueues),"one submit range per connection slot");
 
 class NativeAdrenoGpuPublished : public IOService {
@@ -1588,7 +1590,8 @@ extern "C" void native_adreno_recovery_begin(bool charge_culprit)
     if(!g.published)return;
     /* Halt first, under the ring lock: from here no submission reaches the ring, and the snapshot of the ranges with work in flight is
      * exact. Those connections lose their jobs: faults += 1 (Turnip sees the device lost for that process only), whatever the cause. */
-    uint32_t ranges=0,oldest=UINT32_MAX;
+    NativeAdrenoRangeMask ranges=0;
+    uint32_t oldest=UINT32_MAX;
     g.submit->halt(&ranges,&oldest);
     IOLockLock(g.lock);
     /* The culprit, only for a cause a client's job can produce (charge_culprit: the hang detector, CP_HW_ERROR, the software watchdog):
@@ -1607,7 +1610,7 @@ extern "C" void native_adreno_recovery_begin(bool charge_culprit)
     }
     bool any=false;
     for(unsigned s=0;s<NativeAdrenoMaxClients;++s)
-        if(ranges&(1u<<s))if(CoreBox *box=slotBox(s)) {box->status.noteFault();any=true;}
+        if(ranges&NativeAdrenoRangeBit(s))if(CoreBox *box=slotBox(s)) {box->status.noteFault();any=true;}
     if((ranges&1u) && !slotBox(0)) {
         /* range 0 without a user connection is the kernel client's */
         if(g.kernel_client && g.kernel_client->box()) {g.kernel_client->box()->status.noteFault();any=true;}
@@ -1626,7 +1629,7 @@ extern "C" void native_adreno_recovery_begin(bool charge_culprit)
             at+=snprintf(line+at,sizeof line-size_t(at)," slot %u %s",oldest,culprit->name);
         if(at>0 && size_t(at)<sizeof line)at+=snprintf(line+at,sizeof line-size_t(at),"; jobs in flight fail:");
         for(unsigned s=0;s<NativeAdrenoMaxClients && at>0 && size_t(at)<sizeof line;++s)
-            if(ranges&(1u<<s))
+            if(ranges&NativeAdrenoRangeBit(s))
                 if(const CoreBox *box=slotBox(s))at+=snprintf(line+at,sizeof line-size_t(at)," %u:%s",s,box->name);
     }
 #endif
@@ -1645,7 +1648,7 @@ extern "C" void native_adreno_recovery_end(bool recovered)
     }
     if(recovered) {
         /* The GPU was power cycled and the ring restarted: nothing of the outstanding jobs runs any more, so their references go. */
-        uint32_t abandoned=0;
+        NativeAdrenoRangeMask abandoned=0;
         if(g.submit->recover(&abandoned)!=kIOReturnSuccess)recovered=false;
     }
     if(!recovered) {
@@ -1881,6 +1884,13 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     service->setName("NativeAdrenoGpu");
     service->setProperty("NativeAdrenoCoherentImports",(unsigned long long)native_adreno_coherent_imports(),32);
     service->setProperty(NativeAdrenoImportCleanKey,1ULL,32);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-22, GPU-SLOTS): the client table in force, for a read-only check (ioreg): the windows it can hand out, the
+     * aperture's end in MiB and the per-connection window of an ordinary slot (the first small one) in MiB. */
+    service->setProperty("NativeAdrenoClientSlots",(unsigned long long)NativeAdrenoClientWindowCount(windows),32);
+    service->setProperty("NativeAdrenoClientVaEndMiB",(unsigned long long)(NativeAdrenoClientWindowsEnd(windows)>>20),32);
+    service->setProperty("NativeAdrenoClientWindowMiB",(unsigned long long)(windows[NativeAdrenoLargeSlots+1].bytes>>20),32);
+#endif
     service->registerService();
     return kIOReturnSuccess;
 }
@@ -2006,7 +2016,7 @@ extern "C" void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *d
     if(!d || !__atomic_load_n(&g.published,__ATOMIC_ACQUIRE) || !g.submit || !g.vm || !g.ring)return;
     typedef unsigned long long u64;
     const uint64_t far=d->far,low=far>>32?far-(UINT64_C(1)<<32):0;   /* FAR - 4 GiB (0: FAR is below 4 GiB) */
-    uint32_t ranges=0;
+    NativeAdrenoRangeMask ranges=0;
     const bool known=g.submit->rangesInFlight(d->completed,d->issued,&ranges)==kIOReturnSuccess;
     NativeAdrenoVmPlace over[2]{},below[2]{};
     const uint64_t at[2]={far,low};
@@ -2058,7 +2068,7 @@ extern "C" void native_adreno_note_fault_detail(const NativeAdrenoFaultDetail *d
         if(!known)used+=snprintf(lines[0]+used,sizeof lines[0]-size_t(used)," ? (no fence history)");
         else if(!ranges)used+=snprintf(lines[0]+used,sizeof lines[0]-size_t(used)," none");
         for(unsigned s=0;known && s<NativeAdrenoMaxClients && used>0 && size_t(used)<sizeof lines[0];++s)
-            if(ranges&(1u<<s)) {
+            if(ranges&NativeAdrenoRangeBit(s)) {
                 char who[20];
                 const CoreBox *box=locked?slotBox(s):nullptr;
                 snprintf(who,sizeof who,"%.12s",box?box->name:!locked?"?":s?"-":"kernel");

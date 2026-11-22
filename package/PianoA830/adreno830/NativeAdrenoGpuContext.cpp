@@ -32,7 +32,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
     const NativeAdrenoSmmuProgrammer *programmer=config.programmer;
     if(!programmer || config.bank>63 || !config.asid || config.asid>0xffff || config.slot>127 || config.lpac_slot>127 ||
         config.slot==config.lpac_slot || config.sid==config.lpac_sid || config.sid>0x7fff || config.lpac_sid>0x7fff ||
-        (config.aperture_gib!=2 && config.aperture_gib!=4 && config.aperture_gib!=16) || config.output_bits>48)
+        (config.aperture_gib!=2 && config.aperture_gib!=4 && config.aperture_gib!=16 && config.aperture_gib!=64) || config.output_bits>48)
         return kIOReturnBadArgument;
     used_=true;
     IOReturn status=kIOReturnSuccess;
@@ -45,15 +45,24 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
     /* pagani-gpu-va: 16 GiB (8209 table pages, a 34-bit input) by default for 32 client windows, 4 GiB (2053), 2 GiB (1027) as the old
      * fallback (ARCHITECTURE 4.6.1, 6.2). 16 GiB needs IDR2.UBS of 34 bits or more and a 32 MiB contiguous table pool; without either
      * the context takes the 4 GiB aperture, and the publish shell the 4 GiB windows (apertureBytes()). */
-    const bool wide=config.aperture_gib==16 && smmuInputBits(programmer->id2)>=34;
-    aperture_=config.aperture_gib==2?uint64_t(GpuApertureBytes2G):wide?uint64_t(GpuApertureBytes16G):uint64_t(GpuApertureBytes);
-    size_t pages=config.aperture_gib==2?TablePages2G:wide?TablePages16G:TablePages;
+    /* UniXNU-piano (2026-11-22, private GPU-SLOTS.md): pagani-gpu-va=64 (the macOS default) asks for a 64 GiB aperture, 32833 table pages
+     * (128 MiB) with a 36-bit input, for 64 client windows of which 59 are 1 GiB: without IDR2.UBS >= 36 bits or its tables it is the 16
+     * GiB aperture, then 4 GiB, as before. */
+    const bool wider=config.aperture_gib==64 && smmuInputBits(programmer->id2)>=36;
+    const bool wide=(config.aperture_gib==16 || config.aperture_gib==64) && smmuInputBits(programmer->id2)>=34;
+    aperture_=config.aperture_gib==2?uint64_t(GpuApertureBytes2G):wider?uint64_t(GpuApertureBytes64G):wide?uint64_t(GpuApertureBytes16G):
+        uint64_t(GpuApertureBytes);
+    size_t pages=config.aperture_gib==2?TablePages2G:wider?TablePages64G:wide?TablePages16G:TablePages;
     /* The BO pool first, while the VM still has long contiguous runs (normally the orchestrator reserved it before CB2; then this
      * only reports it). Not fatal: without it each BO is scattered and changes its own pages' attribute. */
     if(!status && config.pool_mib)
         status=NativeAdrenoMemory::reservePoolBestEffort(bits,config.pool_mib,16,config.write_combined_pool,&pool_mib_);
     if(!status) {
         status=tables_.allocate(pages*0x1000,bits,true,pages*0x1000);
+        if(status && wider && !tables_.quarantined()) {
+            aperture_=GpuApertureBytes16G;pages=TablePages16G;
+            status=tables_.allocate(pages*0x1000,bits,true,pages*0x1000);
+        }
         if(status && wide && !tables_.quarantined()) {
             aperture_=GpuApertureBytes;pages=TablePages;
             status=tables_.allocate(pages*0x1000,bits,true,pages*0x1000);

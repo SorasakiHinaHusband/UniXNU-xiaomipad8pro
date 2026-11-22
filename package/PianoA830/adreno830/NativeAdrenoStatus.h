@@ -16,6 +16,13 @@ static_assert(NativeAdrenoReturnNotResponding==kIOReturnNotResponding && NativeA
 #if defined(kIOReturnNotPermitted)
 static_assert(NativeAdrenoReturnNotPermitted==kIOReturnNotPermitted,"NativeAdreno status codes are IOReturn.h's");
 #endif
+/* The client ranges a recovery or a fault names, bit r for range r (NativeAdrenoSubmit.h's NativeAdrenoSubmitRanges, the publish shell's
+ * connection slots). UniXNU-piano (2026-11-22, GPU-SLOTS): 64 bits on macOS (64 slots), 32 upstream. */
+#ifdef ADRENO830_MACOS
+typedef uint64_t NativeAdrenoRangeMask;
+#else
+typedef uint32_t NativeAdrenoRangeMask;
+#endif
 
 /* Monotonic fault and suspend counters of ONE connection, for Turnip's device_check_status and device_get_suspend_count (GetStatus).
  * Turnip compares the fault count with the value it saw last: a change means its context is lost (vk_device_set_lost). Counts are
