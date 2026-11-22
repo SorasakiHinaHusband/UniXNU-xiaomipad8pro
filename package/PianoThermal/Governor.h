@@ -146,6 +146,7 @@ struct GovernorConfig {
 struct TickInput {
   uint32_t busyPermille;   // governor only
   PowerSource power;
+  uint32_t demandKhz = 0;  // the WALT-like demand (Perf.h WaltCore; kHz-equivalent work): when set, the need is demand / target
 };
 
 // The cluster's temperature against its trips (Cluster.h computes it from a poll).
@@ -218,7 +219,8 @@ class Governor {
       return level_;
     }
     if (mode_ != CpuMode::govern) return level_;
-    const uint64_t need = uint64_t(khz_[level_]) * in.busyPermille / (config_.targetPermille ? config_.targetPermille : 800);
+    const uint32_t target = config_.targetPermille ? config_.targetPermille : 800;
+    const uint64_t need = in.demandKhz ? uint64_t(in.demandKhz) * 1000u / target : uint64_t(khz_[level_]) * in.busyPermille / target;
     unsigned want = slowestAtLeast(uint32_t(need > 0xffffffffu ? 0xffffffffu : need));
     if (in.busyPermille >= config_.hispeedPermille && config_.hispeedKhz) {
       const unsigned hs = slowestAtLeast(config_.hispeedKhz);
@@ -292,6 +294,8 @@ class Governor {
     above_ = mode_ == CpuMode::govern && aboveSustained;
   }
   void setDownTicks(uint32_t n) { config_.downTicks = n ? n : 1; }
+  // the thermal limit's release rate (one level up per riseMs under the release point; the full table's Android rule: faster)
+  void setRiseMs(uint32_t ms) { config_.riseMs = ms ? ms : 1; }
   unsigned rawWant() const { return rawWant_; }
   uint32_t perfKhz() const { return perfKhz_; }
   unsigned floorLevel() const

@@ -210,6 +210,88 @@ struct HighPowerCap {
 };
 inline HighPowerCap highPowerCap(uint32_t topKhz, bool aboveRefused) { return HighPowerCap{topKhz, !aboveRefused}; }
 
+// ------------------------------------------------------------------------------------------------- the full table (fullopp)
+// (owner 2026-11-22 22:43: Android's full CPU table and thermal policy, as the GPU's fullopp line). piano-cpufreq-fullopp=1, at run
+// time machdep.piano_cpufreq_fullopp (0/1, the same-boot A/B against the policy above). Numbers as behaviour, from the stock
+// Android of this tablet (docs/drivers/thermal.md section 15):
+//   - the table: the firmware's 16 + 16 levels (NCC0 384..3532.8, NCC1 1017.6..4320 MHz; 4204.8 / 4320 above NCC1's sustained
+//     4089.6), all of them allowed; the thermal daemon's scene decides how much of it a given temperature gets;
+//   - the scenes (the CPU rows of the stock thermal daemon's scene files): "normal", the everyday one, is the step table above
+//     (kCluster0 / kCluster1, boosts until 48 C); "nolimits" has one step per cluster, 51 C (clear 50 C) -> 748.8 / 1017.6 MHz,
+//     boosts until 51 C, i.e. the whole table below 51 C. macOS's Energy Mode picks the scene here: High Power = nolimits,
+//     Automatic and Low Power = normal (Low Power keeps the Power Saver caps on top);
+//   - in every scene the battery-percentage limit (reverse: at or under the trigger): <= 3 % -> 1785.6 / 1401.6 MHz, <= 1 % ->
+//     1363.2 / 1401.6 MHz, cleared at 4 % / 2 %;
+//   - the kernel's silicon rule: the cpu zones' passive trip 95 C with 8 C hysteresis, step_wise on the cluster's cpufreq cooling
+//     (PianoThermal.cpp: piano-cpufreq-hot=95 and the release point piano-cpufreq-fullopp-release, 87 C); no temperature gate on
+//     bursts and boosts beyond the thermal limit itself (piano-cpufreq-fullopp-gate=0).
+enum class Scene : uint8_t { normal = 0, nolimits = 1 };
+constexpr Step kNolimits0[] = {{51000, 50000, 748800}};
+constexpr Step kNolimits1[] = {{51000, 50000, 1017600}};
+struct SceneTable {
+  const Step *steps[2];
+  unsigned count[2];
+  int32_t boostLimitMilli;   // no burst or boost from this virtual skin temperature up (the scene's boost_limit)
+  const char *name;
+};
+inline SceneTable sceneTable(Scene s)
+{
+  if (s == Scene::nolimits) return SceneTable{{kNolimits0, kNolimits1}, {1, 1}, 51000, "nolimits"};
+  return SceneTable{{kCluster0, kCluster1}, {kCluster0Steps, kCluster1Steps}, 48000, "normal"};
+}
+inline Scene sceneFor(bool highPower) { return highPower ? Scene::nolimits : Scene::normal; }
+
+// The battery-percentage limit: level 0 none, 1 (<= 3 %), 2 (<= 1 %); up at the trigger, down only at the clear point.
+// soc < 0 (no reading) keeps the level.
+constexpr int32_t kSocTrig[3] = {0, 3, 1}, kSocClr[3] = {0, 4, 2};
+constexpr uint32_t kSocKhz[3][2] = {{0, 0}, {1785600, 1401600}, {1363200, 1401600}};
+class SocLimit {
+ public:
+  unsigned update(int32_t soc)
+  {
+    if (soc < 0) return level_;
+    while (level_ < 2 && soc <= kSocTrig[level_ + 1]) ++level_;
+    while (level_ > 0 && soc >= kSocClr[level_]) --level_;
+    return level_;
+  }
+  uint32_t khz(unsigned cluster) const { return cluster < 2 ? kSocKhz[level_][cluster] : 0; }
+  unsigned level() const { return level_; }
+
+ private:
+  unsigned level_ = 0;
+};
+
+// The cap of the full table's scene for one cluster: the scene step's (0: none), the battery limit's on top (the lower one wins).
+inline uint32_t fullCapKhz(uint32_t sceneKhz, uint32_t socKhz)
+{
+  if (!socKhz) return sceneKhz;
+  if (!sceneKhz) return socKhz;
+  return socKhz < sceneKhz ? socKhz : sceneKhz;
+}
+
+// WALT-like demand (piano-cpufreq-walt, machdep.piano_cpufreq_walt; the stock governor is walt, its behaviour from its public
+// design): per load window a core's work is its busy share times the cluster's frequency in that window (frequency-invariant,
+// kHz-equivalent), a history of kWaltHist windows is kept, and the demand the governor sees is the larger of the latest window and
+// the history's mean (WALT's default window statistic, "max of recent and average"). The cluster's demand is the max over its cores;
+// the governor then wants demand / target (80 %: the 1.25 headroom), hispeed at >= 90 % busy, ups at once, downs held.
+constexpr unsigned kWaltHist = 5;
+inline uint32_t workKhz(uint32_t busyPermille, uint32_t khz) { return uint32_t(uint64_t(khz) * busyPermille / 1000u); }
+struct WaltCore {
+  uint32_t hist[kWaltHist] = {};
+  uint8_t n = 0, at = 0;
+  uint32_t push(uint32_t work)
+  {
+    hist[at] = work;
+    at = uint8_t((at + 1) % kWaltHist);
+    if (n < kWaltHist) ++n;
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < n; ++i) sum += hist[i];
+    const uint32_t mean = uint32_t(sum / n);
+    return work > mean ? work : mean;
+  }
+  void reset() { n = at = 0; }
+};
+
 }  // namespace pianothermal::perf
 
 #endif

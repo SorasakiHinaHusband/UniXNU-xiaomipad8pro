@@ -329,7 +329,7 @@ struct Cpucp {
             // reverse order inside a page: the parser must sort
             const unsigned j = a1 + (n - 1 - i);
             mem[scmi::kPayload / 4 + w++] = 100 + j;   // perf value (opaque in indexing mode)
-            mem[scmi::kPayload / 4 + w++] = 0;
+            mem[scmi::kPayload / 4 + w++] = 1000 + 37 * j;   // power cost
             mem[scmi::kPayload / 4 + w++] = 30;        // latency
             mem[scmi::kPayload / 4 + w++] = k[j];
             mem[scmi::kPayload / 4 + w++] = j;
@@ -395,6 +395,7 @@ static void testScmi()
         CHECK(dom.levels[i].khz == cp.khz[d][i]);
         CHECK(dom.levels[i].key == cp.keyOf(d, i));
         CHECK(dom.levels[i].latencyUs == 30);
+        if (cp.version >= 0x40000) CHECK(dom.levels[i].power == 1000 + 37 * i);   // the power cost follows its level through the sort
         if (i) CHECK(dom.levels[i].khz > dom.levels[i - 1].khz);
       }
       // sustained: 3532.8 / 4089.6 MHz -> the fastest level at or under it
@@ -1235,6 +1236,93 @@ static void testBoosts()
   CHECK(legacy.boostFloorKhz() == 0);                                     // not in fixed mode
 }
 
+// The full table (Perf.h fullopp, 2026-11-22 22:43): the stock scenes (normal, nolimits) and their boost limits, the battery limit,
+// the scene cap with the battery limit on top, the WALT-like demand, the Governor's demand decision, the thermal limit's release
+// rate, and the sweep pin (floor = ceiling, over sustained, the thermal limit on top).
+static void testFullopp()
+{
+  using namespace pianothermal::perf;
+  const SceneTable normal = sceneTable(perf::Scene::normal), nolimits = sceneTable(perf::Scene::nolimits);
+  CHECK(normal.steps[0] == kCluster0 && normal.count[1] == kCluster1Steps && normal.boostLimitMilli == 48000 && !strcmp(normal.name, "normal"));
+  CHECK(nolimits.count[0] == 1 && nolimits.count[1] == 1 && nolimits.boostLimitMilli == 51000 && !strcmp(nolimits.name, "nolimits"));
+  CHECK(sceneFor(true) == perf::Scene::nolimits && sceneFor(false) == perf::Scene::normal);
+  // nolimits: no cap (the whole table) up to 51 C, then 748.8 / 1017.6, cleared under 50 C
+  SkinCap n0, n1;
+  CHECK(n0.update(nolimits.steps[0], 1, true, 50900) == 0 && n1.update(nolimits.steps[1], 1, true, 45000) == 0);
+  CHECK(n0.update(nolimits.steps[0], 1, true, 51000) == 748800 && n1.update(nolimits.steps[1], 1, true, 51000) == 1017600);
+  CHECK(n0.update(nolimits.steps[0], 1, true, 50100) == 748800 && n0.update(nolimits.steps[0], 1, true, 49900) == 0);
+  CHECK(n1.update(nolimits.steps[1], 1, false, 0) == 1017600);   // no reading: the step stays
+  // the same 40 C virtual skin: normal caps cpu6-7 at 1401.6 (the installed v13.1y6 picture), nolimits not at all
+  SkinCap w1, w2;
+  CHECK(w1.update(normal.steps[1], normal.count[1], true, 40300) == 1401600 && w2.update(nolimits.steps[1], 1, true, 40300) == 0);
+  // the battery limit: <= 3 % -> 1785.6 / 1401.6, <= 1 % -> 1363.2 / 1401.6; down only at 2 % / 4 %; no reading keeps it
+  SocLimit b;
+  CHECK(b.update(78) == 0 && b.khz(0) == 0 && b.khz(1) == 0);
+  CHECK(b.update(3) == 1 && b.khz(0) == 1785600 && b.khz(1) == 1401600);
+  CHECK(b.update(1) == 2 && b.khz(0) == 1363200);
+  CHECK(b.update(-1) == 2);
+  CHECK(b.update(2) == 1 && b.update(3) == 1 && b.update(4) == 0);
+  CHECK(b.update(0) == 2 && b.update(5) == 0);
+  CHECK(fullCapKhz(3072000, 0) == 3072000 && fullCapKhz(0, 1785600) == 1785600 && fullCapKhz(3072000, 1401600) == 1401600 &&
+        fullCapKhz(1017600, 1401600) == 1017600 && fullCapKhz(0, 0) == 0);
+  // WALT-like demand: max(latest, mean of the history), kHz-equivalent
+  CHECK(workKhz(500, 2000000) == 1000000 && workKhz(1000, 4320000) == 4320000 && workKhz(0, 3000000) == 0);
+  WaltCore wc;
+  CHECK(wc.push(1000000) == 1000000);                 // one window: itself
+  CHECK(wc.push(0) == 500000);                        // idle window: the mean holds half
+  CHECK(wc.push(3000000) == 3000000);                 // a burst: the latest wins at once
+  CHECK(wc.push(0) == 1000000 && wc.push(0) == 800000);
+  CHECK(wc.push(0) == 600000);                        // the history is 5 windows: the first (1 GHz) dropped
+  wc.reset();
+  CHECK(wc.push(200000) == 200000);
+  // the Governor on the demand: need = demand / 0.8; hispeed still at >= 90 % busy
+  const uint32_t ncc1[] = {1017600, 1209600, 1401600, 1689600, 1958400, 2246400, 2438400, 2649600, 2841600, 3072000, 3283200,
+                           3513600, 3801600, 4089600, 4204800, 4320000};
+  GovernorConfig gc;
+  gc.externalKhz = capKhz(4320);
+  gc.hispeedKhz = 1800000;
+  Governor g;
+  g.init(CpuMode::govern, gc, ncc1, 16, 13, 0);
+  g.setRuntimeCaps(false, 0, capKhz(4320), true);
+  CHECK(g.khz(g.tick({100, PowerSource::external, 2000000})) == 2649600);   // 2.0 GHz of work / 0.8 = 2.5 GHz -> 2649.6
+  CHECK(g.khz(g.tick({950, PowerSource::external, 1000000})) == 2649600);   // a lower want waits for the down hold
+  g.setDownTicks(1);
+  CHECK(g.khz(g.tick({100, PowerSource::external, 800000})) == 1958400);   // down to the fastest the held ticks wanted (hispeed)
+  CHECK(g.khz(g.tick({100, PowerSource::external, 800000})) == 1017600);   // 1.0 GHz -> 1017.6
+  CHECK(g.khz(g.tick({950, PowerSource::external, 800000})) == 1958400);   // >= 90 % busy: at least hispeed (1800 -> 1958.4)
+  CHECK(g.khz(g.tick({1000, PowerSource::external, 4320000})) == 4320000);  // the full table: over sustained, to the top
+  CHECK(g.khz(g.tick({0, PowerSource::external, 0})) == 1017600);           // no demand: the busy path (0 % -> the slowest)
+  // the release rate: the stock rule's faster release (riseMs 100) against the 1 s default
+  Governor r;
+  r.init(CpuMode::govern, gc, ncc1, 16, 13, 15);
+  ThermalInput hot{true, 1, 1, false}, cool{true, -100, -10, false};
+  for (uint64_t ms = 10; ms <= 50; ms += 10) r.thermal(hot, ms);
+  const unsigned low = r.limit();
+  CHECK(low == 10);
+  r.setRiseMs(100);
+  r.thermal(cool, 100);
+  CHECK(!r.thermal(cool, 150) && r.thermal(cool, 200) && r.limit() == low + 1);
+  CHECK(r.thermal(cool, 300) && r.limit() == low + 2);
+  // the sweep pin: floor = ceiling = the level (over sustained when asked), the thermal limit on top, the power cap on top
+  Governor p;
+  p.init(CpuMode::govern, gc, ncc1, 16, 13, 0);
+  p.setBoostFloor(4204800);
+  p.setRuntimeCaps(false, 0, 4204800, true);
+  CHECK(p.khz(p.enforce(PowerSource::external)) == 4204800 && p.khz(p.tick({0, PowerSource::external})) == 4204800);
+  p.setBoostFloor(2438400);
+  p.setRuntimeCaps(false, 0, 2438400, false);
+  CHECK(p.khz(p.enforce(PowerSource::external)) == 2438400 && p.khz(p.tick({1000, PowerSource::external})) == 2438400);
+  for (uint64_t ms = 10; ms <= 100; ms += 10) p.thermal(hot, ms);
+  CHECK(p.khz(p.enforce(PowerSource::external)) == p.khz(p.limit()) && p.khz(p.limit()) < 2438400);   // 95 C still wins over the pin
+  GovernorConfig saver = gc;
+  saver.batteryKhz = capKhz(1958);
+  Governor q;
+  q.init(CpuMode::govern, saver, ncc1, 16, 13, 0);
+  q.setBoostFloor(4320000);
+  q.setRuntimeCaps(false, 0, 4320000, true);
+  CHECK(q.khz(q.enforce(PowerSource::battery)) == 1958400);   // the power cap (Power Saver) stays on top of a pin
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 1 && !strcmp(argv[1], "--map")) {
@@ -1255,6 +1343,7 @@ int main(int argc, char **argv)
   testInterruptsAndPolling();
   testPerf();
   testBoosts();
+  testFullopp();
   if (failures) {
     std::printf("thermal_host: %d FAILED\n", failures);
     return 1;

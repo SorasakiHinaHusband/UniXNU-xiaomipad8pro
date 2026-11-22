@@ -792,3 +792,36 @@ thermal limits) and of 2026-11-22 (macOS Low Power Mode is the one performance s
   (High Power ran a 1-thread load in 10.9 s vs 14.5 s Automatic, 20.9 s Low Power); cpu6-7 stayed at the 95 C limit's level
   (2649-3513 MHz, zones 90-95 C most of the time, a few readings above 95 C) with the High Power cap 4320 in place and no refusal:
   the thermal limit, not the mode, set the ceiling (step_wise: down at 95 C, up only under 90 C).
+
+## 15. The full table: `machdep.piano_cpufreq_fullopp` (2026-11-22)
+
+The owner's decision of 2026-11-22 22:43: the CPU on Android's whole frequency table and Android's thermal policy, as the GPU's
+full-table line. `Perf.h` (host-tested in `thermal_host` testFullopp), at run time `machdep.piano_cpufreq_fullopp` (root, 0/1;
+boot default `piano-cpufreq-fullopp`, 0), acting with `piano-cpufreq=3` and the perf policy >= 1 (§14); 0 = §14 unchanged.
+
+- **Table**: the firmware's 16 + 16 levels (NCC0 384..3532.8 MHz, NCC1 1017.6..4320 MHz, the same lists the stock Android's cpufreq
+  policies show); with the full table every level is allowed, 4204.8 / 4320 above NCC1's sustained 4089.6 too (a refusal turns
+  that off for the boot, as in §14). The start line `cpufreq: domain N table (MHz:power cost:latency us)` logs the firmware's own
+  power cost per level (SCMI DESCRIBE_LEVELS); the CPU voltages are the firmware's and are not visible to the kernel.
+- **Scenes** (the stock thermal daemon's CPU rows on the virtual skin of §14): Energy Mode Automatic and Low Power = the normal
+  scene (the §14 step table, boosts until 48 C; Low Power keeps the Power Saver caps on top); High Power = the nolimits scene
+  (no cap below 51 C virtual skin, 748.8 / 1017.6 MHz from 51 C, clear 50 C, boosts until 51 C). Below a scene's first trigger the
+  cap is the table's top (`piano-cpufreq-hpm0/1`).
+- **Battery limit** (every stock scene): at or under 3 % 1785.6 / 1401.6 MHz, at or under 1 % 1363.2 / 1401.6 MHz, cleared at 4 %
+  / 2 % (PianoPower's `CurrentCapacity`, read every 10 s); no burst or boost while it holds.
+- **Silicon rule**: the cpu zones' stock passive trip 95 C (`piano-cpufreq-hot=95`), released under `piano-cpufreq-fullopp-release`
+  (87 C: the stock 8 C hysteresis) one level per `piano-cpufreq-fullopp-rise-ms` (100; §14's policies keep `piano-cpufreq-rise-ms`,
+  1000); no temperature gate on bursts and boosts beyond the thermal limit itself (`piano-cpufreq-fullopp-gate=1` keeps §14's). The
+  critical cut (125 C - margin) and the protection policy stay as they are.
+- **WALT-like demand** (`machdep.piano_cpufreq_walt`, boot default `piano-cpufreq-walt`, 0; perf policy >= 1): each core's window
+  work = busy share x the cluster's frequency in that window, a history of 5 windows, demand = max(latest, mean); the cluster's
+  demand is the max over its cores; the governor wants demand / 0.8, hispeed at >= 90 % busy, ups at once, downs held as in §14.
+- **Test only** (`piano-cpufreq-sweep=1`): `machdep.piano_cpufreq_sweep0/1` pin a cluster at the fastest level <= the MHz written
+  (floor = ceiling; no scene, burst or boost; the power and hard caps and the thermal limit on top; 0 = free);
+  `machdep.piano_cpufreq_measure` (write 1) measures each core's clock (dependent adds) at the next poll (`[Ns] sweep: clock N`).
+  With the full table or the sweep a LEVEL_GET per cluster every `piano-cpufreq-fw-check-ms` (1000) compares the firmware's level
+  with ours (`fullopp: domain N: the firmware reports ...`).
+- Lines: `fullopp: machdep.piano_cpufreq_fullopp now N ...` at start, `[Ns] fullopp: on|off, walt on|off` per change, `[Ns] fullopp:
+  on, scene normal|nolimits, walt .., battery N % (limit level N); c0 step i cap N MHz, ceiling N MHz, sweep N MHz, fw N MHz (a/b
+  differ), demand N MHz; c1 ...` every 30 s. `machdep.piano_cpufreq_state` appends per cluster `scene_step= scene_mhz= sweep_mhz=
+  fw_mhz= fw_checks= fw_mismatch= demand_mhz=` and a last segment `| fo fullopp= walt= soc= soc_level= measures= clk_ms= clk=cpu:MHz,...`.
