@@ -560,7 +560,8 @@ static NativeAdrenoClientRecord *clientRecord(const char *name)
 static void noteSlotRefusal(const char *name,bool large,bool listed,const bool taken[NativeAdrenoMaxClients])
 {
     if(!adreno830_status_diag_lines() || !NativeAdrenoSlotLogDue(&g.slot_log,nowUs()))return;
-    NativeAdrenoSlotHolder holders[NativeAdrenoMaxClients]={};
+    static NativeAdrenoSlotHolder holders[NativeAdrenoMaxClients];   /* under g.lock (every caller holds it): off the opener's stack */
+    for(auto &holder:holders)holder={};
     for(unsigned s=0;s<NativeAdrenoMaxClients;++s)
         if(const CoreBox *box=slotBox(s))holders[s]={box->name,box->quiet_s,g.slots[s].orphan!=nullptr};
     NativeAdrenoSlotLine(g.slot_line,name,large?'L':listed?'l':'a',NativeAdrenoClientSmallFree(g.windows,taken),
@@ -1739,7 +1740,9 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
     /* UniXNU-piano: the live GPU connections (slot, process, MiB of own BOs and imports) on the console when the set changed, at most
      * every 10 s (this runs once a second): how many Metal clients a session has and who holds the GPU memory. */
     struct ClientEntry {uint32_t slot,mib;char name[15];NativeAdrenoMapUsage map;NativeAdrenoSizeUsage sizes;};
-    ClientEntry entries[NativeAdrenoMaxClients];
+    /* Static, not on the stack (UniXNU-piano, GPU-SLOTS): 64 entries are ~9.5 KiB, most of a kernel stack. The DCVS thread is this
+     * function's only caller (once a second), so one array serves it. */
+    static ClientEntry entries[NativeAdrenoMaxClients];
     unsigned listed=0;
     uint32_t signature=2166136261u;
     for(unsigned s=0;s<NativeAdrenoMaxClients;++s) {
