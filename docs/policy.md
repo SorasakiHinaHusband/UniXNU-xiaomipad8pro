@@ -216,10 +216,13 @@ implement the cover-open-only and keyboard-only-when-open rules.
 | `piano-policy-kbd-holdoff=MS` | 1000 | the display off at least this long before gpio95 counts (0..10000) |
 | `piano-policy-lpm=1` | 0 | Low Power Mode on from boot (`machdep.piano_policy_lpm` starts at 1; writing 0 turns it off): a test's switch, for an unattended run with the Mac's cable (external power) |
 | `piano-policy-display-tick=1` | 0 | the 5 s display tick of before 2026-11-12 while a keyboard wake could come, even with NativeGopDisplay's messages (the A/B switch) |
+| `piano-smc=N` | 0 | the AppleSMC stand-in (§12): 0 none; 1 published, client type 1 only (IOKit.framework, powerd: the Energy Mode path); 2 also type 0 (libSMC's users). Independent of `piano-policy` |
+| `piano-smc-mshp=0` | 1 | the stand-in answers `MSHP` "not found" too (an SMC without keys and without High Power Mode: the A/B) |
 
 Read, not owned: `piano-keyboard-lid`, `piano-gpu-dcvs-max`, `piano-gpu-maxlevel`, `piano-thermal`, `piano-thermal-gpu-mhz`; PianoA830's
 property `piano-gpu-ceiling-clients`. sysctl:
-`machdep.piano_policy` (state, decisions, counters), `machdep.piano_policy_lpm` (root, 0/1).
+`machdep.piano_policy` (state, decisions, counters), `machdep.piano_policy_lpm` (root, 0/1), `machdep.piano_smc` (the stand-in's
+clients, keys and counters, §12).
 
 ## 7. Idle sleep on battery: macOS's timers (pmset)
 
@@ -339,7 +342,8 @@ before `sleep`.
 
 ## 11. Files
 
-`package/PianoPolicy/` (`PianoPolicy.cpp`, `Policy.h`, `tests/policy_host.cpp`, `README.md`, `UPSTREAM`, `LICENSE`),
+`package/PianoPolicy/` (`PianoPolicy.cpp`, `Policy.h`, `tests/policy_host.cpp`, `AppleSmc.cpp`, `Smc.h`, `tests/smc_host.cpp`,
+`README.md`, `UPSTREAM`, `LICENSE`),
 `tooling/k27/build-native-piano-policy.sh`, `tooling/k27/kext/PianoPolicy.json`, `configs/k27-native-kexts.txt`,
 `tooling/k27/build-policy-test-images.sh`, `tooling/native/piano-policy-agent/piano-policy-agent.sh` and its
 `com.unixnu.piano-policy-agent.plist` (installed by `configs/userland.toml`).
@@ -358,3 +362,52 @@ The first unattended sleep test uses `piano-policy-lid-arm=0`
 (`machdep.piano_policy_lid_arm`, root writes 0/1) to keep lid sleep disarmed and uses the existing
 kernel maximum-duration wake timer. Real cover acceptance is attended; it first observes a valid physical close/open,
 then arms the same image while open. Lid reporting keeps a single owner throughout.
+
+## 12. Energy Mode: the AppleSMC stand-in (step E1, 2026-11-22)
+
+Status 2026-11-22: **built, host-tested (`smc_host: 127 checks, 0 failures`); not run on the tablet.** The first of the Energy Mode
+steps (Automatic / Low Power / High Power in System Settings > Battery). This step only makes macOS offer the three options; it
+changes no clock (the mode's mapping onto PianoThermal and PianoA830 is a later step).
+
+### 12.1 Why an AppleSMC
+
+| Fact | State | Source |
+|---|---|---|
+| The Battery settings extension shows the Energy Mode picker when Low Power Mode and High Power Mode are both supported on AC and on battery, i.e. `IOPMFeatureIsAvailable("LowPowerMode", source)` and `("HighPowerMode", source)` | verified (27.3 binary); the picker's view placement inferred from the type and string names | `PowerPreferences.appex`, SystemAdministration's `ADMPowerActivityManager supportsEcoModeFor:` / `supportsProModeFor:` |
+| `"HighPowerMode"`: false on `UPS Power`; true if `smcSupportsHPM()`; else only for a short list of models (Mac17,11 is not on it). The kernel's Supported Features are not consulted | verified (27.3) | IOKit.framework `IOPMFeatureIsAvailableWithSupportedTable` |
+| `smcSupportsHPM()` reads the SMC key `MSHP` once per process through `_smcReadKey`: true if the read succeeds and the byte is 1; later calls in the same process repeat only "the first read succeeded" | verified (27.3) | IOKit.framework `smcSupportsHPM`, `_smcReadKey` |
+| `_smcReadKey` -> `callSMCFunction`: `IOServiceMatching("AppleSMC")`, `IOServiceOpen` type 1, selector 0, selector 2 with an 80-byte structure (command 9 key info, then command 5 read of that size), selector 1, close | verified (27.3) | IOKit.framework `callSMCFunction` |
+| The sandboxed settings extension may open the user client class `AppleSMCClient` (its entitlements' `iokit-user-client-class`) | verified (entitlements); that the sandbox checks this class name: inferred | the extension's entitlements |
+| The selected mode never reaches the kernel: powerd keeps it per power source (PM preference `LowPowerMode` 0 Automatic, 1 Low Power, 2 High Power) and posts `com.apple.system.lowpowermode` / `com.apple.system.highpowermode` | verified (27.3) | powerd `PMPowerModeHandler`, `PowerModeState` |
+
+### 12.2 What the stand-in is
+
+`package/PianoPolicy/AppleSmc.cpp` (in PianoPolicy's kext, its own personality `AppleSMC` on IOResources, inert without
+`piano-smc`): a service of class `AppleSMC` (an IOService, deliberately not an `AppleSMCFamily`) with `IOUserClientClass =
+AppleSMCClient`. The client answers selectors 0 and 1 with success and selector 2 per `Smc.h`: `MSHP` with key info (size 1, `ui8 `)
+and the byte 1; every other key, every write, key-by-index and every other command "not found" (0x84), in the 80-byte and the
+168-byte form of the structure. Nothing is stored. Client types: level 1 lets only type 1 open (IOKit.framework, powerd); libSMC's
+type 0 (CoreBrightness, thermalmonitord's sensor exchange) is refused, so those processes stay on their "no SMC" path exactly as
+without the stand-in; level 2 also opens type 0. Every process is logged once by name (`PianoSmc: open: ...`, its first
+`'MSHP' = 1 ... to NAME`, its first refusal), every key once with the first process that asked; `sysctl machdep.piano_smc` has the
+counters.
+
+### 12.3 What else sees an AppleSMC (each read before the image)
+
+| Client | What it does with an AppleSMC that knows only `MSHP` | State |
+|---|---|---|
+| IOUSBHostFamily `AppleUSBHostResourcesTypeC` | Its probe needs the device tree's `product` node to carry `usb-c-smc-pwr`; only then, for a port with `usb-c-port-number` or `smc-port-number`, it waits for an AppleSMC without a timeout, casts it to `AppleSMCFamily` and calls it without a null check. piano's ADT has none of these properties, so the class never probes; the stand-in also refuses to publish itself when the property is there (`PianoSmc: start: NOT published`) | verified (27.3 KC disassembly, ADT string count 0) |
+| powerd, at the AppleSMC first match | reads `ShutdownCause` (absent: skipped), resets its dark-wake statistics (a 4 h log timer), arms an `AppleRTC` first match (no such class on piano: never fires) | verified (27.3) |
+| powerd, sleep and wake | at sleep a 2-byte write of `CLWK` after a key-info probe; at wake a read of `CLKU`/`CLWK` (the SMC wake time); its Silent Running type from `WKTP` and `zEPD` (168 bytes): all "not found", so no write happens and the type is "None", the same outcome as without an SMC | verified (27.3) |
+| powerd, battery statistics | a per-pack key write after key info: "not found", logged | verified (27.3) |
+| IOKit.framework `smcSupportsSilentRunning` | reads `WKTP`: not found -> false (as now) | verified (27.3) |
+| CoreBrightness, thermalmonitord, other libSMC users | open type 0: refused at level 1 (unchanged behaviour). At level 2: CoreBrightness's thermal brightness cap reads fail -> "no cap" (-1); thermalmonitord's sensor exchange writes fail and are logged | verified (27.3) |
+| other processes | whatever opens it is in the log and in `machdep.piano_smc` | needs-boot |
+
+### 12.4 Checks on the tablet (energy-e1)
+
+`pmset -g` lists `powermode` (not `lowpowermode`) and `pmset -g cap` the High Power Mode capability, on AC and battery; the console
+shows `PianoSmc: start: AppleSMC stand-in published`, `'MSHP' = 1 ... to powerd` and to the settings extension when System Settings >
+Battery opens; the picker with three options (a camera shot); `pmset -a powermode 0/1/2` flips the two notify states (Low Power still
+reaches PianoPolicy as before); a timer sleep/wake cycle with the stand-in present; the USB console and the charger lines unchanged;
+no `AppleUSBHostResourcesTypeC` in the registry; no panic.
