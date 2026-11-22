@@ -55,9 +55,12 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
     size_t pages=config.aperture_gib==2?TablePages2G:wider?TablePages64G:wide?TablePages16G:TablePages;
     /* The BO pool first, while the VM still has long contiguous runs (normally the orchestrator reserved it before CB2; then this
      * only reports it). Not fatal: without it each BO is scattered and changes its own pages' attribute. */
-    if(!status && config.pool_mib)
+    /* UniXNU-piano (GPU-PAGED P1): paged mode reserves neither the BO pool nor the table pool (the VM builds its tables on demand). */
+    paged_=config.paged;
+    if(!status && config.pool_mib && !paged_)
         status=NativeAdrenoMemory::reservePoolBestEffort(bits,config.pool_mib,16,config.write_combined_pool,&pool_mib_);
-    if(!status) {
+    if(!status && paged_)pages=0;
+    if(!status && !paged_) {
         status=tables_.allocate(pages*0x1000,bits,true,pages*0x1000);
         if(status && wider && !tables_.quarantined()) {
             aperture_=GpuApertureBytes16G;pages=TablePages16G;
@@ -78,8 +81,20 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
     if(!status && !(alias_scratch_=IONewData(uint32_t,AliasScratchEntries)))status=kIOReturnNoMemory;
     if(!status) {
         step(Prepare);
+        if(paged_) {
+            NativeAdrenoVmPagedConfig pc;
+            pc.input_bits=inputBits();pc.output_bits=bits;pc.aperture=aperture_;
+            if(config.cap_bytes)pc.cap_bytes=config.cap_bytes;
+            if(config.reserve_bytes)pc.reserve_bytes=config.reserve_bytes;
+            if(pc.reserve_bytes>=pc.cap_bytes)pc.reserve_bytes=pc.cap_bytes/4;
+            pc.alias_scratch=alias_scratch_;pc.alias_scratch_entries=AliasScratchEntries;
+            uint64_t root=0;
+            status=vm_.preparePaged(pc,&root);
+            if(!status)status=smmu_.preparePaged(root,aperture_,size_t(aperture_/4096),config.bank,config.asid,4000,bits,inputBits());
+        } else {
         status=smmu_.prepare(&tables_,0,0,aperture_,size_t(aperture_/4096),config.bank,config.asid,4000,bits,inputBits());
         if(!status)smmu_.setAliasScratch(alias_scratch_,AliasScratchEntries);
+        }
         if(!status)status=smmu_.setUpperGuard(guard_.spans()[0].physical);
     }
     if(!status) {
@@ -110,10 +125,13 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
 #ifdef ADRENO830_MACOS
         /* UniXNU-piano: NativeAdrenoVmMaxSpans (1048576; 524288 until gpu/table1): the first macOS desktop ran out of the 262144, a long
          * heavy session out of the 524288. Its 40 MiB of records not found: the 20 MiB table as before (the va/map line shows which). */
+        if(paged_)status=vm_.attachPaged(smmu_.binding(),262144);   /* GPU-PAGED P1: one record per mapping, tables on demand */
+        else {
         status=vm_.attach(smmu_.binding(),&lower,nullptr,NativeAdrenoVmMaxSpans,262144);
         if(status==kIOReturnNoMemory)status=vm_.attach(smmu_.binding(),&lower,nullptr,NativeAdrenoVmFallbackSpans,262144);
+        }
 #else
-        status=vm_.attach(smmu_.binding(),&lower,nullptr,262144,262144);
+        status=paged_?vm_.attachPaged(smmu_.binding(),262144):vm_.attach(smmu_.binding(),&lower,nullptr,262144,262144);
 #endif
         /* The null guard and the GMEM window are never mapped (ARCHITECTURE 4.6.2). */
         if(!status)status=vm_.reserveWindow(0,GpuNullGuardBytes);
@@ -124,6 +142,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
         for(unsigned i=0;!status && i<GpuBufferCount;++i)
             status=vm_.map(&buffers_[i],0,kIovas[i],kPermissions[i],0,2,&handles_[i]);
         report->spans=uint32_t(vm_.spanCount());
+        if(paged_) {NativeAdrenoVmPagedStats ps;vm_.pagedStats(&ps);report->table_pages=uint32_t(ps.table_pages);}
     }
     if(!status) {
         step(Ready);

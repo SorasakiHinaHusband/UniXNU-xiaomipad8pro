@@ -109,6 +109,7 @@ IOReturn NativeAdrenoVm::fail(ArmSmmu4KStatus status)
     poisoned_=true;result_.operation=status;result_.complete=false;
     for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory)mappings_[i].memory->quarantine();
     for(auto &r:regions_)if(r.arena) {r.tables->quarantine();r.state->poisoned=1;}
+    if(paged_) {for(size_t i=0;i<chunk_count_;++i)chunks_[i].quarantine();space_.poisoned=1;}   /* GPU-PAGED P1: every table page kept */
     if(has_programmer_)
         result_.quarantine=programmer_.fault(programmer_.cookie,bank_,streams_,stream_count_)==kIOReturnSuccess?
             ArmSmmu4KSuccess:ArmSmmu4KIoError;
@@ -219,6 +220,7 @@ IOReturn NativeAdrenoVm::detach()
     {
         VM_LOCKED;
         if(poisoned_ || objects_ || spanCount())return kIOReturnBusy;
+        /* GPU-PAGED P1: the records go; the table pages stay owned until releasePaged (after the bank is disabled) */
         NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,capacity_);NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);index_.release();
         attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;kit_streams_=nullptr;has_programmer_=false;
         sync_after_map_=false;
@@ -234,6 +236,13 @@ IOReturn NativeAdrenoVm::reserveWindow(uint64_t iova,uint64_t bytes)
     if(poisoned_)return kIOReturnNotReady;
     if(!bytes || ((iova|bytes)&4095) || iova>UINT64_MAX-bytes+1)return kIOReturnBadArgument;
     if(window_count_>=NativeAdrenoVmMaxWindows)return kIOReturnNoResources;
+    if(paged_) {   /* GPU-PAGED P1: one lower space [0, aperture) */
+        if(iova>=paged_config_.aperture || bytes>paged_config_.aperture-iova)return kIOReturnBadArgument;
+        const size_t i=rangeAt(iova);
+        if(i<spanCount() && ranges_[i].iova<=iova+(bytes-1))return kIOReturnBusy;
+        windows_[window_count_++]={iova,bytes,0};
+        return kIOReturnSuccess;
+    }
     for(unsigned u=0;u<2;++u) {
         const ArmSmmu4KLiveArena *a=regions_[u].arena;
         if(!a || iova<a->iova || iova-a->iova>=a->bytes)continue;
@@ -257,9 +266,12 @@ IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignm
     if(!attached_)return kIOReturnNotReady;
     VM_LOCKED;
     if(poisoned_)return kIOReturnNotReady;
-    if(upper>1 || !regions_[upper].arena || !bytes || (bytes&4095) || alignment<4096 ||
+    if(upper>1 || (!paged_ && !regions_[upper].arena) || (paged_ && upper) || !bytes || (bytes&4095) || alignment<4096 ||
         (alignment&(alignment-1)))return kIOReturnBadArgument;
-    const ArmSmmu4KLiveArena *a=regions_[upper].arena;
+    /* GPU-PAGED P1: the paged space is one lower region [0, aperture) */
+    struct Aperture {uint64_t iova,bytes;};
+    const Aperture aperture=paged_?Aperture{0,paged_config_.aperture}:Aperture{regions_[upper].arena->iova,regions_[upper].arena->bytes};
+    const Aperture *a=&aperture;
     const size_t end=upper?spanCount():lower_count_;
     size_t i=upper?lower_count_:0;
     uint64_t offset=0;   /* relative to the aperture: native addresses of the upper region may end at 2^64 */
@@ -556,6 +568,8 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(!handle)return kIOReturnBadArgument;
     *handle=0;
     if(!attached_)return kIOReturnNotReady;
+    /* GPU-PAGED P1: kernel buffers and the self-test's pages: no cap, no reserve, the lower space only */
+    if(paged_)return upper?kIOReturnBadArgument:mapPaged(memory,iova,permissions,writeback,shareability,handle,false,0,false,nullptr);
     VM_LOCKED;
     return mapLocked(memory,upper,iova,permissions,writeback,shareability,handle);
 }
@@ -610,6 +624,16 @@ IOReturn NativeAdrenoVm::mapClient(NativeAdrenoMemory *memory,uint64_t iova,unsi
 #else
         return kIOReturnNotReady;
 #endif
+    /* GPU-PAGED P1: the mapped-bytes cap for every client; a client with keep_spans (every one but the render server) also leaves the
+     * render server's reserve in bytes; the records' reserve as before. */
+    if(paged_)
+        return mapPaged(memory,iova,permissions,wb,sh,handle,true,keep_objects,keep_spans!=0,
+#ifdef ADRENO830_MACOS
+            refusal
+#else
+            nullptr
+#endif
+            );
     VM_LOCKED;
 #ifdef ADRENO830_MACOS
     refusal_={};
@@ -666,8 +690,16 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     }
     clock.lap(1,2);
     /* The mapping's spans are consecutive in the table; unmap them in one transaction. */
-    const size_t spans=record->spans;
+    const size_t spans=paged_?record->memory->spanCount():record->spans;
     const size_t at=rangeAt(record->iova);
+    if(paged_) {   /* GPU-PAGED P1: the leaves of the record's range, its TLB plan, the record */
+        native_adreno_trace_stage=12;
+        const IOReturn paged=unmapPagedTables(*record,at);
+        native_adreno_trace_stage=13;
+        if(paged)return paged;
+        clock.lap(1,3);
+        erase(at,1,0);record->mapped_spans=0;result_.completed_spans=spans;
+    } else {
     if(at>=spanCount() || ranges_[at].iova!=record->iova || spans>spanCount()-at)return fail(ArmSmmu4KStateMismatch);
     for(size_t i=0;i<spans;++i) {
         const auto &span=record->memory->spans()[i];
@@ -686,11 +718,12 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     if(status)return fail(status);
     clock.lap(1,3);
     erase(at,spans,upper);record->mapped_spans=0;result_.completed_spans=spans;
+    }
     native_adreno_trace_stage=14;
     clock.lap(1,4);
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     clock.lap(1,5);clock.done(1,record->memory->bytes());
-    if(record->memory->imported() || record->memory->scanout())
+    if(!paged_ && (record->memory->imported() || record->memory->scanout()))
         import_spans_[aliasClass(record->permissions,record->writeback,record->shareability)&15]-=spans;
     {
         const unsigned kind=record->memory->bytes()<=(size_t)ArmSmmu4KTlbPageLimit*4096?3:4;   /* page TLBIs, else the ASID */
@@ -735,6 +768,7 @@ IOReturn NativeAdrenoVm::setTableWalkCoherent(bool coherent)
     if(!attached_)return kIOReturnNotReady;
     VM_LOCKED;
     if(poisoned_)return kIOReturnNotReady;
+    if(paged_) {coherent_walk_=coherent;return kIOReturnSuccess;}   /* GPU-PAGED P1: tablePublish reads it */
     ArmSmmu4KLiveVisibility next[2]={};
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         const IOReturn status=coherent?NativeAdrenoBindSmmuVisibilityCoherent(regions_[i].tables,&next[i]):
@@ -929,6 +963,7 @@ uint64_t NativeAdrenoVm::handleAt(uint64_t iova) const
     /* ranges_ is sorted by address: the range over iova names the mapping (its spans are consecutive). */
     const size_t i=rangeAt(iova);
     if(i>=spanCount() || ranges_[i].iova>iova)return 0;
+    if(paged_)return ranges_[i].physical<high_ && mappings_[ranges_[i].physical].memory?mappings_[ranges_[i].physical].handle:0;
     for(size_t j=0;j<high_;++j) {
         const Mapping &m=mappings_[j];
         if(m.memory && iova>=m.iova && iova-m.iova<m.memory->bytes())return m.handle;
@@ -988,4 +1023,549 @@ IOReturn NativeAdrenoVm::retireJobAfterCompletion(uint64_t handle)
     Mapping *record=find(handle);if(!record || !record->jobs)return kIOReturnBadArgument;
     IOReturn status=record->memory->retireAfterQuiescence();if(status)return status;
     --record->jobs;return kIOReturnSuccess;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------------------------
+ * UniXNU-piano (2026-11-23, GPU-PAGED P1, private host-checks/20261122-gpu-paged/P1-GATE.md): the paged VM. The tables are the only
+ * per-page record (ArmSmmu4KPaged); ranges_ holds one record per mapping whose `physical` field is the mapping's slot in mappings_.
+ * Table pages: chunks_ (contiguous, zeroed, kernel-mapped, cacheable, held for the device) cut into a free list of 4 KiB pages linked
+ * through their first word; the list, the chunk index and every table change live under the VM lock. A chunk is allocated only by
+ * growTables, outside the VM lock (its own grow lock): no allocation and no wait for memory while every submission waits here. */
+#ifdef ADRENO830_HOST_TEST
+static void *growLockAlloc() {return new std::mutex;}
+static void growLockFree(void *lock) {delete static_cast<std::mutex *>(lock);}
+static void growLockTake(void *lock) {static_cast<std::mutex *>(lock)->lock();}
+static void growLockDrop(void *lock) {static_cast<std::mutex *>(lock)->unlock();}
+#else
+static void *growLockAlloc() {return IOLockAlloc();}
+static void growLockFree(void *lock) {IOLockFree(static_cast<IOLock *>(lock));}
+static void growLockTake(void *lock) {IOLockLock(static_cast<IOLock *>(lock));}
+static void growLockDrop(void *lock) {IOLockUnlock(static_cast<IOLock *>(lock));}
+#endif
+namespace {
+/* A BO's spans as the kit's run iterator (ascending offsets, from 0 for each walk). */
+struct PagedSpans {const NativeAdrenoPhysicalSpan *spans;size_t count,at;};
+int pagedRun(void *cookie,uint64_t offset,uint64_t *physical,uint64_t *bytes)
+{
+    PagedSpans *c=static_cast<PagedSpans *>(cookie);
+    while(c->at<c->count && c->spans[c->at].offset+c->spans[c->at].bytes<=offset)++c->at;
+    if(c->at>=c->count || offset<c->spans[c->at].offset)return 1;
+    const uint64_t into=offset-c->spans[c->at].offset;
+    *physical=c->spans[c->at].physical+into;*bytes=c->spans[c->at].bytes-into;
+    return 0;
+}
+uint64_t pagedNow() {return native_adreno_vm_now_us?native_adreno_vm_now_us():0;}
+}
+int NativeAdrenoVm::chunkAt(uint64_t physical) const
+{
+    size_t low=0,high=chunk_count_;
+    while(low<high) {
+        const size_t mid=low+(high-low)/2;
+        if(chunks_[chunk_order_[mid]].spans()[0].physical<=physical)low=mid+1;else high=mid;
+    }
+    if(!low)return -1;
+    const unsigned c=chunk_order_[low-1];
+    return physical-chunks_[c].spans()[0].physical<chunks_[c].bytes()?int(c):-1;
+}
+/* Whether [physical, physical + bytes) touches a table chunk (the chunks are disjoint and sorted: only the last one starting below the
+ * end can, as it starts inside the range or reaches into it). */
+bool NativeAdrenoVm::onTables(uint64_t physical,uint64_t bytes) const
+{
+    const uint64_t end=physical+bytes;
+    size_t low=0,high=chunk_count_;
+    while(low<high) {
+        const size_t mid=low+(high-low)/2;
+        if(chunks_[chunk_order_[mid]].spans()[0].physical<end)low=mid+1;else high=mid;
+    }
+    if(!low)return false;
+    const NativeAdrenoMemory &c=chunks_[chunk_order_[low-1]];
+    return c.spans()[0].physical>=physical || c.spans()[0].physical+c.bytes()>physical;
+}
+volatile uint64_t *NativeAdrenoVm::tableCpu(void *cookie,uint64_t physical)
+{
+    const NativeAdrenoVm *vm=static_cast<const NativeAdrenoVm *>(cookie);
+    if(physical&4095)return nullptr;
+    const int c=vm->chunkAt(physical);
+    if(c<0)return nullptr;
+    return reinterpret_cast<volatile uint64_t *>(static_cast<unsigned char *>(vm->chunks_[c].mapping())+
+        (physical-vm->chunks_[c].spans()[0].physical));
+}
+int NativeAdrenoVm::tableAllocate(void *cookie,uint64_t *physical,volatile uint64_t **cpu)
+{
+    NativeAdrenoVm *vm=static_cast<NativeAdrenoVm *>(cookie);
+    if(!vm->free_pages_)return 1;
+    volatile uint64_t *page=tableCpu(cookie,vm->free_head_);
+    if(!page)return 1;
+    *physical=vm->free_head_;*cpu=page;
+    vm->free_head_=page[0];
+    __atomic_store_n(&vm->free_pages_,vm->free_pages_-1,__ATOMIC_RELAXED);
+    return 0;
+}
+void NativeAdrenoVm::tableRelease(void *cookie,uint64_t physical,volatile uint64_t *cpu)
+{
+    NativeAdrenoVm *vm=static_cast<NativeAdrenoVm *>(cookie);
+    if(!cpu)cpu=tableCpu(cookie,physical);
+    if(!cpu)return;
+    cpu[0]=vm->free_pages_?vm->free_head_:0;
+    vm->free_head_=physical;
+    __atomic_store_n(&vm->free_pages_,vm->free_pages_+1,__ATOMIC_RELAXED);
+}
+/* A changed table page for the walker: cleaned to PoC until V4 proved the walk coherent (M10), then dsb ishst only. */
+int NativeAdrenoVm::tablePublish(void *cookie,volatile uint64_t *cpu,size_t bytes)
+{
+    const NativeAdrenoVm *vm=static_cast<const NativeAdrenoVm *>(cookie);
+    if(!cpu || bytes!=4096 || (reinterpret_cast<uintptr_t>(cpu)&4095))return 1;
+    if(vm->coherent_walk_) {NativeAdrenoStoreBarrier();return 0;}
+    return NativeAdrenoMaintainOwnedPages(const_cast<uint64_t *>(cpu),4096,NativeAdrenoClean)==kIOReturnSuccess?0:1;
+}
+/* One more chunk (the grow lock held, the VM lock not): allocated, held for the device, then indexed and cut into the free list
+ * under the VM lock, lowest address handed out first. */
+IOReturn NativeAdrenoVm::addChunk(size_t bytes)
+{
+    const size_t slot=chunk_count_;   /* only growers change it, and they hold the grow lock */
+    if(slot>=NativeAdrenoVmPagedMaxChunks)return kIOReturnNoResources;
+    NativeAdrenoMemory &chunk=chunks_[slot];
+    IOReturn status=chunk.allocate(bytes,paged_config_.output_bits,true,bytes);
+    if(status) {if(!chunk.quarantined() && chunk.backed())(void)chunk.release();return status;}
+    if(!chunk.mapping() || chunk.spanCount()!=1 || chunk.spans()[0].bytes!=bytes || chunk.spans()[0].offset ||
+        (chunk.spans()[0].physical&4095)) {(void)chunk.release();return kIOReturnUnsupported;}
+    status=chunk.holdForDevice();
+    if(status) {(void)chunk.release();return status;}
+    VM_LOCKED;
+    const uint64_t base=chunk.spans()[0].physical;
+    size_t at=0;
+    while(at<chunk_count_ && chunks_[chunk_order_[at]].spans()[0].physical<base)++at;
+    memmove(chunk_order_+at+1,chunk_order_+at,(chunk_count_-at)*sizeof chunk_order_[0]);
+    chunk_order_[at]=uint16_t(slot);
+    __atomic_store_n(&chunk_count_,chunk_count_+1,__ATOMIC_RELEASE);
+    const size_t pages=bytes/4096;
+    chunk_pages_+=pages;
+    for(size_t i=pages;i--;)tableRelease(this,base+uint64_t(i)*4096,nullptr);
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::growTables(size_t pages)
+{
+    if(!paged_ || !grow_lock_)return kIOReturnSuccess;
+    if(__atomic_load_n(&free_pages_,__ATOMIC_RELAXED)>=pages)return kIOReturnSuccess;
+    growLockTake(grow_lock_);
+    IOReturn status=kIOReturnSuccess;
+    static const size_t sizes[3]={size_t(2)<<20,size_t(512)<<10,size_t(128)<<10};
+    while(__atomic_load_n(&free_pages_,__ATOMIC_RELAXED)<pages) {
+        const size_t room=paged_config_.table_cap_pages>chunk_pages_?paged_config_.table_cap_pages-chunk_pages_:0;
+        if(!room || chunk_count_>=NativeAdrenoVmPagedMaxChunks) {status=kIOReturnNoResources;break;}
+        status=kIOReturnNoMemory;
+        for(size_t s:sizes) {
+            status=addChunk(s/4096>room?room*4096:s);
+            if(!status)break;
+        }
+        if(status) {__atomic_fetch_add(&pstats_.grow_failures,1,__ATOMIC_RELAXED);break;}
+    }
+    growLockDrop(grow_lock_);
+    return status;
+}
+static void releaseChunk(NativeAdrenoMemory &chunk)
+{
+    if(!chunk.backed())return;
+    if(chunk.deviceReferences())(void)chunk.retireAfterQuiescence();
+    (void)chunk.release();
+}
+IOReturn NativeAdrenoVm::preparePaged(const NativeAdrenoVmPagedConfig &config,uint64_t *root)
+{
+    if(!root)return kIOReturnBadArgument;
+    *root=0;
+    if(attached_ || ranges_ || poisoned_ || paged_)return kIOReturnBusy;
+    if(config.input_bits<32 || config.input_bits>48 || config.output_bits<32 || config.output_bits>48 || !config.aperture ||
+        (config.aperture&4095) || config.aperture>(UINT64_C(1)<<config.input_bits) || !config.table_cap_pages ||
+        config.table_cap_pages>size_t(NativeAdrenoVmPagedMaxChunks)*512 || !config.cap_bytes || config.reserve_bytes>=config.cap_bytes ||
+        (config.alias_scratch && !config.alias_scratch_entries))
+        return kIOReturnBadArgument;
+    if(!lock_ && !(lock_=lockAlloc()))return kIOReturnNoMemory;
+    if(!grow_lock_ && !(grow_lock_=growLockAlloc()))return kIOReturnNoMemory;
+    ranges_=NativeAdrenoNewMeta(ArmSmmu4KRange,NativeAdrenoVmMaxObjects);
+    mappings_=NativeAdrenoNewMeta(Mapping,NativeAdrenoVmMaxObjects);
+    const auto undo=[&](IOReturn status) {
+        for(size_t i=0;i<chunk_count_;++i)releaseChunk(chunks_[i]);
+        chunk_count_=chunk_pages_=0;free_head_=0;free_pages_=0;space_={};paged_=false;
+        if(ranges_)NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,NativeAdrenoVmMaxObjects);
+        if(mappings_)NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);
+        index_.release();ranges_=nullptr;mappings_=nullptr;capacity_=0;
+        return status;
+    };
+    if(!ranges_ || !mappings_ || !index_.allocate())return undo(kIOReturnNoMemory);
+    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i)mappings_[i]=Mapping{};
+    free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));memset(import_spans_,0,sizeof(import_spans_));
+    maintained_head_=UINT32_MAX;maintained_count_=0;window_count_=0;lower_count_=upper_count_=0;objects_=0;bytes_=0;
+    capacity_=NativeAdrenoVmMaxObjects;
+    paged_config_=config;paged_=true;pstats_={};
+    chunk_count_=chunk_pages_=0;free_head_=0;free_pages_=0;trim_count_=0;trim_all_=false;space_={};
+    IOReturn status=growTables(NativeAdrenoVmPagedSpare);
+    if(status)return undo(status);
+    const ArmSmmu4KPagedConfig sc={config.input_bits,config.output_bits,0,config.aperture};
+    const ArmSmmu4KPagedPages pages={this,tableAllocate,tableRelease,tableCpu,tablePublish,nullptr};
+    ArmSmmu4KStatus init;
+    {
+        VM_LOCKED;
+        init=ArmSmmu4KPagedInit(&space_,&sc,&pages);
+    }
+    if(init)return undo(init==ArmSmmu4KCapacity?kIOReturnNoMemory:kIOReturnBadArgument);
+    *root=space_.root_physical;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::attachPaged(const NativeAdrenoSmmuBinding &smmu,unsigned budget)
+{
+    const NativeAdrenoSmmuProgrammer *p=smmu.programmer;
+    if(!paged_ || attached_ || poisoned_ || !space_.prepared)return kIOReturnBusy;
+    if(!p || !p->io || !p->verify || !p->fault || !smmu.streams || !smmu.stream_count || !smmu.context ||
+        smmu.stream_count>NativeAdrenoSmmuContext::MaxStreams || !smmu.context_offset || smmu.bank>255 || !budget || budget>1048576)
+        return kIOReturnBadArgument;
+    const ArmSmmu4KIo *io=p->io;
+    if(!io->read32 || !io->write32 || !io->write64 || !io->barrier)return kIOReturnBadArgument;
+    /* The bank must have been programmed on this space's root with its input size. */
+    const ArmSmmu4KContextConfig *c=smmu.context;
+    if(!c->lower || c->upper || !c->lower_tables || c->lower->table_physical!=space_.root_physical ||
+        c->lower_tables->root_physical!=space_.root_physical || c->lower->input_bits!=paged_config_.input_bits)
+        return kIOReturnBadArgument;
+    VM_LOCKED;
+    io_=*io;context_=smmu.context;budget_=budget;
+    programmer_=*p;has_programmer_=true;kit_streams_=nullptr;sync_after_map_=p->sync_after_map;
+    for(size_t i=0;i<smmu.stream_count;++i)streams_[i]=smmu.streams[i];
+    stream_count_=smmu.stream_count;bank_=smmu.bank;context_offset_=smmu.context_offset;coherent_walk_=false;
+    if(programmer_.verify(programmer_.cookie,bank_,streams_,stream_count_)!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
+    if(context_offset_>io_.register_bytes || io_.register_bytes-context_offset_<0x7f8)return fail(ArmSmmu4KBadRange);
+    ArmSmmu4KPagedAuditResult audit;
+    if(ArmSmmu4KPagedAudit(&space_,nullptr,0,&audit))return fail(ArmSmmu4KStateMismatch);
+    attached_=true;
+    return kIOReturnSuccess;
+}
+/* The paged preflight: request, aperture, reserved windows, read-only rules, records, overlap with a record, every span inside the
+ * output size and on no table page, and the cross-class alias rule (DESIGN 2.5): own BOs and kernel buffers own their pages; an import
+ * or the scanout is compared only with the mappings of another unprivileged class (none at coherence 0). */
+IOReturn NativeAdrenoVm::preflightPaged(const NativeAdrenoMemory *memory,uint64_t iova,unsigned permissions,unsigned writeback,
+    unsigned shareability) const
+{
+    if(!memory || !memory->backed() || memory->quarantined() || !memory->bytes() || !memory->spanCount() ||
+        !(permissions&ArmSmmu4KRead) || (permissions&~15u) || writeback>1 || (shareability!=2 && shareability!=3))
+        return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
+    const uint64_t bytes=memory->bytes(),aperture=paged_config_.aperture;
+    if((iova&4095) || iova>=aperture || bytes>aperture-iova)return VM_REFUSE(Aperture,kIOReturnBadArgument,iova,bytes,aperture,memory);
+    if(forbidden(iova,bytes))return VM_REFUSE(Reserved,kIOReturnBadArgument,iova,bytes,0,memory);
+    if((memory->readOnly() && (permissions&ArmSmmu4KWrite)) || (memory->scanout() && writeback))
+        return VM_REFUSE(ReadOnly,kIOReturnBadArgument,permissions,writeback,0,memory);
+    if(objects_>=NativeAdrenoVmMaxObjects || spanCount()>=capacity_)
+        return VM_REFUSE(Objects,kIOReturnNoResources,objects_,NativeAdrenoVmMaxObjects,0,memory);
+    {
+        const size_t i=rangeAt(iova);
+        if(i<spanCount() && ranges_[i].iova<=iova+(bytes-1))return VM_REFUSE(Overlap,kIOReturnBusy,iova,ranges_[i].iova,0,memory);
+    }
+    const uint64_t limit=UINT64_C(1)<<paged_config_.output_bits;
+    uint64_t offset=0;
+    for(size_t j=0;j<memory->spanCount();++j) {
+        const auto &span=memory->spans()[j];
+        if(span.offset!=offset || !span.physical || !span.bytes || ((span.physical|span.bytes)&4095) ||
+            span.bytes>bytes-offset || span.physical>=limit || span.bytes>limit-span.physical || onTables(span.physical,span.bytes))
+            return VM_REFUSE(Pages,kIOReturnBadArgument,j,span.physical,span.bytes,memory);
+        offset+=span.bytes;
+    }
+    if(offset!=bytes)return VM_REFUSE(Pages,kIOReturnBadArgument,memory->spanCount(),offset,bytes,memory);
+    if(!memory->imported() && !memory->scanout())return kIOReturnSuccess;
+    const unsigned mine=aliasClass(permissions,writeback,shareability)&15;
+    size_t other=0;
+    for(unsigned k=0;k<16;++k)if(k!=mine && !(k&8))other+=class_spans_[k];
+    if(!other)return kIOReturnSuccess;
+    const size_t n=memory->spanCount();
+    uint32_t *order=paged_config_.alias_scratch;
+    const bool indexed=order && n<=paged_config_.alias_scratch_entries;
+    if(indexed)for(size_t i=0;i<n;++i)order[i]=uint32_t(i);
+    NativeAdrenoPhysicalIndex<NativeAdrenoPhysicalSpan> index(memory->spans(),order,indexed?n:0);
+    for(size_t s=0;s<high_;++s) {
+        const Mapping &m=mappings_[s];
+        if(!m.memory)continue;
+        const unsigned cls=aliasClass(m.permissions,m.writeback,m.shareability)&15;
+        if(cls==mine || (cls&8))continue;
+        for(size_t a=0;a<m.memory->spanCount();++a) {
+            const auto &theirs=m.memory->spans()[a];
+            bool hit=false;
+            if(indexed)hit=index.overlaps(theirs.physical,theirs.bytes);
+            else for(size_t b=0;b<n && !hit;++b)hit=overlap(theirs.physical,theirs.bytes,memory->spans()[b].physical,memory->spans()[b].bytes);
+            if(hit)return VM_REFUSE(Alias,kIOReturnBadArgument,theirs.physical,m.iova,mine,memory);
+        }
+    }
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::mapPagedLocked(NativeAdrenoMemory *memory,uint64_t iova,unsigned permissions,unsigned writeback,
+    unsigned shareability,uint64_t *handle,bool client,bool keep_reserve)
+{
+    if(!handle)return kIOReturnBadArgument;*handle=0;result_={};paged_short_=0;
+#ifdef ADRENO830_MACOS
+    refusal_={};
+#endif
+    if(!attached_ || poisoned_)return VM_REFUSE(NotReady,kIOReturnNotReady,attached_,poisoned_,0,memory);
+    PhaseClock clock;
+    const uint64_t p0b_began=NativeAdrenoP0bNow();
+    if(!memory)return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
+    const uint64_t bytes=memory->bytes();
+    /* Bytes, not ranges (P1-GATE.md 2.3): every client stays under the cap; every client but the render server leaves its reserve. */
+    if(client && bytes_+bytes>paged_config_.cap_bytes) {
+        ++pstats_.refused_cap;
+        return VM_REFUSE(Cap,kIOReturnNoResources,bytes_,bytes,paged_config_.cap_bytes,memory);
+    }
+    if(client && keep_reserve && bytes_+bytes+paged_config_.reserve_bytes>paged_config_.cap_bytes) {
+        ++pstats_.refused_reserve;native_adreno_vm_reserve_refused[1]=native_adreno_vm_reserve_refused[1]+1;
+        return VM_REFUSE(ReserveBytes,kIOReturnNoResources,bytes_,bytes,paged_config_.reserve_bytes,memory);
+    }
+    IOReturn checked=preflightPaged(memory,iova,permissions,writeback,shareability);if(checked)return checked;
+    if(next_handle_==UINT64_MAX)return kIOReturnNoResources;
+    /* Reserve, then commit: the table pages this map needs, from the free list, before the device reference and the record. */
+    size_t need=0;
+    ArmSmmu4KStatus status=ArmSmmu4KPagedNeed(&space_,iova,bytes,&need);
+    if(status==ArmSmmu4KOverlap)return fail(ArmSmmu4KStateMismatch);   /* a valid leaf where no record is: tables and records disagree */
+    if(status)return VM_REFUSE(Aperture,kIOReturnBadArgument,iova,bytes,paged_config_.aperture,memory);
+    if(space_.counters.table_pages+need>paged_config_.table_cap_pages) {
+        ++pstats_.refused_tables;
+        return VM_REFUSE(Tables,kIOReturnNoResources,need,free_pages_,paged_config_.table_cap_pages,memory);
+    }
+    ArmSmmu4KPagedReservation reservation{};
+    if(need>free_pages_ || (need && ArmSmmu4KPagedReserve(&space_,need,&reservation))) {
+        ArmSmmu4KPagedCancel(&space_,&reservation);
+        paged_short_=need;   /* mapPaged grows the list outside the lock and tries once more */
+        return VM_REFUSE(Tables,kIOReturnNoResources,need,free_pages_,paged_config_.table_cap_pages,memory);
+    }
+    clock.lap(0,5);
+    checked=memory->holdForDevice();
+    if(checked) {ArmSmmu4KPagedCancel(&space_,&reservation);return VM_REFUSE(Hold,checked,uint32_t(checked),0,0,memory);}
+    clock.lap(0,1);
+    Mapping *record=nullptr;
+    for(size_t i=free_hint_;i<NativeAdrenoVmMaxObjects;++i)if(!mappings_[i].memory) {
+        record=&mappings_[i];free_hint_=i+1;if(high_<i+1)high_=i+1;break;
+    }
+    if(!record) {ArmSmmu4KPagedCancel(&space_,&reservation);memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
+    *record=Mapping{};
+    record->memory=memory;record->iova=iova;record->spans=1;record->permissions=permissions;
+    record->writeback=writeback;record->shareability=shareability;
+    ++objects_;
+    __atomic_store_n(&bytes_,bytes_+bytes,__ATOMIC_RELAXED);
+    if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+    else if(!memory->scanout()) {
+        checked=memory->publishForDevice(0,bytes,permissions&ArmSmmu4KWrite,distrust_write_combined_);
+        if(checked) {ArmSmmu4KPagedCancel(&space_,&reservation);return fail(ArmSmmu4KIoError);}
+    }
+    clock.lap(0,2);
+    PagedSpans cursor={memory->spans(),memory->spanCount(),0};
+    const ArmSmmu4KPagedRuns runs={&cursor,pagedRun};
+    const ArmSmmu4KPagedAttrs attrs={permissions,writeback,shareability};
+    ArmSmmu4KPagedPlan plan;
+    status=ArmSmmu4KPagedMap(&space_,&reservation,iova,bytes,&runs,&attrs,&plan);
+    ArmSmmu4KPagedCancel(&space_,&reservation);   /* what the map did not take (nothing, as Need counted it) */
+    if(status)return fail(status);
+    if(sync_after_map_) {
+        ArmSmmu4KProgramResult synced;
+        const ArmSmmu4KStatus sync=ArmSmmu4KSyncContextTlb(&io_,context_offset_,context_->asid,0,budget_,&synced);
+        if(sync)return fail(sync);
+        NativeAdrenoP0bAdd(&native_adreno_p0b_tlbi[0],1);
+    }
+    clock.lap(0,3);
+    const size_t slot=size_t(record-mappings_);
+    ranges_[spanCount()]={iova,uint64_t(slot),bytes,permissions,writeback,shareability};
+    insert(1,0);record->mapped_spans=1;result_.completed_spans=memory->spanCount();
+    if(needsSubmitMaintenance(memory,permissions,writeback))linkMaintained(*record);
+    clock.lap(0,4);clock.done(0,bytes);
+    {
+        const unsigned kind=!memory->imported()?0:1;
+        native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
+        native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
+        native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+memory->spanCount();
+    }
+    {
+        const unsigned p0b_kind=memory->imported() || memory->scanout()?2:memory->pooled()?0:1;
+        NativeAdrenoP0bAdd(&native_adreno_p0b_map_pages[p0b_kind],bytes/4096);
+        if(p0b_began)NativeAdrenoP0bTime(native_adreno_p0b_map_us[p0b_kind],NativeAdrenoP0bNow()-p0b_began);
+    }
+    ++pstats_.maps;
+    if(bytes_>pstats_.mapped_peak)pstats_.mapped_peak=bytes_;
+    record->handle=next_handle_++;*handle=record->handle;index_.insert(record->handle,uint32_t(slot));
+    result_.complete=true;return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::mapPaged(NativeAdrenoMemory *memory,uint64_t iova,unsigned permissions,unsigned writeback,unsigned shareability,
+    uint64_t *handle,bool client,size_t keep_objects,bool keep_reserve,NativeAdrenoVmRefusal *refusal)
+{
+    (void)refusal;
+    size_t want=memory && memory->bytes()?ArmSmmu4KPagedWorstCase(&space_,iova,memory->bytes()):0;
+    for(unsigned attempt=0;;++attempt) {
+        if(want+NativeAdrenoVmPagedSpare>__atomic_load_n(&free_pages_,__ATOMIC_RELAXED))(void)growTables(want+NativeAdrenoVmPagedSpare);
+        VM_LOCKED;
+#ifdef ADRENO830_MACOS
+        refusal_={};
+#endif
+        IOReturn status;
+        if(keep_objects && objects_+1+keep_objects>NativeAdrenoVmMaxObjects) {
+            native_adreno_vm_reserve_refused[0]=native_adreno_vm_reserve_refused[0]+1;paged_short_=0;
+            status=VM_REFUSE(ReserveObjects,kIOReturnNoResources,objects_,keep_objects,0,memory);
+        } else status=mapPagedLocked(memory,iova,permissions,writeback,shareability,handle,client,keep_reserve);
+        if(status==kIOReturnNoResources && paged_short_ && !attempt) {
+            ++pstats_.grow_retries;want=paged_short_;continue;   /* another map took the pages: grow outside the lock, once more */
+        }
+        if(status==kIOReturnNoResources && paged_short_)++pstats_.refused_tables;
+#ifdef ADRENO830_MACOS
+        if(refusal) {
+            *refusal=status?refusal_:NativeAdrenoVmRefusal{};
+            refusal->objects=objects_;refusal->spans=spanCount();refusal->capacity=capacity_;refusal->bytes=bytes_;
+            refusal->keep_objects=keep_objects;refusal->keep_spans=keep_reserve?paged_config_.reserve_bytes>>20:0;
+        }
+#endif
+        return status;
+    }
+}
+void NativeAdrenoVm::noteTrim(uint64_t iova,uint64_t bytes)
+{
+    if(trim_all_)return;
+    if(trim_count_) {   /* adjacent or overlapping the last one: one range */
+        TrimRange &last=trim_[trim_count_-1];
+        if(iova<=last.iova+last.bytes && last.iova<=iova+bytes) {
+            const uint64_t lo=iova<last.iova?iova:last.iova,hi=iova+bytes>last.iova+last.bytes?iova+bytes:last.iova+last.bytes;
+            last={lo,hi-lo};return;
+        }
+    }
+    if(trim_count_>=NativeAdrenoVmPagedTrimRanges) {trim_all_=true;trim_count_=0;return;}
+    trim_[trim_count_++]={iova,bytes};
+}
+/* The unmap's table half: the leaves of the record's range cleared (no table unlinked, so the plan never depends on the walk caches:
+ * the TLB rule of REPLAY.md), TLBIVAL of <= 512 pages or TLBIASID, one TLBSYNC; a range that left tables empty is noted for the tick. */
+IOReturn NativeAdrenoVm::unmapPagedTables(const Mapping &record,size_t at)
+{
+    const uint64_t bytes=record.memory->bytes();
+    const size_t slot=size_t(&record-mappings_);
+    if(at>=spanCount() || ranges_[at].iova!=record.iova || ranges_[at].bytes!=bytes || ranges_[at].physical!=slot ||
+        ranges_[at].permissions!=record.permissions || ranges_[at].writeback!=record.writeback || ranges_[at].shareability!=record.shareability)
+        return fail(ArmSmmu4KStateMismatch);
+    const ArmSmmu4KPagedAttrs expect={record.permissions,record.writeback,record.shareability};
+    ArmSmmu4KPagedPlan plan;
+    ArmSmmu4KStatus status=ArmSmmu4KPagedUnmap(&space_,record.iova,bytes,&expect,nullptr,0,&plan);
+    if(status)return fail(status);
+    if(plan.walk || plan.retired)return fail(ArmSmmu4KStateMismatch);
+    ArmSmmu4KProgramResult synced;
+    if(plan.kind==ArmSmmu4KPagedTlbPages) {
+        const ArmSmmu4KRange r={plan.iova,0,plan.pages*UINT64_C(4096),record.permissions,record.writeback,record.shareability};
+        status=ArmSmmu4KSyncContextTlbPages(&io_,context_offset_,context_->asid,&r,1,budget_,&synced);
+        ++pstats_.unmap_val;pstats_.unmap_val_pages+=plan.pages;
+    } else if(plan.kind==ArmSmmu4KPagedTlbAsid) {
+        status=ArmSmmu4KSyncContextTlb(&io_,context_offset_,context_->asid,0,budget_,&synced);
+        ++pstats_.unmap_asid;
+    }
+    if(status)return fail(status);
+    if(plan.kept_empty) {pstats_.kept_empty+=plan.kept_empty;noteTrim(record.iova,bytes);}
+    ++pstats_.unmaps;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::trimTables(size_t *out)
+{
+    if(out)*out=0;
+    if(!paged_ || !attached_)return kIOReturnSuccess;
+    VM_LOCKED;
+    if(poisoned_)return kIOReturnNotReady;
+    if(!trim_all_ && !trim_count_)return kIOReturnSuccess;
+    const uint64_t began=pagedNow();
+    size_t n=0;
+    ArmSmmu4KStatus status=ArmSmmu4KSuccess;
+    if(trim_all_) {
+        ArmSmmu4KPagedPlan plan;
+        status=ArmSmmu4KPagedTrim(&space_,retired_,NativeAdrenoVmPagedTrimBatch,&plan);
+        if(!status) {n=plan.retired;trim_all_=plan.kept_empty!=0;++pstats_.trim_full;}
+    } else {
+        size_t done=0;
+        while(done<trim_count_ && n<NativeAdrenoVmPagedTrimBatch) {
+            ArmSmmu4KPagedPlan plan;
+            status=ArmSmmu4KPagedTrimRange(&space_,trim_[done].iova,trim_[done].bytes,retired_+n,NativeAdrenoVmPagedTrimBatch-n,&plan);
+            if(status)break;
+            n+=plan.retired;
+            if(plan.kept_empty)break;   /* the batch is full: this range again at the next tick */
+            ++done;
+        }
+        memmove(trim_,trim_+done,(trim_count_-done)*sizeof trim_[0]);trim_count_-=done;
+    }
+    if(status)return fail(status);   /* the unlinked pages stay owned */
+    if(n) {
+        /* TLBIVAL is leaf-only: an unlinked table needs the walk caches cleared, so one TLBIASID + TLBSYNC for the whole batch, and
+         * only after it the pages go back to the free list. */
+        ArmSmmu4KProgramResult synced;
+        const ArmSmmu4KStatus sync=ArmSmmu4KSyncContextTlb(&io_,context_offset_,context_->asid,0,budget_,&synced);
+        if(sync)return fail(sync);
+        ArmSmmu4KPagedRelease(&space_,retired_,n);
+        pstats_.trim_retired+=n;
+    }
+    ++pstats_.trims;
+    if(began) {const uint64_t us=pagedNow()-began;if(us>pstats_.trim_us_max)pstats_.trim_us_max=us;}
+    if(out)*out=n;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::auditTables(ArmSmmu4KPagedAuditResult *out)
+{
+    if(out)*out={};
+    if(!paged_ || !attached_)return kIOReturnNotReady;
+    const size_t room=__atomic_load_n(&objects_,__ATOMIC_RELAXED)+64;
+    ArmSmmu4KPagedRecord *records=NativeAdrenoNewMeta(ArmSmmu4KPagedRecord,room);
+    ArmSmmu4KPagedRuns *runs=NativeAdrenoNewMeta(ArmSmmu4KPagedRuns,room);
+    PagedSpans *cursors=NativeAdrenoNewMeta(PagedSpans,room);
+    IOReturn result=kIOReturnSuccess;
+    if(!records || !runs || !cursors)result=kIOReturnNoMemory;
+    else {
+        VM_LOCKED;
+        if(poisoned_)result=kIOReturnNotReady;
+        else if(spanCount()>room)result=kIOReturnBusy;
+        else {
+            const uint64_t began=pagedNow();
+            const size_t count=spanCount();
+            for(size_t i=0;i<count;++i) {
+                const Mapping &m=mappings_[ranges_[i].physical];
+                cursors[i]={m.memory->spans(),m.memory->spanCount(),0};
+                runs[i]={&cursors[i],pagedRun};
+                records[i]={ranges_[i].iova,ranges_[i].bytes,{ranges_[i].permissions,ranges_[i].writeback,ranges_[i].shareability},&runs[i]};
+            }
+            ArmSmmu4KPagedAuditResult r;
+            const ArmSmmu4KStatus status=ArmSmmu4KPagedAudit(&space_,records,count,&r);
+            ++pstats_.audits;
+            pstats_.audit_why=r.why;pstats_.audit_iova=r.iova;pstats_.audit_tables=r.tables;pstats_.audit_leaves=r.leaves;
+            pstats_.audit_us=began?pagedNow()-began:0;
+            if(status) {++pstats_.audit_failures;result=kIOReturnIOError;}
+            if(out)*out=r;
+        }
+    }
+    if(records)NativeAdrenoDeleteMeta(records,ArmSmmu4KPagedRecord,room);
+    if(runs)NativeAdrenoDeleteMeta(runs,ArmSmmu4KPagedRuns,room);
+    if(cursors)NativeAdrenoDeleteMeta(cursors,PagedSpans,room);
+    return result;
+}
+void NativeAdrenoVm::pagedStats(NativeAdrenoVmPagedStats *out) const
+{
+    if(!out)return;
+    *out={};
+    if(!paged_ || !lock_)return;
+    VM_LOCKED;
+    *out=pstats_;
+    out->paged=true;out->poisoned=poisoned_;
+    out->table_pages=space_.counters.table_pages;out->table_peak=space_.counters.table_pages_peak;
+    out->table_cap=paged_config_.table_cap_pages;out->chunks=chunk_count_;out->chunk_pages=chunk_pages_;out->free_pages=free_pages_;
+    out->leaves=space_.counters.leaves;out->trim_pending=trim_all_?UINT64_MAX:trim_count_;
+    out->mapped=bytes_;out->cap=paged_config_.cap_bytes;out->reserve=paged_config_.reserve_bytes;out->records=spanCount();
+    out->grow_failures=__atomic_load_n(&pstats_.grow_failures,__ATOMIC_RELAXED);
+}
+uint64_t NativeAdrenoVm::pagedLeaf(uint64_t iova) const
+{
+    if(!paged_ || !lock_)return 0;
+    VM_LOCKED;
+    uint64_t descriptor=0;
+    return ArmSmmu4KPagedLookup(&space_,iova,&descriptor)?0:descriptor;
+}
+IOReturn NativeAdrenoVm::releasePaged()
+{
+    if(!paged_ || attached_ || objects_)return kIOReturnBusy;
+    if(space_.prepared)(void)ArmSmmu4KPagedTeardown(&space_);
+    if(ranges_) {   /* prepared but never attached (detach frees the records of an attached VM) */
+        NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,NativeAdrenoVmMaxObjects);NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);
+        index_.release();ranges_=nullptr;mappings_=nullptr;capacity_=0;
+    }
+    if(lock_) {lockFree(lock_);lock_=nullptr;}
+    for(size_t i=0;i<chunk_count_;++i)releaseChunk(chunks_[i]);
+    chunk_count_=chunk_pages_=0;free_head_=0;free_pages_=0;space_={};paged_=false;trim_count_=0;trim_all_=false;
+    if(grow_lock_) {growLockFree(grow_lock_);grow_lock_=nullptr;}
+    return kIOReturnSuccess;
 }

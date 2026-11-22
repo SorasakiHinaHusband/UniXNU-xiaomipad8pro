@@ -441,6 +441,46 @@ ArmSmmu4KStatus ArmSmmu4KPagedTrim(Space *s,uint64_t *retired,size_t capacity,Ar
     finish_plan(s,plan,&x,0);
     return ArmSmmu4KSuccess;
 }
+/* Trim restricted to the tables that cover [lo, hi): each child is visited only for the part of the range below it; whether a table is
+ * empty is decided over the whole table. */
+static ArmSmmu4KStatus trim_range_walk(Space *s,volatile uint64_t *table,unsigned level,uint64_t lo,uint64_t hi,Retire *x,int *empty)
+{
+    if(level==3) {*empty=table_empty(s,table);return ArmSmmu4KSuccess;}
+    int wrote=0;
+    const uint64_t span=UINT64_C(1)<<shift_of(level);
+    for(uint64_t va=lo;va<hi;) {
+        const uint64_t next=(va|(span-1))+1,end=next<hi?next:hi;
+        const unsigned index=index_of(s,level,va);
+        const uint64_t entry=table[index];++s->counters.descriptor_reads;
+        if(entry && !(level==s->start_level && bit(s->foreign,index))) {
+            volatile uint64_t *child=table_at(s,entry);
+            if(!child)return ArmSmmu4KStateMismatch;
+            int child_empty=0;
+            const ArmSmmu4KStatus status=trim_range_walk(s,child,level+1,va,end,x,&child_empty);
+            if(status)return status;
+            if(child_empty)retire_child(s,table,level,index,x,&wrote);
+        }
+        if(!next)break;   /* the last slot of a 64-bit input */
+        va=end;
+    }
+    if(wrote && publish(s,table))return ArmSmmu4KIoError;
+    *empty=level!=s->start_level && table_empty(s,table);
+    return ArmSmmu4KSuccess;
+}
+ArmSmmu4KStatus ArmSmmu4KPagedTrimRange(Space *s,uint64_t iova,uint64_t bytes,uint64_t *retired,size_t capacity,ArmSmmu4KPagedPlan *plan)
+{
+    if(!plan)return ArmSmmu4KArgument;
+    *plan=(ArmSmmu4KPagedPlan){0};
+    if(!s || !s->prepared || s->poisoned || (capacity && !retired))return ArmSmmu4KArgument;
+    if(!bytes || ((iova|bytes)&(PAGE-1)) || iova>=s->config.iova_end || bytes>s->config.iova_end-iova)return ArmSmmu4KBadRange;
+    Retire x={retired,capacity,0,0,0};
+    int empty=0;
+    const ArmSmmu4KStatus status=trim_range_walk(s,s->root,s->start_level,iova,iova+bytes,&x,&empty);
+    ++s->generation;++s->counters.trims;
+    if(status) {s->poisoned=1;return status;}
+    finish_plan(s,plan,&x,0);
+    return ArmSmmu4KSuccess;
+}
 void ArmSmmu4KPagedRelease(Space *s,const uint64_t *retired,size_t count)
 {
     if(!s || !retired)return;

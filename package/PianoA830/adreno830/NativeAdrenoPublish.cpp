@@ -30,6 +30,7 @@
 #include "NativeAdrenoPublish.h"
 #ifdef ADRENO830_MACOS
 #include "NativeAdrenoMapLines.h"   /* UniXNU-piano */
+#include "NativeAdrenoPagedLine.h"   /* UniXNU-piano: GPU-PAGED P1 */
 #include "NativeAdrenoPoolBypass.h"   /* UniXNU-piano: GPU-PAGED P0b */
 #include <sys/codesign.h>
 #include <sys/proc.h>
@@ -1955,6 +1956,28 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
                 char sizes[NativeAdrenoMapLineBytes];
                 if(NativeAdrenoVaSizesLine(sizes,sizeof sizes,entries[i].slot,entries[i].name,entries[i].sizes)>0)
                     boot_progress_gpu_event(sizes);
+            }
+        }
+        /* UniXNU-piano (2026-11-23, GPU-PAGED P1, private P1-GATE.md): the paged VM's tick: the tables unmaps left empty are trimmed (one
+         * TLBIASID + TLBSYNC, then the pages go back), the audit every piano-gpu-pt-audit seconds, and the `gpu pt:` lines with the va/map
+         * cadence (every 30 s while they move, at once after a refused BoMap or a failed audit). */
+        if(g.vm && g.vm->paged()) {
+            (void)g.vm->trimTables();
+            static uint32_t auditAt,ptAt;
+            static uint64_t ptSignature;
+            bool failed=false;
+            const uint32_t every=__atomic_load_n(&native_adreno_gpu_pt_audit_s,__ATOMIC_RELAXED);
+            if(every && ticks-auditAt>=every) {auditAt=ticks;failed=g.vm->auditTables()!=kIOReturnSuccess;}
+            NativeAdrenoVmPagedStats ps;
+            g.vm->pagedStats(&ps);
+            const uint64_t signature=NativeAdrenoPagedSignature(ps);
+            if(due || failed || (signature!=ptSignature && (!ptAt || ticks-ptAt>=30))) {
+                ptAt=ticks;ptSignature=signature;
+                for(unsigned row=1;row<=3;++row) {
+                    char line[NativeAdrenoMapLineBytes];
+                    if(row==3 && !failed && !ps.audits)break;
+                    if(NativeAdrenoPagedLine(row,ps,line,sizeof line)>0)boot_progress_gpu_event(line);
+                }
             }
         }
     }

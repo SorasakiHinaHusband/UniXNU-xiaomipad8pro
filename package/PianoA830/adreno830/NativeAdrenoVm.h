@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_VM_H
 #include "NativeAdrenoSmmuContext.h"
 #include "NativeAdrenoHandleIndex.h"
+#include "ArmSmmu4KPaged.h"   /* UniXNU-piano: GPU-PAGED P1 */
 struct NativeAdrenoVmRegion {
     NativeAdrenoMemory *tables;
     ArmSmmu4KLiveArena *arena;
@@ -61,6 +62,10 @@ enum NativeAdrenoVmWhy : uint8_t {
     NativeAdrenoVmWhyReserveSpans,  /* the render server's reserve: ranges a needed, b free, c kept */
     NativeAdrenoVmWhyHold,          /* the object refused a device reference (status a) */
     NativeAdrenoVmWhyNotReady,      /* the VM is not attached or poisoned */
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1, paged mode only) */
+    NativeAdrenoVmWhyTables,        /* page-table pages: a needed, b free, c the cap of table pages */
+    NativeAdrenoVmWhyCap,           /* mapped bytes: a mapped, b this mapping, c the cap (piano-gpu-mem-cap-mib) */
+    NativeAdrenoVmWhyReserveBytes,  /* the render server's reserve in bytes: a mapped, b this mapping, c kept */
 };
 struct NativeAdrenoVmRefusal {
     uint8_t why;uint64_t a,b,c;const NativeAdrenoMemory *memory;
@@ -74,8 +79,43 @@ enum NativeAdrenoVmKind : uint8_t {NativeAdrenoVmKindNone,NativeAdrenoVmKindOwn,
                                    NativeAdrenoVmKindScanout};
 struct NativeAdrenoVmPlace {uint64_t handle,iova,bytes;uint8_t kind;};
 #endif
-/* Mappings refused for the render server's reserve: [0] for objects, [1] for table ranges. */
+#ifndef ADRENO830_MACOS
+struct NativeAdrenoVmRefusal;   /* macOS builds only; the paged map path takes a pointer to it */
+#endif
+/* Mappings refused for the render server's reserve: [0] for objects, [1] for table ranges (paged mode: bytes). */
 extern "C" volatile uint32_t native_adreno_vm_reserve_refused[2];
+/* UniXNU-piano (2026-11-23, GPU-PAGED P1, private host-checks/20261122-gpu-paged/P1-GATE.md): paged mode of the GPU's VM, chosen at
+ * boot (piano-gpu-mem=paged; the board sets these before S3): no BO pool, page tables built on demand from kernel chunks
+ * (ArmSmmu4KPaged), one record per mapping instead of one table range per physical span, a mapped-bytes cap with the render server's
+ * reserve, emptied tables trimmed on the publish tick after one TLBIASID. Off (0), the VM is exactly the live-kit VM. */
+extern "C" volatile uint32_t native_adreno_gpu_mem_paged;          /* 1: paged */
+extern "C" volatile uint32_t native_adreno_gpu_mem_cap_mib;        /* the mapped-bytes cap (0: the default 7168) */
+extern "C" volatile uint32_t native_adreno_gpu_mem_reserve_mib;    /* the render server's reserve of it (0: the default 1536) */
+extern "C" volatile uint32_t native_adreno_gpu_pt_audit_s;         /* the tick audits the tables every N s (0: only on request) */
+enum : size_t {
+    NativeAdrenoVmPagedMaxChunks=256,     /* table chunks: 2 MiB (else 512 KiB, else 128 KiB) each */
+    NativeAdrenoVmPagedSpare=64,          /* free table pages a map leaves beyond its worst case when it grows the list */
+    NativeAdrenoVmPagedTrimRanges=64,     /* unmapped ranges with emptied tables the tick trims (more: one whole-tree trim) */
+    NativeAdrenoVmPagedTrimBatch=256,     /* tables one trim unlinks at most (the rest at the next tick) */
+    NativeAdrenoVmPagedTableCap=32833,    /* table pages at most: today's preallocated 64 GiB table (REPLAY.md worst case) */
+};
+enum : uint64_t {NativeAdrenoVmPagedCapDefault=UINT64_C(7168)<<20,NativeAdrenoVmPagedReserveDefault=UINT64_C(1536)<<20};
+struct NativeAdrenoVmPagedConfig {
+    unsigned input_bits=36,output_bits=40;   /* the context's: 36 bits = the 64 GiB aperture */
+    uint64_t aperture=0;                     /* the space is [0, aperture) */
+    size_t table_cap_pages=NativeAdrenoVmPagedTableCap;
+    uint64_t cap_bytes=NativeAdrenoVmPagedCapDefault,reserve_bytes=NativeAdrenoVmPagedReserveDefault;
+    uint32_t *alias_scratch=nullptr;size_t alias_scratch_entries=0;   /* the cross-class alias index of imports */
+};
+/* machdep.piano_gpu_pt and the `gpu pt:` line (a copy under the VM lock). */
+struct NativeAdrenoVmPagedStats {
+    bool paged,poisoned;
+    uint64_t table_pages,table_peak,table_cap,chunks,chunk_pages,free_pages,leaves;
+    uint64_t maps,unmaps,unmap_val,unmap_val_pages,unmap_asid,kept_empty,trims,trim_full,trim_retired,trim_us_max,trim_pending;
+    uint64_t mapped,mapped_peak,cap,reserve,records;
+    uint64_t refused_tables,refused_cap,refused_reserve,grow_failures,grow_retries;
+    uint64_t audits,audit_failures,audit_why,audit_iova,audit_tables,audit_leaves,audit_us;
+};
 /* Coherence level (ARCHITECTURE 4.14.1, 3.6 pagani-gpu-coherent): 0 every GPU mapping non-cacheable; 1 GPU-read-only imports
  * write-back inner-shareable (needs V9a); 2 also GPU-written imports and own BOs a client maps write-back (CachedCoherent, needs
  * V9b and V9c). The effective level is native_adreno_io_coherent; the board sets it once S8 decided (NativeAdrenoVm::setCoherence). */
@@ -155,6 +195,38 @@ class NativeAdrenoVm final {
     IOReturn mapLocked(NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,uint64_t *);
     void lock() const;
     void unlock() const;
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1, private P1-GATE.md): paged mode. The table pages come from chunks_ (contiguous, zeroed,
+     * kernel-mapped, held for the device for the VM's life) through a free list linked by each free page's first word; every list and
+     * table change happens under the VM lock, a chunk is allocated only by growTables outside it (its own grow lock). ranges_ holds
+     * one record per mapping: {iova, the mapping's slot in mappings_, the BO's bytes, attributes}. */
+    bool paged_=false;
+    NativeAdrenoVmPagedConfig paged_config_{};
+    ArmSmmu4KPagedSpace space_{};
+    NativeAdrenoMemory chunks_[NativeAdrenoVmPagedMaxChunks];
+    uint16_t chunk_order_[NativeAdrenoVmPagedMaxChunks]{};   /* chunk indices sorted by physical address */
+    size_t chunk_count_=0,chunk_pages_=0;
+    uint64_t free_head_=0;
+    size_t free_pages_=0;                                    /* read without the lock as a hint (growTables) */
+    void *grow_lock_=nullptr;
+    struct TrimRange {uint64_t iova,bytes;} trim_[NativeAdrenoVmPagedTrimRanges]{};
+    size_t trim_count_=0;
+    bool trim_all_=false;
+    uint64_t retired_[NativeAdrenoVmPagedTrimBatch]{};
+    NativeAdrenoVmPagedStats pstats_{};
+    size_t paged_short_=0;                                   /* table pages the last refused map lacked (0: another reason) */
+    static int tableAllocate(void *,uint64_t *,volatile uint64_t **);
+    static void tableRelease(void *,uint64_t,volatile uint64_t *);
+    static volatile uint64_t *tableCpu(void *,uint64_t);
+    static int tablePublish(void *,volatile uint64_t *,size_t);
+    int chunkAt(uint64_t physical) const;
+    bool onTables(uint64_t physical,uint64_t bytes) const;
+    IOReturn addChunk(size_t bytes);
+    IOReturn preflightPaged(const NativeAdrenoMemory *,uint64_t,unsigned,unsigned,unsigned) const;
+    IOReturn mapPagedLocked(NativeAdrenoMemory *,uint64_t,unsigned,unsigned,unsigned,uint64_t *,bool client,bool keep_reserve);
+    IOReturn mapPaged(NativeAdrenoMemory *,uint64_t,unsigned,unsigned,unsigned,uint64_t *,bool client,size_t keep_objects,bool keep_reserve,
+        NativeAdrenoVmRefusal *refusal);
+    IOReturn unmapPagedTables(const Mapping &,size_t at);
+    void noteTrim(uint64_t iova,uint64_t bytes);
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -259,6 +331,27 @@ public:
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
     unsigned bank() const {return bank_;}
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1, private P1-GATE.md): the paged VM.
+     * preparePaged, before the bank is programmed: the records, the first table chunk and the space's root page (*root: TTBR0 for
+     * NativeAdrenoSmmuContext::preparePaged). attachPaged then binds the programmed, routed context as attach does (the programmer's
+     * verify), with no table pool: an empty space proves itself by its audit. map and mapClient take their table pages from the free
+     * list (reserve, then commit; growTables first, outside the lock) and refuse a short list, the mapped-bytes cap and, for clients
+     * with keep_spans set, the render server's reserve with kIOReturnNoResources before any write. unmap never unlinks a table; the
+     * tables it emptied are trimmed by trimTables (the publish tick): one TLBIASID + TLBSYNC, then the pages go back to the list. */
+    IOReturn preparePaged(const NativeAdrenoVmPagedConfig &config,uint64_t *root);
+    IOReturn attachPaged(const NativeAdrenoSmmuBinding &smmu,unsigned poll_budget);
+    bool paged() const {return paged_;}
+    /* Up to `pages` free table pages (chunks allocated outside the VM lock; never blocks a submission). */
+    IOReturn growTables(size_t pages);
+    /* The tick: the ranges unmaps left empty tables in are trimmed, one TLBIASID + TLBSYNC, the pages freed. *retired may be null. */
+    IOReturn trimTables(size_t *retired=nullptr);
+    /* The whole tree against the records and each mapped BO's spans (ArmSmmu4KPagedAudit, read-only, under the lock). */
+    IOReturn auditTables(ArmSmmu4KPagedAuditResult *out=nullptr);
+    void pagedStats(NativeAdrenoVmPagedStats *out) const;
+    /* After detach (no mapping left) and once no walker can reach the space (the bank disabled): every table and chunk back. */
+    IOReturn releasePaged();
+    /* The leaf the tables hold for iova (0: none), for tests and the fault detail. */
+    uint64_t pagedLeaf(uint64_t iova) const;
 #ifdef ADRENO830_MACOS
     /* Largest unmapped extent of a published client window. The client windows exclude the VM's reserved regions. */
     uint64_t largestClientHole(uint64_t start,uint64_t bytes) const;

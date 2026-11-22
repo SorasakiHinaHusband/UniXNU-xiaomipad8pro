@@ -94,6 +94,11 @@ public:
      * below 2^input_bits. */
     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,
         size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits=40,unsigned input_bits=32);
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1, private P1-GATE.md): a lower context whose tables are built on demand
+     * (NativeAdrenoVm::preparePaged): no table pool, TTBR0 = root_physical, the one zeroed and published root page of an
+     * ArmSmmu4KPagedSpace with this input size. The image is encoded as for prepare (MAIR 0xff44, start level from input_bits). */
+    IOReturn preparePaged(uint64_t root_physical,uint64_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,
+        unsigned output_bits,unsigned input_bits);
     /* The TTBR1 guard of a lower context (CB0, ARCHITECTURE 4.5.4 step 9): the physical address of one zeroed, published,
      * 4 KiB-aligned table page below 2^output_bits. Only after prepare and before program; 0 keeps TTBR1 = 0 (CB2). */
     IOReturn setUpperGuard(uint64_t physical);

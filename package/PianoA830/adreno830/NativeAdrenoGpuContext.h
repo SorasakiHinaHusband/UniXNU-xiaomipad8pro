@@ -41,6 +41,10 @@ struct NativeAdrenoGpuContextConfig {
                                      * 64 (32833 table pages, 128 MiB, a 36-bit input; else 16, else 4) */
     uint32_t pool_mib;              /* pagani-gpu-pool (512); 0: no pool, every BO scattered */
     bool write_combined_pool;       /* the pool's pages write-combined once (user BOs are write-combined) */
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1, private P1-GATE.md): piano-gpu-mem=paged: no BO pool, no table pool, the VM's paged
+     * mode (tables on demand at TTBR0, one record per mapping); cap_bytes/reserve_bytes 0 = the defaults (7168/1536 MiB). */
+    bool paged=false;
+    uint64_t cap_bytes=0,reserve_bytes=0;
 };
 class NativeAdrenoGpuContext final {
     NativeAdrenoMemory tables_,guard_,buffers_[GpuBufferCount];
@@ -53,7 +57,7 @@ class NativeAdrenoGpuContext final {
     uint64_t aperture_=0;
     unsigned output_bits_=0;
     uint32_t pool_mib_=0;
-    bool ready_=false,used_=false;
+    bool ready_=false,used_=false,paged_=false;
 public:
     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,Lpac,VmAttach,Map,Ready};
     /* 4 GiB with a 32-bit input: 1 L1 + 4 L2 + 2048 L3 pages; 2 GiB: 1 + 2 + 1024; 16 GiB with a 34-bit input: 1 + 16 + 8192, 32 MiB
@@ -78,6 +82,7 @@ public:
     uint64_t guardTable() const {return guard_.spanCount()?guard_.spans()[0].physical:0;}
     unsigned outputBits() const {return output_bits_;}
     uint32_t poolMib() const {return pool_mib_;}   /* the pool reserved (0: none) */
+    bool paged() const {return paged_;}             /* UniXNU-piano: GPU-PAGED P1 */
     /* The client window of the aperture: [GpuClientBase, aperture end) (ARCHITECTURE 6.2). */
     uint64_t clientEnd() const {return aperture_;}
 };

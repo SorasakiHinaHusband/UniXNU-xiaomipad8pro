@@ -129,6 +129,10 @@ ArmSmmu4KStatus ArmSmmu4KPagedUnmap(ArmSmmu4KPagedSpace *,uint64_t iova,uint64_t
     uint64_t *retired,size_t capacity,ArmSmmu4KPagedPlan *);
 /* Unlink up to capacity empty tables anywhere in the space (never the root, a pinned or a linked shared slot). Plan Asid + walk. */
 ArmSmmu4KStatus ArmSmmu4KPagedTrim(ArmSmmu4KPagedSpace *,uint64_t *retired,size_t capacity,ArmSmmu4KPagedPlan *);
+/* Trim only the tables covering [iova, iova + bytes) (the range of an unmap that left tables empty): the same rules and plan as Trim,
+ * without a walk of the whole tree. A table is unlinked when it is empty as a whole, whatever part of it the range covers. */
+ArmSmmu4KStatus ArmSmmu4KPagedTrimRange(ArmSmmu4KPagedSpace *,uint64_t iova,uint64_t bytes,uint64_t *retired,size_t capacity,
+    ArmSmmu4KPagedPlan *);
 /* Give unlinked tables back to the allocator: only after the TLBSYNC of their plan completed. */
 void ArmSmmu4KPagedRelease(ArmSmmu4KPagedSpace *,const uint64_t *retired,size_t count);
 /* Pin root slot index of owner (its table allocated when missing) and return the table's physical address. */
