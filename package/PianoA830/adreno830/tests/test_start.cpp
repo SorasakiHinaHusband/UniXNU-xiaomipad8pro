@@ -1905,9 +1905,20 @@ int main()
     hang.cxOn=true;
     recoveryOps.snapshot(recoveryOps.context,&hang);
     CHECK(called("A830Hfi::drainLate")==1 && adreno830_status.hfi_late==A830StatusLate(1,2,1,1));
+    /* UniXNU-piano (2026-11-22, gpu-recover2): a client's hang leaves the GMU healthy: no 3 s late drain (it was the whole of a 3 s
+     * recovery); a GMU watchdog bite is the GMU's own fault: drained. */
+    for(const uint8_t client:{uint8_t(A830FaultHang),uint8_t(A830FaultCpHwError),uint8_t(A830FaultWatchdog)}) {
+        hang.cause=client;
+        recoveryOps.snapshot(recoveryOps.context,&hang);
+    }
+    CHECK(called("A830Hfi::drainLate")==1);
+    hang.cause=A830FaultGmuWatchdog;
+    recoveryOps.snapshot(recoveryOps.context,&hang);
+    CHECK(called("A830Hfi::drainLate")==2);
+    hang.cause=A830FaultNone;
     CHECK(powerOps.gmuForceOff(powerOps.context)==kIOReturnSuccess);
     recoveryOps.snapshot(recoveryOps.context,&hang);   /* a GMU forced off sends nothing */
-    CHECK(called("A830Hfi::drainLate")==1);
+    CHECK(called("A830Hfi::drainLate")==2);
     wiringDrains+=3;
     lateFound={};
     /* The S5 page of an S5 stop: the annibale cold boot's TCM words, GENERAL_11 and RSC status; the design reads none. */
