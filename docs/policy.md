@@ -221,8 +221,8 @@ implement the cover-open-only and keyboard-only-when-open rules.
 
 Read, not owned: `piano-keyboard-lid`, `piano-gpu-dcvs-max`, `piano-gpu-maxlevel`, `piano-thermal`, `piano-thermal-gpu-mhz`; PianoA830's
 property `piano-gpu-ceiling-clients`. sysctl:
-`machdep.piano_policy` (state, decisions, counters), `machdep.piano_policy_lpm` (root, 0/1), `machdep.piano_smc` (the stand-in's
-clients, keys and counters, §12).
+`machdep.piano_policy` (state, decisions, counters), `machdep.piano_policy_lpm` (root, 0/1), `machdep.piano_policy_hpm` (root, 0/1,
+§12.5), `machdep.piano_smc` (the stand-in's clients, keys and counters, §12).
 
 ## 7. Idle sleep on battery: macOS's timers (pmset)
 
@@ -411,3 +411,20 @@ shows `PianoSmc: start: AppleSMC stand-in published`, `'MSHP' = 1 ... to powerd`
 Battery opens; the picker with three options (a camera shot); `pmset -a powermode 0/1/2` flips the two notify states (Low Power still
 reaches PianoPolicy as before); a timer sleep/wake cycle with the stand-in present; the USB console and the charger lines unchanged;
 no `AppleUSBHostResourcesTypeC` in the registry; no panic.
+
+### 12.5 High Power reaches the clocks (steps E2 and E3, 2026-11-22)
+
+Status 2026-11-22: E1 ran on the tablet (energy-e1: `pmset -g custom` lists `powermode` for AC and battery, powerd and the Battery
+settings extension read `MSHP` = 1, `pmset -a powermode 2/1/0` flips `com.apple.system.highpowermode` / `lowpowermode`, Low Power
+reached PianoThermal as before, a timer sleep/wake cycle with the stand-in). E2/E3: **built, host-tested; not run on the tablet.**
+- E2 (the signal): `piano-policy-agent` also waits on `com.apple.system.highpowermode` and writes `sysctl machdep.piano_policy_hpm`
+  (0/1). PianoPolicy (`Policy.h`): Low Power Mode -> Power Saver (PianoThermal 1, the GPU ceiling); else High Power Mode -> High Power
+  (PianoThermal 3, no GPU ceiling) whatever the power source and the profile rule, sent only when PianoThermal publishes
+  `piano-thermal-profiles` >= 3 (else Balanced, said in the decision line); else the rule's own choice (Automatic: with
+  `piano-policy-profile=2` Balanced, with 1 by the power source). Low Power wins when both read 1 (a transient while powerd switches).
+  The GPU keeps PianoA830's own maximum (342 MHz on the daily line) and its input floor; High Power sends no GPU ceiling.
+- E3 (the clocks): PianoThermal's profile 3 (`docs/drivers/thermal.md` §14): the top levels 3532.8 / 4320 MHz as the cap (over
+  sustained unless refused), no skin table, the thermal limit on top.
+- Risks: heat and draw by the nature of the mode (the thermal limit is the guard); on the Mac's 5 V input High Power can draw more
+  than the input gives (the pack then discharges while "on power"); the mode must survive a sleep (PianoThermal keeps its profile
+  across the parked thread, PianoPolicy its inputs).

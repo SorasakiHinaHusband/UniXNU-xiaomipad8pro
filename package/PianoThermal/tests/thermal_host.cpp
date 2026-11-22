@@ -692,12 +692,14 @@ static void testBoost()
 
 static void testProfileAndSleep()
 {
-  CHECK(profileValid(0) && profileValid(1) && profileValid(2) && !profileValid(3) && !profileValid(~uintptr_t(0)));
+  CHECK(profileValid(0) && profileValid(1) && profileValid(2) && profileValid(3) && !profileValid(4) && !profileValid(~uintptr_t(0)));
+  CHECK(kProfileMax == 3 && !strcmp(profileName(Profile::performance), "High Power"));
   const PowerSource sources[3] = {PowerSource::unknown, PowerSource::battery, PowerSource::external};
   for (PowerSource p : sources) {
     CHECK(profilePower(p, Profile::bySource) == p);
     CHECK(profilePower(p, Profile::saver) == PowerSource::battery);
     CHECK(profilePower(p, Profile::balanced) == PowerSource::external);
+    CHECK(profilePower(p, Profile::performance) == PowerSource::external);   // High Power: the external caps on battery too
   }
   GovernorConfig gv;
   gv.batteryKhz = capKhz(1958);
@@ -1141,6 +1143,38 @@ static void testPerf()
   g2.setRuntimeCaps(false, 0, capKhz(4320), true);
   g2.thermal(hot, 5000);
   CHECK(g2.limit() == 14 && g2.khz(g2.ceiling(PowerSource::external)) == 4204800);
+  // High Power (Profile::performance, docs/policy.md 12): the top level as the perf cap, over sustained, on battery too (the
+  // external caps); a load from the floor reaches the top; the firmware's refusal keeps sustained; a hard cap and the thermal
+  // limit stay on top; the cluster whose sustained level is its top (NCC0 3532.8) is not lifted past it.
+  GovernorConfig hc = gc;
+  hc.externalKhz = capKhz(4320);
+  Governor h;
+  h.init(CpuMode::govern, hc, ncc1, 16, 13, 0);
+  const PowerSource hpPower = profilePower(PowerSource::battery, Profile::performance);
+  HighPowerCap hp = highPowerCap(capKhz(4320), false);
+  CHECK(hp.aboveSustained && hp.khz == 4320999);
+  h.setRuntimeCaps(false, 0, hp.khz, hp.aboveSustained);
+  CHECK(h.khz(h.ceiling(hpPower)) == 4320000);
+  h.setDownTicks(5);
+  for (int i = 0; i < 6; ++i) h.tick({1000, hpPower});
+  CHECK(h.khz(h.level()) == 4320000);
+  hp = highPowerCap(capKhz(4320), true);   // the firmware refused a level over sustained this boot
+  CHECK(!hp.aboveSustained);
+  h.setRuntimeCaps(false, 0, hp.khz, hp.aboveSustained);
+  CHECK(h.khz(h.ceiling(hpPower)) == 4089600 && h.khz(h.enforce(hpPower)) <= 4089600);
+  h.setRuntimeCaps(true, capKhz(2438), capKhz(4320), true);
+  CHECK(h.khz(h.ceiling(hpPower)) == 2438400);   // a hard cap given still wins
+  h.setRuntimeCaps(false, 0, capKhz(4320), true);
+  for (uint64_t ms = 6000; ms < 6200; ms += 10) h.thermal(hot, ms);
+  CHECK(h.khz(h.ceiling(hpPower)) < 4089600 && h.khz(h.enforce(hpPower)) < 4089600);   // the thermal limit acts on High Power too
+  const uint32_t ncc0[] = {384000, 556800, 748800, 960000, 1152000, 1363200, 1555200, 1785600, 1996800, 2227200, 2400000, 2745600,
+                           2918400, 3072000, 3321600, 3532800};
+  GovernorConfig hc0 = hc;
+  hc0.externalKhz = capKhz(3532);
+  Governor h0;
+  h0.init(CpuMode::govern, hc0, ncc0, 16, 15, 0);
+  h0.setRuntimeCaps(false, 0, capKhz(3532), true);
+  CHECK(h0.khz(h0.ceiling(hpPower)) == 3532800);
 }
 
 // The launch / input boosts (Perf.h, 2026-11-22): the exec path filter, the app name, which boost holds, and the Governor's floor.

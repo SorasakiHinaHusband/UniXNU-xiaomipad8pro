@@ -102,7 +102,8 @@ are (piano-thermal-sleep-mask=0)`, `[Ns] wake N: polling again`. With `piano-the
 masks as with `piano-thermal-sleep-mask=1`, and while that path is live the hooks mask only the lower ones (Linux's rule, §13.6).
 **The power profile** (2026-11-11; `docs/policy.md` §5.2, `Governor.h` Profile, host-tested): `callPlatformFunction(
 "piano-thermal-profile", false, (void *)(uintptr_t)mode, ...)` on this service, any thread: 0 the caps by the power source (as
-before), 1 Power Saver whatever the source (the `-bat0/-bat1` ceilings), 2 Balanced whatever the source (`-ac0/-ac1`); else
+before), 1 Power Saver whatever the source (the `-bat0/-bat1` ceilings), 2 Balanced whatever the source (`-ac0/-ac1`), 3 High
+Power (§14, 2026-11-22); else
 `kIOReturnBadArgument`, and `kIOReturnUnsupported` without CPU frequency control (`piano-cpufreq` < 2). An atomic the governor reads
 every tick: the power source it hands `Governor::tick` / `enforce` becomes battery for 1, external for 2 (a lower ceiling applies at
 once); the fixed level (mode 2) has no power caps and ignores it. One line per change (`[Ns] cpufreq: profile Power Saver
@@ -781,3 +782,9 @@ thermal limits) and of 2026-11-22 (macOS Low Power Mode is the one performance s
   the level, ceiling, perf cap, step, bursts and the residency per level since boot (ms), for before/after windows from user space.
 - PianoPolicy `piano-policy-profile=2` (docs/policy.md): Low Power Mode on = Power Saver (profile 1, the GPU ceiling), off =
   Balanced (profile 2) whatever the power source.
+- **High Power** (profile 3, 2026-11-22, macOS Energy Mode's third option, docs/policy.md §12): the external-power caps whatever the
+  source and, with the perf policy >= 1, the clusters' top levels as the perf cap (`piano-cpufreq-hpm0/1`, 3532 / 4320 MHz), over
+  the firmware's sustained level unless a level above it was refused this boot (then sustained, 4089.6 on cpu6-7), no skin table,
+  no onset burst; the hard caps (`piano-cpufreq-cap0/1` when given), the boosts and the thermal limit (`piano-cpufreq-hot`) stay on
+  top. With policy 0 High Power changes nothing (the measured source's caps). The service publishes `piano-thermal-profiles` = 3
+  (PianoPolicy sends 3 only then); `machdep.piano_cpufreq_state` begins `perf=N profile=M above_refused=A/B`. Not run on the tablet.

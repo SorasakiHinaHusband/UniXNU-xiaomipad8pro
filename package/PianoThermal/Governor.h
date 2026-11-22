@@ -38,17 +38,23 @@ inline const char *powerName(PowerSource p)
 
 // PianoPolicy's power profile (docs/policy.md 5.2, the platform function "piano-thermal-profile"): 0 the caps by the power source
 // (as without PianoPolicy), 1 Power Saver whatever the source (the battery caps, -bat0/-bat1), 2 Balanced whatever the source (the
-// external-power caps, -ac0/-ac1). The governor (mode 3) is handed profilePower() instead of the measured source; the fixed level
-// (mode 2) has no power caps and so ignores it.
-enum class Profile : uint8_t { bySource = 0, saver = 1, balanced = 2 };
-inline bool profileValid(uintptr_t mode) { return mode <= 2; }
+// external-power caps, -ac0/-ac1), 3 High Power (macOS Energy Mode's High Power, docs/policy.md 12: the external-power caps whatever
+// the source, and with the perf policy >= 1 the clusters' top levels as the perf cap, no skin table, over sustained allowed:
+// perf::highPowerCap; the thermal limit on top as always). The governor (mode 3) is handed profilePower() instead of the measured
+// source; the fixed level (mode 2) has no power caps and so ignores it. kProfileMax is published as piano-thermal-profiles.
+enum class Profile : uint8_t { bySource = 0, saver = 1, balanced = 2, performance = 3 };
+constexpr uint32_t kProfileMax = 3;
+inline bool profileValid(uintptr_t mode) { return mode <= kProfileMax; }
 inline PowerSource profilePower(PowerSource measured, Profile p)
 {
-  return p == Profile::saver ? PowerSource::battery : p == Profile::balanced ? PowerSource::external : measured;
+  return p == Profile::saver ? PowerSource::battery
+         : p == Profile::balanced || p == Profile::performance ? PowerSource::external
+                                                                : measured;
 }
 inline const char *profileName(Profile p)
 {
-  return p == Profile::saver ? "Power Saver" : p == Profile::balanced ? "Balanced" : "by the power source";
+  return p == Profile::saver ? "Power Saver" : p == Profile::balanced ? "Balanced" : p == Profile::performance ? "High Power"
+                                                                                                                : "by the power source";
 }
 
 constexpr uint32_t kAndroidBaseKhz[] = {2400000, 2438400};

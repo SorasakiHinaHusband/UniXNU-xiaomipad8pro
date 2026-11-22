@@ -200,6 +200,16 @@ inline BoostKind boostAt(uint64_t nowNs, uint64_t launchNs, uint32_t launchMs, u
   return BoostKind::none;
 }
 
+// High Power (Profile::performance, macOS Energy Mode): the perf cap is the cluster's top level (piano-cpufreq-hpm0/1, default the
+// tables' tops 3532.8 / 4320 MHz), over the firmware's sustained level unless the firmware refused such a level this boot; no skin
+// table, no onset burst (the ceiling is already the top), the boosts as in Balanced; the hard caps, the power cap and the thermal
+// limit (piano-cpufreq-hot) stay on top in Governor::ceilingFor.
+struct HighPowerCap {
+  uint32_t khz;
+  bool aboveSustained;
+};
+inline HighPowerCap highPowerCap(uint32_t topKhz, bool aboveRefused) { return HighPowerCap{topKhz, !aboveRefused}; }
+
 }  // namespace pianothermal::perf
 
 #endif

@@ -37,8 +37,11 @@
 // piano-thermal-sleep-mask=1, or another driver through the platform functions. Across a system sleep the thread is parked (no
 // SCMI request, no TSENS read in flight; Governor.h SleepPlan); the first zone update after the wake follows at once.
 // The power profile (docs/policy.md 5.2): callPlatformFunction("piano-thermal-profile", mode) from PianoPolicy: 0 the caps by the
-// power source, 1 Power Saver, 2 Balanced, whatever the source (Governor.h Profile); the governor reads it every tick, the fixed
-// level ignores it; the property piano-thermal-profile and one line per change.
+// power source, 1 Power Saver, 2 Balanced, 3 High Power (macOS Energy Mode, docs/policy.md 12), whatever the source (Governor.h
+// Profile); the governor reads it every tick, the fixed level ignores it; the property piano-thermal-profile and one line per change;
+// piano-thermal-profiles = 3 says that mode 3 is taken (PianoPolicy sends it only then). High Power acts with the perf policy >= 1:
+// the clusters' top levels piano-cpufreq-hpm0/1 (3532 / 4320 MHz) as the perf cap, over sustained unless the firmware refused that
+// this boot, no skin table, no onset burst; the hard caps, the power caps (-ac0/1) and the thermal limit stay on top.
 // piano-thermal-adc=1|2 (B6, PianoThermalAdc.cpp; implies piano-thermal=1): the eleven board thermistors on the PMIC ADC, on a thread
 // of their own, and piano_thermal_board_temps() for charging safety. Its only writes: the ADC SDAM's conversion bytes.
 // piano-thermal-irq=1 (PianoThermalIrq.cpp, TsensIrq.h; with piano-thermal >= 1): the TSENS upper/lower threshold interrupts; at
@@ -122,7 +125,7 @@ struct Args {
   bool capGiven[2];
   bool android, androidArmed;
   // the stock-level policy (Perf.h)
-  uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC;
+  uint32_t perf, perfTickMs, perfDownMs, legacyCap[2], burst[2], burstMax[2], burstMs, burstGapMs, skin, skinLimitC, hpmTop[2];
   // the launch and input boosts (Perf.h; 2026-11-22 01:02) and the silicon gate of bursts and boosts
   uint32_t boosts, launchMhz[2], launchMs, inputMhz[2], inputMs, gpuLaunchMhz, gpuInputMhz, launchWatch, gateOpenC, gateEndC, gateQuietMs;
 };
@@ -201,6 +204,9 @@ void readArgs()
   gArgs.burst[1] = clampU(bootArg("piano-cpufreq-burst1", 4089), 0, 5000);
   gArgs.burstMax[0] = clampU(bootArg("piano-cpufreq-burst-max0", 3532), 0, 5000);
   gArgs.burstMax[1] = clampU(bootArg("piano-cpufreq-burst-max1", 4320), 0, 5000);
+  // High Power (Profile::performance, docs/policy.md 12): the perf cap per cluster (the tables' tops)
+  gArgs.hpmTop[0] = clampU(bootArg("piano-cpufreq-hpm0", 3532), 300, 5000);
+  gArgs.hpmTop[1] = clampU(bootArg("piano-cpufreq-hpm1", 4320), 300, 5000);
   gArgs.burstMs = clampU(bootArg("piano-cpufreq-burst-ms", 1500), 0, 10000);
   gArgs.burstGapMs = clampU(bootArg("piano-cpufreq-burst-gap-ms", 500), 0, 60000);
   gArgs.skin = bootArg("piano-cpufreq-skin", 1) ? 1 : 0;
@@ -531,6 +537,7 @@ void registerAndroidCpu()
 // machdep.piano_cpufreq_perf (0 the policy before 2026-11-22, 1 the stock-level one), machdep.piano_cpufreq_perf_tick_ms (the load
 // decision period in mode 1), machdep.piano_cpufreq_state (read only). The writes are root-only; the thread reads them each poll.
 uint32_t gPerf, gPerfTickMs = 20;
+volatile uint32_t gProfileNow;   // PianoPolicy's profile mode as last taken (machdep.piano_cpufreq_state profile=)
 struct PerfDomain {
   uint32_t count;
   uint32_t khz[scmi::kMaxLevels];
@@ -569,11 +576,13 @@ int sysctlPerfInt(struct sysctl_oid *oid, void *, int which, struct sysctl_req *
 int sysctlPerfState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
   if (req->newptr) return EPERM;
-  char buf[1600];
+  char buf[1800];
   const uint64_t now = nowNs();
-  int at = snprintf(buf, sizeof buf, "perf=%u tick_ms=%u skin_mC=%d skin_valid=%u skin_inputs=%#x uptime_ms=%llu boost=%u "
+  int at = snprintf(buf, sizeof buf, "perf=%u profile=%u above_refused=%u/%u tick_ms=%u skin_mC=%d skin_valid=%u skin_inputs=%#x "
+                    "uptime_ms=%llu boost=%u "
                     "launches=%u inputs=%u launch_boosts=%u input_boosts=%u launch_boost_ms=%llu input_boost_ms=%llu gpu_boost=%u/%u/%u",
-                    __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE), __atomic_load_n(&gPerfTickMs, __ATOMIC_ACQUIRE), gSkinMilli,
+                    __atomic_load_n(&gPerf, __ATOMIC_ACQUIRE), __atomic_load_n(&gProfileNow, __ATOMIC_ACQUIRE), gAboveRefused[0] ? 1u : 0u,
+                    gAboveRefused[1] ? 1u : 0u, __atomic_load_n(&gPerfTickMs, __ATOMIC_ACQUIRE), gSkinMilli,
                     gSkinValid, gSkinUsed, (unsigned long long)(now / 1000000ull), __atomic_load_n(&gBoost, __ATOMIC_ACQUIRE),
                     __atomic_load_n(&gLaunches, __ATOMIC_RELAXED), __atomic_load_n(&gInputs, __ATOMIC_RELAXED), gBoostStarts[2],
                     gBoostStarts[1], (unsigned long long)gBoostMs[2], (unsigned long long)gBoostMs[1], gGpuCalls, gGpuTaken, gGpuState);
@@ -949,10 +958,15 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
     if (!profileValid(mode)) return kIOReturnBadArgument;
     if (gArgs.cpufreq < 2) return kIOReturnUnsupported;
     const uint32_t before = __atomic_exchange_n(&profile_, uint32_t(mode), __ATOMIC_ACQ_REL);
+    __atomic_store_n(&gProfileNow, uint32_t(mode), __ATOMIC_RELEASE);
     if (before != mode) {
       setProperty("piano-thermal-profile", uint64_t(mode), 32);
       note("[%us] cpufreq: profile %s (PianoPolicy)%s", upS(), profileName(Profile(mode)),
-           gArgs.cpufreq == 2 ? ": the fixed level (piano-cpufreq=2) has no power caps, ignored" : "");
+           gArgs.cpufreq == 2 ? ": the fixed level (piano-cpufreq=2) has no power caps, ignored"
+           : Profile(mode) == Profile::performance && !__atomic_load_n(&gPerf, __ATOMIC_ACQUIRE)
+               ? ": High Power's top levels need machdep.piano_cpufreq_perf >= 1 (policy 0 keeps the measured source's caps)"
+           : Profile(mode) == Profile::performance
+               ? ": the top levels as the cap, no skin table, the thermal limit on top" : "");
     }
     return kIOReturnSuccess;
   }
@@ -1054,7 +1068,10 @@ bool PianoThermal::start(IOService *provider)
   policy_ = Policy(pc);
   setProperty("piano-thermal", gArgs.level, 32);
   setProperty("piano-cpufreq", gArgs.cpufreq, 32);
-  if (gArgs.cpufreq >= 2) setProperty("piano-thermal-profile", 0ull, 32);
+  if (gArgs.cpufreq >= 2) {
+    setProperty("piano-thermal-profile", 0ull, 32);
+    setProperty("piano-thermal-profiles", uint64_t(kProfileMax), 32);   // mode 3 (High Power) is taken
+  }
   sleepLock_ = IOLockAlloc();
   // piano-thermal-irq=1 uses the threshold interrupts, so a sleep masks them (the hooks: lower only while it is live, as Linux)
   sleep_ = SleepPlan(gArgs.sleepMask != 0 || irq::hookLevel() != 0);
@@ -1406,7 +1423,7 @@ void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
   const int32_t r = scmi::levelSet(channel_, domain_[d], d, want);
   if (r && want > domain_[d].sustained && !gAboveRefused[d]) {   // mode 2's burst: the firmware does not take levels over sustained
     gAboveRefused[d] = true;
-    note("[%us] cpufreq: domain %u: %u MHz (above sustained) refused (%d, %s): bursts stay at sustained for this boot", upS(), d,
+    note("[%us] cpufreq: domain %u: %u MHz (above sustained) refused (%d, %s): bursts and High Power stay at sustained for this boot", upS(), d,
          domain_[d].levels[want].khz / 1000, r, scmi::statusName(r));
     g.setLevel(set_[d]);
     return;
@@ -1678,7 +1695,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
           hottest < int32_t(gateOpen ? gArgs.gateEndC : gArgs.gateOpenC) * 10 &&
           (gateOpen || !hotSeenNs_[d] || now - hotSeenNs_[d] >= uint64_t(gArgs.gateQuietMs) * 1000000ull);
       if (perfMode) {
-        const uint32_t skinKhz = gArgs.skin && !beyond ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
+        const bool high = profile == Profile::performance;   // High Power (docs/policy.md 12): the top levels, no skin table
+        const uint32_t skinKhz = gArgs.skin && !beyond && !high ? skinCap_[d].update(d ? perf::kCluster1 : perf::kCluster0,
                                                                             d ? perf::kCluster1Steps : perf::kCluster0Steps,
                                                                             skin_.valid, skin_.milliC)
                                                        : 0;
@@ -1689,8 +1707,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
           bc.windowMs = gArgs.burstMs;
           bc.gapMs = gArgs.burstGapMs;
           bc.limitMilli = int32_t(gArgs.skinLimitC) * 1000;
-          burst_[d].tick(bc, now / 1000000ull, g.rawWant() > g.ceilingFor(power, skinKhz), power == PowerSource::external && gateOk,
-                         skin_.valid, skin_.milliC);
+          burst_[d].tick(bc, now / 1000000ull, g.rawWant() > g.ceilingFor(power, skinKhz),
+                         power == PowerSource::external && gateOk && !high, skin_.valid, skin_.milliC);
         } else if (burst_[d].open() && !gateOk) {
           perf::BurstConfig bc;
           bc.khz = burstKhz;
@@ -1706,9 +1724,13 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
         boostOn_[d] = boostFloor != 0;
         g.setBoostFloor(boostFloor);
         g.setDownTicks(perf::downTicksFor(gArgs.perfDownMs, curTickMs()));
-        uint32_t perfKhz = beyond ? (burst_[d].open() ? burstKhz : 0) : perf::perfCapKhz(skinKhz, burst_[d].open(), burstKhz);
+        const perf::HighPowerCap hp = perf::highPowerCap(capKhz(gArgs.hpmTop[d]), gAboveRefused[d]);
+        uint32_t perfKhz = high ? hp.khz
+                         : beyond ? (burst_[d].open() ? burstKhz : 0) : perf::perfCapKhz(skinKhz, burst_[d].open(), burstKhz);
         if (boostCap && perfKhz && boostCap > perfKhz) perfKhz = boostCap;
-        if (beyond)   // no skin table: the sustained ceiling, the burst over it while open (unless the firmware refused that)
+        if (high)     // the top level as the cap, over sustained unless refused this boot; the thermal limit on top
+          g.setRuntimeCaps(false, 0, perfKhz, hp.aboveSustained);
+        else if (beyond)   // no skin table: the sustained ceiling, the burst over it while open (unless the firmware refused that)
           g.setRuntimeCaps(false, 0, perfKhz, burst_[d].open() && !gAboveRefused[d]);
         else
           g.setRuntimeCaps(false, 0, perfKhz);
