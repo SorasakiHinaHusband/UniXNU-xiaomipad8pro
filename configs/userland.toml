@@ -34,8 +34,8 @@ approval_env = "PIANO_CAMERA_APPROVAL"
 
 [[unit]]
 name = "piano-coreimage-compat"
-about = "UID 501 Core Image legacy CIKL metadata path while native Metal lacks visible-function reflection; prior preference retained for --remove"
-default_on = true
+about = "RETIRED (cikl1, 2026-11-22: off; piano-coreimage-restore runs its --remove): UID 501 Core Image legacy CIKL path; a legacy CIKL kernel can never render on a Metal context (Preview, Photo Booth effects: SIGSEGV 0x28), the plugin now has the modern CIKL contract; enable only for an experiment, never together with piano-coreimage-restore"
+default_on = false
 
 [[unit.file]]
 source = "tooling/camera/extension/coreimage-compat.m"
@@ -49,6 +49,17 @@ mode = "0755"
 source = "tooling/camera/extension/com.unixnu.piano-coreimage-compat.plist"
 build = "copy"
 dest = "/Library/LaunchAgents/com.unixnu.piano-coreimage-compat.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-coreimage-restore"
+about = "cikl1 (2026-11-22): at each Aqua login piano-coreimage-compat --remove puts back the CI_USE_MTL_DAG_FOR_CIKL_SRC preference and GUI environment the retired legacy policy saved (Core Image's default for every app); without a saved receipt it changes nothing"
+default_on = true
+
+[[unit.file]]
+source = "tooling/camera/extension/com.unixnu.piano-coreimage-restore.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-coreimage-restore.plist"
 mode = "0644"
 
 [[unit]]

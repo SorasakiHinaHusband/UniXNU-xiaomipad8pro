@@ -124,7 +124,9 @@ def manifest_tests(tmp):
           'piano-still-wallpaper: the script, its job and its three data files (0644, no CDHash)')
     check(names['piano-wifi']['planned'] and not any(u['planned'] for n, u in names.items() if n != 'piano-wifi'),
           'piano-wifi is the one planned unit')
-    check(all(u['on'] for u in plan['units']), 'every unit is on in the installed profile')
+    # cikl1 (2026-11-22): the legacy CIKL policy is retired (off; its binary stays for piano-coreimage-restore's --remove)
+    check(all(u['on'] for u in plan['units'] if u['name'] != 'piano-coreimage-compat') and not names['piano-coreimage-compat']['on']
+          and names['piano-coreimage-restore']['on'], 'every unit is on in the installed profile but the retired piano-coreimage-compat')
     dests = [f['dest'] for u in plan['units'] for f in u['files']]
     check(len(dests) == len(set(dests)) and all(d.rsplit('/', 1)[0] in stage.DIRS for d in dests), 'destinations unique, in the allowed directories')
     out = io.StringIO()
