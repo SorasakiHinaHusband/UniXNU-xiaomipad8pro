@@ -464,6 +464,15 @@ static void testFallbacks()
           gShell.plan.fault_ranges==(NativeAdrenoRangeBit(HOG)|NativeAdrenoRangeBit(WS)) && gShell.plan.failed==2);
     CHECK(gShell.faults(WS)==1 && gShell.faults(HOG)==1 && W->submit.outstanding()==0 && W->object.deviceReferences()==1 &&
           W->ring.replays()==0 && W->submit.stats().fallbacks==1 && W->submit.stats().abandoned==2);
+    /* The CP stood in a kernel submission (fence done + 1 is no client's job): nobody is the culprit, nobody's name is charged, every
+     * job fails (nothing would complete the kernel's fence). */
+    boot();
+    CHECK(W->ring.submit(nop,2,&kernelFence)==kIOReturnSuccess && kernelFence==1);
+    const uint32_t g2=submitJob(HOG),g3=submitJob(WS);
+    CHECK(gRecovery.recover(A830FaultHang,1)==kIOReturnSuccess);
+    CHECK(gShell.plan.fallback==NativeAdrenoSubmitFallbackGap && gShell.plan.culprit_range==UINT32_MAX && !gShell.plan.culprit_fence &&
+          gShell.plan.restart==g3 && g2==2 && gShell.faults(HOG)==1 && gShell.faults(WS)==1);
+    CHECK(!gShell.record("PianoGpuHog")->hangs);
     /* Poisoned: a commit that poisoned the ring. */
     boot();
     submitJob(BENCH);
