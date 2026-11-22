@@ -449,12 +449,29 @@ def layer_tests(tmp, shell, tag):
     hal = ('audio-t', True, [(f'{hc}/Info.plist', '0644', b'<plist/>'), (f'{hc}/MacOS/T', '0755', b'exe'),
                              (f'{hc}/_CodeSignature/CodeResources', '0644', b'<plist>seal</plist>')])
     rig.files([cli, hal])
-    code, out = rig.run('--live')
+    old_umask = os.umask(0o077)   # the layer apply's umask (layer-common.sh)
+    try:
+        code, out = rig.run('--live')
+    finally:
+        os.umask(old_umask)
     check(code == 0 and rig.root(f'{hc}/MacOS/T').read_bytes() == b'exe' and
           rig.root(f'{hc}/_CodeSignature/CodeResources').read_bytes() == b'<plist>seal</plist>' and
           oct(rig.root(f'{hc}/MacOS/T').stat().st_mode & 0o777) == '0o755' and
           oct(rig.root(f'{hc}/Info.plist').stat().st_mode & 0o777) == '0o644' and 'was not installed by this installer' not in out,
           f'{tag}: HAL layer: the driver installed into new directories with its modes, nothing taken over')
+    # v13.1y8 (INSTALLED-CLASSIFY.md 1): the layer apply runs install.sh under umask 077; every directory it makes is 0755 at every level
+    # (v13.1y7's install -d left PianoMicNS.driver/ at 0700: the HAL plug-in unreadable for coreaudiod's driver service)
+    dmode = lambda p: oct(rig.root(p).stat().st_mode & 0o777)
+    hdirs = ['/Library/Audio/Plug-Ins/HAL/T.driver', '/Library/Audio/Plug-Ins/HAL/T.driver/Contents', f'{hc}/MacOS', f'{hc}/_CodeSignature']
+    check(all(dmode(d) == '0o755' for d in hdirs), f'{tag}: HAL layer under umask 077: every new bundle directory 0755 ({[dmode(d) for d in hdirs]})')
+    rig.root('/Library/Audio/Plug-Ins/HAL/T.driver').chmod(0o700)   # as v13.1y7's installer left it
+    code, out = rig.run('--check')
+    check(code == 1 and 'a plugin bundle directory is 0755' in out, f'{tag}: HAL layer: --check reports a 0700 bundle directory')
+    code, out = rig.run('--live')
+    check(code == 0 and dmode('/Library/Audio/Plug-Ins/HAL/T.driver') == '0o755' and 'directory 0700 -> 0755 (a plugin bundle directory)' in out and
+          'changed:)' in out, f'{tag}: HAL layer: --live repairs the bundle directory with no file change, and logs it')
+    code, out = rig.run('--check')
+    check(code == 0, f'{tag}: HAL layer: --check passes after the repair')
     rig.files([cli])
     code, out = rig.run('--live')
     check(code == 0 and not any(rig.root(d).exists() for d, _, _ in hal[2]), f'{tag}: HAL layer taken out: its files gone')
