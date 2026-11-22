@@ -29,6 +29,18 @@ public:
         }
     }
     bool r3b() const {return r3b_;}
+    /* gpu/daily4: the qualified ceiling, GMU level 7 (607 MHz), 8 (660) or 9 (734), with its default bus (Sm8750GpuLevels, GPU-ANDROID.md
+     * table: 607 and 660 bus 6, 734 bus 8). Set once after init(), before the guard runs. */
+    static constexpr uint8_t TopMin=7,TopMax=9;
+    static uint8_t defaultBus(uint8_t level) {
+        static const uint8_t buses[TopMax+1]={0,2,2,3,4,4,4,6,6,8};
+        return buses[level<=TopMax?level:TopMax];
+    }
+    bool setTop(uint8_t level) {
+        if(level<TopMin || level>TopMax)return false;
+        top_=level;thermal_.top=level;return true;
+    }
+    uint8_t top() const {return top_;}
     /* Daily mode (pagani-gpu-daily=1, gpu/daily1): the same guard as the daily frequency policy. The permit arms itself once the
      * guard is ready (two fresh board rounds, GPU and board sensors healthy and cool) and has no expiry; every limit of the R3b
      * contract stays: the soft ladder, the board hold, the hard exits (raw 85 C, board 65/40 C, sensor/lease, an unacknowledged
@@ -108,7 +120,7 @@ public:
         const uint64_t end=openedAt()+windowNs_;
         power_->setQualificationLease(now+2500000000ull<end?now+2500000000ull:end);
         // After the boot latch, cool readings may still reach 342; unknown/hot must always be able to reach 160.
-        power_->setQualificationCeiling(!gpuOk || gpuHot?1:high()?7:3,!gpuOk || gpuHot?2:high()?6:3);
+        power_->setQualificationCeiling(!gpuOk || gpuHot?1:high()?top_:3,!gpuOk || gpuHot?2:high()?defaultBus(top_):3);
     }
     void checkLease(uint64_t now,A830ExitContext source=A830ExitContext::Guard) {
         const uint64_t at=__atomic_load_n(&heartbeatAt_,__ATOMIC_ACQUIRE);
@@ -173,12 +185,13 @@ private:
         power_->setQualificationLease(now+A830R3bThermal::Lease<end?now+A830R3bThermal::Lease:end);
         uint8_t cap=hardBoard?1:uint8_t(thermal_.published());
         if(!high() && cap>3)cap=3;
-        const uint8_t buses[]={0,2,2,3,4,4,4,6};
+        if(cap>top_)cap=top_;
         if(thermal_.events&12)a830ExitTrace.board(thermal_.boardCap,now,cap);
-        power_->setQualificationCeiling(cap,buses[cap]);
+        power_->setQualificationCeiling(cap,defaultBus(cap));
         if(deadlineMissed(now) && unsafe_)unsafe_(nullptr,A830ExitOrigin::ProtectionDeadline);
     }
     bool r3b_=false,daily_=false;
+    uint8_t top_=7;
     void (*unsafe_)(void *,A830ExitOrigin)=nullptr;
     A830R3bThermal thermal_{};
     A830PowerState *power_=nullptr;

@@ -9,6 +9,8 @@
 #include "../../include/PianoBoardTemps.h"
 struct A830R3bThermal {
     static constexpr uint64_t Lease=250000000,Period=100000000;
+    /* gpu/daily4: the ladder's top GMU level, the qualified ceiling (7 = 607 MHz; 8 = 660, 9 = 734 on the 660/734 step). */
+    uint8_t top=7;
     uint8_t step=3,entryRounds=0,releaseRounds=0,minValid=255;
     bool boardCap=false,ready=false,healthy=false,halt=false;
     int32_t raw=0,filter16=0,trendRef=0,peaks[8]={};
@@ -64,7 +66,7 @@ struct A830R3bThermal {
         }
         if(!running || !healthy || boardCap || raw>=800 || filter16>750*16)coolSince=0;
         else if(!coolSince)coolSince=now;
-        else if(now-coolSince>=2000000000ull && step<7) {++step;++ups;events|=1;coolSince=now;}
+        else if(now-coolSince>=2000000000ull && step<top) {++step;++ups;events|=1;coolSince=now;}
         if(running && healthy && (raw>=800 || filter16>=800*16) && (!downAt || now-downAt>=500000000)) {
             if(step>3) {--step;++downs;events|=2;}
             downAt=now; // a late window never catches up by dropping several levels

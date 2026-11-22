@@ -34,6 +34,36 @@ static void driveB(unsigned n=1,int deci=740) {
         tickB(deci);gHw.busyTicks+=A830_XO_HZ/10;dcvs.noteSubmit();dcvs.serviceTick(gEnv.now);
     }
 }
+/* gpu/daily4: the qualified ceiling at 660 (level 8) or 734 (level 9): the guard's ladder climbs to it when cool, its bus is
+ * Sm8750's default (6 at 660, 8 at 734), a hot reading steps down from it one level per 500 ms, and no other top is accepted. */
+static void bootTop(uint8_t top,uint32_t mhz) {
+    A830RecoveryOps ops=gRecoveryOps;ops.qualificationLowVote=lowVote;ops.qualificationQuiesce=quiesce;
+    ops.qualificationGxOff=[](void *) {return true;};
+    dcvs=A830Dcvs{};boot(ops);qual=A830Qualification{};qual.init(&power,&recovery,true,halt,false);
+    CHECK(qual.setTop(top) && qual.top()==top);
+    A830DcvsConfig c;c.qualification607=true;c.qualificationR3b=true;c.maxLevel=top;c.maxMhz=mhz;c.maxGiven=true;
+    c.initialLevel=1;c.initialBus=2;A830DcvsOps o=gDcvsOps;
+    o.qualificationFault=voteFault;o.qualificationService=lease;o.qualificationSample=sample;o.qualificationThermal=snapshot;
+    CHECK(dcvs.init(c,kTable,gIo,gPowerEnv,o,&power,&recovery,&tsens)==0);CHECK(dcvs.start()==0);
+}
+static void topLevels() {
+    CHECK(A830Qualification::defaultBus(3)==3 && A830Qualification::defaultBus(7)==6 && A830Qualification::defaultBus(8)==6 &&
+          A830Qualification::defaultBus(9)==8);
+    {A830Qualification q;CHECK(q.top()==7 && !q.setTop(6) && !q.setTop(10) && q.top()==7);}
+    const uint32_t mhz[2]={660,734};
+    for(uint8_t top=8;top<=9;++top) {
+        bootTop(top,mhz[top-8]);openB();
+        driveB(130);
+        CHECK(qual.thermal().step==top && dcvs.level()==top && power.qualificationCap()==top && !qual.reason());
+        driveB(40);
+        CHECK(qual.thermal().step==top && dcvs.level()==top);   /* never past it */
+        tickB(849);CHECK(qual.thermal().step==top-1 && !qual.reason());
+        driveB(5,849);CHECK(qual.thermal().step==top-2);
+        driveB(80,740);CHECK(qual.thermal().step==top);        /* cool again (the filter first): back up, one level per 2 s */
+    }
+    /* the default stays 607 */
+    bootB();openB();driveB(130);CHECK(qual.thermal().step==7 && dcvs.level()==7);
+}
 static void residencyBudget() {
     bootB(true);
     openB();
@@ -178,7 +208,7 @@ static void failuresB() {
 #define A830_R3B_ENTRY main
 #endif
 int A830_R3B_ENTRY() {
-    pureBoundaries();stepsAndBoard();failuresB();residencyBudget();
+    pureBoundaries();topLevels();stepsAndBoard();failuresB();residencyBudget();
     std::printf("PASS: R3b real policy/DCVS/power/recovery boundaries, thermal/board dwell, stale250/251, strict off/low M9/late ACK, independent105 halt, external/boost/wake/park (%u checks)\n",gChecks);
     return 0;
 }
