@@ -7,6 +7,10 @@
 //   bypass  the same VPIO unit with kAUVoiceIOProperty_BypassVoiceProcessing = 1: same devices, aggregate and resampling, no
 //           processing (the control)
 //   raw     no VPIO: one AUHAL unit on the default output device, one on the default input device (the second control)
+//   avrec   (mic-ns3) a plain recorder: AVAudioRecorder on the default input, no far end (FAR.wav ignored), 48 kHz into OUT.wav
+// --input UID (mic-ns3): that HAL device ("PianoMicNS" is "Mic (noise reduced)") as the system default input for the run, restored at
+// the end, as a user picks it in Sound settings for Voice Memos or FaceTime. --list: the HAL's devices (name, UID, input channels,
+// transport) and AVFoundation's audio capture devices (QuickTime Player's microphone menu).
 // It writes the recording (mono, 16 bit) and reports, like piano-hal-rec, frames, sample-time gaps, level and the share of exact
 // zeros: a process the microphone grant does not cover records zeros while the HAL runs IO, so a ~100 % zeros run is a TCC denial
 // or a muted path, never a result.
@@ -48,9 +52,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-enum Mode {MODE_VPIO, MODE_BYPASS, MODE_RAW};
+enum Mode {MODE_VPIO, MODE_BYPASS, MODE_RAW, MODE_AVREC};
 enum {kMaxSlice = 16384, kVpioSlice = 4096};
-static const char *const mode_names[] = {"vpio", "bypass", "raw"};
+static const char *const mode_names[] = {"vpio", "bypass", "raw", "avrec"};
 
 typedef struct {
     enum Mode mode;
@@ -264,6 +268,69 @@ static AudioObjectID default_device(int input)
     return AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, &id) ? kAudioObjectUnknown : id;
 }
 
+static void device_string(AudioObjectID id, AudioObjectPropertySelector sel, char *buf, size_t n);
+static long device_u32(AudioObjectID id, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope);
+
+// mic-ns3: the HAL's devices by UID, and the system default input set for one run (restored at the end).
+static AudioObjectID device_by_uid(const char *uid)
+{
+    const AudioObjectPropertyAddress a = {kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain};
+    CFStringRef u = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+    AudioObjectID id = kAudioObjectUnknown;
+    UInt32 size = sizeof id;
+    const OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof u, &u, &size, &id);
+    CFRelease(u);
+    return st ? kAudioObjectUnknown : id;
+}
+
+static OSStatus set_default_input(AudioObjectID id)
+{
+    const AudioObjectPropertyAddress a = {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain};
+    return AudioObjectSetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, sizeof id, &id);
+}
+
+static long input_channels(AudioObjectID id)
+{
+    const AudioObjectPropertyAddress a = {kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput,
+                                          kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(id, &a, 0, NULL, &size) || !size) return 0;
+    AudioBufferList *l = malloc(size);
+    long n = 0;
+    if (l && !AudioObjectGetPropertyData(id, &a, 0, NULL, &size, l))
+        for (UInt32 i = 0; i < l->mNumberBuffers; ++i) n += l->mBuffers[i].mNumberChannels;
+    free(l);
+    return n;
+}
+
+static void list_devices(void)
+{
+    const AudioObjectPropertyAddress a = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &size);
+    AudioObjectID ids[64];
+    if (size > sizeof ids) size = sizeof ids;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, ids)) size = 0;
+    for (UInt32 i = 0; i < size / sizeof ids[0]; ++i) {
+        char name[256], uid[256];
+        device_string(ids[i], kAudioObjectPropertyName, name, sizeof name);
+        device_string(ids[i], kAudioDevicePropertyDeviceUID, uid, sizeof uid);
+        const long t = device_u32(ids[i], kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal);
+        printf("hal-device id %u name \"%s\" uid \"%s\" input-channels %ld transport '%c%c%c%c' alive %ld\n", (unsigned)ids[i], name, uid,
+               input_channels(ids[i]), (char)(t >> 24), (char)(t >> 16), (char)(t >> 8), (char)t,
+               device_u32(ids[i], kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal));
+    }
+    @autoreleasepool {   // what QuickTime Player's microphone menu lists (AVFoundation's audio capture devices)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        for (AVCaptureDevice *d in [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio])
+            printf("av-device name \"%s\" uid \"%s\"\n", d.localizedName.UTF8String, d.uniqueID.UTF8String);
+#pragma clang diagnostic pop
+    }
+}
+
 static void device_string(AudioObjectID id, AudioObjectPropertySelector sel, char *buf, size_t n)
 {
     const AudioObjectPropertyAddress a = {sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -419,11 +486,61 @@ static int16_t *decimate(const int16_t *s, uint64_t n, unsigned m, uint64_t *fra
     return d;
 }
 
+// avrec: a plain recorder, as QuickTime Player or a simple app records: AVAudioRecorder on the system default input, 48 kHz mono
+// 16-bit linear PCM into OUT.wav, then the same summary line (read back from the file).
+static int avrec(double seconds, const char *out_path, const char *ready, const char *done, const char *stop)
+{
+    @autoreleasepool {
+        NSDictionary *settings = @{AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @48000.0, AVNumberOfChannelsKey: @1,
+                                   AVLinearPCMBitDepthKey: @16, AVLinearPCMIsFloatKey: @NO, AVLinearPCMIsBigEndianKey: @NO};
+        NSError *err = nil;
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        AVAudioRecorder *r = [[AVAudioRecorder alloc] initWithURL:url settings:settings error:&err];
+        if (!r) {printf("vpio-probe: avrec init failed: %s\n", err.localizedDescription.UTF8String); return 1;}
+        char in[256];
+        device_string(default_device(1), kAudioObjectPropertyName, in, sizeof in);
+        const BOOL prepared = [r prepareToRecord];
+        const BOOL started = [r recordForDuration:seconds];
+        const long long t0 = now_ms();
+        printf("vpio-probe: avrec input \"%s\" prepare %d record %d at %lld\n", in, prepared, started, t0);
+        if (!started) return 1;
+        if (ready) {FILE *f = fopen(ready, "w"); if (f) {fprintf(f, "ready %lld\n", t0); fclose(f);}}
+        while (r.recording && now_ms() - t0 < (long long)(seconds * 1000) + 5000) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+            if (exists(stop)) {[r stop]; break;}
+        }
+        if (r.recording) [r stop];
+    }
+    float *pcm = NULL;
+    uint64_t frames = 0;
+    double rate = 0;
+    if (load_wav(out_path, &pcm, &frames, &rate)) {printf("vpio-probe: avrec wrote no readable WAV\n"); return 1;}
+    double sum = 0, peak = 0;
+    uint64_t zeros = 0;
+    for (uint64_t i = 0; i < frames; ++i) {
+        const double v = pcm[i];
+        sum += v * v;
+        if (fabs(v) > peak) peak = fabs(v);
+        zeros += v == 0;
+    }
+    char summary[512];
+    snprintf(summary, sizeof summary, "vpio-probe: callbacks 0 frames %llu expected %.0f gaps 0 (largest 0 frames at 0.00 s) peak %.1f dBFS "
+             "rms %.1f dBFS zeros %.1f%% clipped 0 render-errors 0 (last 0) oversize 0 wav %s %.0f Hz %llu frames",
+             (unsigned long long)frames, seconds * rate, peak > 0 ? 20 * log10(peak) : -999.0,
+             frames && sum > 0 ? 10 * log10(sum / (double)frames) : -999.0, frames ? 100.0 * (double)zeros / (double)frames : 100.0,
+             out_path, rate, (unsigned long long)frames);
+    printf("%s\n", summary);
+    if (done) {FILE *f = fopen(done, "w"); if (f) {fprintf(f, "%s\n", summary); fclose(f);}}
+    free(pcm);
+    return 0;
+}
+
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s --tcc\n"
-                    "       %s vpio|bypass|raw SECONDS FAR.wav|none OUT.wav [--rate HZ] [--far-delay S] "
-                    "[--duck default|min|mid|max|unset] [--advanced-duck 0|1] [--agc 0|1] [--ready FILE] [--done FILE] [--stop FILE]\n",
+    fprintf(stderr, "usage: %s --tcc | --list\n"
+                    "       %s vpio|bypass|raw|avrec SECONDS FAR.wav|none OUT.wav [--rate HZ] [--far-delay S] "
+                    "[--duck default|min|mid|max|unset] [--advanced-duck 0|1] [--agc 0|1] [--input UID] [--ready FILE] [--done FILE] "
+                    "[--stop FILE]\n",
             argv0, argv0);
 }
 
@@ -438,15 +555,17 @@ int main(int argc, char **argv)
         printf("default_input=\"%s\" default_output=\"%s\"\n", in, out);
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "--list")) {list_devices(); return 0;}
     if (argc < 5) {usage(argv[0]); return 2;}
     Probe p;
     memset(&p, 0, sizeof p);
     if (!strcmp(argv[1], "vpio")) p.mode = MODE_VPIO;
     else if (!strcmp(argv[1], "bypass")) p.mode = MODE_BYPASS;
     else if (!strcmp(argv[1], "raw")) p.mode = MODE_RAW;
+    else if (!strcmp(argv[1], "avrec")) p.mode = MODE_AVREC;
     else {usage(argv[0]); return 2;}
     const double seconds = atof(argv[2]);
-    const char *far_path = argv[3], *out_path = argv[4], *ready = NULL, *done = NULL, *stop = NULL, *duck = "min";
+    const char *far_path = argv[3], *out_path = argv[4], *ready = NULL, *done = NULL, *stop = NULL, *duck = "min", *input_uid = NULL;
     double opt_rate = 0, far_delay = 0;
     int agc = -1, advanced = 0;
     for (int i = 5; i < argc; i += 2) {
@@ -460,6 +579,7 @@ int main(int argc, char **argv)
         else if (!strcmp(o, "--ready")) ready = v;
         else if (!strcmp(o, "--done")) done = v;
         else if (!strcmp(o, "--stop")) stop = v;
+        else if (!strcmp(o, "--input")) input_uid = v;
         else {usage(argv[0]); return 2;}
     }
     UInt32 duck_level = 0;
@@ -487,6 +607,23 @@ int main(int argc, char **argv)
            mode_names[p.mode], seconds, rate, far ? far_path : "none", (unsigned long long)far_frames, far_frames / rate, far_delay,
            duck, advanced, agc < 0 ? "unit-default" : agc ? "1" : "0");
     print_tcc("vpio-probe: tcc ");
+    // --input UID: that device as the system default input for this run (VPIO and AVAudioRecorder take the default), restored at exit
+    AudioObjectID previous_input = kAudioObjectUnknown;
+    if (input_uid) {
+        const AudioObjectID want = device_by_uid(input_uid);
+        if (want == kAudioObjectUnknown) {printf("vpio-probe: input %s: no such device\n", input_uid); return 1;}
+        previous_input = default_device(1);
+        const OSStatus dst = want == previous_input ? 0 : set_default_input(want);
+        for (int i = 0; i < 50 && default_device(1) != want; ++i) usleep(20000);
+        printf("vpio-probe: input %s device %u set-default rc %d now %u (was %u)\n", input_uid, (unsigned)want, (int)dst,
+               (unsigned)default_device(1), (unsigned)previous_input);
+        if (default_device(1) != want) return 1;
+    }
+    if (p.mode == MODE_AVREC) {
+        const int rc = avrec(seconds, out_path, ready, done, stop);
+        if (previous_input != kAudioObjectUnknown && previous_input != default_device(1)) set_default_input(previous_input);
+        return rc;
+    }
     const AudioObjectID din = default_device(1), dout = default_device(0);
     print_device("input", din, 1);
     print_device("output", dout, 0);
@@ -662,5 +799,9 @@ int main(int argc, char **argv)
         if (f) {fprintf(f, "%s\n", summary); fclose(f);}
     }
     free(p.rec); free(p.slice); free(far);
+    if (previous_input != kAudioObjectUnknown && previous_input != default_device(1)) {
+        const OSStatus r = set_default_input(previous_input);
+        printf("vpio-probe: default input restored to %u rc %d\n", (unsigned)previous_input, (int)r);
+    }
     return 0;
 }
