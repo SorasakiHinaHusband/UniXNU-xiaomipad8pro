@@ -6,7 +6,8 @@
 # white noise and silence, the tap's events), then the AudioServerPlugIn bundle out/piano-micns/PianoMicNS.driver: arm64 (the HAL's
 # driver service, com.apple.audio.Core-Audio-Driver-Service.helper, is arm64e and loads arm64 plug-ins), macOS 14, -Wall -Wextra
 # -Werror for this repository's files, RNNoise (third_party/rnnoise, BSD-3-Clause, unmodified) with its own warnings off, signed ad
-# hoc as a bundle (codesign: the Info.plist and the executable sealed; the driver service refuses an invalid signature). Prints the
+# hoc as a bundle (codesign: the Info.plist and the executable sealed; the driver service refuses an invalid signature), loaded the
+# way the driver service loads it (tests/plugin_host.c: signature check, CFPlugIn factory, the device's properties). Prints the
 # executable's CDHash (it goes into the trust cache with the userland layer) and writes out/piano-micns/build.json.
 #   environment: CC (default xcrun clang), PIANO_MICNS_WAV (optional: a recording, mono 16-bit 24/48 kHz, through micns_host --wav)
 set -euo pipefail
@@ -23,6 +24,9 @@ for f in "${RN[@]}"; do $CC "${RFLAGS[@]}" -c "$R/src/$f.c" -o "$T/rn-$f.o"; don
 $CC "${OURS[@]}" "$P/tests/micns_host.c" "$P/MicNsCore.c" "$T"/rn-*.o -lm -o "$T/micns_host"
 "$T/micns_host" || { echo "Error: PianoMicNS host tests failed" >&2; exit 1; }
 $CC -std=c11 -Wall -Wextra -Werror -I "$A" "$A/tests/tap_host.c" -o "$T/tap_host" && "$T/tap_host"
+$CC "${OURS[@]}" -DPIANO_MICNS_TEST_TAP "$P/tests/plugin_io_host.c" "$P/PianoMicNS.c" "$P/MicNsCore.c" "$T"/rn-*.o -framework CoreAudio \
+  -framework CoreFoundation -framework IOKit -lm -o "$T/plugin_io_host"
+"$T/plugin_io_host" || { echo "Error: PianoMicNS plugin_io_host failed" >&2; exit 1; }
 if [ -n "${PIANO_MICNS_WAV:-}" ]; then "$T/micns_host" --wav "$PIANO_MICNS_WAV" "$O/micns-host-out.wav"; fi
 # 2 the bundle: arm64, macOS 14
 ARCH=(-arch arm64 -mmacosx-version-min=14.0)
@@ -38,6 +42,9 @@ nm -u "$B/Contents/MacOS/PianoMicNS" | grep -q '_IOServiceOpen' || { echo "Error
 nm -g "$B/Contents/MacOS/PianoMicNS" | grep -q ' T _PianoMicNS_Create$' || { echo "Error: no factory symbol" >&2; exit 1; }
 codesign --force --sign - --timestamp=none "$B"
 codesign --verify --strict --verbose=1 "$B" 2>&1 | tail -1
+# 3 the signed bundle as the driver service loads it (signature check, CFPlugIn factory, the device's properties)
+$CC "${OURS[@]}" "$P/tests/plugin_host.c" -framework CoreAudio -framework CoreFoundation -framework Security -o "$T/plugin_host"
+"$T/plugin_host" "$B" || { echo "Error: PianoMicNS plugin_host failed" >&2; exit 1; }
 CDHASH=$(codesign -dvvv "$B" 2>&1 | sed -n 's/^CDHash=\([0-9a-f]*\)$/\1/p' | head -1)
 [ -n "$CDHASH" ] || { echo "Error: no CDHash" >&2; exit 1; }
 python3 - "$B" "$CDHASH" "$O/build.json" "$D" <<'PY'

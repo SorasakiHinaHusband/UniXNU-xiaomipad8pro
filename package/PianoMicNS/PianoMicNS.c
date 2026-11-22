@@ -48,9 +48,11 @@ static os_log_t gLog;
 static Float64 gHostTicksPerFrame;
 static UInt32 gIoUsers;
 static uint64_t gAnchorHost, gSeed;
+#ifndef PIANO_MICNS_TEST_TAP
 static io_connect_t gConnect;
 static mach_vm_address_t gTapAddress;
 static mach_vm_size_t gTapSize;
+#endif
 static const PianoTapHeader *gTap;
 static MicNs gCore;
 static int gCoreReady;
@@ -64,6 +66,15 @@ static uint64_t ticksNow(void) {return mach_absolute_time();}
 static double ticksToUs(uint64_t t) {return (double)t / (gHostTicksPerFrame * kRate) * 1e6;}   // ticks a second: per frame x rate
 
 // ---- The tap ---------------------------------------------------------------------------------------------------------------------
+#ifdef PIANO_MICNS_TEST_TAP
+// tests/plugin_io_host.c: the tap is the test's memory, the core runs in passthrough when it asks (the IO path's integrity is visible).
+extern const PianoTapHeader *piano_micns_test_tap;
+extern int piano_micns_test_bypass;
+static kern_return_t tapOpen(void) {gTap = piano_micns_test_tap; return gTap ? KERN_SUCCESS : kIOReturnNotFound;}
+static void tapClose(void) {gTap = NULL;}
+#define MICNS_BYPASS piano_micns_test_bypass
+#else
+#define MICNS_BYPASS 0
 static kern_return_t tapOpen(void) {
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceNameMatching(PIANO_TAP_SERVICE));
     if (!service) {os_log_error(gLog, "PianoMicNS: tap: no service %{public}s (PianoAudio level 10 with piano-audio-tap=1 not up yet?)", PIANO_TAP_SERVICE); return kIOReturnNotFound;}
@@ -92,6 +103,7 @@ static void tapClose(void) {
     IOServiceClose(gConnect);
     gConnect = 0; gTapAddress = 0; gTapSize = 0; gTap = NULL;
 }
+#endif
 
 static void report(const char *event) {
     const MicNsStats *s = &gCore.s;
@@ -117,7 +129,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
     (void)d;
     gHost = host;
     pthread_mutex_lock(&gLock);
-    if (!gCoreReady) gCoreReady = micns_init(&gCore, NULL, 0, ticksNow) == 0 ? 1 : -1;
+    if (!gCoreReady) gCoreReady = micns_init(&gCore, NULL, MICNS_BYPASS, ticksNow) == 0 ? 1 : -1;
     pthread_mutex_unlock(&gLock);
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceNameMatching(PIANO_TAP_SERVICE));
     if (service) IOObjectRelease(service);
