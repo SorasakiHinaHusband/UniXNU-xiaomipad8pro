@@ -10,6 +10,19 @@ class IOMemoryDescriptor;
 struct NativeAdrenoMemoryFailure {const char *stage="none";IOReturn status=0;};
 struct NativeAdrenoBackingTotals {uint64_t mapped,unmapped,imports,mapped_peak,allocs,frees;};
 struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
+/* UniXNU-piano (2026-11-22, gpu/daily3c, GPU-DAILY.md "gpu-daily3b result"): the GPU's metadata arrays (every BO's span list, the VM's
+ * range table and mapping records) come from kmem's shared data range (KHEAP_DATA_SHARED, IONewDataShareable), where the GPU's other
+ * kernel buffers and the BO pool are, not from the private one (IONewData: KHEAP_DATA_PRIVATE -> kalloc_large KMA_DATA ->
+ * KMEM_RANGE_ID_DATA_PRIVATE). On RAM boots the private range also carries the volatile Data disk (NativeRamBlock's IOMallocData
+ * chunks, up to 2 GiB) and decmpfs's page-in buffers; gpu-daily3b ran it out (span metadata NoMemory, decmpfs error 12, WindowServer
+ * died). Allocation and free must use the same heap: always through these two. */
+#if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
+#define NativeAdrenoNewMeta(type,count) IONewDataShareable(type,count)
+#define NativeAdrenoDeleteMeta(ptr,type,count) IODeleteDataShareable(ptr,type,count)
+#else
+#define NativeAdrenoNewMeta(type,count) IONewData(type,count)
+#define NativeAdrenoDeleteMeta(ptr,type,count) IODeleteData(ptr,type,count)
+#endif
 struct NativeAdrenoCpuState {
     uint64_t tcr,ttbr0,ttbr1,sctlr;
     uint64_t kernel_page_bytes,kernel_map_page_bytes;

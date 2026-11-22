@@ -132,11 +132,11 @@ IOReturn NativeAdrenoVm::attachCommon(const ArmSmmu4KIo *io,ArmSmmu4KContextConf
     if(lower && (context->lower!=&lower->arena->config || context->lower_tables!=&lower->state->tables))return kIOReturnBadArgument;
     if(upper && (context->upper!=&upper->arena->config || context->upper_tables!=&upper->state->tables))return kIOReturnBadArgument;
     if(!lock_ && !(lock_=lockAlloc()))return kIOReturnNoMemory;
-    ranges_=IONewData(ArmSmmu4KRange,capacity);
-    mappings_=IONewData(Mapping,NativeAdrenoVmMaxObjects);
+    ranges_=NativeAdrenoNewMeta(ArmSmmu4KRange,capacity);
+    mappings_=NativeAdrenoNewMeta(Mapping,NativeAdrenoVmMaxObjects);
     if(!ranges_ || !mappings_ || !index_.allocate()) {
-        if(ranges_)IODeleteData(ranges_,ArmSmmu4KRange,capacity);
-        if(mappings_)IODeleteData(mappings_,Mapping,NativeAdrenoVmMaxObjects);
+        if(ranges_)NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,capacity);
+        if(mappings_)NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);
         index_.release();lockFree(lock_);lock_=nullptr;ranges_=nullptr;mappings_=nullptr;
         return kIOReturnNoMemory;
     }
@@ -148,7 +148,7 @@ IOReturn NativeAdrenoVm::attachCommon(const ArmSmmu4KIo *io,ArmSmmu4KContextConf
     if(upper)regions_[1]=*upper;
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         if(NativeAdrenoBindSmmuVisibility(regions_[i].tables,&visibility_[i])!=kIOReturnSuccess) {
-            IODeleteData(ranges_,ArmSmmu4KRange,capacity_);IODeleteData(mappings_,Mapping,NativeAdrenoVmMaxObjects);index_.release();
+            NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,capacity_);NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);index_.release();
             regions_[0]={};regions_[1]={};ranges_=nullptr;mappings_=nullptr;capacity_=0;lockFree(lock_);lock_=nullptr;
             return kIOReturnBadArgument;
         }
@@ -218,7 +218,7 @@ IOReturn NativeAdrenoVm::detach()
     {
         VM_LOCKED;
         if(poisoned_ || objects_ || spanCount())return kIOReturnBusy;
-        IODeleteData(ranges_,ArmSmmu4KRange,capacity_);IODeleteData(mappings_,Mapping,NativeAdrenoVmMaxObjects);index_.release();
+        NativeAdrenoDeleteMeta(ranges_,ArmSmmu4KRange,capacity_);NativeAdrenoDeleteMeta(mappings_,Mapping,NativeAdrenoVmMaxObjects);index_.release();
         attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;kit_streams_=nullptr;has_programmer_=false;
         sync_after_map_=false;
         capacity_=0;ranges_=nullptr;mappings_=nullptr;stream_count_=0;window_count_=0;fence_=nullptr;

@@ -283,7 +283,7 @@ IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit,bool contigu
         const uint64_t physical=pool.physical+offset;
         if(physical>=limit || bytes>limit-physical) {poolGive(offset,bytes);}
         else {
-            spans_=IONewData(NativeAdrenoPhysicalSpan,1);
+            spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,1);
             if(!spans_) {poolGive(offset,bytes);return kIOReturnNoMemory;}
             span_capacity_=1;span_count_=1;spans_[0]={0,physical,bytes};
             mapping_=pool.virt+offset;bytes_=bytes;pooled_=true;pool_offset_=offset;prepared_=true;unzeroed_=true;
@@ -295,7 +295,7 @@ IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit,bool contigu
     /* UniXNU-piano: no single free extent holds it: several (poolTakeMany), when the BO may have more than one span. Such a BO has no
      * kernel mapping (mapping() is null: its zero fill goes by span, its views and the GPU's table take its spans). */
     else if(!contiguous && pool.physical<limit && pool.bytes<=limit-pool.physical) {
-        NativeAdrenoPhysicalSpan *pieces=IONewData(NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
+        NativeAdrenoPhysicalSpan *pieces=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
         if(!pieces)return kIOReturnNoMemory;
         size_t count=0;
         if(poolTakeMany(bytes,pieces,NativeAdrenoPoolMaxPieces,&count)) {
@@ -304,7 +304,7 @@ IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit,bool contigu
             native_adreno_pool_stats[1]=native_adreno_pool_stats[1]+1;
             return kIOReturnSuccess;
         }
-        IODeleteData(pieces,NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
+        NativeAdrenoDeleteMeta(pieces,NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
     }
 #endif
     native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
@@ -392,7 +392,7 @@ IOReturn NativeAdrenoMemory::allocateBacking(size_t bytes,unsigned bits,bool con
         descriptor_->getLength()!=bytes)goto failed;
     failure_.stage="span-metadata";
     span_capacity_=bytes/4096;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
+    spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {status=kIOReturnNoMemory;goto failed;}
     failure_.stage="physical-spans";
     for(size_t offset=0;offset<bytes;offset+=4096) {
@@ -488,7 +488,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     native_adreno_import_stage=17;
     failure_.stage="import-span-metadata";
     span_capacity_=bytes/4096;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
+    spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {status=kIOReturnNoMemory;goto failed;}
     failure_.stage="import-physical-spans";
     for(size_t offset=0;offset<bytes;offset+=4096) {
@@ -514,13 +514,13 @@ IOReturn NativeAdrenoMemory::importDevice(IOMemoryDescriptor *scanout,uint64_t o
     if(!scanout || (offset&4095) || !bytes || (bytes&4095) || offset>UINT64_MAX-bytes || bytes>NativeAdrenoMemoryMaxBytes ||
         offset+bytes>(uint64_t)scanout->getLength())return kIOReturnBadArgument;
     span_capacity_=bytes/4096;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
+    spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {span_capacity_=0;return kIOReturnNoMemory;}
     for(size_t at=0;at<bytes;at+=4096) {
         IOByteCount length=0;
         const addr64_t physical=scanout->getPhysicalSegment(offset+at,&length,kIOMemoryMapperNone);
         if(!physical || (physical&4095) || length<4096 || physical>UINT64_MAX-4096) {
-            IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+            NativeAdrenoDeleteMeta(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
             spans_=nullptr;span_count_=span_capacity_=0;
             return kIOReturnUnsupported;
         }
@@ -591,7 +591,7 @@ IOReturn NativeAdrenoMemory::release()
         __atomic_fetch_add(&backingFrees,1ull,__ATOMIC_RELAXED);accounted_=false;
     }
     unmapped_=false;write_combined_=false;
-    if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+    if(spans_)NativeAdrenoDeleteMeta(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
     return kIOReturnSuccess;
 }
