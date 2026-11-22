@@ -50,8 +50,8 @@ CHECK=60      # s after a transition: one crash check (a tick)
 # class C (SLIM-LIST.md section 3): "MODE DOMAIN LABEL PROCESS" per line; MODE bg (taskpolicy) or unload (bootout/bootstrap);
 # DOMAIN system or gui (the console user's session). EMPTY by decision: dasd defers the services of SLIM-LIST.md section 2.
 PAUSE=''
-# class A (SLIM-LIST.md section 2, always off: the install's persistent disable): never touched here, also not as a test entry
-NEVER='com.apple.watchdogd com.apple.security.xprotectd com.apple.mobileactivationd com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.AppSSODaemon com.apple.filesystems.fskitd com.apple.passd'
+# class A (SLIM-LIST.md sections 2 and 5, always off: the install's persistent disable): never touched here, also not as a test entry
+NEVER='com.apple.watchdogd com.apple.security.xprotectd com.apple.mobileactivationd com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.AppSSODaemon com.apple.filesystems.fskitd com.apple.passd com.apple.routined'
 
 say() { logger -t piano-policy-agent "$*" 2>/dev/null; slog "$*"; }
 

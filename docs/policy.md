@@ -140,8 +140,12 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
 ### 4.1 The power state of background services (slim, 2026-11-22)
 
 The static list of services turned off on piano was the VM-era Data-seed trim (a 4 GiB 27.0.1 guest); natively only the labels with
-native evidence stay off (class A: watchdogd, xprotectd, mobileactivationd, PerfPowerServices, cryptexd, passd; AppSSODaemon and
-fskitd until their retest). The others are enabled again by an install step, and the agent adds a power state on top:
+native evidence stay off (class A: watchdogd, xprotectd, mobileactivationd, PerfPowerServices, cryptexd, passd, AppSSODaemon,
+routined; fskitd until a retest of its own). The RAM boot slim-dyn1 (2026-11-22) measured them on 27.3: PerfPowerServices 100 % of a
+core, xprotectd exit 1 in a respawn loop, AppSSODaemon SIGABRT every 10 s once the login window asks for it (the login did not
+complete), routined an on-demand respawn every ~10 s (exit 0). Siri.agent is Apple's: its override follows the Siri setting
+(disabled while Siri is off, as on any Mac). The other 33 user and 8 system services are enabled again by an install step, and the
+agent adds a power state on top:
 - **States.** Normal: on power with Low Power Mode off, or High Power on battery. Save: Low Power Mode on, or on battery outside
   High Power. The power source is `com.apple.system.powersources.source` (read with `pmset -g ps`), the modes the two notify names
   above. Save is applied after 30 s of a stable wish (PD renegotiation, fast-charge flaps) and never before 120 s of uptime;

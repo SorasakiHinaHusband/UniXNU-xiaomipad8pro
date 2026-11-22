@@ -134,6 +134,7 @@ bg gui com.apple.knowledge-agent knowledge-agent
 unload gui com.apple.tipsd tipsd
 unload system com.apple.msrpc.wkssvc wkssvc
 bg system com.apple.watchdogd watchdogd
+unload gui com.apple.routined routined
 '''
 
 
@@ -245,6 +246,8 @@ class AgentTests(unittest.TestCase):
             self.assertIn('launchctl bootout system/com.apple.msrpc.wkssvc', c)
             self.assertNotIn('taskpolicy -b -p 50', c)
             self.assertIn('entry refused (test: bg system com.apple.watchdogd): class A', rig.log())
+            self.assertIn('entry refused (test: unload gui com.apple.routined): class A', rig.log())
+            self.assertNotIn('com.apple.routined', rig.calls())
             self.assertEqual(sorted(a[3] for a in rig.applied()), ['com.apple.knowledge-agent', 'com.apple.msrpc.wkssvc', 'com.apple.tipsd'])
             self.assertTrue(all(a[0] == '0A1B2C3D-0001' for a in rig.applied()))
             m = rig.load()
