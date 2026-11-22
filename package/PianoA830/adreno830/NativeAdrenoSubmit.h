@@ -27,6 +27,31 @@ enum : uint32_t {
     NativeAdrenoSubmitSharedJobs=NativeAdrenoSubmitJobs-NativeAdrenoSubmitRanges,
     NativeAdrenoSubmitRetryLimitUs=200000,                 /* the longest in-kernel wait for ring space (ARCHITECTURE 5.4) */
     NativeAdrenoSubmitHistory=64,                          /* fences whose client range is remembered (page-fault attribution) */
+    /* UniXNU-piano (2026-11-22, test only): the hold packet in front of a held job (armHold): CP_WAIT_TIMESTAMP (header + 4) on the
+     * memptrs word at NativeAdrenoSubmitHoldOffset, which nothing writes (0), waited for >= 1. */
+    NativeAdrenoSubmitHoldWords=5,
+    NativeAdrenoSubmitHoldOffset=0x800,
+    /* A job's packets as the ring got them (kept for a recovery's replay): one CP_INDIRECT_BUFFER (4 words) per buffer, the hold. */
+    NativeAdrenoSubmitJobWords=NativeAdrenoSubmitMaxBuffers*4+NativeAdrenoSubmitHoldWords,
+};
+/* UniXNU-piano (2026-11-22, private 20261122-render/ANALYSIS.md "ONE change"): a recovery's plan for the jobs in flight, made once the GPU
+ * stopped (NativeAdrenoSubmit::plan). Replay (the behaviour of Linux msm recover_worker): the jobs the CP passed retire, the job the CP
+ * stood in (fence done + 1) is the culprit when the cause is a client's (charge): its fence counts as completed (restart = its fence)
+ * and only its range is faulted; every other job in flight is replayed with its own fence (replay()). FailAll (the behaviour before):
+ * restart = the last fence issued, every range with a job in flight is faulted and every job dropped; taken when the submit object is
+ * poisoned, when a fence in (restart, issued] has no job here (a kernel submission: nothing could complete it), or when the jobs would
+ * not fit the empty ring again. */
+enum : uint8_t {NativeAdrenoSubmitPlanNone,NativeAdrenoSubmitPlanReplay,NativeAdrenoSubmitPlanFailAll};
+enum : uint8_t {NativeAdrenoSubmitFallbackNone,NativeAdrenoSubmitFallbackPoisoned,NativeAdrenoSubmitFallbackGap,
+                NativeAdrenoSubmitFallbackRoom};
+struct NativeAdrenoSubmitPlan {
+    uint8_t mode,fallback;
+    uint32_t done,issued,restart;          /* the CP's completed fence at the plan, the last issued, the fence the CP restarts at */
+    uint32_t culprit_range,culprit_fence;  /* UINT32_MAX / 0: no culprit */
+    uint32_t retired,failed,replay_jobs,replay_words;
+    uint32_t first_replay,last_replay;     /* fences of the first and last job replayed (0: none) */
+    NativeAdrenoRangeMask fault_ranges,replay_ranges;
+    uint8_t replay_count[NativeAdrenoSubmitRangeCount];   /* jobs replayed per range */
 };
 /* Bit r of a range mask (r < NativeAdrenoSubmitRanges). */
 static inline NativeAdrenoRangeMask NativeAdrenoRangeBit(uint32_t range) {return NativeAdrenoRangeMask(1)<<range;}
@@ -49,6 +74,8 @@ struct NativeAdrenoSubmitStats {
     uint32_t submissions,completed,timeouts,poisoned_jobs;
     uint32_t busy,retries,abandoned,sweeps;   /* Busy answers, NativeAdrenoSubmitRetry answers, jobs dropped by recover(), on-demand retires */
     size_t references_held,references_retired,peak_jobs;
+    /* UniXNU-piano (2026-11-22): jobs replayed by recoveries, culprit jobs skipped, plans that fell back to failing every job, holds. */
+    uint32_t replayed,skipped,fallbacks,holds;
 };
 #ifdef ADRENO830_MACOS
 /* UniXNU-piano (2026-11-21, 20261121-ws-crash: "WindowServer slot 0 Submit -> BadArgument" said nothing of which check refused): why a
@@ -101,6 +128,9 @@ class NativeAdrenoSubmit final {
         uint32_t count=0;
         bool active=false;
         uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
+        /* UniXNU-piano (2026-11-22): what the ring got (packets, the client's GPU context, the source), for a recovery's replay. */
+        uint32_t word_count=0,context=0,source=0;
+        uint32_t words[NativeAdrenoSubmitJobWords]{};
     } jobs_[NativeAdrenoSubmitJobs];
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
@@ -109,7 +139,15 @@ class NativeAdrenoSubmit final {
     bool attached_=false,poisoned_=false,halted_=false;
     /* submit()'s distinct buffers and ring words, used under the Ring lock: too large for the kernel stack at 128 IBs */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
-    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
+    uint32_t scratch_words_[NativeAdrenoSubmitJobWords]{};
+    /* UniXNU-piano (2026-11-22): the ranges whose next submission is held (armHold), the fence of the last held job; the plan of the
+     * running recovery (plan() to replay()). Under the Ring lock. */
+    NativeAdrenoRangeMask hold_ranges_=0;
+    uint32_t held_fence_=0;
+    NativeAdrenoSubmitPlan plan_{};
+    /* The active jobs in fence order after `from` (sequence numbers), into order[]; returns how many. */
+    uint32_t orderLocked(uint32_t from,uint32_t *order) const;
+    void dropAllLocked(NativeAdrenoRangeMask *ranges,IOReturn *result);
     /* The client range of the latest NativeAdrenoSubmitHistory fences this object issued, at fence % NativeAdrenoSubmitHistory:
      * fence | range << 32 | 1 << 63 (0: none). Written and read under the Ring lock; kept across completion and recovery. */
     uint64_t history_[NativeAdrenoSubmitHistory]{};
@@ -198,6 +236,22 @@ public:
     void resume();
     bool halted() const {return __atomic_load_n(&halted_,__ATOMIC_ACQUIRE);}
     IOReturn recover(NativeAdrenoRangeMask *abandoned_ranges);
+    /* UniXNU-piano (2026-11-22, replay; NativeAdrenoSubmitPlan above). plan(): once the GPU stopped (no fence moves any more), while
+     * halted: the jobs the CP passed retire, the culprit is found (charge: the job at the completed fence + 1, never a kernel fence) and
+     * *out says what the restart does; nothing is dropped yet. replay(): after the CP restarted at out->restart (NativeAdrenoRing::
+     * recover(last, &restart), CP_ME_INIT, the secure resume): Replay retires the culprit's job (its fence passed) and puts every
+     * other job into the ring again in fence order with its own fence and context (NativeAdrenoRing::replayFramed); FailAll drops
+     * every job as recover() does. *replayed gets the jobs resubmitted. An error leaves the object poisoned (the device is lost then).
+     * Both refused (NotReady) while not attached; replay() without a plan is recover(). */
+    IOReturn plan(bool charge,NativeAdrenoSubmitPlan *out);
+    IOReturn replay(uint32_t *replayed);
+    /* UniXNU-piano (2026-11-22, test only: piano-gpu-fault-test=1, machdep.piano_gpu_fault_hold): the next submission of any range in
+     * ranges starts with the hold packet (NativeAdrenoSubmitHoldWords): the CP stops in that job for good, a real hang whose culprit
+     * is known (the watchdogs find it, the recovery skips it). One shot: the first held submission disarms every range. 0 disarms.
+     * Unsupported when the memptrs page has no room for the hold word. */
+    IOReturn armHold(NativeAdrenoRangeMask ranges);
+    NativeAdrenoRangeMask holdArmed() const;
+    uint32_t heldFence() const;
     bool poisoned() const {return poisoned_;}
     size_t outstanding() const;
     NativeAdrenoSubmitStats stats() const {return stats_;}

@@ -202,6 +202,7 @@ struct Published {
     uint32_t opened=0,closed=0;
     uint32_t lost=0;          /* the A830Reason of a permanent device loss; 0 while serving */
     uint32_t recovering=0;    /* between native_adreno_recovery_begin and _end */
+    uint32_t replaying=0;     /* UniXNU-piano: between native_adreno_recovery_begin_replay and _end (the replay released the jobs) */
     NativeAdrenoSlotLog slot_log{};   /* the slot refusal line's rate limit */
     char slot_line[NativeAdrenoSlotLineBytes]{};   /* that line: too long for a stack; under g.lock */
     bool past_4g_noted=false;  /* notePast4G wrote its line */
@@ -1640,15 +1641,143 @@ extern "C" void native_adreno_recovery_begin(bool charge_culprit)
     boot_progress_gpu_event(line);
 #endif
 }
+/* UniXNU-piano (2026-11-22, the replay): the ranges' connections get faults += 1 (range 0 without a user connection is the kernel
+ * client's), under g.lock; whether any connection was faulted. */
+static bool faultRangesLocked(NativeAdrenoRangeMask ranges)
+{
+    bool any=false;
+    for(unsigned s=0;s<NativeAdrenoMaxClients;++s)
+        if(ranges&NativeAdrenoRangeBit(s))if(CoreBox *box=slotBox(s)) {box->status.noteFault();any=true;}
+    if((ranges&1u) && !slotBox(0)) {
+        if(g.kernel_client && g.kernel_client->box()) {g.kernel_client->box()->status.noteFault();any=true;}
+        else if(g.kernel_orphan) {g.kernel_orphan->status.noteFault();any=true;}
+    }
+    return any;
+}
+/* The hang charge of a recovery's culprit (native_adreno_hang_culprits, the name's NativeAdrenoClientHangLimit count), under g.lock. */
+static void chargeCulpritLocked(bool charge_culprit,uint32_t culprit)
+{
+    if(!charge_culprit)native_adreno_hang_culprits[4]=native_adreno_hang_culprits[4]+1;
+    else if(culprit>=NativeAdrenoMaxClients)native_adreno_hang_culprits[2]=native_adreno_hang_culprits[2]+1;
+    else {
+        native_adreno_hang_culprits[3]=culprit;
+        CoreBox *box=culprit?slotBox(culprit):nullptr;
+        if(box && !isRenderServer(box->name,sizeof box->name)) {
+            native_adreno_hang_culprits[0]=native_adreno_hang_culprits[0]+1;
+            if(NativeAdrenoClientRecord *record=clientRecord(box->name))record->hangs=record->hangs+1;
+        } else native_adreno_hang_culprits[1]=native_adreno_hang_culprits[1]+1;
+    }
+}
+extern "C" void native_adreno_recovery_begin_replay(void)
+{
+    __atomic_store_n(&g.recovering,1u,__ATOMIC_RELEASE);
+    native_adreno_fault_stats[3]=native_adreno_fault_stats[3]+1;
+    if(!g.published)return;
+    /* Halt first, under the ring lock: from here no submission reaches the ring. Nobody is faulted yet: the plan, once the GPU
+     * stopped, knows the job the CP stood in. */
+    NativeAdrenoRangeMask ranges=0;
+    uint32_t oldest=UINT32_MAX;
+    g.submit->halt(&ranges,&oldest);
+    __atomic_store_n(&g.replaying,1u,__ATOMIC_RELEASE);
+}
+extern "C" uint32_t native_adreno_recovery_plan(bool charge_culprit,uint32_t *restart)
+{
+    if(!g.published || !__atomic_load_n(&g.replaying,__ATOMIC_ACQUIRE))return 0;
+    NativeAdrenoSubmitPlan plan{};
+    if(g.submit->plan(charge_culprit,&plan)!=kIOReturnSuccess)return 0;
+    if(restart)*restart=plan.restart;
+    IOLockLock(g.lock);
+    chargeCulpritLocked(charge_culprit,plan.culprit_fence?plan.culprit_range:UINT32_MAX);
+    const bool any=faultRangesLocked(plan.fault_ranges);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: who the recovery charges, who is faulted (those processes see their device lost) and whose jobs are replayed (they
+     * keep their device and their frames); at most two recoveries a minute (A830Recovery), so no rate limit. */
+    char line[240];
+    {
+        const CoreBox *culprit=plan.culprit_fence && plan.culprit_range<NativeAdrenoMaxClients?slotBox(plan.culprit_range):nullptr;
+        int at=snprintf(line,sizeof line,"recovery: %s",!charge_culprit?"the driver's own fault, nobody charged":
+            !plan.culprit_fence?"nothing in flight":culprit && !isRenderServer(culprit->name,sizeof culprit->name)?"culprit":
+            "in the render server's or the kernel's job");
+        if(plan.culprit_fence && at>0 && size_t(at)<sizeof line)
+            at+=snprintf(line+at,sizeof line-size_t(at)," slot %u %s fence %u",plan.culprit_range,culprit?culprit->name:"(kernel)",
+                plan.culprit_fence);
+        if(plan.mode==NativeAdrenoSubmitPlanFailAll) {
+            static const char *const why[]={"","the submit object is poisoned","a fence in flight is not a client's job",
+                                            "the jobs do not fit the ring again"};
+            if(at>0 && size_t(at)<sizeof line)
+                at+=snprintf(line+at,sizeof line-size_t(at),"; no replay (%s): jobs in flight fail:",why[plan.fallback<4?plan.fallback:0]);
+            for(unsigned s=0;s<NativeAdrenoMaxClients && at>0 && size_t(at)<sizeof line;++s)
+                if(plan.fault_ranges&NativeAdrenoRangeBit(s))
+                    if(const CoreBox *box=slotBox(s))at+=snprintf(line+at,sizeof line-size_t(at)," %u:%s",s,box->name);
+        } else {
+            if(at>0 && size_t(at)<sizeof line)
+                at+=snprintf(line+at,sizeof line-size_t(at),"; faulted %u; jobs in flight replayed: %u (fences %u-%u):",plan.failed,
+                    plan.replay_jobs,plan.first_replay,plan.last_replay);
+            for(unsigned s=0;s<NativeAdrenoMaxClients && at>0 && size_t(at)<sizeof line;++s)
+                if(plan.replay_ranges&NativeAdrenoRangeBit(s)) {
+                    const CoreBox *box=slotBox(s);
+                    at+=snprintf(line+at,sizeof line-size_t(at)," %u:%s x%u",s,box?box->name:s?"(closed)":"(kernel)",
+                        unsigned(plan.replay_count[s]));
+                }
+        }
+    }
+#endif
+    IOLockUnlock(g.lock);
+    if(any)adreno830_status_add32(&adreno830_status.faults,1);
+#ifdef ADRENO830_MACOS
+    boot_progress_gpu_event(line);
+#endif
+    return plan.failed;
+}
+extern "C" IOReturn native_adreno_recovery_replay(uint32_t *replayed)
+{
+    if(replayed)*replayed=0;
+    if(!g.published || !__atomic_load_n(&g.replaying,__ATOMIC_ACQUIRE))return kIOReturnSuccess;
+    const uint64_t began=nowUs();
+    uint32_t count=0;
+    const IOReturn status=g.submit->replay(&count);
+    if(replayed)*replayed=count;
+    /* The fence watchdog learns of the replayed work (a replayed job that hangs again is a hang like any other). */
+    if(status==kIOReturnSuccess && count)if(A830Fence *fence=A830Fence::instance())fence->submitted(g.ring->lastSubmitted());
+#ifdef ADRENO830_MACOS
+    char line[160];
+    const NativeAdrenoSubmitStats stats=g.submit->stats();
+    snprintf(line,sizeof line,"recovery replay: %u job%s resubmitted in %llu us (%#x); so far replayed %u, culprit jobs skipped %u, "
+        "no-replay plans %u",count,count==1?"":"s",(unsigned long long)(nowUs()-began),unsigned(status),stats.replayed,stats.skipped,
+        stats.fallbacks);
+    boot_progress_gpu_event(line);
+#endif
+    return status;
+}
+#ifdef ADRENO830_MACOS
+extern "C" unsigned native_adreno_fault_hold(int pid,char *name)
+{
+    if(name)name[0]=0;
+    if(!__atomic_load_n(&g.published,__ATOMIC_ACQUIRE) || !g.lock || pid<=0)return 0;
+    NativeAdrenoRangeMask ranges=0;
+    unsigned connections=0;
+    IOLockLock(g.lock);
+    for(unsigned s=0;s<NativeAdrenoMaxClients;++s)
+        if(g.slots[s].connection)if(CoreBox *box=slotBox(s))if(box->pid==pid) {
+            ranges|=NativeAdrenoRangeBit(s);++connections;
+            if(name)strlcpy(name,box->name,20);
+        }
+    IOLockUnlock(g.lock);
+    if(!connections || g.submit->armHold(ranges)!=kIOReturnSuccess)return 0;
+    return connections;
+}
+#endif
 extern "C" void native_adreno_recovery_end(bool recovered)
 {
+    const bool replayed=__atomic_exchange_n(&g.replaying,0u,__ATOMIC_ACQ_REL)!=0;
     if(!g.published) {
         if(!recovered)native_adreno_device_lost(A830ReasonHang);
         __atomic_store_n(&g.recovering,0u,__ATOMIC_RELEASE);
         return;
     }
-    if(recovered) {
-        /* The GPU was power cycled and the ring restarted: nothing of the outstanding jobs runs any more, so their references go. */
+    if(recovered && !replayed) {
+        /* The GPU was power cycled and the ring restarted: nothing of the outstanding jobs runs any more, so their references go.
+         * (A replaying recovery's replay op released the culprit's job and put the others into the ring again.) */
         NativeAdrenoRangeMask abandoned=0;
         if(g.submit->recover(&abandoned)!=kIOReturnSuccess)recovered=false;
     }

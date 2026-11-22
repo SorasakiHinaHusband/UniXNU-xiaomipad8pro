@@ -327,9 +327,10 @@ public:
     /* The GPU bring-up shared with the recovery (mutex held): optional CX power-on, SMMU/timer restore after a
      * collapse, GMU start (S4/S5), CP start (S6, memptrs fence = last submitted), secure resume (S7), interrupt lines.
      * Leaves the phase alone. *step is the A830WakeStep* reached (the failing one on error), *subStep the operation's
-     * own step; progress (may be null) is called as each step begins. */
+     * own step; progress (may be null) is called as each step begins. UniXNU-piano (2026-11-22): restart (optional; the recovery's
+     * replay plan) is the memptrs fence S6 restarts at instead of the last submitted one. */
     IOReturn bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t *step,uint16_t *subStep,
-                     void (*progress)(void *context,uint16_t step),void *progressContext);
+                     void (*progress)(void *context,uint16_t step),void *progressContext,const uint32_t *restart=nullptr);
 
 private:
     IOReturn wakeLocked(A830WakeReason reason);

@@ -19,7 +19,12 @@
  *   interrupt lines and the storm-guarded ones re-enabled (armcpu_spi_enable) -> gate open, "GPU RUN".
  * The SMMU contexts are not touched while CX stayed up. A failed recovery, or the 3rd report within 60 s, makes the
  * loss permanent: the gate stays closed (newUserClient refuses, every connection is faulted), "GPU LOST" stays.
- * In-flight jobs are failed, not replayed (design 4.13.4).
+ * In-flight jobs are failed, not replayed (design 4.13.4) -- unless the replay ops are there (UniXNU-piano 2026-11-22, private
+ * 20261122-render/ANALYSIS.md; Linux msm recover_worker is the behaviour reference): then nobody is faulted at the gate; once the GMU
+ * is forced off the plan op names the culprit (a client's cause only: the job the CP stood in), faults its connection alone and
+ * gives the fence S6 restarts at (the culprit's job counts as completed); after S7 and the interrupt restore the replay op puts
+ * every other job in flight into the ring again, with its own fence, before the gate opens. Innocent clients (WindowServer first)
+ * keep their device and their frames. adreno830_recovery_set_replay(0) (piano-gpu-recovery-replay=0) restores the old behaviour.
  *
  * report() may be called from any context, interrupt context included (two atomics and env.wake); the recovery itself
  * runs on the service thread (A830Dcvs owns it) or synchronously through recover() (S8 self-test timeout, tests). */
@@ -75,6 +80,15 @@ struct A830RecoveryOps {
     IOReturn (*readPipe)(void *context,uint8_t pipe,uint32_t reg,uint32_t *value);
     /* A830Cp/A830Smmu: per-pipe CP fault registers, CB0/CB2 FSR/FAR into the snapshot (may be null). */
     void (*snapshot)(void *context,A830HangSnapshot *snapshot);
+    /* UniXNU-piano (2026-11-22): the replay (both or neither; neither = every job in flight fails, as before). plan, once the GPU
+     * stopped (after the GMU was forced off, before S4): the jobs the CP passed retire; for a cause a client's job can produce
+     * (A830FaultBlamesClient) the job right after the completed fence is the culprit: its connection alone gets faults++ (and a hang
+     * against its name); *restart gets the fence S6 restarts at (the culprit's, else the completed one; the last submitted one when
+     * the plan falls back to failing every job). Returns the jobs that will not run again. replay, after S7, the fence signal and the
+     * interrupt restore: every other job in flight goes into the ring again in fence order with its own fence; *replayed the jobs
+     * resubmitted. An error makes the loss final. */
+    uint32_t (*plan)(void *context,uint8_t cause,uint32_t *restart);
+    IOReturn (*replay)(void *context,uint32_t *replayed);
     /* R3b runs these under the power mutex. The vote must prove a new 160 MHz / bus 2 ACK. */
     IOReturn (*qualificationLowVote)(void *context,bool dropAck)=nullptr;
     IOReturn (*qualificationQuiesce)(void *context)=nullptr;
@@ -84,6 +98,7 @@ struct A830RecoveryOps {
 
 struct A830RecoveryConfig {
     bool enabled=true;              /* M10: a global loss is recovered first; false = M7-M9 behaviour (loss is final) */
+    bool replay=true;               /* the replay ops are used (and adreno830_recovery_set_replay did not turn it off) */
     uint32_t windowMs=60000;        /* the 3rd report within this window is final */
     uint8_t maxInWindow=2;          /* recoveries allowed within the window */
     uint32_t watchdogPeriodMs=500;  /* progress check period while work is in flight */
@@ -98,7 +113,12 @@ struct A830RecoveryStats {
     uint16_t lostStep;
     IOReturn lostResult;
     uint32_t gbifTimeouts;
+    /* UniXNU-piano (2026-11-22): recoveries that replayed (the replay ops ran), jobs replayed, gate-to-open time of the last and the
+     * longest recovery in microseconds. */
+    uint32_t replayRecoveries,jobsReplayed,lastUs,maxUs;
 };
+/* The step a failed replay is lost at (stage S6, A830Recovery::recoverLocked): after A830WakeStepIrq. */
+enum : uint16_t {A830RecoveryStepReplay=0x18};
 
 class A830Recovery {
 public:
@@ -120,6 +140,9 @@ public:
     bool watchdogTick(uint64_t now);
     bool lost() const {return __atomic_load_n(&lost_,__ATOMIC_ACQUIRE);}
     bool busy() const {return __atomic_load_n(&running_,__ATOMIC_ACQUIRE);}   /* a recovery is running */
+    /* The running (or last) recovery replays: decided once at its start (config, ops, adreno830_recovery_set_replay). The gate op
+     * reads it to halt the shell without faulting anybody. */
+    bool replaying() const {return __atomic_load_n(&replaying_,__ATOMIC_ACQUIRE);}
     const A830HangSnapshot &snapshot() const {return snapshot_;}
     const A830RecoveryStats &stats() const {return stats_;}
     const A830RecoveryConfig &config() const {return config_;}
@@ -177,7 +200,7 @@ private:
     A830RecoveryStats stats_{};
     uint8_t pendingCause_=A830FaultNone;
     uint64_t pendingDetail_=0;
-    bool lost_=false,running_=false,initialized_=false;
+    bool lost_=false,running_=false,initialized_=false,replaying_=false;
     bool qualification_=false,qualificationClosed_=false,qualificationR3b_=false,daily_=false;
     bool strictMode() const {return qualificationR3b_ && !daily_;}
     bool closesQualification(uint8_t cause) const {return qualification_ && !(daily_ && A830FaultBlamesClient(cause));}
@@ -201,6 +224,12 @@ extern "C" {
 void adreno830_recovery_report(uint8_t cause,uint64_t detail);
 /* 0 open, 1 recovering, 2 lost (A830Gate): what the ABI shell checks before a submission or a new connection. */
 uint8_t adreno830_recovery_gate(void);
+/* UniXNU-piano (2026-11-22): 1 (the default) the recoveries replay the jobs of innocent clients, 0 every job in flight fails as before
+ * (piano-gpu-recovery-replay=0, machdep.piano_gpu_recovery_replay: an A/B switch). Read at each recovery's start; any context. */
+void adreno830_recovery_set_replay(uint32_t on);
+uint32_t adreno830_recovery_replay_mode(void);
+/* The running device's recovery counters (false before init): machdep.piano_gpu_recovery. */
+bool adreno830_recovery_stats(A830RecoveryStats *out);
 #ifdef ADRENO830_MACOS
 /* UniXNU-piano (macOS 27): the hang verdict's snapshot on the console (NativeAdrenoPublish.cpp; a weak no-op in A830Recovery.cpp),
  * called by the orchestrator's snapshot hook once the CP pipe and SMMU registers are in. Thread context (the recovery's). */

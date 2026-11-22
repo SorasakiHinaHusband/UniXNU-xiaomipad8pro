@@ -6,6 +6,7 @@
 namespace {
 constexpr uint64_t NsPerMs=1000000;
 A830Recovery *gRecovery;
+uint32_t gReplayWanted=1;   /* adreno830_recovery_set_replay */
 
 constexpr uint32_t gpuReg(uint32_t dword) {return A830_GPU_REG_BYTE(dword);}
 constexpr uint32_t gmuReg(uint32_t dword) {return A830_GMU_REG_BYTE(dword);}
@@ -42,11 +43,12 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
     if(!ops.gmuForceOff || !ops.gmuStart || !ops.cpStart || !ops.secureResume || !ops.lastSubmitted || !ops.retired)
         return kIOReturnBadArgument;
     if(!recoveryOps.failInflight || !recoveryOps.gate)return kIOReturnBadArgument;
+    if(!recoveryOps.plan!=!recoveryOps.replay)return kIOReturnBadArgument;   /* the replay ops come as a pair */
     if(!config.windowMs || !config.watchdogPeriodMs || config.watchdogLimitMs<config.watchdogPeriodMs || !config.gbifTimeoutUs)
         return kIOReturnBadArgument;
     config_=config;io_=io;env_=env;ops_=ops;rops_=recoveryOps;power_=power;
     snapshot_={};stats_={};
-    pendingCause_=A830FaultNone;pendingDetail_=0;lost_=running_=false;
+    pendingCause_=A830FaultNone;pendingDetail_=0;lost_=running_=replaying_=false;
     qualification_=qualificationClosed_=qualificationR3b_=daily_=false;protectionAt_=0;lowRequest_=0;unsafe_=nullptr;unsafeContext_=nullptr;
     safeOff_=false;
     qualificationSafeLow_=false;
@@ -177,6 +179,7 @@ void A830Recovery::declareLost(uint8_t cause,uint64_t detail,IOReturn result)
     if(!initialized_)return;
     power_->lock();
     if(!lost()) {
+        __atomic_store_n(&replaying_,false,__ATOMIC_RELEASE);   /* a final loss replays nothing: the shell faults as before */
         __atomic_store_n(&running_,true,__ATOMIC_RELEASE);
         if(strictMode()) {
             const bool asleep=qualificationAsleep();
@@ -364,6 +367,11 @@ IOReturn A830Recovery::strictOff(bool provenAsleep)
 IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
 {
     if(lost()) {__atomic_store_n(&running_,false,__ATOMIC_RELEASE);return A830ReturnNotResponding;}
+    /* Replay or fail (decided once, before the gate: the gate op asks replaying()). lead/v131y7 (gpu/recover2 on the R3b line): also in
+     * the daily mode (the daily line's recovery); never in the strict qualification mode (R3b without daily), whose recovery is the
+     * minimal snapshot and the safe-off exit with every job in flight failed, as before. */
+    const bool replay=config_.replay && rops_.plan && rops_.replay && !strictMode() && __atomic_load_n(&gReplayWanted,__ATOMIC_ACQUIRE);
+    __atomic_store_n(&replaying_,replay,__ATOMIC_RELEASE);
     __atomic_store_n(&running_,true,__ATOMIC_RELEASE);
     const uint64_t begin=env_.nowNs(env_.context);
     stats_.lastCause=cause;
@@ -382,12 +390,14 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         if(snapshot_.gxOn) {wr(A830PowerWinGpu,gpuReg(A8XX_RBBM_INT_0_MASK),0);io_.barrier(io_.context);}
         if(rops_.snapshot)rops_.snapshot(rops_.context,&snapshot_);
     }
-    /* The jobs in flight fail (not replayed); their connections get faults++. */
-    stats_.jobsFailed+=rops_.failInflight(rops_.context);
+    /* Without the replay the jobs in flight fail here (the gate faulted their connections); with it the plan decides below. */
+    if(!replay)stats_.jobsFailed+=rops_.failInflight(rops_.context);
     adreno830_status_add32(&adreno830_status.faults,1);
     adreno830_status_lost(A830SRunning,cause,reasonOf(cause),A830ReturnNotResponding);
     const bool restartAllowed=config_.enabled && allowed(begin);
     if(!qualification_ && !restartAllowed) {
+        /* Final: the Lost gate faults every connection, so every job in flight is lost with it. */
+        if(replay)stats_.jobsFailed+=rops_.failInflight(rops_.context);
         loseLocked(cause,A830SRunning,cause,A830ReturnNotResponding);
         return A830ReturnNotResponding;
     }
@@ -411,19 +421,27 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         if(off==kIOReturnSuccess) {power_->setRsccSlept(true);__atomic_store_n(&safeOff_,true,__ATOMIC_RELEASE);}
         else if(qualification_ && !daily_) {
             ++stats_.failures;
+            if(replay)stats_.jobsFailed+=rops_.failInflight(rops_.context);   /* final: lost with the Lost gate */
             loseLocked(cause,A830SGmu,0,off);
             if(unsafe_)unsafe_(unsafeContext_,A830ExitOrigin::StrictOffFailed);
             return off;
         }
     }
-    if(!restartAllowed) {loseLocked(cause,A830SGmu,0,A830ReturnNotResponding);return A830ReturnNotResponding;}
+    if(!restartAllowed) {
+        if(replay)stats_.jobsFailed+=rops_.failInflight(rops_.context);   /* final: lost with the Lost gate */
+        loseLocked(cause,A830SGmu,0,A830ReturnNotResponding);
+        return A830ReturnNotResponding;
+    }
+    /* The GPU stopped: no fence moves now. The replay's plan: the culprit (a client's cause only) and the fence S6 restarts at. */
+    uint32_t restart=0;
+    if(replay)stats_.jobsFailed+=rops_.plan(rops_.context,cause,&restart);
     /* S4/S5/S6/S7 again (plus S1/S3/S4 restore when CX was off); the GMU starts at the DCVS target. */
     const uint8_t level=qualification_?1:power_->targetLevel(),bus=qualification_?2:power_->targetBus();
     if(qualification_)power_->setTarget(1,2);
     __atomic_store_n(&safeOff_,false,__ATOMIC_RELEASE);
     uint16_t step=0,subStep=0;
     a830ExitTrace.stage(A830ExitStage::RestartBegin,0,level,bus);
-    const IOReturn result=power_->bringUp(level,bus,!power_->cxOn(),&step,&subStep,showProgress,&progress);
+    const IOReturn result=power_->bringUp(level,bus,!power_->cxOn(),&step,&subStep,showProgress,&progress,replay?&restart:nullptr);
     a830ExitTrace.stage(A830ExitStage::RestartEnd,uint32_t(result),step,subStep);
     if(result!=kIOReturnSuccess) {
         if(qualification_) {
@@ -437,15 +455,31 @@ IOReturn A830Recovery::recoverLocked(uint8_t cause,uint64_t detail)
         loseLocked(cause,A830PowerStepStage(step),subStep?subStep:step,result);
         return result;
     }
-    /* Waiters see the fence at the last submitted seqno (cpStart wrote it); interrupts the storm guard turned off. */
+    /* Waiters see the fence at the last submitted seqno (cpStart wrote it), with the replay at the restart fence (the culprit's
+     * waiters wake to its fault); interrupts the storm guard turned off. */
     if(rops_.fenceSignal)rops_.fenceSignal(rops_.context);
     if(rops_.irqRestore)rops_.irqRestore(rops_.context);
+    if(replay) {
+        /* After the interrupt restore (it clears what the reset left pending): the replayed jobs' completions interrupt as usual. */
+        adreno830_status_recovering(A830SCp,uint32_t((env_.nowNs(env_.context)-begin)/NsPerMs));
+        uint32_t replayed=0;
+        const IOReturn replayResult=rops_.replay(rops_.context,&replayed);
+        stats_.jobsReplayed+=replayed;
+        if(replayResult!=kIOReturnSuccess) {
+            ++stats_.failures;
+            loseLocked(cause,A830SCp,A830RecoveryStepReplay,replayResult);
+            return replayResult;
+        }
+        ++stats_.replayRecoveries;
+    }
     power_->endRecovery(true,level,bus);
     ++stats_.recoveries;
     adreno830_status_add32(&adreno830_status.recoveries,1);
     const uint64_t end=env_.nowNs(env_.context);
     stats_.lastMs=uint32_t((end-begin)/NsPerMs);
     if(stats_.lastMs>stats_.maxMs)stats_.maxMs=stats_.lastMs;
+    stats_.lastUs=uint32_t((end-begin)/1000);
+    if(stats_.lastUs>stats_.maxUs)stats_.maxUs=stats_.lastUs;
     wdArmed_=false;
     if(qualification_)__atomic_store_n(&qualificationSafeLow_,true,__ATOMIC_RELEASE);
     if(qualificationR3b_)power_->holdQualificationLow(false);
@@ -501,4 +535,14 @@ extern "C" uint8_t adreno830_recovery_gate(void)
     if(recovery->lost())return A830GateLost;
     if(recovery->pending() || recovery->busy())return A830GateRecovering;
     return A830GateOpen;
+}
+
+extern "C" void adreno830_recovery_set_replay(uint32_t on) {__atomic_store_n(&gReplayWanted,on?1u:0u,__ATOMIC_RELEASE);}
+extern "C" uint32_t adreno830_recovery_replay_mode(void) {return __atomic_load_n(&gReplayWanted,__ATOMIC_ACQUIRE);}
+extern "C" bool adreno830_recovery_stats(A830RecoveryStats *out)
+{
+    A830Recovery *recovery=__atomic_load_n(&gRecovery,__ATOMIC_ACQUIRE);
+    if(!out || !recovery)return false;
+    *out=recovery->stats();   /* plain reads: a counter being written may be one behind */
+    return true;
 }

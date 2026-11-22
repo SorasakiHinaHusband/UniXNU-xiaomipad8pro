@@ -434,7 +434,7 @@ IOReturn A830PowerState::enterLocked(uint8_t mode,uint64_t now)
 /* ---- wake ---------------------------------------------------------------------------------------------------------- */
 
 IOReturn A830PowerState::bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t *step,uint16_t *subStep,
-                                 void (*progress)(void *,uint16_t),void *progressContext)
+                                 void (*progress)(void *,uint16_t),void *progressContext,const uint32_t *restart)
 {
     limitQualification(level,bus);
     uint16_t local=0,sub=0;
@@ -478,7 +478,7 @@ IOReturn A830PowerState::bringUp(uint8_t level,uint8_t bus,bool powerOn,uint16_t
     rsccSlept_=false;cxLost_=false;cxRestored_=false;
     __atomic_store_n(&ifpcActive_,ifpcWanted_,__ATOMIC_RELEASE);
     at(A830WakeStepCp);
-    result=ops_.cpStart(ops_.context,ops_.lastSubmitted(ops_.context),subStep);
+    result=ops_.cpStart(ops_.context,restart?*restart:ops_.lastSubmitted(ops_.context),subStep);
     if(result!=kIOReturnSuccess)return result;
     at(A830WakeStepSecure);
     result=ops_.secureResume(ops_.context,subStep);

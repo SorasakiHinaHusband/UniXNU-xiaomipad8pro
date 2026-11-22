@@ -773,7 +773,7 @@ void NativeAdrenoRing::setWaiter(const NativeAdrenoRingWaiter *waiter)
     CHECK(waiter && waiter->wait && waiter->stamp==A830Fence::ringStamp);   /* the queue meter stamps every fenced submission */
     hit("NativeAdrenoRing::setWaiter");
 }
-IOReturn NativeAdrenoRing::recover(uint32_t *last) {hit("NativeAdrenoRing::recover");*last=seqno_;return kIOReturnSuccess;}
+IOReturn NativeAdrenoRing::recover(uint32_t *last,const uint32_t *) {hit("NativeAdrenoRing::recover");*last=seqno_;return kIOReturnSuccess;}
 IOReturn NativeAdrenoRing::submit(const uint32_t *,size_t,uint32_t *fence) {*fence=++seqno_;return kIOReturnSuccess;}
 A830HwInitConfig A830HwInitDefaults() {A830HwInitConfig c={};c.ubwc_mode=5;c.highest_bank_bit=16;c.min_access_length=32;return c;}
 static A830HwInitConfig lastHwInit;
@@ -989,6 +989,10 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
 extern "C" void native_adreno_device_lost(uint32_t reason) {CHECK(reason==A830ReasonPublish);hit("native_adreno_device_lost");}
 extern "C" void native_adreno_recovery_begin(bool charge) {hit(charge?"native_adreno_recovery_begin(charge)":"native_adreno_recovery_begin");}
 extern "C" void native_adreno_recovery_end(bool recovered) {hit(recovered?"native_adreno_recovery_end(ok)":"native_adreno_recovery_end(lost)");}
+/* UniXNU-piano (2026-11-22): the replaying recovery's shell calls (A830RecoveryOps::plan/replay); this recovery double never replays. */
+extern "C" void native_adreno_recovery_begin_replay(void) {hit("native_adreno_recovery_begin_replay");}
+extern "C" uint32_t native_adreno_recovery_plan(bool,uint32_t *) {hit("native_adreno_recovery_plan");return 0;}
+extern "C" IOReturn native_adreno_recovery_replay(uint32_t *replayed) {*replayed=0;return hit("native_adreno_recovery_replay");}
 extern "C" void native_adreno_retire_completed(void) {hit("native_adreno_retire_completed");}
 /* The CB0 faults the publish shell got: far, completed, issued and sampled as passed. */
 static std::vector<A830SmmuFault> faultsNoted;

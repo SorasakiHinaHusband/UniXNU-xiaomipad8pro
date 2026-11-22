@@ -92,6 +92,25 @@ void native_adreno_device_lost(uint32_t reason);
  *        (native_adreno_device_lost semantics). */
 void native_adreno_recovery_begin(bool charge_culprit);
 void native_adreno_recovery_end(bool recovered);
+/* UniXNU-piano (2026-11-22, private 20261122-render/ANALYSIS.md "ONE change"; Linux msm recover_worker is the behaviour reference): the
+ * replaying recovery (A830RecoveryOps::plan/replay) in place of begin's faulting:
+ * begin_replay: begin without faulting or charging anybody (the halt and the gate only).
+ * plan: once the GPU stopped (NativeAdrenoSubmit::plan): for charge_culprit, the process whose job the CP stood in is charged one hang
+ *        (never the render server) and its connection alone gets faults += 1 (Turnip: that process's device is lost); *restart gets
+ *        the fence S6 restarts at (untouched before the shell is published). Every other job in flight is kept for the replay; when it
+ *        cannot be (a poisoned submit object, a kernel fence among them, no room) every connection with a job in flight is faulted as
+ *        begin does. Returns the jobs that will not run again. One console line names the culprit, the faulted and the replayed.
+ * replay: after S7 and the interrupt restore (NativeAdrenoSubmit::replay): the kept jobs go into the ring again with their own fences;
+ *        *replayed gets how many. end(true) after a replaying begin releases nothing (replay did) and resumes as before. */
+void native_adreno_recovery_begin_replay(void);
+uint32_t native_adreno_recovery_plan(bool charge_culprit,uint32_t *restart);
+IOReturn native_adreno_recovery_replay(uint32_t *replayed);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-22, test only: piano-gpu-fault-test=1, machdep.piano_gpu_fault_hold): the next submission of any live connection
+ * of process pid starts with the hold (NativeAdrenoSubmit::armHold): the CP stops in that job, a real hang whose culprit is known.
+ * Returns the connections armed (0: none of that process; nothing armed); name (optional, 20 bytes) gets the process's name. */
+unsigned native_adreno_fault_hold(int pid,char *name);
+#endif
 /* retire_call of the GPU interrupt (fence interrupt, ARCHITECTURE 4.12.3 step 3 and 5.4 "回收"): releases the BO references of every
  * job the CP has passed, so completed work never pins buffers or job slots. Cheap when nothing completed. */
 void native_adreno_retire_completed(void);
