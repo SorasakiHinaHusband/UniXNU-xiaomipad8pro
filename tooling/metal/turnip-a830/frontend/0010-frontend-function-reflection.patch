@@ -20,7 +20,7 @@ Context: UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12, native frontend
  @end
  // MTLDynamicLibrary: iPadOS 27's Core Image keeps its kernel language's standard library as one (CoreImage.framework/CoreImage.metallib,
  // every function exported) and its kernels import from it by install name; the runtime loads it (newDynamicLibraryWithURL:error:) and a
-@@ -1870,8 +1873,326 @@
+@@ -1870,8 +1873,328 @@
   nmb_dynamic_library_install_name(_handle,name.data(),name.size());name.resize(n);return @(name.c_str());
  }
  - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {if(error)*error=nbError(@"serializing a dynamic library is not implemented");return NO;}
@@ -65,7 +65,7 @@ Context: UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12, native frontend
 + return nil;
 +}
 +- (NSString *)description {return [NSString stringWithFormat:@"<NBFunctionStructType %@ %lu members>",_nbTypeName,(unsigned long)_nbMembers.count];}
-+@end
+ @end
 +@interface NBFunctionTextureType : MTLTextureReferenceType
 +@property(nonatomic) MTLDataType nbTexelType;
 +@property(nonatomic) MTLTextureType nbTextureType;
@@ -104,7 +104,7 @@ Context: UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12, native frontend
 +@property(nonatomic) MTLDataType nbElementType;
 +@property(nonatomic) NSUInteger nbLength,nbStride;
 +@property(nonatomic,strong) NBFunctionType *nbElementDescription;
- @end
++@end
 +@implementation NBFunctionArrayType
 +NB_REFLECTION_ANSWERS_MISSING
 +- (MTLDataType)dataType {return MTLDataTypeArray;}
@@ -121,6 +121,7 @@ Context: UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12, native frontend
 +- (MTLArrayType *)elementArrayType {return nil;}
 +- (MTLPointerType *)elementPointerType {return nil;}
 +- (MTLTextureReferenceType *)elementTextureReferenceType {return nil;}
++- (id)elementTensorReferenceType {return nil;}
 +@end
 +@interface NBFunctionStructMember : MTLStructMember
 +@property(nonatomic,copy) NSString *nbName;
@@ -183,6 +184,7 @@ Context: UniXNU-turnip 527b8b7a31192df14b96d10a70c339845ed2cd12, native frontend
 +- (MTLTextureType)textureType {return _nbTextureType;}
 +- (BOOL)isDepthTexture {return _nbDepth;}
 +- (MTLDataType)threadgroupMemoryDataType {return MTLDataTypeNone;}
++- (MTLStructType *)threadgroupMemoryStructType {return nil;}
 +- (NSString *)description {return [NSString stringWithFormat:@"<NBFunctionArgument %@ kind %ld>",_nbName,(long)_nbType];}
 +@end
 +// Apple's Metal for the qualified set (Metal 4.0 visible functions on macOS 27.2.1, QUAL.md): a value argument is binding kind 18 with
