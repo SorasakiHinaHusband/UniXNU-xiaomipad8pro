@@ -787,4 +787,8 @@ thermal limits) and of 2026-11-22 (macOS Low Power Mode is the one performance s
   the firmware's sustained level unless a level above it was refused this boot (then sustained, 4089.6 on cpu6-7), no skin table,
   no onset burst; the hard caps (`piano-cpufreq-cap0/1` when given), the boosts and the thermal limit (`piano-cpufreq-hot`) stay on
   top. With policy 0 High Power changes nothing (the measured source's caps). The service publishes `piano-thermal-profiles` = 3
-  (PianoPolicy sends 3 only then); `machdep.piano_cpufreq_state` begins `perf=N profile=M above_refused=A/B`. Not run on the tablet.
+  (PianoPolicy sends 3 only then); `machdep.piano_cpufreq_state` begins `perf=N profile=M above_refused=A/B` and ends each cluster
+  with `limit_mhz=N hot_dC=N` (the thermal limit's level, the hottest cpu zone). energy-e23 (2026-11-22): the mode plumbing works
+  (High Power ran a 1-thread load in 10.9 s vs 14.5 s Automatic, 20.9 s Low Power); cpu6-7 stayed at the 95 C limit's level
+  (2649-3513 MHz, zones 90-95 C most of the time, a few readings above 95 C) with the High Power cap 4320 in place and no refusal:
+  the thermal limit, not the mode, set the ceiling (step_wise: down at 95 C, up only under 90 C).

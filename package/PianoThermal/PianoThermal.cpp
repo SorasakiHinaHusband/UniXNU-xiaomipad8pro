@@ -543,6 +543,8 @@ struct PerfDomain {
   uint32_t khz[scmi::kMaxLevels];
   uint32_t set, ceilKhz, perfKhz, bursts;   // written by the thread only; the sysctl's reads may be one update old
   int32_t step;
+  uint32_t limitKhz;   // the thermal limit's level (energy-e23: a ceiling under a mode's cap is told apart from the cap)
+  int32_t hotDeci;     // the cluster's hottest cpu zone at the last tick (0.1 C; -9999 no valid reading)
   uint64_t sinceNs, burstMs;
   uint64_t totalNs[scmi::kMaxLevels];
 };
@@ -597,6 +599,8 @@ int sysctlPerfState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
       if (i == set && now > pd.sinceNs) ns += now - pd.sinceNs;
       at = catf(buf, sizeof buf, at, "%s%u:%llu", i ? "," : "", pd.khz[i] / 1000, (unsigned long long)(ns / 1000000ull));
     }
+    // appended after the residency list, so the parsers of the fields before it keep working
+    at = catf(buf, sizeof buf, at, " limit_mhz=%u hot_dC=%d", pd.limitKhz / 1000, pd.hotDeci);
   }
   return SYSCTL_OUT(req, buf, strlen(buf) + 1);
 }
@@ -1746,6 +1750,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     cpuApply(d, want, now);
     gPd[d].ceilKhz = g.khz(g.ceiling(power));
     gPd[d].perfKhz = g.perfKhz();
+    gPd[d].limitKhz = g.khz(g.limit());
+    gPd[d].hotDeci = thermal[d].valid ? thermal[d].hotExcessDeci + (gTrips.hotDeci ? gTrips.hotDeci : 1050) : -9999;
     gPd[d].step = skinCap_[d].step();
     gPd[d].bursts = burst_[d].windows();
     gPd[d].burstMs = burst_[d].openMs(now / 1000000ull);
