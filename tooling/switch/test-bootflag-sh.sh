@@ -48,10 +48,15 @@ unset PIANO_BOOTFLAG_NVMEM
 mkdir -p "$T/bin"; echo 0 > "$T/val"
 cat > "$T/bin/sysctl" <<F
 #!/bin/sh
-case "\$1" in -n) cat "$T/val" ;; -q) echo "\${2#*=}" > "$T/val" ;; esac
+case "\$1" in
+  -n) cat "$T/val" ;;
+  -w) r=\${2#*=}; echo "\$r" >> "$T/reqs"; [ -f "$T/deny" ] && exit 1
+      case \$r in 1) echo 161;; 3) echo 0;; esac > "$T/val" ;;
+esac
 F
 chmod +x "$T/bin/sysctl"
-PATH=$T/bin:$PATH PIANO_BOOTFLAG_BACKEND=sysctl $SH "$S" once-android > /dev/null; ok $([ "$(cat "$T/val")" = 161 ]; echo $?) "sysctl backend: once-android writes 161"
-PATH=$T/bin:$PATH PIANO_BOOTFLAG_BACKEND=sysctl $SH "$S" once-clear > /dev/null; ok $([ "$(cat "$T/val")" = 0 ]; echo $?) "sysctl backend: once-clear writes 0"
+PATH=$T/bin:$PATH PIANO_BOOTFLAG_BACKEND=sysctl $SH "$S" once-android > /dev/null; ok $([ "$(cat "$T/val")" = 161 ] && [ "$(tail -1 "$T/reqs")" = 1 ]; echo $?) "sysctl backend: once-android sends request 1, reads 0xa1"
+PATH=$T/bin:$PATH PIANO_BOOTFLAG_BACKEND=sysctl $SH "$S" once-clear > /dev/null; ok $([ "$(cat "$T/val")" = 0 ] && [ "$(tail -1 "$T/reqs")" = 3 ]; echo $?) "sysctl backend: once-clear sends request 3"
+touch "$T/deny"; PATH=$T/bin:$PATH PIANO_BOOTFLAG_BACKEND=sysctl $SH "$S" once-android > /dev/null 2>&1; ok $([ $? = 4 ]; echo $?) "sysctl backend: a kext refusal is rc 4"
 echo "$([ $fails = 0 ] && echo PASS || echo FAIL): bootflag.sh tests, $n checks, $fails failures"
 [ $fails = 0 ]
