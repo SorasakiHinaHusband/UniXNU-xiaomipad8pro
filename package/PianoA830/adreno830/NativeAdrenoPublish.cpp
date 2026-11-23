@@ -844,7 +844,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(backing && backing->unmapped()) {
         if(!v || v->descriptor)status=kIOReturnNoResources;
         else {
-            IOMemoryDescriptor *descriptor=backing->retainVmCpuDescriptor();
+            IOMemoryDescriptor *descriptor=backing->retainCpuView();   /* UniXNU-piano: the named entry, or the parts' view (GPU-PAGED P1b) */
             if(!descriptor)status=kIOReturnNotReady;
             else {
                 v->token=type;v->descriptor=descriptor;

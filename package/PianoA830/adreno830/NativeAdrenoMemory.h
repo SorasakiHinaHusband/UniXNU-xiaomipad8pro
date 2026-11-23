@@ -6,6 +6,18 @@
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
 class IOMemoryDescriptor;
+class IOMultiMemoryDescriptor;
+/* UniXNU-piano (2026-11-23, GPU-PAGED P1b, private P1-GATE.md section 7): a user BO (the pageable named entry) of at least
+ * NativeAdrenoWireSplitBytes is made of up to NativeAdrenoWireMaxParts named entries wired at the same time by
+ * native_adreno_wire_workers kernel threads and the calling thread (XNU wires each fresh page in the BoAlloc thread: 0.5-3 us per 4 KiB
+ * page, 96 % of a cold launch's BoAlloc time). Part boundaries lie on 64 KiB; the GPU spans are the parts' pages in order; the CPU view
+ * is an IOMultiMemoryDescriptor of the parts. 0 workers (the default) = one named entry wired by the caller, as before. */
+enum : size_t {NativeAdrenoWireSplitBytes=size_t(1)<<20,NativeAdrenoWirePartMin=size_t(256)<<10,NativeAdrenoWireMaxParts=8,
+               NativeAdrenoWireMaxWorkers=7,NativeAdrenoWirePartAlign=size_t(64)<<10};
+extern "C" volatile uint32_t native_adreno_wire_workers;
+/* [0] BOs split, [1] their parts, [2] BOs over the split size wired whole (no workers), [3] split BOs a part's prepare failed,
+ * [4] worker threads started, [5] parts a worker (not the caller) wired. */
+extern "C" volatile uint64_t native_adreno_wire_stats[6];
 /* A factory returning null does not export its inner kern_return_t. Never invent one. */
 struct NativeAdrenoMemoryFailure {const char *stage="none";IOReturn status=0;};
 struct NativeAdrenoBackingTotals {uint64_t mapped,unmapped,imports,mapped_peak,allocs,frees;};
@@ -114,6 +126,12 @@ class NativeAdrenoMemory final {
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
     IOReturn takePooled(size_t bytes,uint64_t limit,bool contiguous);
+    /* UniXNU-piano (GPU-PAGED P1b): the parts of a split user BO (null: one descriptor_ or none) and their CPU view. */
+    IOBufferMemoryDescriptor **parts_=nullptr;
+    uint32_t part_count_=0;
+    IOMultiMemoryDescriptor *multi_=nullptr;
+    IOReturn allocateParts(size_t bytes,uint64_t limit,unsigned parts,bool wc);
+    void releaseParts();
 public:
     NativeAdrenoMemory()=default;
     ~NativeAdrenoMemory()=default;
@@ -208,7 +226,12 @@ public:
      * 1280 submissions, while walking the pool's pages took 0.65 ms of each). The submissions' line audit still covers every object. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
     {return write_combined_ && span_count_ && !pooled_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_ || pooled_ || device_;}
+    bool backed() const {return descriptor_ || parts_ || imported_ || pooled_ || device_;}
+    /* UniXNU-piano (GPU-PAGED P1b): named entries the BO is made of (1 for one descriptor, 0 for other backings). */
+    size_t partCount() const {return parts_?part_count_:descriptor_?1:0;}
+    const IOMultiMemoryDescriptor *partsView() const {return multi_;}
+    /* The CPU view of a user BO (the named entry, or the parts' IOMultiMemoryDescriptor), retained; null as retainVmCpuDescriptor. */
+    IOMemoryDescriptor *retainCpuView();
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();

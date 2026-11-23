@@ -1416,18 +1416,22 @@ IOReturn NativeAdrenoVm::mapPaged(NativeAdrenoMemory *memory,uint64_t iova,unsig
         return status;
     }
 }
+/* UniXNU-piano (GPU-PAGED P1b): the unmapped ranges are kept by 2 MiB block (the span of one level-3 table), neighbours merged; with
+ * every slot taken the tick sweeps the whole space instead, in slices from a cursor (no whole-tree walk under the lock). */
 void NativeAdrenoVm::noteTrim(uint64_t iova,uint64_t bytes)
 {
-    if(pg_->trim_all)return;
-    if(pg_->trim_count) {   /* adjacent or overlapping the last one: one range */
-        TrimRange &last=pg_->trim[pg_->trim_count-1];
-        if(iova<=last.iova+last.bytes && last.iova<=iova+bytes) {
-            const uint64_t lo=iova<last.iova?iova:last.iova,hi=iova+bytes>last.iova+last.bytes?iova+bytes:last.iova+last.bytes;
-            last={lo,hi-lo};return;
+    if(pg_->sweep)return;
+    const uint64_t block=UINT64_C(2)<<20;
+    const uint64_t lo=iova&~(block-1),hi=(iova+bytes+block-1)&~(block-1);
+    for(size_t i=pg_->trim_count;i-- && i+4>=pg_->trim_count;) {   /* the newest few: unmaps of one free burst lie together */
+        TrimRange &r=pg_->trim[i];
+        if(lo<=r.iova+r.bytes && r.iova<=hi) {
+            const uint64_t a=lo<r.iova?lo:r.iova,b=hi>r.iova+r.bytes?hi:r.iova+r.bytes;
+            r={a,b-a};return;
         }
     }
-    if(pg_->trim_count>=NativeAdrenoVmPagedTrimRanges) {pg_->trim_all=true;pg_->trim_count=0;return;}
-    pg_->trim[pg_->trim_count++]={iova,bytes};
+    if(pg_->trim_count>=NativeAdrenoVmPagedTrimRanges) {pg_->sweep=true;pg_->sweep_cursor=0;pg_->trim_count=0;++pg_->stats.trim_full;return;}
+    pg_->trim[pg_->trim_count++]={lo,hi-lo};
 }
 /* The unmap's table half: the leaves of the record's range cleared (no table unlinked, so the plan never depends on the walk caches:
  * the TLB rule of REPLAY.md), TLBIVAL of <= 512 pages or TLBIASID, one TLBSYNC; a range that left tables empty is noted for the tick. */
@@ -1457,31 +1461,46 @@ IOReturn NativeAdrenoVm::unmapPagedTables(const Mapping &record,size_t at)
     ++pg_->stats.unmaps;
     return kIOReturnSuccess;
 }
+/* The tick: pending ranges, then sweep slices, each step a ArmSmmu4KPagedTrimRange of at most NativeAdrenoVmPagedTrimSlice bytes, until
+ * NativeAdrenoVmPagedTrimBudgetUs passed (the publish shell's clock; without one NativeAdrenoVmPagedTrimSteps steps) or the retire batch
+ * is full; the rest waits for the next tick. One TLBIASID + TLBSYNC for what was unlinked, then the pages go back. */
 IOReturn NativeAdrenoVm::trimTables(size_t *out)
 {
     if(out)*out=0;
     if(!paged_ || !attached_)return kIOReturnSuccess;
     VM_LOCKED;
     if(poisoned_)return kIOReturnNotReady;
-    if(!pg_->trim_all && !pg_->trim_count)return kIOReturnSuccess;
+    if(!pg_->sweep && !pg_->trim_count)return kIOReturnSuccess;
     const uint64_t began=pagedNow();
-    size_t n=0;
+    size_t n=0,steps=0;
     ArmSmmu4KStatus status=ArmSmmu4KSuccess;
-    if(pg_->trim_all) {
+    const auto spent=[&] {
+        if(n>=NativeAdrenoVmPagedTrimBatch)return true;
+        if(began)return pagedNow()-began>=NativeAdrenoVmPagedTrimBudgetUs;
+        return steps>=NativeAdrenoVmPagedTrimSteps;
+    };
+    /* one step over [iova, iova + bytes): false when it could not finish (the batch filled) */
+    const auto step=[&](uint64_t iova,uint64_t bytes)->bool {
         ArmSmmu4KPagedPlan plan;
-        status=ArmSmmu4KPagedTrim(&pg_->space,pg_->retired,NativeAdrenoVmPagedTrimBatch,&plan);
-        if(!status) {n=plan.retired;pg_->trim_all=plan.kept_empty!=0;++pg_->stats.trim_full;}
-    } else {
-        size_t done=0;
-        while(done<pg_->trim_count && n<NativeAdrenoVmPagedTrimBatch) {
-            ArmSmmu4KPagedPlan plan;
-            status=ArmSmmu4KPagedTrimRange(&pg_->space,pg_->trim[done].iova,pg_->trim[done].bytes,pg_->retired+n,NativeAdrenoVmPagedTrimBatch-n,&plan);
-            if(status)break;
-            n+=plan.retired;
-            if(plan.kept_empty)break;   /* the batch is full: this range again at the next tick */
-            ++done;
-        }
-        memmove(pg_->trim,pg_->trim+done,(pg_->trim_count-done)*sizeof pg_->trim[0]);pg_->trim_count-=done;
+        status=ArmSmmu4KPagedTrimRange(&pg_->space,iova,bytes,pg_->retired+n,NativeAdrenoVmPagedTrimBatch-n,&plan);
+        ++steps;
+        if(status)return false;
+        n+=plan.retired;
+        return !plan.kept_empty;
+    };
+    while(!status && pg_->trim_count && !spent()) {
+        TrimRange &r=pg_->trim[pg_->trim_count-1];   /* newest first: its tables are the warmest */
+        const uint64_t bytes=r.bytes>NativeAdrenoVmPagedTrimSlice?NativeAdrenoVmPagedTrimSlice:r.bytes;
+        if(!step(r.iova,bytes))break;
+        r.iova+=bytes;r.bytes-=bytes;
+        if(!r.bytes)--pg_->trim_count;
+    }
+    while(!status && pg_->sweep && !spent()) {
+        const uint64_t end=pg_->config.aperture;
+        const uint64_t bytes=end-pg_->sweep_cursor>NativeAdrenoVmPagedTrimSlice?NativeAdrenoVmPagedTrimSlice:end-pg_->sweep_cursor;
+        if(!step(pg_->sweep_cursor,bytes))break;
+        pg_->sweep_cursor+=bytes;
+        if(pg_->sweep_cursor>=end) {pg_->sweep=false;pg_->sweep_cursor=0;}
     }
     if(status)return fail(status);   /* the unlinked pages stay owned */
     if(n) {
@@ -1545,7 +1564,7 @@ void NativeAdrenoVm::pagedStats(NativeAdrenoVmPagedStats *out) const
     out->paged=true;out->poisoned=poisoned_;
     out->table_pages=pg_->space.counters.table_pages;out->table_peak=pg_->space.counters.table_pages_peak;
     out->table_cap=pg_->config.table_cap_pages;out->chunks=pg_->chunk_count;out->chunk_pages=pg_->chunk_pages;out->free_pages=pg_->free_pages;
-    out->leaves=pg_->space.counters.leaves;out->trim_pending=pg_->trim_all?UINT64_MAX:pg_->trim_count;
+    out->leaves=pg_->space.counters.leaves;out->trim_pending=pg_->sweep?UINT64_MAX:pg_->trim_count;
     out->mapped=bytes_;out->cap=pg_->config.cap_bytes;out->reserve=pg_->config.reserve_bytes;out->records=spanCount();
     out->grow_failures=__atomic_load_n(&pg_->stats.grow_failures,__ATOMIC_RELAXED);
 }

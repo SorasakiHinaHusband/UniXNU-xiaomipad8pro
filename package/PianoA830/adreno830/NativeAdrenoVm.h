@@ -95,11 +95,14 @@ extern "C" volatile uint32_t native_adreno_gpu_pt_audit_s;         /* the tick a
 enum : size_t {
     NativeAdrenoVmPagedMaxChunks=256,     /* table chunks: 2 MiB (else 512 KiB, else 128 KiB) each */
     NativeAdrenoVmPagedSpare=64,          /* free table pages a map leaves beyond its worst case when it grows the list */
-    NativeAdrenoVmPagedTrimRanges=64,     /* unmapped ranges with emptied tables the tick trims (more: one whole-tree trim) */
+    NativeAdrenoVmPagedTrimRanges=512,    /* 2 MiB-block ranges with emptied tables the tick trims (more: a resumable sweep) */
+    NativeAdrenoVmPagedTrimSteps=64,      /* steps of one tick without a clock (host) */
     NativeAdrenoVmPagedTrimBatch=256,     /* tables one trim unlinks at most (the rest at the next tick) */
     NativeAdrenoVmPagedTableCap=32833,    /* table pages at most: today's preallocated 64 GiB table (REPLAY.md worst case) */
 };
-enum : uint64_t {NativeAdrenoVmPagedCapDefault=UINT64_C(7168)<<20,NativeAdrenoVmPagedReserveDefault=UINT64_C(1536)<<20};
+enum : uint64_t {NativeAdrenoVmPagedCapDefault=UINT64_C(7168)<<20,NativeAdrenoVmPagedReserveDefault=UINT64_C(1536)<<20,
+    /* UniXNU-piano (GPU-PAGED P1b): one tick's trim work under the VM lock, and the bytes of one step (64 level-3 tables) */
+    NativeAdrenoVmPagedTrimBudgetUs=500,NativeAdrenoVmPagedTrimSlice=UINT64_C(128)<<20};
 struct NativeAdrenoVmPagedConfig {
     unsigned input_bits=36,output_bits=40;   /* the context's: 36 bits = the 64 GiB aperture */
     uint64_t aperture=0;                     /* the space is [0, aperture) */
@@ -213,7 +216,8 @@ class NativeAdrenoVm final {
         size_t free_pages=0;                               /* read without the lock as a hint (growTables) */
         TrimRange trim[NativeAdrenoVmPagedTrimRanges]{};
         size_t trim_count=0;
-        bool trim_all=false;
+        bool sweep=false;                                  /* every pending slot was taken: the tick sweeps the space */
+        uint64_t sweep_cursor=0;
         uint64_t retired[NativeAdrenoVmPagedTrimBatch]{};
         NativeAdrenoVmPagedStats stats{};
         size_t short_pages=0;                              /* table pages the last refused map lacked (0: another reason) */

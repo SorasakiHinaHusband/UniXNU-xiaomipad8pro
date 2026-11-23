@@ -64,6 +64,8 @@ KNOWN = {
         'global, 1582 per process (18 spaces), worst case 32834', 'GPU-PAGED P0a'),
     # UniXNU-piano (2026-11-23, GPU-PAGED P1): the GPU VM's paged mode (piano-gpu-mem=paged) and the gpu-paged0c peak replay at 1/16
     'test_p1vm': (CORE + ['NativeAdrenoVm.cpp', 'NativeAdrenoSmmuContext.cpp'], ['smmu'], None, 'GPU-PAGED P1'),
+    # UniXNU-piano (2026-11-23, GPU-PAGED P1b): split user BOs wired in parallel, and the allocation path's micro-benchmark
+    'test_p1wire': (['NativeAdrenoMemory.cpp'], [], None, 'GPU-PAGED P1b'),
     # UniXNU-piano (2026-11-22, GPU-PAGED P0b): the pool bypass through the user client (test_userclient's fixture and doubles)
     'test_poolbypass': (SUBMIT + ['NativeAdrenoUserClient.cpp', 'NativeAdrenoTimer.cpp'], ['smmu', 'pm4', 'proc'], None, 'GPU-PAGED P0b'),
     'test_timer': (['NativeAdrenoTimer.cpp'], [],

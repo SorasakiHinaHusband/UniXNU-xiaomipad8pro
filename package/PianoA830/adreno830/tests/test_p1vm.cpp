@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);}
 #include <vector>
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
@@ -302,8 +303,8 @@ static void reserveCommit()
         for(size_t i=0;i<=mapped;++i)CHECK(!p.vm.unmap(handles[i]));
         for(auto &b:bos)CHECK(!b.release());
         size_t retired=0;
-        while(!p.vm.trimTables(&retired) && retired) {}
-        OK(stats(p.vm).table_pages==1 && stats(p.vm).trim_full>=1);   /* the root alone: more than 64 ranges made it a whole-tree trim */
+        while(!p.vm.trimTables(&retired) && (retired || stats(p.vm).trim_pending)) {}
+        OK(stats(p.vm).table_pages==1 && !stats(p.vm).trim_full);   /* the root alone: 241 neighbouring 2 MiB blocks merged into one range */
         fixture.contiguous_limit=0;
         down(p);
     }
@@ -345,6 +346,44 @@ static void trimOrder()
     prog.tlb_limit=0;
     OK(!bo.release() && p.vm.detach()==kIOReturnBusy && p.vm.releasePaged()==kIOReturnBusy);   /* nothing is given back */
     scrap();
+}
+/* P1b: one tick's trim stops once its budget is spent and the next tick goes on; neighbouring unmaps share a 2 MiB-block range;
+ * more pending ranges than slots start a sweep that also resumes tick by tick. */
+static uint64_t fakeUs;
+static uint64_t fakeClock() {return fakeUs+=100;}   /* every reading 100 us later */
+static void trimBudget()
+{
+    Paged p;
+    CHECK(up(p,config())==kIOReturnSuccess);
+    /* 100 one-page BOs in one 2 MiB block, unmapped: one pending range */
+    std::vector<NativeAdrenoMemory> small(100);
+    std::vector<uint64_t> hs(100,0);
+    for(size_t i=0;i<100;++i) {CHECK(!small[i].allocateUser(4096,40,4096,true));CHECK(!clientMap(p.vm,&small[i],UINT64_C(0x100000000)+i*4096,3,&hs[i],true));}
+    for(size_t i=0;i<100;++i)CHECK(!p.vm.unmap(hs[i]) && !small[i].release());
+    OK(stats(p.vm).trim_pending==1);
+    size_t r=0;
+    OK(!p.vm.trimTables(&r) && r==2 && !stats(p.vm).trim_pending);
+    /* 600 BOs in 600 separate 2 MiB blocks spread over 75 GiB-slots... the slots overflow: a sweep */
+    const size_t n=600;
+    std::vector<NativeAdrenoMemory> bos(n);
+    std::vector<uint64_t> h(n,0);
+    for(size_t i=0;i<n;++i) {
+        CHECK(!bos[i].allocateUser(4096,40,4096,true));
+        CHECK(!clientMap(p.vm,&bos[i],UINT64_C(0x100000000)+uint64_t(i)*(UINT64_C(64)<<20),3,&h[i],true));
+    }
+    for(size_t i=0;i<n;i+=2)CHECK(!p.vm.unmap(h[i]));   /* every other one: no two neighbours */
+    for(size_t i=1;i<n;i+=2)CHECK(!p.vm.unmap(h[i]));
+    for(auto &b:bos)CHECK(!b.release());
+    NativeAdrenoVmPagedStats s=stats(p.vm);
+    OK(s.trim_pending==UINT64_MAX && s.trim_full==1);   /* sweeping */
+    native_adreno_vm_now_us=fakeClock;fakeUs=0;
+    size_t ticks=0,total=0;
+    while(!p.vm.trimTables(&r) && (r || stats(p.vm).trim_pending)) {++ticks;total+=r;CHECK(ticks<10000);}
+    native_adreno_vm_now_us=nullptr;
+    s=stats(p.vm);
+    /* 64 GiB in 128 MiB slices, at most 5 slices a tick (100 us a reading, 500 us budget) */
+    OK(ticks>=512/5 && total>=n && s.table_pages==1 && s.trim_us_max<=600 && !s.trim_pending);
+    down(p);
 }
 /* A table page whose publication fails poisons the VM (no later map, every reference kept). */
 static void publishFailure()
@@ -491,13 +530,13 @@ static unsigned replay(bool full)
     const NativeAdrenoVmPagedStats unmapped=stats(p.vm);
     size_t trims=0,retired=0,r=0;
     const uint64_t r0=nowUs();
-    while(!p.vm.trimTables(&r) && r) {++trims;retired+=r;}
+    while(!p.vm.trimTables(&r) && (r || stats(p.vm).trim_pending)) {++trims;retired+=r;}
     const uint64_t trimUs=nowUs()-r0;
     const unsigned trimAsids=unsigned(model.tlbiasid-asid0-unsigned(stats(p.vm).unmap_asid-top.unmap_asid));
     const NativeAdrenoVmPagedStats end=stats(p.vm);
     for(size_t i=0;i<used;++i)CHECK(!bos[i].memory.release());
     for(unsigned i=0;i<6;++i)CHECK(!p.vm.unmap(kh[i]) && !kernel[i].release());
-    while(!p.vm.trimTables(&r) && r) {}
+    while(!p.vm.trimTables(&r) && (r || stats(p.vm).trim_pending)) {}
     std::printf("REPLAY %s (bytes 1/%u): %zu objects mapped of %zu, %zu refused; %zu records; %.0f MiB mapped (peak %.0f MiB); "
         "table pages %llu (peak %llu, %.1f MiB) in %llu chunks (%.1f MiB, %llu free); leaves %llu; map %.3f us/page (%zu us total, "
         "%.1f us/map); Metal image check 96 + 187 MiB: %zu refused; audit %s (%zu tables, %zu leaves, %llu us)\n",
@@ -535,6 +574,7 @@ int main(int argc,char **argv)
     syncAfterMap();
     reserveCommit();
     capReserve();
+    trimBudget();
     trimOrder();
     publishFailure();
     const unsigned replayed=replay(false);
