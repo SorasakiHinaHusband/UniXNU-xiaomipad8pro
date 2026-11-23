@@ -26,5 +26,9 @@ done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/power_host.cpp" \
   "$T/PianoMca.o" "$T/ChargePolicy.o" "$T/QcomQrtr.o" -o "$T/power_host"
 "$T/power_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host"   # the SC8541 driver (ChargePump.h)
+"$T/cp_driver_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host_san"
+"$T/cp_driver_host_san"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"
 "$T/battery_host"

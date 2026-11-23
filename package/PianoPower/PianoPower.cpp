@@ -75,6 +75,8 @@
 #include "ChargerEnable.h"
 #include "ChargerFix.h"
 #include "Gauge.h"
+#include "ChargePumpImpl.h"   // the SC8541 charge pump driver (ChargePump.h), on pack A's bus
+#include <sys/sysctl.h>
 #include "GaugeAlerts.h"
 #include "PianoBattery.h"
 #include "Servreg.h"
@@ -108,6 +110,7 @@ struct Args {
   uint32_t ramp, rpMax, writeMs, kick;
   uint32_t wdog, chgen, chgfix, chgwatch;
   uint32_t hvOrder, hvCaps, qc, fvHot;   // charge/pd1 (charging-policy.md §21), each 0 by default
+  uint32_t cp;                           // piano-power-cp=1: the SC8541 driver probes and may be armed (ChargePump.h)
   bool hasRtcOffset;
   bool ponHistory;
   uint32_t rtcOffset;
@@ -146,6 +149,7 @@ void readArgs()
   gArgs.hvCaps = bootArg("piano-power-hv-caps", 0) == 1;
   gArgs.qc = bootArg("piano-power-qc", 0) == 1;
   gArgs.fvHot = bootArg("piano-power-fv-hot", 0) == 1;
+  gArgs.cp = bootArg("piano-power-cp", 0) == 1;     // the SC8541 pump: off by default; writes also need machdep.piano_power_cp_arm=1
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -321,6 +325,25 @@ bool busReadSda(void *ctx) { return rd32(static_cast<GaugeBus *>(ctx)->sda.page.
 bool busReadScl(void *ctx) { return rd32(static_cast<GaugeBus *>(ctx)->scl.page.va + 4) & 1; }
 void busDelay(void *, unsigned us) { IODelay(us); }
 
+// The SC8541 driver while piano-power-cp=1 (set in start): its kick and guard go ahead of any transaction on pack A's bus.
+pianopower::Sc8541 *gCpHook = nullptr;   // the driver itself (allocated by probeCp: PianoPower's instance is at its 16 KiB limit)
+uint32_t gCpFaults = 0;                  // every fault bit seen this boot (published)
+void cpHookFn(void *ctx, I2cBus &bus) { static_cast<pianopower::Sc8541 *>(ctx)->beforeBusTransaction(bus); }
+uint64_t cpNowMs(void *) { return nowMs(); }
+// machdep.piano_power_cp_arm: the per-boot root arm of the pump (0/1), read by the worker every pass.
+int gCpArm = 0;
+int cpArmSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+  int v = __atomic_load_n(&gCpArm, __ATOMIC_ACQUIRE);
+  const int err = sysctl_handle_int(oidp, &v, 0, req);
+  if (err || !req->newptr) return err;
+  if (v != 0 && v != 1) return EINVAL;
+  __atomic_store_n(&gCpArm, v, __ATOMIC_RELEASE);
+  return 0;
+}
+struct sysctl_oid gCpArmOid;
+bool gCpArmRegistered = false;
+
 GaugeReading readBus(GaugeBus &b)
 {
   takePin(b.scl);
@@ -328,6 +351,7 @@ GaugeReading readBus(GaugeBus &b)
   IODelay(20);
   const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
   I2cBus bus(io);
+  if (&b == &gBuses[0] && gCpHook) bus.setHook(cpHookFn, gCpHook);
   GaugeReading g = readGauge(bus);
   givePin(b.sda);
   givePin(b.scl);
@@ -376,6 +400,8 @@ class PianoPower : public IOService {
   int32_t fConfigError = 0;
   uint32_t fStatusSeq = 0;
   uint8_t fCpCtrl = 0;
+  void serviceCp(uint64_t now);
+  void probeCp();
   GaugeAlerts fAlerts;
   uint32_t fSafetyValid = 0;
   uint64_t fSafetyMs = 0;
@@ -666,6 +692,7 @@ void PianoPower::sampleSafety(uint64_t now)
     takePin(b.scl); takePin(b.sda); IODelay(20);
     const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
     I2cBus bus(io);
+    if (!i && gCpHook) bus.setHook(cpHookFn, gCpHook);
     if (!i && bus.readRegisterByte(0x6a, 0x0f, &fCpCtrl) == I2cResult::ok) fSafetyValid |= 1;
     fSafetyValid |= fAlerts.readPack(bus, i);
     givePin(b.sda); givePin(b.scl);
@@ -726,7 +753,13 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
   n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
-  n("CPControl", fCpCtrl); n("LPDValid", piano_mca_has(&fMca, McaLpd)); n("LPD", uint32_t(fMca.value[McaLpd]));
+  n("CPControl", fCpCtrl);
+  if (const pianopower::Sc8541 *cp = gCpHook) {
+    n("CPPresent", cp->present()); n("CPArmed", cp->arm.armed()); n("CPSwitching", cp->switching()); n("CPLost", cp->lost());
+    n("CPFaults", gCpFaults); n("CPBusOCP", cp->busOcpMa());
+    n("CPKickAgeMs", cp->lastKickMs() && now >= cp->lastKickMs() ? now - cp->lastKickMs() : ~0u);
+  }
+  n("LPDValid", piano_mca_has(&fMca, McaLpd)); n("LPD", uint32_t(fMca.value[McaLpd]));
   n("DTPT", fAlerts.active()); n("SafetyAlarmMask", fAlerts.alarms);
   n("SafetyReobserved", fAlerts.retried); n("SafetyReobserveValid", fAlerts.retryValid); n("SafetyRereads", fAlerts.rereads);
   n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
@@ -1301,6 +1334,63 @@ void PianoPower::surveyAdsp()
   note("adsp: survey: SMEM APPS/ADSP partition %s, items %#x, slave-kernel %d (%s), AOSS %#x, RSC id %#x%s%s",
        s.partition ? "missing" : "found", s.items, s.slave, state, s.aoss, s.rsc_id, s.crash[0] ? ", crash reason: " : "", s.crash);
   stage(2, "DSP survey");
+}
+
+// piano-power-cp=1: the SC8541 read only (its device id), the sysctl arm registered; no register is written here.
+void PianoPower::probeCp()
+{
+  if (!gArgs.cp) return;
+  GaugeBus &b = gBuses[0];
+  if (!b.sda.page.va || !b.scl.page.va) {note("cp: pack A's pins are not mapped: the SC8541 stays untouched"); return;}
+  pianopower::Sc8541 *cp = new pianopower::Sc8541(pianopower::Sc8541::Clock{nullptr, cpNowMs});
+  if (!cp) {note("cp: no memory for the driver: the pump stays off"); return;}
+  takePin(b.scl); takePin(b.sda); IODelay(20);
+  const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
+  I2cBus bus(io);
+  const bool present = cp->probe(bus);
+  givePin(b.sda); givePin(b.scl);
+  gCpFaults |= cp->takeFaults();
+  if (!present) {note("cp: no SC8541 at 0x6a (faults %#x): the pump stays off", gCpFaults); delete cp; return;}
+  gCpHook = cp;
+  if (!gCpArmRegistered) {
+    gCpArmOid.oid_parent = &sysctl__machdep_children;
+    gCpArmOid.oid_number = OID_AUTO;
+    gCpArmOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_OID2 | CTLFLAG_LOCKED);
+    gCpArmOid.oid_arg1 = nullptr;
+    gCpArmOid.oid_name = "piano_power_cp_arm";
+    gCpArmOid.oid_handler = cpArmSysctl;
+    gCpArmOid.oid_fmt = "I";
+    gCpArmOid.oid_descr = "PianoPower: arm the SC8541 charge pump for this boot (root; 1 = armed)";
+    gCpArmOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gCpArmOid);
+    gCpArmRegistered = true;
+  }
+  note("cp: SC8541 at 0x6a (id %#x); unarmed until machdep.piano_power_cp_arm=1; no register written", PIANO_CP_DEVICE_ID);
+}
+
+// Every worker pass: the arm, the kick and the guard; a stop on disarm, sleep or shutdown. The bus is pack A's, taken here.
+void PianoPower::serviceCp(uint64_t now)
+{
+  if (!gArgs.cp || !gCpHook) return;
+  pianopower::Sc8541 &fCp = *gCpHook;
+  fCp.arm.bootArg = true;
+  fCp.arm.sysctl = __atomic_load_n(&gCpArm, __ATOMIC_ACQUIRE) == 1;
+  const bool mustStop = fCp.switching() && (!fCp.arm.armed() || fHandover || fShutdownSeen);
+  if (!mustStop && !fCp.kickDue(now) && !fCp.guardDue(now)) return;
+  if (fHandoverAcked && !mustStop) return;   // the gauges' I2C idle while asleep (docs/power.md 4)
+  GaugeBus &b = gBuses[0];
+  takePin(b.scl); takePin(b.sda); IODelay(20);
+  const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
+  I2cBus bus(io);
+  if (mustStop) {
+    fCp.stop(bus, !fCp.arm.armed() ? 0x44495341u /* DISA */ : fHandover ? 0x534c4550u /* SLEP */ : 0x444f574eu /* DOWN */);
+    note("cp: stopped (%s)", !fCp.arm.armed() ? "disarmed" : fHandover ? "system sleep" : "shutdown");
+  } else {
+    fCp.beforeBusTransaction(bus);
+  }
+  givePin(b.sda); givePin(b.scl);
+  const uint32_t f = fCp.takeFaults();
+  if (f) {gCpFaults |= f; note("cp: faults %#x (lost %u, switching %u)", f, fCp.lost(), fCp.switching());}
 }
 
 void PianoPower::probeGauges()
@@ -2394,6 +2484,7 @@ void PianoPower::run()
   }
   surveyAdsp();
   probeGauges();
+  probeCp();
   if (gArgs.level >= 2) startCharger();
   report();
   uint64_t reportDue = nowMs() + uint64_t(gArgs.period) * 1000;
@@ -2412,6 +2503,7 @@ void PianoPower::run()
       if (fWatch.ticks != ticks || (fFix.nextDue() && now >= fFix.nextDue())) fixPoll(now);
     }
     serviceMca(now);
+    serviceCp(now);
     const PianoUsbcObservation observed = piano_usbc_observe(&fContract, fPolicyOn,
         gArgs.ucsi && fWasUp && !fQuiet.raised, now);
     piano_usbc_relay_observe(&observed);
@@ -2448,6 +2540,7 @@ void PianoPower::run()
     if (fChgEn.nextDue() && fChgEn.nextDue() < next) next = fChgEn.nextDue();
     if (fWatch.nextDue() && fWatch.nextDue() < next) next = fWatch.nextDue();
     if (fFix.nextDue() && fFix.nextDue() < next) next = fFix.nextDue();
+    if (const uint64_t cpDue = gCpHook ? gCpHook->nextDeadline() : 0) if (cpDue < next) next = cpDue;
     if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;

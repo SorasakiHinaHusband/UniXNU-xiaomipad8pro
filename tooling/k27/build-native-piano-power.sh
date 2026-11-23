@@ -46,6 +46,10 @@ tail -1 "$T/pon-history-fixture.txt"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/power_host.cpp" "$T/PianoMca.o" "$T/ChargePolicy.o" \
   "$T/QcomQrtr.o" -o "$T/power_host"
 "$T/power_host" || { echo "Error: PianoPower host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host"   # the SC8541 driver (ChargePump.h)
+"$T/cp_driver_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host_san"
+"$T/cp_driver_host_san"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"   # BatteryMap.h (piano-power-ps)
 "$T/battery_host" || { echo "Error: PianoPower battery host tests failed" >&2; exit 1; }
 # The DSP client contract (package/include/PianoAdspContract.h): the QRTR port table against the router codec, the health pieces and
