@@ -625,6 +625,25 @@ bluetoothd to the controller (`HciH4.h` `H4LeMaskPatcher`, stateful across write
 `-le-length-changes`, `-le-phy-updates`, `-disconnections`; the first 32 logged with status, handle and reason, never an address).
 Note that bluetoothd's own HCI trace shows the mask before the patch.
 
+`piano-bt-lerdy=1` (2026-11-24, host-tested; default 0; `machdep.piano_bt_lerdy` switches it at run time) covers the case the mask
+alone cannot: a controller and peer that never run the data length or PHY procedure (the event is only sent when a procedure
+changes something). `HciH4.h` `LeReadyAssist` follows each LE link: once its remote features are read, if neither a Data Length
+Change nor an ATT client request or SMP Pairing Request from the host has passed after 0.75 s, it hands the host, between two
+controller packets, the Data Length Change a procedure that changed nothing would produce (27 octets / 328 us both ways, the link's
+true values in that case); after 1.5 s, for a 2M peer without a PHY Update Complete, one with status 0 on LE 1M both ways; after
+2.25 s the same Data Length Change again (the 27.3 bluetoothd completes its length probe on an event with unchanged values when
+the first one made it rescale). A real event cancels its kind; the host's GATT/SMP start ends the assist for the link. Each
+injection is logged (`bt-lerdy1: injected LE data length change 27/328 handle=... step=N`) and counted
+(`piano-bt-h4-lerdy-features`, `-host-started`, `-injected-length`, `-injected-phy`). bluetoothd's HCI trace records the injected
+events as if the controller had sent them.
+
+The hands-free test peer: `le-test/le-peripheral SECONDS NONCE [plain|secure|hid]` on a Mac next to the tablet (from a Terminal
+window or a session started from one; over ssh CoreBluetooth reports unauthorized). `secure` adds an encryption-required
+characteristic, so `piano-bt-probe --le-pair` on the tablet makes bluetoothd pair (LE Secure Connections, Just Works) and the Mac
+logs `secure-read`. `hid` shows that CoreBluetooth refuses a third-party HID service (`hid_service_added=0 error=8`, measured on
+macOS 27.2): HID over GATT itself needs a real keyboard or mouse. `piano-bt-probe --le-rssi SECONDS` reports the RSSI distribution
+of the test peripheral's advertisements (the RF check at a known distance).
+
 ## 9. Fallback
 
 `piano-bt=0` (the default): nothing runs, the controller stays off (BT_EN low), the shared rails as PianoWifi leaves them. A level that

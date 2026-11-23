@@ -235,8 +235,7 @@ class H4LeMaskPatcher {
   Stats stats_;
 };
 
-// The LE link-ready assist (piano-bt-lerdy; docs/drivers/bluetooth.md, "LE link ready", and
-// private analysis 20261124-bt-pair). The 27.3 bluetoothd leaves an LE link in LE_READY_WAIT_FOR_LENGTH after the remote features
+// The LE link-ready assist (piano-bt-lerdy; docs/drivers/bluetooth.md, "LE link ready"). The 27.3 bluetoothd leaves an LE link in LE_READY_WAIT_FOR_LENGTH after the remote features
 // when both sides support data length extension, and in LE_READY_WAIT_FOR_PHY when both support 2M, until the controller reports
 // LE Data Length Change (subevent 0x07) or LE PHY Update Complete (0x0c). It never requests either procedure itself. A controller
 // (or peer) that does not run them leaves the link without GATT forever. The assist watches the controller's events and the host's
