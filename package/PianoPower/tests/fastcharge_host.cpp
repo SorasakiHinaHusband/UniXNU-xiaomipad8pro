@@ -245,11 +245,23 @@ static void caps() {
   Options o; o.caps = true;
   Bench b(xiaomi67(), o);
   CHECK(b.untilOn()); b.ticks(2);
-  CHECK(b.bus == 9000 && b.icl == 1600 && b.fcc == 3000 && b.link.plan.icl_why == PIANO_CHG_ICL_9V);   // in_pd 1600, chg_pd 3000
-  // an RDO below the row bounds the input: 9 V 2 A charger
+  // T-14 9 V: the RDO 3000 within the 9 V 3 A object, at most in_pps 2500 (a cool connector reads), the charge current chg_pps 3500
+  CHECK(b.bus == 9000 && b.icl == 2500 && b.fcc == 3500 && b.link.plan.icl_why == PIANO_CHG_ICL_9V);
+  // the object bounds the input: 9 V 2 A charger -> 2000 in, the charge current min(2 x 2000, 3500)
   Bench f(fixedOnly(), o);
   CHECK(f.untilOn()); f.ticks(2);
-  CHECK(f.icl == 1600 && f.fcc == 3000);
+  CHECK(f.icl == 2000 && f.fcc == 3500);
+  // without a connector reading, or with one at 50 C or more: the in_pd row 1600, chg_pd 3000 (y10's values)
+  Bench n(xiaomi67(), o);
+  n.board.valid &= ~((1u << PIANO_BOARD_TEMP_CONNECTOR) | (1u << PIANO_BOARD_TEMP_CONNECTOR2));
+  CHECK(n.untilOn()); n.ticks(2);
+  CHECK(n.bus == 9000 && n.icl == 1600 && n.fcc == 3000);
+  Bench w(xiaomi67(), o);
+  CHECK(w.untilOn()); w.ticks(2); CHECK(w.icl == 2500);
+  w.board.milli_c[PIANO_BOARD_TEMP_CONNECTOR] = 51000; w.ticks(2);
+  CHECK(w.bus == 9000 && w.icl == 1600 && w.fcc <= 3200);
+  w.board.milli_c[PIANO_BOARD_TEMP_CONNECTOR] = 30000; w.ticks(2);
+  CHECK(w.icl == 2500 && w.fcc == 3500);
   Options pps = o; pps.hv = 2;
   Bench p(xiaomi67(), pps);
   CHECK(p.untilOn()); p.ticks(2);

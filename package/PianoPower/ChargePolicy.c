@@ -20,6 +20,7 @@
 #define HV_PPS_MAX_MA 3000u
 #define NOTIFY_HOLD_MS 3000u      /* T-14b: a UCSI notification in flight younger than this holds the limits in force, */
 #define NOTIFY_HOLD_MAX 3u        /* for at most this many decisions in a row; then the contract counts as lost */
+#define HV_PD_ROW_MA 1600u       /* stock in_pd: a fixed 9 V PD source's input row; above it only with T-14 9 V's connector rule */
 #define FCC_TBAT_MIN 15
 #define FCC_DERATE_FROM 48
 #define FCC_DERATE_STEP 300u
@@ -988,8 +989,9 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
         s->hv = PIANO_CHG_HV_ON;
         s->hv_pps = (uint8_t)pps;
         s->hv_ma = umin(in->contract_ma, budget);
-        /* cfg.hv_caps: stock in_pd 1600 / in_pps 2500 at 9 V (the class rows), within the RDO and the object */
-        return umin(s->hv_ma, hv_caps(c) ? (pps ? 2500u : 1600u) : PIANO_CHG_ICL_CAP);
+        /* cfg.hv_caps: at most the buck's highest stock input at 9 V (in_pps 2500) within the RDO and the object; the decision
+         * applies the class row of a fixed PD source (in_pd 1600) unless T-14 9 V's connector rule allows more */
+        return umin(s->hv_ma, hv_caps(c) ? PIANO_CHG_ICL_ABS_MAX : PIANO_CHG_ICL_CAP);
     }
     if (s->hv == PIANO_CHG_HV_ASKED) {
         if (now < s->hv_asked_ms + HV_SETTLE_MS) return 0;
@@ -1676,6 +1678,14 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     if (hv_on) {
         icl = umin(s->hv_qc ? piano_charge_icl_qc3_9v(hv_ma) : piano_charge_icl_9v(cls, hv_ma),
                    hv_caps(c) ? PIANO_CHG_ICL_ABS_MAX : icl_cap(c));
+        /* T-14 9 V (owner 2026-11-23 19:22): with cfg.hv_caps a fixed 9 V PD contract gets what it advertises, its RDO within the
+         * object (hv_ma), up to the buck's highest stock input at 9 V (in_pps 2500; the Ubuntu port's fixed-PD rule, its
+         * MCA_ICL_HV_MAX_MA), instead of the in_pd row 1600; above the row only with a connector that reads below 50 degC and no
+         * hot hold (the 5 V rule), else the row. QC and PPS keep their rows. */
+        if (hv_caps(c) && !s->hv_qc && cls == PIANO_CHG_C_PD) {
+            icl = umin(hv_ma, PIANO_CHG_ICL_ABS_MAX);
+            if (icl > HV_PD_ROW_MA && !conn_allows_rp(in, s)) icl = HV_PD_ROW_MA;
+        }
         p->icl_why = PIANO_CHG_ICL_9V;
         p->rp_ma = 0;
     } else {
@@ -1737,6 +1747,9 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
      * the buck can pass from 9 V into a 4 V pack); 5 V and every transition keep the stage A ceilings */
     const int fast = hv_on && hv_caps(c);
     if (fast && s->hv_qc) full = piano_charge_qc_fcc_9v(s->type);
+    /* T-14 9 V: a fixed PD source above its row: the buck's stock maximum at 9 V (chg_pps 3500; the Ubuntu port: 2 x ICL, at most
+     * 3600), still at most twice the input limit below and under every derating and hold */
+    if (fast && !s->hv_qc && cls == PIANO_CHG_C_PD && icl > HV_PD_ROW_MA) full = PIANO_CHG_FCC_ABS_MAX;
     full = umin(full, fast ? PIANO_CHG_FCC_ABS_MAX : fcc_cap(c));
     if (c->strict_contract) {
         full = umin(full ? full : PIANO_CHG_FCC_DEFAULT, fast ? umin(PIANO_CHG_FCC_ABS_MAX, 2 * icl) : PIANO_CHG_FCC_CAP);

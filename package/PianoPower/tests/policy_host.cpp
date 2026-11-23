@@ -2162,12 +2162,12 @@ static void testT14FiveVoltMax()
   // a 9 V source that reaches 9 V: unchanged (the 9 V row), and the barrier before the request (StrictSim::step checks it)
   {
     StrictSim s; daily(s, 1); s.run(40);
-    CHECK(s.busMv == 9000 && s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600);
+    CHECK(s.busMv == 9000 && s.st.hv == PIANO_CHG_HV_ON && s.icl == 2500);   // T-14 9 V (a cool connector reads)
     // the health stop takes it back to 5 V: there the 5 V contract, demand-driven, while held
     s.soc = 80; s.run(30);
     CHECK(s.busMv == 5000 && s.st.hold && s.enable == 0 && s.icl == 3000 && s.plan.fallback == PIANO_CHG_FALLBACK_HEALTH);
     s.soc = 75; s.run(30);                                  // resumed: 9 V again, behind the barrier
-    CHECK(!s.st.hold && s.enable == 1 && s.busMv == 9000 && s.icl == 1600);
+    CHECK(!s.st.hold && s.enable == 1 && s.busMv == 9000 && s.icl == 2500);
   }
   // before the 9 V request (OFF, the 15 s wait): the row only, so the barrier never has to undo a step
   {
@@ -2182,7 +2182,7 @@ static void testT14FiveVoltMax()
     CHECK(s.st.hv == PIANO_CHG_HV_OFF && s.plan.fallback == PIANO_CHG_FALLBACK_SAFETY && s.busMv == 5000);
     CHECK(s.icl == 1500 && maxIcl(s) == 1500);
     s.temp(40); s.run(20);
-    CHECK(s.busMv == 9000 && s.icl == 1600);
+    CHECK(s.busMv == 9000 && s.icl == 2500);
   }
   // a detach in the middle of the steps: the next attach starts from the row, and the quick detach costs one step for 60 s
   {
@@ -2217,6 +2217,74 @@ static void testT14FiveVoltMax()
     s.temp(50); s.run(12);
     CHECK(s.fcc <= 900 && s.icl == 3000);
     s.temp(56); s.run(4); CHECK(s.enable == 0);              // the firmware's and the policy's 55 C stop
+  }
+}
+
+// T-14 9 V (owner 2026-11-23 19:22): with hv_caps a fixed 9 V PD contract gets its RDO within the object, up to the buck's highest
+// stock 9 V input (in_pps 2500), and the charge current up to chg_pps 3500 (at most twice the input); above the in_pd row (1600)
+// only with a connector that reads below 50 C. Every derating, hold and stop unchanged; 80/75 unchanged.
+static void testT14NineVolt()
+{
+  auto daily = [](StrictSim &s) {
+    s.cfg.hv = 1; s.cfg.rp = s.cfg.ramp = 1; s.cfg.rp_cap_ma = 3000;
+    s.cfg.hv_order = s.cfg.hv_caps = s.cfg.qc = s.cfg.fv_hot = 1;
+    s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+    s.loadMa = 3200; s.soc = 40;
+  };
+  auto at9 = [](StrictSim &s, uint32_t pdoMa, uint32_t rdoMa) {
+    s.pd({{5000, 5000, 3000}, {9000, 9000, pdoMa}}); s.fixed9 = pdoMa; s.pps9 = 0;
+    for (unsigned i = 0; i < 40 && s.busMv != 9000; ++i) s.step();
+    s.contractMa = rdoMa;   // the RDO at 9 V (StrictSim keeps the current; the voltage follows the request)
+    s.run(6);
+  };
+  {   // 9 V 3 A (the 70 W charger's fixed object, RDO 3000): 2500 in, 3500 charge
+    StrictSim s; daily(s); at9(s, 3000, 3000);
+    CHECK(s.busMv == 9000 && s.st.hv == PIANO_CHG_HV_ON && s.icl == 2500 && s.fcc == 3500 && s.plan.icl_why == PIANO_CHG_ICL_9V);
+  }
+  {   // 9 V 2 A (an 18 W charger): the object's 2000, charge min(2 x 2000, 3500)
+    StrictSim s; daily(s); at9(s, 2000, 2000);
+    CHECK(s.busMv == 9000 && s.icl == 2000 && s.fcc == 3500);
+  }
+  {   // the cap: a 5 A object and RDO -> 2500 in
+    StrictSim s; daily(s); at9(s, 5000, 5000);
+    CHECK(s.busMv == 9000 && s.icl == 2500 && s.fcc == 3500);
+  }
+  {   // an RDO below the object bounds it
+    StrictSim s; daily(s); at9(s, 3000, 1800);
+    CHECK(s.busMv == 9000 && s.icl == 1800 && s.fcc == 3500);
+  }
+  {   // at or below the row: the stock rows as before (chg_pd 3000)
+    StrictSim s; daily(s); at9(s, 1500, 1500);
+    CHECK(s.busMv == 9000 && s.icl == 1500 && s.fcc == 3000);
+  }
+  {   // no connector reading: the in_pd row 1600 and chg_pd 3000 (y10's behaviour)
+    StrictSim s; daily(s); s.boardValid = 0; at9(s, 3000, 3000);
+    CHECK(s.busMv == 9000 && s.icl == 1600 && s.fcc == 3000);
+  }
+  {   // heat: a connector at 51 C -> the row; at 60 C -> 100 mA; cool -> 2500 again; the charger at 85 C -> 500
+    StrictSim s; daily(s); at9(s, 3000, 3000); CHECK(s.icl == 2500);
+    s.conn1Dc = 510; s.run(2); CHECK(s.icl == 1600 && s.fcc <= 3200);
+    s.conn1Dc = 600; s.run(2); CHECK(s.icl == 100);
+    s.conn1Dc = 310; s.run(20); CHECK(s.busMv == 9000 && s.icl == 2500);
+    s.chgrDc = 850; s.boardValid |= PIANO_CHG_IN_CHGR; s.run(2); CHECK(s.icl <= 500 && s.fcc <= 1000);
+  }
+  {   // a gauge DTPT alert: no raise, the charge current to 500
+    StrictSim s; daily(s); at9(s, 3000, 3000);
+    s.safe &= ~PIANO_CHG_SAFE_DTPT; s.run(3); CHECK(s.fcc <= 500 && s.icl <= 2500);
+  }
+  {   // a pack at 46 C: 5 V again (the 45 C rule), stage A currents; the charge current derates from 48 C at 5 V
+    StrictSim s; daily(s); at9(s, 3000, 3000);
+    s.temp(46); s.run(8); CHECK(s.busMv == 5000 && s.fcc <= 1500 && s.icl <= 1600);
+  }
+  {   // 80/75 unchanged: the hold at 80 % (5 V, charging off), 75 % resumes, 9 V again at 2500 behind the barrier
+    StrictSim s; daily(s); at9(s, 3000, 3000);
+    s.soc = 80; s.run(20); CHECK(s.busMv == 5000 && s.st.hold && s.enable == 0);
+    s.soc = 76; s.run(4); CHECK(s.st.hold && s.enable == 0);
+    s.soc = 75; s.run(30); CHECK(!s.st.hold && s.enable == 1 && s.busMv == 9000 && s.icl == 2500);
+  }
+  {   // without hv_caps nothing changes: the stage-A ceilings at 9 V
+    StrictSim s; daily(s); s.cfg.hv_caps = 0; at9(s, 3000, 3000);
+    CHECK(s.busMv == 9000 && s.icl == 1600 && s.fcc == 1500);
   }
 }
 
@@ -2308,9 +2376,9 @@ static void testT14NotifyCycle()
   {   // during a hold a hot connector still takes the input to 100 mA, and a bus out of the 9 V window ends the hold
     NotifyBench b; daily(b.s); b.s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
     for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
-    b.s.run(6); CHECK(b.s.icl == 1600);
+    b.s.run(6); CHECK(b.s.icl == 2500);                     // T-14 9 V with a cool connector
     b.s.conn1Dc = 600; b.step(200, true); CHECK(b.s.plan.icl_ma == 100 && b.s.icl == 100);
-    b.s.conn1Dc = 310; b.s.run(20); CHECK(b.s.icl == 1600);
+    b.s.conn1Dc = 310; b.s.run(20); CHECK(b.s.icl == 2500);
     b.s.busMv = 7500; b.step(200, true); CHECK(b.s.plan.icl_ma <= 500);
   }
   {   // the 80 % stop acts in a hold; 75 % resumes on the next fresh decision
@@ -2331,6 +2399,7 @@ static void testT14NotifyCycle()
 int main()
 {
   testT14FiveVoltMax();
+  testT14NineVolt();
   testT14NotifyCycle();
   testDailyFiveVoltBudget();
   testBootRampRetry();
