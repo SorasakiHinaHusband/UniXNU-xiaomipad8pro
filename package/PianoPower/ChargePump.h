@@ -225,6 +225,8 @@ class Sc8541 {
   int wdSaved_ = -1;
   uint32_t faults_ = 0, busErrors_ = 0, busocpMa_ = 0, stopReason_ = 0;
   uint64_t lastKickMs_ = 0, guardAtMs_ = 0;
+  uint8_t ctrl2Shadow_ = 0;          // sim (fork B): CTRL2 verified at the start, without CHG_EN / EN_BYPASS
+  bool ctrl2ShadowValid_ = false;
   uint8_t stat_[PIANO_CP_STAT_BYTES] = {};   // 0x13..0x1c as read at the last falling CHG_EN
   bool statValid_ = false;
 

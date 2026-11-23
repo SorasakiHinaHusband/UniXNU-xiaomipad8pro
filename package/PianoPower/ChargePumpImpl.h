@@ -50,6 +50,13 @@ inline bool Sc8541::writeChecked(I2cBus &bus, uint8_t reg, uint8_t mask, uint8_t
   if (!cpWriteAllowed(reg, mask, value, wdSaved_)) {fail(PIANO_CP_FAULT_REFUSED); return false;}
   uint8_t old = 0, back = 0;
   if (!readReg(bus, reg, &old)) return false;
+  // sim (fork B): the bits outside mask come from the register; two agreeing reads first, so a read corrupted on the wire is never
+  // written back into another field (a flipped bit 3 of CTRL2 is EN_BYPASS)
+  if (mask != 0xff) {
+    uint8_t again = 0;
+    if (!readReg(bus, reg, &again)) return false;
+    if (again != old) {fail(PIANO_CP_FAULT_READBACK); return false;}
+  }
   const uint8_t next = uint8_t((old & ~mask) | value);
   if (bus.writeRegisterByte(PIANO_CP_ADDRESS, reg, next) != I2cResult::ok) {busError(); return false;}
   if (!readReg(bus, reg, &back)) return false;
@@ -175,10 +182,13 @@ inline bool Sc8541::start(I2cBus &bus, uint32_t busocpMa)
     if (!writeChecked(bus, w.reg, w.mask, w.value)) {stop(bus, 0x41524d00u /* 'ARM' */); return false;}
   busocpMa_ = ocp;
   // CHG_EN: read-modify-write; it reads back set only some time later, so the session checks it at its next poll
+  ctrl2ShadowValid_ = false;
+  {uint8_t c = 0, d = 0;   // sim (fork B): CTRL2 as verified before CHG_EN (two agreeing reads), the stop's fallback
+   if (readReg(bus, PIANO_CP_REG_CTRL2, &c) && readReg(bus, PIANO_CP_REG_CTRL2, &d) && c == d) {ctrl2Shadow_ = uint8_t(c & ~(PIANO_CP_CHG_EN | PIANO_CP_EN_BYPASS)); ctrl2ShadowValid_ = true;}}
   if (!cpWriteAllowed(PIANO_CP_REG_CTRL2, PIANO_CP_CHG_EN, PIANO_CP_CHG_EN, wdSaved_)) {fail(PIANO_CP_FAULT_REFUSED); return false;}
-  uint8_t ctrl2 = 0;
-  if (!readReg(bus, PIANO_CP_REG_CTRL2, &ctrl2)) {stop(bus, 0x43544c32u); return false;}
-  if (bus.writeRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, uint8_t(ctrl2 | PIANO_CP_CHG_EN)) != I2cResult::ok) {
+  // sim (fork B): CHG_EN set on the CTRL2 value just verified by two agreeing reads (EN_BYPASS clear), never on a single read
+  if (!ctrl2ShadowValid_) {stop(bus, 0x43544c32u); return false;}
+  if (bus.writeRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, uint8_t(ctrl2Shadow_ | PIANO_CP_CHG_EN)) != I2cResult::ok) {
     busError();
     stop(bus, 0x43484745u /* 'CHGE' */);
     return false;
@@ -195,10 +205,15 @@ inline void Sc8541::stop(I2cBus &bus, uint32_t reason)
   switching_ = false;
   if (!present_) return;
   // CHG_EN = 0 whatever the register reads (the bits beside it as read; if the read fails, try once more, then the watchdog)
-  uint8_t ctrl2 = 0;
-  bool read = bus.readRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, &ctrl2) == I2cResult::ok;
-  if (!read) read = bus.readRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, &ctrl2) == I2cResult::ok;
-  if (read && bus.writeRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, uint8_t(ctrl2 & ~PIANO_CP_CHG_EN)) == I2cResult::ok) {
+  // sim (fork B): the bits beside CHG_EN from two agreeing reads, else from the value verified at the start (a read corrupted on
+  // the wire must not reach another CTRL2 field); EN_BYPASS is always cleared by a stop
+  uint8_t ctrl2 = 0, again = 0;
+  const bool a = bus.readRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, &ctrl2) == I2cResult::ok;
+  const bool b = a && bus.readRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, &again) == I2cResult::ok;
+  const bool agree = a && b && ((ctrl2 ^ again) & uint8_t(~PIANO_CP_CHG_EN)) == 0;
+  const uint8_t base = agree ? ctrl2 : ctrl2Shadow_;
+  const bool read = agree || ctrl2ShadowValid_;
+  if (read && bus.writeRegisterByte(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, uint8_t(base & ~(PIANO_CP_CHG_EN | PIANO_CP_EN_BYPASS))) == I2cResult::ok) {
     busErrors_ = 0;
   } else {
     busError();
