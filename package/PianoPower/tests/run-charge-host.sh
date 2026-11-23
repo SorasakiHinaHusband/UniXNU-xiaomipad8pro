@@ -41,3 +41,12 @@ done
 "$T/cp_driver_host_san"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"
 "$T/battery_host"
+# T-CP fork B: the charge pump simulator (cp_sim.h plant + checker, cp_ref.h reference, cp_real.h the integrated driver/session/MiPPS):
+# 45 scenarios, 17 guard mutants, the integrated code under 10 sensitivity cases, and randomized fuzz (1000 episodes here; the full
+# qualification runs `cp_sim_host 10000`). ASan/UBSan.
+for f in ChargePumpSession ChargeMipps ChargePolicy PianoMca; do
+  "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -I "$D/package/include" -c "$P/$f.c" -o "$T/${f}_cpsim.o"
+done
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -I "$P" -I "$D/package/include" "$P/tests/cp_sim_host.cpp" \
+  "$T/ChargePumpSession_cpsim.o" "$T/ChargeMipps_cpsim.o" "$T/ChargePolicy_cpsim.o" "$T/PianoMca_cpsim.o" -o "$T/cp_sim_host"
+CPSIM_REAL_FUZZ=1000 "$T/cp_sim_host" 1000

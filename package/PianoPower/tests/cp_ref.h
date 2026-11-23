@@ -183,8 +183,8 @@ struct RefController final : Controller {
         fw.get(prop::ADAPTER_ID, &mid);
         bool match = false;
         uint8_t exp[16];
-        if (mid) {mipps_answer(pc->host_key, mchal, uint16_t(mid), exp); match = !std::memcmp(exp, mans, 16);}
-        else for (uint32_t id = 0; id < 65536 && !match; ++id) {mipps_answer(pc->host_key, mchal, uint16_t(id), exp); match = !std::memcmp(exp, mans, 16);}
+        if (mid) {mipps_answer(pc->host_key, mchal, mid, exp); match = !std::memcmp(exp, mans, 16);}
+        else for (uint32_t id = 0; id < 65536 && !match; ++id) {mipps_answer(pc->host_key, mchal, id, exp); match = !std::memcmp(exp, mans, 16);}
         mstep = 6;
         if (!match && !(mut & M_TRUST_MIPPS)) {mipps_finish(fw, false); st = St::idle; return;}
         uint8_t f[4]; u32(1, f);
@@ -223,8 +223,8 @@ struct RefController final : Controller {
   bool arm(Bus &b, uint64_t now, uint32_t busocp) {
     uint8_t c3 = 0;
     if (rd(b, PIANO_CP_REG_CTRL3, &c3)) return false;
-    uint8_t c3b = 0;
-    if (rd(b, PIANO_CP_REG_CTRL3, &c3b) || c3b != c3) return false;   // two agreeing reads
+    uint8_t c3b = 0, c3c = 0;
+    if (rd(b, PIANO_CP_REG_CTRL3, &c3b) || c3b != c3 || rd(b, PIANO_CP_REG_CTRL3, &c3c) || c3c != c3) return false;   // three agreeing reads
     if (saved_wd < 0) saved_wd = c3 & PIANO_CP_WD_MASK;
     ctrl3_shadow = c3; have_ctrl3 = true;
     if (!kick(b, now)) return false;
@@ -303,7 +303,7 @@ struct RefController final : Controller {
         if (std::abs(want - have) > step && n) {qc_pulse(fw, n); t_state = now + 300; return;}
       }
       target_ma = ibus_target(s, 2 * vbat_max(s) + 300);
-      if (!arm(b, now, qc ? std::min<uint32_t>(target_ma + 1000, 3000) : target_ma + 1000)) {exit_session(b, fw, true); return;}
+      if (!arm(b, now, qc ? std::min<uint32_t>(target_ma + 1000, 2500) : target_ma + 1000)) {exit_session(b, fw, true); return;}
       if (!wr(b, PIANO_CP_REG_CTRL2, PIANO_CP_CHG_EN, PIANO_CP_CHG_EN) && !(mut & M_NO_READBACK)) {
         // CHG_EN reads back set only later: the opening checks it at its next step
       }
@@ -365,7 +365,7 @@ struct RefController final : Controller {
       if (int32_t(target_ma) - ibus > 200 && ((mut & M_NO_WINDOW) || vbus < window - 100)) {if (qc) qc_pulse(fw, 1); else if (req_mv + 20 <= uint32_t(2 * vb + 2000) || (mut & M_NO_WINDOW)) request_v(fw, s, req_mv + 20, target_ma);}
       else if (ibus > int32_t(target_ma) + 300) {const int down = std::min(10, (ibus - int32_t(target_ma)) / 140); if (qc) qc_pulse(fw, -std::max(1, down)); else request_v(fw, s, req_mv - 20u * uint32_t(std::max(1, down)), target_ma);}
       else if (ibus > int32_t(target_ma)) {if (qc) qc_pulse(fw, -1); else request_v(fw, s, req_mv - 20, target_ma);}
-      const uint32_t ocp = std::clamp<uint32_t>(qc ? std::min<uint32_t>(target_ma + 1000, 3000) : target_ma + 1000, 1000, 7000);
+      const uint32_t ocp = std::clamp<uint32_t>(qc ? std::min<uint32_t>(target_ma + 1000, 2500) : target_ma + 1000, 1000, 7000);
       if (!wr(b, PIANO_CP_REG_BUSOCP, 0x9f, PIANO_CP_ENC_BUSOCP(ocp)) && !(mut & M_NO_READBACK)) exit_session(b, fw, true);
       return;
     }

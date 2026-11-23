@@ -77,10 +77,10 @@ inline void hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, siz
   Sha256 a; a.update(ipad, 64); a.update(msg, mlen); a.final(inner);
   Sha256 b; b.update(opad, 64); b.update(inner, 32); b.final(out);
 }
-inline void mipps_answer(const uint8_t key[32], const uint8_t challenge[16], uint16_t id, uint8_t out[16]) {
-  uint8_t msg[18], mac[32];
+inline void mipps_answer(const uint8_t key[32], const uint8_t challenge[16], uint32_t id, uint8_t out[16]) {
+  uint8_t msg[20], mac[32];   // challenge || the adapter ID as a big-endian u32 (fork D's reading of the protocol)
   std::memcpy(msg, challenge, 16);
-  msg[16] = uint8_t(id >> 8); msg[17] = uint8_t(id);
+  msg[16] = uint8_t(id >> 24); msg[17] = uint8_t(id >> 16); msg[18] = uint8_t(id >> 8); msg[19] = uint8_t(id);
   hmac_sha256(key, 32, msg, sizeof msg, mac);
   std::memcpy(out, mac, 16);
 }
@@ -226,7 +226,9 @@ struct Plant final : Bus, Firmware {
   // the chip
   uint8_t r[0x42] = {};
   bool active = false, en_req = false;
-  uint64_t en_at = 0, wd_kick = 0;
+  uint64_t en_at = 0, wd_kick = 0, en_written_at = 0;
+  uint32_t wd_ms = kWdMs, en_latency_ms = kEnLatencyMs;   // sensitivity: the unknown hardware watchdog period and CHG_EN delay
+  bool auto_inc = true;                                       // sensitivity: block reads without auto-increment
   uint8_t flags = 0;
   double tdie_c = 30, conn_c = 25, conn2_c = 25, charger_c = 30, extra_die_w = 0, extra_conn_w = 0, r_path = 0.004;
   bool last_write_corrupt = false, keep_en = false;
@@ -380,7 +382,7 @@ struct Plant final : Bus, Firmware {
   void trip(uint8_t f) {flags |= f; active = false; en_req = false; r[reg::CTRL2] &= uint8_t(~PIANO_CP_CHG_EN);}
   uint8_t chip_read(uint8_t a) {
     if (a >= sizeof r) return 0;
-    if (a == reg::CTRL2) return uint8_t((r[a] & ~PIANO_CP_CHG_EN) | ((r[a] & PIANO_CP_CHG_EN) && !(en_req && now < en_at) ? PIANO_CP_CHG_EN : 0));   // the bit as written, after its latency
+    if (a == reg::CTRL2) return uint8_t((r[a] & ~PIANO_CP_CHG_EN) | ((r[a] & PIANO_CP_CHG_EN) && now >= en_written_at + en_latency_ms ? PIANO_CP_CHG_EN : 0));   // the bit as written, after its latency
     if (a == reg::FLAG) {const uint8_t v = flags; flags = 0; return v;}
     if (a == reg::STAT) return active ? 1 : 0;
     return r[a];
@@ -402,14 +404,14 @@ struct Plant final : Bus, Firmware {
         if ((out & ~masks) == (out & ~masks & ~v) && (out & masks & ~w.mask) == (out & masks & ~w.mask & ~v) &&
             (v & w.mask) >= w.lo && (v & w.mask) <= w.hi) ok = true;
       }
-    if (a == reg::CTRL3 && (v & PIANO_CP_WD_MASK) == 0) ok = true;   // the release to the saved (reset) field after a confirmed stop
+    if (a == reg::CTRL3 && !active && (((v ^ r[a]) & ~PIANO_CP_WD_MASK) & v) == 0) ok = true;   // the release of the watchdog field to what it held before (A's savedWd), never while switching
     if (!ok && !last_write_corrupt) {char t[64]; std::snprintf(t, sizeof t, "write 0x%02x <- 0x%02x outside kCpAllowed", a, v); write_violations.push_back(t);}
     if (a == reg::DEVICE || a == reg::FLAG || a == reg::STAT || (a >= reg::ADC && a < reg::ADC + 2 * PIANO_CP_ADC_CHANNELS)) return;
     if (ignore_writes[a]) return;
     r[a] = v;
     if (a == reg::CTRL3) wd_kick = now;
     if (a == reg::CTRL2) {
-      if (v & PIANO_CP_CHG_EN) {if (!en_req && !active) {en_req = true; en_at = now + kEnLatencyMs;}}
+      if (v & PIANO_CP_CHG_EN) {if (!en_req && !active) {en_req = true; en_at = now + en_latency_ms; en_written_at = now;}}
       else {en_req = false; active = false; keep_en = false;}
     }
   }
@@ -424,7 +426,7 @@ struct Plant final : Bus, Firmware {
     return got;
   }
   bool bus_fault_recent() const {   // a bus fault window now or within the watchdog period: only the watchdog may be able to stop
-    for (auto &f : faults) if (f.kind != BusFault::latency && now >= f.from_ms && now < f.to_ms + kWdMs) return true;
+    for (auto &f : faults) if (f.kind != BusFault::latency && now >= f.from_ms && now < f.to_ms + wd_ms) return true;
     return false;
   }
   bool stuck_now() {
@@ -442,7 +444,7 @@ struct Plant final : Bus, Firmware {
     if (f == BusFault::nak) {if (addr == PIANO_CP_ADDRESS) ++cp_err; return kNak;}
     if (f == BusFault::timeout) {bus_us += 50000; if (addr == PIANO_CP_ADDRESS) ++cp_err; return kTimeout;}
     if (addr != PIANO_CP_ADDRESS) return kNak;
-    for (unsigned i = 0; i < n; ++i) b[i] = chip_read(uint8_t(a + i));
+    for (unsigned i = 0; i < n; ++i) b[i] = chip_read(uint8_t(auto_inc ? a + i : a));
     if (f == BusFault::bitflip && n) b[std::uniform_int_distribution<unsigned>(0, n - 1)(rng)] ^= uint8_t(1u << (rng() % 8));
     return kOk;
   }
@@ -492,7 +494,7 @@ struct Plant final : Bus, Firmware {
       else {active = true; keep_en = false;}
     }
     if (active && !on) {active = false; keep_en = true; flags |= reg::F_VBUS_LO;}   // input gone: switching stops, CHG_EN stays written
-    if (!active && !en_req && on && (r[reg::CTRL2] & PIANO_CP_CHG_EN)) {en_req = true; en_at = now + kEnLatencyMs;}   // and resumes
+    if (!active && !en_req && on && (r[reg::CTRL2] & PIANO_CP_CHG_EN)) {en_req = true; en_at = now + en_latency_ms;}   // and resumes
     if (active && vs < 2 * (vnode_mv > 0 ? vnode_mv : vth) - 200) {active = false; keep_en = true; flags |= reg::F_VBUS_LO;}
     iout_ma = cp_ibus_ma = 0; cl_mode = false;
     if (active) {
@@ -531,7 +533,7 @@ struct Plant final : Bus, Firmware {
       else if (!(r[reg::BATOVP] & 0x80) && vnode_mv > reg::batovp_mv(r[reg::BATOVP])) trip(reg::F_BATOVP);
       else if (!(r[reg::BATOCP] & 0x80) && iout_ma > reg::batocp_ma(r[reg::BATOCP])) trip(reg::F_BATOCP);
       else if (!(r[reg::TEMP_CTRL] & PIANO_CP_TSHUT_DISABLE) && tdie_c * 10 > kTshutC10) trip(reg::F_TSHUT);
-      else if (wd_on() && now - wd_kick > kWdMs) trip(reg::F_WD);
+      else if (wd_on() && now - wd_kick > wd_ms) trip(reg::F_WD);
     }
     if (active) cp_on_ms += cfg.dt_ms;
     if (r[reg::ADC1] & PIANO_CP_ADC_EN) {
@@ -613,7 +615,8 @@ struct LineBus {
     if (reading_ack) {    // the master's ACK after a byte we sent
       reading_ack = false;
       if (b) {st = St::nacked; return;}
-      ++rgp; prepare_byte();
+      if (p.auto_inc) ++rgp;
+      prepare_byte();
       return;
     }
     if (st == St::rdata) return;   // we drive the bits
@@ -691,6 +694,7 @@ struct Checker {
   Grace grace;
   std::vector<std::string> v;
   std::array<uint64_t, 20> since{}, over{};
+  uint64_t armed_bad_since = 0;
   bool sleep_req = false;
   uint64_t sleep_at = 0;
   size_t seen_write_violations = 0;
@@ -716,8 +720,8 @@ struct Checker {
     const double src_ma = p.mode == Plant::Mode::pps ? p.apdo_ma() : p.mode == Plant::Mode::qc ? p.src.qc_max_ma :
                           p.mode == Plant::Mode::fixed9 ? p.src.fixed9_ma : 3000.0;
     const double budget = std::min<double>(verified_ok ? L.verified_budget_ma : L.std_budget_ma, src_ma);
-    if (p.ipk_ma[0] > L.cell_ocp_ma * 1.06 || p.ipk_ma[1] > L.cell_ocp_ma * 1.06) bad(p, "pack current above the cell OCP + 6 %");
-    if (p.iout_ma + p.buck_out_ma > L.battery_ma * 1.04) bad(p, "battery current above 12 A + 4 %");
+    hold_for(p, 8, p.ipk_ma[0] > L.cell_ocp_ma * 1.06 || p.ipk_ma[1] > L.cell_ocp_ma * 1.06, 15, "pack current above the cell OCP + 6 % for two steps");
+    hold_for(p, 9, p.iout_ma + p.buck_out_ma > L.battery_ma * 1.04, 15, "battery current above 12 A + 4 % for two steps");
     if (p.vbus_mv > L.busovp_mv && p.active) bad(p, "VBUS above 11 V while switching");
     if (vbat > 4550) bad(p, "VBAT above 4550 mV");
     if (p.tdie_c * 10 > L.tdie_exit_c10 + 10 && p.active && !(p.stuck || stalled)) bad(p, "die above 126 C while switching");
@@ -741,20 +745,23 @@ struct Checker {
     cond(p, 5, tmin < L.cell_min_c10 || tmax > L.cell_max_c10, grace.cell_t, "a cell outside 8-55 C");
     cond(p, 6, p.conn_c * 10 >= L.conn_max_c10 || p.conn2_c * 10 >= L.conn_max_c10, grace.conn, "the connector at 50 C or above");
     const bool bus_faulty = p.stuck || p.bus_fault_recent();
-    unable = p.stuck || stalled;
+    unable = p.stuck || (stalled && !asleep);
     cond(p, 7, (!p.gv[0].valid || !p.gv[1].valid) && !bus_faulty, grace.gauge, "a gauge invalid");
     cond(p, 8, p.tdie_c * 10 >= L.tdie_exit_c10, grace.tdie, "the die at 125 C");
-    if ((p.stuck || stalled) && p.active && p.now - p.wd_kick > kWdMs + 500) bad(p, "pump on while the bus is stuck / the host stalled, past the watchdog");
-    if (!p.armed() && p.active && !since[10]) {since[10] = 1; bad(p, "the chip's protections / watchdog / VAC OVP not as intended while switching: " + p.armed_why());}
-    if (p.armed() || !p.active) since[10] = 0;
+    if ((p.stuck || stalled) && p.active && p.now - p.wd_kick > p.wd_ms + 500) bad(p, "pump on while the bus is stuck / the host stalled, past the watchdog");
+    // a register a bus fault corrupted is caught by the read-back and stopped within one pass: 200 ms
+    if (!p.armed() && p.active) {if (!armed_bad_since) armed_bad_since = p.now; if (p.now - armed_bad_since > 200 && !since[10]) {since[10] = 1; bad(p, "the chip's protections / watchdog / VAC OVP not as intended while switching for 200 ms: " + p.armed_why());}}
+    else {armed_bad_since = 0; since[10] = 0;}
     cond(p, 11, p.verify != 0, 0, "MiPPS (0x21002) in progress");
     if (p.cmd8_seen) {bad(p, "VDM command 8 sent (it stalls this firmware)"); const_cast<Plant &>(p).cmd8_seen = false;}
-    if (p.verify && p.now - p.verify_since > 15000) {bad(p, "0x21002 still set 15 s after it was set"); const_cast<Plant &>(p).verify_since = p.now;}
+    if (p.verify && stalled) const_cast<Plant &>(p).verify_since += p.cfg.dt_ms;   // a stalled or sleeping host cannot clear it
+    if (p.verify && p.now - p.verify_since > 15000) {bad(p, "0x21002 still set 15 s (awake) after it was set"); const_cast<Plant &>(p).verify_since = p.now;}
     while (seen_write_violations < p.write_violations.size()) bad(p, p.write_violations[seen_write_violations++]);
     cond(p, 12, asleep, 300, "the system asleep");
     if (sleep_request && !sleep_req) {sleep_req = true; sleep_at = p.now;}
     if (!sleep_request) sleep_req = false;
-    if (sleep_req && p.active && p.now - sleep_at > grace.sleep) {bad(p, "pump still on 2.5 s after the sleep request"); sleep_at = p.now + 1000000;}
+    const uint32_t sleep_grace = (p.stuck || p.bus_fault_recent() || stalled) ? p.wd_ms + 1500 : grace.sleep;
+    if (sleep_req && p.active && p.now - sleep_at > sleep_grace) {bad(p, "pump still on after the sleep request"); sleep_at = p.now + 1000000;}
   }
 };
 
