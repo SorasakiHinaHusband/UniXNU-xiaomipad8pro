@@ -500,7 +500,8 @@ void piano_cp_decide(const PianoCpConfig *c, const PianoCpSys *sys, const struct
                 s->errors++;
                 p->events |= PIANO_CPS_EV_ERROR;
                 if (++s->start_tries >= START_TRIES) {begin_exit(&x, PIANO_CPS_EXIT_START_FAIL, 0); break;}
-                s->request_ms = 0;   /* ask once more */
+                if (volt_free(&x)) s->request_ms = 0;   /* ask once more */
+                else s->request_ms = now;              /* still not answered: one more wait, then the end */
             }
         } else {
             /* QC3-B / 3.5: pulses from 5 V up to the start voltage, one per call, each answered before the next */
