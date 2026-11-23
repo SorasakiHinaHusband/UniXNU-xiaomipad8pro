@@ -481,6 +481,11 @@ struct ScanList {
   uint32_t count = 0;
   // 2026-11-23 (scanExpire): the full scan rounds since the list began, and the frames the current round put in
   uint32_t round = 0, roundFrames = 0;
+  // 2026-11-23 (T-18, office): the network the station is on (never evicted from a full list), and how many entries a full
+  // list gave up for a newer network
+  uint8_t keepBssid[6] = {};
+  bool keepSet = false;
+  uint32_t evicted = 0;
   // dropped: no room left in the list. badFrames: the firmware's own checks failed on the frame.
   uint32_t frames = 0, beacons = 0, probes = 0, ignored = 0, dropped = 0, badFrames = 0;
 };
@@ -681,7 +686,9 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     bool same = true;
     for (unsigned k = 0; k < 6; ++k) same = same && have.bssid[k] == found.bssid[k];
     if (!same) continue;
-    if (found.rssi > have.rssi) have.rssi = found.rssi;
+    // T-18 (office, many access points of one network): the signal is this round's strongest, not the best ever heard: a
+    // far access point heard strong an hour ago must not win the rejoin over the one next to the tablet now
+    if (have.heardRound != list.round || found.rssi > have.rssi) have.rssi = found.rssi;
     if (found.ssidLength && !found.hidden && (!have.ssidLength || have.hidden)) {
       have.ssidLength = found.ssidLength;
       for (unsigned k = 0; k <= kSsidMax; ++k) have.ssid[k] = found.ssid[k];
@@ -730,11 +737,30 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     else ++have.beacons;
     return &have;
   }
+  ScanEntry *slot = nullptr;
   if (list.count == kScanEntriesMax) {
-    ++list.dropped;
-    return nullptr;
+    // T-18 (office: more than 32 networks in the air): a full list gives up its stalest entry (heard in the oldest round,
+    // then the weakest) for a network heard now, when that entry was not heard in this round or is weaker than the new one;
+    // the network the station is on is never given up. Before, a full list dropped every newer network for good, so the
+    // access point next to the tablet could be missing from every rejoin.
+    ScanEntry *victim = nullptr;
+    for (uint32_t i = 0; i < list.count; ++i) {
+      ScanEntry &e = list.entries[i];
+      bool keep = list.keepSet;
+      for (unsigned k = 0; keep && k < 6; ++k) keep = e.bssid[k] == list.keepBssid[k];
+      if (keep) continue;
+      if (!victim || e.heardRound < victim->heardRound || (e.heardRound == victim->heardRound && e.rssi < victim->rssi)) victim = &e;
+    }
+    if (!victim || (victim->heardRound >= list.round && victim->rssi >= found.rssi)) {
+      ++list.dropped;
+      return nullptr;
+    }
+    ++list.evicted;
+    slot = victim;
+  } else {
+    slot = &list.entries[list.count++];
   }
-  ScanEntry &entry = list.entries[list.count++];
+  ScanEntry &entry = *slot;
   entry = found;
   entry.beacons = isProbe ? 0 : 1;
   entry.probes = isProbe ? 1 : 0;

@@ -3374,16 +3374,17 @@ int sysctlLinkDrop(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   if (req->newlen != sizeof incoming) return EINVAL;
   err = SYSCTL_IN(req, &incoming, sizeof incoming);
   if (err) return err;
-  if (incoming < 0 || incoming > 1) return EINVAL;
+  if (incoming < 0 || incoming > 2) return EINVAL;   // 2 (T-18): the loss handled as one not ours (a beacon miss)
   if (gArgs.level < 8 || !gArgs.rejoin) return ENOTSUP;
   if (incoming) {
     struct piano_wifi_assoc_snapshot snapshot = {};
     if (piano_wifi_assoc_snapshot(&snapshot) || !snapshot.authorized) return ENOTCONN;
     uint32_t empty = 0;
-    if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, 1u, false,
+    if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, uint32_t(incoming), false,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
   } else __atomic_store_n(&gLinkDropRequested, 0u, __ATOMIC_RELEASE);
-  note("PianoWifiUsable2 link-loss probe %s", incoming ? "requested" : "cancelled");
+  note("PianoWifiUsable2 link-loss probe %s%s", incoming ? "requested" : "cancelled",
+       incoming == 2 ? " (PianoWifiLossSimV1: handled as an end not ours, the beacon-miss path)" : "");
   return 0;
 }
 struct sysctl_oid gOidLinkDrop;
@@ -5223,7 +5224,11 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     ++gBgScanCount;
     gBgScan = rc == 1 ? kBgScanSent : kBgScanOver;
     // an idle scan is a round of the list (scanExpire); soon after an association ended by itself the idle ones come quicker
-    gBgScanIdle = idle && rc == 1;
+    // T-18 (office): a full scan while associated is a round too (wpa_supplicant counts every full scan), so that a long
+    // association keeps the list's signals current and forgets what went away; the network the station is on stays
+    gBgScanIdle = rc == 1;
+    gLink.scan.keepSet = gSta.vdevUp && !gSta.disconnect;
+    for (unsigned k = 0; k < 6; ++k) gLink.scan.keepBssid[k] = gLink.scan.keepSet ? gSta.bssid[k] : 0;
     if (gBgScanIdle) scanRoundBegin(gLink.scan);
     const uint32_t every = idle && now < gBgScanQuickUntil && gArgs.bgScanS > kBgScanQuickS ? kBgScanQuickS : gArgs.bgScanS;
     gBgScanNext = every ? now + uint64_t(every) * 1000 : 0;
@@ -5756,14 +5761,27 @@ int level7(IOService *owner)
                            now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000;
     if (!stopping && gSta.step == kStaAssociated && gSta.authorized &&
         (timedDrop || __atomic_load_n(&gLinkDropRequested, __ATOMIC_ACQUIRE))) {
-      const bool requestedDrop = __atomic_exchange_n(&gLinkDropRequested, 0u, __ATOMIC_ACQ_REL) != 0;
+      const uint32_t requestedKind = __atomic_exchange_n(&gLinkDropRequested, 0u, __ATOMIC_ACQ_REL);
+      const bool requestedDrop = requestedKind != 0;
       if (timedDrop) gDropDone = true;   // once a boot (a restart's pass does not drop again)
-      dropThisJoin = true;
+      // T-18 (PianoWifiLossSimV1): kind 2 is the office's loss on the tablet's own bench: the teardown is ours (the access
+      // point stays on the air) but everything after it takes the path of a beacon miss (an end not ours: the rejoin scans
+      // first, the lost access point is the suspect, the idle scans come every 30 s, airportd sees an involuntary link down)
+      const bool simulateNotOurs = requestedKind == 2 && !timedDrop;
+      dropThisJoin = !simulateNotOurs;
+      if (simulateNotOurs) {
+        gSta.disconnect = kStaDiscBeaconMiss;
+        gSta.disconnectReason = 0;
+        gSta.disconnectMs = gSta.associatedAt ? uint32_t(now - gSta.associatedAt) : 0;
+        note("level 7: PianoWifiLossSimV1 the association ends as a beacon miss would (the teardown ours, the rejoin not)");
+        stadetail::say(gSta, kStaRepDisconnect, gSta.disconnect, 0);
+        stadetail::beginTeardown(gSta, now);   // the firmware's roam event (beacon miss) takes exactly this step (WifiSta.h)
+      }
       if (requestedDrop) note("PianoWifiUsable2 link-loss probe consumed: authorized station teardown, user intent unchanged");
       note("level 7: the drop test (piano-wifi-droptest=%u): the station leaves its association now (our deauthentication); "
            "the rejoin follows",
            gArgs.dropTest);
-      staStop(gSta, now);   // the teardown sends our deauthentication: the access point drops us as it would on its own
+      if (!simulateNotOurs) staStop(gSta, now);   // the teardown sends our deauthentication: the access point drops us as it would on its own
     }
     if (!stopping && (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) || levelLate())) {
       const bool requested = __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) != 0;
