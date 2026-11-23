@@ -359,6 +359,169 @@ static void testLeMask()
   }
 }
 
+// ------------------------------------------------------------------------------------------------------------ LE link-ready assist
+static void testLeReady()
+{
+  // Packets without the H4 indicator, as the decoders hand them over. The 11-20 owner device: LE Connection Complete handle 1, remote
+  // features 21 00 .. (encryption + data length extension, no 2M).
+  const uint8_t conn[] = {0x3e, 0x13, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 0x18, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00};
+  const uint8_t feat[] = {0x3e, 0x0c, 0x04, 0x00, 0x01, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t feat2m[] = {0x3e, 0x0c, 0x04, 0x00, 0x01, 0x00, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t featBad[] = {0x3e, 0x0c, 0x04, 0x1a, 0x01, 0x00, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t dlc[] = {0x3e, 0x0b, 0x07, 0x01, 0x00, 0xfb, 0x00, 0x48, 0x08, 0xfb, 0x00, 0x48, 0x08};
+  const uint8_t phy[] = {0x3e, 0x06, 0x0c, 0x00, 0x01, 0x00, 0x02, 0x02};
+  const uint8_t disc[] = {0x05, 0x04, 0x00, 0x01, 0x00, 0x08};
+  const uint8_t mtuReq[] = {0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x02, 0xf7, 0x00};
+  const uint8_t mtuRsp[] = {0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x03, 0xf7, 0x00};
+  const uint8_t smpReq[] = {0x01, 0x00, 0x0b, 0x00, 0x07, 0x00, 0x06, 0x00, 0x01, 0x04, 0x00, 0x2d, 0x10, 0x0f, 0x0f};
+  const uint8_t smpRsp[] = {0x01, 0x00, 0x0b, 0x00, 0x07, 0x00, 0x06, 0x00, 0x02, 0x04, 0x00, 0x2d, 0x10, 0x0f, 0x0f};
+  const uint8_t contFrag[] = {0x01, 0x10, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x02, 0xf7, 0x00};
+  const uint8_t wantLength[] = {0x04, 0x3e, 0x0b, 0x07, 0x01, 0x00, 0x1b, 0x00, 0x48, 0x01, 0x1b, 0x00, 0x48, 0x01};
+  const uint8_t wantPhy[] = {0x04, 0x3e, 0x06, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x01};
+  auto run = [](LeReadyAssist &a, uint64_t from, uint64_t to, bool on, std::vector<LeReadyAssist::Inject> &out) {
+    for (uint64_t t = from; t <= to; t += 10) {
+      LeReadyAssist::Inject i;
+      while (a.due(t, on, i)) out.push_back(i);
+    }
+  };
+  // The owner's case: no length change from anyone, no GATT: Data Length Change at +0.75 s and again at +2.25 s; no PHY (no 2M).
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 1000);
+    a.onEvent(feat, sizeof feat, 1100);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 1100, 9000, true, got);
+    CHECK(got.size() == 2 && got[0].step == 1 && got[1].step == 3 && got[0].kind == LeReadyAssist::kInjectLength);
+    CHECK(got.size() == 2 && got[0].len == sizeof wantLength && !memcmp(got[0].bytes, wantLength, sizeof wantLength) &&
+          !memcmp(got[1].bytes, wantLength, sizeof wantLength));
+    CHECK(a.stats().links == 1 && a.stats().features == 1 && a.stats().injectedLength == 2 && a.stats().injectedPhy == 0);
+    // Each injected event is a well-formed H4 event for the host's decoder.
+    H4Decoder d;
+    unsigned events = 0;
+    d.feed(got[0].bytes, got[0].len, [&](uint8_t type, const uint8_t *pk, size_t n) { events += pk && type == kH4Event && n == 13; });
+    CHECK(events == 1 && d.idle());
+  }
+  // The first step is not early: nothing before +0.75 s.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(feat, sizeof feat, 5000);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 5000, 5740, true, got);
+    CHECK(got.empty());
+    run(a, 5750, 5750, true, got);
+    CHECK(got.size() == 1);
+  }
+  // A real length change (here before the features, as bluetoothd also accepts) cancels every length injection.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(dlc, sizeof dlc, 50);
+    a.onEvent(feat, sizeof feat, 100);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 100, 9000, true, got);
+    CHECK(got.empty() && a.stats().realLength == 1);
+  }
+  // A 2M peer whose length change came but whose PHY procedure did not: one PHY Update Complete at +1.5 s, 1M both ways.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(feat2m, sizeof feat2m, 100);
+    a.onEvent(dlc, sizeof dlc, 150);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 100, 9000, true, got);
+    CHECK(got.size() == 1 && got[0].kind == LeReadyAssist::kInjectPhy && got[0].step == 2 && got[0].len == sizeof wantPhy &&
+          !memcmp(got[0].bytes, wantPhy, sizeof wantPhy));
+    // With the real PHY update too, nothing.
+    LeReadyAssist b;
+    b.onEvent(conn, sizeof conn, 0);
+    b.onEvent(feat2m, sizeof feat2m, 100);
+    b.onEvent(phy, sizeof phy, 120);
+    b.onEvent(dlc, sizeof dlc, 150);
+    got.clear();
+    run(b, 100, 9000, true, got);
+    CHECK(got.empty() && b.stats().realPhy == 1);
+  }
+  // The host started GATT (an Exchange MTU request) or SMP (a Pairing Request): the link is ready, nothing is injected. Responses,
+  // a continuing fragment and another handle do not count.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(feat, sizeof feat, 100);
+    a.onHostAcl(mtuRsp, sizeof mtuRsp);
+    a.onHostAcl(smpRsp, sizeof smpRsp);
+    a.onHostAcl(contFrag, sizeof contFrag);
+    CHECK(a.stats().hostStarted == 0);
+    a.onHostAcl(mtuReq, sizeof mtuReq);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 100, 9000, true, got);
+    CHECK(got.empty() && a.stats().hostStarted == 1);
+    LeReadyAssist b;
+    b.onEvent(conn, sizeof conn, 0);
+    b.onEvent(feat, sizeof feat, 100);
+    b.onHostAcl(smpReq, sizeof smpReq);
+    got.clear();
+    run(b, 100, 9000, true, got);
+    CHECK(got.empty() && b.stats().hostStarted == 1);
+    // GATT after the first injection stops the third step.
+    LeReadyAssist c;
+    c.onEvent(conn, sizeof conn, 0);
+    c.onEvent(feat, sizeof feat, 100);
+    got.clear();
+    run(c, 100, 900, true, got);
+    c.onHostAcl(mtuReq, sizeof mtuReq);
+    run(c, 900, 9000, true, got);
+    CHECK(got.size() == 1 && got[0].step == 1);
+  }
+  // Off: nothing, and no step is used up; switched on later, the due steps follow one per call.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(feat, sizeof feat, 100);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 100, 9000, false, got);
+    CHECK(got.empty());
+    LeReadyAssist::Inject i;
+    CHECK(a.due(9000, true, i) && i.step == 1);
+    CHECK(a.due(9000, true, i) && i.step == 3);   // step 2 has nothing to do (no 2M) and is passed over
+    CHECK(!a.due(9000, true, i));
+  }
+  // Failed remote features, an unknown handle, a disconnection and a reconnection on the same handle.
+  {
+    LeReadyAssist a;
+    a.onEvent(conn, sizeof conn, 0);
+    a.onEvent(featBad, sizeof featBad, 100);
+    std::vector<LeReadyAssist::Inject> got;
+    run(a, 100, 9000, true, got);
+    CHECK(got.empty() && a.stats().features == 0);
+    a.onEvent(disc, sizeof disc, 9000);
+    a.onEvent(feat, sizeof feat, 9100);   // no link: ignored
+    run(a, 9100, 20000, true, got);
+    CHECK(got.empty() && a.stats().disconnects == 1);
+    a.onEvent(conn, sizeof conn, 20000);
+    a.onEvent(feat, sizeof feat, 20100);
+    a.onEvent(disc, sizeof disc, 20200);   // gone before the first step
+    run(a, 20100, 30000, true, got);
+    CHECK(got.empty() && a.stats().links == 2);
+  }
+  // Eight links fit, the ninth is counted; malformed lengths are ignored.
+  {
+    LeReadyAssist a;
+    for (uint8_t h = 1; h <= 9; ++h) {
+      uint8_t c[sizeof conn];
+      memcpy(c, conn, sizeof conn);
+      c[4] = h;
+      a.onEvent(c, sizeof c, 0);
+    }
+    CHECK(a.stats().links == 8 && a.stats().full == 1);
+    const uint8_t shortFeat[] = {0x3e, 0x05, 0x04, 0x00, 0x01, 0x00, 0x21};
+    a.onEvent(shortFeat, sizeof shortFeat, 10);
+    const uint8_t lying[] = {0x3e, 0x20, 0x04, 0x00, 0x01, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    a.onEvent(lying, sizeof lying, 10);
+    CHECK(a.stats().features == 0);
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------------ QCA codec
 static void testCodec()
 {
@@ -661,6 +824,7 @@ int main()
   testUartPlan();
   testH4();
   testLeMask();
+  testLeReady();
   testCodec();
   testSetup();
   testRcgTable();

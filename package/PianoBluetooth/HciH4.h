@@ -235,6 +235,173 @@ class H4LeMaskPatcher {
   Stats stats_;
 };
 
+// The LE link-ready assist (piano-bt-lerdy; docs/drivers/bluetooth.md, "LE link ready", and
+// private analysis 20261124-bt-pair). The 27.3 bluetoothd leaves an LE link in LE_READY_WAIT_FOR_LENGTH after the remote features
+// when both sides support data length extension, and in LE_READY_WAIT_FOR_PHY when both support 2M, until the controller reports
+// LE Data Length Change (subevent 0x07) or LE PHY Update Complete (0x0c). It never requests either procedure itself. A controller
+// (or peer) that does not run them leaves the link without GATT forever. The assist watches the controller's events and the host's
+// ACL data and, only for a link that has its remote features but on which the host has not started GATT or SMP as a client, hands
+// the host the event the controller would have sent had the procedure run and changed nothing: Data Length Change with the
+// specification's defaults (27 octets, 328 us both ways) and PHY Update Complete with status 0 on LE 1M both ways. These are the
+// link's true values when no procedure ran. Each injection is at most once per kind and step; a real event for the link cancels its
+// kind. The second Data Length Change (same values) completes bluetoothd's length probe when the first one made it rescale.
+// Portable, no allocation: the host tests drive it with bluetoothd's and the controller's recorded packets.
+class LeReadyAssist {
+ public:
+  static constexpr unsigned kSlots = 8;
+  static constexpr uint64_t kStepMs = 750;   // after the remote features: DLC at 1 step, PHY at 2, DLC again at 3
+  static constexpr uint16_t kDefaultOctets = 27, kDefaultTimeUs = 328;
+  enum : uint8_t { kInjectLength = 1, kInjectPhy = 2 };
+  struct Inject {
+    uint8_t bytes[16] = {};   // an H4 event, indicator first
+    size_t len = 0;
+    uint16_t handle = 0;
+    uint8_t kind = 0, step = 0;
+  };
+  struct Stats {
+    uint64_t links = 0, features = 0, realLength = 0, realPhy = 0, hostStarted = 0, injectedLength = 0, injectedPhy = 0,
+             disconnects = 0, full = 0;
+  };
+
+  // A controller event, the packet without its H4 indicator: [code][length][parameters].
+  void onEvent(const uint8_t *ev, size_t len, uint64_t nowMs)
+  {
+    if (len < 2 || size_t(ev[1]) + 2 != len) return;
+    if (ev[0] == 0x05 && len >= 6) {   // Disconnection Complete: status, handle, reason
+      if (ev[2] == 0) {
+        Slot *s = find(le16(ev + 3) & 0xfffu);
+        if (s) {
+          *s = Slot{};
+          ++stats_.disconnects;
+        }
+      }
+      return;
+    }
+    if (ev[0] != 0x3e || len < 3) return;
+    const uint8_t sub = ev[2];
+    if ((sub == 0x01 || sub == 0x0a || sub == 0x29) && len >= 6) {   // LE (Enhanced) Connection Complete: status, handle
+      if (ev[3] != 0) return;
+      const uint16_t h = le16(ev + 4) & 0xfffu;
+      Slot *s = find(h);
+      if (!s) s = find(kFree);
+      if (!s) {
+        ++stats_.full;
+        return;
+      }
+      *s = Slot{};
+      s->handle = h;
+      ++stats_.links;
+    } else if (sub == 0x04 && len >= 14) {   // LE Read Remote Features Complete: status, handle, 8 feature bytes
+      Slot *s = find(le16(ev + 4) & 0xfffu);
+      if (!s || ev[3] != 0 || s->featuresAt) return;
+      s->featuresAt = nowMs ? nowMs : 1;
+      s->remoteLength = (ev[6] & 0x20) != 0;   // bit 5: LE Data Packet Length Extension
+      s->remote2m = (ev[7] & 0x01) != 0;       // bit 8: LE 2M PHY
+      ++stats_.features;
+    } else if (sub == 0x07 && len >= 5) {   // LE Data Length Change: handle, ...
+      Slot *s = find(le16(ev + 3) & 0xfffu);
+      if (s && !s->realLength) {
+        s->realLength = true;
+        ++stats_.realLength;
+      }
+    } else if (sub == 0x0c && len >= 6) {   // LE PHY Update Complete: status, handle, ...
+      Slot *s = find(le16(ev + 4) & 0xfffu);
+      if (s && !s->realPhy) {
+        s->realPhy = true;
+        ++stats_.realPhy;
+      }
+    }
+  }
+  // The host's ACL packet without its indicator: [handle+flags][length][L2CAP length][CID][payload]. Only a first fragment's
+  // L2CAP header is read: ATT client requests (Exchange MTU, Find Information, Find By Type Value, Read By Type, Read Blob, Read By
+  // Group Type, Read Multiple; opcodes 0x02..0x12 even) or an SMP Pairing Request mean bluetoothd's link is ready.
+  void onHostAcl(const uint8_t *acl, size_t len)
+  {
+    if (len < 9) return;
+    const uint16_t hf = le16(acl);
+    if (((hf >> 12) & 0x3u) == 0x1u) return;   // a continuing fragment
+    Slot *s = find(hf & 0xfffu);
+    if (!s || s->hostStarted) return;
+    const uint16_t cid = le16(acl + 6);
+    const uint8_t op = acl[8];
+    const bool att = cid == 0x0004 && op >= 0x02 && op <= 0x12 && !(op & 1);
+    const bool smp = cid == 0x0006 && op == 0x01;
+    if (att || smp) {
+      s->hostStarted = true;
+      ++stats_.hostStarted;
+    }
+  }
+  // The next injection due at nowMs, if any. Called by the worker between packets; returns true with one event in out.
+  bool due(uint64_t nowMs, bool enabled, Inject &out)
+  {
+    if (!enabled) return false;
+    for (Slot &s : slots_) {
+      if (s.handle == kFree || !s.featuresAt || s.hostStarted) continue;
+      while (s.step < 3 && nowMs >= s.featuresAt + kStepMs * (s.step + 1u)) {   // a step with nothing to do is passed over
+        const uint8_t step = ++s.step;
+        if ((step == 1 || step == 3) && s.remoteLength && !s.realLength) {
+          lengthEvent(s.handle, out);
+          out.step = step;
+          ++stats_.injectedLength;
+          return true;
+        }
+        if (step == 2 && s.remote2m && !s.realPhy) {
+          phyEvent(s.handle, out);
+          out.step = step;
+          ++stats_.injectedPhy;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  const Stats &stats() const { return stats_; }
+
+ private:
+  static constexpr uint16_t kFree = 0xffff;
+  struct Slot {
+    uint16_t handle = kFree;
+    uint64_t featuresAt = 0;
+    uint8_t step = 0;
+    bool remoteLength = false, remote2m = false, realLength = false, realPhy = false, hostStarted = false;
+  };
+  Slot *find(uint16_t h)
+  {
+    for (Slot &s : slots_)
+      if (s.handle == h) return &s;
+    return nullptr;
+  }
+  static void put16(uint8_t *p, uint16_t v)
+  {
+    p[0] = uint8_t(v);
+    p[1] = uint8_t(v >> 8);
+  }
+  static void lengthEvent(uint16_t h, Inject &out)
+  {
+    const uint8_t e[] = {kH4Event, 0x3e, 0x0b, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (size_t i = 0; i < sizeof e; ++i) out.bytes[i] = e[i];
+    put16(out.bytes + 4, h);
+    put16(out.bytes + 6, kDefaultOctets);
+    put16(out.bytes + 8, kDefaultTimeUs);
+    put16(out.bytes + 10, kDefaultOctets);
+    put16(out.bytes + 12, kDefaultTimeUs);
+    out.len = sizeof e;
+    out.handle = h;
+    out.kind = kInjectLength;
+  }
+  static void phyEvent(uint16_t h, Inject &out)
+  {
+    const uint8_t e[] = {kH4Event, 0x3e, 0x06, 0x0c, 0x00, 0, 0, 0x01, 0x01};
+    for (size_t i = 0; i < sizeof e; ++i) out.bytes[i] = e[i];
+    put16(out.bytes + 5, h);
+    out.len = sizeof e;
+    out.handle = h;
+    out.kind = kInjectPhy;
+  }
+  Slot slots_[kSlots];
+  Stats stats_;
+};
+
 // Events: [code][parameter length][parameters].
 struct CommandComplete {
   uint8_t ncmd = 0;
