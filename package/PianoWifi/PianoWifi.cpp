@@ -3794,6 +3794,13 @@ enum : uint32_t { kBgScanNone = 0, kBgScanArmed, kBgScanSent, kBgScanOver };
 uint32_t gBgScan, gBgScanIdNow, gBgScanSeed, gBgScanCount;
 bool gBgScanDone, gBgScanRefused;
 uint64_t gBgScanAt, gBgScanNext;
+// 2026-11-23 (20261123-wifi-rejoin/ANALYSIS.md, PianoWifiScanExpireV1): an idle background scan (no station) ends its round
+// with scanExpire; the access point of an association that ended by itself is its suspect, and until gBgScanQuickUntil the
+// idle scans come every kBgScanQuickS s, so that a network back on the air is in the list (and airportd's next scan) soon.
+constexpr uint32_t kBgScanQuickS = 30, kBgScanQuickMs = 600000, kScanExpireRounds = 2;
+bool gBgScanIdle, gBgSuspectSet;
+uint8_t gBgSuspect[6];
+uint64_t gBgScanQuickUntil;
 bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
 {
   if (id != uint32_t(kWmiEvtScan)) return false;
@@ -5215,19 +5222,42 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     gBgScanSeed = gLink.scan.count;
     ++gBgScanCount;
     gBgScan = rc == 1 ? kBgScanSent : kBgScanOver;
-    gBgScanNext = gArgs.bgScanS ? now + uint64_t(gArgs.bgScanS) * 1000 : 0;
+    // an idle scan is a round of the list (scanExpire); soon after an association ended by itself the idle ones come quicker
+    gBgScanIdle = idle && rc == 1;
+    if (gBgScanIdle) scanRoundBegin(gLink.scan);
+    const uint32_t every = idle && now < gBgScanQuickUntil && gArgs.bgScanS > kBgScanQuickS ? kBgScanQuickS : gArgs.bgScanS;
+    gBgScanNext = every ? now + uint64_t(every) * 1000 : 0;
     note("level 7: background scan: %u channel(s), %s",
          request.channelCount, rc == 1 ? "asked for" : "NOT sent (the command could not be built or was refused)");
     return;
   }
   if (gBgScan == kBgScanSent && (gBgScanDone || now > gBgScanAt + gArgs.scanWaitMs + 3000 || stopping)) {
     gBgScan = kBgScanOver;
+    // 2026-11-23 (PianoWifiScanExpireV1): an idle scan that ran to its end forgets the networks it and the one before did not
+    // hear, and the suspect already when it did not hear it; an idle scan that did not end is no round at all
+    uint32_t expired = 0;
+    if (gBgScanIdle) {
+      gBgScanIdle = false;
+      if (gBgScanDone && !gBgScanRefused) {
+        const bool onNetwork = gSta.vdevUp && !gSta.disconnect;
+        const bool looked = gLink.scan.roundFrames != 0;
+        expired = scanExpire(gLink.scan, kScanExpireRounds, gBgSuspectSet ? gBgSuspect : nullptr, onNetwork ? gSta.bssid : nullptr);
+        if (expired || gBgSuspectSet)
+          note("level 7: PianoWifiScanExpireV1 round %u: %u frame(s), %u network(s) forgotten (not heard in %u rounds%s), %u kept",
+               gLink.scan.round, gLink.scan.roundFrames, expired, kScanExpireRounds,
+               gBgSuspectSet ? (looked ? "; the lost access point looked for" : "; the lost access point kept: nothing heard") : "",
+               gLink.scan.count);
+        if (looked) gBgSuspectSet = false;
+      } else if (gLink.scan.round) {
+        --gLink.scan.round;
+      }
+    }
     // (review of ee9980a, #1 and #6) a list is published only from a scan that ran to its end and found more than it began
     // with; a refusal, a timeout or a stop keeps the list published before (a fast pass's one seeded entry must never replace
     // the boot's whole list)
     // (a list that began with more than the fast pass's one seeded entry is published refreshed even when it did not grow: its
-    // entries' signals and ages are the scan's)
-    const bool publish = gBgScanDone && !gBgScanRefused && (gLink.scan.count > gBgScanSeed || gBgScanSeed > 1);
+    // entries' signals and ages are the scan's; and one that forgot a network is published, so that airportd stops seeing it)
+    const bool publish = gBgScanDone && !gBgScanRefused && (gLink.scan.count > gBgScanSeed || gBgScanSeed > 1 || expired);
     note("level 7: the background scan %s after %llu ms: %u network(s) in the list (%u before it), %s",
          gBgScanRefused ? "was refused at its start" : gBgScanDone ? "ended" : stopping ? "was cut short by the stop" : "ran out of time",
          (unsigned long long)(now - gBgScanAt), gLink.scan.count, gBgScanSeed,
@@ -5509,6 +5539,9 @@ __attribute__((noinline)) void userStopScans()
     } while (nowMs() < until);
     note("PianoWifiPowerLifecycleV1 stop scan: %s", rc == 1 ? "sent" : "transport refused or timed out");
   }
+  // an idle round cut short counts for nothing (PianoWifiScanExpireV1)
+  if (gBgScanIdle && gBgScan == kBgScanSent && gLink.scan.round) --gLink.scan.round;
+  gBgScanIdle = false;
   gBgScan = kBgScanNone;
   gBgScanNext = 0;
 }
@@ -5599,10 +5632,13 @@ int level7(IOService *owner)
   // a fast pass scans beside its association (bgScanTurn); with the menu binding on, every pass does, and again periodically
   gBgScan = gPass.fast || gArgs.bgScanS ? kBgScanArmed : kBgScanNone;
   gBgScanNext = 0;
+  gBgScanIdle = gBgSuspectSet = false;
+  gBgScanQuickUntil = 0;
   if (!gPass.level7At) gPass.level7At = nowMs();
   if (gPass.fast && gLastNetValid) {
     // the fast restart: the last network as the only entry of the list (level 6 did not scan)
     gLink.scan.entries[0] = gLastNet;
+    gLink.scan.entries[0].heardRound = gLink.scan.round;
     gLink.scan.count = 1;
     note("level 7: the fast restart: the last network (%u MHz, channel %u) is joined directly, without a scan", gLastNet.freq,
          unsigned(gLastNet.channel));
@@ -5799,7 +5835,24 @@ int level7(IOService *owner)
   recordAppleJoin(generation, 2, finishedAt);
   // an end that was not ours (the firmware's beacon miss, the access point's deauthentication or disassociation, a kickout with
   // piano-wifi-kickout-ends=1) makes the next join scan first; any other end clears it
-  gRejoinScanCause = (!userStopped && !dropThisJoin) ? gSta.disconnect : 0;
+  // 2026-11-23 (20261123-wifi-rejoin/ANALYSIS.md): a join that failed before an association keeps the cause, so that every
+  // rejoin after such an end scans first until one associates (the access point may be gone, or back on another channel)
+  const bool notOurs = !userStopped && !dropThisJoin;
+  const bool failedBeforeAssoc = notOurs && !gSta.disconnect && !gSta.associatedAt;
+  gRejoinScanCause = notOurs && gSta.disconnect ? gSta.disconnect : failedBeforeAssoc ? gRejoinScanCause : 0;
+  // PianoWifiScanExpireV1: the access point of an association that ended by itself, or of a join it never answered, is looked
+  // for by the next idle scan (soon: the idle scans come quicker for a while) and forgotten when that scan does not hear it
+  if (notOurs && gSta.choice.found && (gSta.disconnect || (failedBeforeAssoc && !gSta.authAnswered))) {
+    for (unsigned i = 0; i < 6; ++i) gBgSuspect[i] = gSta.bssid[i];
+    gBgSuspectSet = true;
+    const uint64_t at = nowMs();
+    gBgScanQuickUntil = at + kBgScanQuickMs;
+    gBgScanNext = at;   // a background scan still running ends first; the idle one follows at once
+    if (gBgScan == kBgScanOver || gBgScan == kBgScanNone) gBgScan = kBgScanArmed;
+    note("level 7: PianoWifiScanExpireV1 join %u ended by %s: the next idle scan looks for its access point (idle scans every "
+         "%u s for %u min)", joins, gSta.disconnect ? staDisconnectName(gSta.disconnect) : "no answer from the access point",
+         gArgs.bgScanS > kBgScanQuickS ? kBgScanQuickS : gArgs.bgScanS, kBgScanQuickMs / 60000);
+  }
   if (gArgs.level >= 8) level8Follow(nowMs());
   if (userStopped) {
     if (gUserControl.radioStop()) stoppedOnRequest = true;

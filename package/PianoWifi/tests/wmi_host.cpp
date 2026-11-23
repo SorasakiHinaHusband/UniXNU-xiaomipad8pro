@@ -1688,6 +1688,65 @@ static void testCodec()
   CHECK(entry && list.count == 1);
   // the shorter header gives no frequency: the channel number names it (boot 10a: the frequency is always the channel's)
   CHECK(entry && std::string(entry->ssid) == "slow" && entry->channel == 36 && entry->freq == 5180 && entry->rssi == -61);
+
+  // 2026-11-23 (20261123-wifi-rejoin): a frame stamps its round; a round that heard nothing forgets nothing; two rounds
+  // without the network forget it; the same frame again brings it back
+  CHECK(entry && entry->heardRound == 0 && list.roundFrames == 1);
+  scanRoundBegin(list);
+  CHECK(list.round == 1 && list.roundFrames == 0 && scanExpire(list, 2, nullptr, nullptr) == 0 && list.count == 1);
+  scanRoundBegin(list);
+  CHECK(scanAdd(list, mgmt) && list.entries[0].heardRound == 2 && list.roundFrames == 1);
+  scanRoundBegin(list);
+  list.roundFrames = 1;   // another network's frame: this round heard the sky
+  CHECK(scanExpire(list, 2, nullptr, nullptr) == 0 && list.count == 1);   // missed one round: kept
+  scanRoundBegin(list);
+  list.roundFrames = 1;
+  CHECK(scanExpire(list, 2, nullptr, nullptr) == 1 && list.count == 0);   // missed two: forgotten
+  CHECK(scanAdd(list, mgmt) && list.count == 1 && list.entries[0].heardRound == 4);
+}
+
+// scanExpire on a list of its own: the suspect, the network the station is on, an entry of an earlier list, the order kept.
+static void testExpire()
+{
+  ScanList list;
+  auto put = [&](uint8_t last, uint32_t heard) {
+    ScanEntry &e = list.entries[list.count++];
+    e = ScanEntry{};
+    const uint8_t mac[6] = {0x02, 0, 0, 0, 0, last};
+    std::memcpy(e.bssid, mac, 6);
+    e.heardRound = heard;
+  };
+  list.round = 5;
+  list.roundFrames = 7;
+  put(1, 5);    // heard this round
+  put(2, 4);    // missed one round
+  put(3, 3);    // missed two: gone
+  put(4, 4);    // the suspect, missed one round: gone
+  put(5, 1);    // the network the station is on, long unheard: kept
+  put(6, 9);    // stamped by an earlier list's rounds: heard now
+  const uint8_t suspect[6] = {0x02, 0, 0, 0, 0, 4}, onNet[6] = {0x02, 0, 0, 0, 0, 5};
+  CHECK(scanExpire(list, 2, suspect, onNet) == 2 && list.count == 4);
+  CHECK(list.entries[0].bssid[5] == 1 && list.entries[1].bssid[5] == 2 && list.entries[2].bssid[5] == 5 &&
+        list.entries[3].bssid[5] == 6);
+  // a suspect heard in this round stays
+  const uint8_t heardSuspect[6] = {0x02, 0, 0, 0, 0, 1};
+  CHECK(scanExpire(list, 2, heardSuspect, onNet) == 0 && list.count == 4);
+  // a deaf round (no frame), a list before its first round, keep 0: nothing goes
+  list.roundFrames = 0;
+  CHECK(scanExpire(list, 1, suspect, onNet) == 0 && list.count == 4);
+  list.roundFrames = 3;
+  CHECK(scanExpire(list, 0, nullptr, onNet) == 0 && list.count == 4);
+  ScanList fresh;
+  fresh.count = 1;
+  fresh.roundFrames = 1;
+  CHECK(scanExpire(fresh, 1, nullptr, nullptr) == 0 && fresh.count == 1);
+  // a full list with stale entries frees its places
+  ScanList full;
+  for (uint32_t i = 0; i < kScanEntriesMax; ++i) full.entries[full.count++].heardRound = 0;
+  full.round = 2;
+  full.roundFrames = 1;
+  full.entries[3].heardRound = 2;
+  CHECK(scanExpire(full, 2, nullptr, nullptr) == kScanEntriesMax - 1 && full.count == 1 && full.entries[0].heardRound == 2);
 }
 
 int main()
@@ -1701,6 +1760,7 @@ int main()
   testOneBand();
   testHandOff();
   testFaults();
+  testExpire();
   std::printf(failures ? "wmi_host: %d check(s) failed\n" : "wmi_host: all passed\n", failures);
   return failures ? 1 : 0;
 }
