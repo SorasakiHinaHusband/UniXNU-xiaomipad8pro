@@ -28,6 +28,7 @@
 #define PIANO_CHARGE_MIPPS_H
 #include <stddef.h>
 #include <stdint.h>
+#include "ChargePump.h"   /* struct piano_cp_in: the session's MiPPS fields */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -110,7 +111,7 @@ typedef struct {
     uint32_t sent8;              /* always 0: command 8 is never sent (a test checks it) */
     /* the engine's own state */
     uint32_t step, sub, attempt, cmd, flag, key_index;
-    uint32_t id_next, id_match_pending;
+    uint32_t id_next, awaiting;   /* awaiting: a request was given and its reply is owed */
     uint64_t deadline_ms, wait_until_ms;
     int32_t pending_error;
     uint8_t challenge[16], response[16];
@@ -134,6 +135,9 @@ int piano_mipps_cleanup_pending(const PianoMipps *m);
 /* The pump's source budget this result allows (PIANO_MIPPS_BUDGET_*). */
 uint32_t piano_mipps_budget_ma(const PianoMipps *m);
 const char *piano_mipps_error_name(int error);
+/* The session's MiPPS fields of struct piano_cp_in (ChargePump.h): will_run 0 (not eligible: no key, MiPPS off, no PD source with an
+ * object above 5 V) gives done 1, not verified, 5000 mA; else done once the engine is DONE, verified, and its budget. */
+void piano_mipps_fill_cp_in(const PianoMipps *m, int will_run, struct piano_cp_in *in);
 
 /* HMAC-SHA256 (RFC 2104 / FIPS 180-4), exposed for the host tests (RFC 4231 vectors). */
 void piano_mipps_sha256(const uint8_t *data, size_t bytes, uint8_t digest[32]);
