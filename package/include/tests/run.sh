@@ -8,7 +8,7 @@
 set -euo pipefail
 P=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-for t in scm_lock_host wcn_rails_host mm_votes_host spmi_lock_host; do
+for t in scm_lock_host wcn_rails_host mm_votes_host spmi_lock_host gpu_preset_host; do
   "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" -o "$T/$t"
   "$T/$t"
 done

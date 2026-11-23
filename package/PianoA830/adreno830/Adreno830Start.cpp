@@ -24,6 +24,7 @@
 #include "A830Dcvs.h"
 #include "A830QualificationExitTest.h"
 #include "A830QualificationTop.h"
+#include "A830Bind.h"
 #include "../../include/PianoGpuQualificationDisplay.h"
 #include <stdarg.h>
 #ifdef ADRENO830_MACOS
@@ -2788,6 +2789,17 @@ void qualificationVoteFault(void *,uint8_t requested,uint8_t bus,IOReturn error)
     gQualification.fault(A830QualVote,nowUs()*1000,A830ExitContext::Dcvs);
     if(gQualification.isDaily())g830.recovery.report(A830FaultHfi,uint32_t(error));   // daily: fault() does not report a vote
 }
+/* gpu/throttle1 (private/host-checks/20261124-gpu-throttle/TABLE.md): the skin table the guard uses (0 Android's normal scene, 1 the
+ * docked table; the board sets it from piano-gpu-skin-table and machdep.piano_gpu_skin_table), the external ceiling's holder (the
+ * board's slots: 0 PianoThermal's passive, 1 the power profile = Low Power Mode, 2 the sweep) and the state machdep.piano_gpu_state
+ * reads: two buffers, the qualification thread writes the one not published, then publishes it (a once-a-second diagnostic). */
+uint32_t gSkinTable,gCeilingHolder=4;
+char gGpuState[2][288];uint32_t gGpuStateAt;
+const char *ceilingHolderName(uint32_t client)
+{
+    static const char *const names[]={"thermal","lpm","sweep","client3"};
+    return client<4?names[client]:"ceiling";
+}
 void qualificationThread(void *)
 {
     uint64_t logAt=0;uint32_t lastReason=0;
@@ -2814,6 +2826,7 @@ void qualificationThread(void *)
         if(gQualification.isFullopp() && (skinTicks++%10)==0) {
             skin={};skin.version=PIANO_SKIN_TEMPS_VERSION;skinOk=adreno830_qualification_skin(&skin);
         }
+        gQualification.thermal().skinTable=gQualification.isFullopp()?uint8_t(__atomic_load_n(&gSkinTable,__ATOMIC_ACQUIRE)==1):0;
         gQualification.tick(now,gpu,board,ok,injectTrip,gQualification.isFullopp() && skinOk?&skin:nullptr);
         static bool dailyOpenLogged;
         if(gQualification.isDaily() && !dailyOpenLogged && gQualification.openedAt()) {
@@ -2846,11 +2859,35 @@ void qualificationThread(void *)
                  * guard's cap and why, the silicon and skin readings, ACD; then the residency above 607 and the HFI ACKs per level. */
                 const auto &t=gQualification.thermal();
                 const uint8_t lv=g830.power_state.votedLevel();
-                const uint8_t cap=g830.power_state.qualificationEffectiveCap(A830ExitContext::Guard);
-                static const char *const causes[]={"none","ladder","skin25","skin45","xo","skin-unknown","hard"};
-                qualLog("R3b LV at-us=%llu lvl=%u mhz=%u cap=%u cause=%s raw=%d filt=%d skin=%d skin-ok=%u xo=%d acd=%u",now/1000,
-                    unsigned(lv),unsigned(lv<=14?FulloppMhz[lv]:0),unsigned(cap),causes[t.cause<=6?t.cause:0],t.raw,t.filter16/16,
-                    t.skinMilli/100,unsigned(t.skinValid),t.xoMilli/100,unsigned(g830.acd_running));
+                /* gpu/throttle1: the cap from the qualified top (the probe started at 7 before) and the limit that holds it */
+                const uint8_t cap=g830.dcvs.ceiling();
+                static const char *const causes[]={"none","ladder","skin25","skin45","xo","skin-unknown","hard","skinband"};
+                A830BindIn bi;
+                bi.voted=lv;bi.cap=cap;bi.top=gQualification.top();bi.guardCap=g830.power_state.qualificationCap();
+                bi.guardStep=uint8_t(gQualification.thermalSnapshot());bi.guardCause=t.cause;
+                bi.latched=g830.power_state.qualificationLatched();bi.opened=gQualification.openedAt()!=0;bi.high=gQualification.high();
+                bi.external=g830.dcvs.externalCeiling();
+                bi.externalName=ceilingHolderName(__atomic_load_n(&gCeilingHolder,__ATOMIC_ACQUIRE));
+                bi.knob=g830.dcvs.knobCeiling();
+                {const uint32_t bk=g830.dcvs.boostCap(now);uint8_t bl=0;
+                 for(uint8_t l=1;bk && l<=14;++l)if(uint32_t(FulloppMhz[l])*1000u<=bk)bl=l;
+                 bi.boost=bk?(bl?bl:1):0;}
+                const char *bind=a830BindName(bi),*why=a830BindWhy(bi);
+                qualLog("R3b LV at-us=%llu lvl=%u mhz=%u cap=%u cause=%s raw=%d filt=%d skin=%d skin-ok=%u xo=%d acd=%u bind=%s why=%s tab=%u",
+                    now/1000,unsigned(lv),unsigned(lv<=14?FulloppMhz[lv]:0),unsigned(cap),causes[t.cause<=7?t.cause:0],t.raw,
+                    t.filter16/16,t.skinMilli/100,unsigned(t.skinValid),t.xoMilli/100,unsigned(g830.acd_running),bind,why,
+                    unsigned(t.skinTable));
+                {
+                    const uint32_t next=(__atomic_load_n(&gGpuStateAt,__ATOMIC_ACQUIRE)+1)&1u;
+                    snprintf(gGpuState[next],sizeof gGpuState[next],
+                        "at_us=%llu lvl=%u mhz=%u cap=%u cap_mhz=%u why=%s bind=%s want=%u table=%s band=%u step=%u ext=%u "
+                        "skin_dC=%d skin_ok=%u raw_dC=%d filt_dC=%d xo_dC=%d latched=%u high=%u",
+                        now/1000,unsigned(lv),unsigned(lv<=14?FulloppMhz[lv]:0),unsigned(cap),unsigned(cap<=14?FulloppMhz[cap]:0),
+                        why,bind,unsigned(g830.dcvs.policyLevel()),t.skinTable?"docked":"android",unsigned(t.band),unsigned(t.step),
+                        unsigned(bi.external),t.skinMilli/100,unsigned(t.skinValid),t.raw,t.filter16/16,t.xoMilli/100,
+                        unsigned(bi.latched),unsigned(bi.high));
+                    __atomic_store_n(&gGpuStateAt,next,__ATOMIC_RELEASE);
+                }
                 const A830DcvsStats &ds=g830.dcvs.stats();
                 qualLog("R3b RESF at-us=%llu ms l7=%llu l8=%llu l9=%llu l10=%llu l11=%llu l12=%llu l13=%llu l14=%llu",now/1000,
                     ds.residencyTotalNs[7]/1000000,ds.residencyTotalNs[8]/1000000,ds.residencyTotalNs[9]/1000000,
@@ -3280,4 +3317,17 @@ extern "C" void adreno830_qualification_display(const PianoGpuQualificationDispl
     if(!d || !gQualificationEnabled || !gQualification.r3b())return;
     qualLog("R3b DISPLAY at-us=%llu period-us=%llu submitted=%llu shown=%llu dropped=%llu copies=%llu mean-us=%llu max-us=%llu prepare-us=%llu read-us=%llu convert-us=%llu write-us=%llu",
         d->atUs,d->periodUs,d->submitted,d->shown,d->dropped,d->copies,d->meanUs,d->maxUs,d->prepareUs,d->readUs,d->convertUs,d->writeUs);
+}
+
+/* gpu/throttle1: the board's side of the skin table, the ceiling holder and machdep.piano_gpu_state (A830Bind.h). */
+extern "C" void adreno830_set_skin_table(uint32_t table) {__atomic_store_n(&gSkinTable,table==1?1u:0u,__ATOMIC_RELEASE);}
+extern "C" uint32_t adreno830_skin_table(void) {return __atomic_load_n(&gSkinTable,__ATOMIC_ACQUIRE);}
+extern "C" void adreno830_note_ceiling_holder(uint32_t client) {__atomic_store_n(&gCeilingHolder,client,__ATOMIC_RELEASE);}
+extern "C" size_t adreno830_gpu_state(char *out,size_t size)
+{
+    if(!out || !size)return 0;
+    const uint32_t at=__atomic_load_n(&gGpuStateAt,__ATOMIC_ACQUIRE)&1u;
+    if(!gGpuState[at][0])snprintf(out,size,"none (the fullopp guard has not reported yet)");
+    else {strlcpy(out,gGpuState[at],size);}
+    return strlen(out);
 }

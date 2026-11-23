@@ -71,6 +71,7 @@
 #include <sys/errno.h>
 #include <stdarg.h>
 #include "Policy.h"
+#include <PianoGpuAndroidPreset.h>
 
 using namespace pianopolicy;
 
@@ -104,6 +105,7 @@ uint32_t bootArg(const char *name, uint32_t fallback, bool *given = nullptr)
   if (given) *given = found;
   return found ? v : fallback;
 }
+bool rawBootArg(void *, const char *name, uint32_t *value) { return PE_parse_boot_argn(name, value, sizeof *value); }
 uint32_t clampArg(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 void readArgs()
@@ -123,8 +125,10 @@ void readArgs()
   // DCVS maximum (342 MHz unless piano-gpu-dcvs-max or piano-gpu-maxlevel is given), PianoThermal's level and passive GPU ceiling.
   gArgs.keyboardLid = bootArg("piano-keyboard-lid", 0);
   bool dcvsGiven = false, levelGiven = false;
-  gArgs.gpuDcvsMax = bootArg("piano-gpu-dcvs-max", 342, &dcvsGiven);
-  gArgs.gpuMaxLevel = bootArg("piano-gpu-maxlevel", 0, &levelGiven);
+  // gpu/throttle1: PianoA830's Android-curve preset (PianoGpuAndroidPreset.h: 1100 MHz / level 14 when no GPU knob is given)
+  const uint32_t gpuLevel = bootArg("piano-gpu", 0);
+  gArgs.gpuDcvsMax = pianogpu::presetArg(rawBootArg, nullptr, gpuLevel, "piano-gpu-dcvs-max", 342, &dcvsGiven);
+  gArgs.gpuMaxLevel = pianogpu::presetArg(rawBootArg, nullptr, gpuLevel, "piano-gpu-maxlevel", 0, &levelGiven);
   gArgs.gpuMaxGiven = (dcvsGiven && gArgs.gpuDcvsMax > gArgs.gpuMhz) || (levelGiven && gArgs.gpuMaxLevel);
   gArgs.thermal = clampArg(bootArg("piano-thermal", 0), 0, 2);
   gArgs.thermalGpuMhz = clampArg(bootArg("piano-thermal-gpu-mhz", 160), 100, 1100);

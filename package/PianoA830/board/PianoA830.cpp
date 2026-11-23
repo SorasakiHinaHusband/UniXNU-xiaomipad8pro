@@ -40,6 +40,7 @@
 #include <sys/sysctl.h>
 #include <sys/errno.h>
 #include <PianoBoardTemps.h>
+#include <PianoGpuAndroidPreset.h>
 #include "PianoA830.h"
 #include "PianoA830Rows.h"
 #include "A830Idle.h"
@@ -225,6 +226,7 @@ uint32_t bootArg(const char *name, uint32_t fallback)
   if (!PE_parse_boot_argn(name, &value, sizeof value)) value = fallback;
   return value;
 }
+bool bootArgGetter(void *, const char *name, uint32_t *value) { return PE_parse_boot_argn(name, value, sizeof *value); }
 
 const char *stageName(unsigned stage)
 {
@@ -1542,6 +1544,10 @@ void registerGpuPaged()
 } // namespace
 
 // ---- the GPU's ceiling slots (PianoGpuCeiling.h) ---------------------------------------------------------------------------------
+extern "C" void adreno830_note_ceiling_holder(uint32_t client);
+extern "C" void adreno830_set_skin_table(uint32_t table);
+extern "C" uint32_t adreno830_skin_table(void);
+extern "C" size_t adreno830_gpu_state(char *out, size_t size);
 namespace {
 IOLock *gCeilingLock;
 pianogpu::CeilingSlots gCeiling;
@@ -1555,6 +1561,7 @@ IOReturn ceilingSet(unsigned client, uint32_t khz)
   gCeiling.set(client, khz, &changed);
   const pianogpu::CeilingSlots now = gCeiling;
   if (changed) adreno830_dcvs_set_ceiling(now.effective);
+  adreno830_note_ceiling_holder(now.holder());   // gpu/throttle1: the LV line's and machdep.piano_gpu_state's "lpm" / "thermal"
   const uint32_t n = changed ? ++gCeilingChanges : 0;
   if (gCeilingLock) IOLockUnlock(gCeilingLock);
   if (changed && A830IdleLogged(n)) {
@@ -1592,6 +1599,47 @@ void registerGpuSweepCeiling()
   oid.oid_name="piano_gpu_sweep_ceiling";oid.oid_handler=sysctlGpuSweepCeiling;oid.oid_fmt="I";
   oid.oid_descr="Test only (piano-gpu-fullopp=1): GPU ceiling slot 2 in MHz for the OPP sweep; 0 clears it";
   oid.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&oid);
+}
+}  // namespace
+
+// ---- gpu/throttle1 (private/host-checks/20261124-gpu-throttle/TABLE.md): the skin table and the GPU state ----------------------
+// machdep.piano_gpu_skin_table (root, 0/1; boot default piano-gpu-skin-table, 1): 1 the docked table (one GMU level per 2 C band of
+// the virtual skin, 1050 from 35 C down to 525 from 55 C), 0 Android's normal scene (1050 from 25 C, 734 from 45 C). Only the
+// fullopp guard uses it; the die ladder, the XO rules, the guard exit and the unsafe exit are the same in both.
+// machdep.piano_gpu_state (read only): the voted level and MHz, the cap and MHz, why (demand = the governor votes below the cap, else
+// the binding limit: lpm, thermal, top, ladder, skin25, skin45, skinband, xo, skin-unknown, hard, startup, permit, knob, boostcap), the
+// governor's level, the table, its band, the guard's step, the external slot, skin / GPU raw / filtered / XO in deci-C.
+namespace {
+int sysctlGpuSkinTable(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+  int value = int(adreno830_skin_table());
+  const int err = sysctl_handle_int(oidp, &value, 0, req);
+  if (err || !req->newptr) return err;
+  if (value != 0 && value != 1) return EINVAL;
+  adreno830_set_skin_table(uint32_t(value));
+  gpuLine("skin table %s (machdep.piano_gpu_skin_table %d)", value ? "docked" : "android normal", value);
+  return 0;
+}
+int sysctlGpuState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  if (req->newptr) return EPERM;
+  char line[320];
+  const size_t n = adreno830_gpu_state(line, sizeof line);
+  return SYSCTL_OUT(req, line, n + 1 <= sizeof line ? n + 1 : sizeof line);
+}
+void registerGpuThrottle()
+{
+  static struct sysctl_oid table, state;
+  table.oid_parent = &sysctl__machdep_children; table.oid_number = OID_AUTO;
+  table.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  table.oid_name = "piano_gpu_skin_table"; table.oid_handler = sysctlGpuSkinTable; table.oid_fmt = "I";
+  table.oid_descr = "GPU skin table of the fullopp guard: 1 docked (2 C bands), 0 Android's normal scene";
+  table.oid_version = SYSCTL_OID_VERSION; sysctl_register_oid(&table);
+  state.oid_parent = &sysctl__machdep_children; state.oid_number = OID_AUTO;
+  state.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  state.oid_name = "piano_gpu_state"; state.oid_handler = sysctlGpuState; state.oid_fmt = "A";
+  state.oid_descr = "GPU level, cap, binding limit, skin table and temperatures (the fullopp guard, once a second)";
+  state.oid_version = SYSCTL_OID_VERSION; sysctl_register_oid(&state);
 }
 }  // namespace
 
@@ -1975,10 +2023,17 @@ bool PianoA830::start(IOService *provider)
   // piano_a830_note: start() runs before the line ring exists (gpu-boost342a lost these two through gpuLine).
   if (gBoostArg) piano_a830_note("boost: piano-gpu-boost=1: the input kexts and callPlatformFunction(\"piano-gpu-boost\") raise a floor "
                                  "under every ceiling (machdep.piano_gpu_boost)");
-  if (bootArg("piano-gpu-fullopp", 0) == 1) {
+  if (pianogpu::presetArg(bootArgGetter, nullptr, gLevel, "piano-gpu-fullopp", 0) == 1) {
     registerGpuSweepCeiling();
     piano_a830_note("fullopp: piano-gpu-fullopp=1: Android's bin-2 curve on the R3b line (ANALYSIS gpu-fullopp); "
                     "machdep.piano_gpu_sweep_ceiling (root, test only) sets ceiling slot 2");
+    // gpu/throttle1: the docked skin table by default (owner 2026-11-24 05:45), piano-gpu-skin-table=0 keeps Android's normal scene
+    adreno830_set_skin_table(bootArg("piano-gpu-skin-table", 1) == 1 ? 1u : 0u);
+    registerGpuThrottle();
+    piano_a830_note("throttle: skin table %s (piano-gpu-skin-table, machdep.piano_gpu_skin_table); machdep.piano_gpu_state; "
+                    "android-curve preset %s (piano-gpu-android-curve)", adreno830_skin_table() ? "docked" : "android normal",
+                    pianogpu::presetActive(bootArgGetter, nullptr, gLevel) ? "on (no GPU qualification argument given)" :
+                    "off (the boot arguments give the GPU knobs)");
   }
   if (const uint32_t floorMhz = bootArg("piano-gpu-input-floor", 0))
     piano_a830_note("input floor: piano-gpu-input-floor=%u MHz, held 80 ms after each submission, a 50 ms busy burst to the top (machdep.piano_gpu_input_floor)", floorMhz);
