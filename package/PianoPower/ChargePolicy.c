@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* The charging policy (ChargePolicy.h; docs/drivers/charging-policy.md). Written fresh from the behaviour and the numbers of the
  * Ubuntu history pages and the GPL xiaomi_mca driver read as a specification; no code taken. */
+#include "ChargePumpSession.h"   /* charge/cp-sess: the glue at the end of this file */
 #include "ChargePolicy.h"
 
 #define ONLINE_MV 4000           /* a bus above 4 V: a source is attached */
@@ -1889,4 +1890,91 @@ uint32_t piano_charge_cp_ibat_ma(const PianoChargeCpInput *in, PianoChargeCpStat
     ma = umin(ma, s->warm_ma);
     if (in->t_cool_c < CP_TBAT_FULL) ma = umin(ma, CP_REDUCED_MA);
     return ma;
+}
+
+/* ---------------------------------------------------------------------------------- the charge-pump session's buck side ---- */
+/* charge/cp-sess (ChargePumpSession.h): the system side of the pump session from this policy's view, and the hand-back of the
+ * source when a session ends. The session itself plans nothing here: while it holds the source, the worker clears
+ * PIANO_CHG_SAFE_CP_OFF, and the strict session above plans no voltage and holds the reduced-current barrier. */
+static int temp_ok(int32_t dc) {return dc > -400 && dc < 900;}
+
+void piano_charge_cp_sys(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s, PianoCpSys *y)
+{
+    zero(y, sizeof *y);
+    const uint64_t now = in->now_ms;
+    y->now_ms = now;
+    y->attached = s->attached;
+    y->sleep_pending = in->sleep == PIANO_CHG_WILL_SLEEP;
+    y->awake = !y->sleep_pending && !s->sleeping;
+    /* the 80/75 health limit: its hold ends a session, and no session starts within 3 % of its stop */
+    y->health_hold = (uint8_t)(s->hold || (limit_on(c) && soc_valid(in) && in->soc_max_pct >= (int32_t)c->stop_pct));
+    if (limit_on(c)) y->soc_entry_max = (uint8_t)(c->stop_pct > 3 ? c->stop_pct - 3 : 0);
+    if (limit_on(c) && !y->soc_entry_max) y->health_hold = 1;
+    /* the source: a validated contract, and the APDO (min != max) reaching furthest above 9 V with 2 A or more */
+    const int contract = c->strict_contract && strict_contract(in);
+    y->contract_valid = (uint8_t)contract;
+    y->contract_pps = (uint8_t)(contract && in->contract_protocol == 2);
+    y->contract_mv = contract ? in->contract_mv : 0;
+    y->contract_ma = contract ? in->contract_ma : 0;
+    if (contract && (in->valid & PIANO_CHG_IN_PDOS)) {
+        const unsigned n = in->pdos < 7 ? in->pdos : 7;
+        for (unsigned i = 0; i < n; i++) {
+            const uint32_t lo = in->pdo[i][0], hi = in->pdo[i][1], ma = umin(in->pdo[i][2], 6000);
+            if (lo == hi || hi < HV_MV || lo > hi || ma < 2000) continue;
+            if (y->src_kind == PIANO_CPS_SRC_PPS && (hi < y->apdo_max_mv || (hi == y->apdo_max_mv && ma <= y->apdo_ma))) continue;
+            y->src_kind = PIANO_CPS_SRC_PPS;
+            y->apdo_min_mv = lo; y->apdo_max_mv = hi; y->apdo_ma = ma;
+        }
+    }
+    /* QC3-B / QC3.5: the buck's QC session's evidence (the firmware type and a fresh non-PD UCSI status) stands in for a contract;
+     * only with that session on (its 0x2011 = 5000 is what takes the source back) */
+    if (!y->src_kind && c->qc && c->strict_contract && (in->valid & PIANO_CHG_IN_TYPE) && (in->valid & PIANO_CHG_IN_NONPD)) {
+        if (in->type == PIANO_CHG_T_HVDCP3_B) y->src_kind = PIANO_CPS_SRC_QC3B;
+        else if (in->type == PIANO_CHG_T_HVDCP3P5) y->src_kind = PIANO_CPS_SRC_QC35;
+        if (y->src_kind) y->contract_valid = 1;
+    }
+    y->bus_valid = (in->valid & PIANO_CHG_IN_BUS) != 0;
+    y->vbus_mv = in->bus_mv;
+    y->ibus_ma = (in->valid & PIANO_CHG_IN_IBUS) ? in->ibus_ma : 0;
+    y->buck_icl_set_ma = s->icl_set;
+    y->buck_fcc_set_ma = s->fcc_set;
+    y->buck_pending = (s->pending & ((1u << PIANO_CHG_S_ICL) | (1u << PIANO_CHG_S_FCC))) != 0;
+    y->volt_pending = (s->pending & (1u << PIANO_CHG_S_VOLT)) != 0;   /* the buck's own voltage write in flight */
+    y->gauges_valid = (uint8_t)(packs_valid(in) && soc_valid(in) && gauge_fresh(in, now));
+    y->soc_pct = in->soc_max_pct;
+    y->vbat_max_mv = in->vbat_max_mv;
+    y->t_cool_dc = in->t_cool_dc;
+    y->t_warm_dc = in->t_warm_dc;
+    if ((in->valid & PIANO_CHG_IN_NTC) && temp_ok(in->t_ntc_dc)) {
+        if (in->t_ntc_dc > y->t_warm_dc) y->t_warm_dc = in->t_ntc_dc;
+        if (in->t_ntc_dc < y->t_cool_dc) y->t_cool_dc = in->t_ntc_dc;
+    }
+    const int c1 = (in->valid & PIANO_CHG_IN_CONN1) && temp_ok(in->t_conn1_dc), c2 = (in->valid & PIANO_CHG_IN_CONN2) && temp_ok(in->t_conn2_dc);
+    y->conn_valid = (uint8_t)(c1 || c2);
+    y->t_conn_dc = c1 && c2 ? (in->t_conn1_dc > in->t_conn2_dc ? in->t_conn1_dc : in->t_conn2_dc) : c1 ? in->t_conn1_dc : in->t_conn2_dc;
+    /* the worker's: vbat_min_mv, ibat_a_ma, ibat_b_ma (cells_valid), pps_taken_word, qc_pulses_taken, attach_seq,
+     * mipps_cleanup_pending */
+}
+
+void piano_charge_cp_handback(PianoChargeState *s, uint32_t property, uint32_t value, uint64_t now)
+{
+    const int slot = PIANO_CHG_S_VOLT;
+    s->volt_set_prop = property;
+    s->volt_set_value = value;
+    s->touched |= (uint8_t)(1u << slot);
+    s->pending &= (uint8_t)~(1u << slot);
+    s->tries[slot] = s->mismatch[slot] = s->rewrites[slot] = 0;
+    s->contract_transition = 1;
+    s->transition_ma = 500;
+    s->hv_retry_ms = now + HV_WAIT_MS;
+    if (s->hv != PIANO_CHG_HV_BLOCKED) s->hv = PIANO_CHG_HV_OFF;
+    if (property == PIANO_CHG_QC_VOLT) {
+        s->hv_qc = 1; s->hv_pps = 0;
+        want_volt(s, PIANO_CHG_QC_VOLT, 5000);
+    } else {
+        /* the mode-change path: the barrier, vSafe5V, the bus back below 6 V, and only then (after HV_WAIT_MS) a new 9 V */
+        s->hv_qc = 0; s->hv_pps = (uint8_t)(property == PIANO_CHG_PPS);
+        s->contract_mode_change = 1;
+        want_volt(s, PIANO_CHG_PD_FIXED, 5000);
+    }
 }
