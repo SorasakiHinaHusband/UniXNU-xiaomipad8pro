@@ -394,6 +394,7 @@ static unsigned fuzz(unsigned fuzz_n, const Sens *x) {
       }
     };
     apply(r, x);
+    if (ep && unsigned(std::atoi(ep)) == n && r.real) {r.real->trace = true; r.p.wlog = true;}
     const Stats s = r.go(30000);
     if (s.violations) {
       ++bad;

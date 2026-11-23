@@ -324,6 +324,7 @@ struct Plant final : Bus, Firmware {
       return 0;
     }
     case prop::VERIFY:
+      if (wlog) std::printf("      VERIFY <- %u at %llu (attached %d)\n", v, (unsigned long long)now, attached);
       if (v && !verify) {++verify_sets; verify_since = now;}
       verify = v ? 1 : 0;
       return 0;
@@ -754,7 +755,7 @@ struct Checker {
     else {armed_bad_since = 0; since[10] = 0;}
     cond(p, 11, p.verify != 0, 0, "MiPPS (0x21002) in progress");
     if (p.cmd8_seen) {bad(p, "VDM command 8 sent (it stalls this firmware)"); const_cast<Plant &>(p).cmd8_seen = false;}
-    if (p.verify && stalled) const_cast<Plant &>(p).verify_since += p.cfg.dt_ms;   // a stalled or sleeping host cannot clear it
+    if (p.verify && stalled) const_cast<Plant &>(p).verify_since = std::min(p.now, p.verify_since + p.cfg.dt_ms);   // a stalled or sleeping host cannot clear it
     if (p.verify && p.now - p.verify_since > 15000) {bad(p, "0x21002 still set 15 s (awake) after it was set"); const_cast<Plant &>(p).verify_since = p.now;}
     while (seen_write_violations < p.write_violations.size()) bad(p, p.write_violations[seen_write_violations++]);
     cond(p, 12, asleep, 300, "the system asleep");

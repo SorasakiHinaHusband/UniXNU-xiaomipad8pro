@@ -117,7 +117,7 @@ struct RealController final : Controller {
     if (drv.guardDue(now)) drv.guard(bus);
     // MiPPS: one authentication per eligible attach
     // a new attach starts a new authentication only once the previous one has finished (its 0x21002 = 0 cleanup included)
-    if (rc.mipps && s.attached && s.attach_seq != mipps_attach && !mipps_running && !piano_mipps_cleanup_pending(&m)) {
+    if (rc.mipps && s.attached && !s.sleep_request && s.attach_seq != mipps_attach && !mipps_running && !piano_mipps_cleanup_pending(&m)) {
       mipps_attach = s.attach_seq;
       const uint32_t pdo = s.pdo_above_5v ? 9000u : 5000u;
       mipps_will_run = piano_mipps_eligible(1, &keys, s.real_type, &pdo, 1, 1, 1, 0) != 0;
@@ -171,7 +171,7 @@ struct RealController final : Controller {
       fw.set(prop::ICL, 500); fw.set(prop::FCC, 500);
       q.push_back({now + rc.step_latency_ms, sys.src_kind == PIANO_CPS_SRC_PPS ? prop::FIXED_MV : prop::QC_MV, 5000});
     }
-    sleep_ok = plan.sleep_ready;
+    sleep_ok = plan.sleep_ready && !mipps_running && !piano_mipps_cleanup_pending(&m);   // no sleep in an authentication
   }
 };
 
