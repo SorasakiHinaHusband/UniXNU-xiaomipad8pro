@@ -69,6 +69,30 @@ XNU_LOG = D / 'tooling/native/xnu-log.py'
 V110 = Path(os.path.expanduser(os.environ.get('PIANO_V110', str(Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0'))))   # the Ubuntu v1.1.0 release (or its few files)
 MAINT_IMAGE = V110 / 'release/boot/boot-ram-maintenance.img'
 MAINT_IMAGE_SHA256 = '54001a50a13fe80c3bd8e926161608b71d91e57e2d6be6b83cdc2bc62b5f6fbc'
+
+
+def maint_image():
+    """(path or None, the paths tried): the maintenance RAM image, the first candidate that hashes to MAINT_IMAGE_SHA256 (the pin
+    makes every candidate safe): $PIANO_V110's, then each PIANO_V110 of ~/.config/piano/env (plain or `export` lines), then this
+    checkout's private/v1.1.0, then the old default. 2026-11-23 18:40: a shell without PIANO_V110 looked only at the old default,
+    where no file is any more, and maint-boot stopped."""
+    roots = [V110]
+    env = Path.home() / '.config/piano/env'
+    if env.is_file():
+        for line in env.read_text().splitlines():
+            m = re.match(r'\s*(?:export\s+)?PIANO_V110=(.*)$', line)
+            if m:
+                roots.append(Path(os.path.expanduser(m.group(1).strip().strip('"').strip("'"))))
+    roots += [D / 'private/v1.1.0', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0']
+    tried = []
+    for root in roots:
+        path = root / 'release/boot/boot-ram-maintenance.img'
+        if path in tried:
+            continue
+        tried.append(path)
+        if path.is_file() and common.sha(path) == MAINT_IMAGE_SHA256:
+            return path, tried
+    return None, tried
 PLATFORM_TOOLS = '/opt/homebrew/share/android-commandlinetools/platform-tools'
 B = common.LBA
 MiB = 1 << 20
@@ -284,7 +308,7 @@ class Session:
         """The ESP region's sha256 on the tablet (as tablet_boot_a)."""
         if self.execute:
             return self.region_sha(self.nodes['lun0'], common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-region-now')
-        return self.sim.get('esp') or self.state.get('esp_sha256')
+        return self.sim.get('esp') or self.esp_state()[1] or self.ledger_esp()[1]
 
     def pair(self, boot_sha, esp_record, what):
         """The rule: an ESP whose ADT asks for more than boot_a's DarwinBoot takes never boots (DarwinBoot refuses the ADT)."""
@@ -303,6 +327,47 @@ class Session:
     def esp_record(self, name):
         path = OUT / (name.removesuffix('.img') + '.json')
         return json.loads(path.read_text()) if path.is_file() else None
+
+    @staticmethod
+    def ledger_esp():
+        """(image, sha256) of OUT/installed.json, the ESP the last install wrote; else (None, None)."""
+        try:
+            record = json.loads((OUT / 'installed.json').read_text())
+            return record.get('image'), record.get('sha256')
+        except (OSError, ValueError, AttributeError):
+            return None, None
+
+    def esp_state(self):
+        """(image, sha256) of the ESP this install's session state wrote, while it is current: written under this backup set
+        (esp_set = backup_name), or an untagged entry of an older tool that installed.json names too. Else (None, None): a value an
+        older session left is never used (2026-11-23 18:56: an old v9 esp_written failed check over the installed v13.1y8 ESP)."""
+        st = self.state
+        name, sha = st.get('esp_written'), st.get('esp_sha256')
+        if not (name or sha):
+            return None, None
+        if st.get('esp_set'):
+            return (name, sha) if st['esp_set'] == st.get('backup_name') else (None, None)
+        return (name, sha) if sha and sha == self.ledger_esp()[1] else (None, None)
+
+    def save_esp(self, name, sha):
+        """Record the ESP this step put on the tablet (None: the region as it was before this install), tagged with the backup set."""
+        self.save(esp_written=name, esp_sha256=sha, esp_set=self.state.get('backup_name'))
+
+    def esp_expected(self):
+        """What check expects the ESP region to hold: (sha256, what, ledger) with ledger = installed.json's (image, sha256) when it
+        must name the same ESP (nothing written in this backup set), else None. The ESP this install wrote (esp_state); else the
+        region as this backup set read it before any write (linux_rootfs-tail-esp); else installed.json's; else (None, None, None)."""
+        name, sha = self.esp_state()
+        if sha:
+            return sha, name or 'the image written', None
+        ledger = self.ledger_esp()
+        entry = (self.state.get('backups') or {}).get('linux_rootfs-tail-esp') or {}
+        if entry.get('verified') and entry.get('sha256'):
+            record = self.esp_by_sha(entry['sha256'])
+            return entry['sha256'], f'{record["image"] if record else "the region"} as this backup set read it', ledger if ledger[1] else None
+        if ledger[1]:
+            return ledger[1], f'{ledger[0]} (installed.json)', None
+        return None, None, None
 
     def save(self, **values):
         self.state.update(values)
@@ -345,7 +410,7 @@ class Session:
         """Whether this install has written region KEY since its backup (then a different SHA-256 now is expected)."""
         st = self.state
         return {'lun0-gpt-primary': st.get('gpt_state') == 'new', 'lun0-gpt-backup': st.get('gpt_state') == 'new',
-                'linux_rootfs-tail-esp': bool(st.get('esp_written')), 'boot_a': bool(st.get('boot_a_written')),
+                'linux_rootfs-tail-esp': bool(self.esp_state()[0]), 'boot_a': bool(st.get('boot_a_written')),
                 # the store region changes with the move and whenever macOS runs from the ESP (data-persist=2)
                 'linux_rootfs-store': st.get('gpt_state') == 'new', 'linux_rootfs-store-header': st.get('gpt_state') == 'new',
                 'lun4-gpt-primary': bool(st.get('slot_success_written')),
@@ -747,7 +812,7 @@ class Session:
     def esp_reset_after(self):
         """The reset time of the default entry of the ESP on the tablet (the one written, else --esp). An ESP whose default does not
         reset (default macos) never comes back to ABL fastboot by itself, so the RAM tests refuse it."""
-        name = self.state.get('esp_written') or self.a.esp
+        name = self.esp_state()[0] or self.a.esp
         rec = self.esp_record(name) or {}
         m = re.search(r'piano-reset-after=(\d+)', rec.get('cmdlines', {}).get(rec.get('default', ''), ''))
         if not m:
@@ -1242,10 +1307,12 @@ def abl_check(s):
 def maint_boot(s):
     """fastboot boot the Ubuntu release's maintenance RAM image, wait for its shell, set the idle limit to 3600 s, install
     tablet.sh (sha256 checked)."""
-    s.need(MAINT_IMAGE.is_file() and common.sha(MAINT_IMAGE) == MAINT_IMAGE_SHA256, f'{MAINT_IMAGE.name} sha256 {MAINT_IMAGE_SHA256[:16]}')
+    image, tried = maint_image()
+    s.need(image is not None, f'{MAINT_IMAGE.name} sha256 {MAINT_IMAGE_SHA256[:16]}: ' +
+           (str(image) if image else 'none of ' + ', '.join(str(t) for t in tried) + ' (set PIANO_V110)'))
     if not s.wait(s.serial, True, 120):
         raise Stop('ABL fastboot not found (power + volume-down 15-20 s)')
-    s.fastboot('boot', str(MAINT_IMAGE), timeout=180)
+    s.fastboot('boot', str(image or MAINT_IMAGE), timeout=180)
     s.wait_shell()
     s.shell('piano-maint idle 3600')
     out = s.shell('. /etc/piano-network; echo "host_ip=$PIANO_HOST_IP"')
@@ -1271,7 +1338,7 @@ def map_step(s):
     r = map_nodes(s)
     # the ESP these checks are for: --esp's record, else the one this install last wrote (after rootfs-clear a map without --esp
     # must not judge linux_rootfs by the 27.0.1 rules)
-    target = s.esp or s.esp_by_sha(s.state.get('esp_sha256'))
+    target = s.esp or s.esp_by_sha(s.esp_state()[1] or s.ledger_esp()[1])
     elsewhere = esp_store(target)
     if r:
         s.need(r['lun0_block_size'] == '4096' and r['lun0_bytes'] == str(LUN0_BYTES), f'LUN 0 {r["lun0"]}: 4096-byte blocks, {LUN0_BYTES} bytes')
@@ -1548,7 +1615,7 @@ def write_esp(s, image_name):
     if r:
         s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp is {r["esp"]}')
     esp = s.nodes.get('esp') or 'sda37'
-    if s.state.get('esp_written'):
+    if s.esp_state()[0]:
         s.require_backup('linux_rootfs-tail-esp')   # the region holds an ESP image of this install; the backup is of before
     else:
         now = s.region_sha(lun0, common.ESP_FIRST, common.ESP_BLOCKS, name='esp-region-sha')
@@ -1578,7 +1645,7 @@ def write_esp(s, image_name):
            f'ESP read back through /dev/{esp} and /dev/{lun0}: {got} / {got2} = {record["sha256"][:16]}')
     s.sim['esp'] = record['sha256']
     if s.execute:
-        s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+        s.save_esp(record['image'], record['sha256'])
         # The installed ESP's seed, which build-ram-images.py and build-esp.py compare theirs with (common.installed_seed).
         common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
                                                    'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S')})
@@ -1664,7 +1731,7 @@ def esp_delta(s):
            f'ESP read back through /dev/{esp} and /dev/{s.nodes["lun0"]}: {got} / {got2} = {record["sha256"][:16]}')
     s.sim['esp'] = record['sha256']
     if s.execute:
-        s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+        s.save_esp(record['image'], record['sha256'])
         common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
                                                    'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
                                                    'by': f'esp-delta over {old_name}'})
@@ -1699,12 +1766,12 @@ def esp_back(s):
     s.sim['esp'] = entry.get('sha256')
     if s.execute:
         if record:   # an ESP of a build record (an earlier install's): the installed seed is its seed again
-            s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+            s.save_esp(record['image'], record['sha256'])
             common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
                                                        'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
                                                        'by': 'rollback esp'})
         else:
-            s.save(esp_written=None, esp_sha256=None)
+            s.save_esp(None, None)
             (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
 
 
@@ -1730,9 +1797,15 @@ def check_step(s):
     v = s.shell(f'sgdisk -v /dev/{lun0}')
     s.need('No problems found' in v if v is not None else None, 'sgdisk -v clean')
     esp_now = s.tablet_esp() if not s.execute else None
-    if s.state.get('esp_sha256') or not s.execute:
+    want, what, ledger = s.esp_expected()
+    old_name, old_sha = s.state.get('esp_written'), s.state.get('esp_sha256')
+    if (old_name or old_sha) and not s.esp_state()[1]:
+        s.log(f'  info  the session state names the ESP {old_name or old_sha[:16]} of an older session: not used')
+    if ledger:
+        s.need(ledger[1] == want, f'installed.json ({ledger[0]}, {ledger[1][:16]}) = the ESP this backup set read ({want[:16]})')
+    if want or not s.execute:
         got = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
-        s.need(got == s.state.get('esp_sha256') if s.execute else None, f'ESP = {s.state.get("esp_written", "the image written")}')
+        s.need(got == want if s.execute else None, f'ESP = {what}')
         esp_now = got if s.execute else esp_now
     record_now = s.esp_by_sha(esp_now) if esp_now else None
     s.pair(boot_now, record_now, 'the pair on the tablet')
@@ -1891,7 +1964,7 @@ def ram_boot_a(s):
     s.need(bool(entry) and image.is_file() and common.sha(image) == entry['sha256'],
            f'{image.name} is a signed image of {entry["record"] if entry else "no boot record"}' +
            (f' (sha256 {entry["sha256"][:16]}, DarwinBoot window up to {entry["fd_bound"] >> 20} MiB)' if entry else ''))
-    esp = s.esp_by_sha(s.state.get('esp_sha256')) or s.esp_record(s.state.get('esp_written') or s.a.esp)
+    esp = s.esp_by_sha(s.esp_state()[1] or s.ledger_esp()[1]) or s.esp_record(s.esp_state()[0] or s.a.esp)
     window = s.esp_window(esp)
     s.need(bool(entry) and (window or 0) <= entry['fd_bound'],
            f'the ESP on the tablet ({esp["image"] if esp else "unknown"}, RAM window {window >> 20 if window else "-"} MiB) boots with this FD')

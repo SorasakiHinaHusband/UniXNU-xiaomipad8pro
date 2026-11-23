@@ -834,6 +834,23 @@ def test_session(tmp, out, dual, seed273, inputs):
     run('map', '--esp', 'esp-k273-v3.img')
     run('rollback', 'esp-final', '--esp', 'esp-k273-v3.img')
     check(esp_region() == v2['sha256'], 'rollback esp-final after esp-delta: v2 again (its image was the backup)')
+
+    # -- check over a stale session state (2026-11-23 18:56, the real case): an older session left esp_written/esp_sha256 of an ESP
+    #    no longer on the tablet (v9, untagged), its build record still here; a --new-backup run that writes no ESP (map backup
+    #    check) must expect the ESP this backup set read before any write (= installed.json's v2), never the stale v9
+    common.write_json(out / 'esp-k273-v9.json', dict(v2, image='esp-k273-v9.img', sha256='99' * 32))
+    st = state()
+    st.update(esp_written='esp-k273-v9.img', esp_sha256='99' * 32)
+    st.pop('esp_set', None)
+    state_path.write_text(json.dumps(st))
+    log = run('map', 'backup', 'check', '--new-backup')
+    tail = log.split('step check')[-1]
+    if 'ESP = esp-k273-v2.img' not in tail:
+        print('\n'.join(x for x in tail.splitlines() if 'ESP' in x or 'installed.json' in x))
+    check('ESP = esp-k273-v2.img' in tail and 'ESP = esp-k273-v9' not in tail and 'esp-k273-v9.img of an older session: not used' in tail
+          and 'installed.json (esp-k273-v2.img' in tail and esp_region() == v2['sha256'],
+          'check after an older session\'s ESP value: expects the ESP this backup set read (v2 = installed.json), not the stale v9')
+    (out / 'esp-k273-v9.json').unlink()
     tp.write_at(lun0, (common.ESP_FIRST + 3) * B, b'not v2')
     log = run('map', 'esp-delta', '--esp', 'esp-k273-v3.img', '--new-backup', expect=3)
     check('the tablet\'s ESP = the installed esp-k273-v2.img' in log and 'FAIL' in log, 'esp-delta refuses an ESP region that is not the installed image')
