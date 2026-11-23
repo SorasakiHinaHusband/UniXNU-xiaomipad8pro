@@ -78,12 +78,14 @@ static void layouts()
         clean();fixture.mode=ScatterUnlessContiguous;
     }
     /* seven workers: 64 MiB in 8 parts (the most) */
+    native_adreno_wire_priority=81;   /* P1d: a change of the workers' priority between BOs (applied before their next part) */
     native_adreno_wire_workers=7;
     {
         NativeAdrenoMemory m;
         OK(!m.allocateUser(64u<<20,40,64u<<20,true) && m.partCount()==8 && spansCover(m));
         OK(!m.release());
     }
+    native_adreno_wire_priority=NativeAdrenoWirePriorityDefault;
     clean();fixture.mode=ScatterUnlessContiguous;
     /* a part's wiring fails: the BO fails, the wired parts are completed, nothing stays */
     native_adreno_wire_workers=3;

@@ -26,6 +26,7 @@ void NativeAdrenoMemory::setKopt(uint32_t bits) {native_adreno_kopt=bits;}
 #include <IOKit/IOMultiMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
 #include <kern/thread.h>
+#include <mach/thread_policy.h>
 #endif
 /* UniXNU-piano (2026-11-22, GPU-PAGED P0b): the pool bypass and its figures (NativeAdrenoPoolBypass.h). */
 extern "C" {
@@ -46,7 +47,8 @@ volatile uint64_t native_adreno_p0b_submit[3];
  * wiring parts of its own batch too and then waiting until every part answered. A batch lives on the caller's stack: it leaves the
  * queue (under the lock) before the caller returns, and a worker only touches it under the lock or between taking a part and
  * counting it done. */
-extern "C" {volatile uint32_t native_adreno_wire_workers;volatile uint64_t native_adreno_wire_stats[6];}
+extern "C" {volatile uint32_t native_adreno_wire_workers;volatile uint64_t native_adreno_wire_stats[6];
+volatile uint32_t native_adreno_wire_priority=NativeAdrenoWirePriorityDefault;}
 namespace {
 struct WireBatch {IOBufferMemoryDescriptor **parts;IOReturn *results;unsigned count,next,done;WireBatch *link;};
 WireBatch *wireHead;
@@ -101,12 +103,41 @@ void wireOne(WireLocked &w,WireBatch *b,bool worker)
     if(worker)__atomic_fetch_add(&native_adreno_wire_stats[5],1u,__ATOMIC_RELAXED);
     if(++b->done==b->count)wireWakeLocked();
 }
+/* The worker's own priority (P1d): THREAD_PRECEDENCE_POLICY's importance is relative to kernel_task's BASEPRI_KERNEL. */
+uint32_t wireWanted()
+{
+    const uint32_t want=__atomic_load_n(&native_adreno_wire_priority,__ATOMIC_RELAXED);
+    return !want || want>NativeAdrenoWirePriorityKernel?uint32_t(NativeAdrenoWirePriorityKernel):want;
+}
+uint32_t wireApplyPriority(uint32_t applied)
+{
+    const uint32_t want=wireWanted();
+    if(want==applied)return applied;
+#ifndef ADRENO830_HOST_TEST
+    thread_precedence_policy_data_t policy={integer_t(want)-integer_t(NativeAdrenoWirePriorityKernel)};
+    /* a refusal leaves the thread where it was; the wanted value is still recorded, so it is not retried part by part */
+    (void)thread_policy_set(current_thread(),THREAD_PRECEDENCE_POLICY,reinterpret_cast<thread_policy_t>(&policy),
+        THREAD_PRECEDENCE_POLICY_COUNT);
+#endif
+    return want;
+}
 void wireWorkerLoop()
 {
+    uint32_t applied=NativeAdrenoWirePriorityKernel;   /* kernel_thread_start's */
+    applied=wireApplyPriority(applied);
     WireLocked w;
     for(;;) {
         WireBatch *b=wireOpen();
         if(!b) {wireWaitLocked(w);continue;}
+        if(wireWanted()!=applied) {
+            /* outside the lock: thread_policy_set may block */
+#ifdef ADRENO830_HOST_TEST
+            w.l.unlock();applied=wireApplyPriority(applied);w.l.lock();
+#else
+            IOLockUnlock(wireLock);applied=wireApplyPriority(applied);IOLockLock(wireLock);
+#endif
+            continue;
+        }
         wireOne(w,b,true);
     }
 }

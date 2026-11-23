@@ -15,6 +15,11 @@ class IOMultiMemoryDescriptor;
 enum : size_t {NativeAdrenoWireSplitBytes=size_t(1)<<20,NativeAdrenoWirePartMin=size_t(256)<<10,NativeAdrenoWireMaxParts=8,
                NativeAdrenoWireMaxWorkers=7,NativeAdrenoWirePartAlign=size_t(64)<<10};
 extern "C" volatile uint32_t native_adreno_wire_workers;
+/* UniXNU-piano (GPU-PAGED P1d, P1-GATE.md section 9): the scheduling priority the workers wire at (0: kernel_thread_start's
+ * BASEPRI_KERNEL 81, above WindowServer's compositing threads, gpu-p1b/p1c's; else that absolute priority, NativeAdrenoWirePriorityDefault
+ * 47 = the user-interactive band below the compositor); a worker applies a change before its next part. */
+enum : uint32_t {NativeAdrenoWirePriorityDefault=47,NativeAdrenoWirePriorityKernel=81};
+extern "C" volatile uint32_t native_adreno_wire_priority;
 /* [0] BOs split, [1] their parts, [2] BOs over the split size wired whole (no workers), [3] split BOs a part's prepare failed,
  * [4] worker threads started, [5] parts a worker (not the caller) wired. */
 extern "C" volatile uint64_t native_adreno_wire_stats[6];
