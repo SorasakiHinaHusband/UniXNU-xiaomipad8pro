@@ -1156,3 +1156,19 @@ contract), at most 3 A; never above the advertisement; the USB default keeps the
   thermal derating, the board holds, sleep (the row), detach (100 mA back, the steps from the row), the ADSP lifecycle. There is no
   new boot argument.
 - **Tests:** `tests/policy_host.cpp` testT14FiveVoltMax. Analysis: the private note T14-ICL.md (charging lane).
+
+## 23. The buck path at 9 V, by default (charge/pd2, 2026-11-24; host-tested, not run)
+
+The daily profile has carried the buck fast-charge set since v13.1y10 (`piano-power-hv=1 -pdo-mca=1 -hv-order=1 -hv-caps=1 -qc=1
+-fv-hot=1`, §21): a PD charger with a fixed 9 V object is asked for 9 V, and its input limit is min(RDO operating current, object,
+2500 mA) with a connector reading below 50 °C, else the in_pd row 1600 (§22, T-14 9 V). The sink's fixed RDO current is formed by the
+charger firmware, not by this driver (we write only the voltage, 0x21018 = 9000); on chargers where the firmware asks 1600 mA, fixed
+9 V stays at 9 V / 1.6 A, as on stock Android (in_pd 1600). A PPS request carries its current (0x21017), so PPS 9 V (mode 2) is the
+buck's only path to in_pps 2500.
+
+- **Changed:** a PPS 9 V contract above 1600 mA now takes the same connector rule as the fixed one (a connector that reads below
+  50 °C, no hot hold), else 1600. Before, PPS got 2500 with no connector reading. `ChargePolicy.c` (the 9 V input limit).
+- **Unchanged:** the charge pump (off: `piano-power-cp=1` and the per-boot root arm), MiPPS (off), every ceiling and allowlist, the
+  80/75 policy, the barrier, the 8.0-9.6 V window, 15-45 °C for 9 V, the board holds. No new boot argument.
+- **Tests:** `tests/policy_host.cpp` testT14NineVolt (PPS cases: 2500 with a cool connector; 1600 without a reading or at 51 °C;
+  100 mA at 60 °C; a 2 A APDO; 80/75 from PPS).

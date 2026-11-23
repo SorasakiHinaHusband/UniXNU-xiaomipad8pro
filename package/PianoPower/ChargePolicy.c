@@ -1686,6 +1686,10 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
             icl = umin(hv_ma, PIANO_CHG_ICL_ABS_MAX);
             if (icl > HV_PD_ROW_MA && !conn_allows_rp(in, s)) icl = HV_PD_ROW_MA;
         }
+        /* charge/pd2: a PPS 9 V contract (in_pps 2500) above the in_pd row takes the same connector rule as the fixed one: every
+         * 9 V input above 1600 mA needs a connector that reads below 50 degC and no hot hold */
+        if (hv_caps(c) && !s->hv_qc && cls == PIANO_CHG_C_PD_PPS && icl > HV_PD_ROW_MA && !conn_allows_rp(in, s))
+            icl = HV_PD_ROW_MA;
         p->icl_why = PIANO_CHG_ICL_9V;
         p->rp_ma = 0;
     } else {

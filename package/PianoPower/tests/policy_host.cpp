@@ -2286,6 +2286,37 @@ static void testT14NineVolt()
     StrictSim s; daily(s); s.cfg.hv_caps = 0; at9(s, 3000, 3000);
     CHECK(s.busMv == 9000 && s.icl == 1600 && s.fcc == 1500);
   }
+  // charge/pd2: PPS 9 V (mode 2) takes in_pps 2500 only with a cool connector reading, like the fixed rule; the row 1600 otherwise
+  auto pps9 = [&](StrictSim &s, uint32_t apdoMa) {
+    daily(s); s.cfg.hv = 2;
+    s.pd({{5000, 5000, 3000}, {9000, 9000, 3000}, {3300, 11000, apdoMa}}); s.fixed9 = 3000; s.pps9 = apdoMa;
+    s.contractMa = std::min<uint32_t>(apdoMa, 3000);
+    for (unsigned i = 0; i < 40 && s.busMv != 9000; ++i) s.step();
+    s.run(6);
+  };
+  {   // a 5 A APDO, a cool connector: PPS, 2500 in, 3500 charge
+    StrictSim s; pps9(s, 5000);
+    CHECK(s.busMv == 9000 && s.protocol == 2 && s.st.hv_pps && s.icl == 2500 && s.fcc == 3500 && s.plan.icl_why == PIANO_CHG_ICL_9V);
+  }
+  {   // no connector reading: the row 1600 (was 2500 before charge/pd2)
+    StrictSim s; s.boardValid = 0; pps9(s, 5000); s.boardValid = 0; s.run(4);
+    CHECK(s.busMv == 9000 && s.protocol == 2 && s.icl == 1600 && s.fcc <= 3200);
+  }
+  {   // a connector at 51 C -> the row; 60 C -> 100 mA; cool -> 2500 again
+    StrictSim s; pps9(s, 5000); CHECK(s.icl == 2500);
+    s.conn2Dc = 515; s.run(2); CHECK(s.icl == 1600 && s.fcc <= 3200);
+    s.conn2Dc = 600; s.run(2); CHECK(s.icl == 100);
+    s.conn2Dc = 300; s.run(20); CHECK(s.busMv == 9000 && s.icl == 2500);
+  }
+  {   // a 2 A APDO: its own current, the row does not bind
+    StrictSim s; pps9(s, 2000);
+    CHECK(s.busMv == 9000 && s.protocol == 2 && s.icl == 2000);
+  }
+  {   // 80/75 unchanged at PPS
+    StrictSim s; pps9(s, 5000);
+    s.soc = 80; s.run(20); CHECK(s.busMv == 5000 && s.st.hold && s.enable == 0);
+    s.soc = 75; s.run(30); CHECK(!s.st.hold && s.enable == 1 && s.busMv == 9000 && s.icl == 2500);
+  }
 }
 
 // T-14b (owner 2026-11-23 19:25; live y10 reads 19:26/19:32 on the 70 W charger): every ~5 s cycle one decision planned ICL 500 with
