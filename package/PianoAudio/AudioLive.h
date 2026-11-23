@@ -106,6 +106,9 @@ typedef struct {
     uint32_t duplex_hold_gen;             /* every request: a new one clears a failure of this boot */
     int miplay;                           /* MIPLAY asked for (spk_miplay_valid: the boot argument, then the sysctl); taken at a start */
     uint32_t miplay_gen;                  /* every request: a new one clears a MIPLAY fallback of this boot */
+    /* spk-probe1: a silent protection probe asked for (audio_live_spk_probe), taken by the worker */
+    uint32_t spk_probe;                   /* the request: seconds (1..AUDIO_SPK_PROBE_MAX_S), + AUDIO_SPK_PROBE_AMPS: amplifiers up, muted */
+    uint32_t spk_probe_gen;               /* every request */
     /* The microphone tap (AudioTap.h): its shared header and ring (null: no tap), and how many tap clients are open; while one is,
      * the capture plan runs as if the Mic device did, and every capture period also goes into the tap. */
     PianoTapHeader *tap;
@@ -133,6 +136,15 @@ int audio_live_spk_select(AudioLiveShared *sh, int on);
 int audio_live_miplay_select(AudioLiveShared *sh, int request);
 /* duplex-age1: 1 the signed sound age (default), 0 the old unsigned test (A/B control); applies from the next worker tick. */
 int audio_live_age_select(AudioLiveShared *sh, int signed_age);
+/* spk-probe1, only with the configuration's spk_probe (piano-audio-spk-probe=1): the speaker
+ * protection pair brought up WITHOUT sound for `request` seconds (1..AUDIO_SPK_PROBE_MAX_S): no PCM is needed, the master mute does
+ * not stop it, the amplifiers stay powered down (or, with + AUDIO_SPK_PROBE_AMPS, are powered up and held MUTED); the monitor runs
+ * (battery voltage, live data); then the path goes down as after idle. Real sound during a probe takes over as usual (without the
+ * amplifiers, that start ends first and the path comes back with them). Taken at the worker's next tick when the speaker path is
+ * down and protection is asked for and ready; sleep cancels it. -1 for another value. */
+#define AUDIO_SPK_PROBE_MAX_S 30u
+#define AUDIO_SPK_PROBE_AMPS 100u
+int audio_live_spk_probe(AudioLiveShared *sh, uint32_t request);
 /* duplex-hold1, an A/B switch (default 0: unchanged). 1: the LPASS macro and digital codec votes, 3: those and the VA (TX core)
  * mclk, requested by a plan of their own BEFORE the first path (speaker or Mic) starts and released only after both are down, so
  * that a Mic start or stop while the speaker plays changes no PRM resource; the Mic's plan then skips the held steps. Taken when
@@ -170,6 +182,7 @@ typedef struct {
     int duplex_hold;                     /* piano-audio-duplex-hold: audio_live_hold_select's mask from the first start (0 off) */
     int age_old;                         /* piano-audio-age=0: the old unsigned sound-age test (A/B control); default the signed one */
     int miplay;                          /* piano-audio-miplay: audio_live_miplay_select's request from the first start (0 off) */
+    int spk_probe;                       /* piano-audio-spk-probe=1: audio_live_spk_probe's requests are taken (0: ignored) */
 } AudioLiveConfig;
 void audio_live_defaults(AudioLiveConfig *c, uint32_t level);
 
@@ -261,6 +274,13 @@ typedef struct {
     int mon_stopping, live_bad, vbat_noted;
     SpkLive live_data;
     uint32_t live_reads, vbat_sends, vbat_uv;
+    uint32_t live_at;                    /* the worker's time of the last live data (live_reads > 0) */
+    /* ---- spk-probe1 (audio_live_spk_probe): the silent protection probe */
+    uint32_t probe_gen, probe_until, probe_requests, probe_runs, probe_refused, probe_reads_from, probe_reads, probe_up;
+    int probing;                         /* a probe was taken and has not ended */
+    int probe_amps;                      /* this probe powers the amplifiers up (muted) */
+    int probe_noamps;                    /* this start of the speaker path is the probe's alone with the amplifiers left powered down */
+    const char *probe_why;               /* the last probe's outcome or refusal (a static string) */
     /* ---- MIPLAY (AudioSpkProt.h), inside the protection pair */
     int mip_ready;                       /* its private file is valid */
     int mip_active;                      /* this start of the protection pair has MIPLAY */
@@ -341,6 +361,14 @@ int audio_live_mic_record(AudioLive *l, int on, AudioMicWindow *backing);
 const AudioMicWindow *audio_live_mic_window(const AudioLive *l);
 void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now_ms);
 const char *audio_live_state(int state);
+/* spk-probe1: the probe's state and the last live data per amplifier as one line, relative values only (r0 in permille of that
+ * amplifier's Re25, f0 Hz, Q, coil temperature in 0.1 C, the read's age in ms at now, a plausibility word): never the calibration
+ * itself. Returns the length written (always terminated when cap > 0). */
+unsigned audio_live_spk_live_text(const AudioLive *l, uint32_t now, char *buf, unsigned cap);
+#define AUDIO_SPK_LIVE_OK_MIN 700u       /* permille of Re25 */
+#define AUDIO_SPK_LIVE_OK_MAX 1500u
+#define AUDIO_SPK_F0_OK_MIN 200u         /* Hz */
+#define AUDIO_SPK_F0_OK_MAX 2000u
 
 #ifdef __cplusplus
 }
