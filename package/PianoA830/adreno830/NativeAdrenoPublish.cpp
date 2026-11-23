@@ -32,6 +32,7 @@
 #include "NativeAdrenoMapLines.h"   /* UniXNU-piano */
 #include "NativeAdrenoPagedLine.h"   /* UniXNU-piano: GPU-PAGED P1 */
 #include "NativeAdrenoPoolBypass.h"   /* UniXNU-piano: GPU-PAGED P0b */
+#include "NativeAdrenoPciIdentity.h"   /* UniXNU-piano: BR1 */
 #include <sys/codesign.h>
 #include <sys/proc.h>
 #include <sys/ubc.h>
@@ -2054,6 +2055,21 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     service->setProperty("NativeAdrenoClientSlots",(unsigned long long)NativeAdrenoClientWindowCount(windows),32);
     service->setProperty("NativeAdrenoClientVaEndMiB",(unsigned long long)(NativeAdrenoClientWindowsEnd(windows)>>20),32);
     service->setProperty("NativeAdrenoClientWindowMiB",(unsigned long long)(windows[NativeAdrenoLargeSlots+1].bytes>>20),32);
+    /* UniXNU-piano (2026-11-24, BR1): the PCI-style identity Chrome's ANGLE and Dawn read from the accelerator's provider
+     * (NativeAdrenoPciIdentity.h); before registerService, so the AGXAccelerator never exists without it. */
+    {
+        const NativeAdrenoPciBytes vendor=NativeAdrenoPciLe32(NativeAdrenoPciVendorQualcomm);
+        if(OSData *data=OSData::withBytes(vendor.b,sizeof vendor.b)) {
+            service->setProperty(NativeAdrenoPciVendorKey,data);
+            data->release();
+        }
+        const uint32_t device_id=info?NativeAdrenoPciDeviceId(info->chip_id):0;
+        const NativeAdrenoPciBytes device=NativeAdrenoPciLe32(device_id);
+        if(OSData *data=device_id?OSData::withBytes(device.b,sizeof device.b):nullptr) {
+            service->setProperty(NativeAdrenoPciDeviceKey,data);
+            data->release();
+        }
+    }
 #endif
     service->registerService();
     return kIOReturnSuccess;
