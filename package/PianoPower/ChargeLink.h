@@ -62,6 +62,7 @@ struct LinkView {
   const piano_board_temps *board = nullptr;   // PianoThermal's last round, or PianoThermal not there
   uint32_t wakes = 0;                         // system wakes so far
   bool willSleep = false, shutdown = false;   // a handover is asked for
+  bool mippsBusy = false;                     // MiPPS runs or owes its 0x21002 = 0: no voltage step (an authentication)
 };
 
 struct LinkReadback {
@@ -161,6 +162,7 @@ class ChargeLink {
     if (has(McaChargeEnable)) {x.valid |= PIANO_CHG_IN_ENABLE; x.enable = m.value[McaChargeEnable];}
     if (has(McaTermVolt)) {x.valid |= PIANO_CHG_IN_FV; x.fv_raw = m.value[McaTermVolt];}
     if (has(McaVerify)) {x.valid |= PIANO_CHG_IN_VERIFY; x.verify = m.value[McaVerify];}
+    if (v.mippsBusy) {x.valid |= PIANO_CHG_IN_VERIFY; x.verify = 1;}
     if (has(McaTbat)) {x.valid |= PIANO_CHG_IN_TBAT; x.tbat_c = m.value[McaTbat];}
     if (has(McaAiclStatus)) {x.valid |= PIANO_CHG_IN_AICL; x.aicl_ma = m.value[McaAiclStatus];}
     if (has(McaPdos)) {
