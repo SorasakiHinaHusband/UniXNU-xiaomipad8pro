@@ -604,11 +604,23 @@ static int conn_allows_rp(const PianoChargeInput *in, const PianoChargeState *s)
 
 static int strict_contract(const PianoChargeInput *in);
 
+/* T-14 (owner 2026-11-23 18:45/18:47): with a 9 V mode (hv 1/2) the 5 V contract budget too, but only once this source is
+ * settled at 5 V: the 9 V request asked and not reached (BLOCKED: 5 V until a detach), no 9 V object (SOURCE), or the health
+ * stop (HEALTH). Never while a 9 V request may still be planned (OFF before its wait, a retry), asked or in force: the barrier's
+ * reduced currents then come first. Mode 0 as before. */
+static int hv_settled_5v(const PianoChargeConfig *c, const PianoChargeState *s, uint8_t fallback)
+{
+    if (!c->hv) return 1;
+    if (s->hv == PIANO_CHG_HV_BLOCKED) return 1;
+    return s->hv == PIANO_CHG_HV_OFF && (fallback == PIANO_CHG_FALLBACK_SOURCE || fallback == PIANO_CHG_FALLBACK_HEALTH);
+}
+
 /* At fixed 5 V the selected RDO, rather than an MCA offer or Rp, authorizes PD current. Keep the same opt-in ceiling,
  * connector check and measured steps as the non-PD path. Voltage withdrawal must finish before this budget is used. */
-static uint32_t contract_5v_budget(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s)
+static uint32_t contract_5v_budget(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s,
+                                   uint8_t fallback)
 {
-    if (!c->strict_contract || c->hv || !ramped(c) || !strict_contract(in) ||
+    if (!c->strict_contract || !hv_settled_5v(c, s, fallback) || !ramped(c) || !strict_contract(in) ||
         !(in->valid & PIANO_CHG_IN_SOURCE) || in->contract_protocol != 1 || in->contract_mv != 5000 ||
         !(in->valid & PIANO_CHG_IN_BUS) || in->bus_mv < ONLINE_MV || in->bus_mv >= HV_5V_MAX_MV ||
         s->contract_transition || s->contract_mode_change || volt_raised(s)) return 0;
@@ -623,7 +635,7 @@ static uint32_t icl_at_5v(const PianoChargeConfig *c, const PianoChargeInput *in
     const uint32_t row = umin(piano_charge_icl_5v(cls, piano_charge_pdo_5v_ma(in->pdo, pdos)), icl_cap(c));
     p->icl_why = PIANO_CHG_ICL_ROW;
     p->rp_ma = 0;
-    const uint32_t contract_ma = with_rp && is_pd(cls) ? contract_5v_budget(c, in, s) : 0;
+    const uint32_t contract_ma = with_rp && is_pd(cls) ? contract_5v_budget(c, in, s, p->fallback) : 0;
     if (contract_ma > row) {
         const uint32_t target = conn_allows_rp(in, s) ? contract_ma : umin(contract_ma, RAMP_BC12_MA);
         if (target > row) {p->icl_why = PIANO_CHG_ICL_CONTRACT_5V; return target;}
@@ -950,7 +962,14 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
     if (!at5 || s->hv == PIANO_CHG_HV_ON) {
         strict_fallback(in, s, p, PIANO_CHG_FALLBACK_READBACK); return 0;
     }
-    if (s->hv == PIANO_CHG_HV_BLOCKED || now < s->attach_ms + HV_WAIT_MS || now < s->hv_retry_ms) return 0;
+    if (s->hv == PIANO_CHG_HV_BLOCKED) {
+        /* T-14: asked and not reached, 5 V until a detach. The withdrawal is confirmed here (5 V asked, taken and back on the bus,
+         * checked above), so the transition is recomputed as every other fallback does: without this the barrier's 500 mA stayed
+         * in force for the rest of the attach, below the 5 V contract's own row. */
+        strict_fallback(in, s, p, PIANO_CHG_FALLBACK_TIMEOUT);
+        return 0;
+    }
+    if (now < s->attach_ms + HV_WAIT_MS || now < s->hv_retry_ms) return 0;
     s->transition_ma = umin(500, umin(in->contract_ma, budget));
     s->contract_transition = 1;
     if (!strict_barrier(in, s)) {p->fallback = PIANO_CHG_FALLBACK_READBACK; return 0;}
