@@ -561,15 +561,10 @@ bool PianoPower::start(IOService *provider)
              ? "a PD sink status without UCSI source PDOs takes the charger firmware's source list (0x21011, PD state SNK_Ready, "
                "vSafe5V first, fixed ascending before PPS) with a second agreeing status read; RDO, opmode and role stay UCSI's"
              : "a PD contract needs UCSI source PDOs (this PPM offers none: PD sources stay without a contract)");
-    note("charge/pd1: piano-power-hv-order=%u piano-power-hv-caps=%u piano-power-qc=%u piano-power-fv-hot=%u: %s%s%s%s "
-         "[PianoFastChargeV1]", gArgs.hvOrder, gArgs.hvCaps, gArgs.qc, gArgs.fvHot,
-         gArgs.hvOrder ? "mode 1 takes a PPS APDO covering 9 V when the source has no fixed 9 V PDO (mode 2 the fixed PDO when it has "
-                         "no such APDO); " : "",
-         gArgs.hvCaps ? "at a validated 9 V contract the stock rows (fixed PD 1600 / 3000 mA, PPS 2500 / 3500, QC3 1600 / 3500, QC2 "
-                        "1200 / 2600; charge current at most twice the input limit; within the RDO and the object); " : "",
-         gArgs.qc ? "QC2/QC3 sources (type 5-8, a fresh non-PD UCSI status) asked for 9 V through 0x2011 behind the same barrier and "
-                    "gates, 0x2011 = 5000 on any loss; " : "",
-         gArgs.fvHot ? "float 4060 mV from 48 C (below 46 C back to 4400) and charging held at that float; " : "");
+    note("charge/pd1 [PianoFastChargeV1]: piano-power-hv-order=%u piano-power-hv-caps=%u piano-power-qc=%u piano-power-fv-hot=%u "
+         "(order: mode 1 the fixed 9 V PDO else an APDO, mode 2 the APDO else the PDO; caps: 9 V rows PD 1600/3000, PPS 2500/3500, "
+         "QC3 1600/3500, QC2 1200/2600 mA, FCC <= 2 x ICL; qc: 0x2011 9 V for type 5-8 with a non-PD UCSI status; fv-hot: 4060 mV "
+         "from 48 C, held at that float; all within the strict session's gates)", gArgs.hvOrder, gArgs.hvCaps, gArgs.qc, gArgs.fvHot);
   }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
