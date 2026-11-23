@@ -351,6 +351,33 @@ int spkState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 // MIPLAY (AudioSpkProt.h): machdep.piano_audio_miplay asks for the Dolby/MiSound subgraph inside the protection plan from its next start
 // (0 off; 1 or 2 the perf mode; +4 the DAP's pregain follows the master volume; +16 x (r + 1) the rotation r); a new request also clears a
 // MIPLAY fallback of this boot. Its state is in machdep.piano_audio_spk_state ("miplay ...").
+// spk-probe1 (AudioLive.h audio_live_spk_probe): machdep.piano_audio_spk_probe, write S = 1..30:
+// the protection pair up S seconds without sound, the amplifiers left powered down; S + 100: powered up and held muted. Refused
+// (EPERM) without piano-audio-spk-probe=1, (ENOENT) while protection is not ready. Read: the ms left of the running probe.
+// machdep.piano_audio_spk_live (read only, always): the probe's state and the last live data per amplifier, relative values only.
+struct sysctl_oid gSpkProbeOid, gSpkLiveOid;
+int spkProbeControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+    if (!gLive || !gShared) return ENXIO;
+    const uint32_t now = nowMs();
+    int value = gLive->probing && int32_t(gLive->probe_until - now) > 0 ? int(gLive->probe_until - now) : 0;
+    const int err = sysctl_handle_int(oidp, &value, 0, req);
+    if (err || !req->newptr) return err;
+    if (!gLive->cfg.spk_probe) return EPERM;
+    if (!gLive->prot_ready) return ENOENT;
+    if (value < 0 || audio_live_spk_probe(gShared, uint32_t(value))) return EINVAL;
+    piano_audio_log("spk-probe1: request %d (taken at the worker's next tick)", value);
+    liveWake();
+    return 0;
+}
+int spkLive(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+    if (req->newptr) return EPERM;
+    if (!gLive) return ENXIO;
+    char line[480];
+    const unsigned n = audio_live_spk_live_text(gLive, nowMs(), line, sizeof line);
+    return SYSCTL_OUT(req, line, size_t(n) + 1);
+}
 struct sysctl_oid gMiplayOid;
 int miplayControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
@@ -388,6 +415,21 @@ void registerSpk()
     gMiplayOid.oid_descr = "MIPLAY (Dolby) inside speaker protection from its next start: 0 off, 1/2 perf mode, +4 pregain tracked, +16(r+1) rotation r";
     gMiplayOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gMiplayOid);
+    bzero(&gSpkLiveOid, sizeof gSpkLiveOid);
+    gSpkLiveOid.oid_parent = &sysctl__machdep_children; gSpkLiveOid.oid_number = OID_AUTO;
+    gSpkLiveOid.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gSpkLiveOid.oid_name = "piano_audio_spk_live"; gSpkLiveOid.oid_handler = spkLive;
+    gSpkLiveOid.oid_fmt = "A"; gSpkLiveOid.oid_descr = "spk-probe1: probe state and per-amp live data (permille of Re25, f0, Q, 0.1 C)";
+    gSpkLiveOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gSpkLiveOid);
+    if (!gLive || !gLive->cfg.spk_probe) return;   // the probe's control only with piano-audio-spk-probe=1
+    bzero(&gSpkProbeOid, sizeof gSpkProbeOid);
+    gSpkProbeOid.oid_parent = &sysctl__machdep_children; gSpkProbeOid.oid_number = OID_AUTO;
+    gSpkProbeOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    gSpkProbeOid.oid_name = "piano_audio_spk_probe"; gSpkProbeOid.oid_handler = spkProbeControl;
+    gSpkProbeOid.oid_fmt = "I"; gSpkProbeOid.oid_descr = "spk-probe1: protection pair S s without sound (1..30; +100 amps up muted)";
+    gSpkProbeOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&gSpkProbeOid);
 }
 // duplex-hold1 (A/B switch, private DUPLEX-VOTES.txt; AudioLive.h audio_live_hold_select): machdep.piano_audio_duplex_hold 0 off, 1 the
 // LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, held by their own plan from before the first path starts until both
@@ -575,6 +617,7 @@ void liveRun(const PianoAudioLevelArgs *a)
     lc.spk_prot = int(a->spk);   // 0, or the round-2 mask (AudioSpkProt.h SPK_VAR_*), checked by PianoAudio.cpp and AudioLive
     lc.age_old = int(a->ageOld);   // duplex-age1 A/B control
     lc.miplay = int(a->miplay);   // MIPLAY: 0, or AudioSpkProt.h's request (checked by PianoAudio.cpp and AudioLive)
+    lc.spk_probe = int(a->spkProbe);   // spk-probe1: 0 ignores machdep.piano_audio_spk_probe, 1 takes it
     lc.duplex_hold = int(a->duplexHold);   // duplex-hold1: 0, 1 or 3 (checked by PianoAudio.cpp and AudioLive)
     static AudioLiveSpk *spkState;   // kept for the boot, as gLive
     if (!spkState) spkState = IOMallocType(AudioLiveSpk);

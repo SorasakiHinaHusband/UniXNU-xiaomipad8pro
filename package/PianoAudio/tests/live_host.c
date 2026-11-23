@@ -2296,6 +2296,85 @@ static void testSoundAge(void)
     CHECK(!w.violations && live.ahead_total == 0 && live.fades_silent_total == 0);
 }
 
+// spk-probe1: the protection pair up without sound for a while, amplifiers down (or up muted),
+// the monitor read, the path down at the end; refused without the configuration's switch or without protection; real sound takes over.
+static int g_probe_cfg;
+static uint32_t g_probe_req, g_probe_at, g_probe_mute_at, g_probe_snd_from, g_probe_snd_to, g_probe_dev_at;
+static int g_probe_rc, g_probe_text_ok, g_probe_down_after;
+static char g_probe_text[480];
+static void probe_setup(AudioLiveConfig *c) {c->spk_probe = g_probe_cfg;}
+static void probe_hook(uint32_t t)
+{
+    if (g_probe_mute_at && t == g_probe_mute_at) audio_live_control(&sh, -1, 1);
+    if (g_probe_dev_at && t == g_probe_dev_at && !w.out_running) device(1, 0);
+    w.amplitude = 20000;
+    w.sound_on = g_probe_snd_to && t >= g_probe_snd_from && t < g_probe_snd_to;
+    if (t == g_probe_at) g_probe_rc = audio_live_spk_probe(&sh, g_probe_req);
+    if (t == g_probe_at + 5000) {
+        audio_live_spk_live_text(&live, now_ms(), g_probe_text, sizeof g_probe_text);
+        g_probe_text_ok = strstr(g_probe_text, "amp0 r0-permille 1020 f0 800 q 3 t-dC 0 ok") &&
+                          strstr(g_probe_text, "why running") && strstr(g_probe_text, "prot active");
+    }
+    if (t == 11500) g_probe_down_after = live.spk_state == LiveDown && !w.prot_dev_open && !w.vi_open && !any_powered();
+}
+static void probe_reset(void)
+{
+    g_probe_cfg = 1; g_probe_req = 6; g_probe_at = 1000; g_probe_mute_at = g_probe_snd_from = g_probe_snd_to = g_probe_dev_at = 0;
+    g_probe_rc = -2; g_probe_text_ok = g_probe_down_after = 0; g_probe_text[0] = 0;
+}
+static void testSpkProbe(void)
+{
+    const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_hook};
+    // the request's range
+    audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
+    CHECK(audio_live_spk_probe(&sh, 0) == -1 && audio_live_spk_probe(&sh, 31) == -1 && audio_live_spk_probe(&sh, 100) == -1);
+    CHECK(audio_live_spk_probe(&sh, 131) == -1 && audio_live_spk_probe(&sh, 1) == 0 && audio_live_spk_probe(&sh, 130) == 0);
+    // A: no device, no sound, amplifiers down: the pair up, the monitor read, nothing powered, nothing played, down at the end
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+    run(&sc);
+    CHECK(g_probe_rc == 0 && !w.violations && live.prot_starts == 1 && live.spk_starts == 1 && !live.prot_fallbacks && live.probe_runs == 1);
+    CHECK(power_ups_after_session() == 0 && w.unmutes == 0 && w.sound_periods == 0 && live.probe_up == 1);
+    unsigned at = expect(live_from(), kProtUp, N(kProtUp));
+    const unsigned rounds = monitor_rounds(&at);
+    CHECK(rounds >= 2 && rounds <= 4 && live.probe_reads == rounds && live.live_reads == rounds);
+    at = expect(at, kProtDown, N(kProtDown));
+    CHECK(at == w.ncmd && logged("spk-probe1: probe 1: the protection pair for 6 s without sound, amplifiers left powered down (speaker down)"));
+    CHECK(logged("spk-probe1: amplifiers left powered down") && logged("spk-probe1: probe 1 over: done: the pair came up and the monitor read"));
+    CHECK(logged("PianoSpeakerProtV1 live ch3 slot 3 r0 7.097 ohm (102.0% of Re25)"));
+    if (!g_probe_text_ok) fprintf(stderr, "spk_live text: %s\n", g_probe_text);
+    CHECK(g_probe_text_ok && g_probe_down_after && !live.probing && !live.probe_noamps);
+    {   // the text after the run: the outcome and four amplifiers, relative values only (no ohms)
+        char t[480];
+        audio_live_spk_live_text(&live, now_ms(), t, sizeof t);
+        CHECK(strstr(t, "probe enabled requests 1 runs 1 refused 0 until-ms 0 reads ") && strstr(t, "why done: the pair came up and the monitor read"));
+        CHECK(strstr(t, "; amp3 r0-permille 1020 f0 830 q 6 t-dC 0 ok") && !strstr(t, "ohm"));
+        char small[24];
+        CHECK(audio_live_spk_live_text(&live, now_ms(), small, sizeof small) == sizeof small - 1 && small[sizeof small - 1] == 0);
+    }
+    // B: the switch off: refused, nothing starts
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_cfg = 0; g_setup = probe_setup;
+    run(&sc);
+    CHECK(g_probe_rc == 0 && !w.violations && live.spk_starts == 0 && live.probe_refused == 1 && !live.probe_runs);
+    CHECK(logged("spk-probe1: request 6 refused: not enabled (piano-audio-spk-probe=1)"));
+    // C: protection not asked for: refused
+    spk_reset(); spk_files(); g_spk = 0; probe_reset(); g_setup = probe_setup;
+    run(&sc);
+    CHECK(!w.violations && live.spk_starts == 0 && logged("refused: protection not asked for"));
+    // D: the master muted, amplifiers up and held muted (S + 100): powered, never unmuted, gain 243 under the pair
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_req = 106; g_probe_mute_at = 500; g_setup = probe_setup;
+    run(&sc);
+    CHECK(!w.violations && live.prot_starts == 1 && live.spk_starts == 1 && power_ups_after_session() == 4 && w.unmutes == 0);
+    CHECK(w.sound_periods == 0 && live.probe_reads >= 2 && logged("amplifiers powered up and held MUTED") && g_probe_down_after);
+    // E: real sound during the amplifier-less probe: that start ends, the path comes back with the amplifiers and plays
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_req = 8; g_probe_at = 500; g_probe_dev_at = 2000;
+    g_probe_snd_from = 2500; g_probe_snd_to = 5000; g_setup = probe_setup;
+    run(&sc);
+    CHECK(!w.violations && live.spk_starts == 2 && live.prot_starts == 2 && !live.prot_fallbacks && power_ups_after_session() == 4);
+    CHECK(w.unmutes == 4 && w.sound_periods > 50 && logged("spk-probe1: probe 1 over: ended: real sound took over"));
+    CHECK(logged("spk-probe1: sound during the amplifier-less probe"));
+    spk_reset(); g_setup = 0;
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -2332,6 +2411,7 @@ int main(void)
     testLedgerOverflow();
     testEpochStarts();
     testProtection();
+    testSpkProbe();
     testProtPlanFallback();
     testProtRunningFallback();
     testProtFiles();
