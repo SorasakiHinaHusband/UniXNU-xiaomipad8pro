@@ -2168,6 +2168,16 @@ static void testT14FiveVoltMax()
     StrictSim s; daily(s, 1);
     for (unsigned i = 0; i < 3; ++i) {s.step(); CHECK(s.icl <= 1500);}
   }
+  // held off for a reason that may clear (a pack above 45 C on a 9 V source: SAFETY, still OFF): the row, not the 5 V contract;
+  // cool again -> the 9 V session behind the barrier
+  {
+    StrictSim s; daily(s, 1); s.temp(46);
+    s.run(40);
+    CHECK(s.st.hv == PIANO_CHG_HV_OFF && s.plan.fallback == PIANO_CHG_FALLBACK_SAFETY && s.busMv == 5000);
+    CHECK(s.icl == 1500 && maxIcl(s) == 1500);
+    s.temp(40); s.run(20);
+    CHECK(s.busMv == 9000 && s.icl == 1600);
+  }
   // a detach in the middle of the steps: the next attach starts from the row, and the quick detach costs one step for 60 s
   {
     StrictSim s; daily(s, 1); s.follows9v = false;
