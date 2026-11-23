@@ -41,6 +41,28 @@ BOOT_A_SHA256 = '389d4271743bb4c69664bdb31c34440589978c8add3af0ce9190c46045259a8
 VENDOR_BOOT_A_SHA256 = '50f70e361b927945afa4adb5ddc9947e39a136cd2cd2e28a311a4c3d2163829a'  # 23-vendor_boot_a (Ubuntu)
 INIT_BOOT_A_SHA256 = 'bbebc3d156fa4bffbdf2fdf83940a71a1ec6d64dcddc60977ece057eb1147061'    # 28-init_boot_a (Ubuntu)
 BOOT_PARTITION_BYTES = 100663296
+# T-16 switcher (private/host-checks/20261123-switcher/DESIGN.md): stock Android's boot triplet (CRITICAL-BACKUP/android-set, THE
+# rollback set; boot = boot_b's backup) and the Magisk init_boot (CRITICAL-BACKUP/android-set-root). With the switcher's resting
+# state, vendor_boot_a/init_boot_a stay Android's and a switch writes boot_a only.
+ANDROID_BOOT_A_SHA256 = '17e890568cecb350a63429f3456ffe12fd15ac142178182e361a32054b282d75'         # android-set boot.img
+ANDROID_VENDOR_BOOT_SHA256 = '99ef425b51e64dfdebf45a6797e75acc3a57e97f562c66994f0d9621626c6f2d'    # android-set vendor_boot.img
+ANDROID_INIT_BOOT_SHA256 = 'ae0b5153ab4231a10148d460659b9e2609d5326f34fb0df20fb41f88029f6e7f'      # android-set init_boot.img (stock)
+ANDROID_INIT_BOOT_MAGISK_SHA256 = 'dce4a7520bf51e84506a4ff06a87afa6090747b0c69b9b22b40f4d9232f72573'  # android-set-root (Magisk v31.1)
+
+
+def slot_a_pairs():
+    """The known slot-A (vendor_boot_a, init_boot_a) pairs ABL loads with boot_a -> their name. A function, so a test that patches
+    VENDOR_BOOT_A_SHA256 / INIT_BOOT_A_SHA256 (the Ubuntu-era pair of macos-set-v5) sees its own values."""
+    return {(VENDOR_BOOT_A_SHA256, INIT_BOOT_A_SHA256): 'the Ubuntu-era pair (macos-set-v5)',
+            (ANDROID_VENDOR_BOOT_SHA256, ANDROID_INIT_BOOT_MAGISK_SHA256): 'Android\'s pair with the Magisk init_boot (macos-set-v5a)',
+            (ANDROID_VENDOR_BOOT_SHA256, ANDROID_INIT_BOOT_SHA256): 'Android\'s stock pair (android-set)'}
+
+
+def slot_a_pair_name(vendor_boot, init_boot):
+    """The name of a known slot-A pair, else None."""
+    return slot_a_pairs().get((vendor_boot, init_boot))
+
+
 BOOT_A_START_512, BOOT_A_SIZE_512 = 618800, 196608   # /sys/class/block/<boot_a>/{start,size}
 
 

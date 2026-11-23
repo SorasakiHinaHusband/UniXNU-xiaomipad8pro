@@ -253,6 +253,8 @@ class Session:
         ESP is booted) and for unknown contents. 'planned:NAME' is a dry run's boot-a of an image not signed yet."""
         if sha == common.BOOT_A_SHA256:
             return 'Ubuntu\'s boot_a (13-boot_a)', None
+        if sha == common.ANDROID_BOOT_A_SHA256:
+            return 'stock Android\'s boot (android-set)', None
         if sha and sha.startswith('planned:'):
             name = sha.removeprefix('planned:')
             entry = self.boot['unsigned'].get(name.replace('-signed.img', '.img')) or {}
@@ -1362,11 +1364,17 @@ def map_step(s):
     else:
         s.log(f'  check GPT head/tail = {common.GPT_PRIMARY_SHA256[:16]}/{common.GPT_BACKUP_SHA256[:16]} (old) or gpt.json\'s (new)')
     signed = ((s.boot or {}).get('signed') or {}).get(s.a.boot_image, {}).get('sha256')
+    pair = {}
     for key, digest in (('boot_a', common.BOOT_A_SHA256), ('vendor_boot_a', common.VENDOR_BOOT_A_SHA256),
                         ('init_boot_a', common.INIT_BOOT_A_SHA256), ('boot_b', None)):
         got = s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}')
         if key in ('vendor_boot_a', 'init_boot_a'):
-            s.need(got == digest if s.execute else None, f'{key} = slot A\'s current image {digest[:16]}')
+            pair[key] = got
+            if key == 'init_boot_a':
+                need_known_pair(s, pair['vendor_boot_a'], got, 'map')
+        elif key == 'boot_a' and s.execute and got == common.ANDROID_BOOT_A_SHA256:
+            s.need(False, f'boot_a holds stock Android ({got[:16]}): switch to macOS first (piano-switch, macos-set-v5 or '
+                          '--only boot with macos-set-v5a), then run this session')
         elif not s.execute:
             s.log(f'  info  {key} sha256 is recorded ({"Ubuntu 13-boot_a " + digest[:16] + " or the macOS image" if digest else "never written"})')
         elif key == 'boot_a':
@@ -1790,6 +1798,8 @@ def check_step(s):
         got = s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}')
         s.need(got == s.state.get(f'{key}_sha256') if s.execute else None, f'{key} unchanged')
     got = s.region_sha(s.nodes['boot_a'], 0, s.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
+    if s.execute and got == common.ANDROID_BOOT_A_SHA256:
+        s.need(False, f'boot_a holds stock Android ({got[:16]}): this session is for macOS; switch to macOS first')
     s.need(got in (s.state.get('boot_a_sha256'), s.state.get('boot_a_written')) if s.execute else None, f'boot_a as expected ({got})')
     boot_now = got if s.execute else s.tablet_boot_a()
     head, tail = s.region_sha(lun0, 0, 6), s.region_sha(lun0, TAIL_LBA, 5)
@@ -1982,6 +1992,17 @@ def ram_boot_a(s):
           '"piano-boot-guard: healthy after 180 s, restart reason normal"; then usb-console.py --send "reset fastboot" --capture 5')
 
 
+def need_known_pair(s, vendor_boot, init_boot, what):
+    """vendor_boot_a + init_boot_a must be one known slot-A pair (common.slot_a_pairs: the Ubuntu-era pair of macos-set-v5, or
+    Android's with the stock or the Magisk init_boot of the T-16 switcher's resting state)."""
+    name = common.slot_a_pair_name(vendor_boot, init_boot) if s.execute else None
+    known = ', '.join(f'{v[:8]}+{i[:8]} {n}' for (v, i), n in common.slot_a_pairs().items())
+    s.need(name is not None if s.execute else None,
+           f'{what}: vendor_boot_a/init_boot_a {(vendor_boot or "?")[:16]}/{(init_boot or "?")[:16]} = a known slot-A pair '
+           f'({name or "UNKNOWN"}; known: {known})')
+    return name
+
+
 def check_boot_image_pair(s, sha, what):
     """Before boot_a gets the contents SHA: the ESP on the tablet (read from it) must boot with their DarwinBoot (the pair rule).
     An FD whose DarwinBoot takes every window needs no read; Ubuntu's boot_a boots no ESP."""
@@ -2016,11 +2037,12 @@ def boot_a_step(s):
     check_boot_image_pair(s, signed or f'planned:{s.a.boot_image}', f'{image.name} with the ESP on the tablet')
     boot_a = s.nodes['boot_a']
     now = s.region_sha(boot_a, 0, s.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
+    if s.execute and now == common.ANDROID_BOOT_A_SHA256:
+        s.need(False, f'boot_a holds stock Android ({now[:16]}): switch to macOS first (piano-switch), then run boot-a')
+    got_pair = [s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}') for key in ('vendor_boot_a', 'init_boot_a')]
+    need_known_pair(s, got_pair[0], got_pair[1], 'boot-a (ABL pairs it with boot_a)')
     s.require_backup('boot_a', now if s.execute else None)
     s.require_backup('boot_b')
-    for key, digest in (('vendor_boot_a', common.VENDOR_BOOT_A_SHA256), ('init_boot_a', common.INIT_BOOT_A_SHA256)):
-        got = s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}')
-        s.need(got == digest if s.execute else None, f'{key} is slot A\'s current image {digest[:16]} (ABL pairs it with boot_a)')
     s.fetch('boot.img', image, signed or '<signed sha256>')
     if s.write(f'{image.name} -> /dev/{boot_a} ({common.BOOT_PARTITION_BYTES} bytes)'):
         s.t('write', 'boot.img', boot_a, 0, MiB, timeout=600)
