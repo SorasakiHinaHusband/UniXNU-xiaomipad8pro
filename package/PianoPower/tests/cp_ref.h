@@ -205,8 +205,17 @@ struct RefController final : Controller {
     fw.set(prop::ICL, 1500); fw.set(prop::FCC, 3000);
     st = St::stopping; t_state = 0;
   }
+  uint8_t ctrl3_shadow = 0;
+  bool have_ctrl3 = false;
   bool kick(Bus &b, uint64_t now) {
     if (mut & M_NO_WD) {t_kick = now; return true;}
+    if (have_ctrl3) {   // a known value, never one made from a read
+      const uint8_t v = uint8_t((ctrl3_shadow & ~PIANO_CP_WD_MASK) | PIANO_CP_WD_ACTIVE);
+      uint8_t back = 0;
+      if (b.write(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL3, v)) {++bus_err_run; return false;}
+      if (rd(b, PIANO_CP_REG_CTRL3, &back) || back != v) return false;
+      t_kick = now; return true;
+    }
     if (!wr(b, PIANO_CP_REG_CTRL3, PIANO_CP_WD_MASK, PIANO_CP_WD_ACTIVE)) return false;
     t_kick = now;
     return true;
@@ -214,7 +223,10 @@ struct RefController final : Controller {
   bool arm(Bus &b, uint64_t now, uint32_t busocp) {
     uint8_t c3 = 0;
     if (rd(b, PIANO_CP_REG_CTRL3, &c3)) return false;
+    uint8_t c3b = 0;
+    if (rd(b, PIANO_CP_REG_CTRL3, &c3b) || c3b != c3) return false;   // two agreeing reads
     if (saved_wd < 0) saved_wd = c3 & PIANO_CP_WD_MASK;
+    ctrl3_shadow = c3; have_ctrl3 = true;
     if (!kick(b, now)) return false;
     uint8_t ovp = 0;
     if (rd(b, PIANO_CP_REG_USBOVP, &ovp) || (ovp & PIANO_CP_USBOVP_MASK) != PIANO_CP_USBOVP_STOCK) return false;
@@ -255,7 +267,8 @@ struct RefController final : Controller {
       if (!rd(b, PIANO_CP_REG_CTRL2, &c2)) {
         if (c2 & PIANO_CP_CHG_EN) {b.write(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL2, uint8_t(ctrl2_shadow & ~(PIANO_CP_CHG_EN | PIANO_CP_EN_BYPASS))); t_guard = now;}
         else {guard_pending = false; confirmed_off = true;
-              if (saved_wd >= 0) {if (wr(b, PIANO_CP_REG_CTRL3, PIANO_CP_WD_MASK, uint8_t(saved_wd))) saved_wd = -1;}}
+              if (saved_wd >= 0) {const uint8_t v = uint8_t((ctrl3_shadow & ~PIANO_CP_WD_MASK) | uint8_t(saved_wd)); uint8_t back = 0;
+                                  if (!b.write(PIANO_CP_ADDRESS, PIANO_CP_REG_CTRL3, v) && !rd(b, PIANO_CP_REG_CTRL3, &back) && back == v) {saved_wd = -1; have_ctrl3 = false;}}}
       } else t_guard = now;
     }
     if (bus_err_run >= PIANO_CP_MAX_BUS_ERRORS && !(mut & M_NO_BUSERR) && st != St::lost && st != St::idle && st != St::mipps) {
@@ -290,7 +303,7 @@ struct RefController final : Controller {
         if (std::abs(want - have) > step && n) {qc_pulse(fw, n); t_state = now + 300; return;}
       }
       target_ma = ibus_target(s, 2 * vbat_max(s) + 300);
-      if (!arm(b, now, target_ma + 1000)) {exit_session(b, fw, true); return;}
+      if (!arm(b, now, qc ? std::min<uint32_t>(target_ma + 1000, 3000) : target_ma + 1000)) {exit_session(b, fw, true); return;}
       if (!wr(b, PIANO_CP_REG_CTRL2, PIANO_CP_CHG_EN, PIANO_CP_CHG_EN) && !(mut & M_NO_READBACK)) {
         // CHG_EN reads back set only later: the opening checks it at its next step
       }
@@ -352,7 +365,8 @@ struct RefController final : Controller {
       if (int32_t(target_ma) - ibus > 200 && ((mut & M_NO_WINDOW) || vbus < window - 100)) {if (qc) qc_pulse(fw, 1); else if (req_mv + 20 <= uint32_t(2 * vb + 2000) || (mut & M_NO_WINDOW)) request_v(fw, s, req_mv + 20, target_ma);}
       else if (ibus > int32_t(target_ma) + 300) {const int down = std::min(10, (ibus - int32_t(target_ma)) / 140); if (qc) qc_pulse(fw, -std::max(1, down)); else request_v(fw, s, req_mv - 20u * uint32_t(std::max(1, down)), target_ma);}
       else if (ibus > int32_t(target_ma)) {if (qc) qc_pulse(fw, -1); else request_v(fw, s, req_mv - 20, target_ma);}
-      if (!wr(b, PIANO_CP_REG_BUSOCP, 0x9f, PIANO_CP_ENC_BUSOCP(std::clamp<uint32_t>(target_ma + 1000, 1000, 7000))) && !(mut & M_NO_READBACK)) exit_session(b, fw, true);
+      const uint32_t ocp = std::clamp<uint32_t>(qc ? std::min<uint32_t>(target_ma + 1000, 3000) : target_ma + 1000, 1000, 7000);
+      if (!wr(b, PIANO_CP_REG_BUSOCP, 0x9f, PIANO_CP_ENC_BUSOCP(ocp)) && !(mut & M_NO_READBACK)) exit_session(b, fw, true);
       return;
     }
     case St::stopping:

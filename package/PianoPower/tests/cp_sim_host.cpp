@@ -294,8 +294,10 @@ int main(int argc, char **argv) {
   std::mt19937_64 g(20261123);
   unsigned bad = 0;
   std::string first;
+  const char *ep = std::getenv("CPSIM_EP");
   for (unsigned n = 0; n < fuzz_n; ++n) {
     Run r;
+    if (ep && unsigned(std::atoi(ep)) == n) {r.ctl.trace = true; r.p.wlog = true;}
     r.p.rng.seed(g());
     std::uniform_real_distribution<double> u(0, 1);
     const SrcKind kinds[] = {SrcKind::pps, SrcKind::pps, SrcKind::pps, SrcKind::qc3b, SrcKind::qc35, SrcKind::fixed_pd, SrcKind::qc3};
@@ -336,7 +338,15 @@ int main(int argc, char **argv) {
       }
     };
     const Stats s = r.go(30000);
-    if (s.violations) {++bad; if (first.empty()) first = "episode " + std::to_string(n) + ": " + s.v[0];}
+    if (s.violations) {
+      ++bad;
+      if (first.empty()) first = "episode " + std::to_string(n) + ": " + s.v[0];
+      if (bad <= 4) {
+        std::printf("  fuzz episode %u: src %d apdo %u mipps %d socA %.2f rA %.3f rB %.3f T %.0f;", n, int(r.p.src.kind), r.p.src.apdo_max_ma, int(r.p.src.mipps), r.p.pk[0].soc, r.p.pk[0].r_ohm, r.p.pk[1].r_ohm, r.p.pk[0].temp_c);
+        for (const auto &e : evs) std::printf(" ev%d@%llu(%.2f)", e.kind, (unsigned long long)e.t, e.a);
+        std::printf("\n    %s\n", s.v[0].c_str());
+      }
+    }
   }
   CHECK(bad == 0, "fuzz: %u of %u episodes reached an unsafe state; first: %s", bad, fuzz_n, first.c_str());
   std::printf("fuzz: %u episodes, %u unsafe\n", fuzz_n, bad);

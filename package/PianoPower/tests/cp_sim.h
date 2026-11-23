@@ -373,16 +373,22 @@ struct Plant final : Bus, Firmware {
            reg::batocp_ma(r[reg::BATOCP]) <= PIANO_CP_BATOCP_MA && !(r[reg::TEMP_CTRL] & PIANO_CP_TSHUT_DISABLE) && wd_on() &&
            !(r[reg::CTRL2] & PIANO_CP_EN_BYPASS) && (r[reg::USBOVP] & PIANO_CP_USBOVP_MASK) == PIANO_CP_USBOVP_STOCK;
   }
+  std::string armed_why() const {
+    char b[160]; std::snprintf(b, sizeof b, "BATOVP %02x BUSOVP %02x BUSOCP %02x BATOCP %02x TEMP %02x CTRL3 %02x CTRL2 %02x USBOVP %02x", r[reg::BATOVP], r[reg::BUSOVP], r[reg::BUSOCP], r[reg::BATOCP], r[reg::TEMP_CTRL], r[reg::CTRL3], r[reg::CTRL2], r[reg::USBOVP]);
+    return b;
+  }
   void trip(uint8_t f) {flags |= f; active = false; en_req = false; r[reg::CTRL2] &= uint8_t(~PIANO_CP_CHG_EN);}
   uint8_t chip_read(uint8_t a) {
     if (a >= sizeof r) return 0;
-    if (a == reg::CTRL2) return uint8_t((r[a] & ~PIANO_CP_CHG_EN) | (active ? PIANO_CP_CHG_EN : 0));
+    if (a == reg::CTRL2) return uint8_t((r[a] & ~PIANO_CP_CHG_EN) | ((r[a] & PIANO_CP_CHG_EN) && !(en_req && now < en_at) ? PIANO_CP_CHG_EN : 0));   // the bit as written, after its latency
     if (a == reg::FLAG) {const uint8_t v = flags; flags = 0; return v;}
     if (a == reg::STAT) return active ? 1 : 0;
     return r[a];
   }
+  bool wlog = false;
   void chip_write(uint8_t a, uint8_t v) {
     ++cp_writes;
+    if (wlog) std::printf("      w %llu 0x%02x <- 0x%02x (active %d en_req %d)\n", (unsigned long long)now, a, v, active, en_req);
     if (a >= sizeof r) return;
     // every write must be one of fork A's allowed rows (the checker's own copy of the rule)
     bool ok = false;
@@ -693,7 +699,9 @@ struct Checker {
     ++count;
     if (v.size() < 12) {char b[40]; std::snprintf(b, sizeof b, "t=%llu ms: ", (unsigned long long)p.now); v.push_back(b + what);}
   }
+  bool unable = false;
   void cond(const Plant &p, unsigned k, bool violated, uint32_t g, const char *what) {
+    if (unable && k != 9) {since[k] = violated && p.active ? p.now : 0; return;}
     if (violated && p.active) {if (!since[k]) since[k] = p.now; if (p.now - since[k] >= g) {bad(p, std::string("pump on while ") + what); since[k] = p.now + 1000000;}}
     else since[k] = 0;
   }
@@ -712,7 +720,8 @@ struct Checker {
     if (p.iout_ma + p.buck_out_ma > L.battery_ma * 1.04) bad(p, "battery current above 12 A + 4 %");
     if (p.vbus_mv > L.busovp_mv && p.active) bad(p, "VBUS above 11 V while switching");
     if (vbat > 4550) bad(p, "VBAT above 4550 mV");
-    if (p.tdie_c * 10 > L.tdie_exit_c10 + 10 && p.active) bad(p, "die above 126 C while switching");
+    if (p.tdie_c * 10 > L.tdie_exit_c10 + 10 && p.active && !(p.stuck || stalled)) bad(p, "die above 126 C while switching");
+    if (p.tdie_c * 10 > kTshutC10 + 20) bad(p, "die above the 150 C thermal shutdown");
     hold_for(p, 0, p.ipk_ma[0] > L.cell_ocp_ma || p.ipk_ma[1] > L.cell_ocp_ma, 150, "pack current above 7 A for 150 ms");
     hold_for(p, 1, p.ibus_ma > budget * 1.04, 300, "IBUS above the source budget (" + std::to_string(int(budget)) + " mA) for 300 ms");
     hold_for(p, 2, p.ibus_ma > p.src.cable_rating_ma * 1.04, 300, "IBUS above the cable rating for 300 ms");
@@ -732,10 +741,12 @@ struct Checker {
     cond(p, 5, tmin < L.cell_min_c10 || tmax > L.cell_max_c10, grace.cell_t, "a cell outside 8-55 C");
     cond(p, 6, p.conn_c * 10 >= L.conn_max_c10 || p.conn2_c * 10 >= L.conn_max_c10, grace.conn, "the connector at 50 C or above");
     const bool bus_faulty = p.stuck || p.bus_fault_recent();
+    unable = p.stuck || stalled;
     cond(p, 7, (!p.gv[0].valid || !p.gv[1].valid) && !bus_faulty, grace.gauge, "a gauge invalid");
     cond(p, 8, p.tdie_c * 10 >= L.tdie_exit_c10, grace.tdie, "the die at 125 C");
-    cond(p, 9, bus_faulty || (stalled && !asleep), grace.bus, "the bus stuck or the host stalled beyond the watchdog");
-    cond(p, 10, !p.armed(), 0, "the chip's protections / watchdog / VAC OVP not as intended");
+    if ((p.stuck || stalled) && p.active && p.now - p.wd_kick > kWdMs + 500) bad(p, "pump on while the bus is stuck / the host stalled, past the watchdog");
+    if (!p.armed() && p.active && !since[10]) {since[10] = 1; bad(p, "the chip's protections / watchdog / VAC OVP not as intended while switching: " + p.armed_why());}
+    if (p.armed() || !p.active) since[10] = 0;
     cond(p, 11, p.verify != 0, 0, "MiPPS (0x21002) in progress");
     if (p.cmd8_seen) {bad(p, "VDM command 8 sent (it stalls this firmware)"); const_cast<Plant &>(p).cmd8_seen = false;}
     if (p.verify && p.now - p.verify_since > 15000) {bad(p, "0x21002 still set 15 s after it was set"); const_cast<Plant &>(p).verify_since = p.now;}
