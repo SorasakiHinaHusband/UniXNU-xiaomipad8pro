@@ -1111,3 +1111,27 @@ by the fix's. Also under ASan/UBSan. `testChgEn` passes unchanged (its gates now
   DSP (§20.3).
 - **Level 2 with the DSP early** (`piano-power=2 piano-power-delay=0`, the policy for the input limit): CHGR stays at 3 past 60 s and
   the `chgr: changed since` line of the report after the DSP's start names the firmware's writes.
+
+## 21. The buck fast-charge set behind boot arguments (charge/pd1, 2026-11-23; built and host-tested, not run)
+
+What the Ubuntu port's charger driver does on the buck path above 5 V, read as a specification (behaviour, sequence and numbers
+only; no code taken), and what PianoPower now has for it, each **off by default** so the daily profile stays at 5 V. All four act
+only in the strict buck session (`piano-power-policy=1`) and only inside its existing gates: a validated contract (with
+`piano-power-pdo-mca=1` on this tablet's UCSI 1.1 PPM, which offers no PDO details), the reduced-current barrier (ICL and FCC at most 500 mA
+acknowledged and the input limit read back) before any voltage request, the 15 s wait after an attach, the 8.0-9.6 V window,
+15-45 degC on every temperature, the connector (50/60 degC) and charger (75/85 degC) holds, CP off, a dry port, no gauge alert,
+verify 0, and Preserve Battery Health (80/75, unchanged).
+
+| Boot argument | What it does | Ubuntu port behaviour it follows |
+|---|---|---|
+| `piano-power-hv-order=1` | mode 1 takes a PPS APDO covering 9 V when the source has no fixed 9 V PDO; mode 2 takes the fixed 9 V PDO when the source has no such APDO; an object once asked for stays the one judged | a fixed 9 V PDO first, else a 9 V PPS request (fixed vSafe5V for 5 V) |
+| `piano-power-hv-caps=1` | at a validated 9 V contract the stock 9 V rows instead of the stage A ceilings: fixed PD input 1600 / charge 3000 mA, PPS 2500 / 3500, QC3 1600 / 3500, QC2 1200 / 2600; the charge current at most twice the input limit in force; always within the RDO and the object; the codec admits a charge current up to 3500 only with it | the stock buck strategy's in_pd/chg_pd, in_pps/chg_pps and qc2/qc3 rows at 9 V |
+| `piano-power-qc=1` | QC2/QC3/3B/3.5 (firmware type 5-8) with a fresh UCSI status of a connected non-PD sink: the barrier, then 0x2011 = 9000; on at 8.0-9.6 V; 0x2011 = 5000 on any loss (a health stop or mode 0 may ask again; a lost or unreached 9 V waits for the next attach) | 0x2011 9000 for a QC type, 9 V counted from the bus |
+| `piano-power-fv-hot=1` | 0x2007 = 4060 mV from 48 degC (the warmest reading) until below 46, back to the firmware's 4400; charging held (0x2003 = 0, reason 9) while the higher pack is within 5 mV of 4060, released 150 mV below or when the warm row ends | the warm row's float from 48 degC with 2 degC hysteresis and the voltage hold |
+
+Not brought over (separate lanes, each with its own analysis): SC8541 direct charging (the charge pump, the PPS stepping to twice
+the battery voltage, the 500/700 ms regulation loop: the port's real fast charge) and MiPPS authentication (whose only consumer
+is the pump's source budget). The registry's `PianoCharge` now also carries the indicator data: `ChargePath` / `ChargePathName`
+(USB 5 V, PD 5 V, PD 9 V, PPS 9 V, QC 9 V, asking 9 V), `InputMW`, `BatteryMW`, `HV`, `HVPPS`, `HVQC`, `HVBudgetMA`, `TermHot`,
+`FVHold`, `FastOptions` (bits 1 order, 2 caps, 4 qc, 8 fv-hot) and the real `FVTarget`; one `buck-fast:` line per report
+(`[PianoFastChargeV1]`). Host test: `tests/fastcharge_host.cpp`.
