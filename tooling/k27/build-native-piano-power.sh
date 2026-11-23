@@ -31,6 +31,9 @@ tail -1 "$T/pon-history-fixture.txt"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/pdo_firmware_host.cpp" \
   "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/pdo_firmware_host"   # piano-power-pdo-mca: the firmware's source list
 "$T/pdo_firmware_host" || { echo "Error: PianoPower firmware PDO list host tests failed" >&2; exit 1; }
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/fastcharge_host.cpp" \
+  "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/fastcharge_host"   # charge/pd1: the buck fast-charge set
+"$T/fastcharge_host" || { echo "Error: PianoPower fast-charge host tests failed" >&2; exit 1; }
 "$T/contract_host" || { echo "Error: PianoPower contract host tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_init_host.cpp" -o "$T/contract_init_host"
 "$T/contract_init_host" || { echo "Error: PianoPower cold UCSI host tests failed" >&2; exit 1; }

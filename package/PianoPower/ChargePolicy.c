@@ -352,7 +352,7 @@ static int slot_of(uint32_t property)
     case PIANO_CHG_ENABLE: return PIANO_CHG_S_ENABLE;
     case PIANO_CHG_FCC: return PIANO_CHG_S_FCC;
     case PIANO_CHG_ICL: return PIANO_CHG_S_ICL;
-    case PIANO_CHG_PD_FIXED: case PIANO_CHG_PPS: return PIANO_CHG_S_VOLT;
+    case PIANO_CHG_PD_FIXED: case PIANO_CHG_PPS: case PIANO_CHG_QC_VOLT: return PIANO_CHG_S_VOLT;   /* QC: charge/pd1 */
     case PIANO_CHG_FV: return PIANO_CHG_S_FV;
     default: return -1;
     }

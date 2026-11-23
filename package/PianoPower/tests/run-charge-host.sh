@@ -15,6 +15,9 @@ done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/pdo_firmware_host.cpp" \
   "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/pdo_firmware_host"
 "$T/pdo_firmware_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/fastcharge_host.cpp" \
+  "$T/ChargePolicy.o" "$T/PianoMca.o" -o "$T/fastcharge_host"   # charge/pd1: the buck fast-charge set (charging-policy.md §21)
+"$T/fastcharge_host"
 "$T/contract_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/contract_init_host.cpp" -o "$T/contract_init_host"
 "$T/contract_init_host"
