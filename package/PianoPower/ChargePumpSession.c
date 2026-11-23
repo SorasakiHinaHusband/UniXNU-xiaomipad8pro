@@ -294,6 +294,10 @@ static uint8_t stop_reason(Ctx *x, uint32_t *faults)
         return PIANO_CPS_EXIT_TBAT;
     if (!y->conn_valid || dc_ceil(y->t_conn_dc) >= PIANO_CPS_CONN_MAX_C) return PIANO_CPS_EXIT_CONN;
     if (iabs(y->ibat_a_ma) >= PIANO_CPS_CELL_OCP_MA || iabs(y->ibat_b_ma) >= PIANO_CPS_CELL_OCP_MA) return PIANO_CPS_EXIT_CELL_OCP;
+    /* sim (fork B): the gauges' sign checked against the pump: the pump pushing >= 2 A into the cells while they read as a
+     * discharge of more than half of it means the pack currents cannot be trusted (an inverted sign hides the per-pack share) */
+    if (d->switching && adc_has(d, PIANO_CP_ADC_IBAT) && d->adc.ibat_ma >= 2000 && y->cells_valid &&
+        y->ibat_a_ma + y->ibat_b_ma <= -(d->adc.ibat_ma / 2)) return PIANO_CPS_EXIT_GAUGE;
     if (s->state >= PIANO_CPS_OPENING) {
         if (!adc_has(d, PIANO_CP_ADC_TDIE) || !adc_has(d, PIANO_CP_ADC_IBUS) || !adc_has(d, PIANO_CP_ADC_VBUS))
             return PIANO_CPS_EXIT_GAUGE;   /* the pump's own readings are what the loop runs on */
@@ -404,7 +408,7 @@ static int regulate(Ctx *x, int cv)
     busocp(x, ibus_target);
     /* one pack well above its share, two polls in a row */
     const int32_t share = (int32_t)(target / 2u) + CELL_SOFT_MARGIN_MA;
-    if (y->ibat_a_ma > share || y->ibat_b_ma > share) {
+    if (iabs(y->ibat_a_ma) > share || iabs(y->ibat_b_ma) > share) {   /* sim (fork B): the magnitude, whatever the gauges' sign */
         if (++s->ocp_strikes >= CELL_SOFT_STRIKES) {begin_exit(x, PIANO_CPS_EXIT_CELL_OCP, 0); return 0;}
     } else {
         s->ocp_strikes = 0;
@@ -416,13 +420,18 @@ static int regulate(Ctx *x, int cv)
     const int32_t ibus = d->adc.ibus_ma, vbus = d->adc.vbus_mv;
     const int32_t ibat = y->ibat_a_ma + y->ibat_b_ma;
     const int32_t t = (int32_t)ibus_target;
-    if (vbus > 2 * y->vbat_max_mv + VBUS_STAGE_MARGIN_MV) step(x, -1, 1);
-    else if (ibus > t + REG_WELL_ABOVE_MA) {
+    /* sim (fork B): above the stage window step down by the excess (at least one step); never step up within 100 mV of it */
+    const int32_t window = 2 * y->vbat_max_mv + VBUS_STAGE_MARGIN_MV;
+    if (vbus > window) {
+        unsigned n = (unsigned)((vbus - window) / (int32_t)REG_STEP_MV) + 1u;
+        n = n > REG_DOWN_MAX_MV / REG_STEP_MV ? REG_DOWN_MAX_MV / REG_STEP_MV : n;
+        step(x, -1, n);
+    } else if (ibus > t + REG_WELL_ABOVE_MA) {
         unsigned n = (unsigned)((ibus - t) / REG_IBUS_PER_STEP_MA);
         n = n < 1u ? 1u : n > REG_DOWN_MAX_MV / REG_STEP_MV ? REG_DOWN_MAX_MV / REG_STEP_MV : n;
         step(x, -1, n);
     } else if (ibus > t + REG_ABOVE_MA || ibat > (int32_t)target + REG_WELL_ABOVE_MA) step(x, -1, 1);
-    else if (ibus < t - REG_BAND_BELOW_MA && !(cv && y->vbat_max_mv >= cv_mv(x->c) - CV_HOLD_MV)) step(x, +1, 1);
+    else if (ibus < t - REG_BAND_BELOW_MA && vbus < window - 100 && !(cv && y->vbat_max_mv >= cv_mv(x->c) - CV_HOLD_MV)) step(x, +1, 1);
     return 1;
 }
 
