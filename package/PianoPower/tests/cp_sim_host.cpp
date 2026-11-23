@@ -32,6 +32,8 @@ struct Stats {
   unsigned violations = 0;
   std::vector<std::string> v;
   uint64_t first_on_ms = 0, last_on_ms = 0, sleep_ready_ms = 0;
+  uint64_t on_unstepped_ms = 0;   // the pump on while a source powers the bus outside PPS/QC stepping (CHG_EN left set over a detach)
+  unsigned unstepped_starts = 0;  // the pump started on such a source (BUSOCP may stop it within one step)
   bool slept = false;
 };
 
@@ -74,6 +76,7 @@ struct Run {
       }
       c.check(p, sleep_req && !asleep, stalled || asleep, asleep);
       if (p.active) {ibus_on_sum += p.ibus_ma; ++ibus_on_n; if (!st.first_on_ms) st.first_on_ms = p.now; st.last_on_ms = p.now;}
+      if (p.active && p.attached && p.powered() && p.mode != Plant::Mode::pps && p.mode != Plant::Mode::qc) st.on_unstepped_ms += p.cfg.dt_ms;
     }
     st.cp_on_ms = p.cp_on_ms; st.mean_ibus_on = ibus_on_n ? ibus_on_sum / ibus_on_n : 0;
     st.max_ibus = p.max_ibus; st.max_ibat = p.max_ibat; st.max_pack = p.max_pack; st.max_tdie = p.max_tdie;
@@ -82,6 +85,7 @@ struct Run {
     st.final_budget = real ? piano_mipps_budget_ma(&real->m) : ctl.budget_ma; st.source_resets = p.source_resets;
     st.soc_end = std::max(p.pk[0].soc, p.pk[1].soc) * 100;
     st.violations = c.count; st.v = c.v;
+    st.unstepped_starts = p.unstepped_starts;
     return st;
   }
 };
@@ -178,7 +182,9 @@ static std::vector<Scenario> scenarios() {
   v.push_back({"detach mid-session, then a fixed 9 V charger", 90000, base,
     [](Run &r, uint64_t t) {attach_at(r, t, 1000); if (t == 30000) r.p.detach(); if (t == 32000) {r.p.src.kind = SrcKind::fixed_pd; r.p.attach();}
                             if (t == 33000) r.p.write(prop::FIXED_MV, reinterpret_cast<const uint8_t *>("\x28\x23\x00\x00"), 4);},
-    [](const Stats &) {return std::string("");}, M_NO_DETACH});
+    [](const Stats &s) {return s.on_unstepped_ms == 0 && s.unstepped_starts == 0 ? std::string("") :
+                         "pump started " + std::to_string(s.unstepped_starts) + "x / on " + std::to_string(s.on_unstepped_ms) +
+                         " ms on the fixed charger (CHG_EN left set over the detach)";}, M_NO_DETACH});
   v.push_back({"re-attach: a second session", 90000, base, [](Run &r, uint64_t t) {attach_at(r, t, 1000); if (t == 30000) r.p.detach(); if (t == 35000) r.p.attach();},
     [](const Stats &s) {return s.last_on_ms > 50000 ? std::string("") : std::string("no second session");}, 0});
   v.push_back({"sleep requested mid-session", 60000, base, [](Run &r, uint64_t t) {attach_at(r, t, 1000); if (t == 30000) r.sleep_req = true;},
@@ -289,7 +295,7 @@ int main(int argc, char **argv) {
   // mutants: each must be caught by the scenarios that name it (and by at least one scenario)
   const uint32_t mutants[] = {M_NO_WD, M_NO_TDIE, M_NO_CONN, M_NO_CELL_OCP, M_NO_SLEEP, M_NO_HEALTH, M_NO_POWER, M_NO_WINDOW,
                               M_NO_READBACK, M_NO_SOC, M_NO_CV, M_TRUST_MIPPS, M_NO_VERIFY_CLEAR, M_SEND_CMD8, M_NO_GAUGE,
-                              M_QC3_COARSE};
+                              M_QC3_COARSE, M_NO_DETACH};
   unsigned caught = 0;
   for (uint32_t m : mutants) {
     unsigned hits = 0, named = 0, named_hit = 0;
@@ -304,7 +310,7 @@ int main(int argc, char **argv) {
     if (named && named_hit == named) ++caught;
     std::printf("  mutant %-26s caught by %u/%u\n", mutant_name(m), hits, named);
   }
-  std::printf("mutants: %u/%zu caught (no-detach-stop not yet modelled: the plant's re-arm after an input loss needs a scenario that keeps CHG_EN set into a fixed 9 V attach)\n", caught, sizeof mutants / sizeof mutants[0]);
+  std::printf("mutants: %u/%zu caught\n", caught, sizeof mutants / sizeof mutants[0]);
   const unsigned bad_ref = fuzz(fuzz_n, nullptr);
   if (bad_ref) std::printf("  FINDING fuzz (reference oracle, report only): %u of %u episodes unsafe (bit-error corner cases of the oracle itself)\n", bad_ref, fuzz_n);
   // the integrated code (A's driver + C's session + D's MiPPS) on the same scenarios, plus the sensitivity cases
@@ -312,7 +318,7 @@ int main(int argc, char **argv) {
     {"integrated, defaults (WD 5 s, CHG_EN 200 ms, auto-increment, step 60 ms)", {}},
     {"WD 2 s", {}, 2000}, {"WD 10 s", {}, 10000}, {"no auto-increment", {}, kWdMs, kEnLatencyMs, false},
     {"CHG_EN delay 50 ms", {}, kWdMs, 50},
-    {"system view 5 s stale (report only: fork C risk 1, see CP-SIM.md)", {5000, 60, false, true}, kWdMs, kEnLatencyMs, true, true},
+    {"system view 5 s stale (fresh packs, connectors, health, port each pass)", {5000, 60, false, true}, kWdMs, kEnLatencyMs, true, false},
     {"PPS step latency 0.7 s", {0, 700, false, true}}, {"PPS step latency 2 s", {0, 2000, false, true}},
     {"PPS step latency 5 s", {0, 5000, false, true}},
     {"pack current sign inverted", {0, 60, true, true}},

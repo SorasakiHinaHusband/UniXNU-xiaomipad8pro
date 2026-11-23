@@ -255,6 +255,8 @@ static void exits() {
   oneExit("bus high", PIANO_CPS_EXIT_BUS_HIGH, true, [](Bench &b) {b.pumpObeys = false; b.d.adc.vbus_mv = 2 * 3900 + 2001;});
   oneExit("pump stopped itself", PIANO_CPS_EXIT_PUMP_FAULT, true, [](Bench &b) {b.d.switching = 0;});
   oneExit("pump readings lost", PIANO_CPS_EXIT_GAUGE, false, [](Bench &b) {b.pumpObeys = false; b.d.adc.valid = 0;});
+  // the input lost, seen only on the pump's own VBUS (the stale system view still attached): a detach, STOP at once
+  oneExit("input lost on the pump ADC", PIANO_CPS_EXIT_DETACH, false, [](Bench &b) {b.pumpObeys = false; b.d.adc.vbus_mv = 300;});
   // the contract lost for 3 s
   {Bench b; CHECK(b.toCC()); b.contractLive = false; b.y.contract_valid = 0; b.ticks(20); CHECK(b.s.state == PIANO_CPS_CC); b.ticks(15);
    CHECK(b.s.exit_reason == PIANO_CPS_EXIT_CONTRACT);}

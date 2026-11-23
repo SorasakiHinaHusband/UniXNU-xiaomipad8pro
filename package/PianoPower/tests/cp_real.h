@@ -145,6 +145,12 @@ struct RealController final : Controller {
     // fresh: the worker's own pack reads (fork C: serviceCp reads the packs each pass)
     sys.gauges_valid = fresh.gauges_valid; sys.cells_valid = fresh.cells_valid; sys.soc_pct = fresh.soc_pct;
     sys.vbat_max_mv = fresh.vbat_max_mv; sys.vbat_min_mv = fresh.vbat_min_mv; sys.ibat_a_ma = fresh.ibat_a_ma; sys.ibat_b_ma = fresh.ibat_b_ma;
+    // fresh as in the worker (fork C, cp-int): the connector thermistors and the pack temperatures, the health hold (the packs'
+    // SOC) and the attachment (the PMIC port) read every pass, not from the codec's snapshot
+    sys.conn_valid = fresh.conn_valid; sys.t_conn_dc = fresh.t_conn_dc;
+    sys.t_cool_dc = fresh.t_cool_dc; sys.t_warm_dc = fresh.t_warm_dc;
+    sys.health_hold = fresh.health_hold;
+    sys.attached = fresh.attached; sys.attach_seq = fresh.attach_seq;
     sys.now_ms = now;
     sys.mipps_cleanup_pending = uint8_t(piano_mipps_cleanup_pending(&m));
     sys.buck_icl_set_ma = p.icl_ma; sys.buck_fcc_set_ma = p.fcc_ma; sys.buck_pending = 0;

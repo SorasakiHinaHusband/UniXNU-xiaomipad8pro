@@ -38,6 +38,7 @@ static int32_t dc_ceil(int32_t dc) {return dc >= 0 ? (dc + 9) / 10 : -(-dc / 10)
 #define VOLT_PENDING_MS 2000u      /* a voltage request not answered within this counts as an error */
 #define STOP_STUCK_MS 2000u        /* CHG_EN still set this long after STOP: stuck (the driver's guard stops again) */
 #define STOP_RESEND_MS 500u
+#define PIANO_CPS_INPUT_LOST_MV 4000   /* the pump's VBUS below this: no source (a detach seen on the pump's own ADC) */
 #define STOP_GUARD_MS (PIANO_CP_GUARD_MS + 100u)   /* the driver's guard re-reads CHG_EN 500 ms after a stop: the source waits for it */
 #define RETRY_FAULT_MS 60000u      /* after a fault exit (below the latch) */
 #define RETRY_TAPER_MS 300000u     /* after the taper hands over to the buck */
@@ -301,6 +302,7 @@ static uint8_t stop_reason(Ctx *x, uint32_t *faults)
     if (s->state >= PIANO_CPS_OPENING) {
         if (!adc_has(d, PIANO_CP_ADC_TDIE) || !adc_has(d, PIANO_CP_ADC_IBUS) || !adc_has(d, PIANO_CP_ADC_VBUS))
             return PIANO_CPS_EXIT_GAUGE;   /* the pump's own readings are what the loop runs on */
+        if (d->adc.vbus_mv < PIANO_CPS_INPUT_LOST_MV) return PIANO_CPS_EXIT_DETACH;   /* the input gone (this pass's reading) */
         if (!d->switching) {*faults = d->faults; return PIANO_CPS_EXIT_PUMP_FAULT;}   /* the pump stopped by itself */
     }
     if (adc_has(d, PIANO_CP_ADC_TDIE) && dc_ceil(d->adc.tdie_dc) >= PIANO_CPS_TDIE_EXIT) return PIANO_CPS_EXIT_TDIE;

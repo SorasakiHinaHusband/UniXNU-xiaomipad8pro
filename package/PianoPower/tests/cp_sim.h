@@ -227,6 +227,7 @@ struct Plant final : Bus, Firmware {
   uint8_t r[0x42] = {};
   bool active = false, en_req = false;
   uint64_t en_at = 0, wd_kick = 0, en_written_at = 0;
+  unsigned unstepped_starts = 0;   // the pump started (or resumed) while a source outside PPS/QC stepping powered the bus
   uint32_t wd_ms = kWdMs, en_latency_ms = kEnLatencyMs;   // sensitivity: the unknown hardware watchdog period and CHG_EN delay
   bool auto_inc = true;                                       // sensitivity: block reads without auto-increment
   uint8_t flags = 0;
@@ -492,7 +493,10 @@ struct Plant final : Bus, Firmware {
       en_req = false;
       if (!on || vs < 2 * vout + 100) {flags |= reg::F_VBUS_LO; if (!keep_en) r[reg::CTRL2] &= uint8_t(~PIANO_CP_CHG_EN);}
       else if (vs > 2 * vout + 2500) {flags |= reg::F_VBUS_HI; if (!keep_en) r[reg::CTRL2] &= uint8_t(~PIANO_CP_CHG_EN);}
-      else {active = true; keep_en = false;}
+      else {
+        active = true; keep_en = false;
+        if (powered() && mode != Mode::pps && mode != Mode::qc) ++unstepped_starts;   // a start on a source with no current limit
+      }
     }
     if (active && !on) {active = false; keep_en = true; flags |= reg::F_VBUS_LO;}   // input gone: switching stops, CHG_EN stays written
     if (!active && !en_req && on && (r[reg::CTRL2] & PIANO_CP_CHG_EN)) {en_req = true; en_at = now + en_latency_ms;}   // and resumes
