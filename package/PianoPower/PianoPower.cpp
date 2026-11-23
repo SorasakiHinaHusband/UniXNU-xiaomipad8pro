@@ -75,7 +75,8 @@
 #include "ChargerEnable.h"
 #include "ChargerFix.h"
 #include "Gauge.h"
-#include "ChargePumpImpl.h"   // the SC8541 charge pump driver (ChargePump.h), on pack A's bus
+#include "ChargePumpImpl.h"
+#include "ChargePumpSession.h"   // the pump session (charge/cp-sess): gates, PPS ramp, CC/CV, the exits   // the SC8541 charge pump driver (ChargePump.h), on pack A's bus
 #include <sys/sysctl.h>
 #include "GaugeAlerts.h"
 #include "PianoBattery.h"
@@ -343,6 +344,22 @@ int cpArmSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 }
 struct sysctl_oid gCpArmOid;
 bool gCpArmRegistered = false;
+// The pump session (ChargePumpSession.h), allocated with the driver (probeCp): its state stays out of PianoPower's instance.
+struct CpSession {
+  PianoCpConfig cfg{};
+  PianoCpState st{};
+  PianoCpPlan plan{};
+  PianoCpSys sys{};
+  piano_cp_in drv{};
+  uint32_t attachSeq = 0, faultsCarry = 0;
+  bool wasAttached = false;
+  bool ppsPending = false, qcPending = false;   // a request of the session queued and not answered
+  uint32_t ppsWord = 0, ppsTaken = 0;
+  int32_t qcTaken = 0;
+  uint64_t reqMs = 0, nextMs = 0, packsMs = 0;
+  GaugeReading packs[2];
+};
+CpSession *gCpSess = nullptr;
 
 GaugeReading readBus(GaugeBus &b)
 {
@@ -401,6 +418,8 @@ class PianoPower : public IOService {
   uint32_t fStatusSeq = 0;
   uint8_t fCpCtrl = 0;
   void serviceCp(uint64_t now);
+  void runCpSession(uint64_t now, I2cBus &bus);
+  void cpAnswered();
   void probeCp();
   GaugeAlerts fAlerts;
   uint32_t fSafetyValid = 0;
@@ -1352,6 +1371,19 @@ void PianoPower::probeCp()
   gCpFaults |= cp->takeFaults();
   if (!present) {note("cp: no SC8541 at 0x6a (faults %#x): the pump stays off", gCpFaults); delete cp; return;}
   gCpHook = cp;
+  if (!gCpSess) {
+    gCpSess = new CpSession;
+    if (gCpSess) {
+      piano_cp_config_default(&gCpSess->cfg);
+      piano_cp_init(&gCpSess->st);
+      gCpSess->plan.sleep_ready = 1;  // nothing held until the session's first step
+      gCpSess->cfg.full_charge = 0;   // the FFC float never with the 80/75 health limit
+      gCpSess->cfg.mipps = 0;         // MiPPS not wired on this build: the 5 A standard budget, no wait
+      piano_mca_allow_cp(1, 0);       // the QC3 pulse follows the buck's QC session (runCpSession)
+    } else {
+      note("cp: no memory for the pump session: the pump stays off");
+    }
+  }
   if (!gCpArmRegistered) {
     gCpArmOid.oid_parent = &sysctl__machdep_children;
     gCpArmOid.oid_number = OID_AUTO;
@@ -1376,7 +1408,8 @@ void PianoPower::serviceCp(uint64_t now)
   fCp.arm.bootArg = true;
   fCp.arm.sysctl = __atomic_load_n(&gCpArm, __ATOMIC_ACQUIRE) == 1;
   const bool mustStop = fCp.switching() && (!fCp.arm.armed() || fHandover || fShutdownSeen);
-  if (!mustStop && !fCp.kickDue(now) && !fCp.guardDue(now)) return;
+  const bool sessionDue = gCpSess && fPolicyOn && fLink.cfg.strict_contract && !fHandoverAcked && now >= gCpSess->nextMs;
+  if (!mustStop && !fCp.kickDue(now) && !fCp.guardDue(now) && !sessionDue) return;
   if (fHandoverAcked && !mustStop) return;   // the gauges' I2C idle while asleep (docs/power.md 4)
   GaugeBus &b = gBuses[0];
   takePin(b.scl); takePin(b.sda); IODelay(20);
@@ -1388,9 +1421,107 @@ void PianoPower::serviceCp(uint64_t now)
   } else {
     fCp.beforeBusTransaction(bus);
   }
+  if (sessionDue) runCpSession(now, bus);
   givePin(b.sda); givePin(b.scl);
   const uint32_t f = fCp.takeFaults();
+  if (gCpSess) gCpSess->faultsCarry |= f;   // the session sees every fault, also those of this pass's own writes
   if (f) {gCpFaults |= f; note("cp: faults %#x (lost %u, switching %u)", f, fCp.lost(), fCp.switching());}
+}
+
+// One step of the pump session (ChargePumpSession.h) with pack A's bus taken: its system side from the policy's last decision, the
+// two packs read afresh while the pump may run, the driver's state and ADC, then the plan executed: the driver action, one PPS word or
+// QC pulse through the codec, and the hand-back of the source to the buck's barrier.
+void PianoPower::runCpSession(uint64_t now, I2cBus &bus)
+{
+  CpSession &S = *gCpSess;
+  pianopower::Sc8541 &cp = *gCpHook;
+  S.cfg.qc3 = fLink.cfg.qc;
+  piano_mca_allow_cp(1, S.cfg.qc3);
+  PianoCpSys &y = S.sys;
+  piano_charge_cp_sys(&fLink.cfg, &fLink.in, &fLink.st, &y);
+  y.now_ms = now;
+  if (fLink.st.attached && !S.wasAttached) S.attachSeq++;
+  S.wasAttached = fLink.st.attached;
+  y.attach_seq = S.attachSeq;
+  y.sleep_pending = fHandover || fShutdownSeen;
+  y.awake = !y.sleep_pending;
+  // the session's own requests: an answer clears them (cpAnswered); the codec's timer giving up does after 10 s
+  if ((S.ppsPending || S.qcPending) && now >= S.reqMs + 10000) S.ppsPending = S.qcPending = false;
+  y.volt_pending = y.volt_pending || S.ppsPending || S.qcPending;
+  y.pps_taken_word = S.ppsTaken;
+  y.qc_pulses_taken = S.qcTaken;
+  // the packs: pack A on this bus, pack B on its own, every 700 ms while the pump may run, every 5 s otherwise
+  const bool pumping = S.st.state >= PIANO_CPS_ENABLING && S.st.state <= PIANO_CPS_STOPPING;
+  if (fGauges && now >= S.packsMs + (pumping ? 700u : 5000u)) {
+    S.packs[0] = readGauge(bus);
+    S.packs[1] = gBuses[1].sda.page.va && gBuses[1].scl.page.va ? readBus(gBuses[1]) : GaugeReading();
+    S.packsMs = now;
+  }
+  const bool packsOk = S.packs[0].ok && S.packs[1].ok && now - S.packsMs <= (pumping ? 1500u : 10000u);
+  y.cells_valid = packsOk ? 1 : 0;
+  if (packsOk) {
+    y.vbat_min_mv = S.packs[0].voltageMv < S.packs[1].voltageMv ? S.packs[0].voltageMv : S.packs[1].voltageMv;
+    const int vmax = S.packs[0].voltageMv > S.packs[1].voltageMv ? S.packs[0].voltageMv : S.packs[1].voltageMv;
+    if (vmax > y.vbat_max_mv) y.vbat_max_mv = vmax;   // the fresher, higher reading
+    y.ibat_a_ma = S.packs[0].currentMa;
+    y.ibat_b_ma = S.packs[1].currentMa;
+  }
+  // the pump
+  cp.fill(&S.drv);
+  S.drv.faults = S.faultsCarry | cp.takeFaults();
+  S.faultsCarry = 0;
+  gCpFaults |= S.drv.faults;
+  S.drv.adc = piano_cp_adc{};
+  if (cp.switching() || pumping) cp.readAdc(bus, &S.drv.adc);
+  S.drv.mipps_done = 1;
+  S.drv.mipps_verified = 0;
+  S.drv.source_budget_ma = PIANO_CP_BUDGET_STANDARD_MA;
+  const uint8_t was = S.st.state;
+  piano_cp_decide(&S.cfg, &y, &S.drv, &S.st, &S.plan);
+  const PianoCpPlan &p = S.plan;
+  switch (p.out.action) {
+  case PIANO_CP_ACT_START:
+    if (!cp.start(bus, p.out.busocp_ma)) note("cp session: the driver refused the start (faults %#x)", gCpFaults);
+    break;
+  case PIANO_CP_ACT_STOP: cp.stop(bus, 0x53455353u /* 'SESS' */ ^ p.out.stop_reason); break;
+  case PIANO_CP_ACT_SET_BUSOCP: cp.setBusOcp(bus, p.out.busocp_ma); break;
+  default: break;
+  }
+  if (p.out.req_valid & PIANO_CP_REQ_PPS) {
+    if (piano_cp_write_allowed(&S.cfg, PIANO_CHG_PPS, p.pps_word, 4) && piano_mca_queue(&fMca, PIANO_MCA_PPS, p.pps_word, 4) == 0) {
+      S.ppsPending = true; S.ppsWord = p.pps_word; S.reqMs = now;
+    } else {
+      note("cp session: PPS %u mV %u mA not queued", p.out.pps_mv, p.out.pps_ma);
+    }
+  }
+  if (p.out.req_valid & PIANO_CPS_REQ_QC_PULSE) {
+    if (piano_cp_write_allowed(&S.cfg, PIANO_CHG_QC_PULSE, p.qc_pulse, 4) && piano_mca_queue(&fMca, PIANO_MCA_QC_PULSE, p.qc_pulse, 4) == 0) {
+      S.qcPending = true; S.reqMs = now;
+    }
+  }
+  if (p.handback) {
+    piano_charge_cp_handback(&fLink.st, p.handback_prop, p.handback_value, now);
+    fLink.requestDecision();
+    S.ppsTaken = 0; S.qcTaken = 0;
+  }
+  if (p.events || S.st.state != was)
+    note("cp session: %s -> %s, events %#x, ibat target %u mA, bus target %u mA, exit %s (faults %#x)", piano_cp_state_name(was),
+         piano_cp_state_name(S.st.state), p.events, p.ibat_target_ma, p.ibus_target_ma, piano_cp_exit_name(p.exit_reason), p.exit_faults);
+  S.nextMs = now + (S.st.state == PIANO_CPS_IDLE || S.st.state == PIANO_CPS_LATCHED ? 1000u : 100u);
+}
+
+// The codec answered a write: the session's own PPS word or QC pulse is taken (or refused).
+void PianoPower::cpAnswered()
+{
+  if (!gCpSess) return;
+  CpSession &S = *gCpSess;
+  if (fMca.last_property == PIANO_MCA_PPS && S.ppsPending && fMca.last_value == S.ppsWord) {
+    S.ppsPending = false;
+    if (fMca.last_result == 0) S.ppsTaken = S.ppsWord;
+  } else if (fMca.last_property == PIANO_MCA_QC_PULSE && S.qcPending) {
+    S.qcPending = false;
+    if (fMca.last_result == 0) S.qcTaken += fMca.last_value == PIANO_CHG_QC_UP ? 1 : -1;
+  }
 }
 
 void PianoPower::probeGauges()
@@ -1993,6 +2124,7 @@ void PianoPower::serviceMca(uint64_t now)
            fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result);
       fMca.events &= ~uint32_t(McaEvWrite);
       fLink.answered(fMca);
+      cpAnswered();
     }
     if (r == McaLateWritten) {
       // the answer to a write already counted as "no answer": the firmware took (or refused) it after all
@@ -2000,7 +2132,7 @@ void PianoPower::serviceMca(uint64_t now)
            piano_mca_property_name(fMca.last_property), fMca.last_property, fMca.last_value,
            fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result, gArgs.writeMs, fMca.late_answers,
            fPolicyOn ? ": handed to the policy" : "");
-      if (fPolicyOn) fLink.answered(fMca);
+      if (fPolicyOn) {fLink.answered(fMca); cpAnswered();}
     }
     if (r == McaIgnored && fMca.ignored_answers > fIgnoredSeen) {
       fIgnoredSeen = fMca.ignored_answers;
@@ -2424,7 +2556,7 @@ void PianoPower::stepPolicy(uint64_t now)
   if (reachable && fLink.due(fMca, v)) {
     if (!fHandover && !fShutdownSeen) sampleSafety(now);
     v.safetyFresh = fSafetyMs && now >= fSafetyMs && now - fSafetyMs <= 10000;
-    v.cpOff = (fSafetyValid & 1) && !(fCpCtrl & 0x10);
+    v.cpOff = (fSafetyValid & 1) && !(fCpCtrl & 0x10) && !(gCpSess && (gCpSess->plan.owns_volt || gCpSess->plan.handback));
     v.dtptValid = fAlerts.complete();
     v.dtpt = fAlerts.active();
     // the port every decision (the Rp current, the #18 check), not only every report
@@ -2451,6 +2583,7 @@ void PianoPower::stepPolicy(uint64_t now)
   if (o.decided || o.waitingPd || o.waitingBoard || o.refused || o.full) logPolicy(o, now);
   if (o.resync) relinkMca(now, o.events & PIANO_CHG_EV_WAKE ? "after the wake" : "the firmware lost the source (#18)");
   setHold(reachable && fLink.hold && !fShutdownSeen);
+  if (gCpSess && !gCpSess->plan.sleep_ready) o.handoverReady = false;   // the pump session holds the source or the pump
   if (fHandover && !fHandoverAcked && (o.handoverReady || now >= fHandoverUntil)) {
     fHandoverAcked = true;
     if (!o.handoverReady) {
@@ -2541,6 +2674,7 @@ void PianoPower::run()
     if (fWatch.nextDue() && fWatch.nextDue() < next) next = fWatch.nextDue();
     if (fFix.nextDue() && fFix.nextDue() < next) next = fFix.nextDue();
     if (const uint64_t cpDue = gCpHook ? gCpHook->nextDeadline() : 0) if (cpDue < next) next = cpDue;
+    if (gCpSess && fPolicyOn && gCpSess->nextMs && gCpSess->nextMs < next) next = gCpSess->nextMs;
     if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;

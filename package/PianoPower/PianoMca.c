@@ -137,6 +137,9 @@ int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes)
     }
 }
 
+static uint8_t gCpPps, gCpQc;   /* charge/cp-sess: piano_mca_allow_cp */
+void piano_mca_allow_cp(int pps, int qc) {gCpPps = (uint8_t)(pps != 0); gCpQc = (uint8_t)(qc != 0);}
+
 int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
 {
     if (!m->external) return piano_mca_write_allowed(property, value, bytes);
@@ -149,8 +152,10 @@ int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t v
     case PIANO_MCA_QC_VOLT: return bytes == 4 && m->qc3_allowed && (value == 5000 || value == 9000);
     case PIANO_MCA_PPS: {
         const uint32_t mv = (value >> 16) * 20, ma = (value & 0xffffu) * 50;
-        return bytes == 4 && m->pps_allowed && mv == 9000 && ma >= 500 && ma <= 3000;
+        return bytes == 4 && ((m->pps_allowed && mv == 9000 && ma >= 500 && ma <= 3000) ||
+                              (gCpPps && mv >= 5000 && mv <= 11000 && ma >= 1000 && ma <= 6000));
     }
+    case PIANO_MCA_QC_PULSE: return bytes == 4 && gCpQc && (value == 0x20u || value == 0x10u);
     case PIANO_MCA_INPUT_SUSPEND: return 0;   /* the built-in policy's opt-in only */
     case PIANO_MCA_FCC:
         if (m->fcc_fast) return bytes == 4 && value >= 100 && value <= PIANO_MCA_FCC_FAST;
@@ -657,6 +662,7 @@ const char *piano_mca_property_name(uint32_t property)
     case PIANO_MCA_CHARGE_ENABLE: return "charge enable";
     case PIANO_MCA_PD_FIXED: return "PD fixed request";
     case PIANO_MCA_PPS: return "PPS request";
+    case PIANO_MCA_QC_PULSE: return "QC3 pulse";
     case PIANO_MCA_QC_VOLT: return "QC voltage request";
     case PIANO_MCA_INPUT_SUSPEND: return "input suspend";
     case PIANO_MCA_CP_STATE: return "CP state";

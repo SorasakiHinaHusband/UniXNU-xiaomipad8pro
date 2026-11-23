@@ -29,6 +29,15 @@ done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host"   # the SC8541 driver (ChargePump.h)
 "$T/cp_driver_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host_san"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P" -c "$P/ChargePumpSession.c" -o "$T/ChargePumpSession.o"   # the pump session
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/cp_session_host.cpp" "$T/ChargePumpSession.o" \
+  "$T/ChargePolicy.o" -o "$T/cp_session_host"
+"$T/cp_session_host"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -c "$P/ChargePumpSession.c" -o "$T/ChargePumpSession_san.o"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -c "$P/ChargePolicy.c" -o "$T/ChargePolicy_san.o"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -I "$D/package/include" \
+  "$P/tests/cp_session_host.cpp" "$T/ChargePumpSession_san.o" "$T/ChargePolicy_san.o" -o "$T/cp_session_host_san"
+"$T/cp_session_host_san"
 "$T/cp_driver_host_san"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"
 "$T/battery_host"

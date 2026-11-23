@@ -200,7 +200,7 @@ static void happyPath() {
   CHECK(b.s.exit_reason == PIANO_CPS_EXIT_TAPER);
   // the pump is off before the source is handed back; the hand-back carries the last word taken
   bool handback = b.p.handback;
-  if (!handback) {b.tick(100); handback = b.p.handback;}
+  for (int i = 0; i < 10 && !handback; i++) {b.tick(100); handback = b.p.handback;}
   CHECK(handback);
   CHECK(b.p.handback_prop == PIANO_CHG_PPS && b.p.handback_value == b.y.pps_taken_word);
   CHECK(!b.d.switching);
@@ -263,7 +263,7 @@ static void exits() {
    b.ticks(8); CHECK(b.s.state == PIANO_CPS_CC || b.s.state == PIANO_CPS_STOPPING || b.s.state == PIANO_CPS_IDLE);
    b.ticks(10); CHECK(b.s.exit_reason == PIANO_CPS_EXIT_CELL_OCP);}
   // the pump lost by the driver: latched at once, not unlatched by a new attach while it stays lost
-  {Bench b; CHECK(b.toCC()); b.d.lost = 1; b.ticks(3); CHECK(b.s.state == PIANO_CPS_LATCHED); CHECK(b.s.exit_reason == PIANO_CPS_EXIT_LOST);
+  {Bench b; CHECK(b.toCC()); b.d.lost = 1; b.ticks(10); CHECK(b.s.state == PIANO_CPS_LATCHED); CHECK(b.s.exit_reason == PIANO_CPS_EXIT_LOST);
    b.y.attach_seq = 2; b.ticks(3); CHECK(b.s.state == PIANO_CPS_LATCHED);}
   // errors: a request never answered, 11 times
   {Bench b; CHECK(b.toCC()); b.autoAck = false; b.ticks(400);
@@ -292,7 +292,7 @@ static void latch() {
   for (int n = 0; n < 3; n++) {
     CHECK(b.toCC() || b.s.state == PIANO_CPS_LATCHED);
     b.d.faults = PIANO_CP_FAULT_HW;
-    b.ticks(5);
+    b.ticks(10);
     if (n < 2) {CHECK(b.s.state == PIANO_CPS_IDLE); b.now += 61000;}
   }
   CHECK(b.s.state == PIANO_CPS_LATCHED);
@@ -323,6 +323,19 @@ static void stuck() {
   unsigned stops = 0;
   for (int a : b.actions) stops += a == PIANO_CP_ACT_STOP;
   CHECK(stops >= 3);   // asked again every 500 ms
+}
+
+static void guardStuck() {
+  Bench b;
+  CHECK(b.toCC());
+  b.y.health_hold = 1;
+  b.tick(100);
+  CHECK(b.s.state == PIANO_CPS_STOPPING);
+  b.ticks(3);
+  b.d.faults = PIANO_CP_FAULT_STOP_STUCK;   // the guard found CHG_EN still set (and stopped it again)
+  b.tick(100);
+  CHECK(b.s.state == PIANO_CPS_LATCHED);
+  CHECK(b.s.exit_reason == PIANO_CPS_EXIT_STUCK);
 }
 
 static void derateTdie() {
@@ -390,7 +403,7 @@ static void qc3() {
   b.ticks(3);
   CHECK(b.s.exit_reason == PIANO_CPS_EXIT_DETACH);
   bool hb = false;
-  for (int i = 0; i < 3; i++) {if (b.p.handback) {hb = true; CHECK(b.p.handback_prop == PIANO_CHG_QC_VOLT);} b.tick(100);}
+  for (int i = 0; i < 12; i++) {if (b.p.handback) {hb = true; CHECK(b.p.handback_prop == PIANO_CHG_QC_VOLT);} b.tick(100);}
   CHECK(hb || b.s.state == PIANO_CPS_IDLE);
 }
 
@@ -423,8 +436,11 @@ static void sleepHandover() {
   CHECK(b.p.out.action == PIANO_CP_ACT_STOP);
   b.d.switching = 0;   // CHG_EN reads clear
   b.tick(100);
-  CHECK(b.p.handback);
-  CHECK(!b.p.sleep_ready);   // the hand-back is this call's: the buck takes the source back first
+  CHECK(!b.p.handback);   // the driver's guard (500 ms) re-reads CHG_EN first
+  CHECK(!b.p.sleep_ready);
+  bool hb = false;
+  for (int i = 0; i < 10 && !hb; i++) {b.tick(100); hb = b.p.handback; if (hb) CHECK(!b.p.sleep_ready);}
+  CHECK(hb);
   b.tick(100);
   CHECK(b.p.sleep_ready);
   // awake again: no session before the settle
@@ -522,6 +538,7 @@ int main() {
   startFailures();
   latch();
   stuck();
+  guardStuck();
   derateTdie();
   budget();
   qc3();

@@ -88,6 +88,7 @@ extern "C" {
 #define PIANO_MCA_VERIFY 0x21002u         /* non-zero while a charger authentication runs */
 #define PIANO_MCA_LPD_STATUS 0x2000au /* read-only u32: zero dry, nonzero wet */
 #define PIANO_MCA_PDOS 0x21011u           /* up to 7 x {min mV, max mV, max mA} */
+#define PIANO_MCA_QC_PULSE 0x201du       /* QC3 pulse: 0x20 up, 0x10 down (the charge-pump session only) */
 #define PIANO_MCA_PPS 0x21017u            /* ask a PPS source for an APDO voltage: (mV / 20) << 16 | mA / 50 (external policy, hv 2) */
 #define PIANO_MCA_PD_FIXED 0x21018u       /* ask the source for a fixed PDO, mV */
 #define PIANO_MCA_QC_VOLT 0x2011u         /* HVDCP/QC voltage request, mV (external policy, b4pd) */
@@ -222,6 +223,9 @@ void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 void piano_mca_use_external_policy(PianoMca *m, int stop, int pps, int qc3);
 /* With the external policy: the input limit admitted up to max_ma (1600..3000; the stepped Type-C current, ChargePolicy's
  * cfg.rp_cap_ma); 0 or less keeps the 1600 mA bound. */
+/* charge/cp-sess: the SC8541 pump session's own requests, for every codec of this boot: a PPS word 5000-11000 mV at 1000-6000 mA
+ * (pps), one QC3 pulse 0x20/0x10 (qc); only with the external policy. Off unless PianoPower's pump session is allocated. */
+void piano_mca_allow_cp(int pps, int qc);
 void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma);
 #define PIANO_MCA_ICL_MAX_RP 3000u    /* the Type-C current's 3.0 A at 5 V */
 /* A write the external policy wants, queued for the gap after this cycle (one per property: a later value replaces a queued one).

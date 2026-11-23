@@ -38,6 +38,7 @@ static int32_t dc_ceil(int32_t dc) {return dc >= 0 ? (dc + 9) / 10 : -(-dc / 10)
 #define VOLT_PENDING_MS 2000u      /* a voltage request not answered within this counts as an error */
 #define STOP_STUCK_MS 2000u        /* CHG_EN still set this long after STOP: stuck (the driver's guard stops again) */
 #define STOP_RESEND_MS 500u
+#define STOP_GUARD_MS (PIANO_CP_GUARD_MS + 100u)   /* the driver's guard re-reads CHG_EN 500 ms after a stop: the source waits for it */
 #define RETRY_FAULT_MS 60000u      /* after a fault exit (below the latch) */
 #define RETRY_TAPER_MS 300000u     /* after the taper hands over to the buck */
 #define RETRY_OTHER_MS 30000u
@@ -569,8 +570,8 @@ void piano_cp_decide(const PianoCpConfig *c, const PianoCpSys *sys, const struct
         (void)regulate(&x, 1);
         break;
     case PIANO_CPS_STOPPING:
-        if (!drv->switching) {finish(&x); break;}
-        if (now >= s->stop_ms + STOP_STUCK_MS) {
+        if (!(drv->faults & PIANO_CP_FAULT_STOP_STUCK) && !drv->switching && now >= s->stop_ms + STOP_GUARD_MS) {finish(&x); break;}
+        if ((drv->faults & PIANO_CP_FAULT_STOP_STUCK) || now >= s->stop_ms + STOP_STUCK_MS) {
             /* the driver's guard stops it again; the source is handed back all the same, the pump latched off this attach */
             p->events |= PIANO_CPS_EV_STUCK;
             s->exit_reason = PIANO_CPS_EXIT_STUCK;

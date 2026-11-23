@@ -49,6 +49,15 @@ tail -1 "$T/pon-history-fixture.txt"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host"   # the SC8541 driver (ChargePump.h)
 "$T/cp_driver_host"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" "$P/tests/cp_driver_host.cpp" -o "$T/cp_driver_host_san"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P" -c "$P/ChargePumpSession.c" -o "$T/ChargePumpSession.o"   # the pump session
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/cp_session_host.cpp" "$T/ChargePumpSession.o" \
+  "$T/ChargePolicy.o" -o "$T/cp_session_host"
+"$T/cp_session_host"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -c "$P/ChargePumpSession.c" -o "$T/ChargePumpSession_san.o"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -c "$P/ChargePolicy.c" -o "$T/ChargePolicy_san.o"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I "$P" -I "$D/package/include" \
+  "$P/tests/cp_session_host.cpp" "$T/ChargePumpSession_san.o" "$T/ChargePolicy_san.o" -o "$T/cp_session_host_san"
+"$T/cp_session_host_san"
 "$T/cp_driver_host_san"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"   # BatteryMap.h (piano-power-ps)
 "$T/battery_host" || { echo "Error: PianoPower battery host tests failed" >&2; exit 1; }
@@ -76,7 +85,7 @@ for p in "$D"/patches/k27/0060-*.patch; do
     | cmp -s - "$P/PmicRtc.h" || { echo "Error: $(basename "$p")'s osfmk/arm64/piano_rtc.h is not package/PianoPower/PmicRtc.h" >&2; exit 1; }
 done
 python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P/PianoAdsp.cpp" "$P/PianoBattery.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/PianoMca.c" "$P/ChargePolicy.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
+  "$P/PianoMca.c" "$P/ChargePolicy.c" "$P/ChargePumpSession.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
   "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/PortEvents.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" "$P/UsbcRelay.c" \
   "$P/PianoUsbcRelay.cpp" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
