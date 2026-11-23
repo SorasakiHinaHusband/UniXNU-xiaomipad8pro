@@ -248,7 +248,7 @@ static void test_keys_file()
     auto bad = f; bad[0] ^= 1; CHECK(piano_mipps_keys_parse(bad.data(), bad.size(), &k) == PIANO_MIPPS_E_FORMAT, "magic");
     bad = f; bad[40] ^= 1; CHECK(piano_mipps_keys_parse(bad.data(), bad.size(), &k) == PIANO_MIPPS_E_FORMAT, "sha");
     bad = f; bad.pop_back(); CHECK(piano_mipps_keys_parse(bad.data(), bad.size(), &k) == PIANO_MIPPS_E_FORMAT, "truncated");
-    bad = f; bad[8] = 9; CHECK(piano_mipps_keys_parse(bad.data(), bad.size(), &k) == PIANO_MIPPS_E_FORMAT, "count");
+    bad = f; bad[8] = 17; CHECK(piano_mipps_keys_parse(bad.data(), bad.size(), &k) == PIANO_MIPPS_E_FORMAT, "count");
     CHECK(piano_mipps_keys_parse(f.data(), f.size(), &k) == PIANO_MIPPS_OK && k.count == 3, "good file");
     piano_mipps_keys_wipe(&k); CHECK(k.count == 0 && k.k[0].key[0] == 0, "wipe");
     // no key: never runs, 5 A

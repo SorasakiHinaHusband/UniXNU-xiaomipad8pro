@@ -52,7 +52,7 @@ extern "C" {
 
 /* The private key file: "PMIPKEY1", u32 LE count (1..PIANO_MIPPS_KEYS_MAX), u32 LE 48, count x {seed[16], key[32]}, then the
  * SHA-256 of everything before it. Parsed by piano_mipps_keys_parse; the bytes are wiped by piano_mipps_keys_wipe. */
-#define PIANO_MIPPS_KEYS_MAX 8u
+#define PIANO_MIPPS_KEYS_MAX 16u
 #define PIANO_MIPPS_KEY_FILE "PianoPower/mipps-keys.bin"
 typedef struct {
     uint8_t seed[16];

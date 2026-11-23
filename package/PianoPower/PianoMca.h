@@ -122,7 +122,7 @@ enum {
  * McaWritten); the request in flight, if any, is still awaited. McaIgnored on a 0x800a answer that matches nothing: ignored_* say
  * what it was. */
 enum {McaIgnored = 0, McaAnswer = 1, McaCycleDone = 2, McaNotified = 3, McaWritten = 4, McaPanNotified = 5, McaPanDone = 6,
-      McaUcsiDone = 7, McaUcsiNotified = 8, McaLateWritten = 9};
+      McaUcsiDone = 7, McaUcsiNotified = 8, McaLateWritten = 9, McaAuxDone = 10};
 /* events for the owner's log (piano_mca_take_events) */
 enum {
     McaEvAttach = 1u << 0, McaEvDetach = 1u << 1, McaEvWrite = 1u << 2, McaEvHvOn = 1u << 3, McaEvHvBlocked = 1u << 4,
@@ -180,6 +180,9 @@ typedef struct {
     int32_t last_result;
     uint32_t last_property, last_value;
     uint32_t events;
+    /* MiPPS (ChargeMipps.h): the auxiliary request channel, owned by the caller (piano_mca_allow_mipps); NULL: none. One request at
+     * a time, sent before the cycle's next read, only to the properties piano_mca_aux_allowed names. A pointer: PianoPower's size cap. */
+    struct PianoMcaAux *aux;
 } PianoMca;
 
 void piano_mca_init(PianoMca *m, unsigned policy, int hv_allowed);
@@ -248,6 +251,20 @@ const char *piano_mca_status_name(int32_t status);
 static inline int piano_mca_has(const PianoMca *m, int field) {return (int)((m->valid >> field) & 1u);}
 
 /* The policy's pieces, exposed for the host tests. */
+typedef struct PianoMcaAux {
+    uint8_t wanted, in_flight, done, write, len, reply_len;
+    uint32_t property;
+    int32_t result;
+    uint8_t data[16], reply[16];
+    uint32_t sent, refused;
+} PianoMcaAux;
+/* MiPPS's transport (ChargeMipps.h): the VDM/verify properties only (never command 8's 0x2100a), 4 or 16 bytes as each takes.
+ * piano_mca_aux_request queues one request (0) or refuses it (-1: not allowed, busy, or not on the list); piano_mca_aux_take gives
+ * its result once (1): retcode 0 = done, else the firmware's code or -60 on the owner's timeout; data/len for a read. */
+void piano_mca_allow_mipps(PianoMca *m, PianoMcaAux *aux);   /* aux NULL: withdrawn */
+int piano_mca_aux_allowed(int write, uint32_t property, const uint8_t *data, uint32_t len);
+int piano_mca_aux_request(PianoMca *m, int write, uint32_t property, const uint8_t *data, uint32_t len);
+int piano_mca_aux_take(PianoMca *m, int32_t *retcode, uint8_t *data, uint32_t *len);
 uint32_t piano_mca_icl_for(int type, uint32_t pdo5v_ma);
 uint32_t piano_mca_fcc_for(int tbat_valid, int32_t tbat_c, int hv);
 int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes);

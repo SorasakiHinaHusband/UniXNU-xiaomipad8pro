@@ -165,9 +165,79 @@ int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t v
     }
 }
 
+void piano_mca_allow_mipps(PianoMca *m, PianoMcaAux *aux)
+{
+    if (aux) zero(aux, sizeof *aux);
+    if (m->aux && m->aux->in_flight) m->in_flight = 0;   /* withdrawn mid-request: the answer, if it comes, is ignored */
+    m->aux = aux;
+}
+
+int piano_mca_aux_allowed(int write, uint32_t property, const uint8_t *data, uint32_t len)
+{
+    if (write) {
+        const uint32_t v = (len == 4 && data) ? le32(data) : 0xffffffffu;
+        switch (property) {
+        case 0x21002u: case 0x21010u: return len == 4 && v <= 1;         /* VERIFY_PROCESS, PD_VERIFIED */
+        case 0x21003u: case 0x21004u: case 0x21005u: return len == 4;    /* commands 1-3 */
+        case 0x21006u: case 0x21007u: return len == 16;                  /* command 4 (seed), 5 (challenge) */
+        case 0x21008u: case 0x21009u: return len == 4 && v <= 1;         /* commands 6, 7 with their flag */
+        default: return 0;                                               /* 0x2100a (command 8) and everything else: never */
+        }
+    }
+    switch (property) {
+    case 0x20002u: case 0x21003u: case 0x2100eu: case 0x21012u: return len == 4;   /* VBUS, version, adapter ID, UVDM state */
+    case 0x21007u: return len == 16;                                                 /* the adapter's answer */
+    default: return 0;
+    }
+}
+
+int piano_mca_aux_request(PianoMca *m, int write, uint32_t property, const uint8_t *data, uint32_t len)
+{
+    PianoMcaAux *a = m->aux;
+    if (!a) return -1;
+    if (a->wanted || a->in_flight || len > 16 || !piano_mca_aux_allowed(write, property, data, len)) {
+        a->refused++;
+        return -1;
+    }
+    a->write = write ? 1 : 0;
+    a->property = property;
+    a->len = (uint8_t)len;
+    zero(a->data, sizeof a->data);
+    if (write && data) for (uint32_t i = 0; i < len; i++) a->data[i] = data[i];
+    a->done = 0;
+    a->wanted = 1;
+    return 0;
+}
+
+int piano_mca_aux_take(PianoMca *m, int32_t *retcode, uint8_t *data, uint32_t *len)
+{
+    PianoMcaAux *a = m->aux;
+    if (!a || !a->done) return 0;
+    a->done = 0;
+    if (retcode) *retcode = a->result;
+    if (len) *len = a->reply_len;
+    if (data) for (uint32_t i = 0; i < a->reply_len; i++) data[i] = a->reply[i];
+    return 1;
+}
+
 uint32_t piano_mca_next(PianoMca *m, uint8_t out[PIANO_MCA_REQUEST_BYTES])
 {
     if (m->in_flight) return 0;
+    if (m->aux && m->aux->wanted) {
+        PianoMcaAux *a = m->aux;
+        zero(out, PIANO_MCA_REQUEST_BYTES);
+        header(out, PIANO_MCA_OWNER, a->write ? PIANO_MCA_OP_WRITE : PIANO_MCA_OP_READ);
+        put32(out + 12, a->property);
+        put32(out + 16, ++m->seq);
+        if (a->write) for (unsigned i = 0; i < a->len; i++) out[20 + i] = a->data[i];
+        m->sent_property = a->property;
+        m->sent_opcode = a->write ? PIANO_MCA_OP_WRITE : PIANO_MCA_OP_READ;
+        m->in_flight = 1;
+        a->in_flight = 1;
+        a->wanted = 0;
+        a->sent++;
+        return PIANO_MCA_REQUEST_BYTES;
+    }
     /* Writes go between cycles, so a cycle's readings belong to one setting. */
     while (m->queued && m->cursor == NO_CYCLE) {
         const uint32_t property = m->queue[0].property, value = m->queue[0].value;
@@ -459,6 +529,13 @@ void piano_mca_timeout(PianoMca *m)
 {
     if (!m->in_flight) return;
     m->timeouts++;
+    if (m->aux && m->aux->in_flight) {
+        m->in_flight = m->aux->in_flight = 0;
+        m->aux->result = -60;
+        m->aux->reply_len = 0;
+        m->aux->done = 1;
+        return;
+    }
     if (m->sent_write) {
         /* the write counts as tried; its result is unknown until its answer comes after all (McaLateWritten) */
         m->in_flight = m->sent_write = 0;
@@ -586,6 +663,21 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         m->last_result = (int32_t)retcode;
         if (!retcode) taken(m, property, m->late_value);
         return McaLateWritten;
+    }
+    if (m->aux && m->aux->in_flight && m->in_flight && seq == m->seq && property == m->sent_property && opcode == m->sent_opcode) {
+        PianoMcaAux *a = m->aux;
+        m->in_flight = a->in_flight = 0;
+        a->result = (int32_t)retcode;
+        a->reply_len = 0;
+        if (!retcode && !a->write) {
+            const uint32_t have = length - 24, want = a->len;
+            const uint32_t n = have < want ? have : want;
+            for (uint32_t i = 0; i < n; i++) a->reply[i] = data[24 + i];
+            a->reply_len = (uint8_t)n;
+            if (n < want) a->result = -61;   /* a short answer */
+        }
+        a->done = 1;
+        return McaAuxDone;
     }
     if (!m->in_flight || seq != m->seq || property != m->sent_property || opcode != m->sent_opcode) {
         m->ignored++;
