@@ -2860,18 +2860,25 @@ void qualificationThread(void *)
                 const auto &t=gQualification.thermal();
                 const uint8_t lv=g830.power_state.votedLevel();
                 /* gpu/throttle1: the cap from the qualified top (the probe started at 7 before) and the limit that holds it */
-                const uint8_t cap=g830.dcvs.ceiling();
+                /* min(knob/ACD-off, DCVS thermal, external slot) under the guard: A830Dcvs::ceiling() without its boost cap (inline
+                 * accessors only: the stage tests link this file without A830Dcvs.cpp) */
+                uint8_t cap=g830.dcvs.knobCeiling();
+                if(g830.dcvs.thermalCeiling() && g830.dcvs.thermalCeiling()<cap)cap=g830.dcvs.thermalCeiling();
+#ifdef ADRENO830_MACOS
+                const uint8_t external=g830.dcvs.externalCeiling();
+#else
+                const uint8_t external=0;
+#endif
+                if(external && external<cap)cap=external;
+                cap=g830.power_state.qualificationEffectiveCap(A830ExitContext::Guard,cap?cap:1);
                 static const char *const causes[]={"none","ladder","skin25","skin45","xo","skin-unknown","hard","skinband"};
                 A830BindIn bi;
                 bi.voted=lv;bi.cap=cap;bi.top=gQualification.top();bi.guardCap=g830.power_state.qualificationCap();
                 bi.guardStep=uint8_t(gQualification.thermalSnapshot());bi.guardCause=t.cause;
                 bi.latched=g830.power_state.qualificationLatched();bi.opened=gQualification.openedAt()!=0;bi.high=gQualification.high();
-                bi.external=g830.dcvs.externalCeiling();
+                bi.external=external;
                 bi.externalName=ceilingHolderName(__atomic_load_n(&gCeilingHolder,__ATOMIC_ACQUIRE));
                 bi.knob=g830.dcvs.knobCeiling();
-                {const uint32_t bk=g830.dcvs.boostCap(now);uint8_t bl=0;
-                 for(uint8_t l=1;bk && l<=14;++l)if(uint32_t(FulloppMhz[l])*1000u<=bk)bl=l;
-                 bi.boost=bk?(bl?bl:1):0;}
                 const char *bind=a830BindName(bi),*why=a830BindWhy(bi);
                 qualLog("R3b LV at-us=%llu lvl=%u mhz=%u cap=%u cause=%s raw=%d filt=%d skin=%d skin-ok=%u xo=%d acd=%u bind=%s why=%s tab=%u",
                     now/1000,unsigned(lv),unsigned(lv<=14?FulloppMhz[lv]:0),unsigned(cap),causes[t.cause<=7?t.cause:0],t.raw,
