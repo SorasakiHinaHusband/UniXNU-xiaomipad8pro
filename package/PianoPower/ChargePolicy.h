@@ -233,6 +233,7 @@ typedef struct {
     uint32_t contract_generation, contract_restore_generation;
     uint8_t contract_mode, contract_transition, contract_mode_change, contract_recheck;
     uint8_t contract_notify_seen, voltage_observe_hold;
+    uint8_t contract_ok, notify_holds;   /* T-14b: the last decision had a valid contract; notification holds in a row */
     uint64_t contract_notify_since;
     uint32_t transition_ma;
     uint8_t handover_fault;       /* refusal/timeout is not successful hardware handover */

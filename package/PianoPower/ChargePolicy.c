@@ -17,6 +17,8 @@
 #define HV_FIXED_MIN_MA 100u
 #define HV_PPS_MIN_MA 500u
 #define HV_PPS_MAX_MA 3000u
+#define NOTIFY_HOLD_MS 3000u      /* T-14b: a UCSI notification in flight younger than this holds the limits in force, */
+#define NOTIFY_HOLD_MAX 3u        /* for at most this many decisions in a row; then the contract counts as lost */
 #define FCC_TBAT_MIN 15
 #define FCC_DERATE_FROM 48
 #define FCC_DERATE_STEP 300u
@@ -777,6 +779,36 @@ static int gauge_fresh(const PianoChargeInput *in, uint64_t now)
 }
 
 /* Current UCSI session authorization. Source advertisements alone never authorize draw. */
+static int strict_contract(const PianoChargeInput *in);
+static int gauge_fresh(const PianoChargeInput *in, uint64_t now);
+
+/* T-14b (owner 2026-11-23 19:25, live y10 reads 19:26/19:32): a UCSI notification also reports the completion of our own periodic
+ * status GET, and the contract is withheld from the input until its CCI read resolves it (ChargeContract.h, ChargeLink::fill). A
+ * decision in that window used to count as "no contract": ICL 100 / FCC 500 (the notify-observing transition and the PD clamp),
+ * and the next fresh snapshot armed the recheck barrier (ICL/FCC 500, fallback READBACK) - every cycle on a steady 9 V contract,
+ * with the firmware's input walk restarting from 100 mA each time. Such a decision now holds the limits in force when everything
+ * else is steady: the last decision had a valid contract, the notification is young and not repeated past NOTIFY_HOLD_MAX, no
+ * transition, mode change or voltage write is under way, the bus is where the session is (8.0-9.6 V at 9 V, below 6 V at 5 V),
+ * the gauges are fresh and LPD/DTPT are clear. Nothing goes up in a hold; the board holds and a stop still go down. */
+static int notify_hold(const PianoChargeConfig *c, const PianoChargeInput *in, const PianoChargeState *s, uint64_t now,
+                       int charge_ok)
+{
+    /* the burst's first notification bounds the hold (a renewed notify_ms never extends it; strict_hv's 5 s bound counts from it
+     * too); a stop of any kind is no steady state: the normal path ends the session */
+    const uint64_t since = s->contract_notify_seen && s->contract_notify_since < in->contract_notify_ms ? s->contract_notify_since
+                                                                                                       : in->contract_notify_ms;
+    if (!charge_ok || !c->strict_contract || !in->contract_notify_pending || (in->valid & PIANO_CHG_IN_CONTRACT) || !s->contract_ok ||
+        !s->attached || !s->icl_set || !s->fcc_set || s->notify_holds >= NOTIFY_HOLD_MAX ||
+        s->contract_transition || s->contract_mode_change || s->contract_recheck || (s->pending & (1u << PIANO_CHG_S_VOLT)) ||
+        now < since || now - since >= NOTIFY_HOLD_MS || !(in->valid & PIANO_CHG_IN_BUS) ||
+        !gauge_fresh(in, now) ||
+        (in->safety & (PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT)) != (PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT) ||
+        ((in->valid & PIANO_CHG_IN_TYPE) && in->type != s->type)) return 0;
+    if (s->hv == PIANO_CHG_HV_ON) return in->bus_mv >= HV_MIN_MV && in->bus_mv <= HV_MAX_MV;
+    return (s->hv == PIANO_CHG_HV_OFF || s->hv == PIANO_CHG_HV_BLOCKED) && !volt_raised(s) &&
+           in->bus_mv >= ONLINE_MV && in->bus_mv < HV_5V_MAX_MV;
+}
+
 static int strict_contract(const PianoChargeInput *in)
 {
     return (in->valid & PIANO_CHG_IN_CONTRACT) && !in->contract_notify_pending && in->contract_generation &&
@@ -840,8 +872,13 @@ static uint32_t strict_hv(const PianoChargeConfig *c, const PianoChargeInput *in
                           (!contract || (in->contract_protocol == 1 && in->contract_mv < HV_5V_MAX_MV));
     const int at9 = contract && in->contract_mv >= HV_MIN_MV && in->contract_mv <= HV_MAX_MV &&
                     (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= HV_MIN_MV && in->bus_mv <= HV_MAX_MV;
-    if (s->contract_generation && s->contract_generation != in->contract_generation) s->contract_recheck = 1;
-    s->contract_generation = in->contract_generation;
+    /* T-14b: only a fresh snapshot carries a generation (ChargeLink omits the contract while a UCSI notification is in flight,
+     * e.g. our own periodic status GET's); a decision without one is no change of contract and must not arm the recheck
+     * barrier. A real change bumps the generation (ChargeContract.h piano_contract_invalidate, the re-read's `changed`). */
+    if (in->contract_generation) {
+        if (s->contract_generation && s->contract_generation != in->contract_generation) s->contract_recheck = 1;
+        s->contract_generation = in->contract_generation;
+    }
     if (contract && s->contract_restore_generation != in->contract_generation) {
         s->contract_restore_generation = in->contract_generation;
         if (s->contract_mode_change || (s->volt_want_prop == PIANO_CHG_PD_FIXED && s->volt_want_value == 5000)) {
@@ -1592,6 +1629,29 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
             s->fcc_full = 0;
         }
     }
+    if (notify_hold(c, in, s, now, charge_ok)) {
+        /* T-14b: the limits in force stay; only a board hold may act in this decision. The burst's start is latched as strict_hv
+         * does, so its 5 s bound on a notification storm still counts from the first one. */
+        s->notify_holds++;
+        if (!s->contract_notify_seen) {s->contract_notify_seen = 1; s->contract_notify_since = in->contract_notify_ms;}
+        else if (in->contract_notify_ms < s->contract_notify_since) s->contract_notify_since = in->contract_notify_ms;
+        p->hv = s->hv;
+        p->cls = (uint8_t)(s->hv == PIANO_CHG_HV_ON ? (s->hv_pps ? PIANO_CHG_C_PD_PPS : PIANO_CHG_C_PD) : piano_charge_class(s->type));
+        p->charge = (uint8_t)charge_ok;
+        const uint32_t held_icl = board_cap(s, p, s->icl_set);
+        const uint32_t held_fcc = held_icl < s->icl_set ? umin(s->fcc_set, umax(2 * held_icl, PIANO_CHG_FCC_DEFAULT)) : s->fcc_set;
+        p->icl_ma = held_icl;
+        p->fcc_ma = held_fcc;
+        p->bus_mv = s->hv == PIANO_CHG_HV_ON ? HV_MV : 5000;
+        if (held_icl < s->icl_set) {
+            plan_fcc(c, s, p, now, held_fcc, held_fcc);
+            plan_icl(c, in, s, p, now, held_icl);
+        }
+        plan_fv(c, in, s, p, now, &t);
+        s->hold_awake = p->hold_awake = (uint8_t)(c->writes && limit_on(c) && charge_ok && soc_valid(in));
+        return;
+    }
+    s->notify_holds = 0;
     if (s->type < 0 && !c->strict_contract) {
         if (!charge_ok) plan_enable(c, in, s, p, now, 0);
         return;
@@ -1609,6 +1669,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
                            qc_session(c, s) ? strict_qc(c, in, s, p, &t, now, charge_ok) :
                                               strict_hv(c, in, s, p, &t, now, charge_ok);
     const int hv_on = s->hv == PIANO_CHG_HV_ON && hv_ma;
+    if (c->strict_contract) s->contract_ok = (uint8_t)strict_contract(in);   /* T-14b: what a notification hold may keep */
     p->hv = s->hv;
     uint32_t icl;
     if (hv_on) {

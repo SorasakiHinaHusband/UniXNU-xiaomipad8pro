@@ -184,12 +184,14 @@ struct Sim {
       slots |= 1u << w.slot;
       if (w.property == PIANO_CHG_ICL) CHECK(w.value <= piano_charge_icl_max(&cfg) && w.value <= PIANO_CHG_RP_ABS_MAX);
       if (w.property == PIANO_CHG_ICL && w.value > (cfg.icl_cap_ma ? cfg.icl_cap_ma : PIANO_CHG_ICL_CAP))
-        CHECK(cfg.rp && cfg.ramp && (plan.icl_why == PIANO_CHG_ICL_RP ||
+        CHECK((plan.icl_why == PIANO_CHG_ICL_9V && cfg.strict_contract && cfg.hv_caps && st.hv == PIANO_CHG_HV_ON &&
+               w.value <= PIANO_CHG_ICL_ABS_MAX) ||   // T-14 9 V
+              (cfg.rp && cfg.ramp && (plan.icl_why == PIANO_CHG_ICL_RP ||
               (plan.icl_why == PIANO_CHG_ICL_CONTRACT_5V && cfg.strict_contract &&
                (!cfg.hv || st.hv == PIANO_CHG_HV_BLOCKED || plan.fallback == PIANO_CHG_FALLBACK_SOURCE ||
                 plan.fallback == PIANO_CHG_FALLBACK_HEALTH) &&   // T-14: a 9 V mode settled at 5 V
                (in.valid & PIANO_CHG_IN_CONTRACT) && in.contract_protocol == 1 && in.contract_mv == 5000 &&
-               w.value <= in.contract_ma)));   // above the cap only a measured 5 V step with source authority
+               w.value <= in.contract_ma))));   // above the cap only a measured 5 V step with source authority
       if (w.property == PIANO_CHG_FCC)   // cfg.hv_caps (charge/pd1): the stock rows only at a 9 V session in force
         CHECK(w.value <= (cfg.strict_contract && cfg.hv_caps && st.hv == PIANO_CHG_HV_ON ? PIANO_CHG_FCC_ABS_MAX :
                           cfg.fcc_cap_ma ? cfg.fcc_cap_ma : PIANO_CHG_FCC_CAP));
@@ -1622,6 +1624,7 @@ struct StrictSim : Sim {
     }
   }
   void run(unsigned n = 12) {while (n--) step();}
+  bool notifyHeld() const {return st.notify_holds > 0;}
 };
 
 static void testDailyFiveVoltBudget()
@@ -1818,7 +1821,8 @@ static void testContractSession()
   {
     StrictSim s; s.run(); CHECK(s.st.hv == PIANO_CHG_HV_ON);
     s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false;
-    s.step(1000); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl <= 100 && s.fcc <= 500);
+    // T-14b: a young notification on a steady contract holds the limits in force (no longer 100 mA behind it)
+    s.step(1000); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600 && s.notifyHeld());
     CHECK(!s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));
     s.notifyPending = false; s.contractValid = true;
     s.step(1000); CHECK(s.st.hv == PIANO_CHG_HV_ON && s.icl == 1600 && s.busMv == 9000);
@@ -1830,7 +1834,9 @@ static void testContractSession()
     StrictSim s; s.run(); s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false;
     s.step(1000); CHECK(s.busMv == 9000);
     s.notifyPending = false; s.contractGen++; // CCI has now confirmed an actual connector change; observation privilege ends
-    s.step(1000); CHECK(s.busMv == 5000 && s.wrote(PIANO_CHG_PD_FIXED,5000));
+    s.step(1000);                             // T-14b: the barrier first (the hold kept 1600), then the withdrawal
+    if (s.busMv != 5000) s.step(1000);
+    CHECK(s.busMv == 5000 && s.wrote(PIANO_CHG_PD_FIXED,5000));
   }
   {
     StrictSim s; s.run(); s.notifyPending = true; s.notifyMs = s.now; s.contractValid = false; s.cfg.admin_stop = 1;
@@ -2214,9 +2220,118 @@ static void testT14FiveVoltMax()
   }
 }
 
+// T-14b (owner 2026-11-23 19:25; live y10 reads 19:26/19:32 on the 70 W charger): every ~5 s cycle one decision planned ICL 500 with
+// fallback READBACK and the transition pending (some cycles ICL 100 acknowledged), the next one 1600 again; the firmware's input
+// walk restarted from 100 mA each time and the packs hardly charged. Mechanism: our own periodic UCSI status GET completes with a
+// notification; while it is in flight ChargeLink omits the contract (ChargeContract.h piano_contract_fresh), so a decision taken
+// then saw no contract (the notify-observing transition and the PD clamp: 100 mA) and recorded generation 0, which armed the
+// recheck barrier (500 mA, READBACK) at the next fresh snapshot of the SAME contract. Model: the firmware's 0x2029 walks from 100 mA
+// at +500 mA/s after each 0x2008 change; each cycle = the periodic decision, the GET's notification decision, the resolved one.
+struct NotifyBench {
+  StrictSim s;
+  uint32_t lastIcl = 0;
+  uint64_t walkFrom = 0;
+  unsigned decisions = 0, lowRequests = 0, readbacks = 0, pendingVolt = 0, iclWrites = 0, voltWrites = 0;
+  uint32_t steady = 0, minRequested = ~0u;
+  bool counting = false;
+  void step(uint64_t dt, bool inFlight, bool newGeneration = false)
+  {
+    const uint32_t gen = s.contractGen;
+    if (newGeneration) s.contractGen = gen + 1;
+    if (inFlight) {s.contractValid = s.sourceValid = false; s.notifyPending = true; s.notifyMs = s.now + dt; s.contractGen = 0;}
+    if (s.icl != lastIcl) {lastIcl = s.icl; walkFrom = s.now;}
+    s.aiclRead = true;
+    s.aiclCap = int(std::min<uint64_t>(s.icl, 100 + 500 * ((s.now + dt - walkFrom) / 1000)));
+    const size_t before = s.all.size();
+    s.step(dt);
+    if (inFlight) {s.contractValid = s.sourceValid = true; s.notifyPending = false; s.contractGen = newGeneration ? gen + 1 : gen;}
+    else if (newGeneration) s.contractGen = gen + 1;
+    if (!counting) return;
+    decisions++;
+    minRequested = std::min(minRequested, s.plan.icl_ma);
+    if (s.plan.icl_ma < steady) lowRequests++;
+    if (s.plan.fallback == PIANO_CHG_FALLBACK_READBACK) readbacks++;
+    if (s.st.contract_transition || (s.st.pending & (1u << PIANO_CHG_S_VOLT))) pendingVolt++;
+    for (size_t i = before; i < s.all.size(); ++i) {
+      if (s.all[i].property == PIANO_CHG_ICL) iclWrites++;
+      if (s.all[i].property == PIANO_CHG_PD_FIXED || s.all[i].property == PIANO_CHG_PPS) voltWrites++;
+    }
+  }
+  void cycle() {step(4500, false); step(200, true); step(300, false);}
+};
+
+static void testT14NotifyCycle()
+{
+  auto daily = [](StrictSim &s) {
+    s.cfg.hv = 1; s.cfg.rp = s.cfg.ramp = 1; s.cfg.rp_cap_ma = 3000;
+    s.cfg.hv_order = s.cfg.hv_caps = s.cfg.qc = s.cfg.fv_hot = 1;
+    s.loadMa = 3200; s.soc = 59; s.contractGen = 7;
+  };
+  {   // the observed case: a steady fixed 9 V contract (the 70 W charger, RDO 1600 at 9 V as read live), no connector reading
+    NotifyBench b; daily(b.s); b.s.contractMa = 1600;
+    for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
+    b.s.run(6);
+    CHECK(b.s.busMv == 9000 && b.s.st.hv == PIANO_CHG_HV_ON && b.s.icl == 1600);
+    b.steady = b.s.icl; b.counting = true;
+    for (unsigned i = 0; i < 6; ++i) b.cycle();
+    CHECK(b.lowRequests == 0 && b.minRequested == 1600);   // y10: 500 (the recheck barrier) and 100 (the in-flight decision)
+    CHECK(b.readbacks == 0 && b.pendingVolt == 0);          // y10: fallback READBACK and the transition every cycle
+    CHECK(b.iclWrites == 0 && b.voltWrites == 0);           // the limit is not rewritten, 9 V is not asked again
+    CHECK(b.s.icl == 1600 && b.s.st.icl_set == 1600 && b.s.busMv == 9000);
+  }
+  {   // a real change while the notification is in flight (the resolved snapshot has a new generation): the barrier still runs
+    NotifyBench b; daily(b.s); b.s.contractMa = 1600;
+    for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
+    b.s.run(6);
+    b.steady = 1600; b.counting = true;
+    b.step(4500, false); b.step(200, true); b.step(300, false, true);
+    CHECK(b.minRequested <= 500 && b.readbacks >= 1);
+    b.s.run(6); CHECK(b.s.busMv == 9000 && b.s.icl == 1600);
+  }
+  {   // a notification that stays in flight: held for at most NOTIFY_HOLD_MAX decisions / 3 s, then the contract counts as lost
+    NotifyBench b; daily(b.s); b.s.contractMa = 1600;
+    for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
+    b.s.run(6);
+    const uint64_t first = b.s.now + 500;
+    bool dropped = false;
+    for (unsigned i = 0; i < 6; ++i) {
+      b.s.contractValid = b.s.sourceValid = false; b.s.notifyPending = true; b.s.notifyMs = first;
+      const uint32_t g = b.s.contractGen; b.s.contractGen = 0;
+      b.s.step(500);
+      b.s.contractGen = g;
+      if (b.s.plan.icl_ma <= 100) dropped = true;
+    }
+    CHECK(dropped);
+    b.s.contractValid = b.s.sourceValid = true; b.s.notifyPending = false; b.s.run(10);
+    CHECK(b.s.busMv == 9000 && b.s.icl == 1600);
+  }
+  {   // during a hold a hot connector still takes the input to 100 mA, and a bus out of the 9 V window ends the hold
+    NotifyBench b; daily(b.s); b.s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+    for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
+    b.s.run(6); CHECK(b.s.icl == 1600);
+    b.s.conn1Dc = 600; b.step(200, true); CHECK(b.s.plan.icl_ma == 100 && b.s.icl == 100);
+    b.s.conn1Dc = 310; b.s.run(20); CHECK(b.s.icl == 1600);
+    b.s.busMv = 7500; b.step(200, true); CHECK(b.s.plan.icl_ma <= 500);
+  }
+  {   // the 80 % stop acts in a hold; 75 % resumes on the next fresh decision
+    NotifyBench b; daily(b.s); b.s.contractMa = 1600;
+    for (unsigned i = 0; i < 40 && b.s.busMv != 9000; ++i) b.s.step();
+    b.s.run(6);
+    b.s.soc = 80; b.step(200, true); CHECK(b.s.enable == 0 && !b.s.notifyHeld());   // a stop is no steady state
+  }
+  {   // 5 V PD settled (T-14: the 5 V contract, 3 A, the 9 V request not reached) with the same notifications: no dips
+    NotifyBench b; daily(b.s); b.s.boardValid = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2; b.s.follows9v = false;
+    b.s.run(60); CHECK(b.s.icl == 3000 && b.s.st.hv == PIANO_CHG_HV_BLOCKED);
+    b.steady = 3000; b.counting = true;
+    for (unsigned i = 0; i < 6; ++i) b.cycle();
+    CHECK(b.lowRequests == 0 && b.iclWrites == 0 && b.s.icl == 3000);
+  }
+}
+
 int main()
 {
   testT14FiveVoltMax();
+  testT14NotifyCycle();
   testDailyFiveVoltBudget();
   testBootRampRetry();
   testContractSession();
