@@ -152,6 +152,10 @@ int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t v
         return bytes == 4 && m->pps_allowed && mv == 9000 && ma >= 500 && ma <= 3000;
     }
     case PIANO_MCA_INPUT_SUSPEND: return 0;   /* the built-in policy's opt-in only */
+    case PIANO_MCA_FCC:
+        if (m->fcc_fast) return bytes == 4 && value >= 100 && value <= PIANO_MCA_FCC_FAST;
+        return piano_mca_write_allowed(property, value, bytes);
+    case PIANO_MCA_TERM_VOLT: return bytes == 4 && m->fv_hot && (value == PIANO_MCA_FV_DEFAULT || value == PIANO_MCA_FV_HOT);
     default: return piano_mca_write_allowed(property, value, bytes);
     }
 }
@@ -293,6 +297,12 @@ void piano_mca_use_external_policy(PianoMca *m, int stop, int pps, int qc3)
     m->stop_allowed = m->policy && stop;
     m->pps_allowed = m->policy && pps;
     m->qc3_allowed = m->policy && qc3;
+}
+
+void piano_mca_allow_fast(PianoMca *m, int fcc_fast, int fv_hot)
+{
+    m->fcc_fast = (uint8_t)(m->policy && m->external && fcc_fast);
+    m->fv_hot = (uint8_t)(m->policy && m->external && fv_hot);
 }
 
 void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma)

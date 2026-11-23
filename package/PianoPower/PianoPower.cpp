@@ -107,6 +107,7 @@ struct Args {
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
   uint32_t wdog, chgen, chgfix, chgwatch;
+  uint32_t hvOrder, hvCaps, qc, fvHot;   // charge/pd1 (charging-policy.md §21), each 0 by default
   bool hasRtcOffset;
   bool ponHistory;
   uint32_t rtcOffset;
@@ -139,6 +140,12 @@ void readArgs()
   // policy + observer: a PD sink snapshot takes its source list from the charger firmware (0x21011) when the PPM offers no PDO
   // details (this tablet's UCSI 1.1 PPM: bmOptionalFeatures 0); without it no PD source ever gets a contract (ChargeContract.h)
   gArgs.pdoMca = bootArg("piano-power-pdo-mca", 0);
+  // charge/pd1, the Ubuntu port's buck fast-charge set in the strict session (policy=1), each off by default (the daily 5 V path):
+  // the other 9 V object when the mode's own is missing, the stock 9 V rows, QC2/QC3 9 V, and the 48 degC warm float with its hold
+  gArgs.hvOrder = bootArg("piano-power-hv-order", 0) == 1;
+  gArgs.hvCaps = bootArg("piano-power-hv-caps", 0) == 1;
+  gArgs.qc = bootArg("piano-power-qc", 0) == 1;
+  gArgs.fvHot = bootArg("piano-power-fv-hot", 0) == 1;
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -554,6 +561,15 @@ bool PianoPower::start(IOService *provider)
              ? "a PD sink status without UCSI source PDOs takes the charger firmware's source list (0x21011, PD state SNK_Ready, "
                "vSafe5V first, fixed ascending before PPS) with a second agreeing status read; RDO, opmode and role stay UCSI's"
              : "a PD contract needs UCSI source PDOs (this PPM offers none: PD sources stay without a contract)");
+    note("charge/pd1: piano-power-hv-order=%u piano-power-hv-caps=%u piano-power-qc=%u piano-power-fv-hot=%u: %s%s%s%s "
+         "[PianoFastChargeV1]", gArgs.hvOrder, gArgs.hvCaps, gArgs.qc, gArgs.fvHot,
+         gArgs.hvOrder ? "mode 1 takes a PPS APDO covering 9 V when the source has no fixed 9 V PDO (mode 2 the fixed PDO when it has "
+                         "no such APDO); " : "",
+         gArgs.hvCaps ? "at a validated 9 V contract the stock rows (fixed PD 1600 / 3000 mA, PPS 2500 / 3500, QC3 1600 / 3500, QC2 "
+                        "1200 / 2600; charge current at most twice the input limit; within the RDO and the object); " : "",
+         gArgs.qc ? "QC2/QC3 sources (type 5-8, a fresh non-PD UCSI status) asked for 9 V through 0x2011 behind the same barrier and "
+                    "gates, 0x2011 = 5000 on any loss; " : "",
+         gArgs.fvHot ? "float 4060 mV from 48 C (below 46 C back to 4400) and charging held at that float; " : "");
   }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
@@ -720,7 +736,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("SafetyReobserved", fAlerts.retried); n("SafetyReobserveValid", fAlerts.retryValid); n("SafetyRereads", fAlerts.rereads);
   n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
   n("RequestedICL", p.icl_ma); n("AppliedICL", s.icl_set); n("ICLReadback", uint32_t(x.icl_ma)); n("AICL", uint32_t(x.aicl_ma));
-  n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FVTarget", 4400); n("FVValid", fvValid); n("FVRaw", uint32_t(x.fv_raw)); n("FV", fvMv);
+  n("RequestedFCC", p.fcc_ma); n("AppliedFCC", s.fcc_set); n("FCCReadbackValid", 0); n("FVTarget", p.fv_mv ? p.fv_mv : 4400); n("FVValid", fvValid); n("FVRaw", uint32_t(x.fv_raw)); n("FV", fvMv);
   n("HealthEnabled", fLink.cfg.limit); n("HealthStop", fLink.cfg.stop_pct); n("HealthResume", fLink.cfg.resume_pct);
   n("Mode", fLink.cfg.hv); n("HealthHold", s.hold); n("HealthDesired", p.charge); n("HealthPending", !applied);
   n("HealthApplied", applied); n("HealthReason", p.why_off); n("EnableReadback", uint32_t(enabled));
@@ -745,7 +761,25 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
     char key[32]; snprintf(key, sizeof key, "Board%uAgeMs", i); n(key, board ? board->age_ms[i] : ~0u);
   }
   n("BoardValid", board ? board->valid : 0);
+  // the charge indicator (charge/pd1; the Ubuntu port's top bar: path, request, input and net battery power)
+  const int path = piano_charge_path(&s, &p, &x);
+  const int32_t inMw = (x.valid & PIANO_CHG_IN_BUS) && (x.valid & PIANO_CHG_IN_IBUS) && x.bus_mv >= 4000 ?
+                       int32_t(int64_t(x.bus_mv) * x.ibus_ma / 1000) : 0;
+  int32_t batMw = 0;
+  for (unsigned i = 0; i < 2; ++i)
+    if (fPack[i].ok) batMw += int32_t(int64_t(fPack[i].voltageMv) * fPack[i].currentMa / 1000);
+  n("ChargePath", uint32_t(path)); n("HV", s.hv); n("HVPPS", s.hv_pps); n("HVQC", s.hv_qc); n("HVBudgetMA", s.hv_ma);
+  n("InputMW", uint32_t(inMw)); n("BatteryMW", uint32_t(batMw)); n("TermHot", s.term_hot); n("FVHold", s.fv_hold);
+  n("FastOptions", (fLink.cfg.hv_order ? 1u : 0u) | (fLink.cfg.hv_caps ? 2u : 0u) | (fLink.cfg.qc ? 4u : 0u) |
+                   (fLink.cfg.fv_hot ? 8u : 0u));
+  {
+    OSString *name = OSString::withCString(piano_charge_path_name(path));
+    if (name) {d->setObject("ChargePathName", name); name->release();}
+  }
   setProperty("PianoCharge", d); d->release();
+  note("buck-fast: seq=%u path=%s hv=%u pps=%u qc=%u budget=%u icl=%u fcc=%u in=%d mW battery=%d mW fv=%u hot=%u hold=%u fallback=%u "
+       "[PianoFastChargeV1]", fStatusSeq, piano_charge_path_name(path), s.hv, s.hv_pps, s.hv_qc, s.hv_ma, p.icl_ma, p.fcc_ma, inMw,
+       batMw, p.fv_mv ? p.fv_mv : 4400u, s.term_hot, s.fv_hold, p.fallback);
   note("buck: seq=%u gen=%u link=%u raw=%d effective=%d valid=%u connector=%u sink=%u pd=%u", fStatusSeq, c.generation,
        fMca.links, piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1, x.type, c.valid, c.connector, c.sink, c.pd);
   note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s stage=%u inflight=%u quarantine=%u cci=%#x cmd=%#llx control=%#llx",
@@ -1411,6 +1445,10 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     real.ok = real.pd = true;
     real.mv = fContract.mv;
     real.ma = fContract.ma;
+  } else if (fPolicyOn && fLink.st.hv_qc && fLink.st.hv == PIANO_CHG_HV_ON && fLink.st.icl_set) {
+    real.ok = true;   // cfg.qc at 9 V: the source's 9 V at the input limit in force (QC has no contract to show)
+    real.mv = 9000;
+    real.ma = int32_t(fLink.st.icl_set);
   }
   clock_sec_t sec = 0;
   clock_usec_t usec = 0;
@@ -1625,6 +1663,10 @@ void PianoPower::startCharger()
     o.stopPct = gArgs.healthStop;
     o.resumePct = gArgs.healthResume;
     o.kick = gArgs.kick != 0;
+    o.hvOrder = gArgs.hvOrder != 0;
+    o.hvCaps = gArgs.hvCaps != 0;
+    o.qc = gArgs.qc != 0;
+    o.fvHot = gArgs.fvHot != 0;
     fLink.configure(fMca, o);
     if (fLink.healthRefused)
       note("policy: piano-power-health-stop=%u / -resume=%u refused (stop 50..100, resume 40..stop - 1): battery health stays off",

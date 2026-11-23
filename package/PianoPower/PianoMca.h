@@ -159,6 +159,9 @@ typedef struct {
     uint8_t pdo_clamp;               /* piano-power-pdo-mca: a source object above 5 A (within its PD field) reads as 5 A */
     uint8_t board_allowed, board_done, board_tries;   /* the board configuration: bit 0 CP state, 1 OTG, 2 CID */
     uint8_t icl_tries, fcc_tries, enable_tries;
+    /* external, charge/pd1: fcc_fast admits the charge current up to 3500 mA (piano-power-hv-caps: the stock 9 V rows), fv_hot the
+     * float voltage 0x2007 = 4400 or 4060 mV (piano-power-fv-hot: the warm row); both 0 by default */
+    uint8_t fcc_fast, fv_hot;
     uint32_t icl_want, fcc_want;     /* what the last cycle wanted (tries restart when it changes) */
     uint32_t icl_set, fcc_set;       /* what the firmware took since its start (0: nothing yet) */
     int32_t ext_tbat_c;              /* the gauges' temperature, from the owner */
@@ -194,6 +197,12 @@ void piano_mca_allow_ucsi(PianoMca *m, int allow);
 /* The source list (0x21011) as the PD source contract's firmware list (piano-power-pdo-mca): an object's current above 5 A but
  * within its PD field (fixed 10.23 A, PPS 6.35 A) is taken as 5 A instead of discarding the whole list; nothing else changes. */
 void piano_mca_clamp_pdos(PianoMca *m, int on);
+/* External policy (charge/pd1): the charge current up to PIANO_MCA_FCC_FAST (fcc_fast) and the float voltage 4400 / 4060 mV
+ * (fv_hot); both refused otherwise, as before. */
+#define PIANO_MCA_FCC_FAST 3500u
+#define PIANO_MCA_FV_DEFAULT 4400u
+#define PIANO_MCA_FV_HOT 4060u
+void piano_mca_allow_fast(PianoMca *m, int fcc_fast, int fv_hot);
 /* A message from the channel (any of the three owners); returns a Mca* result. */
 int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length);
 /* The owner's timer gave up on the request (or the port request) in flight. */

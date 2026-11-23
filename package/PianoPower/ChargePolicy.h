@@ -112,6 +112,18 @@ typedef struct {
     uint8_t admin_stop;    /* explicit administrator inhibit; owner bounds its lease, never a synthetic SOC */
     uint8_t kick;          /* the charging restart (piano-power-kick, docs §17): a charger that keeps the battery at 0 mA with input to
                             * spare gets 0x2003 = 0 and then 1 (at most three times per attach, two minutes apart) */
+    /* The Ubuntu port's buck fast-charge set in the strict session (charge/pd1, docs/drivers/charging-policy.md §21), each off by
+     * default (the daily 5 V path), each only ever inside the existing contract, barrier, thermal and battery-health gates: */
+    uint8_t hv_order;      /* piano-power-hv-order: the source's other 9 V object when the mode's own is missing (mode 1: fixed 9 V
+                            * PDO, else a PPS APDO covering 9 V; mode 2: the APDO, else the fixed PDO), as the Ubuntu port orders them */
+    uint8_t hv_caps;       /* piano-power-hv-caps: at a validated 9 V contract the stock 9 V rows instead of the stage A ceilings
+                            * (fixed PD in 1600 / charge 3000, PPS 2500 / 3500, QC3 1600 / 3500, QC2 1200 / 2600 mA; the charge current
+                            * also at most twice the input limit), always within the RDO and the source object */
+    uint8_t qc;            /* piano-power-qc: QC2/QC3 9 V (0x2011) in the strict session: a firmware type 5-8, a fresh UCSI status
+                            * of a connected non-PD sink, the PD session's own gates and barrier; 5 V again (0x2011 = 5000) on any loss */
+    uint8_t fv_hot;        /* piano-power-fv-hot: the warm-cell float voltage in the strict session: 4060 mV from 48 degC (the
+                            * warmest reading) until below 46, the firmware's 4400 otherwise, and charging held while the higher pack
+                            * is within 5 mV of that float (released 150 mV below) */
 } PianoChargeConfig;
 
 /* writes on, hv off, float off, limit off (80/75 kept for when it is turned on), sleep stop, the stage A ceilings, no steps, the
@@ -136,6 +148,7 @@ enum {
     PIANO_CHG_IN_CONTRACT = 1u << 16, PIANO_CHG_IN_SOURCE = 1u << 17,
     PIANO_CHG_IN_AICL = 1u << 15,   /* 0x2029, the input current the firmware holds itself to (it walks to the request, and on the Mac's
                                      * port stopped at 1750-1800 under 2000) */
+    PIANO_CHG_IN_NONPD = 1u << 18,  /* a fresh UCSI status of a connected sink whose operation mode is not PD (cfg.qc's evidence) */
 };
 enum {PIANO_CHG_SAFE_BOARD = 1u, PIANO_CHG_SAFE_CP_OFF = 2u, PIANO_CHG_SAFE_LPD_DRY = 4u,
       PIANO_CHG_SAFE_DTPT = 8u, PIANO_CHG_SAFE_ALL = 15u};
@@ -223,8 +236,8 @@ typedef struct {
     uint64_t contract_notify_since;
     uint32_t transition_ma;
     uint8_t handover_fault;       /* refusal/timeout is not successful hardware handover */
-    /* the float voltage */
-    uint8_t term_hot;
+    /* the float voltage; fv_hold: cfg.fv_hot's hold at the warm float (the higher pack within 5 mV of 4060) */
+    uint8_t term_hot, fv_hold;
     /* the firmware losing a source the PMIC still sees (#18) */
     uint8_t wedge_checks, wedge_resyncs, wedge_reported;
     uint64_t wedge_since_ms;
@@ -309,7 +322,8 @@ enum {
     PIANO_CHG_KICK_EV_ABANDONED = 1u << 5, /* a write of the restart not answered within a minute: left to the enable's own rules */
 };
 enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP,
-      PIANO_CHG_OFF_ADMIN, PIANO_CHG_OFF_STALE, PIANO_CHG_OFF_FAULT, PIANO_CHG_OFF_FIRMWARE};
+      PIANO_CHG_OFF_ADMIN, PIANO_CHG_OFF_STALE, PIANO_CHG_OFF_FAULT, PIANO_CHG_OFF_FIRMWARE,
+      PIANO_CHG_OFF_WARM_FV};   /* cfg.fv_hot: 48 degC or more and the higher pack at the 4060 mV warm float */
 /* where the input limit came from (plan.icl_why) */
 enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR,
       PIANO_CHG_ICL_CONTRACT_5V};
@@ -372,6 +386,16 @@ uint32_t piano_charge_ramp_back(uint32_t from_ma, uint32_t row_ma);
 uint32_t piano_charge_icl_max(const PianoChargeConfig *c);
 uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma);   /* 0: no 9 V row for the class */
 uint32_t piano_charge_icl_qc3_9v(uint32_t source_ma);        /* HVDCP3 input row, capped at 1600 mA */
+/* cfg.qc: a QC type (HVDCP 5, HVDCP3 6, 3B 7, 3.5 8); its 9 V input row (QC2 1200, QC3 1600) and charge row with cfg.hv_caps (QC2
+ * 2600, QC3 3500); 0 for any other type. */
+int piano_charge_is_qc(int32_t type);
+uint32_t piano_charge_qc_icl_9v(int32_t type);
+uint32_t piano_charge_qc_fcc_9v(int32_t type);
+/* What the session runs on, for the registry and the log (the charge indicator): PIANO_CHG_PATH_*. */
+enum {PIANO_CHG_PATH_NONE = 0, PIANO_CHG_PATH_USB_5V, PIANO_CHG_PATH_PD_5V, PIANO_CHG_PATH_PD_9V, PIANO_CHG_PATH_PPS_9V,
+      PIANO_CHG_PATH_QC_9V, PIANO_CHG_PATH_ASKING};
+int piano_charge_path(const PianoChargeState *s, const PianoChargePlan *p, const PianoChargeInput *in);
+const char *piano_charge_path_name(int path);
 uint32_t piano_charge_fcc_full(int cls, int hv_on);
 uint32_t piano_charge_fcc_thermal(uint32_t full, int t_valid, int32_t t_c);
 /* The lowest current among the PDOs and APDOs whose range covers 5 V, 0 when none. */
