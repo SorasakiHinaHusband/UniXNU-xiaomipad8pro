@@ -247,13 +247,17 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
         output_bits<32 || output_bits>48 || vm->poisoned() || submit->poisoned() ||
         ring->poisoned() || objects<NativeAdrenoClientMinObjects || objects>NativeAdrenoClientMaxObjects ||
         (objects&(objects-1)))return kIOReturnBadArgument;
-    entries_=IONewData(Entry,objects);
+    /* UniXNU-piano (2026-11-23, GPU-PAGED P1c, private P1-GATE.md section 8): the connection's tables from kmem's shared data range
+     * (NativeAdrenoNewMeta), as the GPU's other metadata since gpu/daily3c: on RAM boots the private range also carries the volatile
+     * Data disk, and gpu-p1b's holders' opens failed with NoMemory once its chunks had taken the range (NativeRamBlock: 65 chunk
+     * failures before the first refused open). */
+    entries_=NativeAdrenoNewMeta(Entry,objects);
     if(!entries_)return kIOReturnNoMemory;
     memset(static_cast<void *>(entries_),0,sizeof(Entry)*objects);
-    fifo_=IONewData(uint32_t,objects);
+    fifo_=NativeAdrenoNewMeta(uint32_t,objects);
     if(!fifo_ || !index_.allocate(objects)) {
-        if(fifo_)IODeleteData(fifo_,uint32_t,objects);
-        IODeleteData(entries_,Entry,objects);
+        if(fifo_)NativeAdrenoDeleteMeta(fifo_,uint32_t,objects);
+        NativeAdrenoDeleteMeta(entries_,Entry,objects);
         entries_=nullptr;fifo_=nullptr;
         return kIOReturnNoMemory;
     }
@@ -302,7 +306,7 @@ IOReturn NativeAdrenoUserClient::close()
     if(!open_)return kIOReturnNotReady;
     if(liveObjects() || ownRangeOutstanding())return kIOReturnBusy;
     for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(queues_[i].active)return kIOReturnBusy;
-    IODeleteData(entries_,Entry,entry_count_);IODeleteData(fifo_,uint32_t,entry_count_);entry_count_=0;index_.release();
+    NativeAdrenoDeleteMeta(entries_,Entry,entry_count_);NativeAdrenoDeleteMeta(fifo_,uint32_t,entry_count_);entry_count_=0;index_.release();
     fifo_head_=fifo_count_=fresh_=0;
     queue_base_=0;scoped_=used_=false;window_start_=window_bytes_=window_peak_=0;scanout_={};retry_fence_=0;
     keep_objects_=keep_spans_=keep_pool_=0;source_=NativeAdrenoRingSourceExternal;
