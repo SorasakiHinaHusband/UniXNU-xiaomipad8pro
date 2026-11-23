@@ -1135,3 +1135,24 @@ is the pump's source budget). The registry's `PianoCharge` now also carries the 
 (USB 5 V, PD 5 V, PD 9 V, PPS 9 V, QC 9 V, asking 9 V), `InputMW`, `BatteryMW`, `HV`, `HVPPS`, `HVQC`, `HVBudgetMA`, `TermHot`,
 `FVHold`, `FastOptions` (bits 1 order, 2 caps, 4 qc, 8 fv-hot) and the real `FVTarget`; one `buck-fast:` line per report
 (`[PianoFastChargeV1]`). Host test: `tests/fastcharge_host.cpp`.
+
+## 22. T-14: at 5 V the source's advertised current, at most 3 A, also with a 9 V mode (2026-11-23; built and host-tested, not run)
+
+Owner 2026-11-23 18:45/18:47: at 5 V as much input current as the source advertises (Type-C Rp 1.5 / 3.0 A, or the PD 5 V
+contract), at most 3 A; never above the advertisement; the USB default keeps the class row.
+
+- **Non-PD sources:** unchanged. §15's steps already go to the Rp current within `piano-power-rp-max` (3000), in the daily profile
+  since 2026-11-12. Confirmed on the tablet: 500 -> 3000 on the Mac's port.
+- **PD sources at 5 V:** the 5 V contract budget (the RDO's operating current, the same guarded steps and connector rule, at most
+  3000) applied only with `hv` = 0. It now also applies with `hv` 1/2 once the session is settled at 5 V: the 9 V request asked
+  and not reached (BLOCKED, 5 V until a detach), no 9 V object (fallback SOURCE), or the health stop (HEALTH).
+  - Before a 9 V request, while one is asked or in force, and while the session is held off for a reason that may clear (SAFETY
+    with the session OFF), the row stays: the barrier never has to undo a step.
+  - `ChargePolicy.c` `hv_settled_5v`, `contract_5v_budget`.
+- **Fixed on the way:** after a 9 V request that was not reached, the BLOCKED session never recomputed its transition, so the
+  barrier's 500 mA stayed in force for the rest of the attach, below the 5 V row. strict_hv's BLOCKED branch now recomputes it
+  once the 5 V withdrawal is confirmed.
+- **Unchanged:** the allowlists (<= 3000 already), the FCC ceilings (stage A 1500 at 5 V), the 9 V rows, the 80/75 policy, the
+  thermal derating, the board holds, sleep (the row), detach (100 mA back, the steps from the row), the ADSP lifecycle. There is no
+  new boot argument.
+- **Tests:** `tests/policy_host.cpp` testT14FiveVoltMax. Analysis: the private note T14-ICL.md (charging lane).
