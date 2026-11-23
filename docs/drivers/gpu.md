@@ -525,3 +525,20 @@ separate from WORK queue residence and service costs.
 In R3b with exit-test mode off, `piano-gpu-dcvs-min=607` selects the sustained-residency qualification. The request
 floor follows the effective guard ceiling, including the initial 342 MHz cap. Its absolute 625-second permit includes
 time for the four guarded up-steps and at least 600 seconds of acknowledged level-7 residency when conditions allow.
+
+### Docked skin table, the binding limit and the Android-curve default (gpu/throttle1, 2026-11-24)
+
+- **Android-curve preset** (`package/include/PianoGpuAndroidPreset.h`): with `piano-gpu` >= 2 and none of the 15 GPU qualification
+  arguments on the command line (`piano-gpu-r3b`, `-daily`, `-fullopp`, `-governor`, `-profile`, `-speedbin`, `-dcvs`, `-maxlevel`,
+  `-dcvs-max`, `-dcvs-min`, `-acd`, `-hfi`, `-rails`, `-ddr`, `-ddr-floor`) they read as the installed line gives them (R3b daily
+  guard, bin-2 curve 222..1100 MHz, ACD, KGSL-style governor). One given argument turns the whole preset off (a test image is never a
+  mix); `piano-gpu-android-curve=0` turns it off. PianoPolicy reads the same preset for the GPU maximum Power Saver's 342 MHz acts on.
+- **Skin table** (`piano-gpu-skin-table`, default 1; root `machdep.piano_gpu_skin_table`, fullopp only): 1 = docked, one GMU level
+  per 2 C band of the virtual skin: 1050 MHz from 35 C (clear < 33), 967 from 45 (< 43), 900 from 47 (< 45), 832 from 49 (< 47), 734
+  from 51 (< 49), 607 from 53 (< 51), 525 from 55 (< 53); 0 = Android's normal scene (1050 from 25 C, 734 from 45 C). Both: no usable
+  reading and XO >= 78 C cap 734, the die ladder (95 / 90 C), the guard exit (raw 100 C, XO 90 C) and the unsafe exit (105 C).
+- **Binding limit** (`adreno830/A830Bind.h`): the LV line ends with `bind=` (lpm, thermal, sweep, top, ladder, skin25, skin45, skinband,
+  xo, skin-unknown, hard, startup, permit, knob, boostcap), `why=` (`demand` when the governor votes below the cap) and `tab=`; its
+  `cap=` is `A830Dcvs::ceiling()` (it could not exceed 7 before). `machdep.piano_gpu_state` (read only, once a second): `at_us lvl mhz
+  cap cap_mhz why bind want table band step ext skin_dC skin_ok raw_dC filt_dC xo_dC latched high`.
+- Analysis and the Android / Ubuntu / docked comparison: private host-check `20261124-gpu-throttle` (ANALYSIS.md, TABLE.md).
