@@ -41,6 +41,8 @@ struct Bench {
   uint32_t mca[7][3] = {};
   unsigned mcaN = 0;
   bool mippsPending = false, cpFirst = false;   // charge/mipps2 ladder inputs (PianoPower's LinkView)
+  int32_t type = PIANO_CHG_T_PD;  // the firmware's real type (0x2000c) of a PD source (cp-first2: 11, PD PPS, after MiPPS)
+  int32_t verify = 0;             // 0x21002 (1 while MiPPS runs)
   std::vector<uint8_t> ladders;   // the ladder stages seen, in order (changes only)
   unsigned statusReads = 0, pdoQueries = 0, voltageRequests = 0;
   unsigned wrongObject = 0;       // the firmware confirms 9 V on this object instead of the one asked for
@@ -66,8 +68,8 @@ struct Bench {
   void fill() {
     auto put = [&](int field, int32_t value) {m.valid |= 1u << field; m.value[field] = value;};
     put(McaBusVoltage, int32_t(bus * 1000)); put(McaBusCurrent, int32_t(icl * 1000));
-    put(McaType, pd ? PIANO_CHG_T_PD : PIANO_CHG_T_SDP); put(McaIcl, int32_t(icl)); put(McaChargeEnable, int32_t(enable));
-    put(McaTermVolt, 5200); put(McaVerify, 0); put(McaTbat, 30); put(McaPdState, fwReady && pd ? 2 : 1); put(McaLpd, 0);
+    put(McaType, pd ? type : PIANO_CHG_T_SDP); put(McaIcl, int32_t(icl)); put(McaChargeEnable, int32_t(enable));
+    put(McaTermVolt, 5200); put(McaVerify, verify); put(McaTbat, 30); put(McaPdState, fwReady && pd ? 2 : 1); put(McaLpd, 0);
     if (mcaPdos && pd) {
       const unsigned n = mcaOwn ? mcaN : fwN;
       put(McaPdos, int32_t(n)); m.pdos = uint8_t(n);
@@ -459,6 +461,52 @@ static void mippsVendorObject() {
   }
 }
 
+// cp-first2 (2026-11-24 22:06-22:2x, RAM y12f3, stock Xiaomi charger), replayed: a valid 5 V / 3 A contract on the 2-object list
+// (RDO object 1), MiPPS at 5 V (Ladder 3, 0x21002 = 1), MiPPS done; then the firmware's own RDO 0x7301f441 (object 7, PPS layout),
+// raw type 11 and a 4-entry 0x21011 list. The tablet logged `error=6 fresh PD status/invalid RDO ... obj=7 unmapped=0 mca_pdos=4`
+// with ICL 100 / FCC 500 at a 5.0 V bus. By elimination of ChargeLink's conjuncts (fresh PD sink status, invalid RDO, a list read,
+// object 7 > 4) the list's first slot was not a 5000/5000 object: 0x21011 is not the source's object list by position. The lists
+// below are such lists (the tablet's exact contents were not captured: the console lost 327-632 s). Ubuntu's 5 V PD input
+// (xiaomi_mca_5v_input / xiaomi_mca_pd_5v_ma) takes a 5000/5000 entry at any slot, else 500 mA, never gated on the RDO.
+static void cpFirst2Replay() {
+  struct Case {uint32_t list[4][3]; uint32_t icl;};
+  const Case cases[] = {
+      // control: vSafe5V at slot 1 (in source order): unmapped already on a8ff8e74, so this is not what the tablet held
+      {{{5000, 5000, 3000}, {9000, 9000, 3000}, {3300, 11000, 5000}, {3300, 21000, 3250}}, 1500},
+      {{{3300, 11000, 5000}, {5000, 5000, 3000}, {9000, 9000, 3000}, {3300, 21000, 3250}}, 1500},   // APDO first, vSafe5V at slot 2
+      {{{9000, 9000, 3000}, {5000, 5000, 3000}, {12000, 12000, 2250}, {3300, 11000, 5000}}, 1500},  // not in source order
+      {{{3300, 11000, 5000}, {3300, 21000, 3250}, {9000, 9000, 3000}, {12000, 12000, 2250}}, 500},  // no vSafe5V: Ubuntu's 500
+  };
+  for (const Case &k : cases) {
+    Bench b(true, 1, true);
+    b.fw[1][2] = 3000; b.fw[2][0] = b.fw[2][1] = b.fw[2][2] = 0; b.fwN = 2; b.mcaPdos = true; b.rdo = fixedRdo(1, 3000);
+    // 1. the valid 5 V / 3 A contract, MiPPS pending (the ladder holds 9 V), then MiPPS running (0x21002 = 1)
+    b.mippsPending = true;
+    for (unsigned i = 0; i < 4; ++i) b.tick();
+    CHECK(b.contract.valid && b.contract.object == 1 && b.contract.mv == 5000 && b.link.st.ladder == PIANO_CHG_LAD_MIPPS);
+    b.verify = 1;
+    for (unsigned i = 0; i < 2; ++i) b.tick();
+    CHECK(!b.voltageRequests && b.bus == 5000);
+    // 2. MiPPS done (MiPPSState 3, MiPPSActive 0)
+    b.mippsPending = false; b.verify = 0;
+    // 3. the firmware's vendor-object RDO, raw type 11 and the 4-entry list (the offer sees the same list)
+    b.rdo = kVendorRdo7; b.type = PIANO_CHG_T_PPS;
+    for (unsigned i = 0; i < 7; ++i) for (unsigned j = 0; j < 3; ++j) b.fw[i][j] = i < 4 ? k.list[i][j] : 0;
+    b.fwN = 4;
+    for (unsigned i = 0; i < 16; ++i) b.tick();
+    // the tablet's line: error 6, fresh PD status, object 7, the codec holding 4 entries
+    CHECK(b.contract.status_valid && b.contract.pd && !b.contract.valid && b.contract.last_error == PIANO_CONTRACT_RDO);
+    CHECK(((b.contract.rdo >> 28) & 15u) == 7 && b.m.pdos == 4 && !(b.link.in.valid & PIANO_CHG_IN_CONTRACT));
+    // the fix: the vendor object is unmapped (no 100 mA), never a contract: no 9 V, no PPS word, the bus stays at 5 V
+    CHECK((b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.link.in.rdo_object == 7);
+    CHECK(b.icl == k.icl && b.link.plan.icl_ma == k.icl);
+    if (b.icl != k.icl) std::printf("  cp-first2 replay: icl=%u fcc=%u (want %u)\n", b.icl, b.fcc, k.icl);
+    CHECK(b.fcc > 500 || k.icl == 500);
+    CHECK(!b.voltageRequests && b.bus == 5000 && !b.wrote(PIANO_CHG_PD_FIXED, 9000) && !b.count(PIANO_CHG_PPS));
+    CHECK(b.link.st.ladder == PIANO_CHG_LAD_5V);
+  }
+}
+
 // charge/mipps2: the charging ladder in the Ubuntu port's order (UBUNTU-COMPARE.md section 4): 5 V, MiPPS at 5 V, then the pump from
 // 5 V when it would start, else the buck's 9 V on an object the latest 0x21011 list advertises, confirmed by the contract's object.
 static bool seen(const std::vector<uint8_t> &v, std::initializer_list<uint8_t> order) {
@@ -545,6 +593,7 @@ static void ladderOrder() {
 int main() {
   ladderOrder();
   mippsVendorObject();
+  cpFirst2Replay();
   codecList();
   baselineWithoutFallback();
   fixedNineThenPps();
