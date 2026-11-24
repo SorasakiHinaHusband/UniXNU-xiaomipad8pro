@@ -9,6 +9,7 @@
 #include "ChargeContract.h"
 #include "ChargeLink.h"
 #include "GaugeAlerts.h"
+#include "ChargePumpSession.h"
 #include <cstdio>
 #include <vector>
 using namespace pianopower;
@@ -33,6 +34,7 @@ struct Bench {
   unsigned fwN = 3;
   unsigned features = 0;          // the PPM's bmOptionalFeatures (16: GET_PDOS)
   bool pd = true, connected = true, fwReady = true;
+  bool mcaPdos = false;           // ChargeLink also sees the cycle's 0x21011 list itself (position true), as on the tablet
   unsigned statusReads = 0, pdoQueries = 0, voltageRequests = 0;
   int flipRdoAfterStatus = -1;    // change the RDO after this many status reads (Verify disagreement)
   std::vector<PianoChargeWrite> writes;
@@ -57,6 +59,10 @@ struct Bench {
     put(McaBusVoltage, int32_t(bus * 1000)); put(McaBusCurrent, int32_t(icl * 1000));
     put(McaType, pd ? PIANO_CHG_T_PD : PIANO_CHG_T_SDP); put(McaIcl, int32_t(icl)); put(McaChargeEnable, int32_t(enable));
     put(McaTermVolt, 5200); put(McaVerify, 0); put(McaTbat, 30); put(McaPdState, fwReady && pd ? 2 : 1); put(McaLpd, 0);
+    if (mcaPdos && pd) {
+      put(McaPdos, int32_t(fwN)); m.pdos = uint8_t(fwN);
+      for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) m.pdo[i][k] = i < fwN ? fw[i][k] : 0;
+    }
     LinkView v; v.nowMs = now; v.chargerPdUp = true; v.chargerPdUpMs = 1;
     v.contract = &contract; v.safetyFresh = true; v.cpOff = true; v.dtptValid = alerts.complete(); v.dtpt = alerts.active();
     v.packs = packs; v.packsFresh = true; v.packsMs = now; v.board = &board;
@@ -345,7 +351,61 @@ static void codecList() {
   }
 }
 
+// cp-first1 (2026-11-24 13:10, RAM y12d + piano-power-cp=1 piano-power-mipps=1, the stock Xiaomi charger; MIPPS-RDO.md): after the
+// MiPPS exchange the firmware's own PD engine re-requests the verified adapter's vendor object at 5 V, RDO 0x7301f441 (object 7,
+// PPS-format 5000 mV / 3250 mA) or 0x53026e3c (object 5), while the source list the policy holds has 2 objects. Before
+// charge/mipps2: ContractError 6 (fresh PD status/invalid RDO) and the PD clamp held the input at 100 mA for the whole attach.
+static constexpr uint32_t kVendorRdo7 = 0x7301f441u, kVendorRdo5 = 0x53026e3cu;
+static void mippsVendorObject() {
+  // (a) the list as seen (5 V 3 A, 9 V 3 A) and the object-7 RDO at a 5 V bus: the vendor object is unmapped, not invalid
+  for (uint32_t r : {kVendorRdo7, kVendorRdo5}) {
+    Bench b(true, 1, true);
+    b.fw[1][2] = 3000; b.fw[2][0] = b.fw[2][1] = b.fw[2][2] = 0; b.fwN = 2; b.mcaPdos = true; b.rdo = r;
+    for (unsigned i = 0; i < 16; ++i) b.tick();
+    CHECK(b.contract.status_valid && b.contract.pd && !b.contract.valid && b.contract.last_error == PIANO_CONTRACT_RDO);
+    CHECK(b.contract.rdo == r);
+    CHECK(!(b.link.in.valid & PIANO_CHG_IN_CONTRACT));                       // never a contract: no 9 V, no PPS, no pump
+    CHECK((b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.link.in.rdo_object == (r >> 28));
+    CHECK(!b.voltageRequests && b.bus == 5000);
+    CHECK(b.icl == 1500 && b.link.plan.icl_why == PIANO_CHG_ICL_ROW);       // the vSafe5V row (Ubuntu: min(vSafe5V, 3000)), not 100
+    CHECK(b.fcc <= 1500);
+    // the same RDO with the bus above the 5 V window: no budget of an unknown voltage
+    b.bus = 6220;
+    for (unsigned i = 0; i < 4; ++i) {b.tick(); b.bus = b.bus == 5000 ? 5000 : 6220; b.rdo = r;}
+    CHECK(!b.wrote(PIANO_CHG_PD_FIXED, 9000) && !b.count(PIANO_CHG_PPS));
+  }
+  // (b) no list read at all (or a list without vSafe5V first): still the firmware's 100 mA
+  {
+    Bench b(true, 1, true); b.fwN = 2; b.rdo = kVendorRdo7;
+    for (unsigned i = 0; i < 12; ++i) b.tick();
+    CHECK(!(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.icl <= 100);
+  }
+  // (c) an RDO whose object IS in the list but does not fit it stays invalid (100 mA): only an object the list lacks is unmapped
+  {
+    Bench b(true, 1, true); b.mcaPdos = true; b.rdo = fixedRdo(2, 2500);
+    for (unsigned i = 0; i < 12; ++i) b.tick();
+    CHECK(!b.contract.valid && !(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.icl <= 100);
+  }
+  // (d) the firmware lists the vendor object at its own position (gaps kept): the RDO decodes as a PPS contract at 5 V
+  {
+    Bench b(true, 1, true);
+    const uint32_t list[7][3] = {{5000, 5000, 3000}, {9000, 9000, 3000}, {}, {}, {}, {}, {3300, 11000, 5000}};
+    for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) b.fw[i][k] = list[i][k];
+    b.fwN = 7; b.mcaPdos = true; b.rdo = kVendorRdo7;
+    for (unsigned i = 0; i < 16; ++i) b.tick();
+    CHECK(b.contract.valid && b.contract.object == 7 && b.contract.protocol == PIANO_CONTRACT_PPS);
+    CHECK(b.contract.mv == 5000 && b.contract.ma == 3250 && b.contract.pdos == 7 && !b.contract.offer_rejects);
+    CHECK(b.link.in.contract_protocol == PIANO_CONTRACT_PPS && !(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED));
+    CHECK(b.icl == 1500 && !b.voltageRequests && b.bus == 5000);
+    // the pump session's source view: a valid PPS contract and the 3.3-11 V APDO
+    PianoCpSys y{};
+    piano_charge_cp_sys(&b.link.cfg, &b.link.in, &b.link.st, &y);
+    CHECK(y.contract_valid && y.contract_pps && y.src_kind == PIANO_CPS_SRC_PPS && y.apdo_max_mv == 11000 && y.apdo_ma == 5000);
+  }
+}
+
 int main() {
+  mippsVendorObject();
   codecList();
   baselineWithoutFallback();
   fixedNineThenPps();
