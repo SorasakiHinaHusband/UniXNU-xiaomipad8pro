@@ -43,10 +43,32 @@ static BOOL family(id<MTLDevice> d, NSInteger f) { return gAsker ? gAsker(d, f) 
 
 static unsigned metallibCheck(id<MTLDevice> device, const char *path)
 {
-    NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+    NSData *bytes = [NSData dataWithContentsOfFile:@(path) options:NSDataReadingMappedIfSafe error:nil];
     if (!bytes) {
         printf("metallib: cannot read %s\n", path);
         return 1;
+    }
+    // A file that is no metallib (a browser's framework binary) is searched for the first metallib embedded in it ("MTLB", version
+    // 1.x, its size at offset 16): ANGLE's prebuilt internal shaders, as the browser hands them to newLibraryWithData:.
+    if (bytes.length < 24 || memcmp(bytes.bytes, "MTLB", 4)) {
+        const uint8_t *base = (const uint8_t *)bytes.bytes, *end = base + bytes.length;
+        const uint8_t *found = nullptr;
+        for (const uint8_t *p = base; p + 24 <= end; ++p)
+            if (p[0] == 'M' && p[1] == 'T' && p[2] == 'L' && p[3] == 'B' && p[4] == 1 && p[5] == 0x80) {
+                uint64_t size = 0;
+                memcpy(&size, p + 16, 8);
+                if (size >= 24 && size <= (uint64_t)(end - p)) {
+                    found = p;
+                    bytes = [bytes subdataWithRange:NSMakeRange(p - base, size)];
+                    break;
+                }
+            }
+        if (!found) {
+            printf("metallib: no embedded metallib in %s\n", path);
+            printf("gate angle-internal-shaders = FAIL (no metallib)\n");
+            return 1;
+        }
+        printf("metallib: %lu bytes at offset 0x%lx of %s\n", (unsigned long)bytes.length, (unsigned long)(found - base), path);
     }
     dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     NSError *error = nil;
