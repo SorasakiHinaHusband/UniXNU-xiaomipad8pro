@@ -179,6 +179,18 @@ class ChargeLink {
     if (v.contract && piano_contract_status_fresh(v.contract, v.nowMs) && v.contract->connected && v.contract->sink &&
         !v.contract->pd)
       x.valid |= PIANO_CHG_IN_NONPD;
+    // charge/mipps2: the RDO names an object the firmware's own list lacks (a verified MiPPS adapter's vendor object). Only with
+    // this cycle's list read (vSafe5V at position 1) and the slot beyond the list or empty in it; an object the list holds but the RDO
+    // does not fit stays an invalid RDO.
+    if (v.contract && piano_contract_status_fresh(v.contract, v.nowMs) && v.contract->connected && v.contract->sink &&
+        v.contract->pd && !v.contract->valid && v.contract->last_error == PIANO_CONTRACT_RDO && (x.valid & PIANO_CHG_IN_PDOS) &&
+        x.pdos && x.pdo[0][0] == 5000 && x.pdo[0][1] == 5000 && x.pdo[0][2] >= 100) {
+      const unsigned object = (v.contract->rdo >> 28) & 15u;
+      if (object >= 2 && object <= 7 && (object > x.pdos || (!x.pdo[object - 1][0] && !x.pdo[object - 1][1] && !x.pdo[object - 1][2]))) {
+        x.valid |= PIANO_CHG_IN_PD_UNMAPPED;
+        x.rdo_object = uint8_t(object);
+      }
+    }
     if (v.contract) x.contract_observing = v.contract->linked && !v.contract->quarantined &&
         v.contract->stage != PianoContractIdle &&
         (v.contract->last_error == PIANO_CONTRACT_OK || v.contract->last_error == PIANO_CONTRACT_CHANGED);

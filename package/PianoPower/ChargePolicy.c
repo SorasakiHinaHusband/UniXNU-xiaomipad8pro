@@ -820,6 +820,16 @@ static int strict_contract(const PianoChargeInput *in)
            in->contract_ma >= PIANO_CHG_ICL_DEFAULT && in->contract_ma <= 5000;
 }
 
+/* charge/mipps2 (MIPPS-RDO.md): the firmware re-requested a verified MiPPS adapter's vendor object, which its own source list does
+ * not hold (ChargeLink: PIANO_CHG_IN_PD_UNMAPPED), and the bus reads 5 V. The Ubuntu port's PD rule at 5 V applies there: the vSafe5V
+ * object's current within the class row (<= 1500), never the 100 mA of an unknown contract. It is no contract: no 9 V, no PPS, no
+ * pump, and above the 5 V window nothing changes. */
+static int pd_unmapped_5v(const PianoChargeInput *in)
+{
+    return (in->valid & PIANO_CHG_IN_PD_UNMAPPED) && !strict_contract(in) && (in->valid & PIANO_CHG_IN_BUS) &&
+           in->bus_mv >= ONLINE_MV && in->bus_mv < HV_5V_MAX_MV;
+}
+
 static int strict_barrier(const PianoChargeInput *in, const PianoChargeState *s)
 {
     const uint32_t ma = s->transition_ma ? s->transition_ma : 500;
@@ -1713,13 +1723,15 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
             const int contract = strict_contract(in);
             const uint32_t cap = p->icl_why == PIANO_CHG_ICL_CONTRACT_5V ? piano_charge_icl_max(c) :
                                  hv_on && hv_caps(c) ? PIANO_CHG_ICL_ABS_MAX : PIANO_CHG_ICL_CAP;
-            icl = contract ? umin(icl, umin(in->contract_ma, cap)) : PIANO_CHG_ICL_DEFAULT;
+            const int unmapped = !contract && !hv_on && pd_unmapped_5v(in);
+            icl = contract ? umin(icl, umin(in->contract_ma, cap)) :
+                  unmapped ? umin(icl, icl_at_5v(c, in, s, p, cls, 0)) : PIANO_CHG_ICL_DEFAULT;
         }
         if (s->contract_transition) icl = umin(icl, s->transition_ma);
         if (!gauge_fresh(in, now) || !t.valid) icl = umin(icl, PIANO_CHG_ICL_DEFAULT);
         const uint32_t live_safety = PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT;
         if ((in->safety & live_safety) != live_safety ||
-            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in))))
+            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in)) && !(!hv_on && pd_unmapped_5v(in))))
             icl = umin(icl, s->icl_set ? s->icl_set : PIANO_CHG_ICL_DEFAULT);
         p->transition = s->contract_transition;
     }
@@ -1760,7 +1772,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         const uint32_t live_safety = PIANO_CHG_SAFE_LPD_DRY | PIANO_CHG_SAFE_DTPT;
         if (s->contract_transition || !gauge_fresh(in, now) || !t.valid ||
             (in->safety & live_safety) != live_safety ||
-            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in))))
+            (is_pd(cls) && (!(in->valid & PIANO_CHG_IN_SOURCE) || !strict_contract(in)) && !(!hv_on && pd_unmapped_5v(in))))
             full = umin(full, s->fcc_set ? umin(s->fcc_set, PIANO_CHG_FCC_DEFAULT) : PIANO_CHG_FCC_DEFAULT);
     }
     const uint32_t fcc = fcc_target(s, full, &t, now);

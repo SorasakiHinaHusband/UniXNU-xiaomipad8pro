@@ -17,6 +17,8 @@ using namespace pianopower;
 static unsigned checks, failures;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; std::printf("FAIL line %u: %s\n", __LINE__, #x); } } while (0)
 
+// cp-first1's vendor-object RDOs (MIPPS-RDO.md): object 7 PPS-format 5000 mV / 3250 mA, object 5
+static constexpr uint32_t kVendorRdo7 = 0x7301f441u, kVendorRdo5 = 0x53026e3cu;
 static uint32_t fixedRdo(unsigned object, unsigned ma) {return object << 28 | ma / 10 << 10 | ma / 10;}
 static uint32_t ppsRdo(unsigned object) {return object << 28 | 450u << 9 | 60u;}   // 9000 mV, 3000 mA
 
@@ -339,23 +341,51 @@ static void codecList() {
     piano_mca_clamp_pdos(&m, clamp); piano_mca_link(&m, 1);
     CHECK(codecCycle(m, xiaomi, 3, 2));
     CHECK(piano_mca_has(&m, McaPdState) && m.value[McaPdState] == 2);
-    if (!clamp) CHECK(!piano_mca_has(&m, McaPdos) && !m.pdos);   // today: one 6.1 A object discards the whole list
+    // without the clamp one 6.1 A object no longer discards the whole list (charge/mipps2): its slot is left empty and marked
+    if (!clamp) CHECK(piano_mca_has(&m, McaPdos) && m.pdos == 2 && m.value[McaPdos] == (2 | 4 << 8) && !m.pdo[2][0]);
     else {
       CHECK(piano_mca_has(&m, McaPdos) && m.pdos == 3 && m.pdo[2][0] == 3300 && m.pdo[2][1] == 11000 && m.pdo[2][2] == 5000);
       PianoChargeContract c{}; piano_contract_init(&c); piano_contract_allow_firmware_pdos(&c, 1);
       piano_contract_offer_pdos(&c, m.pdo, m.pdos, 1);
       CHECK(c.offer_n == 3 && c.offer_pdo[2][2] == 5000 && !c.offer_rejects);
     }
+    // charge/mipps2: an object beyond any PD current field is left empty at its position, marked; the rest of the list stays
     CHECK(codecCycle(m, garbage, 2, 2));
-    CHECK(!piano_mca_has(&m, McaPdos) && !m.pdos);   // beyond any PD current field: still not a list
+    CHECK(piano_mca_has(&m, McaPdos) && m.pdos == 1 && m.value[McaPdos] == (1 | 2 << 8) && !m.pdo[1][0] && !m.pdo[1][2]);
+    // ... but an unusable vSafe5V discards it
+    const uint32_t badFirst[2][3] = {{5000, 5000, 20000}, {9000, 9000, 3000}};
+    CHECK(codecCycle(m, badFirst, 2, 2));
+    CHECK(!piano_mca_has(&m, McaPdos) && !m.pdos);
+    // a verified MiPPS adapter's list with gaps: every object at its own position (object 7 = slot 6)
+    const uint32_t sparse[7][3] = {{5000, 5000, 3000}, {9000, 9000, 3000}, {}, {}, {}, {}, {3300, 11000, 6200}};
+    CHECK(codecCycle(m, sparse, 7, 2));
+    CHECK(piano_mca_has(&m, McaPdos) && !m.pdo[2][0] && !m.pdo[5][1]);
+    if (clamp) {
+      CHECK(m.pdos == 7);
+      CHECK(m.value[McaPdos] == 7 && m.pdo[6][0] == 3300 && m.pdo[6][1] == 11000 && m.pdo[6][2] == 5000);
+      PianoChargeContract c{}; piano_contract_init(&c); piano_contract_allow_firmware_pdos(&c, 1);
+      piano_contract_offer_pdos(&c, m.pdo, m.pdos, 1);
+      CHECK(c.offer_n == 7 && !c.offer_rejects && c.offer_pdo[6][2] == 5000 && !c.offer_pdo[3][0]);
+      uint32_t raw[7] = {};
+      CHECK(piano_contract_firmware_pdos(sparse, 7, raw) == 0);   // 6.2 A unclamped is no PD word
+      CHECK(piano_contract_firmware_pdos(m.pdo, 7, raw) == 7 && !raw[2] && raw[6] >> 30 == 3);
+      PianoContractDecoded d{};
+      CHECK(piano_contract_decode(raw, 7, kVendorRdo7, &d) && d.protocol == PIANO_CONTRACT_PPS && d.mv == 5000 && d.ma == 3250);
+      CHECK(!piano_contract_decode(raw, 7, 0x3301f441u, &d));   // the same word at an empty position decodes as nothing
+    } else {
+      CHECK(m.pdos == 2 && m.value[McaPdos] == (2 | 1 << (8 + 6)));   // unclamped 6.2 A: slot 7 unusable, so object 7 is unmapped
+    }
   }
+  // a list whose count ends on an empty slot is no list
+  uint32_t raw[7] = {};
+  const uint32_t trailing[3][3] = {{5000, 5000, 3000}, {9000, 9000, 3000}, {}};
+  CHECK(!piano_contract_firmware_pdos(trailing, 3, raw) && piano_contract_firmware_pdos(trailing, 2, raw) == 2);
 }
 
 // cp-first1 (2026-11-24 13:10, RAM y12d + piano-power-cp=1 piano-power-mipps=1, the stock Xiaomi charger; MIPPS-RDO.md): after the
 // MiPPS exchange the firmware's own PD engine re-requests the verified adapter's vendor object at 5 V, RDO 0x7301f441 (object 7,
 // PPS-format 5000 mV / 3250 mA) or 0x53026e3c (object 5), while the source list the policy holds has 2 objects. Before
 // charge/mipps2: ContractError 6 (fresh PD status/invalid RDO) and the PD clamp held the input at 100 mA for the whole attach.
-static constexpr uint32_t kVendorRdo7 = 0x7301f441u, kVendorRdo5 = 0x53026e3cu;
 static void mippsVendorObject() {
   // (a) the list as seen (5 V 3 A, 9 V 3 A) and the object-7 RDO at a 5 V bus: the vendor object is unmapped, not invalid
   for (uint32_t r : {kVendorRdo7, kVendorRdo5}) {

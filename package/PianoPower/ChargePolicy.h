@@ -149,6 +149,10 @@ enum {
     PIANO_CHG_IN_AICL = 1u << 15,   /* 0x2029, the input current the firmware holds itself to (it walks to the request, and on the Mac's
                                      * port stopped at 1750-1800 under 2000) */
     PIANO_CHG_IN_NONPD = 1u << 18,  /* a fresh UCSI status of a connected sink whose operation mode is not PD (cfg.qc's evidence) */
+    /* charge/mipps2 (MIPPS-RDO.md): a fresh PD sink status whose RDO selects an object the firmware's own position-true source list
+     * (0x21011, read this cycle, vSafe5V first) does not hold: a verified MiPPS adapter's vendor object, re-requested by the
+     * firmware's PD engine at 5 V. Never a contract (no 9 V, no PPS, no pump); at a 5 V bus the vSafe5V row applies, not 100 mA. */
+    PIANO_CHG_IN_PD_UNMAPPED = 1u << 19,
 };
 enum {PIANO_CHG_SAFE_BOARD = 1u, PIANO_CHG_SAFE_CP_OFF = 2u, PIANO_CHG_SAFE_LPD_DRY = 4u,
       PIANO_CHG_SAFE_DTPT = 8u, PIANO_CHG_SAFE_ALL = 15u};
@@ -191,6 +195,7 @@ typedef struct {
     uint8_t contract_notify_pending;
     uint8_t contract_observing;   /* active bounded UCSI reread after a change; never a failed or quarantined transport */
     uint8_t contract_protocol;    /* 1=fixed, 2=PPS; decoded using the selected raw PDO */
+    uint8_t rdo_object;           /* PIANO_CHG_IN_PD_UNMAPPED: the RDO's object position (1-7) */
     uint32_t safety;              /* SAFE_*: valid and safe, not absence of a driver */
     uint32_t faults;              /* nonzero confirmed prohibited state (wet/ISC/SOA), not missing data */
 } PianoChargeInput;
