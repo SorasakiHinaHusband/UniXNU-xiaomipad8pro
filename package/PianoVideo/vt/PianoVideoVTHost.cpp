@@ -128,16 +128,19 @@ bool unlockSurfaceWrite(Session *s){
 // "pid N, ..."), which already holds the surface. The borrowed client is retained, never closed by us.
 void closeSurface(Session *s);
 static bool pianoVtBorrow(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)&&v==1;}return b==1;}
-static IOUserClient *ownerSurfaceClient(IOUserClient *mine,int pid){
-  IOService *root=surfaceRoot();if(!root)return nullptr;
+// Every IOSurfaceRoot client of the task (a sandboxed process may hold several: CoreVideo's, Metal's), retained, in registry order; the
+// diagnostic line lists how many clients each pid has.
+static unsigned ownerSurfaceClients(IOUserClient *mine,int pid,IOUserClient **out,unsigned max){
+  IOService *root=surfaceRoot();if(!root)return 0;
   char want[24];snprintf(want,sizeof want,"pid %d,",pid);const size_t n=strlen(want);
-  IOUserClient *found=nullptr;OSIterator *it=root->getClientIterator();
-  if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;
+  unsigned count=0,total=0;OSIterator *it=root->getClientIterator();
+  if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;++total;
       OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
       const bool match=cs&&!strncmp(cs->getCStringNoCopy(),want,n);OSSafeReleaseNULL(c);
-      if(match){found=u;found->retain();break;}}
+      if(match&&count<max){u->retain();out[count++]=u;}}
     it->release();}
-  OSSafeReleaseNULL(root);return found;
+  IOLog("PianoVideoVT B1: IOSurfaceRoot has %u other clients, %u of pid %d\n",total,count,pid);
+  OSSafeReleaseNULL(root);return count;
 }
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
@@ -154,11 +157,18 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   uint32_t resultBytes=bytes;
   IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
   if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&!s->surfacesBorrowed){
-    IOUserClient *owner=ownerSurfaceClient(s->surfaces,s->client->pid);
-    IOLog("PianoVideoVT B1: lookup id %u refused through our client; owner-task client %s (pid %d)\n",id,owner?"found":"none",s->client->pid);
-    if(owner){closeSurface(s);s->surfaces=owner;s->surfacesBorrowed=true;memset(result,0,bytes);resultBytes=bytes;
-      rc=surfaceMethod(s,4,id,result,&resultBytes);
-      IOLog("PianoVideoVT B1: lookup id %u through the owner-task client status %08x\n",id,rc);}
+    IOUserClient *owners[8]={};const unsigned n=ownerSurfaceClients(s->surfaces,s->client->pid,owners,8);
+    IOLog("PianoVideoVT B1: lookup id %u refused through our client; %u owner-task client(s) (pid %d)\n",id,n,s->client->pid);
+    if(n){closeSurface(s);
+      for(unsigned i=0;i<n;++i){
+        if(s->surfacesBorrowed){owners[i]->release();continue;}
+        s->surfaces=owners[i];s->surfacesBorrowed=true;memset(result,0,bytes);resultBytes=bytes;
+        rc=surfaceMethod(s,4,id,result,&resultBytes);
+        IOLog("PianoVideoVT B1: lookup id %u through owner-task client %u of %u status %08x\n",id,i+1,n,rc);
+        if(rc){OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;}
+      }
+      if(!s->surfaces){rc=kIOReturnNotPermitted;}
+    }
   }
   // A successful method owns both references, even if layout validation fails.
   if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
