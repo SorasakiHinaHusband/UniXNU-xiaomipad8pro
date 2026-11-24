@@ -654,6 +654,12 @@ def seed_gpu_files(mount, staging, built):
 # removes it from the seed, so every process, WindowServer included, loads the view. The bytes are the seed's own (clones): their
 # Mach-Os' CDHashes must already be in the output trust cache, else the copy is refused. Nothing else changes; unset, nothing happens.
 GPU_ADDONS = '/private/var/ngpu/addons'
+# LT-B3 (ANALYSIS.md section 11): PIANO_GPU_ADDON_PLACE=app puts the bundle's real files in /private/var/ngpu/app-library/Extensions/,
+# which kernel patch 0074 shows as a union view over the App cryptex's System/Library, and makes the /S/L/E view's entry an absolute
+# symlink to /System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions/<name>.bundle. Chrome's GPU sandbox maps code only from
+# cryptex paths and matches a symlink's real path. Needs a 0074 kernel: without the view the symlink dangles (no Metal device).
+GPU_APP_LIBRARY = '/private/var/ngpu/app-library'
+GPU_APP_POINT = '/System/Volumes/Preboot/Cryptexes/App/System/Library'
 GPU_ADDON_NAME = re.compile(r'[A-Za-z0-9_-]+')
 
 
@@ -665,6 +671,8 @@ def gpu_addon_request():
         return None, name
     if mode not in ('copy', 'move'):
         raise SystemExit(f'PIANO_GPU_ADDON={mode!r}: copy or move')
+    if os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle') not in ('sle', 'app'):
+        raise SystemExit('PIANO_GPU_ADDON_PLACE: sle or app')
     if not GPU_ADDON_NAME.fullmatch(name):
         raise SystemExit(f'PIANO_GPU_ADDON_NAME={name!r}: letters, digits, _ and - only')
     return mode, name
@@ -673,8 +681,10 @@ def gpu_addon_request():
 def seed_gpu_addon(mount, mode, name, trust, built):
     """The PIANO_GPU_ADDON step on the mounted seed (after seed_gpu_files, so a staged --gpu-bundle is what gets copied). Returns the
     record: mode, name, every file with its sha256 (and CDHash for a Mach-O), and whether the /Library/GPUBundles copy stays."""
+    place = os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle')
     source = mount / GPU_BUNDLES.lstrip('/') / f'{name}.bundle'
-    target = mount / GPU_ADDONS.lstrip('/') / f'{name}.bundle'
+    link = mount / GPU_ADDONS.lstrip('/') / f'{name}.bundle'
+    target = mount / GPU_APP_LIBRARY.lstrip('/') / 'Extensions' / f'{name}.bundle' if place == 'app' else link
     if not (source / 'Contents/Info.plist').is_file():
         raise SystemExit(f'PIANO_GPU_ADDON: the seed has no {GPU_BUNDLES}/{name}.bundle (Contents/Info.plist)')
     reinstalled = [f['dest'] for f, _ in built if f['dest'].startswith(f'{GPU_BUNDLES}/{name}.bundle/')]
@@ -689,11 +699,17 @@ def seed_gpu_addon(mount, mode, name, trust, built):
             raise SystemExit(f'PIANO_GPU_ADDON: {path.relative_to(mount)} has CDHash {bytes(cd).hex()}, not in the trust cache')
         files.append({'path': path.relative_to(source).as_posix(), 'sha256': common.sha(path),
                       'cdhash': bytes(cd).hex() if cd is not None else None})
-    if target.exists():
-        shutil.rmtree(target)
+    for old in {target, link}:
+        if old.is_symlink():
+            old.unlink()
+        elif old.exists():
+            shutil.rmtree(old)
     target.parent.mkdir(parents=True, exist_ok=True)
     for directory in (target.parent.parent, target.parent):
         os.chmod(directory, 0o755)
+    if place == 'app':
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(link.parent, 0o755)
     sh(['cp', '-cR', str(source), str(target)], timeout=120, check=True)
     # the seed's com.apple.macl tag stays with the original; this macOS puts its com.apple.provenance tag back on what it writes
     # (the recipe seed's plugin carries it too)
@@ -704,10 +720,18 @@ def seed_gpu_addon(mount, mode, name, trust, built):
     for f in files:
         if common.sha(target / f['path']) != f['sha256']:
             raise SystemExit(f'PIANO_GPU_ADDON: {GPU_ADDONS}/{name}.bundle/{f["path"]} differs from the seed\'s plugin')
+    record = {'mode': mode, 'name': name, 'dest': f'{GPU_ADDONS}/{name}.bundle', 'boot_arg': 'sheng-gpu-addon=1',
+              'gpu_bundles_copy_kept': mode == 'copy', 'files': files, 'place': place}
+    if place == 'app':
+        view = f'{GPU_APP_POINT}/Extensions/{name}.bundle'
+        os.symlink(view, link)
+        if os.readlink(link) != view:
+            raise SystemExit(f'PIANO_GPU_ADDON_PLACE=app: {link} is not a symlink to {view}')
+        record.update({'real': f'{GPU_APP_LIBRARY}/Extensions/{name}.bundle', 'link': f'{GPU_ADDONS}/{name}.bundle -> {view}',
+                       'kernel': '0074 (app-library view)'})
     if mode == 'move':
         shutil.rmtree(source)
-    return {'mode': mode, 'name': name, 'dest': f'{GPU_ADDONS}/{name}.bundle', 'boot_arg': 'sheng-gpu-addon=1',
-            'gpu_bundles_copy_kept': mode == 'copy', 'files': files}
+    return record
 
 
 def seed_camera_apps(mount, staging, built):
