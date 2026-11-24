@@ -1199,3 +1199,23 @@ Not Ubuntu's order, and not used: 9 V fixed before MiPPS (Ubuntu never authentic
 At 5 V a PD source gets its class row at once (at most 1.5 A) and, once it is settled at 5 V, min(RDO, the vSafe5V object, 3 A) through
 the 10 s steps under the connector rule. The firmware's own AICL (0x2029) still holds the input where a weak source's bus sags: on the
 Mac mini's Rp 3 A port the request is 3 A and the firmware holds 1.8 A at 4.72 V; no host setting raises that safely.
+
+### 24.1 A PD RDO that does not decode, at 5 V (cp-first2, 2026-11-24; host-tested, not run)
+
+On the RAM boot cp-first2 the firmware, after MiPPS, formed RDO 0x7301f441 (object 7, PPS layout 5000 mV / 3250 mA) while its own
+0x21011 list held 4 entries and the first of them was no 5000/5000 object (the only conjunct of the old test that could fail: the
+console line read `error=6 fresh PD status/invalid RDO ... obj=7 unmapped=0 mca_pdos=4`). The input stayed at 100 mA, FCC 500, at a
+5.0 V bus. 0x21011 is the firmware's list, not the source's Source_Capabilities by position (cp-first1: object 7 with 2 entries).
+
+| Ubuntu v1.4.0 (`xiaomi_mca.c`, clone `linux-sm8750-piano` b5100d5f) | ours (charge/mipps2) | mark |
+|---|---|---|
+| L1828-1841 `xiaomi_mca_pd_5v_ma`: the first 5000/5000 entry of 0x21011 at any slot, else 500 (L277) | `pd_unmapped_row`: the same rule, within the class row (<= 1500) and the ceiling | same |
+| L2050-2081 `xiaomi_mca_5v_input`: PD at 5 V = min(that, the UCSI contract or min(that, 3000)), at most 3000; never the RDO | an undecodable RDO of a fresh PD sink status at a 4.0-6.0 V bus, list read: the row above, not 100 mA | same (lower cap: 1500) |
+| L2462-2485 `xiaomi_mca_apply_policy`: 5 V row whenever the bus is below the 5 V window and hv is off | the same; no list read at all: the firmware's 100 mA (nothing known of the source) | different (safer) |
+| L4104-4125 `xiaomi_mca_cp_apdo`: the pump's APDO from 0x21011 at any slot, no RDO position | the pump needs a validated PPS contract (section 24 step 2) | different (safer; open) |
+
+Registry keys that survive the dmesg ring and the swap back: `McaPDO1-7` / `McaPDOCount` / `McaPDOUnusable` (the last non-empty list),
+`McaPDOPrev1-7`, `McaPDONow`, `McaPDOSeenMs`, `McaPDOAttach`, `McaPDOLists`; `PDUnmappedRDO`, `PDUnmappedClass` (bit 0 beyond the count,
+1 empty slot, 2 another object there, 4 no vSafe5V at slot 1, 5 no vSafe5V at all), `PDUnmappedMs`, `PDUnmappedChanges`; `MiPPSRuns`,
+`MiPPSResults`, `MiPPSResultError`, `MiPPSResultVerified`, `MiPPSResultAdapter`, `MiPPSResultMs`, `MiPPSVersion`, `MiPPSCleared`.
+Test: `tests/pdo_firmware_host.cpp` cpFirst2Replay (fails on a8ff8e74 with ICL 100 / FCC 500, as on the tablet).
