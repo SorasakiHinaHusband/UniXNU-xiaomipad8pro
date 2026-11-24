@@ -864,14 +864,26 @@ static int strict_contract(const PianoChargeInput *in)
            in->contract_ma >= PIANO_CHG_ICL_DEFAULT && in->contract_ma <= 5000;
 }
 
-/* charge/mipps2 (MIPPS-RDO.md): the firmware re-requested a verified MiPPS adapter's vendor object, which its own source list does
- * not hold (ChargeLink: PIANO_CHG_IN_PD_UNMAPPED), and the bus reads 5 V. The Ubuntu port's PD rule at 5 V applies there: the vSafe5V
- * object's current within the class row (<= 1500), never the 100 mA of an unknown contract. It is no contract: no 9 V, no PPS, no
- * pump, and above the 5 V window nothing changes. */
+/* charge/mipps2 (MIPPS-RDO.md): a fresh PD sink status whose RDO does not decode against the firmware's 0x21011 list (ChargeLink:
+ * PIANO_CHG_IN_PD_UNMAPPED; a verified MiPPS adapter's vendor object), and the bus reads 5 V. The Ubuntu port's PD rule at 5 V applies
+ * there (xiaomi_mca_5v_input: xiaomi_mca_pd_5v_ma, a 5000/5000 entry at any slot, else 500; min 3000): the class row from that, never
+ * the 100 mA of an unknown contract. It is no contract: no 9 V, no PPS, no pump, and above the 5 V window nothing changes. */
 static int pd_unmapped_5v(const PianoChargeInput *in)
 {
     return (in->valid & PIANO_CHG_IN_PD_UNMAPPED) && !strict_contract(in) && (in->valid & PIANO_CHG_IN_BUS) &&
            in->bus_mv >= ONLINE_MV && in->bus_mv < HV_5V_MAX_MV;
+}
+
+/* Its input: the class's 5 V row from the list's fixed 5000/5000 object at any position (Ubuntu: the buck's 5 V path uses a fixed
+ * PDO, never a PPS APDO), else the row's 500 mA; within the configured ceiling. */
+static uint32_t pd_unmapped_row(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargePlan *p, int cls)
+{
+    uint32_t ma = 0;
+    for (unsigned i = 0; (in->valid & PIANO_CHG_IN_PDOS) && i < in->pdos && i < 7; ++i)
+        if (in->pdo[i][0] == 5000 && in->pdo[i][1] == 5000 && in->pdo[i][2] >= PIANO_CHG_ICL_DEFAULT) {ma = in->pdo[i][2]; break;}
+    p->icl_why = PIANO_CHG_ICL_ROW;
+    p->rp_ma = 0;
+    return umin(piano_charge_icl_5v(cls, ma), icl_cap(c));
 }
 
 static int strict_barrier(const PianoChargeInput *in, const PianoChargeState *s)
@@ -1797,7 +1809,7 @@ static void decide_inner(const PianoChargeConfig *c, const PianoChargeInput *in,
                                  hv_on && hv_caps(c) ? PIANO_CHG_ICL_ABS_MAX : PIANO_CHG_ICL_CAP;
             const int unmapped = !contract && !hv_on && pd_unmapped_5v(in);
             icl = contract ? umin(icl, umin(in->contract_ma, cap)) :
-                  unmapped ? umin(icl, icl_at_5v(c, in, s, p, cls, 0)) : PIANO_CHG_ICL_DEFAULT;
+                  unmapped ? umin(icl, pd_unmapped_row(c, in, p, cls)) : PIANO_CHG_ICL_DEFAULT;
         }
         if (s->contract_transition) icl = umin(icl, s->transition_ma);
         if (!gauge_fresh(in, now) || !t.valid) icl = umin(icl, PIANO_CHG_ICL_DEFAULT);

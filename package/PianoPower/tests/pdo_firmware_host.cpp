@@ -424,17 +424,19 @@ static void mippsVendorObject() {
     for (unsigned i = 0; i < 4; ++i) {b.tick(); b.bus = b.bus == 5000 ? 5000 : 6220; b.rdo = r;}
     CHECK(!b.wrote(PIANO_CHG_PD_FIXED, 9000) && !b.count(PIANO_CHG_PPS));
   }
-  // (b) no list read at all (or a list without vSafe5V first): still the firmware's 100 mA
+  // (b) no list read at all: still the firmware's 100 mA (nothing known of the source)
   {
     Bench b(true, 1, true); b.fwN = 2; b.rdo = kVendorRdo7;
     for (unsigned i = 0; i < 12; ++i) b.tick();
     CHECK(!(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.icl <= 100);
   }
-  // (c) an RDO whose object IS in the list but does not fit it stays invalid (100 mA): only an object the list lacks is unmapped
+  // (c) an RDO whose object is in the list but does not fit it (cp-first2: 0x21011 positions are not the source's objects): the
+  //     same 5 V row as any undecodable RDO (Ubuntu's 5 V PD input never reads the RDO), still never a contract and no 9 V
   {
     Bench b(true, 1, true); b.mcaPdos = true; b.rdo = fixedRdo(2, 2500);
     for (unsigned i = 0; i < 12; ++i) b.tick();
-    CHECK(!b.contract.valid && !(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.icl <= 100);
+    CHECK(!b.contract.valid && (b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.link.in.rdo_object == 2 && b.icl == 1500);
+    CHECK(!(b.link.in.valid & PIANO_CHG_IN_CONTRACT) && !b.voltageRequests && b.bus == 5000);
   }
   // (d) the firmware lists the vendor object at its own position (gaps kept): the RDO decodes as a PPS contract at 5 V; the ladder
   //     then goes on as Ubuntu's does without a pump: 9 V fixed on the listed object 2, confirmed by the contract's object

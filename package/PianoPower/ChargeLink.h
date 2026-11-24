@@ -183,14 +183,16 @@ class ChargeLink {
     if (v.contract && piano_contract_status_fresh(v.contract, v.nowMs) && v.contract->connected && v.contract->sink &&
         !v.contract->pd)
       x.valid |= PIANO_CHG_IN_NONPD;
-    // charge/mipps2: the RDO names an object the firmware's own list lacks (a verified MiPPS adapter's vendor object). Only with
-    // this cycle's list read (vSafe5V at position 1) and the slot beyond the list or empty in it; an object the list holds but the RDO
-    // does not fit stays an invalid RDO.
+    // charge/mipps2: a fresh PD sink status whose RDO does not decode against the firmware's list (a verified MiPPS adapter's vendor
+    // object). 0x21011 is the firmware's own list, not the source's objects by position: cp-first2 had RDO object 7 with a 4-entry
+    // list whose first slot was no 5000/5000 object, cp-first1 object 7 with 2 entries. So no position test here: any RDO object
+    // 1-7 with this cycle's list read. Ubuntu's 5 V PD input (xiaomi_mca_5v_input, xiaomi_mca_pd_5v_ma) never looks at the RDO; the
+    // policy gives the class's 5 V row from a 5000/5000 entry at any slot (else 500 mA) and never a contract (no 9 V, PPS or pump).
     if (v.contract && piano_contract_status_fresh(v.contract, v.nowMs) && v.contract->connected && v.contract->sink &&
         v.contract->pd && !v.contract->valid && v.contract->last_error == PIANO_CONTRACT_RDO && (x.valid & PIANO_CHG_IN_PDOS) &&
-        x.pdos && x.pdo[0][0] == 5000 && x.pdo[0][1] == 5000 && x.pdo[0][2] >= 100) {
+        x.pdos) {
       const unsigned object = (v.contract->rdo >> 28) & 15u;
-      if (object >= 2 && object <= 7 && (object > x.pdos || (!x.pdo[object - 1][0] && !x.pdo[object - 1][1] && !x.pdo[object - 1][2]))) {
+      if (object >= 1 && object <= 7) {
         x.valid |= PIANO_CHG_IN_PD_UNMAPPED;
         x.rdo_object = uint8_t(object);
       }
