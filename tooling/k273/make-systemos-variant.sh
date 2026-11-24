@@ -13,6 +13,11 @@
 #                  image that boots the copy (their CDHashes are printed and recorded)
 #   OUT.img        the copy (a clone of PINNED where the file system allows it); must not exist, must not be PINNED, must not be
 #                  under out/frozen or $PIANO_BACKUP_DIR
+#   VARIANT_PLACE=app (env; default sle): put the bundle under the App cryptex,
+#                  System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions/<name>, and make
+#                  System/Library/Extensions/<name> an absolute symlink to /System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions/<name>.
+#                  Chrome's GPU sandbox (common.sb) maps executable code only from the cryptex paths, and a sandbox matches a symlink's
+#                  real path (LT-B3, ANALYSIS.md section 11). Metal's trusted bundle search follows the symlink (live3).
 #   --restricted   also give the bundle Apple's own plugins' protection: SF_RESTRICTED on every entry and an empty com.apple.rootless
 #                  attribute on the bundle directory (AppleParavirtGPUMetalIOGPUFamily.bundle carries exactly these in the 27.3 OS
 #                  volume). The tablet runs with SIP on, so such files can never be changed there: only for a window that is replaced
@@ -26,6 +31,9 @@ PINNED=${1:?PINNED.img} PINNED_SHA=${2:?PINNED_SHA256} BUNDLE=${3:?BUNDLE} OUT=$
 SUDO=${SUDO:-sudo}
 D=$(cd "$(dirname "$0")/../.." && pwd)
 RESTRICTED=0
+PLACE=${VARIANT_PLACE:-sle}
+case "$PLACE" in sle|app) ;; *) echo "VARIANT_PLACE must be sle or app" >&2; exit 2 ;; esac
+APPEXT=System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions
 case "$FLAG" in --restricted) RESTRICTED=1 ;; '') ;; *) echo "unknown option $FLAG" >&2; exit 2 ;; esac
 real() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 [ -f "$PINNED" ] || { echo "no $PINNED" >&2; exit 1; }
@@ -71,13 +79,25 @@ M=$WORK/mnt
 $SUDO diskutil enableOwnership "$M" > /dev/null
 [ -d "$M/System/Library/Extensions" ] && [ -d "$M/System/Volumes/Preboot/Cryptexes/App" ] \
   || { echo "$OUT: not a SystemOS window (no System/Library/Extensions or Preboot/Cryptexes/App)" >&2; exit 1; }
-T=$M/System/Library/Extensions/$NAME
-[ -e "$T" ] && { echo "$OUT already has System/Library/Extensions/$NAME" >&2; exit 1; }
+LINK=$M/System/Library/Extensions/$NAME
+[ -e "$LINK" ] || [ -L "$LINK" ] && { echo "$OUT already has System/Library/Extensions/$NAME" >&2; exit 1; }
+if [ "$PLACE" = app ]; then
+  REL=$APPEXT/$NAME; T=$M/$REL
+  [ -e "$T" ] && { echo "$OUT already has $REL" >&2; exit 1; }
+  [ -d "$M/$APPEXT" ] || { $SUDO mkdir "$M/$APPEXT"; $SUDO chown root:wheel "$M/$APPEXT"; $SUDO chmod 755 "$M/$APPEXT"; }
+else
+  REL=System/Library/Extensions/$NAME; T=$LINK
+fi
 $SUDO ditto --noextattr --noacl "$BUNDLE" "$T"
 $SUDO chown -R root:wheel "$T"
 $SUDO find "$T" -type d -exec chmod 755 {} +
 $SUDO find "$T" -type f -exec sh -c 'for f; do if [ -x "$f" ]; then chmod 755 "$f"; else chmod 644 "$f"; fi; done' sh {} +
 $SUDO xattr -cr "$T" 2> /dev/null || true
+if [ "$PLACE" = app ]; then
+  $SUDO ln -s "/$REL" "$LINK"
+  $SUDO chown -h root:wheel "$LINK"
+  [ "$(readlink "$LINK")" = "/$REL" ] || { echo "the symlink is not /$REL" >&2; exit 1; }
+fi
 if [ "$RESTRICTED" = 1 ]; then
   $SUDO xattr -w com.apple.rootless "" "$T"
   $SUDO chflags -R restricted "$T"
@@ -101,20 +121,22 @@ PY
 done)
 SRC_FILES=$(cd "$BUNDLE" && find . -type f | sort | while read -r f; do printf '%s %s\n' "$(shasum -a 256 "$f" | cut -d' ' -f1)" "${f#./}"; done)
 [ "$(printf '%s\n' "$FILES" | awk '{print $1, $3}')" = "$SRC_FILES" ] || { echo "the copied bundle differs from $BUNDLE" >&2; exit 1; }
-echo "System/Library/Extensions/$NAME in the copy:" >&2
+echo "$REL in the copy:" >&2
 ls -lnaO@R "$T" >&2
+[ "$PLACE" = app ] && ls -lnaO@ "$LINK" >&2
 sync
 $SUDO umount "$M"
 hdiutil detach "$WHOLE" > /dev/null
 WHOLE=""
 SHA=$(sha "$OUT")
 [ "$(sha "$PINNED")" = "$PINNED_SHA" ] || { echo "the pinned image changed during the run" >&2; exit 1; }
-python3 - "$OUT.json" "$(real "$PINNED")" "$PINNED_SHA" "$UUID" "$(stat -f %z "$OUT")" "$SHA" "$NAME" "$RESTRICTED" "$FILES" <<'PY'
+python3 - "$OUT.json" "$(real "$PINNED")" "$PINNED_SHA" "$UUID" "$(stat -f %z "$OUT")" "$SHA" "$NAME" "$RESTRICTED" "$FILES" "$PLACE" "$REL" <<'PY'
 import json, sys
-out, base, base_sha, uuid, size, sha, name, restricted, files = sys.argv[1:10]
+out, base, base_sha, uuid, size, sha, name, restricted, files, place, rel = sys.argv[1:12]
 rows = [line.split(' ', 2) for line in files.splitlines() if line]
 json.dump({'base': base, 'base_sha256': base_sha, 'volume_uuid': uuid, 'size': int(size), 'sha256': sha,
-           'bundle': f'System/Library/Extensions/{name}', 'restricted': restricted == '1',
+           'bundle': rel, 'place': place,
+           'link': (f'System/Library/Extensions/{name} -> /{rel}' if place == 'app' else None), 'restricted': restricted == '1',
            'files': [{'path': p, 'sha256': s, 'cdhash': None if c == '-' else c} for s, c, p in rows]},
           open(out, 'w'), indent=1)
 PY
