@@ -134,6 +134,7 @@ PianoMcaAux gMippsAux;
 bool gMippsActive = false, gMippsWasAttached = false;
 uint32_t gMippsAttachSeq = 0, gMippsTriedSeq = 0, gMippsUps = 0;
 uint64_t gMippsWakeMs = 0;
+uint32_t gPdosLineHash = 0, gPdosLines = 0;   // charge/mipps2: the last logged 0x21011 list (logMcaEvents)
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -794,6 +795,19 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("VoltagePending", s.contract_transition || (s.pending & (1u << PIANO_CHG_S_VOLT)));
   n("ModePending", s.contract_mode_change); n("RestoreRequired", s.volt_want_prop == PIANO_CHG_PD_FIXED && s.volt_want_value == 5000 && x.bus_mv >= 6000);
   n("ContractError", uint32_t(c.last_error)); n("ContractAgeMs", c.updated_ms && now >= c.updated_ms ? now - c.updated_ms : ~0u);
+  // charge/mipps2 (MIPPS-RDO.md): the RDO's object, whether the list lacks it (a vendor object at 5 V), the firmware's own list by
+  // position (0x21011 as this codec read it, independent of the offer) and its unusable slots, and the MiPPS engine's state
+  n("RDOObject", (c.rdo >> 28) & 15u); n("PDUnmapped", (x.valid & PIANO_CHG_IN_PD_UNMAPPED) ? x.rdo_object : 0);
+  n("McaPDOCount", piano_mca_has(&fMca, McaPdos) ? fMca.pdos : 0xffu);
+  n("McaPDOUnusable", piano_mca_has(&fMca, McaPdos) ? (uint32_t(fMca.value[McaPdos]) >> 8) & 0x7fu : 0);
+  for (unsigned i = 0; i < 7; ++i) {
+    char key[16];
+    snprintf(key, sizeof key, "McaPDO%u", i + 1);
+    n(key, uint64_t(fMca.pdo[i][0]) << 32 | uint64_t(fMca.pdo[i][1] & 0xffffu) << 16 | (fMca.pdo[i][2] & 0xffffu));
+  }
+  n("MiPPSState", gMipps.state); n("MiPPSError", uint32_t(gMipps.error)); n("MiPPSVerified", gMipps.verified);
+  n("MiPPSDiscovered", gMipps.discovered); n("MiPPSLastCmd", gMipps.last_cmd); n("MiPPSActive", gMippsActive);
+  n("MiPPSAttachSeq", gMippsAttachSeq); n("MiPPSTriedSeq", gMippsTriedSeq);
   for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
   n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
@@ -854,11 +868,12 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
        batMw, p.fv_mv ? p.fv_mv : 4400u, s.term_hot, s.fv_hold, p.fallback);
   note("buck: seq=%u gen=%u link=%u raw=%d effective=%d valid=%u connector=%u sink=%u pd=%u", fStatusSeq, c.generation,
        fMca.links, piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1, x.type, c.valid, c.connector, c.sink, c.pd);
-  note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s stage=%u inflight=%u quarantine=%u cci=%#x cmd=%#llx control=%#llx",
+  note("buck-contract: gen=%u seq=%u rdo=%#x protocol=%u mv=%u ma=%u error=%d %s stage=%u inflight=%u quarantine=%u cci=%#x cmd=%#llx control=%#llx obj=%u unmapped=%u mca_pdos=%u",
        c.generation, c.seq, c.rdo, c.protocol, c.mv, c.ma, c.last_error,
        piano_contract_fresh(&c, now) ? "validated" : !piano_contract_status_fresh(&c, now) ? "status unknown/stale" :
        !c.connected ? "fresh disconnected status" : !c.sink ? "fresh source status" : !c.pd ? "fresh non-PD status" : "fresh PD status/invalid RDO",
-       c.stage, c.in_flight, c.quarantined, c.cci, c.command, c.control_readback);
+       c.stage, c.in_flight, c.quarantined, c.cci, c.command, c.control_readback, (c.rdo >> 28) & 15u,
+       (x.valid & PIANO_CHG_IN_PD_UNMAPPED) ? 1u : 0u, piano_mca_has(&fMca, McaPdos) ? unsigned(fMca.pdos) : 0xffu);
   for (unsigned i = 0; i < c.pdos && i < 7; ++i) note("buck-pdo: gen=%u index=%u raw=%#x", c.generation, i + 1, c.source_pdo[i]);
   note("buck-current: seq=%u icl=%u/%u rb=%d fcc=%u/%u fcc_rb=unknown bus=%d/%d fv=%u/%d valid=%u", fStatusSeq, p.icl_ma, s.icl_set,
        x.icl_ma, p.fcc_ma, s.fcc_set, x.bus_mv, x.ibus_ma, fvMv, x.fv_raw, fvValid);
@@ -2062,8 +2077,15 @@ void PianoPower::startCharger()
 void PianoPower::logMcaEvents()
 {
   const uint32_t e = piano_mca_take_events(&fMca);
-  if (!e && fPdosLine) return;
   const PianoMca &m = fMca;
+  // charge/mipps2: a changed list is logged again (a verified MiPPS adapter's vendor objects appear after the exchange), at most
+  // 16 times a boot (globals: the instance is at its size cap)
+  if (fPdosLine && piano_mca_has(&m, McaPdos) && gPdosLines < 16) {
+    uint32_t h = 2166136261u ^ uint32_t(m.value[McaPdos]);
+    for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) h = (h ^ m.pdo[i][k]) * 16777619u;
+    if (h != gPdosLineHash) fPdosLine = false;
+  }
+  if (!e && fPdosLine) return;
   if (e & McaEvAttach)
     note("mca: a source is attached: %d mV, type %s", m.value[McaBusVoltage] / 1000,
          piano_mca_has(&m, McaType) ? piano_mca_type_name(m.value[McaType]) : "?");
@@ -2073,13 +2095,18 @@ void PianoPower::logMcaEvents()
     char line[160];
     unsigned at = 0;
     for (unsigned i = 0; i < m.pdos && i < 7; ++i) {
-      const int n = snprintf(line + at, sizeof line - at, "%s%u.%u-%u V %u mA", i ? ", " : "", m.pdo[i][0] / 1000,
+      const int n = !m.pdo[i][0] ? snprintf(line + at, sizeof line - at, "%s#%u empty", i ? ", " : "", i + 1) :
+                    snprintf(line + at, sizeof line - at, "%s#%u %u.%u-%u V %u mA", i ? ", " : "", i + 1, m.pdo[i][0] / 1000,
                              (m.pdo[i][0] % 1000) / 100, m.pdo[i][1] / 1000, m.pdo[i][2]);
       if (n <= 0 || unsigned(n) >= sizeof line - at) break;
       at += unsigned(n);
     }
-    note("mca: the source's PDOs (%u): %s", m.pdos, line);
+    note("mca: the source's PDOs (%u, unusable slots %#x): %s", m.pdos, (uint32_t(m.value[McaPdos]) >> 8) & 0x7fu, line);
     fPdosLine = true;
+    uint32_t h = 2166136261u ^ uint32_t(m.value[McaPdos]);
+    for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) h = (h ^ m.pdo[i][k]) * 16777619u;
+    gPdosLineHash = h;
+    gPdosLines++;
   }
   if (!e) return;
   if (e & McaEvDetach) note("mca: the source is gone: input limit and charge current back to the firmware's own values");
