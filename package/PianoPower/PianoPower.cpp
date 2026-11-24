@@ -136,6 +136,15 @@ uint32_t gMippsAttachSeq = 0, gMippsTriedSeq = 0, gMippsUps = 0;
 uint64_t gMippsWakeMs = 0;
 uint32_t gPdosLineHash = 0, gPdosLines = 0;
 bool gCpFirst = false;            // charge/mipps2: the armed pump would start from this 5 V (the buck holds its 9 V request)
+// charge/mipps2 (cp-first2: the dmesg ring wrapped and the MiPPS lines were lost; McaPDO1-7 read 0 after the swap back): what the
+// registry keeps for a later read. The last non-empty 0x21011 list seen and the one before it (replaced only by another non-empty
+// list, so a detach or a non-PD source does not wipe them), the last PD RDO that did not decode, and the MiPPS result with its time.
+uint32_t gPdoLast[7][3] = {}, gPdoPrev[7][3] = {}, gPdoLastN = 0, gPdoPrevN = 0, gPdoLastOdd = 0, gPdoLastAttach = 0, gPdoLists = 0;
+uint64_t gPdoLastMs = 0;
+uint32_t gRdoUnmappedLast = 0, gRdoUnmappedClass = 0, gRdoUnmappedCount = 0;
+uint64_t gRdoUnmappedMs = 0;
+uint32_t gMippsRuns = 0, gMippsResultSeen = 0, gMippsLastError = 0, gMippsLastVerified = 0, gMippsLastAdapter = 0;
+uint64_t gMippsDoneMs = 0;
 uint32_t gLadderRefusedPps = 0;   // charge/mipps2: pump PPS words refused for naming no advertised APDO
 uint8_t gLadderLogged = 0xff, gLadderRefusedLogged = 0;   // the last ladder stage and refusal count logged   // charge/mipps2: the last logged 0x21011 list (logMcaEvents)
 
@@ -812,16 +821,52 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
     gLadderLogged = s.ladder;
   }
   n("RDOObject", (c.rdo >> 28) & 15u); n("PDUnmapped", (x.valid & PIANO_CHG_IN_PD_UNMAPPED) ? x.rdo_object : 0);
-  n("McaPDOCount", piano_mca_has(&fMca, McaPdos) ? fMca.pdos : 0xffu);
-  n("McaPDOUnusable", piano_mca_has(&fMca, McaPdos) ? (uint32_t(fMca.value[McaPdos]) >> 8) & 0x7fu : 0);
-  for (unsigned i = 0; i < 7; ++i) {
-    char key[16];
-    snprintf(key, sizeof key, "McaPDO%u", i + 1);
-    n(key, uint64_t(fMca.pdo[i][0]) << 32 | uint64_t(fMca.pdo[i][1] & 0xffffu) << 16 | (fMca.pdo[i][2] & 0xffffu));
+  // the 0x21011 list: McaPDONow the codec's count this cycle (0xff: not read); McaPDO1-7 / McaPDOCount / McaPDOUnusable the last
+  // non-empty list seen (min mV << 32 | max mV << 16 | mA), McaPDOPrev1-7 the one before it, McaPDOSeenMs / McaPDOAttach / McaPDOLists
+  // when, on which attach (MiPPSAttachSeq) and how many different lists this boot
+  if (piano_mca_has(&fMca, McaPdos) && fMca.pdos) {
+    bool same = gPdoLastN == fMca.pdos && gPdoLastOdd == ((uint32_t(fMca.value[McaPdos]) >> 8) & 0x7fu);
+    for (unsigned i = 0; same && i < 7; ++i) for (unsigned k = 0; k < 3; ++k) same = same && gPdoLast[i][k] == fMca.pdo[i][k];
+    if (!same) {
+      memcpy(gPdoPrev, gPdoLast, sizeof gPdoPrev); gPdoPrevN = gPdoLastN;
+      memcpy(gPdoLast, fMca.pdo, sizeof gPdoLast); gPdoLastN = fMca.pdos;
+      gPdoLastOdd = (uint32_t(fMca.value[McaPdos]) >> 8) & 0x7fu;
+      gPdoLists++;
+    }
+    gPdoLastMs = now; gPdoLastAttach = gMippsAttachSeq;
   }
+  n("McaPDONow", piano_mca_has(&fMca, McaPdos) ? fMca.pdos : 0xffu);
+  n("McaPDOCount", gPdoLastN); n("McaPDOUnusable", gPdoLastOdd); n("McaPDOPrevCount", gPdoPrevN);
+  n("McaPDOSeenMs", gPdoLastMs); n("McaPDOAttach", gPdoLastAttach); n("McaPDOLists", gPdoLists);
+  for (unsigned i = 0; i < 7; ++i) {
+    char key[20];
+    snprintf(key, sizeof key, "McaPDO%u", i + 1);
+    n(key, uint64_t(gPdoLast[i][0]) << 32 | uint64_t(gPdoLast[i][1] & 0xffffu) << 16 | (gPdoLast[i][2] & 0xffffu));
+    snprintf(key, sizeof key, "McaPDOPrev%u", i + 1);
+    n(key, uint64_t(gPdoPrev[i][0]) << 32 | uint64_t(gPdoPrev[i][1] & 0xffffu) << 16 | (gPdoPrev[i][2] & 0xffffu));
+  }
+  // the last undecodable PD RDO (kept after the detach): the word, when, how often, and how it relates to the list read with it:
+  // bit 0 the object beyond the list's count, bit 1 an empty slot there, bit 2 the slot holds an object the RDO does not fit,
+  // bit 4 no 5000/5000 object at slot 1 (the list is not the source's object list by position), bit 5 no 5000/5000 object at all
+  if (x.valid & PIANO_CHG_IN_PD_UNMAPPED) {
+    const unsigned o = x.rdo_object;
+    bool any5 = false;
+    for (unsigned i = 0; i < x.pdos && i < 7; ++i) any5 = any5 || (x.pdo[i][0] == 5000 && x.pdo[i][1] == 5000);
+    const bool empty = o <= x.pdos && !x.pdo[o - 1][0] && !x.pdo[o - 1][1] && !x.pdo[o - 1][2];
+    gRdoUnmappedClass = (o > x.pdos ? 1u : 0u) | (empty ? 2u : 0u) | (o <= x.pdos && !empty ? 4u : 0u) |
+                        (!(x.pdo[0][0] == 5000 && x.pdo[0][1] == 5000) ? 0x10u : 0u) | (!any5 ? 0x20u : 0u);
+    if (gRdoUnmappedLast != c.rdo || !gRdoUnmappedCount) gRdoUnmappedCount++;
+    gRdoUnmappedLast = c.rdo; gRdoUnmappedMs = now;
+  }
+  n("PDUnmappedRDO", gRdoUnmappedLast); n("PDUnmappedClass", gRdoUnmappedClass); n("PDUnmappedMs", gRdoUnmappedMs);
+  n("PDUnmappedChanges", gRdoUnmappedCount);
   n("MiPPSState", gMipps.state); n("MiPPSError", uint32_t(gMipps.error)); n("MiPPSVerified", gMipps.verified);
   n("MiPPSDiscovered", gMipps.discovered); n("MiPPSLastCmd", gMipps.last_cmd); n("MiPPSActive", gMippsActive);
   n("MiPPSAttachSeq", gMippsAttachSeq); n("MiPPSTriedSeq", gMippsTriedSeq);
+  // the last finished authentication (serviceMipps): kept until the next one ends
+  n("MiPPSRuns", gMippsRuns); n("MiPPSResults", gMippsResultSeen); n("MiPPSResultError", gMippsLastError);
+  n("MiPPSResultVerified", gMippsLastVerified); n("MiPPSResultAdapter", gMippsLastAdapter); n("MiPPSResultMs", gMippsDoneMs);
+  n("MiPPSVersion", gMipps.version); n("MiPPSCleared", gMipps.cleared);
   for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
   n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
@@ -1552,6 +1597,7 @@ void PianoPower::serviceMipps(uint64_t now)
     if (r) {note("MiPPS: not started (%s): the 5 A pump budget", piano_mipps_error_name(r)); return;}
     gMippsUps = ups;
     gMippsActive = true;
+    gMippsRuns++;
     piano_mca_allow_mipps(&fMca, &gMippsAux);
     note("MiPPS: authentication started (key %u of %u)", pick % gMippsKeys.count + 1, gMippsKeys.count);
   }
@@ -1574,6 +1620,8 @@ void PianoPower::serviceMipps(uint64_t now)
     gMippsActive = false;
     gMippsWakeMs = 0;
     piano_mca_allow_mipps(&fMca, nullptr);
+    gMippsResultSeen++; gMippsLastError = uint32_t(gMipps.error); gMippsLastVerified = gMipps.verified;
+    gMippsLastAdapter = gMipps.adapter_id; gMippsDoneMs = now;
     note("MiPPS: %s (adapter %#x): the pump budget %u mA", gMipps.verified ? "verified" : piano_mipps_error_name(gMipps.error),
          gMipps.adapter_id, piano_mipps_budget_ma(&gMipps));
   }
