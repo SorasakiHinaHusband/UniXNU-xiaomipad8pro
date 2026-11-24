@@ -134,7 +134,10 @@ PianoMcaAux gMippsAux;
 bool gMippsActive = false, gMippsWasAttached = false;
 uint32_t gMippsAttachSeq = 0, gMippsTriedSeq = 0, gMippsUps = 0;
 uint64_t gMippsWakeMs = 0;
-uint32_t gPdosLineHash = 0, gPdosLines = 0;   // charge/mipps2: the last logged 0x21011 list (logMcaEvents)
+uint32_t gPdosLineHash = 0, gPdosLines = 0;
+bool gCpFirst = false;            // charge/mipps2: the armed pump would start from this 5 V (the buck holds its 9 V request)
+uint32_t gLadderRefusedPps = 0;   // charge/mipps2: pump PPS words refused for naming no advertised APDO
+uint8_t gLadderLogged = 0xff, gLadderRefusedLogged = 0;   // the last ladder stage and refusal count logged   // charge/mipps2: the last logged 0x21011 list (logMcaEvents)
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -797,6 +800,17 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("ContractError", uint32_t(c.last_error)); n("ContractAgeMs", c.updated_ms && now >= c.updated_ms ? now - c.updated_ms : ~0u);
   // charge/mipps2 (MIPPS-RDO.md): the RDO's object, whether the list lacks it (a vendor object at 5 V), the firmware's own list by
   // position (0x21011 as this codec read it, independent of the offer) and its unusable slots, and the MiPPS engine's state
+  n("Ladder", s.ladder); n("LadderObject", s.ladder_obj); n("LadderRefused", s.ladder_refused + gLadderRefusedPps);
+  n("LadderRefusal", p.ladder_refusal);
+  if (s.ladder != gLadderLogged || (p.ladder_refusal && p.ladder_refusal != PIANO_CHG_LREF_ORDER && s.ladder_refused != gLadderRefusedLogged &&
+                                     s.ladder_refused < 32)) {
+    gLadderRefusedLogged = s.ladder_refused;
+    note("ladder: %s (object %u, contract object %u, MiPPS pending %u)%s%s", piano_charge_ladder_name(s.ladder), s.ladder_obj,
+         x.contract_object, x.mipps_pending, p.ladder_refusal == PIANO_CHG_LREF_UNLISTED ? ": a 9 V request refused, no advertised object" :
+         p.ladder_refusal == PIANO_CHG_LREF_ORDER ? ": 9 V waits for MiPPS" :
+         p.ladder_refusal == PIANO_CHG_LREF_OBJECT ? ": the contract confirmed another object, back to 5 V" : "", "");
+    gLadderLogged = s.ladder;
+  }
   n("RDOObject", (c.rdo >> 28) & 15u); n("PDUnmapped", (x.valid & PIANO_CHG_IN_PD_UNMAPPED) ? x.rdo_object : 0);
   n("McaPDOCount", piano_mca_has(&fMca, McaPdos) ? fMca.pdos : 0xffu);
   n("McaPDOUnusable", piano_mca_has(&fMca, McaPdos) ? (uint32_t(fMca.value[McaPdos]) >> 8) & 0x7fu : 0);
@@ -1650,6 +1664,8 @@ void PianoPower::runCpSession(uint64_t now, I2cBus &bus)
   piano_mipps_fill_cp_in(&gMipps, willRun ? 1 : 0, &S.drv);
   y.mipps_cleanup_pending = gMippsActive && piano_mipps_cleanup_pending(&gMipps);
   const uint8_t was = S.st.state;
+  // charge/mipps2 ladder: an idle armed pump that would start from this confirmed 5 V goes before the buck's 9 V (Ubuntu's order)
+  gCpFirst = fLink.st.ladder == PIANO_CHG_LAD_5V_READY && piano_cp_may_start(&S.cfg, &y, &S.drv, &S.st);
   piano_cp_decide(&S.cfg, &y, &S.drv, &S.st, &S.plan);
   const PianoCpPlan &p = S.plan;
   switch (p.out.action) {
@@ -1661,7 +1677,12 @@ void PianoPower::runCpSession(uint64_t now, I2cBus &bus)
   default: break;
   }
   if (p.out.req_valid & PIANO_CP_REQ_PPS) {
-    if (piano_cp_write_allowed(&S.cfg, PIANO_CHG_PPS, p.pps_word, 4) && piano_mca_queue(&fMca, PIANO_MCA_PPS, p.pps_word, 4) == 0) {
+    // charge/mipps2 ladder: a PPS word only for an APDO the latest 0x21011 list advertises (position true), never another object
+    const unsigned object = piano_charge_listed_object(&fLink.in, 1, p.out.pps_mv, p.out.pps_ma);
+    if (!object) {
+      gLadderRefusedPps++;
+      note("ladder: PPS %u mV %u mA refused: no advertised APDO covers it (refusal %u)", p.out.pps_mv, p.out.pps_ma, gLadderRefusedPps);
+    } else if (piano_cp_write_allowed(&S.cfg, PIANO_CHG_PPS, p.pps_word, 4) && piano_mca_queue(&fMca, PIANO_MCA_PPS, p.pps_word, 4) == 0) {
       S.ppsPending = true; S.ppsWord = p.pps_word; S.reqMs = now;
     } else {
       note("cp session: PPS %u mV %u mA not queued", p.out.pps_mv, p.out.pps_ma);
@@ -2737,6 +2758,10 @@ void PianoPower::stepPolicy(uint64_t now)
   v.shutdown = fShutdownSeen;
   v.contract = &fContract;
   v.mippsBusy = gMippsActive || piano_mipps_cleanup_pending(&gMipps);
+  // charge/mipps2 ladder: MiPPS will run on this attach (eligible, not yet tried): the buck asks no 9 V before it (Ubuntu's order)
+  v.cpFirst = gCpFirst && gCpSess && gCpHook;
+  v.mippsPending = gArgs.mipps && gMippsKeys.count && gCpSess && !(gMippsTriedSeq == gMippsAttachSeq && gMippsAttachSeq) &&
+                   mippsEligibleNow();
   PortState port;
   piano_board_temps board;
   if (reachable && fLink.due(fMca, v)) {

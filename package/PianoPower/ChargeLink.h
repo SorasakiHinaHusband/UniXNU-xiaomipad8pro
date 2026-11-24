@@ -63,6 +63,8 @@ struct LinkView {
   uint32_t wakes = 0;                         // system wakes so far
   bool willSleep = false, shutdown = false;   // a handover is asked for
   bool mippsBusy = false;                     // MiPPS runs or owes its 0x21002 = 0: no voltage step (an authentication)
+  bool cpFirst = false;                       // charge/mipps2: the armed pump would start from this 5 V (no 9 V request now)
+  bool mippsPending = false;                  // charge/mipps2: MiPPS will run on this attach and has not finished (no 9 V first)
 };
 
 struct LinkReadback {
@@ -163,6 +165,8 @@ class ChargeLink {
     if (has(McaTermVolt)) {x.valid |= PIANO_CHG_IN_FV; x.fv_raw = m.value[McaTermVolt];}
     if (has(McaVerify)) {x.valid |= PIANO_CHG_IN_VERIFY; x.verify = m.value[McaVerify];}
     if (v.mippsBusy) {x.valid |= PIANO_CHG_IN_VERIFY; x.verify = 1;}
+    x.mipps_pending = (v.mippsPending || v.mippsBusy) ? 1 : 0;
+    x.cp_first = v.cpFirst ? 1 : 0;
     if (has(McaTbat)) {x.valid |= PIANO_CHG_IN_TBAT; x.tbat_c = m.value[McaTbat];}
     if (has(McaAiclStatus)) {x.valid |= PIANO_CHG_IN_AICL; x.aicl_ma = m.value[McaAiclStatus];}
     if (has(McaPdos)) {
@@ -201,7 +205,7 @@ class ChargeLink {
       x.valid |= PIANO_CHG_IN_CONTRACT | PIANO_CHG_IN_SOURCE;
       x.contract_generation = c.generation;
       x.contract_link_generation = m.links;
-      x.contract_mv = c.mv; x.contract_ma = c.ma; x.contract_protocol = c.protocol;
+      x.contract_mv = c.mv; x.contract_ma = c.ma; x.contract_protocol = c.protocol; x.contract_object = c.object;
       x.fixed9_ma = x.pps9_ma = 0;
       bool fixed5 = false;
       for (unsigned i = 0; i < c.pdos && i < 7; ++i) {

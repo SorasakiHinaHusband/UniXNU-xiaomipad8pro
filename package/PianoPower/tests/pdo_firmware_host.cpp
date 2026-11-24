@@ -37,7 +37,14 @@ struct Bench {
   unsigned features = 0;          // the PPM's bmOptionalFeatures (16: GET_PDOS)
   bool pd = true, connected = true, fwReady = true;
   bool mcaPdos = false;           // ChargeLink also sees the cycle's 0x21011 list itself (position true), as on the tablet
+  bool mcaOwn = false;            // ... a 0x21011 list other than the offered one (mca/mcaN)
+  uint32_t mca[7][3] = {};
+  unsigned mcaN = 0;
+  bool mippsPending = false, cpFirst = false;   // charge/mipps2 ladder inputs (PianoPower's LinkView)
+  std::vector<uint8_t> ladders;   // the ladder stages seen, in order (changes only)
   unsigned statusReads = 0, pdoQueries = 0, voltageRequests = 0;
+  unsigned wrongObject = 0;       // the firmware confirms 9 V on this object instead of the one asked for
+  bool wrongPps = false;          // ... as a PPS RDO
   int flipRdoAfterStatus = -1;    // change the RDO after this many status reads (Verify disagreement)
   std::vector<PianoChargeWrite> writes;
 
@@ -62,16 +69,20 @@ struct Bench {
     put(McaType, pd ? PIANO_CHG_T_PD : PIANO_CHG_T_SDP); put(McaIcl, int32_t(icl)); put(McaChargeEnable, int32_t(enable));
     put(McaTermVolt, 5200); put(McaVerify, 0); put(McaTbat, 30); put(McaPdState, fwReady && pd ? 2 : 1); put(McaLpd, 0);
     if (mcaPdos && pd) {
-      put(McaPdos, int32_t(fwN)); m.pdos = uint8_t(fwN);
-      for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) m.pdo[i][k] = i < fwN ? fw[i][k] : 0;
+      const unsigned n = mcaOwn ? mcaN : fwN;
+      put(McaPdos, int32_t(n)); m.pdos = uint8_t(n);
+      for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) m.pdo[i][k] = i < n ? (mcaOwn ? mca[i][k] : fw[i][k]) : 0;
     }
     LinkView v; v.nowMs = now; v.chargerPdUp = true; v.chargerPdUpMs = 1;
     v.contract = &contract; v.safetyFresh = true; v.cpOff = true; v.dtptValid = alerts.complete(); v.dtpt = alerts.active();
     v.packs = packs; v.packsFresh = true; v.packsMs = now; v.board = &board;
+    v.mippsPending = mippsPending; v.cpFirst = cpFirst;
     ChargeLink::fill(link.in, m, v);
   }
   void decide() {
     fill(); piano_charge_decide(&link.cfg, &link.in, &link.st, &link.plan);
+    if (ladders.empty() || ladders.back() != link.plan.ladder) ladders.push_back(link.plan.ladder);
+    CHECK(link.plan.ladder == link.st.ladder);
     for (unsigned i = 0; i < link.plan.writes; ++i) {
       const auto w = link.plan.write[i];
       CHECK(piano_charge_write_allowed(&link.cfg, w.property, w.value, w.bytes));
@@ -89,8 +100,15 @@ struct Bench {
       case PIANO_CHG_ICL: icl = w.value; break;
       case PIANO_CHG_FCC: fcc = w.value; break;
       case PIANO_CHG_ENABLE: enable = w.value; for (auto &g : packs) g.currentMa = enable ? 300 : 0; break;
-      case PIANO_CHG_PD_FIXED: bus = w.value; rdo = fixedRdo(bus == 9000 ? 2 : 1, bus == 9000 ? 1600 : 3000); break;
-      case PIANO_CHG_PPS: bus = (w.value >> 16) * 20; rdo = ppsRdo(3); break;
+      case PIANO_CHG_PD_FIXED: {
+        bus = w.value;
+        unsigned obj = 1;
+        for (unsigned i = 0; i < fwN; ++i) if (fw[i][0] == w.value && fw[i][1] == w.value) obj = i + 1;
+        if (wrongObject && bus == 9000) obj = wrongObject;
+        rdo = wrongPps && bus == 9000 ? ppsRdo(obj) : fixedRdo(obj, bus == 9000 ? 1600 : 3000);
+        break;
+      }
+      case PIANO_CHG_PPS: bus = (w.value >> 16) * 20; rdo = ppsRdo(wrongObject ? wrongObject : 3); break;
       default: CHECK(false);
       }
       piano_charge_ack(&link.st, w.property, w.value, 0);
@@ -416,25 +434,116 @@ static void mippsVendorObject() {
     for (unsigned i = 0; i < 12; ++i) b.tick();
     CHECK(!b.contract.valid && !(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED) && b.icl <= 100);
   }
-  // (d) the firmware lists the vendor object at its own position (gaps kept): the RDO decodes as a PPS contract at 5 V
+  // (d) the firmware lists the vendor object at its own position (gaps kept): the RDO decodes as a PPS contract at 5 V; the ladder
+  //     then goes on as Ubuntu's does without a pump: 9 V fixed on the listed object 2, confirmed by the contract's object
   {
     Bench b(true, 1, true);
     const uint32_t list[7][3] = {{5000, 5000, 3000}, {9000, 9000, 3000}, {}, {}, {}, {}, {3300, 11000, 5000}};
     for (unsigned i = 0; i < 7; ++i) for (unsigned k = 0; k < 3; ++k) b.fw[i][k] = list[i][k];
     b.fwN = 7; b.mcaPdos = true; b.rdo = kVendorRdo7;
-    for (unsigned i = 0; i < 16; ++i) b.tick();
+    b.tick();
     CHECK(b.contract.valid && b.contract.object == 7 && b.contract.protocol == PIANO_CONTRACT_PPS);
     CHECK(b.contract.mv == 5000 && b.contract.ma == 3250 && b.contract.pdos == 7 && !b.contract.offer_rejects);
     CHECK(b.link.in.contract_protocol == PIANO_CONTRACT_PPS && !(b.link.in.valid & PIANO_CHG_IN_PD_UNMAPPED));
-    CHECK(b.icl == 1500 && !b.voltageRequests && b.bus == 5000);
-    // the pump session's source view: a valid PPS contract and the 3.3-11 V APDO
+    CHECK(b.icl <= 1500 && !b.voltageRequests && b.bus == 5000);
+    // the pump's source view at this 5 V: a valid PPS contract and the 3.3-11 V APDO; held until the ladder is ready
     PianoCpSys y{};
     piano_charge_cp_sys(&b.link.cfg, &b.link.in, &b.link.st, &y);
     CHECK(y.contract_valid && y.contract_pps && y.src_kind == PIANO_CPS_SRC_PPS && y.apdo_max_mv == 11000 && y.apdo_ma == 5000);
+    CHECK(y.ladder_hold && b.link.st.ladder == PIANO_CHG_LAD_5V_CONTRACT);
+    for (unsigned i = 0; i < 16 && b.link.st.hv != PIANO_CHG_HV_ON; ++i) b.tick();
+    CHECK(b.link.st.hv == PIANO_CHG_HV_ON && b.voltageRequests == 1 && b.wrote(PIANO_CHG_PD_FIXED, 9000));
+    CHECK(b.link.st.ladder_obj == 2 && b.contract.object == 2 && b.link.st.ladder == PIANO_CHG_LAD_9V);
+    piano_charge_cp_sys(&b.link.cfg, &b.link.in, &b.link.st, &y);
+    CHECK(!y.ladder_hold);   // the pump may start from the confirmed 9 V (Ubuntu cp_try_start with hv ON)
+  }
+}
+
+// charge/mipps2: the charging ladder in the Ubuntu port's order (UBUNTU-COMPARE.md section 4): 5 V, MiPPS at 5 V, then the pump from
+// 5 V when it would start, else the buck's 9 V on an object the latest 0x21011 list advertises, confirmed by the contract's object.
+static bool seen(const std::vector<uint8_t> &v, std::initializer_list<uint8_t> order) {
+  size_t at = 0;
+  for (uint8_t want : order) {
+    while (at < v.size() && v[at] != want) ++at;
+    if (at == v.size()) return false;
+  }
+  return true;
+}
+static void ladderOrder() {
+  // 1. the order: MiPPS pending holds the 9 V request (no barrier, no write), then 9 V on the listed object 2
+  {
+    Bench b(true, 1, true); b.mcaPdos = true; b.mippsPending = true;
+    for (unsigned i = 0; i < 10; ++i) b.tick();
+    CHECK(!b.voltageRequests && b.bus == 5000 && b.link.st.ladder == PIANO_CHG_LAD_MIPPS);
+    CHECK(b.link.plan.ladder_refusal == PIANO_CHG_LREF_ORDER && b.link.st.hv == PIANO_CHG_HV_OFF);
+    b.mippsPending = false;
+    for (unsigned i = 0; i < 12 && b.link.st.hv != PIANO_CHG_HV_ON; ++i) b.tick();
+    CHECK(b.link.st.hv == PIANO_CHG_HV_ON && b.voltageRequests == 1 && b.link.st.ladder_obj == 2 && b.contract.object == 2);
+    CHECK(seen(b.ladders, {PIANO_CHG_LAD_MIPPS, PIANO_CHG_LAD_5V_READY, PIANO_CHG_LAD_9V_ASKED, PIANO_CHG_LAD_9V}));
+  }
+  // 2. the pump first: an armed pump that would start from this 5 V holds the buck's 9 V (cp_try_start before apply_policy)
+  {
+    Bench b(true, 1, true); b.mcaPdos = true; b.cpFirst = true;
+    for (unsigned i = 0; i < 12; ++i) b.tick();
+    CHECK(!b.voltageRequests && b.link.st.ladder == PIANO_CHG_LAD_5V_READY);
+    PianoCpSys y{};
+    piano_charge_cp_sys(&b.link.cfg, &b.link.in, &b.link.st, &y);
+    CHECK(!y.ladder_hold && y.src_kind == PIANO_CPS_SRC_PPS);   // the pump may start here, on the listed 3.3-11 V APDO
+    b.cpFirst = false;   // it cannot (or ended): the buck's 9 V follows
+    for (unsigned i = 0; i < 12 && b.link.st.hv != PIANO_CHG_HV_ON; ++i) b.tick();
+    CHECK(b.link.st.hv == PIANO_CHG_HV_ON && b.voltageRequests == 1);
+  }
+  // 3. a skipped stage: no validated 5 V contract (vendor object unmapped, or no contract) -> never a 9 V request, pump held
+  for (uint32_t r : {kVendorRdo7, 0u}) {
+    Bench b(true, 1, true); b.mcaPdos = true; b.rdo = r ? r : fixedRdo(2, 2500);
+    for (unsigned i = 0; i < 16; ++i) b.tick();
+    CHECK(!b.voltageRequests && b.bus == 5000 && b.link.st.ladder == PIANO_CHG_LAD_5V);
+    PianoCpSys y{};
+    piano_charge_cp_sys(&b.link.cfg, &b.link.in, &b.link.st, &y);
+    CHECK(y.ladder_hold && !y.contract_valid);
+  }
+  // 4. an object the latest 0x21011 list does not advertise is never requested: the offer had 9 V, this cycle's list does not
+  {
+    Bench b(true, 1, true); b.mcaPdos = true; b.mcaOwn = true;
+    const uint32_t only5[1][3] = {{5000, 5000, 3000}};
+    for (unsigned k = 0; k < 3; ++k) b.mca[0][k] = only5[0][k];
+    b.mcaN = 1;
+    for (unsigned i = 0; i < 16; ++i) b.tick();
+    CHECK(!b.voltageRequests && !b.wrote(PIANO_CHG_PD_FIXED, 9000) && !b.count(PIANO_CHG_PPS));
+    CHECK(b.link.st.ladder_refused >= 1);
+  }
+  // 5. a failed confirmation -> back to the previous stage, no second request on this attach:
+  //    a. fixed 9 V asked (object 2), the firmware lands on the APDO (object 3, PPS): never confirmed, vSafe5V again
+  {
+    Bench b(true, 1, true); b.mcaPdos = true; b.wrongObject = 3; b.wrongPps = true;
+    for (unsigned i = 0; i < 20; ++i) b.tick();
+    CHECK(b.voltageRequests == 1 && b.wrote(PIANO_CHG_PD_FIXED, 5000) && b.bus == 5000);
+    CHECK(b.link.st.hv == PIANO_CHG_HV_BLOCKED && b.link.st.ladder != PIANO_CHG_LAD_9V);
+  }
+  //    b. PPS 9 V asked on the listed APDO 3, the contract confirms another APDO (object 4): refused, back to 5 V
+  {
+    Bench b(true, 2, true); b.mcaPdos = true; b.wrongObject = 4;
+    const uint32_t two[4][3] = {{5000, 5000, 3000}, {9000, 9000, 2000}, {3300, 11000, 3000}, {3300, 21000, 3000}};
+    for (unsigned i = 0; i < 4; ++i) for (unsigned k = 0; k < 3; ++k) b.fw[i][k] = two[i][k];
+    b.fwN = 4;
+    for (unsigned i = 0; i < 20; ++i) b.tick();
+    CHECK(b.voltageRequests == 1 && b.link.st.ladder_obj == 3);
+    CHECK(b.link.st.hv == PIANO_CHG_HV_BLOCKED && b.link.st.ladder_refused >= 1 && b.wrote(PIANO_CHG_PD_FIXED, 5000));
+    CHECK(b.bus == 5000);
+  }
+  // 6. a multi-protocol charger (5 V, 9 V fixed, a 3.3-11 V APDO): the buck takes the fixed 9 V object (Ubuntu pd_9v_ma prefers it),
+  //    the PPS mode the APDO; each confirmed on its own position
+  for (unsigned hv : {1u, 2u}) {
+    Bench b(true, hv, true); b.mcaPdos = true;
+    for (unsigned i = 0; i < 20 && b.link.st.hv != PIANO_CHG_HV_ON; ++i) b.tick();
+    CHECK(b.link.st.hv == PIANO_CHG_HV_ON && b.link.st.ladder_obj == (hv == 1 ? 2 : 3));
+    CHECK(b.contract.object == b.link.st.ladder_obj && b.voltageRequests == 1);
+    CHECK(hv == 1 ? b.wrote(PIANO_CHG_PD_FIXED, 9000) : b.count(PIANO_CHG_PPS) == 1);
   }
 }
 
 int main() {
+  ladderOrder();
   mippsVendorObject();
   codecList();
   baselineWithoutFallback();

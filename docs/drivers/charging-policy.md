@@ -1172,3 +1172,30 @@ buck's only path to in_pps 2500.
   80/75 policy, the barrier, the 8.0-9.6 V window, 15-45 °C for 9 V, the board holds. No new boot argument.
 - **Tests:** `tests/policy_host.cpp` testT14NineVolt (PPS cases: 2500 with a cool connector; 1600 without a reading or at 51 °C;
   100 mA at 60 °C; a 2 A APDO; 80/75 from PPS).
+
+## 24. The charging ladder, in the Ubuntu port's order (charge/mipps2, 2026-11-24; host-tested, not run)
+
+A line-by-line comparison with the Ubuntu port (yzddmr6/linux-sm8750-piano, `xiaomi_mca.c` at v1.4.0 and at v1.6.3; read for behaviour
+only) covers PD, MiPPS, the pump session, the 9 V buck, AICL, the input caps, the thermal and stop limits and the replug, retry and
+fallback paths: 64 rows, 40 the same, 21 different (each safer or equal: stepped 5 V raises, one 9 V request per attach, the contract's
+object confirmed, liquid and gauge alerts stop charging, an earlier connector limit), 3 not done (MiPPS revocation while pumping above
+5 A, the adapter SVID diagnostic, writing the firmware's AICL enable). v1.6.3 changes nothing on these paths except the liquid and
+gauge-alert holds, which ours already treat more strictly.
+
+The ladder (logged as `ladder: <stage>`, published as `Ladder`, `LadderObject`, `LadderRefused`, `LadderRefusal`):
+1. 5 V: the class row, the Type-C current through the steps.
+2. 5 V on a validated contract whose object the latest 0x21011 list holds (a fixed vSafe5V contract, or a PPS contract at 5 V on a listed
+   APDO: the firmware's own move to a verified MiPPS adapter's object).
+3. MiPPS at 5 V (`piano-power-mipps=1`): while it is pending or running no voltage is asked (Ubuntu authenticates only with the bus at
+   5 V and nothing asked yet).
+4. 5 V ready: the pump (`piano-power-cp=1`, armed) starts from here when its gates hold, and the buck then asks nothing; otherwise the buck
+   asks 9 V: the fixed 9 V object first, the APDO in mode 2, each only when the latest list advertises it, after the reduced-current barrier.
+5. 9 V asked, then 9 V confirmed: the contract on the object asked for and the bus 8.0-9.6 V. Another object, or no confirmation within
+   15 s: vSafe5V again, and no 9 V until the next attach. The pump may also start from a confirmed 9 V.
+6. The pump's PPS steps: from 2 x VBAT + 300 mV, +40 mV while opening, 20 mV in regulation, each step up only after the previous word is
+   taken with the bus following it (within -1.2/+0.3 V) and no pump fault; a PPS word no listed APDO covers is refused and logged.
+Not Ubuntu's order, and not used: 9 V fixed before MiPPS (Ubuntu never authenticates once 9 V is asked).
+
+At 5 V a PD source gets its class row at once (at most 1.5 A) and, once it is settled at 5 V, min(RDO, the vSafe5V object, 3 A) through
+the 10 s steps under the connector rule. The firmware's own AICL (0x2029) still holds the input where a weak source's bus sags: on the
+Mac mini's Rp 3 A port the request is 3 A and the firmware holds 1.8 A at 4.72 V; no host setting raises that safely.

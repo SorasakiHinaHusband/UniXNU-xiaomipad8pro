@@ -164,6 +164,10 @@ typedef struct {
     uint32_t generation;    /* the charger's generation (PianoMca links): a change means the firmware is on its defaults */
     uint32_t wakes;         /* system wakes so far: a change means everything is sent again */
     uint8_t sleep;          /* PIANO_CHG_WILL_SLEEP while the system goes to sleep (repeat until plan.sleep_ready) */
+    /* charge/mipps2 ladder (UBUNTU-COMPARE.md): MiPPS will run on this attach and has not finished (no 9 V before it, the Ubuntu
+     * port's order), and the validated contract's object position (0: none) */
+    uint8_t mipps_pending, contract_object;
+    uint8_t cp_first;       /* charge/mipps2: the armed pump would start from this 5 V now: the buck asks no 9 V (Ubuntu: cp first) */
     /* the charger firmware (PianoMca's last cycle) */
     int32_t bus_mv;         /* 0x20002 / 1000 */
     int32_t ibus_ma;        /* 0x20004 / 1000 (PIANO_CHG_IN_IBUS; it reads 0 once the firmware considers charging done) */
@@ -228,6 +232,9 @@ typedef struct {
     uint64_t fcc_raise_ms;
     /* 9 V */
     uint8_t hv, hv_pps, hv_qc, hv_renegs, hv_checks;
+    /* charge/mipps2 ladder: the stage (PIANO_CHG_LAD_*), the source object position the voltage request in force was planned for
+     * (0: none; the contract must confirm it), and requests refused because they named no advertised object (saturates) */
+    uint8_t ladder, ladder_obj, ladder_refused;
     uint32_t hv_ma;
     uint64_t hv_asked_ms, hv_retry_ms;
     /* Preserve Battery Health */
@@ -334,6 +341,24 @@ enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_
 enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR,
       PIANO_CHG_ICL_CONTRACT_5V};
 
+/* charge/mipps2: the charging ladder, in the Ubuntu port's order (xiaomi_mca.c v1.4.0 L5274-5282, v1.6.3 L5473-5481: MiPPS at 5 V
+ * first, then the pump from 5 V, else the buck's 9 V; UBUNTU-COMPARE.md). Each stage is entered only from the confirmed one below it. */
+enum {
+    PIANO_CHG_LAD_NONE = 0,       /* no source */
+    PIANO_CHG_LAD_5V = 1,         /* 5 V, no validated contract (class/Rp rows; an unmapped vendor object stays here) */
+    PIANO_CHG_LAD_5V_CONTRACT,    /* 5 V on a validated contract whose object the latest 0x21011 list holds */
+    PIANO_CHG_LAD_MIPPS,          /* the MiPPS exchange at 5 V (pending or running): no voltage request */
+    PIANO_CHG_LAD_5V_READY,       /* 5 V, MiPPS done or not to run: the pump may start from here, else the buck asks 9 V */
+    PIANO_CHG_LAD_9V_ASKED,       /* the 9 V request is out for a listed object, not confirmed yet */
+    PIANO_CHG_LAD_9V,             /* 9 V confirmed: contract on the planned object, the bus 8.0-9.6 V */
+};
+/* why a request was refused (plan.ladder_refusal) */
+enum {PIANO_CHG_LREF_NONE = 0, PIANO_CHG_LREF_UNLISTED, PIANO_CHG_LREF_ORDER, PIANO_CHG_LREF_OBJECT};
+const char *piano_charge_ladder_name(int stage);
+/* The position (1-7) of the object of the latest 0x21011 list (position true) a request would name: a fixed object at mv, or an
+ * APDO covering mv with at least ma; 0: none advertised (the request must not be sent). */
+unsigned piano_charge_listed_object(const PianoChargeInput *in, int pps, uint32_t mv, uint32_t ma);
+
 enum {PIANO_CHG_FALLBACK_NONE = 0, PIANO_CHG_FALLBACK_NO_CONTRACT, PIANO_CHG_FALLBACK_SAFETY,
       PIANO_CHG_FALLBACK_GAUGE, PIANO_CHG_FALLBACK_HEALTH, PIANO_CHG_FALLBACK_MODE,
       PIANO_CHG_FALLBACK_READBACK, PIANO_CHG_FALLBACK_TIMEOUT, PIANO_CHG_FALLBACK_SOURCE};
@@ -341,6 +366,8 @@ enum {PIANO_CHG_FALLBACK_NONE = 0, PIANO_CHG_FALLBACK_NO_CONTRACT, PIANO_CHG_FAL
 typedef struct {
     uint8_t fallback;             /* PIANO_CHG_FALLBACK_*; diagnostic, not a successful transition */
     uint8_t transition;           /* reduced-current ACK/readback barrier active */
+    uint8_t ladder;               /* charge/mipps2: the ladder stage after this decision (PIANO_CHG_LAD_*) */
+    uint8_t ladder_refusal;       /* PIANO_CHG_LREF_*: a request this decision refused (0: none) */
     PianoChargeWrite write[PIANO_CHG_MAX_WRITES];   /* in this order */
     uint8_t writes;
     /* what the policy wants now (for the log and the registry) */
