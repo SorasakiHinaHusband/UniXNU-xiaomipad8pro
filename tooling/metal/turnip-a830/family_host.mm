@@ -15,6 +15,9 @@
 // plugin answers by the calling image since frontend 0011), next to this program's own answers (`self family NAME = 0|1`).
 // --expect-mac2 / --expect-no-mac2: LIB must (must not) be told Mac2; this program itself, a caller of no browser image, must never
 // be told Mac2 (the answer every other client keeps). Exit 1 on a mismatch.
+// Without --as the program's own calls are the caller: run a copy of it under an image's path (e.g. .../as-angle/libGLESv2.dylib, an
+// executable of that name) and the plugin answers it as that image. That is the pad's way: its AMFI refuses every ad hoc library in a
+// non-platform process (2026-11-24: plain, + disable-library-validation, + hardened runtime: "different Team IDs"), executables run.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
@@ -221,7 +224,7 @@ int main(int argc, char **argv)
             printf("FAIL: Mac2 %s for %s\n", expectMac2 ? "expected" : "not expected", asLib ?: "this program");
             ++failures;
         }
-        if (expectMac2 >= 0 && selfFamily(device, 2002)) {
+        if (expectMac2 >= 0 && gAsker && selfFamily(device, 2002)) {
             printf("FAIL: Mac2 told to a caller of no browser image (this program)\n");
             ++failures;
         }

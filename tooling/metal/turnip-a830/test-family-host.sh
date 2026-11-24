@@ -31,6 +31,19 @@ run() {   # run LABEL ARGS...: family_host over the hostsim, its output in OUT/L
 fail=0
 run as-angle --as "$OUT/as-angle/libGLESv2.dylib" --expect-mac2 || true
 run as-other --as "$OUT/as-other/libFamilyOther.dylib" --expect-no-mac2 || true
+# The executable itself under an image's path (no library: the pad's way): ANGLE's name gets Mac2, WebGPU.framework's Apple4 (the
+# mechanism's known-positive, frontend familyForCaller before 0011).
+mkdir -p "$OUT/exe/as-angle" "$OUT/exe/WebGPU.framework"
+cp "$OUT/family_host" "$OUT/exe/as-angle/libGLESv2.dylib"; cp "$OUT/family_host" "$OUT/exe/WebGPU.framework/WebGPU"
+runexe() {   # runexe LABEL EXE ARGS...
+  local label=$1 exe=$2; shift 2
+  DYLD_INSERT_LIBRARIES=$SHIM HOSTSIM_GPU=a830 HOSTSIM_PAGE_SIZE=4096 HOSTSIM_VA=16 MESA_LOG= \
+    "$exe" "$@" "$M/NativeAdrenoMetal" "$M/libvulkan_freedreno.dylib" "$OUT/cache" > "$OUT/$label.txt" 2> "$OUT/$label.err" \
+    && echo "$label: rc 0" || echo "$label: rc $?"
+}
+runexe exe-angle "$OUT/exe/as-angle/libGLESv2.dylib" --expect-mac2
+runexe exe-webgpu "$OUT/exe/WebGPU.framework/WebGPU"
+runexe exe-self "$OUT/family_host" --expect-no-mac2
 want() {   # want FILE LINE: the exact line is in FILE
   if grep -qxF "$2" "$1"; then echo "PASS $(basename "$1" .txt): $2"; else echo "FAIL $(basename "$1" .txt): no '$2'"; fail=1; fi
 }
@@ -45,6 +58,13 @@ want "$OUT/as-angle.txt" 'gate angle-metal-renderer-available (default device in
 want "$OUT/as-angle.txt" 'gate angle-require-gpu-family2 (Apple1 or Mac2) = PASS'
 want "$OUT/as-angle.txt" 'angle es version = 3.0 (WebGL2)'
 want "$OUT/as-angle.txt" 'dawn limits row = Mac2'
+want "$OUT/exe-angle.txt" 'family Mac2 = 1'
+want "$OUT/exe-angle.txt" 'family Apple4 = 0'
+want "$OUT/exe-angle.txt" 'RESULT PASS'
+want "$OUT/exe-webgpu.txt" 'family Apple4 = 1'
+want "$OUT/exe-webgpu.txt" 'family Mac2 = 0'
+want "$OUT/exe-self.txt" 'family Mac2 = 0'
+want "$OUT/exe-self.txt" 'RESULT PASS'
 want "$OUT/as-other.txt" 'family Mac2 = 0'
 want "$OUT/as-other.txt" 'gate angle-metal-renderer-available (default device in Mac2) = FAIL'
 want "$OUT/as-other.txt" 'dawn limits row = Apple3'
