@@ -5,6 +5,7 @@
 // validates and enqueues. The worker pumps HFI during asynchronous guest waits;
 // output lookups/maps are scoped to a copy. Synchronous completion stays on the worker.
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -47,6 +48,7 @@ struct Session {
   int replyError=0;
   uint8_t replyUuid[16]={};
   IOUserClient *surfaces=nullptr;
+  bool surfacesBorrowed=false;   // piano-video-vt-borrow: the owner task's own IOSurfaceRoot client, never closed by us
   unsigned surfaceOpens=0,surfaceCloses=0,maps=0;
   pianovideo::vtsurface::Lease surfaceLease;
   uint32_t writeSurfaceID=0;
@@ -120,6 +122,23 @@ bool unlockSurfaceWrite(Session *s){
   if(rc||bytes!=sizeof seed){failure(s,82,rc?int(rc):kBadData);return false;}
   return true;
 }
+// LT-B5 (ANALYSIS.md section 12 of 20261124-browser-gpu): a sandboxed client's surfaces may refuse a lookup by ID through a second
+// IOSurfaceRoot client of the same task (27.3 "disallowing global lookups"; WebKit's GPU process: kIOReturnNotPermitted). With boot-arg
+// piano-video-vt-borrow=1 the lookup is retried once through that task's own existing IOSurfaceRoot client (IOUserClientCreator
+// "pid N, ..."), which already holds the surface. The borrowed client is retained, never closed by us.
+void closeSurface(Session *s);
+static bool pianoVtBorrow(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)&&v==1;}return b==1;}
+static IOUserClient *ownerSurfaceClient(IOUserClient *mine,int pid){
+  IOService *root=surfaceRoot();if(!root)return nullptr;
+  char want[24];snprintf(want,sizeof want,"pid %d,",pid);const size_t n=strlen(want);
+  IOUserClient *found=nullptr;OSIterator *it=root->getClientIterator();
+  if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;
+      OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
+      const bool match=cs&&!strncmp(cs->getCStringNoCopy(),want,n);OSSafeReleaseNULL(c);
+      if(match){found=u;found->retain();break;}}
+    it->release();}
+  OSSafeReleaseNULL(root);return found;
+}
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
   if(!id || s->surfaceLease.held()){failure(s,45,kBadState);return false;}
@@ -133,7 +152,14 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   }
   uint8_t *result=static_cast<uint8_t *>(IOMallocZero(bytes));if(!result){failure(s,41,kNoMemory);return false;}
   uint32_t resultBytes=bytes;
-  const IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
+  IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
+  if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&!s->surfacesBorrowed){
+    IOUserClient *owner=ownerSurfaceClient(s->surfaces,s->client->pid);
+    IOLog("PianoVideoVT B1: lookup id %u refused through our client; owner-task client %s (pid %d)\n",id,owner?"found":"none",s->client->pid);
+    if(owner){closeSurface(s);s->surfaces=owner;s->surfacesBorrowed=true;memset(result,0,bytes);resultBytes=bytes;
+      rc=surfaceMethod(s,4,id,result,&resultBytes);
+      IOLog("PianoVideoVT B1: lookup id %u through the owner-task client status %08x\n",id,rc);}
+  }
   // A successful method owns both references, even if layout validation fails.
   if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
   bool ok=!rc && resultBytes==bytes;
@@ -205,7 +231,8 @@ bool releaseSurface(Session *s){
   return ok;
 }
 void closeSurface(Session *s){
-  if(s->surfaces){s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);++s->surfaceCloses;s->surfaceLease.closed();s->writeSurfaceID=0;}
+  if(s->surfaces){if(!s->surfacesBorrowed)s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;
+    ++s->surfaceCloses;s->surfaceLease.closed();s->writeSurfaceID=0;}
 }
 bool request(Session *s,Writer &w,const uint8_t *b,uint64_t id,uint32_t type){
   // Queue transport while holding the cancellation fence. The send callback
