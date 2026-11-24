@@ -754,9 +754,76 @@ def test_manifest(tmp):
     return write(tmp / 'userland.toml', text)
 
 
-def stage_run(*args):
-    r = sh([sys.executable, str(HERE / 'stage.py'), *map(str, args)], timeout=720, capture_output=True, text=True)
+def stage_run(*args, env=None):
+    environment = {k: v for k, v in os.environ.items() if not k.startswith('PIANO_GPU_ADDON')}
+    environment.update(env or {})
+    r = sh([sys.executable, str(HERE / 'stage.py'), *map(str, args)], timeout=720, capture_output=True, text=True, env=environment)
     return r.returncode, r.stdout + r.stderr
+
+
+def addon_tests(tmp):
+    """PIANO_GPU_ADDON (gpu/safari1): the seed's own plugin cloned to /private/var/ngpu/addons/<name>.bundle, the view's source for
+    sheng-gpu-addon=1; copy keeps /Library/GPUBundles, move removes it; a Mach-O outside the trust cache, move against a staged
+    --gpu-bundle, a bad mode and a live layer are refused."""
+    print('6b. GPU addon (PIANO_GPU_ADDON, a 64 MiB APFS image)')
+    seed = make_seed(tmp)
+    manifest = test_manifest(tmp)
+    trust = write(tmp / 'seed/kernel.macho.trustcache', trust_cache([[bytes([0x11]) * 20]]))
+    bundle = tmp / 'T.bundle'
+    write(bundle / 'Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'T'}))
+    exe = build_c(tmp, 'T', '#include <stdio.h>\nint main(void) { puts("plugin"); return 0; }\n')
+    write(bundle / 'Contents/MacOS/T', exe.read_bytes(), 0o755)
+    want_cd = stage.soft_metal().cdhash(bundle / 'Contents/MacOS/T').hex()
+    base = tmp / 'out/base'   # a seed whose /Library/GPUBundles/T.bundle holds a trusted Mach-O, as the recipe seed holds the plugin
+    code, text = stage_run('--manifest', manifest, '--seed', seed, '--trust', trust, '--out', base, '--gpu-bundle', bundle)
+    check(code == 0, 'the base seed with a trusted plugin' + ('' if code == 0 else ':\n' + text[-2000:]))
+    if code:
+        return
+    seed_a, trust_a = base / 'scratch-data.img', base / 'kernel.macho.trustcache'
+    copy = tmp / 'out/copy'
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', copy,
+                           env={'PIANO_GPU_ADDON': 'copy', 'PIANO_GPU_ADDON_NAME': 'T'})
+    check(code == 0 and 'seed GPU addon (copy): /private/var/ngpu/addons/T.bundle' in text,
+          'copy: staged' + ('' if code == 0 else ':\n' + text[-2000:]))
+    if code == 0:
+        rec = json.loads((copy / 'userland.json').read_text())['seed_gpu_addon']
+        with attached(unpack(copy / 'scratch-data.img', tmp / 'copy.raw'), readonly=True) as mnt:
+            view, kept = mnt / 'private/var/ngpu/addons/T.bundle', mnt / 'Library/GPUBundles/T.bundle'
+            same = all((view / f).read_bytes() == (kept / f).read_bytes() for f in ('Contents/Info.plist', 'Contents/MacOS/T',
+                                                                                  'Contents/MacOS/retained.dylib'))
+            check(same and os.access(view / 'Contents/MacOS/T', os.X_OK), 'copy: the addon holds the seed plugin\'s bytes and modes')
+            names = set(sh(['xattr', str(view)], timeout=30, capture_output=True, text=True).stdout.split())
+            check(names <= {'com.apple.provenance'}, f'copy: no xattrs carried but the build Mac\'s provenance tag ({sorted(names)})')
+            check(oct((mnt / 'private/var/ngpu/addons').stat().st_mode & 0o777) == '0o755', 'copy: the addons directory 0755')
+        check(rec['mode'] == 'copy' and rec['gpu_bundles_copy_kept'] and rec['boot_arg'] == 'sheng-gpu-addon=1' and
+              {f['path']: f['cdhash'] for f in rec['files']}.get('Contents/MacOS/T') == want_cd,
+              'copy: the record names the mode, the boot argument and the Mach-O\'s CDHash')
+    move = tmp / 'out/move'
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', move,
+                           env={'PIANO_GPU_ADDON': 'move', 'PIANO_GPU_ADDON_NAME': 'T'})
+    check(code == 0, 'move: staged' + ('' if code == 0 else ':\n' + text[-2000:]))
+    if code == 0:
+        with attached(unpack(move / 'scratch-data.img', tmp / 'move.raw'), readonly=True) as mnt:
+            check((mnt / 'private/var/ngpu/addons/T.bundle/Contents/MacOS/T').read_bytes() == exe.read_bytes() and
+                  not (mnt / 'Library/GPUBundles/T.bundle').exists(), 'move: the addon present, /Library/GPUBundles/T.bundle gone')
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/move2', '--gpu-bundle',
+                           bundle, env={'PIANO_GPU_ADDON': 'move', 'PIANO_GPU_ADDON_NAME': 'T'})
+    check(code != 0 and 'would put /Library/GPUBundles/T.bundle back' in text, 'move with a staged --gpu-bundle of that name: refused')
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust, '--out', tmp / 'out/untrusted',
+                           env={'PIANO_GPU_ADDON': 'copy', 'PIANO_GPU_ADDON_NAME': 'T'})
+    check(code != 0 and 'not in the trust cache' in text, 'a plugin Mach-O outside the trust cache: refused')
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/bad',
+                           env={'PIANO_GPU_ADDON': 'yes'})
+    check(code != 0 and 'copy or move' in text, 'PIANO_GPU_ADDON=yes: refused')
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/none',
+                           env={'PIANO_GPU_ADDON': 'copy'})
+    check(code != 0 and 'no /Library/GPUBundles/NativeAdrenoMetal.bundle' in text, 'the default name without that plugin: refused')
+    code, text = stage_run('--manifest', manifest, '--live', tmp / 'out/live', env={'PIANO_GPU_ADDON': 'copy'})
+    check(code != 0 and 'seed-only' in text, 'a live layer with PIANO_GPU_ADDON: refused')
+    unset = tmp / 'out/unset'
+    code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', unset)
+    rec = json.loads((unset / 'userland.json').read_text()) if code == 0 else {}
+    check(code == 0 and 'seed_gpu_addon' not in rec and 'seed GPU addon' not in text, 'unset: no addon, no record entry')
 
 
 def seed_tests(tmp):
@@ -954,6 +1021,7 @@ def main():
             trust_tests(tmp / 't')
             cdhash_tests(tmp / 'c')
             seed_tests(tmp / 's')
+            addon_tests(tmp / 'a')
             live_tests(tmp / 'v')
     print(f'\n{"PASS" if not failures else "FAIL"}: {len(failures)} failure(s)')
     return 1 if failures else 0
