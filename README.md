@@ -55,6 +55,7 @@ Per-driver pages, boot arguments and test levels: [docs/drivers/README.md](docs/
 | `tooling/` | `k273/build-k273-image.sh` (the 27.3 kexts → kernel collection → ADT → RAM images, `K273_KERNEL`), `k273/build-k273-esp.py` (the installed 27.3 ESP), `kc/` (the KC build), `adt/`, `bootimg/` (RAM images and their verification), `native/` (the test loop, the USB console, input), `persist/` (the installed copy), `firmware/` (the FD) |
 | `firmware/` | deltas to piano-uefi's `pianoPkg`, Mu-Silicium and UniXNU |
 | `docs/` | bring-up notes, driver pages (`drivers/`), plans and evidence |
+| `skills/`, `tooling/repro/` | the agent guide for another unit and its kit: pins of Apple's inputs, self-fetch, root rebuild checks, host check |
 | `logs/`, `artifacts/ARTIFACTS.md` | committed verification logs; SHA-256 of built artifacts and inputs |
 | `private/`, `out/` | ignored: keys, per-unit calibration; build outputs |
 
@@ -78,6 +79,20 @@ ESP recipe uses `build-k273-esp.py --root-part linux_rootfs` ([docs/persistent-b
 
 Details, the boot arguments and what is read from the k27 tree: [docs/bringup-debugging.md](docs/bringup-debugging.md) §4.
 
+## Building and installing on another unit
+
+[skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md) is written for a coding agent and covers the whole
+path for a second tablet: requirements, inputs, build, RAM-boot validation, the guarded install, rollback and checks. Apple's
+files are never distributed. `tooling/repro/fetch-ipsw.py` fetches the pinned 27.3 IPSW's members from Apple's CDN and the AEA
+keys from Apple, then checks every file against `tooling/repro/pins.json`. The 20.9 GB root image is rebuilt locally and checked
+against the pinned OS window and the SystemOS window's file-level manifest (`tooling/repro/verify-root.py`).
+`tooling/repro/fetch-and-build.sh --dry-run | --check` runs the steps in order.
+
+**Host:** macOS on **Apple silicon** (tested: macOS 27.2.1, Xcode 27.2). Intel Macs are not supported: Xcode 27's compiler and
+linker and macOS 27's own tools are arm64-only, and the build runs arm64e programs it compiles. `tooling/repro/check-host.sh`
+checks the host. Some inputs are still local to the original setup: the k27 kernel tree, the base trust bundle, the Data seed,
+the Turnip tree, and the write tooling's single-unit pins. The skill's "Known gaps" lists each one with options.
+
 ## Boot and test
 
 Everyday development uses RAM boots: `fastboot boot` of a RAM image, which takes priority over the installed copy, with an
@@ -95,6 +110,7 @@ enforces it on every build, before and after the link: no descriptor from elsewh
 
 - [docs/STATUS.md](docs/STATUS.md): what works, per feature, with the build and date it was verified.
 - [docs/USING.md](docs/USING.md): using, updating and recovering the installed system.
+- [skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md): building and installing on another unit (agent guide).
 - [docs/drivers/README.md](docs/drivers/README.md): every driver, its levels and its state.
 - [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md): repositories, local layout, hard rules.
 - [docs/bringup-debugging.md](docs/bringup-debugging.md): the boot chain, debugging without a screen, the test loop, rebuilding.
