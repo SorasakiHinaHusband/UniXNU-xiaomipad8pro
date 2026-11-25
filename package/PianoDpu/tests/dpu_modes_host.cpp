@@ -169,6 +169,30 @@ void testClassifyOthers()
   check(!geometry(zero).ok, "zero words give no geometry");
 }
 
+// Programmable fetch as the boot stages leave it (INTF_CONFIG bit 31): the start keeps its lines before the frame end in every mode.
+void testProgFetch()
+{
+  check(liveProgFetch(0x80800000u, 1234) == 1234 && liveProgFetch(0x00800000u, 1234) == 0, "bit 31 of INTF_CONFIG gates the start");
+  LinkLive l = liveY12k();
+  l.progFetch = (2310 - 24) * 576 + 1;
+  const Geometry g = geometry(l);
+  check(g.ok && g.fetchLines == 24 && g.fetchOffset == 0, "24 fetch lines read back from the start");
+  const LinkWords w120 = plan(g, *modeByHz(120)), w60 = plan(g, *modeByHz(60)), w144 = plan(g, *modeByHz(144)), w90 = plan(g, *modeByHz(90));
+  check(firstDifference(w120, l) == nullptr, "the 120 Hz plan keeps the live start");
+  checkEq(w60.progFetch, (4620 - 24) * 576 + 1, "60 Hz moves the start with the long frame");
+  checkEq(w144.progFetch, (2310 - 24) * 480 + 1, "144 Hz recounts it in 480-clock lines");
+  checkEq(w90.progFetch, (2310 - 24) * 768 + 1, "90 Hz in 768-clock lines");
+  checkEq(changedWords(w120, w60), kWordPeriod | kWordDsiTotal | kWordProgFetch, "with fetch on, 120 -> 60 must also move the start");
+  check(changedWords(w120, w144) & kWordProgFetch, "and 120 -> 144");
+  // The old start at 144 Hz would point past the frame (2286 lines of 576 clocks = 2743 lines of 480): the hazard the plan removes.
+  check((l.progFetch - 1) / w144.htotal >= w144.vtotal, "the unmoved 120 Hz start lies past a 144 Hz frame");
+  const LinkLive pair[2] = {l, l};
+  checkEq(classify(pair).hz, 120, "fetch on still classifies as 120");
+  LinkLive bad = liveY12k();
+  bad.progFetch = 1000 * 576 + 1;   // inside the active lines
+  check(!geometry(bad).ok, "a fetch start inside the active lines is refused");
+}
+
 void testRateGroup()
 {
   const Mode &m144 = *modeByHz(144), &m120 = *modeByHz(120), &m90 = *modeByHz(90), &m60 = *modeByHz(60);
@@ -195,6 +219,7 @@ int main()
   testAllModes();
   testChangedWords();
   testClassifyOthers();
+  testProgFetch();
   testRateGroup();
   if (gFailures) {
     std::printf("PianoDpu modes host tests: %u of %u checks FAILED\n", gFailures, gChecks);

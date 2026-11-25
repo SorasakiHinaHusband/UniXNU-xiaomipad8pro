@@ -18,8 +18,14 @@
 //     DISPLAY_HCTL and ACTIVE_H, the skew from DISPLAY_V_START. Only the front porches come from the mode table (halved per link).
 //
 // So DISPLAY_HCTL, DSI ACTIVE_H/ACTIVE_V and DATA_HCTL are the same in every mode; HSYNC_CTL, VSYNC_PERIOD_F0, VSYNC_PULSE_WIDTH_F0,
-// DISPLAY_V_START_F0, DISPLAY_V_END_F0 and DSI TOTAL change with the horizontal front porch; with the vertical one (60 Hz) only
-// VSYNC_PERIOD_F0 and DSI TOTAL (DpuRefresh.h's plan writes exactly those).
+// DISPLAY_V_START_F0, DISPLAY_V_END_F0 and DSI TOTAL change with the horizontal front porch; with the vertical one (60 Hz)
+// VSYNC_PERIOD_F0 and DSI TOTAL (DpuRefresh.h's plan writes exactly those) -- and, in both cases, INTF_PROG_FETCH_START when
+// programmable fetch is on:
+//   - programmable fetch (INTF_CONFIG bit 31, start in INTF_PROG_FETCH_START +0x170, a vsync counter in INTF clocks: msm
+//     dpu_hw_intf_setup_prg_fetch; msm programmable_fetch_config: start = (vtotal - fetch lines) * htotal + 1). Linux turns it off on
+//     piano (vbp + vsync = 106 lines >= the 24-line worst case), but the boot stages leave it ON: installed y12k's survey reads
+//     INTF_CONFIG 80800000 on both INTFs. Its start counts from vsync, so after a porch change the old value points at another line
+//     (or past the frame at 144 Hz): every switch moves it with the timing, keeping the same number of fetch lines before vsync.
 #pragma once
 #include <stdint.h>
 #include "DpuHw.h"
@@ -34,7 +40,10 @@ constexpr uint64_t kPixelClockHz = 159667200;   // 576 x 2310 x 120, the same fo
 struct LinkLive {
   uint32_t hsyncCtl = 0, period = 0, vsyncWidth = 0, dispVStart = 0, dispVEnd = 0, dispHctl = 0;   // INTF1 / INTF2
   uint32_t dsiTotal = 0, dsiActiveH = 0, dsiActiveV = 0;                                            // DSI0 / DSI1
+  uint32_t progFetch = 0;   // INTF_PROG_FETCH_START when INTF_CONFIG bit 31 is set, else 0 (programmable fetch off)
 };
+constexpr uint32_t kIntfConfigProgFetchEn = 1u << 31;
+inline uint32_t liveProgFetch(uint32_t intfConfig, uint32_t start) { return (intfConfig & kIntfConfigProgFetchEn) ? start : 0; }
 
 // The per-link geometry the live words give.
 struct Geometry {
@@ -42,6 +51,7 @@ struct Geometry {
   const char *why = "not derived";
   unsigned hsync = 0, hsyncBp = 0, hactive = 0, vsync = 0, vbp = 0, vactive = 0, skew = 0;
   unsigned dsiHstart = 0, dsiHend = 0;
+  unsigned fetchLines = 0, fetchOffset = 0;   // programmable fetch: lines before the frame end and the clock offset within its line
 };
 
 // One mode's words for one link.
@@ -49,6 +59,7 @@ struct LinkWords {
   unsigned hz = 0, htotal = 0, vtotal = 0, hfp = 0, vfp = 0;
   uint32_t hsyncCtl = 0, period = 0, vsyncWidth = 0, dispVStart = 0, dispVEnd = 0, dispHctl = 0;
   uint32_t dsiTotal = 0, dsiActiveH = 0, dsiActiveV = 0;
+  uint32_t progFetch = 0;      // INTF_PROG_FETCH_START, 0 with programmable fetch off
   uint64_t pixelClockHz = 0;   // htotal x vtotal x hz
 };
 
@@ -90,6 +101,15 @@ inline Geometry geometry(const LinkLive &l, uint32_t skew = 0)
     g.why = "DSI ACTIVE_H does not carry the INTF's active width at the INTF's start";
     return g;
   }
+  if (l.progFetch) {   // msm: (vtotal - lines) * htotal + 1; any other offset within the line kept as found
+    const unsigned vtotal = l.period / htotal, at = l.progFetch - 1;
+    if (!l.progFetch || l.period % htotal || at / htotal >= vtotal || at / htotal < kVsync + kVbp + kPanelHeight) {
+      g.why = "the programmable fetch start is not inside the vertical front porch";
+      return g;
+    }
+    g.fetchLines = vtotal - at / htotal;
+    g.fetchOffset = at % htotal;
+  }
   g.ok = true;
   g.why = "ok";
   return g;
@@ -115,6 +135,7 @@ inline LinkWords plan(const Geometry &g, const Mode &m)
   w.dsiTotal = uint32_t(w.vtotal - 1) << 16 | uint32_t(dsiHtotal - 1);
   w.dsiActiveH = uint32_t(g.dsiHend) << 16 | g.dsiHstart;
   w.dsiActiveV = uint32_t(g.vsync + g.vbp + g.vactive) << 16 | uint32_t(g.vsync + g.vbp);
+  w.progFetch = g.fetchLines ? (w.vtotal - g.fetchLines) * w.htotal + 1 + (g.fetchOffset < w.htotal ? g.fetchOffset : 0) : 0;
   w.pixelClockHz = uint64_t(w.htotal) * w.vtotal * m.hz;
   return w;
 }
@@ -138,6 +159,7 @@ inline const char *firstDifference(const LinkWords &w, const LinkLive &l)
   if (w.dsiTotal != l.dsiTotal) return "DSI TOTAL";
   if (w.dsiActiveH != l.dsiActiveH) return "DSI ACTIVE_H";
   if (w.dsiActiveV != l.dsiActiveV) return "DSI ACTIVE_V";
+  if (w.progFetch != l.progFetch) return "INTF_PROG_FETCH_START";
   return nullptr;
 }
 
@@ -177,18 +199,21 @@ inline Classified classify(const LinkLive live[2], uint32_t skew = 0)
   return c;
 }
 
-// The words a switch from one mode to another changes on a link (a bit set over the order of LinkWords' nine words, bit 0 HSYNC_CTL).
+// The words a switch from one mode to another changes on a link (a bit set over the order of LinkWords' ten words, bit 0 HSYNC_CTL).
 inline unsigned changedWords(const LinkWords &a, const LinkWords &b)
 {
-  const uint32_t x[9] = {a.hsyncCtl, a.period, a.vsyncWidth, a.dispVStart, a.dispVEnd, a.dispHctl, a.dsiTotal, a.dsiActiveH, a.dsiActiveV};
-  const uint32_t y[9] = {b.hsyncCtl, b.period, b.vsyncWidth, b.dispVStart, b.dispVEnd, b.dispHctl, b.dsiTotal, b.dsiActiveH, b.dsiActiveV};
+  const uint32_t x[10] = {a.hsyncCtl, a.period, a.vsyncWidth, a.dispVStart, a.dispVEnd, a.dispHctl, a.dsiTotal, a.dsiActiveH, a.dsiActiveV,
+                          a.progFetch};
+  const uint32_t y[10] = {b.hsyncCtl, b.period, b.vsyncWidth, b.dispVStart, b.dispVEnd, b.dispHctl, b.dsiTotal, b.dsiActiveH, b.dsiActiveV,
+                          b.progFetch};
   unsigned bits = 0;
-  for (unsigned k = 0; k < 9; ++k)
+  for (unsigned k = 0; k < 10; ++k)
     if (x[k] != y[k]) bits |= 1u << k;
   return bits;
 }
 constexpr unsigned kWordHsyncCtl = 1u << 0, kWordPeriod = 1u << 1, kWordVsyncWidth = 1u << 2, kWordVStart = 1u << 3, kWordVEnd = 1u << 4,
-                   kWordHctl = 1u << 5, kWordDsiTotal = 1u << 6, kWordDsiActiveH = 1u << 7, kWordDsiActiveV = 1u << 8;
+                   kWordHctl = 1u << 5, kWordDsiTotal = 1u << 6, kWordDsiActiveH = 1u << 7, kWordDsiActiveV = 1u << 8,
+                   kWordProgFetch = 1u << 9;
 
 // ------------------------------------------------------------------------------------------------- the panel's rate group
 // Only a switch between the 120 Hz group (120, 60) and 144 or 90 changes the panel's rate-group registers. The Ubuntu driver writes
