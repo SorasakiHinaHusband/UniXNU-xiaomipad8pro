@@ -30,4 +30,7 @@ IOLock *flipTransactionLock();
 void flipPanelBegin();
 void flipPanelEnd(bool paused);
 
+// Serializes the PCC's CTL flush and latch with flips.
+IOLock *flipTransactionLock();
+
 }  // namespace pianodpu

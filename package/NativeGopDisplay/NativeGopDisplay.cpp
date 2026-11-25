@@ -575,9 +575,10 @@ private:
     uint64_t fColorLast[kColorFunctions][9];
     // native-gop-display-color-log=1 (default 0; GopColorLog.h): set_matrix / setBrightnessCorrection logged, then answered as the
     // family answers them (kIOReturnUnsupported): B1 milestone 1 records what Night Shift really sends before anything is applied.
-    bool fColorLog;
+    bool fColorLog, fDpuNightShift;
     uint32_t fMatrixCalls, fMatrixChanges, fMatrixHash, fCorrectionCalls, fCorrectionChanges, fCorrectionLast;
     IOService *dpuService(bool now);
+    IOReturn nightShiftCall(const char *name, void *value = nullptr);
     // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~20-39 ms for 3200x2136
     // BGRA, most of it reading the surface (uncached).
     //   bit 0: (since 2026-11-12 the default, native-gop-display-refresh=1) a frame whose copy waited for the GPU's fence and saw it
@@ -910,8 +911,14 @@ bool NativeGopDisplay::start(IOService *provider)
         PE_parse_boot_argn("piano-dpu-pcc", &fDpuPcc, sizeof(fDpuPcc));
     unsigned colorLog = 0;
     PE_parse_boot_argn("native-gop-display-color-log", &colorLog, sizeof(colorLog));
-    fColorLog = colorLog == 1 && !fExternal;
-    if (fColorLog)
+    unsigned nightShift = 0;
+    PE_parse_boot_argn("native-gop-display-night-shift", &nightShift, sizeof(nightShift));
+    fDpuNightShift = gopcolor::nightShiftEnabled(nightShift, fExternal);
+    fColorLog = (colorLog == 1 && !fExternal) || fDpuNightShift;
+    if (fDpuNightShift) {
+        fDpuPcc = 0;
+        GOPLOG("night shift: set_matrix (slot 309, location 9) and setBrightnessCorrection (slot 314) routed to PianoDpu\n");
+    } else if (fColorLog)
         GOPLOG("color log: set_matrix (slot 309) and setBrightnessCorrection (slot 314) logged, then answered unsupported as the "
                "family does (native-gop-display-color-log=1; nothing applied)\n");
     unsigned dpuPanel = 0;
@@ -1502,12 +1509,12 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
     fDisplayOn = on;
     at<uint32_t>(this, kHardwarePowered) = on;
     GOPLOG("display %s\n", on ? "on" : "off");
-    if (fDpuPanel) {   // the panel's light sleep (PianoDpu's thread; the backlight's request above goes first)
+    if (fDpuPanel || fDpuNightShift) {   // panel light sleep or PCC replay (PianoDpu's thread)
         IOService *dpu = dpuService(true);
         if (dpu)
             dpu->callPlatformFunction("PianoDpuPanel", false, reinterpret_cast<void *>(uintptr_t(on)), nullptr, nullptr, nullptr);
         else
-            GOPLOG("display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
+            GOPLOG("display %s: no PianoDpu service (panel sleep and Night Shift need piano-dpu>=1)\n", on ? "on" : "off");
     }
     powerstate_notify(true, on);
     if (on && (fVblStopped || fVblIdle))   // the tick stopped while the display was off (or nothing moved): again from now
@@ -1515,7 +1522,7 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
     return kIOReturnSuccess;
 }
 
-// The PianoDpu service (piano-dpu-pcc / -panel / -refresh=auto only), looked up at once (now) or at most once a second (the swap
+// The PianoDpu service for colour, panel and refresh, looked up at once (now) or at most once a second (the swap
 // path), retained once found.
 IOService *NativeGopDisplay::dpuService(bool now)
 {
@@ -3064,6 +3071,8 @@ IOReturn NativeGopDisplay::set_digital_out_mode(unsigned int colorID, unsigned i
     setProperty("DisplayWidth", fVideo.v_width, 32);
     setProperty("DisplayHeight", fVideo.v_height, 32);
     setProperty("DPTimingModeId", timingID, 32);
+    if (fDpuNightShift)
+        nightShiftCall("PianoDpuNightShiftModeSet");
     return kIOReturnSuccess;
 }
 
@@ -3152,46 +3161,65 @@ IOReturn NativeGopDisplay::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix, 
     return kIOReturnSuccess;
 }
 
-// Night Shift's two entry points on 27.3 (GopColorLog.h). IOMobileFramebufferLegacy's own set_matrix and setBrightnessCorrection
-// only return kIOReturnUnsupported; these return the same in every case, so WindowServer sees no change. With
-// native-gop-display-color-log=1 each new matrix (location, nine S31.32 words, decoded to thousandths) and each new correction is
-// logged (the first 16 changes, then every 100th); repeats are only counted.
+IOReturn NativeGopDisplay::nightShiftCall(const char *name, void *value)
+{
+    IOService *dpu = dpuService(true);
+    return dpu ? dpu->callPlatformFunction(name, false, value, nullptr, nullptr, nullptr) : kIOReturnNotReady;
+}
+
+// Each callback is forwarded when M4 is enabled. Deduplication here rate-limits the observer only.
 IOReturn NativeGopDisplay::set_matrix(unsigned int location, unsigned long long const (*matrix)[3][3])
 {
-    if (!fColorLog || !matrix)
+    if (!fColorLog)
         return kIOReturnUnsupported;
+    if (!matrix)
+        return fDpuNightShift ? kIOReturnBadArgument : kIOReturnUnsupported;
     uint64_t m[9];
     for (unsigned r = 0; r < 3; ++r)
         for (unsigned c = 0; c < 3; ++c)
             m[3 * r + c] = (*matrix)[r][c];
-    fMatrixCalls++;
     const uint32_t hash = gopcolor::matrixHash(location, m);
-    if (fMatrixChanges && hash == fMatrixHash)
-        return kIOReturnUnsupported;
-    fMatrixHash = hash;
-    if (gopcolor::logged(++fMatrixChanges)) {
+    IOLockLock(fCopyLock);
+    const uint32_t calls = ++fMatrixCalls;
+    const bool changed = !fMatrixChanges || hash != fMatrixHash;
+    if (changed) {
+        fMatrixHash = hash;
+        ++fMatrixChanges;
+    }
+    const uint32_t changes = fMatrixChanges;
+    IOLockUnlock(fCopyLock);
+    const IOReturn result = fDpuNightShift && location == gopcolor::kNightShiftLocation
+        ? nightShiftCall("PianoDpuNightShiftMatrix", m) : kIOReturnUnsupported;
+    if (changed && gopcolor::logged(changes)) {
         long long k[9];
         for (unsigned i = 0; i < 9; ++i)
             k[i] = static_cast<long long>(gopcolor::s3132ToMilli(m[i]));
         GOPLOG("set_matrix #%u (call %u): location %u, %s [%lld %lld %lld | %lld %lld %lld | %lld %lld %lld] (thousandths, [out][in]); "
-               "raw %016llx %016llx %016llx | %016llx %016llx %016llx | %016llx %016llx %016llx; answered unsupported\n",
-               fMatrixChanges, fMatrixCalls, location, gopcolor::shapeName(gopcolor::shape(m)), k[0], k[1], k[2], k[3], k[4], k[5], k[6],
-               k[7], k[8], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+               "raw %016llx %016llx %016llx | %016llx %016llx %016llx | %016llx %016llx %016llx; result %#x\n",
+               changes, calls, location, gopcolor::shapeName(gopcolor::shape(m)), k[0], k[1], k[2], k[3], k[4], k[5], k[6],
+               k[7], k[8], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], result);
     }
-    return kIOReturnUnsupported;
+    return result;
 }
 IOReturn NativeGopDisplay::setBrightnessCorrection(unsigned int value)
 {
     if (!fColorLog)
         return kIOReturnUnsupported;
-    fCorrectionCalls++;
-    if (fCorrectionChanges && value == fCorrectionLast)
-        return kIOReturnUnsupported;
-    fCorrectionLast = value;
-    if (gopcolor::logged(++fCorrectionChanges))
-        GOPLOG("setBrightnessCorrection #%u (call %u): %#x (%u thousandths, 16.16); answered unsupported\n", fCorrectionChanges,
-               fCorrectionCalls, value, gopcolor::u1616ToMilli(value));
-    return kIOReturnUnsupported;
+    IOLockLock(fCopyLock);
+    const uint32_t calls = ++fCorrectionCalls;
+    const bool changed = !fCorrectionChanges || value != fCorrectionLast;
+    if (changed) {
+        fCorrectionLast = value;
+        ++fCorrectionChanges;
+    }
+    const uint32_t changes = fCorrectionChanges, matrixCalls = fMatrixCalls;
+    IOLockUnlock(fCopyLock);
+    const IOReturn result = fDpuNightShift ? nightShiftCall("PianoDpuNightShiftCorrection", reinterpret_cast<void *>(uintptr_t(value)))
+                                           : kIOReturnUnsupported;
+    if (changed && gopcolor::logged(changes))
+        GOPLOG("setBrightnessCorrection #%u (call %u): %#x (%u thousandths, 16.16), matrix calls %u; result %#x\n", changes,
+               calls, value, gopcolor::u1616ToMilli(value), matrixCalls, result);
+    return result;
 }
 
 // The slots IOMobileFramebufferLegacy leaves pure, as AppleParavirtDisplay implements them.

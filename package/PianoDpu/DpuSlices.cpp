@@ -15,6 +15,7 @@
 //   piano-dpu-pcc-encode=0               a diagonal as macOS sends it (default: from linear light to the encoded values)
 //   piano-dpu-pcc-negative=1             negative coefficients as two's complement S3.15 (default: clamped to 0)
 //   piano-dpu-pcc-test=R,G,B             a diagonal in thousandths written as the PCC's values after the start (e.g. 1000,1000,500)
+//   native-gop-display-night-shift=1      the location-9 matrix and correction through DSPP0/1
 //   piano-dpu-panel=1                    the panel's light sleep with display sleep (NativeGopDisplay calls PianoDpuPanel)
 //   piano-dpu-panel-engines=0            DCS only: the timing engines keep running
 //   piano-dpu-panel-hs=1                 DCS in high speed (default: low power, the panel's MIPI_DSI_MODE_LPM)
@@ -24,7 +25,10 @@
 //   "PianoDpuColorMatrix"   p1 = the 72 bytes of an IOMFBColorFixedMatrix (9 uint64_t), p2 = its IOMFBColorMatrixFunction, p3 = the
 //                           call's third argument (logged)
 //   "PianoDpuGammaTable"    p1 = the table's 32-bit words, p2 = how many (fitted when piano-dpu-pcc=2 and 771 words)
-//   "PianoDpuPanel"         p1 = on (0 / 1): NativeGopDisplay's display power, on each change
+//   "PianoDpuPanel"         p1 = on (0 / 1): display sleep and PCC replay
+//   "PianoDpuNightShiftMatrix"     p1 = nine S31.32 matrix words copied synchronously
+//   "PianoDpuNightShiftCorrection" p1 = the unsigned Q16.16 gain
+//   "PianoDpuNightShiftModeSet"    replay the colour after a display mode change
 // Every store goes through DpuSlices.h's guard (the registers of the three slices only: never TLMM, so never the panel's reset or
 // supply pins, never the backlight). Loads and stores use this file's own page maps, all made before the first store; nothing is
 // mapped while interrupts are off.
@@ -43,7 +47,9 @@
 #include <string.h>
 #include "DpuRefresh.h"
 #include "DpuPcc.h"
+#include "DpuNightShift.h"
 #include "DpuPanel.h"
+#include "DpuFlipKernel.h"
 
 using namespace pianodpu;
 using namespace pianodpu::slices;
@@ -67,6 +73,7 @@ struct SliceArgs {
   unsigned refresh = kRefreshOff, refreshDb = 1, refreshTest = 0;
   refresh::PolicyConfig policy;
   unsigned pcc = 0, pccEncode = 1, pccNegative = 0;
+  bool nightShift = false;
   bool pccTest = false;
   int32_t pccTestMilli[3] = {1000, 1000, 1000};
   unsigned panel = 0, panelEngines = 1, panelHs = 0, panelTest = 0;
@@ -87,7 +94,6 @@ void readSliceArgs()
   if (gArgsRead) return;
   gArgsRead = true;
   gA.level = argNumber("piano-dpu", 0, 0, 100);
-  gA.ahbVote = argNumber("piano-dpu-ahb-vote", 0, 0, 2);
   char s[32] = {};
   if (PE_parse_boot_arg_str("piano-dpu-refresh", s, sizeof s)) {
     if (!strcmp(s, "auto")) gA.refresh = kRefreshAuto;
@@ -102,6 +108,11 @@ void readSliceArgs()
   gA.policy.burstWindowMs = argNumber("piano-dpu-refresh-window", 250, 20, 5000);
   gA.policy.dwellMs = argNumber("piano-dpu-refresh-dwell", 200, 50, 60000);
   gA.pcc = argNumber("piano-dpu-pcc", 0, 0, 2);
+  uint32_t nightShift = 0;
+  PE_parse_boot_argn("native-gop-display-night-shift", &nightShift, sizeof nightShift);
+  gA.nightShift = nightShift == 1;
+  if (gA.nightShift) gA.pcc = 0;   // the two experiments share one PCC
+  gA.ahbVote = argNumber("piano-dpu-ahb-vote", gA.nightShift && gA.level >= 2 ? 1 : 0, 0, 2);
   gA.pccEncode = argNumber("piano-dpu-pcc-encode", 1, 0, 1);
   gA.pccNegative = argNumber("piano-dpu-pcc-negative", 0, 0, 1);
   memset(s, 0, sizeof s);
@@ -243,6 +254,9 @@ struct Shared {
   refresh::Policy policy;
   pcc::State color;
   bool colorDirty = false;
+  pcc::NightShift nightShift;
+  bool nightShiftDirty = false, modeSet = false;
+  uint32_t nightMatrixCalls = 0, nightCorrectionCalls = 0;
   uint32_t matrixCalls = 0, matrixRefused = 0, gammaCalls = 0, gammaFits = 0, swapCalls = 0, panelCalls = 0;
   uint64_t lastRaw[9] = {};
   uint32_t lastFunction = 0, lastArg = 0;
@@ -261,6 +275,8 @@ unsigned gHz = 120;
 uint32_t gSwitches, gSwitchFailures, gSleeps, gPccApplies, gPccFailures;
 pcc::Matrix gPccBase = pcc::identity(), gPccLast = pcc::identity();
 bool gPccLastValid;
+pcc::PanelPcc gNightShiftBase, gNightShiftLast;
+bool gDisplayOff;
 refresh::Options gRefreshOptions;
 panel::Options gPanelOptions;
 
@@ -283,6 +299,8 @@ void publish()
 }
 
 // ------------------------------------------------------------------------------------------------------------- B1c
+void nightShiftUpdate(bool replay, const char *why);
+
 bool reread(const char *after)
 {
   const LivePath p = readPath(gIo, gA.ahbVote == 1);
@@ -326,7 +344,7 @@ bool doSwitch(unsigned hz, const char *why)
       note("refresh: off for this boot");
     }
   }
-  reread("a switch");
+  if (reread("a switch") && s.ok && gA.nightShift) nightShiftUpdate(true, "refresh mode set");
   publish();
   return s.ok;
 }
@@ -485,6 +503,43 @@ void pccUpdate(bool force, const char *why)
   pccApply(m, why);
 }
 
+void nightShiftUpdate(bool replay, const char *why)
+{
+  if (gPccBroken || gDisplayOff || gAsleep) return;
+  IOLockLock(gLock);
+  const pcc::NightShift state = gS.nightShift;
+  IOLockUnlock(gLock);
+  const pcc::PanelPcc wanted = pcc::nightShiftPrograms(gNightShiftBase, state);
+  if (!replay && pcc::same(wanted, gNightShiftLast)) return;
+
+  IOLock *flipLock = flipTransactionLock();
+  if (!flipLock) {
+    note("night shift: %s deferred, no CTL lock", why);
+    return;
+  }
+  IOLockLock(flipLock);
+  const LivePath path = readPath(gIo, gA.ahbVote == 1);
+  const pcc::NightShiftApply update = pcc::updateNightShift(gIo, path, wanted, gNightShiftLast, replay);
+  IOLockUnlock(flipLock);
+  if (!update.attempted) {
+    note("night shift: %s deferred (path %s, DSPP mask %x)", why, path.why, path.dspps);
+    return;
+  }
+
+  const pcc::Apply &a = update.result;
+  ++gPccApplies;
+  if (a.ok) {
+    if (replay || gPccApplies <= 32 || gPccApplies % 100 == 0)
+      note("night shift: %s, %s; DSPP0/1 read back (enable %x/%x), one CTL flush latched in %d us, apply %u",
+           why, state.neutral() ? "base" : "matrix and correction", a.enable[0], a.enable[1], a.latchUs, gPccApplies);
+  } else {
+    ++gPccFailures;
+    gPccBroken = !update.restored || gPccFailures >= 3;
+    note("night shift: %s failed: %s; previous PCC restore %s%s", why, a.why, update.restored ? "verified" : "failed",
+         gPccBroken ? "; disabled for this boot" : "");
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------------- B1e
 void logPanel(const char *what, const panel::Result &r)
 {
@@ -550,6 +605,7 @@ void panelStart()
     if (!panelSleep()) break;
     IOSleep(5000);
     if (!panelWake()) break;
+    if (gA.nightShift) nightShiftUpdate(true, "panel wake");
     IOSleep(5000);
     note("panel: test cycle %u of %u done", k + 1, gA.panelTest);
   }
@@ -559,6 +615,7 @@ void panelStart()
 void serve()
 {
   uint64_t nextAlive = nowMs() + 600000;
+  uint32_t publishedMatrices = 0, publishedCorrections = 0;
   for (;;) {
     IOLockLock(gLock);
     uint64_t due = nextAlive;
@@ -575,6 +632,9 @@ void serve()
     gS.wake = false;
     const int want = gS.panelWant;
     gS.panelWant = -1;
+    const bool nightShiftDirty = gS.nightShiftDirty, modeSet = gS.modeSet;
+    const uint32_t nightMatrices = gS.nightMatrixCalls, nightCorrections = gS.nightCorrectionCalls;
+    gS.nightShiftDirty = gS.modeSet = false;
     const bool colorDirty = gS.colorDirty, matrixLog = gS.matrixLog;
     uint64_t raw[9];
     memcpy(raw, gS.lastRaw, sizeof raw);
@@ -597,8 +657,21 @@ void serve()
     if (gammaLog && gammaCalls <= 30)
       note("pcc: gamma call %u: %u words: %s (worst deviation from scaled ramps %u/1000)", gammaCalls, gammaWords, gammaWhy, gammaWorst);
     if (want == 0 && gA.panel) panelSleep();
-    if (want == 1 && gA.panel) panelWake();
+    const bool wakeOk = !(want == 1 && gA.panel && gAsleep) || panelWake();
     if (colorDirty && gA.pcc) pccUpdate(false, "macOS's matrices");
+    if (gA.nightShift) {
+      if (want >= 0) gDisplayOff = !want;
+      if (wakeOk && (want == 1 || modeSet || nightShiftDirty))
+        nightShiftUpdate(want == 1 || modeSet, want == 1 ? "display wake" : modeSet ? "display mode set" : "colour update");
+      if (nightMatrices != publishedMatrices) {
+        gService->setProperty("piano-dpu-night-shift-matrix-calls", nightMatrices, 32);
+        publishedMatrices = nightMatrices;
+      }
+      if (nightCorrections != publishedCorrections) {
+        gService->setProperty("piano-dpu-night-shift-correction-calls", nightCorrections, 32);
+        publishedCorrections = nightCorrections;
+      }
+    }
     if (gA.refresh == kRefreshAuto && !gRefreshBroken && !gAsleep && d.hz != gHz) {
       const bool ok = doSwitch(d.hz, d.hz == 60 ? "idle" : "swaps");
       IOLockLock(gLock);
@@ -656,6 +729,13 @@ void worker(void *, wait_result_t)
     piano_dpu_slices_stage = 3;
     pccStart();
   }
+  if (gA.nightShift) {
+    gPccBroken = !pcc::capturePanelPcc(gIo, gPath, gNightShiftBase);
+    gNightShiftLast = gNightShiftBase;
+    gService->setProperty("piano-dpu-night-shift-matrix-calls", uint64_t(0), 32);
+    gService->setProperty("piano-dpu-night-shift-correction-calls", uint64_t(0), 32);
+    note("night shift: %s", gPccBroken ? "PCC base unavailable for DSPP0/1" : "captured base PCC for DSPP0/1");
+  }
   if (gA.refresh) {
     piano_dpu_slices_stage = 4;
     refreshStart();
@@ -668,7 +748,7 @@ void worker(void *, wait_result_t)
   }
   piano_dpu_slices_stage = 6;
   note("slices: serving (refresh %s, pcc %s, panel %s)", gA.refresh == kRefreshAuto && !gRefreshBroken ? "auto" : gRefreshBroken ? "off" : "fixed",
-       gA.pcc && !gPccBroken ? "on" : "off", gA.panel && !gPanelBroken ? "on" : "off");
+       gPccBroken ? "off" : gA.nightShift ? "Night Shift" : gA.pcc ? "on" : "off", gA.panel && !gPanelBroken ? "on" : "off");
   publish();
   serve();
 }
@@ -679,7 +759,7 @@ void worker(void *, wait_result_t)
 bool dpuSlicesWanted()
 {
   readSliceArgs();
-  return gA.refresh || gA.pcc || gA.panel;
+  return gA.refresh || gA.pcc || gA.panel || gA.nightShift;
 }
 
 void dpuSlicesStart(IOService *dpu)
@@ -689,6 +769,7 @@ void dpuSlicesStart(IOService *dpu)
        gA.refresh == kRefreshAuto ? "auto" : gA.refresh == kRefreshPlan ? "plan" : gA.refresh == 60 ? "60" : gA.refresh == 120 ? "120" : "0", gA.pcc,
        gA.panel, gA.level ? "" : ": piano-dpu=0, not started");
   if (!gA.level) return;
+  gService = dpu;
   gLock = IOLockAlloc();
   thread_t t = nullptr;
   if (!gLock || kernel_thread_start(worker, nullptr, &t) != KERN_SUCCESS) {
@@ -697,13 +778,47 @@ void dpuSlicesStart(IOService *dpu)
     return;
   }
   thread_deallocate(t);
-  gService = dpu;
-  dpu->registerService();   // NativeGopDisplay finds the service by its class
+  if (gA.level < 2) dpu->registerService();   // level 2 publishes the shared service in PianoDpu::start
 }
 
 bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p3, IOReturn *result)
 {
   if (!name || !gLock) return false;
+  if (gA.nightShift && name->isEqualTo("PianoDpuNightShiftMatrix")) {
+    uint64_t raw[9];
+    if (!p1) {
+      *result = kIOReturnBadArgument;
+      return true;
+    }
+    memcpy(raw, p1, sizeof raw);
+    IOLockLock(gLock);
+    ++gS.nightMatrixCalls;
+    const auto input = gS.nightShift.setMatrix(raw);
+    if (input == pcc::NightShift::Input::accepted) gS.nightShiftDirty = true;
+    gS.wake = true;
+    IOLockWakeup(gLock, &gS, false);
+    IOLockUnlock(gLock);
+    *result = input == pcc::NightShift::Input::invalid ? kIOReturnBadArgument : kIOReturnSuccess;
+    return true;
+  }
+  if (gA.nightShift && name->isEqualTo("PianoDpuNightShiftCorrection")) {
+    IOLockLock(gLock);
+    ++gS.nightCorrectionCalls;
+    gS.nightShift.setCorrection(uint32_t(uintptr_t(p1)));
+    gS.nightShiftDirty = gS.wake = true;
+    IOLockWakeup(gLock, &gS, false);
+    IOLockUnlock(gLock);
+    *result = kIOReturnSuccess;
+    return true;
+  }
+  if (gA.nightShift && name->isEqualTo("PianoDpuNightShiftModeSet")) {
+    IOLockLock(gLock);
+    gS.modeSet = gS.wake = true;
+    IOLockWakeup(gLock, &gS, false);
+    IOLockUnlock(gLock);
+    *result = kIOReturnSuccess;
+    return true;
+  }
   if (name->isEqualTo("PianoDpuSwap")) {
     IOLockLock(gLock);
     ++gS.swapCalls;
@@ -768,7 +883,7 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
     gS.wake = true;
     IOLockWakeup(gLock, &gS, false);
     IOLockUnlock(gLock);
-    *result = gA.panel ? kIOReturnSuccess : kIOReturnUnsupported;
+    *result = gA.panel || gA.nightShift ? kIOReturnSuccess : kIOReturnUnsupported;
     return true;
   }
   return false;

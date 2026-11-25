@@ -177,11 +177,11 @@ a full modeset in both Linux ports, and more power, so not planned. Risks: a mis
 (Ubuntu's full-modeset 60 Hz was grey until the stock order was used); the TDDI touch follows display timing (watch touch at 60 Hz);
 the DSI shadow offsets are confirmed by B1a's raw `timing words`.
 
-**4.4 Night Light (B1d).** PCC in DSPP0 and DSPP1 (both halves, same matrix): output R from (R,G,B) at +0x10/+0x14/+0x18, G
+**4.4 Legacy PCC experiment (B1d).** PCC in DSPP0 and DSPP1 (both halves, same matrix): output R from (R,G,B) at +0x10/+0x14/+0x18, G
 +0x1c/+0x20/+0x24, B +0x28/+0x2c/+0x30 (msm's PCC_<input>_<output>_OFF names), S3.15; enable +0 bit 0; flush CTL_DSPP0/1_FLUSH bit 4
 + CTL_FLUSH b29, latched with the frame. A warm white point is a diagonal (e.g. 3400 K ≈ 1.0, 0.73, 0.45). macOS reaches the display through IOMFB's `swap_set_color_matrix` (slot
-343) and `set_gamma_table` (slot 307), both stubs in NativeGopDisplay unless `piano-dpu-pcc` is given: B1d-0 logs which one Night
-Shift calls; a per-channel linear gamma ramp maps exactly onto a PCC diagonal, a non-linear one needs GC v2 via REGDMA (later).
+343) and `set_gamma_table` (slot 307), both stubs in NativeGopDisplay unless `piano-dpu-pcc` is given.
+A per-channel linear gamma ramp maps onto a PCC diagonal. A non-linear one needs GC v2 via REGDMA.
 Re-applied at display-on; no CPU cost per frame. Needs the DSPP in ABL's path (B1a reads the PCC/GC enables; LM n → DSPP n is the
 catalog's wiring). *Implemented* (`DpuPcc.h`): the matrix decoded as S31.32 (each negative word read as two's complement or as
 sign-magnitude, whichever is within ±4; else refused), one per IOMFBColorMatrixFunction, their product; a diagonal is moved from
@@ -194,6 +194,33 @@ CTL_DSPP_n_FLUSH bit 4, CTL_FLUSH bit 29, the latch (60 ms) and a read-back. At 
 is written once: the write path checked with no visible change; a found non-identity matrix is kept as the base, macOS's applied
 before it. A matrix that arrives while the panel sleeps is kept and written at the wake (the light sleep keeps the DSPP's registers
 anyway).
+
+**4.4.1 Night Shift (M4).** CoreBrightness sends the white point through WindowServer and CoreAnimation to IOMobileFramebuffer's
+location-9 `set_matrix` (slot 309) and its independent `setBrightnessCorrection` (slot 314). M1 passed 44/44 observation checks.
+It recorded a signed, general matrix, a unity correction, and all-zero matrices around display-off. Its slider and OFF
+windows contained no logged matrix changes. The M1 observer counted repeats and logged changes, so the test windows
+need both counts and PCC snapshots to distinguish a repeat from a missing callback.
+
+The Linux reference is the piano kernel at `b5100d5f2e0b`, under `drivers/gpu/drm/msm/disp/dpu1`.
+
+| Linux reference | M4 path | Comparison |
+|---|---|---|
+| `dpu_crtc.c:45–46,794–817` converts DRM's sign-magnitude S31.32 CTM to row-major PCC coefficients | `DpuPcc.h` and `DpuNightShift.h` decode Apple's two's-complement words and apply the unsigned Q16.16 correction | Same channel ordering. Linux's macro drops the input sign. M4 preserves it with bit 17 of the PCC word as the sign. The signed encoding and transfer domain need optical verification. |
+| `dpu_hw_dspp.c:15–26,58–76` programs the nine coefficients and enable or bypasses PCC | `DpuPcc.h` uses the same offsets and restores the captured enable and coefficient words | Same register sequence. M4 retains the firmware base when the input returns to neutral. |
+| `dpu_crtc.c:862–863,894–911` stages PCC for every mixer on a colour change or modeset | `DpuSlices.cpp` serializes colour, mode and wake requests on its worker | Same modeset replay, with display-wake replay and retention across silent slider changes. |
+| `dpu_hw_ctl.c:144–180,394–413` stages DSPP sub-block flushes and triggers CTL once | `DpuPcc.h` stages both DSPP PCC masks before one CTL flush, waits for its latch and reads back both halves | Same order. M4 checks the latch and both sets of register words. |
+
+M4 starts with `native-gop-display-night-shift=1` and `piano-dpu>=1`. M4 owns the two PCC blocks when the legacy PCC argument is
+also present. It captures the enable and nine coefficient words from each DSPP at startup. The worker multiplies the matrix by the
+unsigned correction gain (unity at `0x10000`) and composes it with an enabled firmware base. It retains the last matrix when a
+slider step only sends a correction or sends no callbacks. A location-9 identity restores the captured base, including disabled PCC
+and the original words. All-zero matrices are treated as blanking markers, preserving the last colour across wake.
+An OFF operation with no usable matrix or correction leaves the previous transform in effect. A unity correction preserves
+the selected matrix. M1 received unity alongside its non-identity matrix.
+
+Display wake, a successful `set_digital_out_mode`, and a successful PianoDpu refresh switch replay the desired state. The PCC
+transaction holds the same lock as the flip engine until the latch and read-back finish. On a failed transaction the worker
+attempts to restore the last verified words on both DSPPs.
 
 **4.5 Panel off/on (B1e).** Display sleep today only turns the backlight off: the DPU still fetches 3.28 GB/s and the panel scans.
 Off: backlight off (PianoBacklight) → DCS 0x28, 20 ms, 0x10, 100 ms (K:72cfce4c86e5) through the DSI command FIFO (no DMA buffer:
@@ -273,6 +300,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-refresh-test=N` | 0 | first N round trips 120 → 60 → 120, a second at each rate; stops at an anomaly |
 | `piano-dpu-refresh-idle=MS`, `-burst=N`, `-window=MS`, `-dwell=MS` | 1000, 2, 250, 200 | the policy |
 | `piano-dpu-pcc=1\|2` | 0 | B1d: 1 the PCC as found written once, then macOS's colour matrices (NativeGopDisplay logs and forwards `swap_set_color_matrix` and `set_gamma_table`); 2 also fits gamma tables (reads 0xc0c bytes) |
+| `native-gop-display-night-shift=1` | 0 | M4 location-9 matrix and brightness correction on DSPP0/1 (§4.4.1) |
 | `piano-dpu-pcc-encode=0`, `piano-dpu-pcc-negative=1` | 1, 0 | a diagonal as sent (default: linear → encoded); negative coefficients as two's complement (default: clamped) |
 | `piano-dpu-pcc-test=R,G,B` | none | a test diagonal in thousandths written as the PCC's values after the start (0..4000 each) |
 | `piano-dpu-panel=1` | 0 | B1e: the panel's light sleep with display sleep (NativeGopDisplay forwards its display power) |
@@ -602,6 +630,31 @@ apply line, then the backlight. Pass: no garbled frame, the tint survives every 
 `slices: alive: ... panel awake (50 sleeps, ...)`. The panel may be lit black for ~150 ms before the picture (the backlight's thread is
 quicker than the panel's wake): expected.
 
+### 8.4 M4 RAM-boot read list
+
+Use the ordinary volatile-Data RAM profile with `piano-dpu=2 piano-dpu-snapshot=1 native-gop-display-night-shift=1` and prove
+the GUI session and live flips before running the reads. Use M1's `nightshift.js` from the console user's session through
+`/usr/bin/osascript -l JavaScript`. Keep the full event windows from the console and the CoreBrightness/WindowServer log.
+
+1. Run `nightshift.js off` and `read` for the baseline. Confirm `NS_DONE` and `supports=true`. Save
+   `sudo sysctl -n machdep.piano_dpu_snapshot`, with the gate open, and the DSPP0/1 enable and nine coefficients. Record
+   `piano-dpu-night-shift-matrix-calls` and `piano-dpu-night-shift-correction-calls` from the PianoDpu IORegistry entry.
+   Capture a white window spanning both halves with the C920. Keep the window, exposure and white balance fixed.
+2. Run `nightshift.js on 1.0` and wait for the transition to settle. Save the same snapshot, callback counts and C920 frame.
+   Look for accepted `set_matrix #` at location 9, `setBrightnessCorrection #` if sent, and
+   `PianoDpu: night shift:` reporting one CTL flush and read-back on both DSPPs. Confirm that both halves warm consistently.
+3. Run `nightshift.js strength 0.5`, then `strength 1.0`. Take the same readings after each step. A new matrix or a changed
+   correction should update PCC. A repeated or absent callback should keep both sets of words and the measured colour stable.
+   Compare the IORegistry counters to distinguish repeats from no callbacks. Record the CoreBrightness log as the positive
+   control when its slider succeeds without a driver update.
+4. While warm, read both DSPPs after display sleep/wake and after each accepted mode set available in that build. Require the
+   `display wake` or mode-set replay line, the pre-transition PCC words on both halves, and a matching C920 frame. Record any
+   mode transition that the profile cannot exercise as pending.
+5. Run `nightshift.js off` and wait for the transition. Require the base words and enable states on both halves and a C920
+   frame matching the baseline. If CoreBrightness reports OFF and the counters show no driver update, record OFF as unresolved.
+   Separate changes caused by a dark or blank display from changes in the white window's colour. Collect final flip and
+   boot-session evidence.
+
 ## 9. Fallback
 
 Without `piano-dpu` nothing is mapped. Every later level falls back to NativeGopDisplay's copy per swap (refusal) or for the boot (a
@@ -622,7 +675,8 @@ and the SPI 83 handler, which stays attached: ArmCpu has no detach); step 4's fa
 4. Is TCR2 PASize 36 bits enough, and does the walker accept tables above 4 GiB? → B1b(3) (sheng used 48-bit, tables in RAM).
 5. Exact DSI timing shadow offsets: SunUEFI's patch (base + 0x1ec DB, + 0x1e8 flush) and the downstream list (+ 0x1e8, + 0x1e4,
    + 0x1ec the TPG FIFO reset) disagree → c0's shadow words, then c1 (`piano-dpu-refresh-db=2` if the default underruns).
-6. Which IOMFB call carries Night Shift on this external-type display (`swap_set_color_matrix` or `set_gamma_table`)? → B1d-0 log.
+6. M1 identified the location-9 matrix and correction. The M4 RAM run checks the signed PCC encoding, the white point on both
+   halves, and callback delivery on slider and OFF (§8.4).
 7. Does WindowServer accept a refresh change under one advertised timing (frames at 60 while it paces at 120)? → B1c.
 8. Panel sleep via the DSI command FIFO while video runs: the panel driver sends in LP (MIPI_DSI_MODE_LPM), the default here;
    `piano-dpu-panel-hs=1` if LP fails. Is TRIG_CTRL's DMA trigger software and BLOCK_DMA_WITHIN_FRAME set as ABL left it? → e0.
