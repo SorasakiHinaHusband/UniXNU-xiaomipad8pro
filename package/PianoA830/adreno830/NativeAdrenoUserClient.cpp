@@ -297,6 +297,16 @@ IOReturn NativeAdrenoUserClient::setScope(uint32_t queue_base,uint64_t window_st
     queue_base_=queue_base;scoped_=true;window_start_=window_start;window_bytes_=window_bytes;window_peak_=0;
     return kIOReturnSuccess;
 }
+#ifdef ADRENO830_MACOS
+IOReturn NativeAdrenoUserClient::setObjectLimit(uint64_t bytes)
+{
+    if(!open_)return kIOReturnNotReady;
+    if(bytes&4095)return kIOReturnBadArgument;
+    if(liveObjects())return kIOReturnBusy;
+    object_limit_=bytes;
+    return kIOReturnSuccess;
+}
+#endif
 bool NativeAdrenoUserClient::ownRangeOutstanding() const
 {
     return (scoped_ || used_) && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues);
@@ -308,7 +318,7 @@ IOReturn NativeAdrenoUserClient::close()
     for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(queues_[i].active)return kIOReturnBusy;
     NativeAdrenoDeleteMeta(entries_,Entry,entry_count_);NativeAdrenoDeleteMeta(fifo_,uint32_t,entry_count_);entry_count_=0;index_.release();
     fifo_head_=fifo_count_=fresh_=0;
-    queue_base_=0;scoped_=used_=false;window_start_=window_bytes_=window_peak_=0;scanout_={};retry_fence_=0;
+    queue_base_=0;scoped_=used_=false;window_start_=window_bytes_=window_peak_=0;object_limit_=0;scanout_={};retry_fence_=0;
     keep_objects_=keep_spans_=keep_pool_=0;source_=NativeAdrenoRingSourceExternal;
     open_=false;for(auto &queue:queues_)queue=Queue{};vm_=nullptr;submit_=nullptr;ring_=nullptr;timer_=nullptr;status_=nullptr;info_=nullptr;
     return kIOReturnSuccess;

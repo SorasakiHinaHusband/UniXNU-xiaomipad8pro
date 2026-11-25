@@ -608,7 +608,9 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
     const bool listed=!kernel && NativeAdrenoListNamesProcess(NativeAdrenoSandboxGrantList,name_,sizeof name_);
     bool decoder=false;
 #ifdef ADRENO830_MACOS
-    if(!kernel && g.windows==NativeAdrenoClientWindows16G) {
+    /* UniXNU-piano (gpu/slots2): also on the 256 GiB table, whose decoder slot 63 nobody else takes (the 64 GiB table's slot 58 stays as
+     * it was: never handed out, the decoder takes an ordinary slot there). */
+    if(!kernel && (g.windows==NativeAdrenoClientWindows16G || g.windows==NativeAdrenoClientWindows256G)) {
         proc_t process=current_proc();
         if(process && csproc_get_platform_binary(process))
             decoder=NativeAdrenoDecoderClient(true,cs_identity_get(process));
@@ -652,6 +654,10 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
                 NativeAdrenoMemory::poolBytes()/NativeAdrenoPoolRenderShare);
         status=kernel?box->core.setScope(0,0,0):
             box->core.setScope(slot*NativeAdrenoAbiMaxQueues,g.windows[slot].start,g.windows[slot].bytes);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano (gpu/slots2): the slot's per-object limit (1 GiB but in slot 0 on the 256 GiB table; 0 elsewhere: the window's) */
+        if(!status && !kernel)status=box->core.setObjectLimit(NativeAdrenoClientObjectLimit(g.windows,slot));
+#endif
         if(status) {
             noteMountFailure(3,status,slot);
             box->core.releaseAll(&g.clock,0);
@@ -2055,6 +2061,14 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     service->setProperty("NativeAdrenoClientSlots",(unsigned long long)NativeAdrenoClientWindowCount(windows),32);
     service->setProperty("NativeAdrenoClientVaEndMiB",(unsigned long long)(NativeAdrenoClientWindowsEnd(windows)>>20),32);
     service->setProperty("NativeAdrenoClientWindowMiB",(unsigned long long)(windows[NativeAdrenoLargeSlots+1].bytes>>20),32);
+    /* gpu/slots2: an ordinary slot's per-object limit in MiB (Query's max_bo_bytes: its window's unless the table caps it) and the GPU
+     * input size the clients get (Query's input_bits). */
+    {
+        const uint64_t cap=NativeAdrenoClientObjectLimit(windows,NativeAdrenoLargeSlots+1),window=windows[NativeAdrenoLargeSlots+1].bytes;
+        const uint64_t object=cap && cap<window?cap:window<NativeAdrenoMemoryMaxBytes?window:uint64_t(NativeAdrenoMemoryMaxBytes);
+        service->setProperty("NativeAdrenoClientObjectMiB",(unsigned long long)(object>>20),32);
+        service->setProperty("NativeAdrenoClientInputBits",(unsigned long long)input_bits,32);
+    }
     /* UniXNU-piano (2026-11-24, BR1): the PCI-style identity Chrome's ANGLE and Dawn read from the accelerator's provider
      * (NativeAdrenoPciIdentity.h); before registerService, so the AGXAccelerator never exists without it. */
     {

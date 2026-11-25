@@ -1166,7 +1166,7 @@ IOReturn validateBoard(const Adreno830Board *board,Adreno830Failure *failure)
     /* pagani-gpu-perf indexes the level table: 1..Adreno830LevelMax (0 is off); S0 narrows it to the selected table. */
     if(knobs.perf<1 || knobs.perf>Adreno830LevelMax)
         return refuse(failure,A830S0StepKnobs,A830ReasonArgument,Adreno830KnobPerf,knobs.perf,Adreno830LevelMax);
-    if(knobs.va!=2 && knobs.va!=4 && knobs.va!=16 && knobs.va!=64)   /* UniXNU-piano: 64 (GPU-SLOTS) */
+    if(knobs.va!=2 && knobs.va!=4 && knobs.va!=16 && knobs.va!=64 && knobs.va!=256)   /* UniXNU-piano: 64 (GPU-SLOTS), 256 (gpu/slots2) */
         return refuse(failure,A830S0StepKnobs,A830ReasonArgument,Adreno830KnobVa,knobs.va,4);
     if(knobs.dcvs_min_mhz>knobs.dcvs_max_mhz)
         return refuse(failure,A830S0StepKnobs,A830ReasonArgument,Adreno830KnobDcvsMin,knobs.dcvs_min_mhz,knobs.dcvs_max_mhz);
@@ -2193,8 +2193,10 @@ IOReturn stageMetal(Adreno830Device *d,Adreno830Failure *f)
     /* The aperture the GPU context actually built (pagani-gpu-va=16 falls back to 4 GiB without a 34-bit UBS or its 32 MiB of tables):
      * the publish shell picks its client windows from this VA (NativeAdrenoClientWindowsFor). */
     const uint64_t aperture=d->gpu_context.apertureBytes();
-    /* UniXNU-piano (GPU-SLOTS): above 16 GiB the 64 GiB aperture's end (pagani-gpu-va=64), whose table the shell then picks. */
-    info.va_size=(aperture>A830_GPU_VA_CLIENT_END_16G?A830_GPU_VA_CLIENT_END_64G:aperture>A830_GPU_VA_CLIENT_END_4G?A830_GPU_VA_CLIENT_END_16G:
+    /* UniXNU-piano (GPU-SLOTS): above 16 GiB the 64 GiB aperture's end (pagani-gpu-va=64), whose table the shell then picks; gpu/slots2:
+     * above 64 GiB the 256 GiB one's (pagani-gpu-va=256 in paged mode). */
+    info.va_size=(aperture>A830_GPU_VA_CLIENT_END_64G?A830_GPU_VA_CLIENT_END_256G:
+        aperture>A830_GPU_VA_CLIENT_END_16G?A830_GPU_VA_CLIENT_END_64G:aperture>A830_GPU_VA_CLIENT_END_4G?A830_GPU_VA_CLIENT_END_16G:
         b->knobs.va==2?A830_GPU_VA_CLIENT_END_2G:A830_GPU_VA_CLIENT_END_4G)-A830_GPU_VA_CLIENT_BASE;
     info.highest_bank_bit=b->highest_bank_bit;info.ubwc_swizzle=A830_UBWC_SWIZZLE;info.macrotile_mode=A830_UBWC_MACROTILE_MODE;
     info.ubwc_version=b->ubwc_mode;
