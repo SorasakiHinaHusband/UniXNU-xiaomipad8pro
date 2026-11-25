@@ -105,6 +105,24 @@ NSDictionary *ft_gop_properties(void)
             id min = [refresh isKindOfClass:NSDictionary.class] ? refresh[@"displayMinRefreshInterval"] : nil;
             if ([min isKindOfClass:NSNumber.class])
                 result[@"display_min_refresh_interval_raw"] = min;
+            NSDictionary *attributes = CFBridgingRelease(IORegistryEntryCreateCFProperty(
+                service, CFSTR("DisplayAttributes"), kCFAllocatorDefault, 0));
+            id product = [attributes isKindOfClass:NSDictionary.class] ? attributes[@"ProductAttributes"] : nil;
+            if ([product isKindOfClass:NSDictionary.class]) {
+                for (NSString *key in @[@"LegacyManufacturerID", @"ProductID"])
+                    if ([product[key] isKindOfClass:NSNumber.class])
+                        result[key] = product[key];
+                // Only the fixed public product name is retained, never a user-assigned display name.
+                result[@"panel_product_name"] = @([product[@"ProductName"] isEqual:@"Xiaomi Pad 8 Pro"]);
+            }
+            if ([attributes isKindOfClass:NSDictionary.class])
+                for (NSString *key in @[@"NativeFormatHorizontalPixels", @"NativeFormatVerticalPixels"])
+                    if ([attributes[key] isKindOfClass:NSNumber.class])
+                        result[key] = attributes[key];
+            id external = CFBridgingRelease(IORegistryEntryCreateCFProperty(
+                service, CFSTR("external"), kCFAllocatorDefault, 0));
+            if ([external isKindOfClass:NSNumber.class])
+                result[@"builtin"] = @(![external boolValue]);
             IOObjectRelease(service);
             break;
         }

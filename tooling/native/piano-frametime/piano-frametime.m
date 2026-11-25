@@ -14,6 +14,7 @@
 
 #import "display_evidence.h"
 #include "frametime_stats.h"
+#include "panel_match.h"
 #import "scene.h"
 
 typedef struct {
@@ -53,15 +54,65 @@ static CGDirectDisplayID screen_id(NSScreen *screen)
     return [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
 }
 
+typedef struct { size_t width, height; } PixelSize;
+
+static PixelSize display_pixels(CGDirectDisplayID display)
+{
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+    if (!mode)
+        return (PixelSize){0, 0};
+    // Use backing pixels, as active_mode does, including on a HiDPI mode.
+    const PixelSize pixels = {CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode)};
+    CGDisplayModeRelease(mode);
+    return pixels;
+}
+
 static NSScreen *select_screen(bool mainDisplay)
 {
+    NSDictionary *driver = mainDisplay ? @{} : ft_gop_properties();
+    const bool verified = [driver[@"LegacyManufacturerID"] unsignedIntValue] == FT_PANEL_VENDOR &&
+        [driver[@"ProductID"] unsignedIntValue] == FT_PANEL_PRODUCT;
+    NSScreen *selected = nil;
+    unsigned best = 0, matches = 0;
     for (NSScreen *screen in NSScreen.screens) {
         const CGDirectDisplayID display = screen_id(screen);
-        if (mainDisplay ? display == CGMainDisplayID()
-                        : CGDisplayVendorNumber(display) == 0x61a9 && CGDisplayModelNumber(display) == 0x8750)
-            return screen;
+        if (mainDisplay) {
+            if (display == CGMainDisplayID())
+                return screen;
+            continue;
+        }
+        const PixelSize pixels = display_pixels(display);
+        const unsigned rank = ft_panel_match(CGDisplayVendorNumber(display), CGDisplayModelNumber(display),
+            (unsigned)pixels.width, (unsigned)pixels.height, CGDisplayIsBuiltin(display),
+            verified, [driver[@"NativeFormatHorizontalPixels"] unsignedIntValue],
+            [driver[@"NativeFormatVerticalPixels"] unsignedIntValue], [driver[@"builtin"] boolValue],
+            [driver[@"panel_product_name"] boolValue] && [screen.localizedName isEqual:@"Xiaomi Pad 8 Pro"]);
+        if (rank > best) {
+            best = rank;
+            matches = 0;
+            selected = screen;
+        }
+        if (rank && rank == best)
+            ++matches;
     }
-    return nil;
+    return matches == 1 ? selected : nil;
+}
+
+static NSDictionary *display_identity(CGDirectDisplayID display)
+{
+    const PixelSize pixels = display_pixels(display);
+    return @{@"vendor": @(CGDisplayVendorNumber(display)), @"product": @(CGDisplayModelNumber(display)),
+             @"builtin": @(CGDisplayIsBuiltin(display)), @"main": @(display == CGMainDisplayID()),
+             @"pixel_width": @(pixels.width), @"pixel_height": @(pixels.height)};
+}
+
+static NSDictionary *display_inventory(void)
+{
+    NSMutableArray *displays = [NSMutableArray array];
+    for (NSScreen *screen in NSScreen.screens)
+        [displays addObject:display_identity(screen_id(screen))];
+    return @{@"displays": displays, @"native_gop": ft_gop_properties(),
+             @"panel_match_available": @(select_screen(false) != nil)};
 }
 
 static NSDictionary *active_mode(CGDirectDisplayID display)
@@ -144,8 +195,16 @@ static NSDictionary *stats_json(const FtStats *stats, double start, double end)
 {
     (void)notification;
     NSScreen *screen = select_screen(_options.mainDisplay);
-    if (!screen)
+    if (!screen) {
+        for (NSScreen *candidate in NSScreen.screens) {
+            const CGDirectDisplayID display = screen_id(candidate);
+            const PixelSize pixels = display_pixels(display);
+            fprintf(stderr, "piano-frametime: candidate vendor=0x%x product=0x%x builtin=%u pixels=%zux%zu\n",
+                    CGDisplayVendorNumber(display), CGDisplayModelNumber(display), CGDisplayIsBuiltin(display),
+                    pixels.width, pixels.height);
+        }
         [self failSetup:"requested display is unavailable in the GUI session" error:nil];
+    }
     _display = screen_id(screen);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -394,6 +453,7 @@ static NSDictionary *stats_json(const FtStats *stats, double start, double end)
         _modeBefore.count && presented.intervals && !gpuErrors && submitted == completed;
     NSDictionary *report = @{
         @"schema_version": @1, @"capture_valid": @(valid),
+        @"display": display_identity(_display),
         @"config": @{@"preferred_fps": @(_options.fps), @"seconds": @(_options.seconds), @"load": @(_options.load),
                      @"main_display": @(_options.mainDisplay), @"warmup_s": @(warmupSeconds), @"drain_s": @(drainSeconds)},
         @"window": @{@"start_s": @(_start), @"end_s": @(end), @"duration_s": @(end - _start),
@@ -441,6 +501,7 @@ static void usage(FILE *stream)
 {
     fputs("usage: piano-frametime [--fps 60|90|120|144] [--seconds 60..600] [--load 0..512] [--main-display]\n"
           "       piano-frametime --kernel-report BEFORE AFTER [KERNEL_LOG]\n"
+          "       piano-frametime --list-displays\n"
           "       piano-frametime --help\n", stream);
 }
 
@@ -465,6 +526,13 @@ int main(int argc, const char *argv[])
         }
         if ((argc == 4 || argc == 5) && !strcmp(argv[1], "--kernel-report"))
             return ft_kernel_report(argv[2], argv[3], argc == 5 ? argv[4] : NULL);
+        if (argc == 2 && !strcmp(argv[1], "--list-displays")) {
+            if (!gui_session()) {
+                fputs("piano-frametime: launch as the logged-in user in the console GUI session\n", stderr);
+                return 1;
+            }
+            return ft_write_json(display_inventory()) ? 0 : 1;
+        }
         Options options = {.fps = 60, .seconds = 65};
         for (int i = 1; i < argc; ++i) {
             const char *arg = argv[i];

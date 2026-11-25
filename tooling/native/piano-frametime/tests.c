@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "frametime_stats.h"
+#include "panel_match.h"
 
 #include <assert.h>
 #include <math.h>
@@ -52,6 +53,17 @@ static void check_stream(unsigned hz, bool drop, bool judder)
 
 int main(void)
 {
+    assert(ft_panel_match(0x61a9, 0x8750, 3200, 2136, false, false, 0, 0, false, false) == 2);
+    assert(!ft_panel_match(0x61a9, 0xd6, 3200, 2136, false, true, 3200, 2136, false, false));
+    assert(ft_panel_match(0x610, 0x756e6b6e, 3200, 2136, true, true, 3200, 2136, true, false) == 1);
+    assert(!ft_panel_match(0x610, 0x756e6b6e, 3200, 2136, true, false, 3200, 2136, true, false));
+    assert(!ft_panel_match(0x610, 0x756e6b6e, 3200, 2136, true, true, 3200, 2136, false, false));
+    assert(!ft_panel_match(0x610, 0x756e6b6e, 3200, 2136, false, true, 3200, 2136, true, false));
+    assert(!ft_panel_match(0x610, 0x756e6b6e, 1920, 1080, true, true, 3200, 2136, true, false));
+    assert(!ft_panel_match(0, 0, 3200, 2136, false, true, 3200, 2136, false, false));
+    assert(ft_panel_match(0, 0, 3200, 2136, false, true, 3200, 2136, false, true) == 1);
+    assert(!ft_panel_match(0, 0, 3200, 2136, false, false, 3200, 2136, false, true));
+    assert(!ft_panel_match(0, 0, 3200, 2136, false, true, 0, 0, false, true));
     const unsigned rates[] = {60, 90, 120, 144};
     for (size_t i = 0; i < sizeof(rates) / sizeof(*rates); ++i) {
         check_stream(rates[i], false, false);

@@ -1,6 +1,6 @@
 # Piano frame-time probe
 
-`piano-frametime` opens a visible AppKit window on the Xiaomi panel (CoreGraphics vendor `0x61a9`, product `0x8750`). A screen-bound `CADisplayLink` drives a depth-tested Metal scene of rotating cubes in a display-synchronized `CAMetalLayer`. The window covers three quarters of the usable screen in each dimension. `--load` sets the number of fragment shader iterations per covered pixel. Use `--load 0` for the light composition test and record the load and drawable dimensions for 3D comparisons. The probe requests a preferred frame rate. Select and settle the display mode separately.
+`piano-frametime` opens a visible AppKit window on the Xiaomi panel. Default selection prefers the driver's published vendor `0x61a9`, product `0x8750`, with guarded matching for a synthesized CoreGraphics identity (below). A screen-bound `CADisplayLink` drives a depth-tested Metal scene of rotating cubes in a display-synchronized `CAMetalLayer`. The window covers three quarters of the usable screen in each dimension. `--load` sets the number of fragment shader iterations per covered pixel. Use `--load 0` for the light composition test and record the load and drawable dimensions for 3D comparisons. The probe requests a preferred frame rate. Select and settle the display mode separately.
 
 ## Build and run
 
@@ -11,7 +11,7 @@ make -C tooling/native/piano-frametime
 make -C tooling/native/piano-frametime test
 ```
 
-The binary is `out/piano-frametime/piano-frametime`. For a host compile with another installed SDK, use `make -C tooling/native/piano-frametime SDK=macosx all`. `test` runs the portable cadence analysis under ASan and UBSan. `--main-display` selects the host's main display for a local GUI smoke test.
+The binary is `out/piano-frametime/piano-frametime`. For a host compile with another installed SDK, use `make -C tooling/native/piano-frametime SDK=macosx all`. `test` runs the portable cadence analysis and panel-match predicates under ASan and UBSan. `--main-display` explicitly selects the main display, including when the panel's default identity match is unavailable.
 
 Run the animation **as the logged-in console user inside the GUI session**, with the screen awake and unlocked and the window unobscured. An SSH login by itself may lack the console GUI bootstrap context. For a RAM qual spec, stage the executable at `/usr/local/libexec/piano-frametime` in the test payload or transfer it through the runner's existing staging path. The installed-system qual can use the same binary. Run the existing desktop gate first. For M3, select the desired 60, 90, 120, or 144 Hz mode using the CoreGraphics probe in `docs/drivers/dpu-m3.md` on the M3 branch, then verify the active mode before starting the measurement. Use one result set per mode and load. Allow at least 90 seconds per invocation in the spec budget, plus time for staging, desktop login, mode changes, and evidence collection. The defaults are 60 fps, 65 seconds and load 0. The minimum requested duration is 60 seconds, with a separate three-second warmup and two-second drain.
 
@@ -46,6 +46,14 @@ test "$capture_rc" -eq 0 && test "$snapshot_rc" -eq 0 && test "$log_rc" -eq 0
 ```
 
 On a profile without the optional snapshot or with driver IOLog lines delivered only to the console, keep the app output and record the missing evidence. The runner can pass its filtered console capture to `--kernel-report` in place of the unified log. The kernel report exits 0 when both hardware counters advance and the supplied log, if any, contains a positive flip cadence window. Confirm which windows fall inside the run and apply the performance criteria to the saved results.
+
+## Display selection and zero presentation times
+
+Run `piano-frametime --list-displays` in the console GUI session for read-only numeric CG identities, builtin/main flags, pixel dimensions, filtered NativeGopDisplay attributes and `panel_match_available`. It opens no animation window and records no serials or arbitrary display names. Capture JSON also records the selected `display`; a selection failure prints numeric candidates.
+
+The default matcher first prefers CG `0x61a9/0x8750`. A fallback requires the driver's fixed panel UUID and canonical ProductAttributes plus matching native pixel dimensions. It then accepts either the fixed public product name on both sides or a builtin driver/display with CG's conditional Apple/unknown identity (`0x610/0x756e6b6e`). Tied best matches fail. The fake second display is excluded from the driver fallback. This conditional identity was traced in 27.3; the supplied y12l run did not record its actual CG IDs, so the new matcher still needs tablet validation.
+
+In the installed v13.1y12l baseline, every presented handler ran but every `presentedTime` was zero. CA has zero-time release/cleanup paths that invoke these handlers without setting a positive presentation time. Preserve the invalid capture: GPU completion and callback arrival cannot replace actual presentation timestamps. See [the presentation-feedback trace and HOLD gate](../drivers/presented-time.md) for the source gaps and read-only collection list.
 
 ## Reading the report
 
