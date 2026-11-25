@@ -31,9 +31,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
+#include "../../../package/include/PianoBootArgs.h"
 #include "SyncPolicy.h"
 
 @protocol PianoDisplayServicesClient
@@ -59,17 +59,12 @@ static uint64_t nowMs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1
 
 static int bootArg(const char *word)
 {
-  size_t size = 0;
-  if (sysctlbyname("kern.bootargs", NULL, &size, NULL, 0) || !size) return 0;
-  char *args = calloc(1, size + 1);
-  int found = 0;
-  if (args && !sysctlbyname("kern.bootargs", args, &size, NULL, 0)) {
-    const size_t n = strlen(word);
-    for (char *p = args; (p = strstr(p, word)); p += n)
-      if ((p == args || p[-1] == ' ') && (p[n] == ' ' || !p[n])) found = 1;
-  }
-  free(args);
-  return found;
+  char args[PIANO_BOOT_ARGS_MAX];
+  pianoBootArgs(args);
+  const size_t n = strlen(word);
+  for (char *p = args; (p = strstr(p, word)); p += n)
+    if ((p == args || p[-1] == ' ') && (p[n] == ' ' || !p[n])) return 1;
+  return 0;
 }
 
 static int has(io_service_t s, CFStringRef key)
@@ -79,8 +74,7 @@ static int has(io_service_t s, CFStringRef key)
   return v != NULL;
 }
 
-// 6d5c8131 (miplay1): the boot line is split (the line plus the ADT's /chosen tail), so kern.bootargs may lack piano-backlight-native/
-// auto; the kext's own properties say it: native when it publishes its native implementation, automatic-capable when it publishes
+// The kext's own properties report readiness: native when it publishes its native implementation, automatic-capable when it publishes
 // piano-backlight-auto-requested (from its first publication, shortly after it registers). The boot arguments still count.
 static int kextReady(io_service_t s)
 {
