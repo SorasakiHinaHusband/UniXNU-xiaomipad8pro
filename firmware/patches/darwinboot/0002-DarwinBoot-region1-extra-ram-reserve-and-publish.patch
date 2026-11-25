@@ -1,0 +1,349 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index ee919cb..18eec4b 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -16,6 +16,7 @@
+ #include "BootVideo.h"
+ #include "PackedRamdisk.h"
+ #include "WindowSize.h"
++#include "ExtraRam.h"
+ 
+ #define WINDOW_SIZE  SIZE_256MB
+ #define BLOCK_SIZE   SIZE_2MB
+@@ -270,7 +271,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+ 
+ STATIC
+ BOOLEAN
+-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
++AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExtraOffset)
+ {
+   UINT32 Properties;
+   UINT32 Children;
+@@ -282,6 +283,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   UINTN  AddonCandidate;
+   UINTN  PolicyCandidate;
+   UINTN  MemoryCandidate;
++  UINTN  ExtraCandidate;
+   CONST UINT8 *Name;
+   UINTN  NameLength;
+ 
+@@ -292,6 +294,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   AddonCandidate = MAX_UINTN;
+   PolicyCandidate = MAX_UINTN;
+   MemoryCandidate = MAX_UINTN;
++  ExtraCandidate = MAX_UINTN;
+   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
+   Properties = U32 (Data + *Offset);
+   Children = U32 (Data + *Offset + 4);
+@@ -333,6 +336,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+       MemoryCandidate = *Offset;
+     }
++    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "piano-extra-ram") == 0) {
++      if ((ExtraCandidate != MAX_UINTN) || (Length != DARWIN_EXTRA_RAM_PROP_BYTES)) { return FALSE; }
++      ExtraCandidate = *Offset;
++    }
+     *Offset += Length;
+     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
+     *Offset = ALIGN_VALUE (*Offset, 4);
+@@ -362,9 +369,13 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+     *WindowSize = U64 (Data + MemoryCandidate);
+     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
+   }
++  if (ExtraCandidate != MAX_UINTN) {
++    if ((Path != 1) || (*ExtraOffset != MAX_UINTN)) { return FALSE; }
++    *ExtraOffset = ExtraCandidate;
++  }
+   if (Children > (Size - *Offset) / 8) { return FALSE; }
+   for (Index = 0; Index < Children; Index++) {
+-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
++    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExtraOffset)) { return FALSE; }
+   }
+   return TRUE;
+ }
+@@ -624,6 +635,11 @@ Boot (
+   VOID                            *Policies;
+   UINTN                           PolicySize;
+   UINTN                           PolicyOffset;
++  UINTN                           ExtraOffset;
++  DARWIN_EXTRA_RUN                ExtraRuns[DARWIN_EXTRA_RAM_MAX_RUNS];
++  UINTN                           ExtraCount;
++  UINTN                           ExtraIndex;
++  UINT8                           ExtraProp[DARWIN_EXTRA_RAM_PROP_BYTES];
+   UINT64                          PolicyAddress;
+   DARWIN_BOOT_ARGS                *Args;
+   EFI_MEMORY_DESCRIPTOR           *Map;
+@@ -667,6 +683,7 @@ Boot (
+   PolicySize = 0;
+   TreePath = NULL;
+   Map = NULL;
++  ExtraCount = 0;
+   Address = 0;
+   Capacity = 0;
+   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
+@@ -689,9 +706,16 @@ Boot (
+   TrustCacheOffset = MAX_UINTN;
+   AddonOffset = MAX_UINTN;
+   PolicyOffset = MAX_UINTN;
++  ExtraOffset = MAX_UINTN;
+   WindowSize = 0;
+   KeepPacked = FALSE;
+-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
++  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExtraOffset) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
++  // the placeholder must be all zero bytes (DarwinBoot fills it)
++  if (ExtraOffset != MAX_UINTN) {
++    for (ExtraIndex = 0; ExtraIndex < DARWIN_EXTRA_RAM_PROP_BYTES; ExtraIndex++) {
++      if (((UINT8 *)Tree)[ExtraOffset + ExtraIndex] != 0) { Status = EFI_COMPROMISED_DATA; goto Fail; }
++    }
++  }
+   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
+   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
+@@ -757,6 +781,39 @@ Boot (
+   if (EFI_ERROR (Status)) { goto Fail; }
+   Status = AllocateWindow (&Kernel, &WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  //
++  // RAM16G R1: with a /chosen piano-extra-ram placeholder, reserve region1's conventional runs below the window (whole
++  // 2 MiB slabs) and publish them; XNU's window is unchanged. A run UEFI refuses is left out (printed). No placeholder:
++  // nothing reserved (the old behaviour).
++  //
++  if (ExtraOffset != MAX_UINTN) {
++    Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
++    if (EFI_ERROR (Status)) { goto Fail; }
++    for (Index = 0; Index + Stride <= MapSize; Index += Stride) {
++      EFI_MEMORY_DESCRIPTOR *Run = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Index);
++      if ((Run->Type != EfiConventionalMemory) || (Run->NumberOfPages == 0)) { continue; }
++      ExtraCount = DarwinExtraRamAdd (ExtraRuns, (unsigned)ExtraCount, DARWIN_EXTRA_RAM_MAX_RUNS, Run->PhysicalStart,
++                                      Run->PhysicalStart + EFI_PAGES_TO_SIZE (Run->NumberOfPages), DARWIN_EXTRA_RAM_FLOOR,
++                                      Address & ~(DARWIN_EXTRA_RAM_SLAB - 1));
++    }
++    for (ExtraIndex = 0; ExtraIndex < ExtraCount; ) {
++      EFI_PHYSICAL_ADDRESS RunBase = ExtraRuns[ExtraIndex].base;
++      Status = gBS->AllocatePages (AllocateAddress, EfiReservedMemoryType, EFI_SIZE_TO_PAGES (ExtraRuns[ExtraIndex].size), &RunBase);
++      if (EFI_ERROR (Status)) {
++        Print (L"DARWINBOOT: extra-ram run 0x%lx+0x%lx refused: %r\n", ExtraRuns[ExtraIndex].base, ExtraRuns[ExtraIndex].size, Status);
++        CopyMem (&ExtraRuns[ExtraIndex], &ExtraRuns[ExtraIndex + 1], (ExtraCount - ExtraIndex - 1) * sizeof (ExtraRuns[0]));
++        ExtraCount--;
++        continue;
++      }
++      Print (L"DARWINBOOT: extra-ram run %u 0x%lx..0x%lx (%lu MiB) reserved\n", (UINT32)ExtraIndex, ExtraRuns[ExtraIndex].base,
++             ExtraRuns[ExtraIndex].base + ExtraRuns[ExtraIndex].size, ExtraRuns[ExtraIndex].size >> 20);
++      ExtraIndex++;
++    }
++    Status = EFI_SUCCESS;
++    Print (L"DARWINBOOT: extra-ram %u runs, %lu MiB below the window 0x%lx\n", (UINT32)ExtraCount,
++           DarwinExtraRamTotal (ExtraRuns, (unsigned)ExtraCount) >> 20, Address);
++    DarwinExtraRamEncode (ExtraRuns, (unsigned)ExtraCount, ExtraProp);
++  }
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
+   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
+@@ -788,6 +845,7 @@ Boot (
+   Args->DeviceTreeLength = (UINT32)TreeSize;
+   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
+   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
++  if (ExtraOffset != MAX_UINTN) { CopyMem ((VOID *)(UINTN)(TreeAddress + ExtraOffset), ExtraProp, sizeof (ExtraProp)); }
+   if (Request->Ramdisk != NULL) {
+     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
+     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
+@@ -871,6 +929,9 @@ Fail:
+   if (TreePath != NULL) { FreePool (TreePath); }
+   if (Map != NULL) { FreePool (Map); }
+   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
++  for (ExtraIndex = 0; ExtraIndex < ExtraCount; ExtraIndex++) {
++    gBS->FreePages (ExtraRuns[ExtraIndex].base, EFI_SIZE_TO_PAGES (ExtraRuns[ExtraIndex].size));
++  }
+   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
+   return Status;
+ }
+diff --git a/DarwinBootPkg/Driver/ExtraRam.h b/DarwinBootPkg/Driver/ExtraRam.h
+new file mode 100644
+index 0000000..daa4d26
+--- /dev/null
++++ b/DarwinBootPkg/Driver/ExtraRam.h
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++#ifndef DARWINBOOT_EXTRA_RAM_H
++#define DARWINBOOT_EXTRA_RAM_H
++// RAM16G R1 (UniXNU-piano 20261125-ram16g): the conventional runs of DRAM region1 below XNU's window (on SM8750 16 GiB:
++// 874 MiB in three runs at 0x880000000.., cut off from the window by a 139 MiB firmware hole). XNU never sees them (its
++// window is one run); DarwinBoot reserves them (EfiReservedMemoryType) and publishes them in /chosen piano-extra-ram, a
++// placeholder of DARWIN_EXTRA_RAM_PROP_BYTES zero bytes in the ADT (absent: nothing is reserved or published).
++// Property layout (little endian): u32 version (1), u32 count, then DARWIN_EXTRA_RAM_MAX_RUNS pairs u64 base, u64 size
++// (unused pairs 0). Every run is 2 MiB aligned and a multiple of 2 MiB (the GPU tier's slab), sorted, disjoint.
++#define DARWIN_EXTRA_RAM_VERSION    1u
++#define DARWIN_EXTRA_RAM_MAX_RUNS   8u
++#define DARWIN_EXTRA_RAM_PROP_BYTES (8u + 16u * DARWIN_EXTRA_RAM_MAX_RUNS)
++#define DARWIN_EXTRA_RAM_SLAB       0x200000ULL
++#define DARWIN_EXTRA_RAM_FLOOR      0x880000000ULL   // region1's base: region0 (the 2 GiB bank) is R3's, not this
++typedef struct { unsigned long long base; unsigned long long size; } DARWIN_EXTRA_RUN;
++
++// Add the conventional range [start, end) clipped to [floor, limit) and shrunk to whole 2 MiB slabs; adjacent or
++// overlapping runs merge (UEFI splits one run into several descriptors). Returns the new count; a run that does not fit
++// in max is dropped (the count stays). limit is the window's base (nothing at or above it is taken).
++static inline unsigned DarwinExtraRamAdd(DARWIN_EXTRA_RUN *runs, unsigned count, unsigned max, unsigned long long start,
++                                         unsigned long long end, unsigned long long floor, unsigned long long limit) {
++  unsigned i, j;
++  if (start < floor) { start = floor; }
++  if (end > limit) { end = limit; }
++  start = (start + DARWIN_EXTRA_RAM_SLAB - 1) & ~(DARWIN_EXTRA_RAM_SLAB - 1);
++  end &= ~(DARWIN_EXTRA_RAM_SLAB - 1);
++  if (end <= start) { return count; }
++  // merge with any run it touches (repeat: one range may join two runs)
++  for (i = 0; i < count; ) {
++    unsigned long long b = runs[i].base, e = runs[i].base + runs[i].size;
++    if (start <= e && b <= end) {
++      if (b < start) { start = b; }
++      if (e > end) { end = e; }
++      for (j = i + 1; j < count; j++) { runs[j - 1] = runs[j]; }
++      count--;
++      continue;
++    }
++    i++;
++  }
++  if (count >= max) { return count; }
++  for (i = count; i > 0 && runs[i - 1].base > start; i--) { runs[i] = runs[i - 1]; }
++  runs[i].base = start;
++  runs[i].size = end - start;
++  return count + 1;
++}
++
++static inline unsigned long long DarwinExtraRamTotal(const DARWIN_EXTRA_RUN *runs, unsigned count) {
++  unsigned long long t = 0; unsigned i;
++  for (i = 0; i < count; i++) { t += runs[i].size; }
++  return t;
++}
++
++static inline void DarwinExtraRamPut64(unsigned char *p, unsigned long long v) {
++  unsigned i; for (i = 0; i < 8; i++) { p[i] = (unsigned char)(v >> (8 * i)); }
++}
++
++// The property bytes for count runs (count <= DARWIN_EXTRA_RAM_MAX_RUNS).
++static inline void DarwinExtraRamEncode(const DARWIN_EXTRA_RUN *runs, unsigned count, unsigned char *out) {
++  unsigned i;
++  for (i = 0; i < DARWIN_EXTRA_RAM_PROP_BYTES; i++) { out[i] = 0; }
++  out[0] = (unsigned char)DARWIN_EXTRA_RAM_VERSION;
++  out[4] = (unsigned char)count;
++  for (i = 0; i < count && i < DARWIN_EXTRA_RAM_MAX_RUNS; i++) {
++    DarwinExtraRamPut64(out + 8 + 16 * i, runs[i].base);
++    DarwinExtraRamPut64(out + 16 + 16 * i, runs[i].size);
++  }
++}
++#endif
+diff --git a/Test/extra-ram.c b/Test/extra-ram.c
+new file mode 100644
+index 0000000..e06f5d6
+--- /dev/null
++++ b/Test/extra-ram.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++#include <assert.h>
++#include <stdio.h>
++#include "../DarwinBootPkg/Driver/ExtraRam.h"
++#define MiB 0x100000ULL
++int main(void) {
++  DARWIN_EXTRA_RUN r[DARWIN_EXTRA_RAM_MAX_RUNS];
++  unsigned n = 0;
++  const unsigned long long W = 0x8c0004000ULL & ~(DARWIN_EXTRA_RAM_SLAB - 1);   // the 13 GiB window's base
++  // the SM8750 16 GiB layout: three region1 runs below the 139 MiB hole at 0x8b7500000, the window above
++  n = DarwinExtraRamAdd(r, n, 8, 0x880000000ULL, 0x8a0000000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  n = DarwinExtraRamAdd(r, n, 8, 0x8a0400000ULL, 0x8b0000000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  n = DarwinExtraRamAdd(r, n, 8, 0x8b0000000ULL, 0x8b7500000ULL, DARWIN_EXTRA_RAM_FLOOR, W);   // adjacent: merges
++  assert(n == 2);
++  assert(r[0].base == 0x880000000ULL && r[0].size == 512 * MiB);
++  assert(r[1].base == 0x8a0400000ULL && r[1].size == 0x8b7400000ULL - 0x8a0400000ULL);   // end shrunk to a slab
++  // the window and anything above it never; region0 (below the floor) never
++  n = DarwinExtraRamAdd(r, n, 8, 0x8c0004000ULL, 0xc00000000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  n = DarwinExtraRamAdd(r, n, 8, 0x80000000ULL, 0x100000000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  assert(n == 2);
++  // a straddling range is clipped to [floor, window)
++  n = DarwinExtraRamAdd(r, n, 8, 0x87f000000ULL, 0x880200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  assert(n == 2 && r[0].base == 0x880000000ULL && r[0].size == 512 * MiB);
++  // less than one slab after alignment: nothing
++  n = DarwinExtraRamAdd(r, n, 8, 0x8b8001000ULL, 0x8b8200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  assert(n == 2);
++  // a range that joins two runs makes one
++  n = DarwinExtraRamAdd(r, n, 8, 0x8a0000000ULL, 0x8a0400000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  assert(n == 1 && r[0].base == 0x880000000ULL && r[0].size == 0x8b7400000ULL - 0x880000000ULL);
++  assert(DarwinExtraRamTotal(r, n) == 0x37400000ULL);   // 884 MiB here (the fixture has no 4 MiB gap left)
++  // out of order input is sorted; the table is bounded
++  DARWIN_EXTRA_RUN s[3]; unsigned m = 0;
++  m = DarwinExtraRamAdd(s, m, 3, 0x8b0000000ULL, 0x8b0200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  m = DarwinExtraRamAdd(s, m, 3, 0x890000000ULL, 0x890200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  m = DarwinExtraRamAdd(s, m, 3, 0x8a0000000ULL, 0x8a0200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  m = DarwinExtraRamAdd(s, m, 3, 0x8a8000000ULL, 0x8a8200000ULL, DARWIN_EXTRA_RAM_FLOOR, W);
++  assert(m == 3 && s[0].base == 0x890000000ULL && s[1].base == 0x8a0000000ULL && s[2].base == 0x8b0000000ULL);
++  // encoding
++  unsigned char p[DARWIN_EXTRA_RAM_PROP_BYTES];
++  DarwinExtraRamEncode(s, m, p);
++  assert(p[0] == 1 && p[1] == 0 && p[4] == 3);
++  assert(p[8] == 0 && p[11] == 0x90 && p[12] == 0x08 && p[16 + 2] == 0x20);
++  for (unsigned i = 8 + 16 * 3; i < DARWIN_EXTRA_RAM_PROP_BYTES; i++) { assert(p[i] == 0); }
++  printf("PASS: extra-ram runs (merge, clip, slab shrink, bound, sort) and the piano-extra-ram encoding\n");
++  return 0;
++}
+diff --git a/Test/test-extra-ram-adt.py b/Test/test-extra-ram-adt.py
+new file mode 100644
+index 0000000..7184283
+--- /dev/null
++++ b/Test/test-extra-ram-adt.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: BSD-2-Clause-Patent
++"""Compile the production AdtNode and check /chosen piano-extra-ram (RAM16G R1): found once in /chosen with its exact length,
++refused elsewhere, twice or with another length; absent leaves ExtraOffset unset (the old trees parse as before)."""
++import ctypes, struct, subprocess, tempfile
++from pathlib import Path
++root = Path(__file__).resolve().parents[1]
++src = (root / 'DarwinBootPkg/Driver/DarwinBoot.c').read_text()
++fn = src[src.index('STATIC\nBOOLEAN\nAdtNode'):src.index('STATIC\nBOOLEAN\nValidTrustCaches')]
++pre = '''
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++typedef uint8_t UINT8; typedef uint32_t UINT32; typedef uint64_t UINT64; typedef size_t UINTN; typedef int BOOLEAN;
++typedef unsigned short CHAR16; typedef char CHAR8;
++#define STATIC static
++#define CONST const
++#define TRUE 1
++#define FALSE 0
++#define MAX_UINTN SIZE_MAX
++#define ALIGN_VALUE(v,a) (((v)+((a)-1)) & ~((UINTN)(a)-1))
++#define CompareMem(a,b,n) memcmp(a,b,n)
++#define AsciiStrCmp(a,b) strcmp(a,b)
++static const void *ScanMem8(const void *p, UINTN n, UINT8 v) { return memchr(p, v, n); }
++static UINT32 U32(const void *p) { UINT32 v; memcpy(&v,p,4); return v; }
++static UINT64 U64(const void *p) { UINT64 v; memcpy(&v,p,8); return v; }
++#include "WindowSize.h"
++#include "ExtraRam.h"
++'''
++glue = '''
++long long check(const UINT8 *p, UINTN n) {
++  UINTN off = 0, r = MAX_UINTN, t = MAX_UINTN, a = MAX_UINTN, pol = MAX_UINTN, x = MAX_UINTN; UINT64 w = 0; BOOLEAN kp = 0;
++  if (!AdtNode(p, n, &off, 0, 3, &r, &t, &a, &pol, &w, &kp, &x) || off != n) { return -2; }
++  return x == MAX_UINTN ? -1 : (long long)x;
++}
++'''
++def prop(name, data):
++    b = name.encode().ljust(32, b'\0') + struct.pack('<I', len(data)) + data
++    return b + b'\0' * ((-len(b)) % 4)
++def node(props, children=()):
++    return struct.pack('<II', len(props), len(children)) + b''.join(props) + b''.join(children)
++N = 8 + 16 * 8
++with tempfile.TemporaryDirectory() as tmp:
++    w = Path(tmp); (w / 'adt.c').write_text(pre + fn + glue)
++    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-shared', '-fPIC', '-I', str(root / 'DarwinBootPkg/Driver'),
++                    str(w / 'adt.c'), '-o', str(w / 'adt.dylib')], check=True)
++    lib = ctypes.CDLL(str(w / 'adt.dylib')); lib.check.restype = ctypes.c_longlong
++    def check(blob): return lib.check(ctypes.create_string_buffer(blob), len(blob))
++    chosen = lambda extra: node([prop('name', b'chosen\0')] + extra)
++    tree = lambda c: node([prop('name', b'device-tree\0')], [c, node([prop('name', b'cpus\0')])])
++    t = tree(chosen([prop('piano-extra-ram', bytes(N))]))
++    off = check(t); assert off > 0 and t[off:off + N] == bytes(N), off
++    assert check(tree(chosen([]))) == -1                                    # absent: unset, the tree still parses
++    assert check(tree(chosen([prop('piano-extra-ram', bytes(N - 8))]))) == -2   # wrong length
++    assert check(tree(chosen([prop('piano-extra-ram', bytes(N))] * 2))) == -2   # twice
++    other = node([prop('name', b'device-tree\0')], [chosen([]), node([prop('name', b'cpus\0'), prop('piano-extra-ram', bytes(N))])])
++    assert check(other) == -2                                               # not in /chosen
++print('PASS: /chosen piano-extra-ram placeholder: found with its length, absent unset, wrong length / twice / outside /chosen refused')
