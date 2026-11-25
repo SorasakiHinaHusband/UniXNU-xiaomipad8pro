@@ -55,12 +55,13 @@ fallback. The physical window XNU receives stays the same.
 ## R1 RAM boot read list
 
 Use an FD with DarwinBoot patches 0001 and 0002. Package the RAM payload with
-`build-ram-images.py --extra-ram` and use the existing 27.3 desktop RAM profile
-with `data-persist=0 piano-gpu=2 piano-gpu-mem=paged piano-gpu-user-vm=1
+`build-ram-images.py --extra-ram` or set `PIANO_EXTRA_RAM=1` in the
+normal 27.3 RAM build. Use the existing desktop RAM profile with `data-persist=0 piano-gpu=2 piano-gpu-mem=paged piano-gpu-user-vm=1
 piano-gpu-tier=1`. Keep the boot guard and desktop GPU policy. An equivalent
 control uses `piano-gpu-tier=0` and the ordinary ADT. Mode 2 additionally tries
 sub-2 MiB BOs, each of which occupies at least one slab. Full cached coherence
 (`piano-gpu-coherent=2`, the upstream `pagani-gpu-coherent=2`) closes the tier.
+An older FD leaves the placeholder zeroed, which PianoA830 treats as absent.
 
 1. Capture early console lines matching
    `DARWINBOOT: (window|extra-ram)`, `NativeRamBlock: RAM window`,
