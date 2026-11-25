@@ -5,6 +5,7 @@
 //   dsi0/dsi1 raw:   active-h 01cb0020 active-v 08c2006a total 0905023f
 //   refresh:         119.878 Hz (INTF pixel clock 159504 kHz), panel p81 35-02-0b (B2 then B3)
 // The planner's 120 Hz words must be those exactly, and its 60 Hz words DpuRefresh.h's (period 00289b00, DSI total 120b023f).
+//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_modes_host.cpp -o /tmp/dpu_modes_host && /tmp/dpu_modes_host
 #include "DpuModes.h"
 #include "DpuSurvey.h"
 #include <cstdio>

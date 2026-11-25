@@ -2,6 +2,7 @@
 // Host tests of DpuSnapshot.h (B1 milestone 1's run-time snapshot) on the timed register model (dpu_model.h), seeded with the
 // installed v13.1y12k survey's words: the snapshot stores nothing, keeps the survey's gate, classifies the live mode (120, then 60
 // after DpuRefresh.h's own switch on the model), reads both DSI controllers' shadow and command-path words, and its text is bounded.
+//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_snapshot_host.cpp -o /tmp/dpu_snapshot_host && /tmp/dpu_snapshot_host
 #include "DpuSnapshot.h"
 #include "dpu_model.h"
 #include <cstdarg>
