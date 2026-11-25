@@ -274,6 +274,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-panel=1` | 0 | B1e: the panel's light sleep with display sleep (NativeGopDisplay forwards its display power) |
 | `piano-dpu-panel-engines=0`, `piano-dpu-panel-hs=1` | 1, 0 | DCS only (engines keep running); DCS in high speed |
 | `piano-dpu-panel-test=N` | 0 | first N sleep/wake cycles, 5 s asleep and 5 s awake each; stops at a failure |
+| `piano-dpu-snapshot=1` | 0 | B1 milestone 1 (`DpuSnapshot.h`, `DpuSnapshot.cpp`): `sudo sysctl -n machdep.piano_dpu_snapshot` reads the path's registers at the call (loads only, behind the survey's gate; root; at most once per 100 ms): CTL, INTF1/2 timing, engines and counters, both DSI controllers' TOTAL/ACTIVE, timing-shadow words, command path and clock/lane state, the DSPPs' PCC/GC, the live mode classified against `DpuModes.h` and each mode's 144/120/90/60 Hz words, B1c's VFP verdict; each line also on the console (`PianoDpu: snap: ...`) |
 
 ## 7. Kernel collection
 
@@ -637,6 +638,11 @@ and the SPI 83 handler, which stays attached: ArmCpu has no detach); step 4's fa
     flushes (INTF, DSPP) come from different threads, each waiting for its own bits only; a boot where one latch drops the other's
     bits would ask for one lock over every CTL_FLUSH writer. B1b's vsync handler clears underrun bits too, so with B1b running B1c's
     underrun check may see fewer (the rate and lockstep checks stay).
+17. **Programmable fetch is on as the boot stages leave it** (installed v13.1y12k's survey, 2026-11-25: INTF_CONFIG 80800000 on INTF1
+    and INTF2; bit 31 is msm's programmable-fetch enable, `dpu_hw_intf_setup_prg_fetch`), against §4.3's "stays off" (that is what
+    Linux programs on piano: 106 lines of VSYNC+VBP exceed the 24-line worst case). So B1c's `refuse()` rejects the real path as built,
+    and every porch switch (60 and 90/144 alike) must move INTF_PROG_FETCH_START (+0x170, counted from vsync in INTF clocks) with the
+    timing: `DpuModes.h` plans it ((vtotal - lines) x htotal + 1); the snapshot reads the live start (the console cut it off).
 
 ## 11. Licence note
 
