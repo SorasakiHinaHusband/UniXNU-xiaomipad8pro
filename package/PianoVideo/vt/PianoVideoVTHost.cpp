@@ -133,7 +133,33 @@ static void b1Record(const char *line){
   IOService *pv=m?IOService::copyMatchingService(m):nullptr;OSSafeReleaseNULL(m);if(!pv)return;
   char key[40];snprintf(key,sizeof key,"piano-video-vt-b1-%u",seq++%8);pv->setProperty(key,line);pv->release();
 }
-static bool pianoVtBorrow(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)&&v==1;}return b==1;}
+static int pianoVtBorrowMode(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)?int(v):0;}return b;}
+static bool pianoVtBorrow(){return pianoVtBorrowMode()>=1;}
+// piano-video-vt-borrow=2 (diagnostic, LT-B5): once per boot, try the refused surface ID through EVERY IOSurfaceRoot client and record
+// which creator's client accepts it (find_surface admits the owner task or a client that knows it); each accepted lookup is undone at
+// once on that same client (selector 56 invalidate, 1 release: the lease's own pair). Nothing is copied.
+static IOReturn clientMethod(IOUserClient *u,uint32_t selector,uint32_t id,void *out,uint32_t *bytes){
+  uint64_t scalar=id;IOExternalMethodArguments a={};a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=selector;
+  a.scalarInput=&scalar;a.scalarInputCount=1;a.structureOutput=out;a.structureOutputSize=bytes?*bytes:0;
+  IOUserClient2022 *c=OSDynamicCast(IOUserClient2022,u);
+  const IOReturn rc=c?c->externalMethod(selector,reinterpret_cast<IOExternalMethodArgumentsOpaque *>(&a)):u->callExternalMethod(selector,&a);
+  if(bytes)*bytes=uint32_t(a.structureOutputSize);return rc;
+}
+static void b1Record(const char *line);
+static void diagOwner(IOUserClient *mine,uint32_t id){
+  static bool done=false;if(done||pianoVtBorrowMode()!=2)return;done=true;
+  IOService *root=surfaceRoot();if(!root)return;constexpr uint32_t bytes=0xc68;uint8_t *buf=static_cast<uint8_t *>(IOMallocZero(bytes));
+  unsigned tried=0,ok=0;OSIterator *it=buf?root->getClientIterator():nullptr;
+  if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;++tried;
+      uint32_t n=bytes;const IOReturn rc=clientMethod(u,4,id,buf,&n);
+      if(!rc){++ok;OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
+        clientMethod(u,56,id,nullptr,nullptr);clientMethod(u,1,id,nullptr,nullptr);
+        char line[160];snprintf(line,sizeof line,"diag id %u ACCEPTED by %s",id,cs?cs->getCStringNoCopy():"?");IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);
+        OSSafeReleaseNULL(c);}}
+    it->release();}
+  char line[160];snprintf(line,sizeof line,"diag id %u tried %u clients, %u accepted",id,tried,ok);IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);
+  if(buf)IOFree(buf,bytes);OSSafeReleaseNULL(root);
+}
 // Every IOSurfaceRoot client of the task (a sandboxed process may hold several: CoreVideo's, Metal's), retained, in registry order; the
 // diagnostic line lists how many clients each pid has.
 // pid > 0: that task's clients ("pid N,"); pid == 0: every client whose creator names a WebKit process ("com.apple.WebKit"), other pids
@@ -169,6 +195,7 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   uint8_t *result=static_cast<uint8_t *>(IOMallocZero(bytes));if(!result){failure(s,41,kNoMemory);return false;}
   uint32_t resultBytes=bytes;
   IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
+  if(rc==kIOReturnNotPermitted)diagOwner(s->surfaces,id);
   if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&!s->surfacesBorrowed){
     IOUserClient *owners[8]={};unsigned n=ownerSurfaceClients(s->surfaces,s->client->pid,owners,8);
     {const unsigned room=8-n;IOUserClient *more[8]={};const unsigned m=ownerSurfaceClients(s->surfaces,0,more,8);
