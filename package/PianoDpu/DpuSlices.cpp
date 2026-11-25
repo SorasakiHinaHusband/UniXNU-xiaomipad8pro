@@ -88,6 +88,9 @@ struct SliceArgs {
   unsigned ahbVote = 0;   // piano-dpu-ahb-vote: 1 = the gate's Linux rule for GCC's display AHB (DpuAhbVote.h)
 };
 SliceArgs gA;
+// The M5 trace ring, allocated once at the argument read when piano-dpu-panel=1: the 2048-row ring is ~131 KB, and in __DATA PianoDpu
+// no longer fits the kext collection's native-kext data gaps (the y12o KC link: no room for a 0x432b0-byte __DATA, largest gap 0x29f9c).
+panel::TraceRing *gPanelTrace = nullptr;
 bool gArgsRead;
 
 bool modesEnabled() { return gA.modes && !gA.refresh && gA.refreshDb; }
@@ -151,6 +154,13 @@ void readSliceArgs()
   const unsigned panelArg = argNumber("piano-dpu-panel", 0, 0, UINT32_MAX);
   gA.panel = panelArg != 0;
   gA.panelTrace = panelArg == 1;
+  if (gA.panelTrace && !gPanelTrace) {   // zero-filled = an empty ring (total 0)
+    gPanelTrace = static_cast<panel::TraceRing *>(IOMallocZero(sizeof(panel::TraceRing)));
+    if (!gPanelTrace) {
+      gA.panelTrace = false;
+      IOLog("PianoDpu: m5: the trace ring (%lu bytes) could not be allocated: tracing off\n", (unsigned long)sizeof(panel::TraceRing));
+    }
+  }
   gA.panelEngines = argNumber("piano-dpu-panel-engines", 1, 0, 1);
   gA.panelHs = argNumber("piano-dpu-panel-hs", 0, 0, 1);
   gA.panelTest = argNumber("piano-dpu-panel-test", 0, 0, 1000);
@@ -325,8 +335,7 @@ pcc::PanelPcc gNightShiftBase, gNightShiftLast;
 bool gDisplayOff;
 refresh::Options gRefreshOptions;
 panel::Options gPanelOptions;
-// The worker fills this preallocated ring, then publishes a separate copy.
-panel::TraceRing gPanelTrace;
+// The worker fills the preallocated ring (gPanelTrace, allocated with the arguments), then publishes a separate copy.
 struct PanelTraceReport {
   bool pending = false, on = false, ok = false, restored = false;
   unsigned serial = 0, ctl = 0, step = 0;
@@ -648,9 +657,9 @@ void logPanel(const char *what, const panel::Result &r)
 
 panel::TraceRing *beginPanelTrace()
 {
-  if (!gA.panelTrace) return nullptr;
-  gPanelTrace.reset();
-  return &gPanelTrace;
+  if (!gA.panelTrace || !gPanelTrace) return nullptr;
+  gPanelTrace->reset();
+  return gPanelTrace;
 }
 
 void finishPanelTrace(panel::TraceRing *trace, bool on, const panel::Result &r)
@@ -672,9 +681,9 @@ void finishPanelTrace(panel::TraceRing *trace, bool on, const panel::Result &r)
 void publishPanelTrace()
 {
   PanelTraceReport &report = gPanelReport;
-  if (!report.pending) return;
+  if (!report.pending || !gPanelTrace) return;
   report.pending = false;
-  const unsigned count = gPanelTrace.size();
+  const unsigned count = gPanelTrace->size();
   char line[224];
   OSData *dump = OSData::withCapacity((count + 3) * sizeof line);
   bool complete = dump != nullptr;
@@ -684,7 +693,7 @@ void publishPanelTrace()
   };
   snprintf(line, sizeof line, "m5 %u %s ctl%u ok=%u step=%u restored=%u rows=%u dropped=%u", report.serial,
            report.on ? "wake" : "off", report.ctl, unsigned(report.ok), report.step, unsigned(report.restored),
-           count, gPanelTrace.total - count);
+           count, gPanelTrace->total - count);
   emit();
   if (!report.on) {
     for (const panel::Sent &s : report.dcs) {
@@ -698,10 +707,10 @@ void publishPanelTrace()
     }
   }
   for (unsigned i = 0; i < count; ++i) {
-    const panel::TraceSample &s = gPanelTrace.at(i);
+    const panel::TraceSample &s = gPanelTrace->at(i);
     const panel::TraceLink &a = s.link[0], &b = s.link[1];
     snprintf(line, sizeof line, "m5 %u %u %llu %s %c %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x",
-             report.serial, gPanelTrace.total - count + i, (unsigned long long)s.us, panel::traceStepName(s.step), s.boundary ? 'B' : 'P',
+             report.serial, gPanelTrace->total - count + i, (unsigned long long)s.us, panel::traceStepName(s.step), s.boundary ? 'B' : 'P',
              a.en, a.status, a.frame, a.line, b.en, b.status, b.frame, b.line, s.top, s.active, s.flush, s.intfFlush);
     emit();
   }
