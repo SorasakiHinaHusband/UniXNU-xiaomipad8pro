@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # UniXNU-piano
 
 Native macOS 27 on the Xiaomi Pad 8 Pro (`piano`, Snapdragon 8 Elite SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU)
@@ -31,6 +33,9 @@ acceleration, charge-pump fast charging, 120 Hz in daily use, USB host devices a
 **The full per-feature table, with the build and date each result was verified: [docs/STATUS.md](docs/STATUS.md).**
 Today's tablet results: [docs/results-2026-11-25.md](docs/results-2026-11-25.md).
 
+**Showcase:** screenshots and short clips of each feature, taken on the tablet itself, are collected in
+[docs/STATUS.md#showcase](docs/STATUS.md#showcase) (the first native captures are scheduled for the next test boot).
+
 A USB-C debug console (`package/PianoDwc3`, `tooling/native/usb-console.py`) and ssh over the cable are available;
 the monitor's `reset fastboot` returns the tablet to ABL without buttons. Everyday development uses `fastboot boot`
 RAM images, which take priority over the installed copy.
@@ -61,37 +66,75 @@ Per-driver pages, boot arguments and test levels: [docs/drivers/README.md](docs/
 
 ## Build
 
-Inputs: the k27 tree, a local kernel tree the build only reads (its place is `PIANO_K27_TREE`, in the environment or in
-`~/.config/piano/env`), the pinned UEFI checkouts of `unixnu.lock`, and the OS image inputs of `out/inputs/` (recorded in
-`artifacts/ARTIFACTS.md`, never committed).
+The whole path for a new unit (requirements, inputs, build, RAM-boot validation, guarded install, rollback, checks) is
+[skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md), written for a coding agent. This section is the
+summary; the skill is the reference.
+
+### Host requirements
+
+- **A Mac with Apple silicon (M1 or later). Intel Macs are not supported.** Xcode 27's compiler and linker and macOS 27's own
+  tools are arm64-only, and two build steps run arm64e programs they compile. The evidence is in the skill (§1.1).
+- Tested: macOS 27.2.1 with **Xcode 27.2** (the app, not only the Command Line Tools: the kernel needs the iphoneos SDK and
+  `Kernel.framework`; the kernel links with Xcode's `ld-classic`). Homebrew at `/opt/homebrew` with the packages the skill lists
+  (§1.2), `fastboot`, Python 3.11 or later, about 90 GiB free disk, `sudo` in an attached Terminal for the root image steps.
+- `bash tooling/repro/check-host.sh` reads the host and prints `ok` / `WARN` / `FAIL` / `GAP` per requirement; continue only with
+  `0 FAIL`. Run from a native arm64 shell, not under Rosetta.
+
+### Sources and pins
+
+- This repository plus the pinned dependencies of `unixnu.lock` / `feeds.toml` (UniXNU core, Mu-Silicium, piano-uefi,
+  DarwinBoot, the SoC module) and the k27 kernel tree (`PIANO_K27_TREE`, in the environment or in `~/.config/piano/env`; pinned
+  in `unixnu.lock`).
+- Apple's files are never distributed. `tooling/repro/fetch-ipsw.py` fetches the pinned 27.3 IPSW's members from Apple's CDN and
+  the AEA keys from Apple, and checks every file against `tooling/repro/pins.json`.
+- Some inputs are still local to the original setup (the k27 kernel tree, the base trust bundle, the Data seed, the Turnip tree,
+  the write tooling's single-unit pins): the skill's "Known gaps" lists each with its options.
+
+### Build steps
 
 ```sh
-tooling/k273/prepare-k27-tree.sh                             # the 27.3 tree and its relinked kernel; prints K273_KERNEL's path
-tooling/unixnu.sh build firmware --skip-preflight           # the FD
-K273_KERNEL=<path printed by prepare-k27-tree.sh> tooling/k273/build-k273-image.sh
+bash tooling/repro/fetch-and-build.sh --dry-run   # every command it would run; nothing fetched, built or written
+bash tooling/repro/fetch-and-build.sh             # host, inputs, systemos, root, kernel, fd, image (or one step by name)
+bash tooling/repro/fetch-and-build.sh --check     # each step's outputs against the pins (no network)
+```
+
+The steps it runs, also usable one by one:
+
+```sh
+bash tooling/k273/prepare-k27-tree.sh          # the 27.3 kernel tree and its relinked kernel; prints K273_KERNEL's path
+bash tooling/firmware/build-fd.sh               # the UEFI FD from the unixnu.lock checkouts
+K273_KERNEL=<path printed above> bash tooling/k273/build-k273-image.sh   # kexts -> kernel collection -> ADT -> RAM images
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
 
-Only the 27.3 line is built. The retired `tooling/k27/build-native-image.sh` 27.0.1 path is not used. **Layout note
-(2026-11-14):** the root is now on `linux_rootfs` and Data on `linux_data`; `build-k273-image.sh`'s `K273_ROOT=k273` default
-still emits the superseded `native-ufs-root-part=linux_data`, so do not use that default for the current layout. The installed
-ESP recipe uses `build-k273-esp.py --root-part linux_rootfs` ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8).
+- **Kexts and the kernel collection:** the KC links only this repository's kexts (`configs/k27-native-kexts.txt`);
+  `tooling/k27/check-native-kexts.py` enforces it before and after the link. Pass line in the KC log:
+  `native kext rule: ... all this repository's`.
+- **The root image is generated locally, never shipped.** The 20.9 GB root is the IPSW's OS volume (byte for byte, pinned) plus a
+  SystemOS window rebuilt by `tooling/k273/make-systemos.sh` and `make-root-image.sh`, checked by `tooling/repro/verify-root.py`
+  against the pinned file-level manifest (skill §3.1).
+- Only the 27.3 line is built; the retired 27.0.1 path (`tooling/k27/build-native-image.sh`) is not used. Root placement: a new
+  unit starts with the root on `linux_data` (`K273_ROOT_PART=linux_data`, skill §3.2); the reference unit's installed ESP uses
+  `build-k273-esp.py --root-part linux_rootfs` ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8).
 
-Details, the boot arguments and what is read from the k27 tree: [docs/bringup-debugging.md](docs/bringup-debugging.md) §4.
+### Size limit of a RAM image
 
-## Building and installing on another unit
+A RAM boot image must be **at most 250,000,000 bytes**. ABL loads the whole image into the UEFI's 256 MiB kernel region; a
+294,952,960-byte image stayed in fastboot after the download, while 247,767,040-byte images boot
+([docs/k273-line.md](docs/k273-line.md) §4). The cap is `IMAGE_MAX_BYTES` in `tooling/bootimg/build-ram-images.py` (which
+shrinks the payload's free space when an image would pass it) and is checked again by `tooling/bootimg/verify-ram-images.py`
+(both read `PIANO_IMAGE_MAX_BYTES`; do not raise it).
 
-[skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md) is written for a coding agent and covers the whole
-path for a second tablet: requirements, inputs, build, RAM-boot validation, the guarded install, rollback and checks. Apple's
-files are never distributed. `tooling/repro/fetch-ipsw.py` fetches the pinned 27.3 IPSW's members from Apple's CDN and the AEA
-keys from Apple, then checks every file against `tooling/repro/pins.json`. The 20.9 GB root image is rebuilt locally and checked
-against the pinned OS window and the SystemOS window's file-level manifest (`tooling/repro/verify-root.py`).
-`tooling/repro/fetch-and-build.sh --dry-run | --check` runs the steps in order.
+### RAM boot before any install
 
-**Host:** macOS on **Apple silicon** (tested: macOS 27.2.1, Xcode 27.2). Intel Macs are not supported: Xcode 27's compiler and
-linker and macOS 27's own tools are arm64-only, and the build runs arm64e programs it compiles. `tooling/repro/check-host.sh`
-checks the host. Some inputs are still local to the original setup: the k27 kernel tree, the base trust bundle, the Data seed,
-the Turnip tree, and the write tooling's single-unit pins. The skill's "Known gaps" lists each one with options.
+Every image is first booted with `fastboot boot` (a RAM boot writes no partition) and must pass there before anything is written
+to the disk: the console reaches XNU, the USB console answers, the boot returns to ABL by its reset guard, and for a desktop image
+the login window, touch, keyboard cover, ssh, Wi-Fi and battery read correctly (skill §4). Installs then go only through
+`tooling/persist/maint-session.py`, with backups, read-back checks and a rollback for each step
+([docs/persistent-boot.md](docs/persistent-boot.md), [docs/install-esp-v3.md](docs/install-esp-v3.md)).
+
+More: boot arguments and debugging without a screen in [docs/bringup-debugging.md](docs/bringup-debugging.md) (§4 for what is read
+from the k27 tree); what works today in [docs/STATUS.md](docs/STATUS.md).
 
 ## Boot and test
 

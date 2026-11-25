@@ -1,3 +1,5 @@
+English | [简体中文](STATUS.zh-CN.md)
+
 # Support status (2026-11-25)
 
 One row per feature. Every status comes from a run on the tablet; host tests, analyses and "built, not run" work do not count.
@@ -68,3 +70,21 @@ and date of the newest run that showed the result. Daily results: [results-2026-
 - USB host devices, external display, auto-rotate, hardware video encode, VP9/AV1 decode.
 - Hand checks pending on the installed system: microphone recording in an app, QuickTime recording by hand, FaceTime self-view,
   joining a Wi-Fi network from the menu, Wi-Fi auto-rejoin after the network returns.
+
+## Showcase
+
+Screenshots and short clips of the features above, taken on the tablet itself (native screen captures). Webcam footage is used
+only where the physical view matters (rotation, touch). Every file is reviewed frame by frame before it is published: network
+names, account names, notifications, serials and personal content are blurred or cropped, and metadata is stripped. The sources
+of each file are listed in [media/SOURCES.md](media/SOURCES.md).
+
+| Scene | Media | Status |
+| --- | --- | --- |
+| Desktop (Finder, Dock, menu bar) | coming | native capture scheduled for the next test boot |
+| Safari playing H.264 1080p on the hardware decoder | coming | native capture scheduled |
+| Metal 3D demo | coming | native capture scheduled |
+| Photo Booth live camera view | coming | native capture scheduled |
+| Wi-Fi network list | coming | native capture scheduled (network names will be blurred) |
+| Touch gestures (tap, pinch, rotate, scroll) | coming | the existing webcam recordings are out of focus; a new recording is needed |
+| Rotation to portrait | coming | the existing webcam recordings are out of focus; a new recording is needed |
+| Chrome with GPU acceleration | coming | when Chrome's GPU path is ready |
