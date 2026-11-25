@@ -14,7 +14,7 @@ the FAT payload (UniXNU payload layout, written with UniXNU's payload.write_volu
 
   build-ram-images.py --fd FD --fd-name NAME --out DIR [--kc KC --trust T --seed S --adt ADT] [--utc SECONDS] [--extra-ram]
 
---extra-ram adds the region1 reservation placeholder to the payload ADT (docs/drivers/ram-extra.md).
+--extra-ram adds the shared extra-RAM reservation placeholder to the payload ADT (docs/extra-ram.md).
 
 The Data store (docs/data-store.md): a macOS image opens the tablet's store (data-persist=2) only when its seed is the installed one
 (PIANO_INSTALLED_SEED in ~/.config/piano/env, or out/persistent/installed.json), else it runs Data volatile (data-persist=0), with a
@@ -511,7 +511,7 @@ def main():
     p.add_argument('--trust', type=Path)
     p.add_argument('--seed', type=Path)
     p.add_argument('--adt', type=Path)
-    p.add_argument('--extra-ram', action='store_true', help='add the region1 reservation placeholder to the payload ADT')
+    p.add_argument('--extra-ram', action='store_true', help='add the shared extra-RAM reservation placeholder to the payload ADT')
     p.add_argument('--utc', type=int, default=int(time.time()))
     a = p.parse_args()
     if a.extra_ram and not all((a.kc, a.trust, a.seed, a.adt)):

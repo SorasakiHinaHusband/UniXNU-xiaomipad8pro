@@ -24,6 +24,7 @@ chosen = node([prop('name', b'chosen\0'), prop('darwinboot-memory-size', struct.
               [node([prop('name', b'memory-map\0'), prop('RAMDisk', bytes(16))])])
 tree = node([prop('name', b'device-tree\0')], [cpus, chosen, node([prop('name', b'arm-io\0')])])
 out = x.add_extra_ram(tree)
+assert x.BYTES == 384
 assert len(out) == len(tree) + 36 + x.BYTES
 assert x.has_extra_ram(out) and not x.has_extra_ram(tree)
 off, _ = x.find_chosen(out)
@@ -48,4 +49,11 @@ try:
     x.ensure_extra_ram_placeholder(bad); raise SystemExit('FAIL: nonzero placeholder accepted')
 except ValueError:
     pass
-print('PASS: /chosen piano-extra-ram placeholder added (136 zero bytes), tree well formed, other nodes unchanged, second add and no /chosen refused')
+legacy = node([prop('name', b'device-tree\0')], [
+    node([prop('name', b'chosen\0'), prop('piano-extra-ram', bytes(136))]),
+])
+try:
+    x.ensure_extra_ram_placeholder(legacy); raise SystemExit('FAIL: legacy R1 placeholder accepted')
+except ValueError:
+    pass
+print('PASS: /chosen piano-extra-ram placeholder added (384 zero bytes), tree well formed, other nodes unchanged, second add and no /chosen refused')

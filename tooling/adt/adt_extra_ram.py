@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""RAM16G R1: add the /chosen piano-extra-ram placeholder (136 zero bytes) to a flattened ADT. DarwinBoot with
-firmware/patches/darwinboot/0002 finds it, reserves DRAM region1's runs below XNU's window and fills it (u32 version 1, u32 count,
-8 x (u64 base, u64 size)); PianoA830 reads it with piano-gpu-tier=1 or 2. Without the placeholder DarwinBoot reserves nothing.
+"""Add a zero-filled /chosen/piano-extra-ram placeholder to a flattened ADT.
+Patched DarwinBoot fills it with up to 16 little-endian records of 24 bytes
+each (u64 base, u64 size, u32 bank, u32 use). An older FD leaves it zeroed.
 
     adt_extra_ram.py IN OUT      (also make-piano-adt.py --extra-ram)
 """
@@ -10,7 +10,7 @@ import struct
 import sys
 
 NAME = 'piano-extra-ram'
-BYTES = 8 + 16 * 8
+BYTES = 24 * 16
 
 
 def _node_end(t, off):

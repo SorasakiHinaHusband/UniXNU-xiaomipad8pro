@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 J = ROOT / "firmware/patches/darwinboot/region0-allow.json"
 H = ROOT / "package/include/PianoExtraRam.h"
+PATCH_DIR = J.parent
 SLAB = 2 << 20
 USE = {"UseAny": 0, "UseGpu": 1, "UseDsp": 2, "UseVideo": 3, "UseCamera": 4, "UseDisplay": 5, "UseNone": None}
 
@@ -31,6 +32,16 @@ def main():
     errors = []
     ja = [(int(r["base"], 16), int(r["base"], 16) + int(r["size"], 16), "Region0", r["use"], r["stage"], r["name"]) for r in d["allow"]]
     jn = [(int(r["base"], 16), int(r["end"], 16), r["name"]) for r in d["never"]]
+    patch = next(PATCH_DIR.glob("0002-*.patch")).read_text()
+    fw0 = re.search(r"DarwinExtraRamRegion0\[\] = \{(.*?)\n\+\};", patch, re.S).group(1)
+    fw1 = re.search(r"DarwinExtraRamRegion1\[\]\[2\] = \{(.*?)\n\+\};", patch, re.S).group(1)
+    firmware_allow = re.findall(r'\{\{(0x[0-9a-f]+)ULL, (0x[0-9a-f]+)ULL, (\d+), (\d+)\}, (\d+), "([^"]+)"\}', fw0)
+    json_allow = [(r["base"], r["size"], str(r["bank"]), str(r["use"]), str(r["stage"]), r["name"]) for r in d["allow"]]
+    if firmware_allow != json_allow:
+        errors.append("allow: JSON and DarwinBoot region0 table disagree")
+    firmware_region1 = [(int(a, 16), int(b, 16)) for a, b in re.findall(r"\{(0x[0-9a-f]+)ULL, (0x[0-9a-f]+)ULL\}", fw1)]
+    if firmware_region1 != [(a, b) for a, b, bank, *_ in table(src, "kAllowed") if bank == "Region1"]:
+        errors.append("allow: DarwinBoot and PianoExtraRam.h region1 bounds disagree")
     if ja != allowed:
         errors.append("allow: JSON %s != header %s" % (ja, allowed))
     if [(a, b, n) for a, b, _, _, _, n in never] != jn:
