@@ -154,6 +154,47 @@ void refusals()
   CHECK(!storeAllowed(kTlmm + uint64_t(kPanelIdGpio) * kTlmmStride, 1, true));
 }
 
+void counterAndFlushGate()
+{
+  auto io = m1();
+  for (unsigned l = 0; l < 2; ++l) {
+    io.countEnableIgnored[l] = true;
+    io.intf[l + 1].counting = true;
+  }
+  CHECK(switchOk(io, 60));  // NativeGopDisplay's initial request on a 120 Hz boot
+  checkMode(io, 60);
+  CHECK(switchOk(io, 144));
+  checkMode(io, 144);
+  CHECK(io.rd(intfReg(1, kIntfCountEn)) == 0 && io.rd(intfReg(2, kIntfCountEn)) == 0);
+  CHECK(io.glitches == 0 && io.commandsInFrame == 0 && io.refused.empty());
+
+  auto checkRefusal = [](model::Dpu &blocked, const char *expected) {
+    const auto unexpected = [] { CHECK(false); };
+    const auto r = m::switchTo(blocked, 60, {}, unexpected, unexpected);
+    CHECK(r.from == 120 && r.why && !r.timingTouched && !r.reverted);
+    CHECK(blocked.stores.empty() && blocked.dcs.empty());
+    if (!r.why) return;
+    char line[256] = {};
+    m::logFailure(r, 60, [&](const char *fmt, auto... args) {
+      std::snprintf(line, sizeof(line), fmt, args...);
+    });
+    CHECK(std::strcmp(line, expected) == 0);
+    checkMode(blocked, 120);
+  };
+
+  io = m1();
+  for (unsigned i = 1; i <= 2; ++i)
+    io.regs[intfReg(i, kIntfCountEn)] = 3;  // enable bits read back, both counters still frozen
+  checkRefusal(io, "mode: 120 -> 60 Hz: INTF counters not advancing in lockstep "
+                   "(count-en 3/3, frame deltas 0/0, lines 0/0 -> 0/0, line moved 0/0); refused");
+
+  io = m1();
+  io.intf[1].counting = io.intf[2].counting = true;
+  io.ctlFlush = kFlushIntf;
+  io.flushStuck = true;
+  checkRefusal(io, "mode: 120 -> 60 Hz: CTL flush is pending (CTL0, CTL_FLUSH 0x80000000); refused");
+}
+
 void rollback()
 {
   auto io = m1();
@@ -312,6 +353,7 @@ int main()
   allPairs();
   repeatedSwitches();
   refusals();
+  counterAndFlushGate();
   rollback();
   sleepAndFetch();
   nightShiftAndCleanEpochs();

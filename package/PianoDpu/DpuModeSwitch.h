@@ -63,8 +63,28 @@ struct Result {
   const char *restoreWhy = nullptr;
   bool reverted = false;
   bool timingTouched = false;
+  int ctl = -1;
+  uint32_t pendingFlush = 0;
+  CounterInit counters;
   Rate rate;
 };
+
+template <class Log>
+void logFailure(const Result &r, unsigned hz, Log log)
+{
+  if (r.pendingFlush) {
+    log("mode: %u -> %u Hz: %s (CTL%d, CTL_FLUSH 0x%08x); refused", r.from, hz, r.why, r.ctl, r.pendingFlush);
+  } else if (r.counters.sampled && !r.counters.moving) {
+    const auto &c = r.counters;
+    log("mode: %u -> %u Hz: %s (count-en %x/%x, frame deltas %d/%d, lines %u/%u -> %u/%u, line moved %u/%u); refused",
+        r.from, hz, r.why, c.countEn[0], c.countEn[1], c.frameDelta[0], c.frameDelta[1], c.firstLine[0], c.firstLine[1],
+        c.lastLine[0], c.lastLine[1], unsigned(c.lineMoved[0]), unsigned(c.lineMoved[1]));
+  } else {
+    log("mode: %u -> %u Hz: %s; %s%s", r.from, hz, r.why,
+        !r.reverted ? "refused" : r.restoreWhy ? "restore failed: " : "old mode restored; switching disabled",
+        r.restoreWhy ? r.restoreWhy : "");
+  }
+}
 
 // Use one bonded FIFO transfer of four short packets. The final header owns the last-packet flag.
 // Check both line counters again with local interrupts off, including when firmware has enabled the DMA block.
@@ -299,8 +319,15 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
     r.why = "DSI command path is not idle in software-triggered video mode";
     return r;
   }
-  if (io.rd(ctlReg(unsigned(p.ctl), kCtlFlush)) || !countersOn(io, p)) {
-    r.why = "CTL flush is pending or the INTF counters are unavailable";
+  r.ctl = p.ctl;
+  r.pendingFlush = io.rd(ctlReg(unsigned(p.ctl), kCtlFlush));
+  if (r.pendingFlush) {
+    r.why = "CTL flush is pending";
+    return r;
+  }
+  r.counters = initCounters(io, p);
+  if (!r.counters.moving) {
+    r.why = "INTF counters not advancing in lockstep";
     return r;
   }
   if (!io.clearModeUnderruns()) {

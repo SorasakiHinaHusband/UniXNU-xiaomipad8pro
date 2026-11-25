@@ -254,8 +254,8 @@ int32_t waitFlush(Io &io, unsigned ctl, uint32_t mask, uint32_t timeoutUs)
   }
 }
 
-// The counters on (INTF_FRAME_LINE_COUNT_EN = 3, what msm writes with every timing) when the boot stages left them off: the slices
-// measure and time with them. True when both are on (or now turned on).
+// Request both counter enables when the boot stages left them clear (INTF_FRAME_LINE_COUNT_EN = 3, as in msm).
+// The return value describes the readback. Use initCounters when readiness depends on live motion.
 template <class Io>
 bool countersOn(Io &io, LivePath &p)
 {
@@ -267,6 +267,51 @@ bool countersOn(Io &io, LivePath &p)
     ok &= (p.link[i].countEn & kCountersOn) == kCountersOn;
   }
   return ok;
+}
+
+struct CounterInit {
+  bool enabled = false;   // COUNT_EN readback
+  bool sampled = false;
+  bool moving = false;    // both links' live counters
+  uint32_t countEn[2] = {};
+  int32_t frameDelta[2] = {};
+  uint32_t firstLine[2] = {}, lastLine[2] = {};
+  bool lineMoved[2] = {};
+};
+
+template <class Io>
+CounterInit initCounters(Io &io, LivePath &p)
+{
+  if (!p.ok) return {};
+  CounterInit result;
+  result.enabled = countersOn(io, p);
+  // On piano COUNT_EN can read as zero while the counters run. Check both links before timing a transaction.
+  const Frames first = readFrames(io);
+  for (unsigned i = 0; i < 2; ++i) {
+    result.countEn[i] = p.link[i].countEn;
+    result.firstLine[i] = result.lastLine[i] = io.rd(intfReg(i + 1, kIntfLineCount));
+  }
+  result.sampled = true;
+  const uint64_t end = first.us + 50000;   // enough time for at least two frame edges at 60 Hz
+  while (io.nowUs() < end) {
+    io.sleepMs(1);
+    const Frames now = readFrames(io);
+    bool linesInRange = true;
+    for (unsigned i = 0; i < 2; ++i) {
+      const uint32_t line = io.rd(intfReg(i + 1, kIntfLineCount));
+      result.lastLine[i] = line;
+      result.lineMoved[i] |= line != result.firstLine[i];
+      result.frameDelta[i] = int32_t(now.f[i] - first.f[i]);
+      linesInRange &= line <= p.link[i].vtotal && result.firstLine[i] <= p.link[i].vtotal;
+    }
+    if (!linesInRange) break;
+    const int32_t a = result.frameDelta[0], b = result.frameDelta[1];
+    if (result.lineMoved[0] && result.lineMoved[1] && a >= 2 && b >= 2 && a - b >= -1 && a - b <= 1) {
+      result.moving = true;
+      break;
+    }
+  }
+  return result;
 }
 
 }  // namespace slices

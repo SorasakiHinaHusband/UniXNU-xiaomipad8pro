@@ -45,39 +45,6 @@ constexpr uint32_t kTrigDmaMask = 7u, kTrigDmaSw = 4u, kTrigBlockDmaInFrame = 1u
 constexpr uint32_t kDmaCtrl1Bit = 1u << 1;
 constexpr uint32_t kDmaDoneTimeoutUs = 50000, kDmaBusyTimeoutUs = 20000, kEngineStopUs = 40000, kEngineStartUs = 50000;
 
-struct CounterInit {
-  bool enabled = false;   // COUNT_EN readback
-  bool moving = false;    // both links' live counters
-};
-
-template <class Io>
-CounterInit initCounters(Io &io, LivePath &p)
-{
-  if (!p.ok) return {};
-  CounterInit result;
-  result.enabled = countersOn(io, p);
-  // On piano the enable register can read zero while the counters run. Prove motion before using the line counter to time DCS.
-  const Frames first = readFrames(io);
-  const uint32_t lineStart[2] = {io.rd(intfReg(1, kIntfLineCount)), io.rd(intfReg(2, kIntfLineCount))};
-  bool lineMoved[2] = {};
-  const uint64_t end = first.us + 50000;   // at least two frame edges at either 60 or 120 Hz
-  while (io.nowUs() < end) {
-    io.sleepMs(1);
-    const Frames now = readFrames(io);
-    for (unsigned i = 0; i < 2; ++i) {
-      const uint32_t line = io.rd(intfReg(i + 1, kIntfLineCount));
-      if (line > p.link[i].vtotal || lineStart[i] > p.link[i].vtotal) return result;
-      lineMoved[i] |= line != lineStart[i];
-    }
-    const int32_t a = int32_t(now.f[0] - first.f[0]), b = int32_t(now.f[1] - first.f[1]);
-    if (lineMoved[0] && lineMoved[1] && a >= 2 && b >= 2 && a - b >= -1 && a - b <= 1) {
-      result.moving = true;
-      break;
-    }
-  }
-  return result;
-}
-
 // Owned by the request lock. If a dispatched transition failed, the caller may still have a wake to complete.
 struct RequestGate {
   bool ready = false;

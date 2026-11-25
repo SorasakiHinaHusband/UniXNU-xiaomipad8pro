@@ -25,19 +25,34 @@ The three panel rate groups use page select `FF 10` and unlock `FB 01` before th
 | 120 Hz | 117 | 68 | `91` | `40` |
 | 144 Hz | 21 | 68 | `00` | `00` |
 
-## Fix-image gate
+## y12n-qual1 boot refusal
 
-**Path** WindowServer and CoreGraphics mode selection → IOMobileFramebuffer → NativeGopDisplay timing ID → PianoDpuMode →
-CTL and INTF1/2 → bonded DSI0/1 → NT36532. The same NativeGopDisplay mode supplies slot 423, the refresh property and VBL pacing.
+The 2026-11-26 RAM qualification classified M3a as a code failure. The console measured 119.878 Hz on both links, with both
+frame and line counters changing (lines 3633–3634). M5 then recorded `count-en 0/0 -> 0/0` and verified motion on both links
+(line 3685). The M3 service advertised selectable refresh, then refused 120 → 60 Hz before staging timing (line 3692). The
+combined refusal message left the CTL flush value unknown. The zero enable readback would independently have blocked any switch
+that reached the counter check.
 
-**Checks** M1 established the 120 Hz register baseline, fetch state and command-path setup. The Ubuntu and stock references supply
-the timing and command sequence. Establish CoreGraphics enumeration, the effective DSI latch, panel acceptance, visible quality
-and touch on the M3 RAM boot.
+The `M3 initial 60 Hz mode refused` message (line 3693) came from `NativeGopDisplay::createDisplayAttributes` after its boot-time
+`PianoDpuMode` request reached the same gate that serves later mode selections. It consequently published only the boot profile's
+60 Hz timing while scanout remained at 120 Hz. Qualification stopped the M3 phase at enumeration. The transitions, delivered
+cadence, and M3 interactions with M2/M4/M5 remain unmeasured on this boot.
 
-**Root cause** NativeGopDisplay publishes one timing. The earlier VFP-only writer refuses the inherited programmable fetch
-configuration and does not handle a horizontal porch change or a different panel rate group.
+The original M3 analysis traced timing, fetch and DSI programming from M1, and the integration analysis marked M3 counter
+availability unknown. Neither traced how `countersOn` turned the enable readback into an admission check. The timed M3 model
+also coupled successful enable readback to counter motion in its switch cases. M5 had already separated the two after its
+previous qualification, but M3 still used the readback contract.
 
-**One change** Add the opt-in M3 mode list backed by a verified, reversible timing and panel transaction.
+Ubuntu v1.4.0 pins the display kernel to `83f0f89bed14`. The Piano line numbers below refer to the y12n-qual1 code
+(`061fe59c`). The available stock MiCode DSI source also updates the clock master first, then its peer. Its DFPS path
+enables timing double buffering and performs the async timing update without an INTF COUNT_EN readiness check in that
+DSI step. The matching stock SDE INTF and CTL source was unavailable for this comparison. [MiCode DSI display driver](https://github.com/MiCode/vendor_opensource_display-drivers/blob/aa06fd1757c28dce96fbe4e04d4530ec21b52aac/msm/dsi/dsi_display.c#L5102)
+
+| Ubuntu v1.4.0 path | Piano y12n-qual1 path | Comparison |
+| --- | --- | --- |
+| `dpu_encoder_phys_vid.c:463–478,316–332` programs the video INTF and fetch. `dpu_hw_intf.c:243–259` writes `INTF_FRAME_LINE_COUNT_EN = 3` during timing setup. | `DpuSlices.h:260–269` requests the enable bits when needed on the inherited scanout. `DpuModeSwitch.h:302–305` also requires the bits to read back. | **Same** enable request. **Different** readback requirement. M3 can drop that requirement once motion is measured on both inherited links. |
+| `dpu_hw_intf.c:326–356` reads live frame and line counts, with engine status guarding the paired status read. | `DpuSlices.h:107–119,176–184` reads the live counts. `DpuPanel.h:54–77` checks for advancing frames and lines, but `DpuModeSwitch.h:302–305` skips that check. | **Same** live observations. **Missing** motion check in M3. Share M5's two-link check before depending on the counters for timing. |
+| `dpu_hw_ctl.c:88–93` reads `CTL_FLUSH`. `dpu_encoder_phys_vid.c:532–550` waits for the register to clear and reports its value on timeout. | `DpuModeSwitch.h:302–305` refuses a nonzero value before staging, under the flip lock. `DpuSlices.cpp:594–596` prints one reason for both checks. | **Same** zero test. **Different** wait policy. The preflight refusal avoids staging a second transaction over a pending commit. **Missing** the raw flush mask in the refusal. |
 
 ## Driver and boot arguments
 
@@ -47,7 +62,10 @@ Without the boot argument the daily 60 Hz display contract remains in place. The
 alternative users of the timing hardware. Omit `piano-dpu-refresh` on the M3 boot.
 
 NativeGopDisplay's `set_digital_out_mode` validates the color and timing IDs, then calls the PianoDpu worker's synchronous
-`PianoDpuMode` service. The worker shares the flip engine's transaction lock. It classifies and checks both links, stages
+`PianoDpuMode` service. The worker shares the flip engine's transaction lock. M3 checks for a pending CTL flush and uses M5's
+bounded counter check before staging timing. Both links must advance by at least two frames, keep their frame advances within
+one of each other, and show line movement within their live frame totals. A pending flush reports its raw mask. A counter
+refusal reports the enable readbacks, frame advances and line samples. The worker then stages
 the time-critical words with local interrupts masked, and waits for the CTL latch. It reads back the INTF and DSI timing words
 and checks cadence, phase and underruns. A rate-group change uses four HS short writes in the common front porch on both links
 and checks command-DMA completion and the restored command registers. At 60 ↔ 120 Hz only the porches change.
@@ -158,3 +176,19 @@ for rate in CommandLine.arguments.dropFirst() {
     precondition(result == .success && after == wanted)
 }
 ```
+
+## Fix-image gate
+
+Path: NativeGopDisplay's initial 60 Hz request and later WindowServer/CoreGraphics selections through IOMobileFramebuffer
+both call `PianoDpuMode`. The slices worker takes the flip lock and checks CTL, INTF1/2 and bonded DSI0/1 before programming
+the NT36532 timing. NativeGopDisplay publishes the timing, refresh property and VBL pacing after success.
+
+Checks: The active bonded route and counter motion are verified on y12n-qual1. The M3 counter admission check is missing
+there. The CTL flush value at the refusal, the live timing latch, panel acceptance, delivered cadence, visible quality,
+touch and the M3 interactions remain open for RAM qualification.
+
+Root cause: Both links advance while COUNT_EN reads zero. The old M3 gate requires a nonzero enable readback, so it blocks
+this hardware even with an idle CTL. The combined refusal leaves open whether a pending flush took precedence in this boot.
+
+ONE change: Gate M3 on the same live counter motion as M5 and report the measured values for the specific preflight
+refusal. Exercise zero readback with motion, frozen counters and a pending flush in the timed host model.

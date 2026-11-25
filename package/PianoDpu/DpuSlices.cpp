@@ -591,9 +591,7 @@ IOReturn doModeSwitch(unsigned hz)
     }
     ++gSwitchFailures;
     if (r.reverted) gModeBroken = true;
-    note("mode: %u -> %u Hz: %s; %s%s", r.from, hz, r.why,
-         !r.reverted ? "refused" : r.restoreWhy ? "restore failed: " : "old mode restored; switching disabled",
-         r.restoreWhy ? r.restoreWhy : "");
+    modes::logFailure(r, hz, note);
     return r.reverted ? kIOReturnIOError : kIOReturnUnsupported;
   }
   gHz = hz;
@@ -854,7 +852,7 @@ void worker(void *, wait_result_t)
   const bool refreshWrites = gA.refresh && gA.refresh != kRefreshPlan;
   bool countEn = true;
   if (gA.panel) {
-    const panel::CounterInit init = panel::initCounters(gIo, gPath);
+    const CounterInit init = initCounters(gIo, gPath);
     countEn = init.enabled;
     gPanelBroken = !init.moving;
     note("panel: INTF counters: count-en %x/%x -> %x/%x; %s", p.link[0].countEn, p.link[1].countEn,
