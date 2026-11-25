@@ -9,21 +9,14 @@
 #include <stdio.h>
 #endif
 
-/* RAM16G R1, the region1 GPU tier (UniXNU-piano private/host-checks/20261125-ram16g/ANALYSIS.md "Fix-image gate").
- *
- * DarwinBoot (firmware/patches/darwinboot/0002) reserves DRAM region1's conventional runs below XNU's window (SM8750 16 GiB:
- * 874 MiB at 0x880000000.., XNU never manages them) and publishes them in /chosen piano-extra-ram: u32 version 1, u32 count,
- * then 8 pairs u64 base, u64 size, little endian. With boot argument piano-gpu-tier=1 (default 0: the tier is never built
- * and every GPU buffer is backed by XNU pages as before), PianoA830 backs paged GPU buffers from these runs first, in 2 MiB
- * slabs, and falls back to XNU pages when the tier cannot hold a request.
- *
- * Pure and allocation-free (one fixed bitmap): the kernel side supplies the zeroing (bzero_phys on each slab span) and the
- * per-run self-test probe (write and read back a pattern at a physical address through its CPU view), and holds its own lock
- * around alloc/release. Every physical span it returns is whole slabs inside one published run. */
+/* RAM16G R1: DarwinBoot reserves conventional runs below XNU's RAM window and publishes them in
+ * /chosen piano-extra-ram. The wire format is two little-endian u32s (version, count) and eight
+ * (u64 base, u64 size) pairs. The allocator uses whole 2 MiB slabs and leaves zeroing to its caller. */
 namespace a830tier {
 
 constexpr uint64_t kSlab = 2ull << 20;
 constexpr unsigned kMaxRuns = 8;
+constexpr uint64_t kPage = 4096;
 constexpr unsigned kPropBytes = 8 + 16 * kMaxRuns;
 constexpr unsigned kMaxSlabs = 1024;                   /* 2 GiB of slabs: region1's runs are below 1 GiB */
 constexpr uint64_t kRegionLo = 0x880000000ull;         /* region1: the bank below the window's 0x8c0000000 */
@@ -55,13 +48,18 @@ static inline Parse parseProperty(const uint8_t *p, size_t len, Run out[kMaxRuns
   if (len != kPropBytes) { return Parse::badLength; }
   uint32_t version = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
   uint32_t count = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
+  if (!version && !count) {
+    unsigned i = 8;
+    while (i < kPropBytes && p[i] == 0) { ++i; }
+    if (i == kPropBytes) { return Parse::absent; }  /* an FD without reservation support */
+  }
   if (version != 1) { return Parse::badVersion; }
   if (count > kMaxRuns) { return Parse::badCount; }
   uint64_t slabs = 0;
   for (unsigned i = 0; i < count; i++) {
     Run r = {le64(p + 8 + 16 * i), le64(p + 16 + 16 * i)};
     if (!r.size || (r.base | r.size) & (kSlab - 1)) { return Parse::unaligned; }
-    if (r.base < kRegionLo || r.size > kRegionHi - r.base) { return Parse::outOfRegion; }
+    if (r.base < kRegionLo || r.base >= kRegionHi || r.size > kRegionHi - r.base) { return Parse::outOfRegion; }
     if (i && r.base < out[i - 1].base + out[i - 1].size) { return Parse::overlap; }
     slabs += r.size / kSlab;
     if (slabs > kMaxSlabs) { return Parse::tooBig; }
@@ -74,20 +72,31 @@ static inline Parse parseProperty(const uint8_t *p, size_t len, Run out[kMaxRuns
   return Parse::ok;
 }
 
-/* The off switch: on only for the token piano-gpu-tier=1 in the boot arguments (the last one wins); default off. */
-static inline bool bootArgOn(const char *args) {
+/* Last matching token wins. Unknown values disable the tier. */
+static inline unsigned bootArgMode(const char *args) {
   static const char key[] = "piano-gpu-tier=";
-  bool on = false;
-  if (!args) { return false; }
+  unsigned mode = 0;
+  if (!args) { return mode; }
   for (const char *s = args; *s; ) {
-    while (*s == ' ') { s++; }
-    const char *t = s; while (*t && *t != ' ') { t++; }
-    size_t k = sizeof key - 1;
-    if ((size_t)(t - s) == k + 1 && __builtin_memcmp(s, key, k) == 0) { on = s[k] == '1'; }
-    else if ((size_t)(t - s) > k && __builtin_memcmp(s, key, k) == 0) { on = false; }
-    s = t;
+    while (*s == ' ' || *s == '\t') { ++s; }
+    const char *end = s;
+    while (*end && *end != ' ' && *end != '\t') { ++end; }
+    constexpr size_t keyLen = sizeof key - 1;
+    const size_t len = end - s;
+    if (len >= keyLen && __builtin_memcmp(s, key, keyLen) == 0) {
+      mode = len == keyLen + 1 && (s[keyLen] == '1' || s[keyLen] == '2') ? s[keyLen] - '0' : 0;
+    }
+    s = end;
   }
-  return on;
+  return mode;
+}
+
+static inline bool eligible(unsigned mode, uint64_t bytes) {
+  return mode == 2 || (mode == 1 && bytes >= kSlab);
+}
+
+static inline uint64_t slabBytes(uint64_t bytes) {
+  return ((bytes - 1) / kSlab + 1) * kSlab;  /* caller bounds bytes to the tier's capacity */
 }
 
 /* Tier spans as the BO's piece list (NativeAdrenoPhysicalSpan {offset, physical, bytes}: the scattered-BO form poolTakeMany
@@ -99,42 +108,51 @@ template <class Piece> static inline void asPieces(const Span *s, unsigned n, Pi
 
 class Tier {
  public:
-  using ZeroFn = void (*)(uint64_t pa, uint64_t bytes, void *ctx);
-  using ProbeFn = bool (*)(uint64_t pa, void *ctx);
+  using ProbeFn = bool (*)(uint64_t pa, unsigned run, void *ctx);
+  using LineFn = void (*)(const char *line, void *ctx);
 
-  /* Takes the runs and self-tests each (probe of its first and last slab); a failed run is kept out (all its slabs used).
-   * lines receives one line per run: "PianoA830: gpu tier: run I 0xBASE+N MiB self-test ok|FAIL". */
-  bool init(const Run *runs, unsigned n, ZeroFn zero, ProbeFn probe, void *ctx, void (*line)(const char *, void *)) {
+  /* A run opens only after both of its actual endpoint pages pass. */
+  void init(const Run *runs, unsigned n, uint64_t limit, ProbeFn probe, void *ctx, LineFn line) {
     *this = Tier();
-    zero_ = zero; probe_ = probe; ctx_ = ctx;
-    if (!zero || !probe || n > kMaxRuns) { return false; }
+    if (!probe || n > kMaxRuns) { return; }
     for (unsigned i = 0; i < n; i++) {
-      unsigned s = (unsigned)(runs[i].size / kSlab);
-      if (slabs_ + s > kMaxSlabs) { return false; }
-      runs_[i] = runs[i]; first_[i] = slabs_; slabs_ += s; nRuns_ = i + 1;
-      bool ok = probe(runs[i].base, ctx) && probe(runs[i].base + runs[i].size - kSlab, ctx);
-      ok_[i] = ok;
-      if (!ok) { for (unsigned k = first_[i]; k < slabs_; k++) { set(k); } }
-      else { total_ += runs[i].size; }
+      const Run r = runs[i];
+      if (!r.size || (r.base | r.size) & (kSlab - 1) || r.base < kRegionLo ||
+          r.base >= kRegionHi || r.size > kRegionHi - r.base ||
+          (i && r.base < runs[i - 1].base + runs[i - 1].size) ||
+          r.size / kSlab > kMaxSlabs - slabs_) {
+        *this = Tier();
+        return;
+      }
+      runs_[i] = r;
+      first_[i] = slabs_;
+      slabs_ += unsigned(r.size / kSlab);
+      nRuns_ = i + 1;
+      if (r.base < limit && r.size <= limit - r.base) {
+        const bool first = probe(r.base, i, ctx);
+        const bool last = probe(r.base + r.size - kPage, i, ctx);
+        ok_[i] = first && last;
+      }
+      if (ok_[i]) { total_ += r.size; }
       if (line) {
         char b[112];
-        snprintf(b, sizeof b, "PianoA830: gpu tier: run %u 0x%llx+%llu MiB self-test %s", i, (unsigned long long)runs[i].base,
-                 (unsigned long long)(runs[i].size >> 20), ok ? "ok" : "FAIL");
+        snprintf(b, sizeof b, "gpu tier: run %u 0x%llx+%llu MiB self-test %s", i,
+                 (unsigned long long)r.base, (unsigned long long)(r.size >> 20), ok_[i] ? "ok" : "FAIL");
         line(b, ctx);
       }
     }
     free_ = total_;
-    return true;
   }
 
-  /* bytes rounded up to slabs, as up to maxSpans spans (each contiguous inside one run, lowest first); every span zeroed.
+  /* bytes rounded up to slabs, as up to maxSpans spans (each contiguous inside one run, lowest first).
    * Returns the span count, 0 when the tier cannot hold it whole (nothing taken: the caller uses XNU pages). */
-  unsigned alloc(uint64_t bytes, Span *out, unsigned maxSpans) {
-    if (!bytes || !maxSpans || !nRuns_) { return 0; }
-    uint64_t need = (bytes + kSlab - 1) / kSlab;
-    if (need * kSlab > free_) { return 0; }
+  unsigned alloc(uint64_t bytes, Span *out, unsigned maxSpans, uint64_t limit) {
+    if (!bytes || !out || !maxSpans || bytes > free_) { return 0; }
+    const uint64_t need = slabBytes(bytes) / kSlab;
     unsigned n = 0; uint64_t got = 0;
     for (unsigned r = 0; r < nRuns_ && got < need; r++) {
+      const Run run = runs_[r];
+      if (!ok_[r] || run.base >= limit || run.size > limit - run.base) { continue; }
       unsigned end = first_[r] + (unsigned)(runs_[r].size / kSlab);
       for (unsigned k = first_[r]; k < end && got < need; ) {
         if (isSet(k)) { k++; continue; }
@@ -146,16 +164,19 @@ class Tier {
       }
     }
     if (got < need) { undo(out, n); return 0; }
-    for (unsigned i = 0; i < n; i++) { zero_(out[i].pa, out[i].bytes, ctx_); }
     free_ -= need * kSlab;
     return n;
   }
 
   /* Gives spans back; refuses (and changes nothing) a span that is not whole tier slabs all in use. */
   bool release(const Span *s, unsigned n) {
+    if (!s || !n) { return false; }
     for (unsigned i = 0; i < n; i++) {
       unsigned k; uint64_t c;
       if (!locate(s[i], k, c)) { return false; }
+      for (unsigned j = 0; j < i; ++j) {
+        if (s[i].pa < s[j].pa + s[j].bytes && s[j].pa < s[i].pa + s[i].bytes) { return false; }
+      }
       for (uint64_t m = 0; m < c; m++) { if (!isSet(k + (unsigned)m)) { return false; } }
     }
     for (unsigned i = 0; i < n; i++) {
@@ -173,6 +194,7 @@ class Tier {
   uint64_t totalBytes() const { return total_; }
   uint64_t freeBytes() const { return free_; }
   unsigned runs() const { return nRuns_; }
+  bool runPassed(unsigned i) const { return i < nRuns_ && ok_[i]; }
 
  private:
   bool locate(const Span &s, unsigned &k, uint64_t &c) const {
@@ -197,7 +219,6 @@ class Tier {
   unsigned nRuns_ = 0, slabs_ = 0;
   uint64_t bits_[kMaxSlabs / 64] = {};
   uint64_t total_ = 0, free_ = 0;
-  ZeroFn zero_ = nullptr; ProbeFn probe_ = nullptr; void *ctx_ = nullptr;
 };
 
 }  // namespace a830tier

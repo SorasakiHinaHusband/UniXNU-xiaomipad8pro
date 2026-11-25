@@ -429,8 +429,12 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     const bool bypass=NativeAdrenoPoolBypassed();
     const uint64_t p0b_began=NativeAdrenoP0bNow();
     unsigned p0b_path=NativeAdrenoPathPool;
-    if(bypass)NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[NativeAdrenoPathPool][4],1);
-    else {
+    if (!request->contiguous && native_adreno_wc_enabled && NativeAdrenoMemory::tierEligible(request->bytes)) {
+        NativeAdrenoSubmitGuard memory(submit_,NativeAdrenoSubmitLockMemory);
+        status=entry->memory.allocateTier(size_t(request->bytes),output_bits_);
+    }
+    if(status==kIOReturnNoResources && bypass)NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[NativeAdrenoPathPool][4],1);
+    else if(status==kIOReturnNoResources) {
         /* The BO pool is shared by every connection: a pooled allocation runs under the Memory lock. A client with a pool reserve
          * (setReserve: every one but the render server) leaves keep_pool_ bytes of the pool free (read under the same lock, which every
          * pool allocation and release holds). */
@@ -468,7 +472,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     }
     /* A pooled BO's zero fill: its pages are nobody else's, so the zeros of a large BO hold up no other process's BoAlloc, BoImport or
      * BoFree (pagani-gpu-kopt bit 0; a failure releases it below, under the Memory lock). The BO is published only after this. */
-    else if(!status && zero_outside)status=zeroPooled(*entry,clock);
+    else if(!status && (zero_outside || entry->memory.tier()))status=zeroPooled(*entry,clock);
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance
      * (ARCHITECTURE 4.14.1). Turnip maps every BO asking kIOMapWriteCombineCache (kIOMapDefaultCache only with CachedCoherent).
      * The object's own pages (a write-combined pool's BO only takes the flag): no Memory lock either. */
@@ -485,7 +489,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
 #endif
         {
             /* A pooled object gives its pages back to the pool under the Memory lock; one from outside it needs none. */
-            NativeAdrenoSubmitGuard memory(entry->memory.pooled()?submit_:nullptr,NativeAdrenoSubmitLockMemory);
+            NativeAdrenoSubmitGuard memory(entry->memory.sharedBacking()?submit_:nullptr,NativeAdrenoSubmitLockMemory);
 #ifdef ADRENO830_MACOS
             figures=entry->memory.pooled();
 #endif
@@ -509,10 +513,12 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;
     reply->handle=entry->handle;
     /* GPU-PAGED P0b: the path that backed it (a pooled BO says so itself; the attempt before it may have been another path's). */
-    if(entry->memory.pooled())p0b_path=NativeAdrenoPathPool;
-    NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][0],1);
-    NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][1],request->bytes);
-    if(p0b_began)NativeAdrenoP0bTime(native_adreno_p0b_alloc_us[p0b_path],NativeAdrenoP0bNow()-p0b_began);
+    if (!entry->memory.tier()) {
+        if(entry->memory.pooled())p0b_path=NativeAdrenoPathPool;
+        NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][0],1);
+        NativeAdrenoP0bAdd(&native_adreno_p0b_alloc[p0b_path][1],request->bytes);
+        if(p0b_began)NativeAdrenoP0bTime(native_adreno_p0b_alloc_us[p0b_path],NativeAdrenoP0bNow()-p0b_began);
+    }
     return kIOReturnSuccess;
 }
 void NativeAdrenoUserClient::setScanout(const NativeAdrenoScanoutMapping *mapping)
@@ -677,7 +683,7 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     {
         /* A pooled BO goes back to the pool and an import is unwired under the Memory lock; an own BO from outside the pool takes its
          * pages' default attribute back without it (allocBoInner). */
-        NativeAdrenoSubmitGuard memory(entry->memory.pooled() || entry->imported?submit_:nullptr,NativeAdrenoSubmitLockMemory);
+        NativeAdrenoSubmitGuard memory(entry->memory.sharedBacking() || entry->imported?submit_:nullptr,NativeAdrenoSubmitLockMemory);
         release=entry->memory.release();
     }
     if(release) {account(*entry,true);noteFreeRefused(entry->imported,entry->handle,release);return release;}

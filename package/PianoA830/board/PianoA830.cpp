@@ -49,6 +49,8 @@
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
 #include "NativeAdrenoMemory.h"
+#include "A830GpuTier.h"
+#include <IOKit/IODeviceTreeSupport.h>
 #include "NativeAdrenoPoolBypass.h"   // GPU-PAGED P0b: machdep.piano_gpu_pool_bypass, machdep.piano_gpu_paged
 #include "NativeAdrenoGpuContext.h"   // GPU-PAGED P1: NativeAdrenoGpuContextVm
 #include "NativeAdrenoPagedLine.h"    // GPU-PAGED P1: machdep.piano_gpu_pt
@@ -1527,6 +1529,41 @@ void registerGpuPt()
   audit.oid_descr="GPU-PAGED P1: write 1 to audit the paged GPU page tables against the mappings now (EIO on a finding)";
   audit.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&audit);
 }
+int sysctlGpuTier(struct sysctl_oid *,void *,int,struct sysctl_req *req)
+{
+  if(req->newptr)return EPERM;
+  const auto tier=NativeAdrenoMemory::tierStats();
+  char line[256];
+  const int n=snprintf(line,sizeof line,
+      "mode=%u state=%s runs=%u checked=%u pass=%u fail=%u pass-mask=%#x free-mib=%llu used-mib=%llu refusals=%llu allocs=%llu",
+      tier.mode,tier.state,tier.runs,tier.tested,tier.passed,tier.tested-tier.passed,tier.pass_mask,
+      (unsigned long long)(tier.free_bytes>>20),(unsigned long long)(tier.used_bytes>>20),
+      (unsigned long long)tier.refusals,(unsigned long long)tier.allocations);
+  if(n<0 || size_t(n)>=sizeof line)return EIO;
+  return SYSCTL_OUT(req,line,size_t(n)+1);
+}
+void registerGpuTier()
+{
+  static struct sysctl_oid tier;
+  tier.oid_parent=&sysctl__machdep_children;tier.oid_number=OID_AUTO;
+  tier.oid_kind=int(CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED|CTLFLAG_OID2);
+  tier.oid_name="piano_gpu_tier";tier.oid_handler=sysctlGpuTier;tier.oid_fmt="A";
+  tier.oid_descr="RAM16G R1: region1 GPU tier state, per-run qualification mask, capacity and allocation counters";
+  tier.oid_version=SYSCTL_OID_VERSION;sysctl_register_oid(&tier);
+}
+void configureGpuTier()
+{
+  const unsigned mode=a830tier::bootArgMode(PE_boot_args());
+  if(!mode)return;
+  IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
+  OSData *property=chosen?OSDynamicCast(OSData,chosen->getProperty("piano-extra-ram")):nullptr;
+  NativeAdrenoMemory::configureTier(mode,property?static_cast<const uint8_t *>(property->getBytesNoCopy()):nullptr,
+                                 property?property->getLength():0);
+  if(chosen)chosen->release();
+  const auto tier=NativeAdrenoMemory::tierStats();
+  piano_a830_note("gpu tier: mode=%u state=%s runs=%u",mode,tier.mode?tier.state:"no-lock",tier.runs);
+}
+
 void registerGpuPaged()
 {
   static struct sysctl_oid bypass,paged;
@@ -2018,6 +2055,8 @@ bool PianoA830::start(IOService *provider)
   __atomic_store_n(&native_adreno_pool_bypass, bootArg("piano-gpu-pool-bypass", 0) == 1 ? 1u : 0u, __ATOMIC_RELEASE);
   registerGpuPaged();
   registerGpuPt();   // GPU-PAGED P1
+  configureGpuTier();
+  registerGpuTier();
   gBoostArg = bootArg("piano-gpu-boost", 0) == 1 ? 1u : 0u;
   __atomic_store_n(&gBoostEnabled, gBoostArg, __ATOMIC_RELEASE);
   // piano_a830_note: start() runs before the line ring exists (gpu-boost342a lost these two through gpuLine).

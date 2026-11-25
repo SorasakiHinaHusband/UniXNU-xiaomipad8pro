@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /* The region1 GPU tier (A830GpuTier.h, RAM16G R1; boot argument piano-gpu-tier, default off).
  *  1. /chosen piano-extra-ram parsing: the 16 GiB SM8750 layout (three runs, 874 MiB), absent, every refusal.
- *  2. The off switch: only piano-gpu-tier=1 turns it on; the last token wins; prefixes and other values stay off.
- *  3. The slab allocator: whole 2 MiB slabs, lowest first, spans inside one run, every span zeroed, an all-or-nothing refusal
- *     (span limit, too big), release refuses foreign / partial / double frees, exhaustion and refill over 2000 rounds.
+ *  2. The off switch: modes 1 and 2; the last token wins; prefixes and other values stay off.
+ *  3. The slab allocator: whole 2 MiB slabs, lowest first, spans inside one run, all-or-nothing refusals
+ *     (span limit, size and address width), release refuses foreign / partial / double frees, exhaustion and refill over 2000 rounds.
  *  4. The per-run self-test: a run whose probe fails is kept out (its line says FAIL) and never handed out.
  * Build: clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined test_a830gputier.cpp -o /tmp/test_a830gputier && /tmp/test_a830gputier
  * host-test: */
@@ -24,9 +24,17 @@ static std::vector<uint8_t> prop(std::vector<Run> rs, uint32_t version = 1, uint
   for (size_t i = 0; i < rs.size() && i < kMaxRuns; i++) { put64(&b[8 + 16 * i], rs[i].base); put64(&b[16 + 16 * i], rs[i].size); }
   return b;
 }
-struct Ctx { std::vector<Span> zeroed; std::vector<uint64_t> badProbe; std::vector<std::string> lines; };
-static void zero(uint64_t pa, uint64_t bytes, void *c) { ((Ctx *)c)->zeroed.push_back({pa, bytes}); }
-static bool probe(uint64_t pa, void *c) { for (auto b : ((Ctx *)c)->badProbe) if (b == pa) return false; return true; }
+struct Ctx {
+    std::vector<Run> probed;   // base = PA, size = run number
+    std::vector<uint64_t> badProbe;
+    std::vector<std::string> lines;
+};
+static bool probe(uint64_t pa, unsigned run, void *c) {
+  auto &ctx = *static_cast<Ctx *>(c);
+  ctx.probed.push_back({pa, run});
+  for (auto b : ctx.badProbe) if (b == pa) return false;
+  return true;
+}
 static void line(const char *l, void *c) { ((Ctx *)c)->lines.push_back(l); }
 static const uint64_t MiB = 1ull << 20;
 int main() {
@@ -46,29 +54,49 @@ int main() {
   auto hi = prop({{0x8bfe00000ull, 4 * MiB}}); CHECK(parseProperty(hi.data(), hi.size(), r, n) == Parse::outOfRegion);
   auto ov = prop({{0x880000000ull, 4 * MiB}, {0x880200000ull, 2 * MiB}}); CHECK(parseProperty(ov.data(), ov.size(), r, n) == Parse::overlap);
   auto none = prop({}); CHECK(parseProperty(none.data(), none.size(), r, n) == Parse::ok && n == 0);
+  auto tooHigh = prop({{0x8c0200000ull, 2 * MiB}});
+  CHECK(parseProperty(tooHigh.data(), tooHigh.size(), r, n) == Parse::outOfRegion && n == 0);
+  auto legacy = prop({}, 0);
+  CHECK(parseProperty(legacy.data(), legacy.size(), r, n) == Parse::absent && n == 0);
+  legacy[16] = 1;
+  CHECK(parseProperty(legacy.data(), legacy.size(), r, n) == Parse::badVersion);
   /* 2 */
-  CHECK(!bootArgOn(nullptr)); CHECK(!bootArgOn("")); CHECK(!bootArgOn("piano-dpu=2 piano-gpu-user-vm=1"));
-  CHECK(bootArgOn("piano-dpu=2 piano-gpu-tier=1")); CHECK(!bootArgOn("piano-gpu-tier=0"));
-  CHECK(!bootArgOn("piano-gpu-tier=1 piano-gpu-tier=0")); CHECK(bootArgOn("piano-gpu-tier=0 piano-gpu-tier=1"));
-  CHECK(!bootArgOn("piano-gpu-tier=11")); CHECK(!bootArgOn("piano-gpu-tiers=1")); CHECK(!bootArgOn("xpiano-gpu-tier=1"));
+  CHECK(!bootArgMode(nullptr)); CHECK(!bootArgMode("")); CHECK(!bootArgMode("piano-dpu=2 piano-gpu-user-vm=1"));
+  CHECK(bootArgMode("piano-dpu=2 piano-gpu-tier=1")); CHECK(!bootArgMode("piano-gpu-tier=0"));
+  CHECK(!bootArgMode("piano-gpu-tier=1 piano-gpu-tier=0")); CHECK(bootArgMode("piano-gpu-tier=0 piano-gpu-tier=1"));
+  CHECK(!bootArgMode("piano-gpu-tier=11")); CHECK(!bootArgMode("piano-gpu-tiers=1")); CHECK(!bootArgMode("xpiano-gpu-tier=1"));
+  CHECK(bootArgMode("piano-gpu-tier=1\tpiano-gpu-tier=2  ") == 2);
+  CHECK(bootArgMode("piano-gpu-tier=2 piano-gpu-tier=") == 0);
+  CHECK(bootArgMode("piano-gpu-tier=2 piano-gpu-tier=1") == 1);
+  CHECK(!eligible(0, kSlab) && !eligible(1, kSlab - kPage) && eligible(1, kSlab) && eligible(2, kPage));
   /* 3 */
   Ctx ctx; Tier t;
-  CHECK(t.init(sm.data(), 3, zero, probe, &ctx, line));
+  const uint64_t limit = UINT64_C(1) << 36;
+  t.init(sm.data(), 3, limit, probe, &ctx, line);
+  CHECK(ctx.probed.size() == 6);
+  for (unsigned i = 0; i < sm.size(); ++i) {
+      CHECK(ctx.probed[2*i].base == sm[i].base && ctx.probed[2*i].size == i);
+      CHECK(ctx.probed[2*i+1].base == sm[i].base + sm[i].size - kPage && ctx.probed[2*i+1].size == i);
+  }
   CHECK(t.totalBytes() == 874 * MiB && t.freeBytes() == 874 * MiB && ctx.lines.size() == 3);
-  CHECK(ctx.lines[0] == "PianoA830: gpu tier: run 0 0x880000000+512 MiB self-test ok");
+  CHECK(ctx.lines[0] == "gpu tier: run 0 0x880000000+512 MiB self-test ok");
   Span s[8];
-  CHECK(t.alloc(1, s, 8) == 1 && s[0].pa == 0x880000000ull && s[0].bytes == 2 * MiB && ctx.zeroed.size() == 1);
+  CHECK(t.alloc(1, s, 8, limit) == 1 && s[0].pa == 0x880000000ull && s[0].bytes == 2 * MiB);
   CHECK(t.freeBytes() == 872 * MiB);
   Span big[8];
-  unsigned bn = t.alloc(600 * MiB, big, 8);                     /* rest of run 0 (510 MiB) + 90 MiB of run 1 */
+  unsigned bn = t.alloc(600 * MiB, big, 8, limit);                     /* rest of run 0 (510 MiB) + 90 MiB of run 1 */
   CHECK(bn == 2 && big[0].pa == 0x880200000ull && big[0].bytes == 510 * MiB && big[1].pa == 0x8a0400000ull && big[1].bytes == 90 * MiB);
   struct Piece { uint64_t offset, physical, bytes; } pc[2];
   asPieces(big, bn, pc);
   CHECK(pc[0].offset == 0 && pc[0].physical == 0x880200000ull && pc[1].offset == 510 * MiB && pc[1].physical == 0x8a0400000ull && pc[1].bytes == 90 * MiB);
   CHECK(t.owns(0x8a0400000ull) && !t.owns(0x8c0000000ull) && !t.owns(0x87fe00000ull));
-  Span one[1]; size_t z0 = ctx.zeroed.size(); uint64_t f0 = t.freeBytes();
-  CHECK(t.alloc(300 * MiB, one, 1) == 0 && t.freeBytes() == f0 && ctx.zeroed.size() == z0);   /* needs 2 spans: refused whole */
-  CHECK(t.alloc(t.freeBytes() + 1, s + 1, 7) == 0 && t.freeBytes() == f0);                     /* too big: nothing taken */
+  Span one[1]; uint64_t f0 = t.freeBytes();
+  CHECK(t.alloc(300 * MiB, one, 1, limit) == 0 && t.freeBytes() == f0);   /* needs 2 spans: refused whole */
+  CHECK(t.alloc(t.freeBytes() + 1, s + 1, 7, limit) == 0 && t.freeBytes() == f0);                     /* too big: nothing taken */
+  CHECK(t.alloc(UINT64_MAX, one, 1, limit) == 0 && t.freeBytes() == f0);
+  CHECK(t.alloc(kSlab, one, 1, UINT64_C(1) << 32) == 0 && t.freeBytes() == f0);
+  Span duplicate[] = {s[0], s[0]};
+  CHECK(!t.release(duplicate, 2) && t.freeBytes() == f0);
   Span foreign = {0x8c0000000ull, 2 * MiB}, part = {0x880100000ull, 2 * MiB};
   CHECK(!t.release(&foreign, 1)); CHECK(!t.release(&part, 1));
   CHECK(t.release(big, bn) && !t.release(big, bn));             /* double free refused, nothing changed */
@@ -77,7 +105,7 @@ int main() {
   for (int round = 0; round < 2000; round++) {
     if (held.empty() || (rand() % 3)) {
       uint64_t want = (uint64_t)(1 + rand() % 64) * MiB; std::vector<Span> v(8);
-      unsigned k = t.alloc(want, v.data(), 8);
+      unsigned k = t.alloc(want, v.data(), 8, limit);
       if (k) { v.resize(k); uint64_t b = 0; for (auto &x : v) b += x.bytes; CHECK(b == (want + kSlab - 1) / kSlab * kSlab); heldBytes += b; held.push_back(v); }
     } else {
       size_t i = (size_t)rand() % held.size(); uint64_t b = 0; for (auto &x : held[i]) b += x.bytes;
@@ -88,14 +116,19 @@ int main() {
   for (auto &v : held) CHECK(t.release(v.data(), (unsigned)v.size()));
   CHECK(t.freeBytes() == 874 * MiB);
   /* 4 */
-  Ctx bad; bad.badProbe.push_back(0x8a0400000ull + 256 * MiB - kSlab); Tier u;
-  CHECK(u.init(sm.data(), 3, zero, probe, &bad, line));
-  CHECK(bad.lines[1] == "PianoA830: gpu tier: run 1 0x8a0400000+256 MiB self-test FAIL" && u.totalBytes() == 618 * MiB);
-  Span w[8]; unsigned wn = u.alloc(600 * MiB, w, 8);
+  Ctx bad; bad.badProbe.push_back(0x8a0400000ull + 256 * MiB - kPage); Tier u;
+  u.init(sm.data(), 3, limit, probe, &bad, line);
+  CHECK(u.runPassed(0) && !u.runPassed(1) && u.runPassed(2));
+  CHECK(bad.lines[1] == "gpu tier: run 1 0x8a0400000+256 MiB self-test FAIL" && u.totalBytes() == 618 * MiB);
+  Span w[8]; unsigned wn = u.alloc(600 * MiB, w, 8, limit);
   CHECK(wn == 2 && w[0].pa == 0x880000000ull && w[1].pa == 0x8b0400000ull && !u.owns(0x8a0400000ull));
-  Tier e; CHECK(!e.init(sm.data(), 3, nullptr, probe, &ctx, nullptr)); CHECK(e.alloc(2 * MiB, w, 8) == 0);
+  Tier e;
+  Ctx narrow;
+  e.init(sm.data(), 3, UINT64_C(1) << 32, probe, &narrow, nullptr);
+  CHECK(e.runs() == 3 && !e.runPassed(0) && !e.runPassed(2) && narrow.probed.empty());
+  CHECK(e.alloc(kSlab, w, 8, limit) == 0);
   if (fails) { std::fprintf(stderr, "%d of %d checks failed\n", fails, checks); return 1; }
-  std::printf("PASS: gpu tier: piano-extra-ram parsing (SM8750 874 MiB, 11 refusals), the piano-gpu-tier off switch (10 cases), "
-              "2 MiB slab spans with zeroing and all-or-nothing refusals, the BO piece list, 2000 alloc/release rounds, a failed run's self-test kept out\n");
+  std::printf("PASS: gpu tier: %d checks for ADT parsing, modes 0/1/2, exact probe endpoints, failed runs, address widths, "
+              "all-or-nothing slabs and 2000 churn rounds\n", checks);
   return 0;
 }

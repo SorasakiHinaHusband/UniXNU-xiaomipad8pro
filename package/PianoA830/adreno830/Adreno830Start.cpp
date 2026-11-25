@@ -41,6 +41,7 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoStatus.h"
 #include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoTimer.h"
 #include "Sm8750AossQmp.h"
 #include "Sm8750Llcc.h"
@@ -2119,6 +2120,89 @@ IOReturn selfTestPolled(Adreno830Device *d,A830SelfTest &test,const A830SelfTest
     a830_selftest_last=report;
     return r;
 }
+#if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
+struct TierProbe {
+    Adreno830Device *device;
+    bool blocked=false;
+};
+// Persistent storage in case a poisoned VM retains the probe's mapping reference.
+NativeAdrenoMemory tierProbePage;
+IOMemoryDescriptor *tierProbeDescriptor;
+
+bool tierProbe(uint64_t pa,unsigned run,void *cookie)
+{
+    auto &probe=*static_cast<TierProbe *>(cookie);
+    if(probe.blocked)return false;
+    auto &d=*probe.device;
+    auto *vm=d.gpu_context.vm();
+    if(!vm)return false;
+
+    constexpr uint64_t iova=ProbeIova+0x10000;
+    constexpr uint64_t pageBytes=NativeAdrenoGmuPageBytes;
+    IOAddressRange range={pa,pageBytes};
+    IOMemoryDescriptor *descriptor=IOMemoryDescriptor::withAddressRanges(&range,1,
+        static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryTypePhysical64)|kIOMemoryMapperNone,
+        nullptr);
+    if(!descriptor)return false;
+    IOMemoryMap *view=descriptor->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapWriteCombineCache);
+    if(!view) {
+        descriptor->release();
+        return false;
+    }
+
+    // Give the two endpoints different words, including for a run consisting of a single slab.
+    const uint32_t value=0xa8300000u | (run<<12) | uint32_t((pa>>12)&0x1ff);
+    auto *word=reinterpret_cast<volatile uint32_t *>(view->getAddress());
+    *word=~value;
+    __asm__ volatile("dsb sy":::"memory");
+    (void)probeFaults(nullptr,nullptr);
+
+    uint64_t handle=0;
+    IOReturn result=tierProbePage.importDevice(descriptor,0,pageBytes);
+    const char *stage="backing";
+    if(!result) {
+        stage="map";
+        result=vm->map(&tierProbePage,0,iova,ArmSmmu4KRead|ArmSmmu4KWrite,0,2,&handle);
+    }
+    bool quiesced=true;
+    uint32_t seen=0;
+    if(!result) {
+        uint32_t words[4], fence=0;
+        const size_t count=A830SelfTest::memWriteWords(iova,value,words,4);
+        stage="submit";
+        result=d.ring.submit(words,count,&fence);
+        if(!result) {
+            stage="fence";
+            result=d.fence.waitNs(fence,250000000);
+        }
+        const uint32_t fault=probeFaults(nullptr,nullptr);
+        if(result && (fence || d.ring.poisoned()))
+            quiesced=d.recovery.recover(A830FaultSelfTest,pa)==kIOReturnSuccess;
+        if(!result) {
+            __asm__ volatile("dsb sy":::"memory");
+            stage="readback";
+            seen=ml_phys_read_word_64(pa);
+            if(fault || seen!=value || *word!=value)result=kIOReturnIOError;
+        }
+    }
+
+    view->release();
+    const IOReturn unmap=handle && quiesced?vm->unmap(handle):kIOReturnSuccess;
+    if(!quiesced || unmap || tierProbePage.release()!=kIOReturnSuccess) {
+        tierProbeDescriptor=descriptor;  // keep the descriptor alive while the VM might still reference the page
+        probe.blocked=true;
+    } else descriptor->release();
+    if(result || probe.blocked)
+        IOLog("PianoA830: gpu tier: run %u page %#llx %s result=%#x seen=%#x expected=%#x cleanup=%#x blocked=%u\n",
+            run,(unsigned long long)pa,stage,result,seen,value,unmap,probe.blocked);
+    return !result && !probe.blocked;
+}
+void tierProbeLine(const char *line,void *)
+{
+    IOLog("PianoA830: %s\n",line);
+}
+#endif
+
 void bindPower(Adreno830Device *d);
 IOReturn stageFence(Adreno830Device *d,Adreno830Failure *f)
 {
@@ -2173,6 +2257,13 @@ IOReturn stageFence(Adreno830Device *d,Adreno830Failure *f)
     r=adreno830_annibale()?selfTestPolled(d,test,env,&failure):test.run(b->irq_gpu,&d->selftest,&failure);
     if(r!=kIOReturnSuccess)
         return refuse(f,failure.step,failure.reason?failure.reason:A830ReasonIrqWiring,failure.reg,failure.value,failure.expect,r);
+#if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
+    TierProbe tier{d};
+    NativeAdrenoMemory::qualifyTier(d->gpu_context.outputBits(),native_adreno_wc_enabled,
+        b->knobs.coherent==2 || d->selftest.coherence.level>=A830CoherenceFull,tierProbe,&tier,tierProbeLine);
+    if(tier.blocked)
+        return refuse(f,A830S8StepStart,A830ReasonSmmuFault,ProbeIova,0,0,kIOReturnIOError);
+#endif
     /* 112 (GPU_CC frequency-limit events), optional. */
     adreno830_status_step(A830S8StepCxHost);
     d->irq.attachCxHost(b->irq_cx_host);
