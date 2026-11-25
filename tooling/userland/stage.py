@@ -675,8 +675,8 @@ def gpu_addon_request():
         return None, name
     if mode not in ('copy', 'move'):
         raise SystemExit(f'PIANO_GPU_ADDON={mode!r}: copy or move')
-    if os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle') not in ('sle', 'app'):
-        raise SystemExit('PIANO_GPU_ADDON_PLACE: sle or app')
+    if os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle') not in ('sle', 'app', 'app2'):
+        raise SystemExit('PIANO_GPU_ADDON_PLACE: sle, app or app2')
     if not GPU_ADDON_NAME.fullmatch(name):
         raise SystemExit(f'PIANO_GPU_ADDON_NAME={name!r}: letters, digits, _ and - only')
     return mode, name
@@ -688,7 +688,7 @@ def seed_gpu_addon(mount, mode, name, trust, built):
     place = os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle')
     source = mount / GPU_BUNDLES.lstrip('/') / f'{name}.bundle'
     link = mount / GPU_ADDONS.lstrip('/') / f'{name}.bundle'
-    target = mount / GPU_APP_LIBRARY.lstrip('/') / GPU_APP_DIR / f'{name}.bundle' if place == 'app' else link
+    target = mount / GPU_APP_LIBRARY.lstrip('/') / GPU_APP_DIR / f'{name}.bundle' if place in ('app', 'app2') else link
     if not (source / 'Contents/Info.plist').is_file():
         raise SystemExit(f'PIANO_GPU_ADDON: the seed has no {GPU_BUNDLES}/{name}.bundle (Contents/Info.plist)')
     reinstalled = [f['dest'] for f, _ in built if f['dest'].startswith(f'{GPU_BUNDLES}/{name}.bundle/')]
@@ -711,7 +711,7 @@ def seed_gpu_addon(mount, mode, name, trust, built):
     target.parent.mkdir(parents=True, exist_ok=True)
     for directory in (target.parent.parent, target.parent):
         os.chmod(directory, 0o755)
-    if place == 'app':
+    if place in ('app', 'app2'):
         link.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(link.parent, 0o755)
     sh(['cp', '-cR', str(source), str(target)], timeout=120, check=True)
@@ -726,6 +726,24 @@ def seed_gpu_addon(mount, mode, name, trust, built):
             raise SystemExit(f'PIANO_GPU_ADDON: {GPU_ADDONS}/{name}.bundle/{f["path"]} differs from the seed\'s plugin')
     record = {'mode': mode, 'name': name, 'dest': f'{GPU_ADDONS}/{name}.bundle', 'boot_arg': 'sheng-gpu-addon=1',
               'gpu_bundles_copy_kept': mode == 'copy', 'files': files, 'place': place}
+    if place == 'app2':
+        # cryptex1-qual2..4: with the whole bundle a symlink, late Metal clients (system_profiler, Safari) never dlopen it (discovery
+        # refuses the resolved bundle). app2 keeps the bundle a real directory in the /S/L/E view (what Metal's discovery and trust check
+        # see) and makes only its Mach-Os symlinks into the App-cryptex view (what dyld maps: the sandboxes' realpath rule).
+        view = f'{GPU_APP_POINT}/{GPU_APP_DIR}/{name}.bundle'
+        for path in sorted(p for p in target.rglob('*') if p.is_file()):
+            rel = path.relative_to(target)
+            dest = link / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            for d in [dest.parent, *dest.parent.parents]:
+                if d == link.parent: break
+                os.chmod(d, 0o755)
+            if soft_metal().cdhash(path) is not None:
+                os.symlink(f'{view}/{rel.as_posix()}', dest)
+            else:
+                shutil.copy2(path, dest); os.chmod(dest, 0o644)
+        record.update({'real': f'{GPU_APP_LIBRARY}/{GPU_APP_DIR}/{name}.bundle', 'link': f'{GPU_ADDONS}/{name}.bundle: Mach-Os -> {view}',
+                       'kernel': '0074 (app-library view)'})
     if place == 'app':
         view = f'{GPU_APP_POINT}/{GPU_APP_DIR}/{name}.bundle'
         os.symlink(view, link)
