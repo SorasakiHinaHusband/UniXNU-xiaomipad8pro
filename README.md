@@ -15,10 +15,11 @@ SM8750 pieces to be shared later (the code still lives here, and the build pins 
 is the frozen archive of the earlier Linux + Gunyah guest path. The map of repositories, local trees and rules:
 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
 
-## State (2026-11-25)
+## State (2026-11-26)
 
 Native macOS **27.3 (26C5035r)** boots on the tablet from power-on as well as from a RAM image. The current daily
-install is **v13.1y12k** (2026-11-25). The machine identifies as Mac17,11, shown as "Xiaomi Pad 8 Pro" with a
+install is **v13.1y12l** (2026-11-26; its install round passed 65 checks with no FAIL, after 291 PASS on its RAM
+qualification). The machine identifies as Mac17,11, shown as "Xiaomi Pad 8 Pro" with a
 "Snapdragon 8 Elite" chip. Root is on `linux_rootfs`; the owner's Data store is on `linux_data`. High Power is the daily
 Energy Mode. The Android-aligned CPU/GPU frequency curve and PD buck charging (9 V) are on by default; the charge pump
 stays off.
@@ -26,63 +27,70 @@ stays off.
 What works on the installed system today: boot from disk with the owner's data, the display at 60 Hz, the native touch
 screen, the keyboard cover and its trackpad, Wi-Fi (join at boot, off/on, rejoin after a link loss), speakers, battery
 percentage, 5 V and 9 V PD charging with the 80 % hold, automatic brightness, Metal on the Adreno 830 with paged GPU
-memory, Photo Booth and camera recording, hardware video decode in QuickTime and Safari (H.264 up to 1080p), and Safari
-WebGL 2 and WebGPU. Not yet: Bluetooth pairing, lid and power-button sleep on the installed system, Chrome GPU
-acceleration, charge-pump fast charging, 120 Hz in daily use, USB host devices and external displays.
+memory and 4 GiB GPU windows (Core Image on 4032-pixel photos), Photo Booth and camera recording, hardware video decode in
+QuickTime and Safari (H.264 up to 1080p), Safari WebGL 2 and WebGPU, and Chrome with GPU acceleration (WebGL, GPU compositing,
+smooth scrolling and video, with its GPU sandbox on). The installed system uses a 13 GiB memory window. Not yet: Bluetooth
+pairing, cover and power-key sleep on the installed system, Chrome WebGPU (needs a kernel change that comes with the next
+daily), fast disk writes, charge-pump fast charging, 120 Hz in daily use, USB host devices and external displays. In progress:
+the native display path (snapshot, Night Shift, panel sleep, refresh switching), Bluetooth keyboards and mice, cover and
+power-key sleep, disk speed, auto-rotate, and the install guide for other units.
 
 ### Hardware support
 
 Every status comes from a run on the tablet. "Works (installed)" means verified on the system installed on the
-tablet's disk (v13.1y12k unless the row says otherwise); "RAM only" means verified on a RAM boot image only.
+tablet's disk (v13.1y12l unless the row says otherwise); "RAM only" means verified on a RAM boot image only.
 
 ✅ fully supported · 🟡 partial / in progress · ❌ not supported
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Disk boot, exact ESP profile, the owner's Data store resumed, boot guard healthy, no panic. Installs write only changed parts, after backups, with read-back checks and a layer-first rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | v13.1y12k, 2026-11-25 | Frames reach the panel through PianoDpu flips on the boot framebuffer's pipes; the CPU still does per-frame work (a cache clean, split over 4 threads). No underrun, revert or SMMU fault over the session. A fully native DPU path (fences, refresh switching, Night Shift, panel power) is in analysis. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Disk boot, exact ESP profile, the owner's Data store resumed, boot guard healthy, no panic. The v13.1y12l install round: 65 PASS, 0 FAIL, 0 VOID, the first round with no FAIL. Installs write only changed parts, after backups, with read-back checks and a layer-first rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | v13.1y12l, 2026-11-26 | Frames reach the panel through PianoDpu flips on the boot framebuffer's pipes; the CPU still does per-frame work (a cache clean, split over 4 threads). No underrun, revert or SMMU fault over the session. A fully native DPU path (screen snapshot, Night Shift, panel sleep, refresh switching) is in progress. |
 | 120 Hz | 🟡 RAM only | RAM gpu-hz120-2, 2026-11-21 | 120 Hz is exposed and kept across display off/on; 73-78 new frames/s are presented. The daily profile stays at 60 Hz. |
-| Touch screen (native) | ✅ Works (installed) | v13.1y12k, 2026-11-25; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
-| Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12k, 2026-11-25 | Typing and the trackpad work; the cover is known to the login window. |
-| Wi-Fi | 🟡 Works (installed), partial | v13.1y12k, 2026-11-25; v13.1x, 2026-11-21 | Joins at boot (WPA2, DHCP, DNS); radio off/on from the switch rejoins; a forced link loss rejoins within seconds; country code set. Pending: joining by clicking a network row by hand, auto-rejoin after a hotspot goes away and comes back, and a multi-access-point office network (a fix is in the build). |
-| Bluetooth | ❌ Not yet | owner session on an installed v13.1 build, 2026-11-20 | Discovery works; a Bluetooth LE connection times out (HCI 0x08) before the link is ready, so keyboards and mice do not pair. Not in the daily profile. Leading candidate (inferred): Wi-Fi holds the shared antenna; a power-save test is prepared. Bluetooth audio not started. |
+| Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
+| Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
+| Wi-Fi | 🟡 Works (installed), partial | v13.1y12l, 2026-11-26; v13.1x, 2026-11-21 | Joins at boot (WPA2, DHCP, DNS); radio off/on from the switch rejoins; a forced link loss rejoins within seconds; country code set. Pending: joining by clicking a network row by hand, auto-rejoin after a hotspot goes away and comes back, and a multi-access-point office network. |
+| Bluetooth | ❌ Not yet (in progress) | owner session on an installed v13.1 build, 2026-11-20 | Discovery works; a Bluetooth LE connection times out (HCI 0x08) before the link is ready, so keyboards and mice do not pair. Not in the daily profile. In progress: a fix for the LE connection is built, and the radio coexistence with Wi-Fi (the shared antenna) is under analysis. Bluetooth audio not started. |
 | Speakers | ✅ Works (installed) | v13.1u, 2026-11-21 (audible tone) | Playback, volume and mute; speaker protection at gain 243 and the stock Dolby "Movie" processing run on the DSP. Since 2026-11-23, installs are silent by request, so later installs check the output device without a tone. |
-| Microphone | 🟡 Partial | v13.1y12k, 2026-11-25; noise reduction on RAM mic-ns4b, 2026-11-23 | The raw "Mic" device (the default input) and a "Mic (noise reduced)" device (RNNoise) are in the audio system on the installed boot. The recording-during-playback stutter was fixed on the installed system (2026-11-21). An app recording (QuickTime) played back by hand is pending. |
-| Cameras: Photo Booth | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Live front preview with no prompt; the effects grid opens. |
-| Cameras: QuickTime | 🟡 Partial | v13.1y12k, 2026-11-25 | 10 s H.264 movies from the front and rear cameras record (AVFoundation, the QuickTime High preset). A New Movie Recording saved and played back by hand is pending. Encoding is in software. |
-| Cameras: FaceTime | 🟡 Not yet verified | permissions pre-granted, v13.1y12k, 2026-11-25 | Both cameras are listed and FaceTime has Camera and Microphone access; a FaceTime self-view has not been checked. |
+| Microphone | 🟡 Partial | v13.1y12l, 2026-11-26; noise reduction on RAM mic-ns4b, 2026-11-23 | The raw "Mic" device (the default input) and a "Mic (noise reduced)" device (RNNoise) are in the audio system on the installed boot. The recording-during-playback stutter was fixed on the installed system (2026-11-21). An app recording (QuickTime) played back by hand is pending. |
+| Cameras: Photo Booth | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Live front preview with no prompt; the effects grid opens. |
+| Cameras: QuickTime | 🟡 Partial | v13.1y12l, 2026-11-26 | 10 s H.264 movies from the front and rear cameras record (AVFoundation, the QuickTime High preset). A New Movie Recording saved and played back by hand is pending. Encoding is in software. |
+| Cameras: FaceTime | 🟡 Not yet verified | permissions pre-granted, v13.1y12l, 2026-11-26 | Both cameras are listed and FaceTime has Camera and Microphone access; a FaceTime self-view has not been checked. |
 | Charging: 5 V | ✅ Works (installed) | v13.1y12d, 2026-11-24 | Up to 3 A from a 3 A source (input limit 3000 mA; on a computer port the input settles near 1.8 A when the bus sags to about 4.72 V); net battery charge current positive. |
 | Charging: PD 9 V (buck) | ✅ Works (installed) | v13.1y12d, 2026-11-24 | On by default. Fixed 9 V PD on the stock charger: 9 V / 1.6 A (about 14 W, the current the charger firmware requests, as on Ubuntu). PPS 9 V (up to 2.5 A) is built but not run. |
 | Charging: 80 % hold | ✅ Works | RAM chg-buck6, 2026-11-17; in every installed profile since | Stops at 80 %, resumes at 75 %. |
 | Charging: charge pump / MiPPS | ❌ Not yet | first attended try, 2026-11-24 | Off by default. The first attempt stayed at a 100 mA input limit (an unmapped vendor power object); fixed in the build, the next attended test is pending. |
 | Battery percentage | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Percentage, charging state and the gauge read correctly. Cycle count, health and time-to-full fields are not filled yet. |
-| Sleep and wake | 🟡 Partial | RAM v13.1y12d qualification, 2026-11-24 | Suspend-to-idle with a timer wake works; Wi-Fi and the USB link recover; the lock screen appears. Lid close and the power button on the installed system are not verified. |
+| Sleep and wake | 🟡 Partial | RAM v13.1y12d qualification, 2026-11-24 | Suspend-to-idle with a timer wake works; Wi-Fi and the USB link recover; the lock screen appears. Sleep by closing the cover and by the power key on the installed system: the profile change is ready, not yet verified. |
 | Brightness: manual | 🟡 Partial | keys on installed v12, 2026-11-19; slider path on v13.1i | Brightness keys work. The slider path through the system's brightness control works; a hand drag in Control Center is pending. |
-| Brightness: automatic | ✅ Works (installed) | v13.1y12k, 2026-11-25 | The light sensor drives automatic brightness; manual moves do not end automatic mode. A real light-change span is pending. |
-| GPU: Metal (Adreno 830) | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Our Metal plug-in runs WindowServer, the desktop and apps; ImageIO, Core Image on Metal, MetalKit texture loading and Quick Look thumbnails pass (28 of 30 paths; the two failing ones are fixed below). |
-| GPU: paged memory | ✅ Works (installed) | v13.1y12k, 2026-11-25 | 4 KiB paged GPU memory (cap 7168 MiB, no fixed pool), no refusals, no page faults; hang recovery by replay on by default. |
-| GPU: Android-level frequency curve | ✅ Works (installed) | v13.1y12k, 2026-11-25 | The Android 14-level table up to 1100 MHz with its skin and thermal steps and a KGSL-style governor; the Android CPU table. Sustained 3D bench about 50-54 fps at 734 MHz (RAM, 2026-11-23). |
-| GPU: 4 GiB windows | 🟡 RAM only (next daily) | RAM slots2-qual1, 2026-11-25 | 64 client windows of 4 GiB in a 256 GiB aperture, 1 GiB per object. Fixes the two Core Image 4032-pixel out-of-memory paths: 30/30 graded paths pass. |
+| Brightness: automatic | ✅ Works (installed) | v13.1y12l, 2026-11-26 | The light sensor drives automatic brightness; manual moves do not end automatic mode. A real light-change span is pending. |
+| GPU: Metal (Adreno 830) | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Our Metal plug-in runs WindowServer, the desktop and apps; ImageIO, Core Image on Metal, MetalKit texture loading and Quick Look thumbnails pass: 30 of 30 graded paths, including the 4032-pixel Core Image and HEIC texture paths that ran out of memory before; Preview opens a 4032-pixel photo. |
+| GPU: paged memory | ✅ Works (installed) | v13.1y12l, 2026-11-26 | 4 KiB paged GPU memory (cap 7168 MiB, no fixed pool), no refusals, no page faults; hang recovery by replay on by default. |
+| GPU: Android-level frequency curve | ✅ Works (installed) | v13.1y12l, 2026-11-26 | The Android 14-level table up to 1100 MHz with its skin and thermal steps and a KGSL-style governor; the Android CPU table. Sustained 3D bench about 50-54 fps at 734 MHz (RAM, 2026-11-23). |
+| GPU: 4 GiB windows | ✅ Works (installed) | v13.1y12l, 2026-11-26 | 64 client windows of 4 GiB in a 256 GiB aperture, 1 GiB per object, no GPU open refused. Fixes the Core Image 4032-pixel out-of-memory paths (Metal image check 30/30). |
 | Safari: WebGL 2 and WebGPU | ✅ Works (installed) | v13.1y12h, 2026-11-25; again v13.1y12k | WebGL 2 on, WebGPU adapter "adreno"; Safari's GPU process opens the accelerator. |
 | Safari: hardware video decode | ✅ Works (installed) | v13.1y12i, 2026-11-25 | H.264 up to 1920x1088 decodes on the Iris video core: 1080p 600 frames, 0 dropped. |
 | Safari: HEVC and 4K | ✅ Works (installed), software | v13.1y12j, 2026-11-25 | HEVC 2160p 600/0 at 29.9 fps and H.264 2160p 591/5, in Apple's software decoders (by design). VP9 and AV1 are not supported. |
-| Chrome | 🟡 Partial | v13.1y12k, 2026-11-25 | Runs on the installed system on software rendering. The GPU plug-in now loads in Chrome's sandboxed GPU process; the last gate (a disk cache directory the sandbox forbids) has a fix built for the next daily. WebGPU also needs a larger user address space (in progress). Chrome is not used on RAM boots (it can exhaust the RAM-backed Data disk). |
+| Chrome: GPU acceleration | ✅ Works (installed) | v13.1y12l, 2026-11-26 | With Chrome's GPU sandbox on and no flags: WebGL through ANGLE on Metal (Adreno 830, about 31 fps in the WebGL test), GPU compositing, canvas 2D 56 fps, scrolling 60 fps with no frame over 34 ms. Every test video played with 0-1 dropped frames: H.264 and HEVC at 1080p and 2160p, VP9 and AV1 at 1080p (HEVC through VideoToolbox, the others in Chrome's software decoders). No crash report. Chrome is not used on RAM boots (it can exhaust the RAM-backed Data disk). |
+| Chrome: WebGPU | 🟡 In progress | v13.1y12l, 2026-11-26 | No adapter yet (requestAdapter returns null): Chrome's V8 sandbox needs a 47-bit user address space. Kernel patch 0075 provides it and passed its RAM test; it comes with the next daily build. |
 | Video playback (QuickTime) | ✅ Works (installed) | v13.1x, 2026-11-21 | AVC High and HEVC Main10 decoded in hardware; about 100 s each with 0 transient or dark frames on the webcam. |
-| Energy modes | 🟡 Partial | v13.1y12k, 2026-11-25 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified (its check fails, recorded only). |
-| Login window idle CPU | ✅ Works (installed) | v13.1y12j, 2026-11-25 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
-| App launches | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
-| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12k, 2026-11-25 | USB-C debug console with a monitor that returns to the bootloader, root shell and ssh over the cable; no endpoint wedge over the boot. |
+| Energy modes | 🟡 Partial | v13.1y12l, 2026-11-26 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified by hand. |
+| Login window idle CPU | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
+| App launches | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
+| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12l, 2026-11-26 | USB-C debug console with a monitor that returns to the bootloader, root shell and ssh over the cable; no endpoint wedge over the boot. |
 | OS switcher (Android / macOS) | 🟡 RAM only, read-only | RAM v13.1y12e, 2026-11-24 | The boot-flag sysctls read the flag; writes are refused by design. A full switch has not been run. |
 | USB host / OTG | ❌ Not yet | RAM usb-a2d, 2026-11-18 (empty port) | Host mode starts on an empty port; VBUS supply and a real device are not done. |
 | External display (USB-C DP) | ❌ Not yet | none | Design only. |
-| Auto-rotate and other sensors | ❌ Not yet | RAM, 2026-11-19 (accelerometer sample) | The light sensor works; auto-rotate is off in the daily profile. |
+| Auto-rotate and other sensors | ❌ Not yet | RAM, 2026-11-19 (accelerometer sample) | The light sensor works; auto-rotate is off in the daily profile and in analysis. |
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
-| Using all 16 GB of RAM | ❌ Not yet | installed window 8 GiB | The installed system sees an 8 GiB window (RAM images 13 GiB); the second DRAM range is in analysis. |
+| Memory (16 GB) | 🟡 Partial | v13.1y12l, 2026-11-26 | The installed system uses a 13 GiB window (13310 MiB; was 8 GiB). At idle: 47 % free, no compression, no swap, no memory pressure. In progress: the GPU memory tier and the driver pools. |
+| Internal storage (UFS) | 🟡 Partial | v13.1y12l, 2026-11-26 (first measurement) | On the Data volume, against Android on the same unit: 4K random read at queue depth 1 equals Android (15580 vs 14967 IOPS), but reads do not scale with queue depth (8 in flight: 15696 vs 88663); writes are 0.18-0.24x Android (sequential 519 vs 2137 MB/s, 4K random 6494 vs 36693 IOPS); a reader drops from 14490 to 1300 IOPS while a writer runs. WriteBooster is already on from the boot firmware. Fixes are in progress. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 Details (status definitions, known gaps, showcase): [docs/STATUS.md](docs/STATUS.md).
-Today's tablet results: [docs/results-2026-11-25.md](docs/results-2026-11-25.md).
+Today's tablet results: [docs/results-2026-11-26.md](docs/results-2026-11-26.md) (yesterday's:
+[docs/results-2026-11-25.md](docs/results-2026-11-25.md)).
 
 **Showcase:** screenshots and short clips of each feature, taken on the tablet itself, are collected in
 [docs/STATUS.md#showcase](docs/STATUS.md#showcase) (the first native captures are scheduled for the next test boot).
