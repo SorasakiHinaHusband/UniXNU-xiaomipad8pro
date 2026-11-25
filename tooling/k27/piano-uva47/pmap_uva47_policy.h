@@ -63,10 +63,10 @@ piano_uva_root_alloc_size(uint64_t va_valid_mask, unsigned int root_shift)
 
 /* pmap_tt1_allocate()/pmap_tt1_deallocate()'s rounding: a root smaller than a page and not PMAP_ROOT_ALLOC_SIZE takes a whole page. */
 static inline uint64_t
-piano_uva_tt1_alloc_bytes(uint64_t size, uint64_t page_size, uint64_t pmap_root_alloc_size_const)
+piano_uva_tt1_alloc_bytes(uint64_t size, uint64_t page_bytes, uint64_t pmap_root_alloc_size_const)
 {
-	if ((size < page_size) && (size != pmap_root_alloc_size_const)) {
-		size = page_size;
+	if ((size < page_bytes) && (size != pmap_root_alloc_size_const)) {
+		size = page_bytes;
 	}
 	return size;
 }

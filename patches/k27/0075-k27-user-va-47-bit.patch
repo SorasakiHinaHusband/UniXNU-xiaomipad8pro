@@ -1,4 +1,4 @@
-From 3aab181ac14092ef12081c16394c0d4b7586fcbc Mon Sep 17 00:00:00 2001
+From 098851a18964a759b6d1931e785d42c091212a7f Mon Sep 17 00:00:00 2001
 From: k27 <k27@localhost>
 Date: Wed, 25 Nov 2026 22:27:51 +0800
 Subject: [PATCH] k27 0075: user VA 47-bit: every user pmap takes a 4 KiB
@@ -229,7 +229,7 @@ index 609b521..851cda7 100644
  #endif
 diff --git a/osfmk/arm/pmap/pmap_uva47_policy.h b/osfmk/arm/pmap/pmap_uva47_policy.h
 new file mode 100644
-index 0000000..28a5e1b
+index 0000000..5f936d9
 --- /dev/null
 +++ b/osfmk/arm/pmap/pmap_uva47_policy.h
 @@ -0,0 +1,110 @@
@@ -298,10 +298,10 @@ index 0000000..28a5e1b
 +
 +/* pmap_tt1_allocate()/pmap_tt1_deallocate()'s rounding: a root smaller than a page and not PMAP_ROOT_ALLOC_SIZE takes a whole page. */
 +static inline uint64_t
-+piano_uva_tt1_alloc_bytes(uint64_t size, uint64_t page_size, uint64_t pmap_root_alloc_size_const)
++piano_uva_tt1_alloc_bytes(uint64_t size, uint64_t page_bytes, uint64_t pmap_root_alloc_size_const)
 +{
-+	if ((size < page_size) && (size != pmap_root_alloc_size_const)) {
-+		size = page_size;
++	if ((size < page_bytes) && (size != pmap_root_alloc_size_const)) {
++		size = page_bytes;
 +	}
 +	return size;
 +}
