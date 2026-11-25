@@ -813,16 +813,16 @@ def addon_tests(tmp):
     if code == 0:
         rec = json.loads((app / 'userland.json').read_text())['seed_gpu_addon']
         with attached(unpack(app / 'scratch-data.img', tmp / 'app.raw'), readonly=True) as mnt:
-            real = mnt / 'private/var/ngpu/app-library/Extensions/T.bundle'
+            real = mnt / 'private/var/ngpu/app-library/Frameworks/T.bundle'
             link = mnt / 'private/var/ngpu/addons/T.bundle'
             check((real / 'Contents/MacOS/T').read_bytes() == exe.read_bytes() and os.access(real / 'Contents/MacOS/T', os.X_OK),
-                  'app place: the real bundle in app-library/Extensions with the seed plugin\'s bytes')
-            check(link.is_symlink() and os.readlink(link) == '/System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions/T.bundle',
+                  'app place: the real bundle in app-library/Frameworks with the seed plugin\'s bytes')
+            check(link.is_symlink() and os.readlink(link) == '/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/T.bundle',
                   'app place: the addons entry is the absolute symlink into the App cryptex view')
             check(all(oct(d.stat().st_mode & 0o777) == '0o755' for d in (real.parent, real.parent.parent, link.parent)),
-                  'app place: app-library, Extensions and addons are 0755')
+                  'app place: app-library, Frameworks and addons are 0755')
             check(not (mnt / 'Library/GPUBundles/T.bundle').exists(), 'app place + move: /Library/GPUBundles/T.bundle gone')
-        check(rec['place'] == 'app' and rec['real'] == '/private/var/ngpu/app-library/Extensions/T.bundle' and
+        check(rec['place'] == 'app' and rec['real'] == '/private/var/ngpu/app-library/Frameworks/T.bundle' and
               {f['path']: f['cdhash'] for f in rec['files']}.get('Contents/MacOS/T') == want_cd, 'app place: the record')
     code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/badplace',
                            env={'PIANO_GPU_ADDON': 'copy', 'PIANO_GPU_ADDON_NAME': 'T', 'PIANO_GPU_ADDON_PLACE': 'x'})

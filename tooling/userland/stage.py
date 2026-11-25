@@ -654,12 +654,16 @@ def seed_gpu_files(mount, staging, built):
 # removes it from the seed, so every process, WindowServer included, loads the view. The bytes are the seed's own (clones): their
 # Mach-Os' CDHashes must already be in the output trust cache, else the copy is refused. Nothing else changes; unset, nothing happens.
 GPU_ADDONS = '/private/var/ngpu/addons'
-# LT-B3 (ANALYSIS.md section 11): PIANO_GPU_ADDON_PLACE=app puts the bundle's real files in /private/var/ngpu/app-library/Extensions/,
+# LT-B3 (ANALYSIS.md section 11): PIANO_GPU_ADDON_PLACE=app puts the bundle's real files in /private/var/ngpu/app-library/Frameworks/,
 # which kernel patch 0074 shows as a union view over the App cryptex's System/Library, and makes the /S/L/E view's entry an absolute
-# symlink to /System/Volumes/Preboot/Cryptexes/App/System/Library/Extensions/<name>.bundle. Chrome's GPU sandbox maps code only from
+# symlink to /System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/<name>.bundle. Chrome's GPU sandbox maps code only from
 # cryptex paths and matches a symlink's real path. Needs a 0074 kernel: without the view the symlink dangles (no Metal device).
 GPU_APP_LIBRARY = '/private/var/ngpu/app-library'
 GPU_APP_POINT = '/System/Volumes/Preboot/Cryptexes/App/System/Library'
+# Frameworks, not Extensions (cryptex1-qual1, 11-25 10:5x: under App/System/Library/Extensions Safari's GPU process lost WebGPU): the one
+# App-cryptex directory both sandboxes map code from: Chrome common.sb (subpath Preboot/Cryptexes/App/System), WebKit GPUProcess.sb
+# (subpath Preboot/Cryptexes/App/System/Library/Frameworks).
+GPU_APP_DIR = 'Frameworks'
 GPU_ADDON_NAME = re.compile(r'[A-Za-z0-9_-]+')
 
 
@@ -684,7 +688,7 @@ def seed_gpu_addon(mount, mode, name, trust, built):
     place = os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle')
     source = mount / GPU_BUNDLES.lstrip('/') / f'{name}.bundle'
     link = mount / GPU_ADDONS.lstrip('/') / f'{name}.bundle'
-    target = mount / GPU_APP_LIBRARY.lstrip('/') / 'Extensions' / f'{name}.bundle' if place == 'app' else link
+    target = mount / GPU_APP_LIBRARY.lstrip('/') / GPU_APP_DIR / f'{name}.bundle' if place == 'app' else link
     if not (source / 'Contents/Info.plist').is_file():
         raise SystemExit(f'PIANO_GPU_ADDON: the seed has no {GPU_BUNDLES}/{name}.bundle (Contents/Info.plist)')
     reinstalled = [f['dest'] for f, _ in built if f['dest'].startswith(f'{GPU_BUNDLES}/{name}.bundle/')]
@@ -723,11 +727,11 @@ def seed_gpu_addon(mount, mode, name, trust, built):
     record = {'mode': mode, 'name': name, 'dest': f'{GPU_ADDONS}/{name}.bundle', 'boot_arg': 'sheng-gpu-addon=1',
               'gpu_bundles_copy_kept': mode == 'copy', 'files': files, 'place': place}
     if place == 'app':
-        view = f'{GPU_APP_POINT}/Extensions/{name}.bundle'
+        view = f'{GPU_APP_POINT}/{GPU_APP_DIR}/{name}.bundle'
         os.symlink(view, link)
         if os.readlink(link) != view:
             raise SystemExit(f'PIANO_GPU_ADDON_PLACE=app: {link} is not a symlink to {view}')
-        record.update({'real': f'{GPU_APP_LIBRARY}/Extensions/{name}.bundle', 'link': f'{GPU_ADDONS}/{name}.bundle -> {view}',
+        record.update({'real': f'{GPU_APP_LIBRARY}/{GPU_APP_DIR}/{name}.bundle', 'link': f'{GPU_ADDONS}/{name}.bundle -> {view}',
                        'kernel': '0074 (app-library view)'})
     if mode == 'move':
         shutil.rmtree(source)
