@@ -136,13 +136,19 @@ static void b1Record(const char *line){
 static bool pianoVtBorrow(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)&&v==1;}return b==1;}
 // Every IOSurfaceRoot client of the task (a sandboxed process may hold several: CoreVideo's, Metal's), retained, in registry order; the
 // diagnostic line lists how many clients each pid has.
+// pid > 0: that task's clients ("pid N,"); pid == 0: every client whose creator names a WebKit process ("com.apple.WebKit"), other pids
+// included. IOSurface.kext find_surface (27.3) admits a lookup when the surface's owner task (+0x170) is the looking task, or the client
+// already knows the surface, or the surface is global. WebKit re-assigns its decode-pool surfaces to the WebContent task
+// (IOSurfaceSetOwnershipIdentity, s_set_ownership) and the pool reuses them, so the GPU task's own client is refused.
 static unsigned ownerSurfaceClients(IOUserClient *mine,int pid,IOUserClient **out,unsigned max){
   IOService *root=surfaceRoot();if(!root)return 0;
   char want[24];snprintf(want,sizeof want,"pid %d,",pid);const size_t n=strlen(want);
   unsigned count=0,total=0;OSIterator *it=root->getClientIterator();
   if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;++total;
       OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
-      const bool match=cs&&!strncmp(cs->getCStringNoCopy(),want,n);OSSafeReleaseNULL(c);
+      const bool match=cs&&(pid>0?!strncmp(cs->getCStringNoCopy(),want,n):strstr(cs->getCStringNoCopy(),", com.apple.WebKit")!=nullptr);
+      if(match&&pid==0){char line[160];snprintf(line,sizeof line,"candidate %s",cs->getCStringNoCopy());IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);}
+      OSSafeReleaseNULL(c);
       if(match&&count<max){u->retain();out[count++]=u;}}
     it->release();}
   {char line[160];snprintf(line,sizeof line,"IOSurfaceRoot has %u other clients, %u of pid %d",total,count,pid);
@@ -164,7 +170,10 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   uint32_t resultBytes=bytes;
   IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
   if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&!s->surfacesBorrowed){
-    IOUserClient *owners[8]={};const unsigned n=ownerSurfaceClients(s->surfaces,s->client->pid,owners,8);
+    IOUserClient *owners[8]={};unsigned n=ownerSurfaceClients(s->surfaces,s->client->pid,owners,8);
+    {const unsigned room=8-n;IOUserClient *more[8]={};const unsigned m=ownerSurfaceClients(s->surfaces,0,more,8);
+     for(unsigned j=0;j<m;++j){bool dup=false;for(unsigned k=0;k<n;++k)if(owners[k]==more[j])dup=true;
+       if(!dup&&n<8&&j<room+8){owners[n++]=more[j];}else more[j]->release();}}
     {char line[160];snprintf(line,sizeof line,"lookup id %u refused through our client; %u owner-task client(s) (pid %d)",id,n,s->client->pid);
      IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);}
     if(n){closeSurface(s);
