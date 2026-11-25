@@ -44,6 +44,7 @@ using namespace pianodpu;
 bool dpuSlicesWanted();
 void dpuSlicesStart(IOService *dpu);
 bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p3, IOReturn *result);
+void dpuSnapshotStart(uint32_t level, uint32_t ahbVote);   // DpuSnapshot.cpp: machdep.piano_dpu_snapshot with piano-dpu-snapshot=1
 
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
@@ -595,6 +596,7 @@ bool PianoDpu::start(IOService *provider)
   }
   thread_deallocate(t);
   dpuSlicesStart(this);
+  dpuSnapshotStart(gArgs.level, gArgs.ahbVote);
   return true;
 }
 
