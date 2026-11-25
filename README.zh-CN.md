@@ -91,13 +91,15 @@ USB-C 调试控制台（`package/PianoDwc3`、`tooling/native/usb-console.py`）
 
 | 路径 | 内容 |
 | --- | --- |
-| `patches/k27/` | k27 内核补丁 0053-0074（没有 0072），基于 k27 源码树（xnu-12377 + 基线补丁 0001-0052） |
+| `patches/k27-tree/` | 我们在 k27 源码树固定上游版本（macOS-DroidVM）之上的改动：构建脚本、KC 构建器、内核补丁 0050-0054 |
+| `patches/k27/` | k27 内核补丁 0053-0074，基于 k27 源码树（xnu-12377 + 基线补丁 0001-0052） |
 | `patches/k273/` | 27.3 线在 `patches/k27` 之上的内核补丁 |
 | `patches/k27-kc/` | KC 构建器的原生布局（最佳适配、`__TEXT` 中无重定位常量），需手动应用到 k27 树（[docs/kc-space.md](docs/kc-space.md)） |
 | `patches/xnu/` | UniXNU macOS 27.3 线的设备补丁（目前为空） |
 | `package/` | 原生 kext；没有对应启动参数时都不生效 |
 | `configs/` | 原生 kext 列表（`k27-native-kexts.txt`）、ADT 标识与显示节点（`k27-adt.toml`、`k27-gop-display.toml`）、27.3 线的内核配置 |
 | `dts/piano.dts` | 用于 ADT 的 piano 硬件描述 |
+| `.github/`、`scripts/` | CI（检查、每月依赖检查、构建、手动发布：[docs/ci.md](docs/ci.md)）与 `fetch-pins.py` |
 | `tooling/` | `k273/build-k273-image.sh`（27.3 kext → 内核集合 → ADT → RAM 镜像，`K273_KERNEL`）、`k273/build-k273-esp.py`（已安装系统的 27.3 ESP）、`kc/`（KC 构建）、`adt/`、`bootimg/`（RAM 镜像及其校验）、`native/`（测试循环、USB 控制台、输入）、`persist/`（安装到磁盘）、`firmware/`（FD） |
 | `firmware/` | 对 piano-uefi 的 `pianoPkg`、Mu-Silicium 和 UniXNU 的改动 |
 | `docs/` | 移植笔记、驱动说明（`drivers/`）、计划和证据 |
@@ -125,6 +127,10 @@ USB-C 调试控制台（`package/PianoDwc3`、`tooling/native/usb-console.py`）
 
 - 本仓库，加上 `unixnu.lock` / `feeds.toml` 中固定版本的依赖（UniXNU 核心、Mu-Silicium、piano-uefi、DarwinBoot、SoC 模块），
   以及 k27 内核源码树（`PIANO_K27_TREE`，写在环境变量或 `~/.config/piano/env` 中；版本固定在 `unixnu.lock`）。
+- **拉取固定版本：** `python3 scripts/fetch-pins.py` 按提交把 `unixnu.lock` 里的每个依赖拉到 `$UNIXNU_RESEARCH`
+  （`--verify` 只做校验；由 SorasakiHinaHusband 贡献）。k27 内核源码树是固定版本的上游
+  [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) 加上我们的 [patches/k27-tree](patches/k27-tree/README.md)：
+  `tooling/k27/fetch-k27-tree.sh DEST`，然后设 `PIANO_K27_TREE=DEST`。
 - 本项目从不分发 Apple 的文件。`tooling/repro/fetch-ipsw.py` 从 Apple 的 CDN 下载固定版本 27.3 IPSW 的组成文件，从 Apple 获取 AEA 密钥，
   并按 `tooling/repro/pins.json` 校验每个文件。
 - 有些输入目前仍只存在于原始环境（k27 内核源码树、基础信任包、Data 种子、Turnip 源码树、写入工具中的单机固定值）：
@@ -154,6 +160,12 @@ python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 - 只构建 27.3 线；已退役的 27.0.1 路线（`tooling/k27/build-native-image.sh`）不再使用。根卷位置：新设备先把根卷放在 `linux_data`
   （`K273_ROOT_PART=linux_data`，指南 §3.2）；参考设备的已安装 ESP 使用 `build-k273-esp.py --root-part linux_rootfs`
   （[docs/persistent-boot.md](docs/persistent-boot.md) §13.8）。
+
+### CI 与发布
+
+FD、k27 原生内核和我们的 kext 也可以在 GitHub 托管的 runner 上构建（[docs/ci.md](docs/ci.md)）：拉取请求会运行依赖拉取、
+自测和隐私扫描；发布版本（在平板验证通过后手动打标签）只包含我们自己的二进制、构建配方、SHA-256 清单和安装 skill。
+根卷镜像和内核集合始终在用户本地生成。
 
 ### RAM 镜像的大小上限
 
@@ -203,3 +215,5 @@ fastboot，而 247,767,040 字节的镜像可以启动（[docs/k273-line.md](doc
 Copyright (c) 2026 Leo Zhang（第三方部分保留其原有版权人和许可）。
 本仓库从不包含厂商固件、分区镜像和 Apple 载荷（内核集合、信任缓存、由 IPSW 派生的文件），也不包含机密信息、密钥、单机校准数据、
 本地网络或存储细节以及机器名。
+
+`scripts/fetch-pins.py` 最初由 SorasakiHinaHusband 编写（拉取请求 #2）。
