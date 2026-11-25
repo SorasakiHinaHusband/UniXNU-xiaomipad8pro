@@ -195,9 +195,12 @@ static unsigned ownerSurfaceClients(IOUserClient *mine,int pid,IOUserClient **ou
 static IOUserClient *ownerTaskClient(int gpuPid,uint32_t id,int *ownerPid){
   IOService *root=surfaceRoot();if(!root)return nullptr;constexpr uint32_t bytes=0xc68;uint8_t *buf=static_cast<uint8_t *>(IOMallocZero(bytes));
   IOUserClient *found=nullptr;unsigned tried=0;
-  for(int pid=gpuPid-400;buf&&!found&&pid<=gpuPid+400;++pid){
-    if(pid<=1||pid==gpuPid)continue;char name[32]={};proc_name(pid,name,sizeof name);
-    if(strncmp(name,"com.apple.WebKit",16))continue;
+  // borrow=2 (diagnostic): every process, pid 0..99999 (qualvtg8: no WebKit task owns it); borrow=1: WebKit tasks near the GPU pid
+  const bool all=pianoVtBorrowMode()==2;
+  for(int pid=all?0:gpuPid-400;buf&&!found&&pid<=(all?99999:gpuPid+400);++pid){
+    if((!all&&pid<=1)||pid==gpuPid)continue;char name[32]={};proc_name(pid,name,sizeof name);
+    if(!all&&strncmp(name,"com.apple.WebKit",16))continue;
+    if(all&&!name[0])continue;
     proc_t pr=proc_find(pid);if(!pr)continue;task_t t=proc_task(pr);
     IOUserClient *c=nullptr;const IOReturn orc=t?root->newUserClient(t,t,0,nullptr,&c):kIOReturnNotFound;++tried;
     IOReturn lrc=kIOReturnNotFound;
@@ -205,7 +208,7 @@ static IOUserClient *ownerTaskClient(int gpuPid,uint32_t id,int *ownerPid){
       if(!lrc){clientMethod(c,56,id,nullptr,nullptr);clientMethod(c,1,id,nullptr,nullptr);found=c;*ownerPid=pid;}
       else{c->clientClose();c->release();}}
     proc_rele(pr);
-    char line[160];snprintf(line,sizeof line,"owner-task try pid %d %s: open %08x lookup %08x",pid,name,orc,lrc);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
+    if(!all||!lrc){char line[160];snprintf(line,sizeof line,"owner-task try pid %d %s: open %08x lookup %08x",pid,name,orc,lrc);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);}
   }
   char line[160];snprintf(line,sizeof line,"owner-task scan id %u: %u WebKit tasks tried, %s",id,tried,found?"FOUND":"none");IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
   if(buf)IOFree(buf,bytes);OSSafeReleaseNULL(root);return found;
