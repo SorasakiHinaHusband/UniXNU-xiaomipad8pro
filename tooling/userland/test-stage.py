@@ -850,7 +850,7 @@ def addon_tests(tmp):
               {f['path']: f['cdhash'] for f in rec['files']}.get('Contents/MacOS/T') == want_cd, 'app place: the record')
     code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/badplace',
                            env={'PIANO_GPU_ADDON': 'copy', 'PIANO_GPU_ADDON_NAME': 'T', 'PIANO_GPU_ADDON_PLACE': 'x'})
-    check(code != 0 and 'sle or app' in text, 'PIANO_GPU_ADDON_PLACE=x: refused')
+    check(code != 0 and 'sle, app, app2 or view3' in text, 'PIANO_GPU_ADDON_PLACE=x: refused')
     code, text = stage_run('--manifest', manifest, '--seed', seed_a, '--trust', trust_a, '--out', tmp / 'out/move2', '--gpu-bundle',
                            bundle, env={'PIANO_GPU_ADDON': 'move', 'PIANO_GPU_ADDON_NAME': 'T'})
     check(code != 0 and 'would put /Library/GPUBundles/T.bundle back' in text, 'move with a staged --gpu-bundle of that name: refused')
