@@ -1000,8 +1000,11 @@ def live_tests(tmp):
         machos = {f['dest']: f['cdhash'] for f in real['files'] if f['cdhash']}
         check(set(machos) == {'/usr/local/libexec/pianousb-shell', '/usr/local/libexec/piano-rotated', '/usr/local/bin/piano-torch',
                               '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab',
-                              '/usr/local/libexec/piano-wifi-supplicant'},
-              'six Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
+                              '/usr/local/libexec/piano-wifi-supplicant', '/usr/local/bin/piano-camera-default',
+                              '/usr/local/bin/piano-camera-runtime', '/usr/local/bin/piano-charge-config',
+                              '/usr/local/bin/piano-coreimage-compat', '/usr/local/libexec/piano-brightness-sync',
+                              '/usr/local/libexec/piano-login-readiness', '/usr/local/libexec/piano-wifi-controls'},
+              'thirteen Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
         jobs = {}
         for f in real['files']:
             if f['kind'] in ('daemon', 'agent'):
@@ -1026,11 +1029,14 @@ def live_tests(tmp):
                 'system/com.unixnu.piano-still-wallpaper', 'system/com.unixnu.piano-wifi-join', 'system/com.unixnu.piano-camera-grab',
                 'system/com.unixnu.piano-wifi-supplicant', 'system/com.unixnu.piano-airportd-kick', 'system/com.unixnu.piano-usbnet-address',
                 f'gui/{rig.uid}/com.unixnu.piano-rotated', f'gui/{rig.uid}/com.unixnu.piano-login-front',
-                f'gui/{rig.uid}/com.unixnu.piano-passd-policy', f'gui/{rig.uid}/com.unixnu.piano-slim-session'}
+                f'gui/{rig.uid}/com.unixnu.piano-passd-policy', f'gui/{rig.uid}/com.unixnu.piano-slim-session',
+                f'gui/{rig.uid}/com.unixnu.piano-camera-default', f'gui/{rig.uid}/com.unixnu.piano-coreimage-restore',
+                'system/com.unixnu.piano-brightness-sync', 'system/com.unixnu.piano-charge-config', 'system/com.unixnu.piano-keyboard-type',
+                'system/com.unixnu.piano-lw-quiet', 'system/com.unixnu.piano-wifi-controls'}
         check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file() and
               rig.root('/usr/local/share/piano/wallpaper/still.png').read_bytes()[:8] == b'\x89PNG\r\n\x1a\n',
-              f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): nine daemons (the '
-              'airportd-kick of 88f4171e counted) and the four agents loaded (the slim session poster counted), piano-torch in /usr/local/bin, '
+              f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): fourteen daemons (the '
+              'airportd-kick of 88f4171e counted) and the six agents loaded (the slim session poster counted; the retired coreimage-compat off), piano-torch in /usr/local/bin, '
               'the still picture in /usr/local/share/piano/wallpaper')
         code, out = rig.run('--check')
         check(code == 0, 'and --check passes on it')
