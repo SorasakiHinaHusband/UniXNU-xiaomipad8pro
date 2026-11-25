@@ -876,6 +876,8 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);
     if(status!=kIOReturnSuccess) {failure_={"import-cpu-abi",status};return status;}
     const uint64_t limit=UINT64_C(1)<<bits;
+    // Pinning a CPU view does not pin its slab. The owning BO's CPU lease controls that lifetime.
+    const bool tierActive=__atomic_load_n(&gpuTier.active,__ATOMIC_ACQUIRE)!=0;
     imported_=importRange(address,bytes,kIODirectionInOut,task);
     native_adreno_import_stage=14;
     failure_={"import-descriptor-create",kIOReturnNoMemory};
@@ -905,8 +907,6 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {status=kIOReturnNoMemory;goto failed;}
     failure_.stage="import-physical-spans";
-    // Pinning a CPU view does not pin its slab. The owning BO's CPU lease controls that lifetime.
-    const bool tierActive=__atomic_load_n(&gpuTier.active,__ATOMIC_ACQUIRE)!=0;
     for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=imported_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
