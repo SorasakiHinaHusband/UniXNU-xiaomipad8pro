@@ -52,7 +52,7 @@ if bad:
     raise SystemExit('test-uva47: the patch changes the kernel/native attribute: %r' % bad)
 need = ['#define ARM_PARAMETERIZED_PMAP', 'pmap_pt_attr_4k_u47', 'MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL',
         '(-1ULL >> (T0SZ_HW))', 'piano-uva47: user VA 47 bits (T0SZ 17, L0 root)', 'piano-uva47: user VA 39 bits (piano-uva47=0)',
-        'piano_uva_virtual_address_size(T0SZ_HW)']
+        'int return_value = 64 - T0SZ_HW;']
 for n in need:
     if not any(n in l for l in added):
         raise SystemExit('test-uva47: the patch adds no line with %r' % n)
