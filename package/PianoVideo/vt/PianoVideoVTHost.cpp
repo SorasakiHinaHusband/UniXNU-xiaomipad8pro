@@ -200,7 +200,7 @@ static IOUserClient *ownerTaskClient(int gpuPid,uint32_t id,int *ownerPid){
   for(int pid=all?0:gpuPid-400;buf&&!found&&pid<=(all?99999:gpuPid+400);++pid){
     if((!all&&pid<=1)||pid==gpuPid)continue;char name[32]={};proc_name(pid,name,sizeof name);
     if(!all&&strncmp(name,"com.apple.WebKit",16))continue;
-    if(all&&!name[0])continue;
+    if(all&&(!name[0]||pid==0))continue;
     proc_t pr=proc_find(pid);if(!pr)continue;task_t t=proc_task(pr);
     IOUserClient *c=nullptr;const IOReturn orc=t?root->newUserClient(t,t,0,nullptr,&c):kIOReturnNotFound;++tried;
     IOReturn lrc=kIOReturnNotFound;
