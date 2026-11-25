@@ -23,7 +23,7 @@ mkdir -p "$O/host-tests"
 # The writing slices B1c/B1d/B1e (DpuRefresh.h, DpuPcc.h, DpuPanel.h on the timed register model tests/dpu_model.h).
 # B1 milestone 1 (store-free): the 144/120/90/60 Hz timing planner (DpuModes.h) against installed y12k's survey words, and the
 # run-time snapshot (DpuSnapshot.h, machdep.piano_dpu_snapshot with piano-dpu-snapshot=1) on the register model.
-for t in refresh pcc panel modes snapshot clean; do
+for t in refresh pcc panel modes mode_switch snapshot clean; do
   "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/dpu_${t}_host.cpp" -o "$O/host-tests/dpu_${t}_host"
   "$O/host-tests/dpu_${t}_host" || { echo "Error: PianoDpu $t host tests failed" >&2; exit 1; }
 done

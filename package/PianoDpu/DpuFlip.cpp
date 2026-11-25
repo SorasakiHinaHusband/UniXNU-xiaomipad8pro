@@ -629,7 +629,7 @@ IOReturn scanoutRead(PianoDpuScanoutRequest *request)
   return stable ? kIOReturnSuccess : kIOReturnBusy;
 }
 
-// The flip and PCC workers share CTL_FLUSH. Hold this lock from staging through the latch.
+// The flip and slice workers share CTL_FLUSH. Hold this lock from staging through the latch.
 IOLock *flipTransactionLock()
 {
   IOLock *lock = __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
@@ -639,6 +639,18 @@ IOLock *flipTransactionLock()
   if (__atomic_compare_exchange_n(&gLock, &lock, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return fresh;
   IOLockFree(fresh);
   return lock;
+}
+
+void flipInvalidateCleanEpochs()
+{
+  gFlipper.invalidateCleanEpochs();
+}
+
+uint32_t flipPendingUnderruns(bool clear)
+{
+  const uint32_t bits = clear ? __atomic_fetch_and(&gHw.sticky, ~flip::kUnderrunBits, __ATOMIC_ACQ_REL)
+                              : __atomic_load_n(&gHw.sticky, __ATOMIC_ACQUIRE);
+  return bits & flip::kUnderrunBits;
 }
 
 void flipPanelBegin()
@@ -713,7 +725,7 @@ int cleanSkipSysctl(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
   IOLockLock(lock);
   gFlipper.cfg.forceFullClean = !value;
   // Restart epoch qualification even for a slot that is idle during the control.
-  for (auto &epoch : gFlipper.cleanEpochs) epoch = {};
+  flipInvalidateCleanEpochs();
   IOLockUnlock(lock);
   return 0;
 }

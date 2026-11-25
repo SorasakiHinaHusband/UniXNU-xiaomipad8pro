@@ -159,7 +159,9 @@ the live stream reset the SoC on Linux); the bank itself is reprogrammed in plac
    LM split at x 1600 and off the right edge, 1 s each, over the boot framebuffer, then hidden; pass: visible at each place, the
    hole shows the panel through it, fsr 0, no underrun.
 
-**4.3 Refresh switching (B1c).** 120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
+**4.3 Refresh switching (B1c).** The [M3 mode driver and RAM-boot checklist](dpu-m3.md) cover four selectable rates with
+programmable fetch enabled. The original B1c 120 ↔ 60 Hz experiment below requires programmable fetch off.
+120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
 touch impact (SunUEFI ran 30/48/50/60/120 seamlessly). At a frame boundary, on both links: DSI DB_MODE = 1, TOTAL.V_TOTAL = 4620 − 1
 (2310 − 1 back), TIMING_FLUSH = 1; INTF1/INTF2 VSYNC_PERIOD_F0 = 4620·htotal; CTL_INTF_FLUSH (INTF1|INTF2) + CTL_FLUSH b31; DB_MODE =
 0 after the latch. Programmable fetch stays off (the 120 Hz family has 106 lines of VSYNC+VBP, more than the 24-line worst case, so
@@ -172,8 +174,8 @@ counting INTF1's frames (the halves in lockstep), no underrun (cleared first). A
 slice off for the boot. Refused before any store: not the 120 Hz family, a DSI TOTAL that disagrees with its INTF, programmable fetch
 on, a gate closed. Policy (`auto`): 60 Hz once no *burst* of swaps (2 within 250 ms) came for 1 s, 120 Hz at the next burst, 200 ms
 dwell: a blinking cursor (2 swaps/s) is no burst and stays at 60. NativeGopDisplay reports every frame it shows (`PianoDpuSwap`);
-WindowServer keeps seeing one timing (frames simply take two periods while idle) or, later, a 60/120 pair. 90/144 change HFP and the panel's rate group (B2/B3 over the DSI command path while video runs):
-a full modeset in both Linux ports, and more power, so not planned. Risks: a missed DSI/INTF pairing shows a grey or torn screen
+WindowServer keeps seeing one timing in the B1c experiment (frames simply take two periods while idle). 90/144 change HFP and the
+panel's rate group (B2/B3 over the DSI command path while video runs). Risks: a missed DSI/INTF pairing shows a grey or torn screen
 (Ubuntu's full-modeset 60 Hz was grey until the stock order was used); the TDDI touch follows display timing (watch touch at 60 Hz);
 the DSI shadow offsets are confirmed by B1a's raw `timing words`.
 
@@ -269,11 +271,12 @@ request and wakes the slices' thread):
 | Function | Caller | Parameters |
 |---|---|---|
 | `PianoDpuSwap` | NativeGopDisplay's `program_hardware_gated`, each frame shown (`piano-dpu-refresh=auto`) | none |
+| `PianoDpuMode` | NativeGopDisplay's startup and timing selection, synchronously (`piano-dpu-modes=1`) | p1 = target rate in Hz |
 | `PianoDpuColorMatrix` | NativeGopDisplay's `swap_set_color_matrix`, each new matrix of a function (`piano-dpu-pcc`) | p1 = the 72 bytes, p2 = the function, p3 = the third argument |
 | `PianoDpuGammaTable` | NativeGopDisplay's `set_gamma_table`, each new table (`piano-dpu-pcc`) | p1 = the words, p2 = 771 with `piano-dpu-pcc=2`, else 0 (logged only) |
 | `PianoDpuPanel` | NativeGopDisplay's copy worker, synchronously, outside the display gate (`piano-dpu-panel=1`) | p1 = on |
 
-Properties: `piano-dpu-refresh-hz` (60/120), `piano-dpu-panel` (`awake`/`asleep`/`fault`), `piano-dpu-pcc` (the diagonal in thousandths).
+Properties: `piano-dpu-refresh-hz` (60/90/120/144 with M3), `piano-dpu-panel` (`awake`/`asleep`/`fault`), `piano-dpu-pcc` (the diagonal in thousandths).
 All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build time).
 
 ## 6. Boot args
@@ -297,6 +300,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-measure=MS` | 1000 | the frame-counter interval (20..10000) |
 | `piano-dpu-delay=S`, `piano-dpu-repeat=S`, `piano-dpu-samples=N` | 0, 0, 3 | wait first; re-measure every S s, N times (after WindowServer starts, across display sleep) |
 | `piano-dpu-refresh=plan\|60\|120\|auto` | off | B1c (needs `piano-dpu` >= 1): plan = the verdict and the twelve stores logged, nothing written; 60/120 = switch once at the start; auto = the idle policy (NativeGopDisplay reports swaps with the same argument) |
+| `piano-dpu-modes=1` | 0 | M3 selectable 60/90/120/144 Hz on the internal display. Leave `piano-dpu-refresh` unset and select a DSI shadow layout with `piano-dpu-refresh-db=1` or `=2`. [M3 qualification](dpu-m3.md) |
 | `piano-dpu-refresh-db=0\|1\|2` | 1 | the DSI timing shadow: 1 SunUEFI's place (DB + 0x1ec, flush + 0x1e8), 2 downstream's (+ 0x1e8, + 0x1e4), 0 TOTAL written directly |
 | `piano-dpu-refresh-test=N` | 0 | first N round trips 120 → 60 → 120, a second at each rate; stops at an anomaly |
 | `piano-dpu-refresh-idle=MS`, `-burst=N`, `-window=MS`, `-dwell=MS` | 1000, 2, 250, 200 | the policy |

@@ -121,7 +121,7 @@ static void testSleepWake()
   constexpr uint32_t config = 0x80800000u;
   for (unsigned i = 1; i <= 2; ++i) {
     m.regs[intfReg(i, kIntfConfig)] = config;
-    m.regs[intfReg(i, kIntfProgFetch)] = (2290 + i) * model::kHtotal;
+    m.intf[i].fetch = m.regs[intfReg(i, kIntfProgFetch)] = (2290 + i) * model::kHtotal;
   }
   m.sleepMs(3);
   const LivePath p = readPath(m);

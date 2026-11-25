@@ -286,6 +286,11 @@ class Flipper {
   uint64_t backingBytes[smmu::kSlots] = {};
   uint64_t *pages = nullptr;   // kSlotPages entries, the caller's (64 KiB: not in the kext's __DATA, which the KC has little room for)
 
+  void invalidateCleanEpochs()
+  {
+    for (auto &epoch : cleanEpochs) epoch = {};
+  }
+
   // --------------------------------------------------------------------------------------------- the interrupt enables
   void writeEn(uint32_t v)
   {

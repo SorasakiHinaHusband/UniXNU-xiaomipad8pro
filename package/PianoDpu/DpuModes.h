@@ -216,7 +216,7 @@ constexpr unsigned kWordHsyncCtl = 1u << 0, kWordPeriod = 1u << 1, kWordVsyncWid
                    kWordProgFetch = 1u << 9;
 
 // ------------------------------------------------------------------------------------------------- the panel's rate group
-// Only a switch between the 120 Hz group (120, 60) and 144 or 90 changes the panel's rate-group registers. The Ubuntu driver writes
+// A switch between any two groups (120/60, 144, 90) changes the panel's rate-group registers. The Ubuntu driver writes
 // them in its init after selecting command page 0x10 (FF 10, FB 01 just before; panel-novatek-nt36532.c piano_init_sequence); the
 // stock driver sends the same values as its timing-switch command set in high speed while video runs (oem-refresh.md:
 // DSI_CMD_SET_TIMING_VIDEO_SWITCH, timing-switch-video-command-state dsi_hs_mode). Module order (Ubuntu c82da418, stock): the BOE

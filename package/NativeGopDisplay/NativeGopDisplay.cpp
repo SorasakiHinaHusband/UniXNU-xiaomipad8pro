@@ -47,6 +47,7 @@
 #include <sys/kauth.h>
 #include <sys/sysctl.h>
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
+#include "../PianoDpu/DpuModes.h"
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
 #include "GopPanelPower.h"
@@ -316,14 +317,15 @@ public:
     IOReturn get_timing_attributes_gated(IOMFB::RefreshTimingAttributes *, bool) const override;
 
 private:
-    // The timing published (ADT refresh-hz, boot-arg native-gop-display-hz, 30 to 240; default 60). The panel itself keeps the mode
-    // ABL set (120 Hz); this is the rate WindowServer is told and the VBL timer runs at.
+    // The timing published (ADT refresh-hz, boot-arg native-gop-display-hz, 30 to 240; default 60), or the active M3 mode.
     uint32_t fRefreshHz;
     // native-gop-display-120=1 (default 0; GopRefresh.h, docs/drivers/native-gop-display.md "120 Hz"): the panel's own 120 Hz told
     // through every interface WindowServer reads: the timing element at fRefreshHz (120 unless native-gop-display-hz says otherwise),
     // get_timing_attributes_gated at one fRefreshHz period (the family's answers 1/60 s whatever the mode), IOMFBDisplayRefresh published
     // from it before the service registers, and the VBL tick on absolute deadlines. Off: the family's slot and the relative tick, as before.
     bool fRefreshContract = false;
+    bool fDpuModes = false;
+    IOReturn setPianoDpuMode(unsigned hz);
     mutable uint32_t fTimingAttributeCalls = 0;
     // The panel's physical size (ADT panel-width-mm / panel-height-mm, boot-arg native-gop-display-mm=WIDTHxHEIGHT; default piano's
     // 239x163 mm, about 340 dpi at 3200x2136). macOS offers its HiDPI ("looks like" half the pixels) modes by the density these give.
@@ -812,6 +814,9 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("native-gop-display-hz", &fRefreshHz, sizeof(fRefreshHz));
     if (fRefreshHz < 30 || fRefreshHz > 240)
         fRefreshHz = 60;
+    uint32_t modes = 0;
+    PE_parse_boot_argn("piano-dpu-modes", &modes, sizeof(modes));
+    fDpuModes = modes == 1 && !fExternal;
     uint32_t builtin = 0;
     PE_parse_boot_argn("native-gop-display-builtin", &builtin, sizeof(builtin));
     fBuiltin = builtin == 1 && !fExternal;   // D6's second display stays external
@@ -1153,8 +1158,11 @@ bool NativeGopDisplay::start_hardware()
 {
     if (!createDisplayAttributes())
         return false;
-    GOPLOG("display attributes published (one %lux%lu@%u timing, 8-bit SDR sRGB)\n", fVideo.v_width, fVideo.v_height,
-          fRefreshHz);
+    if (fDpuModes)
+        GOPLOG("M3: display attributes published (%u timings, %lux%lu@%u active, 8-bit SDR sRGB)\n",
+               pianodpu::modes::kModeCount, fVideo.v_width, fVideo.v_height, fRefreshHz);
+    else
+        GOPLOG("display attributes published (one %lux%lu@%u timing, 8-bit SDR sRGB)\n", fVideo.v_width, fVideo.v_height, fRefreshHz);
     fVBL = IOTimerEventSource::timerEventSource(this, vblFired);
     if (!fVBL || getWorkLoop()->addEventSource(fVBL) != kIOReturnSuccess) {   // the work loop of the family's command gate
         GOPLOG("Failed to create VBL timer\n");
@@ -1563,7 +1571,7 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
     return kIOReturnSuccess;
 }
 
-// The PianoDpu service for colour, panel and refresh, looked up at once (now) or at most once a second (the swap
+// The PianoDpu slice service, looked up at once (now) or at most once a second (the swap
 // path), retained once found.
 IOService *NativeGopDisplay::dpuService(bool now)
 {
@@ -3038,10 +3046,67 @@ static OSDictionary *point(uint32_t x, uint32_t y)
     return dictionary;
 }
 
-// AppleParavirtDisplay::createDisplayAttributes, with the display of the boot framebuffer: one timing (the GOP mode) with one
-// 8-bit SDR color element. Chromaticities are sRGB's (16.16 fixed point, as a panel's EDID would give them).
+// IOAVTiming describes the full uncompressed raster. DpuModes.h describes each compressed DSI link.
+static bool appendTiming(OSArray *timings, OSArray *colors, uint32_t id, uint32_t width, uint32_t height, unsigned hz,
+                         const pianodpu::Mode *mode)
+{
+    const uint32_t hsync = mode ? pianodpu::kHsync : 32, hbp = mode ? pianodpu::kHbp : 80, hfp = mode ? mode->hfp : 48;
+    const uint32_t vsync = mode ? pianodpu::kVsync : 6, vbp = mode ? pianodpu::kVbp : 14, vfp = mode ? mode->vfp : 3;
+    const uint32_t htotal = width + hsync + hbp + hfp, vtotal = height + vsync + vbp + vfp;
+    uint8_t data[80] = {};
+    at<uint32_t>(data, 4) = htotal;
+    at<uint32_t>(data, 8) = width;
+    at<uint32_t>(data, 12) = hsync;
+    at<uint32_t>(data, 16) = hbp;
+    at<uint32_t>(data, 20) = hfp;
+    at<uint32_t>(data, 28) = 1;
+    at<uint32_t>(data, 36) = vtotal;
+    at<uint32_t>(data, 40) = height;
+    at<uint32_t>(data, 44) = vsync;
+    at<uint32_t>(data, 48) = vbp;
+    at<uint32_t>(data, 52) = vfp;
+    at<uint32_t>(data, 56) = hz << 16;
+    at<uint32_t>(data, 68) = htotal * vtotal * hz;
+    OSObject *timing = ioavTimingWithData(data, 2, 4);
+    if (!timing)
+        return false;
+    at<uint64_t>(timing, kElementID) = id;
+    at<uint32_t>(timing, kElementScore) = id;
+    ioavTimingSetColorElements(timing, colors);
+    const bool ok = timings->setObject(timing);
+    timing->release();
+    return ok;
+}
+
+IOReturn NativeGopDisplay::setPianoDpuMode(unsigned hz)
+{
+    IOService *dpu = dpuService(true);
+    return dpu ? dpu->callPlatformFunction("PianoDpuMode", false, reinterpret_cast<void *>(uintptr_t(hz)), nullptr, nullptr, nullptr)
+               : kIOReturnNotReady;
+}
+
+// All timings share one 8-bit SDR sRGB color element.
 bool NativeGopDisplay::createDisplayAttributes()
 {
+    if (fDpuModes) {
+        IOReturn status = kIOReturnUnsupported;
+        if (fVideo.v_width == pianodpu::kPanelWidth && fVideo.v_height == pianodpu::kPanelHeight) {
+            // The survey and flip ladder run on separate threads. Establish 60 Hz before the family registers us.
+            for (unsigned attempt = 0; attempt < 80; ++attempt) {
+                status = setPianoDpuMode(60);
+                if (status != kIOReturnNotReady)
+                    break;
+                IOSleep(50);
+            }
+        }
+        fDpuModes = status == kIOReturnSuccess;
+        if (fDpuModes) {
+            fRefreshHz = 60;
+            fRefreshContract = true;
+        } else {
+            GOPLOG("M3 initial 60 Hz mode refused (%#x), publishing the boot profile's single timing\n", status);
+        }
+    }
     // native-gop-display-120: IOMFBDisplayRefresh first (start_hardware runs before the family registers us; WindowServer reads it once,
     // in AppleDisplay::update_display_limits), so a refusal can still fall back to the old 60 Hz contract before any timing is published.
     if (fRefreshContract) {
@@ -3055,6 +3120,7 @@ bool NativeGopDisplay::createDisplayAttributes()
         if (!published) {   // never a half-told rate: the old contract whole (60 Hz timing, the family's slot, the relative tick)
             fRefreshContract = false;
             fRefreshHz = 60;
+            fDpuModes = false;
             GOPLOG("refresh contract refused: back to 60 Hz\n");
         }
     }
@@ -3064,36 +3130,25 @@ bool NativeGopDisplay::createDisplayAttributes()
     OSDictionary *chromaticity = OSDictionary::withCapacity(3), *whitePoint = point(20493, 21561);
     OSDictionary *transport = OSDictionary::withCapacity(2), *sourceLimits = OSDictionary::withCapacity(5);
     OSDictionary *scalingLimits = OSDictionary::withCapacity(2), *numLayers = OSDictionary::withCapacity(1);
-    OSArray *colors = OSArray::withCapacity(1), *timings = OSArray::withCapacity(1), *timingColors = OSArray::withCapacity(1);
+    const unsigned count = fDpuModes ? pianodpu::modes::kModeCount : 1;
+    OSArray *colors = OSArray::withCapacity(1), *timings = OSArray::withCapacity(count), *timingColors = OSArray::withCapacity(1);
     OSObject *color = ioavColorWithCapabilities(2, 8, 0, 0, 0, 16, false, nullptr, nullptr, nullptr, nullptr);
-    // CVT reduced blanking as IOAVFamily's sCVTTimingData has it. Sync rates are 16.16 fixed point; the horizontal one is left 0.
-    uint8_t timingData[80] = {};
-    uint32_t hTotal = width + 160, vTotal = height + 23;
-    at<uint32_t>(timingData, 4) = hTotal;
-    at<uint32_t>(timingData, 8) = width;
-    at<uint32_t>(timingData, 12) = 32;                   // horizontal sync width, back porch, front porch
-    at<uint32_t>(timingData, 16) = 80;
-    at<uint32_t>(timingData, 20) = 48;
-    at<uint32_t>(timingData, 28) = 1;                    // horizontal sync polarity (positive)
-    at<uint32_t>(timingData, 36) = vTotal;
-    at<uint32_t>(timingData, 40) = height;
-    at<uint32_t>(timingData, 44) = 6;                    // vertical sync width, back porch, front porch
-    at<uint32_t>(timingData, 48) = 14;
-    at<uint32_t>(timingData, 52) = 3;
-    at<uint32_t>(timingData, 56) = fRefreshHz << 16;
-    at<uint32_t>(timingData, 68) = hTotal * vTotal * fRefreshHz;   // pixel clock in Hz
-    OSObject *timing = ioavTimingWithData(timingData, 2, 4);
     do {
         if (!attributes || !product || !chromaticity || !whitePoint || !transport || !sourceLimits || !scalingLimits || !numLayers || !colors ||
-            !timings || !timingColors || !color || !timing)
+            !timings || !timingColors || !color)
             break;
         at<uint64_t>(color, kElementID) = kColorID;
         at<uint32_t>(color, kElementScore) = kColorID;
-        at<uint64_t>(timing, kElementID) = kTimingID;
-        at<uint32_t>(timing, kElementScore) = kTimingID;
-        if (!colors->setObject(color) || !timingColors->setObject(color) || !timings->setObject(timing))
+        if (!colors->setObject(color) || !timingColors->setObject(color))
             break;
-        ioavTimingSetColorElements(timing, timingColors);
+        // Keep 60 Hz at the daily timing ID. The panel table is in descending order.
+        for (unsigned i = 0; i < count; ++i) {
+            const auto *mode = fDpuModes ? &pianodpu::kModes[count - 1 - i] : nullptr;
+            if (!appendTiming(timings, timingColors, kTimingID + i, width, height, mode ? mode->hz : fRefreshHz, mode))
+                break;
+        }
+        if (timings->getCount() != count)
+            break;
         // The serial number is the size: WindowServer keeps the chosen mode per display identity. LegacyManufacturerID is the EDID
         // vendor code of the three letters ("XMI": 24 << 10 | 13 << 5 | 9 = 0x61a9), what a panel's EDID gives IOMFB and what
         // CGDisplayVendorNumber returns (0 without it).
@@ -3152,7 +3207,6 @@ bool NativeGopDisplay::createDisplayAttributes()
     OSSafeReleaseNULL(timings);
     OSSafeReleaseNULL(timingColors);
     OSSafeReleaseNULL(color);
-    OSSafeReleaseNULL(timing);
     if (!done || set_digital_out_mode(kColorID, kTimingID) != kIOReturnSuccess) {
         GOPLOG("createDisplayAttributes failed (%s)\n", done ? "set_digital_out_mode" : "an element or a property");
         return false;
@@ -3181,8 +3235,37 @@ IOReturn NativeGopDisplay::get_timing_attributes_gated(IOMFB::RefreshTimingAttri
 // The mode of a color and a timing element (the IDs published above); AppleParavirtDisplay's block takes the timing's active size.
 IOReturn NativeGopDisplay::set_digital_out_mode(unsigned int colorID, unsigned int timingID)
 {
-    if (colorID != kColorID || timingID != kTimingID)
+    const unsigned index = timingID - kTimingID;
+    if (colorID != kColorID || index >= (fDpuModes ? pianodpu::modes::kModeCount : 1))
         return kIOReturnBadArgument;
+    if (fDpuModes) {
+        const unsigned hz = pianodpu::kModes[pianodpu::modes::kModeCount - 1 - index].hz;
+        if (hz != fRefreshHz) {
+            const IOReturn status = setPianoDpuMode(hz);
+            if (status != kIOReturnSuccess)
+                return status;
+            const unsigned previous = fRefreshHz;
+            fRefreshHz = hz;   // slot 423 supplies the new refresh property
+            if (!iomfbSetDisplayRefreshProperties(this) || !setProperty("DPTimingModeId", timingID, 32)) {
+                const IOReturn restored = setPianoDpuMode(previous);
+                if (restored == kIOReturnSuccess) {
+                    fRefreshHz = previous;
+                    iomfbSetDisplayRefreshProperties(this);
+                } else {
+                    GOPLOG("M3: refresh property failed, restoring %u Hz returned %#x\n", previous, restored);
+                }
+                return kIOReturnIOError;
+            }
+            if (fVBL && fVBLDue) {
+                uint64_t period;
+                nanoseconds_to_absolutetime(goprefresh::periodNs(hz), &period);
+                fVBLDue = goprefresh::nextDeadline(0, mach_absolute_time(), period);
+                fVBL->wakeAtTime(fVBLDue);
+            }
+            GOPLOG("M3: timing %u, refresh property and VBL at %u Hz\n", timingID, hz);
+            return kIOReturnSuccess;   // PianoDpu already replayed Night Shift inside the mode transaction.
+        }
+    }
     at<uint32_t>(this, kDisplayWidth) = static_cast<uint32_t>(fVideo.v_width);
     at<uint32_t>(this, kDisplayHeight) = static_cast<uint32_t>(fVideo.v_height);
     setProperty("DisplayWidth", fVideo.v_width, 32);

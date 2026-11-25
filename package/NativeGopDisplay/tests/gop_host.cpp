@@ -1905,6 +1905,12 @@ static void testRefreshContract()
     // QuartzCore's heartbeat from displayMinRefreshInterval: value * 2^-32 seconds
     CHECK(std::fabs(double(w[kMinFixed]) / 4294967296.0 - 1.0 / 120) < 1e-9);
     CHECK(fixedAttributes(60, toAbs, w) && w[kMinFixed] == 0x04444444ull);
+    for (const unsigned hz : {90u, 144u}) {
+        CHECK(fixedAttributes(hz, toAbs, w));
+        CHECK(std::fabs(double(w[kMinFixed]) / 4294967296.0 - 1.0 / hz) < 1e-9);
+        CHECK(w[kMaxFixed] == w[kMinFixed] && w[kMaxAbs] == w[kMinAbs] && !w[kStepFixed] && !w[kStepAbs]);
+        CHECK(nextDeadline(0, 1000, w[kMinAbs]) == 1000 + toAbs(periodNs(hz)));
+    }
     CHECK(!fixedAttributes(29, toAbs, w) && !fixedAttributes(241, toAbs, w) && !fixedAttributes(0, toAbs, w));
     // the VBL tick: P = 200000 ticks (120 Hz at 24 MHz)
     const uint64_t P = 200000;

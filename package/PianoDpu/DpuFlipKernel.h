@@ -23,8 +23,10 @@ bool flipFunction(const OSSymbol *name, void *request, void *handoff, IOReturn *
 bool flipStatsSnapshot(flip::Stats &stats);
 IOReturn scanoutRead(PianoDpuScanoutRequest *request);
 
-// Serializes the PCC's CTL flush and latch with flips.
+// Serializes timing and PCC transactions with flips.
 IOLock *flipTransactionLock();
+void flipInvalidateCleanEpochs();   // caller holds flipTransactionLock()
+uint32_t flipPendingUnderruns(bool clear);   // underruns acknowledged by the interrupt handler
 
 // The panel worker calls these as a pair after the flip ladder has finished.
 void flipPanelBegin();
