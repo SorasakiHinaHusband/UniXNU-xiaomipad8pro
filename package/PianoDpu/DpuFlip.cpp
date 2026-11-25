@@ -535,8 +535,9 @@ IOReturn scanoutRead(PianoDpuScanoutRequest *request)
   const int shown = gFlipper.slots.shown;
   Cookie *cookie = nullptr;
   uint64_t offset = 0;
-  if (target.surface && state == flip::State::ready && shown >= 0) {
+  if (target.surface && state == flip::State::ready && shown >= 0)
     cookie = static_cast<Cookie *>(gFlipper.slots.slot[shown].cookie);
+  if (cookie) {
     offset = target.base - smmu::slotIova(unsigned(shown));
     __atomic_add_fetch(&cookie->references, 1, __ATOMIC_RELAXED);
   }

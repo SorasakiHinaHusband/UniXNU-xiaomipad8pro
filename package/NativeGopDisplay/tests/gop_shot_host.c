@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
+// cc -std=c11 -Wall -Wextra -Werror gop_shot_host.c -o /tmp/gop_shot_host && /tmp/gop_shot_host
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "../../../../package/NativeGopDisplay/GopShot.h"
-#include "../Pixels.h"
+#include "../GopShot.h"
+#include "../../../tooling/native/gop-shot/Pixels.h"
 
 static void check_pixel(uint32_t word, int packed10, const uint8_t expected[4])
 {

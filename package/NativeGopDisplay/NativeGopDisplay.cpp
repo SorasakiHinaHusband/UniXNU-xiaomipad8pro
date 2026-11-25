@@ -375,7 +375,7 @@ private:
     uint64_t fVideoPhys;
     IOMemoryMap *fScanoutMap;
     uint8_t *fScanout;
-    bool fShotEnabled;
+    bool fShotEnabled, fShotRegistered;
     uint64_t fShotEpoch;   // odd during a copy-thread presentation, even when idle
     struct sysctl_oid fShotOid;
     void registerShot();
@@ -1042,6 +1042,8 @@ bool NativeGopDisplay::start(IOService *provider)
     }
     unsigned shot = 0;
     fShotEnabled = !fExternal && PE_parse_boot_argn("native-gop-display-shot", &shot, sizeof shot) && shot == 1;
+    fShotRegistered = false;
+    fShotEpoch = 0;
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {
@@ -1080,8 +1082,10 @@ bool NativeGopDisplay::start(IOService *provider)
 void NativeGopDisplay::stop(IOService *provider)
 {
     GOPLOG("stop\n");
-    if (fShotEnabled)
+    if (fShotRegistered) {
         sysctl_unregister_oid(&fShotOid);   // drains active handlers before the boot mapping is released
+        fShotRegistered = false;
+    }
     if (fCopyThreadsSysctl) {
         unregisterNativeGopCopyThreadsSysctl();
         fCopyThreadsSysctl = false;
@@ -2277,7 +2281,7 @@ int NativeGopDisplay::shotRead(void *context, const OSObject *surface, IOMemoryM
         if (display->fVideo.v_width != GOP_SHOT_WIDTH || display->fVideo.v_height != GOP_SHOT_HEIGHT ||
             display->fVideo.v_rowBytes > UINT16_MAX)
             return ENXIO;
-        map = display->fScanoutMap;   // the registered OID holds the instance and mapping live
+        map = display->fScanoutMap;   // stop() drains the OID before releasing this mapping
         stride = static_cast<uint32_t>(display->fVideo.v_rowBytes);
     }
     const uint64_t address = map ? map->getVirtualAddress() : 0;
@@ -2344,6 +2348,7 @@ void NativeGopDisplay::registerShot()
     fShotOid.oid_descr = "Root-only native panel scanout debugging";
     fShotOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&fShotOid);
+    fShotRegistered = true;
 }
 
 // The rows [y0, y1) and columns [x0, x1) of a source (its own coordinates, clipped to it) that a composition reads.
