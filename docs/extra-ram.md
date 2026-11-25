@@ -1,14 +1,16 @@
-# RAM16G R3: driver pools in the region0 bank
+# RAM16G extra RAM for GPU and video
 
 The tablet has 16 GiB of DRAM. ABL hands the HLOS 15.34 GiB, and XNU manages one contiguous window of 13310 MiB at 0x8c0004000.
 About 1522 MiB of HLOS memory sits in region0, the 2 GiB bank at 0x80000000, split into 11 pieces between about 50 carve-outs.
 arm64 XNU cannot add that memory to its VM: it manages one range (one `physBase`/`memSize`, and `pa_valid` is one compare). Drivers
 can still use it as private DMA pools. R3 is that option. R1 is the sibling option: the region1 runs below the window for the GPU.
-The two share one ADT interface, and this page owns its region0 half.
+DarwinBoot publishes both banks in the same ADT property.
 
 ## The interface
 
-DarwinBoot publishes `/chosen/piano-extra-ram`, an array of 24-byte little-endian records:
+The opt-in `--extra-ram` stages a 384-byte placeholder at `/chosen/piano-extra-ram`. DarwinBoot fills it with up to
+16 little-endian records of 24 bytes each. An unused slot is all zeros. An older FD leaves the entire property zeroed and
+both consumers see zero usable runs. Without the property, DarwinBoot keeps its ordinary memory allocation path.
 
 | field | type | meaning |
 |---|---|---|
@@ -17,17 +19,23 @@ DarwinBoot publishes `/chosen/piano-extra-ram`, an array of 24-byte little-endia
 | bank | u32 | 1 = region1 (R1), 0 = region0 (R3) |
 | use | u32 | 0 = any driver pool, 1 = GPU, 2 = DSP, 3 = video, 4 = camera, 5 = display |
 
+DarwinBoot clips region1 conventional memory to the three HLOS spans in
+[the running DT](hyp-evidence/memory-map-running-dt.txt) and to the selected window base. It reserves whole 2 MiB slabs by
+address and publishes each successful run with bank 1 and use 1. It collects up to eight GPU runs.
+
 DarwinBoot takes the region0 runs from `firmware/patches/darwinboot/region0-allow.json`. That file also has the never-use list and
 DarwinBoot's rule. A run is published only in two cases:
-- Every UEFI descriptor overlapping it is conventional memory. DarwinBoot then reserves it with `AllocatePages(AllocateAddress)`
+- UEFI conventional memory descriptors cover the whole run. DarwinBoot then reserves it with `AllocatePages(AllocateAddress)`
   and publishes it only if that succeeds.
 - An EfiReserved descriptor covers it wholly. This is PIL_Reserved, where UEFI never allocates.
 
-Any other descriptor type means the run is not published. Each decision is printed.
+A descriptor of any other type, a gap or partial reserved coverage causes refusal. The console records each overlapping
+descriptor's physical span and type, and each publication, refusal or stage skip.
 
-`piano-extra-ram-stage` (default 1) caps the stage. The kexts never trust the ADT alone. `package/include/PianoExtraRam.h` keeps its
-own allow and never tables, which `tests/region0_allow_check.py` holds equal to the JSON. It refuses any run that is outside them,
-touches a never span, overlaps XNU's window or an earlier run, or fails its self-test.
+Region0 publication is capped at stage 1. `piano-extra-ram-stage=0` disables region0 publication. The stage-2 `cma-block`
+is skipped even if the boot requests a higher stage. `package/include/PianoExtraRam.h` checks the bank, allowed span, use tag,
+never-use spans, overlap with XNU's window and overlap with earlier records. `region0_allow_check.py` checks the JSON, firmware
+table and consumer table for agreement, and compares both copies of the region1 bounds.
 
 ## Region0, run by run
 
@@ -51,11 +59,9 @@ Sources:
 The allow-list holds 600 MiB in 300 slabs: stage 1 has 344 MiB, stage 2 has 256 MiB. The never list also covers everything the brief
 names: qdss, splash, Display_Demura, Piano_Log, cvp, cdsp and video. The host tests check each of these addresses.
 
-Why the modem run is first:
-- Android, Ubuntu and UEFI all agree that nothing else owns it. Android and Ubuntu use it as plain RAM. UEFI marks it EfiReserved.
+The modem run is first because it holds the AVC arena whole. Android treats it as System RAM, Ubuntu disables the modem and UEFI keeps the run reserved.
 - No firmware is loaded there, because the tablet has no modem.
 - DarwinBoot has nothing to allocate for it.
-- It holds the AVC arena whole.
 
 Inferred, not yet seen on the tablet: nothing touches the modem run between ABL and XNU. The RAM boot's self-test and the first
 decoded frame settle this.
@@ -101,12 +107,16 @@ Because the pattern depends on the address, an alias inside the run fails. A fai
 out. A device-side hook, `device(pa, bytes)`, is called per run. Video has no hook of its own: the first decoded AVC frame landing in a
 region0 arena, matching the fixture's golden SHA-256, is its device-side proof.
 
-Switches, all off by default:
-- `piano-extra-ram=1` is the master switch.
-- `piano-video-extra-ram=1` turns on video's use.
+The GPU passes the same ADT bytes and XNU window bounds to the shared validator. Its tier takes only bank-1/use-1 records.
+It keeps its existing S8 GPU endpoint self-test, BO allocator, and `machdep.piano_gpu_tier` counters.
+
+Switches:
+- `piano-gpu-tier=1` enables eligible paged BOs of at least 2 MiB. Mode 2 also tries smaller BOs. Default is 0.
+- `piano-extra-ram=1` enables shared kernel pools, including PianoVideo. Default is 0.
+- `piano-video-extra-ram=1` turns on video's use. Default is 0.
 - `piano-extra-ram-any=<use>` names the one use served the use-0 runs.
 - `piano-extra-ram-stage=N` caps the stage served (default 1).
-- `piano-extra-ram-test=0` skips the self-test. A skipped test means nothing is handed out.
+- `piano-extra-ram-test=0` skips the shared pool self-test and keeps that pool closed.
 
 Tests:
 - `package/include/tests/extra_ram_host.cpp` and `region0_allow_check.py` run in `package/include/tests/run.sh`.
@@ -115,54 +125,57 @@ Tests:
 
 ## Fix-image gate
 
-Path: ABL `/memory` (region0 HLOS pieces) -> UEFI map (pianoPkg MemoryMapLib: PIL_Reserved EfiReserved; RamManagerDxe: the gaps become
-conventional) -> DarwinBoot (R1's change: per-run publication by the region0-allow.json rule, map print) -> `/chosen/piano-extra-ram` ->
-PianoVideo start at level 6 -> `pianoxram::KernelPool::start` (boot args, ADT, PianoExtraRam.h allow/never/window checks, use-3
-ownership, per-run CPU self-test through IODeviceMemory WC) -> `dmaAlloc` session arena: `takeExtra` takes 128 slabs ->
-`kIOMemoryTypePhysical64` descriptor -> WC kernel view, zeroed -> 65536 arena page PAs -> `rememberPage` -> `buildArena` (VideoHw.h
-`arenaPagePa`) -> the video bank's L3 leaves -> Iris DMA -> RAW loans (`IOSubMemoryDescriptor` of `arenaDesc`) -> the VT frontend's
-IOSurface copy from `frame->cpu` (the WC view).
+Path: ABL `/memory` and carve-outs → pianoPkg `MemoryMapLib` and RamManagerDxe UEFI descriptors → DarwinBoot allocates
+the XNU window and qualifies region1 GPU runs plus the region0 stage-1 allow-list → fixed-size `/chosen/piano-extra-ram`
+array → `PianoExtraRam.h` validation.
+- GPU → PianoA830 S8 `CP_MEM_WRITE`, fence and physical readback at both run endpoints → S9 Metal publication →
+  macOS 27.3 WindowServer/Metal via NativeAdrenoMetal and the AGX IOKit ABI → `BoAlloc`, qualified slabs, WC Physical64
+  view and CB0 SMMU leaves → fence retirement and `BoFree`. The Linux msm GEM and sheng Adreno740 paths establish the
+  scatter/gather mapping and descriptor model. See [GPU reference path](drivers/ram-extra.md#reference-path).
+- Video → PianoVideo level 6 `KernelPool::start`, CPU self-test via WC maps, AVC arena takes 128 slabs →
+  `kIOMemoryTypePhysical64` WC descriptor → `rememberPage` and `buildArena` Iris SMMU leaves → decoded NV12 →
+  RAW loans from `arenaDesc` → the macOS 27.3 VideoToolbox frontend's IOSurface copy. Linux SM8750 Iris uses the same
+  video context and firmware carve-out. See [Video hardware description](drivers/video.md#2-hardware-facts).
 
 Checks:
-- ours-OK, verified in source or by host tests:
-  - The modem and PIL-tail runs are HLOS RAM in ABL, Android and mainline, EfiReserved in UEFI, and outside every carve-out.
-  - The allow and never tables equal the JSON.
-  - Ownership by use tag; slab hand-out and give-back.
-  - Self-test detection of an alias, a bit error and a failed map; refusal on a failed device check.
-  - `buildArena` accepts region0 pages and refuses pages next to the run.
-  - The kext builds and its imports check passes, without a static constructor (constinit).
-  - Loans use `arenaDesc`.
-  - XNU fallback on every shortfall.
-- ours-missing:
-  - DarwinBoot's publication and map print (R1's job, shared interface).
-  - A device hook for the camera and DSP users (not integrated yet).
-  - HEVC mixed backing.
-- unknown, the RAM boot answers:
-  - The modem run is untouched at XNU entry (the self-test).
-  - Iris DMA reaches region0 through Gunyah's SMMU stage 2 (the AVC golden frame; the Iris firmware carve-out at 0x9c300000 is in
-    region0 too, which suggests stage 2 covers the bank).
-  - The cost of WC zeroing (start time).
-  - `IODeviceMemory` WC maps of non-managed memory are accepted for 2 MiB at a time (the cdsp slice pattern: verified for 16 MiB).
+- **ours-OK** — XNU window selection is independent of the extra runs. The host tests cover map qualification, refusal
+  and wire encoding, exact ADT placeholder length, zero padding, the allow/never/window/use checks and exclusive ownership.
+- **ours-OK** — GPU tests cover both endpoint probes, failed runs, paged BO fallback, CPU and SMMU mapping constraints and
+  tier counters. Video tests cover self-test failures, slab accounting, AVC L3 leaves for region0 and mixed backing,
+  guard pages and XNU fallback. Both kext builds have zero unresolved imports.
+- **ours-missing** — Stage-2 publication, DSP and camera consumers, and mixed HEVC backing.
+- **unknown** — The live UEFI map and reservation results, Gunyah stage-2 access from each device, WC map and zeroing
+  behavior on both banks, actual slab use and release, and the effect on memory pressure and frame cadence.
 
-Root cause: arm64 XNU manages one contiguous physical range, so the 1522 MiB of HLOS memory in region0 is never XNU RAM. The video
-driver's boot-lifetime 256 MiB AVC arena takes window RAM, even though it needs neither XNU's VM nor contiguity, and its bank
-translates any PA.
+Root cause: XNU manages one contiguous physical window, so the region1 runs below it and region0's eligible fragments
+require explicit driver ownership. R1 carried a 136-byte version/count and GPU pair table. R3 consumed tagged 24-byte
+records from the same property. The R1 length is not a multiple of 24, and its header carries neither bank nor use.
 
-ONE change: PianoVideo backs its level-6 AVC arena with 128 slabs of the region0 modem run when `piano-extra-ram=1` and
-`piano-video-extra-ram=1` are set (default 0), with the self-tested shared pool. It falls back to the XNU allocation on any shortfall.
+ONE change: Standardize one DarwinBoot-to-driver ADT handoff with bank and use tags. Publish only qualified ranges,
+route bank-1/use-1 records into the existing GPU tier and bank-0/use-3 into the existing AVC arena pool, and retain
+both drivers' fallback allocation paths.
 
 ## RAM-boot read list
 
-This needs one RAM image carrying R1's DarwinBoot publication and this branch, with boot args `piano-video=6 piano-video-vt=1
-piano-extra-ram=1 piano-video-extra-ram=1`. The first rows are read-only reads on the running boot.
+Use one 27.3 RAM image with DarwinBoot patches 0001 and 0002, both kexts, their firmware, `PIANO_EXTRA_RAM=1` and the
+volatile Data profile with its boot guard. Start from the desktop paged GPU profile with
+`piano-gpu=2 piano-gpu-mem=paged piano-gpu-user-vm=1 piano-video=6 piano-video-vt=1`. The enabled boot adds
+`piano-gpu-tier=1 piano-extra-ram=1 piano-video-extra-ram=1`. Use the same payload and adjust one argument per control boot.
+
+| control | expected readout |
+|---|---|
+| `piano-gpu-tier=0` | GPU tier mode 0, no endpoint probes or tier allocations. Video can still use the modem slabs. |
+| `piano-extra-ram=0` | Video reports master 0 and parses the ADT with no self-test or slabs taken. The GPU still follows `piano-gpu-tier`. |
+| `piano-video-extra-ram=0` | Video reports driver 0 and uses XNU for the AVC arena. The GPU can still use bank 1. |
+
+Record the console from boot through the workload. Verify `kern.bootargs`, the source build's full argument record if
+the kernel read is clipped, successful login and nonempty captures from this boot before interpreting any counts.
 
 | question | read | pass |
 |---|---|---|
-| DarwinBoot published the modem run | console: DarwinBoot's per-run map print and decision | modem run published, descriptor type EfiReserved; cma-block not published at stage 1 |
-| the ADT holds it | `ioreg -p IODeviceTree -n chosen -l \| grep piano-extra-ram` | 24-byte records incl. `0x89e00000 + 0x11200000, bank 0, use 3` |
-| the kext's verdict | `sudo sysctl machdep.piano_extra_ram_video` | `run.. base=0x89e00000 ... state=ours span=modem slabs=137 ... self-test=pass pages=70144 bad=0`, `used=128 free=9` |
-| the arena came from it | console: `PianoVideo: RAM16G arena from extra RAM: 128 slabs, first 0x89e00000, ..., result 1` and `V9h boot reservation ready` | both present; no `RAM16G arena from XNU` |
-| Iris DMA reaches region0 | the AVC qualification: decoded NV12 SHA-256 = the fixture golden `bd230ec4...` | match (this is the device-side check) |
-| window RAM freed | `vm_stat` / `sysctl vm.page_free_count` vs the same image with `piano-video-extra-ram=0` (A/B by boot arg) | about 256 MiB more free or less wired |
-| nothing else broke | the RAM qualification smoke (boot, ssh, login, Wi-Fi lease, audio, charging), panic log empty | as in the smoke |
-| harness known-positive | `sysctl machdep.piano_extra_ram_video` on a boot with `piano-extra-ram=0` | `piano-extra-ram=0 ... adt=ok`, runs listed, no self-test, `used=0` |
+| Firmware ownership | `DARWINBOOT: window` and `DARWINBOOT: extra-ram` lines, plus `NativeRamBlock: RAM window` | Same XNU window across boots. For each published GPU run, record its successful reservation. Record modem, pil-tail and cma-block decisions. Expect modem and pil-tail to be wholly covered by PIL_Reserved (type 0), and a stage skip for cma-block. |
+| ADT handoff | `ioreg -p IODeviceTree -r -n chosen -d 1 -l -w0 \| grep piano-extra-ram` | Decode the 384-byte value in 24-byte little-endian slots. Match the console reservations to bank 1/use 1, modem `0x89e00000 + 0x11200000` to bank 0/use 3 and pil-tail `0x9ee00000 + 0x04600000` to bank 0/use 2. Unused slots zero. |
+| GPU admission and allocations | Console `PianoA830: gpu tier:` and `adreno830_start:`; `sysctl machdep.piano_gpu_tier machdep.piano_gpu_paged machdep.piano_gpu_pt machdep.piano_gpu_state machdep.piano_gpu_recovery` at desktop idle, under a fixed textured 3D workload, after close and at +10 min | Both endpoints qualify each accepted run and at least one run passes. Match `pass-mask` to console. `allocs` and `used-mib` rise, `free-mib` falls, and workload slabs return on close. Record refusals, faults and recovery counters. |
+| AVC admission and DMA | `sudo sysctl machdep.piano_extra_ram_video`; console `RAM16G arena from extra RAM` and `V9h boot reservation ready`; run the [level-6 VT AVC qualification](drivers/video.md#14-v5a-bounded-native-avc-vt-bridge-tablet-qualification-pending) | Modem is `state=ours`, `self-test=pass pages=70144 bad=0`, `used=128 free=9`. The arena line says `128 slabs` and first PA `0x89e00000`. Active NV12 matches `bd230ec4a9cd22c274831d1b526c43d3ceb39a089257c3cb4114fbea0a8102dc`. |
+| Memory and presentation | `sysctl hw.memsize hw.pagesize vm.swapusage`, `vm_stat`, `memory_pressure`; timed presentation intervals and C920 capture during the same GPU workload | Record free and wired memory on the video control (approximately 256 MiB effect) and the GPU control. Compare p50/p95/p99 intervals and frames over 16.67 ms at the same refresh rate. Retain SMMU fault logs and inspect the capture for pixel errors. |
+| Composite smoke | Boot, login, Wi-Fi lease, audio, charging and panic log | The smoke passes with both consumers enabled and on each control. |
