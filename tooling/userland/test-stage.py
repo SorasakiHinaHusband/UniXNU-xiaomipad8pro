@@ -621,6 +621,30 @@ def keyboard_tests(tmp):
 
 # ---- 4-7: trust cache, cdhash, seed, live ------------------------------------------------------------------------------------
 
+def btm_tests(tmp):
+    print('3a. BTM-stable launcher (docs/userland.md section 3a)')
+    dests = {'/usr/local/libexec/tool', '/usr/local/libexec/tool.sh'}
+    job = {'Label': 'x', 'ProgramArguments': ['/usr/local/libexec/tool', '--run', 'a b']}
+    check(stage.btm_stable(job, dests) and job['ProgramArguments'] == stage.BTM_LAUNCHER + ['/usr/local/libexec/tool', '--run', 'a b'],
+          'a job running our program: /bin/sh -c exec, then the program and its arguments unchanged')
+    job = {'Label': 'x', 'Program': '/usr/local/libexec/tool', 'ProgramArguments': ['tool', '-v']}
+    check(stage.btm_stable(job, dests) and 'Program' not in job and job['ProgramArguments'][3:] == ['/usr/local/libexec/tool', '-v'],
+          'Program + ProgramArguments: Program goes, the program is the exec target')
+    for argv in (['/bin/sh', '/usr/local/libexec/tool.sh'], ['/usr/bin/notifyutil', '-p', 'n'], stage.BTM_LAUNCHER + ['/usr/local/libexec/tool']):
+        job = {'Label': 'x', 'ProgramArguments': list(argv)}
+        check(not stage.btm_stable(job, dests) and job['ProgramArguments'] == argv, f'left as it is: {argv[0]} {argv[1][:20]}')
+    # The launcher really is transparent: the same pid (exec), argv[0] the program's path, arguments with spaces, the exit status.
+    prog = write(tmp / 'prog', '#!/bin/sh\necho "pid=$$ argv0=$0 n=$# a1=$1 a2=$2"\nexit 7\n', 0o755)
+    for shell in SHELLS:
+        r = sh([shell, '-c', 'echo "outer=$$"; exec "$0" "$@"', str(prog), '--run', 'a b'], capture_output=True, text=True)
+        lines = r.stdout.split()
+        outer = r.stdout.split()[0].split('=')[1] if r.stdout else '?'
+        check(r.returncode == 7 and f'pid={outer}' in lines and f'argv0={prog}' in lines and 'n=2' in lines and 'a1=--run' in lines
+              and r.stdout.rstrip().endswith('a2=a b'), f'{shell} -c exec: same pid, argv, exit 7 ({r.stdout.strip()!r})')
+    r = sh(['/bin/sh', '-c', stage.BTM_LAUNCHER[2], str(tmp / 'missing')], capture_output=True, text=True)
+    check(r.returncode in (126, 127), f'a missing program: the job exits {r.returncode} (launchd sees a failed exit, as before)')
+
+
 def trust_cache(hash_lists):
     """A trust cache bundle of version 2 modules, one per list of 20-byte hashes."""
     modules = [struct.pack('<I16sI', 2, bytes([i + 1]) * 16, len(hs)) + b''.join(h + bytes([2, 0, 0, 0]) for h in sorted(hs))
@@ -978,6 +1002,16 @@ def live_tests(tmp):
                               '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab',
                               '/usr/local/libexec/piano-wifi-supplicant'},
               'six Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
+        jobs = {}
+        for f in real['files']:
+            if f['kind'] in ('daemon', 'agent'):
+                jobs[f['dest']] = plistlib.loads((tmp / 'real/live/staging/files' / f['unit'] / Path(f['dest']).name).read_bytes())
+        ours = {f['dest'] for f in real['files']}
+        bad = [d for d, j in jobs.items() if (j.get('Program') or j['ProgramArguments'][0]) in ours]
+        wrapped = [d for d, j in jobs.items() if j['ProgramArguments'][:3] == stage.BTM_LAUNCHER]
+        check(jobs and not bad and len(wrapped) >= 10 and all(jobs[d]['ProgramArguments'][3] in ours for d in wrapped),
+              f'every staged job\'s executable is a system program, never a file of the layer ({len(wrapped)} of {len(jobs)} through '
+              f'the BTM-stable launcher; bad: {bad})')
         archs = {d: sh(['lipo', '-archs', str(tmp / 'real/live/staging/files' / f['unit'] / Path(d).name)], timeout=60,
                        capture_output=True, text=True).stdout.strip() for d in machos for f in real['files'] if f['dest'] == d}
         check(set(archs.values()) == {'arm64'}, 'each one thin arm64')
@@ -1034,6 +1068,7 @@ def main():
         installer_tests(tmp / 'i')
         pmset_tests(tmp / 'p')
         keyboard_tests(tmp / 'k')
+        btm_tests(tmp / 'b')
         if quick:
             print('(--quick: parts 4-7 skipped)')
         elif k27_tree(required=False) is None:

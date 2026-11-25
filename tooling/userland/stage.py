@@ -396,8 +396,9 @@ def add_bluetooth_runtime(plan):
                          'scripts/piano-bluetooth-start': '/usr/local/libexec/piano-bluetooth-start',
                          'launchd/com.unixnu.piano-bluetooth-path1.plist':
                          '/Library/LaunchDaemons/com.unixnu.piano-bluetooth-path1.plist'})
+    # pinned: its job file is staged byte for byte as the runtime's report records it (no BTM_LAUNCHER rewrite)
     unit = {'name': 'piano-bluetooth-path1', 'about': 'opt-in piano-bt=5 POSIX controller runtime',
-            'on': True, 'default_on': True, 'planned': False, 'files': []}
+            'on': True, 'default_on': True, 'planned': False, 'pinned': True, 'files': []}
     problems = []
     existing = {f['dest'] for u in plan['units'] for f in u['files']}
     for name, dest in destinations.items():
@@ -444,6 +445,33 @@ def check_jobs(plan, built):
         f['label'] = label or '-'
     if problems:
         raise SystemExit('launchd jobs:\n  ' + '\n  '.join(problems))
+
+
+# BTM_LAUNCHER: the first words of a job whose program is one of the manifest's own files (docs/userland.md section 3a).
+BTM_LAUNCHER = ['/bin/sh', '-c', 'exec "$0" "$@"']
+
+
+def plan_unit_pinned(plan, f):
+    """True for a file of a pinned unit (the Bluetooth runtime: staged exactly as its build report records)."""
+    return any(u.get('pinned') for u in plan['units'] if u['name'] == f['unit'])
+
+
+def btm_stable(job, dests):
+    """A job whose program the manifest installs is started through BTM_LAUNCHER instead (in place, True when changed).
+
+    Background Task Management (backgroundtaskmanagementd, macOS 13+) keeps one record per legacy launchd job with the plist's
+    sha256 and modification date and the executable's path and modification date (Program, or ProgramArguments[0]). When either
+    file changes, it logs "registerLaunchItem: plist or executable is modified", replaces the record "not notified" and shows
+    "Background Items Added" again. Our programs are rebuilt and replaced by every layer update, so every update re-announced
+    every changed job. With /bin/sh (on the sealed system volume) as the executable, only a change of the job file itself
+    announces the job again. `exec "$0" "$@"` replaces the shell with the program: the same pid, argv and exit status as before."""
+    argv = list(job.get('ProgramArguments') or [])
+    program = job.get('Program') or (argv[0] if argv else None)
+    if not isinstance(program, str) or program not in dests:
+        return False
+    job.pop('Program', None)
+    job['ProgramArguments'] = BTM_LAUNCHER + [program] + argv[1:]
+    return True
 
 
 # ---- building ----------------------------------------------------------------------------------------------------------------
@@ -530,12 +558,17 @@ def build_all(plan, build_dir):
             f['cdhash'] = cdhash if f['trust'] else None
             built.append((f, data))
     check_jobs(plan, built)
+    dests = {f['dest'] for u in plan['units'] if not u['planned'] for f in u['files']}
     out = []
     for f, data in built:
-        if f['kind'] != 'file' and not f['on']:
+        if f['kind'] != 'file':
             job = plistlib.loads(data)
-            job['Disabled'] = True   # off in this profile: launchd loads it only once the owner says launchctl enable
-            data = plistlib.dumps(job, fmt=plistlib.FMT_XML)
+            changed = not plan_unit_pinned(plan, f) and btm_stable(job, dests)
+            if not f['on']:
+                job['Disabled'] = True   # off in this profile: launchd loads it only once the owner says launchctl enable
+                changed = True
+            if changed:
+                data = plistlib.dumps(job, fmt=plistlib.FMT_XML)
         f['sha256'] = sha(data)
         out.append((f, data))
     return out
