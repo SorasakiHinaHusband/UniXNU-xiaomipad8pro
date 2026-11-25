@@ -9,8 +9,9 @@ DarwinBoot publishes both banks in the same ADT property.
 ## The interface
 
 The opt-in `--extra-ram` stages a 384-byte placeholder at `/chosen/piano-extra-ram`. DarwinBoot fills it with up to
-16 little-endian records of 24 bytes each. An unused slot is all zeros. An older FD leaves the entire property zeroed and
-both consumers see zero usable runs. Without the property, DarwinBoot keeps its ordinary memory allocation path.
+16 little-endian records of 24 bytes each. An unused slot is all zeros. An FD without extra-RAM support leaves the entire
+property zeroed and both consumers see zero usable runs. The earlier R1-only firmware validates the legacy 136-byte size,
+so use the combined 0002 patch with the new placeholder. Without the property, DarwinBoot keeps its ordinary memory allocation path.
 
 | field | type | meaning |
 |---|---|---|
@@ -59,12 +60,9 @@ Sources:
 The allow-list holds 600 MiB in 300 slabs: stage 1 has 344 MiB, stage 2 has 256 MiB. The never list also covers everything the brief
 names: qdss, splash, Display_Demura, Piano_Log, cvp, cdsp and video. The host tests check each of these addresses.
 
-The modem run is first because it holds the AVC arena whole. Android treats it as System RAM, Ubuntu disables the modem and UEFI keeps the run reserved.
-- No firmware is loaded there, because the tablet has no modem.
-- DarwinBoot has nothing to allocate for it.
-
-Inferred, not yet seen on the tablet: nothing touches the modem run between ABL and XNU. The RAM boot's self-test and the first
-decoded frame settle this.
+The modem run holds the AVC arena whole. Android treats it as System RAM, Ubuntu disables the modem, and UEFI keeps the run reserved.
+DarwinBoot can hand it off directly when the live map confirms that reservation. The RAM boot still needs to show that the CPU self-test
+and the Iris golden-frame decode both pass with this backing.
 
 ## Which drivers, and in which order
 
