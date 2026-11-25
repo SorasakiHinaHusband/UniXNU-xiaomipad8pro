@@ -11,7 +11,7 @@ R=${UNIXNU_RESEARCH:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research}
 SRC=${DARWINBOOT:-$R/DarwinBoot}
 PIN=$(python3 -c "import tomllib;print(tomllib.load(open('$D/unixnu.lock','rb'))['pin']['DarwinBoot']['commit'])")
 git -C "$SRC" cat-file -e "$PIN^{commit}" 2>/dev/null || { echo "SKIP: no DarwinBoot checkout with $PIN (DARWINBOOT=...)"; exit 0; }
-W=$(mktemp -d /tmp/darwinboot-r1.XXXXXX); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d "${TMPDIR:-/tmp}/darwinboot-r1.XXXXXX"); trap 'rm -rf "$W"' EXIT
 git -C "$SRC" archive "$PIN" | tar -x -C "$W"
 for p in "$D"/firmware/patches/darwinboot/0*.patch; do (cd "$W" && patch -s -p1 < "$p") || { echo "FAIL: $p does not apply"; exit 1; }; done
 cd "$W"

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """RAM16G R1: add the /chosen piano-extra-ram placeholder (136 zero bytes) to a flattened ADT. DarwinBoot with
 firmware/patches/darwinboot/0002 finds it, reserves DRAM region1's runs below XNU's window and fills it (u32 version 1, u32 count,
-8 x (u64 base, u64 size)); PianoA830 reads it when piano-gpu-tier=1. Without the placeholder DarwinBoot reserves nothing.
+8 x (u64 base, u64 size)); PianoA830 reads it with piano-gpu-tier=1 or 2. Without the placeholder DarwinBoot reserves nothing.
 
     adt_extra_ram.py IN OUT      (also make-piano-adt.py --extra-ram)
 """
@@ -42,15 +42,24 @@ def find_chosen(t):
     raise ValueError('no /chosen node')
 
 
-def has_extra_ram(t):
-    off, props_end = find_chosen(t)
+def extra_ram_property(t):
+    """Return the raw /chosen property, or None if it is absent."""
+    off, _ = find_chosen(t)
     nprops = struct.unpack_from('<I', t, off)[0]
+    value = None
     o = off + 8
     for _ in range(nprops):
+        length = struct.unpack_from('<I', t, o + 32)[0] & 0x7fffffff
         if t[o:o + 32].split(b'\0', 1)[0].decode() == NAME:
-            return True
-        o += 36 + (((struct.unpack_from('<I', t, o + 32)[0] & 0x7fffffff) + 3) & ~3)
-    return False
+            if value is not None:
+                raise ValueError(f'/chosen has duplicate {NAME} properties')
+            value = bytes(t[o + 36:o + 36 + length])
+        o += 36 + ((length + 3) & ~3)
+    return value
+
+
+def has_extra_ram(t):
+    return extra_ram_property(t) is not None
 
 
 def add_extra_ram(tree):
@@ -63,6 +72,16 @@ def add_extra_ram(tree):
     struct.pack_into('<I', t, off, struct.unpack_from('<I', t, off)[0] + 1)
     assert _node_end(t, 0)[0] == len(t)
     return bytes(t)
+
+
+def ensure_extra_ram_placeholder(tree):
+    """For image staging, accept a placeholder that make-piano-adt.py already added."""
+    value = extra_ram_property(tree)
+    if value is None:
+        return add_extra_ram(tree)
+    if value != bytes(BYTES):
+        raise ValueError(f'/chosen {NAME} must be a {BYTES}-byte zeroed placeholder')
+    return tree
 
 
 if __name__ == '__main__':

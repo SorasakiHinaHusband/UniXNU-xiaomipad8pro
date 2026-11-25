@@ -40,4 +40,12 @@ try:
     x.add_extra_ram(node([prop('name', b'device-tree\0')], [cpus])); raise SystemExit('FAIL: no /chosen accepted')
 except ValueError:
     pass
+assert x.ensure_extra_ram_placeholder(tree) == out
+assert x.ensure_extra_ram_placeholder(out) == out
+bad = bytearray(out)
+bad[i + 36] = 1
+try:
+    x.ensure_extra_ram_placeholder(bad); raise SystemExit('FAIL: nonzero placeholder accepted')
+except ValueError:
+    pass
 print('PASS: /chosen piano-extra-ram placeholder added (136 zero bytes), tree well formed, other nodes unchanged, second add and no /chosen refused')

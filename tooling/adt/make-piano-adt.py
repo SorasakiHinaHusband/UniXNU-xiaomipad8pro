@@ -86,7 +86,7 @@ def main():
     # or ESP booted by an FD whose DarwinBoot lacks firmware/patches/darwinboot/0001 (it refuses more than 8 GiB).
     p.add_argument('--ram-window', type=lambda v: int(v, 0), help='bytes, 2 MiB steps, 256 MiB to 13 GiB')
     p.add_argument('--extra-ram', action='store_true', help='the /chosen piano-extra-ram placeholder (RAM16G R1: an FD with '
-                   'firmware/patches/darwinboot/0002 reserves and publishes region1; PianoA830 uses it with piano-gpu-tier=1)')
+                   'firmware/patches/darwinboot/0002 reserves and publishes region1; PianoA830 uses it with piano-gpu-tier=1 or 2)')
     p.add_argument('--bt-address-file', type=Path, help='the unit Bluetooth address (default: private/bluetooth-address if present)')
     p.add_argument('--no-bt-address', action='store_true', help='no /arm-io/piano-bt node')
     # The OS line's identity table (default configs/k27-adt.toml, or PIANO_ADT_IDENTITY): configs/k273-adt.toml is the 27.3 line's
