@@ -815,6 +815,86 @@ static void testRcgTable()
   CHECK(!planRcg(12345, 0, 0, 0, 0).ok);
 }
 
+// bt-radio1: RadioRssi buckets the RSSI of advertising and inquiry reports (layouts of the 11-22 trace, addresses zeroed).
+static std::vector<uint8_t> extAdv(const std::vector<std::pair<int, uint8_t>> &reports)
+{
+  std::vector<uint8_t> e = {0x3e, 0, 0x0d, uint8_t(reports.size())};
+  for (const auto &[rssi, dataLen] : reports) {
+    const uint8_t fixed[24] = {0x10, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0xff, 0x7f, uint8_t(int8_t(rssi)), 0, 0, 0, 0, 0, 0,
+                               0, 0, 0, dataLen};
+    e.insert(e.end(), fixed, fixed + 24);
+    for (uint8_t i = 0; i < dataLen; ++i) e.push_back(uint8_t(0xa0 + i));
+  }
+  e[1] = uint8_t(e.size() - 2);
+  return e;
+}
+
+static void testRadioRssi()
+{
+  CHECK(RadioRssi::bucket(-41) == 0 && RadioRssi::bucket(-60) == 0 && RadioRssi::bucket(-61) == 1 && RadioRssi::bucket(-75) == 1);
+  CHECK(RadioRssi::bucket(-76) == 2 && RadioRssi::bucket(-90) == 2 && RadioRssi::bucket(-91) == 3 && RadioRssi::bucket(-100) == 3);
+  CHECK(RadioRssi::bucket(-101) == 4 && RadioRssi::bucket(-128) == 4);
+  {
+    RadioRssi r;
+    const auto a = extAdv({{-114, 27}});   // the 11-22 trace's typical report: -114 dBm, 27 data bytes
+    const auto b = extAdv({{-50, 31}});
+    const auto c = extAdv({{-92, 18}, {-65, 17}});   // two reports in one event: the second's RSSI after the first's data
+    r.onEvent(a.data(), a.size());
+    r.onEvent(b.data(), b.size());
+    r.onEvent(c.data(), c.size());
+    const auto &s = r.stats();
+    CHECK(s.leReports == 4 && s.le[0] == 1 && s.le[1] == 1 && s.le[3] == 1 && s.le[4] == 1 && s.le[2] == 0);
+    CHECK(s.leBest == -50 && s.malformed == 0 && s.classicResults == 0);
+    auto cut = c;   // a report that runs past the event: counted malformed, the first report still counted
+    cut.resize(cut.size() - 20);
+    cut[1] = uint8_t(cut.size() - 2);
+    r.onEvent(cut.data(), cut.size());
+    CHECK(r.stats().malformed == 1 && r.stats().leReports == 5);
+    const auto bad = extAdv({{-50, 3}});
+    std::vector<uint8_t> wrongLen = bad;
+    wrongLen[1] = uint8_t(wrongLen[1] + 1);   // a length byte that does not match: ignored entirely
+    r.onEvent(wrongLen.data(), wrongLen.size());
+    CHECK(r.stats().leReports == 5);
+  }
+  {
+    RadioRssi r;
+    // Legacy LE Advertising Report: [3e][len][02][1][type][addr type][addr 6][data len][data][rssi].
+    std::vector<uint8_t> e = {0x3e, 0, 0x02, 1, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 0x02, 0x01, 0x06, uint8_t(int8_t(-70))};
+    e[1] = uint8_t(e.size() - 2);
+    r.onEvent(e.data(), e.size());
+    std::vector<uint8_t> two = e;   // two legacy reports: field-wise layout, not guessed
+    two[3] = 2;
+    r.onEvent(two.data(), two.size());
+    std::vector<uint8_t> na = e;   // RSSI 127: not available
+    na.back() = 127;
+    r.onEvent(na.data(), na.size());
+    CHECK(r.stats().leReports == 2 && r.stats().le[1] == 1 && r.stats().unavailable == 1 && r.stats().malformed == 1);
+    CHECK(r.stats().leBest == -70);
+  }
+  {
+    RadioRssi r;
+    const uint8_t complete[] = {0x01, 0x01, 0x00};   // Inquiry Complete, status 0 (121 of them and no result on 11-22)
+    for (int i = 0; i < 3; ++i) r.onEvent(complete, sizeof complete);
+    // Inquiry Result with RSSI, one response: addr 6, page scan mode, reserved, class 3, clock offset 2, rssi.
+    const uint8_t withRssi[] = {0x22, 15, 1, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x40, 0x05, 0x25, 0x00, 0x00, uint8_t(int8_t(-58))};
+    r.onEvent(withRssi, sizeof withRssi);
+    std::vector<uint8_t> eir(257, 0);   // Extended Inquiry Result: one response and 240 EIR bytes
+    eir[0] = 0x2f;
+    eir[1] = 255;
+    eir[2] = 1;
+    eir[16] = uint8_t(int8_t(-104));
+    r.onEvent(eir.data(), eir.size());
+    const uint8_t plain[] = {0x02, 15, 1, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x40, 0x05, 0x25, 0x00, 0x00};
+    r.onEvent(plain, sizeof plain);
+    const auto &s = r.stats();
+    CHECK(s.inquiries == 3 && s.classicResults == 2 && s.classicNoRssi == 1 && s.classic[0] == 1 && s.classic[4] == 1);
+    CHECK(s.classicBest == -58 && s.leReports == 0 && s.malformed == 0);
+    const uint8_t shortRssi[] = {0x22, 3, 1, 0, 0};   // a response shorter than 14 bytes
+    r.onEvent(shortRssi, sizeof shortRssi);
+    CHECK(r.stats().malformed == 1);
+  }
+}
+
 int main()
 {
   testSurveyGates();
@@ -825,6 +905,7 @@ int main()
   testH4();
   testLeMask();
   testLeReady();
+  testRadioRssi();
   testCodec();
   testSetup();
   testRcgTable();

@@ -172,7 +172,8 @@ recommendation: C for input devices, A kept open for audio if the owner accepts 
 | `piano-bt-blind=1` | 0 | vote a rail whose PMIC state could not be read (PianoWifi's `piano-wifi-blind`) |
 | `piano-bt-addr=0` | 1 | keep the NVM's default address even when the ADT has the unit's own |
 | `piano-bt-stop=N` | 0 | return after step N (201..205, 301..306, 400..412); the state of that step stays (a sleep still takes it down) |
-| `piano-bt-lemask=1` | 0 | level 5: OR LE Data Length Change (bit 6) and LE PHY Update Complete (bit 11) into the host's LE Set Event Mask (§8.5); root changes it at run time with `machdep.piano_bt_lemask` (applies to bluetoothd's next HCI start) |
+| `piano-bt-lemask=0` | 1 at level 5 (0 before bt/hid1, 2026-11-26) | level 5: OR LE Data Length Change (bit 6) and LE PHY Update Complete (bit 11) into the host's LE Set Event Mask (§8.5); root changes it at run time with `machdep.piano_bt_lemask` (applies to bluetoothd's next HCI start) |
+| `piano-bt-lerdy=1` | 0 | level 5: the LE link-ready assist (§8.5); `machdep.piano_bt_lerdy` at run time |
 
 ## 7. Build, kernel collection
 
@@ -643,6 +644,24 @@ characteristic, so `piano-bt-probe --le-pair` on the tablet makes bluetoothd pai
 logs `secure-read`. `hid` shows that CoreBluetooth refuses a third-party HID service (`hid_service_added=0 error=8`, measured on
 macOS 27.2): HID over GATT itself needs a real keyboard or mouse. `piano-bt-probe --le-rssi SECONDS` reports the RSSI distribution
 of the test peripheral's advertisements (the RF check at a known distance).
+
+### 8.6 Radio health (bt-radio1, 2026-11-26, host-tested; tablet result pending)
+
+The 11-22 owner session's HCI trace (1739 LE extended advertising reports in 27 minutes) had 1570 of them (90 %) at -101 dBm or
+below, the best at -41 dBm; the strong reports came only in about 1.5 s windows every 120 s that line up with PianoWifi's background
+scans. The same boot's 121 classic inquiries (GIAC, 12.8 s each, status 0) returned no Inquiry Result of any kind, so a BR/EDR
+keyboard in pairing mode cannot be found either. The analysis (private notes, 2026-11-24 and 2026-11-26) ranks Wi-Fi's hold on the
+shared 2.4 GHz front end first: station power save off (`piano-wifi-ps=0`, while Linux and Android doze between beacons), and the
+firmware's default dual-MAC configuration with asynchronous SBS left on (Android sends `WMI_PDEV_SET_MAC_CONFIG` with it cleared).
+
+To read this on any boot without a bluetoothd trace, the kext buckets the RSSI of every report it relays (`HciH4.h` `RadioRssi`):
+LE Advertising Report, LE Extended Advertising Report, Inquiry Result with RSSI, Extended Inquiry Result; the plain Inquiry Result
+(no RSSI) and Inquiry Complete are counted. Buckets: >= -60, -61..-75, -76..-90, -91..-100, <= -101 dBm. Properties
+`piano-bt-radio-le-rssi` and `piano-bt-radio-classic-rssi` (five counts, `a/b/c/d/e`), `piano-bt-radio-le-reports`,
+`piano-bt-radio-classic-results`, `piano-bt-radio-inquiries`; a console line at most every 30 s when the count changed:
+`bt-radio1: LE reports=N rssi>=-60/-75/-90/-100/below=a/b/c/d/e best=B; classic results=N (no rssi N) rssi=... inquiries=N`.
+No address is kept. A healthy receiver with Apple devices in the room puts most LE reports above -90 dBm; the 11-22 boot would
+have read `55/10/81/23/1570 best=-41`.
 
 ## 9. Fallback
 

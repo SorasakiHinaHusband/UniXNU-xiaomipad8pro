@@ -401,6 +401,106 @@ class LeReadyAssist {
   Stats stats_;
 };
 
+// The radio's health as the host sees it (bt-radio1; docs/drivers/bluetooth.md, "Radio health"). It counts every advertising and
+// inquiry report the controller sends and buckets its RSSI, so a boot can tell a deaf receiver from a quiet room without a
+// bluetoothd trace: on 11-20/11-22 about 90 % of the LE reports sat at -105..-119 dBm, outside short windows that matched
+// PianoWifi's background scans (host-checks 20261124-bt-pair, 20261126-bt-hid). Reports: LE Advertising Report (subevent 0x02,
+// one report, RSSI after the data), LE Extended Advertising Report (0x0d, 24 fixed bytes plus data per report, RSSI at +13),
+// Inquiry Result with RSSI (0x22, 14 bytes per response, RSSI at +13), Extended Inquiry Result (0x2f, RSSI at +13) and the plain
+// Inquiry Result (0x02, no RSSI: counted only). Inquiry Complete (0x01) is counted so a classic search with no answer shows. RSSI
+// 127 ("not available") is counted apart. No address is kept or logged.
+class RadioRssi {
+ public:
+  // Buckets: [0] >= -60, [1] -61..-75, [2] -76..-90, [3] -91..-100, [4] <= -101 dBm.
+  static constexpr unsigned kBuckets = 5;
+  struct Stats {
+    uint64_t le[kBuckets] = {}, classic[kBuckets] = {};
+    uint64_t leReports = 0, classicResults = 0, classicNoRssi = 0, inquiries = 0, unavailable = 0, malformed = 0;
+    int leBest = -128, classicBest = -128;   // the strongest RSSI seen (-128: none)
+  };
+
+  static unsigned bucket(int rssi)
+  {
+    if (rssi >= -60) return 0;
+    if (rssi >= -75) return 1;
+    if (rssi >= -90) return 2;
+    if (rssi >= -100) return 3;
+    return 4;
+  }
+
+  // ev = [code][parameter length][parameters...], bytes = the whole event.
+  void onEvent(const uint8_t *ev, size_t bytes)
+  {
+    if (bytes < 2 || size_t(ev[1]) + 2 != bytes) return;
+    const uint8_t code = ev[0];
+    if (code == 0x01) {
+      ++stats_.inquiries;
+    } else if (code == 0x02) {
+      if (bytes >= 3) stats_.classicNoRssi += ev[2];
+    } else if (code == 0x22 || code == 0x2f) {
+      if (bytes < 3) return;
+      const unsigned n = ev[2];
+      const size_t step = code == 0x22 ? 14 : 0;   // the extended result carries one response and 240 EIR bytes
+      if (code == 0x2f && n != 1) {
+        ++stats_.malformed;
+        return;
+      }
+      for (unsigned i = 0; i < n; ++i) {
+        const size_t at = 3 + i * step + 13;
+        if (at >= bytes) {
+          ++stats_.malformed;
+          return;
+        }
+        add(int8_t(ev[at]), false);
+      }
+    } else if (code == 0x3e && bytes >= 4) {
+      const uint8_t sub = ev[2];
+      const unsigned n = ev[3];
+      if (sub == 0x02) {
+        // One report: [type][addr type][addr 6][data len][data][rssi]. Several reports in one event are rare and laid out per
+        // field in the specification; they are counted as malformed rather than guessed.
+        if (n != 1 || bytes < 4 + 9) {
+          ++stats_.malformed;
+          return;
+        }
+        const size_t dataLen = ev[4 + 8];
+        const size_t at = 4 + 9 + dataLen;
+        if (at >= bytes) {
+          ++stats_.malformed;
+          return;
+        }
+        add(int8_t(ev[at]), true);
+      } else if (sub == 0x0d) {
+        size_t o = 4;
+        for (unsigned i = 0; i < n; ++i) {
+          if (o + 24 > bytes) {
+            ++stats_.malformed;
+            return;
+          }
+          add(int8_t(ev[o + 13]), true);
+          o += 24 + ev[o + 23];
+        }
+      }
+    }
+  }
+  const Stats &stats() const { return stats_; }
+
+ private:
+  void add(int rssi, bool le)
+  {
+    if (le) ++stats_.leReports;
+    else ++stats_.classicResults;
+    if (rssi == 127) {
+      ++stats_.unavailable;
+      return;
+    }
+    (le ? stats_.le : stats_.classic)[bucket(rssi)]++;
+    int &best = le ? stats_.leBest : stats_.classicBest;
+    if (rssi > best) best = rssi;
+  }
+  Stats stats_;
+};
+
 // Events: [code][parameter length][parameters].
 struct CommandComplete {
   uint8_t ncmd = 0;
