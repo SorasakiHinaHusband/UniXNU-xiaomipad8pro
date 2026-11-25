@@ -146,7 +146,7 @@ static unsigned ownerSurfaceClients(IOUserClient *mine,int pid,IOUserClient **ou
   unsigned count=0,total=0;OSIterator *it=root->getClientIterator();
   if(it){while(OSObject *o=it->getNextObject()){IOUserClient *u=OSDynamicCast(IOUserClient,o);if(!u||u==mine)continue;++total;
       OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
-      const bool match=cs&&(pid>0?!strncmp(cs->getCStringNoCopy(),want,n):strstr(cs->getCStringNoCopy(),", com.apple.WebKit")!=nullptr);
+      const bool match=cs&&(pid>0?!strncmp(cs->getCStringNoCopy(),want,n):strnstr(cs->getCStringNoCopy(),", com.apple.WebKit",cs->getLength()+1)!=nullptr);
       if(match&&pid==0){char line[160];snprintf(line,sizeof line,"candidate %s",cs->getCStringNoCopy());IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);}
       OSSafeReleaseNULL(c);
       if(match&&count<max){u->retain();out[count++]=u;}}
