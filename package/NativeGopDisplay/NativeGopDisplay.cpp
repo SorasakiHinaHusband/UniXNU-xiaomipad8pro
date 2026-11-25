@@ -557,7 +557,7 @@ private:
     // The switch is also machdep.native_gop_flip_lossless (root writes 0/1, flip mode only): one boot compares copied and flipped frames.
     bool fLosslessLayoutLogged;
     uint64_t fLosslessFlips;
-    bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
+    bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request, bool producerComplete = false);
     // The PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), each off without its boot argument (and then nothing of this runs):
     //   piano-dpu-pcc=1|2       swap_set_color_matrix / set_gamma_table: logged (their raw bytes, B1d-0) and handed to PianoDpu's
     //                           PCC (PianoDpuColorMatrix / PianoDpuGammaTable); 2 also lets PianoDpu read a whole 0xc0c-byte table
@@ -1760,7 +1760,7 @@ void NativeGopDisplay::program_hardware_gated()
 
 // PianoDpu's "PianoDpuFlip" (the copy thread only): surface on the panel, or with nullptr the boot framebuffer back. True once the
 // hardware latched it. PianoDpu's service is looked up once a second until found (it registers only with piano-dpu=2).
-bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
+bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request, bool producerComplete)
 {
     if (!fDpu) {
         const uint64_t now = mach_absolute_time();
@@ -1805,7 +1805,8 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
                   request->offset, request->rowBytes);
         }
     }
-    if (fDpu->callPlatformFunction(fDpuFlipSymbol, false, request, nullptr, nullptr, nullptr) != kIOReturnSuccess)
+    void *handoff = producerComplete ? reinterpret_cast<void *>(kPianoDpuFlipProducerComplete) : nullptr;
+    if (fDpu->callPlatformFunction(fDpuFlipSymbol, false, request, handoff, nullptr, nullptr) != kIOReturnSuccess)
         return false;
     static unsigned refusals;
     if (surface && request->result != kPianoDpuFlipShown && refusals++ < 8)
@@ -2023,7 +2024,7 @@ void NativeGopDisplay::runJob(const Job &job, bool retired, bool covered, bool *
     gopcompose::Plan plan = gopcompose::planJob(fPanel, job, onPanel, whole,
                                                 gopcompose::damageAllowed(fDamageMode && !fDamageAuditOff, frameCovered, fullDue));
     PianoDpuFlipRequest request;
-    if (plan.tryFlip && dpuFlip(base, &request)) {
+    if (plan.tryFlip && dpuFlip(base, &request, frameCovered)) {
         *flipped = true;
         fFlips++;
     }

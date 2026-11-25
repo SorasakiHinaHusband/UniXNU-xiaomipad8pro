@@ -21,6 +21,8 @@
 #include <sys/kauth.h>
 #include <sys/sysctl.h>
 #include "DpuSnapshot.h"
+#include "DpuFlip.h"
+#include "DpuFlipKernel.h"
 
 using namespace pianodpu;
 
@@ -110,6 +112,8 @@ void refresh()
   gText[0] = 0;
   Out out;
   snapshot::format(s, ++gSerial, at, out);
+  flip::Stats stats;
+  if (flipStatsSnapshot(stats)) stats.formatClean([&](auto... args) { out.line(args...); });
   if (gMapFailures) out.line("snapshot: %u page maps failed so far (those words read as ffffffff)", gMapFailures);
   gLastUs = at;
 }

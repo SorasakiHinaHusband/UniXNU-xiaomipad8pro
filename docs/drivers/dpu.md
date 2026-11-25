@@ -113,12 +113,15 @@ the live stream reset the SoC on Linux); the bank itself is reprogrammed in plac
    synced, the first/last/guard page checked through our own tables; the surface and its memory retained while mapped. The clean
    (`piano-dpu-clean`, default 1): DC CVAC over the rows the DPU fetches through a read-only cacheable alias of the surface made once
    per window (when XNU refuses the alias, flipped without, counted; 2: refused instead) — the CPU may have drawn the frame
-   (CompositorSW). The flip: for each pipe/rect of the survey's path, SRC = window + offset + (rect's splash offset / 12800) × row bytes
+   (CompositorSW). The optional M2 path uses the DRAM aperture for a whole-backing first clean and skips later pixel cleans only
+   while the wired IOSurface still qualifies as WC. See [the M2 policy and RAM read list](dpu-m2-analysis.md).
+   The flip: for each pipe/rect of the survey's path, SRC = window + offset + (rect's splash offset / 12800) × row bytes
    + (offset % 12800) (VIG1 by SRC_XY or by its own address both work; multirect: SRC0 and SRC1, both YSTRIDE0 halves), YSTRIDE0 = the
    surface's row bytes, SRC_FORMAT with SRCC3_EN cleared when the path has per-pixel alpha (restored for the boot framebuffer); DSB,
    CTL_FLUSH = the pipes' bits (or `piano-dpu-flush`); FLUSH polled after each vsync interrupt (or every ~1 ms) until the pipes' bits
    read 0, at most `piano-dpu-latch` ms; then FSR and the underrun bits are checked. The previous window stays mapped (evictable) and
-   NativeGopDisplay completes the swap only after this returns. The same surface again: cleaned, no flush.
+   NativeGopDisplay completes the swap only after this returns. With M2, a re-show of the same window, offset and stride still takes
+   the eligibility check and DSB before returning.
 4. *Vblank*: SPI 83 (INTID 115) through `armcpu_spi_attach` (`package/common/PianoIrq.h`'s SpiLine and storm guard), attached once
    setup has turned the DPU's INTR_EN off and found MDSS HW_INTR_STATUS 0 (else polled: "another block holds the line"); the handler:
    MDSS status bit 0 → DPU INTR_STATUS & INTR_EN → INTR_CLEAR, the waiter kicked (no bit: a stray for the guard). The INTF1 vsync bit
@@ -254,6 +257,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-flip=N` | 1 | B1b's steps (§8): 1 the boot framebuffer's addresses flushed again ×3; 2 + shifted 64 rows for 2 s and back; 3 + the DPU's SMMU bank in place, a test pattern through window 0 for 2 s, the fault status after a minute, the bank back as found; 4 the bank in place and flips served to NativeGopDisplay |
 | `piano-dpu-irq=0` | 1 | CTL_FLUSH polled every ~1 ms instead of the vsync interrupt (SPI 83) |
 | `piano-dpu-clean=N` | 1 | a surface's fetched rows cleaned from the CPU caches before each flip: 0 never, 1 through a cacheable alias when XNU makes one, 2 refuse a surface without one |
+| `piano-dpu-clean-skip=1` | 0 | at flip step 4, use strict aperture cleans and the verified-WC backing epoch. This selects the pixel-clean policy independently of `piano-dpu-clean` and `piano-dpu-clean-threads`. Root can select the full-clean control with `machdep.piano_dpu_clean_skip=0` and restore the conditional policy with `=1`. |
 | `piano-dpu-flush=MASK` | 0 | the CTL_FLUSH bits of a flip instead of the pipes' own (0x3 for VIG0+VIG1); e.g. 0x20003 adds the CTL's bit 17 if the pipes' bits alone do not latch |
 | `piano-dpu-underrun=0` | 1 | an underrun neither stops the ladder nor reverts |
 | `piano-dpu-latch=MS` | 50 | the latch timeout (10..500): past it, a revert and flips off for the boot |
