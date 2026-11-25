@@ -4,6 +4,7 @@
 #include "test_poolbypass.cpp"
 #undef main
 #include "A830GpuTier.h"
+#include "NativeAdrenoKopt.h"
 
 static std::vector<a830tier::Span> zeroed;
 
@@ -88,6 +89,11 @@ int main()
     CHECK(zeroed.size()==2 && zeroed[0].pa==kRegionLo && zeroed[1].pa==kRegionLo+5*kSlab);
     CHECK(zeroed[0].bytes==kSlab && zeroed[1].bytes==kSlab);
     CHECK(memory->reassertWriteCombined(nullptr)==kIOReturnSuccess);
+    NativeAdrenoMemory alias;
+    const auto nextPhysical=fixture.next_physical;
+    fixture.next_physical=kRegionLo;
+    CHECK(alias.importTask(reinterpret_cast<void *>(2),kPage,kPage,36,kPage)==kIOReturnUnsupported && !alias.backed());
+    fixture.next_physical=nextPhysical;
     CHECK(memory->holdForDevice()==kIOReturnSuccess);
     const NativeAdrenoAbiBoFree held{handle};
     CHECK(path.client.freeBo(&held)==kIOReturnBusy && NativeAdrenoMemory::tierStats().free_bytes==0);
@@ -124,5 +130,5 @@ int main()
     CHECK(NativeAdrenoMemory::tierStats().free_bytes==2*kSlab && NativeAdrenoMemory::tierStats().refusals==1);
     CHECK(path.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
     std::puts("PASS: tier BoAlloc/BoFree: opt-in modes, tier before pool, slab zeroing outside locks, clipped Physical64 spans, "
-              "map and free, exhaustion and metadata rollback, cached-coherent fallback");
+              "map and free, import alias refusal, exhaustion and metadata rollback, cached-coherent fallback");
 }

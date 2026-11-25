@@ -905,10 +905,13 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     spans_=NativeAdrenoNewMeta(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_) {status=kIOReturnNoMemory;goto failed;}
     failure_.stage="import-physical-spans";
+    // Pinning a CPU view does not pin its slab. The owning BO's CPU lease controls that lifetime.
+    const bool tierActive=__atomic_load_n(&gpuTier.active,__ATOMIC_ACQUIRE)!=0;
     for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=imported_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-        if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)
+        if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical ||
+           (tierActive && physical>=a830tier::kRegionLo && physical<a830tier::kRegionHi && gpuTier.slabs.owns(physical)))
             {native_adreno_import_stage=18;native_adreno_import_fail_pa=physical;native_adreno_import_fail_offset=offset;
              status=kIOReturnUnsupported;goto failed;}
         if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)

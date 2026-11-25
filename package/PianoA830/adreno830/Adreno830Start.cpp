@@ -2165,7 +2165,7 @@ bool tierProbe(uint64_t pa,unsigned run,void *cookie)
         result=vm->map(&tierProbePage,0,iova,ArmSmmu4KRead|ArmSmmu4KWrite,0,2,&handle);
     }
     bool quiesced=true;
-    uint32_t seen=0;
+    uint32_t fault=0,viewWord=0;
     if(!result) {
         uint32_t words[4], fence=0;
         const size_t count=A830SelfTest::memWriteWords(iova,value,words,4);
@@ -2175,26 +2175,30 @@ bool tierProbe(uint64_t pa,unsigned run,void *cookie)
             stage="fence";
             result=d.fence.waitNs(fence,250000000);
         }
-        const uint32_t fault=probeFaults(nullptr,nullptr);
+        fault=probeFaults(nullptr,nullptr);
         if(result && (fence || d.ring.poisoned()))
             quiesced=d.recovery.recover(A830FaultSelfTest,pa)==kIOReturnSuccess;
         if(!result) {
             __asm__ volatile("dsb sy":::"memory");
-            stage="readback";
-            seen=ml_phys_read_word_64(pa);
-            if(fault || seen!=value || *word!=value)result=kIOReturnIOError;
+            viewWord=*word;
         }
     }
 
     view->release();
+    uint32_t seen=0;
+    if(!result) {
+        stage="readback";
+        seen=ml_phys_read_word_64(pa);
+        if(fault || seen!=value || viewWord!=value)result=kIOReturnIOError;
+    }
     const IOReturn unmap=handle && quiesced?vm->unmap(handle):kIOReturnSuccess;
     if(!quiesced || unmap || tierProbePage.release()!=kIOReturnSuccess) {
         tierProbeDescriptor=descriptor;  // keep the descriptor alive while the VM might still reference the page
         probe.blocked=true;
     } else descriptor->release();
     if(result || probe.blocked)
-        IOLog("PianoA830: gpu tier: run %u page %#llx %s result=%#x seen=%#x expected=%#x cleanup=%#x blocked=%u\n",
-            run,(unsigned long long)pa,stage,result,seen,value,unmap,probe.blocked);
+        IOLog("PianoA830: gpu tier: run %u page %#llx %s result=%#x seen=%#x view=%#x expected=%#x fsr=%#x cleanup=%#x blocked=%u\n",
+            run,(unsigned long long)pa,stage,result,seen,viewWord,value,fault,unmap,probe.blocked);
     return !result && !probe.blocked;
 }
 void tierProbeLine(const char *line,void *)
