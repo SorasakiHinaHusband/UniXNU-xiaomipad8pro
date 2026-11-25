@@ -89,7 +89,9 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_u
             # launch policy; k27 has none, and the listed jobs run: docs/boot-time.md). PIANO_FAST_BOOT drops it. The clock
             # and time zone (droidvm-utc, droidvm-tz below) are the OS image's settime.sh boot job's.
             'droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd',
-            'mac-amfi-launch-permissive=1', 'union-hide-lower=1', 'malloc-ranges-off=1', 'arm64_maxoffset=0x7FFE000000',
+            # arm64_maxoffset: the 47-bit user map end of k27 0075 (piano-uva47, docs: 128 TiB user VA); a 39-bit kernel (0074 and older, or
+            # piano-uva47=0) refuses the value (above its MAX) and keeps its compiled 0x7FFE000000, so the line is safe on both.
+            'mac-amfi-launch-permissive=1', 'union-hide-lower=1', 'malloc-ranges-off=1', 'arm64_maxoffset=0x7FFFFE000000',
             # 0042: userspace sees 24 MHz over the architected counter (19.2 MHz on SM8750 as in the VM).
             'droidvm-timebase-hz=24000000',
             'exec-env=com.apple.WebKit.WebContent:GIGACAGE_ENABLED=no',
