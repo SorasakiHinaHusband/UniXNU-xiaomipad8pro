@@ -50,7 +50,8 @@ For same-boot A/B after booting with `data-store-concurrent=1`, root can set `ma
 for the single-gate control or back to 1. The switch drains I/O first and refuses after a write failure or DMA
 quarantine. `sysctl machdep.piano_data_io` reports the active mode, stage depth, maximum inflight requests, requests
 that waited in stage/range/fence admission, and successful bitmap publications. These counters reset when the mode
-changes. The single-gate wait counter excludes lock contention. Open, seed/window binding, read-only probes, the
+changes. Since 2026-11-25 it also ends with the store window's device commands since boot (`store_rd=OPS/USus
+store_wr=... store_sync=... store_max=USus`, not reset with the mode). The single-gate wait counter excludes lock contention. Open, seed/window binding, read-only probes, the
 volatile fallback and flatten use the same paths and on-disk bytes in either mode.
 
 ## 2. Store format (`PersistOverlay.h`)
