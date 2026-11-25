@@ -37,6 +37,7 @@
 #include "DpuSurvey.h"
 #include "DpuAhbVote.h"
 #include "DpuFlipKernel.h"
+#include "PianoDpuFlipClient.h"
 
 using namespace pianodpu;
 
@@ -604,6 +605,8 @@ IOReturn PianoDpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p
 {
   IOReturn result = kIOReturnUnsupported;
   if (flipFunction(name, p1, &result)) return result;
+  if (name && name->isEqualTo(kPianoDpuScanoutFunction))
+    return scanoutRead(static_cast<PianoDpuScanoutRequest *>(p1));
   if (dpuSlicesPlatformFunction(name, p1, p2, p3, &result)) return result;
   return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
 }

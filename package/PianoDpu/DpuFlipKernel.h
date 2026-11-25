@@ -6,6 +6,7 @@
 
 class IOService;
 class OSSymbol;
+struct PianoDpuScanoutRequest;
 
 namespace pianodpu {
 
@@ -16,5 +17,6 @@ void flipRun(IOService *owner, const Survey &s, const SmmuSurvey &m, uint32_t sm
 
 // PianoDpu::callPlatformFunction: true when name is "PianoDpuFlip" (PianoDpuFlipClient.h), with *result set.
 bool flipFunction(const OSSymbol *name, void *request, IOReturn *result);
+IOReturn scanoutRead(PianoDpuScanoutRequest *request);
 
 }  // namespace pianodpu

@@ -23,6 +23,18 @@
 #define kPianoDpuFlipFunction "PianoDpuFlip"
 #define kPianoDpuFlipVersion 1u
 
+// Kernel-only readout for NativeGopDisplay. The callback runs outside the flip lock while the window's
+// surface, wiring and CPU map are held. A null surface selects the boot framebuffer. kIOReturnBusy
+// means the read must be discarded (changing or indeterminate scanout).
+#define kPianoDpuScanoutFunction "PianoDpuScanout"
+class OSObject;
+class IOMemoryMap;
+struct PianoDpuScanoutRequest {
+  int (*read)(void *context, const OSObject *surface, IOMemoryMap *map, uint64_t offset, uint32_t stride);
+  void *context;
+  int error;                  // callback result
+};
+
 enum PianoDpuFlipResult : uint32_t {
   kPianoDpuFlipShown = 0,     // latched: on the panel
   kPianoDpuFlipOff,           // not serving: piano-dpu-flip below 4, not ready yet, or off for the boot after a failure

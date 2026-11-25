@@ -44,12 +44,14 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <pexpert/device_tree.h>
+#include <sys/kauth.h>
 #include <sys/sysctl.h>
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
 #include "GopRefresh.h"                        // the fixed refresh contract (native-gop-display-120=1; tests/gop_host.cpp)
 #include "GopColorLog.h"                       // the Night Shift observer (native-gop-display-color-log=1; tests/gop_host.cpp)
+#include "GopShot.h"
 #include "CopyRows.h"
 #include "../include/PianoGpuQualificationDisplay.h"
 static void qualificationDisplay(const PianoGpuQualificationDisplay *evidence) {
@@ -373,6 +375,12 @@ private:
     uint64_t fVideoPhys;
     IOMemoryMap *fScanoutMap;
     uint8_t *fScanout;
+    bool fShotEnabled;
+    uint64_t fShotEpoch;   // odd during a copy-thread presentation, even when idle
+    struct sysctl_oid fShotOid;
+    void registerShot();
+    static int shotSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
+    static int shotRead(void *, const OSObject *, IOMemoryMap *, uint64_t, uint32_t);
     gopcompose::Tables *fTables;   // the 'RGhA' and 'b3a8' conversions, made with the row buffers
     uint8_t *fRow;            // one source row ('RGhA': 8 bytes a pixel)
     uint32_t *fLine;          // one composed row, written to the scanout at once (it is write-combined)
@@ -1032,6 +1040,8 @@ bool NativeGopDisplay::start(IOService *provider)
         GOPLOG("framebuffer cleared to black\n");
         break;
     }
+    unsigned shot = 0;
+    fShotEnabled = !fExternal && PE_parse_boot_argn("native-gop-display-shot", &shot, sizeof shot) && shot == 1;
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {
@@ -1059,6 +1069,8 @@ bool NativeGopDisplay::start(IOService *provider)
             provider->setProperty("DisplayPortCount", 1ULL, 32);
         return false;
     }
+    if (fShotEnabled)
+        registerShot();
     GOPLOG("started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
           display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshPolicy ? "with refresh" : "no refresh",
           fThumbPeriod ? "every " : "off: ", fThumbPeriod, fThumbLimit);
@@ -1068,6 +1080,8 @@ bool NativeGopDisplay::start(IOService *provider)
 void NativeGopDisplay::stop(IOService *provider)
 {
     GOPLOG("stop\n");
+    if (fShotEnabled)
+        sysctl_unregister_oid(&fShotOid);   // drains active handlers before the boot mapping is released
     if (fCopyThreadsSysctl) {
         unregisterNativeGopCopyThreadsSysctl();
         fCopyThreadsSysctl = false;
@@ -2159,7 +2173,11 @@ void NativeGopDisplay::copyLoop()
         const bool retired = !job.fenced || waitGpuFence(job.fence, &answered) || !answered;
         const bool covered = job.fenced && answered && retired;
         bool flipped = false;
+        if (fShotEnabled)
+            __atomic_add_fetch(&fShotEpoch, 1, __ATOMIC_ACQ_REL);
         runJob(job, retired, covered, &flipped);
+        if (fShotEnabled)
+            __atomic_add_fetch(&fShotEpoch, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&fLastFlipped, flipped, __ATOMIC_RELEASE);
         IOLockLock(fCopyLock);
         uint64_t done = 0;
@@ -2239,6 +2257,93 @@ static void invalidateForRead(const uint8_t *start, uint64_t length, bool barrie
         __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
     if (barrier)
         __asm__ volatile("dsb sy" ::: "memory");
+}
+
+struct GopShotRead {
+    NativeGopDisplay *display;
+    struct sysctl_req *req;
+};
+
+int NativeGopDisplay::shotRead(void *context, const OSObject *surface, IOMemoryMap *map, uint64_t offset, uint32_t stride)
+{
+    const auto *read = static_cast<const GopShotRead *>(context);
+    uint32_t format = GOP_SHOT_BGRA8;
+    if (surface) {
+        format = ioSurfacePixelFormat(reinterpret_cast<const IOSurface *>(surface));
+        if (format != GOP_SHOT_BGRA8 && format != GOP_SHOT_BGA)
+            return ENOTSUP;
+    } else {
+        const auto *display = read->display;
+        if (display->fVideo.v_width != GOP_SHOT_WIDTH || display->fVideo.v_height != GOP_SHOT_HEIGHT ||
+            display->fVideo.v_rowBytes > UINT16_MAX)
+            return ENXIO;
+        map = display->fScanoutMap;   // the registered OID holds the instance and mapping live
+        stride = static_cast<uint32_t>(display->fVideo.v_rowBytes);
+    }
+    const uint64_t address = map ? map->getVirtualAddress() : 0;
+    const int bounds = gop_shot_bounds(address != 0, map ? map->getLength() : 0, offset, stride);
+    if (bounds)
+        return bounds;
+    const auto *bytes = reinterpret_cast<const uint8_t *>(address) + offset;
+    const bool cached = surface && (map->getMapOptions() & kIOMapCacheMask) == kIOMapCopybackCache;
+    const GopShotHeader header{GOP_SHOT_VERSION, GOP_SHOT_WIDTH, GOP_SHOT_HEIGHT, format,
+                               surface ? GOP_SHOT_FLIP : GOP_SHOT_BOOT};
+    int error = SYSCTL_OUT(read->req, &header, sizeof header);
+    for (size_t position = 0; !error;) {
+        uint64_t at = 0;
+        const size_t count = gop_shot_chunk(position, stride, &at);
+        if (!count)
+            break;
+        if (cached)
+            invalidateForRead(bytes + at, count);
+        error = SYSCTL_OUT(read->req, bytes + at, count);
+        position += count;
+    }
+    return error;
+}
+
+int NativeGopDisplay::shotSysctl(struct sysctl_oid *, void *arg, int, struct sysctl_req *req)
+{
+    auto *display = static_cast<NativeGopDisplay *>(arg);
+    const int access = gop_shot_access(display->fShotEnabled, kauth_cred_issuser(kauth_cred_get()), req->newptr != 0);
+    if (access)
+        return access;
+    if (!req->oldptr)
+        return SYSCTL_OUT(req, nullptr, GOP_SHOT_BYTES);
+    if (req->oldlen < GOP_SHOT_BYTES)
+        return ENOMEM;
+    const uint64_t epoch = __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE);
+    if (epoch & 1)
+        return EBUSY;
+    GopShotRead read{display, req};
+    PianoDpuScanoutRequest request{shotRead, &read, 0};
+    OSDictionary *match = IOService::serviceMatching(kPianoDpuServiceClass);
+    IOService *dpu = match ? IOService::copyMatchingService(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    const IOReturn result = dpu ? dpu->callPlatformFunction(kPianoDpuScanoutFunction, false, &request, nullptr, nullptr, nullptr)
+                                : kIOReturnNotFound;
+    OSSafeReleaseNULL(dpu);
+    if (result == kIOReturnNotFound)
+        request.error = shotRead(&read, nullptr, nullptr, 0, 0);
+    else if (result != kIOReturnSuccess)
+        return result == kIOReturnBusy ? EBUSY : ENXIO;
+    __atomic_thread_fence(__ATOMIC_ACQ_REL);
+    return epoch == __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE) ? request.error : EBUSY;
+}
+
+void NativeGopDisplay::registerShot()
+{
+    bzero(&fShotOid, sizeof fShotOid);
+    fShotOid.oid_parent = &sysctl__machdep_children;
+    fShotOid.oid_number = OID_AUTO;
+    fShotOid.oid_kind = int(CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
+    fShotOid.oid_arg1 = this;
+    fShotOid.oid_name = "native_gop_display_shot";
+    fShotOid.oid_handler = shotSysctl;
+    fShotOid.oid_fmt = "S,GopShotHeader";
+    fShotOid.oid_descr = "Root-only native panel scanout debugging";
+    fShotOid.oid_version = SYSCTL_OID_VERSION;
+    sysctl_register_oid(&fShotOid);
 }
 
 // The rows [y0, y1) and columns [x0, x1) of a source (its own coordinates, clipped to it) that a composition reads.

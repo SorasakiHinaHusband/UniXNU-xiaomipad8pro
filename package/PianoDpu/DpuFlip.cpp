@@ -194,6 +194,7 @@ struct Cookie {
   IOMemoryDescriptor *memory;
   IOMemoryMap *alias;
   bool prepared;
+  unsigned references = 1;   // window, plus any in-flight readouts
 };
 
 // The 4 KiB pages of md (at most max); false with why when a segment is not 4 KiB aligned or there are too many.
@@ -395,6 +396,7 @@ class KernelHw {
     c->surface = surface;
     c->memory = md;
     c->prepared = true;
+    c->references = 1;
     if (cleanPolicy) {
       c->alias = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
       if (!c->alias) {
@@ -420,7 +422,7 @@ class KernelHw {
   void surfaceRelease(void *cookie)
   {
     Cookie *c = static_cast<Cookie *>(cookie);
-    if (!c) return;
+    if (!c || __atomic_sub_fetch(&c->references, 1, __ATOMIC_ACQ_REL)) return;
     if (c->alias) c->alias->release();
     if (c->prepared) c->memory->complete();   // a complete's direction only carries its error/valid flags: none here
     c->memory->release();
@@ -518,6 +520,46 @@ void publish(const char *what)
 }
 
 }  // namespace
+
+IOReturn scanoutRead(PianoDpuScanoutRequest *request)
+{
+  if (!request || !request->read) return kIOReturnBadArgument;
+  IOLock *lock = __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
+  if (!lock) return kIOReturnNotFound;   // no flip engine
+  if (!IOLockTryLock(lock)) return kIOReturnBusy;
+
+  const auto target = gFlipper.current;
+  const auto state = gFlipper.state;
+  const auto generation = [] { return gFlipper.st.flips + gFlipper.st.reshows + gFlipper.st.toBoot; };
+  const uint64_t before = generation();
+  const int shown = gFlipper.slots.shown;
+  Cookie *cookie = nullptr;
+  uint64_t offset = 0;
+  if (target.surface && state == flip::State::ready && shown >= 0) {
+    cookie = static_cast<Cookie *>(gFlipper.slots.slot[shown].cookie);
+    offset = target.base - smmu::slotIova(unsigned(shown));
+    __atomic_add_fetch(&cookie->references, 1, __ATOMIC_RELAXED);
+  }
+  const bool boot = flip::sameTarget(target, flip::Target{}) && gFlipper.slots.pending < 0;
+  IOLockUnlock(lock);
+  if (!cookie && !boot) return kIOReturnNotReadable;
+
+  IOMemoryMap *map = cookie ? cookie->alias : nullptr;
+  IOMemoryMap *temporary = nullptr;
+  if (cookie && !map) {
+    temporary = cookie->memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+    map = temporary;
+  }
+  request->error = request->read(request->context, cookie ? cookie->surface : nullptr, map, offset, target.stride);
+  if (temporary) temporary->release();
+  gHw.surfaceRelease(cookie);
+  if (request->error) return kIOReturnSuccess;
+
+  if (!IOLockTryLock(lock)) return kIOReturnBusy;
+  const bool stable = state == gFlipper.state && before == generation() && flip::sameTarget(target, gFlipper.current);
+  IOLockUnlock(lock);
+  return stable ? kIOReturnSuccess : kIOReturnBusy;
+}
 
 bool flipFunction(const OSSymbol *name, void *request, IOReturn *result)
 {
