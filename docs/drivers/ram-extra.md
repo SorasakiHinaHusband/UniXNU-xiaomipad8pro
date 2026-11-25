@@ -18,7 +18,7 @@ or Turnip. The Android capture has no stock allocator source for this path.
 |---|---|---|
 | GPU and SMMU | Linux `arch/arm64/boot/dts/qcom/sm8750.dtsi:2318–2328` identifies Adreno 830 and the GPU SIDs | Same GPU and SIDs. `NativeAdrenoGpuContext` uses the existing CB0 page tables and TLB protocol. |
 | BO backing | Linux `drivers/gpu/drm/msm/msm_gem.c:204–245` gets normal pages and builds a scatterlist. sheng's Adreno740 `7487f72` `NativeAdrenoUserClient.cpp:236` starts allocation in its user-client core. | Different source for eligible BOs. `NativeAdrenoMemory::allocateTier` reserves whole slabs, clips the last exposed span to the requested length and falls back through the existing allocation chain on refusal. |
-| GPU mapping | Linux `msm_gem.c:505–532` maps the scatterlist; cached-coherent backing explicitly opts in to cached IOMMU access. | Same scatter/gather principle. `NativeAdrenoVm::attributes` assigns tier BOs non-cacheable leaves. Paged VM pressure and the client cap still count their mapped bytes. |
+| GPU mapping | Linux `msm_gem.c:505–532` maps the scatterlist. Cached-coherent backing explicitly opts in to cached IOMMU access. | Same scatter/gather principle. `NativeAdrenoVm::attributes` assigns tier BOs non-cacheable leaves. Paged VM pressure and the client cap still count their mapped bytes. |
 | CPU view | Linux `msm_gem.c:357–361,1192–1194` sets write combining for WC objects. sheng's Adreno740 `NativeAdrenoPublish.cpp:532` creates a Physical64 descriptor with `withAddressRanges`. | Same write-combined CPU access and Physical64 ranges. Tier views use the factory's designated initializer in a descriptor that enforces WC because IOKit accepts caller-supplied cache bits. |
 | Admission | Linux GEM obtains already-managed pages. | Different ownership. DarwinBoot reserves the runs before ExitBootServices. PianoA830 validates the handoff and probes both endpoint pages with the GPU before exposing a run. |
 
@@ -62,6 +62,8 @@ control uses `piano-gpu-tier=0` and the ordinary ADT. Mode 2 additionally tries
 sub-2 MiB BOs, each of which occupies at least one slab. Full cached coherence
 (`piano-gpu-coherent=2`, the upstream `pagani-gpu-coherent=2`) closes the tier.
 An older FD leaves the placeholder zeroed, which PianoA830 treats as absent.
+A probe failure closes the affected run. If recovery or TLB cleanup cannot
+quiesce the probe, S8 stops before Metal publication.
 
 1. Capture early console lines matching
    `DARWINBOOT: (window|extra-ram)`, `NativeRamBlock: RAM window`,
@@ -82,8 +84,8 @@ An older FD leaves the placeholder zeroed, which PianoA830 treats as absent.
    sysctl -a | grep '^vm\.compressor_'
    vm_stat
    memory_pressure
-   ioreg -p IODeviceTree -r -n chosen -d 1 -w0 | grep '"piano-extra-ram"'
-   ioreg -r -n NativeAdrenoGpu -d 1 -w0 | grep -E '"NativeAdreno(Client|Coherent)'
+   ioreg -l -p IODeviceTree -r -n chosen -d 1 -w0 | grep '"piano-extra-ram"'
+   ioreg -l -r -n NativeAdrenoGpu -d 1 -w0 | grep -E '"NativeAdreno(Client|Coherent)'
    ```
 
    Decode only `piano-extra-ram` from the chosen node. Expect version 1 and
@@ -98,6 +100,6 @@ An older FD leaves the placeholder zeroed, which PianoA830 treats as absent.
    in the control and R1 runs. Report p50, p95, p99 and the count over
    16.67 ms at identical refresh settings. Retain the console window covering
    the workload, including `CB0`, `SMMU`, `fault`, `hang`,
-   `recover` and `NativeGopDisplay:` lines, and record any pixel errors.
+   `recover` and `NativeGopDisplay:` lines. Record C920 video for pixel errors.
    Correlate frame intervals with the tier's measured usage, final GPU
    recovery counters and paged-VM audit result.
