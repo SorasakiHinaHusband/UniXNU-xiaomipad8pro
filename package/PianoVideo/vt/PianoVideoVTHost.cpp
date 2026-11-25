@@ -685,15 +685,22 @@ int queue(Session *s,const uint8_t *m,uint32_t n,uint64_t request,contract::Inpu
 void inventory(Client *c,const Header &h) {
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[4096];int entries[2]={};
   const bool ready=piano_video_native_ready();
-  if(h.type==cc("decs")&&ready){entries[0]=contract::inventoryEntry(*p,false);entries[1]=contract::inventoryEntry(*p,true);}
-  const int list=p->array(entries,h.type==cc("decs")&&ready?2:0);
+  // LT-B5 (cryptex1-qual5/6, ctl1): a WebKit client (Safari's GPU process, admitted by the grant) is offered AVC only. With our HEVC
+  // entry VT in the GPU process picks it for every HEVC stream and has no in-process fallback when the native envelope (1080p) declines a
+  // 4K one (Safari hevc 2160p: code 4; it plays in software through VTDecoderXPCService on the installed y12h). Without the entry, HEVC
+  // stays on that path exactly as before the grant; AVC above 1080p already falls back (its VTMaxDecodeLevel 42).
+  char who[32]={};proc_name(c->pid,who,sizeof who);const bool webkit=!strncmp(who,"com.apple.WebKit",16);
+  unsigned n=0;
+  if(h.type==cc("decs")&&ready){entries[n++]=contract::inventoryEntry(*p,false);if(!webkit)entries[n++]=contract::inventoryEntry(*p,true);}
+  const int list=p->array(entries,n);
   Writer w(b,sizeof b);w.header(h.type,FlagReply,h.uuid,h.request);w.plist(h.type==cc("decs")?cc(",dec"):cc(",enc"),*p,list);w.u32(cc(",ver"),6);send(c,w,b);delete p;
-  IOLog("PianoVideoVT V9: inventory version6 avc1 hvc1 ready %u encoders0 rating400\n",unsigned(ready));
+  IOLog("PianoVideoVT V9: inventory version6 avc1%s ready %u encoders0 rating400 (pid %d)\n",webkit?"":" hvc1",unsigned(ready),c->pid);
 }
 void capabilities(Client *c,const Header &h,const uint8_t *m,uint32_t n){
   int32_t codec=0,version=0;
   const bool supported=paramS32(m,n,cc(",cod"),codec)&&(uint32_t(codec)==cc("avc1")||uint32_t(codec)==cc("hvc1"))&&
-    paramS32(m,n,cc(",ver"),version)&&version==6&&piano_video_native_ready();
+    paramS32(m,n,cc(",ver"),version)&&version==6&&piano_video_native_ready()&&
+    !(uint32_t(codec)==cc("hvc1")&&[&]{char who[32]={};proc_name(c->pid,who,sizeof who);return !strncmp(who,"com.apple.WebKit",16);}());
   if(!supported){status(c,h,kUnsupported);return;}
   Plist *p=new Plist();if(!p){status(c,h,kNoMemory);return;}uint8_t b[2048];
   const int root=contract::capabilities(*p,uint32_t(codec)==cc("hvc1"));Writer w(b,sizeof b);
