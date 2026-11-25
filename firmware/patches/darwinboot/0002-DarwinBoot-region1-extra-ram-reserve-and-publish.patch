@@ -456,19 +456,20 @@ index 0000000..8526e38
 +}
 diff --git a/Test/test-extra-ram-adt.py b/Test/test-extra-ram-adt.py
 new file mode 100644
-index 0000000..4412caf
+index 0000000..580fef4
 --- /dev/null
 +++ b/Test/test-extra-ram-adt.py
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,70 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: BSD-2-Clause-Patent
 +"""Compile the production AdtNode and check /chosen piano-extra-ram (RAM16G R1 + R3): found once in /chosen with its exact length,
-+refused elsewhere, twice or with another length; absent leaves ExtraOffset unset (the old trees parse as before)."""
++refused elsewhere, twice or with another length; absent leaves ExtraOffset unset (the old trees parse as before). Also check the boot argument cap on region0 publication."""
 +import ctypes, struct, subprocess, tempfile
 +from pathlib import Path
 +root = Path(__file__).resolve().parents[1]
 +src = (root / 'DarwinBootPkg/Driver/DarwinBoot.c').read_text()
 +fn = src[src.index('STATIC\nBOOLEAN\nAdtNode'):src.index('STATIC\nBOOLEAN\nValidTrustCaches')]
++stage_fn = src[src.index('STATIC\nUINTN\nExtraRamStage'):src.index('STATIC\nDARWIN_EXTRA_DECISION\nExtraRamRegion0Decision')]
 +pre = '''
 +#include <stdint.h>
 +#include <stddef.h>
@@ -483,6 +484,7 @@ index 0000000..4412caf
 +#define ALIGN_VALUE(v,a) (((v)+((a)-1)) & ~((UINTN)(a)-1))
 +#define CompareMem(a,b,n) memcmp(a,b,n)
 +#define AsciiStrCmp(a,b) strcmp(a,b)
++#define AsciiStrnCmp(a,b,n) strncmp(a,b,n)
 +static const void *ScanMem8(const void *p, UINTN n, UINT8 v) { return memchr(p, v, n); }
 +static UINT32 U32(const void *p) { UINT32 v; memcpy(&v,p,4); return v; }
 +static UINT64 U64(const void *p) { UINT64 v; memcpy(&v,p,8); return v; }
@@ -490,6 +492,7 @@ index 0000000..4412caf
 +#include "ExtraRam.h"
 +'''
 +glue = '''
++unsigned stage(const CHAR8 *args) { return (unsigned)ExtraRamStage(args); }
 +long long check(const UINT8 *p, UINTN n) {
 +  UINTN off = 0, r = MAX_UINTN, t = MAX_UINTN, a = MAX_UINTN, pol = MAX_UINTN, x = MAX_UINTN; UINT64 w = 0; BOOLEAN kp = 0;
 +  if (!AdtNode(p, n, &off, 0, 3, &r, &t, &a, &pol, &w, &kp, &x) || off != n) { return -2; }
@@ -503,7 +506,7 @@ index 0000000..4412caf
 +    return struct.pack('<II', len(props), len(children)) + b''.join(props) + b''.join(children)
 +N = 24 * 16
 +with tempfile.TemporaryDirectory() as tmp:
-+    w = Path(tmp); (w / 'adt.c').write_text(pre + fn + glue)
++    w = Path(tmp); (w / 'adt.c').write_text(pre + fn + stage_fn + glue)
 +    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-shared', '-fPIC', '-I', str(root / 'DarwinBootPkg/Driver'),
 +                    str(w / 'adt.c'), '-o', str(w / 'adt.dylib')], check=True)
 +    lib = ctypes.CDLL(str(w / 'adt.dylib')); lib.check.restype = ctypes.c_longlong
@@ -517,4 +520,13 @@ index 0000000..4412caf
 +    assert check(tree(chosen([prop('piano-extra-ram', bytes(N))] * 2))) == -2   # twice
 +    other = node([prop('name', b'device-tree\0')], [chosen([]), node([prop('name', b'cpus\0'), prop('piano-extra-ram', bytes(N))])])
 +    assert check(other) == -2                                               # not in /chosen
-+print('PASS: /chosen piano-extra-ram placeholder: found with its length, absent unset, wrong length / twice / outside /chosen refused')
++    print('PASS: /chosen piano-extra-ram placeholder: found with its length, absent unset, wrong length / twice / outside /chosen refused')
++    lib.stage.argtypes = (ctypes.c_char_p,)
++    lib.stage.restype = ctypes.c_uint
++    assert lib.stage(b'') == 1
++    assert lib.stage(b'piano-extra-ram-stage=2') == 1
++    assert lib.stage(b'piano-gpu-tier=1 piano-extra-ram-stage=0 piano-video=6') == 0
++    assert lib.stage(b'piano-extra-ram-stage=0x0') == 0
++    assert lib.stage(b'xpiano-extra-ram-stage=0 piano-extra-ram-stage=01') == 1
++    assert lib.stage(b'piano-extra-ram-stage=0\tpiano-extra-ram-stage=1') == 1
++print('PASS: region0 defaults to stage 1, stage 0 disables publication, stage 2 remains capped')
