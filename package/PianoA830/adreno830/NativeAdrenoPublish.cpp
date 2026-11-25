@@ -2068,6 +2068,12 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         const uint64_t object=cap && cap<window?cap:window<NativeAdrenoMemoryMaxBytes?window:uint64_t(NativeAdrenoMemoryMaxBytes);
         service->setProperty("NativeAdrenoClientObjectMiB",(unsigned long long)(object>>20),32);
         service->setProperty("NativeAdrenoClientInputBits",(unsigned long long)input_bits,32);
+        /* one console line ("PianoA830: gpu windows: ...") whatever the trace: the table the boot runs with */
+        char line[200];
+        snprintf(line,sizeof line,"windows: %u slots up to %llu MiB (input %u bits), ordinary window %llu MiB, per-object limit %llu MiB, "
+            "WindowServer %llu MiB",NativeAdrenoClientWindowCount(windows),(unsigned long long)(NativeAdrenoClientWindowsEnd(windows)>>20),
+            unsigned(input_bits),(unsigned long long)(window>>20),(unsigned long long)(object>>20),(unsigned long long)(windows[0].bytes>>20));
+        boot_progress_gpu_event(line);
     }
     /* UniXNU-piano (2026-11-24, BR1): the PCI-style identity Chrome's ANGLE and Dawn read from the accelerator's provider
      * (NativeAdrenoPciIdentity.h); before registerService, so the AGXAccelerator never exists without it. */
