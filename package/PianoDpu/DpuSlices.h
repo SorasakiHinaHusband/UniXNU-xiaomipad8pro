@@ -12,7 +12,7 @@
 //   uintptr_t irqOff(); void irqRestore(uintptr_t)   a few back-to-back stores with nothing in between
 //
 // The store guard (storeAllowed) is the whole list of registers the three slices write: CTL flush words, INTF1/INTF2's timing
-// engine enable, frame period and counter enable, the DSPPs' PCC, the DSI controllers' command-DMA words and their video TOTAL and
+// engine enable, fetch configuration, frame period and counter enable, the DSPPs' PCC, the DSI controllers' command-DMA words and their video TOTAL and
 // timing shadow words, and the DPU's INTF underrun status (write-one-to-clear, those two bits only). Nothing else: never TLMM (so
 // never the panel's reset gpio98 or the supply enables gpio117/118 that switch the KTZ8866's AVDD/AVEE), never the backlight's I2C,
 // the display clocks, the DSI PHYs, VBIF, REGDMA, the SSPPs, the LMs, the DSC or the SMMU.
@@ -64,6 +64,7 @@ inline bool storeAllowed(uint64_t pa, uint32_t v)
   for (unsigned i = 1; i <= 2; ++i) {
     if (pa == intfReg(i, kIntfEn)) return v <= 1;
     if (pa == intfReg(i, kIntfVsyncPeriod)) return true;
+    if (pa == intfReg(i, kIntfConfig) || pa == intfReg(i, kIntfProgFetch)) return true;
     if (pa == intfReg(i, kIntfCountEn)) return v == kCountersOn;
   }
   for (unsigned d = 0; d < kDsppCount; ++d)

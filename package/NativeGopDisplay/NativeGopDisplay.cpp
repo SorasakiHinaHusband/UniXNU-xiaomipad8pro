@@ -49,6 +49,9 @@
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
+#include "GopPanelPower.h"
+#include "../PianoBacklight/PianoBacklightClient.h"
+#include "../PianoTouch/PianoTouchClient.h"
 #include "GopRefresh.h"                        // the fixed refresh contract (native-gop-display-120=1; tests/gop_host.cpp)
 #include "GopColorLog.h"                       // the Night Shift observer (native-gop-display-color-log=1; tests/gop_host.cpp)
 #include "GopShot.h"
@@ -502,6 +505,10 @@ private:
     bool fBacklightCallout;
     IOService *fBacklight;            // retained once found
     bool fPowerPublished, fPowerPublishedOn;   // what "piano-display-power" was last messaged as
+    gopcompose::PanelPower fPanelPower;        // under fCopyLock
+    uint32_t fPanelSystem, fPanelAPI;          // under fCopyLock: raw states for the backlight
+    bool fPanelWantsTouch, fPanelNeedsWake;
+    IOService *fPanelTouch;                   // the copy thread's reference for the active touch hold
     // The VBL tick while the display is off (2026-11-12, docs/power.md "Idle wakeups by driver"): it stops once nothing is queued,
     // waiting, refreshed or retried (a submitted swap calls swap_begin_gated anyway, the display's power-on starts it again), instead of
     // 60 wakeups a second for nothing. native-gop-display-vbl=0: the tick runs always, as before.
@@ -533,6 +540,7 @@ private:
     uint32_t fAuditShown, fAuditWanted, fAuditBad, fAuditCount;
     void publishDisplayPower(bool on);
     void backlightCallout(bool on);
+    bool setPanelPower(bool on, uintptr_t system, uintptr_t api);
     void swapBrightness(const uint8_t *rec);   // 2026-11-21: the swap's nits to PianoBacklight
     int32_t fSwapNitsLast = -1;
     uint32_t fSwapNitsSent = 0;
@@ -923,7 +931,12 @@ bool NativeGopDisplay::start(IOService *provider)
                "family does (native-gop-display-color-log=1; nothing applied)\n");
     unsigned dpuPanel = 0;
     PE_parse_boot_argn("piano-dpu-panel", &dpuPanel, sizeof(dpuPanel));
-    fDpuPanel = dpuPanel != 0 && !fExternal;
+    fDpuPanel = dpuPanel == 1 && !fExternal;
+    if (fDpuPanel) {
+        unsigned touch = 0;
+        PE_parse_boot_argn("piano-touch", &touch, sizeof(touch));
+        fPanelWantsTouch = touch != 0;
+    }
     char dpuRefresh[16] = {};
     fDpuSwaps = !fExternal && PE_parse_boot_arg_str("piano-dpu-refresh", dpuRefresh, sizeof(dpuRefresh)) && !strcmp(dpuRefresh, "auto");
     if (fDpuPcc || fDpuPanel || fDpuSwaps) {
@@ -1153,6 +1166,7 @@ bool NativeGopDisplay::start_hardware()
     if (!fJobDone || getWorkLoop()->addEventSource(fJobDone) != kIOReturnSuccess) {
         OSSafeReleaseNULL(fJobDone);
         fFlipMode = false;
+        fDpuPanel = false;
         fDefer = gopcompose::kDeferNever;
         GOPLOG("no work-loop source for the deferred completions: every swap completes at once, flip mode off\n");
     }
@@ -1280,6 +1294,11 @@ IOReturn NativeGopDisplay::swap_begin_gated()
     if (!fVBL)
         return kIOReturnNotReady;
     fVBL->cancelTimeout();
+    if (fDpuPanel && fPowerPublished && !fPowerPublishedOn) {
+        fVblStopped = true;
+        fVBLDue = 0;
+        return kIOReturnSuccess;
+    }
     uint64_t frames = fFrames;
     while (clean_queue_gated()) {
         IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kSwapQueueFirst);
@@ -1495,29 +1514,51 @@ IOReturn NativeGopDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, 
 }
 
 // AppleParavirtDisplay::do_power_state_change_gated: the display is on while both the system and WindowServer (setAPIPowerState)
-// want it on; each change goes to WindowServer as a power state notification, which CoreAnimation waits for before it swaps. The
-// panel is not switched (no DPMS here): off only stops the copies' source.
+// want it on; each change goes to WindowServer as a power state notification. The copy worker orders the opt-in physical
+// transition around the jobs it presents, outside this gate.
 IOReturn NativeGopDisplay::do_power_state_change_gated()
 {
     bool on = at<uint32_t>(this, kSystemPowerState) && at<uint32_t>(this, kAPIPowerState);
-    if (!fExternal)   // the panel's power only: D6's second display publishes none (its readers mean the panel)
-        publishDisplayPower(on);
-    if (fBacklightCallout)
-        backlightCallout(on);
+    if (fDpuPanel) {
+        if (!on) {
+            publishDisplayPower(false);
+            if (fBacklightCallout)
+                backlightCallout(false);
+        }
+        IOLockLock(fCopyLock);
+        fPanelSystem = at<uint32_t>(this, kSystemPowerState);
+        fPanelAPI = at<uint32_t>(this, kAPIPowerState);
+        if (fPanelPower.request(on))
+            IOLockWakeup(fCopyLock, &fSlot, true);
+        const bool publishOn = on && fPanelPower.canPresent();
+        IOLockUnlock(fCopyLock);
+        if (publishOn) {
+            publishDisplayPower(true);
+            if (fBacklightCallout)
+                backlightCallout(true);
+        }
+    } else {
+        if (!fExternal)
+            publishDisplayPower(on);
+        if (fBacklightCallout)
+            backlightCallout(on);
+    }
     if (on == fDisplayOn)
         return kIOReturnSuccess;
     fDisplayOn = on;
     at<uint32_t>(this, kHardwarePowered) = on;
     GOPLOG("display %s\n", on ? "on" : "off");
-    if (fDpuPanel || fDpuNightShift) {   // panel light sleep or PCC replay (PianoDpu's thread)
+    // y12m merge (M4 + M5): with piano-dpu-panel=1 the copy worker hands the transition to PianoDpu synchronously (setPanelPower,
+    // M5a), and PianoDpu replays Night Shift inside that wake; Night Shift alone keeps M4's notify from this gate
+    if (!fDpuPanel && fDpuNightShift) {   // PCC replay only (PianoDpu's thread)
         IOService *dpu = dpuService(true);
         if (dpu)
             dpu->callPlatformFunction("PianoDpuPanel", false, reinterpret_cast<void *>(uintptr_t(on)), nullptr, nullptr, nullptr);
         else
-            GOPLOG("display %s: no PianoDpu service (panel sleep and Night Shift need piano-dpu>=1)\n", on ? "on" : "off");
+            GOPLOG("display %s: no PianoDpu service (Night Shift needs piano-dpu>=1)\n", on ? "on" : "off");
     }
     powerstate_notify(true, on);
-    if (on && (fVblStopped || fVblIdle))   // the tick stopped while the display was off (or nothing moved): again from now
+    if (on && !fDpuPanel && (fVblStopped || fVblIdle))
         swap_begin_gated();
     return kIOReturnSuccess;
 }
@@ -1529,12 +1570,14 @@ IOService *NativeGopDisplay::dpuService(bool now)
     IOService *found = __atomic_load_n(&fDpuSlices, __ATOMIC_ACQUIRE);
     if (found)
         return found;
-    const uint64_t t = mach_absolute_time();
-    if (!now && t < fDpuSlicesLookupNext)
-        return nullptr;
-    uint64_t second = 0;
-    nanoseconds_to_absolutetime(1000000000ull, &second);
-    fDpuSlicesLookupNext = t + second;
+    if (!now) {
+        const uint64_t t = mach_absolute_time();
+        if (t < fDpuSlicesLookupNext)
+            return nullptr;
+        uint64_t second = 0;
+        nanoseconds_to_absolutetime(1000000000ull, &second);
+        fDpuSlicesLookupNext = t + second;
+    }
     OSDictionary *match = IOService::serviceMatching("PianoDpu");
     IOService *dpu = match ? IOService::copyMatchingService(match) : nullptr;
     OSSafeReleaseNULL(match);
@@ -1620,6 +1663,54 @@ void NativeGopDisplay::backlightCallout(bool on)
     const uintptr_t system = at<uint32_t>(this, kSystemPowerState), api = at<uint32_t>(this, kAPIPowerState);
     fBacklight->callPlatformFunction("PianoBacklightDisplay", false, reinterpret_cast<void *>(uintptr_t(on)),
                                      reinterpret_cast<void *>(system), reinterpret_cast<void *>(api), nullptr);
+}
+
+// The copy worker drains the in-flight job before it gets here. On wake the
+// work loop publishes display power and allows the backlight to light again.
+bool NativeGopDisplay::setPanelPower(bool on, uintptr_t system, uintptr_t api)
+{
+    void *const enable = reinterpret_cast<void *>(uintptr_t(on));
+    if (on) {
+        if (fPanelNeedsWake) {
+            IOService *dpu = dpuService(true);
+            if (!dpu || dpu->callPlatformFunction("PianoDpuPanel", false, enable, nullptr, nullptr, nullptr) != kIOReturnSuccess) {
+                GOPLOG("panel wake failed, swaps held and backlight kept dark\n");
+                return false;
+            }
+            fPanelNeedsWake = false;
+        }
+        if (fPanelTouch)
+            fPanelTouch->callPlatformFunction(pianotouch::kFunctionPanel, false, enable, nullptr, nullptr, nullptr);
+        OSSafeReleaseNULL(fPanelTouch);
+        return true;
+    }
+
+    IOService *dpu = dpuService(true);
+    IOService *backlight = pianobacklight::service();
+    if (!dpu || !backlight || !fBacklightCallout || backlight->callPlatformFunction(
+            pianobacklight::kFunctionDisplay, false, nullptr, reinterpret_cast<void *>(system), reinterpret_cast<void *>(api),
+            this) != kIOReturnSuccess) {
+        GOPLOG("panel sleep refused: DPU service or confirmed backlight blank unavailable\n");
+        return false;
+    }
+    if (fPanelWantsTouch) {
+        if (!fPanelTouch) {
+            OSDictionary *match = IOService::serviceMatching(pianotouch::kServiceClass);
+            fPanelTouch = match ? IOService::copyMatchingService(match) : nullptr;
+            OSSafeReleaseNULL(match);
+        }
+        if (!fPanelTouch || fPanelTouch->callPlatformFunction(pianotouch::kFunctionPanel, false, nullptr, nullptr, nullptr,
+                                                            nullptr) != kIOReturnSuccess) {
+            GOPLOG("panel sleep refused: touch SPI did not park\n");
+            return false;
+        }
+    }
+    const IOReturn result = dpu->callPlatformFunction("PianoDpuPanel", false, nullptr, nullptr, nullptr, nullptr);
+    // A refusal after DCS started still needs the wake call to check whether the panel recovered.
+    fPanelNeedsWake |= result == kIOReturnSuccess || result == kIOReturnIOError;
+    if (result != kIOReturnSuccess)
+        GOPLOG("panel sleep refused by PianoDpu (%#x)\n", result);
+    return result == kIOReturnSuccess;
 }
 
 // AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. Every layer the swap hands over goes into
@@ -1830,13 +1921,20 @@ void NativeGopDisplay::jobDoneAction(OSObject *owner, IOInterruptEventSource *, 
 {
     auto *display = static_cast<NativeGopDisplay *>(owner);
     IOMFBSwapIORequest *swap = display->fWaitingSwap;
-    if (!swap)
-        return;
     IOLockLock(display->fCopyLock);
-    const bool done = display->fDoneSerial >= display->fWaitSerial;
+    const bool wake = display->fPanelPower.wakeComplete;
+    display->fPanelPower.wakeComplete = false;
+    const bool done = swap && display->fDoneSerial >= display->fWaitSerial;
     if (done)
         display->fWaitSerial = 0;
     IOLockUnlock(display->fCopyLock);
+    if (wake) {
+        display->publishDisplayPower(true);
+        if (display->fBacklightCallout)
+            display->backlightCallout(true);
+        if (!done)
+            display->swap_begin_gated();
+    }
     if (!done)
         return;
     display->fWaitingSwap = nullptr;
@@ -2160,8 +2258,22 @@ void NativeGopDisplay::copyLoop()
 {
     IOLockLock(fCopyLock);
     while (!fCopyStop) {
+        bool on;
+        if (fPanelPower.begin(on)) {
+            const uint32_t system = fPanelSystem, api = fPanelAPI;
+            IOLockUnlock(fCopyLock);
+            const bool ok = setPanelPower(on, system, api);
+            IOLockLock(fCopyLock);
+            fPanelPower.finish(on, ok);
+            if (fPanelPower.wakeComplete) {
+                IOLockUnlock(fCopyLock);
+                fJobDone->interruptOccurred(nullptr, nullptr, 0);
+                IOLockLock(fCopyLock);
+            }
+            continue;
+        }
         Job job;
-        if (!gopcompose::takeJob(fSlot, fBusy, &job)) {
+        if (!fPanelPower.canPresent() || !gopcompose::takeJob(fSlot, fBusy, &job)) {
             IOLockSleep(fCopyLock, &fSlot, THREAD_UNINT);
             continue;
         }
@@ -2201,6 +2313,11 @@ void NativeGopDisplay::copyLoop()
             fJobDone->interruptOccurred(nullptr, nullptr, 0);
         IOLockLock(fCopyLock);
     }
+    IOLockUnlock(fCopyLock);
+    if (fPanelNeedsWake || fPanelTouch)
+        setPanelPower(true, 0, 0);
+    OSSafeReleaseNULL(fPanelTouch);
+    IOLockLock(fCopyLock);
     fCopyThreadDone = true;
     IOLockWakeup(fCopyLock, &fCopyThreadDone, false);
     IOLockUnlock(fCopyLock);
