@@ -675,8 +675,8 @@ def gpu_addon_request():
         return None, name
     if mode not in ('copy', 'move'):
         raise SystemExit(f'PIANO_GPU_ADDON={mode!r}: copy or move')
-    if os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle') not in ('sle', 'app', 'app2'):
-        raise SystemExit('PIANO_GPU_ADDON_PLACE: sle, app or app2')
+    if os.environ.get('PIANO_GPU_ADDON_PLACE', 'sle') not in ('sle', 'app', 'app2', 'view3'):
+        raise SystemExit('PIANO_GPU_ADDON_PLACE: sle, app, app2 or view3')
     if not GPU_ADDON_NAME.fullmatch(name):
         raise SystemExit(f'PIANO_GPU_ADDON_NAME={name!r}: letters, digits, _ and - only')
     return mode, name
@@ -750,6 +750,23 @@ def seed_gpu_addon(mount, mode, name, trust, built):
         if os.readlink(link) != view:
             raise SystemExit(f'PIANO_GPU_ADDON_PLACE=app: {link} is not a symlink to {view}')
         record.update({'real': f'{GPU_APP_LIBRARY}/{GPU_APP_DIR}/{name}.bundle', 'link': f'{GPU_ADDONS}/{name}.bundle -> {view}',
+                       'kernel': '0074 (app-library view)'})
+    if place == 'view3':
+        # LT-B3 control (ANALYSIS.md 11, cryptex1-ctl2): the plugin stays a REAL bundle in the /S/L/E view (the layout Safari's WebGPU works
+        # with, ctl1), and a copy goes to the app-library source so kernel 0074 still mounts its view over App/System/Library. Safari WebGPU
+        # false here = the view itself (over WebKit's own directory) costs it; true = the plugin's code resolving into the view does.
+        copy = mount / GPU_APP_LIBRARY.lstrip('/') / GPU_APP_DIR / f'{name}.bundle'
+        if copy.exists():
+            shutil.rmtree(copy)
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        for directory in (copy.parent.parent, copy.parent):
+            os.chmod(directory, 0o755)
+        sh(['cp', '-cR', str(target), str(copy)], timeout=120, check=True)
+        sh(['xattr', '-cr', str(copy)], timeout=60, check=False)
+        for f in files:
+            if common.sha(copy / f['path']) != f['sha256']:
+                raise SystemExit(f'PIANO_GPU_ADDON_PLACE=view3: {copy}/{f["path"]} differs')
+        record.update({'view_copy': f'{GPU_APP_LIBRARY}/{GPU_APP_DIR}/{name}.bundle (not used by Metal: the view only)',
                        'kernel': '0074 (app-library view)'})
     if mode == 'move':
         shutil.rmtree(source)
