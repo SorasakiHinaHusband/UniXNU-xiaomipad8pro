@@ -1,0 +1,26 @@
+# Data store concurrency and durability (M4/M5)
+
+## Installed baseline
+
+M1 measured the installed 27.3 Data volume in single-gate mode at 15,580 4 KiB random-read IOPS at QD1 and 15,696 at QD8. Android on the same device measured 14,967 and 88,663 respectively. The single reader's p99 rose from 85 µs to 2,325 µs alongside a disjoint 1 MiB sequential writer. QD1 random writes reached 6,494 IOPS versus 36,693 on Android. WriteBooster was already enabled by firmware and qualification made zero flag changes. Full sync and barrier calls took 1.67 and 1.78 ms in M1. Those are application timings and do not identify which commands reached UFS.
+
+The measured read tail matches the scope of the disk gate. A 1 MiB write can keep it through eight 128 KiB data commands plus first-touch bitmap updates. A disjoint read waits for the whole request, even if another UFS slot is available. Root uses a separate provider and bypasses the Data gate. M4 exercises concurrent write-through I/O before introducing a different completion or durability policy.
+
+## M4 readiness
+
+The installed Data disk combines a packed RAM seed with a bound overlay on LUN 0 in `linux_data`. A clear presence bit selects the seed or zero. A set bit selects the corresponding 4 KiB store page. The device presents 512-byte logical sectors, so a partial-page write reads and merges the existing 4 KiB page. See [Data store format](../data-store.md).
+
+| Path | Single gate | `data-store-concurrent=1` |
+| --- | --- | --- |
+| Admission | One instance lock and one 128 KiB stage for the whole request | Up to eight private 128 KiB stages. Shared read ranges, exclusive whole-page write ranges, with earlier overlapping waiters protected from overtaking |
+| Data | One read or FUA write per run through NativeUfs | Disjoint caller threads can have commands outstanding at the same time, subject to transport slots and stage allocation |
+| First touch | Data FUA, then bitmap FUA before success | Data FUA, then a serialized publisher can merge already-durable runs in the same bitmap block. It publishes the in-memory bits after bitmap FUA and never waits to form a batch |
+| Overwrite | Data FUA only | Data FUA only |
+| Completion | Callback in the caller after the lock is released | Callback still in the caller, after releasing its range and stage |
+| Sync and power | Completed writes are write-through. Normal sync returns the online status. The opt-in UFS sleep path holds I/O and syncs the store | Sync fences admission and drains admitted I/O. Sleep additionally syncs the LUN and holds admission through wake when UFS suspend is enabled. Stop closes admission and drains it |
+
+The daily installer and installed-profile verifier explicitly forbid the concurrency boot-argument key. The v13 integration plan made this a conditional storage experiment: host fault/durability tests and a corrected benchmark first, then a measured installed-from-disk baseline, then a qualified same-boot A/B before the storage path could advance. The v13 integration linked the implementation with the argument absent in both profiles. The host handoff and M1 now supply the host evidence and installed baseline. They supply no on-device result for concurrent mode. The installer exclusion is a qualification decision, with no recorded concurrent-mode corruption incident in that handoff. Driver history is `31e0f683` and `43782b10`; the latter documents the runtime control.
+
+Host coverage lives in [NativeRamBlock tests](../../package/NativeRamBlock/Test/run-tests.sh) and [NativeUfs tests](../../package/NativeUfs/tests/run-tests.sh). The concurrent harness exercises depth and exhaustion, shared/exclusive ranges and 512-byte RMW, disjoint progress, merge and crash cuts at a bitmap-block boundary, short copies, failure latching, DMA quarantine, sync, switch, sleep/wake and stop drains, and a concurrent stress run. The serial transcript checks command order, returned bytes and persisted contents against the earlier driver. The UFS command and power models separately exercise CDB FUA, response/slot/error handling and failure to sync on sleep. These models cover driver logic. They cannot establish KIOXIA power-loss behavior, actual slot occupancy, or APFS recovery on the device.
+
+The store can be degraded even when its header and window still match. A write or write-side RMW error latches the experimental path against further writes. An unsuccessful command can have committed earlier runs, and a failed bitmap commit can leave durable data hidden behind a clear bit after reboot. In the serial control the legacy publisher mutates its in-memory bitmap before the bitmap I/O returns, so a failed publication can read differently after reboot. Live DMA quarantines the affected stage, and a transport timeout can poison the shared UFS host and affect root reads. A write latch or quarantined stage blocks the live mode switch. APFS can receive short I/O or EIO and can fail to mount or recover. A foreign or wrong-window store can be refused or kept, and a blank or damaged header in a writable window can trigger initialization. Require the recorded bound window, pinned seed, resumed state 2 and unchanged generation before testing, and keep a verified recovery set.
