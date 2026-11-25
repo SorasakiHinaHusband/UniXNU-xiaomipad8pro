@@ -6,6 +6,7 @@
 // output lookups/maps are scoped to a copy. Synchronous completion stays on the worker.
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
+#include <sys/proc.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -24,6 +25,7 @@ volatile uint32_t droidvm_vthost_sessions, droidvm_vthost_frames_in, droidvm_vth
 volatile uint32_t droidvm_vthost_error_stage, droidvm_vthost_replies, droidvm_vthost_unknown, droidvm_vthost_last_unknown;
 volatile int32_t droidvm_vthost_error_value;
 int proc_selfpid(void);
+task_t proc_task(proc_t);
 }
 namespace {
 constexpr int kBadData = -12909, kUnsupported = -12910, kBadState = -12903, kDecodeError = -12911, kNoMemory = -12904;
@@ -186,6 +188,28 @@ static unsigned ownerSurfaceClients(IOUserClient *mine,int pid,IOUserClient **ou
    IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);}
   OSSafeReleaseNULL(root);return count;
 }
+// LT-B5 qualvtg7: no IOSurfaceRoot client of any of the 24 accepts the surface (diag), so its owner task (WebKit re-owns decode-pool
+// surfaces to the WebContent process, which has no IOSurfaceRoot client: its sandbox) is reached by opening a client FOR that task
+// (IOSurfaceRoot::newUserClient from the kernel, as for the GPU task): find_surface's rule (1) owner == task then admits it. The
+// candidates are the other com.apple.WebKit processes with pids near the GPU process's (WebKit launches its processes together).
+static IOUserClient *ownerTaskClient(int gpuPid,uint32_t id,int *ownerPid){
+  IOService *root=surfaceRoot();if(!root)return nullptr;constexpr uint32_t bytes=0xc68;uint8_t *buf=static_cast<uint8_t *>(IOMallocZero(bytes));
+  IOUserClient *found=nullptr;unsigned tried=0;
+  for(int pid=gpuPid-400;buf&&!found&&pid<=gpuPid+400;++pid){
+    if(pid<=1||pid==gpuPid)continue;char name[32]={};proc_name(pid,name,sizeof name);
+    if(strncmp(name,"com.apple.WebKit",16))continue;
+    proc_t pr=proc_find(pid);if(!pr)continue;task_t t=proc_task(pr);
+    IOUserClient *c=nullptr;const IOReturn orc=t?root->newUserClient(t,t,0,nullptr,&c):kIOReturnNotFound;++tried;
+    IOReturn lrc=kIOReturnNotFound;
+    if(!orc&&c){uint32_t n=bytes;lrc=clientMethod(c,4,id,buf,&n);
+      if(!lrc){clientMethod(c,56,id,nullptr,nullptr);clientMethod(c,1,id,nullptr,nullptr);found=c;*ownerPid=pid;}
+      else{c->clientClose();c->release();}}
+    proc_rele(pr);
+    char line[160];snprintf(line,sizeof line,"owner-task try pid %d %s: open %08x lookup %08x",pid,name,orc,lrc);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
+  }
+  char line[160];snprintf(line,sizeof line,"owner-task scan id %u: %u WebKit tasks tried, %s",id,tried,found?"FOUND":"none");IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
+  if(buf)IOFree(buf,bytes);OSSafeReleaseNULL(root);return found;
+}
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
   if(!id || s->surfaceLease.held()){failure(s,45,kBadState);return false;}
@@ -218,6 +242,12 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
         if(rc){OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;}
       }
       if(!s->surfaces){rc=kIOReturnNotPermitted;}
+    }
+    if(rc==kIOReturnNotPermitted){   // the owner task itself (WebContent): a client of our own for it
+      int owner=-1;IOUserClient *c=ownerTaskClient(s->client->pid,id,&owner);
+      if(c){if(s->surfaces){closeSurface(s);}s->surfaces=c;s->surfacesBorrowed=false;++s->surfaceOpens;memset(result,0,bytes);resultBytes=bytes;
+        rc=surfaceMethod(s,4,id,result,&resultBytes);
+        char line[160];snprintf(line,sizeof line,"lookup id %u through a client for owner pid %d status %08x",id,owner,rc);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);}
     }
   }
   // A successful method owns both references, even if layout validation fails.
