@@ -146,6 +146,11 @@ static IOReturn clientMethod(IOUserClient *u,uint32_t selector,uint32_t id,void 
   if(bytes)*bytes=uint32_t(a.structureOutputSize);return rc;
 }
 static void b1Record(const char *line);
+static void diagRecord(const char *line){   // separate keys: the 8-slot B1 ring overwrote the diagnostic in qualvtg6
+  static unsigned seq=0;if(seq>=24)return;OSDictionary *m=IOService::nameMatching("AppleVideoToolboxParavirtualizationDriver");
+  IOService *pv=m?IOService::copyMatchingService(m):nullptr;OSSafeReleaseNULL(m);if(!pv)return;
+  char key[40];snprintf(key,sizeof key,"piano-video-vt-diag-%02u",seq++);pv->setProperty(key,line);pv->release();
+}
 static void diagOwner(IOUserClient *mine,uint32_t id){
   static bool done=false;if(done||pianoVtBorrowMode()!=2)return;done=true;
   IOService *root=surfaceRoot();if(!root)return;constexpr uint32_t bytes=0xc68;uint8_t *buf=static_cast<uint8_t *>(IOMallocZero(bytes));
@@ -154,10 +159,10 @@ static void diagOwner(IOUserClient *mine,uint32_t id){
       uint32_t n=bytes;const IOReturn rc=clientMethod(u,4,id,buf,&n);
       if(!rc){++ok;OSObject *c=u->copyProperty("IOUserClientCreator");OSString *cs=OSDynamicCast(OSString,c);
         clientMethod(u,56,id,nullptr,nullptr);clientMethod(u,1,id,nullptr,nullptr);
-        char line[160];snprintf(line,sizeof line,"diag id %u ACCEPTED by %s",id,cs?cs->getCStringNoCopy():"?");IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);
+        char line[160];snprintf(line,sizeof line,"diag id %u ACCEPTED by %s",id,cs?cs->getCStringNoCopy():"?");IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
         OSSafeReleaseNULL(c);}}
     it->release();}
-  char line[160];snprintf(line,sizeof line,"diag id %u tried %u clients, %u accepted",id,tried,ok);IOLog("PianoVideoVT B1: %s\n",line);b1Record(line);
+  char line[160];snprintf(line,sizeof line,"diag id %u tried %u clients, %u accepted",id,tried,ok);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
   if(buf)IOFree(buf,bytes);OSSafeReleaseNULL(root);
 }
 // Every IOSurfaceRoot client of the task (a sandboxed process may hold several: CoreVideo's, Metal's), retained, in registry order; the
