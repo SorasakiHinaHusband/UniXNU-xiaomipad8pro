@@ -50,7 +50,8 @@ struct Session {
   int replyError=0;
   uint8_t replyUuid[16]={};
   IOUserClient *surfaces=nullptr;
-  bool surfacesBorrowed=false;   // piano-video-vt-borrow: the owner task's own IOSurfaceRoot client, never closed by us
+  bool surfacesBorrowed=false;
+  OSObject *kernelSurface=nullptr;   // piano-video-vt-borrow=3: the surface object itself (no user-client lookup, no lease)   // piano-video-vt-borrow: the owner task's own IOSurfaceRoot client, never closed by us
   unsigned surfaceOpens=0,surfaceCloses=0,maps=0;
   pianovideo::vtsurface::Lease surfaceLease;
   uint32_t writeSurfaceID=0;
@@ -213,6 +214,37 @@ static IOUserClient *ownerTaskClient(int gpuPid,uint32_t id,int *ownerPid){
   char line[160];snprintf(line,sizeof line,"owner-task scan id %u: %u WebKit tasks tried, %s",id,tried,found?"FOUND":"none");IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);
   if(buf)IOFree(buf,bytes);OSSafeReleaseNULL(root);return found;
 }
+// LT-B5 (owner 11:55: carry the output surface itself instead of a by-ID lookup): piano-video-vt-borrow=3 takes the IOSurface object
+// straight from IOSurfaceRoot's table when every lookup path refuses it (qualvtg4-9: no client of any of 507 tasks is admitted by
+// find_surface). Field offsets of the pinned 27.3 IOSurface.kext (KC kc273-mac17j, ~/scratch/iosurface-re disassembly):
+//   IOSurfaceRoot: +0xd0 IOSurface ** table, +0xd8 uint32 count, +0x140 IOLock * (lookupSurface takes it around find_surface)
+//   IOSurface: +0x10 id, +0x30 IOMemoryDescriptor *, +0x80 pixel format, +0x88 alloc offset, +0x90 alloc size, +0x98 plane count,
+//              +0x180 plane records (56 bytes: +0 width, +8 height, +0x18 offset, +0x20 bytes per row)
+// The copy maps [alloc offset, +alloc size) of the surface's own memory descriptor into the kernel. Guarded: the id read back,
+// 420v/x420 two planes, sizes in bounds; any mismatch refuses (no guess).
+static OSObject *kernelSurfaceFor(uint32_t id,contract::Surface &v){
+  IOService *root=surfaceRoot();if(!root)return nullptr;
+  const uint8_t *r=reinterpret_cast<const uint8_t *>(root);OSObject *found=nullptr;
+  IOLock *lock=*reinterpret_cast<IOLock *const *>(r+0x140);
+  if(lock){IOLockLock(lock);
+    OSObject *const *table=*reinterpret_cast<OSObject *const *const *>(r+0xd0);const uint32_t count=*reinterpret_cast<const uint32_t *>(r+0xd8);
+    if(table&&id<count){OSObject *o=table[id];const uint8_t *b=reinterpret_cast<const uint8_t *>(o);
+      if(o&&*reinterpret_cast<const uint32_t *>(b+0x10)==id){o->retain();found=o;}}
+    IOLockUnlock(lock);}
+  OSSafeReleaseNULL(root);
+  if(!found)return nullptr;
+  const uint8_t *b=reinterpret_cast<const uint8_t *>(found);
+  v=contract::Surface();v.id=id;v.base=1;v.format=*reinterpret_cast<const uint32_t *>(b+0x80);v.size=*reinterpret_cast<const uint64_t *>(b+0x90);
+  v.planes=*reinterpret_cast<const uint32_t *>(b+0x98);
+  const uint8_t *pl=*reinterpret_cast<const uint8_t *const *>(b+0x180);
+  if(pl&&v.planes==2)for(unsigned i=0;i<2;++i){const uint8_t *q=pl+56*i;
+    v.plane[i]={*reinterpret_cast<const uint64_t *>(q),*reinterpret_cast<const uint64_t *>(q+8),*reinterpret_cast<const uint64_t *>(q+0x18),
+                *reinterpret_cast<const uint64_t *>(q+0x20),0};}
+  char line[200];snprintf(line,sizeof line,"kernel surface id %u format %08x planes %u alloc %llu+%llu p0 %llux%llu off %llu bpr %llu p1 off %llu bpr %llu",id,v.format,v.planes,
+    *reinterpret_cast<const uint64_t *>(b+0x88),v.size,v.plane[0].width,v.plane[0].height,v.plane[0].offset,v.plane[0].stride,v.plane[1].offset,v.plane[1].stride);
+  IOLog("PianoVideoVT B3: %s\n",line);diagRecord(line);
+  return found;
+}
 bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   constexpr uint32_t bytes=0xc68;
   if(!id || s->surfaceLease.held()){failure(s,45,kBadState);return false;}
@@ -228,7 +260,7 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   uint32_t resultBytes=bytes;
   IOReturn rc=surfaceMethod(s,4,id,result,&resultBytes);
   if(rc==kIOReturnNotPermitted)diagOwner(s->surfaces,id);
-  if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&!s->surfacesBorrowed){
+  if(rc==kIOReturnNotPermitted&&pianoVtBorrow()&&pianoVtBorrowMode()<3&&!s->surfacesBorrowed){
     IOUserClient *owners[8]={};unsigned n=ownerSurfaceClients(s->surfaces,s->client->pid,owners,8);
     {const unsigned room=8-n;IOUserClient *more[8]={};const unsigned m=ownerSurfaceClients(s->surfaces,0,more,8);
      for(unsigned j=0;j<m;++j){bool dup=false;for(unsigned k=0;k<n;++k)if(owners[k]==more[j])dup=true;
@@ -253,6 +285,12 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
         char line[160];snprintf(line,sizeof line,"lookup id %u through a client for owner pid %d status %08x",id,owner,rc);IOLog("PianoVideoVT B1: %s\n",line);diagRecord(line);}
     }
   }
+  if(rc==kIOReturnNotPermitted&&pianoVtBorrowMode()==3){
+    OSSafeReleaseNULL(s->kernelSurface);contract::Surface k;s->kernelSurface=kernelSurfaceFor(id,k);
+    const bool kok=s->kernelSurface&&contract::surface(k,s->config.s.width,s->config.s.height,s->config.pixelFormat());
+    if(!kok){OSSafeReleaseNULL(s->kernelSurface);}
+    if(kok){v=k;IOFree(result,bytes);IOLog("PianoVideoVT B3: lookup id %u through the kernel surface object (no lease)\n",id);return true;}
+  }
   // A successful method owns both references, even if layout validation fails.
   if(!rc){s->surfaceLease.acquire(id);++s->surfaceLookups;}
   bool ok=!rc && resultBytes==bytes;
@@ -261,7 +299,33 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
   IOLog("PianoVideoVT V6p: lookup token %llu request %llu id %u status %08x held %u\n",s->frame.token,s->guest.request,id,rc,unsigned(s->surfaceLease.held()));
   IOFree(result,bytes);if(!ok)failure(s,42,rc?int(rc):kBadData);return ok;
 }
+bool copyFrameKernel(Session *s,const Frame &f,const contract::Surface &v){
+  OSObject *surf=s->kernelSurface;s->kernelSurface=nullptr;if(!surf){failure(s,90,kBadState);return false;}
+  const uint8_t *b=reinterpret_cast<const uint8_t *>(surf);
+  IOMemoryDescriptor *md=*reinterpret_cast<IOMemoryDescriptor *const *>(b+0x30);const uint64_t off=*reinterpret_cast<const uint64_t *>(b+0x88);
+  bool ok=false;
+  if(md&&off<=md->getLength()&&v.size<=md->getLength()-off&&!md->prepare()){
+    IOMemoryMap *map=md->createMappingInTask(kernel_task,0,kIOMapAnywhere,off,v.size);
+    uint8_t *dst=map?reinterpret_cast<uint8_t *>(map->getVirtualAddress()):nullptr;
+    struct Publisher {
+      uintptr_t line;
+      Publisher(){uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));line=uintptr_t(4)<<((ctr>>16)&15);}
+      void clean(const uint8_t *start,uint64_t length){
+        const uintptr_t end=uintptr_t(start)+length;
+        for(uintptr_t a=uintptr_t(start)&~(line-1);a<end;a+=line)__asm__ volatile("dc cvac, %0"::"r"(a):"memory");
+      }
+      void finish(){__asm__ volatile("dsb sy":::"memory");}
+    } publisher;
+    ok=dst&&map->getLength()>=v.size&&pianovideo::vtsurface::copyAndPublish(f.layout,f.length,const_cast<const uint8_t *>(f.cpu),v,dst,publisher);
+    OSSafeReleaseNULL(map);md->complete();
+  }
+  {char line[120];snprintf(line,sizeof line,"kernel copy token %llu id %u %s",f.token,v.id,ok?"OK":"FAILED");IOLog("PianoVideoVT B3: %s\n",line);static unsigned n=0;if(n++<4)diagRecord(line);}
+  surf->release();
+  if(!ok)failure(s,91,kNoMemory);
+  return ok;
+}
 bool copyFrame(Session *s,const Frame &f,const contract::Surface &lookup) {
+  if(s->kernelSurface)return copyFrameKernel(s,f,lookup);
   if(s->writeSurfaceID || !f.memory || f.memory->getLength()<f.length || !f.cpu || !contract::layout(f.layout,f.length) || !contract::surface(lookup,f.layout.width,f.layout.height,f.layout.format)){failure(s,60,kBadData);return false;}
   constexpr uint32_t resultSize=0xc68;
   uint8_t *result=static_cast<uint8_t *>(IOMallocZero(resultSize));
@@ -324,6 +388,7 @@ bool releaseSurface(Session *s){
   return ok;
 }
 void closeSurface(Session *s){
+  OSSafeReleaseNULL(s->kernelSurface);
   if(s->surfaces){if(!s->surfacesBorrowed)s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;
     ++s->surfaceCloses;s->surfaceLease.closed();s->writeSurfaceID=0;}
 }
