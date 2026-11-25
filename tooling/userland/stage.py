@@ -700,6 +700,45 @@ GPU_APP_DIR = 'Frameworks'
 GPU_ADDON_NAME = re.compile(r'[A-Za-z0-9_-]+')
 
 
+# LT-B3 (gpu/cryptex2, private/host-checks/20261124-browser-gpu/ANALYSIS.md section 14): the INSTALLED layer's app2 layout, the one
+# cryptex1-ctl3 qualified (seed mode PIANO_GPU_ADDON_PLACE=app2 with the /Library/GPUBundles copy gone): the whole bundle real under
+# kernel 0074's view source (GPU_APP_LIBRARY/GPU_APP_DIR, shown at GPU_APP_POINT/GPU_APP_DIR), and in the /S/L/E view's source
+# (GPU_ADDONS) the same bundle with its Info.plist real (what Metal's discovery and CFBundle read) and every Mach-O a link (install.sh
+# kind link) to that file's App-cryptex path (what dyld maps: both browsers' GPU sandboxes allow file-map-executable there, judged on the
+# view's mount path). Needs a 0074 kernel and sheng-gpu-addon=1: without the App view the links dangle (no Metal device).
+GPU_LINK_DIR = 'links'
+
+
+def gpu_app2_layer(unit, name, files):
+    """FILES: [(path inside the bundle, bytes)] of the plugin bundle NAME (Contents/Info.plist, Contents/MacOS/<file>, ...). Returns the
+    rows [(f, data)] for staging_tree: first every file real at GPU_APP_LIBRARY/GPU_APP_DIR/<name>.bundle/<path> (staged
+    files/<unit>/<path>, root:wheel, 0755 for a Mach-O, 0644 otherwise), then at GPU_ADDONS/<name>.bundle/<path> the same staged file
+    for a non-Mach-O and, for a Mach-O, a link to GPU_APP_POINT/GPU_APP_DIR/<name>.bundle/<path> (kind link, staged
+    files/<unit>/links/<path> holding the target, its sha256 the target's)."""
+    if not GPU_ADDON_NAME.fullmatch(name):
+        raise SystemExit(f'gpu_app2_layer: bundle name {name!r}')
+    real, links = [], []
+    for inside, data in sorted(files):
+        if not re.fullmatch(r'Contents/(?:Info\.plist|(?:MacOS|Resources)/[A-Za-z0-9_+-][A-Za-z0-9._+-]*)', inside):
+            raise SystemExit(f'gpu_app2_layer: {inside} is not a plugin bundle file')
+        macho = data[:4] == b'\xcf\xfa\xed\xfe'
+        staged = f'files/{unit}/{inside}'
+        mode = '0755' if macho else '0644'
+        row = {'unit': unit, 'name': inside.rsplit('/', 1)[1], 'owner': 'root:wheel', 'on': True, 'label': '-'}
+        real.append(({**row, 'kind': 'file', 'mode': mode, 'staged': staged, 'sha256': sha(data),
+                      'dest': f'{GPU_APP_LIBRARY}/{GPU_APP_DIR}/{name}.bundle/{inside}'}, data))
+        if macho:
+            target = f'{GPU_APP_POINT}/{GPU_APP_DIR}/{name}.bundle/{inside}'.encode()
+            links.append(({**row, 'kind': 'link', 'mode': '0755', 'staged': f'files/{unit}/{GPU_LINK_DIR}/{inside}',
+                           'sha256': sha(target), 'dest': f'{GPU_ADDONS}/{name}.bundle/{inside}'}, target))
+        else:
+            links.append(({**row, 'kind': 'file', 'mode': mode, 'staged': staged, 'sha256': sha(data),
+                           'dest': f'{GPU_ADDONS}/{name}.bundle/{inside}'}, data))
+    if not any(f['kind'] == 'link' for f, _ in links):
+        raise SystemExit(f'gpu_app2_layer: {name}.bundle has no Mach-O')
+    return real + links
+
+
 def gpu_addon_request():
     """(mode, name) from PIANO_GPU_ADDON / PIANO_GPU_ADDON_NAME; mode None when unset."""
     mode = os.environ.get('PIANO_GPU_ADDON', '')

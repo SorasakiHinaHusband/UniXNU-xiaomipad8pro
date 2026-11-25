@@ -504,6 +504,100 @@ CUSTOM_BATTERY = 'Battery Power:\n Sleep On Power Button 1\n standby            
 CUSTOM_AC = 'AC Power:\n Sleep On Power Button 1\n hibernatemode        3\n displaysleep         10\n sleep                1\n'
 
 
+def link_tests(tmp):
+    """2c. install.sh kind link (LT-B3, gpu/cryptex2): the y12j -> y12k transition of the plugin rows (three real files under
+    /private/var/ngpu/addons -> stage.gpu_app2_layer's app2 rows: the bundle real under app-library, the addons Mach-Os links), the
+    check, the receipt, a tampered link repaired, the way back to files, a non-installer file kept and put back, under sh and dash."""
+    print('2c. installer: link rows (app2 layout)')
+    macho = b'\xcf\xfa\xed\xfe' + b'plugin' * 10
+    vk = b'\xcf\xfa\xed\xfe' + b'vulkan' * 10
+    info = b'<plist>info</plist>\n'
+    files = [('Contents/Info.plist', info), ('Contents/MacOS/NativeAdrenoMetal', macho), ('Contents/MacOS/libvulkan_freedreno.dylib', vk)]
+    unit = 'gpu-nativeadrenometal'
+    base = f'{stage.GPU_ADDONS}/NativeAdrenoMetal.bundle'
+    app = f'{stage.GPU_APP_LIBRARY}/{stage.GPU_APP_DIR}/NativeAdrenoMetal.bundle'
+    view = f'{stage.GPU_APP_POINT}/{stage.GPU_APP_DIR}/NativeAdrenoMetal.bundle'
+    plain = [({'unit': unit, 'name': i.rsplit('/', 1)[1], 'owner': 'root:wheel', 'on': True, 'label': '-', 'kind': 'file',
+               'mode': '0755' if d[:4] == b'\xcf\xfa\xed\xfe' else '0644', 'staged': f'files/{unit}/{i}', 'sha256': sha(d),
+               'dest': f'{base}/{i}'}, d) for i, d in files]
+    app2 = stage.gpu_app2_layer(unit, 'NativeAdrenoMetal', files)
+    check([f['kind'] for f, _ in app2] == ['file'] * 3 + ['file', 'link', 'link'] and
+          [f['dest'] for f, _ in app2][:3] == [f'{app}/{i}' for i, _ in files] and
+          [d for f, d in app2 if f['kind'] == 'link'] == [f'{view}/Contents/MacOS/NativeAdrenoMetal'.encode(),
+                                                          f'{view}/Contents/MacOS/libvulkan_freedreno.dylib'.encode()],
+          'gpu_app2_layer: the real bundle under app-library first, then the addons Info.plist real and both Mach-Os links into the App view')
+    tree = stage.staging_tree({'staging': '/private/var/piano/userland'}, app2)
+    check(tree[f'files/{unit}/links/Contents/MacOS/NativeAdrenoMetal'][0] == f'{view}/Contents/MacOS/NativeAdrenoMetal'.encode() and
+          sum(1 for n in tree if n.startswith(f'files/{unit}/')) == 5,
+          'the staging: the three bundle files once (shared by both trees) and the two link targets')
+    refused(stage.gpu_app2_layer, unit, 'NativeAdrenoMetal', [('Contents/Info.plist', info)], match='no Mach-O')
+    for shell in [s for s in ('/bin/sh', '/bin/dash') if Path(s).exists()]:
+        tag = Path(shell).name
+        rig = Rig(tmp / tag, shell)
+
+        def stage_rows(rows):
+            stage.sync_tree(rig.tmp / 'stage', stage.staging_tree({'staging': '/private/var/piano/userland'}, rows))
+
+        receipt = rig.root('/private/var/db/piano-userland/receipt.tsv')
+        stage_rows(plain)
+        code, out = rig.run()
+        check(code == 0 and rig.root(f'{base}/Contents/MacOS/NativeAdrenoMetal').read_bytes() == macho, f'{tag}: base: the y12j files')
+        stage_rows(app2)
+        code, out = rig.run('--live')
+        lk = rig.root(f'{base}/Contents/MacOS/NativeAdrenoMetal')
+        check(code == 0 and lk.is_symlink() and os.readlink(lk) == f'{view}/Contents/MacOS/NativeAdrenoMetal' and
+              os.readlink(rig.root(f'{base}/Contents/MacOS/libvulkan_freedreno.dylib')) == f'{view}/Contents/MacOS/libvulkan_freedreno.dylib',
+              f'{tag}: app2: the addons Mach-Os replaced by links into the App view\n{out}')
+        check(rig.root(f'{app}/Contents/MacOS/NativeAdrenoMetal').read_bytes() == macho and
+              not rig.root(f'{base}/Contents/Info.plist').is_symlink() and rig.root(f'{base}/Contents/Info.plist').read_bytes() == info,
+              f'{tag}: app2: the real bundle under app-library, the addons Info.plist still a real file')
+        check(not list(rig.root(base).rglob('*.piano-link')) and
+              not rig.root('/private/var/db/piano-userland/prev').exists(),
+              f'{tag}: app2: no temporary link left, nothing kept in prev/ (the replaced files were the installer\'s own)')
+        rows = [l.split('\t') for l in receipt.read_text().splitlines()]
+        check(sorted((r[1], r[8]) for r in rows) == sorted((f['kind'], f['dest']) for f, _ in app2),
+              f'{tag}: app2: the receipt lists the six rows with their kinds')
+        code, out = rig.run('--check')
+        check(code == 0, f'{tag}: app2: --check passes\n{out}')
+        code, out = rig.run('--boot')
+        check(code == 0 and 'link ->' not in out and 'changed:)' in out, f'{tag}: app2: a second run changes nothing\n{out}')
+        lk.unlink(); os.symlink('/elsewhere/NativeAdrenoMetal', lk)
+        code, out = rig.run('--check')
+        check(code == 1 and 'link target /elsewhere/NativeAdrenoMetal' in out, f'{tag}: a tampered link: --check fails')
+        code, out = rig.run('--boot')
+        check(code == 0 and os.readlink(lk) == f'{view}/Contents/MacOS/NativeAdrenoMetal', f'{tag}: a tampered link is put right')
+        lk.unlink(); lk.write_bytes(macho)
+        code, out = rig.run('--check')
+        check(code == 1 and 'not a symbolic link' in out, f'{tag}: a file where a link belongs: --check fails')
+        rig.run('--boot')
+        check(lk.is_symlink(), f'{tag}: a file where a link belongs is replaced by the link')
+        stage_rows(plain)
+        code, out = rig.run('--live')
+        check(code == 0 and not lk.is_symlink() and lk.read_bytes() == macho and
+              rig.root(f'{base}/Contents/MacOS/libvulkan_freedreno.dylib').read_bytes() == vk,
+              f'{tag}: back to the y12j rows: the links replaced by the files (not adopted through the link)\n{out}')
+        check(not rig.root(f'{app}/Contents/MacOS/NativeAdrenoMetal').exists() and
+              not rig.root(f'{app}/Contents/Info.plist').exists(),
+              f'{tag}: back to the y12j rows: the app-library files removed (no longer in the manifest)')
+        code, out = rig.run('--check')
+        check(code == 0, f'{tag}: back to the y12j rows: --check passes\n{out}')
+        # a link row taken out of the manifest: the link is removed; a non-installer file it replaced comes back
+        rig2 = Rig(tmp / (tag + '-own'), shell)
+        own = rig2.root(f'{base}/Contents/MacOS/NativeAdrenoMetal')
+        own.parent.mkdir(parents=True); own.write_bytes(b'owner file')
+        stage.sync_tree(rig2.tmp / 'stage', stage.staging_tree({'staging': '/private/var/piano/userland'}, app2))
+        code, out = rig2.run()
+        check(code == 0 and own.is_symlink() and
+              rig2.root(f'/private/var/db/piano-userland/prev{base}/Contents/MacOS/NativeAdrenoMetal').read_bytes() == b'owner file',
+              f'{tag}: a file the installer did not place is kept in prev/ before the link replaces it\n{out}')
+        stage.sync_tree(rig2.tmp / 'stage', stage.staging_tree({'staging': '/private/var/piano/userland'}, []))
+        code, out = rig2.run()
+        check(code == 0 and not own.is_symlink() and own.read_bytes() == b'owner file' and
+              not rig2.root(f'{base}/Contents/MacOS/libvulkan_freedreno.dylib').exists() and
+              not rig2.root(f'{base}/Contents/MacOS/libvulkan_freedreno.dylib').is_symlink(),
+              f'{tag}: the unit taken out: the kept file is back, the other link removed\n{out}')
+
+
 def pmset_tests(tmp):
     print('3. pmset defaults')
     script = HERE / 'piano-pmset-defaults.sh'
@@ -1075,6 +1169,7 @@ def main():
         pmset_tests(tmp / 'p')
         keyboard_tests(tmp / 'k')
         btm_tests(tmp / 'b')
+        link_tests(tmp / 'l')
         if quick:
             print('(--quick: parts 4-7 skipped)')
         elif k27_tree(required=False) is None:
