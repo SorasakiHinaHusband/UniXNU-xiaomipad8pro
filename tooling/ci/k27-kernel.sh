@@ -163,6 +163,7 @@ stage_kernel() {
   local k=$X/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped
   [ -f "$k" ] || k=$(ls "$X"/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped* | head -1)
   cp "$k" "$OUT/kernel-k27-native.macho"
+  cp "$k" "$M/out/k27/kernel-k27-$TOP-native.macho"   # the name tooling/k273/prepare-k27-tree.sh measures (TAG = K27_TREE_TOP)
   ( cd "$OUT" && shasum -a 256 kernel-k27-native.macho > kernel-k27-native.macho.sha256 && cat kernel-k27-native.macho.sha256 )
 }
 
