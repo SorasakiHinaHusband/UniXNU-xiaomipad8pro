@@ -166,7 +166,7 @@ class Pool {
   // Parses /chosen/piano-extra-ram (bytes may be null: no property). Returns the number of runs this caller owns.
   unsigned load(const uint8_t *prop, size_t bytes, const Config &c)
   {
-    *this = Pool();
+    reset();   // in place: no Pool-sized temporary on a kernel stack
     cfg = c;
     present = prop != nullptr;
     if (!prop) return 0;
@@ -379,6 +379,14 @@ class Pool {
     }
   };
 
+  void reset()
+  {
+    for (RunState &s : runs) s = RunState();
+    count = records = 0;
+    present = formatBad = false;
+    for (uint32_t &r : refusals) r = 0;
+    takes = takeFails = gives = giveBad = dropped = 0;
+  }
   bool fail()
   {
     ++takeFails;
