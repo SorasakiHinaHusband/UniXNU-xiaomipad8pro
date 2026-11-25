@@ -1,4 +1,4 @@
-From 098851a18964a759b6d1931e785d42c091212a7f Mon Sep 17 00:00:00 2001
+From 2066f65a41552ec15f3d6dfe12bfdb1807812e04 Mon Sep 17 00:00:00 2001
 From: k27 <k27@localhost>
 Date: Wed, 25 Nov 2026 22:27:51 +0800
 Subject: [PATCH] k27 0075: user VA 47-bit: every user pmap takes a 4 KiB
@@ -9,11 +9,11 @@ Subject: [PATCH] k27 0075: user VA 47-bit: every user pmap takes a 4 KiB
 
 ---
  bsd/dev/arm64/sysctl.c             |   4 +-
- osfmk/arm/pmap/pmap.c              | 113 +++++++++++++++++++++++++----
- osfmk/arm/pmap/pmap_uva47_policy.h | 110 ++++++++++++++++++++++++++++
+ osfmk/arm/pmap/pmap.c              | 119 +++++++++++++++++++++++++----
+ osfmk/arm/pmap/pmap_uva47_policy.h | 110 ++++++++++++++++++++++++++
  osfmk/mach/arm/vm_param.h          |  10 ++-
  pexpert/pexpert/arm64/BCM2837.h    |   6 ++
- 5 files changed, 225 insertions(+), 18 deletions(-)
+ 5 files changed, 231 insertions(+), 18 deletions(-)
  create mode 100644 osfmk/arm/pmap/pmap_uva47_policy.h
 
 diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
@@ -32,7 +32,7 @@ index dca63a2..bb3566f 100644
  }
  
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 609b521..851cda7 100644
+index 609b521..ad6e887 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -100,6 +100,8 @@
@@ -97,7 +97,7 @@ index 609b521..851cda7 100644
  #  else
  SECURITY_READ_ONLY_LATE(vm_map_offset_t) arm64_pmap_max_offset_default = 0x0;
  #  endif
-@@ -2381,6 +2422,21 @@ pmap_bootstrap(
+@@ -2381,6 +2422,17 @@ pmap_bootstrap(
  
  
  
@@ -109,17 +109,13 @@ index 609b521..851cda7 100644
 +		piano_uva47 = piano_uva47_on(uva47_present, uva47_arg);
 +		piano_uva_max_offset = piano_uva_max_address(piano_uva47);
 +		arm64_pmap_max_offset_default = piano_uva_max_offset;
-+		if (piano_uva47) {
-+			printf("piano-uva47: user VA 47 bits (T0SZ 17, L0 root)\n");
-+		} else {
-+			printf("piano-uva47: user VA 39 bits (piano-uva47=0)\n");
-+		}
++		/* the console line comes from pmap_create_commpages: this early, no capture (USB console, kernel ring) keeps it */
 +	}
 +#endif /* !__ARM_16K_PG__ && ARM_PARAMETERIZED_PMAP && XNU_TARGET_OS_OSX */
  	if (PE_parse_boot_argn("arm_maxoffset", &maxoffset, sizeof(maxoffset))) {
  		maxoffset = trunc_page(maxoffset);
  		if ((maxoffset >= pmap_max_offset(FALSE, ARM_PMAP_MAX_OFFSET_MIN))
-@@ -3078,6 +3134,12 @@ pmap_create_options_internal(
+@@ -3078,6 +3130,12 @@ pmap_create_options_internal(
  #if ARM_PARAMETERIZED_PMAP
  	/* Default to the native pt_attr */
  	p->pmap_pt_attr = native_pt_attr;
@@ -132,7 +128,7 @@ index 609b521..851cda7 100644
  #endif /* ARM_PARAMETERIZED_PMAP */
  #if __ARM_MIXED_PAGE_SIZE__
  	if (flags & PMAP_CREATE_FORCE_4K_PAGES) {
-@@ -3108,25 +3170,36 @@ pmap_create_options_internal(
+@@ -3108,25 +3166,36 @@ pmap_create_options_internal(
  	}
  
  	p->ttep = ml_static_vtop((vm_offset_t)p->tte);
@@ -181,7 +177,7 @@ index 609b521..851cda7 100644
  
  	FLUSH_PTE();
  
-@@ -3414,8 +3487,8 @@ pmap_destroy_internal(
+@@ -3414,8 +3483,8 @@ pmap_destroy_internal(
  	if (pmap->hw_tte) {
  		pmap_tt1_deallocate(pmap, pmap->hw_tte, pmap_root_alloc_size(pmap), 0);
  		pmap->hw_tte = (tt_entry_t *) NULL;
@@ -191,7 +187,7 @@ index 609b521..851cda7 100644
  
  	assert((tt_free_entry_t*)pmap->tt_entry_free == NULL);
  
-@@ -7982,7 +8055,9 @@ pmap_switch_user_ttb(pmap_t pmap, pmap_cpu_data_t *cpu_data_ptr)
+@@ -7982,7 +8051,9 @@ pmap_switch_user_ttb(pmap_t pmap, pmap_cpu_data_t *cpu_data_ptr)
  
  
  	if (pmap != kernel_pmap) {
@@ -202,7 +198,24 @@ index 609b521..851cda7 100644
  	} else if (!pmap_user_ttb_is_clear()) {
  		pmap_clear_user_ttb_internal();
  	}
-@@ -11956,7 +12031,11 @@ pmap_max_64bit_offset(
+@@ -11444,6 +11515,16 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 	*kernel_text_addr = 0;
+ 	*user_text_addr = 0;
+ 
++#if !__ARM_16K_PG__ && ARM_PARAMETERIZED_PMAP && defined(XNU_TARGET_OS_OSX)
++	/* k27 0075: the mode pmap_bootstrap chose, printed once the console is up (kernel_bootstrap_thread, before the first user pmap
++	 * that is not the commpage's), with the map end the exec maps get */
++	if (piano_uva47) {
++		printf("piano-uva47: user VA 47 bits (T0SZ 17, L0 root), map end 0x%llx\n", (unsigned long long)arm64_pmap_max_offset_default);
++	} else {
++		printf("piano-uva47: user VA 39 bits (piano-uva47=0), map end 0x%llx\n", (unsigned long long)arm64_pmap_max_offset_default);
++	}
++#endif
++
+ #if XNU_MONITOR
+ 	data_pa = pmap_alloc_page_for_kern(0);
+ 	assert(data_pa);
+@@ -11956,7 +12037,11 @@ pmap_max_64bit_offset(
  	} else if (option == ARM_PMAP_MAX_OFFSET_MIN) {
  		max_offset_ret = min_max_offset;
  	} else if (option == ARM_PMAP_MAX_OFFSET_MAX) {
@@ -214,7 +227,7 @@ index 609b521..851cda7 100644
  	} else if (option == ARM_PMAP_MAX_OFFSET_DEVICE) {
  		if (arm64_pmap_max_offset_default) {
  			max_offset_ret = arm64_pmap_max_offset_default;
-@@ -12986,6 +13065,12 @@ pmap_user_va_bits(pmap_t pmap __unused)
+@@ -12986,6 +13071,12 @@ pmap_user_va_bits(pmap_t pmap __unused)
  #if __ARM_MIXED_PAGE_SIZE__
  	uint64_t tcr_value = pmap_get_pt_attr(pmap)->pta_tcr_value;
  	return 64 - ((tcr_value >> TCR_T0SZ_SHIFT) & TCR_TSZ_MASK);

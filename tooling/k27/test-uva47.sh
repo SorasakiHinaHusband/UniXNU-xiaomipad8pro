@@ -51,7 +51,7 @@ bad = [l for l in removed if 'kernel_pmap->pmap_pt_attr = native_pt_attr' in l o
 if bad:
     raise SystemExit('test-uva47: the patch changes the kernel/native attribute: %r' % bad)
 need = ['#define ARM_PARAMETERIZED_PMAP', 'pmap_pt_attr_4k_u47', 'MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL',
-        '(-1ULL >> (T0SZ_HW))', 'piano-uva47: user VA 47 bits (T0SZ 17, L0 root)', 'piano-uva47: user VA 39 bits (piano-uva47=0)',
+        '(-1ULL >> (T0SZ_HW))', 'piano-uva47: user VA 47 bits (T0SZ 17, L0 root), map end', 'piano-uva47: user VA 39 bits (piano-uva47=0), map end',
         'int return_value = 64 - T0SZ_HW;']
 for n in need:
     if not any(n in l for l in added):

@@ -119,7 +119,7 @@ def main():
     vas = k.sym('virtual_address_size')
     imms = movz32_imms(k.func_words('virtual_address_size')) if vas is not None else []
     check(vas is not None, 'virtual_address_size handler found (movz immediates %s)' % [hex(i) for i in imms])
-    strings = ['piano-uva47: user VA 47 bits (T0SZ 17, L0 root)', 'piano-uva47: user VA 39 bits (piano-uva47=0)', 'piano-uva47']
+    strings = ['piano-uva47: user VA 47 bits (T0SZ 17, L0 root), map end 0x%llx', 'piano-uva47: user VA 39 bits (piano-uva47=0), map end 0x%llx', 'piano-uva47']
     if not baseline:
         check(u47 is not None and u47['root'] == 0 and u47['commpage'] == 1 and u47['max'] == 3 and u47['page'] == 4096
               and u47['pagezero'] == 4096 and u47['shift'] == 12 and u47['mask'] == (1 << 47) - 1,
@@ -138,11 +138,11 @@ def main():
         check(u47 is None, 'no pmap_pt_attr_4k_u47')
         check(max_default == 0x7FFE000000, 'arm64_pmap_max_offset_default initial = %s' % (hex(max_default) if max_default else None))
         check(0x27 in imms and 0x2F not in imms, 'virtual_address_size returns 0x27 (39)')
-        check(not k.has_string(strings[0]), 'no piano-uva47 console string')
+        check(b'piano-uva47: user VA' not in k.data, 'no piano-uva47 console string')
     if fails:
         print('check-uva47-kc: FAIL (%d)' % len(fails))
         return 1
-    print('check-uva47-kc: PASS%s' % ('' if baseline else '; NEED_KC_STRINGS=%r' % strings[0]))
+    print('check-uva47-kc: PASS%s' % ('' if baseline else '; NEED_KC_STRINGS token: piano-uva47:'))
     return 0
 
 
