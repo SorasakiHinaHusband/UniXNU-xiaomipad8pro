@@ -82,9 +82,13 @@
 
 | 场景 | 媒体 | 状态 |
 | --- | --- | --- |
-| 桌面（访达、程序坞、菜单栏） | 即将提供 | 原生截图安排在下一次测试启动时拍摄 |
-| Safari 用硬件解码器播放 H.264 1080p | 即将提供 | 原生截图已安排 |
-| Metal 3D 演示 | 即将提供 | 原生截图已安排 |
+| 关于本机（Snapdragon 8 Elite、可见 13 GB、macOS 27.3） | <img src="media/y12m-about.jpg" width="320" alt="关于本机"> | ✅ 原生截图，v13.1y12m |
+| 显示器设置（内建显示器、亮度、原彩、夜览） | <img src="media/y12m-display-settings.jpg" width="320" alt="显示器设置"> | ✅ 原生截图，v13.1y12m |
+| 电池设置（充电中、能耗模式为高功率） | <img src="media/y12m-battery-settings.jpg" width="320" alt="电池设置"> | ✅ 原生截图，v13.1y12m |
+| 桌面与访达（应用程序） | <img src="media/y12m-finder.jpg" width="320" alt="桌面与访达"> | ✅ 原生截图，v13.1y12m |
+| 活动监视器（磁盘） | <img src="media/y12m-activity-monitor.jpg" width="320" alt="活动监视器"> | ✅ 原生截图，v13.1y12m |
+| Metal 3D 演示（GPU 测试场景） | <img src="media/y12m-metal.jpg" width="320" alt="Metal 3D 演示"> | ✅ 原生截图，v13.1y12m |
+| Safari 播放测试视频（硬件解码） | <img src="media/y12m-safari-video.jpg" width="320" alt="Safari 播放测试视频"> | ✅ 原生截图，v13.1y12m |
 | Photo Booth 摄像头实时画面 | 即将提供 | 原生截图已安排 |
 | Wi-Fi 网络列表 | 即将提供 | 原生截图已安排（网络名称会被模糊） |
 | 触摸手势（点按、缩放、旋转、滚动） | 即将提供 | 现有摄像头录像失焦，需要重新录制 |

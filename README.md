@@ -95,7 +95,7 @@ Today's tablet results: [docs/results-2026-11-26.md](docs/results-2026-11-26.md)
 [docs/results-2026-11-25.md](docs/results-2026-11-25.md)).
 
 **Showcase:** screenshots and short clips of each feature, taken on the tablet itself, are collected in
-[docs/STATUS.md#showcase](docs/STATUS.md#showcase) (the first native captures are scheduled for the next test boot).
+[docs/STATUS.md#showcase](docs/STATUS.md#showcase) (first native captures from the installed v13.1y12m: About This Mac, Displays, Battery, Finder, Activity Monitor, Metal 3D, Safari video).
 
 A USB-C debug console (`package/PianoDwc3`, `tooling/native/usb-console.py`) and ssh over the cable are available;
 the monitor's `reset fastboot` returns the tablet to ABL without buttons. Everyday development uses `fastboot boot`

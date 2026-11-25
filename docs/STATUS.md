@@ -87,9 +87,13 @@ of each file are listed in [media/SOURCES.md](media/SOURCES.md).
 
 | Scene | Media | Status |
 | --- | --- | --- |
-| Desktop (Finder, Dock, menu bar) | coming | native capture scheduled for the next test boot |
-| Safari playing H.264 1080p on the hardware decoder | coming | native capture scheduled |
-| Metal 3D demo | coming | native capture scheduled |
+| About This Mac (Snapdragon 8 Elite, 13 GB visible, macOS 27.3) | <img src="media/y12m-about.jpg" width="320" alt="About This Mac"> | ✅ native capture, v13.1y12m |
+| Displays settings (built-in display, brightness, True Tone, Night Shift) | <img src="media/y12m-display-settings.jpg" width="320" alt="Displays settings"> | ✅ native capture, v13.1y12m |
+| Battery settings (charging, Energy Mode High Power) | <img src="media/y12m-battery-settings.jpg" width="320" alt="Battery settings"> | ✅ native capture, v13.1y12m |
+| Desktop with Finder (Applications) | <img src="media/y12m-finder.jpg" width="320" alt="Desktop with Finder"> | ✅ native capture, v13.1y12m |
+| Activity Monitor (disk view) | <img src="media/y12m-activity-monitor.jpg" width="320" alt="Activity Monitor"> | ✅ native capture, v13.1y12m |
+| Metal 3D demo (GPU benchmark scene) | <img src="media/y12m-metal.jpg" width="320" alt="Metal 3D demo"> | ✅ native capture, v13.1y12m |
+| Safari playing a test video (hardware decode) | <img src="media/y12m-safari-video.jpg" width="320" alt="Safari playing a test video"> | ✅ native capture, v13.1y12m |
 | Photo Booth live camera view | coming | native capture scheduled |
 | Wi-Fi network list | coming | native capture scheduled (network names will be blurred) |
 | Touch gestures (tap, pinch, rotate, scroll) | coming | the existing webcam recordings are out of focus; a new recording is needed |

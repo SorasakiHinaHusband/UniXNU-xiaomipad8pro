@@ -85,7 +85,7 @@ Chrome WebGPU（内核补丁 0075，47 位用户地址空间）。自 v13.1y12m 
 [docs/results-2026-11-25.md](docs/results-2026-11-25.md)）。
 
 **效果展示：** 各项功能的截图和短片（在平板上直接截取）收录在 [docs/STATUS.zh-CN.md#效果展示](docs/STATUS.zh-CN.md#效果展示)
-（第一批原生截图安排在下一次测试启动时拍摄）。
+（第一批原生截图来自已安装的 v13.1y12m：关于本机、显示器、电池、访达、活动监视器、Metal 3D、Safari 视频）。
 
 USB-C 调试控制台（`package/PianoDwc3`、`tooling/native/usb-console.py`）和通过数据线的 ssh 都可用；控制台监视器的
 `reset fastboot` 命令无需按键即可让平板回到 ABL。日常开发使用 `fastboot boot` 启动 RAM 镜像，它优先于已安装的系统。
