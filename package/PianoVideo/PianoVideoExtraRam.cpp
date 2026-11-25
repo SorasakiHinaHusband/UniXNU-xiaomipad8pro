@@ -4,7 +4,8 @@
 // PianoVideo.cpp because <sys/sysctl.h> declares `struct session`, which collides with pianovideo::session there.
 #include <PianoExtraRamSysctl.h>
 
-pianoxram::KernelPool gPianoVideoExtra;
+// constinit: no static constructor needed (a kext C++ initializer must not be relied on for the defaults, e.g. testArg = 1).
+constinit pianoxram::KernelPool gPianoVideoExtra;
 
 namespace {
 struct sysctl_oid gOid;
