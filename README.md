@@ -117,8 +117,9 @@ Per-driver pages, boot arguments and test levels: [docs/drivers/README.md](docs/
 
 ## Build
 
-The whole path for a new unit (requirements, inputs, build, RAM-boot validation, guarded install, rollback, checks) is
-[skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md), written for a coding agent. This section is the
+The whole path for a new unit (requirements, inputs, build, RAM-boot validation, guarded install, rollback, checks) is the
+install guide [skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md), written for a coding agent
+(Chinese: [SKILL.zh-CN.md](skills/install-piano-macos/SKILL.zh-CN.md)). This section is the
 summary; the skill is the reference.
 
 ### Host requirements

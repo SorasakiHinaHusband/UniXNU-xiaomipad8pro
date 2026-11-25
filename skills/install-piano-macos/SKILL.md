@@ -3,6 +3,8 @@ name: install-piano-macos
 description: Guide a coding agent end to end through putting native macOS 27.3 (UniXNU-piano) on ANOTHER Xiaomi Pad 8 Pro (piano, SM8750) — host requirements, fetching the pinned IPSW from Apple and rebuilding every Apple-derived input locally (root image included) with sha256 checks, building the images from this repository, RAM-boot validation with nothing written, the guarded install, rollback, and post-install checks. Use when someone asks to build these images outside the original setup or to install them on a second tablet. Read "Status" and "Known gaps" first: several inputs are still local to the original setup.
 ---
 
+English | [简体中文](SKILL.zh-CN.md)
+
 # Install native macOS 27.3 on a Xiaomi Pad 8 Pro (piano)
 
 You are the operator. The tablet owner sits next to the tablet and presses its buttons. You run commands on a Mac. Follow the

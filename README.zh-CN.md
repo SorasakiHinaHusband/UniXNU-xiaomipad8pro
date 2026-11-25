@@ -107,15 +107,16 @@ USB-C 调试控制台（`package/PianoDwc3`、`tooling/native/usb-console.py`）
 
 ## 构建
 
-新设备的完整流程（要求、输入、构建、RAM 启动验证、受保护的安装、回滚、检查）见
-[skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md)（英文，面向编程代理）。本节是摘要，以该指南为准。
+新设备的完整流程（要求、输入、构建、RAM 启动验证、受保护的安装、回滚、检查）见安装指南
+[skills/install-piano-macos/SKILL.zh-CN.md](skills/install-piano-macos/SKILL.zh-CN.md)（中文版；英文原版
+[SKILL.md](skills/install-piano-macos/SKILL.md) 面向编程代理）。本节是摘要，以该指南为准。
 
 ### 主机要求
 
 - **必须是 Apple 芯片的 Mac（M1 或更新）。不支持 Intel Mac。** Xcode 27 的编译器和链接器以及 macOS 27 自带的工具只有 arm64 版本，
-  而且有两个构建步骤会运行自己编译出的 arm64e 程序。证据见该指南 §1.1。
+  而且有两个构建步骤会运行自己编译出的 arm64e 程序。证据见安装指南 §1.1。
 - 已测试：macOS 27.2.1 加 **Xcode 27.2**（需要完整的 Xcode，仅有命令行工具不够：内核需要 iphoneos SDK 和 `Kernel.framework`，
-  并用 Xcode 的 `ld-classic` 链接）。Homebrew 装在 `/opt/homebrew`，并安装指南 §1.2 列出的软件包、`fastboot`、Python 3.11 或更新版本；
+  并用 Xcode 的 `ld-classic` 链接）。Homebrew 装在 `/opt/homebrew`，并安装安装指南 §1.2 列出的软件包、`fastboot`、Python 3.11 或更新版本；
   约 90 GiB 可用磁盘空间；根卷步骤需要在前台终端里使用 `sudo`。
 - `bash tooling/repro/check-host.sh` 只读检查主机，每项输出 `ok` / `WARN` / `FAIL` / `GAP`；只有 `0 FAIL` 时才继续。
   请在原生 arm64 shell 中运行，不要在 Rosetta 下运行。
@@ -187,7 +188,7 @@ fastboot，而 247,767,040 字节的镜像可以启动（[docs/k273-line.md](doc
 
 - [docs/STATUS.zh-CN.md](docs/STATUS.zh-CN.md)：逐项功能状态，以及每项验证时的版本和日期。
 - [docs/USING.md](docs/USING.md)：已安装系统的使用、更新和恢复。
-- [skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md)：在其他设备上构建和安装（代理指南）。
+- [skills/install-piano-macos/SKILL.zh-CN.md](skills/install-piano-macos/SKILL.zh-CN.md)：在其他设备上构建和安装（安装指南，中文版）。
 - [docs/drivers/README.md](docs/drivers/README.md)：所有驱动、其级别和状态。
 - [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md)：仓库、本地布局、硬性规则。
 - [docs/bringup-debugging.md](docs/bringup-debugging.md)：启动链、无屏调试、测试循环、重新构建。
