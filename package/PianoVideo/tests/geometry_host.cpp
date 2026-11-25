@@ -2,10 +2,12 @@
 // Copyright (c) 2026 Leo Zhang.
 // Geometry vectors include padding-heavy small pictures and the cropped 1080
 // allocation. Check capacities, the two scratch generations and DMA guard gaps.
+// c++ -std=c++20 -O2 -Wall -Wextra -Werror -I .. geometry_host.cpp -o /tmp/video_geometry_host && /tmp/video_geometry_host
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include "VideoArena.h"
+#include "../../include/PianoExtraRam.h"
 using namespace pianovideo;
 using namespace pianovideo::session;
 static unsigned failures;
@@ -102,10 +104,22 @@ static void verifyArena(const Layout &l) {
   // RAM16G: the same arena backed by the region0 run (2 MiB slabs, here in reverse slab order), and mixed with XNU pages; only
   // arenas the run holds (the AVC 256 MiB one; HEVC's larger ones stay XNU-backed).
   if (uint64_t(pageCount) * 4096 <= kExtraArenaEnd - kExtraArenaBase) {
+    using namespace pianoxram;
+    const uint8_t property[kMaxRuns * kRecordBytes] = {
+        0, 0, 0, 0x80, 8, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, // GPU
+        0, 0, 0xe0, 0x89, 0, 0, 0, 0, 0, 0, 0x20, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, // modem
+        0, 0, 0xe0, 0x9e, 0, 0, 0, 0, 0, 0, 0x60, 4, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, // pil-tail
+    };
+    Pool pool;
+    CHECK(pool.load(property, sizeof property, Config{UseVideo}) == 1 && pool.count == 3);
+    CHECK(pool.runs[0].state == StateOtherUse && pool.runs[2].state == StateOtherUse);
+    const auto &modem = pool.runs[1];
+    CHECK(modem.state == StateOurs && modem.first == kExtraArenaBase && modem.slabs == 137);
     ++extraArenas;
     std::vector<uint64_t> extra(pageCount);
     const unsigned slabs = (pageCount + 511) / 512;
-    for (unsigned i = 0; i < pageCount; ++i) extra[i] = kExtraArenaBase + uint64_t(slabs - 1 - i / 512) * 0x200000 + (i % 512) * 4096ull;
+    CHECK(slabs <= modem.slabs);
+    for (unsigned i = 0; i < pageCount; ++i) extra[i] = modem.slab(slabs - 1 - i / 512) + (i % 512) * 4096ull;
     CHECK(extra.back() < kExtraArenaEnd);
     CHECK(buildArena(t, l, extra.data()));
     for (unsigned i = 0; i < pageCount; ++i) CHECK(vsmmu::walk(t, kArenaBase + i * 4096 + 8) == (l.mapped(i) ? extra[i] + 8 : 0));

@@ -558,7 +558,8 @@ struct TierLocked {
 #endif
 }
 
-a830tier::Parse NativeAdrenoMemory::configureTier(unsigned mode,const uint8_t *property,size_t length)
+a830tier::Parse NativeAdrenoMemory::configureTier(unsigned mode,const uint8_t *property,size_t length,
+    uint64_t xnuBase,uint64_t xnuSize)
 {
     using namespace a830tier;
     if (mode != 1 && mode != 2) return Parse::absent;
@@ -572,7 +573,7 @@ a830tier::Parse NativeAdrenoMemory::configureTier(unsigned mode,const uint8_t *p
     gpuTier.mode=mode;
     gpuTier.slabs=Tier();
     gpuTier.refusals=gpuTier.allocations=0;
-    const Parse result=parseProperty(property,length,gpuTier.runs,gpuTier.count);
+    const Parse result=loadRuns(property,length,xnuBase,xnuSize,gpuTier.runs,gpuTier.count);
     gpuTier.state=result!=Parse::ok?parseName(result):gpuTier.count?"pending":"empty";
     return result;
 }

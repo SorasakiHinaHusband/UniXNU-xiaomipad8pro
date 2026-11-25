@@ -3,21 +3,20 @@
 #define A830_GPU_TIER_H
 #include <stddef.h>
 #include <stdint.h>
+#include "../../include/PianoExtraRam.h"
 #if defined(KERNEL)
 #include <libkern/libkern.h>   /* snprintf */
 #else
 #include <stdio.h>
 #endif
 
-/* RAM16G R1: DarwinBoot reserves conventional runs below XNU's RAM window and publishes them in
- * /chosen piano-extra-ram. The wire format is two little-endian u32s (version, count) and eight
- * (u64 base, u64 size) pairs. The allocator uses whole 2 MiB slabs and leaves zeroing to its caller. */
+/* RAM16G R1: use the shared ADT validator for region1 GPU records. The tier
+ * qualifies and allocates whole 2 MiB slabs and leaves zeroing to its caller. */
 namespace a830tier {
 
-constexpr uint64_t kSlab = 2ull << 20;
+constexpr uint64_t kSlab = pianoxram::kSlab;
 constexpr unsigned kMaxRuns = 8;
 constexpr uint64_t kPage = 4096;
-constexpr unsigned kPropBytes = 8 + 16 * kMaxRuns;
 constexpr unsigned kMaxSlabs = 1024;                   /* 2 GiB of slabs: region1's runs are below 1 GiB */
 constexpr uint64_t kRegionLo = 0x880000000ull;         /* region1: the bank below the window's 0x8c0000000 */
 constexpr uint64_t kRegionHi = 0x8c0000000ull;
@@ -25,48 +24,45 @@ constexpr uint64_t kRegionHi = 0x8c0000000ull;
 struct Run { uint64_t base; uint64_t size; };
 struct Span { uint64_t pa; uint64_t bytes; };
 
-enum class Parse { ok, absent, badLength, badVersion, badCount, unaligned, outOfRegion, overlap, tooBig };
+enum class Parse { ok, absent, badLength, rejected };
 
 static inline const char *parseName(Parse p) {
   switch (p) {
-    case Parse::ok: return "ok"; case Parse::absent: return "absent"; case Parse::badLength: return "bad length";
-    case Parse::badVersion: return "bad version"; case Parse::badCount: return "bad count"; case Parse::unaligned: return "unaligned";
-    case Parse::outOfRegion: return "outside region1"; case Parse::overlap: return "overlap"; case Parse::tooBig: return "too big";
+    case Parse::ok: return "ok";
+    case Parse::absent: return "absent";
+    case Parse::badLength: return "bad length";
+    case Parse::rejected: return "region1 record refused";
   }
   return "?";
 }
 
-static inline uint64_t le64(const uint8_t *p) {
-  uint64_t v = 0; for (int i = 7; i >= 0; i--) { v = (v << 8) | p[i]; } return v;
-}
-
-/* The /chosen piano-extra-ram bytes (nullptr: absent) -> runs. Refuses anything DarwinBoot would never write. A count of 0
- * (DarwinBoot found nothing, or every run was refused) is ok with n = 0. */
-static inline Parse parseProperty(const uint8_t *p, size_t len, Run out[kMaxRuns], unsigned &n) {
+static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xnuBase, uint64_t xnuSize,
+                             Run out[kMaxRuns], unsigned &n) {
   n = 0;
-  if (!p) { return Parse::absent; }
-  if (len != kPropBytes) { return Parse::badLength; }
-  uint32_t version = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-  uint32_t count = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
-  if (!version && !count) {
-    unsigned i = 8;
-    while (i < kPropBytes && p[i] == 0) { ++i; }
-    if (i == kPropBytes) { return Parse::absent; }  /* an FD without reservation support */
-  }
-  if (version != 1) { return Parse::badVersion; }
-  if (count > kMaxRuns) { return Parse::badCount; }
-  uint64_t slabs = 0;
-  for (unsigned i = 0; i < count; i++) {
-    Run r = {le64(p + 8 + 16 * i), le64(p + 16 + 16 * i)};
-    if (!r.size || (r.base | r.size) & (kSlab - 1)) { return Parse::unaligned; }
-    if (r.base < kRegionLo || r.base >= kRegionHi || r.size > kRegionHi - r.base) { return Parse::outOfRegion; }
-    if (i && r.base < out[i - 1].base + out[i - 1].size) { return Parse::overlap; }
-    slabs += r.size / kSlab;
-    if (slabs > kMaxSlabs) { return Parse::tooBig; }
-    out[i] = r;
-  }
-  for (unsigned i = count; i < kMaxRuns; i++) {           /* unused pairs are zero */
-    if (le64(p + 8 + 16 * i) || le64(p + 16 + 16 * i)) { return Parse::badCount; }
+  pianoxram::Pool parsed;
+  pianoxram::Config config;
+  config.use = pianoxram::UseGpu;
+  config.xnuBase = xnuBase;
+  config.xnuSize = xnuSize;
+  parsed.load(property, length, config);
+  if (parsed.formatBad) { return Parse::badLength; }
+  if (!parsed.count) { return Parse::absent; }
+  if (parsed.dropped) { return Parse::rejected; }
+
+  unsigned count = 0;
+  for (unsigned i = 0; i < parsed.count; ++i) {
+    const auto &entry = parsed.runs[i];
+    const auto &run = entry.run;
+    if (run.bank != pianoxram::Region1 || run.use != pianoxram::UseGpu) { continue; }
+    if (entry.state != pianoxram::StateOurs || (run.base | run.size) & (kSlab - 1) || count == kMaxRuns) {
+      return Parse::rejected;
+    }
+    unsigned pos = count++;
+    while (pos && out[pos - 1].base > run.base) {
+      out[pos] = out[pos - 1];
+      --pos;
+    }
+    out[pos] = {run.base, run.size};
   }
   n = count;
   return Parse::ok;

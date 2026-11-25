@@ -75,6 +75,7 @@
 #include "../../include/PianoGpuQualificationDisplay.h"
 
 extern "C" int adreno830_qual607_control(int);
+extern "C" uint64_t gPhysBase,gPhysSize;
 using QualLog=pianogpu::QualificationLog<>;
 static QualLog *gQualLog;
 static IOSimpleLock *gQualLogLock;
@@ -1558,7 +1559,7 @@ void configureGpuTier()
   IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
   OSData *property=chosen?OSDynamicCast(OSData,chosen->getProperty("piano-extra-ram")):nullptr;
   NativeAdrenoMemory::configureTier(mode,property?static_cast<const uint8_t *>(property->getBytesNoCopy()):nullptr,
-                                 property?property->getLength():0);
+                                 property?property->getLength():0,gPhysBase,gPhysSize);
   if(chosen)chosen->release();
   const auto tier=NativeAdrenoMemory::tierStats();
   piano_a830_note("gpu tier: mode=%u state=%s runs=%u",mode,tier.mode?tier.state:"no-lock",tier.runs);

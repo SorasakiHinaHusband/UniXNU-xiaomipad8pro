@@ -4,6 +4,7 @@
 // ADT as /chosen/piano-extra-ram, an array of 24-byte little-endian records {base u64, size u64, bank u32, use u32}:
 //   bank 1 = region1 below XNU's window (0x880000000..0x8b7500000, R1: the GPU tier), bank 0 = region0, the 2 GiB bank at 0x80000000
 //   (R3: firmware/patches/darwinboot/region0-allow.json); use 0 any driver pool, 1 GPU, 2 DSP, 3 video, 4 camera, 5 display.
+// An all-zero record is padding. An older FD leaves the whole property zeroed.
 // This header is the portable half (no IOKit; host tests: tests/extra_ram_host.cpp): it parses the records, checks every run against
 // the allow-list and the never-use list compiled in below (the JSON's mirror: tests/region0_allow_check.py keeps them equal) and
 // against XNU's window, hands out 2 MiB slabs per use tag, runs a per-run self-test through a caller-supplied CPU window, and writes
@@ -101,6 +102,7 @@ enum Refusal : uint32_t {
   RefOverlap,    // overlaps an earlier run
   RefSmall,      // no whole 2 MiB slab inside, or more than kMaxSlabs
   RefStage,      // its allowed span's stage is above piano-extra-ram-stage
+  RefUse,        // use does not match the allowed span
   RefSelfTest,   // the CPU self-test failed
   RefDevice,     // the driver's device-side check failed
   RefCount
@@ -108,7 +110,7 @@ enum Refusal : uint32_t {
 inline const char *refusalName(uint32_t r)
 {
   static const char *const names[RefCount] = {"none", "bank", "outside-allow-list", "never-use", "xnu-window", "overlap",
-                                              "no-slab", "stage", "self-test", "device-check"};
+                                              "no-slab", "stage", "use", "self-test", "device-check"};
   return r < RefCount ? names[r] : "?";
 }
 
@@ -158,7 +160,7 @@ class Pool {
   Config cfg;
   RunState runs[kMaxRuns];
   uint32_t count = 0;            // records kept (<= kMaxRuns)
-  uint32_t records = 0;          // records in the property
+  uint32_t records = 0;          // nonempty records in the property
   bool present = false, formatBad = false;
   uint32_t refusals[RefCount] = {};
   uint32_t takes = 0, takeFails = 0, gives = 0, giveBad = 0, dropped = 0;
@@ -174,16 +176,18 @@ class Pool {
       formatBad = true;
       return 0;
     }
-    records = uint32_t(bytes / kRecordBytes);
     unsigned owned = 0;
-    for (uint32_t i = 0; i < records; ++i) {
+    for (size_t i = 0; i < bytes; i += kRecordBytes) {
+      const uint8_t *r = prop + i;
+      const Run run{rd64(r), rd64(r + 8), rd32(r + 16), rd32(r + 20)};
+      if (!run.base && !run.size && !run.bank && !run.use) continue;
+      ++records;
       if (count == kMaxRuns) {
         ++dropped;
         continue;
       }
-      const uint8_t *r = prop + size_t(i) * kRecordBytes;
       RunState &s = runs[count++];
-      s.run = {rd64(r), rd64(r + 8), rd32(r + 16), rd32(r + 20)};
+      s.run = run;
       classify(s, count - 1);
       if (s.state == StateRefused) ++refusals[s.refusal];
       if (s.state == StateOurs) ++owned;
@@ -419,6 +423,7 @@ class Pool {
       if (a.bank == r.bank && r.base >= a.base && end <= a.end) in = &a;
     if (!in) return refused(RefOutside);
     s.span = in->name;
+    if (r.use != in->use) return refused(RefUse);
     if (cfg.xnuSize && overlaps(r.base, end, cfg.xnuBase, cfg.xnuBase + cfg.xnuSize)) return refused(RefWindow);
     for (uint32_t j = 0; j < index; ++j)
       if (overlaps(r.base, end, runs[j].run.base, runs[j].run.base + runs[j].run.size)) return refused(RefOverlap);

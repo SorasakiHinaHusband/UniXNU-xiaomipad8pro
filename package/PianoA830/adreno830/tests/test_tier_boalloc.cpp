@@ -31,14 +31,23 @@ static void freeBo(Path &path,uint64_t handle)
 static void configure(unsigned mode,bool coherent=false)
 {
     using namespace a830tier;
-    uint8_t property[kPropBytes]={1,0,0,0,3};
-    const Run runs[]={{kRegionLo,kSlab},{kRegionLo+3*kSlab,kSlab},{kRegionLo+5*kSlab,kSlab}};
-    for (size_t i=0;i<3;++i)
+    uint8_t property[pianoxram::kMaxRuns * pianoxram::kRecordBytes]={};
+    const pianoxram::Run runs[]={
+        {0x89e00000,0x11200000,pianoxram::Region0,pianoxram::UseVideo},
+        {kRegionLo,kSlab,pianoxram::Region1,pianoxram::UseGpu},
+        {kRegionLo+3*kSlab,kSlab,pianoxram::Region1,pianoxram::UseGpu},
+        {kRegionLo+5*kSlab,kSlab,pianoxram::Region1,pianoxram::UseGpu},
+    };
+    for (size_t i=0;i<sizeof(runs)/sizeof(runs[0]);++i) {
+        uint8_t *record=property+i*pianoxram::kRecordBytes;
         for (unsigned b=0;b<8;++b) {
-            property[8+i*16+b]=uint8_t(runs[i].base>>(8*b));
-            property[16+i*16+b]=uint8_t(runs[i].size>>(8*b));
+            record[b]=uint8_t(runs[i].base>>(8*b));
+            record[8+b]=uint8_t(runs[i].size>>(8*b));
         }
-    CHECK(NativeAdrenoMemory::configureTier(mode,property,sizeof property)==Parse::ok);
+        record[16]=uint8_t(runs[i].bank);
+        record[20]=uint8_t(runs[i].use);
+    }
+    CHECK(NativeAdrenoMemory::configureTier(mode,property,sizeof property,0x8c0004000ull,0x33fe00000ull)==Parse::ok);
     NativeAdrenoMemory::qualifyTier(36,true,coherent,[](uint64_t,unsigned run,void *) {return run!=1;},nullptr,nullptr);
 }
 

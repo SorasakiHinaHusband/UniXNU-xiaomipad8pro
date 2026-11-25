@@ -184,7 +184,8 @@ public:
      * lock, as ever for a pooled BO). Nothing to do for any other object, or twice. */
     IOReturn finishPooled();
     /* Configured once at board start, tested before publishing the accelerator. */
-    static a830tier::Parse configureTier(unsigned mode,const uint8_t *property,size_t length);
+    static a830tier::Parse configureTier(unsigned mode,const uint8_t *property,size_t length,
+                                       uint64_t xnuBase,uint64_t xnuSize);
     static void qualifyTier(unsigned bits,bool write_combined,bool cached_coherent,
         bool (*probe)(uint64_t,unsigned,void *),void *ctx,void (*line)(const char *,void *));
     static NativeAdrenoTierStats tierStats();

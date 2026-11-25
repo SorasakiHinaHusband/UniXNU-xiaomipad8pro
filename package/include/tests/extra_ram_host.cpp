@@ -123,6 +123,11 @@ int main()
     Pool p;
     CHECK(p.load(nullptr, 0, cfg(UseVideo)) == 0 && !p.present);
     CHECK(text(p).find("adt=absent") != std::string::npos);
+    const uint8_t zero[kMaxRuns * kRecordBytes] = {};
+    CHECK(p.load(zero, sizeof zero, cfg(UseVideo)) == 0 && p.present && !p.formatBad);
+    CHECK(p.records == 0 && p.count == 0 && p.dropped == 0);
+    const uint8_t old[136] = {};
+    CHECK(p.load(old, sizeof old, cfg(UseVideo)) == 0 && p.formatBad);
     const uint8_t junk[25] = {};
     CHECK(p.load(junk, sizeof junk, cfg(UseVideo)) == 0 && p.formatBad);
     CHECK(text(p).find("adt=bad-length") != std::string::npos);
@@ -130,7 +135,7 @@ int main()
 
   // Classification of every refusal class, and ownership by tag.
   {
-    const auto v = adt({
+    auto v = adt({
         {0x89e00000, 0x11200000, Region0, UseVideo},          // 0 the modem run: ours
         {0x9ee00000, 0x4600000, Region0, UseDsp},             // 1 pil-tail: another kext's
         {0x9c300000, 0x800000, Region0, UseVideo},            // 2 the video carve-out: never
@@ -145,6 +150,7 @@ int main()
         {0x60000000, 0x200000, Region0, UseVideo},            // 11 not in DRAM's allow-list
     });
     Pool p;
+    v.resize(kMaxRuns * kRecordBytes);
     CHECK(p.load(v.data(), v.size(), cfg(UseVideo)) == 1);
     CHECK(p.count == 12 && p.records == 12);
     CHECK(p.runs[0].state == StateOurs && p.runs[0].slabs == 137 && p.runs[0].first == 0x89e00000ull);
@@ -157,7 +163,7 @@ int main()
     CHECK(p.runs[7].refusal == RefOverlap);
     CHECK(p.runs[8].refusal == RefStage);
     CHECK(p.runs[9].refusal == RefOverlap);
-    const auto tiny = adt({{0x9ee80000, 0x100000, Region0, UseVideo}});
+    const auto tiny = adt({{0x89e80000, 0x100000, Region0, UseVideo}});
     Pool small;
     CHECK(small.load(tiny.data(), tiny.size(), cfg(UseVideo)) == 0 && small.runs[0].refusal == RefSmall);
     CHECK(p.runs[10].refusal == RefNever);
@@ -187,11 +193,21 @@ int main()
     CHECK(m.load(many.data(), many.size(), cfg(UseVideo)) == kMaxRuns && m.dropped == 3);
   }
 
+  // Even a valid physical span cannot be assigned to a different use in the ADT.
+  {
+    const auto swapped = adt({{0x89e00000, 0x11200000, Region0, UseGpu},
+                              {0x9ee00000, 0x4600000, Region0, UseVideo},
+                              {0x880000000, kSlab, Region1, UseAny}});
+    Pool p;
+    CHECK(p.load(swapped.data(), swapped.size(), cfg(UseVideo, UseVideo)) == 0);
+    CHECK(p.refusals[RefUse] == 3);
+  }
+
   // Self-test: a clean run passes; slabs out, back, contiguity; holds().
   {
-    const auto v = adt({{0x89e00000, 0x11200000, Region0, UseVideo}, {0x9ee00000, 0x4600000, Region0, UseVideo}});
+    const auto v = adt({{0x89e00000, 0x11200000, Region0, UseVideo}, {0xe3800000, 0x4600000, Region0, UseAny}});
     Pool p;
-    CHECK(p.load(v.data(), v.size(), cfg(UseVideo)) == 2);
+    CHECK(p.load(v.data(), v.size(), cfg(UseVideo, UseVideo, 2)) == 2);
     FakeRam ram;
     CHECK(p.selfTest(ram) == 2);
     CHECK(p.runs[0].tested == 1 && p.runs[0].testedPages == 137 * 512 && p.runs[0].badWords == 0 && p.runs[0].device == -1);
@@ -208,10 +224,10 @@ int main()
     CHECK(p.holds(arena[5] + 0x1000) && !p.holds(0x89e00000ull + 130 * kSlab) && !p.holds(0x8c0000000ull));
     // 44 left: 9 in run 0, 35 in run 1. Contiguous 10 must come from run 1; 36 fails; non-contiguous 44 spans both.
     uint64_t c[64];
-    CHECK(p.take(10, true, c) && c[0] == 0x9ee00000ull && c[9] == 0x9ee00000ull + 9 * kSlab);
+    CHECK(p.take(10, true, c) && c[0] == 0xe3800000ull && c[9] == 0xe3800000ull + 9 * kSlab);
     CHECK(!p.take(30, true, c));
     CHECK(!p.take(35, false, c));   // only 34 left
-    CHECK(p.give(0x9ee00000ull + 3 * kSlab) && !p.give(0x9ee00000ull + 3 * kSlab) && !p.give(0x9ee00000ull + 0x1000));
+    CHECK(p.give(0xe3800000ull + 3 * kSlab) && !p.give(0xe3800000ull + 3 * kSlab) && !p.give(0xe3800000ull + 0x1000));
     CHECK(!p.give(0x8c0000000ull) && p.giveBad == 3);
     for (unsigned i = 0; i < 128; ++i) CHECK(p.give(arena[i]));
     CHECK(p.usedSlabs() == 9);

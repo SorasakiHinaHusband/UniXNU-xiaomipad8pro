@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* The region1 GPU tier (A830GpuTier.h, RAM16G R1; boot argument piano-gpu-tier, default off).
- *  1. /chosen piano-extra-ram parsing: the 16 GiB SM8750 layout (three runs, 874 MiB), absent, every refusal.
+ *  1. /chosen piano-extra-ram parsing: both banks in one property, empty padding, malformed records and the XNU window.
  *  2. The off switch: modes 1 and 2; the last token wins; prefixes and other values stay off.
  *  3. The slab allocator: whole 2 MiB slabs, lowest first, spans inside one run, all-or-nothing refusals
  *     (span limit, size and address width), release refuses foreign / partial / double frees, exhaustion and refill over 2000 rounds.
@@ -16,13 +16,20 @@
 using namespace a830tier;
 static int fails = 0, checks = 0;
 #define CHECK(c) do { checks++; if (!(c)) { fails++; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
-static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static std::vector<uint8_t> prop(std::vector<Run> rs, uint32_t version = 1, uint32_t count = ~0u) {
-  std::vector<uint8_t> b(kPropBytes, 0);
-  b[0] = (uint8_t)version; b[1] = (uint8_t)(version >> 8);
-  uint32_t c = count == ~0u ? (uint32_t)rs.size() : count; b[4] = (uint8_t)c;
-  for (size_t i = 0; i < rs.size() && i < kMaxRuns; i++) { put64(&b[8 + 16 * i], rs[i].base); put64(&b[16 + 16 * i], rs[i].size); }
-  return b;
+static void put(uint8_t *p, uint64_t v, unsigned bytes) {
+  for (unsigned i = 0; i < bytes; i++) p[i] = uint8_t(v >> (8 * i));
+}
+static std::vector<uint8_t> prop(std::initializer_list<pianoxram::Run> runs) {
+  std::vector<uint8_t> bytes(pianoxram::kMaxRuns * pianoxram::kRecordBytes, 0);
+  uint8_t *p = bytes.data();
+  for (const auto &run : runs) {
+    put(p, run.base, 8);
+    put(p + 8, run.size, 8);
+    put(p + 16, run.bank, 4);
+    put(p + 20, run.use, 4);
+    p += pianoxram::kRecordBytes;
+  }
+  return bytes;
 }
 struct Ctx {
     std::vector<Run> probed;   // base = PA, size = run number
@@ -39,27 +46,31 @@ static void line(const char *l, void *c) { ((Ctx *)c)->lines.push_back(l); }
 static const uint64_t MiB = 1ull << 20;
 int main() {
   /* 1 */
-  std::vector<Run> sm = {{0x880000000ull, 512 * MiB}, {0x8a0400000ull, 256 * MiB}, {0x8b0400000ull, 106 * MiB}};
+  using pianoxram::Region0; using pianoxram::Region1;
+  using pianoxram::UseGpu; using pianoxram::UseDsp; using pianoxram::UseVideo; using pianoxram::UseAny;
+  const pianoxram::Run a{0x880000000ull, 758 * MiB, Region1, UseGpu};
+  const pianoxram::Run b{0x8b0000000ull, 84 * MiB, Region1, UseGpu};
+  const pianoxram::Run c{0x8b5800000ull, 28 * MiB, Region1, UseGpu};
+  const pianoxram::Run modem{0x89e00000, 274 * MiB, Region0, UseVideo};
+  const pianoxram::Run pil{0x9ee00000, 70 * MiB, Region0, UseDsp};
   Run r[kMaxRuns]; unsigned n = 9;
-  auto p = prop(sm);
-  CHECK(parseProperty(p.data(), p.size(), r, n) == Parse::ok && n == 3 && r[2].size == 106 * MiB);
-  CHECK(parseProperty(nullptr, 0, r, n) == Parse::absent && n == 0);
-  CHECK(parseProperty(p.data(), p.size() - 1, r, n) == Parse::badLength);
-  auto v2 = prop(sm, 2); CHECK(parseProperty(v2.data(), v2.size(), r, n) == Parse::badVersion);
-  auto c9 = prop(sm, 1, 9); CHECK(parseProperty(c9.data(), c9.size(), r, n) == Parse::badCount);
-  auto c2 = prop(sm, 1, 2); CHECK(parseProperty(c2.data(), c2.size(), r, n) == Parse::badCount);   /* a third pair left over */
-  auto ua = prop({{0x880001000ull, 2 * MiB}}); CHECK(parseProperty(ua.data(), ua.size(), r, n) == Parse::unaligned);
-  auto z = prop({{0x880000000ull, 0}}); CHECK(parseProperty(z.data(), z.size(), r, n) == Parse::unaligned);
-  auto lo = prop({{0x80000000ull, 2 * MiB}}); CHECK(parseProperty(lo.data(), lo.size(), r, n) == Parse::outOfRegion);
-  auto hi = prop({{0x8bfe00000ull, 4 * MiB}}); CHECK(parseProperty(hi.data(), hi.size(), r, n) == Parse::outOfRegion);
-  auto ov = prop({{0x880000000ull, 4 * MiB}, {0x880200000ull, 2 * MiB}}); CHECK(parseProperty(ov.data(), ov.size(), r, n) == Parse::overlap);
-  auto none = prop({}); CHECK(parseProperty(none.data(), none.size(), r, n) == Parse::ok && n == 0);
-  auto tooHigh = prop({{0x8c0200000ull, 2 * MiB}});
-  CHECK(parseProperty(tooHigh.data(), tooHigh.size(), r, n) == Parse::outOfRegion && n == 0);
-  auto legacy = prop({}, 0);
-  CHECK(parseProperty(legacy.data(), legacy.size(), r, n) == Parse::absent && n == 0);
-  legacy[16] = 1;
-  CHECK(parseProperty(legacy.data(), legacy.size(), r, n) == Parse::badVersion);
+  auto load = [&](const std::vector<uint8_t> &p) {
+    return loadRuns(p.data(), p.size(), 0x8c0004000ull, 0x33fe00000ull, r, n);
+  };
+  CHECK(load(prop({b, modem, c, pil, a})) == Parse::ok && n == 3);
+  CHECK(r[0].base == a.base && r[0].size == a.size && r[1].base == b.base && r[2].size == c.size);
+  CHECK(loadRuns(nullptr, 0, 0, 0, r, n) == Parse::absent && n == 0);
+  CHECK(load(prop({})) == Parse::absent && n == 0);
+  CHECK(load(std::vector<uint8_t>(136, 0)) == Parse::badLength && n == 0);
+  CHECK(load(prop({modem, pil, {modem.base, modem.size, Region0, UseGpu},
+                  {a.base, a.size, Region1, UseAny}, {b.base, b.size, Region1, UseVideo}})) == Parse::ok && n == 0);
+  CHECK(load(prop({{0x880001000ull, 4 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  CHECK(load(prop({{0x880000000ull, 0, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  CHECK(load(prop({{0x80000000ull, 2 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  CHECK(load(prop({{0x8bfe00000ull, 4 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  CHECK(load(prop({a, {0x880200000ull, 2 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  const auto mixed = prop({a, modem, pil});
+  CHECK(loadRuns(mixed.data(), mixed.size(), 0x880000000ull, MiB, r, n) == Parse::rejected && n == 0);
   /* 2 */
   CHECK(!bootArgMode(nullptr)); CHECK(!bootArgMode("")); CHECK(!bootArgMode("piano-dpu=2 piano-gpu-user-vm=1"));
   CHECK(bootArgMode("piano-dpu=2 piano-gpu-tier=1")); CHECK(!bootArgMode("piano-gpu-tier=0"));
@@ -70,6 +81,7 @@ int main() {
   CHECK(bootArgMode("piano-gpu-tier=2 piano-gpu-tier=1") == 1);
   CHECK(!eligible(0, kSlab) && !eligible(1, kSlab - kPage) && eligible(1, kSlab) && eligible(2, kPage));
   /* 3 */
+  std::vector<Run> sm = {{0x880000000ull, 512 * MiB}, {0x8a0400000ull, 256 * MiB}, {0x8b0400000ull, 106 * MiB}};
   Ctx ctx; Tier t;
   const uint64_t limit = UINT64_C(1) << 36;
   t.init(sm.data(), 3, limit, probe, &ctx, line);

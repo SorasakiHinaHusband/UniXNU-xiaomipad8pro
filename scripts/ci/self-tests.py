@@ -6,7 +6,7 @@
 
 What runs:
   - Python test scripts (test-*.py, test_*.py, run-*-tests.py) under package/, tooling/, firmware/;
-  - shell test scripts (test-*.sh, run-tests.sh, run-*-host.sh) there;
+  - shell test scripts (test-*.sh, run-tests.sh, run-*-host.sh, tests/run.sh) there;
   - C/C++ host tests (package/**/tests/*.c, *.cpp) whose header carries their build line
     (`c++ -std=c++20 ... NAME.cpp -o /tmp/NAME && /tmp/NAME`): compiled in their own directory, the binary in a temporary
     directory, then run.
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SKIP_FILE = ROOT / 'scripts/ci/self-tests.skip'
 TIMEOUT = int(os.environ.get('SELFTEST_TIMEOUT', '600'))
 PY_RE = re.compile(r'(^|/)(test[-_][^/]*\.py|run-[^/]*tests?\.py)$')
-SH_RE = re.compile(r'(^|/)(test-[^/]*\.sh|run-tests\.sh|run-[^/]*-host\.sh)$')
+SH_RE = re.compile(r'(^|/)(test-[^/]*\.sh|run-tests\.sh|run-[^/]*-host\.sh|tests/run\.sh)$')
 C_RE = re.compile(r'^package/.*/tests/[^/]+\.(c|cc|cpp)$')
 # a build line in the first lines of a host test: `c++ ... -o /tmp/NAME && /tmp/NAME [args]`
 BUILD_RE = re.compile(r'((?:xcrun\s+)?(?:c\+\+|clang\+\+|clang|cc)\s+[^\n]*?-o\s+(\S+)\s*&&\s*\2\b[^\n]*)')
