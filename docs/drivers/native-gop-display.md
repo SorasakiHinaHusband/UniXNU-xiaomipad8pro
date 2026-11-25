@@ -72,6 +72,7 @@ relaunched 6 times in 240 s. Without it and without a display, WindowServer laun
 | `native-gop-display-hz=N` | ADT `refresh-hz`, else 60 | rate told to WindowServer and of the VBL timer (30..240). The panel stays at ABL's 120 Hz |
 | `native-gop-display-120=1` | 0 | the fixed refresh contract (`GopRefresh.h`): the panel's own 120 Hz told through every interface WindowServer reads: the timing element at 120 (or `native-gop-display-hz`), `get_timing_attributes_gated` (27.3 slot 423; the family's answers 1/60 s whatever the mode) at one period as both minimum and maximum, the registry dictionary `IOMFBDisplayRefresh` published from it before the service registers (`setDisplayRefreshProperties`), the VBL tick on absolute deadlines. Logs `refresh contract: 120 Hz ...`; a refused publication falls back to the whole 60 Hz contract. Off: the family's slot and the relative tick, unchanged |
 | `native-gop-display-color-log=1` | 0 | B1 milestone 1 (`GopColorLog.h`): Night Shift's two 27.3 entry points, `set_matrix` (slot 309: location, nine two's-complement S31.32 words, row-major) and `setBrightnessCorrection` (slot 314, 16.16), logged as they change (first 16, then every 100th); both answered `kIOReturnUnsupported` as the family's own do, with or without the argument, so nothing changes for WindowServer |
+| `native-gop-display-shot=1` | 0 | Root-only still capture of the internal panel's scanout backing, via `machdep.native_gop_display_shot` (§9) |
 | `native-gop-display-mm=WxH` | ADT, else 239x163 | physical size, so the density and macOS's HiDPI ("looks like 1600x1068") modes |
 | `native-gop-display-builtin=1` | 0 | the panel's IOMFB says `external` false (a Mac's internal panel): CGDisplayIsBuiltin and System Settings then call it built-in ("Built-in Display"). Not tried on the tablet: WindowServer treats a built-in display differently (CoreBrightness, [backlight.md](backlight.md) §5), so a RAM boot with it comes first. Without it the display is the external "Xiaomi Pad 8 Pro" (its ProductAttributes: ManufacturerID `XMI`, LegacyManufacturerID 0x61a9 since 2026-11-12, so CGDisplayVendorNumber is no longer 0; the new vendor is a new display identity to WindowServer, which then starts from its default mode once) |
 | `native-gop-display-bars=1` | off | 8 colour bars until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
@@ -561,3 +562,86 @@ the service. Allocation or publication failure fails hardware start. This matche
 desktop plane plus the existing cursor handling. Cursor capability properties remain unchanged. Ordinary desktop/video detachment
 must not move the composed frame to layer 1 or YUV video to ignored layer 2. Explicit forced-detach requests and capture results
 remain qualification questions; the property is not a new multi-plane renderer. Startup IOLog identifies `gpuoom-plane1`.
+
+## 9. Native still capture for the Showcase
+
+`native-gop-display-shot=1` registers `machdep.native_gop_display_shot` once the internal display starts. Only effective UID 0
+can read it. It is read-only and absent by default. The CLI reads the driver's scanout backing directly, so the path requires no
+Screen Recording grant or changes to TCC or SIP.
+
+The DPU records the address and stride once the hardware latches a flip. Under the flip lock, the readout takes a reference to
+that window's IOSurface, prepared descriptor and any CPU alias as a unit. It drops the lock before copying, releases the
+reference on return and checks for a presentation race. With the boot framebuffer selected, NativeGopDisplay reads its existing
+GOP mapping. No readable backing gives `ENXIO`. A changing scanout gives `EBUSY` and the CLI retries a bounded number of times.
+The binary sysctl reply is one versioned header and 3200×2136 pixels. Copyout uses at most 64 KiB at a time and skips any row
+padding. Capture reads the backing pixels before the DPU's colour-processing stages.
+
+The default CLI decoder for the requested packed 10-bit `&BGA` layout takes B from bits 0–9, G from 10–19 and R from 20–29,
+rounds each sRGB code to 8 bits and writes an opaque sRGB PNG. The GOP fallback and plain `BGRA` use 8-bit channels.
+CoreVideo's `CVPixelBuffer.h` names `&BGA` as lossless 32BGRA, and the existing compositor and splash pipe use an 8-bit
+interpretation. `--bga8` selects that interpretation for plane 0. The FourCC and row pitch alone leave the actual byte
+interpretation on this build to the known-pixel RAM check.
+
+| Reference path | Native path | Comparison |
+|---|---|---|
+| Ubuntu v1.4.0 `device/boot/README.md`, firmware scanout at the `simple-framebuffer` node | `NativeGopDisplay.cpp`, `readFramebuffer` | Same firmware backing for the boot frame. The native readout uses the existing GOP mapping. |
+| Linux `drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c`, format list, and `include/uapi/drm/drm_fourcc.h`, `DRM_FORMAT_ARGB8888` and `DRM_FORMAT_XRGB2101010` | `DpuFlip.h`, `flushTo`, and `DpuFlip.cpp`, `scanoutRead` | Different ownership: the native flip records the latched SMMU address and uses its pinned IOSurface for readback. Capture leaves the DPU pipe format as configured. |
+| Android display format inventory, `RGBA_1010102` | `tooling/native/gop-shot/Pixels.h` | Different channel order: Android's RGBA entry puts red in the low bits. The requested native packed BGRA decoder puts blue there. |
+
+### Build and capture
+
+```sh
+make -C tooling/native/gop-shot all test
+tooling/native/gop-shot/capture-ssh.sh /path/to/gop-shot /path/to/tablet-still.png /path/to/mac-still.png
+```
+
+Stage `out/gop-shot/gop-shot` as an executable on the tablet using the RAM harness. Direct invocation on the tablet is
+`sudo /path/to/gop-shot /path/to/tablet-still.png`. The Mac wrapper uses the harness's `/tmp/tsudo --raw`
+(`GOP_SHOT_TSUDO` can name a different harness installation), then fetches and verifies the file with
+`tooling/persist/fetch-chunks.py`. Choose fresh output paths in private directories on both systems. The files have mode
+`0600`, and both programs refuse to overwrite an existing destination. The wrapper leaves the requested tablet PNG in
+place. Capture output reports the source and layout. Transfer output reports sizes and digests.
+
+### RAM-boot read list
+
+1. Use a volatile Data boot with the regular DPU flip profile and add `native-gop-display-shot=1`,
+   `native-gop-display-flip-lossless=1`, `native-gop-display-cursor=0` and `native-gop-display-thumb=0`. Confirm
+   `piano-dpu=2 piano-dpu-flip=4` and a `PianoDpu` latch on the internal panel. On a control boot with the switch absent,
+   root should receive the CLI's “shot sysctl absent” error. On the enabled boot the unprivileged CLI should report
+   “root required”. Both refusals should leave the requested path absent.
+2. After the graphical session settles, show this local test page in browser fullscreen at 100% zoom with neutral SDR settings.
+   Keep the page still and wait for fullscreen controls to disappear.
+
+   ```html
+   <!doctype html>
+   <meta name="color-scheme" content="light">
+   <style>
+   body { margin: 0; display: grid; width: 100vw; height: 100vh;
+          grid-template: 1fr 1fr / 1fr 1fr; }
+   </style>
+   <div style="background:#e02030"></div><div style="background:#2060e0"></div>
+   <div style="background:#10c040"></div><div style="background:#808080"></div>
+   ```
+
+3. Capture one still through the wrapper. Require `source=flip format=&BGA` and all three transport digests to match.
+   On the Mac, compare the four quadrant centers in the fetched PNG against the sRGB values. This example uses Pillow.
+
+   ```sh
+   python3 - /path/to/mac-still.png <<'PY'
+   from PIL import Image
+   import sys
+
+   with Image.open(sys.argv[1]) as png:
+       assert png.format == "PNG" and png.size == (3200, 2136)
+       rgb = png.convert("RGB")
+       for point, expected in {
+           (800, 534): (224, 32, 48), (2400, 534): (32, 96, 224),
+           (800, 1602): (16, 192, 64), (2400, 1602): (128, 128, 128),
+       }.items():
+           assert all(abs(a - b) <= 2 for a, b in zip(rgb.getpixel(point), expected)), point
+   print("known still matches all four expected pixels")
+   PY
+   ```
+
+   Record the actual layout in the run result. If the packed interpretation fails, diagnose with `--bga8` and fresh
+   paths on the same boot. The comparison is the gate for choosing the layout used for Showcase stills.
