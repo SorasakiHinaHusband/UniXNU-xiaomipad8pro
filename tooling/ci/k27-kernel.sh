@@ -16,6 +16,7 @@
 #     platform  out/x12377/un/build/platform-12377-arm64e: ArmDTPlatform and ArmCpu at their unixnu.lock pins, compiled with the
 #               kernel's own recipes (a first kernel pass gives the recipes, the libraries go into the second)
 #     kernel    build-k27-piano.sh with K27_VARIANT=native -> $OUT/kernel-k27-native.macho and its sha256
+#   and, not part of the default: verify (the Apple OSS pins still exist upstream; the monthly dependency check).
 #   Environment: WORK (default $PWD/out/ci), OUT (default $WORK/out), JOBS, K27_TREE_TOP (default 0066), KDK_DMG, LD_CLASSIC.
 #
 # Every Apple-licensed SOURCE here is public (apple-oss-distributions, APSL); the only Apple BINARIES are Xcode's (on the runner) and
@@ -43,6 +44,18 @@ fetch() {   # fetch URL COMMIT DIR: DIR's HEAD at COMMIT (one commit deep)
   git -C "$3" fetch -q --depth 1 origin "$2" && git -C "$3" checkout -q --detach "$2"
 }
 say() { printf '== %s\n' "$*"; }
+
+stage_verify() {   # not a build stage: every Apple OSS pin above still exists upstream (the monthly dependency check)
+  say "verify the Apple OSS pins"
+  local t rc=0 pair
+  for pair in "$XNU_URL $XNU_COMMIT" "$DISPATCH_URL $DISPATCH_COMMIT" "$PLATFORM_URL $PLATFORM_COMMIT" "$AVAIL_URL $AVAIL_COMMIT"; do
+    set -- $pair; t=$(mktemp -d)
+    if git -C "$t" init -q && git -C "$t" fetch -q --depth 1 --filter=blob:none "$1" "$2"; then echo "ok   $1 @ ${2:0:10}"
+    else echo "FAIL $1 @ ${2:0:10}"; rc=1; fi
+    rm -rf "$t"
+  done
+  return $rc
+}
 
 stage_tree() { say tree; bash "$D/tooling/k27/fetch-k27-tree.sh" "$M"; }
 
@@ -147,7 +160,7 @@ stage_platform() {
     mkdir -p "$P/$name"
   done
   # First pass: the kernel's objects without the platform libraries (the link fails; the objects and their recipes are what is needed).
-  K27_VARIANT=native K27_EXTRA_LD= bash "$M/build-k27-piano.sh" > "$WORK/kernel-pass1.log" 2>&1 || true
+  K27_VARIANT=native K27_EXTRA_LD='' bash "$M/build-k27-piano.sh" > "$WORK/kernel-pass1.log" 2>&1 || true
   local recipes=$X/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json
   [ -f "$recipes" ] || { tail -30 "$WORK/kernel-pass1.log"; echo "no kernel compile recipes after the first pass" >&2; exit 1; }
   for name in ArmDTPlatform ArmCpu; do

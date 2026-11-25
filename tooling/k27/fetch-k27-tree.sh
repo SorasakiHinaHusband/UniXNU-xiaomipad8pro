@@ -13,7 +13,7 @@ DEST=${1:?usage: fetch-k27-tree.sh DEST}
 pin() { python3 -c "import tomllib,sys;print(tomllib.load(open('$D/unixnu.lock','rb'))['pin']['k27'][sys.argv[1]])" "$1"; }
 URL=$(pin git); BASE=$(pin commit); TREE=$(pin tree); PATCHES=$D/$(pin patches)
 if [ -d "$DEST/.git" ]; then
-  have=$(git -C "$DEST" rev-parse HEAD^{tree} 2>/dev/null || true)
+  have=$(git -C "$DEST" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
   if [ "$have" = "$TREE" ] && [ -z "$(git -C "$DEST" status --porcelain --untracked-files=no)" ]; then
     echo "k27 tree at $DEST is the pinned one (tree ${TREE:0:12})"; echo "PIANO_K27_TREE=$DEST"; exit 0
   fi
@@ -27,7 +27,7 @@ git -C "$DEST" checkout -q -b piano "$BASE"
 # git am needs an identity for the committer only; the patches keep their authors
 git -C "$DEST" -c user.name=k27-tree -c user.email=k27-tree@fetch.invalid -c core.whitespace=nowarn \
   am -q --whitespace=nowarn --committer-date-is-author-date "$PATCHES"/0*.patch
-got=$(git -C "$DEST" rev-parse HEAD^{tree})
+got=$(git -C "$DEST" rev-parse 'HEAD^{tree}')
 if [ "$got" != "$TREE" ]; then
   echo "k27 tree mismatch: patches/k27-tree on $BASE gives tree $got, unixnu.lock pins $TREE" >&2; exit 1
 fi

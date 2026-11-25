@@ -23,7 +23,7 @@ ALLOW_FILE = ROOT / 'scripts/ci/privacy-scan.allow'
 MARK = 'privacy-scan: ok'
 
 HOME_OK = {'Shared', 'Guest', 'runner', 'user', 'u', 'me', 'NAME', 'name', 'USER', 'you', 'example'}
-EMAIL_OK = re.compile(r'(@users\.noreply\.github\.com|@[A-Za-z0-9.-]*\.invalid|@example\.(com|org|net)|noreply@|no-reply@'
+EMAIL_OK = re.compile(r'(@users\.noreply\.github\.com|@[A-Za-z0-9.-]*\.(invalid|example|test)\b|@example\.(com|org|net)|noreply@|no-reply@'
                       r'|@com\.apple\.)', re.I)
 
 CLASSES = [
@@ -52,13 +52,14 @@ CLASSES = [
 
 # file types that would be Apple payloads, encrypted blobs or build outputs (a PR adding one fails)
 BAD_FILES = ['*.ipsw', '*.dmg', '*.aea', '*.kc', '*.macho', '*.img', '*.fd', '*.enc', '*.zst', '*.p12', '*.mobileprovision',
-             '*kernelcache*', '*.kdk', 'out/*', '*/out/*', '*.secret', '*.psk', '*.pem', '*.key']
+             '*.kdk', 'out/*', '*/out/*', '*.secret', '*.psk', '*.pem', '*.key']
+BAD_BINARIES = ['*kernelcache*', '*.bin', '*.o', '*.a', '*.dylib']   # refused when binary (a script with the name is fine)
 BAD_FILES_OK = ['*.tbd']   # IOGPU.tbd and other text stubs stay (owner decision)
 
 
 def _email_in_header(line, path):
     """An author/copyright header names people by design: a patch's From:, Co-authored-by trailers, AUTHORS/NOTICE files."""
-    if re.match(r'(From|Signed-off-by|Co-authored-by|Reported-by|Reviewed-by):', line.strip(), re.I):
+    if re.match(r'[+ -]?(From|Signed-off-by|Co-authored-by|Reported-by|Reviewed-by):', line.strip(), re.I):   # also a patch in a patch
         return True
     name = Path(path).name.upper()
     return name.startswith(('AUTHORS', 'NOTICE', 'COPYING', 'LICENSE', 'CREDITS', 'MAINTAINERS', 'UPSTREAM'))
@@ -139,6 +140,8 @@ def main():
                     scan_line(f'commit {sha[:10]} message', n, line, allow, hits, diff=True)
         for f in files:
             if any(fnmatch.fnmatch(f, g) for g in BAD_FILES) and not any(fnmatch.fnmatch(f, g) for g in BAD_FILES_OK):
+                bad.append(f)
+            elif any(fnmatch.fnmatch(f, g) for g in BAD_BINARIES) and not is_text(f):
                 bad.append(f)
     else:
         for path in git('ls-files').splitlines():

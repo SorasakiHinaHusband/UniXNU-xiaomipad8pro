@@ -101,13 +101,15 @@ Per-driver pages, boot arguments and test levels: [docs/drivers/README.md](docs/
 
 | Path | What |
 | --- | --- |
-| `patches/k27/` | the k27 kernel patches 0053-0074 (no 0072) on top of the k27 source tree (xnu-12377 + the baseline series 0001-0052) |
+| `patches/k27-tree/` | our delta of the k27 tree on its pinned upstream (macOS-DroidVM): build scripts, KC builder, kernel series 0050-0054 |
+| `patches/k27/` | the k27 kernel patches 0053-0074 on top of the k27 source tree (xnu-12377 + the baseline series 0001-0052) |
 | `patches/k273/` | the 27.3 line's kernel series on top of `patches/k27` |
 | `patches/k27-kc/` | the KC builder's native placement (best fit, relocation-free constants in `__TEXT`), applied by hand to the k27 tree ([docs/kc-space.md](docs/kc-space.md)) |
 | `patches/xnu/` | the device series of the UniXNU macOS 27.3 line (empty: none yet) |
 | `package/` | the native kexts; each is inert without its boot argument |
 | `configs/` | the native kext list (`k27-native-kexts.txt`), the ADT identity and display node (`k27-adt.toml`, `k27-gop-display.toml`), the 27.3 line's kernel config |
 | `dts/piano.dts` | piano's hardware for the ADT |
+| `.github/`, `scripts/` | CI (checks, monthly dependency check, builds, hand-made releases: [docs/ci.md](docs/ci.md)), `fetch-pins.py` |
 | `tooling/` | `k273/build-k273-image.sh` (the 27.3 kexts → kernel collection → ADT → RAM images, `K273_KERNEL`), `k273/build-k273-esp.py` (the installed 27.3 ESP), `kc/` (the KC build), `adt/`, `bootimg/` (RAM images and their verification), `native/` (the test loop, the USB console, input), `persist/` (the installed copy), `firmware/` (the FD) |
 | `firmware/` | deltas to piano-uefi's `pianoPkg`, Mu-Silicium and UniXNU |
 | `docs/` | bring-up notes, driver pages (`drivers/`), plans and evidence |
@@ -137,6 +139,10 @@ summary; the skill is the reference.
 - This repository plus the pinned dependencies of `unixnu.lock` / `feeds.toml` (UniXNU core, Mu-Silicium, piano-uefi,
   DarwinBoot, the SoC module) and the k27 kernel tree (`PIANO_K27_TREE`, in the environment or in `~/.config/piano/env`; pinned
   in `unixnu.lock`).
+- **Fetching the pins:** `python3 scripts/fetch-pins.py` fetches every `unixnu.lock` checkout by commit into `$UNIXNU_RESEARCH`
+  (`--verify` only checks them; contributed by SorasakiHinaHusband). The k27 kernel tree is upstream
+  [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) at its pin plus our [patches/k27-tree](patches/k27-tree/README.md):
+  `tooling/k27/fetch-k27-tree.sh DEST`, then `PIANO_K27_TREE=DEST`.
 - Apple's files are never distributed. `tooling/repro/fetch-ipsw.py` fetches the pinned 27.3 IPSW's members from Apple's CDN and
   the AEA keys from Apple, and checks every file against `tooling/repro/pins.json`.
 - Some inputs are still local to the original setup (the k27 kernel tree, the base trust bundle, the Data seed, the Turnip tree,
@@ -168,6 +174,12 @@ python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 - Only the 27.3 line is built; the retired 27.0.1 path (`tooling/k27/build-native-image.sh`) is not used. Root placement: a new
   unit starts with the root on `linux_data` (`K273_ROOT_PART=linux_data`, skill §3.2); the reference unit's installed ESP uses
   `build-k273-esp.py --root-part linux_rootfs` ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8).
+
+### CI and releases
+
+The FD, the k27 native kernel and our kexts also build on GitHub's hosted runners ([docs/ci.md](docs/ci.md)): pull requests run the
+pin fetch, the self-tests and a privacy scan; releases (tagged by hand after a tablet qualification) carry only our binaries, the
+recipes, SHA-256 manifests and the install skill. The root image and the kernel collection are always built on the user's side.
 
 ### Size limit of a RAM image
 
@@ -218,3 +230,5 @@ Code here is BSD-2-Clause-Patent, Copyright (c) 2026 Leo Zhang, unless a package
 `UPSTREAM` file says otherwise (third-party parts keep their own holders and licences).
 Vendor firmware, partition images and Apple payloads (kernel collections, trust caches, IPSW-derived files) are never in this
 repository; neither are secrets, keys, per-unit calibration, local network or storage details, or machine names.
+
+`scripts/fetch-pins.py` was first written by SorasakiHinaHusband (pull request #2).
