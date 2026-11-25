@@ -116,7 +116,7 @@ index ee919cb..18eec4b 100644
 +      if ((Run->Type != EfiConventionalMemory) || (Run->NumberOfPages == 0)) { continue; }
 +      ExtraCount = DarwinExtraRamAdd (ExtraRuns, (unsigned)ExtraCount, DARWIN_EXTRA_RAM_MAX_RUNS, Run->PhysicalStart,
 +                                      Run->PhysicalStart + EFI_PAGES_TO_SIZE (Run->NumberOfPages), DARWIN_EXTRA_RAM_FLOOR,
-+                                      Address & ~(DARWIN_EXTRA_RAM_SLAB - 1));
++                                      DarwinExtraRamLimit (Address));
 +    }
 +    for (ExtraIndex = 0; ExtraIndex < ExtraCount; ) {
 +      EFI_PHYSICAL_ADDRESS RunBase = ExtraRuns[ExtraIndex].base;
@@ -162,7 +162,7 @@ new file mode 100644
 index 0000000..daa4d26
 --- /dev/null
 +++ b/DarwinBootPkg/Driver/ExtraRam.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,73 @@
 +// SPDX-License-Identifier: BSD-2-Clause-Patent
 +#ifndef DARWINBOOT_EXTRA_RAM_H
 +#define DARWINBOOT_EXTRA_RAM_H
@@ -177,11 +177,16 @@ index 0000000..daa4d26
 +#define DARWIN_EXTRA_RAM_PROP_BYTES (8u + 16u * DARWIN_EXTRA_RAM_MAX_RUNS)
 +#define DARWIN_EXTRA_RAM_SLAB       0x200000ULL
 +#define DARWIN_EXTRA_RAM_FLOOR      0x880000000ULL   // region1's base: region0 (the 2 GiB bank) is R3's, not this
++#define DARWIN_EXTRA_RAM_CEILING    0x8c0000000ULL   // the upper edge of the R1 bank slice
 +typedef struct { unsigned long long base; unsigned long long size; } DARWIN_EXTRA_RUN;
++
++static inline unsigned long long DarwinExtraRamLimit(unsigned long long window) {
++  return window < DARWIN_EXTRA_RAM_CEILING ? window : DARWIN_EXTRA_RAM_CEILING;
++}
 +
 +// Add the conventional range [start, end) clipped to [floor, limit) and shrunk to whole 2 MiB slabs; adjacent or
 +// overlapping runs merge (UEFI splits one run into several descriptors). Returns the new count; a run that does not fit
-+// in max is dropped (the count stays). limit is the window's base (nothing at or above it is taken).
++// in max is dropped (the count stays). limit bounds the R1 slice and the window start.
 +static inline unsigned DarwinExtraRamAdd(DARWIN_EXTRA_RUN *runs, unsigned count, unsigned max, unsigned long long start,
 +                                         unsigned long long end, unsigned long long floor, unsigned long long limit) {
 +  unsigned i, j;
@@ -236,7 +241,7 @@ new file mode 100644
 index 0000000..e06f5d6
 --- /dev/null
 +++ b/Test/extra-ram.c
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +// SPDX-License-Identifier: BSD-2-Clause-Patent
 +#include <assert.h>
 +#include <stdio.h>
@@ -280,6 +285,8 @@ index 0000000..e06f5d6
 +  assert(p[0] == 1 && p[1] == 0 && p[4] == 3);
 +  assert(p[8] == 0 && p[11] == 0x90 && p[12] == 0x08 && p[16 + 2] == 0x20);
 +  for (unsigned i = 8 + 16 * 3; i < DARWIN_EXTRA_RAM_PROP_BYTES; i++) { assert(p[i] == 0); }
++  assert(DarwinExtraRamLimit(0x8b7504000ULL) == 0x8b7504000ULL);
++  assert(DarwinExtraRamLimit(0x900004000ULL) == DARWIN_EXTRA_RAM_CEILING);
 +  printf("PASS: extra-ram runs (merge, clip, slab shrink, bound, sort) and the piano-extra-ram encoding\n");
 +  return 0;
 +}
