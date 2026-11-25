@@ -180,6 +180,7 @@ int numberProperty(IOService *s, const char *key)
 
 // ---------------------------------------------------------------------------------------------------------------- sysctls
 volatile uint32_t gLidArm;
+volatile uint32_t gLidSleepAC;   // machdep.piano_policy_lid_sleep_ac: the AC opt-in, from piano-policy-lid-sleep-ac at start
 volatile uint32_t gLpm;                 // machdep.piano_policy_lpm
 volatile uint32_t gHpm;                 // machdep.piano_policy_hpm (Energy Mode step E2)
 IOLock *gStatusLock;
@@ -227,9 +228,22 @@ int sysctlLidArm(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
   return 0;
 }
 
+// The AC lid demand-sleep opt-in at run time (one boot can test both AC behaviours; the owner can choose without a new profile).
+int sysctlLidSleepAC(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
+{
+  int v = int(__atomic_load_n(&gLidSleepAC, __ATOMIC_ACQUIRE));
+  const int err = sysctl_handle_int(oidp, &v, 0, req);
+  if (err || !req->newptr) return err;
+  if (v != 0 && v != 1) return EINVAL;
+  __atomic_store_n(&gLidSleepAC, uint32_t(v), __ATOMIC_RELEASE);
+  note("sleep-contract1: AC lid demand-sleep %s by the runtime switch (real AC preserved)", v ? "opted in" : "off");
+  kickFromSysctl();
+  return 0;
+}
+
 // machdep.piano_policy (read only) and machdep.piano_policy_lpm (root writes), registered at start. Filled in at run time rather
 // than by SYSCTL_OID's static initializer: its parent and handler are signed pointers on arm64e.
-struct sysctl_oid gOidStatus, gOidLpm, gOidHpm, gOidLidArm;
+struct sysctl_oid gOidStatus, gOidLpm, gOidHpm, gOidLidArm, gOidLidSleepAC;
 
 }  // namespace
 
@@ -343,6 +357,7 @@ bool PianoPolicy::start(IOService *provider)
   fConfig.act = gArgs.level >= 2;
   fConfig.lid = gArgs.lid != 0;
   fConfig.lidSleepAC = gArgs.lidSleepAC == 1;
+  __atomic_store_n(&gLidSleepAC, fConfig.lidSleepAC ? 1u : 0u, __ATOMIC_RELEASE);
   note("sleep-contract1: AC lid demand-sleep %s (real AC preserved)", fConfig.lidSleepAC ? "opted in" : "off");
   fConfig.lidConflict = gArgs.keyboardLid != 0;
   fConfig.profile = gArgs.profile != 0;
@@ -405,6 +420,10 @@ bool PianoPolicy::start(IOService *provider)
           "PianoPolicy: macOS Low Power Mode (0/1), mirrored by the agent");
   fillOid(gOidLidArm,"piano_policy_lid_arm",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_LOCKED,sysctlLidArm,"I","Explicit lid sleep gate; physical polarity observation first");
   sysctl_register_oid(&gOidLidArm);
+  fillOid(gOidLidSleepAC, "piano_policy_lid_sleep_ac", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, sysctlLidSleepAC, "I",
+          "PianoPolicy: AC lid demand-sleep opt-in (0/1; piano-policy-lid-sleep-ac at boot)");
+  sysctl_register_oid(&gOidLidSleepAC);
+  note("machdep.piano_policy_lid_sleep_ac registered (%u)", __atomic_load_n(&gLidSleepAC, __ATOMIC_ACQUIRE));
   sysctl_register_oid(&gOidStatus);
   sysctl_register_oid(&gOidLpm);
   fillOid(gOidHpm, "piano_policy_hpm", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, sysctlHpm, "I",
@@ -552,6 +571,7 @@ Inputs PianoPolicy::gather()
   IOService *kb = __atomic_load_n(&fKeyboard, __ATOMIC_ACQUIRE);
   const int hall = numberProperty(kb, "piano-keyboard-hall");
   in.lidSleepArmed=__atomic_load_n(&gLidArm,__ATOMIC_ACQUIRE)!=0;
+  in.lidSleepAC = int(__atomic_load_n(&gLidSleepAC, __ATOMIC_ACQUIRE));
   in.lid = hall < 0 ? Lid::unknown : hall ? Lid::open : Lid::closed;
   in.attached = numberProperty(kb, "piano-keyboard-attached") == 1;
   IOService *ps = __atomic_load_n(&fPowerSource, __ATOMIC_ACQUIRE);
