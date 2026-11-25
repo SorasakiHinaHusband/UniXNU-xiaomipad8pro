@@ -407,6 +407,8 @@ struct Dpu {
   }
   void delayUs(uint32_t us) { tick(uint64_t(us) * 1000); }
   void sleepMs(uint32_t ms) { tick(uint64_t(ms) * 1000000); }
+  uint64_t pollDeadline(uint32_t us) const { return ns + uint64_t(us) * 1000; }
+  void pollWait(uint64_t deadline, bool) { if (deadline > ns) tick(deadline - ns); }
   uint32_t modeUnderruns() { return (rd(kMdp + kTopIntrStatus) & kUnderrunBits) | irqUnderruns; }
   bool clearModeUnderruns()
   {

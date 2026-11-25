@@ -29,7 +29,7 @@
 //     finish is not restored (the engine still owns the command) and the slice stops for the boot.
 // A DCS short write without a parameter: data type 0x05, header word = last-command flag (bit 31) | type << 16 | command.
 #pragma once
-#include "DpuSlices.h"
+#include "DpuPanelTrace.h"
 
 namespace pianodpu {
 namespace panel {
@@ -94,6 +94,14 @@ struct Sent {
   unsigned stores = 0, refused = 0;
   LinkSaved before[2];
   uint32_t ackAfter[2] = {0, 0}, fifoAfter[2] = {0, 0};
+  uint32_t intrPoll[2] = {};
+  unsigned ackBeforeMask = 0, ackAfterMask = 0;
+  bool triggerAttempted = false;
+
+  unsigned dmaDoneMask() const
+  {
+    return triggerAttempted ? unsigned(done[0]) | (unsigned(done[1]) << 1) : 0;
+  }
 };
 
 template <class Io>
@@ -120,6 +128,7 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
     k.trig = io.rd(dsiReg(l, kDsiTrigCtrl));
     k.fifo = io.rd(dsiReg(l, kDsiFifoStatus));
     k.ack = io.rd(dsiReg(l, kDsiAckErr));
+    s.ackBeforeMask |= 1u << l;
     if ((k.ctrl & (kCtrlEnable | kCtrlVideo)) != (kCtrlEnable | kCtrlVideo)) s.why = "a DSI controller is not enabled in video mode";
     else if (k.tpg) s.why = "a DSI controller's test-pattern / command FIFO is in use";
     else if ((k.trig & kTrigDmaMask) != kTrigDmaSw) s.why = "a DSI controller's command DMA is not software-triggered (TRIG_CTRL)";
@@ -162,12 +171,17 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
   }
   const uint64_t t0 = io.nowUs();
   if (!*s.why) {
+    s.triggerAttempted = true;
     const uintptr_t irq = io.irqOff();
     wr(dsiReg(0, kDsiTrigDma), 1);
     wr(dsiReg(1, kDsiTrigDma), 1);
     io.irqRestore(irq);
     for (;;) {
-      for (unsigned l = 0; l < 2; ++l) s.done[l] = s.done[l] || (io.rd(dsiReg(l, kDsiIntrCtrl)) & kIntDmaDone);
+      for (unsigned l = 0; l < 2; ++l) {
+        if (s.done[l]) continue;
+        s.intrPoll[l] = io.rd(dsiReg(l, kDsiIntrCtrl));
+        s.done[l] = (s.intrPoll[l] & kIntDmaDone) != 0;
+      }
       if (s.done[0] && s.done[1]) break;
       if (io.nowUs() - t0 >= kDmaDoneTimeoutUs) break;
       io.sleepMs(1);
@@ -188,6 +202,7 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
     wr(dsiReg(l, kDsiCtrl), k.ctrl);
     s.ackAfter[l] = io.rd(dsiReg(l, kDsiAckErr));
     s.fifoAfter[l] = io.rd(dsiReg(l, kDsiFifoStatus));
+    s.ackAfterMask |= 1u << l;
   }
   if (*s.why) return s;
   if (!s.done[0] || !s.done[1]) s.why = s.done[0] ? "DSI1's command DMA did not finish within 50 ms" : "DSI0's command DMA did not finish within 50 ms";
@@ -234,7 +249,7 @@ bool programFetch(Io &io, const Fetch &fetch, bool enable, Engines &e)
 }
 // Stop one INTF's engine (index 1 or 2) and wait until it reports stopped.
 template <class Io>
-int32_t stopEngine(Io &io, unsigned intf, Engines &e)
+int32_t stopEngine(Io &io, unsigned intf, Engines &e, const Trace &trace)
 {
   ++e.stores;
   if (!io.wr(intfReg(intf, kIntfEn), 0)) {
@@ -243,20 +258,25 @@ int32_t stopEngine(Io &io, unsigned intf, Engines &e)
   }
   const uint64_t t0 = io.nowUs();
   for (;;) {
-    const uint32_t st = io.rd(intfReg(intf, kIntfStatus));
-    e.status[intf - 1] = st;
-    if (!(st & kIntfStatusOn)) return int32_t(io.nowUs() - t0);
-    if (io.nowUs() - t0 >= kEngineStopUs) return -1;
-    io.sleepMs(1);
+    const uint64_t pa = intfReg(intf, kIntfStatus);
+    const uint32_t st = e.status[intf - 1] = io.rd(pa);
+    const uint64_t elapsed = io.nowUs() - t0;
+    const bool stopped = !(st & kIntfStatusOn);
+    if (stopped || elapsed >= kEngineStopUs) {
+      trace.sample(io, {pa, st});
+      return stopped ? int32_t(elapsed) : -1;
+    }
+    trace.pause(io, 1000, true, {pa, st});
   }
 }
 // Both on again: the CTL's INTF flush first, then INTF1 and INTF2 with nothing in between; running and in lockstep. After a failed
 // stop one engine may still run: INTF2 alone is started at INTF1's frame start (its line counter wrapping), so the halves stay in
 // phase; INTF1 alone (INTF2 running) cannot be aligned that way and is reported.
 template <class Io>
-Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch)
+Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace)
 {
   Engines e;
+  trace.boundary(io, TraceStep::fetchOn);
   if (!programFetch(io, fetch, true, e)) {
     e.why = "could not restore programmable fetch";
     return e;
@@ -265,6 +285,7 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch)
     ++e.stores;
     if (!io.wr(pa, v)) ++e.refused;
   };
+  trace.boundary(io, TraceStep::enable);
   const bool on1 = io.rd(intfReg(1, kIntfStatus)) & kIntfStatusOn, on2 = io.rd(intfReg(2, kIntfStatus)) & kIntfStatusOn;
   wr(ctlReg(unsigned(p.ctl), kCtlIntfFlush), kIntfFlushDsi);
   wr(ctlReg(unsigned(p.ctl), kCtlFlush), kFlushIntf);
@@ -275,7 +296,9 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch)
   const char *phase = nullptr;
   if (on1 && !on2) {
     const unsigned vt = p.link[0].vtotal ? p.link[0].vtotal : kVtotal120;
-    if (!waitLines(io, 0, 2, vt, 3 * vt * kLineNs / 1000)) phase = "INTF1's line counter did not wrap: INTF2 started out of phase";
+    trace.step = TraceStep::align;
+    if (!waitLines(io, 0, 2, vt, 3 * vt * kLineNs / 1000, kLineNs, trace))
+      phase = "INTF1's line counter did not wrap: INTF2 started out of phase";
     const uintptr_t irq = io.irqOff();
     wr(intfReg(2, kIntfEn), 1);
     io.irqRestore(irq);
@@ -292,6 +315,7 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch)
       if (!(io.rd(intfReg(i, kIntfEn)) & 1u)) wr(intfReg(i, kIntfEn), 1);
   }
   const uint64_t t0 = io.nowUs();
+  trace.step = TraceStep::start;
   bool on = false;
   while (!on && io.nowUs() - t0 < kEngineStartUs) {
     on = true;
@@ -299,11 +323,20 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch)
       e.status[i] = io.rd(intfReg(i + 1, kIntfStatus));
       on &= (e.status[i] & kIntfStatusOn) != 0;
     }
-    if (!on) io.sleepMs(1);
+    const PollRead a{intfReg(1, kIntfStatus), e.status[0]}, b{intfReg(2, kIntfStatus), e.status[1]};
+    if (on) {
+      e.us[0] = e.us[1] = int32_t(io.nowUs() - t0);
+      trace.sample(io, a, b);
+    } else {
+      trace.pause(io, 1000, true, a, b);
+    }
   }
-  e.us[0] = e.us[1] = on ? int32_t(io.nowUs() - t0) : -1;
-  e.latchUs = waitFlush(io, unsigned(p.ctl), kFlushIntf, 60000);
-  if (on) e.rate = measureRate(io, 100);
+  trace.step = TraceStep::flush;
+  e.latchUs = waitFlush(io, unsigned(p.ctl), kFlushIntf, 60000, trace);
+  if (on) {
+    trace.step = TraceStep::rate;
+    e.rate = measureRate(io, 100, trace);
+  }
   if (e.refused) e.why = "the store guard refused a store";
   else if (!on) e.why = "a timing engine did not report running within 50 ms";
   else if (e.latchUs < 0) e.why = "the INTF wake flush did not latch";
@@ -334,117 +367,130 @@ struct Result {
 
 // Undo after a failed off: engines (if any stopped) on, sleep-out, display-on.
 template <class Io>
-void undoOff(Io &io, const LivePath &p, const Options &o, Result &r, bool sleeping)
+void undoOff(Io &io, const LivePath &p, const Options &o, Result &r, bool sleeping, Trace &trace)
 {
+  trace.boundary(io, TraceStep::undo);
   if (r.step >= 3) {
-    const Engines e = startEngines(io, p, r.fetch);
+    const Engines e = startEngines(io, p, r.fetch, trace);
     r.stores += e.stores;
     r.refused += e.refused;
     if (!e.ok) return;
     r.enginesStopped = false;
   }
   if (sleeping) {
+    trace.boundary(io, TraceStep::sleepOut);
     const Sent s = sendDcs(io, kDcsSleepOut, o);
     if (!s.ok) return;
     io.sleepMs(o.sleepOutMs);
   }
+  trace.boundary(io, TraceStep::displayOn);
   r.restored = sendDcs(io, kDcsDisplayOn, o).ok;
   if (r.restored) io.sleepMs(o.displayOnMs);
 }
 
 template <class Io>
-Result panelOff(Io &io, const LivePath &p, const Options &o)
+Result panelOff(Io &io, const LivePath &p, const Options &o, TraceRing *ring = nullptr)
 {
   Result r;
+  Trace trace{ring, unsigned(p.ctl)};
   const uint64_t t0 = io.nowUs();
-  auto fail = [&](const char *why) {
+  auto finish = [&](const char *why) {
     r.why = why;
+    trace.boundary(io, TraceStep::end);
     return r;
   };
   r.step = 1;
   r.tUs[0] = io.nowUs() - t0;
+  trace.boundary(io, TraceStep::displayOff);
   r.dcs[0] = sendDcs(io, kDcsDisplayOff, o);
+  trace.boundary(io, TraceStep::displayOffDone);
   if (!r.dcs[0].ok) {
     r.safeAwake = !r.dcs[0].stores ||
                   (r.dcs[0].waitedBlanking && r.dcs[0].done[0] && r.dcs[0].done[1] && !r.dcs[0].refused);
-    return fail(r.dcs[0].why);
+    return finish(r.dcs[0].why);
   }
   io.sleepMs(o.displayOffMs);
   r.step = 2;
   r.tUs[1] = io.nowUs() - t0;
+  trace.boundary(io, TraceStep::sleepIn);
   r.dcs[1] = sendDcs(io, kDcsSleepIn, o);
+  trace.boundary(io, TraceStep::sleepInDone);
   if (!r.dcs[1].ok) {
     if (!r.dcs[1].stores || (r.dcs[1].done[0] && r.dcs[1].done[1] && !r.dcs[1].refused))
-      undoOff(io, p, o, r, !r.dcs[1].waitedBlanking && r.dcs[1].stores);
-    return fail(r.dcs[1].why);
+      undoOff(io, p, o, r, !r.dcs[1].waitedBlanking && r.dcs[1].stores, trace);
+    return finish(r.dcs[1].why);
   }
   io.sleepMs(o.sleepInMs);
   if (!o.engines) {
     r.ok = true;
-    r.why = "ok (DCS only: the timing engines keep running)";
-    return r;
+    return finish("ok (DCS only: the timing engines keep running)");
   }
   r.step = 3;
   r.tUs[2] = io.nowUs() - t0;
+  trace.boundary(io, TraceStep::stopSlave);
   for (unsigned i = 0; i < 2; ++i) {
     r.fetch.config[i] = io.rd(intfReg(i + 1, kIntfConfig));
     r.fetch.start[i] = io.rd(intfReg(i + 1, kIntfProgFetch));
   }
-  r.engines.us[1] = stopEngine(io, 2, r.engines);   // the slave first
+  r.engines.us[1] = stopEngine(io, 2, r.engines, trace);   // the slave first
   r.enginesStopped = true;
   if (r.engines.us[1] < 0) {
-    undoOff(io, p, o, r, true);
-    return fail(r.engines.refused ? "the store guard refused a store" : "INTF2's timing engine did not stop within 40 ms");
+    undoOff(io, p, o, r, true, trace);
+    return finish(r.engines.refused ? "the store guard refused a store" : "INTF2's timing engine did not stop within 40 ms");
   }
   r.step = 4;
   r.tUs[3] = io.nowUs() - t0;
-  r.engines.us[0] = stopEngine(io, 1, r.engines);
+  trace.boundary(io, TraceStep::stopMaster);
+  r.engines.us[0] = stopEngine(io, 1, r.engines, trace);
   if (r.engines.us[0] < 0) {
-    undoOff(io, p, o, r, true);
-    return fail(r.engines.refused ? "the store guard refused a store" : "INTF1's timing engine did not stop within 40 ms");
+    undoOff(io, p, o, r, true, trace);
+    return finish(r.engines.refused ? "the store guard refused a store" : "INTF1's timing engine did not stop within 40 ms");
   }
   // Keep prefetch active for the last scanned frame. The wake flush latches
   // the restored configuration before the first complete frame is sent.
   r.step = 5;
+  trace.boundary(io, TraceStep::fetchOff);
   if (!programFetch(io, r.fetch, false, r.engines)) {
-    undoOff(io, p, o, r, true);
-    return fail("could not disable programmable fetch");
+    undoOff(io, p, o, r, true, trace);
+    return finish("could not disable programmable fetch");
   }
   r.tUs[4] = io.nowUs() - t0;
   r.ok = true;
-  r.why = "ok";
-  return r;
+  return finish("ok");
 }
 
 template <class Io>
-Result panelOn(Io &io, const LivePath &p, const Options &o, bool enginesStopped, const Fetch &fetch)
+Result panelOn(Io &io, const LivePath &p, const Options &o, bool enginesStopped, const Fetch &fetch, TraceRing *ring = nullptr)
 {
   Result r;
+  Trace trace{ring, unsigned(p.ctl)};
   const uint64_t t0 = io.nowUs();
-  auto fail = [&](const char *why) {
+  auto finish = [&](const char *why) {
     r.why = why;
+    trace.boundary(io, TraceStep::end);
     return r;
   };
   r.step = 1;
   if (enginesStopped) {
     r.tUs[0] = io.nowUs() - t0;
-    r.engines = startEngines(io, p, fetch);
-    if (!r.engines.ok) return fail(r.engines.why);
+    r.engines = startEngines(io, p, fetch, trace);
+    if (!r.engines.ok) return finish(r.engines.why);
   }
   r.step = 2;
   r.tUs[1] = io.nowUs() - t0;
+  trace.boundary(io, TraceStep::sleepOut);
   r.dcs[0] = sendDcs(io, kDcsSleepOut, o);
-  if (!r.dcs[0].ok) return fail(r.dcs[0].why);
+  if (!r.dcs[0].ok) return finish(r.dcs[0].why);
   io.sleepMs(o.sleepOutMs);
   r.step = 3;
   r.tUs[2] = io.nowUs() - t0;
+  trace.boundary(io, TraceStep::displayOn);
   r.dcs[1] = sendDcs(io, kDcsDisplayOn, o);
-  if (!r.dcs[1].ok) return fail(r.dcs[1].why);
+  if (!r.dcs[1].ok) return finish(r.dcs[1].why);
   io.sleepMs(o.displayOnMs);
   r.tUs[3] = io.nowUs() - t0;
   r.ok = true;
-  r.why = "ok";
-  return r;
+  return finish("ok");
 }
 
 }  // namespace panel

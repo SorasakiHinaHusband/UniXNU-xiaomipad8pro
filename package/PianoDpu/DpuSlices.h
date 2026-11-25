@@ -170,6 +170,25 @@ struct Frames {
   uint32_t f[2] = {0, 0};
   uint64_t us = 0;
 };
+
+struct PollRead {
+  uint64_t pa = 0;
+  uint32_t value = 0;
+};
+
+// Most callers need only the original wait. Panel tracing can reuse the
+// values used by the predicate and sample during the wait's time budget.
+struct PlainPoll {
+  template <class Io>
+  void sample(Io &, PollRead = {}, PollRead = {}) const {}
+
+  template <class Io>
+  void pause(Io &io, uint32_t us, bool sleep, PollRead = {}, PollRead = {}) const
+  {
+    if (sleep) io.sleepMs(us / 1000);
+    else io.delayUs(us);
+  }
+};
 template <class Io>
 Frames readFrames(Io &io)
 {
@@ -183,20 +202,25 @@ Frames readFrames(Io &io)
 }
 
 // The next frame start of INTF1: its frame counter seen changing (polled every 50 us), at most timeoutUs. The time and both counts.
-template <class Io>
-bool waitFrameEdge(Io &io, uint32_t timeoutUs, Frames *edge)
+template <class Io, class Poll = PlainPoll>
+bool waitFrameEdge(Io &io, uint32_t timeoutUs, Frames *edge, const Poll &poll = {})
 {
   const uint32_t f0 = io.rd(intfReg(1, kIntfFrameCount));
   const uint64_t end = io.nowUs() + timeoutUs;
-  while (io.nowUs() < end) {
-    io.delayUs(50);
+  if (io.nowUs() >= end) return false;
+  io.delayUs(50);
+  for (;;) {
     const Frames r = readFrames(io);
-    if (r.f[0] != f0) {
+    const PollRead a{intfReg(1, kIntfFrameCount), r.f[0]}, b{intfReg(2, kIntfFrameCount), r.f[1]};
+    const bool moved = r.f[0] != f0;
+    if (moved || io.nowUs() >= end) {
+      poll.sample(io, a, b);
+      if (!moved) return false;
       *edge = r;
       return true;
     }
+    poll.pause(io, 50, false, a, b);
   }
-  return false;
 }
 
 // The refresh, frame-edge to frame-edge over about ms milliseconds (both INTFs counted over the same interval): thousandths of a
@@ -207,14 +231,14 @@ struct Rate {
   uint64_t us = 0;
   bool lockstep = false;
 };
-template <class Io>
-Rate measureRate(Io &io, uint32_t ms)
+template <class Io, class Poll = PlainPoll>
+Rate measureRate(Io &io, uint32_t ms, const Poll &poll = {})
 {
   Rate r;
   Frames a, b;
-  if (!waitFrameEdge(io, 40000, &a)) return r;
+  if (!waitFrameEdge(io, 40000, &a, poll)) return r;
   if (ms > 4) io.sleepMs(ms - 4);
-  if (!waitFrameEdge(io, 40000, &b)) return r;
+  if (!waitFrameEdge(io, 40000, &b, poll)) return r;
   r.frames[0] = b.f[0] - a.f[0];
   r.frames[1] = b.f[1] - a.f[1];
   r.us = b.us - a.us;
@@ -226,31 +250,40 @@ Rate measureRate(Io &io, uint32_t ms)
 
 // INTF1's line counter inside [lo, hi] (a frame start is then at least vtotal - hi lines away and lo lines behind). Sleeps while
 // far, spins when near. False when the window did not come within timeoutUs (a counter that does not move).
-template <class Io>
-bool waitLines(Io &io, unsigned lo, unsigned hi, unsigned vtotal, uint32_t timeoutUs, uint32_t lineNs = kLineNs)
+template <class Io, class Poll = PlainPoll>
+bool waitLines(Io &io, unsigned lo, unsigned hi, unsigned vtotal, uint32_t timeoutUs, uint32_t lineNs = kLineNs, const Poll &poll = {})
 {
   const uint64_t end = io.nowUs() + timeoutUs;
   for (;;) {
-    const uint32_t line = io.rd(intfReg(1, kIntfLineCount));
-    if (line >= lo && line <= hi) return true;
-    if (io.nowUs() >= end) return false;
+    const uint64_t pa = intfReg(1, kIntfLineCount);
+    const uint32_t line = io.rd(pa);
+    const bool inRange = line >= lo && line <= hi;
+    if (inRange || io.nowUs() >= end) {
+      poll.sample(io, {pa, line});
+      return inRange;
+    }
     const uint64_t lines = line < lo ? lo - line : (line < vtotal ? vtotal - line : 0) + lo;
     const uint64_t us = lines * lineNs / 1000;
-    if (us > 2500) io.sleepMs(uint32_t((us - 1500) / 1000));
-    else io.delayUs(us > 100 ? 100 : uint32_t(us) + 1);
+    if (us > 2500) poll.pause(io, uint32_t((us - 1500) / 1000) * 1000, true, {pa, line});
+    else poll.pause(io, us > 100 ? 100 : uint32_t(us) + 1, false, {pa, line});
   }
 }
 
 // CTL_FLUSH's mask bits cleared (latched) within timeoutUs: the microseconds it took, or -1.
-template <class Io>
-int32_t waitFlush(Io &io, unsigned ctl, uint32_t mask, uint32_t timeoutUs)
+template <class Io, class Poll = PlainPoll>
+int32_t waitFlush(Io &io, unsigned ctl, uint32_t mask, uint32_t timeoutUs, const Poll &poll = {})
 {
   const uint64_t t0 = io.nowUs();
   for (;;) {
     const uint64_t now = io.nowUs();
-    if (!(io.rd(ctlReg(ctl, kCtlFlush)) & mask)) return int32_t(now - t0);
-    if (now - t0 >= timeoutUs) return -1;
-    io.sleepMs(1);
+    const uint64_t pa = ctlReg(ctl, kCtlFlush);
+    const uint32_t flush = io.rd(pa);
+    const bool latched = !(flush & mask);
+    if (latched || now - t0 >= timeoutUs) {
+      poll.sample(io, {pa, flush});
+      return latched ? int32_t(now - t0) : -1;
+    }
+    poll.pause(io, 1000, true, {pa, flush});
   }
 }
 

@@ -40,9 +40,11 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLocks.h>
 #include <libkern/libkern.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
@@ -82,6 +84,7 @@ struct SliceArgs {
   bool pccTest = false;
   int32_t pccTestMilli[3] = {1000, 1000, 1000};
   unsigned panel = 0, panelEngines = 1, panelHs = 0, panelTest = 0;
+  bool panelTrace = false;
   unsigned ahbVote = 0;   // piano-dpu-ahb-vote: 1 = the gate's Linux rule for GCC's display AHB (DpuAhbVote.h)
 };
 SliceArgs gA;
@@ -145,7 +148,9 @@ void readSliceArgs()
     }
     gA.pccTest = ok && k == 3;
   }
-  gA.panel = argNumber("piano-dpu-panel", 0, 0, 1);
+  const unsigned panelArg = argNumber("piano-dpu-panel", 0, 0, UINT32_MAX);
+  gA.panel = panelArg != 0;
+  gA.panelTrace = panelArg == 1;
   gA.panelEngines = argNumber("piano-dpu-panel-engines", 1, 0, 1);
   gA.panelHs = argNumber("piano-dpu-panel-hs", 0, 0, 1);
   gA.panelTest = argNumber("piano-dpu-panel-test", 0, 0, 1000);
@@ -245,6 +250,21 @@ struct KernelIo {
   }
   void delayUs(uint32_t us) { IODelay(us); }
   void sleepMs(uint32_t ms) { IOSleep(ms); }
+  uint64_t pollDeadline(uint32_t us)
+  {
+    uint64_t deadline;
+    clock_interval_to_deadline(us, kMicrosecondScale, &deadline);
+    return deadline;
+  }
+  void pollWait(uint64_t deadline, bool sleep)
+  {
+    if (!sleep) {
+      clock_delay_until(deadline);
+    } else if (mach_absolute_time() < deadline &&
+               assert_wait_deadline(reinterpret_cast<event_t>(this), THREAD_UNINT, deadline) == THREAD_WAITING) {
+      thread_block(THREAD_CONTINUE_NULL);
+    }
+  }
   uint64_t nowUs() { return ::nowUs(); }
   uintptr_t irqOff() { return uintptr_t(ml_set_interrupts_enabled(FALSE)); }
   void irqRestore(uintptr_t s) { ml_set_interrupts_enabled(boolean_t(s)); }
@@ -305,6 +325,13 @@ pcc::PanelPcc gNightShiftBase, gNightShiftLast;
 bool gDisplayOff;
 refresh::Options gRefreshOptions;
 panel::Options gPanelOptions;
+// The worker fills this preallocated ring, then publishes a separate copy.
+panel::TraceRing gPanelTrace;
+struct PanelTraceReport {
+  bool pending = false, on = false, ok = false, restored = false;
+  unsigned serial = 0, ctl = 0, step = 0;
+  panel::Sent dcs[2];
+} gPanelReport;
 
 void milliHz(uint64_t mhz, unsigned *whole, unsigned *frac)
 {
@@ -619,6 +646,70 @@ void logPanel(const char *what, const panel::Result &r)
        (unsigned long long)(r.tUs[3] / 1000));
 }
 
+panel::TraceRing *beginPanelTrace()
+{
+  if (!gA.panelTrace) return nullptr;
+  gPanelTrace.reset();
+  return &gPanelTrace;
+}
+
+void finishPanelTrace(panel::TraceRing *trace, bool on, const panel::Result &r)
+{
+  if (!trace) return;
+  gPanelReport.pending = true;
+  gPanelReport.on = on;
+  gPanelReport.ok = r.ok;
+  gPanelReport.restored = r.restored;
+  ++gPanelReport.serial;
+  gPanelReport.ctl = unsigned(gPath.ctl);
+  gPanelReport.step = r.step;
+  if (!on) {
+    gPanelReport.dcs[0] = r.dcs[0];
+    gPanelReport.dcs[1] = r.dcs[1];
+  }
+}
+
+void publishPanelTrace()
+{
+  PanelTraceReport &report = gPanelReport;
+  if (!report.pending) return;
+  report.pending = false;
+  const unsigned count = gPanelTrace.size();
+  char line[224];
+  OSData *dump = OSData::withCapacity((count + 3) * sizeof line);
+  bool complete = dump != nullptr;
+  auto emit = [&] {
+    note("%s", line);
+    complete = complete && dump->appendBytes(line, unsigned(strlen(line))) && dump->appendBytes("\n", 1);
+  };
+  snprintf(line, sizeof line, "m5 %u %s ctl%u ok=%u step=%u restored=%u rows=%u dropped=%u", report.serial,
+           report.on ? "wake" : "off", report.ctl, unsigned(report.ok), report.step, unsigned(report.restored),
+           count, gPanelTrace.total - count);
+  emit();
+  if (!report.on) {
+    for (const panel::Sent &s : report.dcs) {
+      if (!s.command) continue;
+      snprintf(line, sizeof line,
+               "m5 %u dcs %02x trig=%u done=%x us=%u porch=%u intr=%08x/%08x ack=%x:%08x/%08x>%x:%08x/%08x fifo=%08x/%08x>%08x/%08x",
+               report.serial, unsigned(s.command), unsigned(s.triggerAttempted), s.dmaDoneMask(), s.doneUs,
+               unsigned(s.waitedBlanking), s.intrPoll[0], s.intrPoll[1], s.ackBeforeMask, s.before[0].ack, s.before[1].ack,
+               s.ackAfterMask, s.ackAfter[0], s.ackAfter[1], s.before[0].fifo, s.before[1].fifo, s.fifoAfter[0], s.fifoAfter[1]);
+      emit();
+    }
+  }
+  for (unsigned i = 0; i < count; ++i) {
+    const panel::TraceSample &s = gPanelTrace.at(i);
+    const panel::TraceLink &a = s.link[0], &b = s.link[1];
+    snprintf(line, sizeof line, "m5 %u %u %llu %s %c %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x",
+             report.serial, gPanelTrace.total - count + i, (unsigned long long)s.us, panel::traceStepName(s.step), s.boundary ? 'B' : 'P',
+             a.en, a.status, a.frame, a.line, b.en, b.status, b.frame, b.line, s.top, s.active, s.flush, s.intfFlush);
+    emit();
+  }
+  if (!complete || !gService->setProperty("piano-dpu-panel-trace", dump))
+    note("m5 %u: could not publish piano-dpu-panel-trace", report.serial);
+  if (dump) dump->release();
+}
+
 bool panelSleep()
 {
   if (gAsleep || gPanelBroken) return false;
@@ -630,7 +721,9 @@ bool panelSleep()
     return false;
   }
   gPath = live;
-  const panel::Result r = panel::panelOff(gIo, gPath, gPanelOptions);
+  panel::TraceRing *trace = beginPanelTrace();
+  const panel::Result r = panel::panelOff(gIo, gPath, gPanelOptions, trace);
+  finishPanelTrace(trace, false, r);
   logPanel("sleep (display off 0x28, 20 ms, sleep in 0x10, 100 ms, INTF2 then INTF1 stopped)", r);
   if (r.ok) {
     gAsleep = true;
@@ -657,7 +750,9 @@ bool panelWake()
     note("panel: wake refused: DSI video path unavailable (%s, ctl%d)", live.why, live.ctl);
     return false;
   }
-  const panel::Result r = panel::panelOn(gIo, gPath, gPanelOptions, gEnginesStopped, gPanelFetch);
+  panel::TraceRing *trace = beginPanelTrace();
+  const panel::Result r = panel::panelOn(gIo, gPath, gPanelOptions, gEnginesStopped, gPanelFetch, trace);
+  finishPanelTrace(trace, true, r);
   logPanel("wake (INTF flush, INTF1 + INTF2 on, sleep out 0x11, 120 ms, display on 0x29)", r);
   gAsleep = false;
   gEnginesStopped = false;
@@ -693,10 +788,14 @@ void panelStart()
     return;
   }
   for (unsigned k = 0; k < gA.panelTest && !gPanelBroken; ++k) {
-    if (!panelSleep()) break;
+    const bool slept = panelSleep();
+    publishPanelTrace();
+    if (!slept) break;
     IOSleep(5000);
-    if (!panelWake()) break;
-    if (gA.nightShift) nightShiftUpdate(true, "panel wake");
+    const bool woke = panelWake();
+    if (woke && gA.nightShift) nightShiftUpdate(true, "panel wake");
+    publishPanelTrace();
+    if (!woke) break;
     IOSleep(5000);
     note("panel: test cycle %u of %u done", k + 1, gA.panelTest);
   }
@@ -775,6 +874,7 @@ void serve()
       gS.panelDone = true;
       IOLockWakeup(gLock, &gS.panelDone, false);
       IOLockUnlock(gLock);
+      publishPanelTrace();
     }
     if (mode) {
       const IOReturn result = doModeSwitch(mode);
