@@ -136,7 +136,8 @@ static void b1Record(const char *line){
   IOService *pv=m?IOService::copyMatchingService(m):nullptr;OSSafeReleaseNULL(m);if(!pv)return;
   char key[40];snprintf(key,sizeof key,"piano-video-vt-b1-%u",seq++%8);pv->setProperty(key,line);pv->release();
 }
-static int pianoVtBorrowMode(){static int b=-1;if(b<0){uint32_t v=0;b=PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v)?int(v):0;}return b;}
+// default 3 (the kernel-surface copy) since y12i; piano-video-vt-borrow=0 off, 1/2 the diagnostic lookup walks
+static int pianoVtBorrowMode(){static int b=-1;if(b<0){uint32_t v=3;PE_parse_boot_argn("piano-video-vt-borrow",&v,sizeof v);b=int(v);}return b;}
 static bool pianoVtBorrow(){return pianoVtBorrowMode()>=1;}
 // piano-video-vt-borrow=2 (diagnostic, LT-B5): once per boot, try the refused surface ID through EVERY IOSurfaceRoot client and record
 // which creator's client accepts it (find_surface admits the owner task or a client that knows it); each accepted lookup is undone at

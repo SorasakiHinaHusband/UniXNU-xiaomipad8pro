@@ -95,7 +95,8 @@ static void captureMessage(const uint8_t *bytes, uint32_t length, uint32_t direc
 // (com.apple.rootless.storage.WebKitGPUSandbox: on WebKit.GPU.xpc, not on WebContent / Networking, checked on 27.2).
 static bool pianoVtGrant() {
     static int grant = -1;
-    if (grant < 0) { uint32_t v = 0; grant = PE_parse_boot_argn("piano-video-vt-grant", &v, sizeof v) && v == 1; }
+    // default ON since y12i (Safari hardware decode qualified: v131y12i-qual1/qual3); piano-video-vt-grant=0 turns it off
+    if (grant < 0) { uint32_t v = 1; PE_parse_boot_argn("piano-video-vt-grant", &v, sizeof v); grant = v == 1; }
     return grant == 1;
 }
 static constexpr const char PianoVtGrantPrefix[] = "com.apple.WebKit";            // 16 characters: the kernel's compare length
