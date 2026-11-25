@@ -284,7 +284,8 @@ struct Shared {
   uint32_t gammaWorstMilli = 0, gammaWords = 0;
   bool gammaLog = false;
   int panelWant = -1;   // -1 nothing new, 0 off, 1 on
-  bool panelReady = false, panelBusy = false, panelDone = false;
+  panel::RequestGate panelGate;
+  bool panelBusy = false, panelDone = false;
   IOReturn panelResult = kIOReturnNotReady;
   unsigned modeWant = 0;    // remains occupied until its caller consumes the result
   bool modeReady = false, modeDone = false;
@@ -770,6 +771,8 @@ void serve()
     }
     if (want >= 0 && gA.panel) {
       IOLockLock(gLock);
+      gS.panelGate.ready = !gPanelBroken;
+      gS.panelGate.wakePending = gPanelBroken && (!want || !panelOk);
       gS.panelResult = panelOk ? kIOReturnSuccess : kIOReturnIOError;
       gS.panelDone = true;
       IOLockWakeup(gLock, &gS.panelDone, false);
@@ -848,9 +851,21 @@ void worker(void *, wait_result_t)
       note("mode: panel ID unavailable; switching off");
     }
   }
-  if (((gA.refresh && gA.refresh != kRefreshPlan) || gA.panel) && !countersOn(gIo, gPath)) {   // plan mode writes nothing
-    note("slices: the INTF frame/line counters stay off (count-en %x/%x): refresh and panel off", gPath.link[0].countEn, gPath.link[1].countEn);
-    gRefreshBroken = gPanelBroken = true;
+  const bool refreshWrites = gA.refresh && gA.refresh != kRefreshPlan;
+  bool countEn = true;
+  if (gA.panel) {
+    const panel::CounterInit init = panel::initCounters(gIo, gPath);
+    countEn = init.enabled;
+    gPanelBroken = !init.moving;
+    note("panel: INTF counters: count-en %x/%x -> %x/%x; %s", p.link[0].countEn, p.link[1].countEn,
+         gPath.link[0].countEn, gPath.link[1].countEn,
+         init.moving ? "both frame and line counters advance" : "could not verify counter motion on both links; panel sleep off");
+  } else if (refreshWrites) {
+    countEn = countersOn(gIo, gPath);
+  }
+  if (refreshWrites && !countEn) {
+    note("refresh: INTF counter enables did not read back (count-en %x/%x): refresh off", gPath.link[0].countEn, gPath.link[1].countEn);
+    gRefreshBroken = true;
   }
   if (gA.pcc) {
     piano_dpu_slices_stage = 3;
@@ -869,7 +884,7 @@ void worker(void *, wait_result_t)
   } else {
     gRefreshBroken = true;
   }
-  if (gA.panel) {
+  if (gA.panel && !gPanelBroken) {
     piano_dpu_slices_stage = 5;
     panelStart();
   }
@@ -879,7 +894,7 @@ void worker(void *, wait_result_t)
        gPccBroken ? "off" : gA.nightShift ? "Night Shift" : gA.pcc ? "on" : "off", gA.panel && !gPanelBroken ? "on" : "off");
   publish();
   IOLockLock(gLock);
-  gS.panelReady = gA.panel;
+  gS.panelGate.ready = gA.panel && !gPanelBroken;
   gS.modeReady = modeReady;
   IOLockUnlock(gLock);
   serve();
@@ -937,7 +952,13 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
     }
     return true;
   }
-  if (!name || !gLock) return false;
+  if (!name) return false;
+  if (!gLock) {
+    if (!gA.panel || !name->isEqualTo("PianoDpuPanel")) return false;
+    note("panel: %s refused: panel worker unavailable", p1 ? "wake" : "sleep");
+    *result = kIOReturnNotReady;
+    return true;
+  }
   if (gA.nightShift && name->isEqualTo("PianoDpuNightShiftMatrix")) {
     uint64_t raw[9];
     if (!p1) {
@@ -1038,8 +1059,10 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
       gS.wake = true;
       IOLockWakeup(gLock, &gS, false);
       *result = kIOReturnSuccess;
-    } else if (!gS.panelReady || gS.panelBusy) {
-      *result = !gS.panelReady ? kIOReturnNotReady : kIOReturnBusy;
+    } else if (!gS.panelGate.admit(p1 != nullptr, [](const char *line) { note("%s", line); })) {
+      *result = kIOReturnNotReady;
+    } else if (gS.panelBusy) {
+      *result = kIOReturnBusy;
     } else {
       ++gS.panelCalls;
       gS.panelBusy = true;

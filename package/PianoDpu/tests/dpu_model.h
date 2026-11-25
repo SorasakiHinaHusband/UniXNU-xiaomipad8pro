@@ -57,6 +57,7 @@ struct Dpu {
   uint32_t irqUnderruns = 0;
   bool resetPccOnTimingChange = false;
   unsigned lateDmas = 0;               // delay this many DMA completions past a short front porch
+  bool countEnableIgnored[2] = {false, false};   // COUNT_EN writes do not change the readback or live counters
   // ---- state
   uint64_t ns = 0;
   std::map<uint64_t, uint32_t> regs;
@@ -309,8 +310,10 @@ struct Dpu {
         return true;
       }
       if (pa == intfReg(i, kIntfCountEn)) {
-        regs[pa] = v;
-        intf[i].counting = (v & 3u) == 3u;
+        if (!countEnableIgnored[i - 1]) {
+          regs[pa] = v;
+          intf[i].counting = (v & 3u) == 3u;
+        }
         return true;
       }
       if (pa == intfReg(i, kIntfEn)) {

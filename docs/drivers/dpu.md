@@ -229,6 +229,12 @@ light sleep and stops fetch using the B1e command path. The DCS packet uses the 
 helper in `UniXNU-sm8750-common` PeripheralIO. Light sleep retains supply, reset, PHY and MDSS state. With M4 on as well
 (lead/v131y12m merge), PianoDpu replays Night Shift inside the synchronous wake, before NativeGopDisplay releases the display;
 M4 alone keeps its notify from the display power gate.
+At startup the M5a worker checks the live dual-DSI video path, requests both INTF frame and line counters with `COUNT_EN = 3`
+where needed, and verifies that both frame and line counters actually advance. The qualification capture showed live counters on
+both links while `COUNT_EN` read back zero. The readback is diagnostic. If the live counter check fails, an M5a sleep request is
+logged and returns `kIOReturnNotReady` before queuing panel work. NativeGopDisplay uses backlight-only sleep, releases touch on
+wake, and requests the configured Night Shift replay. A failure during an accepted panel transition still uses the wake path to
+check recovery.
 *Implemented* (`DpuPanel.h`): per DCS command, on both links: refused unless the controller is enabled in video mode, its FIFO is
 free and its DMA is software-triggered; STATUS0's DMA busy bit waited for (20 ms); INTR_CTRL's done bit cleared, CTRL's command mode
 set beside video (msm's transfer), the FIFO selected and filled, CMD_DMA_CTRL low power (the panel's mode) without broadcast or
@@ -637,6 +643,19 @@ apply line, then the backlight. Check that the tint survives every wake, touch a
 
 The daily display-power callback blanks the KTZ8866 backlight while INTF1 and INTF2 continue scanning the active framebuffer. M5a uses the existing `piano-dpu-panel=1` opt-in to stop fetch at that boundary. The path is WindowServer and IOKit power → NativeGopDisplay's gated power callback and copy worker → PianoBacklight and PianoTouch → PianoDpu's panel sequence → dual DPU INTF and DSI video → NT36532. Pending swaps stay in the display's retained job queue until scanout can latch them again.
 
+The qualification failure occurred before the first DCS command. INTF1 and INTF2 were scanning, programmable fetch was enabled,
+and subsequent M1 snapshots showed the frames and lines advancing with `count-en 0/0`. The slice requested the Linux enable bits
+and interpreted their zero readback as proof that the counters had stopped. It then advertised panel readiness after disabling
+M5a, so requests returned `kIOReturnIOError` from the worker and the engines stayed on in all ten cycles.
+
+Counter setup comparison for the Ubuntu v1.4.0 kernel (`83f0f89bed14`) and UniXNU-sheng (`00ba909`)
+
+| Reference | PianoDpu path | Comparison |
+| --- | --- | --- |
+| `dpu_encoder_phys_vid.c:317,467` and `dpu_hw_intf.c:243–259` program video timing, including `INTF_FRAME_LINE_COUNT_EN = 3` at `+0xa8` | `DpuSlices.cpp:754–775` initializes panel counters after `readPath` validates the clocks, active CTL and both video links. `DpuSlices.h:255–264` uses the same enable value on INTF1 and INTF2. | Same counter register and value. Piano inherits a running video mode and issues only the missing counter enables. |
+| `dpu_hw_intf.c:326–344` reads live frame and line counts when the timing engine is active. `ShengDpuObservation.c:24–34,64–67` records the counters and their enable bits in a read-only observation. | `DpuSnapshot.h:58–70` and `DpuSlices.h:103–116` read the live counts and raw enable bits. `DpuFlip.h:335–357` waits on CTL flush, with vsync for notification. | Same observation. Snapshot and flip paths leave the counter controls to the writing slice. M5a gates on measured progress on both links. |
+| `dpu_encoder_phys_vid.c:235–253` and `dpu_hw_intf.c:284–305` set the programmable fetch start and CONFIG bit 31. `dpu_hw_intf.c:275–282` controls timing-engine enable independently. | `DpuPanel.h::programFetch` and `startEngines` handle fetch and timing on sleep and wake. | Same separation. Counter initialization leaves fetch, timing and CTL flush words untouched. |
+
 | Reference | B1e baseline | M5a |
 | --- | --- | --- |
 | `drm_panel.c:764–862` blanks after notifying touch and enables the backlight before notifying touch | `NativeGopDisplay::do_power_state_change_gated` posts a backlight request in both directions before the panel request | Blank promptly at the logical display-off, then confirm both ICs and touch are quiet before DCS. Release the backlight only after the panel can display a frame. |
@@ -648,8 +667,8 @@ The daily display-power callback blanks the KTZ8866 backlight while INTF1 and IN
 
 RAM-boot read list for the lead session
 
-1. Use the daily flip profile on a volatile Data RAM boot with `piano-dpu-panel=1 piano-dpu-snapshot=1`. Record the boot args, DPU flip-serving line, awake `sudo sysctl -n machdep.piano_dpu_snapshot` and both backlight IC states. Confirm two awake snapshots show advancing frame counters. Use a matched default-off run as the power control.
-2. With a working desktop and the C920 capturing continuously, do 50 cycles of `pmset displaysleepnow` and wake with the keyboard cover. On the first, last and sampled intermediate cycles, take two snapshot reads at least 100 ms apart after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and frame counters unchanged across the reads. Pair each sleep with its wake in the console and verify there was no flip timeout or permanent copy fallback.
+1. Use the daily flip profile on a volatile Data RAM boot with `piano-dpu-panel=1 piano-dpu-snapshot=1`. Record the boot args, DPU flip-serving line, `panel: INTF counters` (raw enable values before and after the enable request, plus the motion verdict), and `slices: serving` with `panel on`. Take two awake `sudo sysctl -n machdep.piano_dpu_snapshot` reads and record both backlight IC states. Verify both frame and line counters move with both engines running. A zero enable readback is acceptable with observed motion. If the live check fails, capture the `panel: sleep refused` line and verify the backlight-only wake, with both engines still running. Use a matched default-off run as the power control.
+2. With a working desktop and the C920 capturing continuously, start with ten cycles of `pmset displaysleepnow` and keyboard-cover wake. Take two snapshot reads at least 100 ms apart in each sleep after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and frame counters unchanged across the reads. Pair each success with a wake and confirm both engines restart before the next cycle. Verify there was no flip timeout or permanent copy fallback. Extend to 50 cycles for the full qualification, sampling the remaining cycles.
 3. On wake compare the snapshot with the awake baseline, including both programmable fetch starts and enable bits. Verify scanout counters advance, a pending swap can latch, keyboard and trackpad work, and touch tap and scroll work. Check the C920 recording across all 50 wakes for garbled or split frames, flashes and stalls.
 4. Record awake and asleep steady-state power with the same brightness, CPU/GPU workload, peripherals and measurement interval for both runs. Use a USB-C meter with identical charger conditions, or run unplugged and sample `Voltage` and signed `InstantAmperage` from `ioreg -r -c AppleSmartBattery -l` (`piano-power-ps=1`). Compare asleep with M5a disabled and enabled. Save the per-cycle results and wattage, including the measurement source.
 

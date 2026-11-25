@@ -3,6 +3,7 @@
 //   - the DCS short packet and its FIFO words; one command on both links: the stores in order, low power, sent in the vertical
 //     blanking (by the hardware's block or, without it, triggered in the front porch), every word restored as found; the
 //     refusals (not video mode, the FIFO in use, no software trigger, a command that is not a sleep command, a busy DMA);
+//   - counter setup from disabled, ten cycles with advancing counters despite zero COUNT_EN, and the logged refusal when stuck;
 //   - display sleep: 0x28, >= 20 ms, 0x10, >= 100 ms, INTF2 stopped before INTF1, both stopped, the panel halves asleep; wake:
 //     the INTF flush, INTF1 and INTF2 started together and in phase, counting in lockstep, 0x11, >= 120 ms, 0x29; 50 cycles;
 //   - the failures: a DMA that never finishes (the link left alone, nothing after it), an engine that does not stop (the panel
@@ -118,16 +119,22 @@ static void testRefusals()
 static void testSleepWake()
 {
   model::Dpu m;
+  m.blockDma = false;
   constexpr uint32_t config = 0x80800000u;
   for (unsigned i = 1; i <= 2; ++i) {
+    m.regs[intfReg(i, kIntfCountEn)] = 0;
+    m.intf[i].counting = false;
     m.regs[intfReg(i, kIntfConfig)] = config;
     m.intf[i].fetch = m.regs[intfReg(i, kIntfProgFetch)] = (2290 + i) * model::kHtotal;
   }
   m.sleepMs(3);
-  const LivePath p = readPath(m);
-  CHECK(p.ok);
+  LivePath p = readPath(m);
+  CHECK(p.ok && p.link[0].countEn == 0 && p.link[1].countEn == 0);
+  const CounterInit init = initCounters(m, p);
+  CHECK(init.enabled && init.moving && m.stores.size() == 2);
+  CHECK(m.firstStore(intfReg(1, kIntfCountEn), 3) == 0 && m.firstStore(intfReg(2, kIntfCountEn), 3) == 1);
   Result off = panelOff(m, p, Options());
-  CHECK(off.ok && off.enginesStopped && off.step == 5);
+  CHECK(off.ok && off.enginesStopped && off.step == 5 && off.dcs[0].waitedBlanking);
   const model::Dcs *d28 = m.firstDcs(0x28, 0), *d10 = m.firstDcs(0x10, 0), *e28 = m.firstDcs(0x28, 1), *e10 = m.firstDcs(0x10, 1);
   CHECK(d28 && d10 && e28 && e10);
   if (d28 && d10) CHECK(d10->ns - d28->ns >= 20000000ull);
@@ -198,7 +205,65 @@ static void testSleepWake()
     CHECK(power.wakeComplete && power.canPresent() && takeJob(slot, busy, &shown) && shown.serial == flip.serial && shown.flip);
     CHECK(finishJob(busy, &done, flip.serial) && done == flip.serial);
   }
-  CHECK(ok == 100 && m.desync == 0 && m.glitches == 0 && m.half[0].displayOn && clean(m));
+  CHECK(ok == 100 && m.desync == 0 && m.glitches == 0 && m.commandsInFrame == 0 && m.half[0].displayOn && clean(m));
+}
+
+static void testZeroCounterReadback()
+{
+  model::Dpu m;
+  m.blockDma = false;
+  for (unsigned i = 1; i <= 2; ++i) {
+    m.regs[intfReg(i, kIntfCountEn)] = 0;
+    m.countEnableIgnored[i - 1] = true;
+    m.regs[intfReg(i, kIntfConfig)] = kIntfConfigProgFetch;
+    m.regs[intfReg(i, kIntfProgFetch)] = 2290 * model::kHtotal;
+  }
+  LivePath p = readPath(m);
+  const CounterInit init = initCounters(m, p);
+  CHECK(p.ok && !init.enabled && init.moving && m.stores.size() == 2);
+  CHECK(p.link[0].countEn == 0 && p.link[1].countEn == 0);
+  for (unsigned k = 0; k < 10; ++k) {
+    const Result off = panelOff(m, p, Options());
+    CHECK(off.ok && off.enginesStopped && off.dcs[0].waitedBlanking);
+    const Frames asleep = readFrames(m);
+    m.sleepMs(100);
+    const Frames after = readFrames(m);
+    for (unsigned i = 1; i <= 2; ++i) {
+      CHECK(m.rd(intfReg(i, kIntfEn)) == 0 && m.rd(intfReg(i, kIntfStatus)) == 0 &&
+            !(m.rd(intfReg(i, kIntfConfig)) & kIntfConfigProgFetch));
+      CHECK(after.f[i - 1] == asleep.f[i - 1]);
+    }
+    const Result on = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
+    CHECK(on.ok && on.engines.rate.lockstep);
+    for (unsigned i = 1; i <= 2; ++i) {
+      CHECK(m.rd(intfReg(i, kIntfEn)) == 1 && m.rd(intfReg(i, kIntfStatus)) == 1 &&
+            (m.rd(intfReg(i, kIntfConfig)) & kIntfConfigProgFetch));
+      CHECK(m.rd(intfReg(i, kIntfFrameCount)) > asleep.f[i - 1] && m.rd(intfReg(i, kIntfCountEn)) == 0);
+    }
+  }
+  CHECK(m.dcs.size() == 80 && m.desync == 0 && m.glitches == 0 && m.commandsInFrame == 0 && clean(m));
+}
+
+static void testUnavailablePanel()
+{
+  model::Dpu m;
+  // The second timing engine runs, but its counters do not advance even with the enable bits set.
+  m.intf[2].counting = false;
+  LivePath p = readPath(m);
+  const CounterInit init = initCounters(m, p);
+  CHECK(p.ok && init.enabled && !init.moving && m.stores.empty());
+  RequestGate gate;
+  gate.ready = init.moving;
+  unsigned logs = 0;
+  const char *message = nullptr;
+  auto log = [&](const char *line) { ++logs; message = line; };
+  if (gate.admit(false, log)) panelOff(m, p, Options());
+  CHECK(logs == 1 && message && std::strstr(message, "sleep refused"));
+  CHECK(m.dcs.empty() && m.stores.empty() && m.intf[1].on && m.intf[2].on);
+  CHECK(!gate.admit(true, log) && logs == 2 && std::strstr(message, "wake refused"));
+  gate.wakePending = true;   // a dispatched transition may still need a recovery wake after sleep was disabled
+  CHECK(gate.admit(true, log) && logs == 2);
+  CHECK(!gate.admit(false, log) && logs == 3);
 }
 
 static void testFailures()
@@ -305,6 +370,8 @@ int main()
   testSend();
   testRefusals();
   testSleepWake();
+  testZeroCounterReadback();
+  testUnavailablePanel();
   testFailures();
   testHeldOnFailedOrSupersededWake();
   if (failures) {

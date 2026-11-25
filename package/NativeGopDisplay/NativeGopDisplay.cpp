@@ -1686,6 +1686,9 @@ bool NativeGopDisplay::setPanelPower(bool on, uintptr_t system, uintptr_t api)
                 return false;
             }
             fPanelNeedsWake = false;
+        } else if (fDpuNightShift) {
+            // Backlight-only wake still needs the PCC replay.
+            nightShiftCall("PianoDpuNightShiftModeSet");
         }
         if (fPanelTouch)
             fPanelTouch->callPlatformFunction(pianotouch::kFunctionPanel, false, enable, nullptr, nullptr, nullptr);
@@ -1716,7 +1719,7 @@ bool NativeGopDisplay::setPanelPower(bool on, uintptr_t system, uintptr_t api)
     const IOReturn result = dpu->callPlatformFunction("PianoDpuPanel", false, nullptr, nullptr, nullptr, nullptr);
     // A refusal after DCS started still needs the wake call to check whether the panel recovered.
     fPanelNeedsWake |= result == kIOReturnSuccess || result == kIOReturnIOError;
-    if (result != kIOReturnSuccess)
+    if (result != kIOReturnSuccess && result != kIOReturnNotReady)
         GOPLOG("panel sleep refused by PianoDpu (%#x)\n", result);
     return result == kIOReturnSuccess;
 }
