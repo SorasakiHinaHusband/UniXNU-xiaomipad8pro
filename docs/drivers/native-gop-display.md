@@ -574,20 +574,24 @@ The DPU records the address and stride once the hardware latches a flip. Under t
 that window's IOSurface, prepared descriptor and any CPU alias as a unit. It drops the lock before copying, releases the
 reference on return and checks for a presentation race. With the boot framebuffer selected, NativeGopDisplay reads its existing
 GOP mapping. No readable backing gives `ENXIO`. A changing scanout gives `EBUSY` and the CLI retries a bounded number of times.
-The binary sysctl reply is one versioned header and 3200×2136 pixels. Copyout uses at most 64 KiB at a time and skips any row
-padding. Capture reads the backing pixels before the DPU's colour-processing stages.
+The binary sysctl reply is a version 1 header followed by 3200×2136 pixels. The header carries the FourCC of the pinned
+IOSurface for a flip and `BGRA` for the GOP fallback. Copyout uses at most 64 KiB at a time and skips any row padding.
+Capture reads the backing pixels before the DPU's colour-processing stages.
 
-The default CLI decoder for the requested packed 10-bit `&BGA` layout takes B from bits 0–9, G from 10–19 and R from 20–29,
-rounds each sRGB code to 8 bits and writes an opaque sRGB PNG. The GOP fallback and plain `BGRA` use 8-bit channels.
-CoreVideo's `CVPixelBuffer.h` names `&BGA` as lossless 32BGRA, and the existing compositor and splash pipe use an 8-bit
-interpretation. `--bga8` selects that interpretation for plane 0. The FourCC and row pitch alone leave the actual byte
-interpretation on this build to the known-pixel RAM check.
+The Showcase uses `gop-shot` with its default format detection. `BGRA` and the linear plane 0 of `&BGA` both decode as
+8-bit BGRA. CoreVideo's `CVPixelBuffer.h` defines `&BGA` as lossless 32BGRA, and the DPU flip path scans its plane 0 as
+linear BGRA. Previous version 1 replies use the same FourCCs and decode with the updated CLI.
+
+The CLI also accepts `l10r` (full-range little-endian ARGB2101010). It takes B from bits 0–9, G from 10–19 and R from
+20–29, and rounds each code to 8 bits. The current DPU flip path admits only linear BGRA, so it produces `BGRA` and `&BGA`
+replies. Both decoders write opaque sRGB PNGs. For diagnostics, pass `--bga8` or `--10bit` to the CLI or wrapper to override
+the decoder while retaining the reported source FourCC. The CLI rejects unsupported FourCCs and malformed replies.
 
 | Reference path | Native path | Comparison |
 |---|---|---|
-| Ubuntu v1.4.0 `device/boot/README.md`, firmware scanout at the `simple-framebuffer` node | `NativeGopDisplay.cpp`, `readFramebuffer` | Same firmware backing for the boot frame. The native readout uses the existing GOP mapping. |
-| Linux `drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c`, format list, and `include/uapi/drm/drm_fourcc.h`, `DRM_FORMAT_ARGB8888` and `DRM_FORMAT_XRGB2101010` | `DpuFlip.h`, `flushTo`, and `DpuFlip.cpp`, `scanoutRead` | Different ownership: the native flip records the latched SMMU address and uses its pinned IOSurface for readback. Capture leaves the DPU pipe format as configured. |
-| Android display format inventory, `RGBA_1010102` | `tooling/native/gop-shot/Pixels.h` | Different channel order: Android's RGBA entry puts red in the low bits. The requested native packed BGRA decoder puts blue there. |
+| Ubuntu v1.4.0 `device/boot/README.md:27` and Linux `arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano.dts:91`, firmware `simple-framebuffer` | `NativeGopDisplay.cpp`, `readFramebuffer` and `shotRead` | Same firmware backing and 8-bit B, G, R bytes. The fourth byte is ignored in the still. |
+| Linux `drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c:60` and `include/uapi/drm/drm_fourcc.h:180`, `ARGB8888` and `XRGB2101010` | `DpuFlip.h`, `checkSurface` and `flushTo`, and `DpuFlip.cpp`, `scanoutRead` | Linux KMS supports distinct format IDs. Native flip uses the existing BGRA pipe and reads back the pinned IOSurface at its latched SMMU address. |
+| Android display `formats.json:420`, `RGBA_1010102` | `tooling/native/gop-shot/Pixels.h`, `gop_shot_rgbx` | Android's RGBA entry puts red in the low bits. CoreVideo's `l10r` puts blue there. |
 
 ### Build and capture
 
@@ -624,7 +628,8 @@ place. Capture output reports the source and layout. Transfer output reports siz
    <div style="background:#10c040"></div><div style="background:#808080"></div>
    ```
 
-3. Capture one still through the wrapper. Require `source=flip format=&BGA` and all three transport digests to match.
+3. Capture one still through the wrapper with no layout flag. Require `source=flip format=&BGA layout=8-bit` and all three
+   transport digests to match.
    On the Mac, compare the four quadrant centers in the fetched PNG against the sRGB values. This example uses Pillow.
 
    ```sh
@@ -644,5 +649,4 @@ place. Capture output reports the source and layout. Transfer output reports siz
    PY
    ```
 
-   Record the actual layout in the run result. If the packed interpretation fails, diagnose with `--bga8` and fresh
-   paths on the same boot. The comparison is the gate for choosing the layout used for Showcase stills.
+   Record the reported format and layout alongside the four-color check. The Showcase uses the same default invocation.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Version 1 of machdep.native_gop_display_shot: header followed by tightly packed little-endian pixels.
+// format is the IOSurface FourCC for a flip, or BGRA for the boot framebuffer.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -11,8 +12,9 @@
 #define GOP_SHOT_HEIGHT 2136u
 #define GOP_SHOT_ROW_BYTES (GOP_SHOT_WIDTH * 4u)
 #define GOP_SHOT_CHUNK_BYTES 65536u
-#define GOP_SHOT_BGRA8 0x42475241u
-#define GOP_SHOT_BGA 0x26424741u
+#define GOP_SHOT_BGRA8 0x42475241u        // 'BGRA', 8 bits per channel
+#define GOP_SHOT_BGA 0x26424741u          // '&BGA', linear plane 0 with BGRA8 pixels
+#define GOP_SHOT_ARGB2101010 0x6c313072u  // 'l10r', full-range little-endian ARGB2101010
 
 enum { GOP_SHOT_BOOT, GOP_SHOT_FLIP };
 

@@ -5,12 +5,11 @@ set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
 layout=()
-if [ "${1:-}" = --bga8 ]; then
-    layout=(--bga8)
-    shift
-fi
+case "${1:-}" in
+    --bga8|--10bit) layout=("$1"); shift ;;
+esac
 if [ "$#" != 3 ] || [[ $1 != /* || $2 != /* ]]; then
-    echo "usage: capture-ssh.sh [--bga8] /tablet/gop-shot /tablet/output.png MAC_OUTPUT.png" >&2
+    echo "usage: capture-ssh.sh [--bga8|--10bit] /tablet/gop-shot /tablet/output.png MAC_OUTPUT.png" >&2
     exit 2
 fi
 remote_tool=$1 remote_png=$2 local_png=$3

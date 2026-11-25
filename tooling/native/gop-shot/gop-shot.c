@@ -8,7 +8,6 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
-#include "../../../package/NativeGopDisplay/GopShot.h"
 #include "Pixels.h"
 
 static CFDataRef encode_png(const uint8_t *pixels)
@@ -65,18 +64,12 @@ static int write_png(const char *path, CFDataRef png)
     return error;
 }
 
-static int read_frame(GopShotHeader *frame)
+static int read_frame(GopShotHeader *frame, GopShotLayout override_layout, GopShotLayout *layout)
 {
     for (unsigned attempt = 0; attempt < 8; ++attempt) {
         size_t size = GOP_SHOT_BYTES;
-        if (sysctlbyname(GOP_SHOT_SYSCTL, frame, &size, NULL, 0) == 0) {
-            if (size == GOP_SHOT_BYTES && frame->version == GOP_SHOT_VERSION &&
-                frame->width == GOP_SHOT_WIDTH && frame->height == GOP_SHOT_HEIGHT &&
-                (frame->format == GOP_SHOT_BGRA8 || frame->format == GOP_SHOT_BGA) &&
-                (frame->source == GOP_SHOT_FLIP || (frame->source == GOP_SHOT_BOOT && frame->format == GOP_SHOT_BGRA8)))
-                return 0;
-            return EPROTO;
-        }
+        if (sysctlbyname(GOP_SHOT_SYSCTL, frame, &size, NULL, 0) == 0)
+            return gop_shot_decode_reply(frame, size, override_layout, layout);
         if (errno != EBUSY)
             return errno;
         if (attempt != 7)
@@ -87,9 +80,14 @@ static int read_frame(GopShotHeader *frame)
 
 int main(int argc, char **argv)
 {
-    const bool bga8 = argc == 3 && strcmp(argv[1], "--bga8") == 0;
-    if ((!bga8 && argc != 2) || argv[argc - 1][0] == '-' || !argv[argc - 1][0]) {
-        fputs("usage: gop-shot [--bga8] OUTPUT.png\n", stderr);
+    GopShotLayout override_layout = GOP_SHOT_LAYOUT_AUTO;
+    if (argc == 3 && strcmp(argv[1], "--bga8") == 0)
+        override_layout = GOP_SHOT_LAYOUT_BGRA8;
+    else if (argc == 3 && strcmp(argv[1], "--10bit") == 0)
+        override_layout = GOP_SHOT_LAYOUT_PACKED10;
+    if ((argc != 2 && override_layout == GOP_SHOT_LAYOUT_AUTO) ||
+        argv[argc - 1][0] == '-' || !argv[argc - 1][0]) {
+        fputs("usage: gop-shot [--bga8|--10bit] OUTPUT.png\n", stderr);
         return 2;
     }
     if (geteuid() != 0) {
@@ -101,7 +99,8 @@ int main(int argc, char **argv)
         fputs("gop-shot: cannot allocate the caller frame buffer\n", stderr);
         return 1;
     }
-    const int read_error = read_frame(frame);
+    GopShotLayout layout;
+    const int read_error = read_frame(frame, override_layout, &layout);
     if (read_error) {
         const char *message = strerror(read_error);
         if (read_error == ENOENT)
@@ -114,11 +113,7 @@ int main(int argc, char **argv)
         free(frame);
         return 1;
     }
-    const bool packed10 = frame->format == GOP_SHOT_BGA && !bga8;
-    uint8_t *pixels = (uint8_t *)(frame + 1);
-    for (size_t position = 0; position < GOP_SHOT_BYTES - sizeof *frame; position += 4)
-        gop_shot_rgbx(pixels + position, packed10);
-    CFDataRef png = encode_png(pixels);
+    CFDataRef png = encode_png((const uint8_t *)(frame + 1));
     const uint32_t source = frame->source, format = frame->format;
     free(frame);
     if (!png) {
@@ -131,7 +126,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "gop-shot: cannot write output: %s\n", strerror(write_error));
         return 1;
     }
-    printf("source=%s format=%s layout=%s\n", source == GOP_SHOT_FLIP ? "flip" : "boot",
-           format == GOP_SHOT_BGA ? "&BGA" : "BGRA", packed10 ? "10-bit" : "8-bit");
+    printf("source=%s format=%c%c%c%c layout=%s\n", source == GOP_SHOT_FLIP ? "flip" : "boot",
+           (uint8_t)(format >> 24), (uint8_t)(format >> 16), (uint8_t)(format >> 8), (uint8_t)format,
+           layout == GOP_SHOT_LAYOUT_PACKED10 ? "10-bit" : "8-bit");
     return 0;
 }
