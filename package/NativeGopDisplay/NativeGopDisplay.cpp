@@ -49,6 +49,7 @@
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
 #include "GopRefresh.h"                        // the fixed refresh contract (native-gop-display-120=1; tests/gop_host.cpp)
+#include "GopColorLog.h"                       // the Night Shift observer (native-gop-display-color-log=1; tests/gop_host.cpp)
 #include "CopyRows.h"
 #include "../include/PianoGpuQualificationDisplay.h"
 static void qualificationDisplay(const PianoGpuQualificationDisplay *evidence) {
@@ -295,6 +296,8 @@ public:
     IOReturn set_color_remap_mode(DisplayColorRemapMode) override;
     IOReturn get_color_remap_mode(DisplayColorRemapMode *) const override;
     IOReturn swap_set_color_matrix(IOMFBColorFixedMatrix *, IOMFBColorMatrixFunction, unsigned int) override;
+    IOReturn set_matrix(unsigned int, unsigned long long const (*)[3][3]) override;   // slot 309: Night Shift (GopColorLog.h)
+    IOReturn setBrightnessCorrection(unsigned int) override;                            // slot 314: its brightness correction
     IOReturn set_notify_tag_mask_gated(IOMFB_NotificationType, IOMFBNotifyRequest *, unsigned int) override;
     IOReturn supported_frame_info(unsigned int, unsigned int *, char (*)[64], unsigned int *) override;
     IOReturn factory_portal(void *, task *) override;
@@ -562,6 +565,10 @@ private:
     uint32_t fColorCalls, fColorChanges, fColorSeen, fGammaCalls, fGammaChanges, fGammaHash;
     uint32_t fColorFunction[kColorFunctions];
     uint64_t fColorLast[kColorFunctions][9];
+    // native-gop-display-color-log=1 (default 0; GopColorLog.h): set_matrix / setBrightnessCorrection logged, then answered as the
+    // family answers them (kIOReturnUnsupported): B1 milestone 1 records what Night Shift really sends before anything is applied.
+    bool fColorLog;
+    uint32_t fMatrixCalls, fMatrixChanges, fMatrixHash, fCorrectionCalls, fCorrectionChanges, fCorrectionLast;
     IOService *dpuService(bool now);
     // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~20-39 ms for 3200x2136
     // BGRA, most of it reading the surface (uncached).
@@ -893,6 +900,12 @@ bool NativeGopDisplay::start(IOService *provider)
     fBacklightCallout = backlight >= 2 && !fExternal;
     if (!fExternal)
         PE_parse_boot_argn("piano-dpu-pcc", &fDpuPcc, sizeof(fDpuPcc));
+    unsigned colorLog = 0;
+    PE_parse_boot_argn("native-gop-display-color-log", &colorLog, sizeof(colorLog));
+    fColorLog = colorLog == 1 && !fExternal;
+    if (fColorLog)
+        GOPLOG("color log: set_matrix (slot 309) and setBrightnessCorrection (slot 314) logged, then answered unsupported as the "
+               "family does (native-gop-display-color-log=1; nothing applied)\n");
     unsigned dpuPanel = 0;
     PE_parse_boot_argn("piano-dpu-panel", &dpuPanel, sizeof(dpuPanel));
     fDpuPanel = dpuPanel != 0 && !fExternal;
@@ -3026,6 +3039,48 @@ IOReturn NativeGopDisplay::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix, 
         dpu->callPlatformFunction("PianoDpuColorMatrix", false, raw, reinterpret_cast<void *>(uintptr_t(f)), reinterpret_cast<void *>(uintptr_t(arg)),
                                   nullptr);
     return kIOReturnSuccess;
+}
+
+// Night Shift's two entry points on 27.3 (GopColorLog.h). IOMobileFramebufferLegacy's own set_matrix and setBrightnessCorrection
+// only return kIOReturnUnsupported; these return the same in every case, so WindowServer sees no change. With
+// native-gop-display-color-log=1 each new matrix (location, nine S31.32 words, decoded to thousandths) and each new correction is
+// logged (the first 16 changes, then every 100th); repeats are only counted.
+IOReturn NativeGopDisplay::set_matrix(unsigned int location, unsigned long long const (*matrix)[3][3])
+{
+    if (!fColorLog || !matrix)
+        return kIOReturnUnsupported;
+    uint64_t m[9];
+    for (unsigned r = 0; r < 3; ++r)
+        for (unsigned c = 0; c < 3; ++c)
+            m[3 * r + c] = (*matrix)[r][c];
+    fMatrixCalls++;
+    const uint32_t hash = gopcolor::matrixHash(location, m);
+    if (fMatrixChanges && hash == fMatrixHash)
+        return kIOReturnUnsupported;
+    fMatrixHash = hash;
+    if (gopcolor::logged(++fMatrixChanges)) {
+        long long k[9];
+        for (unsigned i = 0; i < 9; ++i)
+            k[i] = static_cast<long long>(gopcolor::s3132ToMilli(m[i]));
+        GOPLOG("set_matrix #%u (call %u): location %u, %s [%lld %lld %lld | %lld %lld %lld | %lld %lld %lld] (thousandths, [out][in]); "
+               "raw %016llx %016llx %016llx | %016llx %016llx %016llx | %016llx %016llx %016llx; answered unsupported\n",
+               fMatrixChanges, fMatrixCalls, location, gopcolor::shapeName(gopcolor::shape(m)), k[0], k[1], k[2], k[3], k[4], k[5], k[6],
+               k[7], k[8], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+    }
+    return kIOReturnUnsupported;
+}
+IOReturn NativeGopDisplay::setBrightnessCorrection(unsigned int value)
+{
+    if (!fColorLog)
+        return kIOReturnUnsupported;
+    fCorrectionCalls++;
+    if (fCorrectionChanges && value == fCorrectionLast)
+        return kIOReturnUnsupported;
+    fCorrectionLast = value;
+    if (gopcolor::logged(++fCorrectionChanges))
+        GOPLOG("setBrightnessCorrection #%u (call %u): %#x (%u thousandths, 16.16); answered unsupported\n", fCorrectionChanges,
+               fCorrectionCalls, value, gopcolor::u1616ToMilli(value));
+    return kIOReturnUnsupported;
 }
 
 // The slots IOMobileFramebufferLegacy leaves pure, as AppleParavirtDisplay implements them.
