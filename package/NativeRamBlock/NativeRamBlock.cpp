@@ -498,7 +498,8 @@ public:
     configureDirect();
     registerDirectSysctls();
     IOLog("NativeRamBlock: Data I/O mode %s depth %u\n",
-          commitGate ? "concurrent" : direct ? "single-gate" : "volatile", commitGate ? admission.depth : 1);
+          admission.parallel ? "concurrent" : direct ? "single-gate" : "volatile",
+          admission.parallel ? admission.depth : 1);
     storeTrace("set-up done");
     IOLockUnlock(gate);
   }
@@ -654,7 +655,8 @@ bool NativeRamBlock::start(IOService *provider)
 void NativeRamBlock::configureDirect()
 {
   uint32_t requested = 0;
-  if (!direct || !PE_parse_boot_argn("data-store-concurrent", &requested, sizeof requested) || requested != 1)
+  if (!direct || !PE_parse_boot_argn("data-store-concurrent", &requested, sizeof requested) ||
+      (requested != 1 && requested != 2))
     return;
   auto *lock = IOLockAlloc();
   if (!lock) return;
@@ -664,9 +666,12 @@ void NativeRamBlock::configureDirect()
     stages[count] = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
     if (!stages[count]) break;
   }
-  admission.configure(count);
+  // Arm the live switch without parallel I/O during the initial mount and serial control.
+  const bool startParallel = requested == 1;
+  admission.configure(count, startParallel);
   if (directFailed) writeState.fail();  // a prepublication flatten may have failed
   __atomic_store_n(&commitGate, lock, __ATOMIC_RELEASE);
+  if (!startParallel) IOLog("NativeRamBlock: Data concurrency armed at depth %u; starting in single-gate mode\n", count);
 }
 
 int NativeRamBlock::directModeSysctl(struct sysctl_oid *oid, void *arg, int, struct sysctl_req *req)

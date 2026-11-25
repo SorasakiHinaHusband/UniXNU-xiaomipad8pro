@@ -47,7 +47,9 @@ drains before releasing storage. A write failure latches state 5 and closes furt
 the controller may still DMA into or out of stays quarantined until reboot.
 
 For same-boot A/B after booting with `data-store-concurrent=1`, root can set `machdep.piano_data_concurrent` to 0
-for the single-gate control or back to 1. The switch drains I/O first and refuses after a write failure or DMA
+for the single-gate control or back to 1. A diagnostic boot with `data-store-concurrent=2` prepares that same switch
+and starts in the single-gate control, including the Data mount. See the [M4 procedure](drivers/data-store-m4-m5.md#first-ab-on-the-bound-store).
+The switch drains I/O first and refuses after a write failure or DMA
 quarantine. `sysctl machdep.piano_data_io` reports the active mode, stage depth, maximum inflight requests, requests
 that waited in stage/range/fence admission, and successful bitmap publications. These counters reset when the mode
 changes. Since 2026-11-25 it also ends with the store window's device commands since boot (`store_rd=OPS/USus
