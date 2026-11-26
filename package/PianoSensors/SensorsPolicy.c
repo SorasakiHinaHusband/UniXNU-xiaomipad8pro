@@ -210,7 +210,7 @@ const char *ps_edge_name(int edge)
     return "none";
 }
 
-int ps_accel_sample(SnoState *s, const SfxAxes *axes, const uint32_t bits[3], uint64_t now_ms)
+int ps_accel_sample_at(SnoState *s, const SfxAxes *axes, const uint32_t bits[3], uint64_t now, uint64_t hold)
 {
     int32_t in[3], out[3];
     for (unsigned i = 0; i < 3; ++i) {
@@ -221,7 +221,12 @@ int ps_accel_sample(SnoState *s, const SfxAxes *axes, const uint32_t bits[3], ui
         in[i] = sfx_accel_ios(bits[i]);
     }
     sfx_axes_apply(axes, in, out);
-    return sno_update(s, out[0], out[1], out[2], now_ms);
+    return sno_update_at(s, out[0], out[1], out[2], now, hold);
+}
+
+int ps_accel_sample(SnoState *s, const SfxAxes *axes, const uint32_t bits[3], uint64_t now_ms)
+{
+    return ps_accel_sample_at(s, axes, bits, now_ms, SNO_HOLD_MS);
 }
 
 void ps_rotation_defaults(PsRotationConfig *c)

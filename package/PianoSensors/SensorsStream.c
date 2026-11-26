@@ -517,7 +517,7 @@ static void sample(SsEngine *e, int i, const SscSensorEvent *se, uint64_t at, ui
         if (e->cfg.accel_sample_time) snt_kx(&t, "qtimer", ticks);
         emit(e, i, &t, at, 0);
     }
-    uint64_t sample_ms = at;
+    int state;
     if (e->cfg.accel_sample_time) {
         const uint64_t ticks_per_ms = 19200;   /* SSC's 19.2 MHz QTimer */
         const uint64_t max_gap = 2 * 1000 * ticks_per_ms / e->cfg.accel_hz;
@@ -526,9 +526,10 @@ static void sample(SsEngine *e, int i, const SscSensorEvent *se, uint64_t at, ui
             e->orient.candidate = e->orient.state;
         e->last_accel_ticks = ticks;
         if (!ticks || ticks == last) return;
-        sample_ms = ticks / ticks_per_ms;
+        state = ps_accel_sample_at(&e->orient, &e->cfg.axes, se->data, ticks, SNO_HOLD_MS * ticks_per_ms);
+    } else {
+        state = ps_accel_sample(&e->orient, &e->cfg.axes, se->data, at);
     }
-    const int state = ps_accel_sample(&e->orient, &e->cfg.axes, se->data, sample_ms);
     if (state >= 0) set_edge(e, ps_edge_of(state), at);
 }
 
