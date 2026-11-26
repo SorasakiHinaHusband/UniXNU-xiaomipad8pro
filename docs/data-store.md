@@ -49,8 +49,8 @@ the controller may still DMA into or out of stays quarantined until reboot.
 For same-boot A/B after booting with `data-store-concurrent=1`, root can set `machdep.piano_data_concurrent` to 0
 for the single-gate control or back to 1. A diagnostic boot with `data-store-concurrent=2` prepares that same switch
 and starts in the single-gate control, including the Data mount. See the [M4 procedure](drivers/data-store-m4-m5.md#first-ab-on-the-bound-store).
-The switch drains I/O first and refuses after a write failure or DMA
-quarantine. `sysctl machdep.piano_data_io` reports the active mode, stage depth, maximum inflight requests, requests
+The switch drains I/O first and refuses after a write failure or DMA quarantine. Switching from single-gate to
+concurrent also refuses a store degraded by a read failure. `sysctl machdep.piano_data_io` reports the active mode, stage depth, maximum inflight requests, requests
 that waited in stage/range/fence admission, and successful bitmap publications. These counters reset when the mode
 changes. Since 2026-11-25 it also ends with the store window's device commands since boot (`store_rd=OPS/USus
 store_wr=... store_sync=... store_max=USus`, not reset with the mode). The single-gate wait counter excludes lock contention. Open, seed/window binding, read-only probes, the
@@ -67,10 +67,10 @@ The daemon switches only when all of these hold:
 - `PIANO_DATA_CONCURRENT_AT_BOOT=1` is in its plist;
 - `machdep.piano_data_concurrent` exists and reads 0;
 - the Data volume is mounted;
-- the kernel log names `Data store state 2` (resumed);
-- `machdep.piano_data_io` reports `mode=single-gate`, the direct store.
+- `machdep.piano_data_io` reports `mode=single-gate` and live `store_state=2` (resumed).
 
-It waits up to 180 s for the mount and the state line. In every other case it switches nothing, and it never writes 0. Its one
+It polls for the mount for up to 180 s of sleep and checks the mount again before writing. With an older kernel that lacks
+the live state field, it leaves the mode as it found it. It never writes 0. Its one
 console line, and the same text in `/private/var/run/piano-data-concurrent.status`, says what it did.
 
 Rollback:
