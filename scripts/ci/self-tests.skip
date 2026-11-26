@@ -36,5 +36,5 @@ tooling/persist/test-persist.py                        # INPUT: reads the mainta
 tooling/persist/test-switch-pair.py                    # INPUT: reads the maintainer's partition-table backup
 tooling/persist/test-window-capture.py                 # INPUT: the replay reads local partition-table and boot partition fixtures
 tooling/k27/run-a830-host-tests.py                     # SUITE: scripts/ci/adreno830-host.py runs the shared suite; macOS, board, timing and stock firmware checks run locally
-tooling/metal/turnip-a830/test-cache-fallback-host.sh   # needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
-tooling/metal/turnip-a830/test-family-host.sh   # needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
+tooling/metal/turnip-a830/test-cache-fallback-host.sh   # ARGS: needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
+tooling/metal/turnip-a830/test-family-host.sh           # ARGS: needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
