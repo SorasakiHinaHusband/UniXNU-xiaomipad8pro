@@ -251,11 +251,40 @@ decoding, bounded output, zero stores and detection of a lost compression word
 with both INTFs still running. [Snapshot host tests](../../package/PianoDpu/tests/dpu_snapshot_host.cpp) ·
 [Capture diagnostics](../../package/NativeGopDisplay/GopShotDiagnostics.h)
 
+### Golden display-sleep baseline on v131y12u-ram2
+
+The November 27 RAM boot used `piano-dpu-panel=0` and `piano-dpu-snapshot=1` at 60 Hz. Six snapshots
+(`pre1/2`, `off1/2`, `post1/2`, serials 1–6) each had an open gate, 254 loads and **0 stores**. The C920
+measured YAVG 120.91 on the bright desktop, 9.75 after `pmset displaysleepnow` logged display off, and 116.47
+after `piano_input_sim=150` restored the display with both KTZ8866 ICs at `1498/1498`.
+[RAM capture results](../results-2026-11-27.md#m5-read-only-dsi-pllphy-baseline)
+
+PLL0 stayed locked (`dsi0 pll: status 00000051 local-lock 1`) with DSI1's local lock clear
+(`dsi1 pll: status 00000022 local-lock 0`). The bonded links had identical PHY timing words 0–13,
+`video-compression 06400b11` and `cmd-compression 39003900/00000000`. Passive readback showed `mdp` 575 MHz
+and `pll0` 1725 MHz. Both INTF counters advanced (`65789 -> 70649`) across the capture sequence.
+
+This first hardware validation of `grade_m5_dsi.py` established that live SM8750 `lp-timer=ffffffff` is valid.
+Commit `353b397e6` added the register-specific exception. The active-video and vertical front porch (VFP)
+samples (`line 2231/2310`) showed normal scan-phase changes in the live host words.
+[Snapshot grader](../../tooling/native/m5-dsi-diff/grade_m5_dsi.py)
+
+| Live word | Active video | VFP |
+| --- | --- | --- |
+| `lane-status` | `0x1f00` | `0x1f1f` |
+| `clk-status` | `0x008067c3` | `0x00006343` |
+| `fifo` | `0x00001010` | `0x11111010` |
+
+The grader returned byte-exact **`PASS`** for the register words in the active-video pairs `pre1` → `pre2`,
+`pre1` → `off1` and the active-video post-wake comparison. Compare repeat samples from the same scan phase when
+checking these live words for drift. This is the display-sleep reference with native panel sleep disabled.
+The dark-wake observation with `piano-dpu-panel=1` remains pending.
+
 ### Read-only RAM check plan
 
 1. In an attended RAM qualification, use the existing opt-in M5 path with `piano-dpu-panel=1`, `piano-dpu-snapshot=1` and the existing `native-gop-display-shot=1` capture diagnostics. Keep the panel variant, mode, known bright static pattern, brightness policy and optical exposure fixed across the comparison. Record the mode and panel ID from the snapshot. First take a bright optical sample with a successful active-scanout capture as a positive control.
 2. Collect `sudo sysctl -n machdep.piano_dpu_snapshot` before sleep, during stable M5 sleep, at the first available post-wake sample and again while the panel remains optically dark. Take two or more fresh reads in each stable phase, at least 100 ms apart, and confirm the serial and timestamp advance. Save the existing M5 transition log with both links' DMA_DONE, ACK/FIFO and timing boundaries alongside the sysctl samples. The sysctl is a series of MMIO loads and can return a cached sample within 100 ms. Use the transition log for the intra-wake order. The sysctl alone cannot bracket a 1 µs reset or reconstruct transient changes between samples.
-3. Diff each link against its own bright sample. Compare stable `CTRL`, clock, trigger, timing, lane-map, compression, PHY and PLL settings word for word. Compare live counters, busy/stop-state bits, IRQ/error latches and FIFO occupancy in the context of phase and repeated samples. Require the common and link gates to be open when grading a stable bright/dark pair. Preserve closed gates, all-ones reads, and PLL `unread` as unavailable evidence. On a PHY1 external-clock configuration, grade PLL0 lock and PHY1 mux/global clock plus lane and FIFO evidence together. A change isolated to PHY1's local lock bit is insufficient to call the bonded clock lost.
+3. Diff each link against its own bright sample. Compare stable `CTRL`, clock, trigger, timing, lane-map, compression, PHY and PLL settings word for word. Compare live counters, busy/stop-state bits, IRQ/error latches and FIFO occupancy in the context of scan phase and repeated samples. Require the common and link gates to be open when grading a stable bright/dark pair. Preserve closed gates, unexpected all-ones reads and PLL `unread` as unavailable evidence. The live SM8750 `lp-timer=ffffffff` is valid. On a PHY1 external-clock configuration, grade PLL0 lock and PHY1 mux/global clock plus lane and FIFO evidence together. A change isolated to PHY1's local lock bit is insufficient to call the bonded clock lost.
 4. Pair the dark optical exposure with a successful, stable active-scanout capture of the same pattern. If capture returns `EBUSY`, retain its reason and retry at the same static workload while the same state persists. Record buffer generation and timing from the existing diagnostics. With a confirmed bright pixel source, a reproducible host or PHY change identifies a register to correlate with the transition. A matched bright source plus matching sampled host/PHY state still requires panel or link evidence, such as externally observed HS traffic or an independently qualified panel status measurement. Missing source pixels leave the outcome unclassified.
 
 ## Fix-image gate
