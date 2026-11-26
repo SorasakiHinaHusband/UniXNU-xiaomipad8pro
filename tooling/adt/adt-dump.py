@@ -6,6 +6,7 @@ Values: printable strings as "...", 4/8-byte values as hex integers, the rest as
 Volatile properties (random-seed, unique-chip-id seed) are masked unless --raw.
 """
 import hashlib, struct, sys
+from pathlib import Path
 
 VOLATILE = {'random-seed', 'unique-chip-id'}
 
@@ -32,6 +33,12 @@ def parse(data, offset=0, depth=0):
         children.append(child)
     return (props, children), offset
 
+def parse_tree(data):
+    tree, end = parse(data)
+    if end != len(data):
+        raise ValueError('trailing bytes after the ADT root')
+    return tree
+
 def fmt(name, value, raw):
     if name in VOLATILE and not raw:
         return f'<{len(value)} bytes, masked>'
@@ -57,7 +64,10 @@ def walk(node, path, raw, out):
 
 if __name__ == '__main__':
     raw = '--raw' in sys.argv
-    tree, _ = parse(open(sys.argv[1], 'rb').read())
+    try:
+        tree = parse_tree(Path(sys.argv[1]).read_bytes())
+    except (OSError, ValueError) as error:
+        sys.exit(str(error))
     lines = []
     walk(tree, None, raw, lines)
     print('\n'.join(sorted(lines)))

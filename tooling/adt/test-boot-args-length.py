@@ -85,6 +85,10 @@ def test_boundaries():
     refused('the builder allows 999', ba.fit, ['é' * 500], 'ram')
     refused('embedded NUL', ba.fit, ['piano-test=a\0b'], 'ram')
     assert esp.split_line('plain=1', force=True) == ('plain=1', None)
+    stage = 'piano-extra-ram-stage=0'
+    one, smp, got = ram.boot_entry_args(ba, [stage, 'piano-test=1'], force=True)
+    assert stage in one.split() and stage in smp.split()
+    assert got == ['piano-test=1']
 
     # 0066's limit includes the selector, space and reserved CPU suffix.
     tail_word = 'piano-test=' + 'z' * (4095 - len(' '.join([OPT_IN, 'piano-boot-args=ram', SMP, 'piano-test='])))
@@ -95,6 +99,18 @@ def test_boundaries():
     assert check_layout(daily, got, 'macos', [OPT_IN, SMP, tail_word[:-2]])[0] == 4095
     assert not esp.diag_budget(esp.diag_line(daily, 240), len(' '.join(got)))['included']
     print('PASS limits, opt-out, required readers, duplicate ordering and ADT round trip')
+
+
+def test_merge_loader_bytes():
+    default = ba.with_set(ba.tiny_adt(), None, 'piano-test=1')
+    assert ba.merged('plain=1\0 piano-boot-args=0', default) == ('plain=1 piano-test=1', 'appended')
+
+    # The last byte of the loader field holds half a UTF-8 character. XNU
+    # still counts that byte when sizing the merged C string.
+    line = 'x' * (ba.LEGACY_MAX - 1) + 'é'
+    tail = 'y' * (ba.MERGED_MAX - ba.LEGACY_MAX)
+    assert ba.merged(line, ba.with_set(default, None, tail))[1] == 'too-long'
+    assert ba.merged(line, ba.with_set(default, None, tail[:-1]))[1] == 'appended'
 
 
 def test_adt_bounds():
@@ -185,6 +201,7 @@ def main():
     parser.add_argument('--daily-record', type=Path, help='record from an existing k27.3 daily ESP')
     args = parser.parse_args()
     test_boundaries()
+    test_merge_loader_bytes()
     test_adt_bounds()
     ba.test_userland_visibility()
     test_identity_overlay()

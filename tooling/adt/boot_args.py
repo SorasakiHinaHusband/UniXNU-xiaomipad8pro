@@ -16,7 +16,7 @@ Library (tooling/bootimg/build-ram-images.py):
   kc_has_boot_args(kc_path)                        the collection's kernel has 0066 (its console line's format)
 
 What moves: every piano-* argument but the ones the boot's safety rests on even under a kernel without 0066 (piano-reset-after,
-piano-reset-to, piano-boot-guard*, and the selector itself); everything else (the k27 arguments, native-ufs-*, data-*, pstore-*,
+piano-reset-to, piano-boot-guard*, piano-extra-ram-stage, and the selector itself); everything else (the k27 arguments, native-ufs-*, data-*, pstore-*,
 droidvm-*, cpus, sheng-smp) stays on the line. static-if keys (validation_disables, serverperfmode, lcks, wdt) must stay on the
 line: static_if_init() reads it before the device tree is up. Order is kept within each part, and the kernel appends the tail after
 the line, so for one name the last value still wins as before.
@@ -47,7 +47,7 @@ SET_MAX = 15           # PIANO_BOOT_ARGS_SET_MAX
 KC_MARKER = b'piano-boot-args: /chosen/%s (%u bytes): %u bytes appended'
 MERGED_SYSCTL_MARKER = b'Piano merged boot arguments (0066 ADT tail)\0'
 READER_ABI = b'kern.piano_bootargs\0PianoBootArgs ABI 1\0'
-KEEP = ('piano-reset-after', 'piano-reset-to', 'piano-boot-guard', PROP)
+KEEP = ('piano-reset-after', 'piano-reset-to', 'piano-boot-guard', 'piano-extra-ram-stage', PROP)
 SET_RE = re.compile(r'[A-Za-z0-9._-]{1,%d}' % SET_MAX)
 
 MERGED_READERS = {
@@ -92,7 +92,7 @@ def movable_long(arg):
     name = name_of(arg)
     if name in ADT_DISPLAY_KEYS:
         return True
-    return (movable(arg) and name not in LEGACY_KEYS and name not in (LONG_ARG, 'piano-extra-ram-stage')
+    return (movable(arg) and name not in LEGACY_KEYS and name != LONG_ARG
             and not name.startswith(('piano-metal-', 'piano-tu-')))
 
 
@@ -260,8 +260,9 @@ def selector(args):
 def merged(line, adt):
     """(boot-args, status) as k27 0066 makes them of LINE with this ADT: status appended, none, off, bad-set, missing, empty,
     bad-char or too-long (the merged text is LINE then)."""
-    line = line.encode()[:LEGACY_MAX].decode(errors='ignore')
-    sel = selector(line.split())
+    line_bytes = line.encode().partition(b'\0')[0][:LEGACY_MAX]
+    line = line_bytes.decode(errors='ignore')
+    sel = selector(line_bytes.decode(errors='replace').split())
     if sel == '0':
         return line, 'off'
     if sel is not None and not SET_RE.fullmatch(sel):
@@ -276,10 +277,9 @@ def merged(line, adt):
     text = raw.decode('ascii').strip(' ')
     if not text:
         return line, 'empty'
-    out = f'{line} {text}' if line else text
-    if len(out.encode()) > MERGED_MAX:
+    if len(line_bytes) + bool(line_bytes) + len(text) > MERGED_MAX:
         return line, 'too-long'
-    return out, 'appended'
+    return (f'{line} {text}' if line_bytes else text), 'appended'
 
 
 def kc_has_boot_args(kc):
