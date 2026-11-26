@@ -197,6 +197,16 @@ def parse_console(text, source):
                     task_run=task_run, task_doorbell=task_doorbell, physical_translation='unknown')
         if 'NativeUfs: EFI_MAP_DMA sid=0x60 phase=legacy-transfer-list-stopped' in line:
             add(line_number, 'UFS', 'transfer-list-stopped', sid=0x60)
+        m = re.search(r'NativeUfs: DMA virt=0x[0-9a-f]+ phys=([0-9a-f]+) contiguous=([0-9a-f]+)', line)
+        if m:
+            base, size = (int(v, 16) for v in m.groups())
+            add(line_number, 'UFS', 'physical-buffer', base=base, end=base + size)
+        m = re.search(r'NativeUfs: SID 0x60 found on bank (\d+) '
+                      r'\(sctlr ([0-9a-f]+) cbar ([0-9a-f]+) cba2r ([0-9a-f]+)\)', line)
+        if m:
+            bank, sctlr, cbar, cba2r = m.groups()
+            add(line_number, 'UFS', 'inherited-route', sid=0x60, bank=int(bank),
+                sctlr=int(sctlr, 16), cbar=int(cbar, 16), cba2r=int(cba2r, 16))
         m = re.search(r'PianoDwc3:.*GEVNTADR ([0-9a-f]{16}).*GEVNTSIZ ([0-9a-f]{8})'
                       r'.*GEVNTCOUNT ([0-9a-f]{8})', line)
         if m:
@@ -254,6 +264,10 @@ def parse_console(text, source):
         if m:
             add(line_number, 'Video', 'arena-size', bytes=int(m[1]), table_pages=int(m[2]),
                 physical_extents='unknown')
+        m = re.search(r'PianoWifi: dma: (\d+) MiB at (0x[0-9a-f]+)', line)
+        if m:
+            size, base = int(m[1]) << 20, int(m[2], 16)
+            add(line_number, 'WLAN', 'physical-buffer', base=base, end=base + size)
     return observations
 
 
@@ -279,7 +293,10 @@ def audit(map_text, owner_text, console_text='', run_label='unspecified'):
                                       'R-CPU': 'unknown', 'R-SEC': 'unknown',
                                       'R-VM': 'unknown', 'R-DUMP': 'unknown'},
                             descriptor_indices=sorted({s['index'] for r in group for s in r['segments']}),
-                            native_overlap_slabs=sum(bool(r['native_overlaps']) for r in group)))
+                            native_overlap_slabs=sum(bool(r['native_overlaps']) for r in group),
+                            scoped_physical_exclusions=[i for i, o in enumerate(observations)
+                                                        if o['kind'] == 'physical-buffer' and
+                                                        not intersects(start, end, o['base'], o['end'])]))
     return dict(schema=1, run_label=run_label, provenance='operator must verify same-boot input pairing',
                 gate='HOLD', released_mib=0, map=header, descriptors=descriptors,
                 summary={region: dict(Counter(r['efi'] for r in slabs.values() if r['range'] == region))

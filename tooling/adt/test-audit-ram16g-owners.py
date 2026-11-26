@@ -71,6 +71,8 @@ CONSOLE = '\r\n'.join([
     'transfer_slots=16 transfer_run=0x1 transfer_doorbell=0x0 task_iova=0x124000 '
     'task_slots=4 task_run=0x0 task_doorbell=0x0',
     'NativeUfs: EFI_MAP_DMA sid=0x60 phase=legacy-transfer-list-stopped',
+    'NativeUfs: DMA virt=0xabcdef000 phys=901000000 contiguous=10000',
+    'NativeUfs: SID 0x60 found on bank 5 (sctlr e0 cbar 1f000 cba2r 1); redirecting it',
     'PianoDwc3: device DCFG 00000000 GEVNTADR 0000000012500000 '
     'GEVNTSIZ 80000800 GEVNTCOUNT 00000004',
     'PianoDwc3: SMMU stream 0x40: existing entry slot 9 (smr 80000040 s2cr 00000009; '
@@ -87,6 +89,7 @@ CONSOLE = '\r\n'.join([
     'PianoA830: t g7 ZAP end ok 123us',
     'PianoVideo: start: piano-video=6 cc=1 smmu=2 carveout=0 (carveout 0x9c000000)',
     'PianoVideo: V9 allocated arena 1048576 ledger-pages 256 table-pages 4 metadata 4096',
+    'PianoWifi: dma: 8 MiB at 0x910000000 (synthetic allocation)',
 ])
 
 
@@ -95,6 +98,8 @@ class AuditTest(unittest.TestCase):
         report = owners.audit(fixture(), CONSOLE)
         self.assertEqual(len(report['slabs']), 322)
         self.assertEqual(sum(c['slabs'] for c in report['classes']), 322)
+        self.assertEqual({r['base'] for r in report['slabs']},
+                         {b for c in report['classes'] for b in range(c['base'], c['end'], owners.SLAB)})
         self.assertEqual(report['summary'], {'CMA': {'non-runtime': 128},
                                            'DXE': {'non-runtime': 186},
                                            'FD': {'non-runtime': 7, 'runtime': 1}})
@@ -176,6 +181,9 @@ class AuditTest(unittest.TestCase):
         self.assertFalse(any(o['owner'] == 'ADSP/DTB' for o in report['observations']))
         self.assertEqual(sum(bool(r['native_overlaps']) for r in report['slabs']), 0)
         self.assertTrue(all(c['receipts']['R-DMA'] == 'partial' for c in report['classes']))
+        self.assertTrue(all(c['scoped_physical_exclusions'] for c in report['classes']))
+        self.assertEqual(next(o for o in report['observations'] if o['kind'] == 'inherited-route')['bank'], 5)
+        self.assertEqual(next(o for o in report['observations'] if o['owner'] == 'WLAN')['end'], 0x910800000)
 
     def test_missing_or_irrelevant_console_does_not_close_any_owner_check(self):
         for log in ('', 'PASSED; Gunyah watchdog armed; OWNER secure-world safe'):
