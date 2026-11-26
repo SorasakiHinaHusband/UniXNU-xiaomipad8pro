@@ -35,6 +35,8 @@ namespace modes {
 
 constexpr unsigned kModeCount = sizeof kModes / sizeof kModes[0];
 constexpr uint64_t kPixelClockHz = 159667200;   // 576 x 2310 x 120, the same for every mode
+// The boot path has verified the VFP-only transition. kModes also describes unqualified hardware timings.
+constexpr unsigned kBootModeHz = 60, kInheritedModeHz = 120;
 
 // The live words of one link a plan is derived from and compared with.
 struct LinkLive {

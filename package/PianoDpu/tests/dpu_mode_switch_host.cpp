@@ -15,6 +15,7 @@ namespace m = pianodpu::modes;
 
 namespace {
 
+constexpr m::Options kAllTimings{.allowUnqualified = true};
 unsigned checks, failures;
 #define CHECK(expr) do { ++checks; if (!(expr)) { ++failures; std::printf("FAIL line %d: %s\n", __LINE__, #expr); } } while (0)
 
@@ -43,7 +44,7 @@ model::Dpu m1()
   return io;
 }
 
-bool switchOk(model::Dpu &io, unsigned hz, const m::Options &options = {})
+bool switchOk(model::Dpu &io, unsigned hz, const m::Options &options = kAllTimings)
 {
   const auto r = m::switchTiming(io, hz, options);
   if (r.why) {
@@ -79,7 +80,7 @@ void checkMode(model::Dpu &io, unsigned hz)
 void allPairs()
 {
   for (bool boe : {true, false}) {
-    m::Options options;
+    m::Options options = kAllTimings;
     options.boe = boe;
     options.db = boe ? refresh::Db::sunuefi : refresh::Db::downstream;
     for (const auto &from : kModes) {
@@ -129,22 +130,22 @@ void repeatedSwitches()
 void refusals()
 {
   auto io = m1();
-  CHECK(m::switchTiming(io, 75, {}).why);
-  CHECK(m::switchTiming(io, 90, {refresh::Db::direct}).why);
+  CHECK(m::switchTiming(io, 75, kAllTimings).why);
+  CHECK(m::switchTiming(io, 60, {refresh::Db::direct}).why);
   io.regs[kGcc + kGccDispAhb] = 0x80000000;
-  CHECK(m::switchTiming(io, 90, {}).why);
+  CHECK(m::switchTiming(io, 90, kAllTimings).why);
   io = m1();
   io.regs[kDispCc + kCcPclk1] = 0x80000000;
-  CHECK(m::switchTiming(io, 90, {}).why);
+  CHECK(m::switchTiming(io, 90, kAllTimings).why);
   io = m1();
   io.regs[intfReg(1, kIntfProgFetch)] = 0;
-  CHECK(m::switchTiming(io, 90, {}).why);
+  CHECK(m::switchTiming(io, 90, kAllTimings).why);
   io = m1();
   io.dsi[0].total ^= 1;
-  CHECK(m::switchTiming(io, 90, {}).why);
+  CHECK(m::switchTiming(io, 90, kAllTimings).why);
   io = m1();
   io.regs[dsiReg(0, kDsiTpgCtrl)] = 1;
-  CHECK(m::switchTiming(io, 90, {}).why);
+  CHECK(m::switchTiming(io, 90, kAllTimings).why);
   CHECK(io.stores.empty() && io.dcs.empty());
   CHECK(!storeAllowed(intfReg(1, kIntfHsyncCtl), 1));
   CHECK(storeAllowed(intfReg(1, kIntfHsyncCtl), 1, true));
@@ -161,7 +162,7 @@ void counterAndFlushGate()
     io.countEnableIgnored[l] = true;
     io.intf[l + 1].counting = true;
   }
-  CHECK(switchOk(io, 60));  // NativeGopDisplay's initial request on a 120 Hz boot
+  CHECK(switchOk(io, 60, {}));  // NativeGopDisplay's initial request on a 120 Hz boot
   checkMode(io, 60);
   CHECK(switchOk(io, 144));
   checkMode(io, 144);
@@ -201,7 +202,7 @@ void rollback()
   io.dropStore = intfReg(2, kIntfProgFetch);
   io.dropValue = 0x106da1;
   io.dropCount = 1;
-  auto r = m::switchTiming(io, 144, {});
+  auto r = m::switchTiming(io, 144, kAllTimings);
   CHECK(r.why && r.reverted && !r.restoreWhy);
   CHECK(io.dcs.empty());  // timing read-back failed before the command
   checkMode(io, 120);
@@ -218,13 +219,13 @@ void rollback()
   CHECK(switchOk(io, 144));
   io.underrunAfterDma = 1;   // both halves accepted the new group before the timing check failed
   io.handleUnderrunIrq = true;
-  r = m::switchTiming(io, 90, {});
+  r = m::switchTiming(io, 90, kAllTimings);
   CHECK(r.why && r.reverted && !r.restoreWhy);
   checkMode(io, 144);
 
   io = m1();
   io.dmaHang[1] = true;
-  r = m::switchTiming(io, 144, {});
+  r = m::switchTiming(io, 144, kAllTimings);
   CHECK(r.why && r.reverted && r.restoreWhy);
   CHECK(io.dsi[0].total == 0x0905023f && io.dsi[1].total == 0x0905023f);
   CHECK(io.half[0].b2 == 0x91 && io.half[0].b3 == 0x40);  // the idle link got the old group
@@ -233,13 +234,13 @@ void rollback()
 
   io = m1();
   io.lateDmas = 2;
-  r = m::switchTiming(io, 144, {});
+  r = m::switchTiming(io, 144, kAllTimings);
   CHECK(r.why && std::strstr(r.why, "front porch") && r.reverted && !r.restoreWhy);
   checkMode(io, 120);
 
   io = m1();
   io.flushStuck = true;
-  r = m::switchTiming(io, 90, {});
+  r = m::switchTiming(io, 90, kAllTimings);
   CHECK(r.why && r.reverted && r.restoreWhy);
   CHECK(io.dcs.empty());
 }
@@ -251,17 +252,56 @@ void qual1Underrun()
     io.countEnableIgnored[l] = true;
     io.intf[l + 1].counting = true;
   }
-  io.minFetchLineNs = 3300;
+  io.minFetchLineNs = 3300;  // between the 144 and 120/60 Hz line times
   io.handleUnderrunIrq = true;
-  CHECK(switchOk(io, 60));
-  checkMode(io, 60);
+  CHECK(switchOk(io, m::kBootModeHz, {}));
+  checkMode(io, m::kBootModeHz);
 
-  const auto r = m::switchTiming(io, 144, {});
+  const auto unexpected = [] { CHECK(false); };
+  const auto stores = io.stores.size();
+  // A stale WindowServer choice (144 Hz in qual1) cannot reach the timing or command path.
+  for (unsigned hz : {144u, 90u, 120u}) {
+    const auto refused = m::switchTo(io, hz, {}, unexpected, unexpected);
+    CHECK(refused.why && !refused.timingTouched && !refused.reverted);
+  }
+  CHECK(io.stores.size() == stores && io.dcs.empty() && !io.modeUnderruns());
+  CHECK(switchOk(io, m::kBootModeHz, {}));  // an already running 60 Hz mode must verify without staging
+  for (size_t n = stores; n < io.stores.size(); ++n)
+    CHECK(io.stores[n].pa == intfReg(1, kIntfCountEn) || io.stores[n].pa == intfReg(2, kIntfCountEn));
+  checkMode(io, m::kBootModeHz);
+
+  // Exercise the old failing request in the timed model only. The same starvation continues
+  // until the recovery latch. Those IRQ-sticky bits cannot fail the restored 60 Hz interval.
+  const auto r = m::switchTiming(io, 144, kAllTimings);
   CHECK(r.from == 60 && r.reverted && r.timingTouched && r.rate.lockstep);
   CHECK(r.why && std::strcmp(r.why, "an INTF underran") == 0);
-  CHECK(r.restoreWhy && std::strcmp(r.restoreWhy, "an INTF underran") == 0);
+  CHECK(r.restoreTransitionUnderruns == kUnderrunBits && !r.restoreWhy && !io.modeUnderruns());
   CHECK(io.dcs.size() == 16 && io.glitches == 0);
-  checkMode(io, 60);  // The old timing and group came back despite the failed recovery check.
+  checkMode(io, 60);
+
+  // Also exercise an accepted VFP-only boot switch with a missing latch on one link.
+  io = m1();
+  io.dropStore = intfReg(2, kIntfProgFetch);
+  io.dropValue = 0x280441;
+  io.dropCount = 1;
+  const auto restoredBoot = m::switchTiming(io, m::kBootModeHz, {});
+  CHECK(restoredBoot.why && restoredBoot.reverted && !restoredBoot.restoreWhy);
+  CHECK(restoredBoot.from == m::kInheritedModeHz && io.dcs.empty());
+  checkMode(io, m::kInheritedModeHz);
+
+  io = m1();
+  io.minFetchLineNs = 3700;  // a fault that continues after restoring the old timing
+  const auto brokenBoot = m::switchTiming(io, m::kBootModeHz, {});
+  CHECK(brokenBoot.why && brokenBoot.reverted && brokenBoot.restoreTransitionUnderruns);
+  CHECK(brokenBoot.restoreWhy && std::strcmp(brokenBoot.restoreWhy, "an INTF underran") == 0);
+  CHECK(io.modeUnderruns() && io.dcs.empty());
+
+  io = m1();
+  CHECK(switchOk(io, 90));
+  const auto inheritedStores = io.stores.size();
+  const auto wrongBootMode = m::switchTiming(io, m::kBootModeHz, {});
+  CHECK(wrongBootMode.why && wrongBootMode.from == 90 && !wrongBootMode.timingTouched);
+  CHECK(io.stores.size() == inheritedStores);
 }
 
 void sleepAndFetch()
@@ -278,7 +318,7 @@ void sleepAndFetch()
     m::Options modeOptions;
     modeOptions.panelUnavailable = off.ok;
     const auto unexpected = [] { CHECK(false); };
-    const auto blocked = m::switchTo(io, 144, modeOptions, unexpected, unexpected);
+    const auto blocked = m::switchTo(io, 60, modeOptions, unexpected, unexpected);
     CHECK(blocked.why && !blocked.timingTouched && !blocked.reverted);
     CHECK(io.stores.size() == stores && io.dcs.size() == commands);
     for (unsigned i = 1; i <= 2; ++i) {
@@ -342,18 +382,18 @@ void nightShiftAndCleanEpochs()
     }
   };
   checkColor();
-  CHECK(!m::switchTo(io, 120, {}, invalidate, replay).why);
-  CHECK(m::switchTo(io, 75, {}, invalidate, replay).why);
+  CHECK(!m::switchTo(io, 120, kAllTimings, invalidate, replay).why);
+  CHECK(m::switchTo(io, 75, kAllTimings, invalidate, replay).why);
   CHECK(!invalidations && !replays && prepare(0) == Action::skipped);
 
-  CHECK(!m::switchTo(io, 144, {}, invalidate, replay).why);
+  CHECK(!m::switchTo(io, 144, kAllTimings, invalidate, replay).why);
   CHECK(invalidations == 1 && replays == 1);
   checkColor();
   for (unsigned i = 0; i < smmu::kSlots; ++i) CHECK(prepare(i) == Action::initialized);
   CHECK(prepare(0) == Action::skipped);
 
   io.underrunAfterDma = 1;
-  const auto failed = m::switchTo(io, 90, {}, invalidate, replay);
+  const auto failed = m::switchTo(io, 90, kAllTimings, invalidate, replay);
   CHECK(failed.why && failed.reverted && !failed.restoreWhy);
   CHECK(invalidations == 2 && replays == 2);
   checkColor();
@@ -361,7 +401,7 @@ void nightShiftAndCleanEpochs()
   CHECK(cleans == 3 * smmu::kSlots && verifications == cleans && barriers == 2);
 
   io.flushStuck = true;
-  const auto unrestored = m::switchTo(io, 90, {}, invalidate, replay);
+  const auto unrestored = m::switchTo(io, 90, kAllTimings, invalidate, replay);
   CHECK(unrestored.why && unrestored.restoreWhy);
   CHECK(invalidations == 3 && replays == 2 && !flipper.cleanEpochs[0].initialized);
 }

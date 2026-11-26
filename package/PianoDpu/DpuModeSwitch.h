@@ -55,6 +55,7 @@ struct Options {
   bool boe = true;
   bool hwGatedAhb = false;
   bool panelUnavailable = false;
+  bool allowUnqualified = false;  // host model exercise of all hardware timings
 };
 
 struct Result {
@@ -65,6 +66,7 @@ struct Result {
   bool timingTouched = false;
   int ctl = -1;
   uint32_t pendingFlush = 0;
+  uint32_t restoreTransitionUnderruns = 0;
   CounterInit counters;
   Rate rate;
 };
@@ -271,6 +273,10 @@ template <class Io>
 Result switchTiming(Io &io, unsigned hz, const Options &o)
 {
   Result r;
+  if (!o.allowUnqualified && hz != kBootModeHz) {
+    r.why = "the requested mode is not qualified";
+    return r;
+  }
   if (o.panelUnavailable) {
     r.why = "the panel is off or its scanout is unavailable";
     return r;
@@ -311,7 +317,10 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
     }
   }
   r.from = before[0].hz;
-  if (r.from == hz) return r;
+  if (!o.allowUnqualified && r.from != kInheritedModeHz && r.from != kBootModeHz) {
+    r.why = "the inherited mode is not qualified for the boot switch";
+    return r;
+  }
   const Mode &previous = *modeByHz(r.from);
   const bool groupChanges = !sameGroup(previous, *target);
   panel::LinkSaved saved[2];
@@ -328,6 +337,10 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
   r.counters = initCounters(io, p);
   if (!r.counters.moving) {
     r.why = "INTF counters not advancing in lockstep";
+    return r;
+  }
+  if (r.from == hz) {
+    r.why = verifyRate(io, hz, before[0].vtotal, r.rate);
     return r;
   }
   if (!io.clearModeUnderruns()) {
@@ -356,10 +369,6 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
     r.restoreWhy = "the bonded CTL path changed during the switch";
     return r;
   }
-  if (!io.clearModeUnderruns()) {
-    r.restoreWhy = "could not clear INTF underrun status for the restore";
-    return r;
-  }
   const auto &window = recovery.link[0].period == before[0].period ? before[0] : after[0];
   r.restoreWhy = stageTiming(io, p, after, before, db, window, r.timingTouched);
   // If the command was triggered, a partial transfer may have changed either panel half.
@@ -376,8 +385,18 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
         r.restoreWhy = "DSI command path was not restored";
     }
   }
+  if (r.restoreWhy) return r;
+
+  // The failed mode may still underrun up to the old timing latch and panel command.
+  // Start the recovery observation only after old timing and command state read back.
+  r.restoreTransitionUnderruns = io.modeUnderruns();
+  if (!io.clearModeUnderruns()) {
+    r.restoreWhy = "could not clear INTF underrun status on the restored timing";
+    return r;
+  }
   Rate restoredRate;
-  if (!r.restoreWhy) r.restoreWhy = verifyRate(io, r.from, before[0].vtotal, restoredRate);
+  r.restoreWhy = verifyRate(io, r.from, before[0].vtotal, restoredRate);
+  if (!r.restoreWhy) r.restoreWhy = verifyTiming(io, p, before, o.hwGatedAhb);
   return r;
 }
 

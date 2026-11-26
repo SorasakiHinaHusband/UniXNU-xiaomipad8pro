@@ -1,6 +1,7 @@
 # Piano DPU M3 refresh modes
 
-M3 keeps the 60, 90, 120 and 144 Hz hardware timing plans for the internal 3200 × 2136 display. The qualified boot path publishes one fixed 60 Hz timing after verification. The 27.3 RAM boot captured for M1 was
+M3 keeps the 60, 90, 120 and 144 Hz hardware timing plans for the internal 3200 × 2136 display. The M3 boot path
+publishes one fixed 60 Hz timing after verification. The 27.3 RAM boot captured for M1 was
 scanning at 120 Hz with programmable fetch enabled on both interfaces. Each fetch start was `0x0013b6c1`, 24 lines before the
 end of the frame. The DSI timing-shadow words at +0x1e4/+0x1e8/+0x1ec were idle (zero). Both command engines were configured for
 software triggering with the in-frame DMA block clear.
@@ -91,8 +92,8 @@ from 3.608 to 3.006 µs. The Android display capture lists 144 in the same group
 timing-group documentation gives equal bit clocks and HS rate-group commands. The captured Android ODM `*_mi.xml`
 files contain display calibration, so the exact 144 porches above are from the pinned Linux table. Stock clock and
 command evidence comes from SunUEFI's `oem-refresh.md`, the P81 boot panel descriptions and the MiCode DFPS path.
-SUNUEFI's stock note labels the variants oppositely to the P81 panel XML and pinned Linux driver. The latter two
-agree on BOE B2 first and CSOT B3 first, which is also the qual1 boot log's order. [SunUEFI OEM refresh trace](https://github.com/Project-SunUEFI/Project-SunUEFI/blob/4ef87402/docs/devel/hardware/oem-refresh.md)
+SunUEFI's stock note labels the variants oppositely to the P81 panel XML and pinned Linux driver. The latter two
+agree on BOE B2 first and CSOT B3 first, which is also the qual1 boot log's order. [SunUEFI OEM refresh trace](https://github.com/slwyts/Project-SunUEFI/blob/4ef87402/docs/devel/hardware/oem-refresh.md)
 
 The 144 fetch word is `(2310 − 24) × 480 + 1 = 0x00106da1` on each INTF. Leaving the 60 Hz word
 `0x00280441` in place would put the start beyond the 144 frame. M3 actually stages the correct target word
@@ -127,6 +128,10 @@ bottleneck remains unknown. Unchanged fetch/QoS resources and a shorter line dea
 suspects. A transition edge or panel/DSI sequencing issue remains possible.
 
 ### Line comparison at the y12o base (0ea7e24d)
+
+The Sheng reference has counter and CTL observations in `DisplayTimingProbe.cpp:15–26` and a read-only survey contract
+in `ShengDpuObservation.h:34–42` at `00ba909`. It supplies the same hardware observations for the admission check.
+The P81 clock, DSC and mode-commit references come from MSM and stock P81. [Pinned Ubuntu kernel](https://github.com/yzddmr6/linux-sm8750-piano/tree/83f0f89bed14a0cb7d582a26e72bced0387870f4)
 
 | Ubuntu file and lines, with stock where available | Piano file and lines | Comparison |
 | --- | --- | --- |
@@ -163,12 +168,12 @@ persisting underrun still fails recovery.
 `piano-dpu-modes=1` establishes the verified 60 Hz mode before NativeGopDisplay offers it as the single
 `TimingElements` entry (ID 1000, color ID 100). The DPU worker admits only 60 Hz from the inherited 120 Hz
 mode or an already running 60 Hz mode. 90 Hz and a runtime return to 120 Hz have no directed qualification.
-A stale higher timing ID returns unsupported to IOMFB before a mode service call, property update or VBL change.
+A stale higher timing ID returns `kIOReturnUnsupported` to IOMFB before a mode service call, property update or VBL change.
 A request for the published timing remains idempotent. The 60 Hz VFP-only commit changes DSI TOTAL, the INTF
 period and the enabled fetch starts. It retains the known 120 Hz line and link clocks and the inherited resources.
 Omit `piano-dpu-refresh` on the M3 boot. A refusal before staging keeps the boot profile fallback. A verified
-rollback restores the inherited 120 Hz mode for a single fixed timing. An unverified rollback returns offline
-and prevents publishing an unverified timing. The normal inactive-argument path keeps its existing contract.
+rollback returns `kIOReturnAborted` to startup and leaves the inherited 120 Hz mode as the single fixed timing.
+An unverified rollback returns `kIOReturnOffline` and prevents timing registration.
 
 | Refresh | Expected INTF clock | Frame interval | INTF programmable fetch start with M1's 24-line lead |
 | --- | ---: | ---: | --- |
@@ -181,9 +186,8 @@ The IOAV timing elements describe the uncompressed framebuffer raster. The fixed
 timing hardware. The default DSI shadow layout follows SunUEFI's 60/120 Hz path (+0x1ec DB, +0x1e8 flush).
 `piano-dpu-refresh-db=2` selects +0x1e8 DB and +0x1e4 flush, the offsets in the downstream
 [DSI register definitions](https://android.googlesource.com/kernel/msm/+/fb1612bae1aa0107928e17a1add77fa9a83f15c4/drivers/gpu/drm/msm/dsi-staging/dsi_ctrl_reg.h).
-M1 read all three words at idle. The live latch and the panel's handling of the ordered HS FIFO packets still need RAM-boot
-qualification. The [Qualcomm command path](https://android.googlesource.com/kernel/msm-extra/display-drivers/+/e7ab2aa8bd2f6f27b311ccada3722d20dee4bcef/msm/dsi/dsi_ctrl_hw_cmn.c)
-documents the FIFO, software trigger, and DMA completion.
+M1 read all three words at idle. Qual1 verified the VFP-only latch. The hardware timing of the ordered HS FIFO packets and
+panel acceptance during rate-group changes remain open. [Qualcomm command path](https://android.googlesource.com/kernel/msm-extra/display-drivers/+/e7ab2aa8bd2f6f27b311ccada3722d20dee4bcef/msm/dsi/dsi_ctrl_hw_cmn.c)
 
 ## Interaction with M2/M4/M5
 
@@ -256,10 +260,10 @@ Checks: **ours-OK** on qual1 for boot counter motion, the 120 → 60 commit, tim
 boundary. **Unknown** are the precise failing interface and resource, the clock/urgency state at 144, a live clean 60 Hz
 restore, power-state interactions after the fix, and the exact WindowServer failure after IOMFB returned the error.
 
-Root cause: Unqualified 144 Hz was exposed as settable. The link math is valid but the native VIG/DSC feed gets
-20% less line time with unchanged resource programming, and the live HFP/rate-group transition lacks stock's coupled
-commit sequence. An underrun was observed after timing/cadence checks, with the precise source unresolved. The restore
-measured a sticky underrun across old and new timing, so its error could include frames from the failed mode.
+Root cause: Unqualified 144 Hz was exposed as settable. The native VIG/DSC feed needs 20% higher per-line throughput
+with unchanged resource programming. The live HFP and rate-group transition also lacks stock's coupled commit sequence.
+The sticky underrun status leaves the failing frame unresolved. The restore used an observation window that included
+the failed mode, so its error could also have come from 144 Hz frames.
 
 ONE change: Make M3 a qualified fixed-mode contract. Publish 60 Hz only after verifying it or publish the confirmed
 inherited 120 Hz as a single fallback after a verified rollback. Refuse unqualified requests before writes. Keep the
