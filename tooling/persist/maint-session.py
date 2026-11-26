@@ -1623,10 +1623,16 @@ def store_backup_back(s):
     s.restore('linux_rootfs-store-now', s.nodes['lun0'], store_new(s), B)
 
 
+def refuse_placeholder_esp(record):
+    if record.get('status') == 'TEST_PLACEHOLDER_NOT_FOR_INSTALL' or (record.get('pool') or {}).get('placeholder'):
+        raise Stop(f'{record["image"]}: a placeholder pool ESP cannot be installed')
+
+
 def write_esp(s, image_name):
     record = s.esp_record(image_name)
     if not record:
         raise Stop(f'{image_name}: no build record in out/persistent (tooling/persist/build-esp.py)')
+    refuse_placeholder_esp(record)
     lun0 = s.nodes['lun0']
     r = map_nodes(s)
     if r:
@@ -1680,6 +1686,7 @@ def esp_delta(s):
     record = s.esp
     if not record:
         raise Stop('esp-delta needs --esp NEW (a build record in out/persistent)')
+    refuse_placeholder_esp(record)
     try:
         old_name = json.loads((OUT / 'installed.json').read_text())['image']
     except (OSError, ValueError, KeyError):
@@ -2620,6 +2627,221 @@ def localnet_preflight(s):
         s.log('        (dry run: a real run from this shell would stop here)')
 
 
+# -- T-20 v2: the quiesced capture of the root image's two windows ----------------------------------------------------------
+CAPTURE_WINDOWS = (('os', 'OS'), ('systemos', 'SystemOS'))   # (file stem, the window's name in the SHNGROOT manifest)
+
+
+def root_manifest_windows(raw):
+    """The windows of a SHNGROOT manifest block (tooling/native/make-root-manifest.py): [{name, offset, size, sha256}] or None."""
+    if len(raw) < 24 or raw[:8] != b'SHNGROOT':
+        return None
+    version, count, _ = struct.unpack_from('<IIQ', raw, 8)
+    if version not in (1, 2) or not 0 < count <= 4 or len(raw) < 24 + 128 * count:
+        return None
+    out = []
+    for i in range(count):
+        name, offset, size, _, _, digest = struct.unpack_from('<32sQQII32s', raw, 24 + 128 * i)
+        out.append({'name': name.rstrip(b'\0').decode(errors='replace'), 'offset': offset, 'size': size, 'sha256': digest.hex()})
+    return out
+
+
+def range_sha_nocache(path, at, length):
+    """SHA-256 of LENGTH bytes of PATH from byte AT, read with the page cache off (F_NOCACHE)."""
+    h, left = hashlib.sha256(), length
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        os.lseek(fd, at, os.SEEK_SET)
+        while left:
+            chunk = os.read(fd, min(4 * MiB, left))
+            if not chunk:
+                break
+            h.update(chunk)
+            left -= len(chunk)
+    finally:
+        os.close(fd)
+    return h.hexdigest() if not left else None
+
+
+def receive_into(s, dev, skip, count, bs, dest, at, name):
+    """One piece streamed by the tablet (tablet.sh send, a detached job for a big piece) into DEST at byte AT (the file exists, of its
+    whole size). Returns (bytes, sha256 of the bytes as they arrived). A stall of STALL s ends the piece."""
+    total = count * bs
+    server = socket.create_server((s.host_ip(), s.a.nc_port))
+    server.settimeout(120)
+    got, held = {}, {}
+
+    def run():
+        conn, f = None, None
+        try:
+            conn, _ = server.accept()
+            held['conn'] = conn
+            conn.settimeout(STALL)
+            h, n = hashlib.sha256(), 0
+            f = open(dest, 'r+b')
+            f.seek(at)
+            while n < total:
+                chunk = conn.recv(min(MiB, total - n))
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                n += len(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+            got.update(bytes=n, sha256=h.hexdigest())
+        except OSError as e:
+            got.update(error=str(e).replace(str(Path(dest).parents[2]), '$PIANO_BACKUP_DIR'))
+        finally:
+            if f:
+                f.close()
+            if conn:
+                conn.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        if total > 256 * MiB:
+            s.job(name, 'send', dev, skip, count, bs, s.a.nc_port, timeout=limit(total))
+        else:
+            s.t('send', dev, skip, count, bs, s.a.nc_port, timeout=limit(total, floor=600))
+        thread.join(STALL + 60)
+    finally:
+        if thread.is_alive() and held.get('conn'):
+            held['conn'].shutdown(socket.SHUT_RDWR)
+            thread.join(30)
+        server.close()
+    if 'error' in got or 'bytes' not in got:
+        raise Stop(f'piece {name} of /dev/{dev} did not arrive: {got.get("error", "the stream ended early")}')
+    return got['bytes'], got['sha256']
+
+
+@step('window-capture', 'maintenance, read only on the tablet; writes the two window captures (PIANO_BACKUP_DIR)')
+def window_capture(s):
+    """T-20 v2 (PLAN-v2.md): the root image's OS and SystemOS windows read raw while nothing mounts them (this maintenance boot), the
+    source the System and SystemOS copies are made from. The root partition is the --esp record's default entry's
+    (native-ufs-root-part, linux_rootfs by default); its block 0 must be the SHNGROOT manifest whose sha256 and windows are --root-json's
+    (out/inputs/k273/root/root.json: manifest_sha256, windows OS and SystemOS); the first block of each window must start an APFS
+    container (NXSB). Each window in pieces of --rootfs-piece-mib into PIANO_BACKUP_DIR/<set>/windows/<os|systemos>.img, raw, with the
+    rootfs-backup checks on every piece: (1) the tablet's sha256 of the piece from the medium (page cache dropped), (2) the sha256 of
+    the bytes as they arrive, (3) the stored range read back without the page cache; (1) = (2) also shows the region did not change
+    between two reads minutes apart (nothing writes it). A piece is tried 3 times; a stopped step resumes at the first piece not yet
+    verified. At the end every window file is read back whole without the cache; windows/CAPTURE.json and SHA256SUMS record the
+    result. Nothing is written on the tablet."""
+    mapped = map_nodes(s)
+    part = esp_root_part(s.esp) if s.esp else ROOTFS_KEY
+    s.need(part in (ROOTFS_KEY, 'linux_data'), f'{part}: a supported root partition for window capture')
+    node, start, blocks = part_geometry(s, part)
+    if s.execute:
+        s.need(mapped and mapped.get('mounted') == '0', 'nothing from UFS is mounted')
+        lun0 = s.nodes.get('lun0')
+        s.need(bool(node) and start is not None and blocks > 0 and
+               re.fullmatch(re.escape(lun0 or '?') + r'\d+', node) is not None,
+               f'{part} is a mapped partition of LUN 0 (/dev/{node}, LBA {start}, {blocks} blocks)')
+    rj = Path(s.a.root_json) if s.a.root_json else None
+    s.need(rj is not None and rj.is_file() if s.execute else None, f'--root-json {rj}: the root image record')
+    want = json.loads(rj.read_text()) if rj and rj.is_file() else {'windows': []}
+    digest = s.region_sha(node, 0, 1, name='sha-root-manifest')
+    h = s.t('peek', node, 0, 0, 24 + 128 * 4)
+    found = root_manifest_windows(bytes.fromhex(h['hex'])) if h else None
+    if s.execute:
+        s.need(digest == want.get('manifest_sha256'), f'{part} block 0 sha256 {digest} = the root manifest of {rj.name} '
+               f'({str(want.get("manifest_sha256"))[:16]})')
+        s.need(found is not None, f'{part} block 0 is a SHNGROOT manifest')
+    windows = []
+    for stem, wname in CAPTURE_WINDOWS:
+        w = next((x for x in (found or []) if x['name'] == wname), None)
+        r = next((x for x in want['windows'] if x['name'] == wname), None)
+        if s.execute:
+            s.need(w is not None and r is not None and (w['offset'], w['size']) == (r['offset'], r['size']),
+                   f'window {wname}: the manifest\'s {w and (w["offset"], w["size"])} = {rj.name}\'s {r and (r["offset"], r["size"])}')
+            s.need(w['offset'] >= MiB and w['size'] > 0 and w['offset'] % MiB == 0 and w['size'] % MiB == 0 and
+                   w['offset'] + w['size'] <= blocks * B,
+                   f'window {wname}: whole MiB, inside {part} ({blocks * B} bytes)')
+            nx = bytes.fromhex(s.t('peek', node, w['offset'] // B, 0, 128)['hex'])
+            s.need(nx[32:36] == b'NXSB', f'window {wname}: block 0 starts an APFS container (NXSB; {nx[32:36]!r})')
+            windows.append(dict(stem=stem, name=wname, offset=w['offset'], size=w['size'], nx_uuid=nx[72:88].hex(),
+                                manifest_sha256_field=w['sha256']))
+        else:
+            windows.append(dict(stem=stem, name=wname, offset=(r or {}).get('offset', MiB), size=(r or {}).get('size', MiB), nx_uuid=None))
+    nas, name = s.nas()
+    folder = nas / 'windows' if nas else None
+    total = sum(w['size'] for w in windows)
+    s.log(f'  capture: {", ".join(w["name"] + " " + str(w["offset"]) + "+" + str(w["size"]) for w in windows)} of /dev/{node} ({part}) '
+          f'-> {name}/windows/ ({total} bytes, raw)')
+    progress = s.state.get('window_capture_progress') or {}
+    plan = {'set': name, 'node': node, 'part': part, 'piece_mib': s.a.rootfs_piece_mib, 'manifest': digest,
+            'windows': [[w['stem'], w['offset'], w['size']] for w in windows]}
+    if {k: progress.get(k) for k in plan} != plan:
+        progress = dict(plan, pieces={})
+    if folder:
+        folder.mkdir(exist_ok=True)
+        done = sum(q['bytes'] for q in progress['pieces'].values())
+        free = shutil.disk_usage(folder).free
+        s.need(free >= total - done + (1 << 30), f'{free >> 30} GiB free on the backup disk for {total >> 30} GiB of windows')
+    per = max(1, s.a.rootfs_piece_mib)
+    for w in windows:
+        dest = folder / f'{w["stem"]}.img' if folder else None
+        if dest is not None and (not dest.is_file() or dest.stat().st_size != w['size']):
+            with open(dest, 'wb') as f:
+                f.truncate(w['size'])
+            for k in [k for k in progress['pieces'] if k.startswith(w['stem'] + ':')]:
+                del progress['pieces'][k]
+        mib = w['size'] // MiB
+        for i, at in enumerate(range(0, mib, per)):
+            n = min(per, mib - at)
+            skip = w['offset'] // MiB + at
+            key = f'{w["stem"]}:{i}'
+            want_sha = s.region_sha(node, skip, n, MiB, name=f'sha-{w["stem"]}-{i:03d}')
+            if not s.execute:
+                s.t('job', f'send-{w["stem"]}-{i:03d}', 'send', node, skip, n, MiB, s.a.nc_port)
+                continue
+            q = progress['pieces'].get(key)
+            if q and q['sha256'] == want_sha and range_sha_nocache(dest, at * MiB, n * MiB) == want_sha:
+                s.log(f'  ok    {w["name"]} piece {i}: verified in an earlier run (sha256 {want_sha[:16]})')
+                continue
+            for attempt in range(1, PIECE_TRIES + 1):
+                try:
+                    got, raw = receive_into(s, node, skip, n, MiB, dest, at * MiB, f'send-{w["stem"]}-{i:03d}')
+                    back = range_sha_nocache(dest, at * MiB, n * MiB)
+                    if got == n * MiB and raw == want_sha and back == want_sha:
+                        break
+                    s.log(f'  WARN  {w["name"]} piece {i}, try {attempt}: received {got} bytes {raw}, read back {back}; the tablet\'s {want_sha}')
+                    if raw != want_sha:   # the stream is not what the tablet hashed: hash again (a source that moves fails every try)
+                        want_sha = s.region_sha(node, skip, n, MiB, name=f'sha-{w["stem"]}-{i:03d}-again')
+                except Stop as e:
+                    s.log(f'  WARN  {w["name"]} piece {i}, try {attempt}: {e}')
+            else:
+                raise Stop(f'{w["name"]} piece {i} failed {PIECE_TRIES} times (a moving source or a bad link): run window-capture again '
+                           f'(it resumes here)')
+            s.log(f'  ok    {w["name"]} piece {i}: {n * MiB} bytes, sha256 {want_sha[:16]} = received = read back without cache')
+            progress['pieces'][key] = {'window': w['stem'], 'skip': skip, 'at': at * MiB, 'bytes': n * MiB, 'sha256': want_sha}
+            s.save(window_capture_progress=progress)
+    if not s.execute:
+        s.log('  check every piece: the tablet\'s sha256 = received = read back without cache; then each window file read back whole')
+        return
+    record = {'what': 'T-20 v2 quiesced capture of the root image windows (maintenance boot, nothing mounted)',
+              'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'set': name, 'partition': part, 'node': node,
+              'partition_first_lba': start, 'root_manifest_sha256': digest, 'root_json': str(rj),
+              'esp': (s.esp or {}).get('image'), 'esp_sha256': (s.esp or {}).get('sha256'), 'windows': {}}
+    for w in windows:
+        dest = folder / f'{w["stem"]}.img'
+        whole = range_sha_nocache(dest, 0, w['size'])
+        pieces = sorted((q for q in progress['pieces'].values() if q['window'] == w['stem']), key=lambda q: q['at'])
+        covered = sum(q['bytes'] for q in pieces)
+        s.need(whole is not None and covered == w['size'] and
+               all(range_sha_nocache(dest, q['at'], q['bytes']) == q['sha256'] for q in pieces),
+               f'{w["name"]}: every piece read back again without cache = its sha256 ({covered} of {w["size"]} bytes)')
+        record['windows'][w['stem']] = {'name': w['name'], 'file': f'windows/{w["stem"]}.img', 'offset': w['offset'], 'size': w['size'],
+                                        'sha256': whole, 'nx_uuid': w['nx_uuid'], 'manifest_sha256_field': w['manifest_sha256_field'],
+                                        'pieces': pieces}
+        s.log(f'  ok    {w["name"]} captured: {w["size"]} bytes, sha256 {whole}')
+    (folder / 'CAPTURE.json').write_text(json.dumps(record, indent=1) + '\n')
+    (folder / 'SHA256SUMS').write_text(''.join(f'{v["sha256"]}  {k}.img\n' for k, v in record['windows'].items()))
+    s.state.pop('window_capture_progress', None)
+    s.save(window_capture=record)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('steps', nargs='*')
@@ -2647,6 +2869,7 @@ def main():
     p.add_argument('--rootfs-backup-set', metavar='NAME', help='rootfs-clear and its rollback: the verified linux_rootfs backup of '
                    'this earlier set in PIANO_BACKUP_DIR (default: this session\'s)')
     p.add_argument('--rootfs-zero', action='store_true', help='rootfs-clear: zeros by dd instead of a discard')
+    p.add_argument('--root-json', help='window-capture: the root image record (out/inputs/k273/root/root.json)')
     p.add_argument('--http-port', type=int, default=8000)
     p.add_argument('--nc-port', type=int, default=9000)
     a = p.parse_args()

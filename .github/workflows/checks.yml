@@ -70,6 +70,8 @@ jobs:
           DARWINBOOT: ${{ runner.temp }}/self-test-sources/DarwinBoot
           SELFTEST_TIMEOUT: "1500"
         run: python3 scripts/ci/self-tests.py --junit "$RUNNER_TEMP/self-tests.xml"
+      - name: Verify pool capture with real APFS image attachments
+        run: bash tooling/pool/test-pool-capture-check.sh --real-apfs
       - uses: actions/upload-artifact@v7
         if: always()
         with:
