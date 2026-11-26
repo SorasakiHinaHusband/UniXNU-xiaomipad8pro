@@ -51,6 +51,8 @@ def check(ok, what):
 
 
 def header(data):
+    if len(data) < HEADER.size:
+        raise ValueError('truncated Android boot image header')
     values = dict(zip(FIELDS, HEADER.unpack_from(data, 0)))
     page = values['page_size']
     if values['magic'] != b'ANDROID!' or values['header_version'] != 2 or values['header_size'] != HEADER.size:
@@ -114,7 +116,7 @@ def fat_file(ramdisk, name):
         return out.read_bytes()
 
 
-def check_firmware(ramdisk, files, info):
+def check_firmware(ramdisk, files, info, adt):
     """The boot addon (docs/kc-space.md, docs/drivers/sensors.md section 5b): present exactly when the build recorded one (firmware
     entries or the sensor pack), then the ADT has the GpuAddon slot and every entry is a pin of the payload's own collection with that
     pin's size and SHA-256, or the recorded sensor pack; absent: no slot. No private hash shown."""
@@ -124,7 +126,6 @@ def check_firmware(ramdisk, files, info):
     record = obj(info.get('firmware') or {}, 'firmware')
     sensor = obj(info['sensor_pack'], 'sensor_pack') if info.get('sensor_pack') is not None else None
     name = 'EFI/UniXNU/Payloads/kernel.macho.gpuaddon'
-    adt = fat_file(ramdisk, 'EFI/UniXNU/Payloads/kernel.macho.adt')
     if not record.get('addon') and not sensor:
         check(name not in files, 'no boot addon (the build recorded none)')
         check(not fw.adt_slot(adt), 'the ADT has no /chosen/memory-map GpuAddon slot (DarwinBoot refuses a slot without an addon)')
@@ -229,7 +230,13 @@ def check_entries(config, macos, adt, ramdisk, info, kc_name):
     has_guard = None
     for entry in xnu:
         args = entry.get('args')
-        if not isinstance(args, str) or not args.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in args):
+        if not isinstance(args, str):
+            raise ValueError('expected string args in each XNU boot entry')
+        if '\0' in args:
+            raise ValueError('XNU boot arguments contain an embedded NUL')
+        if len(args.encode()) > ba.LEGACY_MAX:
+            raise ValueError(f'XNU boot argument line exceeds the {ba.LEGACY_MAX}-byte DarwinBoot limit')
+        if not args.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in args):
             raise ValueError('expected printable ASCII args in each XNU boot entry')
         merged, status = ba.merged(args, adt)
         print(f'    boot-args ({status}): {merged}')
@@ -301,14 +308,27 @@ def main(argv=None):
 
 
 def verify_image(a, path, data, info, ref, fd, dtb_bytes, payload_hash):
-    print(f'\n== {path.name}  {len(data)} bytes  sha256 {hashlib.sha256(data).hexdigest()}')
+    digest = hashlib.sha256(data).hexdigest()
+    print(f'\n== {path.name}  {len(data)} bytes  sha256 {digest}')
     h = header(data)
     kernel, ramdisk, dtb, end = sections(data, h)
+    signed = path.name.endswith('-signed.img')
+    recorded_size = info.get('bytes', end if signed else len(data))
+    if type(recorded_size) is not int or not end <= recorded_size <= len(data) or (
+            not signed and recorded_size != len(data)):
+        raise ValueError('invalid image size in build record')
+    if 'sha256' in info:
+        expected = required_hash(info, 'sha256')
+        if recorded_size < len(data):
+            digest = hashlib.sha256(memoryview(data)[:recorded_size]).hexdigest()
+        check(digest == expected, 'image bytes match the build record')
     for field in SAME_AS_REFERENCE:
         check(h[field] == ref[field], f'header {field} = {h[field]!r:.60} (Ubuntu RAM set: {ref[field]!r:.60})')
     print(f'  info  kernel_size {h["kernel_size"]}  ramdisk_size {h["ramdisk_size"]}  dtb_size {h["dtb_size"]}  '
           f'cmdline {h["cmdline"].rstrip(bytes(1))!r}')
     check(h['id'][:20] == mkbootimg_id(kernel, ramdisk, dtb), 'header id is the SHA-1 of the sections (mkbootimg)')
+    if len(kernel) < 64:
+        raise ValueError('truncated ARM64 image header')
     check(kernel[56:60] == b'ARM\x64', 'kernel field starts with an ARM64 image header')
     text_offset, image_size, flags = struct.unpack_from('<QQQ', kernel, 8)
     shim = info.get('shim_bytes', len(kernel) - len(fd) - len(dtb_bytes))
@@ -333,8 +353,17 @@ def verify_image(a, path, data, info, ref, fd, dtb_bytes, payload_hash):
             digest = required_hash(info, key)
             check(files.get(name, (0, None))[1] == digest, f'{name} is the input the build recorded')
         if all(name in files for name in (kc_name, adt_name)):
-            check_firmware(ramdisk, files, info)
             raw_adt = fat_file(ramdisk, adt_name)
+            check_firmware(ramdisk, files, info, raw_adt)
+            spec = importlib.util.spec_from_file_location('adt_extra_ram', ROOT / 'tooling/adt/adt_extra_ram.py')
+            extra_ram = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(extra_ram)
+            placeholder = extra_ram.extra_ram_property(raw_adt)
+            if placeholder is not None:
+                check(placeholder == bytes(extra_ram.BYTES),
+                      f'/chosen {extra_ram.NAME} is a {extra_ram.BYTES}-byte zeroed placeholder')
+            elif info.get('extra_ram'):
+                check(False, 'extra-RAM placeholder is missing')
             check(ROOT_27_0_1 not in raw_adt.upper(), 'the ADT does not name the retired 27.0.1 root (configs/k27-adt.toml)')
             check(ROOT_27_3 in raw_adt.upper(), 'the ADT names the 27.3 root (configs/k273-adt.toml root_match_volume_uuid)')
     config = files.get('EFI/UniXNU/unixnu.toml', (0, None, None))[2]

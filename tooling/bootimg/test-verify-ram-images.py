@@ -5,9 +5,13 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -125,6 +129,44 @@ class VerifyRamImages(unittest.TestCase):
         struct.pack_into('<I', invalid, 36, 0)
         self.image.write_bytes(invalid)
         self.check_result(1, 'invalid boot image page size')
+        self.image.write_bytes(self.data[:vr.HEADER.size - 1])
+        self.check_result(1, 'truncated Android boot image header')
+
+    def test_recorded_image_hash_covers_padding_and_signed_prefix(self):
+        self.info.update(sha256=digest(self.data), bytes=len(self.data))
+        self.check_result(0, 'image bytes match the build record')
+        signed = self.root / 'boot-signed.img'
+        signed.write_bytes(self.data + b'fixture footer')
+        self.check_result(0, 'image bytes match the build record', signed)
+        modified = bytearray(self.data)
+        modified[PAGE - 1] = 1  # Outside the sections hashed by mkbootimg.
+        self.image.write_bytes(modified)
+        signed.write_bytes(modified + b'fixture footer')
+        self.check_result(1, 'image bytes match the build record')
+        self.check_result(1, 'image bytes match the build record', signed)
+
+    def test_mkbootimg_id_known_encoding(self):
+        self.assertEqual(vr.mkbootimg_id(b'kernel', b'ramdisk', b'dtb').hex(),
+                         '7bfbb9fb2b9e8de49aea126a957fba6c0418c856')
+
+    def test_builder_loads_unixnu_payload_on_this_python(self):
+        scripts = self.root / 'UniXNU/scripts/unixnu'
+        scripts.mkdir(parents=True)
+        (scripts / '__init__.py').touch()
+        (scripts / 'payload.py').write_text(
+            'import os\n'
+            'import tomllib\n'
+            'def write_volume(stage, image, label, size_mib):\n'
+            '    epoch = int(os.environ["SOURCE_DATE_EPOCH"])\n'
+            '    assert all(path.stat().st_mtime == epoch for path in stage.rglob("*"))\n'
+            '    image.write_text(tomllib.loads(\'value = "ready"\')["value"])\n')
+        source = ('import runpy, sys; from pathlib import Path; '
+                  'b = runpy.run_path(sys.argv[1]); b["uefi_payload"](Path(sys.argv[2]))')
+        env = dict(os.environ, UNIXNU_RESEARCH=str(self.root))
+        result = subprocess.run([sys.executable, '-c', source, builder.__file__, str(self.root)],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'payload-uefi.img').read_text(), 'ready')
 
     def test_missing_macos_payload_hash(self):
         self.macos('data-persist=0')
@@ -137,6 +179,65 @@ class VerifyRamImages(unittest.TestCase):
         menu = 'EFI/UniXNU/unixnu.toml'
         self.files[menu] += b'[[entry]]\ntype = "xnu" # additional boot option\nargs = "data-persist=2"\n'
         self.check_result(1, 'FAIL  boot data-persist=2 matches the build record')
+
+    def test_loader_line_byte_limit_with_adt_tail(self):
+        start = 'piano-boot-args=ram '
+        args = start + 'x' * (1023 - len(start))
+        self.macos(args, tail='data-persist=0')
+        self.check_result(0, 'ADT boot arguments resolve')
+        self.macos(args[:-1] + 'é', tail='data-persist=0')
+        self.check_result(1, 'exceeds the 1023-byte DarwinBoot limit')
+
+    def test_extra_ram_handoff_requires_zeroed_descriptor_table(self):
+        self.macos('data-persist=0')
+        adt = list(vr.PAYLOADS)[1]
+        self.info['extra_ram'] = True
+        self.check_result(1, 'extra-RAM placeholder is missing')
+        slab = 2 << 20
+        record = struct.Struct('<QQII')
+        misaligned = record.pack(0x880000001, slab, 1, 1)
+        overlapping = record.pack(0x880000000, 2 * slab, 1, 1) + record.pack(0x880200000, slab, 1, 1)
+        for records, status in ((b'', 0), (misaligned, 1), (overlapping, 1)):
+            with self.subTest(records=records):
+                props = [('test-root', vr.ROOT_27_3 + b'\0'), ('piano-extra-ram', records.ljust(384, b'\0'))]
+                self.files[adt] = node('device-tree', children=[node('chosen', props)])
+                self.info['adt_sha256'] = digest(self.files[adt])
+                self.check_result(status, '384-byte zeroed placeholder')
+
+    def test_truncated_or_corrupt_firmware_headers(self):
+        self.macos('data-persist=0')
+        adt = list(vr.PAYLOADS)[1]
+        chosen = node('chosen', [('test-root', vr.ROOT_27_3 + b'\0')],
+                      [node('memory-map', [('GpuAddon', bytes(16))])])
+        self.files[adt] = node('device-tree', children=[chosen])
+        self.info['adt_sha256'] = digest(self.files[adt])
+        self.info['firmware'] = {'addon': True}
+        name = 'EFI/UniXNU/Payloads/kernel.macho.gpuaddon'
+        fw = builder.firmware_module()
+        stream = zlib.compress(b'firmware', 9)
+
+        def addon(body):
+            return struct.pack('<8sIIQ', fw.ADDON_MAGIC, 1, 0, 24 + len(body)) + body
+
+        def entry(packed, size=8):
+            return struct.pack('<IIQQ', 2, 0o644, size, len(packed)) + fw.pad8(b'f\0') + fw.pad8(packed)
+
+        cases = (addon(b'')[:23], addon(entry(stream)[:23]), addon(entry(b'\0' + stream[1:])),
+                 addon(entry(stream + b'junk')), addon(entry(stream, 2)))
+        for i, blob in enumerate(cases):
+            with self.subTest(case=i):
+                self.files[name] = blob
+                self.check_result(1, 'the addon parses')
+        valid = fw.container([('f', 0o644, b'firmware')])
+        self.assertEqual(valid, addon(entry(stream)))
+        self.assertEqual(fw.parse_addon(valid), [('f', 0o644, b'firmware')])
+
+    def test_malformed_gpuaddon_slot_is_rejected(self):
+        fw = builder.firmware_module()
+        for props in ([('GpuAddon', bytes(15))], [('GpuAddon', bytes(16))] * 2):
+            with self.subTest(props=props), self.assertRaisesRegex(ValueError, 'GpuAddon'):
+                tree = node('device-tree', children=[node('chosen', children=[node('memory-map', props)])])
+                fw.adt_with_slot(tree)
 
     def test_effective_store_guard_and_warm_seed(self):
         self.macos('piano-boot-args=ram', tail='data-persist=2')

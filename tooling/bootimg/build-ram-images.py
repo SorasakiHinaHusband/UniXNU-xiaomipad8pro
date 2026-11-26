@@ -52,6 +52,16 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
+    # UniXNU imports tomllib by name.
+    sys.modules['tomllib'] = tomllib
+
 DEVICE = Path(__file__).resolve().parents[2]
 RESEARCH = Path(os.environ.get('UNIXNU_RESEARCH', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'))
 sys.path.insert(0, str(RESEARCH / 'UniXNU/scripts'))
@@ -559,7 +569,7 @@ def kernel_field(fd, dtb, work, name):
 def pack(out, fd, dtb, ramdisk, work, name):
     kernel, info = kernel_field(fd, dtb, work, name)
     image = out / f'{name}.img'
-    subprocess.run(['python3', str(MKBOOTIMG), *V2, '--kernel', str(kernel), '--ramdisk', str(ramdisk),
+    subprocess.run([sys.executable, str(MKBOOTIMG), *V2, '--kernel', str(kernel), '--ramdisk', str(ramdisk),
                     '--dtb', str(dtb), '--output', str(image)], check=True)
     return image, info
 
