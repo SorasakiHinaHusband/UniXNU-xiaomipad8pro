@@ -239,7 +239,7 @@ frame. Since 2026-11-18 it first wakes with Shift, requires a **new** lit-frame 
 `piano-login-readiness` AX probe to confirm the selected target account and focused secure field, clears that field,
 then types once on stdin to `piano-input.py type --stdin --enter`. Success requires a new Finder plus the matching console
 UID. AX denial or missing UI proof stops before password input. `--now` skips the SecurityAgent wait and preserves the other
-checks. The 2026-11-18 host test left native login-window AX access for tablet qualification. From the Mac:
+checks. Host tests covered the transaction at the time, with native login-window AX access awaiting tablet qualification. From the Mac:
 `tooling/native/usb-console.py --port 1` (the root shell), or `tooling/native/desk-ssh.sh` (ssh with the key, bound to the Mac's
 end of the cable, to the fixed 169.254.80.2, or to `-a <address>` of the `desk-dev: usb net: enN inet ...` line; the Mac's side of
 the USB network left at "Using DHCP" self-assigns a 169.254 address; Internet Sharing gives the tablet a lease instead,

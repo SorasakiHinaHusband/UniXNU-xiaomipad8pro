@@ -3,7 +3,8 @@
 ## Installed baseline (2026-11-27)
 
 **v13.1y12q** booted with the owner's Data store and the daily userland layer. The manifest records staged files and job
-defaults. The following checks establish what ran on the tablet. [Userland manifest](../configs/userland.toml) ·
+defaults. Staging uses the `/bin/sh -c 'exec "$0" "$@"'` launcher to give Background Task Management a stable executable path.
+[Userland manifest](../configs/userland.toml) · [Background Task Management](#3a-background-task-management-why-jobs-start-through-binsh-2026-11-25) ·
 [November 27 results](results-2026-11-27.md)
 
 - **Login and debug.** `piano-lw-quiet` holds `audiomxd` until login, removing the roughly 1.3-core retry loop at the login

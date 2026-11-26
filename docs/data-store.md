@@ -13,11 +13,10 @@ The installed system's Data volume is `package/NativeRamBlock`: a RAM **seed** (
 
 ### Historical store guard bring-up (2026-11-11 to 2026-11-14)
 
-Before the 2026-11-14 layout, the store window was at the end of `linux_rootfs`. Before the guard, a store made for one seed was silently re-initialised by any boot
-with another seed (`Data store state 3`, fresh). A rebuilt Turnip plugin, a staged file or a RAM test image with another seed
-dropped every Data change. The store at the old place had generation 10 at the install: it had been started over about ten
-times that day. The `esp-daily-macos` / `esp-gpu-macos` collection and seed `aced5bf9…` belonged to the retired 27.0.1 line.
-Section 7 records the original experiment.
+Before the 2026-11-14 layout, the store window was at the end of `linux_rootfs`. Before the guard, booting with a different seed
+silently re-initialised the store (`Data store state 3`, fresh). A rebuilt Turnip plugin, a staged file or a RAM test image with
+another seed dropped every Data change. The store at the old place had generation 10 at the install. The `esp-daily-macos` /
+`esp-gpu-macos` collection and seed `aced5bf9…` belonged to the retired 27.0.1 line. Section 7 records the original experiment.
 
 ## 1. The pieces
 
@@ -410,7 +409,6 @@ On the Mac, from a checkout with these commits. The installed ESP image is the o
 checkout's `out/persistent/`:
 
 ```sh
-# A current test would use the installed ESP record (seed prefix 9bd6f902).
 PIANO_A830_METAL=0 K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # current builder; root-layout caveat in k273-line.md §4
 python3 tooling/persist/store-test-images.py --installed-esp <persist checkout>/out/persistent/esp-daily-macos.img
 ```
@@ -546,7 +544,7 @@ or a bug.
 
 ## 9. The store's base and the system layer (2026-11-12)
 
-Built and host-tested offline; nothing of it has run on the tablet.
+This section records the 2026-11-12 design and offline host tests before tablet qualification.
 
 ### 9.1 What the seed identity is made of
 

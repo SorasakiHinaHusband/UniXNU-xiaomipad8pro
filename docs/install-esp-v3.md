@@ -26,9 +26,9 @@ and resumes the Data store. [November 26 install results](results-2026-11-26.md#
 ## Historical ESP v3 checklist (2026-11-12, retired 2026-11-14)
 
 **Archive only.** ESP v3 (`esp-daily3-macos.img`, SHA-256
-`fa5c0485a1d29634284ef77cdbd3bd4e608a56caa9a77cde8ebdf55e2aa29ca5`) was a proposed 27.0.1 daily system that never shipped.
-The 27.3-only migration cleared the old `8f3331104e03c970` store. The commands and expected output below describe the retired
-v3 plan. [Migration history](k273-line.md#historical-migration-2026-11-12-to-2026-11-14)
+`fa5c0485a1d29634284ef77cdbd3bd4e608a56caa9a77cde8ebdf55e2aa29ca5`) was a proposed 27.0.1 daily system that was never installed.
+The 27.3-only migration retired the 27.0.1 volume and store. The commands and expected output below describe the retired v3 plan.
+[Migration history](k273-line.md#historical-migration-2026-11-12-to-2026-11-14)
 
 ### 1. Your decisions (before the session)
 
@@ -78,7 +78,7 @@ store no longer exists; this gate cannot pass and is not today's check. The curr
 
 The historical first-boot expectation was `Data store state 2 ... seed 8f333110, store seed 8f333110`; today's installed store
 reports seed/store seed `9bd6f902`. The boot-guard expectation remains `piano-boot-guard: healthy after 180 s, restart reason normal`. **Stop and roll back** on `state 3`, `state 7`,
-`kept` or `started over`. The login window still shows the old plugin's boxes behind the clock until the layer is in.
+`kept` or `started over`. The v3 checklist expected the old plugin's boxes behind the clock until the layer was in place.
 
 ### 4. The system layer (once, you at the keyboard)
 

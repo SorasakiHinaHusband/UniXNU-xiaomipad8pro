@@ -10,10 +10,11 @@ verified both times. `boot_a` holds the v5 BootShim and FD. The 27.3-only ESP de
 
 | Setting | Installed default |
 | --- | --- |
-| Kernel | Patch 0075 supplies a 47-bit user address space, verified by `machdep.virtual_address_size = 47`. Patch 0076 exports the full merged boot arguments through `kern.piano_bootargs` for the USB root shell and updated helpers. |
+| Kernel | Native k27 patches 0053–0076 and the 27.3 patches. Patch 0075 supplies a 47-bit user address space, verified by `machdep.virtual_address_size = 47`. Patch 0076 exports the full merged boot arguments through `kern.piano_bootargs` for the USB root shell and updated helpers. |
 | Data | Direct store resumes, then M4 concurrent admission switches on after mount. M5 write-back and queue modes stay off. |
 | USB debug | Console, root shell and SSH over USB. Network TX flow control is enabled and was active during the second disk boot. |
 | Display | 60 Hz with neutral colours. Night Shift routing, native panel sleep and refresh switching stay off. Fixed 120 Hz and 144 Hz remain RAM-only. |
+| Network and audio | Built-in Wi-Fi on `en0`, speakers, and the raw and RNNoise microphone inputs. Bluetooth preflight passed on v13.1y12q. Pairing remains an attended check. |
 | Power and input | High Power Energy Mode, 5 V and 9 V PD buck charging, native touch, keyboard cover and trackpad. The cover and power-key sleep policy is armed. Physical checks remain pending. |
 
 [Support status](STATUS.md) · [November 26 results](results-2026-11-26.md) ·
@@ -242,6 +243,9 @@ bootloader`, and either treat the v4 container as tested by its Ubuntu twin or w
   fastboot after 240 s, where `tooling/native/native-loop.sh`'s dump image (patched FD) reads its log.
 
 ### 7. Roll back (least invasive first)
+
+For a current daily update, start with the ESP and layer rollback order. The partition recovery record below describes the
+original layout. [Daily updates and rollback](install-esp-v3.md#daily-update-and-rollback)
 
 **Always available:** power + volume-down (15-20 s from a hung or panicked kernel) reaches ABL fastboot; ABL is never written.
 From there every `fastboot boot` RAM image works as before: with the patched FD its own payload wins over the ESP
@@ -838,6 +842,9 @@ and the 27.3 store's header are hashed before and after: unchanged. Expected lin
 27.3 boot of §13.4 (nothing it reads was touched).
 
 #### 13.6 Roll back, least invasive first
+
+For a current daily update, use the previous verified ESP and check its layer compatibility before booting. The steps below
+document the 2026-11-14 migration back to its dual-ESP layout. [Daily updates and rollback](install-esp-v3.md#daily-update-and-rollback)
 
 1. A hang or panic: the boot guard lands in ABL fastboot within 180 s; always: power + volume-down 15-20 s. RAM images still win.
 2. Step 1, from ABL fastboot: `python3 $P maint-boot map`, then `python3 $P rollback esp-final` (the dual ESP from session A's set,
