@@ -676,7 +676,7 @@ static void registerFlipLosslessSysctl()
     struct sysctl_oid &o = gOidFlipLossless;
     o.oid_parent = &sysctl__machdep_children;
     o.oid_number = OID_AUTO;
-    o.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+    o.oid_kind = static_cast<int>(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
     o.oid_arg1 = nullptr;
     o.oid_arg2 = 0;
     o.oid_name = "native_gop_flip_lossless";
@@ -1128,7 +1128,7 @@ bool NativeGopDisplay::start(IOService *provider)
         auto &oid = fGpuFencePollOid;
         oid.oid_parent = &sysctl__machdep_children;
         oid.oid_number = OID_AUTO;
-        oid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+        oid.oid_kind = static_cast<int>(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
         oid.oid_arg1 = &fGpuFencePollMode;
         oid.oid_name = "native_gop_fence_deadline";
         oid.oid_handler = gpuFenceDeadlineSysctl;
@@ -1417,12 +1417,13 @@ IOReturn NativeGopDisplay::swap_begin_gated()
               fIdleStops, fVblIdleStop || fFlipMode ? "" : " (native-gop-display-vbl < 2: it runs while the display is on)");
         fTickRuns = fIdleStops = 0;
         if (fDamageMode) {
-            const uint64_t frames = fDamageCopies + fDamageNothing + fWholeNoRegion + fWholeUncovered + fWholePeriodic + fWholeOther;
+            const uint64_t damageFrames = fDamageCopies + fDamageNothing + fWholeNoRegion + fWholeUncovered + fWholePeriodic + fWholeOther;
             GOPLOG("damage: %llu of %llu frames from their dirty regions, mean %llu.%llu%% of the panel, %llu us mean, %llu us max "
                   "(%llu with nothing of the frame to draw, %llu refreshes of what was drawn); whole: %llu without a region, %llu not "
                   "fence-covered, %llu periodic, %llu other (first, after a flip or an undrawn frame, damage off); %llu of %llu new "
                   "frames named a region; audit %llu points, %llu differed%s\n",
-                  fDamageCopies, frames, fDamageCopies ? fDamagePixels * 1000 / fDamageCopies / (fVideo.v_width * fVideo.v_height) / 10 : 0,
+                  fDamageCopies, damageFrames,
+                  fDamageCopies ? fDamagePixels * 1000 / fDamageCopies / (fVideo.v_width * fVideo.v_height) / 10 : 0,
                   fDamageCopies ? fDamagePixels * 1000 / fDamageCopies / (fVideo.v_width * fVideo.v_height) % 10 : 0,
                   fDamageCopies ? fDamageNs / fDamageCopies / 1000 : 0, fDamageMaxNs / 1000, fDamageNothing, fDamageRefreshes,
                   fWholeNoRegion, fWholeUncovered, fWholePeriodic, fWholeOther, fDirtyFrames, fPeriodFrames,
@@ -2725,8 +2726,8 @@ bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *sou
         }
     }
     const uint64_t pixelBytes = gopcompose::bytesPerPixel(readFormat);
-    if (!memory || !usable || !width || !height || width > 16384 || height > 16384 || rowBytes < width * pixelBytes ||
-        offset + (height - 1) * rowBytes + width * pixelBytes > memory->getLength()) {
+    if (!memory || !usable || !width || !height || width > 16384 || height > 16384 ||
+        !gopcompose::surfaceRowsFit(memory->getLength(), offset, rowBytes, width * pixelBytes, height)) {
         static unsigned refused;
         if (refused++ < 8)
             GOPLOG("%s surface %llux%llu format %#x row %llu offset %llu (memory %llu bytes) is not read\n", base ? "a frame" : "a cursor",
@@ -3035,11 +3036,12 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
     fLastCenter = stats.centre;
     if (!fFirstLitLogged && stats.samples && fLastLitPerMille >= 500) {   // the login window (or a desktop) reached the panel
         fFirstLitLogged = true;
-        uint64_t ns = 0;
-        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        uint64_t nowNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        const uint64_t nowMs = nowNs / 1000000ull;
         GOPLOG("first lit frame: frame %llu, %llu.%llu%% non-black, mean #%06llx, at %llu ms (%llu ms after the first frame)\n", fFrames,
-              fLastLitPerMille / 10, fLastLitPerMille % 10, fLastMean, ns / 1000000ull,
-              fFirstFrameMs && ns / 1000000ull >= fFirstFrameMs ? ns / 1000000ull - fFirstFrameMs : 0);
+              fLastLitPerMille / 10, fLastLitPerMille % 10, fLastMean, nowMs,
+              fFirstFrameMs && nowMs >= fFirstFrameMs ? nowMs - fFirstFrameMs : 0);
     }
     if (haveBase && format != gopcompose::kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
         GOPLOG("frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,

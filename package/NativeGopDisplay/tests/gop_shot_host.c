@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// cc -std=c11 -Wall -Wextra -Werror gop_shot_host.c -o /tmp/gop_shot_host && /tmp/gop_shot_host
+// cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all gop_shot_host.c -o /tmp/gop_shot_host && /tmp/gop_shot_host
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
