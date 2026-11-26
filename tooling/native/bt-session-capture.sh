@@ -7,18 +7,23 @@ export LC_ALL=C
 
 usage() {
     cat <<'EOF'
-usage: bt-session-capture.sh start RESULTS_PARENT
+usage: bt-session-capture.sh preflight RESULTS_DIR [--wait-seconds N]
+       bt-session-capture.sh start RESULTS_PARENT
        bt-session-capture.sh mark RUN LABEL [NOTE]
        bt-session-capture.sh sample RUN LABEL
        bt-session-capture.sh finish RUN
 Set BT_SESSION_SSH and REDACT_WIFI to override the host harness paths.
+Preflight waits up to 90 seconds by default. Use 0 to take a snapshot without polling.
 EOF
 }
 
 die() { echo "bt-session-capture: $*" >&2; exit 1; }
 [[ ${1:-} != --help ]] || { usage; exit 0; }
 case "${1:-}:$#" in
-    start:2|mark:3|mark:4|sample:3|finish:2) ;;
+    preflight:2|start:2|mark:3|mark:4|sample:3|finish:2) ;;
+    preflight:4)
+        [[ $3 == --wait-seconds && $4 =~ ^[0-9]{1,9}$ ]] || { usage >&2; exit 2; }
+        ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -51,6 +56,111 @@ redact() {
     # IORegistry represents some addresses as OSData; the harness helper handles textual addresses.
     sed -E '/"(local-mac-address|mac-address-bluetooth0|ControllerAddress|DeviceAddress|BD_ADDR)"[[:space:]]*=/s/= .*/= <redacted>/' |
         python3 "$redactor"
+}
+
+preflight_reads=$(cat <<'REMOTE'
+export LC_ALL=C
+set +e
+piano_status() {
+    /usr/sbin/ioreg -r -c PianoBluetooth -d 1 -l -w0 |
+        /usr/bin/grep -E 'piano-bt-(state|host-ready|h4-le-masks|radio-le-rssi)'
+}
+launchd_status() {
+    # launchctl indents the job fields with one tab and nested fields with more.
+    /bin/launchctl print "system/$1" |
+        /usr/bin/awk '/^system\/[^ ]+ = \{$/ || /^\t(state|pid|program|last exit code) = /'
+}
+REMOTE
+)
+
+preflight_snapshot=$(cat <<'REMOTE'
+printf '%s\n' '@@ sw_vers'
+/usr/bin/sw_vers
+printf '%s\n' '@@ boot'
+/usr/sbin/sysctl kern.bootsessionuuid
+printf '%s\n' '@@ bootargs'
+/usr/sbin/sysctl -n kern.piano_bootargs | /usr/bin/tr ' ' '\n' |
+    /usr/bin/grep -E '^piano-(bt(=|-)|usb-net=|wifi(=|-ps=))'
+printf '%s\n' '@@ sysctl'
+/usr/sbin/sysctl machdep.piano_bt_boot machdep.piano_bt_firmware machdep.piano_bt_lemask machdep.piano_bt_lerdy
+printf '%s\n' '@@ dev'
+/bin/ls -l /dev/cu.BLTH
+printf '%s\n' '@@ pianobt'
+piano_status
+printf '%s\n' '@@ hci'
+/usr/sbin/ioreg -r -c IOBluetoothHCIController -d 1 -w0
+printf '%s\n' '@@ service'
+/usr/sbin/ioreg -r -n bluetooth -d 1 -l -w0
+printf '%s\n' '@@ adt'
+/usr/sbin/ioreg -p IODeviceTree -r -n bluetooth -d 1 -l -w0 |
+    /usr/bin/grep -E 'transport-(encoding|speed)'
+printf '%s\n' '@@ runtime'
+(
+    cd /private/var/piano/bluetooth-path1 &&
+    /usr/bin/shasum -a 256 -c runtime.sha256 &&
+    /usr/bin/cmp bin/bluetoothd /usr/sbin/bluetoothd &&
+    /usr/bin/cmp bin/BlueTool /usr/sbin/BlueTool &&
+    /usr/bin/cmp bin/PianoBluetooth.runtime /usr/sbin/PianoBluetooth.runtime &&
+    /usr/bin/cmp lib/QcaBTType0.dylib /usr/lib/QcaBTType0.dylib &&
+    printf '%s\n' 'staged and mounted runtime match'
+)
+printf '%s\n' '@@ helpers'
+/bin/ls -l /usr/local/libexec/piano-bluetooth-start /usr/local/libexec/piano-bt-runtime-mount \
+    /usr/local/libexec/piano-bt-probe /Library/LaunchDaemons/com.unixnu.piano-bluetooth-path1.plist
+printf '%s\n' '@@ mount'
+/sbin/mount | /usr/bin/grep -E 'on /usr/(sbin|lib) '
+printf '%s\n' '@@ launchd'
+for job in com.unixnu.piano-bluetooth-path1 com.apple.BlueTool com.apple.bluetoothd; do
+    launchd_status "$job"
+done
+printf '%s\n' '@@ probe'
+/usr/local/libexec/piano-bt-probe --status
+printf '%s\n' '@@ profiler'
+/usr/sbin/system_profiler -timeout 12 SPBluetoothDataType
+printf '%s\n' '@@ lemask-log'
+/usr/bin/log show --last boot --style compact --info --no-pager \
+    --predicate 'process == "kernel" AND eventMessage CONTAINS "bt-lemask1: LE event mask"'
+printf '%s\n' '@@ trace'
+/usr/bin/defaults read com.apple.MobileBluetooth.debug
+/bin/ls -lt /private/var/root/Library/Logs/Bluetooth/*.pklg
+printf '%s\n' '@@ end' BT_PREFLIGHT_DONE
+REMOTE
+)
+
+capture_preflight() {
+    local results=$1 wait_seconds=$2 started=$SECONDS remaining deadline sample stage
+    local settle=skipped
+    local -a rc=(0 0)
+    mkdir -p -- "$results"
+    stage=$(mktemp "$results/.preflight.XXXXXXXX")
+
+    if (( wait_seconds > 0 )); then
+        settle=timeout
+        while (( (remaining = wait_seconds - (SECONDS - started)) > 0 )); do
+            deadline=$(( remaining < 5 ? remaining : 5 ))
+            if sample=$(remote "$deadline" "$preflight_reads"$'\n''piano_status && launchd_status com.apple.bluetoothd' 2>/dev/null) &&
+                grep -Eq '^[[:blank:]]*"piano-bt-host-ready" = Yes$' <<< "$sample" &&
+                grep -Eq '^[[:blank:]]*"piano-bt-h4-le-masks-patched" = [0-9]*[1-9][0-9]*$' <<< "$sample" &&
+                grep -Eq $'^\tstate = running$' <<< "$sample" &&
+                grep -Eq $'^\tpid = [1-9][0-9]*$' <<< "$sample"; then
+                settle=ready
+                break
+            fi
+            (( SECONDS - started < wait_seconds )) || break
+            sleep 1
+        done
+    fi
+    printf 'BT_PREFLIGHT_SETTLE status=%s elapsed_seconds=%s wait_seconds=%s\n' \
+        "$settle" "$((SECONDS - started))" "$wait_seconds" > "$stage"
+
+    remote 75 "$preflight_reads"$'\n'"$preflight_snapshot" 2>&1 | redact >> "$stage" || rc=( "${PIPESTATUS[@]}" )
+    if (( rc[1] != 0 )); then
+        printf 'BT_PREFLIGHT_CAPTURE_ERROR redactor_exit=%s\n' "${rc[1]}" > "$stage"
+    elif (( rc[0] != 0 )); then
+        printf '\nBT_PREFLIGHT_CAPTURE_ERROR remote_exit=%s\n' "${rc[0]}" >> "$stage"
+    fi
+    mv -f -- "$stage" "$results/preflight.txt"
+    (( rc[0] == 0 && rc[1] == 0 )) || die "preflight capture failed (SSH=${rc[0]}, redactor=${rc[1]})"
 }
 
 record_status() {
@@ -357,6 +467,9 @@ REMOTE
 }
 
 case "$1" in
+    preflight)
+        capture_preflight "$2" "$((10#${4:-90}))"
+        ;;
     start)
         mkdir -p -- "$2"
         run=$(mktemp -d "$2/bt-session-$(date -u '+%Y%m%dT%H%M%SZ').XXXXXXXX")
