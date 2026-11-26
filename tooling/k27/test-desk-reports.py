@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """Host test of tooling/k27/desk-reports.sh (the diag desktop image's boot-job reporter, docs/attended-desktop.md) on this Mac, with
-stand-ins for launchctl and log on PATH and the "minute" scaled to 0 s:
+stand-ins for launchctl, log and ps on PATH and the "minute" scaled to 0 s:
 
   python3 tooling/k27/test-desk-reports.py
 
@@ -42,6 +42,10 @@ case "$*" in
      i=0; while [ $i -lt 400 ]; do echo "2026-11-12 10:00:04.000 E Finder[500:4] error $i"; i=$((i + 1)); done ;;
 esac
 '''
+PS = r'''#!/bin/sh
+[ "$*" = '-Aro pid,%cpu,cputime,comm' ] || exit 2
+printf 'PID %%CPU TIME COMM\n120 10.0 0:01.00 WindowServer\n'
+'''
 
 
 def run(console, minutes='1'):
@@ -49,7 +53,7 @@ def run(console, minutes='1'):
         tmp = Path(tmp)
         bin_dir = tmp / 'bin'
         bin_dir.mkdir()
-        for name, body in (('launchctl', LAUNCHCTL), ('log', LOG)):
+        for name, body in (('launchctl', LAUNCHCTL), ('log', LOG), ('ps', PS)):
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o755)
         out = tmp / 'console.txt'
@@ -86,7 +90,8 @@ def main():
     check(sum(1 for l in lines if 'Finder[500:4] error' in l) <= 250, 'the log is capped')
     check('Exiting: no payload' in text, 'xprotectd\'s lines')
     check('mechanism builtin:authenticate took 13 s' in text, 'authorizationhost\'s lines, unfiltered')
-    check(any(l.startswith('desk-reports: ps (login + 3 min): ') for l in lines), 'the busiest processes after the login')
+    check('desk-reports: ps (login + 3 min): 120 10.0 0:01.00 WindowServer' in lines,
+          'the busiest processes after the login')
     check(lines[-1] == 'desk-reports: end', 'the end line')
 
     lines = run('/etc/hosts', minutes='0')   # root's: no login

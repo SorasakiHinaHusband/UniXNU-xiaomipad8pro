@@ -9,12 +9,18 @@ pass=0 fail=0
 ok() { if eval "$2"; then echo "PASS $1"; pass=$((pass+1)); else echo "FAIL $1"; fail=$((fail+1)); fi; }
 bash "$T/ram-m0-tab.sh" idle > "$W/idle.txt" 2>&1
 ok "tab: M0_DONE" "grep -q '^M0_DONE$' '$W/idle.txt'"
-ok "tab: hw.memsize read" "grep -q '^hw.memsize=[0-9]' '$W/idle.txt'"
+if memsize=$(sysctl -n hw.memsize 2>/dev/null); then
+  ok "tab: hw.memsize read" "grep -Fxq 'hw.memsize=$memsize' '$W/idle.txt'"
+  memsize_mib='[0-9]+'
+else
+  ok "tab: hw.memsize unavailable" "grep -Fxq 'MISSING sysctl hw.memsize' '$W/idle.txt'"
+  memsize_mib='-'
+fi
 ok "tab: vm_stat section" "grep -q '^Pages free:' '$W/idle.txt'"
 ok "tab: never applies pressure" "! grep -nE 'memory_pressure +-' '$T/ram-m0-tab.sh'"
 python3 -I "$T/summarize-ram-m0.py" "$W/idle.txt" > "$W/sum.txt"; rc=$?
 ok "summary rc 0" "[ $rc = 0 ]"
-ok "summary line" "grep -q '^phase=idle memsize_mib=[0-9]' '$W/sum.txt'"
+ok "summary line" "grep -Eq '^phase=idle memsize_mib=$memsize_mib ' '$W/sum.txt'"
 ok "summary hint" "grep -q '^M0 HINT' '$W/sum.txt'"
 printf 'phase=apps\nhw.memsize=13956546560\nhw.pagesize=16384\nvm.swapusage=total = 1024.00M  used = 300.00M  free = 724.00M\nkern.memorystatus_vm_pressure_level=2\nPages free: 100.\nPages speculative: 10.\nPages occupied by compressor: 90000.\nM0_DONE\n' > "$W/apps.txt"
 python3 -I "$T/summarize-ram-m0.py" "$W/apps.txt" > "$W/sum2.txt"
