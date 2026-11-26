@@ -87,12 +87,12 @@ def extract(path, prefix, expected):
 def reader_frames(wav, log, seed):
     ready = wav.with_suffix('.ready').read_text().strip()
     done = wav.with_suffix('.done').read_text().strip()
-    report = log.read_text()
+    events = [line for line in log.read_text().splitlines() if line.startswith(('CAPTURE ', 'CONNECTION_CLOSED '))]
     ready_match = re.fullmatch(r'READY seed=(\d+) frames=(\d+) root=1 direct-driver=1', ready)
     done_match = re.fullmatch(r'CAPTURE_DONE frames=(\d+) seed=(\d+)', done)
-    result = re.search(r'^CAPTURE PASS seed=(\d+) frames=(\d+) blocks=(\d+) anchors=(\d+) '
-                       r'stop_rc=0x0 unmap_ring=0x0 unmap_status=0x0$', report, re.M)
-    if not (ready_match and done_match and result and 'CONNECTION_CLOSED rc=0x0 result=0' in report):
+    result = re.fullmatch(r'CAPTURE PASS seed=(\d+) frames=(\d+) blocks=(\d+) anchors=(\d+) '
+                          r'stop_rc=0x0 unmap_ring=0x0 unmap_status=0x0', events[0]) if events else None
+    if not (ready_match and done_match and result and events[1:] == ['CONNECTION_CLOSED rc=0x0 result=0']):
         raise ValueError('incomplete safe-reader lifecycle')
     ready_seed, min_frames = map(int, ready_match.groups())
     done_frames, done_seed = map(int, done_match.groups())

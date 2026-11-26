@@ -42,6 +42,12 @@ class Contract(unittest.TestCase):
         d = row(); del d['Pack0Valid']
         with self.assertRaises(KeyError): power.policy_state(d)
 
+    def test_gauge_age_bounds(self):
+        for age in (0, 45000):
+            self.assertEqual(power.policy_state(dict(row(), PackAgeMs=age)), 'hold')
+        with self.assertRaises(ValueError):
+            power.policy_state(dict(row(), PackAgeMs=-1))
+
     def test_ui_must_match_vote(self):
         for state, text in [('hold', 'AC Power; not charging;'), ('charging', 'AC Power; charging;')]:
             power.ui_state(text, state)

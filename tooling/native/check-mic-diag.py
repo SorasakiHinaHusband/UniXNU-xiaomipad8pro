@@ -72,20 +72,24 @@ def windows(measure, pcm, timeline, report):
 def lifecycle(console, logs):
     text = Path(console).read_text(errors='replace')
     bad = check('PianoAudio:' in text, 'current-window console audio known-positive')
+    capture_seeds = []
     for log in logs:
-        content = Path(log).read_text()
-        record = re.search(r'^CAPTURE PASS seed=(\d+) frames=(\d+) blocks=(\d+) anchors=(\d+) '
-                           r'stop_rc=0x0 unmap_ring=0x0 unmap_status=0x0$', content, re.M)
-        bad += check(bool(record) and 'CONNECTION_CLOSED rc=0x0 result=0' in content,
+        lines = Path(log).read_text().splitlines()
+        events = [line for line in lines if line.startswith(('CAPTURE ', 'CONNECTION_CLOSED '))]
+        record = re.fullmatch(r'CAPTURE PASS seed=(\d+) frames=(\d+) blocks=(\d+) anchors=(\d+) '
+                              r'stop_rc=0x0 unmap_ring=0x0 unmap_status=0x0', events[0]) if events else None
+        bad += check(bool(record) and events[1:] == ['CONNECTION_CLOSED rc=0x0 result=0'],
                      Path(log).name + ' explicit stop/unmap/connection close')
         if record:
             seed, frames, blocks, anchors = map(int, record.groups())
+            capture_seeds.append(seed)
             bad += check(seed > 0 and frames >= 2 * 48000 and blocks * 480 == frames and anchors > 0,
                          Path(log).name + ' real clock progress and exact copied frame count')
     # Reuse the supplied existing driver layer checker as a separate gate.
     # Here require two distinct engine epochs, not merely two copied log lines.
-    seeds = set(re.findall(r'HAL ring: input mode 0 ring 7680.* seed (\d+)', text))
-    bad += check(len(seeds) >= 2, 'two distinct input engine seeds after full release')
+    seeds = {int(seed) for seed in re.findall(r'HAL ring: input mode 0 ring 7680\b[^\n]* seed ([0-9]+)\b', text)}
+    bad += check(len(set(capture_seeds)) == 2 and seeds.issuperset(capture_seeds),
+                 'two distinct capture seeds seen in the current console window')
     return bad
 
 

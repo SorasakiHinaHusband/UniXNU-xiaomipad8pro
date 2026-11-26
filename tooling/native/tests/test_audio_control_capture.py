@@ -52,6 +52,15 @@ class CaptureTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(capture.InvalidCapture):
                 capture.identity(text)
 
+    def test_control_ids_are_unique_positive_integers(self):
+        for fields in ('', 'id=0', 'id=52.5', 'id=7 id=52'):
+            with self.subTest(fields=fields), self.assertRaises(capture.InvalidCapture):
+                capture.identity(PROBE.replace('id=52', fields))
+        duplicate = PROBE.replace('count=1', 'count=2').replace(
+            'device_volume phase=', 'control id=52 class=other\ndevice_volume phase=')
+        with self.assertRaises(capture.InvalidCapture):
+            capture.identity(duplicate)
+
 
 if __name__ == "__main__":
     unittest.main()

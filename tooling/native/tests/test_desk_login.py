@@ -50,6 +50,7 @@ esac
 n=$(grep -c '^type ' "$TRACE" 2>/dev/null || :); n=${n:-0}
 case "$MODE:$n" in
   already:*|ready:[12]|retry:2|nocons:1) echo 'C=501 U=1 L=0 S=0 F=81,';;
+  badfinder:*) echo 'C=501 U=1 L=0 S=0 F=,,';;
   oldfinder:0) echo 'C=0 U=1 L=0 S=1 F=80,';;
   oldfinder:1) echo 'C=501 U=1 L=0 S=0 F=80,';;
   wronguid:1) echo 'C=502 U=1 L=0 S=0 F=81,';;
@@ -152,7 +153,7 @@ echo "lavfi.signalstats.YAVG=$y"
         self.run_case('locked', 0, 1, console_line=False)
 
     def test_state_only(self):
-        for mode, rc in (('already', 0), ('locked', 3), ('ready', 4), ('nousers', 1)):
+        for mode, rc in (('already', 0), ('locked', 3), ('ready', 4), ('nousers', 1), ('badfinder', 1)):
             with self.subTest(mode=mode):
                 self.run_case(mode, rc, 0, extra=('--state',))
 

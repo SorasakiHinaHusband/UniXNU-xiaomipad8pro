@@ -33,6 +33,8 @@ want = {'private/', 'private/var/', 'private/var/folders/', 'private/var/folders
 assert set(keep) == want, sorted(set(keep) ^ want)
 assert keep == [n for n in names if n in want]   # archive order
 assert w.selected(names, [], True) == names
+assert w.selected(names, [], False) == []
+assert w.selected([], w.DEFAULT_INCLUDE, False) == []
 
 with tempfile.TemporaryDirectory() as tmp:
     src, dst = Path(tmp) / 'in.tar.xz', Path(tmp) / 'out.tar.xz'
@@ -57,16 +59,18 @@ with tempfile.TemporaryDirectory() as tmp:
         f = got['private/var/folders/zz/h/0/com.apple.LaunchServices.dv/a.csstore']
         assert f.uid == 501 and t.extractfile(f).read() == f.name.encode() and f.pax_headers.get('LIBARCHIVE.xattr.com.apple.test') == 'eA=='
     w.check_owners(dst)   # private, private/var, ... are root's: accepted
-    bad = Path(tmp) / 'bad.tar.xz'
-    with tarfile.open(bad, 'w:xz') as t:
-        info = tarfile.TarInfo('private/var')
-        info.type, info.uid = tarfile.DIRTYPE, 501
-        t.addfile(info)
-    try:
-        w.check_owners(bad)
-        raise AssertionError('a user-owned private/var accepted')
-    except SystemExit:
-        pass
+    for name in ('private/var', './private/var', 'private//var'):
+        bad = Path(tmp) / 'bad.tar.xz'
+        with tarfile.open(bad, 'w:xz') as t:
+            info = tarfile.TarInfo(name)
+            info.type, info.uid = tarfile.DIRTYPE, 501
+            t.addfile(info)
+        try:
+            w.check_owners(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f'a user-owned {name} accepted')
 
 script = w.tablet_script()
 assert "'" not in script and '--numeric-owner' in script and '--exclude "private/var/folders/*/*/T"' in script

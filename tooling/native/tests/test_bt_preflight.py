@@ -258,6 +258,7 @@ class PreflightTests(unittest.TestCase):
         for before, after, gate in (
             ("26C5035r", "unexpected", "build"),
             ("piano-bt=5\n", "piano-bt=5\npiano-bt=4\n", "arg-bt"),
+            ("piano-bt=5\n", "piano-bt=4\tpiano-bt=5\n", "arg-bt"),
             ("piano-bt=5\n", "piano-bt=5\npiano-bt-ibs=1\n", "arg-ibs"),
             ('"piano-bt-host-ready" = Yes', '"piano-bt-host-ready" = No', "host-ready"),
             ("bin/BlueTool: OK\n", "", "runtime"),
@@ -269,6 +270,8 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(gate=gate):
                 self.artifact.write_text(ready.replace(before, after, 1))
                 self.assertIn(f"FAIL BT-{gate} ", self.grade(1))
+        self.artifact.write_text(ready.replace("piano-bt=5\n", "piano-bt=5\tpiano-bt=5\n", 1))
+        self.grade(0)
         self.artifact.write_text(ready.replace("@@ trace\n", ""))
         self.grade(2)
 

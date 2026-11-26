@@ -21,7 +21,8 @@ SCRIPT = D / 'tooling/k27/desk-reports.sh'
 
 LAUNCHCTL = r'''#!/bin/sh
 case "$1" in
-  list) printf 'PID\tStatus\tLabel\n'
+  list) if [ "${REPORT_LIST+x}" = x ]; then printf '%s' "$REPORT_LIST"; exit 0; fi
+        printf 'PID\tStatus\tLabel\n'
         printf -- '-\t0\tcom.apple.fine\n'
         printf '123\t-\tcom.apple.running\n'
         printf -- '-\t78\tcom.apple.mobileactivationd\n'
@@ -48,7 +49,7 @@ printf 'PID %%CPU TIME COMM\n120 10.0 0:01.00 WindowServer\n'
 '''
 
 
-def run(console, minutes='1'):
+def run(console, minutes='1', listing=None):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         bin_dir = tmp / 'bin'
@@ -59,6 +60,8 @@ def run(console, minutes='1'):
         out = tmp / 'console.txt'
         env = dict(os.environ, PATH=f'{bin_dir}:{os.environ["PATH"]}', DESK_REPORTS_OUT=str(out), DESK_REPORTS_TICK='1',
                    DESK_REPORTS_SCALE='0', DESK_REPORTS_CONSOLE=str(console), DESK_REPORTS_TMP=str(tmp / 'failing'))
+        if listing is not None:
+            env['REPORT_LIST'] = listing
         subprocess.run(['/bin/sh', str(SCRIPT), minutes], env=env, check=True, timeout=60)
         return out.read_text().splitlines()
 
@@ -99,6 +102,19 @@ def main():
     check('desk-reports: no login within 0 min' in text, 'no login: said')
     check(any(l.startswith('desk-reports: failing (no login): ') for l in lines), 'no login: the failing jobs still')
     check('log: loginwindow' not in text, 'no login: no log window')
+
+    lines = run('/etc/hosts', minutes='0', listing='')
+    check([line for line in lines if 'failing (' in line] == [
+        'desk-reports: failing (start): PID STATUS LABEL',
+        'desk-reports: failing (no login): PID STATUS LABEL',
+    ], 'an empty listing only produces headings')
+
+    listing = '-\t78\tcom.apple.watchdogd\n\nfailed\t78\tcom.apple.badpid\n-\tbad\tcom.apple.badstatus\n-\t1'
+    lines = run('/etc/hosts', minutes='0', listing=listing)
+    check([line for line in lines if line.startswith('desk-reports: failing (start):')] == [
+        'desk-reports: failing (start): PID STATUS LABEL',
+        'desk-reports: failing (start): -\t78\tcom.apple.watchdogd',
+    ], 'the first valid row is kept and blank or malformed rows are ignored')
 
     print(f'{len(failures)} failed' if failures else 'all passed')
     return 1 if failures else 0

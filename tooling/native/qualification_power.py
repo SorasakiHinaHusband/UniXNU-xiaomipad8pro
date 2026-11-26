@@ -23,7 +23,7 @@ def policy_state(row):
             'daily 80/75 5V-only config')
     require(not any(row[k] for k in ('ConfigPending', 'ConfigError', 'HealthPending', 'PendingSlots')),
             'pending/error charge vote')
-    require(row['Pack0Valid'] == row['Pack1Valid'] == 1 and row['PackAgeMs'] <= 45000
+    require(row['Pack0Valid'] == row['Pack1Valid'] == 1 and 0 <= row['PackAgeMs'] <= 45000
             and row['InputValid'] & 257 == 257, 'invalid/stale dual gauge or bus')
     soc = max(row['Pack0SOC'], row['Pack1SOC'])
     require(all(0 <= row[f'Pack{i}SOC'] <= 100 for i in (0, 1)), 'invalid SOC')

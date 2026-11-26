@@ -9,7 +9,7 @@ import re
 
 def current_capacity(text):
     # AppleRawCurrentCapacity is in mAh, despite sharing the suffix.
-    values = re.findall(r'^ *"CurrentCapacity" *= *([0-9]+) *$', text, re.M)
+    values = re.findall(r'^[ \t]*"CurrentCapacity"[ \t]*=[ \t]*([0-9]+)[ \t]*$', text, re.M)
     if len(values) != 1 or not 0 <= int(values[0]) <= 100:
         raise ValueError('expected one CurrentCapacity percentage in 0..100')
     return int(values[0])

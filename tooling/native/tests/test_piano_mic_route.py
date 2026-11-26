@@ -51,6 +51,10 @@ class RouteFixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'seed'):
                 route.reader_frames(wav, log, 12)
             frames = route.reader_frames(wav, log, 11)
+            text = log.read_text()
+            log.write_text(text.replace('result=0', 'result=01'))
+            with self.assertRaisesRegex(ValueError, 'lifecycle'):
+                route.reader_frames(wav, log, 11)
             route.write_wav(wav, [0] * (frames - 480))
             with self.assertRaisesRegex(ValueError, 'frame count'):
                 route.score(wav, 2.0, 997, .20, frames)

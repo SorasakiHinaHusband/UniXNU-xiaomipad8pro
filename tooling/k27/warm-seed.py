@@ -30,6 +30,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import plistlib
 import shutil
 import subprocess
@@ -117,7 +118,7 @@ def check_owners(pack):
     wrong = []
     with tarfile.open(pack, 'r:xz') as t:
         for m in t.getmembers():
-            if m.name.rstrip('/') in ROOT_DIRS and m.uid != 0:
+            if posixpath.normpath(m.name) in ROOT_DIRS and m.uid != 0:
                 wrong.append(f'{m.name} uid {m.uid}')
     if wrong:
         raise SystemExit(f'{pack}: not a pack collect made as root on the tablet ({", ".join(wrong[:4])}): extracting it at boot '

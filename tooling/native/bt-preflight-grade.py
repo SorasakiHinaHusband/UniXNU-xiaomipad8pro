@@ -88,12 +88,16 @@ def grade(sections, settle, source):
     check("bootsession", matches(
         r"^kern\.bootsessionuuid: [0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$", sections["boot"],
     ), "boot session UUID readable")
-    args = dict(arg.split("=", 1) for arg in sections["bootargs"].split() if "=" in arg)
-    check("arg-bt", args.get("piano-bt") == "5", "effective piano-bt=5")
-    check("arg-usbnet", args.get("piano-usb-net") == "1", "effective piano-usb-net=1")
-    check("arg-btstop", args.get("piano-bt-stop", "0") == "0", "piano-bt-stop absent or zero")
-    check("arg-baud", args.get("piano-bt-baud", "3200000") == "3200000", "transport speed 3200000 bit/s")
-    check("arg-ibs", args.get("piano-bt-ibs", "0") == "0", "IBS disabled")
+    args = {}
+    for token in sections["bootargs"].split():
+        key, sep, value = token.partition("=")
+        if sep:
+            args.setdefault(key, set()).add(value)
+    check("arg-bt", args.get("piano-bt") == {"5"}, "effective piano-bt=5")
+    check("arg-usbnet", args.get("piano-usb-net") == {"1"}, "effective piano-usb-net=1")
+    check("arg-btstop", args.get("piano-bt-stop", {"0"}) == {"0"}, "piano-bt-stop absent or zero")
+    check("arg-baud", args.get("piano-bt-baud", {"3200000"}) == {"3200000"}, "transport speed 3200000 bit/s")
+    check("arg-ibs", args.get("piano-bt-ibs", {"0"}) == {"0"}, "IBS disabled")
 
     values = dict(line.split(":", 1) for line in sections["sysctl"].splitlines() if line.startswith("machdep.") and ":" in line)
     check("boot0", values.get("machdep.piano_bt_boot", "").strip() == "0", "machdep.piano_bt_boot=0")
