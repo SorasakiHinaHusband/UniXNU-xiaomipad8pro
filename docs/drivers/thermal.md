@@ -12,6 +12,20 @@
   v13.1y12l on November 26. Hands-on verification of the System Settings Energy Mode picker remains pending.
   [Support status](../STATUS.md) · [Hardware backlog, B5](../BACKLOG-hardware.md#2-backlog-b1b15)
 
+## Sensor faults
+
+- A CPU cluster needs a fresh, plausible TSENS reading from every zone in its cooling map. A missing zone selects the
+  cluster's slowest level. The normal recovery timer starts when the complete set reads below the release threshold.
+  Cached TSENS readings remain available for diagnostics. Critical confirmation uses fresh polls, and wake starts it again.
+  At `piano-thermal=2`, incomplete TSENS coverage holds the configured passive GPU ceiling even when the remaining zones
+  read cool. A fault alone never triggers critical shutdown.
+- ADC sample age includes time spent suspended. The charging API and CPU skin policy retain their three-period freshness
+  window, and the GPU APIs retain two periods. Only fresh, plausible, enabled channels count. Virtual skin requires all
+  inputs except when a fresh pin reading confirms the DSP owns the charger channel.
+- With CPU skin protection enabled, a fault uses the lowest existing skin steps, 748.8 and 1017.6 MHz, across Energy Modes.
+  CPU bursts and launch/input boosts require a valid skin reading. The GPU skin guard caps at 734 MHz or its previous
+  lower limit during a skin or XO fault, including a docked/mobile table change. A fresh reading is required to relax it.
+
 ## Historical bring-up notes
 
 The design, boot arguments, test plans and measurements below describe the builds under test at the time.
@@ -780,11 +794,11 @@ thermal limits) and of 2026-11-22 (macOS Low Power Mode is the one performance s
 | 2 (beyond stock) | as 1 | as 1 | off (the sustained 3532.8 / 4089.6 ceilings) | to 3532 / 4320 MHz (`-burst-max0/1`), over sustained only while open | as 1 |
 
 - **Virtual skin**: the stock thermal daemon's sensor from the board thermistors of §12 (batt 500, quiet 131, charger -9, wifi 89,
-  msm 232 per mille of 1000, + 1.6 C); a missing input scales the present ones up to the full weight; valid only with the battery
-  and one skin thermistor. Readings are the ADC's last round (`piano-thermal-adc-s`, 30 s).
+  msm 232 per mille of 1000, + 1.6 C). When the DSP drives the charger pin, the other four inputs are scaled up to the full
+  weight. Readings are the ADC's last round (`piano-thermal-adc-s`, 30 s).
 - **Skin step table** (the stock normal scene): cpu0-5 2745.6 MHz from 15 C, 2400 at 37 C, 1996.8 at 39, 1555.2 at 41-44,
   1363.2 at 45, 960 at 46, 748.8 at 48; cpu6-7 3072 from 15 C, 2649.6 at 34, 1958.4 at 37-39, 1689.6 at 39.5, 1401.6 at 40,
-  1017.6 at 44; each step leaves only under its own clear point. No reading = the first step, never "no cap".
+  1017.6 at 44; each step leaves only under its own clear point. A sensor fault uses the lowest step.
 - **Burst**: macOS gives the kernel no launch/animation hint, so a burst opens at a load onset (the governor wanted more than its
   ceiling on this decision and not on the one before), lasts at most `piano-cpufreq-burst-ms` (1500), the next one needs a new onset
   and `piano-cpufreq-burst-gap-ms` (500); none from the skin boost limit (`piano-cpufreq-skin-boost-limit`, 48 C) and none on Power

@@ -166,9 +166,52 @@ static void bootClosed()
   in.lid = Lid::closed;
   CHECK(run(e, in) == "root:kIOPMDisableClamshell root:kIOPMSetACAdaptorConnected (none) root:kIOPMClamshellClosed");
   in.lid = Lid::open;
-  CHECK(run(e, in) == "root:kIOPMEnableClamshell root:kIOPMClamshellOpened user");
+  CHECK(run(e, in) == "root:kIOPMClamshellOpened user root:kIOPMEnableClamshell");
   in.lid = Lid::closed;
   CHECK(run(e, in) == "root:kIOPMClamshellClosed");
+}
+
+static void coverRecovery()
+{
+  Engine e(actLid());
+  Inputs in = base();
+  in.screen = Screen::on;
+  run(e, in);
+  in.lid = Lid::closed;
+  CHECK(run(e, in) == "root:kIOPMClamshellClosed");
+  // An aborted suspend with the cover still closed does not replay the close.
+  CHECK(run(e, in) == "");
+  in.lid = Lid::unknown;
+  CHECK(run(e, in) == "root:kIOPMDisableClamshell");
+  in.lid = Lid::open;
+  in.screen = Screen::off;
+  CHECK(run(e, in) == "root:kIOPMClamshellOpened user root:kIOPMEnableClamshell");
+  CHECK(run(e, in) == "");
+  const char *why = "";
+  Actions a;
+  CHECK(e.powerKey(in, kLongPressMs - 1, a, &why) == Key::wakeDisplay && a.n == 1);
+  a.n = 0;
+  CHECK(e.powerKey(in, kLongPressMs, a, &why) == Key::passThrough && a.n == 0);
+  in.screen = Screen::on;
+  CHECK(e.powerKey(in, kLongPressMs - 1, a, &why) == Key::sleep && a.n == 1 && a.a[0].value == kSleepNow);
+
+  // Keep clamshell sleep disabled through an unplug while disarmed, then re-arm as the cover opens.
+  in.power = Power::external;
+  in.lid = Lid::closed;
+  CHECK(run(e, in) == "root:kIOPMDisableClamshell root:kIOPMSetACAdaptorConnected (connected) root:kIOPMClamshellClosed");
+  in.lidSleepArmed = false;
+  in.power = Power::battery;
+  CHECK(run(e, in) == "root:kIOPMSetACAdaptorConnected (none)");
+  in.lidSleepArmed = true;
+  in.lid = Lid::open;
+  CHECK(run(e, in) == "root:kIOPMClamshellOpened user root:kIOPMEnableClamshell");
+  in.lid = Lid::closed;
+  CHECK(run(e, in) == "root:kIOPMClamshellClosed");
+  in.power = Power::external;
+  CHECK(run(e, in) == "root:kIOPMDisableClamshell root:kIOPMSetACAdaptorConnected (connected)");
+  in.power = Power::battery;
+  in.lid = Lid::open;
+  CHECK(run(e, in) == "root:kIOPMClamshellOpened user root:kIOPMSetACAdaptorConnected (none) root:kIOPMEnableClamshell");
 }
 
 static void noSleep()
@@ -725,6 +768,10 @@ static void parse()
   CHECK(!on && mask == 0);
   parseSleep("on; wake mask 0X1f", &on, &mask);
   CHECK(on && mask == 0x1f);
+  parseSleep("on; wake mask 0x100000002", &on, &mask);
+  CHECK(on && mask == 0);
+  parseSleep("on; wake mask 0x2unexpected", &on, &mask);
+  CHECK(on && mask == 0);
 }
 
 // machdep.piano_sleep's read resolved (2026-11-12, queue5 P10: every 0062-0064 kernel answered EPERM, the OID without CTLFLAG_KERN,
@@ -833,6 +880,7 @@ int main()
   acDemandSleep();
   acRuntimeSwitch();
   coverOnBattery();
+  coverRecovery();
   bootClosed();
   noSleep();
   lidOff();

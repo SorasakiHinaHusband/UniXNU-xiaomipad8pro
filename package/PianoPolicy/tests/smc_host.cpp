@@ -207,6 +207,12 @@ int main()
     const Call c = answer(Config(), in, kSmallBytes, out, kLargeBytes);
     CHECK(c.ret == 0 && c.mshp && out[kResultAt] == kSuccess && getU32(out + kDataSizeAt) == 1 && out[kLargeBytes - 1] == 0);
     CHECK(answer(Config(), in, kMinBytes, out, kMinBytes).ret == 0);
+    in[kCommandAt] = kCmdRead;
+    for (uint32_t requested : {0u, 1u, 32u, UINT32_MAX}) {
+      putU32(in + kDataSizeAt, requested);
+      CHECK(answer(Config(), in, kMinBytes, out, kMinBytes).mshp);
+      CHECK(getU32(out + kDataSizeAt) == 1 && out[kBytesAt] == 1);
+    }
   }
   // 7. Client types per level: level 1 lets only type 1 open (IOKit.framework, powerd), level 2 also libSMC's type 0.
   {

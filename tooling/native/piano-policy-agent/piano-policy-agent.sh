@@ -55,30 +55,43 @@ NEVER='com.apple.watchdogd com.apple.security.xprotectd com.apple.mobileactivati
 
 say() { logger -t piano-policy-agent "$*" 2>/dev/null; slog "$*"; }
 
-lpm() {
-  s=$(notifyutil -g "$LPM" | awk '{print $2}')
-  case "$s" in 0|1) ;; *) s=0 ;; esac
-  if sysctl -w machdep.piano_policy_lpm="$s" > /dev/null 2>&1; then
-    say "Low Power Mode $s: machdep.piano_policy_lpm=$s"
+mode_value() {
+  local value
+  value=$(notifyutil -g "$1" | awk '{print $2}')
+  case "$value" in 1) echo 1 ;; *) echo 0 ;; esac
+}
+
+write_mode() {   # suffix, label, value
+  if sysctl -w "machdep.piano_policy_$1=$3" > /dev/null 2>&1; then
+    say "$2 $3: machdep.piano_policy_$1=$3"
   else
-    say "Low Power Mode $s: machdep.piano_policy_lpm not there (PianoPolicy inert: boot with piano-policy=N)"
+    say "$2 $3: machdep.piano_policy_$1 unavailable"
   fi
 }
 
-hpm() {
-  s=$(notifyutil -g "$HPM" | awk '{print $2}')
-  case "$s" in 0|1) ;; *) s=0 ;; esac
-  if sysctl -w machdep.piano_policy_hpm="$s" > /dev/null 2>&1; then
-    say "High Power Mode $s: machdep.piano_policy_hpm=$s"
+energy_modes() {
+  local low high
+  low=$(mode_value "$LPM")
+  high=$(mode_value "$HPM")
+  # Either notification may arrive after both values changed. Low Power takes precedence during the two writes.
+  if [ "$low" = 1 ]; then
+    write_mode lpm "Low Power Mode" "$low"
+    write_mode hpm "High Power Mode" "$high"
   else
-    say "High Power Mode $s: machdep.piano_policy_hpm not there (a kernel before Energy Mode, or PianoPolicy inert)"
+    write_mode hpm "High Power Mode" "$high"
+    write_mode lpm "Low Power Mode" "$low"
   fi
 }
 
 lid() {
-  r=$(ioreg -r -c IOPMrootDomain -d 1 | grep -E '"AppleClamshell(State|CausesSleep)"')
-  case "$r" in *'"AppleClamshellState" = Yes'*) ;; *) return ;; esac
-  case "$r" in *'"AppleClamshellCausesSleep" = Yes'*) say "cover closed: the system sleeps"; return ;; esac
+  local r
+  r=$(ioreg -r -c IOPMrootDomain -d 1) || return 0
+  printf '%s\n' "$r" | grep -Eq '^[[:space:]]*"AppleClamshellState" = Yes[[:space:]]*$' || return 0
+  if printf '%s\n' "$r" | grep -Eq '^[[:space:]]*"AppleClamshellCausesSleep" = Yes[[:space:]]*$'; then
+    say "cover closed: the system sleeps"
+    return
+  fi
+  printf '%s\n' "$r" | grep -Eq '^[[:space:]]*"AppleClamshellCausesSleep" = No[[:space:]]*$' || return 0
   pmset displaysleepnow && say "cover closed without sleep: display sleep (the screen locks)"
 }
 
@@ -141,8 +154,8 @@ store() {   # EVENT
 }
 readpower() {   # lpmv, hpmv, srcv and want (normal, save, off)
   local p
-  lpmv=$(notifyutil -g "$LPM" | awk '{print $2}'); case "$lpmv" in 0|1) ;; *) lpmv=0 ;; esac
-  hpmv=$(notifyutil -g "$HPM" | awk '{print $2}'); case "$hpmv" in 0|1) ;; *) hpmv=0 ;; esac
+  lpmv=$(mode_value "$LPM")
+  hpmv=$(mode_value "$HPM")
   p=$(pmset -g ps 2>/dev/null | head -1)
   case "$p" in
     *"'Battery Power'"*) srcv=battery ;; *"'AC Power'"*) srcv=ac ;; *"'UPS Power'"*) srcv=ups ;; *) srcv=unknown ;;
@@ -363,7 +376,7 @@ case "${1:-}" in
   --start) slim_start; exit $? ;;
   --event)
     case "${2:-}" in
-      lpm) lpm; slim lpm ;; hpm) hpm; slim hpm ;; lid) lid ;; source|session|tick) slim "$2" ;;
+      lpm|hpm) energy_modes; slim "$2" ;; lid) lid ;; source|session|tick) slim "$2" ;;
       *) echo 'usage: piano-policy-agent --event lpm|hpm|lid|source|session|tick' >&2; exit 2 ;;
     esac
     exit 0 ;;
@@ -371,14 +384,13 @@ case "${1:-}" in
 esac
 
 say "started (pid $$): Low Power Mode -> machdep.piano_policy_lpm; High Power Mode -> machdep.piano_policy_hpm; a cover closed without sleep -> display sleep; the power state of background services (slim)"
-lpm
-hpm
+energy_modes
 slim_start
 slim start
 notifyutil -w "$LPM" -w "$HPM" -w "$LID" -w "$SRC" -w "$SESSION" -w "$TICK" | while read -r key _; do
   case "$key" in
-    "$LPM") lpm; slim lpm ;;
-    "$HPM") hpm; slim hpm ;;
+    "$LPM") energy_modes; slim lpm ;;
+    "$HPM") energy_modes; slim hpm ;;
     "$LID") lid ;;
     "$SRC") slim source ;;
     "$SESSION") slim session ;;

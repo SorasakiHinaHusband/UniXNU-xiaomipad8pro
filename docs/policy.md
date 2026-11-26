@@ -138,14 +138,15 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
   keep their own behaviour). **Level 2** acts. The cover part needs `piano-policy-lid=1` as well (the hall polarity, `keyboard.md`
   §10.3) and refuses while `piano-keyboard-lid` is set (two clamshell controllers).
 - **Safety rules** (`Policy.h`): the cover sleeps the system only on battery, with system sleep on, the cover-open wake armed and the
-  cover seen open since boot (a boot inside a closed folio never sleeps at once); an unknown power source locks only; the order of
-  the root domain's messages leaves no window where a closed cover on power could sleep; PianoThermal's passive ceiling is never
-  lifted: with PianoA830's slots ours is client 1 and the lowest slot wins (§5.3), without them ours is never written over or
-  cleared (a race between the read and the write is repaired by putting it back).
+  cover seen open since boot (a boot inside a closed folio never sleeps at once). The lid-arm switch and unknown hall or power state
+  disallow clamshell sleep. The policy reports a reopening before an AC change or re-arm can re-evaluate a previously closed
+  cover. An abort with the cover still closed does not replay the notification. PianoA830 applies the lowest of PianoThermal's
+  protection ceiling and PianoPolicy's Energy Mode ceiling (§5.3).
 - **The agent** (`tooling/native/piano-policy-agent/piano-policy-agent.sh`, root): one `notifyutil -w` on
-  `com.apple.system.lowpowermode` and `com.apple.system.powermanagement.clamshellstate` (and the names of §4.1);
-  LPM → `sysctl -w machdep.piano_policy_lpm`;
-  closed without sleep (root domain's `AppleClamshellCausesSleep` No) → `pmset displaysleepnow`. Stock tools, no polling.
+  `com.apple.system.lowpowermode`, `com.apple.system.highpowermode`, `com.apple.system.powermanagement.clamshellstate` and the
+  names of §4.1. Either Energy Mode notification refreshes both kernel flags. The flags accept 0 or 1, and Low Power wins when
+  both are set during a transition. The agent calls `pmset displaysleepnow` only when the root domain reports
+  `AppleClamshellState` Yes and `AppleClamshellCausesSleep` No. The agent is event-driven.
   Installed by the userland pipeline (`configs/userland.toml`, `docs/userland.md`): `/usr/local/libexec/piano-policy-agent` and
   the LaunchDaemon `com.unixnu.piano-policy-agent.plist`, on in the installed profile, through the Data seed's boot job (a new
   seed identity, `docs/data-store.md`) or a live update. By hand from the USB root shell:

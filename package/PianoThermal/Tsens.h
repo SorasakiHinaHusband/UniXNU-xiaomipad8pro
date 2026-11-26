@@ -295,6 +295,13 @@ class Monitor {
     return false;
   }
   bool usable(unsigned c, unsigned s) const { return c < kControllers && s < kMaxSensors && (usable_[c] & (1u << s)); }
+  bool fresh(unsigned c, unsigned s) const { return c < kControllers && s < kMaxSensors && (fresh_[c] & (1u << s)); }
+  bool allFresh() const
+  {
+    for (unsigned c = 0; c < kControllers; ++c)
+      if (fresh_[c] != (1u << kMap[c].count) - 1u) return false;
+    return true;
+  }
   int32_t deci(unsigned c, unsigned s) const { return deci_[c][s]; }
   uint32_t raw(unsigned c, unsigned s) const { return raw_[c][s]; }
   uint16_t freshMask(unsigned c) const { return fresh_[c]; }

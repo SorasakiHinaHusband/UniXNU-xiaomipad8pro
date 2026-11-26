@@ -304,6 +304,41 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(rig.state()['state'], 'save'); self.assertIn('taskpolicy -b -p 700', rig.calls())
         self.each(t)
 
+    def test_rapid_energy_modes(self):
+        def t(rig):
+            rig.run('--start')
+            # One notification can arrive after both flags have changed.
+            for lpm, hpm, event, writes in (
+                (1, 0, 'hpm', ('lpm=1', 'hpm=0')),
+                (0, 1, 'lpm', ('hpm=1', 'lpm=0')),
+                (1, 1, 'hpm', ('lpm=1', 'hpm=1')),
+                (0, 0, 'hpm', ('hpm=0', 'lpm=0')),
+                (2, -1, 'lpm', ('hpm=0', 'lpm=0')),
+            ):
+                rig.clear()
+                rig.notify(lpm=lpm, hpm=hpm)
+                rig.event(event)
+                self.assertEqual(
+                    [call for call in rig.calls().splitlines() if call.startswith('sysctl -w ')],
+                    ['sysctl -w machdep.piano_policy_' + write for write in writes],
+                )
+        self.each(t)
+
+    def test_lid_requires_explicit_lock_only(self):
+        def t(rig):
+            for state, sleeps, expected in (
+                ('Yes', 'Yes', False), ('No', 'No', False), ('Yes', '', False),
+                ('Yes', 'Unknown', False), ('Yes', 'No', True), ('No', 'No', False),
+            ):
+                rig.clear()
+                registry = '    "AppleClamshellState" = ' + state + '\n'
+                if sleeps:
+                    registry += '    "AppleClamshellCausesSleep" = ' + sleeps + '\n'
+                rig.put('ioreg', registry)
+                rig.event('lid')
+                self.assertEqual('pmset displaysleepnow' in rig.calls(), expected)
+        self.each(t)
+
     def test_restart_restores_first(self):
         def t(rig):
             rig.into_save()
