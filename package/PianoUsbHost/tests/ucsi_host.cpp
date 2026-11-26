@@ -6,10 +6,11 @@
 // PPM: a reset clears the notification enable and latches RESET_COMPLETE, every command completes in CCI (with the MESSAGE_IN length),
 // ACK_CC_CI clears the command completion and, with the connector-change bit, the connector's pending change; a change is shown in the
 // CCI's connector field until it is acknowledged; notifications go out only for enabled events.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 ucsi_host.cpp -o /tmp/ucsi_host && /tmp/ucsi_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I../../PianoDwc3 ucsi_host.cpp -o /tmp/ucsi_host && /tmp/ucsi_host
 #include "UcsiClient.h"
 #include "PortRole.h"
 #include "ControllerLoan.h"
+#include "../../PianoPower/UsbcObservation.h"
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -41,6 +42,7 @@ struct Ppm {
   bool refuseWrites = false;    // answer writes with return code 1
   bool uorRejected = false;     // SET_UOR ends with ERROR, GET_ERROR_STATUS: swap rejected
   bool uorUnsupported = false;
+  unsigned statusLength = 0;   // override CCI length while leaving the mailbox contents intact
   // the connector
   struct Con {
     bool connected = false, provider = false;
@@ -181,7 +183,7 @@ struct Ppm {
           return;
         }
         statusBytes();
-        complete(kCciCommandComplete, version >= kV2_0 ? 19 : 9);
+        complete(kCciCommandComplete, statusLength ? statusLength : version >= kV2_0 ? 19 : 9);
         return;
       case kAckCcCi: {
         if (control & kAckConnectorChange) {
@@ -827,8 +829,83 @@ static void hostGateCases()
   }
 }
 
+static void testIncompleteWitnesses()
+{
+  Rig r;
+  r.c.start(1, r.now);
+  r.run(2000);
+  CHECK(r.c.phase == Phase::ready);
+  r.take();
+  r.ppm.notify();
+  const auto notification = r.ppm.out.front();
+  r.ppm.out.clear();
+  const auto reads = r.ppm.reads;
+  for (uint32_t length = kHeader; length < notification.size(); ++length) {
+    r.c.receive(notification.data(), length, r.now);
+    r.run(0);
+  }
+  CHECK(r.ppm.reads == reads && !(r.take() & kEvNotify));
+  auto otherReceiver = notification;
+  put32(otherReceiver.data() + 16, 1);
+  r.c.receive(otherReceiver.data(), uint32_t(otherReceiver.size()), r.now);
+  r.run(0);
+  CHECK(r.ppm.reads == reads && !(r.take() & kEvNotify));
+
+  r.ppm.plug(kPartnerUfp, true, kModeDefault);
+  r.run(100);
+  CHECK(r.c.status.valid && r.c.status.connected && r.c.status.provider);
+  r.ppm.statusLength = 3;
+  r.ppm.event(kChangePowerDirection);
+  r.run(100);
+  CHECK(!r.c.status.valid && (r.take() & kEvFailed));
+
+  RoleSwitch rs;
+  rs.enabled = true;
+  rs.debounceMs = 0;
+  CHECK(rs.step(Role::host, false, 1000) == SwitchAction::none && rs.deadline() == 0);
+  CHECK(rs.step(Role::host, true, 1001) == SwitchAction::toHost);
+  rs.done(SwitchAction::toHost, true);
+  CHECK(rs.step(Role::host, false, 1002) == SwitchAction::toDevice);
+}
+
+static void testSharedVbusHandoff()
+{
+  const uint64_t now = 1000;
+  PianoChargeContract contract = {};
+  contract.linked = contract.initialized = contract.status_valid = contract.connected = 1;
+  contract.updated_ms = now;
+  contract.version = kV1_1;
+  contract.connector = kConnector;
+  contract.status_bytes = 9;
+  const uint32_t ufp = 1u << 19 | uint32_t(kPartnerUfp) << 29;
+  PortWitnesses w;
+  auto gate = [&](uint64_t at, bool allowSinkHost) {
+    const auto snapshot = piano_usbc_observe(&contract, 1, 1, at);
+    const bool fresh = pianousbhost::observePort(w, snapshot, at);
+    return pianousbhost::hostGate(fresh, pianousbhost::portView(w), allowSinkHost);
+  };
+  // The owner publishes provider status while sourcing VBUS for the UFP.
+  put32(contract.status_raw, ufp | 1u << 20);
+  CHECK(gate(now, false));
+  // A pending power-role change withdraws that witness even with an attached port notification.
+  w.panSeen = true;
+  w.pan.mux = kMuxUsb3;
+  contract.notify_pending = 1;
+  CHECK(!gate(now, true) && pianousbhost::portView(w).connected && !w.ucsi.valid);
+  contract.notify_pending = 0;
+  contract.sink = 1;
+  put32(contract.status_raw, ufp);
+  CHECK(!gate(now, false) && gate(now, true));
+  const auto snapshot = piano_usbc_observe(&contract, 1, 1, now);
+  CHECK(pianousbhost::observePort(w, snapshot, snapshot.expires_ms));
+  CHECK(!pianousbhost::observePort(w, snapshot, snapshot.expires_ms + 1));
+  CHECK(!pianousbhost::hostGate(w.ucsiReady, pianousbhost::portView(w), true));
+}
+
 int main()
 {
+  testSharedVbusHandoff();
+  testIncompleteWitnesses();
   hostGateCases();
   sharedConnector();
   testCodec();

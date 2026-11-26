@@ -124,10 +124,11 @@ struct RoleSwitch {
   // The decision of this moment (none: device mode stays armed, as device), whether a cable is in. Returns what to do now.
   SwitchAction step(Role decided, bool connected, uint64_t now)
   {
-    const Role want = decided == Role::host ? Role::host : Role::device;
+    const Role want = connected && decided == Role::host ? Role::host : Role::device;
     if (want != wanted) {
       wanted = want;
       wantedSince = now;
+      deferred = false;
       if (want == Role::host && current == Role::device && !enabled) wouldSwitch++;
     }
     if (!connected) failedThisConnection = false;
