@@ -39,6 +39,7 @@ static inline const char *parseName(Parse p) {
 static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xnuBase, uint64_t xnuSize,
                              Run out[kMaxRuns], unsigned &n) {
   n = 0;
+  if (xnuSize > UINT64_MAX - xnuBase) { return Parse::rejected; }
   pianoxram::Pool parsed;
   pianoxram::Config config;
   config.use = pianoxram::UseGpu;
@@ -48,6 +49,10 @@ static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xn
   if (parsed.formatBad) { return Parse::badLength; }
   if (!parsed.count) { return Parse::absent; }
   if (parsed.dropped) { return Parse::rejected; }
+  for (unsigned i = 0; i < parsed.count; ++i) {
+    const auto &run = parsed.runs[i].run;
+    if (run.size > UINT64_MAX - run.base) { return Parse::rejected; }
+  }
 
   unsigned count = 0;
   for (unsigned i = 0; i < parsed.count; ++i) {
@@ -56,6 +61,13 @@ static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xn
     if (run.bank != pianoxram::Region1 || run.use != pianoxram::UseGpu) { continue; }
     if (entry.state != pianoxram::StateOurs || (run.base | run.size) & (kSlab - 1) || count == kMaxRuns) {
       return Parse::rejected;
+    }
+    // The shared parser checks earlier records. Later records also reserve their range, even with a different use tag.
+    for (unsigned j = i + 1; j < parsed.count; ++j) {
+      const auto &other = parsed.runs[j].run;
+      if (other.size && pianoxram::overlaps(run.base, run.base + run.size, other.base, other.base + other.size)) {
+        return Parse::rejected;
+      }
     }
     unsigned pos = count++;
     while (pos && out[pos - 1].base > run.base) {
@@ -92,7 +104,8 @@ static inline bool eligible(unsigned mode, uint64_t bytes) {
 }
 
 static inline uint64_t slabBytes(uint64_t bytes) {
-  return ((bytes - 1) / kSlab + 1) * kSlab;  /* caller bounds bytes to the tier's capacity */
+  if (bytes > UINT64_MAX - (kSlab - 1)) { return 0; }
+  return (bytes + (kSlab - 1)) & ~(kSlab - 1);
 }
 
 /* Tier spans as the BO's piece list (NativeAdrenoPhysicalSpan {offset, physical, bytes}: the scattered-BO form poolTakeMany
@@ -110,7 +123,7 @@ class Tier {
   /* A run opens only after both of its actual endpoint pages pass. */
   void init(const Run *runs, unsigned n, uint64_t limit, ProbeFn probe, void *ctx, LineFn line) {
     *this = Tier();
-    if (!probe || n > kMaxRuns) { return; }
+    if (!runs || !probe || n > kMaxRuns) { return; }
     for (unsigned i = 0; i < n; i++) {
       const Run r = runs[i];
       if (!r.size || (r.base | r.size) & (kSlab - 1) || r.base < kRegionLo ||
@@ -123,7 +136,11 @@ class Tier {
       runs_[i] = r;
       first_[i] = slabs_;
       slabs_ += unsigned(r.size / kSlab);
-      nRuns_ = i + 1;
+    }
+    nRuns_ = n;
+    // Validate the whole layout before S8 touches any physical page.
+    for (unsigned i = 0; i < nRuns_; ++i) {
+      const Run r = runs_[i];
       if (r.base < limit && r.size <= limit - r.base) {
         const bool first = probe(r.base, i, ctx);
         const bool last = probe(r.base + r.size - kPage, i, ctx);

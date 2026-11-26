@@ -5,7 +5,7 @@
  *  3. The slab allocator: whole 2 MiB slabs, lowest first, spans inside one run, all-or-nothing refusals
  *     (span limit, size and address width), release refuses foreign / partial / double frees, exhaustion and refill over 2000 rounds.
  *  4. The per-run self-test: a run whose probe fails is kept out (its line says FAIL) and never handed out.
- * Build: clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined test_a830gputier.cpp -o /tmp/test_a830gputier && /tmp/test_a830gputier
+ * Build: clang++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all test_a830gputier.cpp -o /tmp/test_a830gputier && /tmp/test_a830gputier
  * host-test: */
 #include "../A830GpuTier.h"
 #include <cstdio>
@@ -43,7 +43,71 @@ static bool probe(uint64_t pa, unsigned run, void *c) {
   return true;
 }
 static void line(const char *l, void *c) { ((Ctx *)c)->lines.push_back(l); }
-static const uint64_t MiB = 1ull << 20;
+static constexpr uint64_t MiB = 1ull << 20;
+
+static void testFragmentation(const Run (&runs)[3], uint64_t limit) {
+  Ctx ctx;
+  Tier tier;
+  tier.init(runs, 3, limit, probe, &ctx, nullptr);
+  constexpr uint64_t capacity = 870 * MiB;
+  const uint64_t sizes[] = {2 * MiB, 4 * MiB, 8 * MiB, 16 * MiB, 32 * MiB, 64 * MiB, 128 * MiB};
+  Span pieces[3]{};
+  Span prefix{}, held[7]{};
+  CHECK(tier.alloc(504 * MiB, &prefix, 1, limit) == 1);
+  uint64_t next = runs[0].base + prefix.bytes;
+  for (unsigned i = 0; i < 7; ++i) {
+    CHECK(tier.alloc(sizes[i], &held[i], 1, limit) == 1);
+    CHECK(held[i].pa == next && held[i].bytes == sizes[i]);
+    next += sizes[i];
+  }
+  CHECK(next == runs[0].base + runs[0].size);
+  CHECK(tier.alloc(112 * MiB, pieces, 3, limit) == 2);
+  CHECK(pieces[0].pa == runs[1].base && pieces[0].bytes == runs[1].size);
+  CHECK(pieces[1].pa == runs[2].base && pieces[1].bytes == runs[2].size);
+  CHECK(tier.freeBytes() == 0 && tier.alloc(1, pieces + 2, 1, limit) == 0);
+
+  // Leave two separated holes. Failing the span limit must put the first hole back.
+  CHECK(tier.release(held + 4, 1) && tier.release(held + 6, 1));
+  CHECK(tier.freeBytes() == 160 * MiB);
+  Span holes[2]{};
+  CHECK(tier.alloc(160 * MiB, holes, 1, limit) == 0 && tier.freeBytes() == 160 * MiB);
+  CHECK(tier.alloc(160 * MiB, holes, 2, limit) == 2 && tier.freeBytes() == 0);
+  CHECK(holes[0].pa == held[4].pa && holes[0].bytes == held[4].bytes);
+  CHECK(holes[1].pa == held[6].pa && holes[1].bytes == held[6].bytes);
+  CHECK(tier.release(holes, 2) && tier.release(held + 5, 1));
+  Span coalesced{};
+  CHECK(tier.alloc(224 * MiB, &coalesced, 1, limit) == 1);
+  CHECK(coalesced.pa == held[4].pa && coalesced.bytes == 224 * MiB);
+
+  const Span overflow{pieces[0].pa, UINT64_MAX & ~(kSlab - 1)};
+  const Span acrossRuns{pieces[0].pa + pieces[0].bytes - kSlab, 2 * kSlab};
+  const Span overlap[] = {coalesced, {coalesced.pa + kSlab, kSlab}};
+  const Span invalidBatch[] = {pieces[1], acrossRuns};
+  CHECK(!tier.release(&overflow, 1) && !tier.release(overlap, 2));
+  CHECK(!tier.release(invalidBatch, 2) && tier.freeBytes() == 0);
+  CHECK(!tier.release(nullptr, 1) && !tier.release(pieces, 0));
+  CHECK(tier.release(&coalesced, 1) && tier.release(held, 4) && tier.release(&prefix, 1));
+  CHECK(tier.release(pieces, 2) && tier.freeBytes() == capacity);
+
+  // A narrower allocation limit can fail after taking a span from an accessible run.
+  CHECK(tier.alloc(capacity, pieces, 3, runs[1].base) == 0 && tier.freeBytes() == capacity);
+  CHECK(tier.alloc(capacity, pieces, 3, limit) == 3 && tier.freeBytes() == 0);
+  for (unsigned i = 0; i < 3; ++i) {
+    CHECK(pieces[i].pa == runs[i].base && pieces[i].bytes == runs[i].size);
+  }
+  CHECK(tier.release(pieces, 3) && tier.freeBytes() == capacity);
+  CHECK(tier.alloc(0, pieces, 3, limit) == 0 && tier.alloc(kSlab, nullptr, 3, limit) == 0);
+  CHECK(tier.alloc(kSlab, pieces, 0, limit) == 0 && tier.freeBytes() == capacity);
+
+  // Adjacent physical runs still have independent qualification and release boundaries.
+  const Run adjacent[] = {{runs[0].base, kSlab}, {runs[0].base + kSlab, kSlab}};
+  tier.init(adjacent, 2, limit, probe, &ctx, nullptr);
+  CHECK(tier.alloc(2 * kSlab, pieces, 3, limit) == 2);
+  const Span merged{adjacent[0].base, 2 * kSlab};
+  CHECK(!tier.release(&merged, 1) && tier.freeBytes() == 0);
+  CHECK(tier.release(pieces, 2) && tier.freeBytes() == 2 * kSlab);
+}
+
 int main() {
   /* 1 */
   using pianoxram::Region0; using pianoxram::Region1;
@@ -69,8 +133,15 @@ int main() {
   CHECK(load(prop({{0x80000000ull, 2 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
   CHECK(load(prop({{0x8bfe00000ull, 4 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
   CHECK(load(prop({a, {0x880200000ull, 2 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
+  const pianoxram::Run wrongUse{a.base + kSlab, kSlab, Region1, UseVideo};
+  CHECK(load(prop({a, wrongUse})) == Parse::rejected && n == 0);
+  CHECK(load(prop({wrongUse, a})) == Parse::rejected && n == 0);
+  const pianoxram::Run wrapping{UINT64_MAX - kSlab + 1, 2 * kSlab, Region1, UseGpu};
+  CHECK(load(prop({a, wrapping})) == Parse::rejected && n == 0);
+  CHECK(load(prop({wrapping, a})) == Parse::rejected && n == 0);
   const auto mixed = prop({a, modem, pil});
   CHECK(loadRuns(mixed.data(), mixed.size(), 0x880000000ull, MiB, r, n) == Parse::rejected && n == 0);
+  CHECK(loadRuns(mixed.data(), mixed.size(), a.base, UINT64_MAX, r, n) == Parse::rejected && n == 0);
   /* 2 */
   CHECK(!bootArgMode(nullptr)); CHECK(!bootArgMode("")); CHECK(!bootArgMode("piano-dpu=2 piano-gpu-user-vm=1"));
   CHECK(bootArgMode("piano-dpu=2 piano-gpu-tier=1")); CHECK(!bootArgMode("piano-gpu-tier=0"));
@@ -80,10 +151,16 @@ int main() {
   CHECK(bootArgMode("piano-gpu-tier=2 piano-gpu-tier=") == 0);
   CHECK(bootArgMode("piano-gpu-tier=2 piano-gpu-tier=1") == 1);
   CHECK(!eligible(0, kSlab) && !eligible(1, kSlab - kPage) && eligible(1, kSlab) && eligible(2, kPage));
+  CHECK(!eligible(3, UINT64_MAX) && bootArgMode("piano-gpu-tier=2 piano-gpu-tier=-1") == 0);
+  const uint64_t maxSlabBytes = UINT64_MAX & ~(kSlab - 1);
+  CHECK(slabBytes(0) == 0 && slabBytes(1) == kSlab && slabBytes(kSlab + 1) == 2 * kSlab);
+  CHECK(slabBytes(maxSlabBytes) == maxSlabBytes && slabBytes(maxSlabBytes + 1) == 0 && slabBytes(UINT64_MAX) == 0);
   /* 3 */
   std::vector<Run> sm = {{0x880000000ull, 512 * MiB}, {0x8a0400000ull, 256 * MiB}, {0x8b0400000ull, 106 * MiB}};
   Ctx ctx; Tier t;
   const uint64_t limit = UINT64_C(1) << 36;
+  const Run region1[] = {{a.base, a.size}, {b.base, b.size}, {c.base, c.size}};
+  testFragmentation(region1, limit);
   t.init(sm.data(), 3, limit, probe, &ctx, line);
   CHECK(ctx.probed.size() == 6);
   for (unsigned i = 0; i < sm.size(); ++i) {
@@ -134,11 +211,30 @@ int main() {
   CHECK(bad.lines[1] == "gpu tier: run 1 0x8a0400000+256 MiB self-test FAIL" && u.totalBytes() == 618 * MiB);
   Span w[8]; unsigned wn = u.alloc(600 * MiB, w, 8, limit);
   CHECK(wn == 2 && w[0].pa == 0x880000000ull && w[1].pa == 0x8b0400000ull && !u.owns(0x8a0400000ull));
+  CHECK(u.release(w, wn) && u.freeBytes() == u.totalBytes());
+  Ctx failed;
+  for (const auto &run : region1) { failed.badProbe.push_back(run.base); }
+  u.init(region1, 3, limit, probe, &failed, line);
+  CHECK(failed.probed.size() == 6 && failed.lines.size() == 3 && u.runs() == 3);
+  for (unsigned i = 0; i < 3; ++i) {
+    CHECK(!u.runPassed(i) && !u.owns(region1[i].base) && failed.lines[i].find("FAIL") != std::string::npos);
+  }
+  CHECK(u.totalBytes() == 0 && u.freeBytes() == 0 && u.alloc(kSlab, w, 8, limit) == 0);
   Tier e;
   Ctx narrow;
   e.init(sm.data(), 3, UINT64_C(1) << 32, probe, &narrow, nullptr);
   CHECK(e.runs() == 3 && !e.runPassed(0) && !e.runPassed(2) && narrow.probed.empty());
   CHECK(e.alloc(kSlab, w, 8, limit) == 0);
+  const Run overlapping[] = {{a.base, 2 * kSlab}, {a.base + kSlab, kSlab}};
+  Ctx invalid;
+  e.init(overlapping, 2, limit, probe, &invalid, line);
+  CHECK(!e.runs() && !e.totalBytes() && invalid.probed.empty() && invalid.lines.empty());
+  e.init(nullptr, 1, limit, probe, &invalid, line);
+  CHECK(!e.runs() && invalid.probed.empty());
+  e.init(region1, kMaxRuns + 1, limit, probe, &invalid, line);
+  CHECK(!e.runs() && invalid.probed.empty());
+  e.init(region1, 3, limit, nullptr, &invalid, line);
+  CHECK(!e.runs() && invalid.lines.empty());
   if (fails) { std::fprintf(stderr, "%d of %d checks failed\n", fails, checks); return 1; }
   std::printf("PASS: gpu tier: %d checks for ADT parsing, modes 0/1/2, exact probe endpoints, failed runs, address widths, "
               "all-or-nothing slabs and 2000 churn rounds\n", checks);
