@@ -171,11 +171,10 @@ class Graders(unittest.TestCase):
     def test_gpu_heartbeat_requires_unique_samples_and_covers_boundaries(self):
         gpu = load('check-gpu-qualification')
         records = [{'at-us': i * 1_000_000} for i in range(600)]
-        self.assertTrue(gpu.heartbeat(records, 0, 600_000_000))
-        self.assertFalse(gpu.heartbeat([records[0]] * 600, 0, 600_000_000))
-        self.assertFalse(gpu.heartbeat(records[3:], 0, 600_000_000))
-        self.assertFalse(gpu.heartbeat(records[:-3], 0, 600_000_000))
-        self.assertFalse(gpu.heartbeat(records[:100] + records[103:], 0, 600_000_000))
+        self.assertEqual(len(gpu.heartbeat(records, 0, 600_000_000, 'test')), 600)
+        for bad in ([records[0]] * 600, records[3:], records[:-3], records[:100] + records[103:]):
+            with self.assertRaises(ValueError):
+                gpu.heartbeat(bad, 0, 600_000_000, 'test')
 
     def test_mic_windows_require_all_phases_and_finite_times(self):
         with tempfile.TemporaryDirectory() as tmp:
