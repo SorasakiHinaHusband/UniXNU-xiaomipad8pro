@@ -112,8 +112,8 @@ expose that API, the result is an unqualified context, requiring a trusted local
 `configs/userland.toml` (format 1; its header documents every key):
 
 - `staging = "/private/var/piano/userland"`: where the files are carried on Data.
-- `[[unit]]` has `name`, `about`, `default_on`, and optionally `status = "planned"`. A unit has at most one launchd job. A unit
-  without a job is a command-line tool and is always installed.
+- `[[unit]]` has `name`, `about`, `default_on`, and optionally `status = "planned"`. A planned unit may omit its files.
+  A unit has at most one launchd job. A ready unit without a job is a command-line tool and is always installed.
 - `[[unit.file]]` has `dest`, `owner` (default `root:wheel`), `mode`, and `build`:
   - `copy`
   - `cc`: `xcrun clang -arch arm64|arm64e -mmacosx-version-min=14.0 -O2 -Wall -Wextra -Werror`, with `cflags` and `frameworks`. The
@@ -526,7 +526,7 @@ Then the owner's system: section 7.5, with the owner present.
    The installer runs early in the boot job, which in the native boots starts well before WindowServer, so this is a corner case.
 8. **The live path has no host step for the user pipe yet** (7.6). Its first use on the owner's system needs the owner's password
    (7.5).
-9. **The planned `piano-wifi`**: its entry is ready, its source is not. `stage.py` skips it until `status = "planned"` is removed.
+9. **The planned `piano-wifi`** can be staged once its source and file entry are added and `status = "planned"` is removed.
 
 ## 11. Files
 

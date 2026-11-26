@@ -6,8 +6,8 @@
 #
 # [[unit]]       one piece: name, about, default_on (its launchd job runs in the installed profile: loaded at install; false: the
 #                job file is installed with Disabled and the owner turns it on with launchctl enable), status = "planned" (listed,
-#                not built or staged). A unit has at most one launchd job; a unit without one is a command-line tool and is always
-#                installed (default_on must be true).
+#                may omit files and is skipped by the stager). A unit has at most one launchd job. A ready unit without one
+#                is a command-line tool and is always installed (default_on must be true).
 # [[unit.file]]  one installed file:
 #   dest         its path on the tablet: /Library/LaunchDaemons/<Label>.plist, /Library/LaunchAgents/<Label>.plist (a launchd job,
 #                root:wheel 0644: launchd refuses any other), /usr/local/bin/<name> (commands), /usr/local/libexec/<name> (helpers),
@@ -493,14 +493,6 @@ name = "piano-wifi"
 about = "the Wi-Fi command-line tool of docs/drivers/wifi.md section 13.1 (scan, join, status over PianoWifi's control socket); not written yet"
 status = "planned"
 default_on = true
-
-[[unit.file]]
-source = "tooling/native/piano-wifi/piano-wifi.c"
-build = "cc"
-arch = "arm64"
-frameworks = ["CoreFoundation"]
-dest = "/usr/local/bin/piano-wifi"
-mode = "0755"
 
 [[unit]]
 name = "piano-charge-config"

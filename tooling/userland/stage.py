@@ -185,7 +185,7 @@ def load_manifest(path, on=(), off=()):
                 'planned': u.get('status') == 'planned', 'files': []}
         for f in u.get('file', []):
             unit['files'].append(check_file(f, unit, problems))
-        if not unit['files']:
+        if not unit['files'] and not unit['planned']:
             problems.append(f'{where}: no files')
         jobs = [f for f in unit['files'] if f['kind'] != 'file']
         if len(jobs) > 1:
