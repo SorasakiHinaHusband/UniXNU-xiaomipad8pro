@@ -38,6 +38,8 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -50,6 +52,7 @@
 #include "../PianoDpu/DpuModes.h"
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 #include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
+#include "GopFence.h"
 #include "GopPanelPower.h"
 #include "../PianoBacklight/PianoBacklightClient.h"
 #include "../PianoTouch/PianoTouchClient.h"
@@ -488,8 +491,8 @@ private:
     Rect fGlyphLogged;
     // The GPU's fence rule (PianoA830, docs/drivers/gpu.md): WindowServer swaps a frame when its command buffer is scheduled, not when
     // the GPU finished it, and the family's IOSurface fences do not see the A830's work. So a swap records the newest fence the GPU
-    // had handed out when it was programmed, and its copy first waits until the GPU retired that fence (at most fGpuFenceWaitMs, then
-    // it copies anyway). PianoA830's registered service is found by class and asked with callPlatformFunction("native-adreno-fences"),
+    // had handed out when it was programmed, and its worker first waits until the GPU retired that fence.
+    // PianoA830's registered service is found by class and asked with callPlatformFunction("native-adreno-fences"),
     // so neither kext links against the other; without it, or with boot-arg native-gop-display-gpu-fence=0, nothing waits.
     // Since 2026-11-12 a frame the GPU has not finished is never copied (50 ms before, then copied anyway: the login's white bands):
     // native-gop-display-gpu-fence-ms (default 1000, 10..10000) is only the hang guard; a job whose wait hits it is left undrawn (the
@@ -500,6 +503,11 @@ private:
     const OSSymbol *fGpuFenceSymbol;
     uint64_t fGpuLookupNext;          // mach time of the next lookup while none was found
     uint64_t fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuTimeouts;
+    uint32_t fGpuFencePollMode = gopfence::Unavailable;  // atomic, sampled once per wait
+    struct sysctl_oid fGpuFencePollOid = {};
+    struct FencePollTiming {
+        uint64_t waits = 0, sleeps = 0, sleepNs = 0, lateSleeps = 0;
+    } fFencePollTiming[2];  // legacy and deadline statistics, under fCopyLock
     // The display power for other drivers (docs/policy.md 5.6): every power change call publishes "piano-display-power" (boolean),
     // and a change of it is messaged to the interested clients (kIOMessageServicePropertyChange, the property's name), always.
     // The backlight callout (boot-arg piano-backlight=2 only; without it nothing more runs): each call is then also handed to
@@ -676,6 +684,19 @@ static void registerFlipLosslessSysctl()
     o.oid_version = SYSCTL_OID_VERSION;
     o.oid_refcnt = 0;
     sysctl_register_oid(&o);
+}
+
+static int gpuFenceDeadlineSysctl(struct sysctl_oid *oid, void *arg, int, struct sysctl_req *req)
+{
+    auto *mode = static_cast<uint32_t *>(arg);
+    int value = __atomic_load_n(mode, __ATOMIC_ACQUIRE) == gopfence::Deadline;
+    const int err = sysctl_handle_int(oid, &value, 0, req);
+    if (err || !req->newptr)
+        return err;
+    if (value != 0 && value != 1)
+        return EINVAL;
+    __atomic_store_n(mode, value == 1 ? gopfence::Deadline : gopfence::Legacy, __ATOMIC_RELEASE);
+    return 0;
 }
 
 static IOPMPowerState gPowerStates[2] = {   // AppleParavirtDisplay's gPowerState
@@ -1098,6 +1119,21 @@ bool NativeGopDisplay::start(IOService *provider)
     }
     if (fShotEnabled)
         registerShot();
+    if (gopfence::deadlineControlAvailable(fDpuModeHz, fRefreshHz, fFlipMode, fGpuFences && fGpuFenceSymbol)) {
+        auto &oid = fGpuFencePollOid;
+        oid.oid_parent = &sysctl__machdep_children;
+        oid.oid_number = OID_AUTO;
+        oid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+        oid.oid_arg1 = &fGpuFencePollMode;
+        oid.oid_name = "native_gop_fence_deadline";
+        oid.oid_handler = gpuFenceDeadlineSysctl;
+        oid.oid_fmt = "I";
+        oid.oid_descr = "NativeGopDisplay 120 Hz fence poll sleep (0 legacy, 1 system-critical)";
+        oid.oid_version = SYSCTL_OID_VERSION;
+        __atomic_store_n(&fGpuFencePollMode, gopfence::Legacy, __ATOMIC_RELEASE);
+        sysctl_register_oid(&oid);
+        GOPLOG("120 Hz GPU fence poll: machdep.native_gop_fence_deadline=0 (root writes 0/1)\n");
+    }
     GOPLOG("started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
           display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshPolicy ? "with refresh" : "no refresh",
           fThumbPeriod ? "every " : "off: ", fThumbPeriod, fThumbLimit);
@@ -1107,6 +1143,10 @@ bool NativeGopDisplay::start(IOService *provider)
 void NativeGopDisplay::stop(IOService *provider)
 {
     GOPLOG("stop\n");
+    if (__atomic_load_n(&fGpuFencePollMode, __ATOMIC_ACQUIRE) != gopfence::Unavailable) {
+        sysctl_unregister_oid(&fGpuFencePollOid);
+        __atomic_store_n(&fGpuFencePollMode, gopfence::Unavailable, __ATOMIC_RELEASE);
+    }
     if (fShotRegistered) {
         sysctl_unregister_oid(&fShotOid);   // drains active handlers before the boot mapping is released
         fShotRegistered = false;
@@ -1429,6 +1469,21 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         if (fGpuWaits)
             GOPLOG("%llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
                   fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, fGpuFenceWaitMs);
+        if (__atomic_load_n(&fGpuFencePollMode, __ATOMIC_ACQUIRE) != gopfence::Unavailable) {
+            FencePollTiming samples[2];
+            IOLockLock(fCopyLock);
+            for (unsigned arm = 0; arm < 2; ++arm) {
+                samples[arm] = fFencePollTiming[arm];
+                fFencePollTiming[arm] = {};
+            }
+            IOLockUnlock(fCopyLock);
+            for (unsigned arm = 0; arm < 2; ++arm) {
+                const auto &s = samples[arm];
+                if (s.waits)
+                    GOPLOG("GPU fence poll %s: %llu waits, %llu sleeps, %llu us total sleep, %llu sleeps over 2 ms\n",
+                           arm ? "deadline" : "legacy", s.waits, s.sleeps, s.sleepNs / 1000, s.lateSleeps);
+            }
+        }
         if (fCopyMode) {   // what the copy mode saved: refresh copies not made (at this period's mean copy time), the reads' cost
             const uint64_t mean = fCopies ? fCopyNs / fCopies : 0;
             GOPLOG("copy mode %#x: %llu refresh copies skipped (about %llu ms of copying saved, mean copy %llu us); "
@@ -2224,30 +2279,54 @@ bool NativeGopDisplay::waitGpuFence(uint32_t fence, bool *answered)
     if (!gpu)
         return false;
     const uint64_t start = mach_absolute_time();
-    uint64_t waited = 0;
-    bool retiredInTime = false;
-    for (;;) {
-        uint32_t submitted = 0, retired = 0;
-        if (gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, &retired, nullptr, nullptr) != kIOReturnSuccess)
-            break;
-        *answered = true;
-        if (static_cast<int32_t>(retired - fence) >= 0) {
-            retiredInTime = true;
-            break;
+    const uint32_t mode = __atomic_load_n(&fGpuFencePollMode, __ATOMIC_ACQUIRE);
+    const bool deadline = mode == gopfence::Deadline;
+    FencePollTiming sample;
+    const auto elapsed = [start] {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+        return ns;
+    };
+    const auto readFence = [&](uint32_t *retired) {
+        uint32_t submitted = 0;
+        return gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, retired, nullptr, nullptr) == kIOReturnSuccess;
+    };
+    const auto sleepPoll = [&](uint32_t delayNs) {
+        const uint64_t before = mode == gopfence::Unavailable ? 0 : elapsed();
+        if (deadline) {
+            // The interval uses a 1 ns scale. Only the display worker waits on this channel.
+            if (assert_wait_timeout_with_leeway(reinterpret_cast<event_t>(&fGpuFencePollMode), THREAD_UNINT,
+                    TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, delayNs, 0, 1) == THREAD_WAITING)
+                thread_block(THREAD_CONTINUE_NULL);
+        } else {
+            IOSleep(1);
         }
-        absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
-        if (waited >= fGpuFenceWaitMs * 1000000ull) {
-            fGpuTimeouts++;
-            break;
+        if (mode != gopfence::Unavailable) {
+            const uint64_t slept = elapsed() - before;
+            sample.sleeps++;
+            sample.sleepNs += slept;
+            sample.lateSleeps += slept > 2 * gopfence::kPollNs;
         }
-        IOSleep(1);
+    };
+    const auto result = gopfence::wait(fence, fGpuFenceWaitMs * 1000000ull, deadline, readFence, elapsed, sleepPoll);
+    const uint64_t waited = elapsed();
+    if (mode != gopfence::Unavailable) {
+        IOLockLock(fCopyLock);
+        auto &sum = fFencePollTiming[deadline ? 1 : 0];
+        sum.waits++;
+        sum.sleeps += sample.sleeps;
+        sum.sleepNs += sample.sleepNs;
+        sum.lateSleeps += sample.lateSleeps;
+        IOLockUnlock(fCopyLock);
     }
-    absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
+    *answered = result.answered;
+    if (result.timedOut)
+        fGpuTimeouts++;
     fGpuWaits++;
     fGpuWaitNs += waited;
     if (waited > fGpuWaitMaxNs)
         fGpuWaitMaxNs = waited;
-    return retiredInTime;
+    return result.retired;
 }
 
 // The copy thread, without waiting: whether the GPU retired fence (true when it does not answer).
