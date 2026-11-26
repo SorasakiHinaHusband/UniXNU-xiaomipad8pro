@@ -94,7 +94,9 @@ contract, not a tool fault. Vulkan defines a raw copy between size-compatible fo
 exact. Host smokes use `--paths swap,ubwc`.
 
 For the GPU-only RAM profile, opt into kernel patch 0077 with `PIANO_K27_GPU_TIER_WC=1` during 27.3 kernel preparation.
-Select that kernel and boot with `piano-gpu-tier=1 piano-extra-ram=0 piano-video-extra-ram=0`. The daily profile keeps all three switches at 0. [Kernel patch](../../patches/k27/README.md)
+Use the resulting clone as `K273_TREE` and the printed kernel as `K273_KERNEL` for the RAM image build. Stage the
+image with `PIANO_EXTRA_RAM=1` to publish the reservation property. Boot with
+`piano-gpu-tier=1 piano-extra-ram=0 piano-video-extra-ram=0`. The daily profile keeps all three boot switches at 0. [Kernel patch](../../patches/k27/README.md)
 
 Spec fragment (runner helper `rsudo`, `$RESULTS` on the host; the binary staged at
 `/usr/local/libexec/piano-tier-workload`; run after the desktop-login gate, as the console user inside the GUI session like
