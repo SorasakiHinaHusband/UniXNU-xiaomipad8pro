@@ -172,6 +172,23 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-usbnet-address.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-data-concurrent"
+about = "the direct Data store switched to concurrent admission once per boot, after the mount and the store's state 2 (data-store-concurrent=2 keeps the mount serial: the path qualified by dab-r2/dab-w1 and the power cut; docs/data-store.md \"Concurrent mode at boot\"); nothing without machdep.piano_data_concurrent, on volatile Data or another store state; never switches back; disabled by removing PIANO_DATA_CONCURRENT_AT_BOOT from its plist"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-data-concurrent/piano-data-concurrent.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-data-concurrent"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-data-concurrent/com.unixnu.piano-data-concurrent.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-data-concurrent.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-policy-agent"
 about = "PianoPolicy's agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display sleep on a cover closed without sleep, the power state of background services (section 4.1); event driven"
 default_on = true

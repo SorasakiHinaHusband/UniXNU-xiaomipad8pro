@@ -56,6 +56,27 @@ changes. Since 2026-11-25 it also ends with the store window's device commands s
 store_wr=... store_sync=... store_max=USus`, not reset with the mode). The single-gate wait counter excludes lock contention. Open, seed/window binding, read-only probes, the
 volatile fallback and flatten use the same paths and on-disk bytes in either mode.
 
+### Concurrent mode at boot (`piano-data-concurrent`, 2026-11-26)
+
+The daily line keeps `data-store-concurrent=2`: the stages are armed and Data mounts in the single-gate mode. Then the
+`piano-data-concurrent` daemon (`tooling/native/piano-data-concurrent`) switches the store to concurrent admission once. This is the
+order the tablet qualified: the dab-r2/dab-w1 A/B (QD8 read 4.9x, mixed reader p99 2528 to 269 us) and the direct power cut
+(m5dur-m4cc-cut4/verify4: every acknowledged record intact). `data-store-concurrent=1` (concurrent before the mount) was not run on the tablet.
+
+The daemon switches only when all of these hold:
+- `PIANO_DATA_CONCURRENT_AT_BOOT=1` is in its plist;
+- `machdep.piano_data_concurrent` exists and reads 0;
+- the Data volume is mounted;
+- the kernel log names `Data store state 2` (resumed);
+- `machdep.piano_data_io` reports `mode=single-gate`, the direct store.
+
+It waits up to 180 s for the mount and the state line. In every other case it switches nothing, and it never writes 0. Its one
+console line, and the same text in `/private/var/run/piano-data-concurrent.status`, says what it did.
+
+Rollback:
+- on a running boot: `sudo sysctl -w machdep.piano_data_concurrent=0`;
+- for good: remove the key or the plist.
+
 ## 2. Store format (`PersistOverlay.h`)
 
 All integers little endian. Block 0:
