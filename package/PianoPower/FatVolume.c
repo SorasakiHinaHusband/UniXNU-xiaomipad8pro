@@ -122,7 +122,7 @@ static void long_part(LongName *l, const uint8_t *d)
         l->valid = seq >= 1 && seq <= LFN_ENTRIES;
         l->count = (uint8_t)seq;
         l->sum = d[13];
-    } else if (!l->valid || seq != l->next - 1u || d[13] != l->sum) {
+    } else if (!l->valid || seq == 0 || seq != l->next - 1u || d[13] != l->sum) {
         l->valid = 0;
     }
     if (!l->valid) return;
