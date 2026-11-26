@@ -195,13 +195,17 @@ inline void formatFaults(const Faults &f, char *out, unsigned size)
   out[size - 1] = 0;
 }
 
-// The hard limit is Ubuntu's 100 mA total (2 x 50 mA, ITARGET 9 in torch mode).
-constexpr unsigned kHardMaxMa = kUbuntuTorchMaxMa;
+constexpr unsigned kDefaultLevel = 0;
+constexpr unsigned kDefaultMaxMa = kUbuntuTorchMaxMa;
+constexpr unsigned kHardMaxMa = kFactoryTorchMaxMa;   // 2 x 200 mA, ITARGET and TORCH_CLAMP 39
+constexpr unsigned kLadderLevelsMa[] = {100, 200, 300, 400};
+constexpr unsigned kLadderWindowSeconds = 10, kLadderWindowMs = kLadderWindowSeconds * 1000;
 constexpr uint8_t kProbeFlashItarget = 1, kProbeFlashTicks = 8;
 constexpr unsigned kProbeFlashMs = kProbeFlashTicks * kTimerStepMs;
 constexpr unsigned kProbeFlashMa = (kProbeFlashItarget + 1) * kPianoChannels * kFlashStepUa / 1000;
 constexpr unsigned kProbeMaxSeconds = 60, kProbePollMs = 500, kPulsePollMs = 20;
-static_assert(kProbeFlashMa == 50 && kProbeFlashMa <= kHardMaxMa, "bounded T4 pulse");
+static_assert(kProbeFlashMa == 50 && kProbeFlashMa <= kHardMaxMa && kProbeFlashTicks == 8 && kProbeFlashMs == 80,
+              "bounded T4 pulse");
 inline unsigned clampMa(unsigned ma, unsigned maxMa)
 {
   if (maxMa > kHardMaxMa) maxMa = kHardMaxMa;
@@ -278,7 +282,7 @@ class Controller {
     StepResult r;
     if (!allowChannels(r, mask)) return r;
     if (!channelsAvailable(r, mask)) return r;
-    const uint8_t maxItarget = maxItargetForMask(mask, kTorchStepUa);
+    const uint8_t maxItarget = maxItargetForMask(mask, kTorchStepUa, kHardMaxMa);
     if (clamp > maxItarget) clamp = maxItarget;
     if (itarget > clamp) itarget = clamp;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
@@ -302,14 +306,14 @@ class Controller {
   StepResult flashPulse(uint8_t itarget, uint8_t timerTicks, uint8_t mask = kPianoChannelMask)
   {
     StepResult r;
-    if (!timerTicks || timerTicks > kTimerValueMask) {
+    if (!timerTicks || timerTicks > kProbeFlashTicks) {
       ++r.refused;
       fail(r, kRegTimer0, timerTicks, 0, "the FLASH pulse arguments are outside the bounded diagnostic range");
       return r;
     }
     if (!allowChannels(r, mask)) return r;
     if (!channelsAvailable(r, mask)) return r;
-    const uint8_t maxItarget = maxItargetForMask(mask, kFlashStepUa);
+    const uint8_t maxItarget = maxItargetForMask(mask, kFlashStepUa, kProbeFlashMa);
     if (itarget > maxItarget) itarget = maxItarget;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
@@ -387,13 +391,13 @@ class Controller {
     return true;
   }
 
-  static uint8_t maxItargetForMask(uint8_t mask, unsigned stepUa)
+  static uint8_t maxItargetForMask(uint8_t mask, unsigned stepUa, unsigned maxMa)
   {
     unsigned channels = 0;
     for (unsigned ch = 0; ch < kChannels4ch; ++ch) channels += (mask >> ch) & 1u;
     // Keep the pair's per-channel ceiling even when a single channel is selected.
     if (channels < kPianoChannels) channels = kPianoChannels;
-    return uint8_t(kHardMaxMa * 1000 / (channels * stepUa) - 1);
+    return uint8_t(maxMa * 1000 / (channels * stepUa) - 1);
   }
 
   void remember(uint8_t reg, uint8_t value)
@@ -421,7 +425,7 @@ class Controller {
 // ----------------------------------------------------------------------------------------------------------- the guard
 enum class Reason : uint8_t {
   none, user, timeout, test, bootFoundOn, pmicThermal, pmicCurrent, pmicVoltage, shortCircuit, channelOpen, socHot, batteryHot,
-  statusUnreadable, lostState, writeFailed, pmicFault, sleep, shutdown
+  statusUnreadable, lostState, writeFailed, pmicFault, sleep, shutdown, pmicTimer
 };
 inline const char *reasonName(Reason r)
 {
@@ -438,12 +442,13 @@ inline const char *reasonName(Reason r)
     case Reason::channelOpen: return "a channel's open-circuit bit (the LED, its supply, or the wiring is absent: register-perfect but no light)";
     case Reason::socHot: return "the SoC temperature (PianoThermal)";
     case Reason::batteryHot: return "the battery temperature (PianoPower)";
-    case Reason::statusUnreadable: return "the status could not be read twice in a row";
-    case Reason::lostState: return "the enables no longer read on";
+    case Reason::statusUnreadable: return "the status could not be read";
+    case Reason::lostState: return "the module or channel enables differ from the requested state";
     case Reason::writeFailed: return "a write or its read-back failed";
     case Reason::pmicFault: return "the PMIC real-time fault bit (open, short, or regulator not ready)";
     case Reason::sleep: return "system sleep";
     case Reason::shutdown: return "shutdown or restart";
+    case Reason::pmicTimer: return "the PMIC safety timer expired during the ladder";
   }
   return "?";
 }
@@ -501,10 +506,28 @@ inline Reason judge(const Controller::Live &l, unsigned &unreadable, const Tempe
   return Reason::none;
 }
 
+inline Reason ladderDarkFault(const Controller::Live &l, const Temperatures &t, const GuardConfig &c)
+{
+  const Reason hot = refuseOn(t, c);
+  if (hot != Reason::none) return hot;
+  if (l.statusOk) {
+    const Reason supply = supplyFault(l.status2);
+    if (supply != Reason::none) return supply;
+    const Faults f = decodeFaults(l.status1, l.status2, l.status3, kPianoChannelMask);
+    if (f.shortCircuit) return Reason::shortCircuit;
+    if (f.open) return Reason::channelOpen;
+    if (f.timeout) return Reason::pmicTimer;
+  }
+  if (l.rtOk && (l.rt & kRtFault)) return Reason::pmicFault;
+  if ((l.moduleOk && (l.moduleEn & kModuleEnBit)) || (l.channelsOk && (l.chanEn & 0x0f))) return Reason::lostState;
+  return l.ok ? Reason::none : Reason::statusUnreadable;
+}
+
 inline bool coolsDown(Reason r)
 {
   return r == Reason::pmicThermal || r == Reason::pmicCurrent || r == Reason::pmicVoltage || r == Reason::shortCircuit ||
-         r == Reason::channelOpen || r == Reason::pmicFault || r == Reason::socHot || r == Reason::batteryHot || r == Reason::writeFailed;
+         r == Reason::channelOpen || r == Reason::pmicFault || r == Reason::pmicTimer ||
+         r == Reason::socHot || r == Reason::batteryHot || r == Reason::writeFailed;
 }
 
 // ------------------------------------------------------------------------------------------------- the torch's state
@@ -518,7 +541,7 @@ class Torch {
     ctl_.setBus(bus, allowSpare);
     allowSpare_ = allowSpare;
     cfg_ = c;
-    maxMa_ = clampMa(maxMa, maxMa);
+    maxMa_ = clampMa(maxMa, kHardMaxMa);
   }
 
   struct Outcome {
@@ -631,8 +654,8 @@ class Torch {
   }
 
  public:
-  // While lit, about once a second: the time limit, then the guard. Returns the reason it went off (Reason::none: still lit).
-  Outcome poll(uint64_t nowMs, const Temperatures &t)
+  // Check the time limit and guards. The ladder additionally stops on the first unreadable sample or a timer fault.
+  Outcome poll(uint64_t nowMs, const Temperatures &t, bool ladder = false)
   {
     Outcome o;
     if (powerBlock_ != Reason::none || !mask_) return o;
@@ -655,7 +678,11 @@ class Torch {
     }
     o.live = ctl_.live();
     o.sampled = true;
-    const Reason bad = judge(o.live, unreadable_, t, cfg_, mask_);
+    Reason bad = judge(o.live, unreadable_, t, cfg_, mask_);
+    if (bad == Reason::none && ladder) {
+      if (!o.live.ok) bad = Reason::statusUnreadable;
+      else if (decodeFaults(o.live.status1, o.live.status2, o.live.status3, mask_).timeout) bad = Reason::pmicTimer;
+    }
     if (bad != Reason::none) {
       o.steps = turnOff(nowMs, bad).steps;
       o.reason = bad;
@@ -737,7 +764,7 @@ class Torch {
 
   Controller ctl_;
   GuardConfig cfg_;
-  unsigned maxMa_ = kTorchMinMa;
+  unsigned maxMa_ = kDefaultMaxMa;
   bool lit_ = false, testMode_ = false, flash_ = false, allowSpare_ = false;
   unsigned ma_ = 0, unreadable_ = 0;
   uint8_t itarget_ = 0, mask_ = 0, lastMask_ = 0;

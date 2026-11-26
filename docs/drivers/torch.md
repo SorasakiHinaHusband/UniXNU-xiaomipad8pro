@@ -2,17 +2,21 @@
 
 ## Status (2026-11-27)
 
-- **T4 fault/status probe host-tested.** PianoTorch enforces a hard cap of **100 mA total** (two 50 mA channels).
-  Level 2 with a boot test selects T4 only with the exact `piano-torch-probe=1` switch. The factory pair, spare pair and timed
-  FLASH pulse share the power-state, temperature and PMIC guards. [Driver](../../package/PianoTorch/PianoTorch.cpp)
-- **Attended RAM boot pending.** Both November 15 T2 RAM runs read back all 12 register writes and the rear LED stayed dark.
-  An owner at the LED is needed to correlate visible light with the T4 register evidence.
+- **Owner decision `OWNER-0717`.** The cap can be set up to **400 mA total** (2 x 200 mA, ITARGET 39, TORCH_CLAMP 39).
+  The cap defaults to **100 mA total** when `piano-torch-max-ma` is omitted. PianoTorch defaults to off (`piano-torch=0`).
+  The T4 fault/status probe and opt-in `piano-torch-ladder=1` are host-verified. The ladder runs 100/200/300/400 mA total
+  within the configured cap, with 10 s lit and 10 s dark per step. Both diagnostics retain the temperature and PMIC guards,
+  write allowlist, activation and explicit OFF read-backs, and synchronous OFF on sleep or shutdown. T4's optional FLASH
+  pulse stays at 50 mA total for 80 ms. [Driver](../../package/PianoTorch/PianoTorch.cpp)
+- **Attended lit RAM boot pending.** Both November 15 T2 RAM runs read back all 12 register writes and the rear LED stayed dark.
+  The lit test waits until the owner is beside the tablet to watch the LED and match visible light to the register evidence.
   [Hardware backlog, B12](../BACKLOG-hardware.md#2-backlog-b1b15)
 
 ## Attended T4 RAM qualification checklist
 
-1. Build the RAM image with a 30 s observer setup delay, 15 s per torch pair, a 100 mA total ceiling, and a 300 s return timer.
-   Enable both temperature sources. Use the RAM A bundled image with volatile Data.
+1. Build the RAM A bundled image with volatile Data, a 30 s observer setup delay and a 300 s return timer.
+   Keep PianoThermal and PianoPower enabled. The T4 fault/status command below uses 15 s per torch pair and a 100 mA total
+   cap for the initial mapping check.
 
    ```sh
    PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_DATA_PERSIST=0 PIANO_RESET_AFTER=300 \
@@ -22,9 +26,18 @@
      tooling/k27/build-native-image.sh
    ```
 
+   For the owner-approved attended ladder, build with all four current steps enabled.
+
+   ```sh
+   PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_DATA_PERSIST=0 PIANO_RESET_AFTER=300 \
+     PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-thermal=1 piano-power=1 piano-power-ps=1 \
+     piano-torch=2 piano-torch-max-ma=400 piano-torch-ladder=1 piano-torch-delay=30" \
+     tooling/k27/build-native-image.sh
+   ```
+
 2. Put the owner where they can see the rear LED and its reflection on a matte surface in a dim room. Start port 0 capture in
    one terminal and boot once from ABL in a second terminal. Use the locally configured tablet selector. Keep the capture
-   and its timestamps through `probe: T4 finished` and the scheduled return to ABL.
+   and its timestamps through the diagnostic and the scheduled return to ABL.
 
    ```sh
    python3 tooling/native/usb-console.py --capture 600
@@ -34,8 +47,8 @@
    fastboot -s "$PIANO_SERIAL" boot out/ram/boot-piano-macos-ram-A-bundled.img
    ```
 
-3. Use the `probe … next window` lines as the cue to watch. Tell the owner which window is coming and record the answer
-   against that window, with an approximate timestamp.
+3. For T4, use the `probe … next window` lines as the cue to watch. For the ladder, use the `ladder step` lines and record
+   the LED's visible state for each 10 s lit and 10 s dark window. Record the owner's observations with approximate timestamps.
 
    | Window | Ask the owner |
    |---|---|
@@ -46,7 +59,12 @@
 
    After the scheduled return, confirm ABL answers with `fastboot -s "$PIANO_SERIAL" getvar product`.
 
-4. Save the `PianoTorch:` lines with the owner's observations. Verify the start line has `max=100`, `probe=1 spare=1 flash=1`
+4. Save the `PianoTorch:` lines with the owner's observations. For the ladder, verify `max=400` and `ladder=1`, TORCH_CLAMP 39,
+   ITARGET 9/19/29/39, 12/12 activation read-backs and 4/4 explicit OFF read-backs for each completed step. Check the 500 ms
+   PMIC status and flash/SoC/battery temperature samples in both phases. A fault, unreadable status, SoC at or above 85 °C,
+   battery at or above 45 °C, sleep or shutdown ends the ladder with explicit OFF.
+
+   For the T4 mapping run, verify the start line has `max=100`, `probe=1 spare=1 flash=1`
    and `test=15 s`, and the survey shows PPID `0x1ee`, owner EE 0, TYPE `0x18`, and SUBTYPE `0x07`. Keep both 256-byte
    dumps (`probe dump before all windows`, `probe dump after all windows`, each 16 rows of 16 bytes). Keep the active and
    post-window register diffs, read-back counts, and any `--` unreadable fields, skipped windows, trips or OFF failures.
@@ -70,8 +88,8 @@
 5. Match the visible result to the register evidence. Light only on B warrants a wiring check. A channel open or short, VPH
    or BOB fault, or a real-time fault without a channel fault identifies where to investigate. The real-time fault bit alone
    cannot distinguish an open, short or regulator-not-ready condition. If both pairs stay dark with clean activation and OFF
-   read-back, the run establishes the result at the qualified current and ambient light. **Any increase above 100 mA total
-   requires explicit owner approval.**
+   read-back, the run establishes the result at the qualified current and ambient light. The owner-approved hard cap is
+   400 mA total for both T4 torch windows and the ladder.
 
 The Linux flash driver and piano device tree agree on PM8550 channels 1+2, software strobe for torch, the four-channel
 register layout and a 100 mA total torch ceiling. The rear camera references the same LED. The LED node defines no separate
@@ -142,10 +160,11 @@ no channel outside the driver's set on (else "someone else drives this module").
   allowlisted **for the probe only** (`piano-torch-probe`, the one-boot test of which pair the LED really sits on); a normal boot
   never writes them. `Controller::put` refuses anything else. Masked writes read first, merge under the mask, write, and compare read-back. Activation stops on a read or write failure.
   OFF tries every step and can use the last known value during an observer failure.
-- **Current** (`piano-torch-ma`): 50 mA (2 × 25 mA, ITARGET 4) unless a request names a current. `piano-torch-max-ma` can lower
-  the hard 100 mA total cap (Ubuntu's DT limit, ITARGET 9, clamp 9). Torch current rounds down to 5 mA steps per channel.
+- **Current** (`piano-torch-ma`): 50 mA (2 × 25 mA, ITARGET 4) unless a request names a current. `piano-torch-max-ma` defaults
+  to 100 mA total (Ubuntu's DT limit, TORCH_CLAMP 9) and can be set up to 400 mA total (2 × 200 mA, TORCH_CLAMP 39).
+  Requests respect the configured clamp and round down to 5 mA steps per channel.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
-  1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, STATUS1 short **or open** (the open bit is the
+  1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, INT_RT_STS fault, STATUS1 short **or open** (the open bit is the
   module's own word for a lit register state with no LED current path — since 2026-11-15 it is a fault reason, not an unknown) →
   off and 60 s cool-down; the
   enables no longer on → off; the hottest TSENS controller (PianoThermal's `TemperaturesDeciC`, refreshed at its report interval)
@@ -167,6 +186,7 @@ boolean) and `piano-torch-seconds` from an administrator only (`IOUserClient::cl
 `tooling/native/piano-torch/piano-torch.c` (IOKit.framework, built on the Mac like `pianousb-shell`; installed as
 `/usr/local/bin/piano-torch` by `configs/userland.toml`, `docs/userland.md`): `sudo piano-torch on [MA [S]]`,
 `off`, `toggle`, `status`; exit 0 when the state after the request is the one asked for. Usable from the root shell over USB too.
+The CLI clamps its numeric `MA` argument to 100 mA. With no numeric argument, `on` uses the boot's configured `piano-torch-ma`.
 
 **From other drivers**: `callPlatformFunction` `PianoTorchSet` (mA, seconds, caller), `PianoTorchToggle` (caller),
 `PianoTorchStatus` (buffer, size); queued, never blocking on the PMIC (`PianoTorchClient.h`).
@@ -182,9 +202,9 @@ tool is user-space work for later.
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `piano-torch` | 0 | 1 survey (read only); 2 survey + control |
+| `piano-torch` | 0 | 0 off, 1 survey (read only), 2 survey and control |
 | `piano-torch-ma` | 50 | lamp current of an on without its own (10..max, 5 mA a channel steps) |
-| `piano-torch-max-ma` | 100 | the limit (10..100 mA total) |
+| `piano-torch-max-ma` | 100 | 10..400 mA total, with larger values clamped to 400 mA |
 | `piano-torch-timeout` | 300 | auto-off of a request without its own time (10..1800 s) |
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
@@ -192,7 +212,7 @@ tool is user-space work for later.
 | `piano-torch-probe` | 0 | `1` with level 2 and a nonzero `piano-torch-test` selects T4. The factory-pair window polls all three STATUS bytes, INT_RT_STS and the enables every 500 ms before, during and after the test, with full dumps and diffs. |
 | `piano-torch-probe-spare` | 0 | `1` adds the spare-pair mapping window when T4 runs |
 | `piano-torch-flash` | 0 | `1` adds an 80 ms, 50 mA FLASH pulse when T4 runs and the cap permits it, followed by explicit off |
-| `piano-torch-ladder` | 0 | `1` selects the level 2 current ladder. The cap permits only the 100 mA step, which is skipped if the cap is set lower. The step runs for 10 s lit and 10 s dark with 500 ms status and temperature polls. |
+| `piano-torch-ladder` | 0 | `1` selects the guarded level 2 ladder of 100/200/300/400 mA total within the configured cap. Each step runs for 10 s lit and 10 s dark with 500 ms status and temperature polls. |
 
 ### 7. Kernel collection
 
@@ -255,7 +275,7 @@ tablet (built on the Mac by the build script: `out/native-kexts/PianoTorch/host-
 root shell with `base64 -D`, or staged with `stage-soft-metal.py --file <tool>:usr/local/bin/piano-torch --boot-run "/bin/chmod 755
 /usr/local/bin/piano-torch"`, as staged files are mode 644). In the root shell: `piano-torch on` → `level 2: on 50 mA (2 x 25 mA, itarget 4), off in 300 s`;
 `piano-torch off` → `off (asked)`; `piano-torch on 100 10` and wait → `off (the time limit)` after 10 s; `piano-torch on 500` → 100 mA
-(`on: 500 mA asked, 100 mA set`); as a plain user → `not an administrator: use sudo`; lit through 5 minutes once (default timeout)
+(the CLI caps the argument before sending it); as a plain user → `not an administrator: use sudo`; lit through 5 minutes once (default timeout)
 with a finger on the lens area: warm, not hot; `lit:` lines every 30 s show status 00.
 
 Failure lines: `owner EE n (another EE...)` / `level 2 refused: ...` (nothing written: report the survey); `off (...): a write or its
@@ -281,8 +301,9 @@ Without `piano-torch` nothing is mapped. Level 2 refusing leaves level 1's surve
    (*inferred*, not verified for this block); ABL/Ubuntu boot next. Check once in T3 (`reset` from the console while lit).
 5. The flash thermistor (ADC 0x145) as a direct guard → with B6's ADC conversions.
 6. Camera flash (400 mA, 300 ms strobe) is B11's, not this driver's; it would need the derating sequence and a hardware strobe.
-7. Raising the 100 mA cap toward the factory's 400 mA a channel (if T4 shows clean registers and no light at 100 mA) is an owner
-   decision: Ubuntu's cap is a port's choice, the hardware's design point is higher, and the guard's temperatures already apply.
+7. **Decided 2026-11-27 (`OWNER-0717`).** The owner approved a hard cap of 400 mA total (2 × 200 mA) and a guarded
+   100/200/300/400 mA ladder for an attended RAM boot. The default cap is 100 mA and the driver defaults to off.
+   The lit test waits until the owner is beside the tablet watching the LED.
 
 ### 11. Licence note
 

@@ -4,7 +4,7 @@
 //   - level 1: only observer reads of the flash APID, never a write, never another peripheral, never past its 256 bytes;
 //   - the refusals (no APID, another owner, not a flash module, the three-channel layout, channels 3/4 in use, a partial survey);
 //   - the on sequence: only the ten allowlisted registers of PPID 0x1ee, masked read-modify-write (other bits kept), each read
-//     back; 50 mA -> ITARGET 4 on both channels, the clamp 9, 5 mA steps, software strobe, timers off; the hard 100 mA cap;
+//     back; 50 mA -> ITARGET 4 on both channels, default clamp 9, 5 mA steps, software strobe, timers off; the hard 400 mA cap;
 //   - off; a read-back mismatch and a denied write (both: off attempted, the state off, a cool-down);
 //   - the guard: the time limit, the boot test, the module's thermal/current/voltage/short bits, the SoC and battery limits,
 //     one unreadable poll tolerated and two not, the enables found off.
@@ -178,6 +178,10 @@ static void testProbeOptIn()
   CHECK(!bootSwitchEnabled("piano-torch-probe=1 piano-torch-probe=0", key));
   CHECK(!bootSwitchEnabled("piano-torch-probe=1 piano-torch-probe", key));
   CHECK(bootSwitchEnabled("piano-torch-probe=0 piano-torch-probe=1", key));
+  constexpr const char *ladder = "piano-torch-ladder";
+  CHECK(!bootSwitchEnabled("piano-torch=0 piano-torch-max-ma=400", ladder));
+  CHECK(!bootSwitchEnabled("piano-torch=2 piano-torch-ladder=0", ladder));
+  CHECK(bootSwitchEnabled("piano-torch=2 piano-torch-max-ma=400 piano-torch-ladder=1", ladder));
 }
 
 static void testConstants()
@@ -185,7 +189,8 @@ static void testConstants()
   CHECK(kPpid == 0x1ee);
   CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(400) == 39 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
-  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(500, 500) == 100);
+  CHECK(kDefaultLevel == 0 && kDefaultMaxMa == 100 && kHardMaxMa == 400);
+  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(500, 500) == 400);
   CHECK(boundedRequest(0, 100) == 0 && boundedRequest(50, 100) == 50 && boundedRequest(1ull << 32, 100) == 100);
   CHECK(boundedRequest(UINT64_MAX, 1800) == 1800);
   CHECK(clampForMa(100) == 9 && clampForMa(60) == 5 && clampForMa(400) == 39);
@@ -233,7 +238,7 @@ static void testRequestBoundaries()
   Arbiter a;
   piano(a);
   Port p(true);
-  Torch t(p.bus, GuardConfig(), UINT32_MAX);
+  Torch t(p.bus, GuardConfig(), kDefaultMaxMa);
   const struct { uint64_t request; unsigned current; } cases[] = {
     {0, 0}, {1, 10}, {9, 10}, {10, 10}, {11, 10}, {99, 90}, {100, 100}, {101, 100},
     {UINT32_MAX, 100}, {1ull << 32, 100}, {(1ull << 32) + 1, 100}, {UINT64_MAX, 100},
@@ -320,7 +325,7 @@ static void testOnOff()
   a.r(kPpid, kRegItarget0) = 0x80;    // bit 7: kept
   Port p(true);
   GuardConfig g;
-  Torch t(p.bus, g, 100);
+  Torch t(p.bus, g, kDefaultMaxMa);
   Temperatures temps;
   char line[120];
   t.describe(0, line, sizeof line);
@@ -349,14 +354,14 @@ static void testOnOff()
   o = low.request(4000, 100, 10, temps);
   CHECK(o.lit && low.ma() == 60 && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
   low.request(4500, 0, 0, temps);
-  Torch oversized(p.bus, g, 5000);
-  o = oversized.request(5000, 400, 10, temps);
-  CHECK(o.lit && oversized.maxMa() == 100 && oversized.ma() == 100 && oversized.itarget() == 9);
-  CHECK((a.flash(kRegItarget0) & kItargetMask) == 9 && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  Torch oversized(p.bus, g, 500);
+  o = oversized.request(5000, 500, 10, temps);
+  CHECK(o.lit && oversized.maxMa() == 400 && oversized.ma() == 400 && oversized.itarget() == 39);
+  CHECK((a.flash(kRegItarget0) & kItargetMask) == 39 && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
   oversized.request(6000, 0, 0, temps);
   Controller c(p.bus);
-  const StepResult capped = c.on(77, 77);
-  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  const StepResult capped = c.on(60, 60);
+  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
   c.off();
   const StepResult lowerClamp = c.on(77, 5);
   CHECK(lowerClamp.ok && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
@@ -387,13 +392,14 @@ static void testOnOff()
   CHECK(pulse.ok && pulse.writes == 11 && pulse.readbacks == 11);
   CHECK((a.flash(kRegIres) & kPianoChannelMask) == 0 && a.flash(kRegTimer0) == (kTimerEnable | 8) &&
         a.flash(kRegTimer0 + 1) == (kTimerEnable | 8));
-  CHECK((a.flash(kRegItarget0) & kItargetMask) == 3 && (a.flash(kRegStrobe0) & kStrobeMask) == kStrobeSoftwareLevelHigh &&
+  CHECK((a.flash(kRegItarget0) & kItargetMask) == 1 && (a.flash(kRegStrobe0) & kStrobeMask) == kStrobeSoftwareLevelHigh &&
         (a.flash(kRegChanEn) & kPianoChannelMask) == kPianoChannelMask && (a.flash(kRegModuleEn) & kModuleEnBit) == kModuleEnBit);
-  CHECK((a.flash(kRegItarget0 + 1) & kItargetMask) == 3);   // 2 x 50 mA at the FLASH step size
+  CHECK((a.flash(kRegItarget0 + 1) & kItargetMask) == 1);   // 2 x 25 mA at the FLASH step size
   const StepResult pulseOff = c.off();
   CHECK(pulseOff.ok && a.flash(kRegChanEn) == 0 && (a.flash(kRegModuleEn) & kModuleEnBit) == 0);
   a.writes.clear();
   CHECK(!c.flashPulse(3, 0).ok && a.writes.empty());
+  CHECK(!c.flashPulse(3, 9).ok && a.writes.empty());
   CHECK(!c.flashPulse(3, 0x80).ok && a.writes.empty());
   // a mask above the four channels is refused before any write
   a.writes.clear();
@@ -402,13 +408,13 @@ static void testOnOff()
 
   // The controller also accepts a four-channel mask. The cap applies to its combined current.
   constexpr uint8_t allChannels = kPianoChannelMask | kOtherChannelMask;
-  CHECK(c.on(77, 77, allChannels).ok && a.flash(kRegTorchClamp) == 4);
+  CHECK(c.on(77, 77, allChannels).ok && a.flash(kRegTorchClamp) == 19);
   for (unsigned ch = 0; ch < kChannels4ch; ++ch)
-    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 4);   // 4 x 25 mA in torch mode
+    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 19);   // 4 x 100 mA in torch mode
   CHECK(c.off(allChannels).ok);
   CHECK(c.flashPulse(77, 8, allChannels).ok);
   for (unsigned ch = 0; ch < kChannels4ch; ++ch)
-    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 1);   // 4 x 25 mA in FLASH mode
+    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 0);   // 4 x 12.5 mA in FLASH mode
   CHECK(c.off(allChannels).ok);
 
   // An earlier spare-pair shutdown can disable the module while leaving a
@@ -420,6 +426,74 @@ static void testOnOff()
   a.r(kPpid, kRegChanEn) = 0x04;
   const StepResult staleFlash = c.flashPulse(3, 8);
   CHECK(!staleFlash.ok && staleFlash.failedReg == kRegChanEn && a.writes.empty());
+}
+
+static void testLadder()
+{
+  for (const unsigned cap : {kDefaultMaxMa, 400u}) {
+    Arbiter a;
+    piano(a);
+    Port p(true);
+    Torch t(p.bus, GuardConfig(), cap);
+    uint64_t start = 0;
+    unsigned completed = 0;
+    for (const unsigned ma : kLadderLevelsMa) {
+      if (ma > t.maxMa()) break;
+      CHECK(ma == (completed + 1) * 100);
+      const auto on = t.request(start, ma, kLadderWindowSeconds, {});
+      CHECK(on.lit && on.ma == ma && on.steps.ok && on.steps.writes == 12 && on.steps.readbacks == 12);
+      CHECK(on.live.ok && on.live.lit(kPianoChannelMask));
+      t.setTestMode(true);
+      const unsigned target = ma / 10 - 1;
+      CHECK(a.flash(kRegItarget0) == target && a.flash(kRegItarget0 + 1) == target);
+      CHECK(a.flash(kRegTorchClamp) == cap / 10 - 1 && a.flash(kRegIres) == kPianoChannelMask);
+      CHECK(t.deadlineMs() == start + 10000);
+      for (unsigned elapsed = 0; elapsed < 10000; elapsed += 500)
+        CHECK(t.poll(start + elapsed, {}, /*ladder=*/true).lit);
+      const auto off = t.poll(start + 10000, {}, /*ladder=*/true);
+      CHECK(!off.lit && off.reason == Reason::test && off.steps.ok && off.steps.writes == 4 && off.steps.readbacks == 4);
+      for (unsigned elapsed = 0; elapsed <= 10000; elapsed += 500)
+        CHECK(ladderDarkFault(t.controller().live(), {}, t.config()) == Reason::none);
+      CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0 && !t.needsOff() && onlyFlash(a));
+      start += 20000;
+      ++completed;
+    }
+    CHECK(completed == cap / 100);
+  }
+}
+
+static void testLadderReadFailures()
+{
+  const struct { uint8_t reg, bits; Reason reason; } cases[] = {
+    {kRegIntRtSts, 0, Reason::statusUnreadable},
+    {kRegIntRtSts, kRtFault, Reason::pmicFault},
+    {kRegStatus3, 0x01, Reason::pmicTimer},
+  };
+  for (const bool dark : {false, true}) {
+    for (const auto &[reg, bits, reason] : cases) {
+      Arbiter a;
+      piano(a);
+      Port p(true);
+      Torch t(p.bus, GuardConfig(), 400);
+      CHECK(t.request(0, 100, kLadderWindowSeconds, {}).lit);
+      CHECK(t.poll(10000, {}, /*ladder=*/true).steps.readbacks == 4);
+      CHECK(t.request(20000, 200, kLadderWindowSeconds, {}).lit);
+      if (dark) CHECK(t.poll(30000, {}, /*ladder=*/true).steps.readbacks == 4);
+      const uint64_t sample = dark ? 30500 : 20500;
+      if (!bits) a.unreadableRegs[reg] = true;
+      else a.r(kPpid, reg) = bits;
+      Torch::Outcome off;
+      if (dark) {
+        const auto fault = ladderDarkFault(t.controller().live(), {}, t.config());
+        CHECK(fault == reason);
+        off = t.turnOff(sample, fault);
+      } else {
+        off = t.poll(sample, {}, /*ladder=*/true);
+      }
+      CHECK(!off.lit && off.reason == reason && off.steps.ok && off.steps.writes == 4 && off.steps.readbacks == 4);
+      CHECK(!t.needsOff() && a.flash(kRegModuleEn) == 0 && a.flash(kRegChanEn) == 0 && onlyFlash(a));
+    }
+  }
 }
 
 static void testFailures()
@@ -691,7 +765,7 @@ static void testProbeSafety()
   Temperatures cool, hot;
   hot.socValid = true;
   hot.socDeci = 850;
-  t.configure(p.bus, GuardConfig(), 100, true);
+  t.configure(p.bus, GuardConfig(), 400, true);
   CHECK(t.requestProbe(0, 400, 15000, hot, sparePair, false).reason == Reason::socHot && a.writes.empty());
   CHECK(t.requestProbe(0, 50, 0, hot, pianoPair, true).reason == Reason::socHot && a.writes.empty());
   a.r(kPpid, kRegStatus2) = kSts2VphLow;
@@ -706,8 +780,8 @@ static void testProbeSafety()
   const size_t beforePulse = a.writes.size();
   CHECK(t.requestProbe(500, 50, 0, cool, pianoPair, true).reason == Reason::channelOpen && a.writes.size() == beforePulse);
   const auto spare = t.requestProbe(1000, 9999, 15000, cool, sparePair, false);
-  CHECK(spare.lit && spare.ma == 100 && spare.live.chanEn == sparePair);
-  CHECK(a.flash(kRegItarget0 + 2) == 9 && a.flash(kRegItarget0 + 3) == 9 && a.flash(kRegTorchClamp) == 9);
+  CHECK(spare.lit && spare.ma == 400 && spare.live.chanEn == sparePair && spare.steps.readbacks == 12);
+  CHECK(a.flash(kRegItarget0 + 2) == 39 && a.flash(kRegItarget0 + 3) == 39 && a.flash(kRegTorchClamp) == 39);
   const auto asleep = t.quiesce(1100, Reason::sleep);
   CHECK(asleep.reason == Reason::sleep && asleep.steps.ok && asleep.steps.writes == 4);
   CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0 && a.flash(kRegItarget0 + 2) == 0);
@@ -731,25 +805,30 @@ static void testProbePulse()
   Temperatures t;
   Torch low(p.bus, GuardConfig(), 40);
   CHECK(!low.requestProbe(0, 100, 0, t, kPianoChannelMask, true).lit && a.writes.empty());
-  Torch pulse(p.bus, GuardConfig(), 100);
-  const auto started = pulse.requestProbe(0, 9999, 0, t, kPianoChannelMask, true);
+  Torch pulse(p.bus, GuardConfig(), 400);
+  const auto factory = pulse.requestProbe(0, 500, 15000, t, kPianoChannelMask, false);
+  CHECK(factory.lit && factory.ma == 400 && factory.steps.writes == 12 && factory.steps.readbacks == 12);
+  CHECK(a.flash(kRegItarget0) == 39 && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
+  CHECK(pulse.poll(15000, t).steps.readbacks == 4);
+  const uint64_t start = 16000;
+  const auto started = pulse.requestProbe(start, 9999, 0, t, kPianoChannelMask, true);
   CHECK(started.lit && started.ma == 50 && started.sampled && started.live.chanEn == kPianoChannelMask);
-  CHECK(pulse.deadlineMs() == 80 && (a.flash(kRegItarget0) & kItargetMask) == 1);
-  CHECK(pulse.poll(79, t).lit);
+  CHECK(pulse.deadlineMs() == start + 80 && (a.flash(kRegItarget0) & kItargetMask) == 1);
+  CHECK(pulse.poll(start + 79, t).lit);
   a.r(kPpid, kRegStatus3) = 0x05;   // both timers expired
   a.r(kPpid, kRegChanEn) = 0;
-  const auto ended = pulse.poll(80, t);
+  const auto ended = pulse.poll(start + 80, t);
   CHECK(!ended.lit && ended.reason == Reason::test && ended.sampled && ended.live.status3 == 0x05);
   CHECK(ended.steps.ok && ended.steps.writes == 4 && a.flash(kRegModuleEn) == 0);
-  CHECK(pulse.requestProbe(500, 50, 0, t, kPianoChannelMask, true).lit);
+  CHECK(pulse.requestProbe(start + 500, 50, 0, t, kPianoChannelMask, true).lit);
   t.batteryValid = true;
   t.batteryCenti = 4500;
-  const auto tripped = pulse.poll(520, t);
+  const auto tripped = pulse.poll(start + 520, t);
   CHECK(!tripped.lit && tripped.reason == Reason::batteryHot && tripped.steps.writes == 4);
   CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
   t = {};
-  CHECK(pulse.requestProbe(62000, 50, 0, t, kPianoChannelMask, true).lit);
-  CHECK(pulse.quiesce(62001, Reason::shutdown).steps.ok && a.flash(kRegModuleEn) == 0 && a.flash(kRegChanEn) == 0);
+  CHECK(pulse.requestProbe(start + 62000, 50, 0, t, kPianoChannelMask, true).lit);
+  CHECK(pulse.quiesce(start + 62001, Reason::shutdown).steps.ok && a.flash(kRegModuleEn) == 0 && a.flash(kRegChanEn) == 0);
   CHECK(onlyFlash(a));
 }
 
@@ -761,6 +840,8 @@ int main()
   testRequestBoundaries();
   testSurvey();
   testOnOff();
+  testLadder();
+  testLadderReadFailures();
   testFailures();
   testGuard();
   testGuardRegressions();

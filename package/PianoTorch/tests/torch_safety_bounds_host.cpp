@@ -11,9 +11,10 @@
 namespace {
 using namespace pianotorch;
 
-constexpr unsigned kSafetyCeilingMa = 100;
+constexpr unsigned kSafetyCeilingMa = 400;
 constexpr unsigned kSafetyCeilingUa = kSafetyCeilingMa * 1000;
-static_assert(kHardMaxMa == kSafetyCeilingMa);
+constexpr unsigned kDefaultCurrentUa = 100000;
+static_assert(kDefaultLevel == 0 && kDefaultMaxMa == 100 && kHardMaxMa == kSafetyCeilingMa);
 
 int failures = 0;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "%s:%d: %s\n", __func__, __LINE__, #expr); ++failures; } } while (0)
@@ -140,7 +141,8 @@ void checkCurrent(uint64_t rawMa, unsigned configuredMaxMa)
   if (expectedMa) {
     const uint8_t target = uint8_t(expectedMa / 10 - 1);
     CHECK(pmic.reg[kRegChanEn] == kPianoChannelMask && pmic.reg[kRegIres] == kPianoChannelMask);
-    CHECK(pmic.reg[kRegItarget0] == target && pmic.reg[kRegItarget0 + 1] == target);
+    CHECK(out.steps.writes == 12 && out.steps.readbacks == 12);
+    CHECK(pmic.reg[kRegItarget0] == target && pmic.reg[kRegItarget0 + 1] == target && target <= pmic.reg[kRegTorchClamp]);
     CHECK(pmic.reg[kRegTorchClamp] == expectedMax / 10 - 1);
   } else {
     checkOff(pmic, torch);
@@ -150,8 +152,8 @@ void checkCurrent(uint64_t rawMa, unsigned configuredMaxMa)
 void testCurrentBounds()
 {
   // Include a non-quantized configured ceiling and an oversized boot argument.
-  for (const unsigned limit : {0u, 9u, 10u, 95u, 100u, 101u, UINT32_MAX}) {
-    for (unsigned ma = 0; ma <= 101; ++ma) checkCurrent(ma, limit);
+  for (const unsigned limit : {0u, 9u, 10u, 95u, kDefaultMaxMa, 101u, 199u, 399u, 400u, 401u, 500u, UINT32_MAX}) {
+    for (unsigned ma = 0; ma <= 500; ++ma) checkCurrent(ma, limit);
     for (const uint64_t ma : {uint64_t(UINT32_MAX), uint64_t(uint32_t(INT32_MIN)), uint64_t(uint32_t(-2)),
                               uint64_t(INT64_MIN), uint64_t(-2), UINT64_MAX})
       checkCurrent(ma, limit);
@@ -164,11 +166,12 @@ void testCurrentBounds()
   }
 
   FlashPmic pmic;
-  Torch torch(pmic.bus(), {}, UINT32_MAX);
+  Torch torch(pmic.bus(), {}, 500);
   const auto on = torch.request(0, UINT32_MAX, 1, {});
   CHECK(on.lit && on.ma == kSafetyCeilingMa && pmic.currentUa() == kSafetyCeilingUa);
-  CHECK(torch.controller().on(UINT8_MAX, UINT8_MAX).ok);
-  CHECK(pmic.reg[kRegTorchClamp] == 9 && pmic.currentUa() == kSafetyCeilingUa && pmic.peakUa == kSafetyCeilingUa);
+  CHECK(torch.controller().on(60, 60).ok);
+  CHECK(pmic.reg[kRegTorchClamp] == 39 && pmic.reg[kRegItarget0] == 39 && pmic.reg[kRegItarget0 + 1] == 39);
+  CHECK(pmic.currentUa() == kSafetyCeilingUa && pmic.peakUa == kSafetyCeilingUa);
   checkTeardown(pmic, torch, torch.turnOff(1, Reason::user), Reason::user);
 }
 
@@ -181,9 +184,9 @@ void checkSoftwareDeadline(unsigned seconds, unsigned expectedSeconds)
   const auto on = torch.request(start, 100, seconds, {});
   CHECK(on.lit && torch.deadlineMs() == end);
   CHECK(pmic.reg[kRegTimer0] == 0 && pmic.reg[kRegTimer0 + 1] == 0);
-  CHECK(torch.poll(end - 1, {}).lit && pmic.currentUa() == kSafetyCeilingUa);
+  CHECK(torch.poll(end - 1, {}).lit && pmic.currentUa() == kDefaultCurrentUa);
   pmic.runTimers(expectedSeconds * 1000);
-  CHECK(pmic.currentUa() == kSafetyCeilingUa);
+  CHECK(pmic.currentUa() == kDefaultCurrentUa);
   checkTeardown(pmic, torch, torch.poll(end, {}), Reason::timeout);
   const unsigned writes = pmic.writeAttempts;
   CHECK(!torch.poll(end + 1000, {}).lit && pmic.writeAttempts == writes);
@@ -203,7 +206,7 @@ void testHardwareWatchdog()
 {
   for (bool blockCleanup : {false, true}) {
     FlashPmic pmic;
-    Torch torch(pmic.bus(), {}, 100);
+    Torch torch(pmic.bus(), {}, 400);
     const auto on = torch.requestProbe(0, UINT32_MAX, UINT32_MAX, {}, kPianoChannelMask, true);
     CHECK(on.lit && on.ma == 50 && torch.deadlineMs() == 80 && pmic.currentUa() == 50000);
     CHECK(pmic.reg[kRegTimer0] == (kTimerEnable | 8) && pmic.reg[kRegTimer0 + 1] == (kTimerEnable | 8));
@@ -226,26 +229,44 @@ void testHardwareWatchdog()
   }
 }
 
+uint64_t reachLadderStep(FlashPmic &pmic, Torch &torch, unsigned finalMa)
+{
+  uint64_t start = 0;
+  for (const unsigned ma : kLadderLevelsMa) {
+    const auto on = torch.request(start, ma, kLadderWindowSeconds, {});
+    CHECK(on.lit && on.ma == ma && on.steps.writes == 12 && on.steps.readbacks == 12);
+    CHECK(pmic.currentUa() == ma * 1000 && pmic.reg[kRegTorchClamp] == 39);
+    if (ma == finalMa) return start;
+    checkTeardown(pmic, torch, torch.poll(start + kLadderWindowMs, {}, /*ladder=*/true), Reason::timeout);
+    start += 2 * kLadderWindowMs;
+  }
+  CHECK(false);
+  return start;
+}
+
 void testFaultCutoffs()
 {
   const struct { uint8_t reg, bits; Reason reason; } cases[] = {
     {kRegStatus2, kSts2Otst1, Reason::pmicThermal}, {kRegStatus2, kSts2Otst2, Reason::pmicThermal},
     {kRegStatus2, kSts2BobThermOverload, Reason::pmicThermal}, {kRegStatus2, kSts2VphLow, Reason::pmicVoltage},
-    {kRegStatus2, kSts2BclIbat, Reason::pmicCurrent}, {kRegIntRtSts, kRtFault, Reason::pmicFault},
+    {kRegStatus2, kSts2BclIbat, Reason::pmicCurrent}, {kRegStatus2, kSts2BobIlimS1, Reason::pmicCurrent},
+    {kRegStatus2, kSts2BobIlimS2, Reason::pmicCurrent}, {kRegIntRtSts, kRtFault, Reason::pmicFault},
     {kRegStatus1, 0x01, Reason::shortCircuit}, {kRegStatus1, 0x08, Reason::channelOpen},
   };
   for (const auto &[addr, bits, reason] : cases) {
     FlashPmic pmic;
-    Torch torch(pmic.bus(), {}, 100);
-    CHECK(torch.request(0, 100, 10, {}).lit && pmic.currentUa() == kSafetyCeilingUa);
+    Torch torch(pmic.bus(), {}, 400);
+    const uint64_t trip = reachLadderStep(pmic, torch, 300) + kProbePollMs;
     pmic.reg[addr] = bits;
-    checkTeardown(pmic, torch, torch.poll(1, {}), reason);
+    const auto off = torch.poll(trip, {}, /*ladder=*/true);
+    CHECK(off.steps.writes == 4 && off.steps.readbacks == 4);
+    checkTeardown(pmic, torch, off, reason);
     pmic.reg[addr] = 0;
     const unsigned writes = pmic.writeAttempts;
-    const auto blocked = torch.request(60000, 100, 10, {});
+    const auto blocked = torch.request(trip + 59999, 400, 10, {});
     CHECK(!blocked.lit && blocked.reason == reason && pmic.writeAttempts == writes);
-    CHECK(torch.request(60001, 100, 10, {}).lit);
-    checkTeardown(pmic, torch, torch.turnOff(60002, Reason::user), Reason::user);
+    CHECK(torch.request(trip + 60000, 400, 10, {}).lit);
+    checkTeardown(pmic, torch, torch.turnOff(trip + 60001, Reason::user), Reason::user);
   }
 
   const struct { Temperatures below, at; Reason reason; } temperatures[] = {
@@ -254,19 +275,22 @@ void testFaultCutoffs()
   };
   for (const auto &[below, at, reason] : temperatures) {
     FlashPmic pmic;
-    Torch torch(pmic.bus(), {}, 100);
-    const auto refused = torch.request(0, 100, 10, at);
+    Torch torch(pmic.bus(), {}, 400);
+    const auto refused = torch.request(0, 400, 10, at);
     CHECK(!refused.lit && refused.reason == reason && pmic.writeAttempts == 0);
-    CHECK(torch.request(1, 100, 10, below).lit && torch.poll(2, below).lit);
-    checkTeardown(pmic, torch, torch.poll(3, at), reason);
+    const uint64_t start = reachLadderStep(pmic, torch, 300);
+    CHECK(torch.poll(start + kProbePollMs, below, /*ladder=*/true).lit);
+    const auto off = torch.poll(start + 2 * kProbePollMs, at, /*ladder=*/true);
+    CHECK(off.steps.writes == 4 && off.steps.readbacks == 4);
+    checkTeardown(pmic, torch, off, reason);
   }
 }
 
 void testSpmiWriteFaults()
 {
   FlashPmic healthy;
-  Torch normal(healthy.bus(), {}, 100);
-  const auto on = normal.request(0, 100, 1, {});
+  Torch normal(healthy.bus(), {}, 400);
+  const auto on = normal.request(0, 400, 1, {});
   CHECK(on.lit && on.steps.writes == 12);
   const auto timeout = normal.poll(1000, {});
   checkTeardown(healthy, normal, timeout, Reason::timeout);
@@ -275,9 +299,9 @@ void testSpmiWriteFaults()
     // A timed-out write may still have reached the PMIC, even the final enable.
     for (unsigned step = 1; step <= on.steps.writes; ++step) {
       FlashPmic pmic;
-      Torch torch(pmic.bus(), {}, 100);
+      Torch torch(pmic.bus(), {}, 400);
       pmic.fault = {step, status, status == 0};
-      const auto failed = torch.request(0, 100, 1, {});
+      const auto failed = torch.request(0, 400, 1, {});
       CHECK(!failed.lit && failed.ma == 0 && failed.reason == Reason::writeFailed);
       CHECK(!failed.steps.ok && failed.steps.writes == step - 1 && pmic.writeFailures == 1);
       CHECK(failed.cleanedUp && failed.cleanup.ok && failed.cleanup.readbacks == 4);
@@ -286,8 +310,8 @@ void testSpmiWriteFaults()
     }
     for (unsigned step = 1; step <= timeout.steps.writes; ++step) {
       FlashPmic pmic;
-      Torch torch(pmic.bus(), {}, 100);
-      CHECK(torch.request(0, 100, 1, {}).lit);
+      Torch torch(pmic.bus(), {}, 400);
+      CHECK(torch.request(0, 400, 1, {}).lit);
       pmic.fault = {pmic.writeAttempts + step, status, status == 0};
       checkTeardown(pmic, torch, torch.poll(1000, {}), Reason::timeout);
       CHECK(pmic.writeFailures == 1);
@@ -340,7 +364,7 @@ class HostLifecycle {
 void testBootOff()
 {
   FlashPmic pmic;
-  Torch torch(pmic.bus(), {}, 100);
+  Torch torch(pmic.bus(), {}, kDefaultMaxMa);
   const auto boot = torch.checkBootState(0, survey(pmic.bus()));
   CHECK(!boot.lit && boot.ma == 0 && boot.reason == Reason::none && pmic.writeAttempts == 0);
   checkOff(pmic, torch);
@@ -356,9 +380,9 @@ void testLifecycleTeardown()
 {
   for (StopEvent event : {StopEvent::displaySuspend, StopEvent::systemSuspend, StopEvent::clientDisconnect}) {
     FlashPmic pmic;
-    Torch torch(pmic.bus(), {}, 100);
+    Torch torch(pmic.bus(), {}, 400);
     HostLifecycle host(torch);
-    CHECK(host.queue(100) && host.dispatch(2).lit && pmic.currentUa() == kSafetyCeilingUa);
+    CHECK(host.queue(400) && host.dispatch(2).lit && pmic.currentUa() == kSafetyCeilingUa);
     CHECK(host.queue(50));  // Pending ON must be discarded along with the active one.
     const bool disconnect = event == StopEvent::clientDisconnect;
     const auto off = host.stop(3, event);
