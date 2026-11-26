@@ -85,9 +85,8 @@ def run(*args):
     return subprocess.run([sys.executable, '-I', PACK] + list(args), capture_output=True, text=True)
 
 
-def main():
+def main(t):
     sel = sys.argv[1]
-    t = tempfile.mkdtemp(prefix='packsel-')
     p = lambda n: os.path.join(t, n)
     kern = kernel()
     rd = os.urandom(70000)
@@ -144,6 +143,9 @@ def main():
         check(rr.returncode != 0 and why in rr.stderr, f'refuses {name} ({rr.stderr.strip()[:90]})')
     open(p('nofooter.img'), 'wb').write(boot(kern, rd))
     refuse('no AVB footer', [p('nofooter.img'), sel, p('macos.img'), '-o', p('x.img')], 'no AVB footer')
+    open(p('truncated-android.img'), 'wb').write(with_footer(boot(kern, rd)[:-PAGE], PROPS))
+    refuse('a stock ramdisk truncated before AVB padding',
+           [p('truncated-android.img'), sel, p('macos.img'), '-o', p('x.img')], 'truncated boot image sections')
     open(p('wrapped.img'), 'wb').write(with_footer(out, PROPS))
     refuse('a second wrap', [p('wrapped.img'), sel, p('macos.img'), '-o', p('x.img')], 'already carries a selector')
     open(p('nobranch.img'), 'wb').write(with_footer(boot(kernel(code1=0xd503201f), rd), PROPS))
@@ -154,8 +156,15 @@ def main():
     refuse('a foreign selector', [p('android.img'), p('fakesel.bin'), p('macos.img'), '-o', p('x.img')], 'version tag')
     open(p('tinyuefi.img'), 'wb').write(boot(b'MZ' + bytes(100)))
     refuse('no UEFI payload', [p('android.img'), sel, p('tinyuefi.img'), '-o', p('x.img')], 'no UEFI payload')
+    open(p('truncated-uefi.img'), 'wb').write(boot(uefi)[:-PAGE])
+    refuse('a truncated UEFI payload', [p('android.img'), sel, p('truncated-uefi.img'), '-o', p('x.img')],
+           'truncated boot image sections')
+    open(p('uefi-ram.img'), 'wb').write(boot(uefi, rd))
+    refuse('a UEFI RAM image whose ramdisk would be dropped',
+           [p('android.img'), sel, p('uefi-ram.img'), '-o', p('x.img')], 'UEFI input carries a ramdisk')
     open(p('vendor.img'), 'wb').write(with_footer(boot(kern, rd), PROPS, name='vendor_boot'))
     refuse('another partition footer', [p('vendor.img'), sel, p('macos.img'), '-o', p('x.img')], 'unexpected AVB partition')
+    check(not os.path.exists(p('x.img')) and not os.path.exists(p('x.img.avb.json')), 'refused inputs create no output')
 
     # determinism
     run(p('android.img'), sel, p('macos.img'), '-o', p('out2.img'))
@@ -179,4 +188,5 @@ def main():
     sys.exit(1 if fails else 0)
 
 
-main()
+with tempfile.TemporaryDirectory(prefix='packsel-') as work:
+    main(work)

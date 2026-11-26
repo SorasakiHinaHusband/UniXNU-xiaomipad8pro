@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """Build piano's combined boot_a (T-16 UEFI OS switch): the stock Android boot.img with firmware/selector placed after the kernel's
-memory footprint and the UEFI payload (BootShim + FD + DTB, the kernel field of a macOS-set boot.img) after it. The kernel's
-second instruction (b primary_entry) is redirected to the selector; image_size grows so ABL reserves the room. The layout and the
-undo check follow piano-uefi's tools/pack.py (BSD-2-Clause-Patent, firmware/selector/NOTICE.md).
+memory footprint and the UEFI payload (BootShim + FD + DTB, the kernel field of a persistent macOS-set v4 boot.img) after it.
+The Android ramdisk is the only ramdisk carried. The kernel's second instruction now branches to the selector, and image_size
+grows so ABL reserves the room. The layout and undo check follow piano-uefi's tools/pack.py (BSD-2-Clause-Patent,
+firmware/selector/NOTICE.md).
 
   pack-selector.py ANDROID_BOOT SELECTOR_BIN UEFI_BOOT -o OUT.img     -> OUT.img (unsigned) + OUT.img.avb.json (the stock props)
   pack-selector.py --check-signed OUT-signed.img ANDROID_BOOT         -> footer, props and rollback equal to the stock image's
@@ -17,6 +18,7 @@ import struct
 import sys
 
 PAGE = 4096
+V4_HEADER_SIZE = 1584
 META_MAGIC = b'PIANO-UEFI-SEL1\0'
 SEL_TAG = b'PIANO-SW-SEL-V1\0'
 BRANCH_RANGE = 1 << 27
@@ -36,18 +38,23 @@ def align(n, a=PAGE):
 def read_boot(data):
     if data[:8] != b'ANDROID!':
         fail('not an Android boot image')
+    if len(data) < PAGE:
+        fail('truncated boot header')
     kernel_size, ramdisk_size, os_version, header_size = struct.unpack_from('<4I', data, 8)
     version = struct.unpack_from('<I', data, 40)[0]
     if version != 4:
         fail(f'boot header v{version}; piano uses v4')
-    sig_size = struct.unpack_from('<I', data, 1580)[0]
-    off = PAGE
-    kernel = data[off:off + kernel_size]
-    off += align(kernel_size)
-    ramdisk = data[off:off + ramdisk_size]
-    off += align(ramdisk_size)
+    if header_size != V4_HEADER_SIZE:
+        fail(f'boot v4 header size {header_size}; expected {V4_HEADER_SIZE}')
+    sig_size = struct.unpack_from('<I', data, V4_HEADER_SIZE - 4)[0]
+    ramdisk_offset = PAGE + align(kernel_size)
+    end = ramdisk_offset + align(ramdisk_size) + align(sig_size)
+    if end > len(data):
+        fail('truncated boot image sections')
+    kernel = data[PAGE:PAGE + kernel_size]
+    ramdisk = data[ramdisk_offset:ramdisk_offset + ramdisk_size]
     return {'header': bytearray(data[:header_size]), 'kernel': kernel, 'ramdisk': ramdisk,
-            'sig_size': sig_size, 'os_version': os_version, 'end': off + align(sig_size) if sig_size else off}
+            'sig_size': sig_size, 'os_version': os_version, 'end': end}
 
 
 def kernel_info(kernel):
@@ -154,8 +161,11 @@ def pack(a):
         fail('the Android boot.img has no AVB footer: its props (boot patch level) are needed')
     if avb['partition_name'] != 'boot' or avb['partition_size'] != BOOT_PARTITION:
         fail(f"unexpected AVB partition {avb['partition_name']} / size {avb['partition_size']}")
-    boot = read_boot(adata)
-    uefi = read_boot(open(a.uefi, 'rb').read())['kernel']
+    boot = read_boot(adata[:avb['original_size']])
+    uefi_boot = read_boot(open(a.uefi, 'rb').read())
+    if uefi_boot['ramdisk']:
+        fail('UEFI input carries a ramdisk; use a persistent macOS-set v4 image')
+    uefi = uefi_boot['kernel']
     sel = open(a.selector, 'rb').read()
     kernel, lay = wrap(boot['kernel'], sel, uefi)
     img = write_boot(boot, kernel)
