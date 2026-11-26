@@ -189,23 +189,32 @@ void testDsiClockOff()
 
 constexpr uint32_t probeHostOffsets[] = {
     0x010, 0x020, 0x030, 0x034, 0x038, 0x00c, 0x068, 0x0b0, 0x0b4, 0x0b8,
-    0x0bc, 0x0c0, 0x0c4, 0x0cc, 0x10c, 0x120, 0x180, 0x2a8, 0x2ac};
-constexpr uint32_t probePhyOffsets[] = {0x010, 0x014, 0x01c, 0x140, 0x148, 0x14c};
+    0x0bc, 0x0c0, 0x0c4, 0x0cc, 0x10c, 0x120, 0x180, 0x2a8, 0x2ac, 0x040, 0x044, 0x04c, 0x118, 0x0a4};
+constexpr uint32_t probePhyOffsets[] = {
+    0x010, 0x014, 0x01c, 0x140, 0x148, 0x14c, 0x028, 0x02c, 0x030, 0x1b0, 0x034, 0x038, 0x03c, 0x0a0, 0x0a4, 0x024};
+constexpr uint32_t probeTimingOffsets[] = {
+    0x0b4, 0x0b8, 0x0bc, 0x0c0, 0x0c4, 0x0c8, 0x0cc, 0x0d0, 0x0d4, 0x0d8, 0x0dc, 0x0e0, 0x0e4, 0x0e8};
+constexpr uint64_t probePllStatus[] = {0x0ae956b0, 0x0ae976b0};
 
 void enableLinkClocks(model::Dpu &m)
 {
   for (uint32_t off : {kCcByte0, kCcByte1, kCcPclk0, kCcPclk1}) m.regs[kDispCc + off] = kCbcrEnable;
 }
 
-void checkProbeLoads(const std::vector<uint64_t> &seen, unsigned link, bool expected)
+void checkProbeLoads(const std::vector<uint64_t> &seen, unsigned link, bool expected, bool pllExpected = false)
 {
   for (uint32_t off : probeHostOffsets)
     CHECK(std::count(seen.begin(), seen.end(), kDsi[link] + off) == int(expected));
-  for (uint64_t pa : seen)
-    if (pa >= kDsiPhy[link] && pa < kDsiPhy[link] + 0x1000)
-      CHECK(expected && std::find(std::begin(probePhyOffsets), std::end(probePhyOffsets), pa - kDsiPhy[link]) != std::end(probePhyOffsets));
+  const auto mappedLoads = std::count_if(seen.begin(), seen.end(), [&](uint64_t pa) {
+    return pa >= kDsiPhy[link] && pa < kDsiPhy[link] + 0x1000;
+  });
+  // The entire PHY page is covered, including holes, the lane resource and the separate PLL window.
+  CHECK(size_t(mappedLoads) == (expected ? std::size(probePhyOffsets) + std::size(probeTimingOffsets) : 0) + unsigned(pllExpected));
   for (uint32_t off : probePhyOffsets)
     CHECK(std::count(seen.begin(), seen.end(), kDsiPhy[link] + off) == int(expected));
+  for (uint32_t off : probeTimingOffsets)
+    CHECK(std::count(seen.begin(), seen.end(), kDsiPhy[link] + off) == int(expected));
+  CHECK(std::count(seen.begin(), seen.end(), probePllStatus[link]) == int(pllExpected));
 }
 
 void testM5Probe()
@@ -216,6 +225,9 @@ void testM5Probe()
   for (unsigned l = 0; l < 2; ++l) {
     for (uint32_t off : probeHostOffsets) m.regs[kDsi[l] + off] = ((l + 1) << 16) | off;
     for (uint32_t off : probePhyOffsets) m.regs[kDsiPhy[l] + off] = ((l + 3) << 16) | off;
+    for (uint32_t off : probeTimingOffsets) m.regs[kDsiPhy[l] + off] = ((l + 5) << 16) | off;
+    m.regs[kDsiPhy[l] + 0x024] |= 0x60;
+    m.regs[probePllStatus[l]] = 0x80 + (1 - l);   // Only PLL0 locks in this bonded control.
   }
   for (bool enabled : {false, true}) {
     Snapshot s;
@@ -227,14 +239,17 @@ void testM5Probe()
     CHECK(s.loads == seen.size());
     CHECK(m.stores.empty() && m.refused.empty());
     for (unsigned l = 0; l < 2; ++l) {
-      checkProbeLoads(seen, l, enabled);
+      checkProbeLoads(seen, l, enabled, enabled);
       const auto &words = s.m5Link[l];
       CHECK(words.read == enabled);
+      CHECK(words.pllStatus == (enabled ? 0x81 - l : UINT32_MAX));
       if (!enabled) continue;
       for (unsigned i = 0; i < HostWordCount; ++i)
         CHECK(words.host[i] == (((l + 1) << 16) | probeHostOffsets[i]));
       for (unsigned i = 0; i < PhyWordCount; ++i)
-        CHECK(words.phy[i] == (((l + 3) << 16) | probePhyOffsets[i]));
+        CHECK(words.phy[i] == (((l + 3) << 16) | probePhyOffsets[i] | (probePhyOffsets[i] == 0x024 ? 0x60 : 0)));
+      for (unsigned i = 0; i < std::size(probeTimingOffsets); ++i)
+        CHECK(words.timing[i] == (((l + 5) << 16) | probeTimingOffsets[i]));
     }
     Text t;
     format(s, 10, 0, t);
@@ -245,6 +260,40 @@ void testM5Probe()
     CHECK(t.has("cmd-compression 000202a8/000202ac") == enabled);
     CHECK(t.has("dsi1 phy: clk-cfg0 00040010 clk-cfg1 00040014") == enabled);
     CHECK(t.has("phy-err 000200b4 timeout 000200c0") == enabled);
+    CHECK(t.has("dsi0 m5: cmd-cfg0 00010040 cmd-cfg1 00010044 dma-length 0001004c reset 00010118 misr-ctrl 000100a4") == enabled);
+    CHECK(t.has("dsi1 phy: ctrl0 00040064 ctrl1 00040028 ctrl2 0004002c ctrl3 00040030 ctrl5 000401b0 lane-cfg0 00040034 lane-cfg1 00040038 "
+                "lane-ctrl0 000400a0 lane-ctrl1 000400a4 pll-ctrl 0004003c") == enabled);
+    CHECK(t.has("dsi0 phy timing 0..13: 000500b4 000500b8 000500bc 000500c0 000500c4 000500c8 000500cc 000500d0 "
+                "000500d4 000500d8 000500dc 000500e0 000500e4 000500e8") == enabled);
+    CHECK(t.has("dsi0 pll: status 00000081 local-lock 1") == enabled);
+    CHECK(t.has("dsi1 pll: status 00000080 local-lock 0") == enabled);
+  }
+}
+
+void testPllProbePower()
+{
+  for (uint32_t ctrl0 : {0u, 0x20u, 0x40u, UINT32_MAX, 0x60u}) {
+    model::Dpu m;
+    seedY12k(m);
+    enableLinkClocks(m);
+    m.regs[kDsiPhy[0] + 0x024] = ctrl0;
+    m.regs[kDsiPhy[1] + 0x024] = 0x60;
+    m.regs[probePllStatus[0]] = UINT32_MAX;   // Even a permitted load may fail to map.
+    m.regs[probePllStatus[1]] = 0;            // Zero from a successful load is meaningful.
+    Snapshot s;
+    std::vector<uint64_t> seen;
+    take(s, [&](uint64_t pa) {
+      seen.push_back(pa);
+      return m.rd(pa);
+    }, true, true);
+    CHECK(s.m5Link[0].read && s.m5Link[1].read);
+    checkProbeLoads(seen, 0, true, ctrl0 == 0x60u);
+    checkProbeLoads(seen, 1, true, true);
+    Text t;
+    format(s, 12, 0, t);
+    CHECK(t.has("dsi0 pll: status unread"));
+    CHECK(t.has("dsi1 pll: status 00000000 local-lock 0"));
+    CHECK(m.stores.empty() && m.refused.empty());
   }
 }
 
@@ -264,6 +313,7 @@ void testM5ClockGates()
     model::Dpu m;
     seedY12k(m);
     enableLinkClocks(m);
+    for (uint64_t base : kDsiPhy) m.regs[base + 0x024] = 0x60;
     m.regs[c.reg] = c.value;
     Snapshot s;
     std::vector<uint64_t> seen;
@@ -274,7 +324,7 @@ void testM5ClockGates()
     for (unsigned l = 0; l < 2; ++l) {
       const bool expected = c.link >= 0 && unsigned(c.link) != l;
       CHECK(s.m5Link[l].read == expected);
-      checkProbeLoads(seen, l, expected);
+      checkProbeLoads(seen, l, expected, expected);
     }
     CHECK(m.stores.empty() && m.refused.empty());
   }
@@ -283,6 +333,7 @@ void testM5ClockGates()
   model::Dpu m;
   seedY12k(m);
   enableLinkClocks(m);
+  for (uint64_t base : kDsiPhy) m.regs[base + 0x024] = 0x60;
   Snapshot s;
   std::vector<uint64_t> seen;
   take(s, [&](uint64_t pa) {
@@ -292,7 +343,7 @@ void testM5ClockGates()
   }, true, true);
   CHECK(s.dsi[0].read && !s.m5Link[0].read && s.m5Link[1].read);
   checkProbeLoads(seen, 0, false);
-  checkProbeLoads(seen, 1, true);
+  checkProbeLoads(seen, 1, true, true);
   CHECK(m.stores.empty() && m.refused.empty());
 }
 
@@ -383,6 +434,7 @@ int main()
   testGateClosed();
   testDsiClockOff();
   testM5Probe();
+  testPllProbePower();
   testM5ClockGates();
   testHalfSwitched();
   testPanelAsleep();
