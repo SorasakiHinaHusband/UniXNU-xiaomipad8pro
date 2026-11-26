@@ -33,6 +33,7 @@ if [[ $op == cleanup-locked ]]; then
     if [[ -s "$dir/seed-owner" ]]; then
         read -r row stamp req < "$dir/seed-owner"
         [[ $row =~ ^[1-9][0-9]*$ && $stamp =~ ^[0-9]+$ && $req =~ ^([0-9a-f]{2})+$ ]]
+        [[ -f $db && ! -L $db ]]
         deleted=$(sql "DELETE FROM access WHERE $where AND rowid=$row AND last_modified=$stamp
              AND auth_value=2 AND auth_reason=4 AND auth_version=1 AND flags=0
              AND csreq=X'$req'; SELECT changes();")
@@ -62,17 +63,18 @@ case $op in
         req=$(xxd -p "$reqfile" | tr -d '\n')
         [[ $req =~ ^([0-9a-f]{2})+$ ]]
         stamp=$(date +%s)
-        # Close the root-only ownership receipt before committing. Only an inserted
-        # row produces a receipt, including when another writer already has a policy.
+        # Write the root-only ownership receipt before committing. A write failure
+        # aborts the transaction. An existing policy leaves no ownership receipt.
         umask 077
         sql <<SQL
+            CREATE TEMP TABLE receipt (bytes INTEGER NOT NULL CHECK(bytes > 0));
             BEGIN IMMEDIATE;
-.output $dir/seed-owner
             INSERT INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags, last_modified)
             SELECT 'kTCCServiceAccessibility', '$wrapper', 1, 2, 4, 1, X'$req', 0, $stamp
-            WHERE NOT EXISTS (SELECT 1 FROM access WHERE $where)
-            RETURNING rowid, last_modified, lower(hex(csreq));
-.output stdout
+            WHERE NOT EXISTS (SELECT 1 FROM access WHERE $where);
+            INSERT INTO receipt
+                SELECT writefile('$dir/seed-owner', rowid || ' ' || last_modified || ' ' || lower(hex(csreq)) || char(10))
+                FROM access WHERE rowid=last_insert_rowid() AND changes()=1;
             COMMIT;
 SQL
         [[ -s "$dir/seed-owner" ]] || { echo GUI_TCC_EXISTING_POLICY; exit 2; }

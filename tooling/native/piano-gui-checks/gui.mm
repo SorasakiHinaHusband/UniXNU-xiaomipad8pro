@@ -304,13 +304,8 @@ static int wifiUI(NSString *op, id app, NSData *ssid)
     }
 
     NSString *name = [[NSString alloc] initWithData:ssid encoding:NSUTF8StringEncoding];
-    if (!name.length && ![op isEqual:@"wifi-list"]) return fail(@"wifi-target-file");
+    if (!name.length) return fail(@"wifi-target-file");
     NSArray *(^inventory)(void) = ^{ return rows(panel(app, extra), toggle); };
-    if ([op isEqual:@"wifi-list"]) {
-        NSMutableArray *names = [NSMutableArray array];
-        for (id row in inventory()) [names addObject:rowName(row)];
-        return emit(@{@"menu": @YES, @"rows": names});
-    }
     id (^find)(void) = ^id { return only(inventory(), ^BOOL(id row) { return rowLabel(row, name); }); };
     id row = waitFor(3, find);
     if (!row) {
@@ -456,7 +451,7 @@ int main(int argc, const char *argv[])
         if (!trusted || getuid() == 0) return fail(@"console-user-ax-trust");
         id app = controlCenter();
         if (!app) return fail(@"control-center-process");
-        if ([@[@"wifi-menu", @"wifi-list", @"wifi-off", @"wifi-on"] containsObject:op] && argc == 2)
+        if ([@[@"wifi-menu", @"wifi-off", @"wifi-on"] containsObject:op] && argc == 2)
             return wifiUI(op, app, nil);
         if ([@[@"wifi-find", @"wifi-click"] containsObject:op] && argc == 3)
             return wifiUI(op, app, ssidFile(argv[2]));

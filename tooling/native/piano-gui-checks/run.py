@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run a GUI phase using the installed-observe actions environment."""
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import math
 import os
@@ -24,23 +26,29 @@ def env(name):
 
 def bash(name, *args, body=None, timeout=35, heartbeat=None):
     command = ["/bin/bash", "-c", f'{name} "$@"', "gui-checks", *map(str, args)]
-    if heartbeat is None:
-        return subprocess.run(command, input=b"" if body is None else body, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=timeout, check=False)
-    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT) as child:
-        deadline = time.monotonic() + timeout
+    with subprocess.Popen(command, stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True) as child:
         try:
-            while time.monotonic() < deadline:
-                try:
-                    output, _ = child.communicate(timeout=.4)
-                    return subprocess.CompletedProcess(command, child.returncode, output)
-                except subprocess.TimeoutExpired:
-                    heartbeat()
-            raise subprocess.TimeoutExpired(command, timeout)
-        finally:
-            if child.poll() is None:
-                child.kill()
+            if heartbeat is None:
+                output, _ = child.communicate(body, timeout=timeout)
+            else:
+                deadline = time.monotonic() + timeout
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        output, _ = child.communicate(timeout=min(.4, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        heartbeat()
+                else:
+                    raise subprocess.TimeoutExpired(command, timeout)
+            return subprocess.CompletedProcess(command, child.returncode, output)
+        except BaseException:
+            # Stop the local transport as well as its Bash wrapper before recovery starts.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
 
 
 def verdict(status, message):
@@ -266,7 +274,9 @@ def load_input():
 
 def key_escape():
     source = load_input()
-    if source.main(["key", "esc"]):
+    with redirect_stderr(io.StringIO()):
+        failed = source.main(["key", "esc"])
+    if failed:
         raise CheckError("HID Escape failed")
 
 

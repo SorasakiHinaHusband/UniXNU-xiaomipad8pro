@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Source from installed-observe actions, then call gui_checks_installed after desklogin and lit.
+# Source from installed-observe actions, then call gui_checks_installed after the desktop gate.
 gui_checks_installed() (
     set +x
     set -o pipefail
@@ -42,6 +42,7 @@ gui_checks_installed() (
         local rc=$? reply
         trap - EXIT
         trap '' INT TERM
+        set +e
         if [[ -n "$GUI_REMOTE" ]]; then
             # session.sh is published only after both root copies pass verification.
             reply=$(SSH_T=45 rsudo "if [ -x $GUI_REMOTE/session.sh ]; then

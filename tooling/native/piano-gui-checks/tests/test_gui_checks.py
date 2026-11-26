@@ -1,4 +1,5 @@
 import json
+import os
 import platform
 from pathlib import Path
 import subprocess
@@ -88,6 +89,38 @@ class WorkflowReceipts(unittest.TestCase):
                 with self.assertRaises(run.CheckError):
                     run.ssid_bytes(path)
 
+    def test_target_staging_requires_receipt_and_sends_only_ssid_on_stdin(self):
+        target = b"offline fixture"
+        dest = "/test-staging/target"
+        with (patch.dict(os.environ, GUI_TARGET=dest, GUI_SSID_FILE="/test-fixture"),
+              patch.object(run, "ssid_bytes", return_value=target),
+              patch.object(run, "bash", return_value=subprocess.CompletedProcess([], 0, b"no answer")) as helper):
+            with self.assertRaisesRegex(run.CheckError, "could not stage"):
+                run.stage_target()
+        self.assertEqual(helper.call_args.kwargs["body"], target)
+        self.assertNotIn(target.decode(), helper.call_args.args[1])
+
+    def test_wifi_passes_only_scalar_evidence_to_redactor(self):
+        receipt = {"row": True, "owner": "synthetic-private-text",
+                   "before": {"target": False, "t": 12.0, "ssid": "synthetic-private-text"}}
+        raw = b"synthetic-private-text\nGUI " + json.dumps(receipt).encode() + b"\n"
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            redactor = folder / "redact.py"
+            redactor.write_text("import sys\nfor line in sys.stdin: print(line.replace('12.0', '0.0'), end='')\n")
+            with (patch.dict(os.environ, GUI_RESULTS=d, GUI_REDACT=str(redactor)),
+                  patch.object(run, "bash", return_value=subprocess.CompletedProcess([], 0, raw))):
+                info = run.remote("wifi-click", artifact="wifi-click")
+            self.assertEqual(info, {"row": True, "before": {"target": False, "t": 12.0}})
+            self.assertEqual(json.loads((folder / "wifi-click.txt").read_text()),
+                             {"row": True, "before": {"target": False, "t": 0.0}})
+
+    def test_wifi_failure_does_not_echo_transport_error(self):
+        raw = b'GUI {"error":"synthetic-private-text"}\n'
+        with patch.object(run, "bash", return_value=subprocess.CompletedProcess([], 0, raw)):
+            with self.assertRaisesRegex(run.CheckError, "^wifi-menu: action failed or receipt missing$"):
+                run.remote("wifi-menu")
+
     def test_hid_drag_keeps_button_held_during_move(self):
         geometry = {"x": 100, "y": 30, "width": 220, "height": 20, "slider": .30}
         history = []
@@ -115,17 +148,128 @@ class WorkflowReceipts(unittest.TestCase):
         port.send.assert_called_once_with("R")
         port.close.assert_called_once()
 
-    def test_spec_attempts_both_brightness_paths_after_wifi_failure(self):
-        result = subprocess.run(["/bin/bash", "-c", """
-            note() { :; }
-            verdict() { :; }
-            fexpect() { return 0; }
-            python3() { printf '%s\\n' "$2"; test "$2" != wifi; }
-            source "$1"
-            steps
-            """, "fixture", FIXTURES.parent / "gui-checks.spec"], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout.splitlines(), ["ax-trust", "wifi", "brightness-ax", "brightness-hid"])
+
+class InstalledSpec(unittest.TestCase):
+    """Mock the installed actions environment without loading the tablet runner."""
+
+    harness = r"""
+        set -euo pipefail
+        BOOT=installed KIND=observe REC_C920=0 DRY=0
+        R=$2/results GUI_BIN=$2/gui GUI_SSID_FILE=$2/ssid GUI_REDACT=$2/redact.py
+        export MOCK_EVENTS=$2/events MOCK_CASE=$3
+        mkdir "$R"
+        if [[ "$MOCK_CASE" == dry ]]; then
+            DRY=1
+            unset GUI_BIN GUI_SSID_FILE GUI_REDACT
+        fi
+        [[ "$MOCK_CASE" != recording ]] || REC_C920=1
+        event() { printf '%s\n' "$1" >> "$MOCK_EVENTS"; }
+        export -f event
+        trap 'event parent-exit' EXIT
+        steps() { event caller-steps; }
+        verdict() { printf '%s\n' "$1" >> "$R/verdict.txt"; }
+        fexpect() { event "fexpect:$1"; grep -Eq -- "$2" "$R/$1"; }
+        shot() { event "shot:$1"; return 99; }
+        rssh() {
+            case "$1" in
+                *kern.bootsessionuuid*) event identity
+                    echo 'GUI_SESSION 00000000-0000-0000-0000-000000000001 501' ;;
+                *GUI_STAGING_READY*) event staging
+                    [[ "$MOCK_CASE" != staging-lost ]] && echo GUI_STAGING_READY || true ;;
+                *GUI_STAGE_SHA256*)
+                    case "$1" in *'/session.sh'*) event stage-session ;; *) event stage-binary ;; esac
+                    if [[ "$MOCK_CASE" == bad-sha && "$1" == *'/session.sh'* ]]; then
+                        cat >/dev/null
+                        echo 'GUI_STAGE_SHA256 mismatched'
+                    else
+                        command python3 -c 'import sys, hashlib, base64; print("GUI_STAGE_SHA256", hashlib.sha256(base64.b64decode(sys.stdin.buffer.read())).hexdigest())'
+                    fi ;;
+                *GUI_STAGING_REMOVED*) event staging-cleanup; echo GUI_STAGING_REMOVED ;;
+                *) event unexpected-rssh; return 99 ;;
+            esac
+        }
+        rsudo() {
+            case "$1" in
+                *GUI_INSTALL_OK*) event root-install
+                    [[ "$MOCK_CASE" != root-lost ]] && echo GUI_INSTALL_OK || true ;;
+                *GUI_CLEANUP_OK*) event remote-cleanup
+                    [[ "$MOCK_CASE" != cleanup-lost ]] && echo GUI_CLEANUP_OK || true ;;
+                *'session.sh ax-trust '*) event remote-ax-trust; echo 'GUI {"trusted":true}' ;;
+                *) event unexpected-rsudo; return 99 ;;
+            esac
+        }
+        python3() {
+            [[ "$1" == */run.py ]] || return 99
+            event "phase:$2"
+            case "$2" in
+                ax-trust) command python3 "$@" ;;
+                wifi) [[ "$MOCK_CASE" != wifi-failure ]] ;;
+                brightness-ax|brightness-hid) ;;
+                *) return 99 ;;
+            esac
+        }
+        source "$1"
+        rc=0
+        gui_checks_installed || rc=$?
+        steps
+        exit "$rc"
+    """
+    staging = ["identity", "staging", "stage-binary", "stage-session"]
+    phases = ["root-install", "phase:ax-trust", "remote-ax-trust", "fexpect:gui-checks/ax-trust.txt",
+              "phase:wifi", "phase:brightness-ax", "phase:brightness-hid"]
+    cleanup = ["remote-cleanup", "staging-cleanup"]
+
+    def invoke(self, scenario, status, events):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            binary = folder / "gui"
+            binary.write_bytes(b"offline-probe")
+            binary.chmod(0o700)
+            (folder / "ssid").write_text("offline-network\n")
+            (folder / "redact.py").touch()
+            result = subprocess.run(
+                ["/bin/bash", "-c", self.harness, "fixture", FIXTURES.parent / "gui-checks.spec", d, scenario],
+                text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+            self.assertEqual((folder / "events").read_text().splitlines(), [*events, "caller-steps", "parent-exit"])
+            return (folder / "results" / "verdict.txt").read_text()
+
+    def test_dry_records_info_without_accessing_tablet_or_fixtures(self):
+        self.assertEqual(self.invoke("dry", 0, []), "INFO gui-checks dry run\n")
+
+    def test_installed_actions_harness(self):
+        verdicts = self.invoke("normal", 0, self.staging + self.phases + self.cleanup)
+        self.assertIn("PASS gui-checks console-user Accessibility verified", verdicts)
+        self.assertIn("INFO gui-checks staging cleanup confirmed", verdicts)
+
+    def test_sha_mismatch_refuses_root_install(self):
+        verdicts = self.invoke("bad-sha", 2, self.staging + ["staging-cleanup"])
+        self.assertIn("staged session.sh SHA-256 differs", verdicts)
+
+    def test_lost_staging_receipt_still_cleans_candidate(self):
+        self.invoke("staging-lost", 2, ["identity", "staging", "staging-cleanup"])
+
+    def test_lost_install_receipt_still_cleans_both_locations(self):
+        self.invoke("root-lost", 2, self.staging + ["root-install"] + self.cleanup)
+
+    def test_wifi_failure_still_runs_both_brightness_phases_and_cleanup(self):
+        self.invoke("wifi-failure", 1, self.staging + self.phases + self.cleanup)
+
+    def test_failed_remote_cleanup_still_attempts_staging_cleanup(self):
+        verdicts = self.invoke("cleanup-lost", 2, self.staging + self.phases + self.cleanup)
+        self.assertIn("FAIL HARNESS gui-checks remote cleanup unconfirmed", verdicts)
+
+    def test_continuous_recording_refused_before_remote_access(self):
+        self.assertIn("requires camera stills", self.invoke("recording", 2, []))
+
+    def test_fragment_has_no_tablet_lock_access(self):
+        lock_path = "/tmp/piano-tablet." + "lock"
+        tools = FIXTURES.parent
+        self.assertFalse((tools / ("run-" + "installed.sh")).exists())
+        for name in ("build.sh", "gui-checks.spec", "session.sh", "run.py", "grade.py"):
+            with self.subTest(name=name):
+                self.assertNotIn(lock_path, (tools / name).read_text())
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and platform.machine() == "arm64", "arm64 macOS SDK required")

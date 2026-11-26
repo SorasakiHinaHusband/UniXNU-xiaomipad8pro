@@ -1,18 +1,35 @@
 # Installed Wi-Fi and brightness GUI checks
 
-Run from the main-session Mac that owns the tablet's USB and C920 connections. The check uses the current macOS 27.3 build `26C5035r` boot with its installed Data store (`data-persist=2`). It holds the harness tablet lock for the whole run. It uses the existing USB SSH, `desk-login`, C920 `shot` and `piano-input` helpers. It compiles one arm64 user-space probe locally.
+Build the arm64 probe on the Mac that owns the tablet's USB and C920 connections.
 
 ```sh
-bash tooling/native/piano-gui-checks/run-installed.sh "$HOME/.config/piano/wifi.secret"
+mkdir -p out/piano-gui-checks
+bash tooling/native/piano-gui-checks/build.sh out/piano-gui-checks/gui
 ```
 
-The optional argument is a Mac-local UTF-8 file containing one SSID line or a single `ssid=` entry in the usual Wi-Fi secret file. Use a visible, previously saved test network with a DHCP server and auto-join enabled. The runner extracts only the SSID and sends it on stdin to a mode-0600 temporary file on the tablet. Keep the file outside the repository. The standard file above is the default.
+Source [the spec fragment](../../tooling/native/piano-gui-checks/gui-checks.spec) from the harness-approved actions file for a `tabletrun.sh` spec with `BOOT=installed`, `KIND=observe` and `REC_C920=0`. The harness owns the installed boot, lock, desk login and teardown. Its compiler binds `verify` steps to registered actions and fixed step lists. Register the GUI action and its step with the harness before submitting a spec. Use `desklogin` and a `shot desktop-reference` before the action. If the plan needs an optical gate, grade that still in the actions file. The harness's `lit` step requires continuous recording.
 
-The runner sources [the spec block](../../tooling/native/piano-gui-checks/gui-checks.spec). The harness's installed observation compiler only admits fixed read-only operations. This block uses the main-session entry point above and runs against the boot already present. Run it with the camera available and the tablet screen in the standard C920 framing. The desktop account must match the harness USB SSH account. The runner logs in or unlocks through `desk-login` when needed.
+An actions file can wire `verify gui-checks` as follows. Set `GUI_SSID_FILE` and `GUI_REDACT` in the host actions environment. `GUI_REDACT` points to the harness's `redact-wifi.py`. Set `GUI_BIN` if the build lives outside `out/piano-gui-checks/gui`.
+
+```bash
+source tooling/native/piano-gui-checks/gui-checks.spec
+
+verdict() { printf '%s\n' "$1" >> "$R/verdict.txt"; log "verdict: $1"; }
+fexpect() { grep -Eq -- "$2" "$R/$1"; }
+
+verify_action() {
+    case "$1" in
+        gui-checks) gui_checks_installed ;;
+        *) return 2 ;;
+    esac
+}
+```
+
+Use a visible, previously saved Wi-Fi test network with DHCP and auto-join enabled. Keep the local UTF-8 fixture file outside the repository. It accepts one SSID line or a single `ssid=` entry. The Wi-Fi phase sends only the SSID on stdin to a mode-0600 file in the tablet's staging directory. It saves scalar receipts through the redactor. The fragment uses C920 stills only during brightness checks because Wi-Fi images could show network names. The desktop account must match the harness USB SSH account, and the tablet must use installed Data (`data-persist=2`).
 
 ## Results
 
-Each run creates a private `private/host-checks/YYYYMMDD-runs/gui-checks.*` directory in the harness checkout. Read `verdict.txt` for the individual checks and `run.log` for their order. The command exits 0 when every check passes, 1 for a graded check failure, or 2 when Accessibility setup or verified cleanup fails. The setup diagnostics and photos remain in the private results directory. Wi-Fi photos can show nearby network names. Text evidence records booleans and counts and passes through `redact-wifi.py` before saving.
+In the harness results directory, read `verdict.txt` for the checks, `gui-checks/` for scalar evidence and `shot-brightness-*.jpg` for the C920 stills. The fragment returns 0 when every check passes, 1 for a graded failure, or 2 for a setup or cleanup failure. In harness dry mode it records an INFO verdict and returns 0 without contacting the tablet or requiring a build or secrets.
 
 - **Wi-Fi row click.** The helper locates the menu-bar Wi-Fi extra owned by Control Center, opens the popover, inventories pressable rows and finds an exact SSID match. It expands Other Networks when necessary. The saved receipts confirm that the menu opened and the target row was found. If the boot already joined the target, the runner disassociates once to create a baseline. The helper checks again immediately before pressing the row. Within 30 seconds of the press, the driver must report the exact SSID on `en0` with active link and a DHCP ACK and lease matching the configured IPv4 address.
 - **Wi-Fi toggle.** The same popover switch must cause GET19 to report off and the link to drop within 15 seconds. The runner holds off for at least five seconds, then presses the switch back on. Power, target association and a matching DHCP lease must return within 30 seconds. Both windows use tablet monotonic timestamps. The runner attempts to restore power through the menu if the cycle is interrupted.
@@ -23,13 +40,15 @@ Both brightness grades require the AX slider and CoreBrightness's normalized `Di
 
 ## Accessibility
 
-The remote runner checks the console UID, Finder, GUI bootstrap and unlocked state before using `launchctl asuser` and `sudo -u` to run the Objective-C helper in the console session. It probes `AXIsProcessTrusted` through the same path. When that probe needs a grant, the runner uses the SSH wrapper's signed requirement and system Accessibility row from the harness `tcc-seed.sh` convention. The installed variant preserves any existing TCC entry, creates only that row when absent, restarts the console user's `tccd`, then probes again. Cleanup deletes the temporary row by its requirement and timestamp and restarts that user's `tccd` again. The RAM seed itself requires volatile Data and also seeds camera consent.
+The fragment verifies the SHA-256 of both staged files and their root-owned installed copies. The remote session checks the boot UUID, console UID, Finder, GUI bootstrap and unlocked state before probing `AXIsProcessTrusted` and running GUI actions via `launchctl asuser` and `sudo -u`. If the probe needs a grant, the session inserts the SSH wrapper's Accessibility row only when the policy is absent, restarts the console user's `tccd`, and probes again. Cleanup matches the inserted row's ID, timestamp, requirement and grant attributes before deleting it and restarting `tccd`. The exit handler attempts both remote and staging cleanup and checks each receipt, including after setup or phase failures.
 
 ## Offline verification
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tooling/native/piano-gui-checks/tests -v
-shellcheck -s bash tooling/native/piano-gui-checks/{build.sh,run-installed.sh,session.sh,gui-checks.spec}
+shellcheck -s bash tooling/native/piano-gui-checks/{build.sh,session.sh,gui-checks.spec}
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tooling/native/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 tooling/native/test_piano_input.py -v
 ```
 
-The panel fixture and luminance trace come from `20261120-installed-issues/verify-v131h-002447` in the private host checks. They contain scalar output from the earlier direct brightness checks. The DHCP packet and GUI receipts use offline fixture data. The native DHCP parser test compiles the probe on arm64 macOS and runs against a file. The AX selectors, installed TCC attribution and simulated drag still require a run against the installed tablet.
+The panel and luminance fixtures contain scalar output from earlier brightness checks. The DHCP packet and GUI receipts use offline fixture data. The native DHCP parser test compiles the probe on arm64 macOS and runs against a file. The AX selectors, installed TCC attribution and simulated drag still require a run against the installed tablet.
