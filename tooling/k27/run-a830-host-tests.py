@@ -5,9 +5,9 @@ firmware pins, twice: as upstream builds them and with -DADRENO830_MACOS (the ma
 
     run-a830-host-tests.py [--out DIR] [--no-firmware] [--adreno-firmware DIR] [names ...]
 
-The runner expects the UniXNU tree layout (ROOT/../UniXNU/kits/{ArmSmmu4K,AdrenoPM4,AdrenoFirmware}), so the sources are staged into
-OUT/src/adreno830 next to OUT/src/UniXNU/kits with links to package/PianoA830/kits and, for test_a830votes only, to a checkout of the
-AdrenoFirmware kit (BSD-2-Clause-Patent; default unixnu-research/AdrenoFirmware; read, never copied). Known differences on piano,
+The sources are staged into OUT/src/adreno830 next to OUT/src/UniXNU/kits with links to package/PianoA830/kits. For test_a830votes,
+the wrapper stages the AdrenoFirmware kit at the unixnu.lock pin, as CI does. It uses a matching local checkout when available
+or fetches into OUT/kits. Use --adreno-firmware or ADRENO_FIRMWARE_KIT to supply a checkout explicitly. Known differences on piano,
 reported as KNOWN and not as failures:
   test_sha256 gen80000_{sqe,aqe,zap}: the test also requires the image to equal Adreno830's built-in pin table
       (NativeAdrenoFirmware.cpp), which is the 13T's; nothing in the driver uses that table (S0 checks the board's pins, which are
@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -38,7 +39,6 @@ KNOWN = {
 }
 
 
-KNOWN_MACOS = {}
 MACOS_LISTS = r"""
 #include "NativeAdrenoPublish.h"
 #include <cstdio>
@@ -187,6 +187,35 @@ def board_tests(out):
     return results
 
 
+def firmware_kit(out, override):
+    name = 'AdrenoFirmware'
+    files = ('AdrenoHfiVotes.c', 'AdrenoHfiVotes.h')
+    if override is None:
+        pin = tomllib.loads((REPO / 'unixnu.lock').read_text())['pin'][name]['commit']
+        research = Path(os.environ.get('UNIXNU_RESEARCH', REPO / 'unixnu-research'))
+        legacy = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'
+        for root in (research, legacy):
+            candidate = root / name
+            if not all((candidate / file).is_file() for file in files):
+                continue
+            head = subprocess.run(['git', '-C', candidate, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+            if head.returncode == 0 and head.stdout.strip() == pin:
+                return candidate.resolve()
+
+        cache = out / 'kits'
+        fetch = subprocess.run([sys.executable, REPO / 'scripts/fetch-pins.py', '--only', name],
+                               env=dict(os.environ, UNIXNU_RESEARCH=str(cache), GIT_TERMINAL_PROMPT='0'),
+                               capture_output=True, text=True)
+        if fetch.returncode:
+            (out / 'adreno-firmware.log').write_text(fetch.stdout + fetch.stderr)
+            sys.exit('Could not fetch the pinned AdrenoFirmware kit. See adreno-firmware.log or use --adreno-firmware DIR.')
+        override = cache / name
+
+    if not all((override / file).is_file() for file in files):
+        sys.exit('The AdrenoFirmware checkout must contain AdrenoHfiVotes.c and AdrenoHfiVotes.h. Use --adreno-firmware DIR.')
+    return override.resolve()
+
+
 def stage(out, adreno_firmware):
     src = out / 'src'
     shutil.rmtree(src, ignore_errors=True)
@@ -203,13 +232,13 @@ def stage(out, adreno_firmware):
     kits.mkdir(parents=True)
     for name in ('ArmSmmu4K', 'AdrenoPM4'):
         (kits / name).symlink_to(PACKAGE / 'kits' / name)
-    if adreno_firmware and (adreno_firmware / 'AdrenoHfiVotes.c').is_file():
+    if adreno_firmware is not None:
         (kits / 'AdrenoFirmware').symlink_to(adreno_firmware)
     return src / 'adreno830'
 
 
 def run(root, out, firmware, names, macos):
-    command = [sys.executable, str(root / 'tests/run-host-tests.py'), '--out', str(out)]
+    command = [sys.executable, str(root / 'tests/run-host-tests.py'), '--unixnu', str(root.parent / 'UniXNU'), '--out', str(out)]
     if firmware:
         command += ['--firmware', str(REPO / 'out/native-kexts/PianoA830/firmware'),
                     '--pins', str(PACKAGE / 'board/piano-gpu-firmware.json')]
@@ -221,25 +250,29 @@ def run(root, out, firmware, names, macos):
     (out.parent / f'{out.name}.log').write_text(text)
     passed = [l for l in result.stdout.splitlines() if re.match(r'^(test_\S+|kernel objects)( \([^)]*\))?: PASS', l)]
     failed = sorted({m.group(1) for m in re.finditer(r'^FAIL (test_[a-z0-9_]+(?: gen80000_\S+)?)', result.stdout, re.M)})
-    return passed, failed, text
+    summary = re.search(r'^\d+ passed, (\d+) failed, \d+ expected failures, \d+ skipped$', result.stdout, re.M)
+    if not summary or int(summary[1]) != len(failed) or result.returncode != int(bool(failed)):
+        failed.append(f'unclassified suite failure (see {out.name}.log)')
+    return passed, failed
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, default=REPO / 'out/native-kexts/PianoA830/host-tests')
     parser.add_argument('--no-firmware', action='store_true')
-    parser.add_argument('--adreno-firmware', type=Path, default=Path(os.environ.get(
-        'ADRENO_FIRMWARE_KIT', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research/AdrenoFirmware')))
+    parser.add_argument('--adreno-firmware', type=Path, default=os.environ.get('ADRENO_FIRMWARE_KIT'))
     parser.add_argument('names', nargs='*')
     args = parser.parse_args()
-    root = stage(args.out, args.adreno_firmware)
+    args.out = args.out.resolve()
+    args.out.mkdir(parents=True, exist_ok=True)
+    kit = firmware_kit(args.out, args.adreno_firmware) if not args.names or 'test_a830votes' in args.names else None
+    root = stage(args.out, kit)
     bad = 0
     for label, macos in (('upstream', False), ('ADRENO830_MACOS', True)):
-        passed, failed, _ = run(root, args.out / ('macos' if macos else 'upstream'), not args.no_firmware, args.names, macos)
-        table = {**KNOWN, **(KNOWN_MACOS if macos else {})}
-        known = [f for f in failed if f in table]
-        real = [f for f in failed if f not in table]
-        print(f'host tests ({label}): {len(passed)} passed, {len(known)} known ({"; ".join(f"{k}: {table[k]}" for k in known) or "none"}), '
+        passed, failed = run(root, args.out / ('macos' if macos else 'upstream'), not args.no_firmware, args.names, macos)
+        known = [f for f in failed if f in KNOWN]
+        real = [f for f in failed if f not in KNOWN]
+        print(f'host tests ({label}): {len(passed)} passed, {len(known)} known ({"; ".join(f"{k}: {KNOWN[k]}" for k in known) or "none"}), '
               f'{len(real)} failed{": " + ", ".join(real) if real else ""}')
         bad += len(real)
         if macos and not args.names:
