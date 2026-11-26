@@ -4,6 +4,16 @@
 
 The VPIO probe's `avrec` mode uses the same recorder and its `--tcc` reports the same AVFoundation authorization value. The existing VPIO TCC seeder is limited to RAM boots. For an installed session, grant the signed app microphone access through the logged-in user's privacy prompt or System Settings. Earlier checks cover other parts of the audio path. `piano-hal-rec` captures through the HAL's AudioQueue, `piano-mic-diag` reads the PianoAudio input before the HAL, and `audio-listen.py` listens for the tablet's speakers using the host microphone. [VPIO probe](../../tooling/native/piano-vpio-probe/piano-vpio-probe.m) · [Piano mic diagnostics](../../tooling/native/piano-mic-diag.md)
 
+## Ubuntu mainline comparison
+
+References are from the local `XiaomiPad8Pro-Ubuntu` clones at `xiaomipad-8pro-mainline` commit `b43fc2b` and `linux-sm8750-piano` commit `b5100d5f2e0b`.
+
+| Path | Ubuntu mainline reference | UniXNU check |
+| --- | --- | --- |
+| Capture route | `device/audio/ucm2/Qualcomm/sm8750/Xiaomi-Pad-8-Pro/HiFi.conf:54–93` maps VA DEC0/1 to DMIC0/2 on the two-channel ALSA capture PCM 2. The capture-only profile uses the same route in `device/audio/ucm2/Qualcomm/sm8750/Piano-Capture-Diag/HiFi.conf:13–61`. | `tooling/native/piano-mic-check/piano-mic-check.m:288–299,344–352` records the selected CoreAudio input through AVFoundation. The qualification stays at the app and harness layers. |
+| Capture evidence | `tools/mic-capture-check.py:123–195,230–268` grades the saved ALSA WAV offline, with an optional known-frequency source. | `tooling/native/piano-mic-check/analyze.py:50–112` grades the saved app capture offline, using a quiet take and a known 1 kHz stimulus. |
+| Speaker evidence | `tools/speaker-playback-device.sh:71–124` plays one bounded tone through ALSA. `tools/speaker-playback-check.py:139–221` grades the stream, amplifier state and a current proxy. | `tooling/native/piano-mic-check/piano-mic-check.m:270–285` reports AVAudioPlayer completion. `tooling/native/audio-listen.py:16–19,36–76` provides independent acoustic capture and tone detection on the Mac. |
+
 ## Build on the Mac host
 
 ```sh
