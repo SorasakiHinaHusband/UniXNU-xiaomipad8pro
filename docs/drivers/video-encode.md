@@ -6,6 +6,11 @@ still open in [B10](../BACKLOG-hardware.md#2-backlog-b1b15). This is the
 analysis prerequisite for the historical V8 encode item in video.md, not
 the later section also named V8 for High AVC **decode**.
 
+For the later E1 implementation and its first tablet START failure, see
+[E1 stage-5 analysis](video-encode-e1.md#stage-5-static-analysis) and its
+[current fix-image gate](video-encode-e1.md#fix-image-gate). The implementation
+gap matrix below describes the historical baseline named above.
+
 The missing work is an encode session, its memory/ownership model, and its
 VideoToolbox protocol implementation. Changing the empty encoder inventory
 alone would expose an unusable endpoint. A bounded 1080p NV12 → AVC session
