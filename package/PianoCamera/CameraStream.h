@@ -105,20 +105,24 @@ inline AeVerdict aeRule(const AeStep &s, const AeStep *prev, uint64_t ev, uint64
 {
   const uint32_t m = s.above, sat = s.satPermille;
   next = ev;
-  if (m + target / 4 >= target && m <= target + target / 4 && sat < 50) return AeVerdict::converged;
+  if (m >= target - target / 4 && m <= uint64_t(target) + target / 4 && sat < 50) return AeVerdict::converged;
   if (prev && prev->above >= 8 && m >= 8 && sat < 900 && prev->satPermille < 900) {
-    const bool moved = ev * 10 >= prevEv * 14 || prevEv * 10 >= ev * 14;
+    const uint64_t low = ev < prevEv ? ev : prevEv, high = ev < prevEv ? prevEv : ev;
+    const bool moved = high > low && (unsigned __int128)high * 5 >= (unsigned __int128)low * 7;
     const bool still = uint64_t(m) * 10 < uint64_t(prev->above) * 11 && uint64_t(prev->above) * 10 < uint64_t(m) * 11;
     if (moved && still) return AeVerdict::noResponse;
   }
+  const uint64_t up = ev > UINT64_MAX / 8 ? UINT64_MAX : ev * 8;
   uint64_t n;
   if (sat > 250) {
     n = ev / 4;
   } else if (m < 4) {
-    n = ev * 8;
+    n = up;
   } else {
-    n = ev * target / m;
-    if (n > ev * 8) n = ev * 8;
+    // Split the quotient so only 64-bit division is needed in the kext.
+    const uint64_t whole = ev / m, tail = ev % m * target / m;
+    n = target && whole > (UINT64_MAX - tail) / target ? UINT64_MAX : whole * target + tail;
+    if (n > up) n = up;
     if (n < ev / 8) n = ev / 8;
   }
   if (n < evMin) n = evMin;
@@ -132,16 +136,18 @@ inline AeVerdict aeRule(const AeStep &s, const AeStep *prev, uint64_t ev, uint64
   return AeVerdict::none;
 }
 // Exposure x gain as the two controls: the exposure first (as long as the frame allows, at the lowest gain), then the gain.
-inline void aeSplit(const ExposureFacts &f, uint32_t eMax, uint64_t ev, uint32_t &e, uint32_t &g)
+inline bool aeSplit(const ExposureFacts &f, uint32_t eMax, uint64_t ev, uint32_t &e, uint32_t &g)
 {
+  if (!f.gMin || f.gMax < f.gMin || !f.eMin || eMax < f.eMin) return false;
   uint64_t x = ev / f.gMin;
   if (x > eMax) x = eMax;
   if (x < f.eMin) x = f.eMin;
-  uint64_t y = (ev + x / 2) / x;
+  uint64_t y = ev / x + (ev % x >= (x + 1) / 2);
   if (y < f.gMin) y = f.gMin;
   if (y > f.gMax) y = f.gMax;
   e = uint32_t(x);
   g = uint32_t(y);
+  return true;
 }
 
 enum : int {
@@ -1149,8 +1155,7 @@ class Stream {
         ++r_.aeCount;
         if (r_.aeVerdict == AeVerdict::none) {
           uint32_t e, g;
-          aeSplit(f, eMax(), next, e, g);
-          if (!aeApply(e, g)) {
+          if (!aeSplit(f, eMax(), next, e, g) || !aeApply(e, g)) {
             fail(kStepL3Stream, StreamFailure::table, "continuous exposure control failed");
             break;
           }
@@ -1380,8 +1385,7 @@ class Stream {
         return true;
       }
       uint32_t e = 0, g = 0;
-      aeSplit(f, eMax(), next, e, g);
-      if (!aeApply(e, g)) {
+      if (!aeSplit(f, eMax(), next, e, g) || !aeApply(e, g)) {
         r_.aeVerdict = AeVerdict::failed;
         ops.note("ae: a control write failed (exposure %u gain %u): the stream goes on with the last controls", e, g);
         return true;

@@ -2246,16 +2246,75 @@ static void testExposureLoop()
   s.satPermille = 600;
   CHECK(aeRule(s, nullptr, 10, 0, 10, 100000, 160, next) == AeVerdict::bright);
   uint32_t e = 0, g = 0;
-  aeSplit(kFrontExposure, 2808, 1024ull * 7936, e, g);
+  CHECK(aeSplit(kFrontExposure, 2808, 1024ull * 7936, e, g));
   CHECK(e == 2808 && g >= 2893 && g <= 2895);   // the exposure first, at the lowest gain, then the gain
-  aeSplit(kRearExposure, 4266, 100ull * 32, e, g);
-  CHECK(e == 100 && g == 32);
+  CHECK(aeSplit(kRearExposure, 4266, 100ull * 32, e, g) && e == 100 && g == 32);
+  CHECK(aeSplit(kRearExposure, 4266, UINT64_MAX, e, g) && e == 4266 && g == kRearExposure.gMax);
+  CHECK(aeSplit(kRearExposure, 22, 22 * 32 + 11, e, g) && e == 22 && g == 33);
+  ExposureFacts invalid = kRearExposure;
+  invalid.gMin = 0;
+  CHECK(!aeSplit(invalid, 4266, 1000, e, g));
+  invalid = kRearExposure;
+  invalid.eMin = 0;
+  CHECK(!aeSplit(invalid, 0, 1000, e, g) && e == 22 && g == 33);
+
+  s = AeStep{};
+  CHECK(aeRule(s, nullptr, UINT64_MAX / 2, 0, 1, UINT64_MAX - 1, 160, next) == AeVerdict::none);
+  CHECK(next == UINT64_MAX - 1);
+  s.above = 20;
+  CHECK(aeRule(s, nullptr, UINT64_MAX / 2, 0, 1, UINT64_MAX, 160, next) == AeVerdict::none);
+  CHECK(next == UINT64_MAX);
+  s.above = 400;
+  CHECK(aeRule(s, nullptr, UINT64_MAX - 2, 0, 1, UINT64_MAX, 160, next) == AeVerdict::none);
+  CHECK(next == (UINT64_MAX - 2) / 5 * 2 + 1);
+  p = s;
+  const uint64_t unit = UINT64_MAX / 7;
+  CHECK(aeRule(s, &p, 7 * unit, 5 * unit, 1, UINT64_MAX, 160, next) == AeVerdict::noResponse);
+  CHECK(aeRule(s, &p, 7 * unit - 1, 5 * unit, 1, UINT64_MAX, 160, next) == AeVerdict::none);
+  s.above = UINT32_MAX;
+  CHECK(aeRule(s, nullptr, 1000, 0, 1, UINT64_MAX, UINT32_MAX, next) == AeVerdict::converged);
 }
 
 // Level 5's pieces off the tablet: the stream's last frame handed to ops.frameReady (the kernel copies it into memory type 0), and
 // the first software ISP (CameraIsp.h) on it and on a synthetic frame: the Bayer orders, grey world, the digital gain, the sizes.
 static void testIsp()
 {
+  CHECK(pianoSrgb8(NAN) == 0 && pianoSrgb8(-INFINITY) == 0 && pianoSrgb8(INFINITY) == 255);
+  {
+    const uint8_t raw[] = {0, 0, 255, 255, 0xf0, 0, 0, 255, 255, 0xf0};
+    uint8_t rgb[6] = {};
+    float work[6] = {};
+    PianoIspStats stats{};
+    CHECK(pianoIsp(raw, sizeof raw, 4, 2, 5, kPianoCameraRGGB, 1022, 1, work, 6, rgb, 6, &stats) == 0);
+    CHECK(stats.digital == 1.f && rgb[0] == 0 && rgb[3] == 255);
+  }
+  {
+    // Independent byte fixtures for R=125, G=(40,84), B=65. The two greens straddle black=64.
+    const uint8_t rows[4][2][5] = {
+      {{31, 10, 31, 10, 0x11}, {21, 16, 21, 16, 0x44}},
+      {{10, 31, 10, 31, 0x44}, {16, 21, 16, 21, 0x11}},
+      {{10, 16, 10, 16, 0x44}, {31, 21, 31, 21, 0x11}},
+      {{16, 10, 16, 10, 0x11}, {21, 31, 21, 31, 0x44}},
+    };
+    for (uint32_t bayer = 0; bayer < 4; ++bayer) {
+      // Odd height and unaligned, padded rows, with only packed bytes stored on the last row.
+      constexpr uint32_t stride = 7, h = 5;
+      uint8_t storage[1 + (h - 1) * stride + 5];
+      std::memset(storage, 0xff, sizeof storage);
+      uint8_t *raw = storage + 1;
+      for (uint32_t y = 0; y < 4; ++y) std::memcpy(raw + y * stride, rows[bayer][y % 2], 5);
+      float work[3] = {};
+      uint8_t rgb[3] = {};
+      PianoIspStats stats{};
+      CHECK(pianoBayerChannel(bayer, UINT32_MAX, 10) == pianoBayerChannel(bayer, 1, 0));
+      CHECK(pianoIsp(raw, sizeof storage - 2, 4, h, stride, bayer, 64, 2, work, 3, rgb, 3, &stats) == -1);
+      CHECK(pianoIsp(raw, sizeof storage - 1, 4, h, stride, bayer, 64, 2, work, 3, rgb, 3, &stats) == 0);
+      CHECK(stats.width == 1 && stats.height == 1);
+      CHECK(stats.mean[0] == 61.f && stats.mean[1] == 10.f && stats.mean[2] == 1.f);
+      CHECK(stats.gain[0] == 0.25f && stats.gain[1] == 1.f && stats.gain[2] == 4.f && stats.digital == 16.f);
+      CHECK(rgb[0] > rgb[1] && rgb[1] > rgb[2] && rgb[2] > 0);
+    }
+  }
   {
     uint8_t raw[10] = {}, rgb[18] = {};
     float work[18] = {};
@@ -2302,6 +2361,9 @@ static void testIsp()
   uint8_t img[4 * 2 * 3] = {}, thumb[2 * 1 * 3] = {};
   for (unsigned i = 0; i < sizeof img; ++i) img[i] = uint8_t(i < 12 ? 10 : 200);   // the first row dark, the second bright
   pianoThumb(img, 4, 2, 2, 1, thumb);
+  CHECK(thumb[0] == 105 && thumb[3] == 105);
+  pianoThumb(img, UINT32_MAX, UINT32_MAX, 2, 1, thumb);
+  pianoThumb(img, 4, 2, UINT32_MAX, UINT32_MAX, thumb);
   CHECK(thumb[0] == 105 && thumb[3] == 105);
   // the model's front scene: the kept frame is the stream's last, the ISP reads it as BGGR
   L3Rig r;
