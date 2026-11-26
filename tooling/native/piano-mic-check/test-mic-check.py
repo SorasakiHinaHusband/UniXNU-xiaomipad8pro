@@ -29,6 +29,61 @@ def run(command, status, *markers):
         f"{command}: exit={result.returncode}, expected {status} and {markers}\n"
         f"{result.stdout}\n{result.stderr}"
     )
+    return result.stdout
+
+
+def tone_measurements(output):
+    line = next(line for line in output.splitlines() if line.startswith("tone_frequency_hz="))
+    return {name: float(value) for name, value in (field.split("=") for field in line.split())}
+
+
+def pcm_sample(value):
+    return min(32767, max(-32768, round(value * 32768)))
+
+
+def test_capture_levels(binary, host, folder):
+    def sine(name, frequency, amplitude, dc=0):
+        path = folder / f"{name}.wav"
+        write_wav(path, (pcm_sample(dc + amplitude * math.sin(math.tau * frequency * i / RATE))
+                         for i in range(SECONDS * RATE)))
+        return path
+
+    clean = sine("clean-minus-18", 1000, 10 ** (-18 / 20))
+    clipped = sine("clipped-1khz", 1000, 2.5)
+    detuned = sine("clipped-detuned", 1002.1, 2.5)
+    for path, frequency, clipped_marker in (
+        (clean, 1000, "clipping_detected=no"),
+        (clipped, 1000, "clipping_detected=yes"),
+        (detuned, 1002.1, "clipping_detected=yes"),
+    ):
+        markers = ("tone_detected=yes", clipped_marker)
+        host_tone = tone_measurements(run([*host, path, "--mode", "tone", "--seconds", str(SECONDS)],
+                                          0, *markers, "grade=pass"))
+        native_tone = tone_measurements(run([binary, "--analyze", path, "--tone"], 0, *markers, "result=ok"))
+        assert all(abs(native_tone[field] - value) <= 0.02 for field, value in host_tone.items()), (
+            host_tone, native_tone
+        )
+        assert abs(host_tone["tone_frequency_hz"] - frequency) <= 0.02, host_tone
+        if path == clean:
+            assert abs(host_tone["tone_dbfs"] - (-18 - 10 * math.log10(2))) < 0.02, host_tone
+            assert host_tone["tone_snr_db"] >= 60, host_tone
+        else:
+            assert 6 <= host_tone["tone_sinad_db"] < 12 <= host_tone["tone_snr_db"], host_tone
+
+    wrong = sine("wrong-500hz", 500, 0.8)
+    wrong_clipped = sine("wrong-500hz-clipped", 500, 2.5, dc=0.5)
+    outside_band = sine("outside-band", 979, 0.8)
+    broadband = folder / "broadband-minus-3.wav"
+    rng = random.Random(51)
+    # For a uniform signal clipped to +/-1, mean square is 1 - 2/(3 * limit).
+    limit = 2 / (3 * (1 - 10 ** (-3 / 10)))
+    noise = [pcm_sample(rng.uniform(-limit, limit)) for _ in range(SECONDS * RATE)]
+    rms_dbfs = 10 * math.log10(sum(value ** 2 for value in noise) / (len(noise) * 32768 ** 2))
+    assert abs(rms_dbfs - (-3)) < 0.05
+    write_wav(broadband, noise)
+    for path in (wrong, wrong_clipped, outside_band, broadband):
+        run([*host, path, "--mode", "tone", "--seconds", str(SECONDS)], 1, "tone_detected=no", "grade=fail")
+        run([binary, "--analyze", path, "--tone"], 5, "tone_detected=no", "result=tone_missing")
 
 
 def test_replay(host, folder):
@@ -103,10 +158,12 @@ def main(binary, stimulus, folder):
                           for i in range(SECONDS * RATE)))
     write_wav(dc, [800] * (SECONDS * RATE))
     write_wav(loud, (rng.randint(-25000, 25000) for _ in range(SECONDS * RATE)))
+    run([*host, quiet, "--mode", "quiet", "--seconds", str(SECONDS)],
+        0, "tone_detected=no", "clipping_detected=no", "noise_floor_sane=yes", "grade=pass")
     for data, mode, status, marker in (
-        (quiet, "quiet", 0, "noise_floor_sane=yes"),
         (quiet, "tone", 1, "tone_detected=no"),
         (zero, "quiet", 1, "noise_floor_sane=no"),
+        (zero, "tone", 1, "tone_detected=no"),
         (dc, "quiet", 1, "noise_floor_sane=no"),
         (loud, "quiet", 1, "noise_floor_sane=no"),
         (wrong, "tone", 1, "tone_detected=no"),
@@ -115,8 +172,10 @@ def main(binary, stimulus, folder):
         run([*host, data, "--mode", mode, "--seconds", str(SECONDS)], status, marker)
     for data in (zero, dc):
         run([binary, "--analyze", data], 4, "result=silence")
+        run([binary, "--analyze", data, "--tone"], 4, "tone_detected=no", "result=silence")
     for data in (quiet, wrong, transient):
-        run([binary, "--analyze", data, "--tone"], 5, "result=tone_missing")
+        run([binary, "--analyze", data, "--tone"], 5, "tone_detected=no", "result=tone_missing")
+    test_capture_levels(binary, host, folder)
 
     m4a = folder / "tone.m4a"
     subprocess.run(["/usr/bin/afconvert", "-f", "m4af", "-d", "LEI16", stimulus, m4a], check=True)

@@ -10,9 +10,9 @@ References are from the local `XiaomiPad8Pro-Ubuntu` clones at `xiaomipad-8pro-m
 
 | Path | Ubuntu mainline reference | UniXNU check |
 | --- | --- | --- |
-| Capture route | `arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano-desktop.dts:58–71` declares the VA backend. `device/audio/ucm2/Qualcomm/sm8750/Xiaomi-Pad-8-Pro/HiFi.conf:54–93` maps VA DEC0/1 to DMIC0/2 on two-channel ALSA capture PCM 2. | `tooling/native/piano-mic-check/piano-mic-check.m:328–339,384–392` records the selected CoreAudio input through AVFoundation. |
-| Capture evidence | `tools/mic-capture-check.py:123–195,230–268` grades the saved ALSA WAV offline, with an optional known-frequency source. | `tooling/native/piano-mic-check/analyze.py:53–115` grades the saved app capture offline, using a quiet take and a known 1 kHz stimulus. |
-| Speaker evidence | `tools/speaker-playback-device.sh:71–124` plays one bounded tone through ALSA. `tools/speaker-playback-check.py:139–221` grades the stream, amplifier state and a current proxy. | `tooling/native/piano-mic-check/piano-mic-check.m:271–326` checks the output route and AVAudioPlayer completion. `tooling/native/audio-listen.py:16–42` captures the speaker on the Mac. `tooling/native/piano-mic-check/analyze.py:118–162` grades the acoustic result. |
+| Capture route | `arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano-desktop.dts:58–71` declares the VA backend. `device/audio/ucm2/Qualcomm/sm8750/Xiaomi-Pad-8-Pro/HiFi.conf:54–93` maps VA DEC0/1 to DMIC0/2 on two-channel ALSA capture PCM 2. | The app records the selected CoreAudio input through AVFoundation. [`record_to`](../../tooling/native/piano-mic-check/piano-mic-check.m) |
+| Capture evidence | `tools/mic-capture-check.py:123–195,230–268` grades the saved ALSA WAV offline, with an optional known-frequency source. | The host grades the saved app capture offline, using a quiet take and a known 1 kHz stimulus. [`analyze_wav`](../../tooling/native/piano-mic-check/analyze.py) |
+| Speaker evidence | `tools/speaker-playback-device.sh:71–124` plays one bounded tone through ALSA. `tools/speaker-playback-check.py:139–221` grades the stream, amplifier state and a current proxy. | The app checks the output route and AVAudioPlayer completion. The Mac captures and grades the acoustic result. [`replay`](../../tooling/native/piano-mic-check/piano-mic-check.m) · [`audio-listen.py`](../../tooling/native/audio-listen.py) · [`analyze_replay`](../../tooling/native/piano-mic-check/analyze.py) |
 
 ## Build on the Mac host
 
@@ -50,7 +50,7 @@ Without the boot arg, the attended flow uses an existing grant or `MIC_CHECK_REQ
 
 ## Read the evidence
 
-The app reports the microphone authorization state and numeric `mic_status` using AVFoundation's values 0 (not determined), 1 (restricted), 2 (denied), and 3 (authorized). The capture log has the input name and HAL stream format, the saved recording format, per-second RMS and peak dBFS, and the default output name during a speaker run. The analyzer reports the frequency and SNR of the detected 1 kHz signal. Exact digital zero displays as −200 dBFS.
+The app reports the microphone authorization state and numeric `mic_status` using AVFoundation's values 0 (not determined), 1 (restricted), 2 (denied), and 3 (authorized). The capture log has the input name and HAL stream format, the saved recording format, per-second RMS and peak dBFS, and the default output name during a speaker run. Both capture analyzers report `clipping_detected=yes` and `clipped_samples` when they find samples at full scale. Exact digital zero displays as −200 dBFS.
 
 The printed `$R/mic-check.*` directory holds `boot.txt`, the `tcc*.txt` receipts, the pulled M4As, and the input grades. `remote-stage.txt` points to the private copies on the tablet. For an unattended PASS, look for `mic_status=3` in `tcc.txt` or `tcc-after-*.txt`, `playback_complete=yes` in both `replay-*.txt` logs, and `grade=pass` in `replay.grade.txt`. The paired `c920-quiet.wav` and `c920-tone.wav` preserve the acoustic evidence. Check the adjacent `*.record.txt` logs when the recorder fails to start or complete.
 
@@ -74,7 +74,9 @@ python3 tooling/native/piano-mic-check/analyze.py /path/to/c920-tone.wav \
   --mode replay --control /path/to/c920-quiet.wav --seconds 18
 ```
 
-- **Tone** requires two adjacent 200 ms windows with a 980–1020 Hz component, scanned in 5 Hz steps. Each window must reach −55 dBFS tone RMS and 12 dB SNR. SNR compares the estimated tone power to the remaining AC power in that window.
+- **Tone** requires two adjacent 200 ms windows with a fitted 980–1020 Hz fundamental at −55 dBFS RMS or higher and at least 12 dB SNR. Both analyzers refine the 5 Hz scan to fit a sine at fractional frequencies. `tone_sinad_db` compares the fundamental with all remaining AC power. For windows with at least 1% full-scale samples and at least 6 dB SINAD, `tone_snr_db` removes the fitted second through ninth harmonics below Nyquist from that residual. Other windows use the full residual for SNR.
 - **Quiet** requires each full second's AC RMS to fall between −85 and −25 dBFS, the capture's peak to stay at or below −6 dBFS, and no test tone to be detected. The reported noise floor is the median of those full-second AC RMS levels. These are initial qualification bands for a quiet room.
 - **Replay** requires two adjacent 200 ms windows at 980–1020 Hz, each at −75 dBFS tone RMS or higher and at least 12 dB SNR. The weaker window must also be at least 10 dB above the quiet replay's strongest sustained 1 kHz level. A qualifying tone in the quiet replay fails the control. Both C920 takes must contain nonconstant PCM and match the requested duration within 0.25 s.
 - The capture modes also require the duration to be within 0.25 s when `--seconds` is supplied. The host analyzer exits 0 for a pass, 1 for audio outside the grade, and 2 for invalid or unreadable input.
+
+In the clipped qualification take, the 1.4–1.6 s window had 6,586 full-scale samples out of 9,600. The old fit put the fundamental at the 1000 Hz bin (−3.85 dBFS), leaving leaked fundamental power and distortion in the residual (0.30 dB SNR). Fitting 1002.06 Hz recovers the fundamental at −1.25 dBFS with 11.93 dB SINAD. The third harmonic alone is about −14 dBFS. Both capture analyzers now detect the tone at 24.48 dB SNR and report 20,052 clipped samples across the take. The paired quiet take passes at a −44.04 dBFS noise floor with no tone detected.

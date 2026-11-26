@@ -15,6 +15,8 @@ enum { OK = 0, Error = 1, Usage = 2, NoPermission = 3, Silence = 4, ToneMissing 
 static const double kMinInputDBFS = -85.0;
 static const double kMinToneDBFS = -55.0;
 static const double kMinToneSNR = 12.0;
+static const double kMinClippedToneSINAD = 6.0;
+static const int kMinToneHz = 980, kMaxToneHz = 1020;
 
 @interface AudioCompletion : NSObject <AVAudioRecorderDelegate, AVAudioPlayerDelegate>
 @property (atomic) BOOL finished;
@@ -142,29 +144,109 @@ static double power_db(double power)
 }
 
 typedef struct {
-    int frequency;
+    double frequency;
     double snr;
+    double sinad;
     double power;
 } Tone;
 
-static Tone find_tone(const float *samples, size_t count, double rate, double mean, double acPower)
+typedef struct {
+    double frequency;
+    double power;
+    double cosineGain;
+    double sineGain;
+    double cosineMean;
+} SineFit;
+
+static SineFit fit_sine(const double *samples, size_t count, double rate, double frequency)
 {
-    Tone best = { .snr = -200.0 };
-    for (int hz = 980; hz <= 1020; hz += 5) {
-        double coefficient = 2.0 * cos(2.0 * M_PI * hz / rate);
-        double previous = 0.0, older = 0.0;
-        for (size_t i = 0; i < count; ++i) {
-            double state = samples[i] - mean + coefficient * previous - older;
-            older = previous;
-            previous = state;
-        }
-        double power = 2.0 * (previous * previous + older * older - coefficient * previous * older) /
-                       ((double)count * count);
-        if (power > best.power) {
-            best = (Tone){ hz, power_db(power) - power_db(acPower - power), power };
+    double step = 2.0 * M_PI * frequency / rate;
+    double cosine = cos(step), sine = sin(step);
+    double coefficient = 2.0 * cosine;
+    double previous = 0.0, older = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        double state = samples[i] + coefficient * previous - older;
+        older = previous;
+        previous = state;
+    }
+
+    // Rotate to the center of the window so the two quadratures are orthogonal.
+    // Centering the cosine by its mean removes DC from the fit between bins.
+    double phase = step * (count - 1) / 2.0;
+    double real = previous - older * cosine, imag = older * sine;
+    double cosineDot = real * cos(phase) + imag * sin(phase);
+    double sineDot = imag * cos(phase) - real * sin(phase);
+    double cosineMean = sin(count * step / 2.0) / (count * sin(step / 2.0));
+    double cosineEnergy = (count + sin(count * step) / sine) / 2.0;
+    double sineGain = sineDot / (count - cosineEnergy);
+    double cosineGain = cosineDot / (cosineEnergy - count * cosineMean * cosineMean);
+    double power = (cosineGain * cosineDot + sineGain * sineDot) / count;
+    return (SineFit){ frequency, power, cosineGain, sineGain, cosineMean };
+}
+
+static void remove_sine(double *samples, size_t count, double rate, SineFit fit)
+{
+    double step = 2.0 * M_PI * fit.frequency / rate, center = (count - 1) / 2.0;
+    for (size_t i = 0; i < count; ++i) {
+        double phase = step * (center - i);
+        samples[i] -= fit.cosineGain * (cos(phase) - fit.cosineMean) + fit.sineGain * sin(phase);
+    }
+}
+
+static BOOL tone_in_band(double frequency)
+{
+    // Keep the frequency test consistent with the reported precision.
+    return frequency >= kMinToneHz - 0.005 && frequency <= kMaxToneHz + 0.005;
+}
+
+static BOOL sample_at_rail(float sample)
+{
+    return sample <= -1.0f || sample >= 32767.0f / 32768.0f;
+}
+
+static Tone find_tone(double *samples, size_t count, double rate, double acPower, size_t clipped)
+{
+    // Match the host detector, including guard bins and sub-bin refinement.
+    SineFit best = fit_sine(samples, count, rate, kMinToneHz - 5);
+    for (int hz = kMinToneHz; hz <= kMaxToneHz + 5; hz += 5) {
+        SineFit trial = fit_sine(samples, count, rate, hz);
+        if (trial.power > best.power)
+            best = trial;
+    }
+    double step = 2.5;
+    for (int refinement = 0; refinement < 6; ++refinement, step /= 2.0) {
+        SineFit lower = fit_sine(samples, count, rate, best.frequency - step);
+        SineFit upper = fit_sine(samples, count, rate, best.frequency + step);
+        if (lower.power > best.power)
+            best = lower;
+        if (upper.power > best.power)
+            best = upper;
+    }
+    SineFit lower = fit_sine(samples, count, rate, best.frequency - step);
+    SineFit upper = fit_sine(samples, count, rate, best.frequency + step);
+    double curvature = lower.power + upper.power - 2.0 * best.power;
+    if (curvature < 0.0) {
+        double shift = fmin(1.0, fmax(-1.0, (lower.power - upper.power) / (2.0 * curvature)));
+        SineFit refined = fit_sine(samples, count, rate, best.frequency + step * shift);
+        if (refined.power > best.power)
+            best = refined;
+    }
+
+    double level = power_db(best.power), residual = acPower - best.power;
+    double sinad = level - power_db(residual);
+    // Only remove harmonics for substantial clipping with a dominant fundamental.
+    if (tone_in_band(best.frequency) && sinad >= kMinClippedToneSINAD && clipped * 100 >= count) {
+        remove_sine(samples, count, rate, best);
+        for (int harmonic = 2; harmonic <= 9; ++harmonic) {
+            double frequency = best.frequency * harmonic;
+            if (frequency >= rate / 2.0 - 5.0)
+                break;
+            SineFit fit = fit_sine(samples, count, rate, frequency);
+            remove_sine(samples, count, rate, fit);
+            residual -= fit.power;
         }
     }
-    return best;
+    return (Tone){ best.frequency, level - power_db(residual), sinad, best.power };
 }
 
 static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
@@ -195,10 +277,13 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
     AVAudioFrameCount second = (AVAudioFrameCount)llround(rate);
     size_t window = second / 5;
     AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:second];
-    if (!buffer)
+    NSMutableData *toneBuffer = expectTone ? [NSMutableData dataWithLength:window * sizeof(double)] : nil;
+    if (!buffer || (expectTone && !toneBuffer))
         return Error;
+    double *signal = toneBuffer.mutableBytes;
     BOOL hasInput = NO, detected = NO;
     unsigned consecutive = 0;
+    size_t railSamples = 0;
     Tone best = { .snr = -200.0 }, previous = best;
     // Best qualifying window, or the strongest candidate for diagnosis on a failed tone run.
     Tone candidate = best;
@@ -214,6 +299,7 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
         for (size_t i = 0; i < count; ++i) {
             sumSquares += (double)samples[i] * samples[i];
             peak = fmax(peak, fabs(samples[i]));
+            railSamples += sample_at_rail(samples[i]);
         }
         printf("second=%lld rms_dbfs=%.2f peak_dbfs=%.2f\n", (long long)(offset / second),
                power_db(sumSquares / count), power_db(peak * peak));
@@ -228,13 +314,18 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
             hasInput |= power_db(acPower) >= kMinInputDBFS;
             if (!expectTone)
                 continue;
-            Tone tone = find_tone(samples + start, window, rate, mean, acPower);
+            size_t clipped = 0;
+            for (size_t i = 0; i < window; ++i) {
+                signal[i] = samples[start + i] - mean;
+                clipped += sample_at_rail(samples[start + i]);
+            }
+            Tone tone = find_tone(signal, window, rate, acPower, clipped);
             if (tone.power > candidate.power)
                 candidate = tone;
-            if (power_db(tone.power) >= kMinToneDBFS && tone.snr >= kMinToneSNR) {
+            if (tone_in_band(tone.frequency) && power_db(tone.power) >= kMinToneDBFS && tone.snr >= kMinToneSNR) {
                 if (++consecutive >= 2) {
                     detected = YES;
-                    Tone stronger = tone.snr >= previous.snr ? tone : previous;
+                    Tone stronger = tone.snr > previous.snr ? tone : previous;
                     if (stronger.snr > best.snr)
                         best = stronger;
                 }
@@ -245,13 +336,14 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
         }
     }
 
+    printf("clipping_detected=%s\nclipped_samples=%zu\n", railSamples ? "yes" : "no", railSamples);
     if (expectTone) {
         Tone tone = detected ? best : candidate;
         printf("tone_detected=%s\n", detected ? "yes" : "no");
-        if (tone.frequency)
-            printf("%s=%d tone_snr_db=%.2f tone_dbfs=%.2f\n",
+        if (power_db(tone.power) > -200.0)
+            printf("%s=%.2f tone_snr_db=%.2f tone_dbfs=%.2f tone_sinad_db=%.2f\n",
                    detected ? "tone_frequency_hz" : "tone_candidate_hz",
-                   tone.frequency, tone.snr, power_db(tone.power));
+                   tone.frequency, tone.snr, power_db(tone.power), tone.sinad);
     }
     if (!hasInput)
         return Silence;
