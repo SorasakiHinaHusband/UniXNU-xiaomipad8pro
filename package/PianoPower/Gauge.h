@@ -359,7 +359,7 @@ inline PackReading combinePacks(const GaugeReading *g, unsigned n)
     p.currentMa += g[i].currentMa;
     p.remainingMah += g[i].remainingMah;
     p.fullMah += g[i].fullMah;
-    p.full = (p.packs == 1 || p.full) && (g[i].status & kGaugeFc);
+    p.full = (p.packs == 1 || p.full) && gaugeWordCredible(kGaugeStatus, g[i].status) && (g[i].status & kGaugeFc);
   }
   if (!p.packs) return p;
   p.ok = true;

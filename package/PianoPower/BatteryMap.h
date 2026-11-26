@@ -102,7 +102,7 @@ inline BatteryValues mapBattery(const GaugeReading *packs, unsigned n, const Pac
     if (!packs[i].ok) continue;
     average += packs[i].averageMa;
     design += packs[i].designMah;
-    if (unsigned(packs[i].cycles) > cycles) cycles = unsigned(packs[i].cycles);
+    if (packs[i].cycles != 0xffff && unsigned(packs[i].cycles) > cycles) cycles = unsigned(packs[i].cycles);
   }
   v.amperageMa = int(average);
   v.designMah = design > 0 ? unsigned(design) : v.fullMah;

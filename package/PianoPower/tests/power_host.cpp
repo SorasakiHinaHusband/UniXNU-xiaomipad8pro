@@ -3161,6 +3161,10 @@ static void testRtc()
   CHECK(r.ok && r.rtc.apid == rtc && r.rtc.owner == 0 && r.sdam.apid == sdam && r.type == 0x0b && r.subtype == 0x07);
   CHECK(r.enabled && r.count == raw && r.sdamOk && r.sdamOffset == cell);
   CHECK(r.source == RtcOffsetSource::sdam && r.offset == cell && r.utc == 1794355200u && r.dated);
+  Arbiter unsupported = arb;
+  unsupported.v7 = false;
+  CHECK(!readRtc(io, unsupported, false, 0).ok);
+  CHECK(!readRtc(io, unsupported, false, 0, &r).ok);
   // The argument wins over the cell; an offset that gives no date is reported as such; the counter stopped.
   r = readRtc(io, arb, true, 1794355200u - raw + 7, &r);
   CHECK(r.source == RtcOffsetSource::arg && r.utc == 1794355207u && r.dated);
