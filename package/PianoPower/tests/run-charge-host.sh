@@ -3,8 +3,8 @@
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../../.." && pwd)
 P=$D/package/PianoPower
-T=$D/out/chg-host
-mkdir -p "$T"
+T=$(mktemp -d "${TMPDIR:-/tmp}/piano-charge-host.XXXXXXXX")
+trap 'rm -rf "$T"' EXIT
 for f in PianoMca ChargePolicy QcomQrtr; do
   "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/$f.c" -o "$T/$f.o"
 done
