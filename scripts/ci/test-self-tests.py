@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -86,6 +87,27 @@ class SuiteTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('stdout\ufffd', output)
         self.assertIn('stderr', output)
+
+    def test_timed_out_wrapper_stops_its_background_jobs(self):
+        path = self_tests.CHARGE_HOST_TESTS
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / path
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text('sleep 30 &\nprintf "%s\\n" "$!"\nwait\n')
+            with patch.object(self_tests, 'ROOT', root), patch.object(self_tests, 'TIMEOUT', 1):
+                _, ok, _, output = self_tests.run_one('sh', path, None, 2)
+        self.assertFalse(ok)
+        timeout, child = output.splitlines()
+        self.assertEqual(timeout, 'timeout after 1 s')
+        for _ in range(50):
+            try:
+                os.kill(int(child), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail('background job survived the wrapper timeout')
 
     def test_list_reports_stale_skips_only_when_unfiltered(self):
         kept = 'scripts/ci/test-actual.py'
