@@ -85,9 +85,16 @@ metal_sustain_installed() {
   if [ "$pull_failed" -ne 0 ]; then
     verdict "FAIL HARNESS metal-sustain: evidence transfer failed ($d)"; return 1
   fi
+  local grade_rc
   if python3 "$hostdir/grade.py" "$result" > "$result/grade.txt" 2>&1; then
     verdict 'PASS metal-sustain: 600-second installed Metal 3D benchmark (metal-sustain/grade.txt)'
     return 0
+  else
+    grade_rc=$?
+  fi
+  if [ "$grade_rc" -eq 2 ]; then
+    verdict 'VOID metal-sustain: external interaction in bounded console capture (metal-sustain/grade.txt)'
+    return 2
   fi
   verdict 'FAIL metal-sustain: see metal-sustain/grade.txt'
   return 1

@@ -17,6 +17,12 @@ FAULT = re.compile(
     r'|DEVICE LOST|hang snapshot|recovery done|recovery: (?:culprit|the driver)'
     r'|MTLCommandBuffer(?:StatusError|ErrorDomain)|R3a UNSAFE|R3b3 exit|panic\(cpu', re.I)
 FREQUENCY = re.compile(r'^at_us=(\d+) lvl=(\d+) mhz=(\d+)\b')
+CONSOLE_MARKER = re.compile(r'PIANO_METAL_SUSTAIN ([A-Za-z0-9]+) (BEGIN|END)\b')
+CONSOLE_EVENT = re.compile(
+    r'(?P<touch>PianoTouch: contact [0-9]+ down\b)'
+    r'|(?P<browser>PianoA830: (?:Safari|Google Chrome|com\.apple\.WebKit)[^\s]* opens the accelerator\b)'
+    r'(?:, type \S+: \S+ \(at (?P<browser_ms>[0-9]+) ms\))?'
+    r'|R3b LV at-us=(?P<heartbeat_us>[0-9]+) lvl=\d+ mhz=\d+\b')
 
 
 def require(condition, message):
@@ -49,24 +55,56 @@ def number(cell):
     return value
 
 
+def console_confounds(console):
+    touches = browser_opens = 0
+    ranges = []
+    previous_heartbeat = -math.inf
+    untimed_event = False
+    for event in CONSOLE_EVENT.finditer(console):
+        if event['heartbeat_us'] is not None:
+            heartbeat = int(event['heartbeat_us']) / 1_000_000
+            if untimed_event:
+                ranges.append((min(previous_heartbeat, heartbeat), max(previous_heartbeat, heartbeat)))
+                untimed_event = False
+            previous_heartbeat = heartbeat
+        elif event['touch'] is not None:
+            touches += 1
+            untimed_event = True
+        else:
+            browser_opens += 1
+            if event['browser_ms'] is None:
+                untimed_event = True
+            else:
+                stamp = int(event['browser_ms']) / 1000
+                ranges.append((stamp, stamp))
+    if untimed_event:
+        ranges.append((previous_heartbeat, math.inf))
+    return touches, browser_opens, ranges
+
+
 def grade(root):
+    console = (root / 'console.txt').read_text(errors='replace')
+    markers = list(CONSOLE_MARKER.finditer(console))
+    require(len(markers) == 2 and markers[0][1] == markers[1][1] and
+            [marker[2] for marker in markers] == ['BEGIN', 'END'], 'incomplete console window')
+    console = console[markers[0].end():markers[1].start()]
+    touches, browser_opens, confound_ranges = console_confounds(console)
+    print(f'Console confounds touch_contacts={touches} browser_accelerator_opens={browser_opens}')
+    fault = FAULT.search(console)
+    require(fault is None, f'GPU hang/reset/error in console window: {fault.group() if fault else ""}')
+    require(re.search(r'R3b LV .*\blvl=\d+ .*\bmhz=\d+', console), 'no in-window GPU console heartbeat')
+
     before_boot, before_freq, before_recovery = snapshot(root / 'before.txt')
     after_boot, after_freq, after_recovery = snapshot(root / 'after.txt')
     require(before_boot == after_boot, 'boot changed during the test')
     require(before_recovery == after_recovery and before_recovery['lost_cause'] == 0,
             f'GPU recovery/fault/watchdog changed or GPU lost: {before_recovery} -> {after_recovery}')
-    require((root / 'run.txt').read_text().splitlines().count('METAL_SUSTAIN_REMOTE_RC=0') == 1,
-            'console-user command did not confirm exit 0')
-
-    console = (root / 'console.txt').read_text(errors='replace')
-    markers = re.findall(r'PIANO_METAL_SUSTAIN ([A-Za-z0-9]+) (BEGIN|END)\b', console)
-    require(len(markers) == 2 and markers[0][0] == markers[1][0] and
-            [phase for _, phase in markers] == ['BEGIN', 'END'], 'incomplete console window')
-    require(re.search(r'R3b LV .*\blvl=\d+ .*\bmhz=\d+', console), 'no in-window GPU console heartbeat')
-    fault = FAULT.search(console)
-    require(fault is None, f'GPU hang/reset/error in console window: {fault.group() if fault else ""}')
 
     log = (root / 'summary.log').read_text().splitlines()
+    require(not any(line.startswith(('METAL_SUSTAIN_ERROR ', 'METAL_SUSTAIN_COMMAND_ERROR ')) for line in log),
+            'Metal or command-buffer error')
+    require((root / 'run.txt').read_text().splitlines().count('METAL_SUSTAIN_REMOTE_RC=0') == 1,
+            'console-user command did not confirm exit 0')
     begins = [line for line in log if line.startswith('METAL_SUSTAIN_BEGIN ')]
     ends = [fields(line) for line in log if line.startswith('METAL_SUSTAIN_END ')]
     require(len(begins) == 1 and 'device="Adreno' in begins[0], 'Adreno hardware start is missing')
@@ -75,8 +113,6 @@ def grade(root):
                                                    height='1280', draws='257').items()), 'wrong workload settings')
     require(len(ends) == 1 and all(ends[0].get(k) == v for k, v in
             dict(rc='0', elapsed_s='600.000000', windows='60', unfinished='0').items()), 'incomplete 600-second run')
-    require(not any(line.startswith(('METAL_SUSTAIN_ERROR ', 'METAL_SUSTAIN_COMMAND_ERROR ')) for line in log),
-            'Metal or command-buffer error')
     summaries = [fields(line) for line in log if line.startswith('WINDOW ')]
     require(len(summaries) == SECONDS // WINDOW, 'missing 10-second windows')
 
@@ -116,6 +152,7 @@ def grade(root):
     last_completion = 0.0
     worst_p99, lowest_fps, stalls, total, presented = 0.0, math.inf, 0, 0, 0
     stall_windows, slow_windows, low_fps_windows = [], [], []
+    window_metrics = []
     for i, (summary, frames, samples) in enumerate(zip(summaries, cohorts, readings)):
         require(int(summary['index']) == i and int(summary['start_s']) == i * WINDOW and
                 float(summary['seconds']) == WINDOW and int(summary['submitted']) == len(frames) and
@@ -125,9 +162,13 @@ def grade(root):
                 int(summary['min_level']) == min(s[1] for s in samples) and
                 int(summary['max_level']) == max(s[1] for s in samples) and
                 int(summary['max_mhz']) == max(s[2] for s in samples), f'window {i}: missing or invalid frequency readings')
-        gpu_timed = sum(bool(f['gpu_start_s'] and f['gpu_end_s'] and
-                             number(f['gpu_end_s']) > number(f['gpu_start_s'])) for f in frames)
-        require(gpu_timed > 0 and gpu_timed == int(summary['gpu_timed']), f'window {i}: GPU timing missing or invalid')
+        gpu_work = []
+        for frame in frames:
+            if frame['gpu_start_s'] and frame['gpu_end_s']:
+                duration = number(frame['gpu_end_s']) - number(frame['gpu_start_s'])
+                if duration > 0:
+                    gpu_work.append(duration * 1000)
+        require(gpu_work and len(gpu_work) == int(summary['gpu_timed']), f'window {i}: GPU timing missing or invalid')
         completions = sorted(number(f['completion_callback_s']) for f in frames)
         distinct = []
         for stamp in completions:
@@ -154,26 +195,41 @@ def grade(root):
         # The CSV rounds absolute stamps to nanoseconds before subtraction.
         if p99 > P99_MAX_MS + .000002:
             slow_windows.append(i)
+        window_metrics.append((fps, p99, max(gpu_work)))
         worst_p99, lowest_fps = max(worst_p99, p99), min(lowest_fps, fps)
         stalls += window_stalls
         total += len(distinct)
         presented += int(summary['presented'])
 
+    # Untimestamped events may fall anywhere between their surrounding console heartbeats.
+    confound_windows = [i for i in range(len(summaries)) if any(
+        first < start + (i + 1) * WINDOW and last >= start + i * WINDOW for first, last in confound_ranges)]
+    for i, (fps, p99, gpu_work_max) in enumerate(window_metrics):
+        print(f'WINDOW index={i} fps={fps:.2f} p99_ms={p99:.2f} gpu_work_max_ms={gpu_work_max:.3f}')
     peak_level = max(level for samples in readings for _, level, _ in samples)
     print(f'Adreno 3D completed={total} fps={total / SECONDS:.2f} min_10s_fps={lowest_fps:.2f} '
           f'worst_10s_p99_ms={worst_p99:.2f} stalls_gt_50_ms={stalls} stall_windows={stall_windows} '
-          f'peak_level={peak_level} presented={presented}')
+          f'peak_level={peak_level} presented={presented} '
+          f'undisturbed_windows={len(summaries) - len(confound_windows)}/{len(summaries)} '
+          f'confound_windows={confound_windows}')
     if not presented:
         print('Drawable presentation timestamps unavailable. FPS and frame intervals use successful Metal completions.')
-    require(not low_fps_windows and not slow_windows,
-            f'performance floor: fps < {FPS_MIN:g} in {low_fps_windows}; p99 > {P99_MAX_MS:g} ms in {slow_windows}')
+    floor_failure = low_fps_windows or slow_windows
+    floor_details = f'fps < {FPS_MIN:g} in {low_fps_windows}, p99 > {P99_MAX_MS:g} ms in {slow_windows}'
+    if touches or browser_opens:
+        print('VOID installed Metal sustain (CONFOUND): external interaction in bounded console capture')
+        if floor_failure:
+            print(f'Performance floor missed ({floor_details})')
+        return 2
+    require(not floor_failure, f'performance floor: {floor_details}')
     print('PASS installed Metal sustain')
+    return 0
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         sys.exit('usage: grade.py RESULT_DIRECTORY')
     try:
-        grade(Path(sys.argv[1]))
+        sys.exit(grade(Path(sys.argv[1])))
     except (KeyError, OSError, StopIteration, TypeError, ValueError, csv.Error) as error:
         sys.exit(f'FAIL installed Metal sustain: {error or "missing capture record"}')
