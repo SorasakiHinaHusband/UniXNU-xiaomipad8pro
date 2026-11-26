@@ -56,6 +56,8 @@ def irq(generation=8, **fields):
 
 class GradeTest(unittest.TestCase):
     def test_historical_populations(self):
+        final_fi = notification(92_870_001, 99, 3187, same_frame=3186, before_flush=1, other_frame=1)
+        final_fi.update(type3_last_mask=0x80000003, type3_last_slots=6, frame_info_last_delta_raw=67_000_775)
         console = [
             "trailing unrelated line" + pipe_line(captured=1716, used=1715, fallback=2403),
             "NativeGopDisplay: pacing120 at-us 252133064 window-us 10008020: replaced 0",
@@ -64,7 +66,7 @@ class GradeTest(unittest.TestCase):
             "NativeGopDisplay: pacing120 stage-fence: n 511 sum 5487141 min 6894 mean 10738 max 12219 us;",
             pipe_line(captured=1716, used=1715, fallback=2914),
             "machdep.native_gop_notifications: " + json.dumps(notification(1)),
-            json.dumps(notification(92_870_001, 99, 3187, same_frame=3186, before_flush=1, other_frame=1)),
+            json.dumps(final_fi),
         ]
         report = grade.analyze(console)
         self.assertEqual(report["malformed_lines"], [])
@@ -74,6 +76,8 @@ class GradeTest(unittest.TestCase):
         self.assertEqual(legacy["pipe_reports"][1]["delta"]["fallback"], 511)
         self.assertEqual(legacy["pacing_windows"][0]["events"]["program"], 511)
         self.assertEqual(legacy["pacing_windows"][0]["stages"]["stage-fence"]["mean_us"], 10738)
+        self.assertEqual(legacy["notifications"][1]["type3_last_mask"], 0x80000003)
+        self.assertEqual(legacy["notifications"][1]["frame_info_last_delta_raw"], 67_000_775)
         delta = legacy["notifications"][1]["delta"]
         self.assertEqual(delta["programs"], 3286)
         self.assertEqual(delta["audit"]["missing"], 3187)

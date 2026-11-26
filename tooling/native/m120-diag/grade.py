@@ -13,6 +13,8 @@ PIPE_TOTALS = """captured polls ready used pending_used fallback cancelled faile
                  overlapped overlap_us""".split()
 FI_TOTALS = """programs complete_hooks dropped_hooks cleanup_calls type3_attempts type3_accepted
                type3_errors frame_info_valid frame_info_missing frame_info_packets""".split()
+FI_LAST = """type3_last_mask type3_last_slots type3_last_result frame_info_first_time_raw
+             frame_info_last_time_raw frame_info_last_delta_raw""".split()
 AUDIT_TOTALS = """not_armed no_sample clock_back before_flush after_end same_frame other_frame
                   flush_pending not_new flip_failed no_coverage not_direct provider_unavailable
                   serial_mismatch swap_mismatch no_handoff dropped""".split()
@@ -161,6 +163,7 @@ def read_notifications(row):
     if uint(row["version"]) != 1 or uint(row["abi"]) != 2 or uint(row["hz"]) != 120:
         raise ValueError("unsupported notification snapshot")
     result = {key: uint(row[key]) for key in ["at_us", *FI_TOTALS]}
+    result.update({key: uint(row[key]) for key in FI_LAST if key in row})
     result["audit"] = None
     if uint(row.get("frame_info_audit_enabled", 0), 1):
         audit = row["frame_info_audit"]
