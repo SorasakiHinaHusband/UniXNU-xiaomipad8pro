@@ -272,8 +272,8 @@ bool voteDisplayBandwidth(const Mode &mode)
   note("mode: MM0 AB/IB %u/%u kB/s, aux %u/%u vcd %u, cmd %#x=%#x, RPMh %d step %u slot %u status %#x",
        modes::scanoutAvgKBps(mode), modes::kMm0PeakKBps, unit, unsigned(width), unsigned(vcd), addr, cmd.data,
        rc, result.step, result.tcs, result.command[0]);
-  // Keep an acknowledged vote until reboot. The resource's inherited DRV-2
-  // value is unavailable, so a rollback cannot put it back.
+  // Keep an acknowledged vote until reboot, including after a timing rollback.
+  // This transaction does not save the inherited DRV-2 vote.
   return rc == Sm8750RpmhOk;
 }
 
