@@ -45,6 +45,9 @@ class ReleaseAssets(unittest.TestCase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('fixture\n')
+        self.git('init', '-q')
+        self.git('add', '--', *RECIPES, SKILL)
+        self.commit_recipes()
         for name in BINARIES[:2]:
             (self.assets / name).write_bytes(macho(2))   # MH_EXECUTE
         with tarfile.open(self.assets / BINARIES[2], 'w:gz') as archive:
@@ -59,6 +62,17 @@ class ReleaseAssets(unittest.TestCase):
     def write_build_sums(self, names=BINARIES):
         self.build_sums = checksums(self.assets, names)
         (self.assets / 'SHA256SUMS').write_text(self.build_sums)
+
+    def git(self, *args):
+        subprocess.run(['git', *args], cwd=self.root, check=True, capture_output=True)
+
+    def commit_recipes(self):
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                 'commit', '-qm', 'Recipe fixture')
+
+    def remove_skill(self):
+        self.git('rm', '-q', '--', SKILL)
+        self.commit_recipes()
 
     def release(self, allow_no_skill=False):
         env = dict(os.environ, TAG='v-test', ALLOW_NO_SKILL='1' if allow_no_skill else '0')
@@ -90,6 +104,20 @@ class ReleaseAssets(unittest.TestCase):
         with tarfile.open(self.assets / 'install-piano-macos-skill.tar.gz') as archive:
             self.assertIn(SKILL, archive.getnames())
 
+    def test_archives_only_committed_recipe_and_skill_content(self):
+        untracked = 'tooling/k273/local-build.img'
+        recipe = 'tooling/ci/example.sh'
+        (self.root / untracked).write_bytes(b'local build fixture')
+        (self.root / recipe).write_bytes(b'working copy edit')
+        (self.root / SKILL).with_name('local-notes.txt').write_text('local skill fixture')
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with tarfile.open(self.assets / 'piano-recipes.tar.gz') as archive:
+            self.assertNotIn(untracked, archive.getnames())
+            self.assertEqual(archive.extractfile(recipe).read(), b'fixture\n')
+        with tarfile.open(self.assets / 'install-piano-macos-skill.tar.gz') as archive:
+            self.assertNotIn('skills/install-piano-macos/local-notes.txt', archive.getnames())
+
     def test_rejects_fileset_kernel_collection(self):
         (self.assets / KERNEL).write_bytes(macho(12))   # MH_FILESET
         self.write_build_sums()
@@ -113,7 +141,7 @@ class ReleaseAssets(unittest.TestCase):
         self.assert_refused('unexpected release asset: extra.ipsw')
 
     def test_requires_skill_unless_overridden(self):
-        (self.root / SKILL).parent.rename(self.root / 'removed-skill')
+        self.remove_skill()
         self.assert_refused('release without the install skill is refused')
         result = self.release(allow_no_skill=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -122,7 +150,7 @@ class ReleaseAssets(unittest.TestCase):
     def test_retry_removes_stale_optional_assets(self):
         result = self.release()
         self.assertEqual(result.returncode, 0, result.stderr)
-        (self.root / SKILL).parent.rename(self.root / 'removed-skill')
+        self.remove_skill()
         (self.fd / 'fd.sha256').unlink()
         result = self.release(allow_no_skill=True)
         self.assertEqual(result.returncode, 0, result.stderr)

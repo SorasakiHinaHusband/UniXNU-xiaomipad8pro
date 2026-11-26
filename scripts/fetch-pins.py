@@ -62,6 +62,7 @@ def fetch_commit(dest, url, commit, blobs=True):
     os.makedirs(dest, exist_ok=True)
     if not os.path.exists(os.path.join(dest, ".git")):
         sh(["git", "init", "-q", dest])
+    if "origin" not in out(["git", "-C", dest, "remote"]).splitlines():
         sh(["git", "-C", dest, "remote", "add", "origin", url])
     else:
         sh(["git", "-C", dest, "remote", "set-url", "origin", url])

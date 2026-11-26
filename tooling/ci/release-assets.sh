@@ -28,7 +28,11 @@ shopt -u dotglob
 build_sums=SHA256SUMS
 [ ! -f "$A/BUILD-SHA256SUMS" ] || build_sums=BUILD-SHA256SUMS
 [ -f "$A/$build_sums" ] || die "no $build_sums (build.yml's kernel-kexts artifact)"
-if [ ! -d skills/install-piano-macos ] && [ "${ALLOW_NO_SKILL:-0}" != 1 ]; then
+skill=skills/install-piano-macos
+has_skill=0
+if [ "$(git cat-file -t "HEAD:$skill" 2>/dev/null)" = tree ]; then
+  has_skill=1
+elif [ "${ALLOW_NO_SKILL:-0}" != 1 ]; then
   die "skills/install-piano-macos is not in $TAG: a release without the install skill is refused (ALLOW_NO_SKILL=1 to override)"
 fi
 
@@ -64,12 +68,12 @@ PY
 stage=$(mktemp -d "$A/.release-assets.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 cp -- "$A/$build_sums" "$stage/BUILD-SHA256SUMS"
-# The recipes: the pins and patches the binaries were built from, and the scripts that build them.
-COPYFILE_DISABLE=1 tar -czf "$stage/piano-recipes.tar.gz" unixnu.lock feeds.toml board.toml patches configs tooling/ci tooling/k27/fetch-k27-tree.sh \
+# Take recipes and the skill from the release commit so local files and edits stay out of the archives.
+git archive --format=tar.gz -o "$stage/piano-recipes.tar.gz" HEAD -- unixnu.lock feeds.toml board.toml patches configs tooling/ci tooling/k27/fetch-k27-tree.sh \
   tooling/k27/build-native-image.sh tooling/k27/kext tooling/k273 tooling/kc scripts/fetch-pins.py docs/ci.md
 # The install skill (skills/install-piano-macos): the user side builds the root image and the kernel collection with it.
-if [ -d skills/install-piano-macos ]; then
-  COPYFILE_DISABLE=1 tar -czf "$stage/install-piano-macos-skill.tar.gz" skills/install-piano-macos
+if [ "$has_skill" = 1 ]; then
+  git archive --format=tar.gz -o "$stage/install-piano-macos-skill.tar.gz" HEAD -- "$skill"
 fi
 [ -f "$F/fd.sha256" ] && cp -- "$F/fd.sha256" "$stage/FD-SHA256.txt"
 {
