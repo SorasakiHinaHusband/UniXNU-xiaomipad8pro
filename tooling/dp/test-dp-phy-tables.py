@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """Host checks of the tracked DP tables and generated header."""
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,8 +12,10 @@ TOOL = Path(__file__).with_name('dp-phy-tables.py').resolve()
 DATA = ROOT / 'data/dp'
 
 CONSUMER = r'''
-#include "DpPhyTables.h"
+#include "DpQmpPhy.h"
 #include <iterator>
+
+using namespace pianodp;
 
 static_assert(std::size(piano_dp_qmp_serdes_common) == 20);
 static_assert(std::size(piano_dp_qmp_tx_shared) == 11);
@@ -80,6 +83,25 @@ static_assert(valid_matrix(piano_dp_qmp_swing_hbr_rbr));
 static_assert(valid_matrix(piano_dp_qmp_pre_emphasis_hbr_rbr));
 static_assert(valid_matrix(piano_dp_qmp_swing_hbr3_hbr2));
 static_assert(valid_matrix(piano_dp_qmp_pre_emphasis_hbr3_hbr2));
+
+constexpr bool valid_piano_selection() {
+    DpQmpPhySettings settings;
+    for (const auto& rate : piano_dp_qmp_rates) {
+        const uint32_t clock = rate.link_clk_hz / 1000;
+        if (!validDpLink({clock, 4}))
+            return false;
+        if (clock <= kPianoDpMaxRateKhz) {
+            if (!lookupDpQmpPhy(clock, {2, 1}, settings) || settings.rate != &rate)
+                return false;
+        } else if (lookupDpQmpPhy(clock, {2, 1}, settings) || settings.rate ||
+                   settings.swing || settings.preemphasis) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(valid_piano_selection());
 int main() { return 0; }
 '''
 
@@ -90,11 +112,12 @@ def main():
     subprocess.run([*tool, '--self-test'], check=True)
     with tempfile.TemporaryDirectory(prefix='dp-phy-host-') as tmp:
         work = Path(tmp)
-        subprocess.run([*tool, 'header', str(DATA), str(work / 'DpPhyTables.h')], check=True)
+        subprocess.run([*tool, 'header', str(DATA), str(work / 'DpQmpTables.h')], check=True)
         consumer = work / 'consumer.cpp'
         consumer.write_text(CONSUMER, encoding='utf-8')
         exe = work / 'consumer'
-        subprocess.run(['clang++', '-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror',
+        subprocess.run([os.environ.get('CXX') or 'c++', '-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(ROOT / 'package/PianoDp'), '-I', str(work),
                         str(consumer), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
     print('DP PHY tables host test: ok')

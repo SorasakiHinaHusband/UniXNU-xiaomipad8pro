@@ -161,22 +161,23 @@ import check: PianoPower's `piano_port_*` / `piano_adsp_health` come from PianoP
 `NativeGopDisplay.json`, the vtable check unchanged). Linked 2026-11-11: PianoDp ≈ 30 KB of code and strings, 2.7 KB `__DATA,__const`
 (its vtable), 1.2 KB `__bss` (the page table).
 
-The offline D0 headers validate up to four EDID blocks, select RGB 8 bpc modes against piano's HBR2 and pin lane budgets,
-train against a scripted AUX/DPCD sink, and calculate MSA and a 64-symbol TU for progressive SST. The PianoDp host runner checks
-both suites under ASan/UBSan. It generates the QMP header from the manifest-checked table and tests all ten legal swing and
-pre-emphasis pairs at each of RBR, HBR, and HBR2, including selection of the rate-specific serdes overlay. Controller AUX encoding
-and DisplayID tiles are later work. [EDID model](../../package/PianoDp/DpEdid.h) · [Training and stream model](../../package/PianoDp/DpLinkTrain.h) · [PHY lookup](../../package/PianoDp/DpQmpPhy.h) · [Host runner](../../package/PianoDp/tests/run-dp-host.sh)
+The offline model reads base and advertised extended DPCD receiver caps, including TPS3/TPS4, downstream-port information and
+eDP capability flags. Training tries the permitted rates from highest to lowest at each lane count and halves the lane count
+when that rate search fails. The host runner generates the QMP header from the manifest-checked tables and exercises every
+legal drive pair at RBR, HBR and HBR2. The bandwidth and MSA/TU checks cover 1, 2 and 4 lanes through HBR3. Piano's training,
+PHY lookup and publication policy cap the rate at HBR2. [Training and stream model](../../package/PianoDp/DpLinkTrain.h) · [PHY lookup](../../package/PianoDp/DpQmpPhy.h) · [Host runner](../../package/PianoDp/tests/run-dp-host.sh) · [Linux DPCD definitions](https://github.com/torvalds/linux/blob/master/include/drm/display/drm_dp.h)
 
-The D1 hotplug model consumes serialized HPD events for one sink. It reads EDID in 16-byte chunks and retries DEFER and timeout
-at the same offset for up to four attempts per chunk. NACK, short reads, and I/O errors end the attempt. The tests exercise
-rate and lane fallback, IRQ_HPD link-loss recovery, and teardown across repeated plugs and failed stream starts. The adapter
-models complete I2C-over-AUX reads and owns stream, PHY, and AUX cleanup. [Hotplug model](../../package/PianoDp/DpHotplug.h)
+The hotplug model consumes serialized HPD events for one SST sink. A branch must report one downstream sink before the model
+reads EDID. An active IRQ records the service vector and checks the sink count, downstream-change flag and trained lanes.
+Loss of lane lock or alignment triggers a fresh probe and training. A change behind an occupied branch refreshes EDID, and an
+empty or multi-sink branch parks the stream. The model retries each 16-byte EDID read up to four attempts total on DEFER or
+timeout. The adapter owns stream, PHY and AUX cleanup. [Hotplug model](../../package/PianoDp/DpHotplug.h)
 
-The D6 timing builder returns up to 16 distinct progressive RGB 8 bpc timings for an IOAV publisher. It preserves the order of
-eligible DTDs, starting with the base preferred timing, then adds eligible CTA VICs. It records the raster, porches, syncs, pixel
-clock, and 16.16 refresh for each timing. The tests cover the fake display's raster and refresh bounds, the 594 MHz pixel-clock
-ceiling, and the negotiated link's 8b/10b payload with two symbols reserved per 64-symbol TU. Both models run through the host
-suite. Level 1 still defaults off and issues zero MMIO stores. [External timing builder](../../package/PianoDp/DpExternalModes.h)
+The EDID model validates up to four blocks and decodes CTA SVDs, HDMI VSDB video codes, and DisplayID Type I and VII timings and
+tile topology. The D6 timing builder returns up to 16 distinct progressive RGB 8 bpc timings in detailed-timing order followed
+by video-code order. It applies the raster and refresh bounds, the 594 MHz pixel-clock ceiling and the link's 8b/10b payload
+with two symbols reserved per 64-symbol TU. Displays that describe a multi-tile topology are ineligible for SST mode publication.
+Both host suites run under ASan/UBSan. Level 1 defaults off and issues zero MMIO stores. [EDID model](../../package/PianoDp/DpEdid.h) · [External timing builder](../../package/PianoDp/DpExternalModes.h) · [Linux CTA and DisplayID decoding](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/drm_edid.c)
 
 ### 8. Ladder and effort (RAM boots, owner present with a monitor and a USB-C/DP cable or dock)
 
