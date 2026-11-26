@@ -130,15 +130,14 @@ public:
     if (b->type == BufArp) return;
 
     const uint64_t now = o.hw.nowUs();
-    const uint64_t ts = uint64_t(v[8]) | uint64_t(v[9]) << 32;
     if (b->type == BufRaw) {
-      const unsigned f = frameIndex(ts, set.fps);
-      if (b->index >= kRaws || f >= r.etb || rawFrame[b->index] != f) {
+      // Iris matches RAW returns by buffer index and uses the timestamp on BITSTREAM returns.
+      if (b->index >= kRaws || rawFrame[b->index] >= r.etb) {
         fail(kErrHfi, Buffers, p[2], p[4]);
         return;
       }
       b->queued = false;
-      frames[f].ebdUs = now;
+      frames[rawFrame[b->index]].ebdUs = now;
       ++r.ebd;
       return;
     }
@@ -157,7 +156,7 @@ public:
       if (!(v[10] & kFlagLast) && !cleanup) fail(kErrHfi, Buffers, v[10], p[4]);
       return;
     }
-    const unsigned f = frameIndex(ts, set.fps);
+    const unsigned f = frameIndex(uint64_t(v[8]) | uint64_t(v[9]) << 32, set.fps);
     if (f >= r.etb || frames[f].bytes) {
       fail(kErrHfi, Buffers, p[2], p[4]);
       return;

@@ -12,8 +12,9 @@ the next [RAM run](#fix-image-gate).
 ## Host results
 
 - The ASan/UBSan suite checks the exact ARP and capability packets, four
-  simultaneous RAW and BITSTREAM slots, and nanosecond PTS recovery at 30 and
-  60 fps, including out-of-order returns. It verifies default-off bring-up,
+  simultaneous RAW and BITSTREAM slots, and out-of-order returns. EBD uses
+  the queued RAW slot even when the returned timestamp is zero. FBD uses the
+  returned nanosecond PTS at 30 and 60 fps. It verifies default-off bring-up,
   ARP quarantine and exact AVC page table restoration after
   AVC → E1 → Main10 → AVC on both XNU and region0 backings. The AVC, HEVC
   and VT suites pass. The FFmpeg checker accepts its reference stream and

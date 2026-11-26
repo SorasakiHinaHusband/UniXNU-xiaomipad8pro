@@ -87,7 +87,7 @@ struct Peer {
   bool sessionErrorOnProp = false, dropLast = false, dropCloseAck = false, systemError = false, badBitstream = false;
   bool faultOnRaw = false, watchdogOnStop = false;
   bool rejectArp = false, reportArpOnStop = false, errorCloseAck = false, errorBitstreamStart = false;
-  bool reorderFirstBatch = false, wrongRawTimestamp = false;
+  bool reorderFirstBatch = false, zeroRawTimestamps = false, wrongRawIndex = false;
   OutputReply firstOutput = OutputReply::Normal;
   uint32_t sessionErrorProp = 0;
   Peer() : uc(kUcBytes / 4)
@@ -160,7 +160,8 @@ struct Peer {
     out[8] = mode == OutputReply::BadTimestamp ? UINT32_MAX : raw[8];
     out[9] = mode == OutputReply::BadTimestamp ? UINT32_MAX : raw[9];
     auto returnedRaw = raw;
-    if (wrongRawTimestamp && idr) returnedRaw[8] = 1000000000ULL / fps;
+    if (zeroRawTimestamps) returnedRaw[8] = returnedRaw[9] = 0;
+    if (wrongRawIndex && idr) returnedRaw[1] = (raw[1] + 1) % kRaws;
     reply({packet(PropPictureType, 2, PortBitstream, 1, {idr ? PictureIdr : PictureP}),
            packet(Buffers, 1, PortBitstream, 5, out), packet(Buffers, 1, PortRaw, 5, returnedRaw)});
     return true;
@@ -689,6 +690,7 @@ static void sessionTests()
     Run r(640, 480);
     r.peer.rawBatch = 4;
     r.peer.reorderFirstBatch = true;
+    r.peer.zeroRawTimestamps = true;
     CHECK(r.go() == 0 && r.t.r.pass());
     const auto &p = r.peer;
     CHECK(p.patternOk == 10 && !p.patternBad);
@@ -789,10 +791,10 @@ static void sessionTests()
     r.go();
     CHECK(r.t.r.badNal > 0 && !r.t.r.pass());
   }
-  {  // a timestamp for a different RAW frame cannot return this input credit
+  {  // a different slot cannot return this input credit with the original IOVA
     Run r(640, 480);
     r.peer.rawBatch = 4;
-    r.peer.wrongRawTimestamp = true;
+    r.peer.wrongRawIndex = true;
     CHECK(r.go() == kErrHfi && r.t.r.failedStage == Frames && r.t.r.closed);
     CHECK(r.t.r.etb == 4 && r.t.r.ebd == 3 && !r.t.frames[0].ebdUs && r.t.frames[1].ebdUs);
   }
