@@ -50,6 +50,7 @@ vm = load('volume_manifest', R / 'volume-manifest.py')
 vr = load('verify_root', R / 'verify-root.py')
 up = load('unit_profile', R / 'unit-profile.py')
 dtb = load('boot_dtb', R / 'boot-dtb.py')
+repo_manifest = load('repo_manifest', D / 'scripts/repo_manifest.py')
 
 
 class NoNetwork:
@@ -388,18 +389,12 @@ class Scripts(unittest.TestCase):
             command = [sys.executable, str(D / 'scripts/fetch-pins.py'), '--dry-run']
             got = subprocess.run(command, cwd=t, env=env, capture_output=True, text=True, timeout=30)
             self.assertFalse(research.exists())
-            if sys.version_info < (3, 11):
-                self.assertEqual(got.returncode, 2, got.stderr)
-                self.assertIn('reading unixnu.lock requires Python 3.11 or later', got.stderr)
-                return
             self.assertEqual(got.returncode, 0, got.stderr)
             unknown = subprocess.run([*command, '--only', 'missing-pin'], cwd=t, env=env,
                                      capture_output=True, text=True, timeout=30)
             self.assertEqual(unknown.returncode, 2, unknown.stderr)
             self.assertIn('unknown pin(s)', unknown.stderr)
-        import tomllib
-
-        pins = tomllib.loads((D / 'unixnu.lock').read_text())['pin']
+        pins = repo_manifest.load_manifest(D / 'unixnu.lock')['pin']
         expected_checkouts = {'UniXNU': 'UniXNU', 'Mu-Silicium': 'Mu-Silicium-piano',
                               'piano-uefi': 'piano-uefi-UniXNU-piano'}
         for name, checkout in expected_checkouts.items():
