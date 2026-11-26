@@ -564,7 +564,7 @@ Fail-safe: a load from a block whose gate read on cannot write anything; a stall
 #### 8.1 H5 test images (`piano-usbhost=5`)
 
 RAM boots through the native loop (`tooling/native/native-loop.sh IMAGE`: the test runs until `piano-reset-after`, then the dump
-image pulls its log from the pstore mailbox; `grep PianoUsbHost <console-log>`). Built and linked
+image pulls its log from the pstore mailbox; `grep PianoUsbHost "$CONSOLE_LOG"`). Built and linked
 2026-11-11 (default collection: 48 kexts kept, as before), not booted.
 
 | Image | Build | What it shows |
@@ -667,9 +667,9 @@ VBUS, as H5c) counted under `USB devices` with its idVendor:idProduct is the H6 
 
 #### 8.3 H3/H4 test images and the batched tablet list (`piano-usbhost=3|4`)
 
-Built like image G2 (charging.md §5e), in the main checkout (`PIANO_K27_TREE` from `~/.config/piano/env`): RAM boots through
-`tooling/native/native-loop.sh IMAGE out/ram-dump/boot-piano-macos-ram-A-bundled.img`; the logs from the pstore mailbox
-(`<console-log>`) and, while the Mac cable is in, the USB console (`python3 tooling/native/usb-console.py
+Built like image G2 (charging.md §5e), in the main checkout with `PIANO_K27_TREE` set: RAM boots through
+`tooling/native/native-loop.sh IMAGE out/ram-dump/boot-piano-macos-ram-A-bundled.img`; the logs come from the pstore mailbox
+(`CONSOLE_LOG` in the example) and, while the Mac cable is in, the USB console (`python3 tooling/native/usb-console.py
 --capture 1000 &`). Every image runs PianoPower at level 2 **with writes** (the board configuration is the H3 prerequisite; it also
 writes the input limit and charge current, as image I / P1 do). Common prefix:
 
@@ -678,7 +678,7 @@ PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=420 \
   PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 <the image's arguments>" tooling/k27/build-native-image.sh
 mkdir -p out/ram-usbc/<image> && cp out/ram/boot-piano-macos-ram-A-bundled.img out/ram/build-A-bundled.json out/ram-usbc/<image>/
 grep -E 'PianoUsbHost: (level|port|ucsi|role|hand-off|stage 4|host|No-Op|port [0-9])|PianoPower: (ucsi|mca: (USB-C|board|write)|\[[0-9]+s\] (usb|diag port))|PianoDwc3: hand-off' \
-  <console-log>
+  "$CONSOLE_LOG"
 ```
 
 | # | Image | Arguments | Attended? | Plugs | What it answers |
@@ -789,7 +789,7 @@ Built 2026-11-14 from the A2 collection `660bced2…` (the ADT, trust cache and 
 `a0e0a6e92acd44f4362830aac42aa3894421b0127be95b00a953f15f3ed643fa`; both `verify-ram-images.py PASS: 0 failure(s)` and below the
 250,000,000-byte limit. Run it like the other RAM probes: `tooling/native/native-loop.sh
 out/ram-a2/boot-piano-macos-ram-A-bundled.img out/ram-a2-dump/boot-piano-macos-ram-A-bundled.img`, then
-`grep -E 'PianoXhciHost|PianoUsbHost' <console-log>`. Nothing needs a hand on the tablet; with
+`grep -E 'PianoXhciHost|PianoUsbHost' "$CONSOLE_LOG"`. Nothing needs a hand on the tablet; with
 nothing in the port the probe still answers questions 1–9 below. **`piano-touch=2` is in the line but PianoTouch is not in this
 collection** (the stack's kexts keep their addresses and leave no `__DATA_CONST` gap for it, §5.2a): expect no `PianoTouch:` line
 and do not read that as a touch regression. The 900 s reset timer returns the probe to fastboot for the dump image.
@@ -811,7 +811,7 @@ and do not read that as a touch regression. The 900 s reset timer returns the pr
 | 11 | Does the interrupt line work or does it have to be polled? | the `interrupt SPI 133: N entries …` counters growing in later lines; `0 entries` with events arriving means the poll fallback is doing the work (`piano-usbhost-irq=0` isolates it) |
 | 12 | Did anything of Apple's stack load that should not have? | `PianoUsbHost: stack: AppleUSBHostResources up (IOUSBHostFamily loaded through the gate)` is expected; no `IOUSBMassStorageDriver`/hub/HID matching lines before a device is attached |
 | 13 | The summary, for the result table | `PianoUsbHost: host summary: switch ok \| probe PASS \| nub up \| PianoXhciHost attached \| USB devices 0 (last 0000:0000) \| interrupt SPI 133 \| host kept` |
-| 14 | Did the RAM boot reach userspace and return to fastboot? | `piano-boot-guard: deferred` with `piano-reset-after=900`, `NativeRamBlock: Data store state` 1/3 (volatile, **never** 2), the Wi-Fi and charging lines, and the return to fastboot at 900 s |
+| 14 | Did the RAM boot reach userspace and return to fastboot? | `piano-boot-guard: piano-reset-after=900 owns the watchdog and the restart reason: the guard stays off` (if the profile enables the guard), `NativeRamBlock: Data store state` 1/3 (volatile, **never** 2), the Wi-Fi and charging lines, and the return to fastboot at 900 s |
 
 With a device in the port (attended, later): `USB devices 1` with its `idVendor:idProduct` and, for a stick, a mount — that is the
 H6 pass. This first boot deliberately needs nobody at the tablet: a bus-powered device would also need the DSP's VBUS (H3).

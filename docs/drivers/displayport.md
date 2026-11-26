@@ -8,9 +8,10 @@ PHY table extraction with provenance, AUX and link training, and external scanou
 and B7's Type-C host work. [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
 
 **Built-in panel.** Installed v13.1y12q uses PianoDpu flips at 60 Hz, with native screenshots and neutral colours. Night Shift
-routing, native panel sleep and refresh switching are off in the daily profile. Fixed 120/144 Hz scanout is RAM-only. The November 27
-DPU clock and RPMh readback and the unlocked Night Shift sweep also passed on RAM. M5R woke with matching compression-route registers
-and a dark panel, so the panel-sleep fix-image gate remains HOLD. [Support status](../STATUS.md) · [November 26 display results](../results-2026-11-26.md#evening) · [November 27 RAM qualification](../results-2026-11-27.md#ram-qualification) · [Night Shift RAM results](../results-2026-11-27.md#unlocked-night-shift-ns-base)
+routing, native panel sleep and refresh switching are off in the daily profile. Fixed scanout at 120.004 Hz and 144.146 Hz
+passed on RAM with zero interface underruns on November 26. The November 27 DPU clock and RPMh readback and the unlocked
+Night Shift sweep also passed on RAM. M5R woke with matching compression-route registers and a dark panel, so the panel-sleep
+fix-image gate remains HOLD. [Support status](../STATUS.md) · [November 26 display results](../results-2026-11-26.md#evening) · [November 27 RAM qualification](../results-2026-11-27.md#ram-qualification) · [Night Shift RAM results](../results-2026-11-27.md#unlocked-night-shift-ns-base)
 
 ## Original DisplayPort design and bring-up plan (2026-11-11 to 2026-11-12)
 

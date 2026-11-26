@@ -2,10 +2,11 @@
 
 ## Status as of 2026-11-27
 
-**The region1 GPU tier remains in qualification.** Installed v13.1y12q uses the 13 GiB XNU window (13310 MiB, measured on
-installed v13.1y12l on November 26). The EFI audit classified 319/322 two-MiB slabs as non-runtime and released 0 MiB pending
-owner verification. The November 26 RAM pass for the 684 MiB mixed 4K Main10 HEVC arena used region0 and XNU pages. It covers
-video backing. GPU tier and other driver pool qualification remain open. [Support status](../STATUS.md) · [November 26 memory results](../results-2026-11-26.md#efi-memory-battery-and-video)
+**The region1 GPU tier remains in qualification.** Installed v13.1y12q uses the 13 GiB XNU window (13310 MiB measured on
+v13.1y12l on November 26). Installed v13.1y12l verified 4 KiB paged GPU memory with a 7168 MiB cap. The November 26 EFI audit
+classified 319/322 two-MiB slabs as non-runtime, released 0 MiB and awaits owner verification. The November 26 RAM pass for
+the 684 MiB mixed 4K Main10 HEVC arena exercised region0 and XNU backing for video. GPU tier and other driver pool qualification
+remain open. [Support status](../STATUS.md) · [November 26 memory results](../results-2026-11-26.md#efi-memory-battery-and-video)
 
 ## R1 design and admission checks (2026-11-26)
 
