@@ -204,7 +204,8 @@ inline GammaFit fitGamma(const uint32_t *w, unsigned words)
     gain[c] = sr ? int32_t((sc * kOne + sr / 2) / sr) : 0;
     for (unsigned k = 0; k < kGammaEntries; ++k) {
       const int64_t want = (int64_t(ref[k]) * gain[c] + kOne / 2) / kOne, dev = int64_t(ch[c][k]) - want;
-      const uint32_t milli = uint32_t(((dev < 0 ? -dev : dev) * 1000 + top / 2) / top);
+      const uint64_t magnitude = uint64_t(dev < 0 ? -dev : dev);
+      const uint32_t milli = uint32_t((magnitude * 1000 + top / 2) / top);
       if (milli > g.worstMilli) g.worstMilli = milli;
     }
   }
