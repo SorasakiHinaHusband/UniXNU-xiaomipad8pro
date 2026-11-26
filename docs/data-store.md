@@ -3,7 +3,8 @@
 ## Installed baseline (2026-11-27)
 
 Both disk boots of **v13.1y12q** resumed and verified the owner's 200 GiB Data store on `linux_data`. M4 concurrent mode
-was active during the second boot and is enabled by default after Data mounts. M5 write-back and queue modes stay off.
+was active during the second boot and is enabled by default after Data mounts. M5 stays opt-in on `main` with
+`data-store-write-back=0` and `data-store-queue=0`.
 [November 27 results](results-2026-11-27.md) · [Support status](STATUS.md#known-gaps) · [27.3 line](k273-line.md#current-line-2026-11-27)
 
 The installed system's Data volume is `package/NativeRamBlock`: a RAM **seed** (the payload's `scratch-data.img`) plus a persistent
@@ -96,9 +97,26 @@ The Data-volume A/B on installed **v13.1y12o** measured concurrent mode against 
 
 The concurrent-mode canary survived a clean reboot. The separate scratch-window power-cut tests used a direct reset.
 Concurrent, write-back and queue modes each **passed 32/32**, retaining every record acknowledged after `F_FULLFSYNC`
-and resuming without recovery errors. The unacknowledged tail could be lost. Disk M5 throughput A/B remains pending.
-[November 26 storage results](results-2026-11-26.md#data-storage) · [November 27 results](results-2026-11-27.md) ·
+and resuming without recovery errors. The unacknowledged tail could be lost.
+[November 26 storage results](results-2026-11-26.md#data-storage) ·
 [M4/M5 driver notes](drivers/data-store-m4-m5.md) · [Durability procedure](tools/durability.md)
+
+### Scratch-window throughput and latency A/B (2026-11-27)
+
+The Disk M5 speed A/B closed on three RAM boots with zero store or UFS kernel errors and the owner's Data store
+untouched. M4 concurrent returned `VERDICT GAIN` against serial. Against M4 concurrent:
+
+- **M5 write-back (`data-store-write-back=1`, `data-store-queue=0`) passed.** Write throughput rose 1.71×–4.12×,
+  reaching 3,089.8 MB/s at 1 MiB QD8 and about 11.1k–12.0k IOPS for 4 KiB random writes. Sync p50 fell 42%–58%,
+  and mixed-reader p99 fell 7% to 243.7 µs. Write-back is a scratch-qualified daily candidate with a prior 32/32
+  power-cut pass. Daily promotion requires an owner decision and a fresh owner-store backup.
+- **M5 queue (`data-store-write-back=0`, `data-store-queue=1`) failed.** With worker dispatch at 256–289 µs,
+  4 KiB random-read IOPS fell to 0.51×–0.57× and 128 KiB write throughput to 0.57×. Mixed-reader p99 and
+  `fsync` p50 rose to 1.62× and 1.39×. All 401 queue-full refusals came between P1 and P2, with zero during
+  timed read/write phases. Queue mode is unsuitable for daily use.
+
+[November 27 scratch-window results](results-2026-11-27.md#disk-m5-scratch-window-ab) ·
+[Full driver comparison](drivers/data-store-m4-m5.md#scratch-window-throughput-and-latency-ab-2026-11-27)
 
 ## 2. Store format (`PersistOverlay.h`)
 

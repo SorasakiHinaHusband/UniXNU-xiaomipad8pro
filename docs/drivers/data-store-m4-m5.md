@@ -317,7 +317,7 @@ distinguish software delay from the physical command tail.
 
 ## M5 switches and instrumentation
 
-Both `data-store-write-back` and `data-store-queue` default to `0`.
+On `main`, M5 is opt-in. The defaults are `data-store-write-back=0` and `data-store-queue=0`.
 
 - `data-store-write-back=1` opts a read-write direct Data disk into write-back. The advertised cache state is fixed at
   publication. Only an ordinary write whose entire provider request is already present uses WRITE(10) without FUA.
@@ -364,12 +364,74 @@ path and verified every record acknowledged after `F_FULLFSYNC` on recovery.
 | M5 write-back | 32/32 | 0 |
 | M5 queue | 32/32 | 0 |
 
-Daily throughput A/B on the scratch window is pending. [November 26 results](../results-2026-11-26.md#data-storage)
+[November 26 results](../results-2026-11-26.md#data-storage)
+
+### Scratch-window throughput and latency A/B (2026-11-27)
+
+Three RAM boots ran the pinned `dskbench` on the confirmed `linux_rootfs` scratch window at LBA 64973631
+(6,291,456 pages), using the same frozen M5 images that passed 32/32 power-cut durability on 2026-11-26.
+The owner's Data store was untouched across all three boots. Store and UFS kernel errors were zero.
+
+| Run | Phases | Verdict |
+| --- | --- | --- |
+| `m5bench-m4cc` | A1 serial → B M4 concurrent → A2 serial | `VERDICT GAIN`, `rc=0`, 0 errors |
+| `m5bench-m5wb` | P1/P2 concurrent, `data-store-write-back=1`, `data-store-queue=0` | `VERDICT PASS`, `rc=0`, 0 errors |
+| `m5bench-m5q` | P1/P2 concurrent, `data-store-write-back=0`, `data-store-queue=1`, four read workers and four write workers | `VERDICT FAIL`, 401 queue-full refusals between P1 and P2, 0 during timed read/write phases |
+
+Serial is the A1/A2 mean, M4-conc is B, and M5-wb and M5-queue are the P1/P2 means from their respective boots.
+Ratios use M4-conc as the baseline.
+
+| Workload and metric | Serial | M4-conc | M5-wb | M5-queue |
+| --- | ---: | ---: | ---: | ---: |
+| Data 4 KiB random read QD1, IOPS | 11,804 | 11,922 | 10,626 (0.89×) | 6,124 (0.51×) |
+| Data 4 KiB random read QD1, p99 µs | 172.4 | 154.4 | 173.9 (1.13×) | 235.2 (1.52×) |
+| Data 4 KiB random read QD8, IOPS | 13,814 | 61,988 | 57,736 (0.93×) | 35,407 (0.57×) |
+| Data 4 KiB random read QD8, p99 µs | 8,294.3 | 202.5 | 227.8 (1.13×) | 451.9 (2.23×) |
+| Data 4 KiB random read QD32, IOPS | 13,762 | 75,660 | 68,208 (0.90×) | 41,561 (0.55×) |
+| Data sequential read 128 KiB QD1, MB/s | 801.5 | 867.3 | 822.1 (0.95×) | 450.6 (0.52×) |
+| Data sequential read 1 MiB QD1, MB/s | 900.6 | 953.2 | 922.2 (0.97×) | 678.1 (0.71×) |
+| Data sequential read 1 MiB QD8, MB/s | 690.5 | 3,207.6 | 2,775.1 (0.87×) | 1,997.7 (0.62×) |
+| Data fill 4 MiB QD1, MB/s | 397.6 | 452.3 | 822.1 (1.82×) | 406.6 (0.90×) |
+| Data sequential write 1 MiB QD1, MB/s | 447.1 | 455.0 | 841.1 (1.85×) | 386.1 (0.85×) |
+| Data sequential write 1 MiB QD8, MB/s | 494.0 | 750.7 | 3,089.8 (4.12×) | 768.8 (1.02×) |
+| Data 4 KiB random write QD1, IOPS and available p99 | 6,159 | 6,617 | 11,969 (1.81×), 756.7 µs | 12,767 (1.93×), 675.2 µs |
+| Data 4 KiB random write QD8, IOPS and available p99 | 6,006 | 6,158, 5,518.1 µs | 11,066 (1.80×), 3,836.7 µs | 12,676 (2.06×), 4,287.1 µs |
+| Data 128 KiB write QD1, MB/s | 413.2 | 412.6 | 706.5 (1.71×) | 234.8 (0.57×) |
+| Mixed reader alone, p99 µs | 119.7 | 133.3 | 134.5 (1.01×) | 189.4 (1.42×) |
+| Mixed reader with 1 MiB writer, p99 µs | 2,394.9 | 262.9 | 243.7 (0.93×) | 426.5 (1.62×) |
+| Mixed writer, MB/s | 456.9 | 434.9 | 816.8 (1.88×) | 434.6 (1.00×) |
+| `sync=none` 4 KiB, p50 µs | 127.5 | 121.1 | 51.0 (0.42×) | 44.9 (0.37×) |
+| `fsync` 4 KiB, p50 µs | 133.2 | 135.7 | 58.2 (0.43×) | 188.9 (1.39×) |
+| `F_FULLFSYNC` 4 KiB, p50 µs | 1,510.6 | 1,470.7 | 853.7 (0.58×) | 1,276.6 (0.87×) |
+| `F_BARRIERFSYNC` 4 KiB, p50 µs | 1,504.9 | 1,546.7 | 791.0 (0.51×) | 1,283.5 (0.83×) |
+
+Raw root controls stayed flat across the three boots, at approximately 4,645–5,071 IOPS for 4 KiB QD1,
+37,981–38,801 IOPS for 4 KiB QD8, and 1,663–1,857 MB/s for 1 MiB QD8.
+
+**Provider counter deltas.** M5-wb averaged 351,194 `cached` writes out of 351,496 writes (99.9%) and
+807 flushes. Cached writes averaged 53.7 µs versus 191.2 µs for `fua` writes on M4-conc. M5-queue
+averaged 381,550 queued write operations, with `q_w_us` at 256–289 µs.
+
+**Queue-full diagnosis.** The inter-phase burst between P1 and P2 accounted for `full=401` and the M5-queue
+failure verdict. The timed read and write phases recorded zero queue-full refusals, and the kernel logged zero
+store or UFS errors. Worker-thread dispatch overhead accompanied the read regression even in the timed phases.
+
+- **M5-wb** delivered 1.71×–4.12× M4-conc write throughput, reaching 3,089.8 MB/s for 1 MiB QD8 sequential
+  writes and about 11.1k–12.0k IOPS for 4 KiB random writes. Sync p50 latency fell 42%–58%, and reader p99
+  under mixed load fell 7%. With zero errors and the prior 32/32 power-cut pass, it is a strong daily candidate.
+  Daily promotion requires an owner decision and a fresh owner-store backup. `data-store-write-back=0` remains
+  the default on `main`.
+- **M5-queue** is unsuitable for daily use. Across QD1/QD8/QD32, 4 KiB random-read IOPS fell to 0.51×–0.57×
+  M4-conc, and 1 MiB QD8 read throughput fell to 0.62×. The 128 KiB write rate fell to 0.57×, mixed-reader p99
+  rose to 1.62×, and `fsync` p50 rose to 1.39×. The 401 inter-phase refusals also failed the run.
+  `data-store-queue=0` remains the default on `main`.
+
+[November 27 scratch-window results](../results-2026-11-27.md#disk-m5-scratch-window-ab)
 
 ### Expected gain from M1
 
-The later [APFS analysis](m5-apfs.md) found cached traffic in scratch sync and mixed intervals. Installed row
-eligibility is still undetermined, and the write-back switch remains a scratch experiment.
+The [APFS analysis](m5-apfs.md) found cached traffic in scratch sync and mixed intervals. The estimates below predate
+the measured scratch comparison. Write-back remains scratch-qualified, and installed workload eligibility is undetermined.
 
 - **Write-back.** QD1 sustained 6,494 writes/s, or about 154 µs per write. The 4 KiB write/read p50 gap was 33 µs
   (103 vs 70 µs). If removing FUA saves 33 µs per eligible overwrite, the estimate is about 8.3k IOPS (+27%)
@@ -432,8 +494,8 @@ eligibility is still undetermined, and the write-back switch remains a scratch e
 
 Path: decoded 27.3 libsystem_kernel pread/pwrite/fsync/fcntl → XNU VFS/UBC → APFS Data → IOMedia/IOBlockStorageDriver → NativeRamBlock doAsyncReadWrite / doSynchronize / doSynchronizeCache → ordered admission and DirectDisk / PersistOverlay → tracked NativeUfs store I/O → UTRL slots, WRITE(10), SYNCHRONIZE CACHE(10), validated completion → KIOXIA UFS. Sheng RamBlock 525abe5 supplies the caller-thread reference. The Ubuntu v1.4.0 sd/UFS comparison is above.
 
-Checks: ours-OK in the host models for the bound store format, stage and range ownership, data FUA before bitmap FUA, cached overwrites and fenced sync, failed flush handling, queued dispatch and completion, the read reserve, one-slot fairness, and tracked DMA quarantine. Both provider sync entry points and the barrier option compile for arm64e. Unknown on 27.3 hardware includes APFS's exact fsync and checkpoint calls including shutdown, device cache/FUA and cold-power durability, UFS occupancy under load, and APFS recovery with either switch. The first write-back run uses a disposable store. The installed comparison requires the fresh verified backup, effective-arg and boot checks, and recovery plan above.
+Checks: ours-OK in the host models for the bound store format, stage and range ownership, data FUA before bitmap FUA, cached overwrites and fenced sync, failed flush handling, queued dispatch and completion, the read reserve, one-slot fairness, and tracked DMA quarantine. Both provider sync entry points and the barrier option compile for arm64e. The scratch-window direct-reset and performance results are above. Open checks include APFS's exact fsync and checkpoint calls including shutdown, cold-power durability beyond the direct-reset tests, UFS occupancy under load, and installed APFS recovery. An installed write-back comparison requires the owner decision, fresh verified backup, effective-arg and boot checks, and recovery plan above.
 
-Root cause: M1 measured a whole-request Data gate, 15,696 QD8 read IOPS against 15,580 at QD1 and an 85 → 2,325 µs mixed-reader p99. The gate covers all writer stages and bitmap publications. It can hide free transport slots. Data also incurs FUA on every overwrite, which is a candidate for part of the 6,494 vs 36,693 QD1 write gap. The FUA share is unmeasured and WriteBooster was already enabled.
+Root cause: M1 measured a whole-request Data gate, 15,696 QD8 read IOPS against 15,580 at QD1 and an 85 → 2,325 µs mixed-reader p99. The gate covers all writer stages and bitmap publications. It can hide free transport slots. M1 Data also incurs FUA on every overwrite, which is a candidate for part of the 6,494 vs 36,693 QD1 write gap. M1 did not measure the share of time spent in FUA writes. WriteBooster was already enabled.
 
-ONE change: M5 caches only ordinary overwrites of fully present request ranges behind `data-store-write-back=1`, with synchronous whole-LUN fences and the existing first-touch protocol. Qualify the independent queue-depth follow-on with write-back off. Its sole change is bounded off-caller dispatch and completion under `data-store-queue=1`, preserving write-through. Both switches default off.
+ONE change: M5 caches only ordinary overwrites of fully present request ranges behind `data-store-write-back=1`, with synchronous whole-LUN fences and the existing first-touch protocol. The independent `data-store-queue=1` scratch run used bounded off-caller dispatch and completion with write-through. Both switches default to `0` on `main`.
