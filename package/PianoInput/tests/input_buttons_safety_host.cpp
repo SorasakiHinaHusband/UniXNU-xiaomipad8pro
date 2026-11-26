@@ -311,6 +311,26 @@ void testSuspendWakeAndStuckRelease()
   CHECK(volWake.wakePoll(kReleased) == 0);
   CHECK(volWake.wakePoll(kDown) == PIANO_PM_WAKE_VOLUME_DOWN);
   CHECK(volWake.wakePoll(kDown) == 0 && volWake.reports.empty());
+
+  ButtonRun pending(true);
+  pending.policyInputs.sleepOn = true;
+  pending.policyInputs.screen = pianopolicy::Screen::on;
+  pending.runUntil(100);
+  CHECK(pending.inject(150) == SimResult::ok);
+  pending.runUntil(160, kUp);   // Policy has a short press in progress when the poll thread parks.
+  pending.suspend(kUp);
+  CHECK(pending.wakePoll(kUp) == 0);
+  CHECK(pending.wakePoll(kPower) == PIANO_PM_WAKE_POWER_KEY);
+  pending.runUntil(210, kPower);
+  CHECK(pending.sim.active(210));
+  pending.resume();            // The kernel saw Power release before the first awake sample.
+  CHECK(!pending.sim.active(210));
+  pending.runUntil(500, kUp);
+  pending.runUntil(600);
+  pending.runUntil(700, kUp);
+  pending.runUntil(800);
+  CHECK(pending.asks.empty());
+  CHECK(pending.reports == std::vector<Report>{{140, 0x02}, {210, 0x00}, {640, 0x02}, {740, 0x00}});
 }
 
 void testSimulationIsolation()
