@@ -20,7 +20,8 @@ static void ledger(AudioLive *l, unsigned event, uint32_t before, uint32_t after
     const AudioLiveShared *s = l->sh;
     uint64_t w[AUDIO_LEDGER_WORDS] = {0};
     w[0]=event; w[1]=l->now; w[2]=__atomic_load_n(&s->epoch,__ATOMIC_ACQUIRE);
-    w[3]=l->spk_mode; w[4]=load(&s->want_out); w[5]=before; w[6]=after; w[7]=want; w[8]=got; w[9]=want-got;
+    w[3]=(uint64_t)l->spk_mode; w[4]=(uint64_t)load(&s->want_out);
+    w[5]=before; w[6]=after; w[7]=want; w[8]=got; w[9]=want-got;
     const uint32_t producer_seq=__atomic_load_n(&s->producer_seq,__ATOMIC_SEQ_CST);
     w[10]=__atomic_load_n(&s->producer_ms,__ATOMIC_ACQUIRE);
     w[11]=__atomic_load_n(&s->producer_frames,__ATOMIC_ACQUIRE);
@@ -34,7 +35,7 @@ static void ledger(AudioLive *l, unsigned event, uint32_t before, uint32_t after
         w[10]=w[11]=w[24]=w[25]=w[26]=0; w[12]=UINT32_MAX;
     }
     w[28]=__atomic_load_n(&s->boundary_ms,__ATOMIC_ACQUIRE); w[29]=l->sleep_generation;
-    w[30]=l->spk_state; w[31]=l->underruns;
+    w[30]=(uint64_t)l->spk_state; w[31]=l->underruns;
     audio_ledger_put(l->ledger,w);
 }
 
@@ -1459,7 +1460,7 @@ static void mic_apply_pending(AudioLive *l)
         const unsigned requested = old & MicSetting;
         if (requested == ((old >> MicAppliedShift) & MicSetting)) return;
         const uint32_t generation = (uint32_t)(old >> MicGenerationShift) + 1;
-        const uint64_t next = ((uint32_t)old & ~(MicSetting << MicAppliedShift)) |
+        const uint64_t next = ((uint32_t)old & ~((uint32_t)MicSetting << MicAppliedShift)) |
                               (requested << MicAppliedShift) | ((uint64_t)generation << MicGenerationShift);
         if (mic_control_update(l->sh, &old, next)) {
             mic_route_applied(l, requested, generation);
@@ -1907,7 +1908,8 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
             l->cfg.idle_ms, l->ports->name);
     }
     l->now = now_ms;
-    const uint32_t epoch = __atomic_load_n(&l->sh->epoch,__ATOMIC_ACQUIRE), out = load(&l->sh->want_out);
+    const uint32_t epoch = __atomic_load_n(&l->sh->epoch,__ATOMIC_ACQUIRE);
+    const uint32_t out = (uint32_t)load(&l->sh->want_out);
     if (epoch != l->ledger_epoch || out != l->ledger_out) {
         if (epoch != l->ledger_epoch) {
             AudioRing *r = &l->sh->out;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""Host tests for the self-test runner's duration summary."""
+"""Host tests for the self-test runner's discovery and duration summary."""
 import importlib.util
 import io
 import sys
@@ -12,6 +12,21 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('self_tests', Path(__file__).with_name('self-tests.py'))
 self_tests = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(self_tests)
+
+
+class SuiteTests(unittest.TestCase):
+    def test_suite_member_needs_no_standalone_build_line(self):
+        runner = 'package/Example/tests/run-example-host.sh'
+        member = 'package/Example/tests/covered_host.c'
+        unregistered = 'package/Example/tests/new_host.c'
+        with (
+            patch.object(self_tests, 'tracked', return_value=[runner, member, unregistered]),
+            patch.object(self_tests, 'build_line', return_value=None),
+        ):
+            tests, unrunnable = self_tests.collect('Example', {member: f'SUITE: {runner}'})
+
+        self.assertEqual(tests, [('sh', runner, None), ('c', member, None)])
+        self.assertEqual(unrunnable, [unregistered])
 
 
 class SlowestTests(unittest.TestCase):

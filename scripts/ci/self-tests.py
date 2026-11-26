@@ -10,9 +10,9 @@ What runs:
   - C/C++ host tests (package/**/tests/*.c, *.cpp) whose header carries their build line
     (`c++ -std=c++20 ... NAME.cpp -o /tmp/NAME && /tmp/NAME`): compiled in their own directory, the binary in a temporary
     directory, then run.
-Entries in scripts/ci/self-tests.skip (one path per line, `#` and a reason after it) are excluded from standalone runs. The
-reason identifies the enclosing suite or explains why a test is left out. A test that is neither run nor skipped is reported,
-so a new test cannot fall out of CI unnoticed.
+Entries in scripts/ci/self-tests.skip (one path per line, `#` and a reason after it) are excluded from standalone runs.
+The reason identifies the enclosing suite or explains why a test is left out. C/C++ tests without a build line are reported
+unless they have a skip entry, so a new test cannot fall out of CI unnoticed.
 
 The tests run with an empty HOME and without PIANO_* variables, so nothing local leaks in. The summary ends with up to ten of
 the slowest tests. Exit status 1 when any test fails.
@@ -68,7 +68,7 @@ def build_line(path):
     return line
 
 
-def collect(only):
+def collect(only, skips):
     tests, unrunnable = [], []
     for p in tracked():
         if not p.startswith(('package/', 'tooling/', 'firmware/', 'scripts/')):
@@ -81,7 +81,7 @@ def collect(only):
             tests.append(('sh', p, None))
         elif C_RE.match(p):
             line = build_line(p)
-            if line:
+            if line or p in skips:
                 tests.append(('c', p, line))
             elif re.search(r'(_host|^test_)', Path(p).stem):
                 unrunnable.append(p)
@@ -131,8 +131,8 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--junit')
     a = ap.parse_args()
-    tests, unrunnable = collect(a.only)
     skips = load_skips()
+    tests, unrunnable = collect(a.only, skips)
     stale = sorted(set(skips) - {p for _, p, _ in tests} - set(unrunnable))
     run = [t for t in tests if t[1] not in skips]
     if a.list:

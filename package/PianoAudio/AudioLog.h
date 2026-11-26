@@ -38,7 +38,7 @@ inline bool piano_audio_spk_probe_enabled(const char *args)
     while (*args == ' ' || *args == '\t') ++args;
     const char *end = args;
     while (*end && *end != ' ' && *end != '\t') ++end;
-    const size_t length = end - args;
+    const size_t length = static_cast<size_t>(end - args);
     if (length >= keyLength && __builtin_memcmp(args, key, keyLength) == 0 &&
         (length == keyLength || args[keyLength] == '=')) {
       enabled = length == keyLength + 2 && args[keyLength + 1] == '1';

@@ -111,9 +111,10 @@ extern "C" int piano_audio_dsp_link(uint32_t wait_s, uint32_t settle_ms, int por
             lastGuard = gLink.guard.state;
         }
         if (gLink.set != lastSet) {
-            const AudioPorts *now = audio_ports(gLink.set);
+            const AudioPorts *newPorts = audio_ports(gLink.set);
             piano_audio_log("dsp: nobody answered from port %#x: GPR ports set %d (%s: %s) now: APM %#x, PRM %#x, data %#x",
-                            audio_ports(lastSet)->apm, gLink.set, now->name, now->source, now->apm, now->prm, now->data);
+                            audio_ports(lastSet)->apm, gLink.set, newPorts->name, newPorts->source, newPorts->apm, newPorts->prm,
+                            newPorts->data);
             lastSet = gLink.set;
             lastQueries = 0;
         }

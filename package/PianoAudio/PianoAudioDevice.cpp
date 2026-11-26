@@ -392,7 +392,8 @@ void PianoAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty(piano_audio_mute_key(isInput), masterMute ? kOSBooleanTrue : kOSBooleanFalse);
     if (isInput) {
         e->setProperty("piano-audio-input-contract", "mic-delivery1:inpt/main:mono:db-linear:pre-HAL");
-        setNumber(e, "piano-audio-input-gain-q15", masterMute ? 0 : piano_audio_input_q15(volumePercent));
+        const uint32_t inputGain = masterMute ? 0u : uint32_t(piano_audio_input_q15(int(volumePercent)));
+        setNumber(e, "piano-audio-input-gain-q15", inputGain);
         e->setProperty("piano-audio-input-zero", "raw0=silence;finite-db-floor=-36;raw1-100=db-linear");
     }
 }
