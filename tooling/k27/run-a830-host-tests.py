@@ -172,21 +172,13 @@ def macos_lists(root, out, name='macos_lists', text=MACOS_LISTS):
 
 
 def board_tests(out):
-    """The board's portable pieces (package/PianoA830/board/tests/test_*.cpp: the LLCC island, the ceiling slots), each built with
-    ASan/UBSan against the board headers alone and run; each prints its PASS line."""
-    results = []
-    out.mkdir(parents=True, exist_ok=True)
-    for source in sorted((PACKAGE / 'board/tests').glob('test_*.cpp')):
-        binary = out / source.stem
-        command = ['xcrun', 'clang++', '-std=c++20', '-O1', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
-                   '-I', str(PACKAGE / 'board'), str(source), '-o', str(binary)]
-        built = subprocess.run(command, capture_output=True, text=True)
-        if built.returncode:
-            results.append((source.stem, False, built.stderr[-2000:]))
-            continue
-        ran = subprocess.run([str(binary)], capture_output=True, text=True)
-        results.append((source.stem, ran.returncode == 0 and ran.stdout.startswith('PASS'), (ran.stdout + ran.stderr).strip()))
-    return results
+    """Run the board tests using their standalone Build lines, including tests that link the driver."""
+    command = [sys.executable, str(REPO / 'scripts/ci/self-tests.py'), '--only', 'package/PianoA830/board/tests/']
+    result = subprocess.run(command, capture_output=True, text=True)
+    log = result.stdout + result.stderr
+    (out / 'board.log').write_text(log)
+    print(log, end='')
+    return result.returncode == 0
 
 
 def firmware_kit(out, override):
@@ -284,10 +276,8 @@ def main():
             ok, text = macos_lists(root, args.out, 'macos_events', MACOS_EVENTS)
             print(f'macos_events: {text}')
             bad += 0 if ok else 1
-    if not args.names:
-        for name, ok, text in board_tests(args.out / 'board'):
-            print(f'board {name}: {text}' if ok else f'FAIL board {name}: {text}')
-            bad += 0 if ok else 1
+    if not args.names and not board_tests(args.out):
+        bad += 1
     return 1 if bad else 0
 
 
