@@ -74,6 +74,7 @@ static void test_fat(void)
     CHECK(fat_open(&v, "folder/image.bin", &f) == FatDamaged);
     put(root + 26, 2, 2);
     memset(disk + 22 * 512, 0xe5, 512);
+    v.cached_sector = UINT64_MAX;
     put(disk + 512 + 4, 0xffff, 2);
     CHECK(fat_open(&v, "folder/missing", &f) == FatNotFound);
     v.cached_sector = UINT64_MAX;
