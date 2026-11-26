@@ -38,7 +38,9 @@ The official actions run on Node.js 24 (`checkout@v7`, `upload-artifact@v7`, `do
   test of `package/`, `tooling/`, `firmware/` and `scripts/` that needs no Apple content, no `out/` and no tablet, with an empty
   `HOME` and no `PIANO_*` variables. `scripts/ci/self-tests.skip` names each one it does not run and why (a checker that takes a
   built file, a test that needs build output or a local backup, a header build line that names generated inputs, or `KNOWN-FAIL`:
-  failing on `main` today, an open item). A JUnit report is the only upload.
+  failing on `main` today, an open item). The runner installs `mtools` and `llvm` with Homebrew. `SELFTEST_TIMEOUT=1500` gives each
+  test command up to 1,500 seconds. The log ends with the ten slowest tests (or all tests for smaller runs) and their elapsed times,
+  including compilation for C/C++ tests. A JUnit report is the only upload from `checks.yml`.
 
 Locally: `python3 scripts/ci/privacy-scan.py [--diff BASE]`, `python3 scripts/ci/self-tests.py [--list] [--only SUBSTR]`,
 `python3 scripts/fetch-pins.py --verify`.
