@@ -2,7 +2,7 @@
 // Host tests of DpuSnapshot.h (B1 milestone 1's run-time snapshot) on the timed register model (dpu_model.h), seeded with the
 // installed v13.1y12k survey's words: the snapshot stores nothing, keeps the survey's gate, classifies the live mode (120, then 60
 // after DpuRefresh.h's own switch on the model), reads both DSI controllers' shadow and command-path words, and its text is bounded.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_snapshot_host.cpp -o /tmp/dpu_snapshot_host && /tmp/dpu_snapshot_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. dpu_snapshot_host.cpp -o /tmp/dpu_snapshot_host && /tmp/dpu_snapshot_host
 #include "DpuSnapshot.h"
 #include "DpuPanel.h"
 #include "dpu_model.h"
@@ -36,6 +36,7 @@ struct Text {
       if (l.find(s) != std::string::npos) return true;
     return false;
   }
+  bool hasLine(const char *s) const { return std::find(lines.begin(), lines.end(), s) != lines.end(); }
 };
 
 // The words the model does not simulate, as installed y12k's survey read them (both links alike).
@@ -258,15 +259,23 @@ void testM5Probe()
     for (const auto &line : t.lines) CHECK(line.size() < 480);
     CHECK(t.has("dsi0 m5: vid-cfg0 00010010 vid-cfg1 00010020") == enabled);
     CHECK(t.has("cmd-compression 000202a8/000202ac") == enabled);
-    CHECK(t.has("dsi1 phy: clk-cfg0 00040010 clk-cfg1 00040014") == enabled);
     CHECK(t.has("phy-err 000200b4 timeout 000200c0") == enabled);
     CHECK(t.has("dsi0 m5: cmd-cfg0 00010040 cmd-cfg1 00010044 dma-length 0001004c reset 00010118 misr-ctrl 000100a4") == enabled);
-    CHECK(t.has("dsi1 phy: ctrl0 00040064 ctrl1 00040028 ctrl2 0004002c ctrl3 00040030 ctrl5 000401b0 lane-cfg0 00040034 lane-cfg1 00040038 "
-                "lane-ctrl0 000400a0 lane-ctrl1 000400a4 pll-ctrl 0004003c") == enabled);
-    CHECK(t.has("dsi0 phy timing 0..13: 000500b4 000500b8 000500bc 000500c0 000500c4 000500c8 000500cc 000500d0 "
-                "000500d4 000500d8 000500dc 000500e0 000500e4 000500e8") == enabled);
-    CHECK(t.has("dsi0 pll: status 00000081 local-lock 1") == enabled);
-    CHECK(t.has("dsi1 pll: status 00000080 local-lock 0") == enabled);
+    const char *phyAndPllRows[] = {
+      "dsi0 phy: clk-cfg0 00030010 clk-cfg1 00030014 rbuf-ctrl 0003001c phy-status 00030140 lane-status0 00030148 lane-status1 0003014c",
+      "dsi0 phy: ctrl0 00030064 ctrl1 00030028 ctrl2 0003002c ctrl3 00030030 ctrl5 000301b0 lane-cfg0 00030034 lane-cfg1 00030038 "
+      "lane-ctrl0 000300a0 lane-ctrl1 000300a4 pll-ctrl 0003003c",
+      "dsi0 phy timing 0..13: 000500b4 000500b8 000500bc 000500c0 000500c4 000500c8 000500cc 000500d0 "
+      "000500d4 000500d8 000500dc 000500e0 000500e4 000500e8",
+      "dsi0 pll: status 00000081 local-lock 1",
+      "dsi1 phy: clk-cfg0 00040010 clk-cfg1 00040014 rbuf-ctrl 0004001c phy-status 00040140 lane-status0 00040148 lane-status1 0004014c",
+      "dsi1 phy: ctrl0 00040064 ctrl1 00040028 ctrl2 0004002c ctrl3 00040030 ctrl5 000401b0 lane-cfg0 00040034 lane-cfg1 00040038 "
+      "lane-ctrl0 000400a0 lane-ctrl1 000400a4 pll-ctrl 0004003c",
+      "dsi1 phy timing 0..13: 000600b4 000600b8 000600bc 000600c0 000600c4 000600c8 000600cc 000600d0 "
+      "000600d4 000600d8 000600dc 000600e0 000600e4 000600e8",
+      "dsi1 pll: status 00000080 local-lock 0",
+    };
+    for (const char *line : phyAndPllRows) CHECK(t.hasLine(line) == enabled);
   }
 }
 
