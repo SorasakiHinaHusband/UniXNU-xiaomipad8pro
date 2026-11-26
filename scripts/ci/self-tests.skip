@@ -32,6 +32,7 @@ package/PianoBluetooth/tests/firmware_host.c           # SUITE: package/PianoBlu
 package/PianoCamera/tests/camera_host.cpp              # SUITE: package/PianoCamera/tests/run-camera-host.sh
 package/PianoDp/tests/dp_host.cpp                      # SUITE: package/PianoDp/tests/run-dp-host.sh
 package/PianoDp/tests/dp_d0_host.cpp                   # SUITE: package/PianoDp/tests/run-dp-host.sh generates the PHY header
+package/PianoPower/tests/policy_host.cpp              # SUITE: package/PianoPower/tests/run-charge-host.sh
 package/PianoVideo/tests/bringup_host.cpp              # SUITE: package/PianoVideo/tests/run-bringup-host.sh
 package/PianoVideo/tests/enc_host.cpp                  # SUITE: package/PianoVideo/tests/run-bringup-host.sh
 package/PianoVideo/tests/video_vt_cancel_e1_handoff_host.cpp # SUITE: package/PianoVideo/tests/run-bringup-host.sh
