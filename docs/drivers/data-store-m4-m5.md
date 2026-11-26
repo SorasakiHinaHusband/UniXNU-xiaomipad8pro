@@ -28,13 +28,10 @@ sectors, so a partial-page write reads and merges the existing 4 KiB page. See [
 | Completion | Callback in the caller after the lock is released | Callback still in the caller, after releasing its range and stage |
 | Sync and power | Completed writes are write-through. Normal sync returns the online status. The opt-in UFS sleep path holds I/O and syncs the store | Sync fences admission and drains admitted I/O. Sleep additionally syncs the LUN and holds admission through wake when UFS suspend is enabled. Stop closes admission and drains it |
 
-The daily installer and installed-profile verifier explicitly forbid the concurrency boot-argument key. The v13
-integration plan made this a conditional storage experiment: host fault/durability tests and a corrected benchmark
-first, then a measured installed-from-disk baseline, then a qualified same-boot A/B before the storage path could
-advance. The v13 integration linked the implementation with the argument absent in both profiles. The host handoff and
-M1 now supply the host evidence and installed baseline. They supply no on-device result for concurrent mode. The
-installer exclusion is a qualification decision, with no recorded concurrent-mode corruption incident in that handoff.
-Driver history is `31e0f683` and `43782b10`; the latter documents the runtime control.
+The initial v13 integration linked the driver with the concurrency argument absent from both installer profiles.
+After the installed v13.1y12o A/B, the daily v13.1y12q profile uses `data-store-concurrent=2`. Data mounts in
+single-gate mode, then the boot daemon enables concurrency after it verifies the mounted store has live state 2.
+[Installed A/B results](../results-2026-11-26.md#data-storage) · [Concurrent mode at boot](../data-store.md#concurrent-mode-at-boot-piano-data-concurrent-2026-11-26)
 
 The concurrent harness exercises depth and exhaustion, shared/exclusive ranges and 512-byte RMW, disjoint read
 progress behind a held write, merge and crash cuts at a bitmap-block boundary, short copies, failure latching, DMA
@@ -320,6 +317,8 @@ distinguish software delay from the physical command tail.
 
 ## M5 switches and instrumentation
 
+Both `data-store-write-back` and `data-store-queue` default to `0`.
+
 - `data-store-write-back=1` opts a read-write direct Data disk into write-back. The advertised cache state is fixed at
   publication. Only an ordinary write whose entire provider request is already present uses WRITE(10) without FUA.
   First touches, mixed present/clear requests, the bitmap and store setup use FUA. A forced write drains older I/O
@@ -349,9 +348,23 @@ distinguish software delay from the physical command tail.
 returns. Its three queue timing sums cover acceptance to dispatch, dispatch to I/O finish and I/O finish to callback.
 It also shows `write_back`, `dirty`, write-back flush attempts, forced requests and barrier options received.
 `fua` and `cached` count tracked runtime write accessors and their timing sums include slot wait and transfer.
-`store_rd` and `store_sync` include setup and power calls, so use per-row deltas. Convert ticks using the host
-timebase. Data `inflight_max` is the stage peak. UFS `ufs_peak` is the shared slot peak since boot. Use the
+`store_rd` and `store_sync` include setup and power calls. They report cumulative counts and microseconds as
+`OPS/USus`, so use per-row deltas. Convert raw tick fields using the host timebase. Data `inflight_max` is the
+stage peak. UFS `ufs_peak` is the shared slot peak since boot. Use the
 `native-ufs-perf=1` per-window transport samples in a matching trace to attribute physical overlap.
+
+### Scratch-window power-cut results, 2026-11-26
+
+All three modes passed on a disposable window in `linux_rootfs`. Each run used the direct PSCI `SYSTEM_RESET`
+path and verified every record acknowledged after `F_FULLFSYNC` on recovery.
+
+| Mode | Acknowledged records recovered | Recovery errors |
+| --- | ---: | ---: |
+| M4 concurrent write-through | 32/32 | 0 |
+| M5 write-back | 32/32 | 0 |
+| M5 queue | 32/32 | 0 |
+
+Daily throughput A/B on the scratch window is pending. [November 26 results](../results-2026-11-26.md#data-storage)
 
 ### Expected gain from M1
 
