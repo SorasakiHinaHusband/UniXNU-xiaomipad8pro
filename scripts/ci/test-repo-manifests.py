@@ -223,6 +223,8 @@ def wrapper_sources(name, path, script):
             relative = Path(arg)
         if relative.is_absolute() or '..' in relative.parts or '$' in relative.as_posix():
             raise ValueError(f'{path}: expected a repository-relative source input')
+        if any(part.casefold() == 'private' for part in relative.parts):
+            raise ValueError(f'{path}: source {relative} references private checkout content')
         if relative.parts[0] == 'out':
             continue  # Generated sources need the image build inputs.
         # The GPU wrapper uses one brace expansion and a source glob.
@@ -235,6 +237,7 @@ def wrapper_sources(name, path, script):
 
 
 def validate_kext_build(root, names):
+    root = root.resolve()
     script = '\n'.join(line.strip() for line in read(root, IMAGE_BUILD).splitlines()
                        if not line.lstrip().startswith('#'))
     # The default LIST drives both the wrapper dispatch and descriptor staging, in inventory order.
@@ -269,7 +272,16 @@ def validate_kext_build(root, names):
         if not any(package in source.parents for source in sources):
             raise ValueError(f'{path}: expected a source in {package}')
         for source in sorted(sources):
-            if not any(p.is_file() for p in root.glob(source.as_posix())):
+            found = False
+            for match in root.glob(source.as_posix()):
+                resolved = match.resolve()
+                if not resolved.is_relative_to(root) or any(
+                    part.casefold() == 'private' for part in resolved.relative_to(root).parts
+                ):
+                    raise ValueError(f'{path}: source {match.relative_to(root)} must resolve inside the public checkout')
+                if match.is_file():
+                    found = True
+            if not found:
                 raise ValueError(f'{path}: missing source {source}')
 
 
@@ -414,6 +426,11 @@ class Regressions(unittest.TestCase):
         (self.root / source).unlink()
         with self.assertRaisesRegex(ValueError, r'missing source package/Example/Example\.cpp'):
             validate_kext_build(self.root, ['Example'])
+
+    def test_native_wrapper_refuses_private_source(self):
+        script = 'python3 "$D/tooling/k27/build-native-kext.py" Example "$D/private/example.cc"'
+        with self.assertRaisesRegex(ValueError, 'references private checkout content'):
+            list(wrapper_sources('Example', 'fixture.sh', script))
 
     def test_bad_lock_shas(self):
         good = 'a' * 40
