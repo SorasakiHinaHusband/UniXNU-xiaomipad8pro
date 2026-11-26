@@ -31,8 +31,9 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 
 `tests/usbnet_txflow_model_host.cpp` exercises the daily `piano-usb-net-txflow=1` contract by moving 69 MiB through the portable
 frame rings and gadget with delayed host completions. It also checks NTB bounds and reassembly, stale completions, and reconnect
-after reset, unplug, sleep, and a controller loan. The offline receiver enforces disjoint datagrams and table ranges, and the loan
-model supplies the queue flush at release. Live throughput and controller-loan teardown remain tablet qualification items.
+after reset, unplug, sleep, and a controller loan. The offline receiver enforces disjoint datagrams and table ranges.
+`tests/dwc3_composite_churn_stress_host.cpp` checks NCM, console and shell bytes, HID reports, EP0 recovery, and transfer ownership
+across repeated resets and controller loans. Live throughput and hardware handoff remain tablet qualification items.
 
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).

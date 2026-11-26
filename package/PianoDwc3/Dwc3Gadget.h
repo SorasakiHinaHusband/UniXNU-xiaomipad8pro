@@ -339,6 +339,22 @@ public:
     return ok && run(50);
   }
 
+  // A loan also ends the gadget session. Release is confirmed only after the
+  // halt and endpoint commands finish, with old events discarded before the
+  // host takes over the controller.
+  bool quiesceForHandoff()
+  {
+    using namespace dwc3;
+    if (!deviceRole()) return false;
+    h->wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
+    h->barrier();
+    if (!halt(100) || wedged_) return false;
+    const uint32_t errors = stats.cmdErrors;
+    busReset(false);
+    drainEvents(false);
+    return !wedged_ && stats.cmdErrors == errors && !(h->rd(GEVNTCOUNT) & 0xffffu);
+  }
+
   // ------------------------------------------------------------------------------------------- wedged: the controller recovery
   // Wedged: an endpoint command whose CMDACT did not clear (the core still owns it; more commands on top of it are undefined, and
   // with a SETUP waiting for a TRB the core takes no END TRANSFER of any endpoint, so they pile up: energy-e4 after the replug), or
@@ -917,6 +933,7 @@ private:
     const Reply stall = {kStall, 0}, none = {kNoData, 0};
     if ((type & 0x60) == 0x00) {   // standard
       const unsigned recipient = type & 0x1f;
+      if (recipient > 2) return stall;   // this device serves device, interface and endpoint recipients
       const bool in = type & 0x80;
       switch (request) {
       case 0x00:   // GET_STATUS

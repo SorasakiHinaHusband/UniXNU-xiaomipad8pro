@@ -531,12 +531,9 @@ static void controllerLoan()
   prime(s);
   auto &h = s.h;
   CHECK(handoffDecide(kHoDevice, kAskRelease) == HandoffDo::release && !handoffCoreFree(true, kHoDevice));
-  CHECK(s.g.halt(100) && (h.rd(DSTS) & DSTS_DEVCTRLHLT));
-  h.wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
+  CHECK(s.g.quiesceForHandoff() && (h.rd(DSTS) & DSTS_DEVCTRLHLT));
   CHECK(handoffCoreFree(true, kHoReleased) && (h.rd(GEVNTSIZ) & GEVNTSIZ_INTMASK));
-  // Supply the network session boundary as an offline contract. The kernel release
-  // wrapper parks the gadget after halt and does not issue the NCM link-down callback.
-  h.netLink(false, 0);
+  expectTransfersRetired(s);
   postStaleCompletions(h);
   h.regs[GCTL] = (h.rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | (ROLE_HOST << 12);
   const auto commands = h.cmds.size();
@@ -548,7 +545,7 @@ static void controllerLoan()
   CHECK(!sleep.takeoverMayRun());
   CHECK(sleep.on(true).touch && sleep.takeoverMayRun());
   h.regs[GCTL] = (h.rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAP_DEVICE;
-  s.start();   // the reclaim is a fresh takeover. The soft reset ends the old DMA ownership.
+  s.start();   // the reclaim is a fresh takeover. The soft reset clears the old event ring.
   CHECK(h.softResets == 2 && !h.rd(GEVNTCOUNT) && !s.g.stats.stale);
   CHECK(handoffSettled(kAskReclaim, kHoDevice));
   reconnectWithPendingReset(s);

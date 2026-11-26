@@ -2131,7 +2131,7 @@ void waitAwake()
 
 // ------------------------------------------------------------------------------- the hand-off to PianoUsbHost (piano-usb-handoff=1)
 // PianoUsbHost asks through callPlatformFunction (UsbHandoff.h); the USB thread acts between passes: a release stops the device
-// controller (RUN_STOP 0, the halt awaited), masks its event interrupt and parks the thread until a reclaim; a reclaim re-reads the
+// controller, retires the gadget's transfers, masks its event interrupt and parks the thread until a reclaim; a reclaim re-reads the
 // core's power domain and clocks and, only when they read on, runs the whole takeover again (PianoUsbHost has put the core back in
 // device mode first). Without piano-usb-handoff nothing of this runs and the platform function answers unsupported.
 volatile uint32_t gHandoffState = kHoOff, gHandoffAsk = kAskState;
@@ -2148,24 +2148,17 @@ bool handoffRelease()
 {
   using namespace dwc3;
   gRunning = false;
-  const bool halted = gGadget.halt(100);
-  if (!halted) {
-    note("usb-a2b release REFUSED: device did not halt; host cannot borrow");
+  if (!gGadget.quiesceForHandoff()) {
+    note("usb-a2b release REFUSED: device quiescence unconfirmed; host cannot borrow");
     handoffSet(kHoUnsafe);
     return false;
   }
   __atomic_store_n(&gDomainConfigured, 0u, __ATOMIC_RELEASE);
   __atomic_store_n(&gDomainNet, 0u, __ATOMIC_RELEASE);
-  if (gLines[kPortConsole] & 1) consoleClosed();
-  IOLockLock(gLock);
-  for (uint16_t &line : gLines) line = 0;
-  IOLockUnlock(gLock);
-  gHal.wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
-  gHal.barrier();
   if (gIrqMode) irqOff("the controller is handed to PianoUsbHost");
   gHandoffReleases++;
-  gHal.note("hand-off: released to PianoUsbHost (%u): DCTL %08x DSTS %08x (%s); the console keeps its log for the replay", gHandoffReleases,
-            gHal.rd(DCTL), gHal.rd(DSTS), halted ? "halted" : "NOT halted within 100 ms");
+  gHal.note("hand-off: released to PianoUsbHost (%u): DCTL %08x DSTS %08x (halted); the console keeps its log for the replay",
+            gHandoffReleases, gHal.rd(DCTL), gHal.rd(DSTS));
   __atomic_store_n(&gRoleSeen, 0xffu, __ATOMIC_RELAXED);   // PianoUsbHost changes the role: not known until GCTL is read again
   handoffSet(kHoReleased);
   return true;
