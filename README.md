@@ -35,8 +35,8 @@ smooth scrolling and video, with its GPU sandbox on) and, since v13.1y12m, Chrom
 from the display driver and the Bluetooth LE event-mask fix. In RAM qualification, a simulated cover close on the charger locked
 the screen without sleeping, and a simulated power-key press slept and woke the system. The physical keys and closing the cover
 on battery still need attended checks. The installed system uses a 13 GiB memory window. Bluetooth keyboard and mouse pairing,
-disk write-back caching, charge-pump fast charging, USB host devices and external displays remain open. Work continues on disk
-speed, auto-rotate and validating the install guide on other units.
+charge-pump fast charging, USB host devices and external displays remain open. Work continues on auto-rotate and validating
+the install guide on other units.
 
 On the v13.1y12s RAM boot, the PCC fix changed the Night Shift tint from blue to orange. The panel still looked warm with
 Night Shift off, so v13.1y12s was held. M5 logged successful bonded DSI wakes,
@@ -49,6 +49,7 @@ Flags-free Chrome passed WebGL 2 and WebGPU with 17/17 V8 sandboxes secure. Blue
 keyboard and mouse pairing awaits the owner's hands-on session. A read-only audio check confirmed the daily duplex profile,
 with concurrent playback and recording still pending. The RAM qualification passed 607 checks. Night Shift graded unity
 while off and warm after wake, with an unlocked recheck pending. The M5 panel stayed dark after wake.
+The Disk M5 scratch-window speed A/B is complete. Daily M5 write-back awaits an owner decision and a fresh owner-store backup.
 [November 27 results](docs/results-2026-11-27.md)
 
 Kernel patch 0076 lets the USB debug shell and other updated helpers read the full boot line, including arguments past
@@ -64,7 +65,7 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-27 | Both disk boots reached the login window at +32 s and verified that the owner's Data store resumed. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-27 | Both disk boots reached the login window at +32 s and verified that the owner's Data store resumed. The `inst-y12q-obs3` console confirmed `cs-native4k-skip=1` with 896 files and 7496 MiB skipped. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. [Boot results](docs/results-2026-11-27.md#installed-boot) |
 | Display | ✅ Works (installed), 60 Hz | installed v13.1y12q, 2026-11-26; RAM v131y12t-qual1, 2026-11-27 | PianoDpu flips on the boot framebuffer and native screenshots are enabled. Daily v13.1y12q has neutral colours at 60 Hz. On RAM, DPU clock/RPMh readback passed, and Night Shift graded unity (R/G/B 1.000) while off and warm after wake. Screen auto-lock interrupted the mid-run warm transition. In M5R, the compression-route registers matched the bright desktop after wake, but the panel stayed dark. The fix-image gate is HOLD. Night Shift routing, native panel sleep and refresh switching stay off in daily use. The fixed 120 Hz and 144 Hz profiles remain RAM-only. |
 | 120 Hz / 144 Hz | 🟡 Partial | RAM m120c-120 and m120c-144, 2026-11-26 | Fixed scanout on both links reached 120.004 Hz and, with the MM0 bandwidth vote, a stable 144.146 Hz, with zero interface underruns in both runs. Both profiles are off by default. App cadence was about 48–60 callbacks/s. At 120 Hz, all 153 type-3 packets were accepted with zero transport errors and monotonic timestamps. The app latched 51.2 distinct new surfaces/s and all 3562 drawables reported zero `presentedTime`. Swap-service pipelining passed host tests and awaits tablet validation. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
@@ -105,7 +106,7 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
 | Memory (16 GB) | 🟡 Partial | installed v13.1y12l and RAM m120c-120 and ram16g-hevc1, 2026-11-26 | The installed system uses 13 GiB (13310 MiB). At idle it had 47% free, with no compression, swap or memory pressure. The EFI audit classified 319/322 two-MiB slabs as non-runtime (CMA 128/128, DXE 184/186, FD 7/8), released 0 MiB and awaits owner verification. The 684 MiB mixed HEVC arena (274 MiB from region 0 and 410 MiB from XNU) passed its RAM reservation self-test. All 24/24 decoded 4K Main10 frames matched the golden P010 hashes, 12 on first open and 12 on resident reopen, with no video faults. The GPU memory tier and driver pools remain in progress. |
-| Internal storage (UFS) | 🟡 Partial | installed v13.1y12q (concurrent mode), 2026-11-27; installed v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | The first installed Data benchmark reached 1435 MB/s sequential read and 519 MB/s sequential write at 4 MiB. Compared with serial mode, concurrent 4 KiB random-read IOPS reached 4.9× at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential read and write throughput reached 4.8× and 1.5×, and 4 KiB random-write IOPS reached 0.9×. Mixed-load read p99 fell from 2528 to 269 µs. The canary survived a clean reboot. In scratch-window tests, concurrent, write-back and queue modes each preserved all 32 records acknowledged after `F_FULLFSYNC` across a direct reset. The unacknowledged tail could be lost. Concurrent mode switches on after Data mounts on v13.1y12q. Write-back and queue modes stay off. |
+| Internal storage (UFS) | 🟡 Partial | installed v13.1y12q and RAM scratch-window A/B, 2026-11-27; installed v13.1y12o and RAM scratch-window power-cut tests, 2026-11-26 | M4 concurrent mode starts after Data mounts on v13.1y12q. The installed A/B measured 4.9× and 5.6× serial 4 KiB random-read IOPS at QD8 and QD32. All three modes passed 32/32 in scratch-window power-cut tests. In the scratch-window speed A/B, M5-wb passed with 1.71×–4.12× M4-conc write throughput and 42%–58% lower sync p50. M5-queue failed with lower read IOPS and 401 inter-phase queue-full refusals. `data-store-write-back=0` and `data-store-queue=0` are the defaults on `main`. Daily write-back requires an owner decision and a fresh owner-store backup. Queue mode is unsuitable for daily use. [Scratch-window results](docs/results-2026-11-27.md#disk-m5-scratch-window-ab) |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 Details (status definitions, known gaps, showcase): [docs/STATUS.md](docs/STATUS.md).
