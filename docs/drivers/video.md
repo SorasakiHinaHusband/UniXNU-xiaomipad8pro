@@ -18,7 +18,8 @@
   [November 26 RAM results](../results-2026-11-26.md#efi-memory-battery-and-video)
 
 See the [pending AVC cancellation analysis for `ram16g-hevc1`](video-hevc-cancel.md).
-Hardware encode remains open. [Hardware backlog, B10](../BACKLOG-hardware.md#2-backlog-b1b15)
+The opt-in E1 H.264 encode self-test is host-tested and built for arm64e. Tablet qualification is pending.
+[E1 integration and qualification](video-encode-e1.md) · [Hardware backlog, B10](../BACKLOG-hardware.md#2-backlog-b1b15)
 
 ## Historical bring-up notes
 
@@ -220,6 +221,11 @@ collapsed, votes dropped; on = nothing until the next session.
 | `piano-video-resumes=N` | 0 | level 4: resume / ping / idle / collapse cycles after the first collapse (the test plan: 10) |
 | `piano-video-unload=1` | 0 | level 4: end with Linux's deinit (resume, PAS shutdown, off, the bank and UC region released); 0 leaves the steady state (collapsed, firmware kept) |
 | `piano-video-stop=STEP` | 0 | levels 2-4: power everything down after step STEP (§12.6's numbers): the bisecting aid |
+| `piano-video-enc=1` | 0 | level 6 with a successful boot reservation: run one native H.264 encode self-test on synthetic NV12 (§18) |
+| `piano-video-enc-delay=S` | 120 | E1 start delay in seconds (0–3600) |
+| `piano-video-enc-res=R` | 0 | E1 input size (0 for 640×480, 1 for 1280×720, 2 for 1920×1080, 3 for 320×240) |
+| `piano-video-enc-frames=N` | 10 | E1 frame count (2–120) |
+| `piano-video-enc-kbps=K` | 2000 | E1 variable bitrate in kbit/s (100–40000) |
 | `piano-video-mmcx-floor=VLVL` | 0x140 | the MMCX vote is never below this and never lowered under it (NOM_L1: the boot display's need, §12.1); 0 only once a native display votes its own |
 | later: `piano-video-codecs=MASK`, `piano-video-direct` | 3 (H.264, HEVC), 0 | which codecs `decs` offers (4 = VP9); decode into IOSurfaces |
 
@@ -924,3 +930,24 @@ translates every page as before (`VideoHw.h arenaPagePa`). The CPU view is one w
 cached alias exists. Loans are subranges of the same physical descriptor. Any shortfall falls back to the XNU allocation unchanged and
 is logged as `RAM16G arena from XNU: ...`. The pool's report is `machdep.piano_extra_ram_video` (root). HEVC arenas larger than the
 run stay XNU-backed.
+
+### 18. E1 bounded native H.264 encode self-test
+
+E1 exercises the native Iris encoder once with synthetic frames. VideoToolbox still reports zero hardware encoders through
+`encs`, and movie encoding continues through `VTEncoderXPCService` in software. The native self-test requires one literal
+`piano-video-enc=1` token, level 6 and a successful boot reservation. Omission, a zero value or duplicate keys leave it off.
+
+- `VideoEncode.h` defines the aligned NV12 input, bitstream and VPU35 internal buffer sizes for the four supported sizes.
+  The arena maps two raw buffers, two bitstream buffers and the internal buffers. The H.264 script uses High 5.0, CABAC,
+  variable bitrate, headers joined to the first IDR and zero B-frames.
+- `VideoEncodeSession.h` follows the pinned Linux Iris stream-on order. It opens one session, configures and starts the
+  raw port, provisions the internal buffers and starts the bitstream port. The session submits the bounded frame count,
+  waits for DRAIN acknowledgment and LAST, stops both ports and closes the session. The `E1` log records transactions
+  and output sizes, picture types, NAL types and timing.
+- The worker waits at most ten minutes for the shared decoder reservation after the configured delay. After a healthy session
+  and CLOSE acknowledgment, the core stays resident for the next decode session, which remaps its own arena. Failure
+  quarantines the core for that boot. The IORegistry properties `piano-video-enc-result` and `piano-video-enc-stream` carry
+  the result and up to 256 KiB of Annex B output.
+- The host suites check opt-in parsing, arena mapping, scripted HFI transactions and FFmpeg grading of the synthetic
+  pattern. The macOS host suite also exercises the VT cancellation path under ASan/UBSan.
+  [E1 integration and qualification](video-encode-e1.md)

@@ -27,6 +27,7 @@
 #include "VideoSmmu.h"
 #include "VideoArena.h"
 #include "VideoSession.h"
+#include "VideoEncode.h"
 
 namespace pianovideo {
 
@@ -105,6 +106,9 @@ class Bringup {
   uint32_t avcWidth = 0, avcHeight = 0; // selected before DMA preparation; zero preserves the legacy qualification
   bool hevc = false;
   uint32_t bitdepth = 8;
+  // E1 (piano-video-enc=1): an encoder session's buffers replace the decoder layout while encoder is set; cleared after it.
+  bool encoder = false;
+  enc::Geometry encGeometry;
   unsigned doorbells = 0, txEvents = 0, rxEvents = 0, dbgChecks = 0, dbgErrors = 0, msgDrops = 0, watchdogSamples = 0;
   uint32_t watchdogSeen = 0;
   int teardownRc = kOk;
@@ -528,6 +532,7 @@ class Bringup {
   }
   bool prepareLayout()
   {
+    if (encoder) return enc::buildLayout(layout, encGeometry);
     return hevc ? layout.initHevc(avcWidth, avcHeight, bitdepth) :
            avcWidth ? layout.init(avcWidth, avcHeight) : layout.init();
   }

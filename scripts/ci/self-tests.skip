@@ -10,6 +10,7 @@ tooling/native/tests/test_mic_diag.py                  # ARGS: takes a recorded 
 tooling/native/piano-mic-check/test-mic-check.py       # ARGS: tooling/native/piano-mic-check/run-tests.sh builds the app and WAV via make test
 package/PianoCamera/tests/camera_host.cpp              # SUITE: package/PianoCamera/tests/run-camera-host.sh
 package/PianoVideo/tests/bringup_host.cpp              # SUITE: package/PianoVideo/tests/run-bringup-host.sh
+package/PianoVideo/tests/enc_host.cpp                  # SUITE: package/PianoVideo/tests/run-bringup-host.sh
 tooling/persist/test-data-store.py                     # INPUT: imports the UniXNU checkout's unixnu.bootimg (fetch-pins.py UniXNU)
 tooling/persist/test-persist.py                        # INPUT: reads the maintainer's partition-table backup
 tooling/persist/test-switch-pair.py                    # INPUT: reads the maintainer's partition-table backup

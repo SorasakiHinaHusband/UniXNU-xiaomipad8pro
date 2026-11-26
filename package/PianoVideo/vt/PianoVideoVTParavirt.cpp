@@ -368,7 +368,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
 IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t) {
     droidvm_vtpv_notify_calls = droidvm_vtpv_notify_calls + 1;
     droidvm_vtpv_notify_type = type;
-    if (type != 0) { droidvm_vtpv_notify_result = kIOReturnBadArgument; return kIOReturnBadArgument; }
+    if (type != 0) { droidvm_vtpv_notify_result = uint32_t(kIOReturnBadArgument); return kIOReturnBadArgument; }
     IOLockLock(lock);
     IOReturn result = kIOReturnNotReady;
     if (!queue) {

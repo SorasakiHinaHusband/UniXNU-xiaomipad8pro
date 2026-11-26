@@ -23,12 +23,13 @@ for header in IOKit/IOLib.h pexpert/pexpert.h sys/proc.h IOKit/IOService.h \
   mkdir -p "$build_dir/shim/$(dirname "$header")"
   printf '#include "vt_cancel_kernel_shim.h"\n' > "$build_dir/shim/$header"
 done
-for test in video_host geometry_host session_host stream_host hevc_host vt_host vt_surface_host vt_sync_host vt_contract_host vt_cancel_host; do
+for test in video_host geometry_host session_host stream_host hevc_host enc_host vt_host vt_surface_host vt_sync_host vt_contract_host vt_cancel_host; do
   "${CXX:-c++}" -std=c++20 "${checks[@]}" -I "$build_dir/shim" -I package/PianoVideo/tests \
     -I package/PianoVideo -I package/PianoVideo/vt -I package/include \
     "package/PianoVideo/tests/$test.cpp" -o "$build_dir/$test"
   "$build_dir/$test"
 done
+python3 package/PianoVideo/tests/enc_stream_check.py --self-test --pattern-tool "$build_dir/enc_host"
 python3 package/PianoVideo/tests/fixture_host.py
 python3 package/PianoVideo/tests/hevc_files_host.py --host "$build_dir/hevc_host" \
   package/PianoVideo/tests/fixtures/v9/main10-1080.mp4 package/PianoVideo/tests/fixtures/v9/main8-1080.mp4
