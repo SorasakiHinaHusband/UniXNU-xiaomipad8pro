@@ -12,11 +12,12 @@ WINDOW = 10
 FPS_MIN = 30.0
 P99_MAX_MS = 40.0
 RECOVERY_KEYS = ('recoveries', 'failures', 'reports', 'watchdog', 'jobs_failed', 'lost_cause')
+BOOT_UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', re.I)
 FAULT = re.compile(
     r'GPU (?:LOST|RECOVER\b|restarts?\b|restarted\b|resets?\b|resetting\b|hang\b|hung\b|context is lost)'
     r'|DEVICE LOST|hang snapshot|recovery done|recovery: (?:culprit|the driver)'
     r'|MTLCommandBuffer(?:StatusError|ErrorDomain)|R3a UNSAFE|R3b3 exit|panic\(cpu', re.I)
-FREQUENCY = re.compile(r'^at_us=(\d+) lvl=(\d+) mhz=(\d+)\b')
+FREQUENCY = re.compile(r'^at_us=(\d+) lvl=(\d+) mhz=(\d+)(?=\s|$)')
 CONSOLE_MARKER = re.compile(r'PIANO_METAL_SUSTAIN ([A-Za-z0-9]+) (BEGIN|END)\b')
 CONSOLE_EVENT = re.compile(
     r'(?P<touch>PianoTouch: contact [0-9]+ down\b)'
@@ -34,15 +35,27 @@ def fields(line):
     return dict(re.findall(r'(\w+)=(\S+)', line))
 
 
+def valid_frequency(level, mhz):
+    # The fullopp guard reports GMU levels 0 through 14, with 0 representing off.
+    return 0 <= level <= 14 and 0 <= mhz <= 1100 and (level == 0) == (mhz == 0)
+
+
 def snapshot(path):
     lines = path.read_text().splitlines()
-    boot = next(line.removeprefix('BOOT=') for line in lines if line.startswith('BOOT='))
-    state = next(FREQUENCY.match(line) for line in lines if FREQUENCY.match(line))
-    counters = next(line.split() for line in lines if line.startswith('replay '))
-    require(re.fullmatch(r'[\da-fA-F-]{36}', boot), 'missing boot UUID')
-    recovery = {key: int(value) for key, value in zip(counters[::2], counters[1::2]) if key in RECOVERY_KEYS}
-    require(set(recovery) == set(RECOVERY_KEYS), 'incomplete GPU recovery counters')
-    return boot, tuple(map(int, state.groups())), recovery
+    boots = [line.removeprefix('BOOT=') for line in lines if line.startswith('BOOT=')]
+    require(len(boots) == 1 and BOOT_UUID.fullmatch(boots[0]), 'missing or invalid boot UUID')
+    states = [match for line in lines if (match := FREQUENCY.match(line))]
+    require(len(states) == 1, 'missing or ambiguous GPU state')
+    at, level, mhz = map(int, states[0].groups())
+    require(at > 0 and valid_frequency(level, mhz), 'invalid GPU state frequency')
+    rows = [line.split() for line in lines if line.startswith('replay ')]
+    require(len(rows) == 1 and len(rows[0]) % 2 == 0, 'incomplete or ambiguous GPU recovery counters')
+    keys, values = rows[0][::2], rows[0][1::2]
+    require(len(keys) == len(set(keys)) and set(RECOVERY_KEYS).issubset(keys) and
+            all(re.fullmatch(r'[0-9]{1,10}', v) and int(v) <= 0xffffffff for v in values),
+            'incomplete or invalid GPU recovery counters')
+    recovery = {key: int(value) for key, value in zip(keys, values) if key in RECOVERY_KEYS}
+    return boots[0].lower(), (at, level, mhz), recovery
 
 
 def percentile(samples, p):
@@ -103,7 +116,8 @@ def grade(root):
     log = (root / 'summary.log').read_text().splitlines()
     require(not any(line.startswith(('METAL_SUSTAIN_ERROR ', 'METAL_SUSTAIN_COMMAND_ERROR ')) for line in log),
             'Metal or command-buffer error')
-    require((root / 'run.txt').read_text().splitlines().count('METAL_SUSTAIN_REMOTE_RC=0') == 1,
+    statuses = [line for line in (root / 'run.txt').read_text().splitlines() if line.startswith('METAL_SUSTAIN_REMOTE_RC=')]
+    require(statuses == ['METAL_SUSTAIN_REMOTE_RC=0'],
             'console-user command did not confirm exit 0')
     begins = [line for line in log if line.startswith('METAL_SUSTAIN_BEGIN ')]
     ends = [fields(line) for line in log if line.startswith('METAL_SUSTAIN_END ')]
@@ -125,7 +139,7 @@ def grade(root):
         i, at, level, mhz = (int(state[k]) for k in ('window', 'at_us', 'lvl', 'mhz'))
         elapsed = float(state['elapsed_s'])
         require(0 <= i < len(readings) and i * WINDOW <= elapsed <= (i + 1) * WINDOW and
-                frequency_at <= at <= after_freq[0] and (level == 0) == (mhz == 0), 'invalid frequency sample')
+                frequency_at <= at <= after_freq[0] and valid_frequency(level, mhz), 'invalid frequency sample')
         require(not readings[i] or at > readings[i][-1][0], 'repeated or out-of-order frequency sample')
         frequency_at = at
         low_seen |= level <= 3

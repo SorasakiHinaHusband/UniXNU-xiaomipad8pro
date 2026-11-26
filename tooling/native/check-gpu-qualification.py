@@ -21,20 +21,29 @@ def fields(line):
     return record
 
 
+def indexed_rows(rows, size, label):
+    indexed = {int(i): values for i, *values in rows}
+    require(len(rows) == size and set(indexed) == set(range(size)), f'{label} row indices')
+    return indexed
+
+
 def tables(text):
     arcs = {}
+    arc_rows = re.findall(r"R3a ARC (\w+) index=(\d+) vlvl=([0-9a-f]+)", text)
     for name, present, count in re.findall(r"R3a ARC (\w+) present=(\d+) count=(\d+)", text):
-        rows = {int(i): int(v, 16) for n, i, v in re.findall(r"R3a ARC (\w+) index=(\d+) vlvl=([0-9a-f]+)", text) if n == name}
         count = int(count)
-        require(present in ('0', '1') and 0 <= count <= 16 and (present == '1' or count == 0)
-                and set(rows) == set(range(count)), f'{name} ARC row count')
-        arcs[name] = [rows[i] for i in range(count)]
+        require(name not in arcs and (present == '0' and count == 0 or present == '1' and 1 <= count <= 16),
+                f'ARC {name} header')
+        rows = indexed_rows([(i, v) for n, i, v in arc_rows if n == name], count, f'ARC {name}')
+        arcs[name] = [int(rows[i][0], 16) for i in range(count)]
+        require(all(v <= 0xffff for v in arcs[name]), f'ARC {name} voltage width')
     require(all(arcs.get(n) and arcs[n][0] == 0 for n in ('gfx', 'mx', 'cx')), 'ARC capture incomplete')
     require(all(all(a < b for a, b in zip(v, v[1:])) for v in arcs.values()), 'ARC monotonicity')
     def index(table, corner, clamp=False):
         return next((i for i, v in enumerate(table) if v >= corner), len(table)-1 if clamp else None)
-    gx = {int(g): (int(k), int(v, 16), int(d, 16)) for g, k, v, d in re.findall(r"R3a GX (\d+) khz=(\d+) gx=([0-9a-f]+) dep=([0-9a-f]+)", text)}
-    require(set(gx) == set(range(12)) and gx[0] == (0, 0, 0xffffffff), 'full GX table/off row')
+    gx_rows = re.findall(r"R3a GX (\d+) khz=(\d+) gx=([0-9a-f]+) dep=([0-9a-f]+)", text)
+    gx = {g: (int(k), int(v, 16), int(d, 16)) for g, (k, v, d) in indexed_rows(gx_rows, 12, 'GX').items()}
+    require(gx[0] == (0, 0, 0xffffffff), 'GX off row')
     khz = [160000, 222000, 342000, 389000, 443000, 525000, 607000, 660000, 734000, 832000, 900000]
     corners = [0x32, 0x34, 0x38, 0x3c, 0x40, 0x50, 0x80, 0x90, 0xc0, 0xe0, 0x100]
     secondary = arcs.get('gmxc') or arcs['mx']
@@ -47,17 +56,19 @@ def tables(text):
         if arcs.get('gbx'):
             dep = (dep & ~(63 << 20)) | index(arcs['gbx'], rounded, True) << 20
         require(gx[g] == (freq, vote, dep), f'GX/dependency row {g}')
-    cx = {int(c): (int(k), int(v, 16)) for c, k, v in re.findall(r"R3a CX (\d+) khz=(\d+) vote=([0-9a-f]+)", text)}
+    cx_rows = re.findall(r"R3a CX (\d+) khz=(\d+) vote=([0-9a-f]+)", text)
+    cx = {c: (int(k), int(v, 16)) for c, (k, v) in indexed_rows(cx_rows, 3, 'CX').items()}
     for c, (freq, corner) in enumerate([(0, 0), (500000, 0x40), (650000, 0x80)]):
         i = index(arcs['cx'], corner)
         require(i is not None, 'CX coverage')
         vote = arcs['cx'][i] << 16 | index(arcs['mx'], arcs['cx'][i], True) << 8 | i
         require(cx[c] == (freq, vote), f'CX row {c}')
-    bcms = {int(i): (int(u), int(w), int(v)) for i, _, u, w, v in re.findall(r"R3a BCM (\d+) addr=([0-9a-f]+) unit=(\d+) width=(\d+) vcd=(\d+)", text)}
+    bcm_rows = re.findall(r"R3a BCM (\d+) addr=([0-9a-f]+) unit=(\d+) width=(\d+) vcd=(\d+)", text)
+    bcms = {i: (int(u), int(w), int(v)) for i, (_, u, w, v) in indexed_rows(bcm_rows, 4, 'BCM').items()}
+    require(all(unit > 0 and width > 0 for unit, width, _ in (bcms[0], bcms[1])), 'BCM unit and width')
     rows = re.findall(r"R3a DDR (\d+) kbps=(\d+) wait=([0-9a-f]+) words=([0-9a-f]+),([0-9a-f]+),([0-9a-f]+)", text)
-    require({int(r[0]) for r in rows} == set(range(12)) and set(bcms) == set(range(4)), 'M2 capture incomplete')
-    for i, kbps, wait, *words in rows:
-        i, kbps = int(i), int(kbps)
+    for i, (kbps, wait, *words) in indexed_rows(rows, 12, 'DDR').items():
+        kbps = int(kbps)
         expected, mask = [], 0
         for b in range(3):
             commit = b == 2 or bcms[b][2] != bcms[b+1][2]
@@ -71,15 +82,19 @@ def tables(text):
                 value |= min(16383, max(1, (kbps*width//[16, 4][b])*1000//unit))
             expected.append(value)
         require([int(w, 16) for w in words] == expected and int(wait, 16) == mask, f'DDR row {i}')
-    require('C5-607-v1 full-table verified M1=49 GX12 CX3 M2=160' in text, 'invalid C5 telemetry')
+    require('C5-607-v1 full-table verified M1=49 GX12 CX3 M2=160' in text, 'verification marker missing')
     return arcs
 
 
-def heartbeat(records, start, end):
-    # A replay of the same sample adds no time coverage.
-    times = sorted({int(record['at-us']) for record in records})
-    boundaries = [start, *times, end]
-    return len(times) >= 590 and all(b - a <= 2_500_000 for a, b in zip(boundaries, boundaries[1:]))
+def heartbeat(records, opened, end, label):
+    times = [(int(record['at-us']), record) for record in records]
+    window = [(at, record) for at, record in times if opened <= at < end]
+    require(len(window) >= 590, f'{label} heartbeat incomplete')
+    stamps = [at for at, _ in window]
+    max_gap = 2_500_000
+    require(stamps[0] - opened <= max_gap and end - stamps[-1] <= max_gap and
+            all(0 < b - a <= max_gap for a, b in zip(stamps, stamps[1:])), f'{label} heartbeat order or gaps')
+    return [record for _, record in window]
 
 
 def adjudicate(root):
@@ -96,21 +111,16 @@ def adjudicate(root):
     inj_at = int(inj[2])
     opened = min(int(t['opened-us']) for t in temps if int(t['opened-us']))
     require(600_000_000 <= inj_at-opened <= 602_000_000, 'full 600-second soak, bounded injection tail')
-    before = [c for c in counters if opened <= int(c['at-us']) < inj_at]
-    require(heartbeat(before, opened, inj_at), 'continuous normal counter capture')
+    before = heartbeat(counters, opened, inj_at, 'counter')
     require(all(1 <= int(c['level']) <= 7 for c in before), 'normal acknowledged level exceeds607')
     for key in ('failures', 'timeout', 'errors', 'stale', 'malformed', 'queuefull', 'forceoff', 'recover', 'recoverfail', 'gbif'):
         require(len({c[key] for c in before}) == 1, f'normal delta {key}')
-    normal_temps = [t for t in temps if opened <= int(t['at-us']) < inj_at]
-    require(heartbeat(normal_temps, opened, inj_at), 'temperature heartbeat gaps')
-    for t in temps:
-        if opened <= int(t['at-us']) < inj_at:
-            require(t['gpu-valid'] == 'ff' and int(t['gpu-max']) < 700, 'invalid C5 telemetry')
-            require(int(t['msm']) < 65000 and int(t['quiet']) < 40000, 'invalid C5 telemetry')
-            require(t['board-ok'] == '1' and t['valid'] == '3' and t['disabled'] == '0' and t['state'] == '2', 'invalid C5 telemetry')
-            ages = [int(age) for age in t['age-ms'].split(',')]
-            require(len(ages) == 2 and all(0 <= age <= 10000 for age in ages)
-                    and t['reason'] == '0', 'invalid temperature age/reason')
+    for t in heartbeat(temps, opened, inj_at, 'temperature'):
+        require(t['gpu-valid'] == 'ff' and int(t['gpu-max']) < 700, 'GPU temperature invalid or too hot')
+        require(int(t['msm']) < 65000 and int(t['quiet']) < 40000, 'board temperature too hot')
+        require(t['board-ok'] == '1' and t['valid'] == '3' and t['disabled'] == '0' and t['state'] == '2', 'invalid board temperature')
+        ages = [int(a) for a in t['age-ms'].split(',')]
+        require(len(ages) == 2 and all(0 <= a <= 10000 for a in ages) and t['reason'] == '0', 'stale or unsafe board temperature')
     windows = {}
     for r in res:
         at = int(r['at-us'])
@@ -129,7 +139,7 @@ def adjudicate(root):
     first, last = before[-1], post[-1]
     for key in ('failures', 'timeout', 'forceoff', 'recover'):
         require(int(last[key])-int(first[key]) == 1, f'exactly one injection {key}')
-    require(last['dropped'] == '1' and last['sticky'] == '1' and last['reason'] == '1', 'invalid C5 telemetry')
+    require(last['dropped'] == '1' and last['sticky'] == '1' and last['reason'] == '1', 'injection fallback state')
     low = re.search(r'R3a fresh-M9 ACK level=1 bus=2 header=[0-9a-f]+ at-us=(\d+) elapsed-us=\d+ high-acks=(\d+)', text[inj.start():])
     require(low, 'fresh low M9')
     for c in post:
@@ -181,7 +191,7 @@ def main():
         message = ('PASS C5 table encoding' if args.tables_only else
                    'PASS C5 automated gates; review webcam pixels and service/q/copy benefit separately')
         rc = 0
-    if not args.tables_only:
+    if not args.tables_only and args.result.is_dir():
         try:
             with (args.result/'verdict.txt').open('a') as stream:
                 stream.write(message+'\n')

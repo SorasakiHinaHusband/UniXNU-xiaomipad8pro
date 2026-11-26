@@ -67,11 +67,40 @@ def write_capture(root, *, slow_p99=False, low_fps=False, events='', before_begi
 
 
 class GradeTests(unittest.TestCase):
-    def grade(self, **fixture):
+    def grade(self, replacements=(), **fixture):
         with tempfile.TemporaryDirectory() as directory:
-            write_capture(Path(directory), **fixture)
+            root = Path(directory)
+            write_capture(root, **fixture)
+            for name, old, new in replacements:
+                path = root / name
+                text = path.read_text()
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new, 1))
             return subprocess.run([sys.executable, str(GRADER), directory], check=False,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def test_snapshots_require_unambiguous_boot_and_recovery_counters(self):
+        for old, new, reason in (
+                ('BOOT=00000000-0000-4000-8000-000000000000', 'BOOT=' + '-' * 36, 'boot UUID'),
+                ('reports 0', 'reports 1 reports 0', 'recovery counters'),
+                ('reports 0', 'reports -1', 'recovery counters'),
+                ('reports 0', 'reports 4294967296', 'recovery counters')):
+            with self.subTest(new=new):
+                result = self.grade(replacements=[(name, old, new) for name in ('before.txt', 'after.txt')])
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stdout)
+
+    def test_conflicting_remote_exit_status_fails(self):
+        result = self.grade(replacements=[('run.txt', 'METAL_SUSTAIN_REMOTE_RC=0\n',
+                                          'METAL_SUSTAIN_REMOTE_RC=1\nMETAL_SUSTAIN_REMOTE_RC=0\n')])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('command did not confirm exit 0', result.stdout)
+
+    def test_out_of_range_frequency_cannot_prove_a_step(self):
+        result = self.grade(replacements=[('summary.log', 'lvl=4 mhz=300', 'lvl=255 mhz=300'),
+                                          ('summary.log', 'min_level=4 max_level=4', 'min_level=255 max_level=255')])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('invalid frequency sample', result.stdout)
 
     def test_undisturbed_pass_ignores_events_outside_markers(self):
         events = ('PianoTouch: native: contact 7 down as touch 1\n'
