@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "../../../package/include/PianoBootArgs.h"
+#include "../audio-wav.h"
 
 enum { OK = 0, Error = 1, Usage = 2, NoPermission = 3, Silence = 4, ToneMissing = 5 };
 static const double kMinInputDBFS = -85.0;
@@ -114,13 +115,13 @@ static BOOL report_input(AudioDeviceID device)
     AudioObjectPropertyAddress address = {
         kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain
     };
-    UInt32 size;
+    UInt32 size = 0;
     if (AudioObjectGetPropertyDataSize(device, &address, 0, NULL, &size) != noErr ||
         size < sizeof(AudioStreamID))
         return NO;
     NSMutableData *streams = [NSMutableData dataWithLength:size];
-    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, streams.mutableBytes) != noErr ||
-        size < sizeof(AudioStreamID))
+    if (!streams || AudioObjectGetPropertyData(device, &address, 0, NULL, &size, streams.mutableBytes) != noErr ||
+        size < sizeof(AudioStreamID) || size > streams.length || size % sizeof(AudioStreamID))
         return NO;
     const AudioStreamID *ids = streams.bytes;
     address.mSelector = kAudioStreamPropertyVirtualFormat;
@@ -129,7 +130,7 @@ static BOOL report_input(AudioDeviceID device)
         AudioStreamBasicDescription format;
         UInt32 bytes = sizeof(format);
         if (AudioObjectGetPropertyData(ids[i], &address, 0, NULL, &bytes, &format) != noErr ||
-            !isfinite(format.mSampleRate) || format.mSampleRate <= 0 || format.mChannelsPerFrame == 0)
+            bytes != sizeof(format) || !isfinite(format.mSampleRate) || format.mSampleRate <= 0 || format.mChannelsPerFrame == 0)
             return NO;
         printf("input_format=%.0f Hz %u ch %u bit id=0x%08x flags=0x%x\n",
                format.mSampleRate, (unsigned)format.mChannelsPerFrame, (unsigned)format.mBitsPerChannel,
@@ -252,6 +253,18 @@ static Tone find_tone(double *samples, size_t count, double rate, double acPower
 static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
 {
     NSError *error = nil;
+    if ([url.pathExtension.lowercaseString isEqualToString:@"wav"]) {
+        const char *path = url.fileSystemRepresentation;
+        FILE *wav = path ? fopen(path, "rb") : NULL;
+        AudioWav header;
+        int status = wav ? audio_wav_read_header(wav, &header, 0) : -1;
+        if (wav)
+            fclose(wav);
+        if (status) {
+            fprintf(stderr, "decode: invalid or incomplete RIFF/WAVE file\n");
+            return Error;
+        }
+    }
     AVAudioFile *file = [[AVAudioFile alloc] initForReading:url commonFormat:AVAudioPCMFormatFloat32
                                               interleaved:NO error:&error];
     if (!file) {
@@ -287,16 +300,25 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
     Tone best = { .snr = -200.0 }, previous = best;
     // Best qualifying window, or the strongest candidate for diagnosis on a failed tone run.
     Tone candidate = best;
-    for (AVAudioFramePosition offset = 0; offset < frames; offset += second) {
+    for (AVAudioFramePosition offset = 0; offset < frames;) {
         AVAudioFrameCount count = (AVAudioFrameCount)MIN((AVAudioFramePosition)second, frames - offset);
         if (![file readIntoBuffer:buffer frameCount:count error:&error] || buffer.frameLength != count) {
             fprintf(stderr, "decode: incomplete PCM read%s%s\n", error ? ": " : "",
                     error.localizedDescription.UTF8String ?: "");
             return Error;
         }
-        const float *samples = buffer.floatChannelData[0];
+        float *const *channelData = buffer.floatChannelData;
+        if (!channelData || !channelData[0]) {
+            fprintf(stderr, "decode: missing PCM samples\n");
+            return Error;
+        }
+        const float *samples = channelData[0];
         double sumSquares = 0.0, peak = 0.0;
         for (size_t i = 0; i < count; ++i) {
+            if (!isfinite(samples[i])) {
+                fprintf(stderr, "decode: nonfinite PCM sample\n");
+                return Error;
+            }
             sumSquares += (double)samples[i] * samples[i];
             peak = fmax(peak, fabs(samples[i]));
             railSamples += sample_at_rail(samples[i]);
@@ -334,6 +356,7 @@ static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
                 consecutive = 0;
             }
         }
+        offset += count;
     }
 
     printf("clipping_detected=%s\nclipped_samples=%zu\n", railSamples ? "yes" : "no", railSamples);
@@ -495,12 +518,14 @@ static int capture(NSURL *output, long seconds, BOOL tone, BOOL playback)
 
     // The recorder owns a fresh path; publish the finalized file without replacing any prior result.
     struct stat existing;
-    if (lstat(output.fileSystemRepresentation, &existing) == 0 || errno != ENOENT) {
+    const char *outputPath = output.fileSystemRepresentation;
+    if (!outputPath || lstat(outputPath, &existing) == 0 || errno != ENOENT) {
         fprintf(stderr, "record: output must be a new path\n");
         return Error;
     }
     NSURL *templateURL = [output.URLByDeletingLastPathComponent URLByAppendingPathComponent:@".mic-check.XXXXXXXX"];
-    char *scratch = strdup(templateURL.fileSystemRepresentation);
+    const char *templatePath = templateURL.fileSystemRepresentation;
+    char *scratch = templatePath ? strdup(templatePath) : NULL;
     if (!scratch || !mkdtemp(scratch)) {
         perror("record: mkdtemp");
         free(scratch);
@@ -510,7 +535,7 @@ static int capture(NSURL *output, long seconds, BOOL tone, BOOL playback)
     NSURL *temp = [folder URLByAppendingPathComponent:@"recording.m4a"];
     int status = record_to(temp, seconds, tone);
     if (status == OK) {
-        if (link(temp.fileSystemRepresentation, output.fileSystemRepresentation) != 0) {
+        if (link(temp.fileSystemRepresentation, outputPath) != 0) {
             perror("record: publish");
             status = Error;
         } else {

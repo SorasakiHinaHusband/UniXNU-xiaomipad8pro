@@ -30,5 +30,17 @@ def write_tone(path):
         wav.writeframes(samples.tobytes())
 
 
+def main():
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} OUTPUT.wav", file=sys.stderr)
+        return 2
+    try:
+        write_tone(sys.argv[1])
+    except (OSError, wave.Error) as error:
+        print(f"make-tone: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    write_tone(sys.argv[1])
+    sys.exit(main())

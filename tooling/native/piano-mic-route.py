@@ -117,7 +117,7 @@ def score(path, onset, carrier, search, expected_frames=None):
     check_carrier(carrier)
     if not math.isfinite(onset) or not math.isfinite(search) or search < 0:
         raise ValueError('expected a finite onset and nonnegative search range')
-    with path.open('rb') as f:
+    with open(path, 'rb') as f:
         rate, channels, frames = read_pcm16_header(f)
         if (rate, channels) != (RATE, 1):
             raise ValueError('expected mono S16 48 kHz WAV')

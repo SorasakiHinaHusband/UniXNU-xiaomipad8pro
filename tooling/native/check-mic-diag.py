@@ -57,31 +57,31 @@ def windows(measure, pcm, timeline, report):
     if bad:
         return bad
     # Use the alignment selected by TWO independent unity chip envelopes.
-    origin = times[0] - finite_time(info['file_onset'])
+    origin = finite_time(times[0] - finite_time(info['file_onset']))
     for p, at in zip(plays, times):
-        start = at - origin - .75
+        start = finite_time(at - origin - .75)
         end = start + 5
         bad += check(start >= 0 and end <= len(x) / rate,
                      p['phase'] + ' has a complete contiguous 5-second PCM window')
         if start < 0 or end > len(x) / rate:
             continue
         item = m.metrics(x, rate, start, end)
-        print(json.dumps(dict(phase=p['phase'], window_seconds=5, **item), sort_keys=True))
+        print(json.dumps(dict(phase=p['phase'], window_seconds=5, **item), sort_keys=True, allow_nan=False))
         if p['phase'] == 'mute':
             # Controls were applied >=2 seconds before playback and retained
             # >=3 seconds afterwards. This window includes no transitions.
             values = x[round(start * rate):round(end * rate)]
             bad += check(len(values) == 5 * rate and not any(values),
                          'input mute gives exactly zero PCM throughout five seconds')
-    start = a - origin + .5
-    bad += check(b - a >= 6 and start >= 0 and start + 5 <= len(x) / rate,
+    start = finite_time(a - origin + .5)
+    bad += check(finite_time(b - a) >= 6 and start >= 0 and start + 5 <= len(x) / rate,
                  'separate source-off silence window has five seconds')
     if start >= 0 and start + 5 <= len(x) / rate:
         quiet = m.metrics(x, rate, start, start + 5)
         # An unmodulated room line cannot pass the separate chip-envelope gate.
         tone = finite_time(info['phases'][0]['carrier_amplitude'])
         suppression = 20 * math.log10(max(tone, 1e-12)) - quiet['tone_dbfs']
-        print(json.dumps(dict(source_off=quiet, tone_over_source_off_db=suppression), sort_keys=True))
+        print(json.dumps(dict(source_off=quiet, tone_over_source_off_db=suppression), sort_keys=True, allow_nan=False))
         bad += check(math.isfinite(suppression) and suppression >= 15,
                      'no 997Hz tone with source off (>=15dB suppression)')
     return bad

@@ -48,6 +48,7 @@ class CaptureTests(unittest.TestCase):
                      PROBE.replace("count=1", "count=1e0"),
                      PROBE.replace("probe_rc=0", "probe_rc=0\nprobe_rc=bad"),
                      PROBE.replace("scalar_status=0", "scalar_status=-1"),
+                     PROBE.replace("scalar=1 db_status=0", "scalar= scalar=1 db_status=0"),
                      PROBE.replace("probe_rc=0", "probe_rc=142"),
                      PROBE.replace("pid_after pid=123", "pid_after pid=124"),
                      PROBE.replace("virtual_main phase=test status=0 size=4 scalar=1", "virtual_main phase=test status=0 size=4 scalar=0")):

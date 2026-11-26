@@ -303,7 +303,7 @@ def say_speech(text, voice, rate=48000):
         subprocess.run(['afconvert', '-f', 'WAVE', '-d', 'LEI16@%d' % rate, '-c', '1', aiff, wav], check=True)
         r, x = read_wav(wav)
     if r != rate:
-        raise SystemExit('say/afconvert gave %d Hz' % r)
+        raise ValueError('say/afconvert gave %d Hz' % r)
     return x
 
 
@@ -311,7 +311,7 @@ def fit(x, n, rate):
     """Trim (with a 30 ms fade) or pad x to n samples."""
     if len(x) >= n:
         x = x[:n]
-        f = int(0.03 * rate)
+        f = min(n, int(0.03 * rate))
         for i in range(f):
             x[n - 1 - i] *= i / f
         return x
@@ -655,6 +655,13 @@ def invalid_number(value):
     raise ValueError(f'invalid measurement number: {value}')
 
 
+def measurement_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        invalid_number(text)
+    return value
+
+
 def verdict(a):
     tags = a.tags or ['vpio', 'bypass', 'raw', 'other', 'vpio2']
     B = {}
@@ -662,7 +669,13 @@ def verdict(a):
         p = os.path.join(a.run, t + '-measure.json')
         if os.path.isfile(p):
             with open(p) as report:
-                B[t] = json.load(report, parse_constant=invalid_number)
+                data = json.load(report, parse_constant=invalid_number, parse_float=measurement_float)
+            if not isinstance(data, dict) or any(
+                data.get(key) is not None and not isinstance(data[key], dict)
+                for key in ('probe', 'c920', 'delay')
+            ):
+                raise ValueError(f'{p}: invalid measurement report')
+            B[t] = data
     lines = []
     out = lines.append
 

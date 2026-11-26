@@ -18,7 +18,7 @@ def records(text, prefix):
     for line in text.splitlines():
         if not line.startswith(prefix):
             continue
-        pairs = re.findall(r"(?:^|\s)(\w+)=([^\s]+)", line[len(prefix):])
+        pairs = re.findall(r"(?:^|\s)(\w+)=(\S*)", line[len(prefix):])
         record = dict(pairs)
         if len(record) != len(pairs):
             raise InvalidCapture(f"duplicate field in {prefix.strip()} record")
