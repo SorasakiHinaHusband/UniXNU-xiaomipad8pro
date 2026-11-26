@@ -169,6 +169,7 @@ persisting underrun still fails recovery.
 `TimingElements` entry (ID 1000, color ID 100). `piano-dpu-modes=120` requests the same fixed contract at 120 Hz.
 It verifies the inherited 120 Hz or the VFP-only return from 60 before publication.
 See [the 120 and 144 Hz analysis](dpu-m3-144.md) for the high-refresh hardware qualification gate.
+See [the M3 bandwidth analysis](dpu-m3-bandwidth.md) for the active Ubuntu vote, the native MM0 gap and the 144 Hz qualification proposal.
 A stale higher timing ID returns `kIOReturnUnsupported` to IOMFB before a mode service call, property update or VBL change.
 A request for the published timing remains idempotent. The 60 Hz VFP-only commit changes DSI TOTAL, the INTF
 period and the enabled fetch starts. It retains the known 120 Hz line and link clocks and the inherited resources.
