@@ -41,6 +41,9 @@ class Contract(unittest.TestCase):
                 power.policy_state(dict(row(), **{key: value}))
         d = row(); del d['Pack0Valid']
         with self.assertRaises(KeyError): power.policy_state(d)
+        for values in (dict(ConfigPending=None), dict(HealthHold=1.0), dict(Pack0SOC=80.0), dict(InputValid=-1)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                power.policy_state(dict(row(), **values))
 
     def test_gauge_age_bounds(self):
         for age in (0, 45000):
@@ -53,6 +56,8 @@ class Contract(unittest.TestCase):
             power.ui_state(text, state)
             with self.assertRaises(ValueError): power.ui_state(text, 'hold' if state == 'charging' else 'charging')
         with self.assertRaises(ValueError): power.ui_state('Battery Power; discharging;', 'hold')
+        with self.assertRaises(ValueError): power.ui_state('AC Power; charging;', 'unknown')
+        with self.assertRaises(ValueError): power.ui_state('Battery Power; label=AC Power; charging;', 'charging')
 
 
 if __name__ == '__main__': unittest.main()

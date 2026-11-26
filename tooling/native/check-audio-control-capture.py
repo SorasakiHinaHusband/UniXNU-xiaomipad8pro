@@ -34,7 +34,7 @@ def one(text, prefix):
 
 
 def success(text, tag):
-    codes = re.findall(rf"^{re.escape(tag)}=(\d+)$", text, re.M)
+    codes = re.findall(rf"^{re.escape(tag)}=(.*)$", text, re.M)
     if any(c in ("124", "137", "142") for c in codes) or re.search(
             r"Alarm clock|timed? out|TIMEOUT", text, re.I):
         raise InvalidCapture(f"TIMEOUT ({tag}); no numeric readback")
@@ -79,7 +79,7 @@ def probe(text, wanted=None):
     controls = one(text, "control_list_read ")
     require(controls, status=0)
     all_controls = records(text, "control ")
-    if number(controls, "count") != len(all_controls) or not all_controls:
+    if not all_controls or controls.get("count") != str(len(all_controls)):
         raise InvalidCapture("incomplete control list")
     ids = [c.get("id", "") for c in all_controls]
     if len(set(ids)) != len(ids) or not all(re.fullmatch(r"[1-9][0-9]*", cid) for cid in ids):
@@ -140,7 +140,7 @@ def main():
             print("finite coherent level/volm/vmvc; " + probe(texts[0], args.wanted))
         else:
             print(identity(texts[0]))
-    except (InvalidCapture, OSError, KeyError) as error:
+    except (ValueError, OSError, KeyError) as error:
         print(str(error), file=sys.stderr)
         return 1
     return 0

@@ -24,6 +24,7 @@ class BatteryTests(unittest.TestCase):
         for text in ('"AppleRawCurrentCapacity" = 30\n',
                      'prefix "CurrentCapacity" = 30\n',
                      '"CurrentCapacity" = 101\n',
+                     '"CurrentCapacity" = 30\n"CurrentCapacity" = broken\n',
                      '"CurrentCapacity" = 30\n"CurrentCapacity" = 31\n'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 capacity.current_capacity(text)

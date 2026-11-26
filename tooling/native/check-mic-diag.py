@@ -28,19 +28,38 @@ def check(ok, label):
     return not ok
 
 
+def finite_time(value):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError('capture time must be finite')
+    return value
+
+
 def windows(measure, pcm, timeline, report):
     m = load_measure(measure)
     text = Path(report).read_text()
     info, _ = json.JSONDecoder().raw_decode(text)
     x, rate, channels = m.read(pcm)
-    rows = [json.loads(s) for s in Path(timeline).read_text().splitlines() if s]
+    rows = [json.loads(s) for s in Path(timeline).read_text().splitlines() if s.strip()]
     plays = [r for r in rows if r['event'] == 'play']
-    bad = check(not info['failures'] and rate == 48000 and channels == 1,
+    if [p['phase'] for p in plays] != ['unity', 'lower', 'mute', 'recover']:
+        raise ValueError('expected unity, lower, mute and recover playback in order')
+    times = [finite_time(p['before']) for p in plays]
+    if any(a >= b for a, b in zip(times, times[1:])):
+        raise ValueError('playback times must increase')
+    silence = [r for r in rows if r['event'] in ('silence-start', 'silence-end')]
+    if [r['event'] for r in silence] != ['silence-start', 'silence-end']:
+        raise ValueError('expected one source-off silence interval')
+    a, b = (finite_time(r['at']) for r in silence)
+    failures = info['failures']
+    bad = check((failures == [] or type(failures) is int and failures == 0)
+                and len(x) > 0 and rate == 48000 and channels == 1,
                 'coded tone/gain/mute/recovery report and mono S16 48k PCM')
+    if bad:
+        return bad
     # Use the alignment selected by TWO independent unity chip envelopes.
-    origin = plays[0]['before'] - info['file_onset']
-    for p in plays:
-        start = p['before'] - origin - .75
+    origin = times[0] - finite_time(info['file_onset'])
+    for p, at in zip(plays, times):
+        start = at - origin - .75
         end = start + 5
         bad += check(start >= 0 and end <= len(x) / rate,
                      p['phase'] + ' has a complete contiguous 5-second PCM window')
@@ -54,18 +73,17 @@ def windows(measure, pcm, timeline, report):
             values = x[round(start * rate):round(end * rate)]
             bad += check(len(values) == 5 * rate and not any(values),
                          'input mute gives exactly zero PCM throughout five seconds')
-    a = next(r['at'] for r in rows if r['event'] == 'silence-start')
-    b = next(r['at'] for r in rows if r['event'] == 'silence-end')
     start = a - origin + .5
     bad += check(b - a >= 6 and start >= 0 and start + 5 <= len(x) / rate,
                  'separate source-off silence window has five seconds')
     if start >= 0 and start + 5 <= len(x) / rate:
         quiet = m.metrics(x, rate, start, start + 5)
         # An unmodulated room line cannot pass the separate chip-envelope gate.
-        tone = info['phases'][0]['carrier_amplitude']
+        tone = finite_time(info['phases'][0]['carrier_amplitude'])
         suppression = 20 * math.log10(max(tone, 1e-12)) - quiet['tone_dbfs']
         print(json.dumps(dict(source_off=quiet, tone_over_source_off_db=suppression), sort_keys=True))
-        bad += check(suppression >= 15, 'no 997Hz tone with source off (>=15dB suppression)')
+        bad += check(math.isfinite(suppression) and suppression >= 15,
+                     'no 997Hz tone with source off (>=15dB suppression)')
     return bad
 
 

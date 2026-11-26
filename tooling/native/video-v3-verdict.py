@@ -16,13 +16,20 @@ TERMINAL = r"PianoVideo: bring-up: V3 (?:ok:|FAILED)"
 def evaluate(folder, start=0):
     def read(name):
         path = folder / name
-        if not path.is_file() or (start and path.stat().st_mtime < start):
+        try:
+            if start and path.stat().st_mtime < start:
+                return ""
+            return path.read_text(errors="replace")
+        except OSError:
             return ""
-        return path.read_text(errors="replace").replace("\r", "")
 
-    candidates = [(name, read(name)) for name in ("console.out", "mailbox.txt")]
-    complete = [(n, t) for n, t in candidates if re.search(BANNER, t) and re.search(TERMINAL, t)]
-    positive = [(n, t) for n, t in candidates if re.search(BANNER, t)]
+    positive = []
+    for name in ("console.out", "mailbox.txt"):
+        capture = read(name)
+        banner = re.search(BANNER, capture)
+        if banner:
+            positive.append((name, capture[banner.start():]))
+    complete = [(n, t) for n, t in positive if re.search(TERMINAL, t)]
     source, text = (complete or positive or [("none", "")])[0]
     rows = []
 
@@ -46,7 +53,8 @@ def evaluate(folder, start=0):
     check("TCR2 defined fields", r"PianoVideo: smmu: verify TCR2 want [0-9a-f]+ got [0-9a-f]+ mask 0003801f mismatch 00000000 PASS")
     check("ASID/owner stability", r"PianoVideo: smmu: owners before-routes [0-9a-f]+->[0-9a-f]+ ASID [0-9]+ result 1")
     check("both S2CRs before matching", r"PianoVideo: smmu: verify S2CR .* mismatch 00000000 PASS", 2)
-    check("both exact SID matches", r"PianoVideo: smmu: verify SMR want 8000194[07] got 8000194[07] mask ffffffff mismatch 00000000 PASS", 2)
+    check("exact SID 1940", r"PianoVideo: smmu: verify SMR want 80001940 got 80001940 mask ffffffff mismatch 00000000 PASS")
+    check("exact SID 1947", r"PianoVideo: smmu: verify SMR want 80001947 got 80001947 mask ffffffff mismatch 00000000 PASS")
     check("both matches invalidated", r"PianoVideo: smmu: verify release-SMR .* mismatch 00000000 PASS", 2)
     check("both legal S2CR releases", r"PianoVideo: smmu: release group .* result 1", 2)
     check("legal M0 bank release", r"PianoVideo: smmu: release bank [0-9]+ M0 1 .* result 1")
@@ -69,7 +77,7 @@ def evaluate(folder, start=0):
         else:
             # A successful lifecycle can diagnose a later firmware gate. A bank/power failure cannot pass the SMMU transaction.
             check("exact later firmware failing stage", r"PianoVideo: V3 version error -[0-9]+ stage (?:3[0-8]|4[4-8]) received [01]")
-            if int(stage) not in list(range(30, 39)) + list(range(44, 49)):
+            if not re.fullmatch(r"3[0-8]|4[4-8]", stage):
                 rows.append(("failure belongs to firmware after applied routes", False, 0, 1, "later firmware stage", stage))
     if folder.name == "dry":
         status = "DRY ONLY"
@@ -91,13 +99,17 @@ def main():
     for label, ok, hits, minimum, pattern, sample in rows:
         lines.append(f"- {'PASS' if ok else 'FAIL'} {label}: hits={hits}, required={minimum}; /{pattern}/; sample: {sample}")
     content = "\n".join(lines) + "\n"
-    (args.folder / "V3-VERDICT.md").write_text(content)
-    result = args.folder / "RESULT.md"
-    if result.is_file():
-        original = result.read_text(errors="replace").split("\n<!-- video-v3-verdict -->", 1)[0]
-        result.write_text(original + "\n<!-- video-v3-verdict -->\n" + content)
+    try:
+        (args.folder / "V3-VERDICT.md").write_text(content)
+        result = args.folder / "RESULT.md"
+        if result.is_file():
+            original = result.read_text(errors="replace").split("\n<!-- video-v3-verdict -->", 1)[0]
+            result.write_text(original + "\n<!-- video-v3-verdict -->\n" + content)
+    except OSError as exc:
+        parser.exit(1, f"V3 verdict: cannot write report: {exc}\n")
     print(f"V3 verdict: {status}; source={source}; {firmware}; {args.folder / 'V3-VERDICT.md'}")
+    return 0 if status in ("PASS", "DRY ONLY") else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

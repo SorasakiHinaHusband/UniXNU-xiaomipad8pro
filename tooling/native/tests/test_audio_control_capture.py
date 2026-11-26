@@ -45,6 +45,8 @@ class CaptureTests(unittest.TestCase):
         for text in (PROBE.replace("db=-4.529953e-06", "db=nan"),
                      PROBE.replace("db=-4.529953e-06", "db=-inf"),
                      PROBE.replace("db=-4.529953e-06", "db=1"),
+                     PROBE.replace("count=1", "count=1e0"),
+                     PROBE.replace("probe_rc=0", "probe_rc=0\nprobe_rc=bad"),
                      PROBE.replace("scalar_status=0", "scalar_status=-1"),
                      PROBE.replace("probe_rc=0", "probe_rc=142"),
                      PROBE.replace("pid_after pid=123", "pid_after pid=124"),
