@@ -7,7 +7,7 @@
 //   piano-dpu-refresh=plan|60|120|auto   plan: the verdict and the stores a switch would make, nothing written; 60 / 120: switch
 //                                        once at the start and stay; auto: the idle policy (DpuRefresh.h) fed by NativeGopDisplay's
 //                                        swaps (it calls PianoDpuSwap when it has the same argument)
-//   piano-dpu-modes=1|120                M3 verified fixed 60 or 120 Hz, established synchronously by the slices worker
+//   piano-dpu-modes=1|120|144            M3 fixed 60/120 Hz or the 144 Hz bandwidth qualification profile
 //   piano-dpu-refresh-db=0|1|2           the DSI timing shadow: 1 SunUEFI's place (default), 2 downstream's, 0 none (TOTAL directly)
 //   piano-dpu-refresh-test=N             first N round trips 120 -> 60 -> 120, one second at each rate (stops at an anomaly)
 //   piano-dpu-refresh-idle=MS, -burst=N, -window=MS, -dwell=MS   the policy (1000, 2, 250, 200)
@@ -23,7 +23,8 @@
 //   piano-dpu-panel-test=N               standalone level-1 DCS test, 5 s asleep and 5 s awake each
 // Platform functions (IOService::callPlatformFunction on the PianoDpu service, registered when a slice is on; no link dependency):
 //   "PianoDpuSwap"          no parameters: a frame was shown
-//   "PianoDpuMode"          p1 = configured fixed rate, returns Aborted for a verified restore or Offline if recovery failed
+//   "PianoDpuMode"          p1 = configured fixed rate, p2 = optional unsigned * for the verified rate
+//                           returns Aborted for a verified restore or Offline if recovery failed
 //   "PianoDpuColorMatrix"   p1 = the 72 bytes of an IOMFBColorFixedMatrix (9 uint64_t), p2 = its IOMFBColorMatrixFunction, p3 = the
 //                           call's third argument (logged)
 //   "PianoDpuGammaTable"    p1 = the table's 32-bit words, p2 = how many (fitted when piano-dpu-pcc=2 and 771 words)
@@ -32,9 +33,8 @@
 //   "PianoDpuNightShiftMatrix"     p1 = nine S31.32 matrix words copied synchronously
 //   "PianoDpuNightShiftCorrection" p1 = the unsigned Q16.16 gain
 //   "PianoDpuNightShiftModeSet"    replay the colour after a display mode change
-// Every store goes through DpuSlices.h's guard (the registers of the three slices only: never TLMM, so never the panel's reset or
-// supply pins, never the backlight). Loads and stores use this file's own page maps, all made before the first store; nothing is
-// mapped while interrupts are off.
+// Display stores go through DpuSlices.h's guard. The 144 Hz MM0 vote uses the shared RPMh transaction on its own mapping.
+// Nothing is mapped while interrupts are off.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
@@ -54,6 +54,7 @@
 #include "DpuPcc.h"
 #include "DpuNightShift.h"
 #include "DpuPanel.h"
+#include "DpuBandwidth.h"
 #include "DpuModeSwitch.h"
 #include "DpuFlipKernel.h"
 
@@ -222,7 +223,62 @@ uintptr_t pageVa(uint64_t pa)
   return gPages[gPageCount++].va;
 }
 
+IOMemoryMap *mapVoteRange(uint64_t base, uint32_t size)
+{
+  IODeviceMemory *memory = IODeviceMemory::withRange(base, size);
+  IOMemoryMap *map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (memory) memory->release();
+  return map;
+}
+
+bool voteDisplayBandwidth(const Mode &mode)
+{
+  // sm8750.dtsi aop-cmd-db and apps_rsc/DRV-2. Copy cmd-db once and use the
+  // same validated parser and serialized ACTIVE TCS transport as PianoA830.
+  IOMemoryMap *dbMap = mapVoteRange(0x81c60000, Sm8750CmdDbBytes);
+  if (!dbMap) {
+    note("mode: MM0 command database unavailable");
+    return false;
+  }
+  const auto read = [](void *base, uint32_t offset) { return rd32(uintptr_t(base) + offset); };
+  const Sm8750RpmhIo dbIo{reinterpret_cast<void *>(uintptr_t(dbMap->getVirtualAddress())), read, nullptr, nullptr};
+  auto *db = static_cast<Sm8750CmdDb *>(IOMallocData(sizeof(Sm8750CmdDb)));
+  uint32_t addr = 0, unit = 0;
+  uint16_t width = 0;
+  uint8_t vcd = 0;
+  int rc = db ? Sm8750CmdDbCopy(&dbIo, db) : Sm8750RpmhIoError;
+  if (!rc) rc = Sm8750CmdDbBcm(db, "MM0", &addr, &unit, &width, &vcd);
+  if (db) IOFreeData(db, sizeof(Sm8750CmdDb));
+  dbMap->release();
+  const auto vote = modes::mm0Vote(mode, unit, width);
+  if (rc || !vote.average || !vote.peak) {
+    note("mode: MM0 missing or invalid in cmd-db (%d, unit %u, width %u)", rc, unit, unsigned(width));
+    return false;
+  }
+
+  IOMemoryMap *drv = mapVoteRange(0x16520000, 0x10000);
+  if (!drv) {
+    note("mode: MM0 apps DRV-2 unavailable");
+    return false;
+  }
+  const Sm8750RpmhIo rpmh{
+      reinterpret_cast<void *>(uintptr_t(drv->getVirtualAddress())), read,
+      [](void *base, uint32_t offset, uint32_t value) { wr32(uintptr_t(base) + offset, value); },
+      [](void *, unsigned us) { if (us >= 1000) IOSleep(us / 1000); else IODelay(us); }};
+  const Sm8750RpmhCmd cmd{addr, Sm8750BcmCommand(1, 1, vote.average, vote.peak)};
+  Sm8750RpmhResult result;
+  rc = Sm8750RpmhWriteActive(&rpmh, &cmd, 1, 1, &result);
+  drv->release();
+  note("mode: MM0 AB/IB %u/%u kB/s, aux %u/%u vcd %u, cmd %#x=%#x, RPMh %d step %u slot %u status %#x",
+       modes::scanoutAvgKBps(mode), modes::kMm0PeakKBps, unit, unsigned(width), unsigned(vcd), addr, cmd.data,
+       rc, result.step, result.tcs, result.command[0]);
+  // Keep an acknowledged vote until reboot. The resource's inherited DRV-2
+  // value is unavailable, so a rollback cannot put it back.
+  return rc == Sm8750RpmhOk;
+}
+
 struct KernelIo {
+  bool voteModeBandwidth(const Mode &mode) { return voteDisplayBandwidth(mode); }
   uint32_t rd(uint64_t pa)
   {
     const uintptr_t va = pageVa(pa);
@@ -317,7 +373,7 @@ struct Shared {
   panel::RequestGate panelGate;
   bool panelBusy = false, panelDone = false;
   IOReturn panelResult = kIOReturnNotReady;
-  unsigned modeWant = 0;    // remains occupied until its caller consumes the result
+  unsigned modeWant = 0, modeResultHz = 0;    // modeWant stays occupied until its caller consumes the result
   bool modeReady = false, modeDone = false;
   IOReturn modeResult = kIOReturnNotReady;
 } gS;
@@ -639,10 +695,12 @@ IOReturn doModeSwitch(unsigned hz)
     }
     ++gSwitchFailures;
     modes::logFailure(r, hz, note);
+    if (hz == modes::kHighModeHz && r.underruns) note("mode: 144 Hz verification INTF underrun mask %#x", r.underruns);
     if (r.restoreTransitionUnderruns)
       note("mode: underrun status before restored-mode verification: %#x", r.restoreTransitionUnderruns);
     if (r.reverted) {
       gModeFailure = r.restoreWhy ? kIOReturnOffline : kIOReturnAborted;
+      if (!r.restoreWhy) gHz = r.from;
       return gModeFailure;
     }
     return kIOReturnUnsupported;
@@ -925,6 +983,7 @@ void serve()
       const IOReturn result = doModeSwitch(mode);
       IOLockLock(gLock);
       gS.modeResult = result;
+      gS.modeResultHz = result == kIOReturnSuccess || result == kIOReturnAborted ? gHz : 0;
       gS.modeDone = true;
       IOLockWakeup(gLock, &gS.modeDone, false);
       IOLockUnlock(gLock);
@@ -1034,7 +1093,11 @@ void worker(void *, wait_result_t)
   }
   piano_dpu_slices_stage = 6;
   const char *refreshState = gRefreshBroken ? "off" : gA.refresh == kRefreshAuto ? "auto" : "fixed";
-  if (modeReady) refreshState = gA.modeHz == modes::kBootModeHz ? "M3 fixed 60 Hz" : "M3 fixed 120 Hz";
+  char fixedRefresh[24];
+  if (modeReady) {
+    snprintf(fixedRefresh, sizeof fixedRefresh, "M3 fixed %u Hz", gA.modeHz);
+    refreshState = fixedRefresh;
+  }
   note("slices: serving (refresh %s, pcc %s, panel %s)", refreshState,
        gPccBroken ? "off" : gA.nightShift ? "Night Shift" : gA.pcc ? "on" : "off", gA.panel && !gPanelBroken ? "on" : "off");
   publish();
@@ -1090,6 +1153,7 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
         IOLockWakeup(gLock, &gS, false);
         while (!gS.modeDone) IOLockSleep(gLock, &gS.modeDone, THREAD_UNINT);
         *result = gS.modeResult;
+        if (p2) *static_cast<unsigned *>(p2) = gS.modeResultHz;
         gS.modeWant = 0;
         gS.modeDone = false;
       }

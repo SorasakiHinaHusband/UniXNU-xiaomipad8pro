@@ -328,7 +328,7 @@ private:
     // from it before the service registers, and the VBL tick on absolute deadlines. Off: the family's slot and the relative tick, as before.
     bool fRefreshContract = false;
     unsigned fDpuModeHz = 0;
-    IOReturn setPianoDpuMode(unsigned hz);
+    IOReturn setPianoDpuMode(unsigned hz, unsigned &verifiedHz);
     mutable uint32_t fTimingAttributeCalls = 0;
     // The panel's physical size (ADT panel-width-mm / panel-height-mm, boot-arg native-gop-display-mm=WIDTHxHEIGHT; default piano's
     // 239x163 mm, about 340 dpi at 3200x2136). macOS offers its HiDPI ("looks like" half the pixels) modes by the density these give.
@@ -3165,10 +3165,10 @@ static bool appendTiming(OSArray *timings, OSArray *colors, uint32_t id, uint32_
     return ok;
 }
 
-IOReturn NativeGopDisplay::setPianoDpuMode(unsigned hz)
+IOReturn NativeGopDisplay::setPianoDpuMode(unsigned hz, unsigned &verifiedHz)
 {
     IOService *dpu = dpuService(true);
-    return dpu ? dpu->callPlatformFunction("PianoDpuMode", false, reinterpret_cast<void *>(uintptr_t(hz)), nullptr, nullptr, nullptr)
+    return dpu ? dpu->callPlatformFunction("PianoDpuMode", false, reinterpret_cast<void *>(uintptr_t(hz)), &verifiedHz, nullptr, nullptr)
                : kIOReturnNotReady;
 }
 
@@ -3178,10 +3178,11 @@ bool NativeGopDisplay::createDisplayAttributes()
     if (fDpuModeHz) {
         using namespace pianodpu::modes;
         IOReturn status = kIOReturnUnsupported;
+        unsigned verifiedHz = 0;
         if (fVideo.v_width == pianodpu::kPanelWidth && fVideo.v_height == pianodpu::kPanelHeight) {
             // The survey and flip ladder run on separate threads. Verify scanout before the family registers us.
             for (unsigned attempt = 0; attempt < 80; ++attempt) {
-                status = setPianoDpuMode(fDpuModeHz);
+                status = setPianoDpuMode(fDpuModeHz, verifiedHz);
                 if (status != kIOReturnNotReady)
                     break;
                 IOSleep(50);
@@ -3192,11 +3193,11 @@ bool NativeGopDisplay::createDisplayAttributes()
             return false;
         }
         if (status == kIOReturnSuccess || status == kIOReturnAborted) {
-            // Aborted means the other member of the 60/120 pair was restored and verified.
-            fRefreshHz = status == kIOReturnSuccess ? fDpuModeHz : (fDpuModeHz == kBootModeHz ? kInheritedModeHz : kBootModeHz);
+            if (!verifiedHz) return false;
+            fRefreshHz = verifiedHz;
             fRefreshContract = true;
         } else {
-            if (fDpuModeHz == kInheritedModeHz) {
+            if (fDpuModeHz != kBootModeHz) {
                 GOPLOG("M3 initial %u Hz mode could not be verified (%#x)\n", fDpuModeHz, status);
                 return false;
             }

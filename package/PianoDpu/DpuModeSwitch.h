@@ -67,7 +67,7 @@ struct Result {
   bool timingTouched = false;
   int ctl = -1;
   uint32_t pendingFlush = 0;
-  uint32_t restoreTransitionUnderruns = 0;
+  uint32_t underruns = 0, restoreTransitionUnderruns = 0;
   CounterInit counters;
   Rate rate;
 };
@@ -254,7 +254,7 @@ const char *verifyTiming(Io &io, const LivePath &before, const LinkWords words[2
 }
 
 template <class Io>
-const char *verifyRate(Io &io, unsigned hz, unsigned vtotal, Rate &rate)
+const char *verifyRate(Io &io, unsigned hz, unsigned vtotal, Rate &rate, uint32_t *underruns = nullptr)
 {
   rate = measureRate(io, 38);
   const uint64_t expected = hz * 1000ull, tolerance = expected / 50;
@@ -266,7 +266,9 @@ const char *verifyRate(Io &io, unsigned hz, unsigned vtotal, Rate &rate)
   const unsigned phase = a >= b ? a - b : b - a;
   if (a >= vtotal || b >= vtotal || (phase > 12 && phase < vtotal - 12))
     return "INTF line counters are out of phase";
-  if (io.modeUnderruns()) return "an INTF underran";
+  const uint32_t pending = io.modeUnderruns();
+  if (underruns) *underruns = pending;
+  if (pending) return "an INTF underran";
   return nullptr;
 }
 
@@ -340,8 +342,12 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
     r.why = "INTF counters not advancing in lockstep";
     return r;
   }
+  if (hz == kHighModeHz && !o.allowUnqualified && !io.voteModeBandwidth(*target)) {
+    r.why = "the 144 Hz MM0 bandwidth vote did not complete";
+    return r;
+  }
   if (r.from == hz) {
-    r.why = verifyRate(io, hz, before[0].vtotal, r.rate);
+    r.why = verifyRate(io, hz, before[0].vtotal, r.rate, &r.underruns);
     return r;
   }
   if (!io.clearModeUnderruns()) {
@@ -353,7 +359,7 @@ Result switchTiming(Io &io, unsigned hz, const Options &o)
   if (!r.why) r.why = verifyTiming(io, p, after, o.hwGatedAhb);
   if (!r.why && groupChanges)
     r.why = sendRateGroup(io, rateGroup(*target, o.boe), after[0], commandTriggered);
-  if (!r.why) r.why = verifyRate(io, hz, after[0].vtotal, r.rate);
+  if (!r.why) r.why = verifyRate(io, hz, after[0].vtotal, r.rate, &r.underruns);
   if (!r.why) r.why = verifyTiming(io, p, after, o.hwGatedAhb);
   if (!r.why || !r.timingTouched) return r;
 

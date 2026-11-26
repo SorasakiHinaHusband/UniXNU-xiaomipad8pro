@@ -56,6 +56,8 @@ struct Dpu {
   unsigned dropCount = 0;
   unsigned underrunAfterDma = 0;       // inject one underrun after this many bonded commands
   uint32_t minFetchLineNs = 0;          // inject recurring SSPP starvation below this line-time budget
+  bool bandwidthVoteFails = false;
+  uint32_t votedMinFetchLineNs = 0;    // model's service limit after a successful vote
   bool handleUnderrunIrq = false;
   uint32_t irqUnderruns = 0;
   bool resetPccOnTimingChange = false;
@@ -68,6 +70,7 @@ struct Dpu {
   std::vector<Store> stores;
   std::vector<uint64_t> refused;
   std::vector<Dcs> dcs;
+  std::vector<size_t> bandwidthVotes; // store log position when the request completed
   unsigned glitches = 0, midFrameTotal = 0, commandsInFrame = 0, desync = 0, irqDepth = 0;
   struct Intf {
     bool on = true, stopPending = false, counting = true;
@@ -222,6 +225,14 @@ struct Dpu {
     ns = t;
   }
   void tick(uint64_t dns) { advanceTo(ns + dns); }
+
+  bool voteModeBandwidth(const Mode &)
+  {
+    bandwidthVotes.push_back(stores.size());
+    if (bandwidthVoteFails) return false;
+    if (votedMinFetchLineNs) minFetchLineNs = votedMinFetchLineNs;
+    return true;
+  }
 
   // ---- the DSI command DMA
   void finishDma(unsigned l)

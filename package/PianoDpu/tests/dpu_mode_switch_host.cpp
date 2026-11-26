@@ -2,6 +2,7 @@
 // Host test of PianoDpu M3 (DpuModeSwitch.h): every directed switch, 100 back-to-back switches, refusals and rollback.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_mode_switch_host.cpp -o /tmp/dpu_mode_switch_host && /tmp/dpu_mode_switch_host
 #include "DpuModeSwitch.h"
+#include "DpuBandwidth.h"
 #include "DpuFlip.h"
 #include "DpuNightShift.h"
 #include "dpu_model.h"
@@ -264,7 +265,7 @@ void qual1Underrun()
     const auto refused = m::switchTo(io, hz, {}, unexpected, unexpected);
     CHECK(refused.why && !refused.timingTouched && !refused.reverted);
   }
-  CHECK(io.stores.size() == stores && io.dcs.empty() && !io.modeUnderruns());
+  CHECK(io.stores.size() == stores && io.dcs.empty() && io.bandwidthVotes.empty() && !io.modeUnderruns());
   CHECK(switchOk(io, m::kBootModeHz, {}));  // an already running 60 Hz mode must verify without staging
   for (size_t n = stores; n < io.stores.size(); ++n)
     CHECK(io.stores[n].pa == intfReg(1, kIntfCountEn) || io.stores[n].pa == intfReg(2, kIntfCountEn));
@@ -307,7 +308,7 @@ void qual1Underrun()
 void fixed120Boot()
 {
   static_assert(m::bootModeHz(1) == 60 && m::bootModeHz(120) == 120);
-  static_assert(!m::bootModeHz(0) && !m::bootModeHz(60) && !m::bootModeHz(90) && !m::bootModeHz(144));
+  static_assert(!m::bootModeHz(0) && !m::bootModeHz(60) && !m::bootModeHz(90));
   const m::Options options{.fixedHz = m::bootModeHz(120)};
   auto io = m1();
   for (unsigned l = 0; l < 2; ++l) {
@@ -328,7 +329,7 @@ void fixed120Boot()
     const auto refused = m::switchTo(io, hz, options, unexpected, unexpected);
     CHECK(refused.why && !refused.timingTouched && !refused.reverted);
   }
-  CHECK(io.stores.size() == stores && io.dcs.empty());
+  CHECK(io.stores.size() == stores && io.dcs.empty() && io.bandwidthVotes.empty());
 
   // The measurement must catch starvation even when all inherited timing words already match.
   io.minFetchLineNs = 3700;
@@ -352,6 +353,66 @@ void fixed120Boot()
   CHECK(restored.why && restored.from == 60 && restored.reverted && !restored.restoreWhy);
   CHECK(fail.dcs.empty() && !fail.modeUnderruns());
   checkMode(fail, 60);
+}
+
+void fixed144Boot()
+{
+  static_assert(m::bootModeHz(144) == 144);
+  static_assert(m::scanoutAvgKBps(kModes[0]) == 5109350 && m::scanoutAvgKBps(kModes[1]) == 4257792);
+  static_assert(m::scanoutAvgKBps(kModes[3]) == 4257792);  // 60 Hz doubles the total lines
+  static_assert(m::kMm0PeakKBps == 4257792);
+  constexpr auto mm0At144 = m::mm0Vote(kModes[0], 2000000, 32);
+  constexpr auto mm0At120 = m::mm0Vote(kModes[1], 2000000, 32);
+  static_assert(mm0At144.average == 1277 && mm0At120.average == 1064);
+  static_assert(mm0At144.peak == 2128 && mm0At120.peak == mm0At144.peak);
+  static_assert(m::mm0Vote(kModes[0], 0, 32).average == 0 && m::mm0Vote(kModes[0], 1, 0).peak == 0);
+  static_assert(m::mm0Vote(kModes[0], 1, 32).average == Sm8750RpmhBcmVoteMask);
+
+  const m::Options options{.fixedHz = m::kHighModeHz};
+  for (unsigned from : {60u, 120u}) {
+    auto io = m1();
+    io.minFetchLineNs = 3300;
+    if (from == 60) CHECK(switchOk(io, from, {}));
+    const size_t start = io.stores.size();
+
+    auto refused = io;
+    refused.bandwidthVoteFails = true;
+    const auto blocked = m::switchTiming(refused, 144, options);
+    CHECK(blocked.why && !blocked.timingTouched && !blocked.reverted);
+    CHECK(refused.bandwidthVotes.size() == 1 && refused.dcs.empty());
+    for (size_t n = start; n < refused.stores.size(); ++n)
+      CHECK(refused.stores[n].pa == intfReg(1, kIntfCountEn) || refused.stores[n].pa == intfReg(2, kIntfCountEn));
+    checkMode(refused, from);
+
+    auto starved = io;
+    const auto restored = m::switchTiming(starved, 144, options);
+    CHECK(restored.why && restored.reverted && restored.from == from && !restored.restoreWhy);
+    CHECK(restored.underruns == kUnderrunBits && starved.bandwidthVotes.size() == 1);
+    checkMode(starved, from);
+
+    io.votedMinFetchLineNs = 2900;
+    const auto result = m::switchTiming(io, 144, options);
+    CHECK(!result.why && result.timingTouched && !result.reverted && result.rate.lockstep && !result.underruns);
+    CHECK(io.bandwidthVotes.size() == 1 && io.bandwidthVotes.front() < io.stores.size());
+    if (!io.bandwidthVotes.empty())
+      for (size_t n = start; n < io.bandwidthVotes.front(); ++n)
+        CHECK(io.stores[n].pa == intfReg(1, kIntfCountEn) || io.stores[n].pa == intfReg(2, kIntfCountEn));
+    CHECK(io.dcs.size() == 8 && !io.glitches && io.refused.empty());
+    checkMode(io, 144);
+
+    const auto path = readPath(io);
+    const panel::Options sleep;
+    const auto off = panel::panelOff(io, path, sleep);
+    CHECK(off.ok && off.enginesStopped);
+    CHECK(panel::panelOn(io, path, sleep, off.enginesStopped, off.fetch).ok);
+    checkMode(io, 144);
+    CHECK(io.bandwidthVotes.size() == 1 && !io.modeUnderruns());
+  }
+
+  auto io = m1();
+  io.ctlFlush = 0x10;
+  const auto pending = m::switchTiming(io, 144, options);
+  CHECK(pending.why && !pending.timingTouched && io.bandwidthVotes.empty());
 }
 
 void sleepAndFetch()
@@ -467,6 +528,7 @@ int main()
   rollback();
   qual1Underrun();
   fixed120Boot();
+  fixed144Boot();
   sleepAndFetch();
   nightShiftAndCleanEpochs();
   std::printf("PianoDpu M3 mode switch: %u checks, %u failures\n", checks, failures);

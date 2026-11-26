@@ -35,12 +35,13 @@ namespace modes {
 
 constexpr unsigned kModeCount = sizeof kModes / sizeof kModes[0];
 constexpr uint64_t kPixelClockHz = 159667200;   // 576 x 2310 x 120, the same for every mode
-// Fixed boot profiles use the same VFP-only timing family. kModes also describes unqualified hardware timings.
-constexpr unsigned kBootModeHz = 60, kInheritedModeHz = 120;
+// The 60/120 profiles use the VFP-only path. Fixed 144 needs the MM0 bandwidth vote.
+constexpr unsigned kBootModeHz = 60, kInheritedModeHz = 120, kHighModeHz = 144;
 
 constexpr unsigned bootModeHz(uint32_t arg)
 {
-  return arg == 1 ? kBootModeHz : arg == kInheritedModeHz ? kInheritedModeHz : 0;
+  if (arg == 1) return kBootModeHz;
+  return arg == kInheritedModeHz || arg == kHighModeHz ? arg : 0;
 }
 
 // The live words of one link a plan is derived from and compared with.
