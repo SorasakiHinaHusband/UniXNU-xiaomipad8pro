@@ -4,6 +4,7 @@
 # then its own host tests: Test/window-size.c (0001), Test/extra-ram.c (region1 collection, region0 map checks and encoding),
 # Test/test-extra-ram-adt.py (the production AdtNode on /chosen piano-extra-ram), test-kernel-parser.py and test-packed-ramdisk.py
 # (unchanged parsers still pass), and an ADT made by tooling/adt/adt_extra_ram.py parsed by that AdtNode.
+# Without a checkout, compile the extra-RAM header and standalone tests directly from 0002.
 #   DARWINBOOT=<checkout> tooling/firmware/test-darwinboot-extra-ram.sh   (optional default checkout; explicit checkout must contain the pin)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
@@ -22,27 +23,37 @@ with open(sys.argv[1], encoding='utf-8') as lock:
     print(tomllib.loads(lock.read())['pin']['DarwinBoot']['commit'])
 PY
 )
-if ! git -C "$SRC" cat-file -e "$PIN^{commit}" 2>/dev/null; then
-  if [ -n "${DARWINBOOT:-}" ]; then
-    echo "FAIL: DARWINBOOT checkout does not contain $PIN" >&2
-    exit 1
-  fi
-  echo "SKIP: no DarwinBoot checkout with $PIN (DARWINBOOT=...)"
-  exit 0
+have_checkout=0
+if git -C "$SRC" cat-file -e "$PIN^{commit}" 2>/dev/null; then
+  have_checkout=1
+elif [ -n "${DARWINBOOT:-}" ]; then
+  echo "FAIL: DARWINBOOT checkout does not contain $PIN" >&2
+  exit 1
 fi
 W=$(mktemp -d "${TMPDIR:-/tmp}/darwinboot-r1.XXXXXX")
 trap 'rm -rf -- "$W"' EXIT
-git -C "$SRC" archive "$PIN" | tar -x -C "$W"
-for p in "$D"/firmware/patches/darwinboot/0*.patch; do (cd "$W" && patch -f -s -p1 < "$p") || { echo "FAIL: $p does not apply"; exit 1; }; done
-cd "$W"
-cc -O2 -Wall -Wextra -Werror Test/window-size.c -o window-size
-./window-size
-echo "PASS: window-size"
+if [ "$have_checkout" = 1 ]; then
+  git -C "$SRC" archive "$PIN" | tar -x -C "$W"
+  cd "$W"
+  for p in "$D"/firmware/patches/darwinboot/0*.patch; do
+    patch -f -s -p1 < "$p" || { echo "FAIL: $p does not apply"; exit 1; }
+  done
+  cc -O2 -Wall -Wextra -Werror Test/window-size.c -o window-size
+  ./window-size
+  echo "PASS: window-size"
+else
+  cd "$W"
+  git apply --include=DarwinBootPkg/Driver/ExtraRam.h --include=Test/extra-ram.c "$D"/firmware/patches/darwinboot/0002-*.patch
+fi
 cc -O2 -Wall -Wextra -Werror -fsanitize=address,undefined Test/extra-ram.c -o extra-ram
 ./extra-ram
 cc -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -I DarwinBootPkg/Driver \
   "$D/tooling/firmware/extra-ram-host.c" -o extra-ram-host
 ./extra-ram-host
+if [ "$have_checkout" = 0 ]; then
+  echo "RESULT PASS (checkout-independent extra-RAM tests)"
+  exit 0
+fi
 python3 Test/test-extra-ram-adt.py
 python3 Test/test-kernel-parser.py
 python3 Test/test-packed-ramdisk.py

@@ -11,7 +11,9 @@ if DARWINBOOT="$W/no checkout" bash "$D/test-darwinboot-extra-ram.sh" > "$W/log"
 fi
 grep -F 'FAIL: DARWINBOOT checkout does not contain' "$W/log"
 env -u DARWINBOOT UNIXNU_RESEARCH="$W/no sources" bash "$D/test-darwinboot-extra-ram.sh" > "$W/log" 2>&1
-grep -F 'SKIP: no DarwinBoot checkout' "$W/log"
+grep -F 'PASS: extra-ram region1 clipping' "$W/log"
+grep -F 'PASS: whole-slab boundaries' "$W/log"
+grep -Fx 'RESULT PASS (checkout-independent extra-RAM tests)' "$W/log"
 
 if bash "$D/make-own-binaries.sh" "$W/no image.zst" "$W/output dir" > "$W/log" 2>&1; then
   echo 'the extractor accepted a missing UEFI image' >&2
