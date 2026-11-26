@@ -1,10 +1,10 @@
 # PianoVideo E1 integration
 
-The first tablet capture, `v131y12u-m5obs1` (RAM, 2026-11-27), failed at stage 5
-when START(BITSTREAM=1) returned a session error. Commit `2bd83f8ad` implements
-the five host-side conformance fixes from the
-[stage-5 analysis](#stage-5-static-analysis). Tablet qualification is pending
-the next [RAM run](#fix-image-gate).
+RAM `v131y12u-e1fix1` (2026-11-27) recorded the first real-hardware Iris VPU 3.5
+H.264 encode PASS for the opt-in E1 kernel self-test. The preceding tablet
+capture, `v131y12u-m5obs1`, failed at stage 5 when START(BITSTREAM=1) returned
+a session error. The retest verified all five `b10-e1-stage5-fix` conformance
+gates from the [stage-5 analysis](#stage-5-static-analysis).
 
 - E1 starts only with one literal `piano-video-enc=1` token, level 6 and a successful boot reservation. It waits for the decoder's exclusive lease and reuses the arena with its current backing. On firmware system error, watchdog or SMMU fault, the worker stops issuing HFI commands and quarantines the core with its DMA backing held for the rest of the boot.
 - AVC and HEVC continue to use the existing decode path, VT inventory and borrow policy. The RAM16G reservation and XNU fallback still serve decode. See the [driver guide](video.md#18-e1-bounded-native-h264-encode-self-test).
@@ -39,6 +39,9 @@ reconstruction capacities are the same as in the original capture.
 | 320×240 | 384×256 | 320×240 | 131,072 | 15 | 9,732,096 |
 
 ## RAM batch E qualification
+
+This matrix covers the RAM16G backing. The `v131y12u-e1fix1` PASS used the
+standard 256 MiB XNU backing. [Fix-image result](#fix-image-gate)
 
 Use the same 27.3 RAM payload, pinned Iris firmware addon, fixed display profile and volatile Data across the four boots below. Use the RAM16G qualification FD with DarwinBoot patch 0002 and stage the ADT placeholder with `PIANO_EXTRA_RAM=1`. Keep `piano-video=6 piano-video-vt=1 piano-extra-ram=1` in every boot and keep the normal VT grant and borrow defaults. Save the commit, FD/KC identities, boot UUID, `kern.boottime`, merged `kern.piano_bootargs` and a fresh serial capture per boot.
 
@@ -450,31 +453,36 @@ not treat an ARP-only fix as closure of all known gates.
 
 ## Fix-image gate
 
-**Host implementation complete. Tablet qualification pending.** The
-encoder queues ARP once on NONE before START(RAW=2). Both STOPs preserve
-ARP ownership. A successful CLOSE fences the session's DMA, while a
-failed CLOSE or a device fault leaves the backing in quarantine. Linux
-keeps ARP outside the port tables and destroys it after session CLOSE.
+**E1 640×480 gate closed on RAM.** `v131y12u-e1fix1` (image `43ea26f225fc88cb`,
+`b10-e1-stage5-fix` commits `2bd83f8ad` / `721bb6011`) passed all five
+conformance gates live at 640×480, 10 frames and 2 Mbps.
+
+| Gate | Hardware result |
+| --- | --- |
+| Session ARP | `HFI_BUFFER_ARP` (type 9, port 0, 204,800 B) was mapped and queued exactly once before `START(2)`. |
+| H.264 deblocking | `HFI_PROP_DEBLOCKING_MODE` carried `00060600` on both RAW and BITSTREAM stream-ons. |
+| Time-delta rate control | `HFI_PROP_TIME_DELTA_BASED_RATE_CONTROL` carried `0` on both stream-ons. |
+| External buffer pools | The 14-entry guarded layout (32,980,992 B) mapped, with four RAW and four BITSTREAM slots. |
+| Frame timing and completion | With the nanosecond HFI timestamp fix in place, the frame gate passed with 10 EBD and 10 nonempty FBD. |
+
+Both `HFI_CMD_START` replies (RAW port 2, BITSTREAM port 1) and `DRAIN ACK`
+returned `flags 00000001`. `STOP(1)`, `STOP(2)` and `CLOSE` completed with
+`close-error 0` and `queued-at-close 0`. The kernel finished in **314 ms**
+with **22,439 B** of H.264 and zero watchdog events, faults or quarantine.
+The host FFmpeg check decoded **10/10** frames and measured **51.6 dB average**
+and **51.2 dB minimum** PSNR-Y against a 30.0 dB threshold. On the same boot,
+`video-v6 --qualify` passed **13/13** AVC decode phases after switching the
+resident Iris arena from E1 to AVC. [Full RAM results](../results-2026-11-27.md#v131y12u-e1fix1-2026-11-27)
+
+Both STOPs preserve ARP ownership. A successful CLOSE fences the session's
+DMA, while a failed CLOSE or a device fault leaves the backing in quarantine.
+Linux keeps ARP outside the port tables and destroys it after session CLOSE.
 [Iris persistent buffer lifecycle](https://github.com/yzddmr6/linux-sm8750-piano/blob/b5100d5f2e0bb80e1191d521a48596674608eb3d/drivers/media/platform/qcom/iris/iris_buffer.c#L661-L706)
 [Iris session CLOSE](https://github.com/yzddmr6/linux-sm8750-piano/blob/b5100d5f2e0bb80e1191d521a48596674608eb3d/drivers/media/platform/qcom/iris/iris_vidc.c#L312-L325)
 
-The next RAM run must show successful START replies on both ports, ten
-input returns, ten nonempty outputs with SPS/PPS/IDR, DRAIN/LAST, both STOPs
-and CLOSE, with no session or system errors, watchdog or SMMU fault. Run the
-independent Annex B checker and capture the default-off decode controls
-described in [RAM batch E qualification](#ram-batch-e-qualification).
-
-### Documentation verification
-
-Required commands for this analysis commit:
-
-```sh
-python3 scripts/ci/test-doc-links.py
-python3 scripts/ci/privacy-scan.py --diff origin/main
-git diff --check
-```
-
-Executed successfully: doc links **0 errors**; privacy scan **0 hits,
-0 refused files** against `origin/main`; `git diff --check` clean. Only
-this document and the cross-link in `video-encode.md` changed; no driver,
-C/C++ or Python source changes are included.
+E1 stays RAM-only and opt-in. Installed daily `v13.1y12q` defaults to
+`piano-video-enc=0` with an empty VT encoder inventory (`encs=0`). The
+inventory stayed empty with `piano-video-enc=1` in the qualifying RAM run.
+**HOLD** pending analysis for 720p/1080p hardware runs and E2+ userspace
+VideoToolbox encoder registration (`VTCompressionSession`). Implementation
+and hardware qualification of those paths remain open.
