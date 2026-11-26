@@ -1,98 +1,88 @@
 # Native bring-up on piano: how to boot, debug and iterate without watching the screen
 
-Learned during the first native RAM boots, 2026-11-10 (the local bring-up notes `el1-home-ram-boot-result.md`, not published;
-session log `logs/home-ram-boot-session-20261110.md`). Rules that never change:
-- Routine tests are RAM boots (`fastboot boot`). Partition writes are allowed only through the owner-approved maintenance plan in
-  `docs/persistent-boot.md` (ESP, `boot_a`, GPT and the Linux-era root/Data regions, with backups and read-back). Never write
-  firmware/calibration partitions or any `_b` partition; never `flash_all_lock`.
-- `oem` goes only to our own in-RAM UEFI (`-s piano-uefi`), never to ABL.
-- Never `systemctl isolate` on the tablet.
+## Current baseline (2026-11-27)
 
-The one approved exception to the first rule is the persistent install (`docs/persistent-boot.md`). Once its ESP exists on UFS,
-every RAM image, the loop's dump image above all, must be built with FD A carrying `firmware/patches/unixnu/0001` (the boot
-image's own RAM payload wins); an older image boots the ESP's configuration instead.
+The reference tablet booted **v13.1y12q** from disk on 2026-11-26. It runs native macOS 27.3 (26C5035r) as Mac17,11 at
+EL1, with Gunyah at EL2. The v5 BootShim and UEFI firmware are on `boot_a`. The ESP's `macos-27.3` entry supplies the
+kernel collection, ADT, trust cache, Data seed and boot arguments. The 13 GiB XNU window measured 13310 MiB on v13.1y12l.
+[27.3 line](k273-line.md#current-line-2026-11-27) · [Installed profile](USING.md#2-the-installed-profile)
+
+The macOS root uses the OS and SystemOS windows on `linux_rootfs`. The 200 GiB direct Data store is on `linux_data`
+at LBA 71859642. Data mounts in serial mode and switches to concurrent mode after mount. Write-back and queue modes
+stay off. USB debug network TX flow control is on by default and passed 66/66 exact transfers in qualification.
+[November 26 results](results-2026-11-26.md) · [Data concurrency and durability](drivers/data-store-m4-m5.md)
+
+Daily display stays at 60 Hz with Night Shift routing, native panel sleep and refresh switching off. Fixed 120 Hz and
+144 Hz have RAM scanout results. [Support status](STATUS.md) · [Hardware backlog](BACKLOG-hardware.md)
+
+Routine tests use RAM boots. Partition changes follow the approved maintenance procedure with verified backups and
+read-back. Firmware and calibration partitions and all `_b` partitions stay read-only. The in-RAM `piano-uefi` device
+handles the debug `oem` commands. Avoid `systemctl isolate` on the tablet.
+[Project rules](PROJECT-MAP.md#6-hard-rules) · [Install design](persistent-boot.md) · [Operator's guide](USING.md)
 
 ## 1. The boot chain, and what each stage needs
 
-```
-ABL (fastboot boot) ─► BootShim (kernel field) ─► Mu-Silicium UEFI (FD at 0xA7100000) ─► UniXNU.efi menu
-   ─► DarwinBoot.efi ─► k27 XNU at EL1 (Gunyah at EL2)
+```text
+Disk: ABL → BootShim + v5 FD on boot_a → UniXNU.efi → macos-27.3 on the ESP
+ RAM: ABL → BootShim + FD A in the RAM image → UniXNU.efi → RAM payload
+Both: DarwinBoot.efi → native k27 XNU at EL1 (Gunyah at EL2)
 ```
 
-| Stage | Requirement | Symptom when it is missing |
+| Stage | What to check | Failure signal |
 |---|---|---|
-| ABL → kernel | The kernel field's ARM64 header must look like a Linux Image: `text_offset 0`, `flags 0xa`, `image_size` covering shim + FD (`build-ram-images.py` rewrites Mu's BootShim header, which carries the FD base in `text_offset`) | `fastboot boot` answers OKAY, the panel goes black, the tablet is back in ABL fastboot about 80 s later, and every further `boot` in that ABL session fails with `Load Error` (reset ABL with `fastboot reboot bootloader`) |
-| UEFI drivers | FD **A** (piano-uefi's bundled DXEs). FD B (this tablet's own OS3.0.303 DXEs) resets after 10–15 s | early reset about 26 s after `fastboot boot`; it returned to Ubuntu when Ubuntu was installed, while a current reboot reaches ABL/ESP (macOS 27.3) or Android |
-| UEFI → UniXNU payload | SEC must keep x0 (the DT from ABL) in the entry-argument HOB: `firmware/patches/mu-silicium/0001` | Piano_Log: `UNIXNURAMDISK: no entry argument HOB`; the menu has only the built-in entries and falls through to the UEFI shell |
-| DarwinBoot → XNU | A linear BGRA GOP: `firmware/patches/0002` (SimpleFbDxe instead of piano-uefi's Blt-only ScaledFbDxe) | console: `DARWINBOOT: boot refused: Unsupported; firmware retained`; the menu redraws (looks like a flash) |
-| DarwinBoot → XNU: RAM | XNU's window (`configs/k27-adt.toml` `owned_memory_size`, 13 GiB less 2 MiB since 2026-11-12) needs FD A built with `firmware/patches/darwinboot/0001` (`tooling/firmware/build-fd.sh`: the `.ram-window` stamp `build-ram-images.py` checks); an older FD refuses an ADT asking for more than 8 GiB. Console check: `NativeRamBlock: RAM window 0x8c0004000..0xbffe04000 (13310 MiB) in DRAM 0x8c0000000..0xc00000000` (8192 MiB with an 8 GiB ADT) | older FD: the menu redraws after `DARWINBOOT: boot refused` (Compromised Data); no run for the window: `NO WINDOW <size> BIG RUN ...` and the free runs drawn on the panel; a shrunk window: `DARWINBOOT: window 0x33fe00000 requested, <size> taken (largest run)` and a smaller RAM window line |
-| XNU CPUs | Boot with all 8 ADT CPUs (`sheng-smp=1`), **not** `cpus=1` | `cpus=1`: `Kernel data abort` in `recount_switch_thread+0x84` (far 0xfffffff36ee62004, esr 0x96000007) |
-| XNU root | NativeUfs (`package/NativeUfs`, `native-ufs-root=1`, current `native-ufs-root-part=linux_rootfs`): the SHNGROOT windows OS + SystemOS; Data = the RAM seed with its changed pages in the 200 GiB NativeUfs store over `linux_data` (`data-store-part=linux_data`, LBA 71859642) | `Waiting on <dict> IOMedia … UUID C73696D4…` |
-| UFS: SMMU | piano's firmware leaves SID 0x60 on context bank 1 (PKX110: bank 0); the entry is redirected to the bypass bank | `SMMU plan for stream 0x60: conflicting UFS stream mapping (slot 1 smr 80000060 s2cr 1)` |
-| UFS: link | the link is in Hibern8 when XNU starts: UniXNU-Odin3's SM8750 link handling (AHIT off, Hibern8 exit, IACR off) | `FAILED at NOP OUT` (LINK tx=1) |
-| UFS: writes | the development build writes the windows in place (`NATIVE_UFS_UNVERIFIED_ROOT`); without it APFS's writes fail | `disk5s1: device is not ready.` by the hundred |
+| ABL → BootShim on a RAM boot | The ARM64 header has `text_offset 0`, `flags 0xa` and an `image_size` covering BootShim + FD. [RAM image builder](../tooling/bootimg/build-ram-images.py) | In the early bring-up, ABL accepted the download but returned to fastboot about 80 s later. Subsequent boots in that session reported `Load Error`. |
+| UEFI drivers | Use FD A, built with the bundled piano-uefi DXEs. [FD builder](../tooling/firmware/build-fd.sh) | The early FD B built with the unit's OS3.0.303 DXEs reset before XNU. |
+| UEFI → UniXNU RAM payload | SEC preserves the ABL device tree argument in the entry-argument HOB. The RAM payload takes precedence over the ESP. [SEC patch](../firmware/patches/mu-silicium/0001-sec-entry-arg-hob.patch) · [RAM precedence patch](../firmware/patches/unixnu/0001-UniXNULib-config-prefer-the-RAM-payload.patch) | `UNIXNURAMDISK: no entry argument HOB` if entry argument x0 was lost. An FD without the precedence patch can select the ESP configuration. |
+| DarwinBoot → XNU | The linear BGRA GOP comes from SimpleFbDxe. [Linear GOP patch](../firmware/patches/0002-pianoPkg-linear-gop-for-darwinboot.patch) | With the old Blt-only GOP, the menu redraws after `DARWINBOOT: boot refused: Unsupported`. |
+| DarwinBoot RAM window | The 27.3 ADT requests `0x33fe00000` bytes. The FD builder stamps the FD that supports it. Check the console's `NativeRamBlock: RAM window` line for 13310 MiB. [27.3 ADT](../configs/k273-adt.toml) · [DarwinBoot window patch](../firmware/patches/darwinboot/0001-DarwinBoot-window-up-to-13-GiB-shrink-to-the-largest-run.patch) | Older FD builds refuse requests above 8 GiB. A short allocation produces `taken (largest run)`, and a missing run produces `NO WINDOW`. |
+| XNU CPUs | Boot with all eight ADT CPUs using `sheng-smp=1`. [RAM image builder](../tooling/bootimg/build-ram-images.py) | The early `cpus=1` test aborted in `recount_switch_thread+0x84`. |
+| XNU root and Data | NativeUfs publishes both SHNGROOT windows. Check `native-ufs-root-part`, `data-store-part` and the store state against the intended profile. [UFS driver](drivers/ufs.md) · [Data store](data-store.md) | Repeated `Waiting on <dict> IOMedia` points to root matching. The store-state line distinguishes a resumed store from volatile Data. |
+| UFS controller | The driver redirects SID 0x60 to the bypass bank and exits Hibern8 for UFS link bring-up. [UFS driver](drivers/ufs.md) | The early failures were `conflicting UFS stream mapping` and `FAILED at NOP OUT`. |
 
-Menu input: volume keys move, the power key is Enter. Images boot their default at once (`PIANO_MENU_TIMEOUT`, default 0; -1 waits for a key;
-`PIANO_MENU_DEFAULT`, default `macos-8cpu`).
+In the RAM image menu, volume keys move and power selects. The RAM builder defaults to `PIANO_MENU_TIMEOUT=0` and
+`PIANO_MENU_DEFAULT=macos-8cpu`. A timeout of `-1` waits for a key. [RAM image builder](../tooling/bootimg/build-ram-images.py)
 
 ## 2. Seeing what happened without a camera
 
-**In UEFI** (before DarwinBoot exits boot services), our FD exposes piano-uefi's debug fastboot as a second USB device,
-`piano-uefi`:
+| Stage or symptom | Evidence and tool |
+|---|---|
+| ABL download or firmware handoff | During a RAM boot the USB sequence is ABL fastboot → disconnect → `piano-uefi` fastboot → disconnect as DarwinBoot hands off to XNU. Before handoff, the in-RAM UEFI exposes the console (`oem log`), panel (`oem screenshot`) and the `Piano_Log` DEBUG buffer (`oem dump`, address `D7F00000`, length `100000` in hex). The DEBUG buffer includes driver loads and the `UNIXNU:` and `UNIXNURAMDISK:` lines. |
+| Live XNU console and monitor | PianoDwc3 device mode (`piano-usb=2`) enumerates as `1209:0001` with CDC-ACM console and shell ports. The host console tool replays the retained log first. The monitor's `args` command shows the merged boot arguments. [Host USB console](../tooling/native/usb-console.py) · [USB debug driver](drivers/usb-device-debug.md) |
+| Console after a reset | Patches 0055 and 0058 mirror the console and replicate the ring and its header 11 times for majority decoding. With 0071 the last 64 KiB of the 7 MiB CVP region is reserved for the separate reset reason, and the console uses the first `0x6f0000` bytes. The decoder's `decode` mode reads an existing dump file on the host. [Mailbox decoder](../tooling/native/xnu-log.py) · [27.3 ADT](../configs/k273-adt.toml) |
+| Reset intent or boot hang | Patch 0063 guards the installed boot, with the launchd exec check at 180 s and continued Gunyah watchdog and CPU liveness checks. Wake or halt tracing can be read from captured logs. Patch 0071 can retain reset intent when enabled, independently of the console ring. An absent record leaves the cause unknown. [Boot guard](boot-guard.md) · [Halt diagnosis](halt.md) · [Halt trace grader](../tooling/native/halt-trace-verdict.py) |
+| Desktop is up but the panel is suspect | Use the native framebuffer capture for the pixels presented to scanout. [Framebuffer capture source](../tooling/native/gop-shot/gop-shot.c) · [Camera app checks](tools/cam-apps-check.md) |
+| Panic addresses or a missing backtrace | The native kernel runs unslid. Resolve PC and LR against the matching unstripped kernel, and use the collection's `natives.json` for kext addresses. Patch 0073 adds opt-in panic text on the retained linear scanout during the panic hold. [Historical panic example](#6-historical-panic-investigations-2026-11-12-to-2026-11-13) · [Panic text diagnostics](../tooling/k27/piano-panic-text/README.md) |
 
-```sh
-fastboot -s piano-uefi oem log        && fastboot -s piano-uefi get_staged console.txt   # what the console printed
-fastboot -s piano-uefi oem screenshot && fastboot -s piano-uefi get_staged shot.bmp      # the panel
-fastboot -s piano-uefi oem dump D7F00000 100000 && fastboot -s piano-uefi get_staged pianolog.bin  # DEBUG log (Piano_Log)
-```
+For host controls and console capture, see the [operator's guide](USING.md#3-from-the-mac). Use the
+[boot timeline tool](../tooling/native/boot-timeline.py) to derive timing from a recorded console and the
+[boot-time guide](boot-time.md) for the historical timing probes.
 
-The DEBUG log has every driver load, `UNIXNU:` and `UNIXNURAMDISK:` line. `reboot-bootloader` is not supported there;
-`fastboot -s piano-uefi reboot` returns through ABL to the installed ESP (macOS 27.3) or the selected Android path, not Ubuntu. The USB timeline alone tells the stage: `<serial> fastboot` (ABL) →
-nothing → `piano-uefi fastboot` (our UEFI) → nothing (DarwinBoot handed over to XNU).
+### Historical console recovery (2026-11-10 to 2026-11-12)
 
-**In XNU**, k27 patch 0055 (`pstore-console=0x9cb00000 pstore-console-size=0x700000`) mirrors every console byte into
-a RAM mailbox, `cvp@9cb00000` (7 MiB, no-map, used by neither the installed OS nor the firmware). The unattended loop's dump image
-pulls it with `fastboot -s piano-uefi oem dump 9cb00000 700000` + `get_staged` (`tooling/native/xnu-log.py`, aligned 8-byte
-accesses only). Ubuntu originally read it through `/dev/mem`; that installation no longer exists.
-Measured 2026-11-10:
-- Ubuntu's own `ramoops@a3500000` does not survive even an Ubuntu reboot: the region is `Display_Demura` in the firmware's
-  memory map.
-- DRAM loses about 4 % of the bits of the mailbox across any reset (a plain Ubuntu reboot as much as XNU's PSCI reset). So
-  the ring is stored 11 times, and the reader takes the bitwise majority (residual ~2e-6 per bit).
-- A hard power-off (power + volume-down) loses everything.
+The first native RAM boots recovered the log through Ubuntu's `/dev/mem` using aligned 8-byte accesses.
+Ubuntu's `ramoops@a3500000` lost its log on reboot because the firmware uses that range for display demura.
+The CVP mailbox retained enough data to decode after a warm reset, with about 4% bit loss measured in the first tests.
+A hard power-off lost the mailbox. The November 12 XNU USB console added a live capture path.
+[November 11 forensics](forensics-2026-11-11.md) · [November 12 results](results-2026-11-12.md)
 
-**Live, over the USB-C cable** (running on the tablet since 2026-11-12, [results-2026-11-12.md](results-2026-11-12.md)): with `piano-usb=2` in the image's arguments, `package/PianoDwc3`
-takes the USB controller over in device mode once XNU runs; the USB timeline then continues with `1209:0001 piano macOS debug`
-(two CDC-ACM ports). `tooling/native/usb-console.py` on the Mac shows the console live (the retained log first) and talks to
-a small kernel monitor. Design, levels and test steps: `docs/drivers/usb-device-debug.md`.
+## 3. The unattended loop
 
-**Getting back on its own:** k27 patch 0056 (`piano-reset-after=<s>`) resets through PSCI after N seconds and pets the
-Gunyah watchdog until then (bite 32 s after the last pet: the backstop for hangs and panics). The panic path restarts by
-itself when `panic-spin=1` is absent. The installed system, which has no `piano-reset-after`, gets the same backstop from k27
-0063's boot guard (`piano-boot-guard=SECS`, [boot-guard.md](boot-guard.md)); a test run with `piano-reset-after` keeps 0056's.
+[The RAM test loop](../tooling/native/native-loop.sh) boots a test image and checks that ABL answers after it returns.
+The RAM builder defaults to `PIANO_RESET_AFTER=45`. Patch 0056 schedules the PSCI reset with the Gunyah watchdog as
+a backstop, and 0057 directs the reset to ABL fastboot. A test with an active `piano-reset-after` owns the watchdog
+in place of the installed boot guard.
 
-**Decoding a panic photo** (fallback): the verbose console draws every glyph twice ("ppaanniicc"); keep every second
-character. DarwinBoot loads the kernel at its link address (no slide), so pc/lr look up directly in
-`out/k27/kc-k27-native.nm` (+ the KC's `natives.json`).
+The loop defaults to keeping the live console capture and leaving the tablet in ABL after the test. A second boot for
+a mailbox dump requires a matching `DUMP_GUARD_RECORD` with a qualified independent reset path that covers the ABL
+handoff before USB appears. The loop also checks battery voltage before permitting a dump boot. Consult the
+[RAM test procedure](USING.md#4-test-a-change-ram-boot-nothing-written) for the reference layout and seed handling.
 
-## 3. The unattended loop (no Ubuntu, 2026-11-11)
+### Historical two-boot capture (2026-11-11)
 
-```sh
-K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # 27.3 kexts -> KC -> out/ram + out/ram-dump; root-layout caveat in k273-line.md §4
-tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
-```
-
-The tablet waits in ABL fastboot. One test: `fastboot boot` the image → XNU runs until `piano-reset-after`
-(`PIANO_RESET_AFTER`, default 45) resets it; k27 0057 set the PMIC restart reason, so ABL stays in fastboot → `fastboot boot` the
-dump image → while its UEFI runs, `fastboot -s piano-uefi oem dump 9cb00000 700000` + `get_staged` pull the test's log → the
-dump image's XNU resets at once → parked in ABL fastboot again. About reset time + 70 s per test; results in
-`logs/native-runs/<ts>-loop/{loop.log,xnu-console.txt}`. The UniXNU menu boots its default at once (`PIANO_MENU_TIMEOUT=0`).
-
-Ubuntu's root is gone (linux_rootfs holds the macOS windows), so the old Ubuntu-based `native-run.sh` was removed. The
-maintenance RAM image of the Ubuntu release (USB NCM, telnet root shell: `tooling/native/maint-shell.py`) is the way to write
-partitions from the tablet itself.
-
-A person is needed only when the tablet is parked (no reset, no fastboot): power + volume-down for 15–20 s.
+The original unattended loop ran the test, rebooted to ABL, then booted a separate dump image to pull the console
+mailbox from its in-RAM UEFI. The dump image reset after one second in XNU. The earlier Ubuntu-based loop retired
+when the macOS root moved to `linux_rootfs`. The maintenance RAM image remains part of the approved install procedure.
+[November 11 results](results-2026-11-11.md) · [Install design](persistent-boot.md)
 
 ## 4. Rebuild after a change
 
