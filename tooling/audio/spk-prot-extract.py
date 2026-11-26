@@ -217,6 +217,8 @@ class Acdb:
                 de, do = self.at('CDDE', cdde), self.at('CDDO', cddo)
                 de_end, do_end, pool_end = self.end('CDDE'), self.end('CDDO'), self.end('POOL')
                 nd, nt = self.u32(de, end=de_end), self.u32(do, end=do_end)
+                if nt > (do_end - do - 4) // 4:
+                    raise AcdbError('truncated CDDO offsets')
                 out = []
                 for k in range(nd):
                     iid, pid = self.u32(de + 4 + 8 * k, 2, end=de_end)
@@ -436,7 +438,10 @@ def self_test():
     last_size = len(blob) - len(last) - 4
     short_pool = bytearray(blob)
     struct.pack_into('<I', short_pool, last_size, len(last) + 1)
-    for bad, why in ((blob + b'POOL', 'truncated chunk header'), (short_modules, 'read past the end'),
+    short_offsets = bytearray(blob)
+    last_offsets = acdb.end('CDDO') - 4 * (len(dev_cal) + 1)
+    struct.pack_into('<I', short_offsets, last_offsets, len(dev_cal) + 1)
+    for bad, why in ((short_offsets, 'truncated CDDO offsets'), (blob + b'POOL', 'truncated chunk header'), (short_modules, 'read past the end'),
                      (short_pool, 'truncated POOL parameter')):
         try:
             collect(Acdb(bad))
@@ -504,7 +509,7 @@ def main():
         else:
             p.print_help()
             return 2
-    except AcdbError as e:
+    except (AcdbError, OSError) as e:
         raise SystemExit(f'Error: {e}')
     return 0
 

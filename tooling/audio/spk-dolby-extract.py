@@ -184,7 +184,13 @@ def read_map(text):
             raise DolbyError(f'map line {n}: shape {shape}')
         if cond is not None and not cond.startswith('if:'):
             raise DolbyError(f'map line {n}: {cond} (if:ELEMENT)')
-        rows.append({'fourcc': fourcc, 'pid': int(pid, 0), 'scope': scope, 'source': source, 'shape': shape,
+        try:
+            parameter = int(pid, 0)
+        except ValueError:
+            raise DolbyError(f'map line {n}: invalid parameter id') from None
+        if not 0 < parameter <= 0xffffffff:
+            raise DolbyError(f'map line {n}: invalid parameter id')
+        rows.append({'fourcc': fourcc, 'pid': parameter, 'scope': scope, 'source': source, 'shape': shape,
                      'if': cond[3:] if cond else None})
     pids = [r['pid'] for r in rows if 'pid' in r]
     if len(pids) != len(set(pids)):
@@ -447,7 +453,10 @@ def read_log(text, speaker_count, global_counts):
         m = SETPARAM.search(line)
         if m and 'speaker' not in done:
             dev, name, n, vals = int(m.group(1), 16), m.group(2), int(m.group(3)), m.group(4)
-            got = [int(v) for v in vals.replace(' ', '').split(',') if v not in ('',)]
+            try:
+                got = [int(v) for v in vals.replace(' ', '').split(',') if v]
+            except ValueError:
+                raise DolbyError(f'{name}: invalid logged value') from None
             sets[(dev, name)] = (n, got[:n])
             continue
         m = LENGTH.search(line)
@@ -491,7 +500,7 @@ def verify(acdb_bytes, dax_bytes, map_text, log_text, profile):
                 bad.append(f'{fourcc} (count)')
             elif logged == values:
                 same += 1
-            elif len(logged) < n and values[:len(logged)] == logged:
+            elif 0 < len(logged) < n and values[:len(logged)] == logged:
                 prefix += 1
             else:
                 bad.append(f'{fourcc} (values)')
@@ -651,6 +660,8 @@ def self_test():
     refused(lambda: build(synthetic(ctrl=True)[0], SYN_DAX.encode(), SYN_MAP, 'Syn'), 'control link')
     refused(lambda: build(synthetic(dap_extra=[(0x4012, 1, bytes(4))])[0], SYN_DAX.encode(), SYN_MAP, 'Syn'), 'not one of its modules')
     refused(lambda: build(blob, SYN_DAX.encode(), SYN_MAP, 'Nope'), 'profile')
+    refused(lambda: read_map(SYN_MAP.replace('0x20001', 'not-an-id')), 'invalid parameter id')
+    refused(lambda: read_map(SYN_MAP.replace('0x20001', '0x100000000')), 'invalid parameter id')
     refused(lambda: build(blob, SYN_DAX.encode(), SYN_MAP.replace('t-list list', 't-list nlist'), 'Syn'), 'bytes, the ACDB has')
     refused(lambda: build(blob, SYN_DAX.encode(), SYN_MAP.replace('0x2000a', '0x2000b'), 'Syn'), 'no such DAP parameter')
     refused(lambda: build(blob, SYN_DAX.encode(), SYN_MAP + 'aaaa 0x20011 speaker profile:e-int int\n', 'Syn'), 'twice')
@@ -693,6 +704,9 @@ def self_test():
           f'verify: all speaker parameters match ({bad}; {report})')
     check(any(f'{len(sp)} logged, {len(sp)} equal' in r for r in report) and any('full speaker commit: found' in r for r in report), 'verify: lengths')
     check(any('low-latency' in r and 'different' in r for r in report), 'verify: the low-latency matrix compared')
+    empty = [line.replace('[42]', '[]') for line in log]
+    _, bad = verify(blob, SYN_DAX.encode(), SYN_MAP, '\n'.join(empty), 'Syn')
+    check(bad == ['aaaa (values)'], 'verify: an empty prefix supplies no values')
     log[0] = log[0].replace('[42]', '[43]')
     _, bad = verify(blob, SYN_DAX.encode(), SYN_MAP, '\n'.join(log), 'Syn')
     check(bad == ['aaaa (values)'], f'verify: a changed value found ({bad})')
@@ -745,7 +759,7 @@ def main():
         else:
             p.print_help()
             return 2
-    except (DolbyError, SPE.AcdbError) as e:
+    except (DolbyError, SPE.AcdbError, OSError) as e:
         raise SystemExit(f'Error: {e}')
     return 0
 
