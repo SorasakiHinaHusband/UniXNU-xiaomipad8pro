@@ -42,7 +42,8 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 - **Display colour and power.** [M4 Night Shift PCC](dpu-m4-pcc-colour.md) and [M5 panel sleep and wake](dpu-m5-analysis.md).
 - **Storage and memory.** [Data concurrency and durability](data-store-m4-m5.md), [APFS write-back eligibility](m5-apfs.md),
   [RAM16G GPU memory](ram-extra.md) and [RAM16G ownership proof](ram16g-owners.md).
-- **Audio and video.** [Audio duplex and input wake](audio-duplex.md) and [VideoToolbox cancellation analysis](video-hevc-cancel.md).
+- **Audio and video.** [Audio duplex and input wake](audio-duplex.md), [VideoToolbox cancellation analysis](video-hevc-cancel.md)
+  and [Iris hardware encode static analysis](video-encode.md) (B10, fix-image gate HOLD).
 - **Networking.** [Wi-Fi menu](wifi-menu.md), [Wi-Fi toggle and rejoin](wifi-toggle-rejoin.md) and [USB debug network TX flow control](usb-net-reset.md).
 - **Sensors and power.** [Auto-rotate](auto-rotate.md), [charging over the buck path](charging-buck-session.md),
   [Android-reference brightness and CPU ceiling](android-reference-controls.md) and [PMK8550 power-on history](pon-history.md).
