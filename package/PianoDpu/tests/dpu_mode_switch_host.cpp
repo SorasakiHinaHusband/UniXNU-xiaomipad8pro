@@ -454,6 +454,10 @@ void nightShiftAndCleanEpochs()
   CHECK(pcc::capturePanelPcc(io, readPath(io), base));
   pcc::PanelPcc last = base;
   pcc::NightShift state;
+  // ns-base: the first location-9 matrix is the boot reference (cancelled); send an identity reference first so the
+  // white point below is applied as a relative change, as with Night Shift turned on after boot.
+  const uint64_t identityRef[9] = {1ull << 32, 0, 0, 0, 1ull << 32, 0, 0, 0, 1ull << 32};
+  CHECK(state.setMatrix(identityRef) == pcc::NightShift::Input::accepted);
   const uint64_t whitePoint[9] = {1ull << 32, 1ull << 29, 0, 0, 3ull << 30, 0, 0, 0, 1ull << 31};
   CHECK(state.setMatrix(whitePoint) == pcc::NightShift::Input::accepted);
   state.setCorrection(pcc::kOne / 2);
