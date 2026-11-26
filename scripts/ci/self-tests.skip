@@ -8,8 +8,8 @@ tooling/switch/test-bootflag-sh.sh                     # SUITE: tooling/switch/r
 tooling/switch/test-sign-props.sh                      # SUITE: tooling/switch/run-tests.sh
 tooling/native/tests/test_mic_diag.py                  # ARGS: takes a recorded fixture as its argument
 tooling/native/piano-mic-check/test-mic-check.py       # ARGS: tooling/native/piano-mic-check/run-tests.sh builds the app and WAV via make test
-package/PianoCamera/tests/camera_host.cpp              # HEADER: -I<gen>, the sensor tables generated from data/camera by the build
-package/PianoVideo/tests/bringup_host.cpp              # HEADER: links QcomMdt.o from the kext build
+package/PianoCamera/tests/camera_host.cpp              # SUITE: package/PianoCamera/tests/run-camera-host.sh
+package/PianoVideo/tests/bringup_host.cpp              # SUITE: package/PianoVideo/tests/run-bringup-host.sh
 tooling/persist/test-data-store.py                     # INPUT: imports the UniXNU checkout's unixnu.bootimg (fetch-pins.py UniXNU)
 tooling/persist/test-persist.py                        # INPUT: reads the maintainer's partition-table backup
 tooling/persist/test-switch-pair.py                    # INPUT: reads the maintainer's partition-table backup
