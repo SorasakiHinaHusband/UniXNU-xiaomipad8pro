@@ -7,16 +7,16 @@ FLASH pulse for photos and a shared green privacy LED; those are provenance fact
 - `piano-torch=1`: a read-only survey over the SPMI observer channel: the flash APID and its owner EE, the module's identity,
   enables, per-channel current/strobe/timer, clamp, thermal thresholds, status bytes and raw bytes. The only store is the
   observer's read command.
-- `piano-torch=2`: the survey, then torch control. Writes go only to that peripheral, only to the ten registers of
+- `piano-torch=2`: the survey, then torch control. Writes go only to that peripheral, only to the registers of
   `TorchCore.h`'s allowlist, each read-modify-write under its mask and read back. Off after `piano-torch-timeout` (300 s),
   on the module's own fault/over-temperature bits, at SoC >= `piano-torch-soc-max` (85 C, PianoThermal) or battery >=
   `piano-torch-batt-max` (45 C, PianoPower), when the enables read off, on system sleep and on shutdown. 50 mA by default
-  (`piano-torch-ma`), 100 mA by default and up to the factory's 400 mA total only when `piano-torch-max-ma` opts in.
-  `piano-torch-test=S` lights it once at boot for S seconds. `piano-torch-ladder=1` runs the guarded 100/200/300/400 mA ladder
-  with 10-second dark intervals and 500 ms status/temperature samples.
-  `piano-torch-probe=1` runs the T4 survey: a 15-second factory-pair window with STATUS1/INT_RT_STS polls every 500 ms before,
-  during and after plus full-page dumps; `piano-torch-probe-spare=1` adds the spare-pair mapping window and `piano-torch-flash=1`
-  adds one bounded timed FLASH pulse afterward.
+  (`piano-torch-ma`), with a hard cap of 100 mA total. `piano-torch-max-ma` can lower the cap.
+  `piano-torch-test=S` lights it once at boot for S seconds. `piano-torch-ladder=1` runs the guarded 100 mA step when the
+  configured cap allows it, with a 10-second dark interval and 500 ms status/temperature samples.
+  `piano-torch-probe=1` with `piano-torch-test=S` selects T4, which runs an S-second factory-pair window with STATUS1/INT_RT_STS
+  polls every 500 ms before, during and after plus full-page dumps. `piano-torch-probe-spare=1` adds the spare-pair mapping
+  window. `piano-torch-flash=1` adds one timed 50 mA FLASH pulse afterward if the configured cap permits it.
 
 Control from macOS: `sudo piano-torch on|off|toggle|status` (`tooling/native/piano-torch`, an IORegistry property the kext
 accepts from an administrator only); from other drivers: `PianoTorchSet` / `PianoTorchToggle` / `PianoTorchStatus`

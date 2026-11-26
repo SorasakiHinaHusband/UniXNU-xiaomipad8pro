@@ -156,13 +156,29 @@ static bool onlyFlash(const Arbiter &a)
   return true;
 }
 
+static void testProbeOptIn()
+{
+  constexpr const char *key = "piano-torch-probe";
+  CHECK(!bootSwitchEnabled(nullptr, key) && !bootSwitchEnabled(" \t", key));
+  CHECK(!bootSwitchEnabled("piano-torch=2 piano-torch-test=8", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe-spare=1 piano-torch-flash=1", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=2", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=11", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=18446744073709551617", key));
+  CHECK(bootSwitchEnabled("piano-torch=2\tpiano-torch-probe=1  ", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=1 piano-torch-probe=0", key));
+  CHECK(!bootSwitchEnabled("piano-torch-probe=1 piano-torch-probe", key));
+  CHECK(bootSwitchEnabled("piano-torch-probe=0 piano-torch-probe=1", key));
+}
+
 static void testConstants()
 {
   CHECK(kPpid == 0x1ee);
   CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(400) == 39 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
-  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(200, 500) == 200 &&
-        clampMa(500, 500) == 400);
+  CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(500, 500) == 100);
   CHECK(clampForMa(100) == 9 && clampForMa(60) == 5 && clampForMa(400) == 39);
   CHECK(!writable(kRegThermThrsh1, 0x07) && !writable(kRegThermThrsh2, 0x07) && !writable(0xd0, 0xff) && !writable(0x3d, 0xff));
   CHECK(!writable(kRegChanEn, 0x10) && !writable(kRegIres, 0x10) && !writable(kRegModuleEn, 0x7f) && !writable(kRegChanEn, 0));
@@ -277,16 +293,17 @@ static void testOnOff()
   o = low.request(4000, 100, 10, temps);
   CHECK(o.lit && low.ma() == 60 && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
   low.request(4500, 0, 0, temps);
-  Torch silly(p.bus, g, 5000);
-  CHECK(silly.maxMa() == 400);
-  Torch factory(p.bus, g, 400);
-  o = factory.request(5000, 400, 10, temps);
-  CHECK(o.lit && factory.ma() == 400 && factory.itarget() == 39 && (a.flash(kRegItarget0) & kItargetMask) == 39 && a.flash(kRegItarget0 + 1) == 39 &&
-        a.flash(kRegTorchClamp) == 39);
-  factory.request(6000, 0, 0, temps);
+  Torch oversized(p.bus, g, 5000);
+  o = oversized.request(5000, 400, 10, temps);
+  CHECK(o.lit && oversized.maxMa() == 100 && oversized.ma() == 100 && oversized.itarget() == 9);
+  CHECK((a.flash(kRegItarget0) & kItargetMask) == 9 && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  oversized.request(6000, 0, 0, temps);
   Controller c(p.bus);
   const StepResult capped = c.on(77, 77);
-  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
+  CHECK(capped.ok && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  c.off();
+  const StepResult lowerClamp = c.on(77, 5);
+  CHECK(lowerClamp.ok && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
   c.off();
 
   // the probe's spare-pair window: channels 3+4 through the same sequence, their registers only, the piano pair's kept
@@ -303,12 +320,13 @@ static void testOnOff()
   // The optional T4 diagnostic pulse uses FLASH's 12.5 mA resolution and a
   // bounded safety timer, then the ordinary off sequence restores a safe state.
   a.writes.clear();
-  const StepResult pulse = c.flashPulse(3, 8);
+  const StepResult pulse = c.flashPulse(77, 8);
   CHECK(pulse.ok && pulse.writes == 11 && pulse.readbacks == 11);
   CHECK((a.flash(kRegIres) & kPianoChannelMask) == 0 && a.flash(kRegTimer0) == (kTimerEnable | 8) &&
         a.flash(kRegTimer0 + 1) == (kTimerEnable | 8));
   CHECK((a.flash(kRegItarget0) & kItargetMask) == 3 && (a.flash(kRegStrobe0) & kStrobeMask) == kStrobeSoftwareLevelHigh &&
         (a.flash(kRegChanEn) & kPianoChannelMask) == kPianoChannelMask && (a.flash(kRegModuleEn) & kModuleEnBit) == kModuleEnBit);
+  CHECK((a.flash(kRegItarget0 + 1) & kItargetMask) == 3);   // 2 x 50 mA at the FLASH step size
   const StepResult pulseOff = c.off();
   CHECK(pulseOff.ok && a.flash(kRegChanEn) == 0 && (a.flash(kRegModuleEn) & kModuleEnBit) == 0);
   a.writes.clear();
@@ -318,6 +336,17 @@ static void testOnOff()
   a.writes.clear();
   const StepResult wild = c.on(4, 9, 0x10);
   CHECK(!wild.ok && wild.refused == 1 && a.writes.empty());
+
+  // The controller also accepts a four-channel mask. The cap applies to its combined current.
+  constexpr uint8_t allChannels = kPianoChannelMask | kOtherChannelMask;
+  CHECK(c.on(77, 77, allChannels).ok && a.flash(kRegTorchClamp) == 4);
+  for (unsigned ch = 0; ch < kChannels4ch; ++ch)
+    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 4);   // 4 x 25 mA in torch mode
+  CHECK(c.off(allChannels).ok);
+  CHECK(c.flashPulse(77, 8, allChannels).ok);
+  for (unsigned ch = 0; ch < kChannels4ch; ++ch)
+    CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 1);   // 4 x 25 mA in FLASH mode
+  CHECK(c.off(allChannels).ok);
 }
 
 static void testFailures()
@@ -433,6 +462,7 @@ static void testGuard()
 
 int main()
 {
+  testProbeOptIn();
   testConstants();
   testSurvey();
   testOnOff();

@@ -4,17 +4,17 @@
 //   piano-torch=1  a read-only survey, logged as "PianoTorch: ..." lines: the SPMI arbiter, the flash module's APID and its owner
 //                  EE, identity, enables, per-channel current/strobe/timer, clamp, thermal thresholds, status bytes, raw bytes.
 //                  The only store is the SPMI observer channel's read command (package/PianoPower/SpmiObserver.h).
-//   piano-torch=2  the survey, then torch control: writes only to that peripheral, only the ten registers of TorchCore.h's
+//   piano-torch=2  the survey, then torch control: writes only to that peripheral, only the registers of TorchCore.h's
 //                  allowlist, each read back; a time limit (piano-torch-timeout), the module's own fault and over-temperature
 //                  bits, the SoC (PianoThermal) and battery (PianoPower) temperatures; off on system sleep and shutdown. Control:
 //                  an administrator's IORegistry property (tooling/native/piano-torch) or another driver's callPlatformFunction
 //                  (PianoTorchClient.h); piano-torch-test=S lights it once for S seconds at boot (the attended first test).
 // Without piano-torch the driver declines in probe() and maps nothing.
-// Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own), piano-torch-max-ma (default 100,
-// hard cap 400; the factory range is opt-in), piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85),
-// piano-torch-batt-max=C (default 45), piano-torch-delay=S (default 0), piano-torch-probe-spare=1 to add the old channel-B
-// mapping window, piano-torch-flash=1 for one bounded timed FLASH pulse after the torch window, and piano-torch-ladder=1 for
-// the guarded 100/200/300/400 mA ten-second ladder.
+// Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own), piano-torch-max-ma (hard cap 100),
+// piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85), piano-torch-batt-max=C (default 45),
+// piano-torch-delay=S (default 0), and piano-torch-probe=1 to replace the boot test with T4. The probe can add a spare-pair
+// window (piano-torch-probe-spare=1) or a timed FLASH pulse (piano-torch-flash=1). The separate piano-torch-ladder=1 mode
+// runs the guarded current steps allowed by the configured cap.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -63,10 +63,11 @@ void readArgs()
   gArgs.delay = clampArg(bootArg("piano-torch-delay", 0), 0, 600);
   gArgs.socMax = clampArg(bootArg("piano-torch-soc-max", 85), 40, 105);
   gArgs.battMax = clampArg(bootArg("piano-torch-batt-max", 45), 30, 60);
-  gArgs.probe = clampArg(bootArg("piano-torch-probe", 0), 0, 1);
-  gArgs.probeSpare = clampArg(bootArg("piano-torch-probe-spare", 0), 0, 1);
-  gArgs.flash = clampArg(bootArg("piano-torch-flash", 0), 0, 1);
-  gArgs.ladder = clampArg(bootArg("piano-torch-ladder", 0), 0, 1);
+  const char *args = PE_boot_args();
+  gArgs.probe = bootSwitchEnabled(args, "piano-torch-probe");
+  gArgs.probeSpare = bootSwitchEnabled(args, "piano-torch-probe-spare");
+  gArgs.flash = bootSwitchEnabled(args, "piano-torch-flash");
+  gArgs.ladder = bootSwitchEnabled(args, "piano-torch-ladder");
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -517,7 +518,7 @@ void PianoTorch::run()
   if (gArgs.ladder) {
     ladder();
   } else if (gArgs.probe && gArgs.test) {
-    probe();   // replaces the single boot test: two windows (the factory's pair and the spare pair), dumps and polls
+    probe();   // replaces the single boot test with the T4 windows, dumps and polls
   } else if (gArgs.test) {
     note("test: on at %u mA for %u s (piano-torch-test)", gArgs.ma, gArgs.test);
     queue(gArgs.ma, gArgs.test, "the boot test");
@@ -525,8 +526,8 @@ void PianoTorch::run()
   serve();
 }
 
-// The T4 probe (piano-torch-probe=1 with piano-torch-test=S): one 15-second lit window by default — channels 1+2 (the factory's
-// own torch pair) at piano-torch-ma — with STATUS1's per-channel short/open bits and INT_RT_STS (0x10) polled every 500 ms
+// The T4 probe (piano-torch-probe=1 with piano-torch-test=S): one S-second lit window on channels 1+2 (the factory's torch pair)
+// at piano-torch-ma, with STATUS1's per-channel short/open bits and INT_RT_STS (0x10) polled every 500 ms
 // before, during and after it, and a full 256-byte register dump before and after. The old spare-pair mapping window remains
 // available with piano-torch-probe-spare=1. A bounded timed FLASH pulse can follow the torch window with piano-torch-flash=1.
 void PianoTorch::probe()
@@ -648,6 +649,11 @@ void PianoTorch::probeFlashPulse()
   // afterward to cover a timer or V4L2-owner edge case.
   constexpr uint8_t kFlashItarget = 1;
   constexpr uint8_t kFlashTimerTicks = 8;
+  constexpr unsigned kPulseMa = (kFlashItarget + 1) * kPianoChannels * kFlashStepUa / 1000;
+  if (gArgs.maxMa < kPulseMa) {
+    note("probe FLASH pulse skipped: %u mA exceeds the configured cap of %u mA", kPulseMa, gArgs.maxMa);
+    return;
+  }
   note("probe FLASH pulse: timed 80 ms at 50 mA total (2 x 25 mA, 12.5 mA steps); V4L2 close trap covered by explicit off");
   IOLockLock(gLock);
   const StepResult pulse = gTorch.controller().flashPulse(kFlashItarget, kFlashTimerTicks, kPianoChannelMask);
@@ -667,10 +673,13 @@ void PianoTorch::probeFlashPulse()
 void PianoTorch::ladder()
 {
   static const unsigned levels[] = {100, 200, 300, 400};
-  note("ladder: 100/200/300/400 mA total (2 channels), 10 s lit + 10 s dark, status/fault and temperatures every 500 ms; cap %u mA",
-       gArgs.maxMa);
+  note("ladder: 10 s lit + 10 s dark per step, status/fault and temperatures every 500 ms; cap %u mA", gArgs.maxMa);
   for (unsigned step = 0; step < sizeof(levels) / sizeof(levels[0]); ++step) {
     const unsigned ma = levels[step];
+    if (ma > gArgs.maxMa) {
+      note("ladder: %u mA and higher steps skipped under the %u mA cap", ma, gArgs.maxMa);
+      return;
+    }
     const uint64_t start = nowMs();
     const Temperatures t0 = readTemperatures(start);
     IOLockLock(gLock);
@@ -750,7 +759,7 @@ void PianoTorch::ladder()
     }
     note("ladder step %u complete: %u mA lit 10 s, dark 10 s", step + 1, ma);
   }
-  note("ladder complete: all four levels passed without a fault or guard");
+  note("ladder complete: all levels passed without a fault or guard");
 }
 
 // The control loop: requests as they come; while lit, a poll every second (the time limit, the guard).

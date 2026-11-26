@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoTorch's portable part (docs/drivers/torch.md section 4): the SPMI write channel, the level 1 survey of the PM8550 flash
-// module, the only writes level 2 makes (an allowlist of ten registers of that one peripheral, each written read-modify-write
+// module, the only writes level 2 makes (an allowlist of registers of that one peripheral, each written read-modify-write
 // under its mask and read back), the torch on/off sequences, and the guard that turns the torch off (time limit, the module's own
 // fault and over-temperature bits, the SoC and battery temperatures other drivers publish, a lost or unreadable state).
 // No I/O of its own: reads and writes go through a Bus the kext (PianoTorch.cpp) or the host test (tests/torch_host.cpp) gives.
@@ -11,11 +11,30 @@
 #include <libkern/libkern.h>
 #else
 #include <stdio.h>
+#include <string.h>
 #endif
 #include "FlashHw.h"
 #include "../include/PianoSpmi.h"   // the SPMI lock and the transactions every kext shares
 
 namespace pianotorch {
+
+// A diagnostic switch needs an explicit =1 token. The last mention of the switch wins.
+inline bool bootSwitchEnabled(const char *args, const char *name)
+{
+  if (!args) return false;
+  const size_t keyLen = strlen(name);
+  bool enabled = false;
+  while (*args) {
+    while (*args == ' ' || *args == '\t') ++args;
+    const char *end = args;
+    while (*end && *end != ' ' && *end != '\t') ++end;
+    const size_t len = end - args;
+    if (len >= keyLen && memcmp(args, name, keyLen) == 0 && (len == keyLen || args[keyLen] == '='))
+      enabled = len == keyLen + 2 && args[keyLen + 1] == '1';
+    args = end;
+  }
+  return enabled;
+}
 
 // ------------------------------------------------------------------------------------------------- the SPMI write channel
 // The write channel of one APID: its 0x20 bytes at chnls + 0x1000 * APID (the kext maps that one page and nothing else of the
@@ -175,11 +194,8 @@ inline void formatFaults(const Faults &f, char *out, unsigned size)
   out[size - 1] = 0;
 }
 
-// The normal default remains Ubuntu's 100 mA total. The factory hardware permits 400 mA total (2 x 200 mA); the
-// higher limit is opt-in through piano-torch-max-ma and is used only for short guarded probes such as torch5.
-constexpr unsigned kFactoryTorchMaxMa = 400;
-constexpr unsigned kHardMaxMa = kFactoryTorchMaxMa;
-constexpr uint8_t kHardMaxItarget = itargetForMa(kHardMaxMa);
+// The hard limit is Ubuntu's 100 mA total (2 x 50 mA, ITARGET 9 in torch mode).
+constexpr unsigned kHardMaxMa = kUbuntuTorchMaxMa;
 inline unsigned clampMa(unsigned ma, unsigned maxMa)
 {
   if (maxMa > kHardMaxMa) maxMa = kHardMaxMa;
@@ -238,13 +254,14 @@ class Controller {
   StepResult on(uint8_t itarget, uint8_t clamp, uint8_t mask = kPianoChannelMask)
   {
     StepResult r;
-    if (itarget > kHardMaxItarget) itarget = kHardMaxItarget;
-    if (clamp > kHardMaxItarget) clamp = kHardMaxItarget;
     if (!mask || mask & 0xf0) {
       ++r.refused;
       fail(r, kRegChanEn, mask, 0, "the channel mask is not one to four of the module's channels");
       return r;
     }
+    const uint8_t maxItarget = maxItargetForMask(mask, kTorchStepUa);
+    if (clamp > maxItarget) clamp = maxItarget;
+    if (itarget > clamp) itarget = clamp;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
       if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
@@ -266,12 +283,13 @@ class Controller {
   StepResult flashPulse(uint8_t itarget, uint8_t timerTicks, uint8_t mask = kPianoChannelMask)
   {
     StepResult r;
-    if (itarget > kHardMaxItarget) itarget = kHardMaxItarget;
     if (!timerTicks || timerTicks > kTimerValueMask || !mask || mask & 0xf0) {
       ++r.refused;
       fail(r, kRegTimer0, timerTicks, 0, "the FLASH pulse arguments are outside the bounded diagnostic range");
       return r;
     }
+    const uint8_t maxItarget = maxItargetForMask(mask, kFlashStepUa);
+    if (itarget > maxItarget) itarget = maxItarget;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
       if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
@@ -319,6 +337,15 @@ class Controller {
   }
 
  private:
+  static uint8_t maxItargetForMask(uint8_t mask, unsigned stepUa)
+  {
+    unsigned channels = 0;
+    for (unsigned ch = 0; ch < kChannels4ch; ++ch) channels += (mask >> ch) & 1u;
+    // Keep the pair's per-channel ceiling even when a single channel is selected.
+    if (channels < kPianoChannels) channels = kPianoChannels;
+    return uint8_t(kHardMaxMa * 1000 / (channels * stepUa) - 1);
+  }
+
   void remember(uint8_t reg, uint8_t value)
   {
     cache_[reg] = value;

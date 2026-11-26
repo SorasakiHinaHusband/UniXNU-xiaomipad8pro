@@ -59,9 +59,8 @@ no channel outside the driver's set on (else "someone else drives this module").
   allowlisted **for the probe only** (`piano-torch-probe`, the one-boot test of which pair the LED really sits on); a normal boot
   never writes them. `Controller::put` refuses anything else. Every write reads first (on a failed read: the last known value),
   merges under the mask, writes, reads back and compares; a mismatch aborts the on and runs the off (which tries every step).
-- **Current**: `piano-torch-ma` 50 (2 × 25 mA, ITARGET 4) unless a request names one; the default `piano-torch-max-ma` is 100,
-  while the factory-safe range reaches 400 mA total (2 × 200 mA) only when that existing cap argument opts in.
-  (Ubuntu's DT limit, ITARGET 9, clamp 9). 5 mA a channel steps, rounded down.
+- **Current** (`piano-torch-ma`): 50 mA (2 × 25 mA, ITARGET 4) unless a request names a current. `piano-torch-max-ma` can lower
+  the hard 100 mA total cap (Ubuntu's DT limit, ITARGET 9, clamp 9). Torch current rounds down to 5 mA steps per channel.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
   1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, STATUS1 short **or open** (the open bit is the
   module's own word for a lit register state with no LED current path — since 2026-11-15 it is a fault reason, not an unknown) →
@@ -102,15 +101,15 @@ tool is user-space work for later.
 |---|---|---|
 | `piano-torch` | 0 | 1 survey (read only); 2 survey + control |
 | `piano-torch-ma` | 50 | lamp current of an on without its own (10..max, 5 mA a channel steps) |
-| `piano-torch-max-ma` | 100 | the limit (10..400; 100 is the default, 400 is the factory cap) |
+| `piano-torch-max-ma` | 100 | the limit (10..100 mA total) |
 | `piano-torch-timeout` | 300 | auto-off of a request without its own time (10..1800 s) |
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
 | `piano-torch-delay` | 0 | wait first (s) |
-| `piano-torch-probe` | 0 | 1: replace the boot test with the T4 probe: one factory-pair window at `piano-torch-test` s, STATUS1/INT_RT_STS polls every 500 ms before/during/after, full dumps before/after and diffs |
-| `piano-torch-probe-spare` | 0 | 1: add the spare-pair mapping window from the original T4 checklist |
-| `piano-torch-flash` | 0 | 1: add one bounded 80 ms FLASH pulse after the torch window, then explicit off |
-| `piano-torch-ladder` | 0 | 1: guarded 100/200/300/400 mA total ladder; each level is 10 s lit, 10 s dark, with 500 ms status/fault and flash/SoC/battery temperature polls; any fault or existing guard stops it |
+| `piano-torch-probe` | 0 | `1` with level 2 and a nonzero `piano-torch-test` selects T4. The factory-pair window polls STATUS1/INT_RT_STS every 500 ms before, during and after the test, with full dumps and diffs. |
+| `piano-torch-probe-spare` | 0 | `1` adds the spare-pair mapping window when T4 runs |
+| `piano-torch-flash` | 0 | `1` adds an 80 ms, 50 mA FLASH pulse when T4 runs and the cap permits it, followed by explicit off |
+| `piano-torch-ladder` | 0 | `1` selects the level 2 current ladder. The cap permits only the 100 mA step, which is skipped if the cap is set lower. The step runs for 10 s lit and 10 s dark with 500 ms status and temperature polls. |
 
 ## 7. Kernel collection
 
@@ -132,7 +131,7 @@ grep -a "PianoTorch" logs/usb-console/<newest>-port0.txt
 
 **T1 expected** (`piano-torch=1`, nothing changes; `..` = values to record; **ran 2026-11-14, see below**):
 ```
-PianoTorch: start: piano-torch=1 ma=50 max=100 timeout=300 s test=0 s soc-max=85 C batt-max=45 C delay=0 probe=0 (PM8550 SID 1 flash 0xee00, PPID 0x1ee)
+PianoTorch: start: piano-torch=1 ma=50 max=100 timeout=300 s test=0 s soc-max=85 C batt-max=45 C delay=0 probe=0 spare=0 flash=0 ladder=0 (PM8550 SID 1 flash 0xee00, PPID 0x1ee)
 PianoTorch: level 1: loads only, nothing written (the SPMI observer's read command is the only store)
 PianoTorch: stage 1: SPMI: the arbiter and the flash module's APID (read only)
 PianoTorch: spmi: arbiter 0x70020000, 896 APIDs; flash PPID 0x1ee: APID .., owner EE 0 (this processor: writes possible)

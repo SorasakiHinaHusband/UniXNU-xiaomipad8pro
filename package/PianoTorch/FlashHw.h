@@ -88,6 +88,7 @@ constexpr uint8_t kSts2Voltage = kSts2VphLow;
 constexpr uint8_t kPianoChannelMask = 0x03;          // led-sources <1 2>: channel indices 0 and 1
 constexpr unsigned kPianoChannels = 2;
 constexpr unsigned kTorchStepUa = 5000;              // with the IRESOLUTION bit set
+constexpr unsigned kFlashStepUa = 12500;             // with the IRESOLUTION bit clear
 constexpr unsigned kUbuntuTorchMaxMa = 100;          // led-max-microamp 100000 for the lamp (both channels)
 constexpr unsigned kTorchMinMa = kPianoChannels * kTorchStepUa / 1000;   // 10: one step on each channel
 
