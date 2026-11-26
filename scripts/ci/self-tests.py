@@ -117,12 +117,10 @@ def run_one(kind, path, line):
         else:
             out = os.path.join(tmp, 'bin')
             os.mkdir(out)
-            # the binary goes to the temporary directory, not /tmp: parallel runs and other users stay apart
-            m = BUILD_RE.search(line)
-            exe = shlex.quote(os.path.join(out, os.path.basename(m['output'])))
-            for group in ('run', 'output'):
-                lo, hi = m.span(group)
-                line = line[:lo] + exe + line[hi:]
+            # Relocate each use of the executable, including later invocations and fixture builders.
+            output = BUILD_RE.search(line)['output']
+            exe = shlex.quote(os.path.join(out, os.path.basename(output)))
+            line = re.sub(r'(?<!\S)' + re.escape(output) + r'(?=$|[\s;&|)])', lambda _: exe, line)
             cmd, cwd = ['bash', '-c', line], full.parent
         try:
             r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, encoding='utf-8', errors='replace', timeout=TIMEOUT,

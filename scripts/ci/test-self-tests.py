@@ -66,16 +66,17 @@ class SuiteTests(unittest.TestCase):
             fake.write_text('#!/bin/sh\ncp ./program "$2"\n')
             fake.chmod(0o755)
             program = root / 'program'
-            program.write_text('#!/bin/sh\nprintf "%s" "$1"\n')
+            program.write_text('#!/bin/sh\nprintf "%s\\n" "$1"\n')
             program.chmod(0o755)
-            line = 'cc -o /tmp/example && /tmp/example /tmp/example.extra'
+            line = ('cc -o /tmp/example && /tmp/example /tmp/example.extra'
+                    ' && /tmp/example "$(printf %s /tmp/example)"')
             with patch.object(self_tests, 'ROOT', root), \
                  patch.object(self_tests.tempfile, 'TemporaryDirectory', return_value=Scratch()), \
                  patch.dict(os.environ, {'PATH': tmp + os.pathsep + os.environ['PATH']}):
                 _, ok, _, output = self_tests.run_one('c', 'example.c', line)
 
         self.assertTrue(ok, output)
-        self.assertEqual(output, '/tmp/example.extra')
+        self.assertEqual(output.splitlines(), ['/tmp/example.extra', str(root / 'scratch folder/bin/example')])
 
     def test_timeout_preserves_output_from_both_streams(self):
         err = subprocess.TimeoutExpired([], 1, output=b'stdout\xff', stderr=b'stderr')
