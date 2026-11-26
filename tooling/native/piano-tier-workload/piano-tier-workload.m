@@ -174,7 +174,7 @@ static void usage(FILE *f)
         "  --help             this text\n"
         "\n"
         "Output: line-oriented on stdout ('tier LABEL <sysctl line>', 'warm ...', 'phase ...', final 'RESULT pass|fail ...').\n"
-        "Exit: 0 pass; 1 data mismatch, Metal error or no device; 2 usage; 4 --require-tier not met.\n"
+        "Exit: 0 pass; 1 data mismatch, Metal error, no device or interruption; 2 usage; 4 --require-tier not met.\n"
         "--tier-report reads three files of one machdep.piano_gpu_tier line each (before the run, during --linger, after exit)\n"
         "and exits 0 when all samples say mode=1 state=ready, private-req and allocs rose by --expect-bos, used-mib\n"
         "rose by --expect-mib, used-mib ended at most --slack-mib above BEFORE, and the denial counters stayed fixed.\n"
@@ -254,7 +254,7 @@ static int readLineFile(const char *path, tier_line *t)
     size_t len = fread(line, 1, sizeof line, f);
     bool complete = feof(f) && !ferror(f);
     fclose(f);
-    if (!complete || !len || memchr(line, '\0', len) || memchr(line, '\n', len - 1))
+    if (!complete || !len || len == sizeof line || memchr(line, '\0', len) || memchr(line, '\n', len - 1))
         return -1;
     line[len] = '\0';
     return tier_parse(line, t);

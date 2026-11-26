@@ -97,7 +97,8 @@ class WorkloadCLI(unittest.TestCase):
 
     def test_report_rejects_bad_samples(self):
         for line in (None, '', snapshot() * 2, snapshot().replace('mode=1', 'mode=1 mode=1'),
-                     snapshot().replace('allocs=0', 'allocs=-1'), snapshot().encode() + b'\0'):
+                     snapshot().replace('allocs=0', 'allocs=-1'), snapshot().encode() + b'\0',
+                     snapshot().rstrip('\n').ljust(1024)):
             with self.subTest(line=line):
                 result = self.report([snapshot(), snapshot(126, 6), line], 1)
                 self.assertTrue(result.stdout.startswith('tier-report FAIL unreadable '))
