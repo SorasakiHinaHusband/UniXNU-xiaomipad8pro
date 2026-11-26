@@ -226,7 +226,7 @@ attempts to restore the last verified words on both DSPPs.
 
 **4.5 Panel off/on (B1e, M5a).** With the default display sleep, the backlight goes dark and the DPU keeps scanning. M5a adds
 light sleep and stops fetch using the B1e command path. The DCS packet uses the host command FIFO described by the DSI0 FIFO
-helper in `UniXNU-sm8750-common` PeripheralIO. Light sleep retains supply, reset, PHY and MDSS state. With M4 on as well
+helper in `UniXNU-sm8750-common` PeripheralIO. Light sleep retains panel supplies, panel reset, PHY and the configured DPU pixel path. With M4 on as well
 (lead/v131y12m merge), PianoDpu replays Night Shift inside the synchronous wake, before NativeGopDisplay releases the display;
 M4 alone keeps its notify from the display power gate.
 At startup the M5a worker checks the live dual-DSI video path, requests both INTF frame and line counters with `COUNT_EN = 3`
@@ -235,19 +235,22 @@ both links while `COUNT_EN` read back zero. The readback is diagnostic. If the l
 logged and returns `kIOReturnNotReady` before queuing panel work. NativeGopDisplay uses backlight-only sleep, releases touch on
 wake, and requests the configured Night Shift replay. A failure during an accepted panel transition still uses the wake path to
 check recovery.
-*Implemented* (`DpuPanel.h`): per DCS command, on both links: refused unless the controller is enabled in video mode, its FIFO is
-free and its DMA is software-triggered; STATUS0's DMA busy bit waited for (20 ms); INTR_CTRL's done bit cleared, CTRL's command mode
-set beside video (msm's transfer), the FIFO selected and filled, CMD_DMA_CTRL low power (the panel's mode) without broadcast or
-master, +0x390 bit 1 cleared, the length; then TRIG_DMA on DSI0 and DSI1 back to back. The hardware holds the DMA out of the active
-frame (BLOCK_DMA_WITHIN_FRAME); where that bit is clear the trigger waits for INTF1's front porch. Done within 50 ms on both, every
-word restored as found (PeripheralIO's restore, its +0x1ec pulse included); a link whose DMA did not finish is left to its engine and
-the slice stops. Engines: EN = 0 on INTF2, INTF_STATUS bit 0 clear within 40 ms (Ubuntu's slave poll), then INTF1. Once both
-engines stop, clear INTF_CONFIG bit 31 on each link that had programmable fetch. Wake restores the saved fetch starts and enable
-bits before the CTL's INTF flush and enables INTF1 and INTF2 with interrupts off. Once the flush latches and both engines count in
-lockstep, send 0x11, wait 120 ms, send 0x29, wait 10 ms and re-apply the configured PCC. A recoverable failed stop restores
-the engines, fetch registers and panel. A partial DCS transfer or a failed wake holds pending swaps and keeps the backlight dark.
-NativeGopDisplay's copy worker drains a running job before the sleep sequence and waits for both backlight ICs and the configured
-touch driver. Its work loop releases the backlight only after the worker confirms the wake. See §8.4 for qualification.
+In `DpuPanel.h`, the off sequence transmits both DCS commands from the two host FIFOs while timing runs. It uses hardware
+blanking when available and waits for INTF1's front porch otherwise. Each command has a 50 ms DMA completion deadline.
+The worker then clears the master request, waits for both effective engines to stop, hands off the CTL to INTF2 and stops
+INTF2. It clears programmable fetch after both counters freeze.
+
+On wake, the worker proves both INTFs are quiescent, preserves both hosts' control and clock words, and resets both DSI
+controllers with the SM8750 clock force-on mask. It sends LP DCS 0x11, waits 120 ms, sends 0x29, and waits 10 ms with the hosts
+in command-only mode. It restores video mode, programmable fetch and the bonded CTL route, waits for the flush, then starts
+both INTFs and checks lockstep before replaying PCC. With `piano-dpu-panel-engines=0`, timing stays on and wake commands
+still use the video blanking path.
+
+A failed wake aborts an owned DMA in the stopped command path before restoring its saved settings. When the hosts can
+be restored, the driver attempts the bonded video restart. The copy worker waits at most 1.5 s for the panel wake reply,
+then releases touch and uses the normal work-loop signal to resume presentation, VBL and the backlight even on error.
+It logs the fallback once and skips physical panel sleep for the rest of the boot. A panel that missed a wake command can
+still stay dark. See the [y12p wake analysis](dpu-m5-analysis.md#y12p-qual1-first-wake) for register and reset evidence.
 
 **4.6 External DisplayPort (B8) needs:** the DP controller `af54000` (INTF0, INTF3 for MST) and the USB/DP combo PHY (lanes 4,
 1.62–8.1 Gbit/s), AUX + link training (DPCD), HPD and orientation from the DSP's altmode service and the Type-C mux (B7, PianoPower's
@@ -623,7 +626,7 @@ PianoDpu: panel: dsi0 command path: ctrl ........ status ........ fifo ........ 
 PianoDpu: panel: dsi1 command path: ...
 PianoDpu: panel: piano-dpu-panel=1: sleep with the display (low-power DCS, then the timing engines stopped); nothing of the panel's reset or supplies is touched
 PianoDpu: panel: sleep (DCS 28/10, master-first CTL handoff): ok (step 5); dcs 28 sent in ... us, 10 sent in ... us; engines intf1 ... us intf2 ... us status 0/0; at 0/2./12./13. ms
-PianoDpu: panel: wake (bonded route and timing, DCS 11/29): ok (step 3); dcs 11 sent in ... us, 29 sent in ... us; engines intf1 ... us intf2 ... us status 1/1, counting in lockstep; at 0/1../2../2.. ms
+PianoDpu: panel: wake (DCS 11/29, bonded route and timing): ok (step 3); dcs 11 sent in ... us, 29 sent in ... us; engines intf1 ... us intf2 ... us status 1/1, counting in lockstep; at 0/0/12./13. ms
 PianoDpu: panel: test cycle 1 of 3 done                                         (three times)
 ```
 Pass: the picture goes black, comes back whole (no garbled frame, both halves aligned) each time; the survey's samples
@@ -631,8 +634,7 @@ Pass: the picture goes black, comes back whole (no garbled frame, both halves al
 question 8 (`(dma trigger 4 software, ...)`; `no block: triggered in the front porch` works too). Failure lines: `sleep ...: DSI1's
 command DMA did not finish within 50 ms (step 1)` (the FIFO route does not take the command: nothing else was done; report the
 command-path lines), `the master did not stop both timing engines within 40 ms (step 3)`, `the slave handoff did not flush (step 4)`, `wake ...: a timing engine
-did not report running within 50 ms (step 1)` followed by `panel: WAKE FAILED: the panel may stay dark until a reset
-(piano-reset-after)`.
+did not report running within 50 ms (step 4)`. With NativeGopDisplay, capture the one `using backlight-only power for this boot` line and verify that subsequent display-power events still run.
 
 **e1** (with WindowServer, 50 cycles: `pmset displaysleepnow` in the root shell, wake with `piano-input.py key shift`):
 `NativeGopDisplay: display off` → PianoBacklight's `backlight OFF` lines and `PianoDpu: panel: sleep (...): ok (step 5)`. At the wake
@@ -669,12 +671,12 @@ Counter setup comparison for the Ubuntu v1.4.0 kernel (`83f0f89bed14`) and UniXN
 | `dpu_encoder_phys_vid.c:611–663` and `dpu_encoder.c:1385–1421,1450–1462` drain and stop the master, verify both effective stops, then reset, remove INTF1 and submit the slave route | `DpuPanel.h::panelOff`, `stopEngine`, `resetPanelCtl` and `submitPanelRoute` use the same order and retire the prior flush and a live master frame with polls | Same handoff. Native uses STATUS and raw counter freeze as the stop proof for the inherited display. |
 | `dpu_encoder.c:1476–1498,2433–2457` waits for the slave's independent stop, then unbinds and flushes the empty CTL | `DpuPanel.h::panelOff` verifies both requests are off and the counters are frozen, then clears programmable fetch | Different cleanup. Native retains the slave route and all pixel resources for light sleep. |
 | `dpu_hw_intf.c:285–305` sets FETCH_START before setting CONFIG bit 31 | B1e only stops and starts timing | Save both live fetch configurations, clear their enable bits for sleep and restore the saved starts and enable state before the wake flush. |
-| `dpu_encoder.c:1862–1919` submits a shared flush once and `dpu_encoder_phys_vid.c:668–683` enables timing afterward. `panel-novatek-nt36532.c:652–654` sends sleep-out, waits 120 ms, then sends display-on | `DpuPanel.h::startEngines` restores the saved route and fetch, waits for the shared flush, then starts the pair. `panelOn` sends wake DCS after lockstep. | Same flush-before-enable order. The retained-route wake restores the original CTL while both engines are off and replays PCC before releasing the display-power clients. |
+| `dpu_encoder.c:1862–1919` submits a shared flush once and `dpu_encoder_phys_vid.c:668–683` enables timing afterward. `panel-novatek-nt36532.c:652–654` sends sleep-out, waits 120 ms, then sends display-on | `DpuPanel.h::startEngines` restores the saved route and fetch, waits for the shared flush, then starts the pair. `panelOn` in y12p sent wake DCS after lockstep. | Same flush-before-enable order. Current M5a resets both hosts and sends 11 and 29 in LP command mode with the INTFs stopped. It then restores the original CTL before enabling timing and replays PCC before releasing the display-power clients. |
 
 RAM-boot read list for the lead session
 
 1. Use the daily flip profile on a volatile Data RAM boot with `piano-dpu-panel=1 piano-dpu-snapshot=1`. Record the boot args, DPU flip-serving line, `panel: INTF counters` (raw enable values before and after the enable request, plus the motion verdict), and `slices: serving` with `panel on`. Take two awake `sudo sysctl -n machdep.piano_dpu_snapshot` reads and record both backlight IC states. Verify both frame and line counters move with both engines running. A zero enable readback is acceptable with observed motion. If the live check fails, capture the `panel: sleep refused` line and verify the backlight-only wake, with both engines still running. Use a matched default-off run as the power control.
-2. With a working desktop and the C920 capturing continuously, start with ten cycles of `pmset displaysleepnow` and keyboard-cover wake. Take two snapshot reads at least 100 ms apart in each sleep after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and both frame and line counters stable. The selected CTL should be at ACTIVE 0x4, MASTER 0, with FLUSH clear. Save the first off and wake traces using the [M5 read list](dpu-m5-analysis.md#trace-read-list). Pair each success with a wake and confirm both engines restart before the next cycle. Verify there was no flip timeout or permanent copy fallback. Extend to 50 cycles for the full qualification, sampling the remaining cycles.
+2. With a working desktop and the C920 capturing continuously, start with ten cycles of `pmset displaysleepnow` and keyboard-cover wake. Take two snapshot reads at least 100 ms apart in each sleep after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and both frame and line counters stable. The selected CTL should be at ACTIVE 0x4, MASTER 0, with FLUSH clear. Save the first off and wake traces using the [M5 read list](dpu-m5-analysis.md#trace-read-list). Pair each success with a wake. Require both DCS completion masks to be 3 with `porch=0` and both INTFs still stopped at the two DCS boundaries. Check that both engines restart in lockstep before the next cycle. Verify there was no flip timeout or permanent copy fallback. Extend to 50 cycles for the full qualification, sampling the remaining cycles.
 3. On wake compare the snapshot with the awake baseline, including both programmable fetch starts and enable bits. Verify scanout counters advance, a pending swap can latch, keyboard and trackpad work, and touch tap and scroll work. Check the C920 recording across all 50 wakes for garbled or split frames, flashes and stalls.
 4. Record awake and asleep steady-state power with the same brightness, CPU/GPU workload, peripherals and measurement interval for both runs. Use a USB-C meter with identical charger conditions, or run unplugged and sample `Voltage` and signed `InstantAmperage` from `ioreg -r -c AppleSmartBattery -l` (`piano-power-ps=1`). Compare asleep with M5a disabled and enabled. Save the per-cycle results and wattage, including the measurement source.
 

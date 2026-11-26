@@ -6,7 +6,7 @@
 //   - counter setup from disabled, ten cycles with advancing counters despite zero COUNT_EN, and the logged refusal when stuck;
 //   - y12o's observed slave timeout, master timeout recovery, and poll timing with tracing on/off;
 //   - display sleep: 0x28, >= 20 ms, 0x10, >= 100 ms, master stop, CTL handoff, slave stop, both halves asleep; wake:
-//     the bonded route and INTF flush, INTF1 and INTF2 started together and in phase, counting in lockstep, 0x11, >= 120 ms, 0x29; 50 cycles;
+//     both DSI hosts reset, 0x11, >= 120 ms, 0x29, the bonded route and INTF flush, both INTFs started in lockstep; 50 cycles;
 //   - the failures: a DMA that never finishes (the link left alone, nothing after it), an engine that does not stop (the panel
 //     brought back), an engine that does not start; DCS only; high speed;
 //   - nothing written outside the guard's registers: never TLMM (the panel's reset and supply pins).
@@ -93,6 +93,11 @@ static void testRefusals()
   CHECK(!storeAllowed(ctlReg(0, kCtlSwReset), 1) && !storeAllowed(ctlReg(0, kCtlStart), 1, true));
   CHECK(!storeAllowed(ctlReg(1, kCtlSwReset), 1, false, 0) && !storeAllowed(ctlReg(0, kCtlSwReset), 2, false, 0));
   CHECK(!storeAllowed(ctlReg(0, kCtlIntfActive), 0, false, 0) && !storeAllowed(ctlReg(0, kCtlIntfMaster), kDsiIntfSlave, false, 0));
+  for (unsigned l = 0; l < 2; ++l) {
+    CHECK(!storeAllowed(dsiReg(l, kDsiSwReset), 1) && !storeAllowed(dsiReg(l, kDsiClkCtrl), kDsiResetClocks, true));
+    CHECK(storeAllowed(dsiReg(l, kDsiSwReset), 0, false, 0) && storeAllowed(dsiReg(l, kDsiSwReset), 1, false, 0));
+    CHECK(!storeAllowed(dsiReg(l, kDsiSwReset), 2, false, 0));
+  }
   {
     model::Dpu m;
     m.regs[dsiReg(1, kDsiCtrl)] = 0x1f5;   // DSI1 in command mode
@@ -170,26 +175,31 @@ static void testSleepWake()
   const size_t before = m.stores.size();
   Result on = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
   CHECK(on.ok && on.engines.ok && on.engines.rate.lockstep && on.engines.latchUs >= 0);
-  CHECK(m.stores.size() >= before + 12);
-  if (!on.ok || m.stores.size() < before + 12) return;
+  size_t restart = before;
+  while (restart < m.stores.size() && m.stores[restart].pa != ctlReg(0, kCtlSwReset)) ++restart;
+  CHECK(m.stores.size() >= restart + 12);
+  if (!on.ok || m.stores.size() < restart + 12) return;
   for (unsigned i = 1; i <= 2; ++i) {
-    CHECK(m.stores[before + 1 + 2 * (i - 1)].pa == intfReg(i, kIntfProgFetch));
-    CHECK(m.stores[before + 2 + 2 * (i - 1)].pa == intfReg(i, kIntfConfig));
+    CHECK(m.stores[restart + 1 + 2 * (i - 1)].pa == intfReg(i, kIntfProgFetch));
+    CHECK(m.stores[restart + 2 + 2 * (i - 1)].pa == intfReg(i, kIntfConfig));
     CHECK(m.rd(intfReg(i, kIntfConfig)) == config && m.rd(intfReg(i, kIntfProgFetch)) == (2290 + i) * model::kHtotal);
   }
-  CHECK(m.stores[before].pa == ctlReg(0, kCtlSwReset));
-  CHECK(m.stores[before + 5].pa == ctlReg(0, kCtlIntfActive) && m.stores[before + 5].v == kIntfFlushDsi);
-  CHECK(m.stores[before + 6].pa == ctlReg(0, kCtlIntfMaster) && m.stores[before + 6].v == kDsiIntfMaster);
-  CHECK(m.stores[before + 7].pa == ctlReg(0, kCtlIntfFlush) && m.stores[before + 8].pa == ctlReg(0, kCtlFlush));
-  CHECK(m.stores[before + 9].pa == ctlReg(0, kCtlStart));
-  CHECK(m.stores[before + 10].pa == intfReg(1, kIntfEn) && m.stores[before + 11].pa == intfReg(2, kIntfEn));
-  CHECK(m.stores[before + 11].ns - m.stores[before + 10].ns < 1000 && m.desync == 0);
+  CHECK(m.stores[restart].pa == ctlReg(0, kCtlSwReset));
+  CHECK(m.stores[restart + 5].pa == ctlReg(0, kCtlIntfActive) && m.stores[restart + 5].v == kIntfFlushDsi);
+  CHECK(m.stores[restart + 6].pa == ctlReg(0, kCtlIntfMaster) && m.stores[restart + 6].v == kDsiIntfMaster);
+  CHECK(m.stores[restart + 7].pa == ctlReg(0, kCtlIntfFlush) && m.stores[restart + 8].pa == ctlReg(0, kCtlFlush));
+  CHECK(m.stores[restart + 9].pa == ctlReg(0, kCtlStart));
+  CHECK(m.stores[restart + 10].pa == intfReg(1, kIntfEn) && m.stores[restart + 11].pa == intfReg(2, kIntfEn));
+  CHECK(m.stores[restart + 11].ns - m.stores[restart + 10].ns < 1000 && m.desync == 0);
   CHECK(m.intf[1].on && m.intf[2].on && m.intf[1].frames > f1 && m.intf[1].frames - f1 == m.intf[2].frames - f2);
   const model::Dcs *d11 = m.firstDcs(0x11, 0), *d29 = nullptr;
   for (const model::Dcs &x : m.dcs)
     if (x.command == 0x29 && x.link == 1 && d11 && x.ns > d11->ns) d29 = &x;
   CHECK(d11 && d29);
-  if (d11 && d29) CHECK(d29->ns - d11->ns >= 120000000ull);
+  if (d11 && d29) {
+    CHECK(d29->ns - d11->ns >= 120000000ull);
+    CHECK(d29->ns < m.stores[restart].ns);
+  }
   CHECK(!m.half[0].sleeping && !m.half[1].sleeping && m.half[0].displayOn && m.half[1].displayOn);
   CHECK(m.glitches == 0 && clean(m));
   // 50 cycles
@@ -213,7 +223,7 @@ static void testSleepWake()
     CHECK(power.begin(want) && !want);
     const Result sleep = panelOff(m, p, Options());
     ok += sleep.ok;
-    power.finish(false, sleep.ok);
+    power.finish(false);
     flip.serial++;
     const Admission held = admitSwap(slot, busy, flip, LayerChange(), kDeferAlways);
     CHECK(held.hadJob && held.offer == Offer::Taken && held.waitSerial == flip.serial);
@@ -223,7 +233,7 @@ static void testSleepWake()
     CHECK(power.request(true) && power.begin(want) && want && !power.canPresent());
     const Result wake = panelOn(m, p, Options(), sleep.enginesStopped, sleep.fetch);
     ok += wake.ok;
-    power.finish(true, wake.ok);
+    power.finish(true);
     CHECK(power.wakeComplete && power.canPresent() && takeJob(slot, busy, &shown) && shown.serial == flip.serial && shown.flip);
     CHECK(finishJob(busy, &done, flip.serial) && done == flip.serial);
   }
@@ -431,7 +441,7 @@ static void testStopTimeoutTrace()
   CHECK(off.ok && ring.at(ring.size() - 1).link[1].status == 0);
   ring.reset();
   const Result on = panelOn(io, p, Options(), off.enginesStopped, off.fetch, &ring);
-  CHECK(on.ok && on.engines.rate.lockstep && ring.at(0).step == TraceStep::ctlReset);
+  CHECK(on.ok && on.engines.rate.lockstep && ring.at(0).step == TraceStep::dsiReset);
   CHECK(ring.at(ring.size() - 1).link[1].status == 1 && io.desync == 0);
   CHECK(io.maxPollOverrunNs == 0);
   ring.reset();
@@ -444,33 +454,36 @@ static void testStopTimeoutTrace()
               (unsigned long long)maxSampleNs, (unsigned long long)maxPollShiftNs, kLineNs);
 }
 
-// Qual2b off, wake property and console were identical. The fixture keeps all
-// sampled words and intervals, with only the timestamp origin rebased.
-static std::vector<TraceSample> readY12oTrace()
+// Trace fixtures preserve the sampled words and intervals, with a rebased timestamp origin.
+static std::ifstream openTrace(const char *name)
 {
-  // beside this source file, whatever the working directory (build-native-piano-dpu.sh runs the tests from the repo root)
   const std::string src = __FILE__;
   const std::size_t slash = src.find_last_of('/');
-  std::ifstream file((slash == std::string::npos ? std::string() : src.substr(0, slash + 1)) + "m5-y12o-off.trace");
+  return std::ifstream((slash == std::string::npos ? std::string() : src.substr(0, slash + 1)) + name);
+}
+
+static void readTraceLine(std::istream &file, const char *prefix)
+{
   std::string line;
   std::getline(file, line);
-  CHECK(line == "m5 1 off ctl0 ok=0 step=3 restored=1 rows=216 dropped=0");
-  for (const char *report : {"m5 1 dcs 28 trig=1 done=3 us=1245 porch=1", "m5 1 dcs 10 trig=1 done=3 us=1270 porch=1"}) {
-    std::getline(file, line);
-    CHECK(line.starts_with(report));
-  }
+  CHECK(line.starts_with(prefix));
+}
+
+static std::vector<TraceSample> readTraceRows(std::istream &file, unsigned serial, unsigned count)
+{
+  std::string line;
   std::vector<TraceSample> rows;
-  while (std::getline(file, line)) {
+  while (rows.size() < count && std::getline(file, line)) {
     TraceSample s{};
-    unsigned index = 0;
+    unsigned found = 0, index = 0;
     unsigned long long us = 0;
     char step[16] = {}, kind = 0;
     auto &a = s.link[0], &b = s.link[1];
-    const int n = std::sscanf(line.c_str(), "m5 1 %u %llu %15s %c %x/%x/%x/%x %x/%x/%x/%x %x/%x/%x/%x",
-                              &index, &us, step, &kind, &a.en, &a.status, &a.frame, &a.line,
+    const int n = std::sscanf(line.c_str(), "m5 %u %u %llu %15s %c %x/%x/%x/%x %x/%x/%x/%x %x/%x/%x/%x",
+                              &found, &index, &us, step, &kind, &a.en, &a.status, &a.frame, &a.line,
                               &b.en, &b.status, &b.frame, &b.line, &s.top, &s.active, &s.flush, &s.intfFlush);
-    CHECK(n == 16 && index == rows.size() && (kind == 'B' || kind == 'P'));
-    if (n != 16) return {};
+    CHECK(n == 17 && found == serial && index == rows.size() && (kind == 'B' || kind == 'P'));
+    if (n != 17) return {};
     s.us = us;
     s.boundary = kind == 'B';
     unsigned tag = 0;
@@ -480,7 +493,7 @@ static std::vector<TraceSample> readY12oTrace()
     s.step = TraceStep(tag);
     rows.push_back(s);
   }
-  CHECK(rows.size() == 216);
+  CHECK(rows.size() == count);
   return rows;
 }
 
@@ -491,7 +504,11 @@ static int64_t scanPosition(uint32_t frame, uint32_t line)
 
 static void testY12oTrace()
 {
-  const auto rows = readY12oTrace();
+  auto file = openTrace("m5-y12o-off.trace");
+  readTraceLine(file, "m5 1 off ctl0 ok=0 step=3 restored=1 rows=216 dropped=0");
+  readTraceLine(file, "m5 1 dcs 28 trig=1 done=3 us=1245 porch=1");
+  readTraceLine(file, "m5 1 dcs 10 trig=1 done=3 us=1270 porch=1");
+  const auto rows = readTraceRows(file, 1, 216);
   if (rows.size() != 216) return;
   model::Dpu replay;
   const auto &stop = rows[4];
@@ -570,6 +587,145 @@ static void testY12oTrace()
   CHECK(ring.total == ring.size() && ring.at(ring.size() - 1).active == kIntfFlushDsi && run.latchedMaster == kDsiIntfMaster);
 }
 
+static void replayMovingCounters(const std::vector<TraceSample> &rows, unsigned link)
+{
+  model::Dpu clock;
+  const unsigned intf = link + 1;
+  const uint64_t base = clock.frameNs(intf);
+  const uint64_t origin = rows.front().us;
+  bool seeded = false;
+  for (const auto &s : rows) {
+    const auto &sample = s.link[link];
+    const uint64_t when = base + (s.us - origin) * 1000;
+    if (!(sample.status & kIntfStatusOn)) {
+      seeded = false;
+      continue;
+    }
+    // Counters sit at zero briefly when a link first starts driving video.
+    if (!seeded && !sample.frame) continue;
+    if (!seeded) {
+      clock.ns = when;
+      clock.intf[intf].frames = sample.frame;
+      clock.intf[intf].start = when - sample.line * kLineNs;
+      clock.intf[3 - intf].on = false;
+      seeded = true;
+    }
+    clock.advanceTo(when);
+    const auto measured = scanPosition(sample.frame, sample.line);
+    const auto simulated = scanPosition(clock.intf[intf].frames, clock.line(intf));
+    CHECK(simulated >= measured - 14 && simulated <= measured + 14);
+  }
+}
+
+static void compareTraceBoundaries(const std::vector<TraceSample> &captured, const TraceRing &model)
+{
+  unsigned next = 0;
+  for (const auto &s : captured) {
+    if (!s.boundary) continue;
+    while (next < model.size() && (!model.at(next).boundary || model.at(next).step != s.step)) ++next;
+    CHECK(next < model.size());
+    if (next == model.size()) return;
+    const auto &m = model.at(next++);
+    CHECK(m.active == s.active && m.top == s.top && m.flush == s.flush && m.intfFlush == s.intfFlush);
+    for (unsigned l = 0; l < 2; ++l)
+      CHECK(m.link[l].en == s.link[l].en && m.link[l].status == s.link[l].status);
+  }
+}
+
+static void testY12pWakeTrace()
+{
+  auto file = openTrace("m5-y12p-wake.trace");
+  readTraceLine(file, "m5 1 off ctl0 ok=1 step=5 restored=0 rows=144 dropped=0");
+  readTraceLine(file, "m5 1 dcs 28 trig=1 done=3 us=1185 porch=1");
+  readTraceLine(file, "m5 1 dcs 10 trig=1 done=3 us=1265 porch=1");
+  const auto off = readTraceRows(file, 1, 144);
+  readTraceLine(file, "m5 2 wake ctl0 ok=0 step=2 restored=0 rows=68 dropped=0");
+  const auto wake = readTraceRows(file, 2, 68);
+  if (off.size() != 144 || wake.size() != 68) return;
+  CHECK(file.peek() == std::char_traits<char>::eof());
+  for (unsigned l = 0; l < 2; ++l) {
+    replayMovingCounters(off, l);
+    replayMovingCounters(wake, l);
+    CHECK(off.back().link[l].frame == wake.front().link[l].frame && off.back().link[l].line == wake.front().link[l].line);
+  }
+
+  model::Dpu m;
+  m.blockDma = false;
+  m.retainBusyVideo[0] = true;  // the DSI0 timeout observed in serial 2
+  m.advanceTo(m.frameNs(1));
+  const auto origin = m.ns;
+  for (unsigned l = 0; l < 2; ++l) {
+    m.intf[l + 1].frames = off.front().link[l].frame;
+    m.intf[l + 1].start = m.ns - off.front().link[l].line * kLineNs;
+    m.regs[dsiReg(l, kDsiCtrl)] = 0x1f7;
+    m.regs[dsiReg(l, kDsiDmaLength)] = l ? 0x84 : 4;
+    m.regs[intfReg(l + 1, kIntfConfig)] = kIntfConfigProgFetch;
+    m.regs[intfReg(l + 1, kIntfProgFetch)] = m.intf[l + 1].fetch = 2290 * model::kHtotal;
+  }
+  const LivePath path = readPath(m);
+  TraceRing ring;
+  const Result slept = panelOff(m, path, Options(), &ring);
+  CHECK(slept.ok && slept.enginesStopped && m.dsi[0].videoStuck);
+  CHECK(slept.dcs[0].dmaDoneMask() == 3 && slept.dcs[1].dmaDoneMask() == 3);
+  compareTraceBoundaries(off, ring);
+  const Frames frozen = readFrames(m);
+  m.advanceTo(origin + wake.front().us * 1000);
+  const Frames after = readFrames(m);
+  CHECK(frozen.f[0] == after.f[0] && frozen.f[1] == after.f[1]);
+  const model::Dpu asleep = m;
+
+  // Replay y12p's wake. Restarted timing does not clear the stuck video FSM.
+  ring.reset();
+  Trace legacy{&ring, 0};
+  const Engines engines = startEngines(m, path, slept.fetch, legacy);
+  CHECK(engines.ok && engines.rate.lockstep);
+  legacy.boundary(m, TraceStep::sleepOut);
+  const Sent failed = sendDcs(m, kDcsSleepOut, Options());
+  legacy.boundary(m, TraceStep::end);
+  CHECK(!failed.ok && failed.waitedBlanking && failed.triggerAttempted && !failed.done[0] && failed.doneUs >= kDmaDoneTimeoutUs);
+  CHECK(m.dsi[0].dmaPending && !m.firstDcs(kDcsDisplayOn, 0));
+  compareTraceBoundaries(wake, ring);
+  const auto &dcs11 = wake[wake.size() - 2];
+  CHECK(dcs11.step == TraceStep::sleepOut && wake.back().us - dcs11.us == 58801);
+
+  m = asleep;
+  ring.reset();
+  const Result fixed = panelOn(m, path, Options(), slept.enginesStopped, slept.fetch, &ring);
+  CHECK(fixed.ok && fixed.scanoutRestored && fixed.engines.rate.lockstep && (fixed.dsiBeforeReset[0] & kStatusVideoBusy));
+  CHECK(fixed.dcs[0].dmaDoneMask() == 3 && fixed.dcs[1].dmaDoneMask() == 3 && !fixed.dcs[0].waitedBlanking && !fixed.dcs[1].waitedBlanking);
+  const auto *d11 = m.firstDcs(kDcsSleepOut, 0), *d29 = m.firstDcs(kDcsDisplayOn, 1);
+  CHECK(d11 && d29 && d11->ns + 120000000 <= d29->ns && d29->ns < m.startNs[1] && d29->ns < m.startNs[2]);
+  for (unsigned l = 0; l < 2; ++l) {
+    CHECK(m.storesTo(dsiReg(l, kDsiSwReset)) == 2 && !m.dsi[l].videoStuck && m.half[l].displayOn && !m.half[l].sleeping);
+    CHECK(m.rd(dsiReg(l, kDsiCtrl)) == path.link[l].dsiCtrl &&
+          m.rd(dsiReg(l, kDsiClkCtrl)) == 0x33f && m.rd(dsiReg(l, kDsiDmaLength)) == (l ? 0x84u : 4u));
+  }
+  CHECK(m.glitches == 0 && m.desync == 0 && m.commandsInFrame == 0 && clean(m));
+
+  // A real DMA fault in either wake command must release presentation and retire the FIFO.
+  for (unsigned budget : {0u, 1u}) {
+    m = asleep;
+    const unsigned link = budget;
+    m.dmaBudget[link] = int(budget);
+    const auto start = m.nowUs();
+    const Result timedOut = panelOn(m, path, Options(), slept.enginesStopped, slept.fetch);
+    CHECK(!timedOut.ok && timedOut.scanoutRestored && timedOut.step == 2 + budget);
+    CHECK(timedOut.dcs[budget].triggerAttempted && timedOut.dcs[budget].dmaDoneMask() == (3u ^ (1u << link)));
+    CHECK(m.nowUs() - start < kWakeReplyTimeoutMs * 1000u && m.intf[1].on && m.intf[2].on);
+    if (!budget) CHECK(!m.firstDcs(kDcsDisplayOn, 0) && !m.firstDcs(kDcsDisplayOn, 1));
+    for (unsigned l = 0; l < 2; ++l)
+      CHECK(m.storesTo(dsiReg(l, kDsiSwReset)) == 4 && !m.dsi[l].dmaPending && !m.rd(dsiReg(l, kDsiTpgCtrl)) &&
+            m.rd(dsiReg(l, kDsiCtrl)) == path.link[l].dsiCtrl && m.rd(dsiReg(l, kDsiClkCtrl)) == 0x33f &&
+            m.rd(dsiReg(l, kDsiDmaLength)) == (l ? 0x84u : 4u));
+    CHECK(m.glitches == 0 && clean(m));
+    RequestGate gate;
+    gate.ready = true;
+    gate.latchFallback();
+    auto log = [](const char *) { CHECK(false); };
+    CHECK(!gate.admit(false, log) && !gate.admit(true, log));
+  }
+}
+
 static void testFailures()
 {
   {   // display-off never finishes on DSI1: stop there, DSI1's words left to its engine, nothing more
@@ -636,7 +792,7 @@ static void testFailures()
     CHECK(!r.ok && r.restored && std::strstr(r.why, "programmable fetch") && m.dcs.size() == 8);
     CHECK(m.latchedMaster == kDsiIntfMaster && readPath(m).ok && m.half[0].displayOn && clean(m));
   }
-  {   // the engines do not start at the wake: reported, no DCS sent into a stopped link
+  {   // the engines do not start after the command-only wake
     model::Dpu m;
     m.sleepMs(3);
     const LivePath p = readPath(m);
@@ -645,7 +801,7 @@ static void testFailures()
     m.engineDead[0] = m.engineDead[1] = true;
     const size_t dcs = m.dcs.size();
     const Result r = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
-    CHECK(!r.ok && r.step == 1 && std::strstr(r.why, "running") && m.dcs.size() == dcs);
+    CHECK(!r.ok && r.step == 4 && !r.scanoutRestored && std::strstr(r.why, "running") && m.dcs.size() == dcs + 4);
   }
   {   // the bonded wake route never latches
     model::Dpu m;
@@ -655,7 +811,7 @@ static void testFailures()
     m.flushStuck = true;
     const size_t dcs = m.dcs.size();
     const Result wake = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
-    CHECK(!wake.ok && std::strstr(wake.why, "flush") && m.dcs.size() == dcs && !m.intf[1].on && !m.intf[2].on);
+    CHECK(!wake.ok && std::strstr(wake.why, "flush") && m.dcs.size() == dcs + 4 && !m.intf[1].on && !m.intf[2].on);
   }
   {   // DCS only: the engines keep running
     model::Dpu m;
@@ -670,7 +826,7 @@ static void testFailures()
   }
 }
 
-static void testHeldOnFailedOrSupersededWake()
+static void testBacklightOnlyAndSupersededWake()
 {
   using namespace gopcompose;
   PanelPower power;
@@ -682,18 +838,18 @@ static void testHeldOnFailedOrSupersededWake()
   CHECK(offer(slot, frame, nullptr) == Offer::Taken);
   bool on;
   CHECK(power.request(false) && power.begin(on) && !on);
-  power.finish(false, true);
+  power.finish(false);
   CHECK(power.request(true) && power.begin(on) && on);
-  power.finish(true, false);
-  CHECK(!power.canPresent() && !power.wakeComplete && slot.job.serial == 42);
+  power.finish(true);  // error restored through the backlight path
+  CHECK(power.canPresent() && power.wakeComplete && slot.job.serial == 42);
   CHECK(power.request(false) && power.request(true) && power.begin(on) && on);
   CHECK(power.request(false));   // a new sleep arrived while the wake was in progress
-  power.finish(true, true);
+  power.finish(true);
   CHECK(!power.canPresent() && !power.wakeComplete && slot.job.serial == 42);
   CHECK(power.begin(on) && !on);
-  power.finish(false, false);    // a clean refusal of the hardware sleep
+  power.finish(false);    // a clean refusal of the hardware sleep
   CHECK(power.request(true) && power.begin(on) && on);
-  power.finish(true, true);
+  power.finish(true);
   Busy busy;
   Job resumed;
   CHECK(power.canPresent() && power.wakeComplete && takeJob(slot, busy, &resumed) && resumed.serial == 42 && resumed.flip);
@@ -709,8 +865,9 @@ int main()
   testUnavailablePanel();
   testStopTimeoutTrace();
   testY12oTrace();
+  testY12pWakeTrace();
   testFailures();
-  testHeldOnFailedOrSupersededWake();
+  testBacklightOnlyAndSupersededWake();
   if (failures) {
     std::printf("%d failures\n", failures);
     return 1;

@@ -341,6 +341,7 @@ struct PanelTraceReport {
   bool pending = false, on = false, ok = false, restored = false;
   unsigned serial = 0, ctl = 0, step = 0;
   panel::Sent dcs[2];
+  uint32_t dsiBeforeReset[2] = {};
 } gPanelReport;
 
 void milliHz(uint64_t mhz, unsigned *whole, unsigned *frac)
@@ -679,10 +680,10 @@ void finishPanelTrace(panel::TraceRing *trace, bool on, const panel::Result &r)
   ++gPanelReport.serial;
   gPanelReport.ctl = unsigned(gPath.ctl);
   gPanelReport.step = r.step;
-  if (!on) {
-    gPanelReport.dcs[0] = r.dcs[0];
-    gPanelReport.dcs[1] = r.dcs[1];
-  }
+  gPanelReport.dcs[0] = r.dcs[0];
+  gPanelReport.dcs[1] = r.dcs[1];
+  gPanelReport.dsiBeforeReset[0] = r.dsiBeforeReset[0];
+  gPanelReport.dsiBeforeReset[1] = r.dsiBeforeReset[1];
 }
 
 void publishPanelTrace()
@@ -692,7 +693,7 @@ void publishPanelTrace()
   report.pending = false;
   const unsigned count = gPanelTrace->size();
   char line[224];
-  OSData *dump = OSData::withCapacity((count + 3) * sizeof line);
+  OSData *dump = OSData::withCapacity((count + 6) * sizeof line);
   bool complete = dump != nullptr;
   auto emit = [&] {
     note("%s", line);
@@ -702,16 +703,23 @@ void publishPanelTrace()
            report.on ? "wake" : "off", report.ctl, unsigned(report.ok), report.step, unsigned(report.restored),
            count, gPanelTrace->total - count);
   emit();
-  if (!report.on) {
-    for (const panel::Sent &s : report.dcs) {
-      if (!s.command) continue;
-      snprintf(line, sizeof line,
-               "m5 %u dcs %02x trig=%u done=%x us=%u porch=%u intr=%08x/%08x ack=%x:%08x/%08x>%x:%08x/%08x fifo=%08x/%08x>%08x/%08x",
-               report.serial, unsigned(s.command), unsigned(s.triggerAttempted), s.dmaDoneMask(), s.doneUs,
-               unsigned(s.waitedBlanking), s.intrPoll[0], s.intrPoll[1], s.ackBeforeMask, s.before[0].ack, s.before[1].ack,
-               s.ackAfterMask, s.ackAfter[0], s.ackAfter[1], s.before[0].fifo, s.before[1].fifo, s.fifoAfter[0], s.fifoAfter[1]);
-      emit();
-    }
+  if (report.on) {
+    snprintf(line, sizeof line, "m5 %u pre-reset status=%08x/%08x", report.serial, report.dsiBeforeReset[0], report.dsiBeforeReset[1]);
+    emit();
+  }
+  for (const panel::Sent &s : report.dcs) {
+    if (!s.command) continue;
+    snprintf(line, sizeof line,
+             "m5 %u dcs %02x trig=%u done=%x us=%u porch=%u intr=%08x/%08x ack=%x:%08x/%08x>%x:%08x/%08x fifo=%08x/%08x>%08x/%08x",
+             report.serial, unsigned(s.command), unsigned(s.triggerAttempted), s.dmaDoneMask(), s.doneUs,
+             unsigned(s.waitedBlanking), s.intrPoll[0], s.intrPoll[1], s.ackBeforeMask, s.before[0].ack, s.before[1].ack,
+             s.ackAfterMask, s.ackAfter[0], s.ackAfter[1], s.before[0].fifo, s.before[1].fifo, s.fifoAfter[0], s.fifoAfter[1]);
+    emit();
+    if (!report.on) continue;
+    const auto &a = s.before[0], &b = s.before[1];
+    snprintf(line, sizeof line, "m5 %u host %02x ctrl=%08x/%08x status=%08x/%08x lane=%08x/%08x clk=%08x/%08x",
+             report.serial, unsigned(s.command), a.ctrl, b.ctrl, a.status, b.status, a.lane, b.lane, a.clocks, b.clocks);
+    emit();
   }
   for (unsigned i = 0; i < count; ++i) {
     const panel::TraceSample &s = gPanelTrace->at(i);
@@ -763,22 +771,23 @@ bool panelWake()
   const LivePath live = readPath(gIo, gA.ahbVote == 1, gEnginesStopped);
   if (live.ctl != gPath.ctl || (gEnginesStopped && live.intfActive != kDsiIntfSlave) ||
       (live.link[0].dsiCtrl & 3u) != 3u || (live.link[1].dsiCtrl & 3u) != 3u) {
+    gPanelBroken = gPanelUnsafe = true;
+    gAsleep = gEnginesStopped = false;
     flipPanelEnd(true);
     note("panel: wake refused: DSI video path unavailable (%s, ctl%d)", live.why, live.ctl);
+    publish();
     return false;
   }
   panel::TraceRing *trace = beginPanelTrace();
   const panel::Result r = panel::panelOn(gIo, gPath, gPanelOptions, gEnginesStopped, gPanelFetch, trace);
   finishPanelTrace(trace, true, r);
-  logPanel(gEnginesStopped ? "wake (bonded route and timing, DCS 11/29)" : "wake (DCS 11/29)", r);
+  logPanel(gEnginesStopped ? "wake (DCS 11/29, bonded route and timing)" : "wake (DCS 11/29)", r);
   gAsleep = false;
   gEnginesStopped = false;
-  const bool ok = r.ok && reread("the wake");
-  if (!ok) {
-    gPanelBroken = true;
-    gPanelUnsafe = true;
-    note("panel: WAKE FAILED: the panel may stay dark until a reset (piano-reset-after); sleep off for this boot");
-  }
+  const bool scanout = r.scanoutRestored && reread("the wake");
+  const bool ok = r.ok && scanout;
+  gPanelBroken = !ok;
+  gPanelUnsafe = !scanout;
   if (ok && gA.pcc) pccUpdate(true, "re-applied at the wake");
   flipPanelEnd(gPanelUnsafe);
   publish();
@@ -885,8 +894,11 @@ void serve()
     }
     if (want >= 0 && gA.panel) {
       IOLockLock(gLock);
-      gS.panelGate.ready = !gPanelBroken;
-      gS.panelGate.wakePending = gPanelBroken && (!want || !panelOk);
+      if (want && !panelOk) gS.panelGate.latchFallback();
+      if (!gS.panelGate.fallback) {
+        gS.panelGate.ready = !gPanelBroken;
+        gS.panelGate.wakePending = gPanelBroken && !want;
+      }
       gS.panelResult = panelOk ? kIOReturnSuccess : kIOReturnIOError;
       gS.panelDone = true;
       IOLockWakeup(gLock, &gS.panelDone, false);
@@ -1187,8 +1199,20 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
       gS.panelWant = p1 ? 1 : 0;
       gS.wake = true;
       IOLockWakeup(gLock, &gS, false);
-      while (!gS.panelDone) IOLockSleep(gLock, &gS.panelDone, THREAD_UNINT);
-      *result = gS.panelResult;
+      if (p1) {
+        uint64_t deadline;
+        clock_interval_to_deadline(panel::kWakeReplyTimeoutMs, kMillisecondScale, &deadline);
+        while (!gS.panelDone && IOLockSleepDeadline(gLock, &gS.panelDone, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {}
+      } else {
+        while (!gS.panelDone) IOLockSleep(gLock, &gS.panelDone, THREAD_UNINT);
+      }
+      if (gS.panelDone) {
+        *result = gS.panelResult;
+      } else {
+        // A late worker may finish restoring hardware. It cannot admit any future M5 requests.
+        gS.panelGate.latchFallback();
+        *result = kIOReturnTimeout;
+      }
       gS.panelBusy = false;
     }
     IOLockUnlock(gLock);

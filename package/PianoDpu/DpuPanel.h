@@ -4,11 +4,11 @@
 // Off (after PianoBacklight turned the backlight off on the same display-power change): DCS display-off (0x28), 20 ms, sleep-in
 // (0x10), 100 ms, then stop INTF1 and hand off the CTL to INTF2 before stopping INTF2 (Ubuntu 1.4.0, K:1fead1793340).
 // Reset the CTL only after both effective engines are quiescent. Keep the pixel resources bound through the slave's final frame
-// and clear programmable fetch after both engines stop. The DSI controllers, PHYs, panel reset and supplies stay as they are.
-// On: restore the fetch registers and bonded route, latch the shared CTL flush, then enable INTF1 and INTF2 back to back.
-// Verify both count in lockstep, then DCS sleep-out (0x11), 120 ms, display-on (0x29), 10 ms; the caller re-applies
-// the PCC and PianoBacklight lights the panel.
-// The DCS commands go out while the video stream runs (the command engine sends in the vertical blanking; its DMA reads the
+// and clear programmable fetch after both engines stop. The PHYs, panel reset and supplies retain the boot configuration.
+// On: with both INTFs stopped, reset both DSI hosts to clear the old video FSM, send DCS sleep-out (0x11), 120 ms, display-on
+// (0x29), 10 ms in command mode, then restore video. Restore fetch and the bonded route, latch the shared CTL flush, then start
+// both INTFs and verify lockstep. The caller re-applies PCC and lights the backlight.
+// While timing runs, DCS commands use vertical blanking (the DMA reads the
 // controller's own command FIFO, so no buffer has to be reachable by the DSI's DMA through the SMMU), on both links, one trigger each
 // (DSI0 then DSI1, back to back, as msm sends a bonded pair's commands). Per link, from msm's dsi_host.c (the video-mode transfer:
 // command mode enabled beside video for the transfer, the DMA's low-power bit as the panel's MIPI_DSI_MODE_LPM asks, the done bit)
@@ -19,11 +19,11 @@
 //     TEST_PATTERN_GEN_CTRL = 0x30006 (CMD_DMA_TPG_EN, TPG_DMA_FIFO_MODE, pattern 3: the DMA FIFO); the packet's words into the
 //     FIFO (+0x17c), an odd count padded with a zero word; CMD_DMA_CTRL: broadcast (31) and master (30) cleared, FROM_FRAME_BUFFER
 //     (28) set, LOW_POWER (26) set for LP; the second DMA control word (+0x390) bit 1 cleared; DMA length = the packet's bytes;
-//   - TRIG_DMA = 1 on DSI0 and DSI1; when TRIG_CTRL's BLOCK_DMA_WITHIN_FRAME (bit 12) is clear the trigger waits for INTF1's line
+//   - TRIG_DMA = 1 on DSI0 and DSI1; in video, when TRIG_CTRL's BLOCK_DMA_WITHIN_FRAME (bit 12) is clear the trigger waits for INTF1's line
 //     counter in the front porch first; INTR_CTRL bit 0 on both within 50 ms;
 //   - restore: INTR_CTRL enables | 1, TEST_PATTERN_GEN_CTRL = 0, +0x1ec pulsed 1 then 0 (PeripheralIO's FIFO reset; SunUEFI's
 //     DSI timing DB mode word, idle here either way), CMD_DMA_CTRL, +0x390, the length and CTRL as found. A link whose DMA did not
-//     finish is not restored (the engine still owns the command) and the slice stops for the boot.
+//     finish still owns the command. A stopped-host wake can abort it with a controller reset before restoring those words.
 // A DCS short write without a parameter: data type 0x05, header word = last-command flag (bit 31) | type << 16 | command.
 #pragma once
 #include "DpuPanelTrace.h"
@@ -34,22 +34,32 @@ using namespace slices;
 
 constexpr uint8_t kDcsDisplayOff = 0x28, kDcsSleepIn = 0x10, kDcsSleepOut = 0x11, kDcsDisplayOn = 0x29;
 constexpr uint32_t kCtrlEnable = 1u, kCtrlVideo = 1u << 1, kCtrlCommand = 1u << 2;
-constexpr uint32_t kStatusDmaBusy = 1u << 1;
+constexpr uint32_t kStatusDmaBusy = 1u << 1, kStatusVideoBusy = 1u << 3;
+constexpr uint32_t kCtrlRun = kCtrlEnable | kCtrlVideo | kCtrlCommand;
 constexpr uint32_t kIntDmaDone = 1u, kIntEnables = 0xa222aa02u;   // the odd (enable) bits PeripheralIO keeps; bit 0 = CMD_DMA_DONE
 constexpr uint32_t kTpgFifo = 0x30006u;
 constexpr uint32_t kDmaBroadcast = 1u << 31, kDmaMaster = 1u << 30, kDmaFromBuffer = 1u << 28, kDmaLowPower = 1u << 26;
 constexpr uint32_t kTrigDmaMask = 7u, kTrigDmaSw = 4u, kTrigBlockDmaInFrame = 1u << 12;
 constexpr uint32_t kDmaCtrl1Bit = 1u << 1;
 constexpr uint32_t kDmaDoneTimeoutUs = 50000, kDmaBusyTimeoutUs = 20000, kEngineStopUs = 40000, kEngineStartUs = 50000;
+constexpr uint32_t kWakeReplyTimeoutMs = 1500;
 
 // Owned by the request lock. If a dispatched transition failed, the caller may still have a wake to complete.
 struct RequestGate {
   bool ready = false;
   bool wakePending = false;
+  bool fallback = false;
+
+  void latchFallback()
+  {
+    ready = wakePending = false;
+    fallback = true;
+  }
 
   template <class Log>
   bool admit(bool on, Log log) const
   {
+    if (fallback) return false;
     if (ready || (on && wakePending)) return true;
     log(on ? "panel: wake refused: panel sleep unavailable" : "panel: sleep refused: panel sleep unavailable");
     return false;
@@ -80,6 +90,7 @@ struct Options {
 
 struct LinkSaved {
   uint32_t ctrl = 0, dma = 0, dma1 = 0, length = 0, intr = 0, tpg = 0, trig = 0, status = 0, fifo = 0, ack = 0;
+  uint32_t lane = 0, clocks = 0;
 };
 struct Sent {
   bool ok = false;
@@ -101,8 +112,24 @@ struct Sent {
   }
 };
 
+template <class Io, class Write>
+void restoreDcsLink(Io &io, unsigned l, const LinkSaved &k, bool clearFifo, Write wr)
+{
+  wr(dsiReg(l, kDsiIntrCtrl), (k.intr & kIntEnables) | kIntDmaDone);
+  wr(dsiReg(l, kDsiTpgCtrl), 0);
+  if (clearFifo) {
+    wr(dsiReg(l, kDsiShadow[2]), 1);
+    io.delayUs(1);
+    wr(dsiReg(l, kDsiShadow[2]), 0);
+  }
+  wr(dsiReg(l, kDsiCmdDmaCtrl), k.dma);
+  wr(dsiReg(l, kDsiDmaCtrl1), k.dma1);
+  wr(dsiReg(l, kDsiDmaLength), k.length);
+  wr(dsiReg(l, kDsiCtrl), k.ctrl);
+}
+
 template <class Io>
-Sent sendDcs(Io &io, uint8_t command, const Options &o)
+Sent sendDcs(Io &io, uint8_t command, const Options &o, bool commandOnly = false)
 {
   Sent s;
   s.command = command;
@@ -125,17 +152,21 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
     k.trig = io.rd(dsiReg(l, kDsiTrigCtrl));
     k.fifo = io.rd(dsiReg(l, kDsiFifoStatus));
     k.ack = io.rd(dsiReg(l, kDsiAckErr));
+    k.lane = io.rd(dsiReg(l, kDsiLaneStatus));
+    k.clocks = io.rd(dsiReg(l, kDsiClkStatus));
     s.ackBeforeMask |= 1u << l;
-    if ((k.ctrl & (kCtrlEnable | kCtrlVideo)) != (kCtrlEnable | kCtrlVideo)) s.why = "a DSI controller is not enabled in video mode";
+    if (commandOnly && (k.ctrl & kCtrlRun) != (kCtrlEnable | kCtrlCommand)) s.why = "a DSI host is not in command-only mode";
+    else if (!commandOnly && (k.ctrl & (kCtrlEnable | kCtrlVideo)) != (kCtrlEnable | kCtrlVideo)) s.why = "a DSI controller is not enabled in video mode";
     else if (k.tpg) s.why = "a DSI controller's test-pattern / command FIFO is in use";
     else if ((k.trig & kTrigDmaMask) != kTrigDmaSw) s.why = "a DSI controller's command DMA is not software-triggered (TRIG_CTRL)";
     if (*s.why) return s;
   }
   const uint64_t busyEnd = io.nowUs() + kDmaBusyTimeoutUs;
+  const uint32_t busy = kStatusDmaBusy | (commandOnly ? kStatusVideoBusy : 0);
   for (unsigned l = 0; l < 2; ++l)
-    while ((s.before[l].status = io.rd(dsiReg(l, kDsiStatus0))) & kStatusDmaBusy) {
+    while ((s.before[l].status = io.rd(dsiReg(l, kDsiStatus0))) & busy) {
       if (io.nowUs() >= busyEnd) {
-        s.why = "a DSI command DMA stayed busy for 20 ms (nothing written)";
+        s.why = "a DSI host stayed busy for 20 ms (nothing written)";
         return s;
       }
       io.delayUs(100);
@@ -156,7 +187,7 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
     return s;
   }
   // Without the hardware's block, trigger in the front porch (INTF1's lines 2242 .. vtotal - 8).
-  if (!(s.before[0].trig & kTrigBlockDmaInFrame) || !(s.before[1].trig & kTrigBlockDmaInFrame)) {
+  if (!commandOnly && (!(s.before[0].trig & kTrigBlockDmaInFrame) || !(s.before[1].trig & kTrigBlockDmaInFrame))) {
     const uint32_t ht = io.rd(intfReg(1, kIntfHsyncCtl)) >> 16;
     const uint32_t vt = ht ? io.rd(intfReg(1, kIntfVsyncPeriod)) / ht : 0;
     s.waitedBlanking = true;
@@ -169,10 +200,10 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
   const uint64_t t0 = io.nowUs();
   if (!*s.why) {
     s.triggerAttempted = true;
-    const uintptr_t irq = io.irqOff();
+    const uintptr_t irq = commandOnly ? 0 : io.irqOff();
     wr(dsiReg(0, kDsiTrigDma), 1);
     wr(dsiReg(1, kDsiTrigDma), 1);
-    io.irqRestore(irq);
+    if (!commandOnly) io.irqRestore(irq);
     for (;;) {
       for (unsigned l = 0; l < 2; ++l) {
         if (s.done[l]) continue;
@@ -187,16 +218,7 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o)
   }
   for (unsigned l = 0; l < 2; ++l) {
     if (!s.done[l]) continue;   // still the engine's: not touched
-    const LinkSaved &k = s.before[l];
-    wr(dsiReg(l, kDsiIntrCtrl), (k.intr & kIntEnables) | kIntDmaDone);
-    wr(dsiReg(l, kDsiTpgCtrl), 0);
-    wr(dsiReg(l, kDsiShadow[2]), 1);
-    io.delayUs(1);
-    wr(dsiReg(l, kDsiShadow[2]), 0);
-    wr(dsiReg(l, kDsiCmdDmaCtrl), k.dma);
-    wr(dsiReg(l, kDsiDmaCtrl1), k.dma1);
-    wr(dsiReg(l, kDsiDmaLength), k.length);
-    wr(dsiReg(l, kDsiCtrl), k.ctrl);
+    restoreDcsLink(io, l, s.before[l], true, wr);
     s.ackAfter[l] = io.rd(dsiReg(l, kDsiAckErr));
     s.fifoAfter[l] = io.rd(dsiReg(l, kDsiFifoStatus));
     s.ackAfterMask |= 1u << l;
@@ -447,13 +469,61 @@ struct Result {
   unsigned step = 0;         // the step reached (failed in, when !ok)
   bool restored = false;     // a failure undone: the panel shows again
   bool safeAwake = false;    // refusal before DCS reached either panel link
+  bool scanoutRestored = false; // bonded video can run even if the panel did not accept wake
   bool enginesStopped = false;
   Fetch fetch;
   Sent dcs[2];               // the two commands of the sequence
+  uint32_t dsiBeforeReset[2] = {};
   Engines engines;
   uint64_t tUs[6] = {};      // when each step started (relative to the call)
   uint32_t stores = 0, refused = 0;
 };
+
+struct DsiHost {
+  uint32_t ctrl, clocks;
+};
+
+template <class Io>
+bool resetDsiHosts(Io &io, int ctl, const DsiHost (&saved)[2], Trace &trace)
+{
+  trace.boundary(io, TraceStep::dsiReset);
+  if (io.rd(intfReg(1, kIntfEn)) || io.rd(intfReg(2, kIntfEn)) || !timingQuiescent(io)) return false;
+  bool ok = true;
+  for (unsigned l = 0; l < 2; ++l)
+    ok &= io.wr(dsiReg(l, kDsiCtrl), saved[l].ctrl & ~kCtrlRun);
+  for (unsigned l = 0; l < 2; ++l) {
+    const uint32_t clocks = saved[l].clocks | kDsiResetClocks;
+    ok &= io.wr(dsiReg(l, kDsiClkCtrl), clocks, ctl);
+    ok &= io.rd(dsiReg(l, kDsiClkCtrl)) == clocks && io.rd(dsiReg(l, kDsiCtrl)) == (saved[l].ctrl & ~kCtrlRun);
+  }
+  if (ok) {
+    for (unsigned l = 0; l < 2; ++l) {
+      ok &= io.wr(dsiReg(l, kDsiSwReset), 1, ctl);
+      io.delayUs(1);
+      ok &= io.wr(dsiReg(l, kDsiSwReset), 0, ctl);
+      ok &= io.rd(dsiReg(l, kDsiSwReset)) == 0;
+      ok &= !(io.rd(dsiReg(l, kDsiStatus0)) & (kStatusDmaBusy | kStatusVideoBusy));
+    }
+  }
+  for (unsigned l = 0; l < 2; ++l) {
+    ok &= io.wr(dsiReg(l, kDsiClkCtrl), saved[l].clocks, ctl);
+    ok &= io.rd(dsiReg(l, kDsiClkCtrl)) == saved[l].clocks;
+  }
+  trace.sample(io);
+  return ok;
+}
+
+template <class Io>
+bool setDsiMode(Io &io, const DsiHost (&saved)[2], bool commandOnly)
+{
+  bool ok = true;
+  for (unsigned l = 0; l < 2; ++l) {
+    const uint32_t ctrl = commandOnly ? (saved[l].ctrl & ~kCtrlVideo) | kCtrlCommand : saved[l].ctrl;
+    ok &= io.wr(dsiReg(l, kDsiCtrl), ctrl);
+    ok &= io.rd(dsiReg(l, kDsiCtrl)) == ctrl;
+  }
+  return ok;
+}
 
 // Undo after a failed off: engines (if any stopped) on, sleep-out, display-on.
 template <class Io>
@@ -584,24 +654,63 @@ Result panelOn(Io &io, const LivePath &p, const Options &o, bool enginesStopped,
     return r;
   };
   r.step = 1;
+  DsiHost saved[2] = {};
   if (enginesStopped) {
-    r.tUs[0] = io.nowUs() - t0;
-    r.engines = startEngines(io, p, fetch, trace);
-    if (!r.engines.ok) return finish(r.engines.why);
+    if (!p.ok || p.intfActive != kIntfFlushDsi || p.intfMaster != kDsiIntfMaster)
+      return finish("the saved bonded video path is unavailable");
+    for (unsigned l = 0; l < 2; ++l) {
+      saved[l] = {io.rd(dsiReg(l, kDsiCtrl)), io.rd(dsiReg(l, kDsiClkCtrl))};
+      r.dsiBeforeReset[l] = io.rd(dsiReg(l, kDsiStatus0));
+      if (saved[l].ctrl != p.link[l].dsiCtrl || saved[l].clocks == UINT32_MAX ||
+          io.rd(dsiReg(l, kDsiTpgCtrl)) || (r.dsiBeforeReset[l] & kStatusDmaBusy))
+        return finish("the retained DSI host configuration changed");
+    }
+    if (!resetDsiHosts(io, p.ctl, saved, trace))
+      return finish("the stopped DSI hosts did not reset");
+    if (!setDsiMode(io, saved, true)) {
+      if (setDsiMode(io, saved, false)) {
+        r.engines = startEngines(io, p, fetch, trace);
+        r.scanoutRestored = r.engines.ok;
+      }
+      return finish("the DSI hosts did not enter the stopped command window");
+    }
   }
+
   r.step = 2;
   r.tUs[1] = io.nowUs() - t0;
   trace.boundary(io, TraceStep::sleepOut);
-  r.dcs[0] = sendDcs(io, kDcsSleepOut, o);
-  if (!r.dcs[0].ok) return finish(r.dcs[0].why);
-  io.sleepMs(o.sleepOutMs);
-  r.step = 3;
-  r.tUs[2] = io.nowUs() - t0;
-  trace.boundary(io, TraceStep::displayOn);
-  r.dcs[1] = sendDcs(io, kDcsDisplayOn, o);
-  if (!r.dcs[1].ok) return finish(r.dcs[1].why);
-  io.sleepMs(o.displayOnMs);
+  r.dcs[0] = sendDcs(io, kDcsSleepOut, o, enginesStopped);
+  if (r.dcs[0].ok) {
+    io.sleepMs(o.sleepOutMs);
+    r.step = 3;
+    r.tUs[2] = io.nowUs() - t0;
+    trace.boundary(io, TraceStep::displayOn);
+    r.dcs[1] = sendDcs(io, kDcsDisplayOn, o, enginesStopped);
+    if (r.dcs[1].ok) io.sleepMs(o.displayOnMs);
+  }
+  const Sent &last = r.dcs[r.step - 2];
   r.tUs[3] = io.nowUs() - t0;
+  if (enginesStopped) {
+    // An unfinished transfer owns its FIFO. Abort it before restoring the DMA words and re-enabling video.
+    bool clean = true;
+    if (!last.ok && last.stores) {
+      clean = resetDsiHosts(io, p.ctl, saved, trace);
+      if (clean) {
+        auto wr = [&](uint64_t addr, uint32_t value) { clean &= io.wr(addr, value); };
+        for (unsigned l = 0; l < 2; ++l)
+          restoreDcsLink(io, l, last.before[l], false, wr);
+      }
+    }
+    if (!clean || !setDsiMode(io, saved, false)) return finish("could not restore the DSI hosts after wake DCS");
+    r.engines = startEngines(io, p, fetch, trace);
+    r.scanoutRestored = r.engines.ok;
+    if (!r.engines.ok && last.ok) {
+      r.step = 4;
+      return finish(r.engines.why);
+    }
+  }
+  if (!last.ok) return finish(last.why);
+  r.scanoutRestored = true;
   r.ok = true;
   return finish("ok");
 }

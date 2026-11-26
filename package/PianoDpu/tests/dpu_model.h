@@ -45,6 +45,7 @@ struct Dpu {
   DbHw dbHw = DbHw::sunuefi;
   bool blockDma = true;                 // TRIG_CTRL bit 12 as the boot stages left it
   bool dmaHang[2] = {false, false};     // a link's command DMA never finishes
+  bool retainBusyVideo[2] = {};         // losing the INTF input can strand the host video FSM
   int dmaBudget[2] = {-1, -1};          // >= 0: this many more transfers finish, then the link hangs
   bool engineStuck[2] = {false, false}; // EN = 0 does not stop INTF1 / INTF2
   bool engineDead[2] = {false, false};  // EN = 1 does not start it
@@ -81,6 +82,7 @@ struct Dpu {
     bool db = false, armed = false;
     std::vector<uint32_t> fifo;
     bool dmaPending = false;
+    bool videoStuck = false;
     uint64_t dmaAt = 0;
     uint32_t intr = 0x00000002;   // the DMA done enable bit on, status clear
   } dsi[2];
@@ -117,6 +119,7 @@ struct Dpu {
       regs[dsiReg(l, kDsiCmdDmaCtrl)] = kDmaLowPowerFact | 0x10000000u;
       regs[dsiReg(l, kDsiDmaCtrl1)] = 0x2;
       regs[dsiReg(l, kDsiDmaLength)] = 0;
+      regs[dsiReg(l, kDsiClkCtrl)] = 0x33fu;
     }
   }
   static constexpr uint32_t kDmaLowPowerFact = 1u << 26;
@@ -188,9 +191,11 @@ struct Dpu {
         if (!intf[i].on || intf[i].start + frameNs(i) != next) continue;
         if (intf[i].stopPending) {
           intf[i].on = false;
+          dsi[i - 1].videoStuck |= retainBusyVideo[i - 1];
           intf[i].stopPending = false;
           if (i == 1 && latchedMaster == kDsiIntfMaster) {
             intf[2].on = false;
+            dsi[1].videoStuck |= retainBusyVideo[1];
             intf[2].stopPending = false;
           }
           continue;
@@ -261,7 +266,7 @@ struct Dpu {
       return;   // not a FIFO transfer the engine takes: nothing happens
     if (dmaBudget[l] == 0) dmaHang[l] = true;
     if (dmaBudget[l] > 0) --dmaBudget[l];
-    if (dmaHang[l]) {   // the engine took it and never finishes: busy for good
+    if (dmaHang[l] || d.videoStuck) {   // the engine took it and cannot finish without a reset
       d.dmaPending = true;
       d.dmaAt = UINT64_MAX;
       return;
@@ -306,7 +311,10 @@ struct Dpu {
     for (unsigned l = 0; l < 2; ++l) {
       if (pa == dsiReg(l, kDsiTotal)) return dsi[l].db ? dsi[l].shadow : dsi[l].total;
       if (pa == dsiReg(l, kDsiIntrCtrl)) return dsi[l].intr;
-      if (pa == dsiReg(l, kDsiStatus0)) return dsi[l].dmaPending ? 0x2u | 0x8u : 0x8u;
+      if (pa == dsiReg(l, kDsiStatus0)) {
+        const bool video = (regs[dsiReg(l, kDsiCtrl)] & 2u) && intf[l + 1].on;
+        return (dsi[l].dmaPending ? 2u : 0u) | (video || dsi[l].videoStuck ? 8u : 0u);
+      }
       if (pa == dsiReg(l, kDsiTrigCtrl)) return 4u | (blockDma ? 1u << 12 : 0u);
       if (pa == dsiReg(l, dbModeWord())) return dsi[l].db ? 1u : 0u;
     }
@@ -405,6 +413,16 @@ struct Dpu {
     for (unsigned l = 0; l < 2; ++l) {
       Dsi &d = dsi[l];
       const unsigned i = l + 1;
+      if (pa == dsiReg(l, kDsiSwReset) && v) {
+        if (intf[1].on || intf[2].on || (regs[dsiReg(l, kDsiCtrl)] & 7u) ||
+            (regs[dsiReg(l, kDsiClkCtrl)] & kDsiResetClocks) != kDsiResetClocks) {
+          ++glitches;
+          return true;
+        }
+        d.dmaPending = d.videoStuck = false;
+        d.fifo.clear();
+        d.intr &= ~1u;
+      }
       if (pa == dsiReg(l, kDsiTotal)) {
         if (d.db) {
           d.shadow = v;

@@ -13,7 +13,8 @@
 //
 // The store guard (storeAllowed) is the whole list of registers the three slices write: CTL flush words, INTF1/INTF2's timing
 // engine enable, fetch configuration, porch timing and counter enable, the DSPPs' PCC, the DSI controllers' command-DMA words,
-// video TOTAL and timing shadow words, and the DPU's INTF underrun status (write-one-to-clear, those two bits only). Never TLMM (so
+// video TOTAL, timing shadow words, the panel transaction's DSI host reset and local clock control, and the DPU's INTF underrun
+// status (write-one-to-clear, those two bits only). Never TLMM (so
 // never the panel's reset gpio98 or the supply enables gpio117/118 that switch the KTZ8866's AVDD/AVEE), never the backlight's I2C,
 // the display clocks, the DSI PHYs, VBIF, REGDMA, the SSPPs, the LMs, the DSC or the SMMU.
 #pragma once
@@ -51,6 +52,9 @@ constexpr uint64_t dsiReg(unsigned l, uint32_t off) { return kDsi[l] + off; }
 // Command DMA (msm dsi.xml CMD_DMA_CTRL 0x38, DMA_LEN 0x48, TRIG_CTRL 0x80, TRIG_DMA 0x8c, INTR_CTRL 0x10c, TEST_PATTERN_GEN_CTRL
 // 0x158; the command FIFO word and the second DMA control word from UniXNU-sm8750-common's PeripheralIO.h, which sends DCS through
 // this FIFO on an SM8750 command-mode panel): see DpuPanel.h. Video timing: TOTAL (DpuHw.h) and the timing shadow words (DpuRefresh.h).
+constexpr uint32_t kDsiSwReset = 0x118;   // dsi.xml RESET 0x114, with the 6G register shift
+// SM8750 dynamic force-on clocks during a host reset (Ubuntu v1.4.0 dsi_host.c:2621–2632).
+constexpr uint32_t kDsiResetClocks = 0x23f | (1u << 8) | (1u << 11) | (1u << 21);
 constexpr uint32_t kDsiCmdDmaCtrl = 0x03c, kDsiDmaLength = 0x04c, kDsiAckErr = 0x068, kDsiTrigCtrl = 0x084, kDsiTrigDma = 0x090,
                    kDsiTpgCtrl = 0x15c, kDsiTpgFifo = 0x17c, kDsiDmaCtrl1 = 0x390, kDsiShadow[3] = {0x1e4, 0x1e8, 0x1ec};
 
@@ -82,6 +86,10 @@ inline bool storeAllowed(uint64_t pa, uint32_t v, bool modeTiming = false, int p
   for (unsigned d = 0; d < kDsppCount; ++d)
     if (pa == pccReg(d, 0) || (pa >= pccReg(d, 0x10) && pa <= pccReg(d, 0x30))) return true;
   for (unsigned l = 0; l < 2; ++l) {
+    if (panelCtl >= 0 && unsigned(panelCtl) < kCtlCount) {
+      if (pa == dsiReg(l, kDsiSwReset)) return v <= 1;
+      if (pa == dsiReg(l, kDsiClkCtrl)) return true;
+    }
     const uint32_t at[] = {kDsiCtrl, kDsiTotal, kDsiCmdDmaCtrl, kDsiDmaLength, kDsiTrigDma, kDsiIntrCtrl, kDsiTpgCtrl, kDsiTpgFifo,
                            kDsiDmaCtrl1, kDsiShadow[0], kDsiShadow[1], kDsiShadow[2]};
     for (uint32_t off : at)

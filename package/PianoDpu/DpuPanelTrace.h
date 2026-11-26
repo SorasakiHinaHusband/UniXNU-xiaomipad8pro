@@ -9,7 +9,7 @@ using namespace slices;
 enum class TraceStep {
   displayOff, displayOffDone, sleepIn, sleepInDone, stopSlave, stopMaster, fetchOff,
   undo, fetchOn, enable, align, start, flush, rate, sleepOut, displayOn,
-  drain, ctlReset, handoff, routeOn, end
+  drain, ctlReset, handoff, routeOn, dsiReset, end
 };
 
 inline const char *traceStepName(TraceStep step)
@@ -35,6 +35,7 @@ inline const char *traceStepName(TraceStep step)
   case TraceStep::ctlReset:       return "ctl-reset";
   case TraceStep::handoff:        return "handoff";
   case TraceStep::routeOn:        return "route-on";
+  case TraceStep::dsiReset:       return "dsi-reset";
   case TraceStep::end:            return "end";
   }
   return "?";
