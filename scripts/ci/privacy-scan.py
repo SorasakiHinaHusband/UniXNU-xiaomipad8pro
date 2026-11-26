@@ -5,6 +5,7 @@
     python3 scripts/ci/privacy-scan.py                 # every tracked text file
     python3 scripts/ci/privacy-scan.py --staged        # only additions to the index
     python3 scripts/ci/privacy-scan.py --diff BASE     # only lines added since BASE (and the commit messages BASE..HEAD)
+    python3 scripts/ci/privacy-scan.py --staged        # only lines added to the index
 
 The maintainer's own pre-publish audit has a private list of literal values; it is not here and must never be. This scan only
 knows shapes: a user's home path, the maintainer's private notes folder, RFC 1918 LAN addresses, host names on local

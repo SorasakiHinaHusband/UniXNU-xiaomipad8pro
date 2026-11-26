@@ -146,6 +146,19 @@ class GitDiff(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('1 hits, 0 refused files', result.stdout)
 
+    def test_staged_uses_index_bytes_and_refuses_outputs(self):
+        path = self.root / 'capture.txt'
+        path.write_text('staged fixture ' + J(['192.', '168.1.20']) + '\n')
+        (self.root / 'fixture.o').write_bytes(b'\0fixture')
+        self.git('add', '-A')
+        path.write_text('clean working copy\n')
+        (self.root / 'fixture.o').unlink()
+        result = subprocess.run([sys.executable, str(self.script), '--staged'], cwd=self.root,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('capture.txt:1: LAN address', result.stdout)
+        self.assertIn('1 hits, 1 refused files', result.stdout)
+
     def test_empty_diff_and_invalid_base(self):
         result = self.scan(self.base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
