@@ -1,6 +1,6 @@
 # Piano DPU M3 refresh modes
 
-M3 adds selectable 60, 90, 120 and 144 Hz modes for the internal 3200 × 2136 display. The 27.3 RAM boot captured for M1 was
+M3 keeps the 60, 90, 120 and 144 Hz hardware timing plans for the internal 3200 × 2136 display. The qualified boot path publishes one fixed 60 Hz timing after verification. The 27.3 RAM boot captured for M1 was
 scanning at 120 Hz with programmable fetch enabled on both interfaces. Each fetch start was `0x0013b6c1`, 24 lines before the
 end of the frame. The DSI timing-shadow words at +0x1e4/+0x1e8/+0x1ec were idle (zero). Both command engines were configured for
 software triggering with the in-frame DMA block clear.
@@ -11,7 +11,7 @@ software triggering with the in-frame DMA block clear.
 | Ubuntu `panel-novatek-nt36532.c:496–511,617–650`, module order and rate-group values | Rate-group writes on demand through the bonded DSI controllers | Same register values and module order. BOE sends B2 first. CSOT sends B3 first. |
 | Ubuntu `dsi_host.c:1220–1260,1354–1391,1462–1494`, DSI video synchronization and DMA packet encoding | HS short writes in the common front porch with DMA completion checked on both controllers | Same short-packet layout. The driver uses the controller FIFO and checks the line counters before triggering. |
 | Ubuntu `dpu_hw_intf.c:103–282,284–306`, timing setup and programmable fetch | Stage both interfaces together and move each enabled fetch start with the porch | Firmware already enabled fetch. The driver preserves its distance from the end of the frame. |
-| Stock DFPS, master DSI host first with double buffering, followed by the HS timing-switch commands | Stage the DSI and INTF words together, verify the latch, send the new rate group when it changes | Same ordering. The stock 60 Hz exit path also has a pen clear command. Its relevance to this port remains to be checked on hardware. |
+| Stock DFPS, master DSI host first with double buffering, followed by the HS timing-switch commands | Stage the DSI and INTF words together, verify the latch, send the new rate group when it changes | Different: stock also coordinates the SDE commit and clears the pen on exit from 60 Hz to a different rate group. The fixed 60 Hz path has no rate-group exit. |
 
 The stock sequence is described in the [MiCode DSI display driver](https://github.com/MiCode/vendor_opensource_display-drivers/blob/aa06fd1757c28dce96fbe4e04d4530ec21b52aac/msm/dsi/dsi_display.c#L5433)
 and [SDE encoder driver](https://github.com/MiCode/vendor_opensource_display-drivers/blob/aa06fd1757c28dce96fbe4e04d4530ec21b52aac/msm/sde/sde_encoder.c#L7075).
@@ -54,24 +54,121 @@ DSI step. The matching stock SDE INTF and CTL source was unavailable for this co
 | `dpu_hw_intf.c:326–356` reads live frame and line counts, with engine status guarding the paired status read. | `DpuSlices.h:107–119,176–184` reads the live counts. `DpuPanel.h:54–77` checks for advancing frames and lines, but `DpuModeSwitch.h:302–305` skips that check. | **Same** live observations. **Missing** motion check in M3. Share M5's two-link check before depending on the counters for timing. |
 | `dpu_hw_ctl.c:88–93` reads `CTL_FLUSH`. `dpu_encoder_phys_vid.c:532–550` waits for the register to clear and reports its value on timeout. | `DpuModeSwitch.h:302–305` refuses a nonzero value before staging, under the flip lock. `DpuSlices.cpp:594–596` prints one reason for both checks. | **Same** zero test. **Different** wait policy. The preflight refusal avoids staging a second transaction over a pending commit. **Missing** the raw flush mask in the refusal. |
 
+## y12o-qual1 underrun and login failure
+
+The 2026-11-26 RAM run reached ssh and captured the NativeGopDisplay start and multiple WindowServer launches. The login
+gate timed out. Console lines 3697, 3812–3813 and 3819 show the BOE module, Night Shift replay, both links verified at
+60.043 Hz after 120 → 60, and four timing elements published with 60 Hz active. At 4648 the 60 → 144 request and its
+restore both reported `an INTF underran`. AMFI logged core-dump denials from successive WindowServer PIDs starting on the
+next line. The denials establish repeated process failure. The specific WindowServer exception and its recovery policy
+remain unknown.
+
+The IOAV timing inventory is a contract. In y12o, the kernel equated every calculable timing with a supported selection.
+IOAV carries the full uncompressed raster, a 16.16 rate and a nominal raster clock. The refresh dictionary and slot 423
+describe the active interval. The saved display identity and four timing IDs allow WindowServer to request 144 Hz during
+startup even when the boot request has already made 60 Hz active. The 27.3 shared-cache symbols show
+`CA::WindowServer::IOMFBDisplay` and `AppleDisplay::update_display_limits` in QuartzCore and imports of
+`IOMobileFramebufferGetSupportedDigitalOutModes`, `GetDigitalOutMode` and `SetDigitalOutMode`. The NativeGopDisplay
+virtual method returns the worker's IOReturn to IOMFB. Bounded verification on the worker's flip lock completes before
+NativeGopDisplay changes the active ID, refresh property or VBL pacing. An error therefore leaves 60 Hz in software even
+if the hardware recovery cannot be verified. The trace has no user-space stack to prove what handling follows that return.
+
+### Transport and fetch budget
+
+Ubuntu v1.4.0 pins the comparison to Linux `83f0f89bed14`. Its panel sets full-width HFP 42/234/618/234 for
+144/120/90/60 Hz. At 144, the 3306 × 2310 uncompressed raster gives the DRM clock of 1,099,707 kHz (integer truncation).
+The per-link compressed active interval is ceil(1600 × 8 / 30) = 427 clocks. Each link adds 16 sync, 16 back and
+21 front. Thus 480 × 2310 × 144 = 159,667,200 Hz. The 120/90 modes use htotal 576/768 with the same vtotal.
+60 uses 576 × 4620. All four give the same nominal compressed clock. Four D-PHY lanes and RGB101010 yield
+159.6672 MHz × 30 / 4 = 1,197.504 Mbit/s per lane and 149.688 MHz byte clock. The stock group is 1,197.5 Mbit/s,
+149.6875 MHz byte clock and 159.666666 MHz pixel clock. The sub-5-ppm rounding difference is immaterial here.
+144 Hz therefore needs neither a different DSI PHY PLL nor a different slice setup. It needs timely delivery of each line.
+
+The P81 10-bpc, 8-bpp DSC 1.1 profile has two 800 × 24 slices per link, 800 compressed payload bytes per slice-line
+and 89 slice rows. Ubuntu computes packetization and the panel-specific PPS at modeset. Native inherits DSC and the
+DSI stream configuration. Its 144 plan keeps the active width and the payload per line, while cutting line time
+from 3.608 to 3.006 µs. The Android display capture lists 144 in the same group as 120, 90 and 60. The stock
+timing-group documentation gives equal bit clocks and HS rate-group commands. The captured Android ODM `*_mi.xml`
+files contain display calibration, so the exact 144 porches above are from the pinned Linux table. Stock clock and
+command evidence comes from SunUEFI's `oem-refresh.md`, the P81 boot panel descriptions and the MiCode DFPS path.
+SUNUEFI's stock note labels the variants oppositely to the P81 panel XML and pinned Linux driver. The latter two
+agree on BOE B2 first and CSOT B3 first, which is also the qual1 boot log's order. [SunUEFI OEM refresh trace](https://github.com/Project-SunUEFI/Project-SunUEFI/blob/4ef87402/docs/devel/hardware/oem-refresh.md)
+
+The 144 fetch word is `(2310 − 24) × 480 + 1 = 0x00106da1` on each INTF. Leaving the 60 Hz word
+`0x00280441` in place would put the start beyond the 144 frame. M3 actually stages the correct target word
+and reads both back. In microseconds the 24-line advance shrinks from 86.58 to 72.15 and vsync + VBP from
+382.40 to 318.66. Linux disables programmable fetch when those 106 lines already exceed the catalog's 24-line
+worst case. SSPP bandwidth prefill is a separate 35-line budget in Linux. It fits within the 106 start-of-frame lines
+at either rate, so it does not increase the Linux bandwidth formula here. It says nothing about VIG service during
+active scanout, when each linear half must deliver 6,400 bytes per line every 3.006 µs at 144.
+
+| Native linear BGRA, unity scale | 60 Hz | 90 Hz | 120 Hz | 144 Hz |
+| --- | ---: | ---: | ---: | ---: |
+| Active bytes per second, kB/s | 1,640,448 | 2,460,672 | 3,280,896 | 3,937,075 |
+| One line's active-time throughput, both pipes, kB/s (`3200 × 4 × vtotal × Hz`) | 3,548,160 | 2,661,120 | 3,548,160 | 4,257,792 |
+| Linux AB formula with 120% factor, total kB/s | 4,257,792 | 3,193,344 | 4,257,792 | 5,109,350 |
+| Plane clock proxy, one 1600-wide half with 105% factor, MHz | 465.696 | 349.272 | 465.696 | 558.835 |
+| Linux CRTC clock formula, full width before OPP cap, MHz | 931.392 | 698.544 | 931.392 | 1117.670 |
+
+Linux splits AB across the ICC paths it acquires and passes the catalog's 800,000 kB/s minimum DRAM IB to each
+path. IB is a separate peak argument with different aggregation from the splash OPP. Linux raises AB/IB before it
+raises the MDP clock and caps the full-width clock calculation at the 575 MHz SM8750 OPP. The half-width figure shows
+the 20% rate increase at each pipe and the 575 MHz OPP that would cover that estimate. It is a sizing proxy and does
+not measure this firmware's VIG, DSC or clock-cycle requirements.
+
+Piano's `kSplashAvgKBps` and `kSplashPeakKBps` are documentation constants for the Linux simplefb vote
+(3,280,896/4,257,792 kB/s). PianoDpu issues no display interconnect vote and only votes the GCC register AHB
+branch. The qual1 MDP RCG logged source 1 and divide-by-3, which gives no MHz without the PLL0 rate. The
+PianoA830 idle DDR floor was level 5 (6,671 MB/s table entry, sized for 120 Hz). It provides shared DDR headroom,
+with no per-display AB/IB, VBIF latency guarantee or MDP clock vote. The nominal splash AB is already 656,179
+kB/s below the steady 144 payload before overhead, if the inherited display allocation was equivalent to that
+reference. Qual1 contains no live display ICC, MDP PLL rate, VBIF pressure or per-link underrun timestamp. The exact
+bottleneck remains unknown. Unchanged fetch/QoS resources and a shorter line deadline are the primary feed-side
+suspects. A transition edge or panel/DSI sequencing issue remains possible.
+
+### Line comparison at the y12o base (0ea7e24d)
+
+| Ubuntu file and lines, with stock where available | Piano file and lines | Comparison |
+| --- | --- | --- |
+| `panel-novatek-nt36532.c:420–450`, full raster and four porches. `dsi_host.c:608–655,658–687`, round compressed width per link and derive PCLK and byte rate. | `DpuHw.h:163–179`, `DpuModes.h:119–139`, `NativeGopDisplay.cpp:3052–3073`. | **Same** raster and compressed transport math. **Different** clock ownership. Native retains the running PHY and checks the timing family. Stock's equal clock groups support that choice. |
+| `panel-novatek-nt36532.c:461–470,656–671,821–836`; `dsi_host.c:961–996,1042–1105`; `dpu_encoder.c:2067–2085,2149–2150`. | `DpuModes.h:119–139`; `DpuSlices.h:54–84` store allowlist. | **Same** slice geometry as the boot description. **Missing** live DSC/PPS and packetization verification. The retained VFP-only path uses the inherited payload format, H timing and rate group. |
+| `dpu_encoder_phys_vid.c:176–212,225–250`; `dpu_hw_intf.c:284–306`. | `DpuModes.h:104–112,138`; `DpuModeSwitch.h:216–226,238–249`. | **Same** start formula. **Different** enable policy. Linux needs zero VFP fetch lines. The VFP-only change retains the active boot policy and moves the 24-line start with the frame. |
+| `dpu_plane.c:116–184,1574–1583`; `dpu_core_perf.c:40–107,129–136,215–242,337–397`; `catalog/dpu_12_0_sm8750.h:439–465`; `sm8750.dtsi:4079–4081,4112–4142`. | `DpuHw.h:178–179`; `DpuAhbVote.h:15–22`; `DpuSlices.cpp:611–642`; `PianoA830.cpp:707–734`. | **Missing** per-mode MDP/ICC/MMCX vote. Keep the inherited 120-line-rate and measured 60 profile. Retain the firmware resources that delivered the same burst rate on qual1. Higher rates need measured clock and bandwidth ownership first. |
+| `dpu_plane.c:196–310,354–409,1484–1533` drives SSPP FIFO fill, QoS LUT and VBIF outstanding limits. | `PianoDpu.cpp` survey; `DpuSlices.h:54–84`; qual1 console 258–265, VIG0/1 `fetch 0x87`, `qos 1`. | **Missing** a per-mode SSPP/VBIF program or deadline measurement. Preserve inherited VIG/flush configuration for the unchanged per-line rate. |
+| `dsi_manager.c:208–335,358–411`; `dsi_host.c:387–417,2453–2455,2570`; `dpu_encoder_phys_vid.c:316–332,463–500`; `dpu_hw_ctl.c:144–180,339–344`. | `DpuModeSwitch.h:193–235,337–380`. | **Different** transaction. Linux programs on a full modeset, coordinates enable/flush, and stops the shared path before teardown. The retained M3 boot transaction uses SunUEFI's VFP shadow sequence. Simultaneity of both DSI and CTL latches during HFP changes is **unknown**. |
+| `panel-novatek-nt36532.c:617–671`; stock clock-master-first DFPS and HS timing-video-switch with 60 Hz exit pen handling. | `DpuModeSwitch.h:89–190,337–343,363–377`. | **Same** group values and module order. **Different** timing of panel writes relative to SDE commit. The VFP-only path needs no rate-group DMA. |
+| `dpu_encoder_phys_vid.c:532–550` reports CTL timeout; normal Linux enable/disable reinitializes timing and panel state. | `DpuModeSwitch.h:346–380`; `DpuSlices.cpp:251–259,623–632`. | **Different** live inverse transaction. **Missing** a fresh underrun observation boundary after restoring and reading back the old mode. |
+
+### Why both verifications failed
+
+The string at 4648 can come only from the final underrun predicate in `verifyRate`. The forward step therefore
+got past timing readback, both HS DMA completions and the cadence and phase checks. The first sticky bit can have
+been raised at any point from the pre-switch clear through the 144 verification. Neither DMA done nor register readback
+proves that the first live frame latched atomically or that the panel accepted the new group on the expected frame.
+The timed model idealized the DSI/CTL latch and checked matching totals and a fetch position inside blanking. It modeled
+no bandwidth, clock margin, FIFO service deadline or mismatch between the panel's and controller's frame boundaries.
+Its original one-shot underrun injection ended by the time recovery began.
+
+The inverse operation cleared raw and IRQ-sticky underruns while 144 could still be scanning, waited for a safe
+programming window, staged DSI0 then DSI1, INTF fetch/timing and the bonded CTL flush, and then sent the old group
+into its front porch. A bad frame from the remaining 144 interval or from the timing/group handover could set the
+bit again before the restored 60 interval. The restore's exact error shows the old timing, command-register readback,
+cadence and phase passed. Persistent half-switched register state is therefore unnecessary to explain the log. Panel
+acceptance and clean steady 60 scanout after the handover are both unknown from this capture. Record the transition
+status up to old-mode restoration, then clear it and verify the restored rate and timing over complete frames. A
+persisting underrun still fails recovery.
+
 ## Driver and boot arguments
 
-`piano-dpu-modes=1` enables M3. On the internal display, startup asks PianoDpu to establish 60 Hz before publishing the four
-timing elements. If startup cannot establish that mode, NativeGopDisplay publishes the boot profile's single timing.
-Without the boot argument the daily 60 Hz display contract remains in place. The existing B1c refresh policy and M3 are
-alternative users of the timing hardware. Omit `piano-dpu-refresh` on the M3 boot.
-
-NativeGopDisplay's `set_digital_out_mode` validates the color and timing IDs, then calls the PianoDpu worker's synchronous
-`PianoDpuMode` service. The worker shares the flip engine's transaction lock. M3 checks for a pending CTL flush and uses M5's
-bounded counter check before staging timing. Both links must advance by at least two frames, keep their frame advances within
-one of each other, and show line movement within their live frame totals. A pending flush reports its raw mask. A counter
-refusal reports the enable readbacks, frame advances and line samples. The worker then stages
-the time-critical words with local interrupts masked, and waits for the CTL latch. It reads back the INTF and DSI timing words
-and checks cadence, phase and underruns. A rate-group change uses four HS short writes in the common front porch on both links
-and checks command-DMA completion and the restored command registers. At 60 ↔ 120 Hz only the porches change.
-An anomaly after staging triggers a second transaction with the preceding timing and rate group and disables further
-switches for that boot. A still-busy DMA remains under the controller's ownership, and the log reports incomplete recovery.
-On success NativeGopDisplay updates its active Hz, slot 423, `IOMFBDisplayRefresh`, and the next armed VBL deadline.
+`piano-dpu-modes=1` establishes the verified 60 Hz mode before NativeGopDisplay offers it as the single
+`TimingElements` entry (ID 1000, color ID 100). The DPU worker admits only 60 Hz from the inherited 120 Hz
+mode or an already running 60 Hz mode. 90 Hz and a runtime return to 120 Hz have no directed qualification.
+A stale higher timing ID returns unsupported to IOMFB before a mode service call, property update or VBL change.
+A request for the published timing remains idempotent. The 60 Hz VFP-only commit changes DSI TOTAL, the INTF
+period and the enabled fetch starts. It retains the known 120 Hz line and link clocks and the inherited resources.
+Omit `piano-dpu-refresh` on the M3 boot. A refusal before staging keeps the boot profile fallback. A verified
+rollback restores the inherited 120 Hz mode for a single fixed timing. An unverified rollback returns offline
+and prevents publishing an unverified timing. The normal inactive-argument path keeps its existing contract.
 
 | Refresh | Expected INTF clock | Frame interval | INTF programmable fetch start with M1's 24-line lead |
 | --- | ---: | ---: | --- |
@@ -104,42 +201,11 @@ documents the FIFO, software trigger, and DMA completion.
 
 ## RAM-boot read list
 
-Run the **M3 phase last** in a combined qualification, after completing and saving the M2, M4, and M5 results. Keep the display
-at 60 Hz through the earlier phases on an M3-enabled boot. Use the 27.3 M1 flip profile with volatile Data and a boot guard,
-`piano-dpu=2 piano-dpu-flip=4 piano-dpu-ahb-vote=1`, and
-`piano-dpu-modes=1 piano-dpu-snapshot=1 piano-dpu-cadence=2`. Keep `piano-dpu-clean-skip=1`,
-`native-gop-display-night-shift=1`, and `piano-dpu-panel=1` with the M5 backlight and touch settings for the integration reads.
-
-1. After the GUI session is ready, record `system_profiler SPDisplaysDataType`, the CoreGraphics mode list, and both driver
-   services in IORegistry. Expect the same panel resolution at 60, 90, 120 and 144 Hz in the list. The first active mode should
-   be 60 Hz. Take a baseline with `sudo sysctl -n machdep.piano_dpu_snapshot`. Save the two timing totals, both fetch starts,
-   the DSI shadow and command path, `DPTimingModeId`, and `IOMFBDisplayRefresh`.
-2. In the same desktop session, switch along
-   `60 → 90 → 120 → 144 → 60 → 120 → 90 → 144 → 90 → 60 → 144 → 120 → 60`.
-   This covers each of the 12 directed pairs once. After each switch, compare the active CoreGraphics rate, the refresh property,
-   the snapshot's classified mode and both fetch starts. Save the corresponding `PianoDpu: mode: … verified` and
-   `NativeGopDisplay: M3: timing …` lines. A refusal, underrun, failed revert, or disagreement fails this step.
-3. With M2's conditional policy active, warm a steady flip workload until its `clean:` `skip` counter increases. Read
-   `machdep.piano_dpu_snapshot` before the switch, on the first eligible shows after it, and after repeated shows. Check that
-   `init` increases again for reused WC slots before they resume skipping. Record `maps` and `evictions` to distinguish a reused
-   slot from a newly mapped backing. With Night Shift active, capture the PCC enable and coefficients for both halves before
-   and after the switch, and the `night shift: M3 mode switch` replay line. Confirm the warm white point and the retained correction.
-4. At 90 Hz, take a snapshot before sleep and another when `piano-dpu-panel` reports `asleep`. Check both INTF engine and fetch
-   enable bits and verify the counters stop. Request 144 Hz through CoreGraphics in the same login session. If it reaches the
-   driver, expect `mode: 144 Hz refused` and no verified switch. Read the snapshot again while asleep to confirm the engines and
-   fetch remain off and the timing stays at 90 Hz. On wake, verify both 90 Hz fetch starts, the Night Shift wake replay, and
-   advancing frame counters before retrying 144 Hz. This retry must succeed and update both fetch starts. Return to 60 Hz.
-5. At every rate, run the same continuously animating workload. Save at least two complete `piano-dpu-cadence` windows with
-   latched frames and compare their presented intervals with the table. Keep the mode verification's frame-counter cadence
-   alongside the flip cadence so a renderer that misses frames can be distinguished from incorrect scanout timing.
-6. Record the C920 across all 12 transitions with moving high-contrast content. Watch the panel and inspect the recordings for a grey or
-   black frame, a split between the halves, or tearing. At each steady rate exercise taps, continuous scrolling and two-finger
-   gestures. Save a positive touch event count and note any loss, stalls or coordinate shift.
-7. Run 100 successful switches starting at 60 Hz. Use eight complete directed-pair loops and the first four edges of the next
-   loop. Record the requested and returned rate for every step, the switch count, both links' timing and cadence at the end,
-   and any display or touch errors. Finish at 60 Hz and confirm the original mode, fetch starts and working touch.
-8. On a separate control boot from the same kexts with the M3 argument absent, record the daily single 60 Hz timing and verify
-   that the M3 path made no writes.
+1. With M3 armed from boot, verify 120 → 60 on both links, one 3200 × 2136 timing at ID 1000, matching
+   `IOMFBDisplayRefresh` and stable login. Compare the snapshot's 60 Hz totals, both fetch starts and underrun status.
+2. Restart the GUI session and enumerate again. A saved higher rate must resolve to the offered 60 Hz timing. Check
+   flip cadence, Night Shift, panel sleep/wake and touch on the fixed mode. Confirm that wake restores both 60 Hz fetch starts.
+3. On a control boot with the M3 argument absent, check the existing single timing and zero M3 stores.
 
 The following Swift probe enumerates modes and can exercise a sequence through CoreGraphics. Run it in the logged-in GUI session.
 It selects the internal panel by the Xiaomi vendor and product IDs, then keeps the active logical resolution when switching.
@@ -179,16 +245,24 @@ for rate in CommandLine.arguments.dropFirst() {
 
 ## Fix-image gate
 
-Path: NativeGopDisplay's initial 60 Hz request and later WindowServer/CoreGraphics selections through IOMobileFramebuffer
-both call `PianoDpuMode`. The slices worker takes the flip lock and checks CTL, INTF1/2 and bonded DSI0/1 before programming
-the NT36532 timing. NativeGopDisplay publishes the timing, refresh property and VBL pacing after success.
+Path: QuartzCore WindowServer selects an IOAV color/timing pair through IOMFB. NativeGopDisplay enumerates the timings
+and validates the IDs. Its startup calls the synchronous PianoDpu worker under the flip lock to establish 60 Hz.
+The worker checks the bonded CTL0/INTF1+2/DSI0+1 path carrying VIG0/1 through LM0/1 and DSC0/1 to the P81 panel.
+Ubuntu uses full MSM modesets. SunUEFI has the live same-group VFP path and MiCode shows the separate SDE/DSI DFPS path.
+NativeGopDisplay publishes the timing, slot 423, refresh dictionary and VBL period from the verified result.
 
-Checks: The active bonded route and counter motion are verified on y12n-qual1. The M3 counter admission check is missing
-there. The CTL flush value at the refusal, the live timing latch, panel acceptance, delivered cadence, visible quality,
-touch and the M3 interactions remain open for RAM qualification.
+Checks: **ours-OK** on qual1 for boot counter motion, the 120 → 60 commit, timing and cadence readback and Night Shift.
+**ours-missing** for qualification at enumeration, per-mode MDP/ICC/VBIF sizing and the recovery underrun observation
+boundary. **Unknown** are the precise failing interface and resource, the clock/urgency state at 144, a live clean 60 Hz
+restore, power-state interactions after the fix, and the exact WindowServer failure after IOMFB returned the error.
 
-Root cause: Both links advance while COUNT_EN reads zero. The old M3 gate requires a nonzero enable readback, so it blocks
-this hardware even with an idle CTL. The combined refusal leaves open whether a pending flush took precedence in this boot.
+Root cause: Unqualified 144 Hz was exposed as settable. The link math is valid but the native VIG/DSC feed gets
+20% less line time with unchanged resource programming, and the live HFP/rate-group transition lacks stock's coupled
+commit sequence. An underrun was observed after timing/cadence checks, with the precise source unresolved. The restore
+measured a sticky underrun across old and new timing, so its error could include frames from the failed mode.
 
-ONE change: Gate M3 on the same live counter motion as M5 and report the measured values for the specific preflight
-refusal. Exercise zero readback with motion, frozen counters and a pending flush in the timed host model.
+ONE change: Make M3 a qualified fixed-mode contract. Publish 60 Hz only after verifying it or publish the confirmed
+inherited 120 Hz as a single fallback after a verified rollback. Refuse unqualified requests before writes. Keep the
+validated line rate, DSC configuration and inherited 120 Hz resources for 60 Hz. After a failed boot timing commit,
+verify the previous timing and count underruns from a fresh baseline on restored scanout. Surface a persistent
+failure as offline. Exercise the qual1 sequence and verify both the refusal and the recovery window in the timed model.
