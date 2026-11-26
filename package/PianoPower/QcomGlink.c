@@ -67,10 +67,9 @@ static void tx_write(QcomGlink *g, const uint8_t *header, uint32_t header_length
     uint32_t head = *f->head;
     for (uint32_t i = 0; i < header_length; ++i) {f->data[head] = header[i]; if (++head == f->length) head = 0;}
     for (uint32_t i = 0; i < data_length; ++i) {f->data[head] = data[i]; if (++head == f->length) head = 0;}
-    head = align8(head);
-    if (head >= f->length) head -= f->length;
+    const uint64_t padded_head = align8(head);
     barrier();
-    *f->head = head;
+    *f->head = (uint32_t)(padded_head >= f->length ? padded_head - f->length : padded_head);
     g->tx_messages++;
     g->kick_pending = 1;
 }

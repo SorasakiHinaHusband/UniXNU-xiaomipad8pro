@@ -9,9 +9,10 @@ cc=("${CC:-cc}" -std=c11 "${flags[@]}")
 cxx=("${CXX:-c++}" -std=c++20 "${flags[@]}")
 
 # Compile C sources as C, including the dependencies of the mixed C++ suites.
-for source in ChargePolicy FatVolume PianoMca QcomGlink QcomMdt QcomQmp QcomQrtr QcomRpmh QcomSmem QcomSmp2p QrtrPorts Sm8750Scm UsbcRelay; do
+for source in ChargePolicy FatVolume PianoMca QcomMdt QcomQmp QcomQrtr QcomRpmh QcomSmem QcomSmp2p QrtrPorts Sm8750Scm UsbcRelay; do
     "${cc[@]}" -c "$P/$source.c" -o "$T/$source.o"
 done
+"${cc[@]}" -Wshorten-64-to-32 -c "$P/QcomGlink.c" -o "$T/QcomGlink.o"
 "${cc[@]}" -DPIANO_PORT_EVENTS_TEST -c "$P/PortEvents.c" -o "$T/PortEvents.o"
 
 run() {
