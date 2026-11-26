@@ -290,6 +290,14 @@ Compare same-phase repeats to check unexplained live register differences. The s
 MMIO reads. Native panel sleep was disabled for this display-sleep reference. The dark-wake observation
 with `piano-dpu-panel=1` remains pending.
 
+The `v131y12u-m5obs1` pre-observation confirmed the bright control (`gop-shot` `mean=224.0`,
+`grade_m5_dsi.py PASS`). With standalone `piano-dpu-panel=1`, `DpuSlices::readSliceArgs()` chose the
+`piano-dpu-ahb-vote` default before parsing the panel flag, so startup exited at the GCC display AHB clock gate.
+Commit `2516bd2f` confines the fix to the argument order and AHB vote default in slice startup.
+The wake capture needs a `caffeinate -u` user-activity assertion because macOS re-blanked after 10 s.
+The live read-only M5 dark-wake capture on `v131y12u-m5obs2` remains required before any M5 fix image.
+[M5 RAM pre-observation](../results-2026-11-27.md#m5-read-only-pre-observation)
+
 ### Read-only RAM check plan
 
 1. In an attended RAM qualification, use the existing opt-in M5 path with `piano-dpu-panel=1`, `piano-dpu-snapshot=1` and the existing `native-gop-display-shot=1` capture diagnostics. Keep the panel variant, mode, known bright static pattern, brightness policy and optical exposure fixed across the comparison. Record the mode and panel ID from the snapshot. First take a bright optical sample with a successful active-scanout capture as a positive control.
