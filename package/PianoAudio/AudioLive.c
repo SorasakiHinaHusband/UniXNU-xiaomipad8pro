@@ -727,7 +727,7 @@ static void live_report(AudioLive *l, uint32_t now)
     }
     l->live_data = v;
     l->live_reads++;
-    l->live_at = now;
+    if (l->cfg.spk_probe) l->live_at = now;
     for (unsigned c = 0; c < 4; ++c) {
         const uint32_t mohm = (uint32_t)((uint64_t)v.re[c] * 1000u / 4096u);
         const uint32_t pct = l->spk->prot.re25[c] ? (uint32_t)((uint64_t)v.re[c] * 1000u / l->spk->prot.re25[c]) : 0;

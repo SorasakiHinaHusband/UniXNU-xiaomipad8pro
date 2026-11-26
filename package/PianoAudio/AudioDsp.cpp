@@ -348,13 +348,10 @@ int spkState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
                            l.mip_failed, l.mip_starts, l.mip_fallbacks, int(l.preg_sent), l.preg_updates, l.mip_why ? l.mip_why : "-");
     return SYSCTL_OUT(req, line, size_t(n < int(sizeof line) ? n : int(sizeof line) - 1) + 1);
 }
-// MIPLAY (AudioSpkProt.h): machdep.piano_audio_miplay asks for the Dolby/MiSound subgraph inside the protection plan from its next start
-// (0 off; 1 or 2 the perf mode; +4 the DAP's pregain follows the master volume; +16 x (r + 1) the rotation r); a new request also clears a
-// MIPLAY fallback of this boot. Its state is in machdep.piano_audio_spk_state ("miplay ...").
 // spk-probe1 (AudioLive.h audio_live_spk_probe): machdep.piano_audio_spk_probe, write S = 1..30:
-// the protection pair up S seconds without sound, the amplifiers left powered down; S + 100: powered up and held muted. Refused
-// (EPERM) without piano-audio-spk-probe=1, (ENOENT) while protection is not ready. Read: the ms left of the running probe.
-// machdep.piano_audio_spk_live (read only, always): the probe's state and the last live data per amplifier, relative values only.
+// the protection pair up S seconds without sound, the amplifiers left powered down; S + 100: powered up and held muted.
+// Writes return ENOENT while protection is not ready. Read: the ms left of the running probe.
+// machdep.piano_audio_spk_live (read only): the probe's state and the last live data per amplifier, relative values only.
 struct sysctl_oid gSpkProbeOid, gSpkLiveOid;
 int spkProbeControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
@@ -378,6 +375,9 @@ int spkLive(struct sysctl_oid *, void *, int, struct sysctl_req *req)
     const unsigned n = audio_live_spk_live_text(gLive, nowMs(), line, sizeof line);
     return SYSCTL_OUT(req, line, size_t(n) + 1);
 }
+// MIPLAY (AudioSpkProt.h): machdep.piano_audio_miplay asks for the Dolby/MiSound subgraph inside the protection plan from its next start
+// (0 off; 1 or 2 the perf mode; +4 the DAP's pregain follows the master volume; +16 x (r + 1) the rotation r); a new request also clears a
+// MIPLAY fallback of this boot. Its state is in machdep.piano_audio_spk_state ("miplay ...").
 struct sysctl_oid gMiplayOid;
 int miplayControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
@@ -415,6 +415,7 @@ void registerSpk()
     gMiplayOid.oid_descr = "MIPLAY (Dolby) inside speaker protection from its next start: 0 off, 1/2 perf mode, +4 pregain tracked, +16(r+1) rotation r";
     gMiplayOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gMiplayOid);
+    if (!gLive->cfg.spk_probe || gLive->cfg.level < 9) return;
     bzero(&gSpkLiveOid, sizeof gSpkLiveOid);
     gSpkLiveOid.oid_parent = &sysctl__machdep_children; gSpkLiveOid.oid_number = OID_AUTO;
     gSpkLiveOid.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
@@ -422,7 +423,6 @@ void registerSpk()
     gSpkLiveOid.oid_fmt = "A"; gSpkLiveOid.oid_descr = "spk-probe1: probe state and per-amp live data (permille of Re25, f0, Q, 0.1 C)";
     gSpkLiveOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gSpkLiveOid);
-    if (!gLive || !gLive->cfg.spk_probe) return;   // the probe's control only with piano-audio-spk-probe=1
     bzero(&gSpkProbeOid, sizeof gSpkProbeOid);
     gSpkProbeOid.oid_parent = &sysctl__machdep_children; gSpkProbeOid.oid_number = OID_AUTO;
     gSpkProbeOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);

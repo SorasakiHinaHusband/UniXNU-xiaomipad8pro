@@ -2298,11 +2298,10 @@ static void testSoundAge(void)
 
 // spk-probe1: the protection pair up without sound for a while, amplifiers down (or up muted),
 // the monitor read, the path down at the end; refused without the configuration's switch or without protection; real sound takes over.
-static int g_probe_cfg;
 static uint32_t g_probe_req, g_probe_at, g_probe_mute_at, g_probe_snd_from, g_probe_snd_to, g_probe_dev_at;
 static int g_probe_rc, g_probe_text_ok, g_probe_down_after;
 static char g_probe_text[480];
-static void probe_setup(AudioLiveConfig *c) {c->spk_probe = g_probe_cfg;}
+static void probe_setup(AudioLiveConfig *c) {c->spk_probe = 1;}
 static void probe_hook(uint32_t t)
 {
     if (g_probe_mute_at && t == g_probe_mute_at) audio_live_control(&sh, -1, 1);
@@ -2319,7 +2318,7 @@ static void probe_hook(uint32_t t)
 }
 static void probe_reset(void)
 {
-    g_probe_cfg = 1; g_probe_req = 6; g_probe_at = 1000; g_probe_mute_at = g_probe_snd_from = g_probe_snd_to = g_probe_dev_at = 0;
+    g_probe_req = 6; g_probe_at = 1000; g_probe_mute_at = g_probe_snd_from = g_probe_snd_to = g_probe_dev_at = 0;
     g_probe_rc = -2; g_probe_text_ok = g_probe_down_after = 0; g_probe_text[0] = 0;
 }
 static void testSpkProbe(void)
@@ -2351,8 +2350,8 @@ static void testSpkProbe(void)
         char small[24];
         CHECK(audio_live_spk_live_text(&live, now_ms(), small, sizeof small) == sizeof small - 1 && small[sizeof small - 1] == 0);
     }
-    // B: the switch off: refused, nothing starts
-    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_cfg = 0; g_setup = probe_setup;
+    // B: the default configuration refuses the request and starts nothing.
+    spk_reset(); spk_files(); g_spk = 1; probe_reset();
     run(&sc);
     CHECK(g_probe_rc == 0 && !w.violations && live.spk_starts == 0 && live.probe_refused == 1 && !live.probe_runs);
     CHECK(logged("spk-probe1: request 6 refused: not enabled (piano-audio-spk-probe=1)"));
