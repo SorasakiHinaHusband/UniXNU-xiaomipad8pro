@@ -9,6 +9,42 @@ using namespace pianowifi::a80211;
 static unsigned failures;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++failures; } } while (0)
 
+static void radioCycles()
+{
+  WifiUserControl owner;
+  uint32_t previousOff = owner.read();
+  for (unsigned cycle = 1; cycle <= 4; ++cycle) {
+    const uint32_t off = owner.setPower(false);
+    CHECK(owner.serial(off) == owner.serial(previousOff) + 1);
+    CHECK(owner.setPower(false) == off && owner.radioStop() && !owner.join());
+    CHECK(!owner.radioOffConfirmed(off));
+    if (cycle > 1) {
+      owner.radioOff(previousOff);
+      CHECK(!owner.radioOffConfirmed(previousOff) && !owner.radioOffConfirmed(off));
+      CHECK(owner.pending(off) && owner.radioStop());
+    }
+
+    // The worker captures OFF before checking the physical pins. ON can
+    // arrive before the readback completes without changing this serial.
+    const bool quickOn = cycle % 2 != 0;
+    if (quickOn) {
+      const uint32_t on = owner.setPower(true);
+      CHECK(owner.serial(on) == owner.serial(off) && owner.setPower(true) == on);
+      CHECK(owner.radioStop() && !owner.allowed(on) && !owner.radioOffConfirmed(off));
+    }
+    owner.radioOff(off);
+    CHECK(owner.radioOffConfirmed(off) && !owner.pending(owner.read()));
+    CHECK(owner.power(owner.read()) == quickOn && owner.radioStop() == !quickOn);
+    if (cycle > 1) {
+      owner.radioOff(previousOff);
+      CHECK(owner.radioOffConfirmed(off) && !owner.radioOffConfirmed(previousOff));
+    }
+    CHECK(owner.serial(owner.setPower(true)) == owner.serial(off));
+    CHECK(owner.allowed(owner.read()) && !owner.radioStop());
+    previousOff = off;
+  }
+}
+
 static void joinReceipt()
 {
   WifiJoinRequest request;
@@ -45,6 +81,7 @@ static void joinReceipt()
 
 int main()
 {
+  radioCycles();
   joinReceipt();
   WifiUserControl u;
   CHECK(u.allowed(u.read()));

@@ -104,10 +104,13 @@ struct WifiUserControl {
   }
   void stopped(uint32_t w) { __atomic_store_n(&applied, serial(w), __ATOMIC_RELEASE); }
   // Called after WLAN_EN is low and DMA is disabled. A concurrent new off
-  // remains pending if it arrived after this snapshot.
+  // remains pending. ON can change the flags of the same cycle.
   void radioOff(uint32_t w) {
-    uint32_t old = w;
-    (void)__atomic_compare_exchange_n(&word, &old, w & ~kCycle, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    uint32_t current = read();
+    do {
+      if (serial(current) != serial(w)) return;
+    } while (!__atomic_compare_exchange_n(&word, &current, current & ~kCycle, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
     stopped(w);
   }
 };
