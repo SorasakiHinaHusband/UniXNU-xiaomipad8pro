@@ -472,7 +472,7 @@ def shell_tests():
         spec.loader.exec_module(runner)
     finally:
         sys.dont_write_bytecode = saved
-    tests, _ = runner.collect(None)
+    tests, _ = runner.collect(None, runner.load_skips())
     return {Path(path) for kind, path, _ in tests if kind == 'sh'}
 
 
