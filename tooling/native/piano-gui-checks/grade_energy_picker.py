@@ -42,7 +42,7 @@ def power_preferences(text):
 
 
 def powermode(text):
-    value = one(text, r"^[ \t]*powermode\b([^\n]*)$").strip()
+    value = one(text, r"^[ \t]*powermode(?:[ \t]+([^\n]*))?$").strip()
     if value not in ("0", "1", "2"):
         raise ValueError("invalid powermode")
     return int(value)

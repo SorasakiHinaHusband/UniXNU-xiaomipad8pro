@@ -18,11 +18,12 @@ import run
 
 
 class MockTransport:
-    def __init__(self, source="ac", ac=2, battery=1, fault=None):
+    def __init__(self, source="ac", ac=2, battery=1, fault=None, profile_rule=2):
         self.source = source
         self.original = {"ac": ac, "battery": battery}
         self.prefs = self.original.copy()
         self.fault = fault
+        self.profile_rule = profile_rule
         self.t = 300_000_000
         self.host_time = 0
         self.calls = []
@@ -41,12 +42,12 @@ class MockTransport:
     def state(self):
         mode = self.prefs[self.source]
         low, high = int(mode == 1), int(mode == 2)
-        profile = (2, 1, 3)[mode]
+        profile = (2 if self.profile_rule == 2 else 0, 1, 3)[mode]
         written, cap, ext, bind = (342, 342, 3, "lpm") if low else (0, 832, 0, "skinband")
         power = "AC Power" if self.source == "ac" else "Battery Power"
         source = f"Now drawing from '{power}'"
         sample = {
-            "started_us": self.t - 10_000, "source": source, "source_after": source, "profile_rule": "2",
+            "started_us": self.t - 10_000, "source": source, "source_after": source, "profile_rule": str(self.profile_rule),
             "pmset": f"System-wide power settings:\nCurrently in use:\n powermode {mode}\n",
             "custom": f"Battery Power:\n powermode {self.prefs['battery']}\nAC Power:\n powermode {self.prefs['ac']}\n",
             "lpm": f"com.apple.system.lowpowermode {low}\n", "hpm": f"com.apple.system.highpowermode {high}\n",
@@ -68,6 +69,8 @@ class MockTransport:
             if self.fault in replacements:
                 key, value = replacements[self.fault]
                 sample[key] = value
+            if self.fault == "delayed" and self.t < self.pressed + 4_000_000:
+                sample["lpm"] = f"com.apple.system.lowpowermode {1 - low}\n"
         return sample
 
     def bash(self, command, op, token, *args, timeout):
@@ -98,6 +101,7 @@ class MockTransport:
             source, before, target = args
             assert source == self.source and before == self.prefs[source] and before != target
             self.attempts += 1
+            self.pressed = self.t - 50_000
             self.prefs[source] = target
             if self.fault == "other-pref-changed":
                 self.prefs["battery"] = (self.prefs["battery"] + 1) % 3
@@ -105,7 +109,9 @@ class MockTransport:
                 raise subprocess.TimeoutExpired(command, timeout)
             if self.fault == "signal":
                 signal.raise_signal(signal.SIGTERM)
-            r.update(source=source, before=before, target=target, pressed_us=self.t - 50_000, status=0, mode=target)
+            if self.fault == "hangup":
+                signal.raise_signal(signal.SIGHUP)
+            r.update(source=source, before=before, target=target, pressed_us=self.pressed, status=0, mode=target)
             if self.fault in ("press-refused", "restore-failed"):
                 r["status"] = -25206
         elif op == "energy-finish":
@@ -160,6 +166,10 @@ class PickerWorkflow(unittest.TestCase):
         self.assertEqual(fixture.attempts, 0)
         self.assertFalse(fixture.settings)
 
+    def test_delayed_propagation_with_the_default_thermal_rule(self):
+        fixture, _, _ = self.invoke("PASS", source="battery", fault="delayed", profile_rule=1)
+        self.assertGreater(fixture.host_time, 4)
+
     def test_propagation_mismatch_checks_every_layer(self):
         for fault, layer in (("wrong-notify", "powerd"), ("wrong-policy", "PianoPolicy"),
                              ("wrong-thermal", "PianoThermal"), ("wrong-gpu", "PianoA830"),
@@ -171,7 +181,8 @@ class PickerWorkflow(unittest.TestCase):
                 self.assertEqual(fixture.prefs, fixture.original)
 
     def test_action_error_signal_and_timeout_all_restore(self):
-        for fault, status in (("lost-arm", "VOID"), ("lost-action", "VOID"), ("signal", "VOID"), ("press-refused", "FAIL")):
+        for fault, status in (("lost-arm", "VOID"), ("lost-action", "VOID"), ("signal", "VOID"),
+                              ("hangup", "VOID"), ("press-refused", "FAIL")):
             with self.subTest(fault=fault):
                 fixture, _, _ = self.invoke(status, fault=fault)
                 self.assertEqual(fixture.prefs, fixture.original)

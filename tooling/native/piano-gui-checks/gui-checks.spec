@@ -51,6 +51,7 @@ gui_checks_installed() (
         local rc=$? reply cleanup_timeout=45
         trap - EXIT
         trap '' INT TERM
+        if [[ $checks == energy-picker ]]; then trap '' HUP; fi
         set +e
         if [[ -n "$GUI_REMOTE" ]]; then
             # session.sh is published only after both root copies pass verification.
@@ -108,6 +109,7 @@ gui_checks_installed() (
     trap gui_checks_cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [[ $checks == energy-picker ]]; then trap 'exit 129' HUP; fi
     upload=/private/var/tmp/piano-gui.$token
     receipt=$(rssh "/bin/mkdir -m 700 $upload && echo GUI_STAGING_READY" </dev/null 2>&1) || receipt=
     if ! grep -Fqx GUI_STAGING_READY <<< "$receipt"; then

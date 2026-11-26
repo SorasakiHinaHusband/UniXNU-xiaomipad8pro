@@ -85,8 +85,9 @@ def check(bash, parse_reply, verdict, path):
     except KeyboardInterrupt:
         capture["interrupted"] = True
     finally:
-        # A second INT/TERM must not interrupt closing Settings and restoring preferences.
-        handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+        # Repeated signals must not interrupt closing Settings and restoring preferences.
+        handlers = {sig: signal.signal(sig, signal.SIG_IGN)
+                    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         try:
             if "arm" in capture:
                 capture["finish"] = exchange("energy-finish")

@@ -1,4 +1,4 @@
-# Installed Wi-Fi and brightness GUI checks
+# Installed GUI checks
 
 Build the arm64 probe on the Mac that owns the tablet's USB and C920 connections.
 
@@ -26,6 +26,30 @@ verify_action() {
 ```
 
 Use a visible, previously saved Wi-Fi test network with DHCP and auto-join enabled. Keep the local UTF-8 fixture file outside the repository. It accepts one SSID line or a single `ssid=` entry. The Wi-Fi phase sends only the SSID on stdin to a mode-0600 file in the tablet's staging directory. It saves scalar receipts through the redactor. The fragment uses C920 stills only during brightness checks because Wi-Fi images could show network names. The desktop account must match the harness USB SSH account, and the tablet must use installed Data (`data-persist=2`).
+
+## Battery Energy Mode picker
+
+For a dedicated installed observation on v13.1y12q, register `verify gui-energy-picker` through the same harness action and desktop gates. Add this case to `verify_action`.
+
+```bash
+gui-energy-picker) gui_checks_installed energy-picker ;;
+```
+
+Use an unlocked English-language desktop and keep the power source steady. The opt-in action uses the same native build, staging checks and Accessibility probe. It needs neither Wi-Fi fixtures nor camera evidence.
+
+The check reads the active `pmset -g` mode, both preferences from `pmset -g custom` and the original powerd and driver state. It opens System Settings directly to Battery. It finds the pop-up for the active power source and uses AX presses on the named menu items. The cycle visits Low Power, Automatic and High Power, starting after the initial mode so each selection proves an actual change.
+
+Each selection must read back in AX and propagate within 15 seconds to `pmset`, both `notifyutil` states, both `machdep.piano_policy_*` flags, the PianoThermal profile in `machdep.piano_cpufreq_state` and the PianoA830 ceiling in `machdep.piano_gpu_state`. PianoPolicy's written ceiling and fresh GPU state confirm the 342 MHz Low Power limit and its release. The inactive power source's preference must stay at its original value. For Automatic, PianoThermal must report profile 0 for the default policy rule or profile 2 for `piano-policy-profile=2`.
+
+The session journals both original preferences before opening Settings. On success, error or INT/TERM/HUP it quits Settings normally, restores either changed preference with source-specific `pmset` writes and verifies both preferences. The runner then reads back the full chain with a fresh driver sample. The harness exit handler retries cleanup under the same lock as the AX operations and retains the recovery journal if it cannot confirm cleanup.
+
+The private capture is `gui-checks/energy-picker.json` under the harness results directory. When the picker or menu is missing or ambiguous, the receipt includes a bounded AX hierarchy with roles, labels and identifiers. Those labels can contain desktop account details. The pure-Python grader can replay the capture offline.
+
+```sh
+python3 tooling/native/piano-gui-checks/grade_energy_picker.py "$R/gui-checks/energy-picker.json"
+```
+
+**PASS** (0) requires three genuine selections and verified cleanup. **FAIL** (1) means usable evidence shows a wrong selection, propagation mismatch or cleanup failure. **VOID** (2) means the action or its evidence could not establish a result, such as a missing picker, stale sample or empty capture. The host tests build the native helper and exercise the harness with mocked transport and AX receipts. A desktop run is still needed to validate the live Battery AX hierarchy and the installed picker.
 
 ## Results
 

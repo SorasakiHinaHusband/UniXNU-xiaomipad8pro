@@ -297,6 +297,17 @@ class NativeParser(unittest.TestCase):
         cls.binary = Path(scratch.name) / "gui"
         subprocess.run(["/bin/bash", FIXTURES.parent / "build.sh", cls.binary], check=True)
 
+    def test_energy_finish_receipt(self):
+        token = "0" * 32
+        result = subprocess.run([self.binary, "energy-finish", token, "true", "false"],
+                                text=True, capture_output=True, check=True)
+        receipt = run.parse_reply(result.stdout)
+        self.assertEqual(receipt["token"], token)
+        self.assertEqual(receipt["op"], "energy-finish")
+        self.assertIs(receipt["closed"], True)
+        self.assertIs(receipt["restored"], False)
+        self.assertGreater(receipt["t_us"], 0)
+
     def test_ipconfig_lease_fixture(self):
         packet = (FIXTURES / "dhcp-ack.txt").read_text()
         with tempfile.TemporaryDirectory() as d:

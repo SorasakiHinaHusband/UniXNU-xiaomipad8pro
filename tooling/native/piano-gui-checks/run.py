@@ -392,7 +392,11 @@ def main(phase):
     signal.signal(signal.SIGTERM, interrupted)
     if phase == "energy-picker":
         from energy_picker import check
-        return check(bash, parse_reply, verdict, Path(env("GUI_RESULTS")) / "energy-picker.json")
+        old_hup = signal.signal(signal.SIGHUP, interrupted)
+        try:
+            return check(bash, parse_reply, verdict, Path(env("GUI_RESULTS")) / "energy-picker.json")
+        finally:
+            signal.signal(signal.SIGHUP, old_hup)
     if phase == "ax-trust":
         try:
             prepare_ax()
