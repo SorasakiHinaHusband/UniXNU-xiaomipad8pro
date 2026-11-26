@@ -46,7 +46,9 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 - **Audio and video.** [Audio duplex and input wake](audio-duplex.md), [VideoToolbox cancellation analysis](video-hevc-cancel.md),
   [Iris hardware encode static analysis](video-encode.md) (B10, fix-image gate HOLD) and
   [Iris E1 encode self-test integration](video-encode-e1.md).
-- **Networking.** [Wi-Fi menu](wifi-menu.md), [Wi-Fi toggle and rejoin](wifi-toggle-rejoin.md) and [USB debug network TX flow control](usb-net-reset.md).
+- **Networking and USB.** [Wi-Fi menu](wifi-menu.md), [Wi-Fi toggle and rejoin](wifi-toggle-rejoin.md),
+  [WCN7860 Wi-Fi / Bluetooth coexistence](wifi-bt-coex.md), [USB debug network TX flow control](usb-net-reset.md)
+  and [USB host2 integration and Phase U qualification](usb-host2-qualification.md).
 - **Sensors and power.** [Auto-rotate](auto-rotate.md), [charging over the buck path](charging-buck-session.md),
   [Android-reference brightness and CPU ceiling](android-reference-controls.md) and [PMK8550 power-on history](pon-history.md).
 
