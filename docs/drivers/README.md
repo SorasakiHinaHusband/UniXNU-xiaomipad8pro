@@ -50,8 +50,10 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 - **Storage and memory.** [Data concurrency and durability](data-store-m4-m5.md), [APFS write-back eligibility](m5-apfs.md),
   [RAM16G GPU memory](ram-extra.md), [GPU tier workload and crash analysis](ram16g-tier-crash.md) and [RAM16G ownership proof](ram16g-owners.md).
 - **Audio and video.** [Audio duplex and input wake](audio-duplex.md), [VideoToolbox cancellation analysis](video-hevc-cancel.md),
-  [Iris hardware encode static analysis](video-encode.md) (B10, fix-image gate HOLD) and
-  [Iris E1 encode self-test integration](video-encode-e1.md).
+  [Iris hardware encode static analysis](video-encode.md) (historical B10 fix-image gate),
+  [Iris E1 encode self-test integration](video-encode-e1.md) and
+  [E1 720p/1080p scaling and Apple 27.3 E2 contract analysis](video-encode-e2-analysis.md)
+  (E1 30 fps RAM observe ready; E2 implementation image HOLD).
 - **Networking and USB.** [Wi-Fi menu](wifi-menu.md), [Wi-Fi toggle and rejoin](wifi-toggle-rejoin.md),
   [WCN7860 Wi-Fi / Bluetooth coexistence](wifi-bt-coex.md), [USB debug network TX flow control](usb-net-reset.md)
   and [USB host2 integration and Phase U qualification](usb-host2-qualification.md).

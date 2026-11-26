@@ -1,10 +1,18 @@
 # PianoVideo E1 integration
 
 RAM `v131y12u-e1fix1` (2026-11-27) recorded the first real-hardware Iris VPU 3.5
-H.264 encode PASS for the opt-in E1 kernel self-test. The preceding tablet
-capture, `v131y12u-m5obs1`, failed at stage 5 when START(BITSTREAM=1) returned
-a session error. The retest verified all five `b10-e1-stage5-fix` conformance
-gates from the [stage-5 analysis](#stage-5-static-analysis).
+H.264 encode PASS for the opt-in E1 kernel self-test (105/0, `rc=0`, 640×480
+10/10 frames, PSNR-Y min 51.2 / avg 51.6 dB, 314 ms, 22,439 bytes, followed by
+13/13 AVC decode on the same resident core). RAM `v131y12u-e1-1080p` (2026-11-27)
+then passed Full-HD 1920×1080@30 (113/0, `rc=0`, 14 entries 56,180,736 B, `VPSS 0`,
+10/10 frames, PSNR-Y min 41.0 / avg 44.3 dB, 358 ms, 88,882 bytes, followed by
+13/13 AVC decode on the same resident core). The preceding tablet capture,
+`v131y12u-m5obs1`, failed at stage 5 when START(BITSTREAM=1) returned a session
+error; the retest verified all five `b10-e1-stage5-fix` conformance gates from
+the [stage-5 analysis](#stage-5-static-analysis). See the
+[720p/1080p scaling and Apple 27.3 E2 contract analysis](video-encode-e2-analysis.md)
+for the next gate: E2 VideoToolbox encoder registration remains HOLD and daily
+installed `v13.1y12q` keeps `piano-video-enc=0` and `encs=0`.
 
 - E1 starts only with one literal `piano-video-enc=1` token, level 6 and a successful boot reservation. It waits for the decoder's exclusive lease and reuses the arena with its current backing. On firmware system error, watchdog or SMMU fault, the worker stops issuing HFI commands and quarantines the core with its DMA backing held for the rest of the boot.
 - AVC and HEVC continue to use the existing decode path, VT inventory and borrow policy. The RAM16G reservation and XNU fallback still serve decode. See the [driver guide](video.md#18-e1-bounded-native-h264-encode-self-test).
