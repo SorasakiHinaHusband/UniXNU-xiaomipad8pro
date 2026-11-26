@@ -1540,12 +1540,12 @@ def gpt_step(s):
         now_head = s.region_sha(lun0, 0, 6)
         now_tail = s.region_sha(lun0, TAIL_LBA, 5)
         already_written = (now_head, now_tail) == (head, tail)
-        if already_written and s.state.get('gpt_state') == 'new':
-            s.log('  info  the GPT is already the new one')
-            return
         s.need(already_written or (now_head == common.GPT_PRIMARY_SHA256 and now_tail in (common.GPT_BACKUP_SHA256, tail)),
                'live GPT is the known original, the complete update, or the original primary with the new backup copy')
-        validate_gpt_update(s, head, tail)
+        if not already_written or s.state.get('gpt_state') != 'new':
+            validate_gpt_update(s, head, tail)
+        if already_written:
+            s.log('  info  both GPT copies already match the update; verifying the partition map')
     else:
         s.require_backup('lun0-gpt-primary')
         s.require_backup('lun0-gpt-backup')

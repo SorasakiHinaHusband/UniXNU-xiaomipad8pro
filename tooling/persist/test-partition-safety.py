@@ -154,13 +154,14 @@ class PartitionSafety(unittest.TestCase):
         self.s.save.assert_not_called()
 
     def test_gpt_resumes_checks_after_both_copies_were_written(self):
-        self.s.state['gpt_state'] = 'old'
+        self.s.state['gpt_state'] = 'new'  # A separate map can already have recorded both on-disk hashes.
         self.s.region_sha.side_effect = [sha(self.head), sha(self.tail)]
         self.s.shell = Mock(return_value='No problems found')
         mapped = {'lun0_block_size': str(B), 'lun0_bytes': str(maint.LUN0_BYTES), 'mounted': '0',
                   'linux_rootfs': f'fixture-root {common.ROOTFS_FIRST * 8} {(common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1) * 8}',
                   'esp': f'fixture-esp {common.ESP_FIRST * 8} {common.ESP_BLOCKS * 8}'}
-        with patch.object(maint, 'map_nodes', return_value=mapped):
+        stale_map = dict(mapped, esp='none')
+        with patch.object(maint, 'map_nodes', side_effect=[stale_map, mapped]):
             maint.gpt_step(self.s)
         self.s.fetch.assert_not_called()
         self.s.t.assert_called_once_with('rereadpt', 'fixture-disk')
