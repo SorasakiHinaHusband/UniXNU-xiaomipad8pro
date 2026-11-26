@@ -248,7 +248,7 @@ struct NvmInfo {
   size_t addressAt = 0;   // offset of the default address's six bytes in the file (little endian, as Read BD_ADDR returns it)
 };
 // Patches the tags in place. ibs / deepSleep: 1 set the bit (what Linux always does), 0 clear it, -1 leave the file's value. The
-// baud code is the speed the host will run at (Linux writes it unconditionally). Bounds as btqca's qca_tlv_check_data.
+// baud code is the speed the host will run at (Linux writes it unconditionally). The tag layout follows btqca's qca_tlv_check_data.
 inline NvmInfo patchNvm(uint8_t *f, size_t n, uint8_t baud, int ibs, int deepSleep)
 {
   NvmInfo r;
