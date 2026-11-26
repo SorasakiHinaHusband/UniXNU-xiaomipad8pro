@@ -32,6 +32,12 @@ accepts from an administrator only); from other drivers: `PianoTorchSet` / `Pian
 | `FlashHw.h` | the facts, each with its source; the current/ITARGET/clamp arithmetic |
 | `PianoTorchClient.h` | the names other code uses (properties, platform functions) |
 | `tests/torch_host.cpp` | host tests against an SPMI arbiter v7 model |
+| `tests/torch_safety_bounds_host.cpp` | ASan/UBSan checks for the total current ceiling, deadlines, fault cutoffs and teardown readback |
+
+Run both host suites with `python3 scripts/ci/self-tests.py --only package/PianoTorch/tests/`. The B12 suite exercises the
+portable controller and guard. Its PMIC model simulates the diagnostic FLASH hardware timer. Ordinary torch mode uses the
+software deadline. Display-only suspend and client disconnect are host-model events. **HOLD** applies to any increase above
+100 mA total, which requires the owner's decision.
 
 Build: `tooling/k27/build-native-piano-torch.sh` (host tests, a store check of the portable headers, the user-space tool on a
 Mac, the objects, the import check). PianoTorch is in `configs/k27-native-kexts.txt` and inert without `piano-torch`. It
