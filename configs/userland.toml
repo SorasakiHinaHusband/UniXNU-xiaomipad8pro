@@ -406,7 +406,7 @@ default_on = true
 [[unit.file]]
 source = "tooling/native/piano-brightness-sync/piano-brightness-sync.m"
 build = "cc"
-inputs = ["package/include/PianoBootArgs.h"]
+inputs = ["package/include/PianoBootArgs.h", "tooling/native/piano-brightness-sync/SyncPolicy.h"]
 arch = "arm64"
 cflags = ["-fobjc-arc"]
 frameworks = ["Foundation", "IOKit"]
