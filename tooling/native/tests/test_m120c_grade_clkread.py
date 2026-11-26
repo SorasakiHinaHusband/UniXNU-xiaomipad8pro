@@ -68,6 +68,24 @@ class ClkreadGradeTest(unittest.TestCase):
         result = self.grade(["arm", "120"], [sample(1, 2128), sample(2, 2128)], 1)
         self.assertEqual(result["CLKREAD_MODE"], "FAIL")
 
+    def test_opp_tolerance_boundaries(self):
+        start = sample(1, 2554)
+        for hz, expected in ((574_999_000, 0), (575_001_000, 0), (574_998_999, 1), (575_001_001, 1)):
+            with self.subTest(hz=hz):
+                result = self.grade(["arm", "144"], [start, sample(2, 2554, mdp=hz)], expected)
+                self.assertEqual(result["CLKREAD_MDP"], "FAIL" if expected else "PASS")
+
+    def test_bcm_response_limits(self):
+        start = sample(1, 2554)
+        after = sample(2, 2554)
+        for bad in (after.replace("raw=227e90a1", "raw=ffffffff"),
+                    after.replace("x=2554", "x=16384"),
+                    after.replace("unit=1000000", "unit=0"),
+                    after.replace("width=32", "width=0")):
+            self.assertNotEqual(bad, after)
+            result = self.grade(["arm", "144"], [start, bad], 1)
+            self.assertEqual(result["CLKREAD_MM0"], "FAIL")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,15 @@ class GradeTest(unittest.TestCase):
         self.assertEqual(legacy["pipe_reports"][2]["delta"]["fallback"], 1)
         self.assertIsNone(legacy["notifications"][1]["delta"])
 
+    def test_wrapped_rollups_start_a_new_baseline(self):
+        top = grade.UINT64_MAX
+        lines = [pipe_line(captured=top), pipe_line(captured=0), pipe_line(captured=1)]
+        result = grade.analyze(lines)
+        reports = result["legacy"]["pipe_reports"]
+        self.assertIsNone(reports[1]["delta"])
+        self.assertEqual(reports[2]["delta"]["captured"], 1)
+        self.assertEqual(result["fix_image"], "HOLD")
+
     def test_every_pipe_bucket(self):
         cases = {
             "unobserved": {"take": 0},
@@ -152,6 +161,15 @@ class GradeTest(unittest.TestCase):
         self.assertNotIn("discard this", json.dumps(result))
         result = grade.analyze(map(json.dumps, [valid, pipe(42), flush(), irq()]), details=True)
         self.assertIsNone(result["raw"]["records"]["flush"][0]["swap"])
+
+    def test_unsigned_record_boundaries(self):
+        for invalid in (-1, 1 << 32, float("nan"), True):
+            with self.subTest(invalid=invalid):
+                rows = [irq(before2=invalid), irq(ticks=grade.UINT64_MAX)]
+                result = grade.analyze(map(json.dumps, rows))
+                self.assertEqual(result["malformed_lines"], [1])
+                self.assertEqual(result["raw"]["physical"]["irq_rows"], 1)
+                self.assertEqual(result["fix_image"], "HOLD")
 
     def test_cli(self):
         script = Path(__file__).with_name("grade.py")

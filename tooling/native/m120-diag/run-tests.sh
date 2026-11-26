@@ -11,7 +11,7 @@ flags=(-std=c++17 -Wall -Wextra -Werror)
 "$scratch/plain"
 echo "m120 diagnostics C++ plain passed"
 
-"$compiler" "${flags[@]}" -fsanitize=address,undefined -fno-sanitize-recover=all \
+"$compiler" "${flags[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
     -fno-omit-frame-pointer "$dir/diagnostics_test.cpp" -o "$scratch/sanitized"
 "$scratch/sanitized"
 echo "m120 diagnostics C++ ASan/UBSan passed"

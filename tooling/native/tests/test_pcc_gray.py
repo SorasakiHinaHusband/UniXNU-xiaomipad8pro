@@ -58,6 +58,14 @@ class PccGrayTests(unittest.TestCase):
             self.assertAlmostEqual(g, .370, delta=.001)
             self.assertAlmostEqual(b, .059, delta=.001)
 
+    def test_word_limits_and_reserved_bits(self):
+        rows = grader.responses(snapshot("fffc8000 20000 00000 | 00000 1ffff 3ffff | 00000 00000 00000"))
+        for _, gray, enabled in rows:
+            self.assertTrue(enabled)
+            self.assertEqual(gray, [1, -1 / 32768, -1 / 32768])
+        identity = snapshot("08000 00000 00000 | 00000 08000 00000 | 00000 00000 08000")
+        self.assertEqual(self.run_cli(identity, "off").returncode, 0)
+
     def test_channel_order_and_red_floor(self):
         for gray in ([.8, .5, .05], [1, .2, .3], [.9, 1, .1], [1, 0, -.1]):
             # Negative B satisfies the requested ordering; this isn't an
@@ -82,7 +90,8 @@ class PccGrayTests(unittest.TestCase):
         self.assertEqual(self.run_cli(text, "warm").returncode, 1)
 
     def test_incomplete_or_malformed_is_invalid(self):
-        for text in ("", snapshot(CAPTURES["warm"]).splitlines()[0], snapshot("08000 00000")):
+        for text in ("", snapshot(CAPTURES["warm"]).splitlines()[0], snapshot("08000 00000"),
+                     snapshot("nan 0 0 | 0 8000 0 | 0 0 8000")):
             with self.subTest(text=text):
                 self.assertEqual(self.run_cli(text, "off").returncode, 2)
 
