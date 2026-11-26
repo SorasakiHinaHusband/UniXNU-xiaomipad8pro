@@ -2,7 +2,9 @@
 
 Analysis companion to [ram16g-plan2](ram16g-plan2.md). **CMA, lower DXE and FD currently contribute 0 proved MiB.** A successful EFI map describes firmware allocation types; it does not certify secure-world permissions, Gunyah memory-parcel ownership, or the last DMA reference. The m120c-120 map must be joined with those independent receipts before a slab is admitted.
 
-This lane changes documentation only. No tablet access, image build, memory-map change, SCM call or push is authorized here. Future behavior must remain behind a default-off boot argument.
+This lane changes documentation and host-only audit tooling. No tablet access, image build, memory-map change, SCM call or push is authorized here. Future behavior must remain behind a default-off boot argument.
+
+The actual **m120c-120** capture (2026-11-26) records a complete 112-descriptor map: CMA 128 non-runtime slabs, lower DXE 184 non-runtime + 2 runtime slabs, FD 7 non-runtime + 1 runtime slab. The runtime slabs start at `0xd3c00000`, `0xd3e00000` and `0xa7600000`; all three stay excluded. The 319 non-runtime slabs are map observations only: **0 MiB released**, with secure-world, Gunyah and complete inherited DMA/CPU lifetimes still unproved. The detailed reconciliation below distinguishes these native receipts from the historical A/D placements.
 
 ## Reference scope
 
