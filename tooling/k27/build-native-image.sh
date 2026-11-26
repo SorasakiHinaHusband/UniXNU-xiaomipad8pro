@@ -61,7 +61,7 @@ for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
   case $k in PianoUsbHostStack|PianoUsbHostStackA2) continue ;; esac   # codeless (a plist entry only): nothing to build
   case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoIR) b=piano-ir ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; PianoXhciHost) b=piano-xhcihost ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
-  tooling/k27/build-native-"$b".sh > "out/k27/build-native-$b.log" 2>&1 || { tail -20 "out/k27/build-native-$b.log" >&2; exit 1; }
+  tooling/k27/build-native-$b.sh > "out/k27/build-native-$b.log" 2>&1 || { tail -20 "out/k27/build-native-$b.log" >&2; exit 1; }
 done
 # PIANO_STOP_AFTER=kexts: the kexts' objects only (out/native-kexts; CI's tooling/ci/build-kexts.sh), no collection, ADT or image.
 if [ "${PIANO_STOP_AFTER:-}" = kexts ]; then echo "kexts built (out/native-kexts), PIANO_STOP_AFTER=kexts"; exit 0; fi
@@ -179,21 +179,11 @@ fi
 fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext
-# shellcheck disable=SC2086  # LIST is a whitespace-separated name list, with globbing disabled.
-python3 - "$D/out" $LIST <<'PY'
-import json
-import sys
-from pathlib import Path
-
-out, *names = sys.argv[1:]
-root = json.dumps(out)[1:-1]
-for name in names:
-    src = Path('tooling/k27/kext') / f'{name}.json'
-    dest = Path(out) / 'k27/kext' / src.name
-    dest.write_text(src.read_text(encoding='utf-8').replace('@OUT@', root), encoding='utf-8')
-PY
+# Escape the path for a JSON string, then for the sed replacement.
+OUT_JSON=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1])[1:-1])' "$D/out")
+OUT_SED=$(printf '%s' "$OUT_JSON" | sed 's/[\\&#]/\\&/g')
 DESCRIPTORS=()
-for k in $LIST; do DESCRIPTORS+=("$D/out/k27/kext/$k.json"); done
+for k in $LIST; do sed "s#@OUT@#$OUT_SED#g" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; DESCRIPTORS+=("$D/out/k27/kext/$k.json"); done
 # When an explicit USB host profile owns the shared consumer libraries, retain
 # its original personalities and gate checks. Bluetooth owns only its Family.
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
