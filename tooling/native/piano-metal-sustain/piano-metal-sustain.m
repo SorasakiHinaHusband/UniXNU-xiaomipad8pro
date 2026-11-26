@@ -42,14 +42,17 @@ typedef struct { unsigned seconds, width, height, draws; bool onscreen; } Option
 @interface Capture : NSObject {
 @public
     atomic_bool commandError;
+    atomic_uint_fast64_t lastCompletionMs;
 }
 @end
 
 @implementation Capture
 - (instancetype)init
 {
-    if ((self = [super init]))
+    if ((self = [super init])) {
         atomic_init(&commandError, false);
+        atomic_init(&lastCompletionMs, 0);
+    }
     return self;
 }
 @end
@@ -208,9 +211,12 @@ static size_t report_window(WindowSamples *window, unsigned index, double second
     double *gpu = completion + capacity, *gpuEnd = gpu + capacity, *present = gpuEnd + capacity;
     size_t completed = 0, errors = 0, presentCallbacks = 0, gpuCount = 0, presents = 0;
     size_t cpuDuplicates = 0, completionDuplicates = 0, gpuDuplicates = 0, presentDuplicates = 0;
+    size_t i = 0;
     for (Frame *f in window.frames) {
         const bool done = atomic_load_explicit(&f->completed, memory_order_acquire);
         const bool reported = atomic_load_explicit(&f->presentReported, memory_order_acquire);
+        cpu[i] = f->submit;
+        encode[i++] = (f->submit - f->encodeBegin) * 1000;
         printf("%zu,%u,", f->sequence, index);
         csv_time(f->begin);
         csv_time(f->encodeBegin);
@@ -235,12 +241,6 @@ static size_t report_window(WindowSamples *window, unsigned index, double second
             if (timestamp(f->present))
                 present[presents++] = f->present;
         }
-    }
-    // CPU data belongs to the submitting thread and is available even for an unfinished command.
-    size_t i = 0;
-    for (Frame *f in window.frames) {
-        cpu[i] = f->submit;
-        encode[i++] = (f->submit - f->encodeBegin) * 1000;
     }
     const size_t cpuIntervals = intervals(cpu, count, &previous->submit, &cpuDuplicates);
     const size_t completionIntervals = intervals(completion, completed, &previous->completion, &completionDuplicates);
@@ -286,6 +286,25 @@ static int failure(const char *reason)
     return 1;
 }
 
+// Slot and drawable deadlines cover calls that return. Keep a separate deadline for stalled Metal calls.
+static dispatch_source_t completion_watchdog(Capture *capture)
+{
+    dispatch_source_t watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    atomic_store(&capture->lastCompletionMs, (uint64_t)(CACurrentMediaTime() * 1000));
+    dispatch_source_set_timer(watchdog, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(watchdog, ^{
+        const uint64_t last = atomic_load(&capture->lastCompletionMs);
+        if (CACurrentMediaTime() * 1000 - last > 15000) {
+            static const char message[] = "METAL_SUSTAIN_ERROR no command completed for 15 seconds\n";
+            (void)write(STDERR_FILENO, message, sizeof message - 1);
+            _Exit(1);
+        }
+    });
+    dispatch_activate(watchdog);
+    return watchdog;
+}
+
 static int benchmark(Options options, id<MTLDevice> device, CAMetalLayer *layer)
 {
     NSError *setup = nil;
@@ -312,6 +331,7 @@ static int benchmark(Options options, id<MTLDevice> device, CAMetalLayer *layer)
     id activity = [NSProcessInfo.processInfo beginActivityWithOptions:activityOptions reason:@"Metal sustained 3D measurement"];
     dispatch_semaphore_t slots = dispatch_semaphore_create(queueDepth);
     Capture *capture = [Capture new];
+    dispatch_source_t watchdog = completion_watchdog(capture);
     NSMutableDictionary<NSNumber *, WindowSamples *> *windows = [NSMutableDictionary dictionary];
     Previous previous = {0};
     uint64_t latestState = 0;
@@ -376,8 +396,14 @@ static int benchmark(Options options, id<MTLDevice> device, CAMetalLayer *layer)
             frame->sequence = ++sequence;
             frame->begin = begin;
             frame->encodeBegin = CACurrentMediaTime();
+            id<MTLTexture> color = layer ? drawable.texture : offscreen;
+            if (color.width != options.width || color.height != options.height) {
+                dispatch_semaphore_signal(slots);
+                rc = failure("render target dimensions differ from the requested drawable size");
+                break;
+            }
             id<MTLCommandBuffer> command = [queue commandBuffer];
-            if (!command || ![scene encode:command color:layer ? drawable.texture : offscreen time:begin - warmup]) {
+            if (!command || ![scene encode:command color:color time:begin - warmup]) {
                 dispatch_semaphore_signal(slots);
                 rc = failure("could not encode the 3D render pass");
                 break;
@@ -392,6 +418,7 @@ static int benchmark(Options options, id<MTLDevice> device, CAMetalLayer *layer)
                 [command presentDrawable:drawable];
             [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                 frame->completion = CACurrentMediaTime();
+                atomic_store(&capture->lastCompletionMs, (uint64_t)(frame->completion * 1000));
                 frame->status = completed.status;
                 frame->gpuStart = completed.GPUStartTime;
                 frame->gpuEnd = completed.GPUEndTime;
@@ -441,6 +468,7 @@ static int benchmark(Options options, id<MTLDevice> device, CAMetalLayer *layer)
             ++nextReport;
         }
     }
+    dispatch_source_cancel(watchdog);
     [NSProcessInfo.processInfo endActivity:activity];
     if (!rc && (unfinished || atomic_load(&capture->commandError) || !previous.completion || measured < options.seconds))
         rc = 1;
