@@ -405,17 +405,22 @@ def prepare_ax():
 
 
 def main(phase):
-    # Let both protocol finally blocks run on TERM as well as Ctrl-C.
+    # Run the phase's recovery on session loss as well as an explicit stop.
     def interrupted(signum, _frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, interrupted)
+    old_term = signal.signal(signal.SIGTERM, interrupted)
+    old_hup = signal.signal(signal.SIGHUP, interrupted)
+    try:
+        return run_phase(phase)
+    finally:
+        signal.signal(signal.SIGHUP, old_hup)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+def run_phase(phase):
     if phase == "energy-picker":
         from energy_picker import check
-        old_hup = signal.signal(signal.SIGHUP, interrupted)
-        try:
-            return check(bash, parse_reply, verdict, Path(env("GUI_RESULTS")) / "energy-picker.json")
-        finally:
-            signal.signal(signal.SIGHUP, old_hup)
+        return check(bash, parse_reply, verdict, Path(env("GUI_RESULTS")) / "energy-picker.json")
     if phase == "ax-trust":
         try:
             prepare_ax()

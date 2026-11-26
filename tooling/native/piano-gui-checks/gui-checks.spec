@@ -48,10 +48,9 @@ gui_checks_installed() (
 
     # shellcheck disable=SC2329
     gui_checks_cleanup() {
-        local rc=$? reply cleanup_timeout=45
+        local rc=${1:-$?} reply cleanup_timeout=45
         trap - EXIT
-        trap '' INT TERM
-        if [[ $checks == energy-picker ]]; then trap '' HUP; fi
+        trap '' HUP INT TERM
         set +e
         if [[ -n "$GUI_REMOTE" ]]; then
             # session.sh is published only after both root copies pass verification.
@@ -107,9 +106,9 @@ gui_checks_installed() (
     token=$(/usr/bin/uuidgen | tr -d '-') || return 2
     [[ "$token" =~ ^[[:xdigit:]]{32}$ ]] || return 2
     trap gui_checks_cleanup EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if [[ $checks == energy-picker ]]; then trap 'exit 129' HUP; fi
+    trap 'gui_checks_cleanup 130' INT
+    trap 'gui_checks_cleanup 143' TERM
+    trap 'gui_checks_cleanup 129' HUP
     upload=/private/var/tmp/piano-gui.$token
     receipt=$(rssh "/bin/mkdir -m 700 $upload && echo GUI_STAGING_READY" </dev/null 2>&1) || receipt=
     if ! grep -Fqx GUI_STAGING_READY <<< "$receipt"; then

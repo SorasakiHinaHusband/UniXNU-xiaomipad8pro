@@ -121,6 +121,32 @@ class WorkflowReceipts(unittest.TestCase):
             with self.assertRaisesRegex(run.CheckError, "^wifi-menu: action failed or receipt missing$"):
                 run.remote("wifi-menu")
 
+    def test_wifi_power_is_restored_on_hangup(self):
+        driver = '''
+import signal
+import run
+
+def remote(op, **kwargs):
+    if op == "wifi-off":
+        signal.raise_signal(signal.SIGHUP)
+    if op == "wifi-on":
+        print("restored Wi-Fi power", flush=True)
+    return {}
+
+run.wifi_check = run.wifi_toggle
+run.remote = remote
+run.wifi_state = lambda label: {"power": False}
+run.wait_wifi = lambda *args: [(0, {"power": True})]
+try:
+    run.main("wifi")
+except KeyboardInterrupt:
+    raise SystemExit(129)
+'''
+        result = subprocess.run([sys.executable, '-c', driver], cwd=FIXTURES.parent,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.stdout, 'restored Wi-Fi power\n', result.stderr)
+        self.assertEqual(result.returncode, 129)
+
     def test_hid_drag_keeps_button_held_during_move(self):
         geometry = {"x": 100, "y": 30, "width": 220, "height": 20, "slider": .30}
         history = []
@@ -212,7 +238,12 @@ class InstalledSpec(unittest.TestCase):
             event "phase:$2"
             case "$2" in
                 ax-trust) command python3 "$@" ;;
-                wifi) [[ "$MOCK_CASE" != wifi-failure ]] ;;
+                wifi)
+                    case "$MOCK_CASE" in
+                        wifi-hangup) command python3 -c 'import os, signal; os.kill(os.getppid(), signal.SIGHUP)' ;;
+                        wifi-terminated) command python3 -c 'import os, signal; os.kill(os.getppid(), signal.SIGTERM)' ;;
+                    esac
+                    [[ "$MOCK_CASE" != wifi-failure ]] ;;
                 brightness-ax|brightness-hid) ;;
                 energy-picker) [[ "$MOCK_CASE" != energy-void ]] || return 2 ;;
                 *) return 99 ;;
@@ -265,6 +296,11 @@ class InstalledSpec(unittest.TestCase):
 
     def test_wifi_failure_still_runs_both_brightness_phases_and_cleanup(self):
         self.invoke("wifi-failure", 1, self.staging + self.phases + self.cleanup)
+
+    def test_wifi_interruption_cleans_the_temporary_session(self):
+        for scenario, status in (("wifi-hangup", 129), ("wifi-terminated", 143)):
+            with self.subTest(scenario=scenario):
+                self.invoke(scenario, status, self.staging + self.phases[:-2] + self.cleanup)
 
     def test_failed_remote_cleanup_still_attempts_staging_cleanup(self):
         verdicts = self.invoke("cleanup-lost", 2, self.staging + self.phases + self.cleanup)
