@@ -99,6 +99,11 @@ inline bool allLanesHaveStatus(const uint8_t (&status)[6], unsigned lanes, unsig
   return true;
 }
 
+inline bool linkEqualized(const uint8_t (&status)[6], unsigned lanes)
+{
+  return (status[2] & kAlignDone) && allLanesHaveStatus(status, lanes, kEqDone);
+}
+
 template <typename Io>
 struct TrainAttempt {
   Io &io;
@@ -147,8 +152,7 @@ struct TrainAttempt {
       const bool crDone = allLanesHaveStatus(status, result.link.lanes, kCrDone);
       if (cr && crDone) return DpTrainStatus::Trained;
       if (!cr && !crDone) return DpTrainStatus::ClockRecoveryFailed;
-      if (!cr && (status[2] & kAlignDone) && allLanesHaveStatus(status, result.link.lanes, kEqDone))
-        return DpTrainStatus::Trained;
+      if (!cr && linkEqualized(status, result.link.lanes)) return DpTrainStatus::Trained;
 
       // As on piano's reference path, apply lane 0's drive request to every active lane.
       const DpDrive next = clampDpDrive(status[4] & 3, (status[4] >> 2) & 3);

@@ -2,8 +2,8 @@
 // Run run-dp-host.sh to generate DpQmpTables.h and run both sanitized host tests.
 // After generating that header in /tmp, the standalone build from this directory is:
 // c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I/tmp dp_d0_host.cpp -o /tmp/dp_d0_host && /tmp/dp_d0_host
-#include "DpLinkTrain.h"
-#include "DpQmpTables.h"
+#include "DpHotplug.h"
+#include "DpQmpPhy.h"
 
 #include <algorithm>
 #include <array>
@@ -293,14 +293,6 @@ static void testModeBudget()
   CHECK(mode && computeDpMsaTu(mode->timing, link, stream) && stream.validSymbols == 53);
 }
 
-static bool qmpDriveExists(uint32_t rate, DpDrive d)
-{
-  if (d.swing > 3 || d.preemphasis > 3) return false;
-  const auto &swing = rate >= kDpHbr2Khz ? piano_dp_qmp_swing_hbr3_hbr2 : piano_dp_qmp_swing_hbr_rbr;
-  const auto &pre = rate >= kDpHbr2Khz ? piano_dp_qmp_pre_emphasis_hbr3_hbr2 : piano_dp_qmp_pre_emphasis_hbr_rbr;
-  return swing[d.swing][d.preemphasis] <= 0x3f && pre[d.swing][d.preemphasis] <= 0x3f;
-}
-
 using StatusBytes = std::array<uint8_t, 6>;
 static constexpr StatusBytes kCrOk{0x11, 0x11};
 static constexpr StatusBytes kEqOk{0x77, 0x77, 1};
@@ -406,7 +398,8 @@ struct Sink {
 
   bool setPhy(uint32_t rate, unsigned lanes, unsigned swing, unsigned pre)
   {
-    CHECK(validDpLink({rate, lanes}) && qmpDriveExists(rate, {swing, pre}));
+    DpQmpPhySettings phy;
+    CHECK(validDpLink({rate, lanes}) && lookupDpQmpPhy(rate, {swing, pre}, phy));
     const size_t nextAttempt = current == Pattern::Disabled ? attempt : attempt - 1;
     CHECK(nextAttempt < script.size());
     if (nextAttempt < script.size()) {
@@ -623,22 +616,305 @@ static void testMsaTu()
   CHECK(edidModeFits(edge, {kDpHbr2Khz, 2}) && !computeDpMsaTu(edge, {kDpHbr2Khz, 2}, out));
 }
 
+static void testExternalModes()
+{
+  const auto wire = multiBlockEdid();
+  EdidInfo edid;
+  CHECK(parseEdid(wire.data(), wire.size(), edid) == Edid::Ok);
+  constexpr DpLink wide{kDpHbr2Khz, 4}, narrow{kDpHbr2Khz, 2};
+  constexpr auto rgb8 = DpPixelFormat::Rgb8;
+  const auto full = buildDpExternalModes(edid, wide, rgb8);
+  CHECK(full.count == 5 && full.timingId(0) == 1000 && full.timingId(4) == 1004 && !full.timingId(5));
+  CHECK(full.modes[0].pixelHz == 533250000 && full.modes[1].pixelHz == 241500000 &&
+        full.modes[3].pixelHz == 594000000 && full.modes[4].pixelHz == 297000000);
+  CHECK((full.modes[2] == DpExternalTiming{{2200, 1920, 44, 148, 88, true}, {1125, 1080, 5, 36, 4, true},
+                                          148500000, 60u << 16}));
+  CHECK(full.modes[1].refresh16_16 == 3928919);  // 241.5 MHz / (2720 * 1481), rounded to 16.16
+  const auto limited = buildDpExternalModes(edid, narrow, rgb8);
+  CHECK(limited.count == 3 && limited.modes[0] == full.modes[1] && limited.modes[1] == full.modes[2] &&
+        limited.modes[2] == full.modes[4]);
+  CHECK(!buildDpExternalModes(edid, {kDpRbrKhz, 1}, rgb8).count);
+  CHECK(!buildDpExternalModes(edid, {kDpHbr2Khz, 3}, rgb8).count);
+  for (auto format : {DpPixelFormat::Rgb10, DpPixelFormat::Ycbcr420, DpPixelFormat(255)})
+    CHECK(!buildDpExternalModes(edid, wide, format).count);
+
+  // VICs can supply the first mode when every DTD falls outside the link budget.
+  const auto base = baseBlock(k4k60Rb, 1);
+  Block cta{2, 3, 9, 0, 0x44, 95, 105, 97, 16};
+  seal(cta.data());
+  const auto fallback = wireEdid({base, cta});
+  CHECK(parseEdid(fallback.data(), fallback.size(), edid) == Edid::Ok);
+  const auto ctaModes = buildDpExternalModes(edid, narrow, rgb8);
+  CHECK(ctaModes.count == 2 && ctaModes.modes[0] == full.modes[4] && ctaModes.modes[1] == full.modes[2]);
+
+  edid = {};
+  edid.modeCount = 1;
+  DpTiming &t = edid.modes[0].timing;
+  t = k4k30;
+  t.pixelKhz = 348750;
+  CHECK(buildDpExternalModes(edid, narrow, rgb8).count == 1);
+  ++t.pixelKhz;
+  CHECK(edidModeFits(t, narrow) && !buildDpExternalModes(edid, narrow, rgb8).count);
+  t = k4k60Cta;
+  ++t.pixelKhz;
+  DpMsaTu stream;
+  CHECK(computeDpMsaTu(t, wide, stream) && !buildDpExternalModes(edid, wide, rgb8).count);
+
+  t = k1080p60;
+  t.pixelKhz = 0;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t = k1080p60;
+  t.hSyncWidth = 0;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t.hSyncWidth = t.hBlank;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t = k1080p60;
+  t.vBlank = UINT16_MAX;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t = k1080p60;
+  t.interlaced = true;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t.interlaced = false;
+  t.separateSync = false;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t = k1080p60;
+  ++t.hActive;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+
+  t = {9600, 640, 160, 16, 96, 480, 20, 2, 2}; // 800 * 500 pixels per frame
+  CHECK(buildDpExternalModes(edid, wide, rgb8).modes[0].refresh16_16 == (24u << 16));
+  --t.pixelKhz;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+  t.pixelKhz = 48000;
+  CHECK(buildDpExternalModes(edid, wide, rgb8).modes[0].refresh16_16 == (120u << 16));
+  ++t.pixelKhz;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+
+  edid.modeCount = EdidInfo::kMaxModes;
+  for (size_t i = 0; i < edid.modeCount; ++i) {
+    edid.modes[i].timing = k1080p60;
+    edid.modes[i].timing.pixelKhz += uint32_t(i / 2);
+    edid.modes[i].timing.vSyncPositive = (i & 1) != 0;
+  }
+  const auto capped = buildDpExternalModes(edid, wide, rgb8);
+  CHECK(capped.count == DpExternalModes::kMaxModes && !capped.timingId(capped.count));
+  for (size_t i = 0; i < capped.count; ++i) {
+    CHECK(capped.modes[i].pixelHz == edid.modes[i].timing.pixelKhz * 1000);
+    CHECK(capped.modes[i].vertical.positiveSync == edid.modes[i].timing.vSyncPositive);
+  }
+  ++edid.modeCount;
+  CHECK(!buildDpExternalModes(edid, wide, rgb8).count);
+}
+
+struct HotplugSink : Sink {
+  using Sink::Sink;
+  std::vector<uint8_t> edid;
+  std::vector<Aux> edidReplies;
+  size_t nextReply = 0, nextOffset = 0;
+  unsigned edidReads = 0, irqReads = 0, starts = 0, teardowns = 0;
+  StatusBytes irqStatus = kEqOk;
+  Aux irqReply = Aux::Ack;
+  DpExternalTiming runningMode{};
+  bool auxOpen = false, phyOn = false, streamOn = false, failStream = false;
+
+  Aux readEdid(size_t offset, uint8_t *bytes, size_t size)
+  {
+    ++edidReads;
+    CHECK(!phyOn && !streamOn && offset == nextOffset && size == kDpEdidAuxChunk);
+    auxOpen = true;
+    if (nextReply < edidReplies.size()) {
+      const Aux reply = edidReplies[nextReply++];
+      if (reply != Aux::Ack) return reply;
+    }
+    if (offset > edid.size() || size > edid.size() - offset) return Aux::ShortTransfer;
+    std::copy_n(edid.data() + offset, size, bytes);
+    nextOffset += size;
+    return Aux::Ack;
+  }
+
+  Aux auxRead(uint32_t addr, uint8_t *bytes, size_t size)
+  {
+    CHECK(auxOpen);
+    if (streamOn && addr == 0x202 && size == irqStatus.size()) {
+      ++irqReads;
+      if (irqReply == Aux::Ack) std::copy(irqStatus.begin(), irqStatus.end(), bytes);
+      return irqReply;
+    }
+    CHECK(nextOffset == edid.size());
+    return Sink::auxRead(addr, bytes, size);
+  }
+
+  bool setPhy(uint32_t rate, unsigned lanes, unsigned swing, unsigned pre)
+  {
+    phyOn = true;
+    return Sink::setPhy(rate, lanes, swing, pre);
+  }
+
+  bool startStream(DpLink link, const DpExternalTiming &mode)
+  {
+    CHECK(phyOn && !streamOn && current == Pattern::Disabled && mode.pixelHz);
+    CHECK(attempt && attempt <= script.size() && script[attempt - 1].link.rateKhz == link.rateKhz &&
+          script[attempt - 1].link.lanes == link.lanes);
+    ++starts;
+    streamOn = true;
+    runningMode = mode;
+    return !failStream;
+  }
+
+  void teardown()
+  {
+    CHECK(auxOpen && current == Pattern::Disabled);
+    ++teardowns;
+    streamOn = phyOn = auxOpen = false;
+    runningMode = {};
+    nextOffset = 0;
+  }
+};
+
+using Hotplug = DpHotplugStatus;
+
+static void checkParked(const DpHotplug &port, const HotplugSink &sink)
+{
+  CHECK(port.status() != Hotplug::Active);
+  CHECK(!port.link().rateKhz && !port.link().lanes && !port.modes().count && !port.modes().timingId(0));
+  for (const auto &mode : port.modes().modes) CHECK(mode == DpExternalTiming{});
+  CHECK(sink.runningMode == DpExternalTiming{});
+  CHECK(!sink.auxOpen && !sink.phyOn && !sink.streamOn && !sink.nextOffset && sink.current == Pattern::Disabled);
+}
+
+static void testHotplug()
+{
+  DpHotplug port;
+  const std::vector<StatusBytes> noLock(4, kCrPending);
+  HotplugSink sink{{{kDpHbr2Khz, 4}, noLock}, {{kDpHbrKhz, 4}, noLock}, {{kDpRbrKhz, 4}, noLock},
+                   {{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 4}}, {{kDpHbr2Khz, 2}}};
+  checkParked(port, sink);
+  CHECK(port.hpd(sink, false, true, 4) == Hotplug::Disconnected);
+  CHECK(port.hpd(sink, true, false, 3) == Hotplug::InvalidPinLanes);
+  CHECK(!sink.edidReads && !sink.reads && !sink.writes && !sink.teardowns);
+
+  sink.edid = multiBlockEdid();
+  sink.edidReplies = {Aux::Ack, Aux::Defer, Aux::Timeout};
+  CHECK(port.hpd(sink, true, false, 4) == Hotplug::Active);
+  CHECK(sink.attempt == 4 && sink.starts == 1 && sink.streamOn && sink.edidReads == 34);
+  CHECK(sink.delays.size() >= 2 && sink.delays[0] == kDpEdidAuxRetryDelayUs && sink.delays[1] == kDpEdidAuxRetryDelayUs);
+  CHECK(port.link().rateKhz == kDpHbr2Khz && port.link().lanes == 2);
+  CHECK(port.modes().count == 3 && port.modes().modes[0].pixelHz == 241500000);
+  CHECK(sink.runningMode == port.modes().modes[0]);
+  CHECK(port.hpd(sink, true, false, 4) == Hotplug::Active);
+  CHECK(sink.edidReads == 34 && !sink.irqReads && !sink.teardowns);
+  sink.irqStatus = {0x77, 0, 1};  // the other two lanes are inactive after fallback
+  CHECK(port.hpd(sink, true, true, 4) == Hotplug::Active);
+  CHECK(sink.irqReads == 1 && sink.starts == 1 && !sink.teardowns);
+
+  sink.irqStatus = {0x17, 0, 1};  // second active lane lost equalization
+  sink.edid = wireEdid({baseBlock(k1080p60)});
+  CHECK(port.hpd(sink, true, true, 4) == Hotplug::Active);
+  CHECK(sink.irqReads == 2 && sink.teardowns == 1 && sink.starts == 2 && port.link().lanes == 4);
+  CHECK(port.modes().count == 1 && port.modes().modes[0].pixelHz == 148500000 && !port.modes().modes[1].pixelHz);
+
+  sink.edid = wireEdid({baseBlock(k4k30)});
+  CHECK(port.hpd(sink, true, false, 2) == Hotplug::Active);
+  CHECK(port.link().lanes == 2 && port.modes().count == 1 && port.modes().modes[0].pixelHz == 297000000);
+  CHECK(port.hpd(sink, false, true, 2) == Hotplug::Disconnected && sink.teardowns == 3);
+  checkParked(port, sink);
+  CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected && sink.teardowns == 3);
+
+  for (unsigned cycle = 0; cycle < 6; ++cycle) {
+    const DpTiming &mode = cycle & 1 ? k1440p60 : k1080p60;
+    sink.edid = wireEdid({baseBlock(mode)});
+    sink.script.push_back({{kDpHbr2Khz, 2}});
+    CHECK(port.hpd(sink, true, false, 2) == Hotplug::Active);
+    CHECK(port.modes().count == 1 && port.modes().modes[0].pixelHz == mode.pixelKhz * 1000);
+    CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected);
+    checkParked(port, sink);
+  }
+  CHECK(sink.starts == 9 && sink.teardowns == 9 && sink.attempt == sink.script.size());
+}
+
+static void testHotplugErrors()
+{
+  DpHotplug port;
+  for (Aux reply : {Aux::Nack, Aux::ShortTransfer, Aux::IoError, Aux::Defer, Aux::Timeout}) {
+    HotplugSink sink({});
+    sink.edid = wireEdid({baseBlock(k1080p60)});
+    sink.edidReplies.assign(kDpEdidAuxAttempts, reply);
+    const unsigned attempts = reply == Aux::Defer || reply == Aux::Timeout ? kDpEdidAuxAttempts : 1;
+    CHECK(port.hpd(sink, true, false, 4) == Hotplug::EdidAuxError);
+    CHECK(sink.edidReads == attempts && sink.delays.size() == attempts - 1 && !sink.reads && !sink.starts && sink.teardowns == 1);
+    checkParked(port, sink);
+    CHECK(port.hpd(sink, true, false, 4) == Hotplug::EdidAuxError && sink.edidReads == attempts);
+    CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected && sink.teardowns == 1);
+  }
+
+  HotplugSink sink{{{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}};
+  sink.edid = wireEdid({baseBlock(k1080p60, kEdidMaxBlocks)});
+  CHECK(port.hpd(sink, true, false, 2) == Hotplug::BadEdid);
+  CHECK(sink.edidReads == 8 && !sink.reads);
+  checkParked(port, sink);
+  sink.edid = wireEdid({baseBlock(k1080p60)});
+  ++sink.edid[127];
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::BadEdid && !sink.reads);
+  checkParked(port, sink);
+
+  sink.edid = wireEdid({baseBlock(k4k60Cta)});
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::NoMode && !sink.starts && sink.attempt == 1);
+  checkParked(port, sink);
+  sink.edid = wireEdid({baseBlock(k1080p60)});
+  sink.failStream = true;
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::StreamFailed && sink.starts == 1);
+  checkParked(port, sink);
+  sink.failStream = false;
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active && sink.starts == 2);
+
+  // An unreadable IRQ status invalidates the active stream and tries one fresh training session.
+  sink.irqReply = Aux::Timeout;
+  sink.faults.push_back({false, 0, Pattern::Disabled, Aux::Nack});
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::TrainFailed && sink.irqReads == 1 && sink.faults[0].used);
+  checkParked(port, sink);
+  CHECK(port.hpd(sink, false, true, 0) == Hotplug::Disconnected && sink.teardowns == 6);
+}
+
 static void testQmpTables()
 {
   static_assert(piano_dp_qmp_piano_max_mbps * 100 == kDpHbr2Khz);
-  static_assert(piano_dp_qmp_rates[0].link_clk_hz == kDpRbrKhz * 1000);
-  static_assert(piano_dp_qmp_rates[1].link_clk_hz == kDpHbrKhz * 1000);
-  static_assert(piano_dp_qmp_rates[2].link_clk_hz == kDpHbr2Khz * 1000);
-  for (uint32_t rate : {kDpRbrKhz, kDpHbrKhz, kDpHbr2Khz}) {
-    for (unsigned swing = 0; swing <= 3; ++swing) {
-      for (unsigned pre = 0; pre <= 3; ++pre) {
-        CHECK(qmpDriveExists(rate, {swing, pre}) == (swing + pre <= 3));
+  const struct {
+    uint32_t rateKhz;
+    const PianoDpQmpWrite *overlay;
+    const uint8_t (&swing)[4][4], (&pre)[4][4];
+  } supported[] = {
+    {kDpRbrKhz, piano_dp_qmp_serdes_rbr, piano_dp_qmp_swing_hbr_rbr, piano_dp_qmp_pre_emphasis_hbr_rbr},
+    {kDpHbrKhz, piano_dp_qmp_serdes_hbr, piano_dp_qmp_swing_hbr_rbr, piano_dp_qmp_pre_emphasis_hbr_rbr},
+    {kDpHbr2Khz, piano_dp_qmp_serdes_hbr2, piano_dp_qmp_swing_hbr3_hbr2, piano_dp_qmp_pre_emphasis_hbr3_hbr2},
+  };
+  DpQmpPhySettings settings;
+  for (const auto &rate : supported) {
+    for (unsigned swing = 0; swing <= 4; ++swing) {
+      for (unsigned pre = 0; pre <= 4; ++pre) {
+        CHECK(lookupDpQmpPhy(rate.rateKhz, {0, 0}, settings));
+        const bool found = lookupDpQmpPhy(rate.rateKhz, {swing, pre}, settings);
+        CHECK(found == (swing + pre <= 3));
+        if (found && swing + pre <= 3) {
+          CHECK(settings.rate && settings.rate->link_clk_hz == rate.rateKhz * 1000u &&
+                settings.rate->link_mbps == rate.rateKhz / 100 && settings.rate->serdes == rate.overlay &&
+                settings.rate->serdes_count == 9);
+          CHECK(settings.swing == rate.swing[swing][pre] && settings.preemphasis == rate.pre[swing][pre]);
+        } else {
+          CHECK(!settings.rate && !settings.swing && !settings.preemphasis);
+        }
         const DpDrive drive = clampDpDrive(swing, pre);
-        CHECK(drive.swing == swing && drive.preemphasis == std::min(pre, 3 - swing));
-        CHECK(qmpDriveExists(rate, drive));
+        CHECK(drive.swing == std::min(swing, 3u) && drive.preemphasis == std::min(pre, 3 - drive.swing));
+        CHECK(lookupDpQmpPhy(rate.rateKhz, drive, settings));
       }
     }
   }
+  for (uint32_t rate : {0u, kDpRbrKhz - 1, kDpHbr2Khz + 1, 810000u, UINT32_MAX}) {
+    CHECK(lookupDpQmpPhy(kDpHbr2Khz, {1, 0}, settings));
+    CHECK(!lookupDpQmpPhy(rate, {0, 0}, settings));
+    CHECK(!settings.rate && !settings.swing && !settings.preemphasis);
+  }
+  CHECK(!lookupDpQmpPhy(kDpHbrKhz, {0, UINT32_MAX}, settings));
+  CHECK(!lookupDpQmpPhy(kDpHbrKhz, {UINT32_MAX, 0}, settings));
   CHECK((clampDpDrive(UINT32_MAX, UINT32_MAX) == DpDrive{3, 0}));
 }
 
@@ -651,7 +927,10 @@ int main()
   testTrainFallback();
   testTrainErrors();
   testMsaTu();
+  testExternalModes();
+  testHotplug();
+  testHotplugErrors();
   testQmpTables();
-  std::printf("PianoDp D0 host tests: %s\n", failures ? "failed" : "passed");
+  std::printf("PianoDp D0/D1/D6 host tests: %s\n", failures ? "failed" : "passed");
   return failures != 0;
 }

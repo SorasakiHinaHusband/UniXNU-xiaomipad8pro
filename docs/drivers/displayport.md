@@ -3,9 +3,9 @@
 ## Status as of 2026-11-27
 
 **External DisplayPort remains design-only (B8).** The tracked `PianoDp` level 1 is a read-only survey and port-event decoder.
-D6 is a RAM-backed second display for testing the macOS display path. D0 now includes host-tested EDID/CTA mode selection,
-callback-driven AUX/DPCD link training, and MSA/TU arithmetic with the extracted QMP PHY tables. Controller AUX transactions,
-hardware link training, external scanout, hot-plug and tablet qualification remain open.
+D6 is a RAM-backed second display for testing the macOS display path. The offline models cover EDID/CTA mode selection,
+AUX/DPCD link training with the extracted QMP PHY tables, HPD recovery, and an external timing list. Controller AUX transactions,
+hardware link training, external scanout, live hot-plug, and tablet qualification remain open.
 B8 depends on B1's DPU path and B7's Type-C host work. [PHY tables](../../data/dp/README.md) · [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
 
 **Built-in panel.** Installed v13.1y12q uses PianoDpu flips at 60 Hz, with native screenshots and neutral colours. Night Shift
@@ -163,8 +163,20 @@ import check: PianoPower's `piano_port_*` / `piano_adsp_health` come from PianoP
 
 The offline D0 headers validate up to four EDID blocks, select RGB 8 bpc modes against piano's HBR2 and pin lane budgets,
 train against a scripted AUX/DPCD sink, and calculate MSA and a 64-symbol TU for progressive SST. The PianoDp host runner checks
-both suites under ASan/UBSan and verifies the training drive indices against generated QMP tables. Controller AUX encoding
-(including I2C-over-AUX transfers) and DisplayID tiles are later work. [EDID model](../../package/PianoDp/DpEdid.h) · [Training and stream model](../../package/PianoDp/DpLinkTrain.h) · [Host runner](../../package/PianoDp/tests/run-dp-host.sh)
+both suites under ASan/UBSan. It generates the QMP header from the manifest-checked table and tests all ten legal swing and
+pre-emphasis pairs at each of RBR, HBR, and HBR2, including selection of the rate-specific serdes overlay. Controller AUX encoding
+and DisplayID tiles are later work. [EDID model](../../package/PianoDp/DpEdid.h) · [Training and stream model](../../package/PianoDp/DpLinkTrain.h) · [PHY lookup](../../package/PianoDp/DpQmpPhy.h) · [Host runner](../../package/PianoDp/tests/run-dp-host.sh)
+
+The D1 hotplug model consumes serialized HPD events for one sink. It reads EDID in 16-byte chunks and retries DEFER and timeout
+at the same offset for up to four attempts per chunk. NACK, short reads, and I/O errors end the attempt. The tests exercise
+rate and lane fallback, IRQ_HPD link-loss recovery, and teardown across repeated plugs and failed stream starts. The adapter
+models complete I2C-over-AUX reads and owns stream, PHY, and AUX cleanup. [Hotplug model](../../package/PianoDp/DpHotplug.h)
+
+The D6 timing builder returns up to 16 distinct progressive RGB 8 bpc timings for an IOAV publisher. It preserves the order of
+eligible DTDs, starting with the base preferred timing, then adds eligible CTA VICs. It records the raster, porches, syncs, pixel
+clock, and 16.16 refresh for each timing. The tests cover the fake display's raster and refresh bounds, the 594 MHz pixel-clock
+ceiling, and the negotiated link's 8b/10b payload with two symbols reserved per 64-symbol TU. Both models run through the host
+suite. Level 1 still defaults off and issues zero MMIO stores. [External timing builder](../../package/PianoDp/DpExternalModes.h)
 
 ### 8. Ladder and effort (RAM boots, owner present with a monitor and a USB-C/DP cable or dock)
 
