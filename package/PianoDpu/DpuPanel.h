@@ -42,7 +42,7 @@ constexpr uint32_t kDmaBroadcast = 1u << 31, kDmaMaster = 1u << 30, kDmaFromBuff
 constexpr uint32_t kTrigDmaMask = 7u, kTrigDmaSw = 4u, kTrigBlockDmaInFrame = 1u << 12;
 constexpr uint32_t kDmaCtrl1Bit = 1u << 1;
 constexpr uint32_t kDmaDoneTimeoutUs = 50000, kDmaBusyTimeoutUs = 20000, kEngineStopUs = 40000, kEngineStartUs = 50000;
-constexpr uint32_t kWakeReplyTimeoutMs = 1500;
+constexpr uint32_t kPanelReplyTimeoutMs = 1500;
 
 // Owned by the request lock. If a dispatched transition failed, the caller may still have a wake to complete.
 struct RequestGate {
@@ -55,6 +55,14 @@ struct RequestGate {
     ready = wakePending = false;
     fallback = true;
   }
+
+  void sleepTimedOut(int &queued)
+  {
+    queued = -1;   // the worker takes and clears it under the same lock
+    latchFallback();
+  }
+
+  bool undoLateSleep(int dispatched, bool asleep) const { return fallback && dispatched == 0 && asleep; }
 
   template <class Log>
   bool admit(bool on, Log log) const

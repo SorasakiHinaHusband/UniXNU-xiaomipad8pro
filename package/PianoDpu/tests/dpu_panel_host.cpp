@@ -711,7 +711,7 @@ static void testY12pWakeTrace()
     const Result timedOut = panelOn(m, path, Options(), slept.enginesStopped, slept.fetch);
     CHECK(!timedOut.ok && timedOut.scanoutRestored && timedOut.step == 2 + budget);
     CHECK(timedOut.dcs[budget].triggerAttempted && timedOut.dcs[budget].dmaDoneMask() == (3u ^ (1u << link)));
-    CHECK(m.nowUs() - start < kWakeReplyTimeoutMs * 1000u && m.intf[1].on && m.intf[2].on);
+    CHECK(m.nowUs() - start < kPanelReplyTimeoutMs * 1000u && m.intf[1].on && m.intf[2].on);
     if (!budget) CHECK(!m.firstDcs(kDcsDisplayOn, 0) && !m.firstDcs(kDcsDisplayOn, 1));
     for (unsigned l = 0; l < 2; ++l)
       CHECK(m.storesTo(dsiReg(l, kDsiSwReset)) == 4 && !m.dsi[l].dmaPending && !m.rd(dsiReg(l, kDsiTpgCtrl)) &&
@@ -724,6 +724,30 @@ static void testY12pWakeTrace()
     auto log = [](const char *) { CHECK(false); };
     CHECK(!gate.admit(false, log) && !gate.admit(true, log));
   }
+}
+
+static void testSleepReplyTimeout()
+{
+  auto unexpectedLog = [](const char *) { CHECK(false); };
+  RequestGate queued;
+  queued.ready = true;
+  int want = 0;
+  queued.sleepTimedOut(want);
+  CHECK(want == -1 && !queued.admit(false, unexpectedLog) && !queued.admit(true, unexpectedLog));
+  CHECK(!queued.undoLateSleep(want, true));
+
+  RequestGate dispatched;
+  dispatched.ready = true;
+  model::Dpu m;
+  m.sleepMs(3);
+  const LivePath path = readPath(m);
+  CHECK(!dispatched.undoLateSleep(0, true));
+  dispatched.sleepTimedOut(want);  // the worker already took the off request
+  const Result off = panelOff(m, path, Options());
+  CHECK(off.ok && dispatched.undoLateSleep(0, off.ok) && !dispatched.undoLateSleep(0, false));
+  const Result on = panelOn(m, path, Options(), off.enginesStopped, off.fetch);
+  CHECK(on.ok && on.scanoutRestored && !dispatched.undoLateSleep(1, true));
+  CHECK(!dispatched.admit(false, unexpectedLog) && !dispatched.admit(true, unexpectedLog));
 }
 
 static void testFailures()
@@ -866,6 +890,7 @@ int main()
   testStopTimeoutTrace();
   testY12oTrace();
   testY12pWakeTrace();
+  testSleepReplyTimeout();
   testFailures();
   testBacklightOnlyAndSupersededWake();
   if (failures) {

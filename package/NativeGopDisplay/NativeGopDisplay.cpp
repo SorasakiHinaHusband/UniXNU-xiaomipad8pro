@@ -1776,6 +1776,8 @@ void NativeGopDisplay::setPanelPower(bool on, uintptr_t system, uintptr_t api)
         }
     }
     const IOReturn result = dpu->callPlatformFunction("PianoDpuPanel", false, nullptr, nullptr, nullptr, nullptr);
+    if (result == kIOReturnTimeout)
+        fPanelBacklightOnly = true;
     // A refusal after DCS started still needs the wake call to check whether the panel recovered.
     fPanelNeedsWake |= result == kIOReturnSuccess || result == kIOReturnIOError;
     if (result != kIOReturnSuccess && result != kIOReturnNotReady)

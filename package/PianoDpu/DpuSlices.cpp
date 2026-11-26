@@ -894,6 +894,7 @@ void serve()
     }
     if (want >= 0 && gA.panel) {
       IOLockLock(gLock);
+      const bool undoLateSleep = gS.panelGate.undoLateSleep(want, gAsleep);
       if (want && !panelOk) gS.panelGate.latchFallback();
       if (!gS.panelGate.fallback) {
         gS.panelGate.ready = !gPanelBroken;
@@ -904,6 +905,12 @@ void serve()
       IOLockWakeup(gLock, &gS.panelDone, false);
       IOLockUnlock(gLock);
       publishPanelTrace();
+      if (undoLateSleep) {
+        // The copy worker is already on backlight-only power. Restore a late sleep on this worker.
+        note("panel: sleep finished after its reply deadline; attempting one wake");
+        panelWake();
+        publishPanelTrace();
+      }
     }
     if (mode) {
       const IOReturn result = doModeSwitch(mode);
@@ -1199,18 +1206,15 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
       gS.panelWant = p1 ? 1 : 0;
       gS.wake = true;
       IOLockWakeup(gLock, &gS, false);
-      if (p1) {
-        uint64_t deadline;
-        clock_interval_to_deadline(panel::kWakeReplyTimeoutMs, kMillisecondScale, &deadline);
-        while (!gS.panelDone && IOLockSleepDeadline(gLock, &gS.panelDone, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {}
-      } else {
-        while (!gS.panelDone) IOLockSleep(gLock, &gS.panelDone, THREAD_UNINT);
-      }
+      uint64_t deadline;
+      clock_interval_to_deadline(panel::kPanelReplyTimeoutMs, kMillisecondScale, &deadline);
+      while (!gS.panelDone && IOLockSleepDeadline(gLock, &gS.panelDone, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {}
       if (gS.panelDone) {
         *result = gS.panelResult;
       } else {
-        // A late worker may finish restoring hardware. It cannot admit any future M5 requests.
-        gS.panelGate.latchFallback();
+        // Cancel a queued sleep. A wake may already be needed to undo a completed sleep.
+        if (p1) gS.panelGate.latchFallback();
+        else gS.panelGate.sleepTimedOut(gS.panelWant);
         *result = kIOReturnTimeout;
       }
       gS.panelBusy = false;
