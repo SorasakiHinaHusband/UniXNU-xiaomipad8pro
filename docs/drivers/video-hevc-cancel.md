@@ -7,10 +7,9 @@ establishes the missing contract: accepted asynchronous frames need terminal
 `Demt` dispositions **processed before the `dinv` reply clears the guest's
 callback target**. Native STOP/CLOSE and `dinv=0` alone do not retire them.
 
-The fix below implements that contract and has host regression coverage.
-Tablet qualification of the fix is still outstanding. This investigation
-only read archived evidence and local binaries; it did not access the tablet,
-build a fix image, change budgets, or push anything.
+The fix in `a426ce70` implements that contract and has host regression coverage.
+It passed [RAM qualification](#ram-qualification-2026-11-27) on `v131y12u-ram1`
+with the standard 256 MiB XNU arena. Installed `v13.1y12q` predates the fix.
 
 ## Deciding control evidence
 
@@ -365,12 +364,11 @@ callback target is live → deferred `dinv` reply/worker exit → public `dfin`
 Checks: **ours-OK**: both archived runs, PID/session attribution, XNU-only
 control, clean native teardown, exact 27.3 vtable/call/wait/accounting/handler/
 reply-order trace, terminal wire contract, production-worker regression,
-ASan/UBSan host suites and arm64e kernel compile. **Still required on the fix
-image**: public `cancel-joined`, epoch-21 IDR/golden hashes and separation,
-`phase-pass name=cancel-recreate`, `PASS qualification`, **`V6_TOOL_EXIT=0`**,
-plus the separate correct HEVC mode/verdict. Keep the existing tool/image
-provenance discipline and **360/420-second budgets**. The mixed-backing fix
-image must also preserve its HEVC golden/reopen results.
+ASan/UBSan host suites and arm64e kernel compile. The standard-arena RAM run
+below passed the AVC qualification, including `cancel-recreate`. Keep the
+existing tool/image provenance discipline and **360/420-second budgets**.
+The mixed-backing fix image still needs its separate HEVC mode/verdict and
+must preserve its HEVC golden/reopen results.
 
 Root cause: **Closed at the contract/source boundary**. `if (!invalidated)`
 omitted four terminal async dispositions and `frames.cancel()` discarded
@@ -380,8 +378,28 @@ needed by later `Demt`. `dfin=-12903` is a consequence of invalidate order,
 not the cause. RAM16G mixed HEVC backing and HEVC phase budget exhaustion
 are excluded by the control and time accounting.
 
-ONE change: **READY for a cancellation fix image, not tablet-qualified** —
-defer `dinv` until the existing worker has released resources and obtained
-terminal `Demt` ACKs for its accepted async work. The implementation and
-host regression are local; no fix image was built or run, no tablet state
-was changed, and nothing was pushed.
+The fix defers `dinv` until the worker releases resources and obtains bounded
+terminal `Demt` ACKs for its accepted async work.
+
+## RAM qualification (2026-11-27)
+
+**PASS on `v131y12u-ram1`**, using the standard **256 MiB XNU arena**. Unchanged
+`video-v6 --qualify` passed all **13/13 phases** in 11 s with `failures=0`,
+`bounded-stream-correctness-only=1` and **`V6_TOOL_EXIT=0`**.
+
+- `cancel-begin epoch=20 accepted=8 pending=4 no-wait-before-invalidate=1` was
+  followed by **4/4** terminal `Demt` dispositions for tokens 5–8 (`status=-12911`,
+  `flags=3`, `image=0`, 28,133–78,527 µs). `cancel-joined` reported eight callbacks
+  with `remaining-public-callbacks-not-required=0`. Native close cancelled four
+  frames, paired one surface open with one close and left zero maps. Invalidate
+  reported worker joined, surfaces released and `close-status 0`.
+- Epoch 21 recreated at an IDR and returned **30/30 images at 83.98 fps**, with
+  zero null callbacks or errors, high-water 5, maximum callback latency 54,366 µs
+  and longest output gap 10,351 µs.
+- Video SMMU reported `PASS RXV native-submits=278 stale-snapshots=15 issues=0`,
+  with zero faults or quarantine. The harness grep matched benign `watchdog 0`
+  power-on lines.
+
+This closes the pre-fix `RXV` cancellation timeout on standard-arena RAM
+hardware. Installed `v13.1y12q` predates the fix.
+[November 27 hardware results](../results-2026-11-27.md#videotoolbox-pending-cancellation)

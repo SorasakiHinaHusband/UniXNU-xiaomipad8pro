@@ -1,6 +1,7 @@
 # IR transmitter: SE15 / GPIO29 (`PianoIR`)
 
-**Built and host-tested. PianoIR has yet to run on the tablet.** The kext is listed in `configs/k27-native-kexts.txt`.
+**Emission-free bring-up passed on RAM `v131y12u-ram1` (2026-11-27).** Actual emission awaits an attended receiver
+check. The kext is listed in `configs/k27-native-kexts.txt`.
 Only `piano-ir=1` and `piano-ir=2` pass `probe()`. With the boot argument absent, PianoIR maps no MMIO, allocates no DMA and
 starts no worker. The userland layer includes the `piano-ir` CLI without a launch job. The Ubuntu port drives the same
 emitter through LIRC (`ir-ctl`).
@@ -58,10 +59,16 @@ PianoIR: pins after send: gpio29 ctl ... io ...
 ## 5. Qualification
 
 The host suite checks encoding, bounds, GPIO park readback and GENI transfer and recovery against register models.
-Tablet qualification is pending. First confirm a read-only survey with zero MMIO stores. On a separate opt-in RAM boot,
-check GPIO29 with the emitter in view of an IR-sensitive camera. The internal loopback should move 64 bytes while the
-pad remains low. Compare idle pad samples with a manually requested transmission and verify the pad returns low after
-the send. Check that an unprivileged send is rejected and that an administrator can send again after a sleep/wake cycle.
+
+With `piano-ir=2` on `v131y12u-ram1`, stream `0x423` used SMMU bypass bank 81. The read-only survey made
+**45 MMIO loads, 0 stores and 0 map failures**. GPIO29 stayed dark as a GPIO input. The survey skipped the
+SE15 read while QUP2/s7 was unclocked. After the GCC vote, SE15 brought up GENI SE DMA at **1,920,000 Hz**.
+The internal loopback moved and returned **64/64 bytes in 499 µs (`rc=0`)**, with GPIO29 held as GPIO.
+`piano-ir status` and IORegistry agreed on `ready: GENI SE15 at 1920000 Hz` and zero sends.
+[November 27 register and loopback results](../results-2026-11-27.md#se15-infrared-bring-up)
+
+The attended receiver check still needs to verify actual emission and that GPIO29 returns low after a send.
+The unprivileged-send refusal and an administrator send after sleep/wake also remain open.
 
 ## 6. Teardown and failures
 

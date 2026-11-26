@@ -974,8 +974,6 @@ flags a second owner of a vote and counts PRM commands while the speaker stream 
 
 ### 14. Silent protection probe and per-amp feedback (spk-probe1, 2026-11-24)
 
-The probe has been host-tested and built for arm64e. It has yet to run on the tablet.
-
 The probe brings up speaker protection and its V/I monitor in silence. Both sysctls require the exact
 `piano-audio-spk-probe=1` boot argument at levels 9-10.
 
@@ -989,6 +987,13 @@ The probe brings up speaker protection and its V/I monitor in silence. Both sysc
   The fields are `r0-permille` (r0 relative to that amplifier's Re25), `f0` (Hz), `q`, `t-dC` (coil temperature in 0.1 C),
   and `ok` (700..1500 permille and f0 200..2000 Hz) or `check`. The plausibility result is for observation only.
 
-The DSP's live readings with the amplifiers down or muted still need hardware validation. The `testSpkProbe` host test in
-`tests/live_host.c` covers the request range, default-off and protection-off refusal, both amplifier modes, the deadline
-with a muted device offering PCM, playback takeover, a busy speaker path, protection failures, and sleep cancellation.
+**PASS on RAM `v131y12u-ram1` (2026-11-27).** With `piano-audio-spk-probe=1`, a write of `8` to
+`machdep.piano_audio_spk_probe` produced one run with zero refusals and four live V/I monitor reads. The monitor
+was active at +4 s and idle at +14 s, with the speaker back down. All four FourSemi amps (`amp0`–`amp3`) reported
+`ok` at **25.0 °C**. Protection and MiPlay each recorded one start and zero fallbacks. No sound was audible.
+This was an opt-in RAM probe. The installed `v13.1y12q` check was read-only.
+[Per-amp readings and timeline](../results-2026-11-27.md#silent-speaker-protection-probe)
+
+The `testSpkProbe` host test in `tests/live_host.c` covers the request range, default-off and protection-off refusal,
+both amplifier modes, the deadline with a muted device offering PCM, playback takeover, a busy speaker path,
+protection failures, and sleep cancellation.

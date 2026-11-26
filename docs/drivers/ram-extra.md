@@ -29,13 +29,23 @@ marker. The boot log and live kernel records confirmed Safari's GPU connection. 
   `mode=2` requirement on this `mode=1` boot. Allocation, residency, release, readback and denial checks passed.
 - **`RXV` (pre-fix frozen image).** AVC `video-v6` passed 12 phases, then timed out at `cancel-recreate`
   with eight accepted frames and four pending. The frozen image predates `a426ce70` on `main`, which defers
-  the `dinv` reply in `PianoVideoVTHost.cpp` until terminal `Demt` dispositions are acknowledged.
-  [Pending-cancel analysis](video-hevc-cancel.md)
+  the `dinv` reply in `PianoVideoVTHost.cpp` until terminal `Demt` dispositions are acknowledged. The fix passed
+  all 13 phases on standard-arena RAM `v131y12u-ram1`. [RAM qualification](video-hevc-cancel.md#ram-qualification-2026-11-27)
 - **`RXB` (`test/environment`, known `LT-B4`).** `install-chrome-pad.sh` completed and Chrome launched on RAM-backed
   volatile Data, then the tablet reset to ABL at +1719 s. The abort matches the known RAM-Data exhaustion reset.
-  Chrome is installed-only, and the like-for-like `ram16g-tctl3` control was underway.
+  Chrome is installed-only. The paired `ram16g-tctl3` control reproduced the reset.
 
 Daily stays **OFF** (`piano-extra-ram=0`, `piano-gpu-tier=0`). This qualification covers the RAM boot only.
+
+### Paired tier-OFF control (ram16g-tctl3, 2026-11-27)
+
+The RAM control (`02f02d50`, `rc=2`, 1557 s) set `piano-extra-ram=0` and `piano-gpu-tier=0`. It reported
+`mode=0 state=off`, 0 MiB used and zero kernel 0077 lines. Metal Image passed 30/30, the 3D bench opened
+successfully with zero GPU faults, and `RXV4` matched NV12 `bd230ec4`. The same pre-fix `RXV` cancellation
+timeout (`V6_TOOL_EXIT=124`) reproduced with the tier off. `a426ce70` on `main` closes that timeout, with
+the fix verified on RAM `v131y12u-ram1`. The control also reproduced the volatile-Data Chrome reset,
+one Safari H.264 dropped frame and the `RXX` harness path mismatch.
+[Tier-OFF results](../results-2026-11-27.md#ram16g-tctl3-tier-off-control-2026-11-27)
 
 ## R1 design and admission checks (2026-11-26)
 

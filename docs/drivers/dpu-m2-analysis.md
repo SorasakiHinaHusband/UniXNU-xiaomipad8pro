@@ -1,6 +1,7 @@
 # DPU M2: conditional scanout cache clean
 
-Analysis and host implementation, 2026-11-26. RAM qualification is pending.
+Analysis and host implementation, 2026-11-26. The November 27 RAM A/B measured
+live WC coverage and performance. Automated optical qualification is pending.
 
 ## Decision
 
@@ -12,7 +13,6 @@ whose CPU writers remain write-combined can skip repeated pixel cleans.
 CPU-write absence is neither required for that case nor established by M1.
 
 The policy is implemented behind `piano-dpu-clean-skip=1`, off by default.
-Live WC coverage, performance and coherency remain RAM-boot checks.
 
 ## Baseline and scope
 
@@ -379,6 +379,22 @@ python3 tooling/native/grade-dpu-m2.py capture.json
 If live WC coverage is insufficient, retain the fallback reason counters
 and repeat with a workload that exercises a verified WC pool.
 
+## RAM A/B on v131y12u-ram1 (2026-11-27)
+
+With strict WC mode enabled at boot, `PianoGpuBench --cadence` ran two matched
+38 s windows in order on the same boot. Arm A (`policy=0`) ran 2522 full cleans
+for 2522 shown flips. Arm B (`policy=1`) ran one initialization clean and skipped
+cache cleans on **2457/2458** verified-WC flips (**99.96%**), with zero full cleans. Pixel-clean
+time fell **99.98%** from **3855.13 to 0.95 µs per shown flip**, saving **9.47 s**
+at B's shown count. Attribute checks took 721,749 µs in B. Client
+`drawable_wait_ms` p95 fell from **16.37 to 0.92 ms** (−94.4%). Both arms recorded
+zero underruns, GOP copies, returns to the boot framebuffer and WindowServer crashes.
+
+C920 stills looked clean in both arms. `grade-dpu-m2.py` returned **`M2 VOID`**
+solely because `optical_checks=0`. The automated optical follow-up
+`v131y12u-m2opt` is queued. The daily default stays **OFF** (`piano-dpu-clean-skip=0`).
+[November 27 counters and cadence results](../results-2026-11-27.md#dpu-m2-strict-wc-clean-skip)
+
 ## Fix-image gate
 
 Path: WindowServer/SkyLight -> QuartzCore GPU composition or software destination
@@ -393,9 +409,9 @@ Checks: ours-OK on host: geometry, retention, SMMU/TLB maintenance, the
 WC-preserving aperture view, the effective-page predicate and epoch, strict
 failure handling, counters and tests, and the pinned kernel import check.
 The existing NativeGopDisplay fence path reports confirmed completion to
-PianoDpu. Unknown on hardware: live WC coverage and mapper preservation,
-frequency of missing handoffs, cost including attribute checks, and the
-mixed-use RAM coherency result.
+PianoDpu. The RAM A/B above measured effective WC coverage, clean time and
+attribute check cost for the cadence workload. Automated optical coverage
+and the mixed-use RAM coherency result remain open.
 
 Root cause: the legacy `Flipper::flipSurface` cleans each accepted frame although QuartzCore's
 display allocator explicitly requests WC on its normal branch. The current
@@ -409,4 +425,4 @@ preserve and verify WC backing, initialize by a successful acquisition clean,
 skip subsequent pixel cleans within that valid epoch with publication/DSB
 preserved, and retain the full clean or refuse/copy on any failed predicate or
 maintenance failure. Default/cached/real-time/unknown buffers remain conservative.
-The RAM qualification procedure above is the remaining qualification gate.
+The RAM qualification procedure above still requires automated optical coverage.
