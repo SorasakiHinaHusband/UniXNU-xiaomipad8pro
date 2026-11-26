@@ -59,6 +59,9 @@ PianoIR: pins after send: gpio29 ctl ... io ...
 ## 5. Qualification
 
 The host suite checks encoding, bounds, GPIO park readback and GENI transfer and recovery against register models.
+The ASan/UBSan frame safety test models the RAM qualification with emission held at level 2 after loopback.
+It checks that suspend and disconnect park GPIO29 before aborting an in-flight internal DMA command and retain
+the DMA buffer until both fresh reset acknowledgments arrive. [Host test](../../package/PianoIR/tests/ir_frame_safety_model_host.cpp)
 
 With `piano-ir=2` on `v131y12u-ram1`, stream `0x423` used SMMU bypass bank 81. The read-only survey made
 **45 MMIO loads, 0 stores and 0 map failures**. GPIO29 stayed dark as a GPIO input. The survey skipped the
@@ -67,7 +70,8 @@ The internal loopback moved and returned **64/64 bytes in 499 µs (`rc=0`)**, wi
 `piano-ir status` and IORegistry agreed on `ready: GENI SE15 at 1920000 Hz` and zero sends.
 [November 27 register and loopback results](../results-2026-11-27.md#se15-infrared-bring-up)
 
-The attended receiver check still needs to verify actual emission and that GPIO29 returns low after a send.
+Optical IR emission verification remains **HOLD** pending an attended receiver check that also verifies GPIO29
+returns low after a send.
 The unprivileged-send refusal and an administrator send after sleep/wake also remain open.
 
 ## 6. Teardown and failures
