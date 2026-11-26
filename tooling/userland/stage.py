@@ -192,10 +192,18 @@ def load_manifest(path, on=(), off=()):
             problems.append(f'{where}: {len(jobs)} launchd jobs; one unit has at most one')
         if not jobs and not unit['default_on']:
             problems.append(f'{where}: default_on false needs a launchd job to turn off (a command-line tool is always installed)')
+        staged_entries = set()
         for f in unit['files']:
             if f['dest'] in dests:
                 problems.append(f'{where}: {f["dest"]} is also unit {dests[f["dest"]]}\'s')
             dests[f['dest']] = name
+            staged = f['staged'] or f'files/{name}/{f["name"]}'
+            if not isinstance(staged, str):
+                continue  # check_file has already diagnosed the invalid path.
+            key = staged.casefold()  # The staging volume can be case-insensitive.
+            if any(p == key or p.startswith(key + '/') or key.startswith(p + '/') for p in staged_entries):
+                problems.append(f'{where}: staging path conflicts with another file: {staged}')
+            staged_entries.add(key)
         units.append(unit)
     for name, value in [(n, True) for n in on] + [(n, False) for n in off]:
         match = [u for u in units if u['name'] == name]

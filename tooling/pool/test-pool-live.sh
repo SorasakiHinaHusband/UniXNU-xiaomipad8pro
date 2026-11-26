@@ -87,5 +87,15 @@ lst > /dev/null; merge; live; head -3 "$T/live.txt" > "$T/live.cut"; mv "$T/live
 [ $rc = 2 ] && grep -q '^VOID' "$T/compare.txt"; check $? 'a truncated live output: VOID'
 live; printf 'o\tsbin\n' >> "$T/list.txt"; cmp_; rc=$?
 [ $rc = 2 ] && grep -q 'not the one' "$T/compare.txt"; check $? 'a list made from other inputs: VOID'
+mv "$T/os.manifest" "$T/os.good"
+tail -1 "$T/os.good" > "$T/os.manifest"
+lst > "$T/compare.txt" 2>&1; rc=$?
+[ $rc = 2 ] && grep -q '^VOID' "$T/compare.txt"; check $? 'a source footer with missing records: VOID'
+mv "$T/os.good" "$T/os.manifest"
+lst > /dev/null; live
+{ head -1 "$T/live.txt"; cat "$T/live.txt"; } > "$T/live.duplicate"
+mv "$T/live.duplicate" "$T/live.txt"
+cmp_; rc=$?
+[ $rc = 2 ] && grep -q '^VOID' "$T/compare.txt"; check $? 'a repeated live record: VOID'
 echo "$([ $fails = 0 ] && echo PASS || echo FAIL): $fails failure(s)"
 exit $([ $fails = 0 ] && echo 0 || echo 1)

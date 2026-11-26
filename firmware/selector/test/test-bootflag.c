@@ -200,6 +200,20 @@ static void test_fdt(void)
 	CHECK(piano_fdt_has_bootarg(fdt, size, charging, sizeof(charging) - 1) == 1, "off-mode charging");
 	size = fdt_fixture(fdt, "chosen", "alias=bootmonitor.bootmode=recovery bootmonitor.bootmode=recovery-extra");
 	CHECK(piano_fdt_has_bootarg(fdt, size, recovery, sizeof(recovery) - 1) == 0, "only exact recovery tokens");
+	fdt_word(fdt + size - 13, 0);
+	CHECK(piano_fdt_has_bootarg(fdt, size, recovery, sizeof(recovery) - 1) == -1, "bad structure after bootargs takes stock");
+	size = fdt_fixture(fdt, "chosen", "quiet");
+	{
+		const unsigned end = size - 21;
+		memmove(fdt + end + 16, fdt + end, size - end);
+		memcpy(fdt + end, fdt + 76, 16);
+		fdt_word(fdt + end + 4, 4);
+		memcpy(fdt + end + 12, "a=b", 4);
+		fdt_word(fdt + 4, size + 16);
+		fdt_word(fdt + 12, size - 9 + 16);
+		fdt_word(fdt + 36, size - 9 + 16 - 56);
+		CHECK(piano_fdt_has_bootarg(fdt, size + 16, recovery, sizeof(recovery) - 1) == -1, "duplicate bootargs takes stock");
+	}
 	size = fdt_fixture(fdt, "other", recovery);
 	CHECK(piano_fdt_has_bootarg(fdt, size, recovery, sizeof(recovery) - 1) == 0, "recovery token outside /chosen");
 	size = fdt_fixture(fdt, "chosen", recovery);

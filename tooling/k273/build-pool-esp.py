@@ -27,7 +27,12 @@ from pathlib import Path
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
+    # The shared ESP builder also imports the TOML parser.
+    sys.modules.setdefault('tomllib', tomllib)
 
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))

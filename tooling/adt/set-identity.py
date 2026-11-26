@@ -20,7 +20,10 @@ from pathlib import Path
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
 
 DEVICE = Path(__file__).resolve().parents[2]
 IDENTITIES = DEVICE / 'configs/k27-identity'

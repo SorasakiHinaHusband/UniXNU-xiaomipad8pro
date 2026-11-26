@@ -44,7 +44,7 @@ static inline int piano_fdt_arg(const unsigned char *p, unsigned size, const cha
 static inline int piano_fdt_has_bootarg(const unsigned char *fdt, unsigned available, const char *arg, unsigned len)
 {
 	unsigned total, pos, end, strings, strings_size, structure_size, depth = 0;
-	int root = 0, chosen = 0;
+	int root = 0, chosen = 0, seen_chosen = 0, match = -1;
 
 	if (!fdt || available < 40 || piano_fdt_u32(fdt) != 0xd00dfeedu)
 		return -1;
@@ -69,10 +69,14 @@ static inline int piano_fdt_has_bootarg(const unsigned char *fdt, unsigned avail
 				return -1;
 			root = 1;
 			depth++;
-			if (depth == 2)
+			if (depth == 2) {
 				chosen = n == 6 && fdt[pos] == 'c' && fdt[pos + 1] == 'h' &&
 					fdt[pos + 2] == 'o' && fdt[pos + 3] == 's' &&
 					fdt[pos + 4] == 'e' && fdt[pos + 5] == 'n';
+				if (chosen && seen_chosen)
+					return -1;
+				seen_chosen |= chosen;
+			}
 			pos += (n + 4) & ~3u;	/* align the name and its NUL */
 		} else if (token == 2) {	/* FDT_END_NODE */
 			if (!depth)
@@ -90,12 +94,17 @@ static inline int piano_fdt_has_bootarg(const unsigned char *fdt, unsigned avail
 			if (chosen && depth == 2 && strings_size - name >= 9) {
 				const unsigned char *s = fdt + strings + name;
 				if (s[0] == 'b' && s[1] == 'o' && s[2] == 'o' && s[3] == 't' &&
-				    s[4] == 'a' && s[5] == 'r' && s[6] == 'g' && s[7] == 's' && !s[8])
-					return piano_fdt_arg(fdt + pos, n, arg, len);
+				    s[4] == 'a' && s[5] == 'r' && s[6] == 'g' && s[7] == 's' && !s[8]) {
+					if (match >= 0)
+						return -1;
+					match = piano_fdt_arg(fdt + pos, n, arg, len);
+					if (match < 0)
+						return -1;
+				}
 			}
 			pos += (n + 3) & ~3u;
 		} else if (token == 9) {	/* FDT_END */
-			return root && !depth ? 0 : -1;
+			return root && !depth ? match > 0 : -1;
 		} else if (token != 4) {	/* FDT_NOP is skippable */
 			return -1;
 		}

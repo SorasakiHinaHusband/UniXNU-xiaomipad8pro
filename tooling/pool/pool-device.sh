@@ -78,7 +78,8 @@ V=$WORK/$VOL
 
 get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | tail -1; }
 put() {   # KEY VALUE: the state file rewritten through a new file (a cut leaves the old one)
-    { [ -f "$STATE" ] && grep -v "^$1=" "$STATE"; printf '%s=%s\n' "$1" "$2"; } > "$STATE.new" && mv -f "$STATE.new" "$STATE"
+    { [ -f "$STATE" ] && grep -v "^$1=" "$STATE"; printf '%s=%s\n' "$1" "$2"; } > "$STATE.new" && mv -f "$STATE.new" "$STATE" ||
+        die "cannot record $1 in state.env"
 }
 vget() { get "${VOL}_$1"; }
 vput() { put "${VOL}_$1" "$2"; }
@@ -112,10 +113,14 @@ root_systemos() {   # the volume UUID `/` reports (the SystemOS union mount repo
     if [ -n "${POOL_TEST_ROOT_SYSTEMOS:-}" ]; then echo "$POOL_TEST_ROOT_SYSTEMOS"; return 0; fi
     plist / VolumeUUID
 }
-booted_copy() {   # 0 when `/` runs on one of this tool's copies (the pool entry)
+require_inactive_copies() {
     local now
-    now=$(root_systemos)
-    [ -n "$now" ] && { [ "$now" = "$(get os_volume_uuid)" ] || [ "$now" = "$(get systemos_volume_uuid)" ]; }
+    now=$(root_systemos) || die 'cannot identify the root volume'
+    [[ "$now" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] ||
+        die 'cannot identify the root volume'
+    if [ "$now" = "$(get os_volume_uuid)" ] || [ "$now" = "$(get systemos_volume_uuid)" ]; then
+        die "$1"
+    fi
 }
 unescape_list() {   # manifest paths (bytes outside 0x21-0x7e and the backslash as \xHH) -> raw paths, one per line
     local line
@@ -283,7 +288,7 @@ mount_rw() {
     mkdir -p "$MNT"
     "$MOUNT" -t apfs -o nobrowse "/dev/$1" "$MNT" || die "mount /dev/$1 at $MNT"
 }
-unmount() { "$UMOUNT" "$MNT" 2>/dev/null || "$UMOUNT" -f "$MNT" 2>/dev/null || true; }
+unmount() { "$UMOUNT" "$MNT" 2>/dev/null || "$UMOUNT" -f "$MNT" 2>/dev/null; }
 mine_disk() {   # the device of this tool's volume of $VOL, checked by UUID, name and container
     local uuid disk
     uuid=$(vget volume_uuid)
@@ -297,8 +302,9 @@ mine_disk() {   # the device of this tool's volume of $VOL, checked by UUID, nam
 step_extract() {
     local disk fam t0 n
     disk=$(mine_disk) || exit 1
-    booted_copy && die '/ runs on a copy (the pool entry): never written while booted'
+    require_inactive_copies '/ runs on a copy (the pool entry): never written while booted'
     vput verified no
+    vput extracted no
     mount_rw "$disk"
     trap unmount EXIT
     # SF_RESTRICTED (0x80000) is on most system entries; root sets it only where SIP lets it. Probed on the target.
@@ -356,7 +362,7 @@ step_extract() {
     done < "$WORK/x.firmlink"
     vput firmlink_markers "$fixed"
     sync
-    unmount
+    unmount || die "cannot unmount $MNT after extraction"
     trap - EXIT
     vput extracted yes
     vput extract_seconds $(( $(date +%s) - t0 ))
@@ -366,13 +372,14 @@ step_extract() {
 step_verify() {
     local disk relax out rc got
     [ "$(vget extracted)" = yes ] || die 'not extracted'
+    vput verified no
     disk=$(mine_disk) || exit 1
     mkdir -p "$MNT"
     "$MOUNT" -t apfs -o rdonly,nobrowse "/dev/$disk" "$MNT" || die "mount -r /dev/$disk"
     trap unmount EXIT
     "$MANIFEST_TOOL" --exclude .fseventsd "$MNT" > "$WORK/$VOL-copy.manifest" 2> "$WORK/$VOL-copy.manifest.err"
     rc=$?
-    unmount
+    unmount || die "cannot unmount $MNT after verification"
     trap - EXIT
     [ "$rc" = 0 ] || die "the copy's manifest: rc $rc ($(head -3 "$WORK/$VOL-copy.manifest.err"))"
     # always: the firmlink markers (SF_FIRMLINK, com.apple.fs.firmlink, com.apple.fs.altlink), kernel-reserved (step_extract);
@@ -400,6 +407,7 @@ step_fstab() {
     [ "$(get os_verified)" = yes ] && [ "$(get systemos_verified)" = yes ] || die 'both copies verified first'
     if [ -f "$FSTAB" ] && grep -qF "$TAG" "$FSTAB"; then
         fstab_lines | while IFS= read -r u; do grep -qxF "$u" "$FSTAB" || exit 1; done || die "$FSTAB has the tag but not every line"
+        put fstab yes
         log 'fstab block there already'
         return 0
     fi
@@ -412,9 +420,8 @@ step_fstab() {
         put fstab_existed no
     fi
     tmp=$FSTAB.pool-new
-    { [ -f "$FSTAB" ] && cat "$FSTAB"; echo "$TAG"; fstab_lines; } > "$tmp"
-    chmod 644 "$tmp"
-    mv -f "$tmp" "$FSTAB"
+    { if [ -f "$FSTAB" ]; then cat "$FSTAB" || die "cannot read $FSTAB"; fi; echo "$TAG" && fstab_lines; } > "$tmp" &&
+        chmod 644 "$tmp" && mv -f "$tmp" "$FSTAB" || die "cannot install $FSTAB"
     put fstab yes
     log 'fstab: the two copies and the two old windows ro,noauto'
 }
@@ -422,7 +429,7 @@ step_fstab() {
 step_undo() {
     local v uuid disk cont out name
     cont=$(get container)
-    booted_copy && die '/ runs on a copy (the pool entry is booted): boot macos-27.3 first'
+    require_inactive_copies '/ runs on a copy (the pool entry is booted): boot macos-27.3 first'
     if [ -f "$FSTAB" ] && grep -qF "$TAG" "$FSTAB"; then
         fstab_lines > "$WORK/x.fstab-lines"
         echo "$TAG" >> "$WORK/x.fstab-lines"

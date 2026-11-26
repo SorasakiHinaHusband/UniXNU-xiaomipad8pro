@@ -26,6 +26,29 @@ ms() {
     shift
     python3 "$MAINT" --session "$MSESSION" --boot-image "${BOOT_IMAGE:-boot-piano-macos-persistent-v5-signed.img}" "$@" > "$log" 2>&1
 }
+
+# A detached step may survive an SSH failure. Trust only a complete exit status.
+dev_step() {   # STEP [VOL] [MAX_SECONDS]
+    local step=$1 vol=${2:-} max=${3:-900} tag i rc=''
+    tag=$step${vol:+-$vol}
+    if rsudo "/bin/rm -f '$PR/$tag.rc' || exit 1; /usr/bin/nohup /bin/sh -c \"POOL_DATA_UUID='$POOL_DATA_UUID' /bin/bash '$PR/pool-device.sh' $step '$PR' $vol > '$PR/$tag.out' 2>&1; echo \\\$? > '$PR/$tag.rc.new' && /bin/mv -f '$PR/$tag.rc.new' '$PR/$tag.rc'\" > /dev/null 2>&1 < /dev/null &" \
+        > /dev/null 2>&1; then
+        for i in $(seq 1 $((max / 10 + 1))); do
+            nap "${POOL_POLL:-10}"
+            if rc=$(rsudo "cat '$PR/$tag.rc' 2>/dev/null" 2>/dev/null) &&
+                [[ "$rc" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$rc" -le 255 ]; then
+                rsudo "cat '$PR/$tag.out' 2>/dev/null" > "$ROUND/device-$tag.log" 2>&1 || true
+                [ "$rc" = 0 ]
+                return $?
+            fi
+        done
+    fi
+    rsudo "cat '$PR/$tag.out' 2>/dev/null" > "$ROUND/device-$tag.log" 2>&1 || true
+    say "recovery hold: no confirmed exit status for $tag; it may still be running (device-$tag.log)"
+    phase recovery
+    exit 3
+}
+
 pool_gate_args() {
     local old profile
     [ -f "${POOL_BASE_GATE_SPEC:-}" ] && [ -f "${POOL_PROFILE_ARGS:-}" ] || return 1

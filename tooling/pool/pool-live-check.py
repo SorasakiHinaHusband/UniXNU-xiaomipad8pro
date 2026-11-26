@@ -30,6 +30,7 @@ from pathlib import Path
 FIRMLINKS = ('private', 'Applications', 'Library', 'Users', 'Volumes', 'cores', 'opt', 'usr/local', 'System/Library/Caches',
              'System/Volumes/Hardware')
 FIELDS = ('path', 'type', 'mode', 'uid', 'gid', 'flags', 'size', 'mtime', 'data', 'link', 'hardlink', 'xattrs', 'acl', 'compression')
+SUMMARY = re.compile(r'# entries (\d{1,20}) files \d{1,20} bytes \d{1,20}(?: missing (\d{1,20}))? sha256 [0-9a-f]{64} errors 0')
 
 
 def escape(text):
@@ -37,19 +38,29 @@ def escape(text):
     return ''.join(chr(b) if 0x20 < b < 0x7f and b != 0x5c else f'\\x{b:02x}' for b in text.encode())
 
 
+def manifest_lines(path, *, live=False):
+    lines = Path(path).read_text(errors='surrogateescape').splitlines()
+    summary = lines.pop() if lines else ''
+    match = SUMMARY.fullmatch(summary)
+    if not match or (match[2] is not None) != live:
+        raise SystemExit(f'VOID: {path}: no clean final summary line')
+    return lines, summary, int(match[1]), int(match[2] or 0)
+
+
 def load_manifest(path):
-    """[(path, fields)] in file order; the summary line must say errors 0."""
-    rows, summary = [], None
-    for line in Path(path).read_text(errors='surrogateescape').splitlines():
-        if line.startswith('# entries'):
-            summary = line
-            continue
+    """[(path, fields)] in file order, with one record per path in a complete manifest."""
+    lines, _, entries, _ = manifest_lines(path)
+    rows, paths = [], set()
+    for line in lines:
         f = line.split('\t')
         if len(f) != 14:
             raise SystemExit(f'VOID: {path}: a line of {len(f)} fields')
+        if f[0] in paths:
+            raise SystemExit(f'VOID: {path}: repeated path {f[0]}')
+        paths.add(f[0])
         rows.append((f[0], f))
-    if not summary or not summary.endswith('errors 0'):
-        raise SystemExit(f'VOID: {path}: no clean summary line ({summary})')
+    if len(rows) != entries or not any(p == '.' and f[1] == 'd' for p, f in rows):
+        raise SystemExit(f'VOID: {path}: incomplete source manifest')
     return rows
 
 
@@ -135,23 +146,24 @@ def cmd_compare(a):
     rows, hidden = v.listing()
     if want != rows:
         raise SystemExit('VOID: the list is not the one these manifests and mounts give (made from other inputs)')
-    live, ls, missing, summary = {}, {}, {}, None
-    for line in Path(a.live).read_text(errors='surrogateescape').splitlines():
-        if line.startswith('# entries'):
-            summary = line
-        elif line.startswith('#ls\t'):
-            _, t, p, n = line.split('\t')
-            ls.setdefault((t, p), set()).add(n)
-        elif line.startswith('#missing\t'):
-            _, t, p, e = line.split('\t')
-            missing[(t, p)] = e
+    live, ls, missing = {}, {}, {}
+    lines, summary, entries, missing_count = manifest_lines(a.live, live=True)
+    for line in lines:
+        f = line.split('\t')
+        if len(f) == 4 and f[0] == '#ls':
+            ls.setdefault((f[1], f[2]), set()).add(f[3])
+            continue
+        if len(f) == 4 and f[0] == '#missing':
+            key, store, value = (f[1], f[2]), missing, f[3]
+        elif len(f) == 15:
+            key, store, value = (f[0], f[1]), live, f[1:]
         else:
-            f = line.split('\t')
-            if len(f) != 15:
-                raise SystemExit(f'VOID: {a.live}: a line of {len(f)} fields')
-            live[(f[0], f[1])] = f[1:]
-    if not summary or not re.search(r' errors 0$', summary):
-        raise SystemExit(f'VOID: {a.live}: no clean summary line ({summary}): the live run did not finish or could not read')
+            raise SystemExit(f'VOID: {a.live}: malformed live record')
+        if key in live or key in missing:
+            raise SystemExit(f'VOID: {a.live}: repeated live path {key}')
+        store[key] = value
+    if len(live) != entries or len(missing) != missing_count:
+        raise SystemExit(f'VOID: {a.live}: live counts disagree with its final summary')
     counts, samples = {}, []
 
     def bad(kind, text):

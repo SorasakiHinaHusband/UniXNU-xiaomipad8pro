@@ -24,7 +24,7 @@
 #   device  the archives (os 11.8 GB, systemos 3.1 GB), manifests, lists, pool-manifest and pool-device.sh into /private/var/tmp/ROUND
 #           (create_remote; each sha256 checked after the copy); pool-device.sh as root, each step detached with its own status file:
 #           preflight os/systemos (the old windows read raw again), create, extract, verify of each, fstab; the state fetched. Nothing is
-#           written to the ESP unless both copies verified. A refusal here: the copies made so far are undone, exit 1.
+#           written to the ESP unless both copies verified. A refusal here undoes the copies. An unconfirmed step holds for recovery.
 #   build   tooling/k273/build-pool-esp.py --state ROUND/state.env: the pool ESP and its record in OUT
 #   esp     the battery again; go_abl; the ABL battery voltage (>= 3500 mV); maint-session maint-boot map esp-delta check maint-exit
 #           --esp POOL --new-backup (as v13.1y10); a stopped session is a recovery hold (exit 3)
@@ -81,11 +81,13 @@ CAP=''
 PHASE=pre
 LOCKED=0
 FINISHED=0
+COPIES_MAY_EXIST=0
 [ -d "$PACKAGE" ] && [ -f "$PACKAGE/PACKAGE.tsv" ] || { echo "no pool package $PACKAGE (tooling/pool/mk-pool-package.sh)" >&2; exit 1; }
 # the package copies of v13.1y10's functions, then the pool's host functions
 source "$PACKAGE/install-functions.sh"
 source "$PACKAGE/install-gate.sh"
 source "$PACKAGE/pool-host.sh"
+declare -F dev_step > /dev/null || { echo 'rebuild the pool package with tooling/pool/mk-pool-package.sh' >&2; exit 1; }
 # the fake tablet (tooling/persist/test-pool-session.py): every device seam replaced by an executable; nothing else changes
 if [ "${POOL_FAKE:-0}" = 1 ]; then
     for seam in RSSH RSUDO GO_ABL MS DISK_BOOT GUI_GATES BATTERY LIVE_BOOT; do
@@ -135,21 +137,6 @@ must_gate() {   # LABEL FUNCTION ARGS...: 0 PASS, 1 FAIL -> rollback, 2 VOID -> 
 }
 json() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2], {"d": d}))' "$@"; }
 
-# -- the device steps: detached on the tablet (an extraction outlives an ssh session), a status file each --------------------------
-dev_step() {   # STEP [VOL] [MAX_SECONDS]: started detached on the tablet (nohup; v13.1y10's layer_apply pattern), its rc file polled
-    local step=$1 vol=${2:-} max=${3:-900} tag i rc=''
-    tag=$step${vol:+-$vol}
-    rsudo "/bin/rm -f '$PR/$tag.rc'; /usr/bin/nohup /bin/sh -c \"POOL_DATA_UUID='$POOL_DATA_UUID' /bin/bash '$PR/pool-device.sh' $step '$PR' $vol > '$PR/$tag.out' 2>&1; echo \\\$? > '$PR/$tag.rc'\" > /dev/null 2>&1 < /dev/null &" \
-        > /dev/null 2>&1 || return 1
-    for i in $(seq 1 $((max / 10 + 1))); do
-        nap "${POOL_POLL:-10}"
-        rc=$(rsudo "cat '$PR/$tag.rc' 2>/dev/null" 2>/dev/null | tr -dc 0-9)
-        [ -n "$rc" ] && break
-    done
-    rsudo "cat '$PR/$tag.out' 2>/dev/null" > "$ROUND/device-$tag.log" 2>&1 || true
-    [ -n "$rc" ] || echo "no rc after $max s (the step may still run on the tablet: $PR/$tag.out)" >> "$ROUND/device-$tag.log"
-    [ "$rc" = 0 ]
-}
 pool_put() {   # LOCAL REMOTE: put (v13.1y10's: five tries, sha256 read back) with an ssh time limit for the file's size
     local size
     size=$(stat -f %z "$1")
@@ -175,8 +162,13 @@ root_os() {   # the volume UUID of the root mount itself (the first mount on /: 
 }
 refuse() {   # WHY: before any ESP write; the copies made so far undone (pool-device.sh undo)
     say "refused: $1"
-    if [ "$PHASE" = device ]; then
-        dev_step undo '' 600 && say '  the copies made so far undone' || say '  the undo of the copies did not finish: device-undo.log'
+    if [ "$PHASE" = device ] && [ "$COPIES_MAY_EXIST" = 1 ]; then
+        if ! dev_step undo '' 600; then
+            say 'recovery hold: undo of the copies failed (device-undo.log)'
+            phase recovery
+            exit 3
+        fi
+        say '  the copies made so far undone'
     fi
     phase refused
     exit 1
@@ -296,6 +288,7 @@ for s in 'preflight os 600' 'preflight systemos 600' 'r1b - -' 'create os 300' '
          'extract systemos 2400' 'verify systemos 900' 'fstab - 120'; do
     set -- $s
     if [ "$1" = r1b ]; then r1b; continue; fi
+    if [ "$1" = create ]; then COPIES_MAY_EXIST=1; fi
     vol=$2; [ "$vol" = - ] && vol=''
     t1=$(date +%s)
     dev_step "$1" "$vol" "$3" || refuse "device step $1 $vol: $(tail -1 "$ROUND/device-$1${vol:+-$vol}.log")"

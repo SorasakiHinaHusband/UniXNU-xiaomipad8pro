@@ -16,9 +16,12 @@ import sys
 try:
     import tomllib
 except ModuleNotFoundError:
-    import tomli as tomllib
-with open(sys.argv[1], 'rb') as lock:
-    print(tomllib.load(lock)['pin'][sys.argv[2]][sys.argv[3]])
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
+with open(sys.argv[1], encoding='utf-8') as lock:
+    print(tomllib.loads(lock.read())['pin'][sys.argv[2]][sys.argv[3]])
 PY
 }
 M=$R/Mu-Silicium-piano

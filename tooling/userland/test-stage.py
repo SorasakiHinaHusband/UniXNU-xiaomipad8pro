@@ -144,6 +144,11 @@ def manifest_tests(tmp):
         return stage.load_manifest(path, on, off)
 
     check(load(unit_toml('a', [good_tool, good_job]))['units'][0]['files'][1]['kind'] == 'daemon', 'a good manifest loads')
+    first = dict(good_tool, staged='files/a/shared')
+    for path in ('files/a/shared', 'files/a/shared/nested', 'files/a/SHARED'):
+        second = dict(good_tool, dest='/usr/local/bin/other', staged=path)
+        check(refused(load, unit_toml('a', [first, second]), match='staging path conflicts'),
+              f'manifest refuses conflicting staged files at files/a/shared and {path}')
     bad = {
         'a dest outside the allowed directories': (unit_toml('a', [{**good_tool, 'dest': '/usr/bin/tool'}]), 'dest must be'),
         'a group-writable mode': (unit_toml('a', [{**good_tool, 'mode': '0775'}]), 'not writable'),

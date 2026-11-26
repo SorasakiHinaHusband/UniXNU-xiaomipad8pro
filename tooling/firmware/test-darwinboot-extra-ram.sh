@@ -14,9 +14,12 @@ import sys
 try:
     import tomllib
 except ModuleNotFoundError:
-    import tomli as tomllib
-with open(sys.argv[1], 'rb') as lock:
-    print(tomllib.load(lock)['pin']['DarwinBoot']['commit'])
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
+with open(sys.argv[1], encoding='utf-8') as lock:
+    print(tomllib.loads(lock.read())['pin']['DarwinBoot']['commit'])
 PY
 )
 if ! git -C "$SRC" cat-file -e "$PIN^{commit}" 2>/dev/null; then

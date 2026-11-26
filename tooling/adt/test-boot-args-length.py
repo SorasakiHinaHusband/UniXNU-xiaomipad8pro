@@ -118,12 +118,16 @@ def test_identity_overlay():
         source = Path(scratch) / 'in.adt'
         output = Path(scratch) / 'out.adt'
         source.write_bytes(ba.serialize(root))
-        result = subprocess.run([sys.executable, str(ROOT / 'tooling/adt/set-identity.py'),
-                                 str(source), str(output), '--identity', 'piano'], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        props, _ = ba.load(output.read_bytes())
-        values = {name: value for name, _, value, _ in props}
-        assert values['compatible'] == b'PianoAP\0'
+        interpreters = {sys.executable}
+        if sys.platform == 'darwin':
+            interpreters.add('/usr/bin/python3')
+        for python in sorted(interpreters):
+            result = subprocess.run([python, str(ROOT / 'tooling/adt/set-identity.py'),
+                                     str(source), str(output), '--identity', 'piano'], capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr
+            props, _ = ba.load(output.read_bytes())
+            values = {name: value for name, _, value, _ in props}
+            assert values['compatible'] == b'PianoAP\0'
 
 
 def test_qual(record):

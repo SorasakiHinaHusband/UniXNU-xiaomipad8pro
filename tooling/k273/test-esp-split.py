@@ -31,7 +31,12 @@ from pathlib import Path
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib
+    # The shared ESP builder also imports the TOML parser.
+    sys.modules.setdefault('tomllib', tomllib)
 
 HERE = Path(__file__).resolve().parent
 D = HERE.parents[1]

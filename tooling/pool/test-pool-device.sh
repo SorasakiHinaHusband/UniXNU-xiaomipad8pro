@@ -97,6 +97,11 @@ run create os; [ $? = 0 ] && [ "$(grep -c addVolume "$M/calls")" = 2 ]; check $?
 run fstab; [ $? != 0 ] && grep -q 'both copies verified first' "$T/last.log"; check $? 'fstab refused before both are verified'
 run extract os; [ $? != 0 ] && grep -q 'SF_RESTRICTED cannot be set' "$T/last.log"; check $? 'extract refuses when SF_RESTRICTED cannot be set'
 export POOL_ACCEPT_UNRESTRICTED=1
+printf '#!/bin/sh\nexit 1\n' > "$T/umount-fails"
+chmod +x "$T/umount-fails"
+POOL_UMOUNT=$T/umount-fails run extract os; [ $? != 0 ] && ! grep -qx 'os_extracted=yes' "$W/state.env"
+check $? 'extract refuses to certify a volume it could not unmount'
+"$M/bin/umount" "$W/mnt" || exit 1
 run extract os; check $? 'extract os (POOL_ACCEPT_UNRESTRICTED=1)'
 run verify os; check $? 'verify os'
 run extract systemos; check $? 'extract systemos'
@@ -105,15 +110,23 @@ grep -q '^os_restricted_settable=no' "$W/state.env" && grep -q '^systemos_verifi
 [ -f "$M/vols/disk3s10/System/Library/Localizable.stringsdict" ] && xattr -p com.example.a "$M/vols/disk3s9/usr/lib/lib3.dylib" | grep -qx systemos
 check $? 'each copy holds its own volume (os on disk3s10, systemos on disk3s9)'
 run fstab; check $? 'fstab'
+sed -i '' '/^fstab=yes$/d' "$W/state.env"
 run fstab; [ $? = 0 ] && [ "$(grep -c 'apfs ro,noauto$' "$POOL_FSTAB")" = 4 ]; check $? 'fstab again: still four lines'
+grep -qx 'fstab=yes' "$W/state.env"; check $? 'fstab retry restores the state marker after an interrupted run'
 grep -q '^LABEL=Owner' "$POOL_FSTAB" && grep -q "^UUID=$OS_OLD none apfs ro,noauto$" "$POOL_FSTAB"; check $? 'fstab: the owner line kept, the old windows noauto'
 chmod u+w "$M/vols/disk3s10/usr/lib/lib2.dylib" 2>/dev/null; printf 'x' | dd of="$M/vols/disk3s10/usr/lib/lib2.dylib" bs=1 seek=10 conv=notrunc 2>/dev/null
 run verify os; [ $? != 0 ] && grep -q 'data 1' "$W/os-verify.txt"; check $? 'verify refuses a changed byte'
+! grep -qx 'os_verified=yes' "$W/state.env"; check $? 'a failed recheck invalidates the previous verification'
 run extract os && run verify os; check $? 'extract + verify again: equal'
 MOCK_ROOT_UUID=9A0B0C0D-1111-2222-3333-444455556666 bash "$P" undo "$W" > "$T/last.log" 2>&1; [ $? != 0 ] && grep -q 'boot macos-27.3 first' "$T/last.log"
 check $? 'undo refused while / runs on the copy'
 MOCK_ROOT_UUID=9A0B0C0D-1111-2222-3333-444455556666 bash "$P" extract "$W" os > "$T/last.log" 2>&1; [ $? != 0 ] && grep -q 'never written while booted' "$T/last.log"
 check $? 'extract refused while / runs on a copy'
+MOCK_ROOT_UUID= run extract os; [ $? != 0 ] && grep -q 'cannot identify the root volume' "$T/last.log"
+check $? 'extract refuses when the root volume cannot be identified'
+MOCK_ROOT_UUID= run undo; [ $? != 0 ] && grep -q 'cannot identify the root volume' "$T/last.log" &&
+    [ -f "$M/vol-PianoOS.uuid" ] && [ -f "$M/vol-PianoSystemOS.uuid" ]
+check $? 'undo preserves both volumes when the root volume cannot be identified'
 MOCK_NEWNAME=Other bash "$P" undo "$W" > "$T/last.log" 2>&1; [ $? != 0 ] && grep -q 'not deleted' "$T/last.log" && [ -f "$M/vol-PianoOS.uuid" ]
 check $? 'undo refuses a volume whose name is not its own'
 run undo; check $? 'undo'
