@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 
 using namespace pianothermal;
@@ -302,6 +303,12 @@ static void dieFaults()
   }
   Bench b;
   CHECK(b.step(-1).protection.deci == -1 && b.monitor.allFresh());  // -0.1 C is a legitimate reading.
+  CHECK(!b.step(400).protection.gpuLimited());
+  b.die.publish(400, b.nowMs);
+  b.die.sensor[1][kMap[1].cpuFirst].status = UINT32_MAX;
+  const auto coldFault = b.tick();
+  CHECK(coldFault.protection.after == State::normal && coldFault.protection.gpuLimited());
+  CHECK(coldFault.caps == Pair{kTop[0], kFloor[1]});
 }
 
 static void adcFaults()
