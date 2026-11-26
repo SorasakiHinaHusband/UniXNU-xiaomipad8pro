@@ -14,6 +14,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 using task_t=void *;
 using proc_t=void *;
 using IOReturn=int;
@@ -46,7 +47,12 @@ inline void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns){*ns=uint64_t(st
 inline thread_t current_thread(){return nullptr;}
 inline void thread_set_thread_name(thread_t,const char *){}
 inline void thread_terminate(thread_t){}
-inline void thread_deallocate(thread_t t){t->detach();delete t;}
+inline thread_local std::thread *kernelThreadJoinTarget=nullptr;
+inline void thread_deallocate(thread_t t){
+  if(kernelThreadJoinTarget)*kernelThreadJoinTarget=std::move(*t);
+  else t->detach();
+  delete t;
+}
 inline int kernel_thread_start(void (*f)(void *,wait_result_t),void *p,thread_t *t){*t=new std::thread([=]{f(p,0);});return 0;}
 inline bool PE_parse_boot_argn(const char *,void *,size_t){return false;}
 extern "C" inline int proc_selfpid(){return 1;}

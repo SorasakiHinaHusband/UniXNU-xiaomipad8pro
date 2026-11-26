@@ -49,7 +49,7 @@ run_video_test() {
 }
 
 tests=(bringup_host stream_host session_host video_host geometry_host hevc_host enc_host fixture_host
-       vt_host vt_surface_host vt_sync_host vt_contract_host vt_cancel_host)
+       vt_host vt_surface_host vt_sync_host vt_contract_host vt_cancel_host video_vt_cancel_e1_handoff_host)
 if [ "$(uname -s)" = Darwin ]; then
   tests+=(vt_serializer_host)
 fi
