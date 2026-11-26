@@ -4,7 +4,9 @@
  * model only PianoAudioDevice.cpp:532-540,557-558's absolute deadline loop.
  * Delays are synthetic injections of the published aud-mic4 maximum magnitudes,
  * NOT a reconstruction of unrecorded individual wake times or their cause. */
-#include "AudioLive.h"
+/* As in mic_fifo_host.c, including production C also exposes the exact
+ * speaker refill boundary without inventing a DSP scheduling implementation. */
+#include "../AudioLive.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,10 +130,39 @@ static void boundaries(void)
     CHECK(r.late_periods == 6 && r.max_us == 10001);
 }
 
+static void four_slot_refill(void)
+{
+    static AudioLive live;
+    int16_t pcm[AUDIO_LIVE_START_FRAMES * 2];
+    for (unsigned i = 0; i < sizeof pcm / sizeof pcm[0]; ++i) pcm[i] = 1000;
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        memset(&live, 0, sizeof live);
+        audio_live_shared_init(&sh, out, in, AUDIO_Q15_ONE);
+        sh.output_frames = piano_audio_timing_profile(mode)->periodFrames;
+        live.sh = &sh;
+        /* This is the post-unmute prime_left selection in production. */
+        live.prime_left = mode == 0 ? AUDIO_LIVE_DEPTH : 0;
+        CHECK(audio_ring_write(&sh.out, pcm, AUDIO_LIVE_START_FRAMES) == AUDIO_LIVE_START_FRAMES);
+        for (unsigned burst = AUDIO_LIVE_DEPTH; burst; --burst) take_period(&live, burst);
+        if (mode == 0) {
+            CHECK(live.underruns == 0 && sh.out.underruns == 0 && live.skipped == 0);
+            CHECK(audio_ring_fill(&sh.out) == AUDIO_LIVE_TARGET);
+        } else {
+            /* Actual mode480 threshold 2400 trims 2880 to 960 BEFORE a
+             * 1920-frame refill. Two exact 480-frame short reads follow. */
+            CHECK(live.skipped == 1 && live.underruns == 2 && sh.out.underruns == 960);
+            CHECK(audio_ring_fill(&sh.out) == 0);
+        }
+        printf("four-slot refill mode %u: skipped %u short-reads %u missing %llu frames\n",
+               mode, live.skipped, live.underruns, (unsigned long long)sh.out.underruns);
+    }
+}
+
 int main(void)
 {
     metric_ambiguity();
     boundaries();
+    four_slot_refill();
     printf("duplex_schedule_host: %u checks passed (synthetic timing, real capture FIFO)\n", checks);
     return 0;
 }
