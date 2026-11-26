@@ -49,9 +49,9 @@ cat > "$W/bin/python3" <<'SH'
 set -eu
 if [ "$1" = -m ] && [ "$2" = venv ]; then
   mkdir -p "$3/bin"
-  ln -s "$FIXTURE_PYTHON" "$3/bin/python"
+  printf '#!/bin/sh\nexec "$FIXTURE_PYTHON" "$@"\n' > "$3/bin/python"
   printf '#!/bin/sh\nexit 0\n' > "$3/bin/pip"
-  chmod +x "$3/bin/pip"
+  chmod +x "$3/bin/python" "$3/bin/pip"
 else
   exec "$FIXTURE_PYTHON" "$@"
 fi
