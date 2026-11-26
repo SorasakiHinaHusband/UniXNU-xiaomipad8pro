@@ -10,7 +10,8 @@ start = driver.split('bool PianoDpu::start(IOService *provider)', 1)[1].split('I
 assert start.index('dpuSlicesReadArgs();') < start.index('kernel_thread_start(') < start.index('dpuSlicesStart(this);')
 wanted = slices.split('bool dpuSlicesWanted()\n{', 1)[1].split('}', 1)[0]
 assert 'readSliceArgs(' not in wanted
-read_args = slices.split('void readSliceArgs()\n{', 1)[1].split('gArgsRead = true;', 1)[0]
-assert read_args.index('"piano-dpu-panel"') < read_args.index('"piano-dpu-ahb-vote"')
-assert '(gA.nightShift || modesEnabled() || gA.panel) && gA.level >= 2 ? 1 : 0' in read_args
+read_args = slices.split('void readSliceArgs()\n{', 1)[1].split('}', 1)[0]
+# The sanitized interaction suite tests the startup policy itself.
+assert 'gA = readStartupArgs(PE_parse_boot_argn, PE_parse_boot_arg_str);' in read_args
+assert 'return gA.wanted();' in wanted
 print('PianoDpu startup: boot options initialized before either worker starts')

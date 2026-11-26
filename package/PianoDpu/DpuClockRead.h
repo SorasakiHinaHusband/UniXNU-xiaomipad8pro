@@ -114,4 +114,12 @@ void format(const Clocks &clocks, Out &out)
            readable && major == 2 ? unsigned((crm.cfg1 >> 20) & 15) : 0, readable && major == 2 ? unsigned((crm.cfg1 >> 24) & 7) : 0);
 }
 
+template <class Out, class ReadVotes>
+void formatReadback(const Clocks &clocks, bool snapshotOn, Out &out, ReadVotes readVotes)
+{
+  format(clocks, out);
+  if (snapshotOn) out.line("clkread_rpmh status=unavailable (ACTIVE transport requires stores)");
+  else readVotes(out);
+}
+
 }  // namespace pianodpu::clkread

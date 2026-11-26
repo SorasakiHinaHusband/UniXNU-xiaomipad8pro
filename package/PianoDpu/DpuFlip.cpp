@@ -795,7 +795,7 @@ void flipRun(IOService *owner, const Survey &s, const SmmuSurvey &m, uint32_t sm
   cfg.irq = bootArg("piano-dpu-irq", 1) != 0;
   cfg.clean = bootArg("piano-dpu-clean", 1);
   if (cfg.clean > 2) cfg.clean = 2;
-  cfg.cleanSkip = cfg.level == 4 && bootArg("piano-dpu-clean-skip", 0) == 1;
+  cfg.cleanSkip = flip::readCleanSkip(cfg.level, bootArg);
   cfg.flush = bootArg("piano-dpu-flush", 0);
   cfg.underrun = bootArg("piano-dpu-underrun", 1) != 0;
   cfg.latchMs = bootArg("piano-dpu-latch", 50);

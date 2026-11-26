@@ -225,11 +225,7 @@ void refresh()
                (unsigned long long)stats.cleanFull, (unsigned long long)stats.toBoot, (unsigned long long)stats.cleanUnderruns,
                clean.pendingUnderruns, unsigned(clean.serving));
   }
-  if (gClockRead) {
-    clkread::format(clocks, out);
-    if (!gSnapshotOn) formatVotes(out);
-    else out.line("clkread_rpmh status=unavailable (ACTIVE transport requires stores)");
-  }
+  if (gClockRead) clkread::formatReadback(clocks, gSnapshotOn, out, formatVotes);
   if (gMapFailures) out.line("snapshot: %u page maps failed so far (those words read as ffffffff)", gMapFailures);
   gLastUs = gClockRead ? nowUs() : at;
 }
