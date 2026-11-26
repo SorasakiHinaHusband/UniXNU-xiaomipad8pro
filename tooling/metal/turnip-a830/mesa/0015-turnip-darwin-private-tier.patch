@@ -33,7 +33,7 @@ the legacy request and cache path when talking to a kernel without it.
        return result;
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -1221,7 +1221,14 @@
+@@ -1652,7 +1652,14 @@
     struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
     /* TU_DARWIN_BO_CACHE=0 turns the cache off (the host checks of the release paths need every free to reach the kernel). */
     static const bool cache_enabled = debug_get_bool_option("TU_DARWIN_BO_CACHE", true);
@@ -49,9 +49,9 @@ the legacy request and cache path when talking to a kernel without it.
     const bool read_only = !!(flags & TU_BO_ALLOC_GPU_READ_ONLY);
     /* A BO larger than its cache budget is released when it is freed (darwin_cache_put): it keeps its own size instead of its size class,
      * which held up to a quarter more for nothing (a 16384x16384 texture, 1 GiB and its UBWC metadata, asked 1.25 GiB of the kernel). */
-@@ -1268,7 +1275,10 @@
-       if (result != VK_SUCCESS)
-          return result;
+@@ -1726,7 +1733,10 @@
+          return tu_darwin_capacity_result(dev, result);
+       }
 
 -      NativeAdrenoAbiBoAlloc alloc = {.bytes = alloc_size, .align_log2 = 12, .contiguous = 0};
 +      NativeAdrenoAbiBoAlloc alloc = {
