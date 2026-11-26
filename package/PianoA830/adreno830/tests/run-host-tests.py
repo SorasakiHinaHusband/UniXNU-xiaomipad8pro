@@ -45,7 +45,7 @@ KNOWN = {
         'transactions', 'M2/M7/M10'),
     'test_ring': (['NativeAdrenoRing.cpp'], ['pm4'],
         'PASS: Gen8 ring: register-free attach, kernel/raw/framed packets with both SRAM inits, fenced WPTR 10 us x 200 with '
-        'poison on failure, Busy vs NoResources, exact publication, A830Fence waiter, ring lock, recovery (15 cases)', 'M4/M10'),
+        'poison on failure, Busy vs NoResources, exact publication, A830Fence waiter, ring lock, recovery (16 cases)', 'M4/M10'),
     'test_submit': (SUBMIT, ['smmu', 'pm4'],
         'PASS: 12 execbuf cases over software SMMU/CP peers: exact framed IB packet and fence with no SMMU access, cache '
         'maintenance or TLBI on submit; 9 pre-reference refusals; 44 job slots with one reserved per range (32) and Busy only with '
