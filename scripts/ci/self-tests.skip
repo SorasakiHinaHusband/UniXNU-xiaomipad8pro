@@ -13,7 +13,6 @@ tooling/persist/test-data-store.py                     # INPUT: imports the UniX
 tooling/persist/test-persist.py                        # INPUT: reads the maintainer's partition-table backup
 tooling/persist/test-switch-pair.py                    # INPUT: reads the maintainer's partition-table backup
 tooling/k27/run-a830-host-tests.py                     # KNOWN-FAIL ffec0acd: test_a830votes fails (56 pass); also 6.5 min
-tooling/native/test_piano_input.py                     # KNOWN-FAIL ffec0acd: test_refused_command_releases_and_reports ('Z 1' != 'R')
 tooling/native/tests/test_desk_login.py                # KNOWN-FAIL ffec0acd: the fake sleep does float arithmetic in bash $(( ))
 tooling/metal/turnip-a830/test-cache-fallback-host.sh   # needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
 tooling/metal/turnip-a830/test-family-host.sh   # needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
