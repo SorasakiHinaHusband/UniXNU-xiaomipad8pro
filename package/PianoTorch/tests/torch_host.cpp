@@ -30,6 +30,7 @@ struct Arbiter {
   std::vector<Apid> apids;
   std::map<uint32_t, uint8_t> pmic;               // ppid << 8 | reg
   std::map<uint32_t, bool> ignoresWrites;          // a register that keeps its value (a read-back mismatch)
+  std::map<uint8_t, bool> unreadableRegs;
   std::map<int, uint32_t> obsvStatus, obsvD0, obsvD1;
   std::map<int, uint32_t> chnlStatus, chnlData;
   std::vector<std::tuple<uint16_t, uint8_t, unsigned>> reads;   // ppid, reg, bytes
@@ -67,8 +68,8 @@ struct Arbiter {
     const uint16_t ppid = apids[apid].ppid;
     reads.emplace_back(ppid, reg, bytes);
     CHECK(unsigned(reg) + bytes <= 0x100);
-    if (failReads) {
-      --failReads;
+    if (failReads || unreadableRegs[reg]) {
+      if (failReads) --failReads;
       obsvStatus[apid] = 0x3;
       return;
     }
@@ -179,6 +180,8 @@ static void testConstants()
   CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(400) == 39 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
   CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(500, 500) == 100);
+  CHECK(boundedRequest(0, 100) == 0 && boundedRequest(50, 100) == 50 && boundedRequest(1ull << 32, 100) == 100);
+  CHECK(boundedRequest(UINT64_MAX, 1800) == 1800);
   CHECK(clampForMa(100) == 9 && clampForMa(60) == 5 && clampForMa(400) == 39);
   CHECK(!writable(kRegThermThrsh1, 0x07) && !writable(kRegThermThrsh2, 0x07) && !writable(0xd0, 0xff) && !writable(0x3d, 0xff));
   CHECK(!writable(kRegChanEn, 0x10) && !writable(kRegIres, 0x10) && !writable(kRegModuleEn, 0x7f) && !writable(kRegChanEn, 0));
@@ -253,6 +256,8 @@ static void testSurvey()
   flaky.read = Once::read;
   v = survey(flaky);
   CHECK(!v.complete && v.failures == 1 && writeRefusal(v, 2, 0) != nullptr);
+  const Survey partial = survey(flaky, true);
+  CHECK(!partial.complete && partial.valid[0x0f] && !partial.valid[0x10] && !partial.valid[0xff]);
 }
 
 static void testOnOff()
@@ -309,6 +314,13 @@ static void testOnOff()
   // the probe's spare-pair window: channels 3+4 through the same sequence, their registers only, the piano pair's kept
   a.writes.clear();
   a.r(kPpid, kRegIres) = 0x03;      // the piano pair's bits stand
+  CHECK(!c.on(4, 9, 0x0c).ok && a.writes.empty());
+  CHECK(!c.flashPulse(1, 8, 0x0c).ok && a.writes.empty());
+  CHECK(!c.off(0x0c).ok && a.writes.empty());
+  StepResult unauthorized;
+  CHECK(!c.put(unauthorized, kRegIres, 0x04, 0x04) && a.writes.empty());
+  CHECK(!c.put(unauthorized, kRegTimer0 + 3, 0xff, 0) && a.writes.empty());
+  c.setBus(p.bus, true);
   const StepResult spare = c.on(4, 9, 0x0c);
   CHECK(spare.ok && spare.writes == 12 && spare.readbacks == 12);
   CHECK(a.flash(kRegChanEn) == 0x0c && a.flash(kRegIres) == 0x0f);
@@ -376,6 +388,7 @@ static void testFailures()
   o = t.request(1000 + 59000, 50, 0, temps);
   CHECK(!o.lit && o.reason == Reason::writeFailed && o.steps.writes == 0);   // the cool-down: no write at all
   a.ignoresWrites.clear();
+  t.poll(1000 + 59500, temps);
   o = t.request(1000 + 60000, 50, 0, temps);
   CHECK(o.lit);
   t.request(70000, 0, 0, temps);
@@ -449,6 +462,7 @@ static void testGuard()
   o = t.poll(304000, temps);
   CHECK(!o.lit && o.reason == Reason::statusUnreadable);
   a.failReads = 0;
+  CHECK(t.poll(305000, temps).steps.ok && !t.needsOff());
   // someone (or the module) turned the channels off
   CHECK(t.request(400000, 50, 0, temps).lit);
   a.r(kPpid, kRegChanEn) = 0x01;
@@ -470,6 +484,129 @@ static void testGuard()
   CHECK(onlyFlash(a));
 }
 
+static void testGuardRegressions()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Torch t(p.bus, GuardConfig(), kHardMaxMa);
+  Temperatures temps;
+
+  CHECK(t.request(0, 50, 10, temps).lit);
+  a.failReads = 1000;
+  temps.batteryValid = true;
+  temps.batteryCenti = 4500;
+  CHECK(t.poll(500, temps).reason == Reason::batteryHot);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+
+  a.failReads = 0;
+  temps = {};
+  CHECK(t.poll(1000, temps).steps.ok && !t.needsOff());
+  CHECK(t.request(61000, 50, 10, temps).lit);
+  a.r(kPpid, kRegIntRtSts) = kRtFault;
+  CHECK(!t.poll(61500, temps).lit);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+
+  piano(a);
+  Torch retry(p.bus, GuardConfig(), kHardMaxMa);
+  CHECK(retry.request(0, 50, 1, temps).lit);
+  const uint32_t enable = uint32_t(kPpid) << 8 | kRegChanEn;
+  a.ignoresWrites[enable] = true;
+  CHECK(!retry.poll(1000, temps).steps.ok && a.flash(kRegModuleEn) == 0);
+  a.ignoresWrites.erase(enable);
+  retry.poll(1500, temps);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+}
+
+static void testProbeReadback()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Controller c(p.bus);
+  a.unreadableRegs[kRegStatus1] = true;
+  a.r(kPpid, kRegIntRtSts) = kRtRampUpDone;
+  a.r(kPpid, kRegModuleEn) = kModuleEnBit;
+  a.r(kPpid, kRegChanEn) = kPianoChannelMask;
+  const Controller::Live partial = c.live();
+  CHECK(!partial.ok && !partial.statusOk && partial.rtOk && partial.moduleOk && partial.channelsOk);
+  CHECK(partial.rt == kRtRampUpDone && partial.lit(kPianoChannelMask));
+  a.r(kPpid, kRegChanEn) = kPianoChannelMask | 0x04;
+  CHECK(!c.live().lit(kPianoChannelMask));
+}
+
+static void testProbeSafety()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Torch t;
+  constexpr uint8_t pianoPair = kPianoChannelMask, sparePair = kOtherChannelMask;
+  Temperatures cool, hot;
+  hot.socValid = true;
+  hot.socDeci = 850;
+  t.configure(p.bus, GuardConfig(), 100, true);
+  CHECK(t.requestProbe(0, 400, 15000, hot, sparePair, false).reason == Reason::socHot && a.writes.empty());
+  CHECK(t.requestProbe(0, 50, 0, hot, pianoPair, true).reason == Reason::socHot && a.writes.empty());
+  a.r(kPpid, kRegStatus2) = kSts2VphLow;
+  CHECK(t.requestProbe(0, 400, 15000, cool, sparePair, false).reason == Reason::pmicVoltage && a.writes.empty());
+  a.r(kPpid, kRegStatus2) = 0;
+
+  // Only the selected pair's open bits trip its window. An open on A can still be followed by B.
+  a.r(kPpid, kRegStatus1) = 0x02;
+  auto open = t.requestProbe(0, 100, 15000, cool, pianoPair, false);
+  CHECK(!open.lit && open.reason == Reason::channelOpen && open.sampled && open.live.chanEn == pianoPair);
+  CHECK(open.cleanedUp && open.cleanup.ok && a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  const size_t beforePulse = a.writes.size();
+  CHECK(t.requestProbe(500, 50, 0, cool, pianoPair, true).reason == Reason::channelOpen && a.writes.size() == beforePulse);
+  const auto spare = t.requestProbe(1000, 9999, 15000, cool, sparePair, false);
+  CHECK(spare.lit && spare.ma == 100 && spare.live.chanEn == sparePair);
+  CHECK(a.flash(kRegItarget0 + 2) == 9 && a.flash(kRegItarget0 + 3) == 9 && a.flash(kRegTorchClamp) == 9);
+  const auto asleep = t.quiesce(1100, Reason::sleep);
+  CHECK(asleep.reason == Reason::sleep && asleep.steps.ok && asleep.steps.writes == 4);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0 && a.flash(kRegItarget0 + 2) == 0);
+  const size_t afterOff = a.writes.size();
+  CHECK(!t.request(62000, 100, 0, cool).lit && a.writes.size() == afterOff);
+  t.resume();
+  CHECK(t.requestProbe(62000, 100, 15000, cool, sparePair, false).reason == Reason::sleep && a.writes.size() == afterOff);
+  a.r(kPpid, kRegStatus1) = 0;
+  CHECK(t.request(62000, 100, 0, cool).lit);   // a new runtime request may run after wake
+  CHECK(t.quiesce(62001, Reason::shutdown).steps.ok);
+  t.resume();
+  CHECK(!t.operational() && !t.request(70000, 50, 0, cool).lit);
+  CHECK(onlyFlash(a));
+}
+
+static void testProbePulse()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Temperatures t;
+  Torch low(p.bus, GuardConfig(), 40);
+  CHECK(!low.requestProbe(0, 100, 0, t, kPianoChannelMask, true).lit && a.writes.empty());
+  Torch pulse(p.bus, GuardConfig(), 100);
+  const auto started = pulse.requestProbe(0, 9999, 0, t, kPianoChannelMask, true);
+  CHECK(started.lit && started.ma == 50 && started.sampled && started.live.chanEn == kPianoChannelMask);
+  CHECK(pulse.deadlineMs() == 80 && (a.flash(kRegItarget0) & kItargetMask) == 1);
+  CHECK(pulse.poll(79, t).lit);
+  a.r(kPpid, kRegStatus3) = 0x05;   // both timers expired
+  a.r(kPpid, kRegChanEn) = 0;
+  const auto ended = pulse.poll(80, t);
+  CHECK(!ended.lit && ended.reason == Reason::test && ended.sampled && ended.live.status3 == 0x05);
+  CHECK(ended.steps.ok && ended.steps.writes == 4 && a.flash(kRegModuleEn) == 0);
+  CHECK(pulse.requestProbe(500, 50, 0, t, kPianoChannelMask, true).lit);
+  t.batteryValid = true;
+  t.batteryCenti = 4500;
+  const auto tripped = pulse.poll(520, t);
+  CHECK(!tripped.lit && tripped.reason == Reason::batteryHot && tripped.steps.writes == 4);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  t = {};
+  CHECK(pulse.requestProbe(62000, 50, 0, t, kPianoChannelMask, true).lit);
+  CHECK(pulse.quiesce(62001, Reason::shutdown).steps.ok && a.flash(kRegModuleEn) == 0 && a.flash(kRegChanEn) == 0);
+  CHECK(onlyFlash(a));
+}
+
 int main()
 {
   testProbeOptIn();
@@ -478,6 +615,10 @@ int main()
   testOnOff();
   testFailures();
   testGuard();
+  testGuardRegressions();
+  testProbeReadback();
+  testProbeSafety();
+  testProbePulse();
   if (failures) {
     std::printf("torch_host: %d failure(s)\n", failures);
     return 1;

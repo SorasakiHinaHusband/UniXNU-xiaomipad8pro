@@ -14,9 +14,11 @@ FLASH pulse for photos and a shared green privacy LED; those are provenance fact
   (`piano-torch-ma`), with a hard cap of 100 mA total. `piano-torch-max-ma` can lower the cap.
   `piano-torch-test=S` lights it once at boot for S seconds. `piano-torch-ladder=1` runs the guarded 100 mA step when the
   configured cap allows it, with a 10-second dark interval and 500 ms status/temperature samples.
-  `piano-torch-probe=1` with `piano-torch-test=S` selects T4, which runs an S-second factory-pair window with STATUS1/INT_RT_STS
-  polls every 500 ms before, during and after plus full-page dumps. `piano-torch-probe-spare=1` adds the spare-pair mapping
-  window. `piano-torch-flash=1` adds one timed 50 mA FLASH pulse afterward if the configured cap permits it.
+  `piano-torch-probe=1` with `piano-torch-test=S` selects T4, which runs a guarded S-second factory-pair window with
+  STATUS1/2/3 and INT_RT_STS polls every 500 ms before, during and after, plus full-page dumps.
+  `piano-torch-probe-spare=1` adds the spare-pair mapping window. `piano-torch-flash=1` adds one timed 50 mA FLASH pulse
+  if the requested torch windows complete cleanly and the configured cap permits it. See the
+  [attended RAM qualification checklist](../../docs/drivers/torch.md#attended-t4-ram-qualification-checklist).
 
 Control from macOS: `sudo piano-torch on|off|toggle|status` (`tooling/native/piano-torch`, an IORegistry property the kext
 accepts from an administrator only); from other drivers: `PianoTorchSet` / `PianoTorchToggle` / `PianoTorchStatus`

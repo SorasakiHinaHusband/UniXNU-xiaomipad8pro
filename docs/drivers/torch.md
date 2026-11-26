@@ -2,13 +2,81 @@
 
 ## Status (2026-11-27)
 
-- **T4 fault/status probe on `main`, host-tested.** PianoTorch enforces a hard cap of **100 mA total** (two 50 mA channels).
-  Level 2 with a boot test selects T4 only when the exact `piano-torch-probe=1` switch is set. The plain host suite and
-  the ASan/UBSan build both passed, including checks for the current cap and exact switch parsing.
-  [Torch core](../../package/PianoTorch/TorchCore.h) · [Driver](../../package/PianoTorch/PianoTorch.cpp) · [Host tests](../../package/PianoTorch/tests/torch_host.cpp)
-- **Owner-attended LED check pending.** Both November 15 T2 RAM runs read back all 12 register writes and the rear LED
-  stayed dark. The T4 probe still needs its tablet run with an observer at the LED.
+- **T4 fault/status probe host-tested.** PianoTorch enforces a hard cap of **100 mA total** (two 50 mA channels).
+  Level 2 with a boot test selects T4 only with the exact `piano-torch-probe=1` switch. The factory pair, spare pair and timed
+  FLASH pulse share the power-state, temperature and PMIC guards. [Driver](../../package/PianoTorch/PianoTorch.cpp)
+- **Attended RAM boot pending.** Both November 15 T2 RAM runs read back all 12 register writes and the rear LED stayed dark.
+  An owner at the LED is needed to correlate visible light with the T4 register evidence.
   [Hardware backlog, B12](../BACKLOG-hardware.md#2-backlog-b1b15)
+
+## Attended T4 RAM qualification checklist
+
+1. Build the RAM image with a 30 s observer setup delay, 15 s per torch pair, a 100 mA total ceiling, and a 300 s return timer.
+   Enable both temperature sources. Use the RAM A bundled image with volatile Data.
+
+   ```sh
+   PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_DATA_PERSIST=0 PIANO_RESET_AFTER=300 \
+     PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-thermal=1 piano-power=1 piano-power-ps=1 \
+     piano-torch=2 piano-torch-ma=100 piano-torch-max-ma=100 piano-torch-delay=30 piano-torch-test=15 \
+     piano-torch-probe=1 piano-torch-probe-spare=1 piano-torch-flash=1" \
+     tooling/k27/build-native-image.sh
+   ```
+
+2. Put the owner where they can see the rear LED and its reflection on a matte surface in a dim room. Start port 0 capture in
+   one terminal and boot once from ABL in a second terminal. Use the locally configured tablet selector. Keep the capture
+   and its timestamps through `probe: T4 finished` and the scheduled return to ABL.
+
+   ```sh
+   python3 tooling/native/usb-console.py --capture 600
+   ```
+
+   ```sh
+   fastboot -s "$PIANO_SERIAL" boot out/ram/boot-piano-macos-ram-A-bundled.img
+   ```
+
+3. Use the `probe … next window` lines as the cue to watch. Tell the owner which window is coming and record the answer
+   against that window, with an approximate timestamp.
+
+   | Window | Ask the owner |
+   |---|---|
+   | A, factory channels 1+2 | “Was the rear LED dark before A? Did it turn on at all? Was it faint, steady, flickering, or only a brief blink? Did it go dark again?” |
+   | B, spare channels 3+4 | “Did B light the same rear LED, a different emitter, or neither? Was it fainter or brighter than A? Was it dark again at the end?” |
+   | FLASH, factory channels 1+2 | “Did you catch one brief blink or a reflection? Was the LED dark immediately afterward?” Record a skipped pulse separately. |
+   | End of session | “Is the rear LED still dark?” If any emitter stays lit after its window, end the session with an orderly shutdown and record the OFF failure. |
+
+   After the scheduled return, confirm ABL answers with `fastboot -s "$PIANO_SERIAL" getvar product`.
+
+4. Save the `PianoTorch:` lines with the owner's observations. Verify the start line has `max=100`, `probe=1 spare=1 flash=1`
+   and `test=15 s`, and the survey shows PPID `0x1ee`, owner EE 0, TYPE `0x18`, and SUBTYPE `0x07`. Keep both 256-byte
+   dumps (`probe dump before all windows`, `probe dump after all windows`, each 16 rows of 16 bytes). Keep the active and
+   post-window register diffs, read-back counts, and any `--` unreadable fields, skipped windows, trips or OFF failures.
+
+   - Torch windows log the immediate activation sample and approximately 500 ms polls before, during and after the window.
+     FLASH records activation and samples on a 20 ms cadence, including a timer-boundary sample if it reaches its deadline.
+     FLASH samples are written to the console after explicit OFF.
+   - Each sample labels the pair and reports raw `STATUS1` (`0x06`, per-channel short/open), `STATUS2` (`0x07`, VPH low,
+     BCL, BOB current limits, OTST and BOB thermal overload), `STATUS3` (`0x09`, per-channel timer expiry),
+     and `INT_RT_STS` (`0x10`, fault and ramp-up/down done). It also reports `MODULE_EN`, `CHAN_EN` and available temperatures.
+     T4 labels channels `ch1` through `ch4`. The original survey uses zero-based indices.
+   - For a clean 100 mA torch window, look for 12 of 12 activation writes read back, `MODULE_EN` bit 7 set and
+     `CHAN_EN` low nibble `03` for A or `0c` for B. Each selected pair has `ITARGET=09`, its `IRESOLUTION` bits set,
+     `TORCH_CLAMP=09` (low seven bits), software-level active-high `STROBE=01` (low seven bits) and `TIMER=00`.
+     FLASH requests 50 mA total for 80 ms on A, with `ITARGET=01`, A's resolution bits clear and `TIMER=88`.
+     Check each executed window's explicit OFF read-back, and verify bit 7 of `MODULE_EN` and all four `CHAN_EN` bits clear.
+   - A confirmed OFF after an A-only open permits the alternate B check. A short, module-wide or temperature trip,
+     failed activation or unconfirmed OFF stops further activation. FLASH runs only after the requested torch windows
+     complete cleanly. An orderly sleep or shutdown aborts the remaining windows. Wake leaves the diagnostic ended.
+
+5. Match the visible result to the register evidence. Light only on B warrants a wiring check. A channel open or short, VPH
+   or BOB fault, or a real-time fault without a channel fault identifies where to investigate. The real-time fault bit alone
+   cannot distinguish an open, short or regulator-not-ready condition. If both pairs stay dark with clean activation and OFF
+   read-back, the run establishes the result at the qualified current and ambient light. **Any increase above 100 mA total
+   requires explicit owner approval.**
+
+The Linux flash driver and piano device tree agree on PM8550 channels 1+2, software strobe for torch, the four-channel
+register layout and a 100 mA total torch ceiling. The rear camera references the same LED. The LED node defines no separate
+BOB/VPH supply control or external strobe GPIO. The raw page also covers mitigation, OTST thresholds and unnamed registers
+inside PPID `0x1ee`. The probe reads supply-related fault flags within that peripheral.
 
 ## Historical design and bring-up notes
 
@@ -48,8 +116,9 @@ path the later PMIC work (B4 charging policies, B6 thermistors, B7's repeater) n
 `set_flash_module_en`, `qcom_flash_fault_get`, probe's clamp): a torch on is strobe off (CHAN_EN clear) → module off →
 current (ITARGET per channel, IRESOLUTION 5 mA bits) → timer 0 → module on → software strobe word 0x01 per channel and CHAN_EN set;
 off is the same with 0 mA. Every write is a regmap field update (read-modify-write of that field only). Correction of 2026-11-15:
-the derating dance (thresholds lowered to read OTST, STATUS2 read, thresholds restored) runs in the torch path too — it only ever
-restores what it lowered, so it changes nothing about lighting. Xiaomi's vendor driver (`leds-qti-flash.c`, the driver the factory
+Linux also lowers the OTST thresholds temporarily, reads STATUS2 to calculate a current budget and restores the thresholds.
+For this board's single LED, both four-channel derating ceilings exceed the 100 mA torch limit. Xiaomi's vendor driver
+(`leds-qti-flash.c`, the driver the factory
 tree binds) reaches the same end state by another route: its probe clears every channel's safety-timer enable bit and leaves the
 strobe source bits at software/level; its torch brightness path writes IRESOLUTION + ITARGET then MODULE_EN + CHAN_EN through its
 "switch" grouping; it never writes TORCH_CLAMP (the reset 200 mA a channel stands) and touches MITIGATION only at flash ≥ 1 A. No
@@ -71,8 +140,8 @@ no channel outside the driver's set on (else "someone else drives this module").
 - **Allowlist** (`TorchCore.h kWritable`, 16 registers): TIMER 0x3e-0x41, ITARGET 0x42-0x45 (b6:0), MODULE_EN 0x46 (b7),
   IRESOLUTION 0x49 (b3:0), STROBE 0x4a-0x4d (b6:0), CHAN_EN 0x4e (b3:0), TORCH_CLAMP 0xed (b6:0). Channels 3/4's registers are
   allowlisted **for the probe only** (`piano-torch-probe`, the one-boot test of which pair the LED really sits on); a normal boot
-  never writes them. `Controller::put` refuses anything else. Every write reads first (on a failed read: the last known value),
-  merges under the mask, writes, reads back and compares; a mismatch aborts the on and runs the off (which tries every step).
+  never writes them. `Controller::put` refuses anything else. Masked writes read first, merge under the mask, write, and compare read-back. Activation stops on a read or write failure.
+  OFF tries every step and can use the last known value during an observer failure.
 - **Current** (`piano-torch-ma`): 50 mA (2 × 25 mA, ITARGET 4) unless a request names a current. `piano-torch-max-ma` can lower
   the hard 100 mA total cap (Ubuntu's DT limit, ITARGET 9, clamp 9). Torch current rounds down to 5 mA steps per channel.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
@@ -120,7 +189,7 @@ tool is user-space work for later.
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
 | `piano-torch-delay` | 0 | wait first (s) |
-| `piano-torch-probe` | 0 | `1` with level 2 and a nonzero `piano-torch-test` selects T4. The factory-pair window polls STATUS1/INT_RT_STS every 500 ms before, during and after the test, with full dumps and diffs. |
+| `piano-torch-probe` | 0 | `1` with level 2 and a nonzero `piano-torch-test` selects T4. The factory-pair window polls all three STATUS bytes, INT_RT_STS and the enables every 500 ms before, during and after the test, with full dumps and diffs. |
 | `piano-torch-probe-spare` | 0 | `1` adds the spare-pair mapping window when T4 runs |
 | `piano-torch-flash` | 0 | `1` adds an 80 ms, 50 mA FLASH pulse when T4 runs and the cap permits it, followed by explicit off |
 | `piano-torch-ladder` | 0 | `1` selects the level 2 current ladder. The cap permits only the 100 mA step, which is skipped if the cap is set lower. The step runs for 10 s lit and 10 s dark with 500 ms status and temperature polls. |
@@ -179,18 +248,8 @@ ignored bit 2n+1), INT_RT_STS 0x10 (the fault bit whose factory meaning is open/
 five surveyed ranges, and any window on channels 3/4. Also open: the current itself — the factory drives this lamp at up to
 400 mA **a channel**; 10-25 mA a channel behind a diffuser may simply be invisible in a lit room.
 
-**T4, the probe** (next boot; `piano-torch=2 piano-torch-ma=100 piano-torch-test=15 piano-torch-probe=1 piano-torch-flash=1
-piano-torch-delay=S`, owner watching the rear LED in a dim room): window A on channels 1+2 (the factory's pair, the real control
-path) has STATUS1's open and short bits plus INT_RT_STS `0x10` logged every 500 ms before, during and after; the full 256-byte
-page is dumped before and after. `piano-torch-probe-spare=1` adds the original B channels 3+4 mapping window. What each line answers:
-- `probe during ... STATUS1=.. ch0[short=0 open=1] ... INT_RT_STS(0x10)=01` in window A → the channels are open (no LED / no anode
-  supply on ch1+2) and, if the optional window B shows the same, the whole module has no load or no supply: wiring/supply, not the driver;
-- the optional window B lights (owner sees it) → the lamp is on channels 3+4 and the factory/Ubuntu mapping is wrong for this board;
-- neither window lights, no fault bit anywhere, diffs show only the registers we wrote → the state is not the issue: next suspects
-  are the current (2 × 50 mA too dim: an owner decision whether to raise the cap toward the factory's 400 mA a channel) and the
-  LED's supply rail outside this peripheral;
-- `probe diff` lines naming registers we never wrote (0x4f, 0x65, 0xe8-0xeb...) that change with the windows → the module's own
-  state machine moved: those become the next registers to decode.
+**T4** uses the [attended RAM qualification checklist](#attended-t4-ram-qualification-checklist) above.
+
 **T3** (attended, runtime): `piano-torch=2 piano-usb=2 piano-usb-shell=1` (+ `piano-power=1` for the battery input); the tool on the
 tablet (built on the Mac by the build script: `out/native-kexts/PianoTorch/host-tests/piano-torch`, ad-hoc signed; pasted over the
 root shell with `base64 -D`, or staged with `stage-soft-metal.py --file <tool>:usr/local/bin/piano-torch --boot-run "/bin/chmod 755
