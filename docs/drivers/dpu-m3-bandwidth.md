@@ -1,5 +1,7 @@
 # Piano DPU M3 bandwidth at 144 Hz
 
+**Owner decision (2026-11-27, `OWNER-0748`):** 120 Hz is approved as the daily default refresh rate; keep 144 Hz as opt-in.
+
 y12o reached the INTF underrun check during 60 → 144 Hz after both links had passed timing, DMA and cadence checks. The sticky status only locates the error within the switch interval. Fixed 120 Hz is the working control. See [the qualification and rollback analysis](dpu-m3.md#y12o-qual1-underrun-and-login-failure) and [the earlier high-refresh analysis](dpu-m3-144.md).
 
 ## Ubuntu calculation

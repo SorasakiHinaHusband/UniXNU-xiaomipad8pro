@@ -2,7 +2,10 @@
 
 Analysis and host implementation, 2026-11-26. On November 27, `v131y12u-m2opt2`
 earned a RAM-qualified **`M2 PASS` (`rc=0`)** with automated C920 optical grading
-and a reverse-order sanity check. M2 awaits install promotion.
+and a reverse-order sanity check. **Owner decision (2026-11-27, `OWNER-0749`):**
+promotion to the installed daily build is APPROVED (combinable with the `y12t`
+Night Shift install package if safe, with backup, SHA-256, read-back verify, and
+a ready rollback).
 
 ## Decision
 

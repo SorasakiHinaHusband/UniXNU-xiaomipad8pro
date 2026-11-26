@@ -2,7 +2,10 @@
 
 The original M4 investigation below covers PCC register encoding. The
 [location-9 boot-reference fix](#location-9-boot-reference) covers the remaining warm
-Night Shift OFF state and records the 2026-11-27 RAM qualification.
+Night Shift OFF state and records the 2026-11-27 RAM qualification. **Owner decision
+(2026-11-27, `OWNER-0749`):** `y12t` install with Night Shift daily routing ON is
+APPROVED (combinable with DPU M2 promotion if safe, with backup, SHA-256, read-back
+verify, and a ready rollback).
 
 ## References and register layout
 

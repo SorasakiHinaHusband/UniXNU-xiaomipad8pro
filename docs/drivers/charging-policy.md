@@ -10,8 +10,9 @@
 - **Battery health.** On November 26, RAM `m120c-120` reported **122 cycles**, 9200 mAh design capacity and 8781 mAh
   full capacity. System Information showed 122 cycles and “Service Recommended” and omitted Maximum Capacity. The
   November 27 opt-in **BH-2** check on RAM `v131y12t-qual1` published `AppleSmartBatteryPack`, and `powerd` returned
-  `0xe00002ca` (`kIOReturnIOError`) writing `BHPersistentStorage`. The gate is **HOLD** pending the owner's decision on
-  27.3 `powerd` analysis. [November 26 battery results](../results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM results](../results-2026-11-27.md#ram-qualification)
+  `0xe00002ca` (`kIOReturnIOError`) writing `BHPersistentStorage`. **Owner decision (2026-11-27, `OWNER-0748`):**
+  host-side disassembly analysis of Apple 27.3 `powerd` is APPROVED (analysis only; never commit Apple binaries) to
+  fix the battery health storage write. [November 26 battery results](../results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM results](../results-2026-11-27.md#ram-qualification)
 - **PPS and direct charging.** The **9 V PPS buck** path up to 2.5 A has a host safety audit and awaits RAM qualification.
   **Charge Pump / MiPPS stays off by default.** The November 24 attended attempt stayed at a 100 mA input limit because of an
   unmapped vendor power object. The fix is built and awaits an owner-present test.

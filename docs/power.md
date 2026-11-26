@@ -13,8 +13,8 @@ wake and the fix-image gate remains HOLD. [Support status](STATUS.md) · [Hardwa
 Charge Pump / MiPPS is off by default and the fix for the first run's 100 mA limit awaits an attended check. Battery percentage
 and power state work on disk. RAM `m120c-120` reported 122 cycles, 9200 mAh design capacity and 8781 mAh full capacity. System
 Information showed “Service Recommended” and omitted Maximum Capacity. On November 27 the opt-in RAM BH-2 check published
-`AppleSmartBatteryPack`. The gate remains HOLD after `powerd` returned `kIOReturnIOError` writing `BHPersistentStorage`, pending
-the owner's decision on 27.3 `powerd` analysis. [Support status](STATUS.md) · [November 26 battery results](results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM qualification](results-2026-11-27.md#ram-qualification)
+`AppleSmartBatteryPack`. **Owner decision (2026-11-27, `OWNER-0748`):** host-side disassembly analysis of Apple 27.3 `powerd`
+is APPROVED (analysis only; never commit Apple binaries) to fix `kIOReturnIOError` writing `BHPersistentStorage`. [Support status](STATUS.md) · [November 26 battery results](results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM qualification](results-2026-11-27.md#ram-qualification)
 
 **Thermal and idle policy.** Low Power, Automatic and High Power reached the policy through `pmset` on installed v13.1y12l.
 High Power is the daily setting. The November 27 installed 10-minute Metal 3D run completed 35,985 frames at 59.98 fps and

@@ -1,5 +1,10 @@
 # Data store concurrency and durability (M4/M5)
 
+**Owner decision (2026-11-27, `OWNER-0748`):** M5 write-back disk caching (`data-store-write-back=1`) is APPROVED
+for daily use. Mandatory pre-condition: take a fresh backup of the owner's Data store with SHA-256 recorded and
+read-back verified first, then enable `data-store-write-back=1` in the next install package. M5-queue remains
+disabled (`data-store-queue=0`).
+
 ## Installed baseline
 
 M1 measured the installed 27.3 Data volume in single-gate mode at 15,580 4 KiB random-read IOPS at QD1 and 15,696 at

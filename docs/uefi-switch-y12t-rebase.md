@@ -1,5 +1,7 @@
 # UEFI OS switcher on `lead/v131y12t`
 
+**Owner decision (2026-11-27, `OWNER-0749`):** writing `boot_a` for the OS switcher is APPROVED (fastboot/bootloader stays reachable for recovery). Rules: back up `boot_a` first with SHA-256 recorded, write, read back and verify, keep bootloader unlocked, never touch `userdata`/`super`/`metadata`, and keep a rollback image ready.
+
 `main-repo/switch/sel1` at `48e56066` is its own merge base with `lead/v131y12t` at `3fcf74f4`. The seven switcher commits after `0663a6d2` entered the lead line in `d801f66e` on y12e. There were zero switcher-only commits to replay and no conflicts to resolve. The audit on `codex/switch-sel1-audit` used the T-16 switcher design and followed the existing slot-A rules in [Persistent boot](persistent-boot.md).
 
 ## Compatibility
