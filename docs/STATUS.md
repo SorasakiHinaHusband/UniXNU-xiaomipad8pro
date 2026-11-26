@@ -9,18 +9,17 @@ One row per feature. Every status comes from a run on the tablet; host tests, an
 - **Partial**: works, with the gaps named in the note.
 - **Not yet**: not working, or never run on the tablet.
 
-The installed daily build is **v13.1y12o** (2026-11-26). The install round recorded 75 PASS and 0 FAIL. RAM qualification
-recorded 485 PASS and 2 non-product FAILs. All 29 post-install checks passed. "Verified" names the build and date of
-the newest run that showed the result. Daily results are in [results-2026-11-26.md](results-2026-11-26.md) and the earlier
-`results-*.md` pages.
+The installed daily build is **v13.1y12p** (2026-11-26), with display and power fixes behind switches that default to off.
+"Verified" names the build and date of the newest run that showed the result. Daily results are in
+[results-2026-11-26.md](results-2026-11-26.md) and the earlier `results-*.md` pages.
 
 ✅ fully supported · 🟡 partial / in progress · ❌ not supported
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12o, 2026-11-26 | Disk boot, exact ESP profile, the owner's Data store resumed, boot guard healthy, no panic. The install round recorded 75 PASS and 0 FAIL. Installs write only changed parts, after backups, with read-back checks and a rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | v13.1y12o, 2026-11-26 | Frames reach the panel through PianoDpu flips on the boot framebuffer's pipes. The CPU still cleans the cache per frame across 4 threads. No underrun, revert or SMMU fault over the installed session. Native screenshots are on. Native panel sleep, Night Shift and refresh switching are off by default. v13.1y12o adds a live-counter gate for refresh switching and panel-sleep tracing. |
-| 120 Hz | 🟡 RAM only | RAM gpu-hz120-2, 2026-11-21 | The earlier RAM boot kept 120 Hz across display off/on and presented 73-78 new frames/s. macOS lists only 60 Hz modes on the daily build. A fixed 120 Hz mode is built behind a switch and needs a tablet check. A 144 Hz test boot hit an underrun. The daily build offers no 144 Hz mode. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12p, 2026-11-26 | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | v13.1y12p, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on. Native panel sleep, Night Shift and refresh switching are off by default. |
+| 120 Hz | 🟡 Partial | v13.1y12p and v13.1y12q test profiles, 2026-11-26 | macOS offers 120 Hz on the fixed-120 profile and both panel links scan at 120.0 Hz. The profile is off by default. Apps reach roughly 58–60 fps. Swaps take about 13 ms against an 8.33 ms period due to GPU-fence wait and vblank acceptance. A fix is under analysis. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
 | Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
 | Wi-Fi | 🟡 Works (installed), partial | v13.1y12l, 2026-11-26; v13.1x, 2026-11-21 | Joins at boot (WPA2, DHCP, DNS); radio off/on from the switch rejoins; a forced link loss rejoins within seconds; country code set. Pending: joining by clicking a network row by hand, auto-rejoin after a hotspot goes away and comes back, and a multi-access-point office network. |
@@ -51,7 +50,7 @@ the newest run that showed the result. Daily results are in [results-2026-11-26.
 | Energy modes | 🟡 Partial | v13.1y12l, 2026-11-26 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified by hand. |
 | Login window idle CPU | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
 | App launches | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
-| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12o, 2026-11-26 | USB-C debug console with a monitor that returns to the bootloader, root shell and SSH over the cable. No endpoint wedge over the boot. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. Single transfers above roughly 512 KB can drop when the TX queue overflows. TX flow control is built, off by default and in qualification. |
+| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12o (installed) and flow-control test, 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue dropped frames during large single transfers. The flow-control fix passed 66/66 exact transfers and goes into the next daily build. |
 | OS switcher (Android / macOS) | 🟡 RAM only, read-only | RAM v13.1y12e, 2026-11-24 | The boot-flag sysctls read the flag; writes are refused by design. A full switch has not been run. |
 | USB host / OTG | ❌ Not yet | RAM usb-a2d, 2026-11-18 (empty port) | Host mode starts on an empty port; VBUS supply and a real device are not done. |
 | External display (USB-C DP) | ❌ Not yet | none | Design only. |
@@ -59,7 +58,7 @@ the newest run that showed the result. Daily results are in [results-2026-11-26.
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
 | Memory (16 GB) | 🟡 Partial | v13.1y12l, 2026-11-26 | The installed system uses a 13 GiB window (13310 MiB; was 8 GiB). At idle: 47 % free, no compression, no swap, no memory pressure. In progress: the GPU memory tier and the driver pools. |
-| Internal storage (UFS) | 🟡 Partial | v13.1y12l, 2026-11-26 (first measurement) | On the Data volume, against Android on the same unit: 4K random read at queue depth 1 equals Android (15580 vs 14967 IOPS), but reads do not scale with queue depth (8 in flight: 15696 vs 88663); writes are 0.18-0.24x Android (sequential 519 vs 2137 MB/s, 4K random 6494 vs 36693 IOPS); a reader drops from 14490 to 1300 IOPS while a writer runs. WriteBooster is already on from the boot firmware. Fixes are in progress. |
+| Internal storage (UFS) | 🟡 Partial | v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode goes into the next daily build. Write-back and queue modes stay off. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 ## Known gaps
@@ -69,10 +68,11 @@ the newest run that showed the result. Daily results are in [results-2026-11-26.
 - Closing the cover on battery (attended check); the Energy Mode picker; the brightness slider by hand.
 - Chrome on RAM boots.
 - Charge pump / MiPPS fast charging; PPS 9 V.
-- Fixed 120 Hz needs a tablet check. Native panel sleep, Night Shift and refresh switching are built, off by default and
-  in qualification. The GPU memory tier and driver pools are in progress.
-- Large single transfers over USB debug networking can drop. The TX flow-control fix is in qualification and off by default.
-- Disk: no read scaling with queue depth, writes 0.18-0.24x Android, reads stall behind writes (fixes in progress).
+- The fixed 120 Hz profile drives the panel at 120 Hz, with app cadence still around 58–60 fps. Native panel sleep, Night Shift
+  and refresh switching are built, off by default and in qualification. The GPU memory tier and driver pools are in progress.
+- Large single transfers over USB debug networking can drop on the installed build. The tested TX flow-control fix goes into
+  the next daily build.
+- Data concurrency goes into the next daily build. At QD8, 4 KiB random writes ran at 0.9× the serial rate in testing.
 - USB host devices, external display, auto-rotate (in analysis), hardware video encode, VP9/AV1 in Safari.
 - The install guide for other units (in progress).
 - Hand checks pending on the installed system: microphone recording in an app, QuickTime recording by hand, FaceTime self-view,
