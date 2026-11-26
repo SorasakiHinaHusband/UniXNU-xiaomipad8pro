@@ -3,7 +3,7 @@
 #define PERSIST_EXT4_VERIFY_H
 
 #include "PersistExt4Ro.h"
-#include "SensorsPack.h"
+#include "SensorsLoad.h"
 
 namespace persist_ext4 {
 
@@ -13,10 +13,9 @@ enum class Equivalence { Match, Mismatch, InvalidPack, ImageError, Limit };
 // packBytes readable bytes. The result carries no path or calibration data.
 inline Equivalence verifyRegistry(Reader &image, const uint8_t *packBytes, uint32_t packSize)
 {
-    constexpr uint32_t maxPackBytes = 4u << 20; // SensorsLoad.h's SL_MAX_BYTES
     SspHeader header;
     SspPack pack;
-    if (packSize > maxPackBytes || ssp_header(packBytes, packSize, &header) ||
+    if (packSize > SL_MAX_BYTES || ssp_header(packBytes, packSize, &header) ||
         header.total != packSize || ssp_open(&pack, &header, packBytes + SSP_HEADER))
         return Equivalence::InvalidPack;
 
@@ -47,6 +46,7 @@ inline Equivalence verifyRegistry(Reader &image, const uint8_t *packBytes, uint3
     Frame stack[MaxDepth - 1]; // imageRoot uses two path components
     Result rc = image.lookup(imageRoot, sizeof imageRoot - 1, stack[0].dir);
     if (rc == Result::NotFound) return Equivalence::Mismatch;
+    if (rc == Result::Limit) return Equivalence::Limit;
     if (rc != Result::Ok || !stack[0].dir.directory()) return Equivalence::ImageError;
 
     char path[SSP_PATH] = "/mnt/vendor/persist/sensors/registry";
@@ -67,7 +67,7 @@ inline Equivalence verifyRegistry(Reader &image, const uint8_t *packBytes, uint3
         }
         if (rc == Result::Limit) return Equivalence::Limit;
         if (rc != Result::Ok) return Equivalence::ImageError;
-        if (++visited > SSP_MAX_ENTRIES || frame.pathLength + 1 + entry.length >= sizeof path)
+        if (++visited > SSP_MAX_ENTRIES || depth + 2 == MaxDepth || frame.pathLength + 1 + entry.length >= sizeof path)
             return Equivalence::Limit;
 
         size_t length = frame.pathLength;
@@ -88,7 +88,7 @@ inline Equivalence verifyRegistry(Reader &image, const uint8_t *packBytes, uint3
         if (image.inode(entry.inode, child) != Result::Ok) return Equivalence::ImageError;
         if (child.directory()) {
             if (index >= 0 && packed.flags != SSP_DIRECTORY) return Equivalence::Mismatch;
-            if (depth + 1 == sizeof stack / sizeof *stack || child.size() > maxScannedBytes - scannedBytes)
+            if (child.size() > maxScannedBytes - scannedBytes)
                 return Equivalence::Limit;
             for (unsigned i = 0; i <= depth; ++i) if (stack[i].dir.number() == child.number()) return Equivalence::ImageError;
             scannedBytes += child.size();

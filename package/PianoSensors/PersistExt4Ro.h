@@ -57,7 +57,10 @@ public:
         if (le16(sb + 0x3a) != 1 || le32(sb + 0xe8)) return Result::Unsupported;
         const uint32_t revision = le32(sb + 0x4c);
         const uint32_t incompat = le32(sb + 0x60), roCompat = le32(sb + 0x64);
+        // Flexible block groups, EA inodes, and the checksum seed leave these read paths intact.
         constexpr uint32_t supportedIncompat = FileType | Extents | Blocks64 | 0x200 | 0x400 | 0x2000;
+        // Sparse superblocks, large/huge files, GDT checksums, dir_nlink, extra_isize,
+        // quota, metadata checksums, read-only, project quota, and verity.
         constexpr uint32_t supportedRo = 0x7b | 0x100 | 0x400 | 0x1000 | 0x2000 | 0x8000;
         if (revision > 1 || (incompat & ~supportedIncompat) || (roCompat & ~supportedRo))
             return Result::Unsupported;
@@ -78,7 +81,7 @@ public:
             blocksPerGroup != le32(sb + 0x24) || !blocksPerGroup || blocksPerGroup > blockSize_ * 8 ||
             !inodesPerGroup_ || inodesPerGroup_ > blockSize_ * 8 || inodeCount_ < 2 ||
             inodeSize_ < 128 || inodeSize_ > blockSize_ || (inodeSize_ & (inodeSize_ - 1)) ||
-            (descSize_ != 32 && descSize_ != 64) || ((incompat & Blocks64) && descSize_ != 64) ||
+            ((incompat & Blocks64) && descSize_ != 64) ||
             blocks_ <= first || blocks_ > imageBytes / blockSize_)
             return Result::Corrupt;
 
