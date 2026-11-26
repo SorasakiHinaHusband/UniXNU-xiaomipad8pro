@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""Host tests for the self-test runner's discovery and duration summary."""
+"""Host tests for the self-test runner's discovery, scheduling and duration summary."""
 import importlib.util
 import io
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -128,13 +129,99 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(cases[skipped].find('skipped').attrib['message'], reason)
 
 
+class SchedulingTests(unittest.TestCase):
+    def test_runs_known_slow_suites_first_and_lists_in_discovery_order(self):
+        priority = [
+            'tooling/persist/test-k273-only.py',
+            'package/PianoPower/tests/run-charge-host.sh',
+            'package/PianoA830/adreno830/tests/run-host-tests.py',
+            'package/PianoVideo/tests/run-bringup-host.sh',
+            'package/PianoCamera/tests/run-camera-host.sh',
+            'tooling/k27/test-cs-native4k.sh',
+        ]
+        fast = ['package/Example/test-fast.py', 'scripts/ci/test-fast.py']
+        tracked = sorted(priority + fast)
+        started = []
+
+        def run_one(_kind, path, _line, _subjob_limit):
+            started.append(path)
+            return path, True, 0, ''
+
+        with (
+            patch.object(self_tests, 'tracked', return_value=tracked),
+            patch.object(self_tests, 'load_skips', return_value={}),
+            patch.object(self_tests, 'run_one', side_effect=run_one),
+        ):
+            listing = io.StringIO()
+            with patch.object(sys, 'argv', ['self-tests.py', '--list']), redirect_stdout(listing):
+                self.assertEqual(self_tests.main(), 0)
+            self.assertEqual([line.split()[-1] for line in listing.getvalue().splitlines()], tracked)
+            self.assertEqual(started, [])
+
+            with patch.object(sys, 'argv', ['self-tests.py', '--jobs', '1']), redirect_stdout(io.StringIO()):
+                self.assertEqual(self_tests.main(), 0)
+            self.assertEqual(started, priority + fast)
+
+    def test_pool_refills_while_longest_suite_is_running(self):
+        longest = 'tooling/persist/test-k273-only.py'
+        second = 'package/PianoPower/tests/run-charge-host.sh'
+        fast = 'scripts/ci/test-fast.py'
+        first_wave = threading.Barrier(2)
+        fast_started = threading.Event()
+        started = []
+
+        def run_one(_kind, path, _line, _subjob_limit):
+            started.append(path)
+            if path in (longest, second):
+                first_wave.wait(timeout=5)
+            if path == longest and not fast_started.wait(timeout=5):
+                raise AssertionError('the free worker did not start the next suite')
+            if path == fast:
+                fast_started.set()
+            return path, True, 0, ''
+
+        with (
+            patch.object(sys, 'argv', ['self-tests.py', '--jobs', '2']),
+            patch.object(self_tests, 'tracked', return_value=sorted([longest, second, fast])),
+            patch.object(self_tests, 'load_skips', return_value={}),
+            patch.object(self_tests, 'run_one', side_effect=run_one),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(self_tests.main(), 0)
+        self.assertCountEqual(started[:2], [longest, second])
+        self.assertEqual(started[2:], [fast])
+
+    def test_inner_jobs_share_only_spare_cpu_slots(self):
+        paths = sorted(self_tests.PARALLEL_SHELL_SUITES)
+        limits = {}
+
+        def run_one(_kind, path, _line, subjob_limit):
+            limits[path] = subjob_limit
+            return path, True, 0, ''
+
+        for jobs, extra, expected in [('3', [], 1), ('2', [], 2), ('3', ['--only', 'run-charge-host'], 4)]:
+            with self.subTest(jobs=jobs, extra=extra):
+                limits.clear()
+                with (
+                    patch.object(sys, 'argv', ['self-tests.py', '--jobs', jobs, *extra]),
+                    patch.object(self_tests.os, 'cpu_count', return_value=4),
+                    patch.object(self_tests, 'tracked', return_value=paths),
+                    patch.object(self_tests, 'load_skips', return_value={}),
+                    patch.object(self_tests, 'run_one', side_effect=run_one),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(self_tests.main(), 0)
+                selected = [self_tests.CHARGE_HOST_TESTS] if extra else paths
+                self.assertEqual(limits, dict.fromkeys(selected, expected))
+
+
 class SlowestTests(unittest.TestCase):
     def test_reports_ten_slowest_at_end_even_on_failure(self):
         paths = [f'scripts/ci/test-{i:02d}.py' for i in range(12)]
         tests = [('py', path, None) for path in reversed(paths)]
         durations = dict(zip(paths, [2.5, 4.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5]))
 
-        def run_one(_kind, path, _line):
+        def run_one(_kind, path, _line, _subjob_limit):
             ok = path != paths[-1]
             return path, ok, durations[path], '' if ok else 'test failed'
 
