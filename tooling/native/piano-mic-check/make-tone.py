@@ -9,13 +9,15 @@ import wave
 
 RATE = 48000
 FREQUENCY = 1000
+PEAK_DBFS = -36
 
 
 def write_tone(path):
     samples = array.array("h", [0]) * (2 * RATE)
-    # A one-second burst at -18 dBFS peak, with 20 ms ramps and quiet at both edges.
+    # Leave headroom for the tablet's built-in speaker-to-mic coupling.
+    # The one-second burst has 20 ms ramps and quiet at both edges.
     ramp = RATE // 50
-    amplitude = 32767 * 10 ** (-18 / 20)
+    amplitude = 32767 * 10 ** (PEAK_DBFS / 20)
     for frame in range(RATE):
         gain = min(1, frame / ramp, (RATE - 1 - frame) / ramp)
         samples[RATE // 2 + frame] = round(

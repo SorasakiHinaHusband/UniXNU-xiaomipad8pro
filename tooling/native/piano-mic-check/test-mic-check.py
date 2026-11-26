@@ -80,6 +80,12 @@ def main(binary, stimulus, folder):
             RATE, 2 * RATE, 2, 1
         )
         assert wav.readframes(RATE // 2) == bytes(RATE)
+        burst = array.array("h", wav.readframes(RATE))
+        if sys.byteorder == "big":
+            burst.byteswap()
+        peak_dbfs = 20 * math.log10(max(map(abs, burst)) / 32768)
+        assert abs(peak_dbfs - (-36)) < 0.05
+        assert wav.readframes(RATE // 2) == bytes(RATE)
 
     run([binary, "--analyze", stimulus, "--tone"], 0, "tone_frequency_hz=1000", "duration_s=2.000")
     run([*host, stimulus, "--mode", "tone", "--seconds", "2"], 0, "tone_detected=yes")
