@@ -340,6 +340,37 @@ void testSkinFaults()
   expectThermalVote(7);
 }
 
+void testAdvancingAdcRounds()
+{
+  boot();
+  Sensors sensors;
+  sensors.setSkin(22000);
+  const Snapshot first = sensors.adc;
+  for (unsigned i = 0; i < 49; ++i) sensors.tick();
+  CHECK(!guard.high() && guard.thermal().entryRounds == 1);
+
+  sensors.refreshAdc(22000);
+  const Snapshot second = sensors.adc;
+  sensors.adc.rounds = first.rounds;
+  sensors.refreshSkin();
+  sensors.tick();
+  CHECK(guard.thermal().healthy && !guard.high() && dcvs.ceiling() == 3);
+
+  for (const char *channel : {"msm", "quiet"}) {
+    sensors.adc = second;
+    const int i = channelIndex(channel);
+    sensors.adc.atUs[i] = first.atUs[i];
+    sensors.refreshSkin();
+    sensors.tick();
+    CHECK(guard.thermal().healthy && !guard.high() && dcvs.ceiling() == 3);
+  }
+
+  sensors.adc = second;
+  sensors.refreshSkin();
+  sensors.tick();
+  CHECK(guard.thermal().healthy && guard.ready() && guard.high());
+}
+
 void expectHardFallback(Sensors &sensors, A830QualReason reason, unsigned exits = 0)
 {
   sensors.tick();
@@ -444,15 +475,20 @@ pianopolicy::Config energyConfig()
   return config;
 }
 
-void applyEnergyMode(pianopolicy::Engine &engine, pianopolicy::Inputs inputs, uint32_t profile, uint32_t khz)
+void applyEnergyMode(pianopolicy::Engine &engine, pianopolicy::Inputs inputs, uint32_t profile, uint32_t khz,
+                     bool profileChanged = true)
 {
   using namespace pianopolicy;
   inputs.gpuClients = pianogpu::kCeilingClients;
+  bool profileAction = false;
+  const bool slotChanged = engine.gpuWritten() != khz;
   const Actions actions = engine.step(inputs, gEnv.now / ms);
+  CHECK(actions.n == unsigned(profileChanged) + unsigned(slotChanged));
   for (unsigned i = 0; i < actions.n; ++i) {
     const Action &action = actions.a[i];
     if (action.kind == Kind::thermalProfile) {
-      CHECK(action.value == profile);
+      CHECK(!profileAction && action.value == profile);
+      profileAction = true;
       engine.profileDone(action.value, Result::taken);
     } else if (action.kind == Kind::gpuCeiling) {
       CHECK(action.client == pianogpu::kCeilingPolicy && action.value == khz);
@@ -462,6 +498,7 @@ void applyEnergyMode(pianopolicy::Engine &engine, pianopolicy::Inputs inputs, ui
       CHECK(false);
     }
   }
+  CHECK(profileAction == profileChanged);
   CHECK(engine.gpuOwnSlot() && engine.gpuWritten() == khz && slots.khz[pianogpu::kCeilingPolicy] == khz);
 }
 
@@ -490,7 +527,7 @@ void testEnergyModes()
     sensors.tick();
     expectVote(1, 160000);
     input.hpm = true;
-    applyEnergyMode(engine, input, kThermalSaver, 342000);
+    applyEnergyMode(engine, input, kThermalSaver, 342000, false);
     sensors.tick();
     expectVote(1, 160000);
     input.lpm = false;
@@ -510,7 +547,7 @@ void testEnergyModes()
     input.hpm = true;
     applyEnergyMode(engine, input, kThermalPerformance, 0);
     input.power = source == Power::external ? Power::battery : Power::external;
-    applyEnergyMode(engine, input, kThermalPerformance, 0);
+    applyEnergyMode(engine, input, kThermalPerformance, 0, false);
     sensors.tick();
     CHECK(guard.thermal().skinTable == 1);
     expectThermalVote(12);
@@ -622,6 +659,7 @@ int main()
   testLadder();
   testSkinBands();
   testSkinFaults();
+  testAdvancingAdcRounds();
   testHardFaults();
   testFilteredDieStep();
   testEnergyModes();
