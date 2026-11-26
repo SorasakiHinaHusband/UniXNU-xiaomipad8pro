@@ -195,6 +195,29 @@ inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, boo
   return {nullptr, 0};
 }
 
+// Guard start() and take() with the request lock. The delayed callback posts
+// one completion per accepted scan, including scans overtaken by power-off.
+struct ScanCompletions {
+  bool start() { return pending_++ == 0; }
+  uint32_t take() {
+    const uint32_t pending = pending_;
+    pending_ = 0;
+    return pending;
+  }
+
+ private:
+  uint32_t pending_ = 0;
+};
+
+template <typename Post>
+inline void postScanCompletions(uint32_t pending, bool power, Post post)
+{
+  while (pending--) {
+    if (power) post(kEvScanCacheUpdated);
+    post(kEvScanDone);
+  }
+}
+
 // SET 20 carries one of two fixed association records.  The field meanings and offsets are
 // confirmed by the 27.3 Apple80211Associate2 parser and by the Pad 6 Pro binding (PAD6P0125;
 // SHENG-JOIN): the modern record has 32-bit authentication/key fields and moves the network
@@ -589,6 +612,41 @@ struct Association {
   uint32_t state = kStateInit;
 };
 
+inline Association associationFromSnapshot(const struct piano_wifi_assoc_snapshot &raw)
+{
+  Association next;
+  next.associated = raw.associated != 0;
+  next.authorized = raw.authorized != 0;
+  next.ssidLength = raw.ssid_length <= kSsidMax ? raw.ssid_length : kSsidMax;
+  for (unsigned i = 0; i < next.ssidLength; ++i) next.ssid[i] = raw.ssid[i];
+  for (unsigned i = 0; i < sizeof next.bssid; ++i) next.bssid[i] = raw.bssid[i];
+  next.channel = raw.channel;
+  next.frequency = raw.frequency_mhz;
+  next.rssi = raw.rssi_dbm;
+  next.noise = raw.noise_dbm;
+  next.rate = raw.rate_mbps;
+  next.authType = raw.auth_type;
+  next.cipher = raw.cipher;
+  next.opMode = raw.op_mode ? raw.op_mode : kOpModeStation;
+  next.result = raw.associate_result;
+  next.generation = raw.join_generation;
+  next.state = raw.state;
+  return next;
+}
+
+constexpr unsigned kAssociateWaitMs = 8000, kAssociateWaitStepMs = 20;
+
+inline const char *associateWaitOutcome(const struct piano_wifi_assoc_snapshot &raw, uint32_t generation, uint64_t elapsedNs)
+{
+  if (raw.join_generation != generation) return "superseded";
+  if (!raw.power) return "power off";
+  if (raw.authorized) return "authorized";
+  if (raw.associate_result == 2) return "failed";
+  if (raw.associate_result == 9) return "timed out";
+  if (elapsedNs >= uint64_t(kAssociateWaitMs) * 1000000ull) return raw.associated ? "associated, not yet authorized" : "timeout";
+  return nullptr;
+}
+
 // Event ordering shared by the kernel front end and its host contract.  The
 // custom 802.1X path reports ASSOC_DONE as soon as 802.11 association is
 // complete, while SSID/BSSID/LINK-up wait for the private port's AUTHORIZE.
@@ -650,6 +708,9 @@ struct State {
   bool power = true;              // requested power; the worker owns physical off/on
   Association association;        // current GET state
   Association eventAssociation;   // last notified state: GET polling never consumes an event
+  uint16_t associationCapability = 0;
+  uint8_t associationRsnLength = 0;
+  uint8_t associationRsn[PIANO_WIFI_ASSOC_RSN_MAX] = {};
   bool eventPower = true;
   LinkEvent linkEvent = {};        // event4 and GET156 agree, including a voluntary leave
   uint32_t cursor = 0;            // the next SCAN_RESULT
@@ -679,8 +740,19 @@ inline Association observeAssociation(State &s, const Association &next, bool po
 {
   const Association old = s.eventAssociation;
   s.association = next;
+  s.associationCapability = 0;
+  s.associationRsnLength = 0;
   s.power = power;
   if (emit) { s.eventAssociation = next; s.eventPower = power; }
+  return old;
+}
+
+inline Association observeAssociation(State &s, const struct piano_wifi_assoc_snapshot &raw, bool emit)
+{
+  const auto old = observeAssociation(s, associationFromSnapshot(raw), raw.power != 0, emit);
+  s.associationCapability = raw.capability;
+  s.associationRsnLength = raw.rsn_length <= sizeof raw.rsn ? raw.rsn_length : 0;
+  for (unsigned i = 0; i < s.associationRsnLength; ++i) s.associationRsn[i] = raw.rsn[i];
   return old;
 }
 
@@ -1158,7 +1230,14 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       for (unsigned i = 0; i < 6; ++i) b.bssid[i] = s.association.bssid[i];
       b.ssidLength = s.association.ssidLength; for (unsigned i = 0; i < b.ssidLength; ++i) b.ssid[i] = s.association.ssid[i];
       b.channel = s.association.channel; b.freq = s.association.frequency; b.rssi = s.association.rssi;
-      if (s.association.authType == 2) b.capability |= 0x11; // ESS + privacy even after cache clear
+      // The selected network can come from a newer scan than the front end's
+      // snapshot, or the user can clear that snapshot during association.
+      if (s.associationCapability) b.capability = s.associationCapability;
+      if (s.associationRsnLength && s.associationRsnLength <= sizeof b.rsn) {
+        b.rsnLength = s.associationRsnLength;
+        for (unsigned i = 0; i < b.rsnLength; ++i) b.rsn[i] = s.associationRsn[i];
+      }
+      if (s.association.authType == 2) b.capability |= kDot11CapEss | kDot11CapPrivacy;
       if (s.association.authType == 1) {
         b.capability = uint16_t((b.capability | 0x1) & ~0x10u);
         b.rsnLength = 0;

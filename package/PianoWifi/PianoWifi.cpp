@@ -3382,7 +3382,7 @@ int sysctlLinkDrop(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   if (gArgs.level < 8 || !gArgs.rejoin) return ENOTSUP;
   if (incoming) {
     struct piano_wifi_assoc_snapshot snapshot = {};
-    if (piano_wifi_assoc_snapshot(&snapshot) || !snapshot.authorized) return ENOTCONN;
+    if (piano_wifi_assoc_snapshot_v3(&snapshot) || !snapshot.authorized) return ENOTCONN;
     uint32_t empty = 0;
     if (!__atomic_compare_exchange_n(&gLinkDropRequested, &empty, uint32_t(incoming), false,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
@@ -4117,7 +4117,7 @@ extern "C" int piano_wifi_assoc_radio_usable(void)
   return __atomic_load_n(&gRadioUsable, __ATOMIC_SEQ_CST) && !gUserControl.radioStop() ? 1 : 0;
 }
 
-extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
+extern "C" int piano_wifi_assoc_snapshot_v3(struct piano_wifi_assoc_snapshot *out)
 {
   if (!out) return EINVAL;
   bzero(out, sizeof *out);
@@ -4152,15 +4152,19 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
   if (out->associate_result == 1 && !out->authorized) out->associate_result = 2;
   out->state = out->associated ? (out->authorized ? 4 : 3) : 0;
   if (!out->associated) return 0;
-  out->ssid_length = gSta.choice.net.ssidLength <= PIANO_WIFI_ASSOC_SSID_MAX ? gSta.choice.net.ssidLength : PIANO_WIFI_ASSOC_SSID_MAX;
-  for (uint32_t i = 0; i < out->ssid_length; ++i) out->ssid[i] = gSta.choice.net.ssidRaw[i];
+  const ScanEntry &net = gSta.choice.net;
+  out->ssid_length = net.ssidLength <= PIANO_WIFI_ASSOC_SSID_MAX ? net.ssidLength : PIANO_WIFI_ASSOC_SSID_MAX;
+  for (uint32_t i = 0; i < out->ssid_length; ++i) out->ssid[i] = net.ssidRaw[i];
   for (unsigned i = 0; i < 6; ++i) out->bssid[i] = gSta.bssid[i];
-  out->channel = uint16_t(gSta.choice.channel ? gSta.choice.channel : gSta.choice.net.channel);
-  out->frequency_mhz = gSta.choice.freq ? gSta.choice.freq : gSta.choice.net.freq;
-  out->rssi_dbm = gSta.choice.rssi ? gSta.choice.rssi : gSta.choice.net.rssi;
-  out->rate_mbps = gSta.choice.net.rateCount ? uint32_t(gSta.choice.net.rates[gSta.choice.net.rateCount - 1] & 0x7f) / 2u : 6u;
+  out->channel = uint16_t(gSta.choice.channel ? gSta.choice.channel : net.channel);
+  out->frequency_mhz = gSta.choice.freq ? gSta.choice.freq : net.freq;
+  out->rssi_dbm = gSta.choice.rssi ? gSta.choice.rssi : net.rssi;
+  out->rate_mbps = net.rateCount ? uint32_t(net.rates[net.rateCount - 1] & 0x7f) / 2u : 6u;
   out->auth_type = gSta.rsn ? 2 : 1;
   out->cipher = gSta.rsn ? (gSta.pairwise ? uint8_t(gSta.pairwise) : 4) : 0;
+  out->capability = net.capability;
+  out->rsn_length = net.rsnElementLength <= sizeof out->rsn ? net.rsnElementLength : 0;
+  for (uint32_t i = 0; i < out->rsn_length; ++i) out->rsn[i] = net.rsnElement[i];
   return 0;
 }
 // Boot 10q: the station's power save (wanted: the boot argument, then the sysctl; applied: what the firmware was told for the

@@ -71,7 +71,6 @@ class PianoWifi80211 : public IO80211Controller {
                                                   // answered at once, the daemon asks again straight away)
   static constexpr unsigned kReportMs = 60000;
   static constexpr unsigned kAssociationTickMs = 250;
-  static constexpr unsigned kAssociateWaitMs = 8000, kAssociateWaitStepMs = 20;   // ASSOCIATE's bounded wait for an outcome
   static constexpr uint32_t kScanLinesMax = 400;   // two lines a scan: about 200 scans, the first half hour of a boot
 
   IOLock *fLock = nullptr;
@@ -104,8 +103,7 @@ class PianoWifi80211 : public IO80211Controller {
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   uint64_t fScanSerial = 0;  // every SCAN_REQ gets one (ADOPTION.md 6.1 item 3): the 15 ms CoreWLAN scan is found by it
   uint32_t fScanRecords = 0; // records served since the serial's scan; printed at its list end
-  uint32_t fScanDonePending = 0; // one completion is required for every accepted scan request
-  bool fScanDoneArmed = false;   // guarded by fLock; the delayed callback drains fScanDonePending
+  pianowifi::a80211::ScanCompletions fScanCompletions; // guarded by fLock
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
 
@@ -878,67 +876,52 @@ void PianoWifi80211::syncDriverAvailableLocked(bool force, const char *why)
 // the station is authorized, failed, superseded or powered off (bounded) lets the next request find the network current.
 void PianoWifi80211::waitAssociationOutcome()
 {
+  using namespace pianowifi::a80211;
   struct piano_wifi_assoc_snapshot raw = {};
-  if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) return;
+  if (piano_wifi_assoc_snapshot_v3(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) return;
   const uint32_t generation = raw.join_generation;
   uint64_t start = 0, now = 0, elapsedNs = 0;
   clock_get_uptime(&start);
-  const char *outcome = "timeout";
-  for (;;) {
+  const char *outcome = nullptr;
+  while (!outcome) {
     IOSleep(kAssociateWaitStepMs);
     bzero(&raw, sizeof raw);
-    if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) { outcome = "no snapshot"; break; }
+    if (piano_wifi_assoc_snapshot_v3(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) { outcome = "no snapshot"; break; }
     clock_get_uptime(&now);
     absolutetime_to_nanoseconds(now - start, &elapsedNs);
-    if (raw.join_generation != generation) { outcome = "superseded"; break; }
-    if (!raw.power) { outcome = "power off"; break; }
-    if (raw.authorized) { outcome = "authorized"; break; }
-    if (raw.associate_result == 2 || raw.associate_result == 9) { outcome = raw.associate_result == 9 ? "timed out" : "failed"; break; }
-    if (elapsedNs >= uint64_t(kAssociateWaitMs) * 1000000ull) { outcome = raw.associated ? "associated, not yet authorized" : "timeout"; break; }
+    outcome = associateWaitOutcome(raw, generation, elapsedNs);
   }
   note80211("%s: PianoWifiAssociateWaitV1 generation %u: %s after %llu ms", fIfName, unsigned(generation), outcome,
             (unsigned long long)(elapsedNs / 1000000ull));
 }
 
-// One completion per accepted scan: an earlier one still waiting is posted at once (thread_call_cancel is true only for a call
-// that had not started; one that runs posts its own), this one's after kScanDoneMs.
+// Coalesce scans on the pending timer and post one completion per accepted request.
 void PianoWifi80211::scanStarted()
 {
-  bool schedule = false;
   IOLockLock(fLock);
-  ++fScanDonePending;
-  if (!fScanDoneArmed) {
-    fScanDoneArmed = true;
-    schedule = true;
-  }
+  const bool schedule = fScanCompletions.start();
   IOLockUnlock(fLock);
   if (schedule) arm(fScanDoneCall, kScanDoneMs);
 }
 
 void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
 {
+  using namespace pianowifi::a80211;
   auto *self = static_cast<PianoWifi80211 *>(p);
   Tick tick(self);
   if (!tick.run) return;
-  uint32_t pending = 0;
   IOLockLock(self->fLock);
   const bool power = self->fState->power;
-  pending = self->fScanDonePending;
-  self->fScanDonePending = 0;
-  self->fScanDoneArmed = false;
+  const uint32_t pending = self->fScanCompletions.take();
   IOLockUnlock(self->fLock);
-  while (pending--) {
-    // Apple80211Scan consumes the synchronous records first.  The subset
-    // manager then waits for the separate cache transition (event 11) before
-    // replying to CoreWLAN; both notifications use the socket fallback in
-    // this profile because selector 5 reports no IOUC event pipe.
-    if (power) {
-      self->postEvent(pianowifi::a80211::kEvScanCacheUpdated);
+  // The cache update precedes SCAN_DONE. Both use the BSD socket fallback
+  // in this profile because selector 5 reports no IOUC event pipe.
+  postScanCompletions(pending, power, [self](uint32_t code) {
+    self->postEvent(code);
+    if (code == kEvScanCacheUpdated)
       note80211("%s: PianoWifiPowerAckV2 scan cache updated BSD event %u posted before scan done", self->fIfName,
-                unsigned(pianowifi::a80211::kEvScanCacheUpdated));
-    }
-    self->postEvent(pianowifi::a80211::kEvScanDone);
-  }
+                unsigned(kEvScanCacheUpdated));
+  });
 }
 
 void PianoWifi80211::noteOtherIoctl(unsigned long cmd)
@@ -1078,34 +1061,18 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   if (!fState || !fSyncLock) return;
   IOLockLock(fSyncLock);
   struct piano_wifi_assoc_snapshot raw = {};
-  if (piano_wifi_assoc_snapshot(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) {
+  if (piano_wifi_assoc_snapshot_v3(&raw) != 0 || raw.version != PIANO_WIFI_ASSOC_SNAPSHOT_VERSION) {
     IOLockUnlock(fSyncLock);
     return;
   }
-  Association next = {};
-  next.associated = raw.associated != 0;
-  next.authorized = raw.authorized != 0;
-  next.ssidLength = raw.ssid_length <= pianowifi::kSsidMax ? raw.ssid_length : pianowifi::kSsidMax;
-  memcpy(next.ssid, raw.ssid, next.ssidLength);
-  memcpy(next.bssid, raw.bssid, sizeof next.bssid);
-  next.channel = raw.channel;
-  next.frequency = raw.frequency_mhz;
-  next.rssi = raw.rssi_dbm;
-  next.noise = raw.noise_dbm;
-  next.rate = raw.rate_mbps;
-  next.authType = raw.auth_type;
-  next.cipher = raw.cipher;
-  next.opMode = raw.op_mode ? raw.op_mode : kOpModeStation;
-  next.result = raw.associate_result;
-  next.generation = raw.join_generation;
-  next.state = raw.state;
   Association old = {};
   bool powerChanged = false;
   bool changed = false, associatedChanged = false, authorizedChanged = false, resultChanged = false, bssidChanged = false,
        ssidChanged = false, stateChanged = false;
   IOLockLock(fLock);
   powerChanged = powerEventRequired(*fState, raw.power != 0, powerSetAccepted);
-  old = observeAssociation(*fState, next, raw.power != 0, emit);
+  old = observeAssociation(*fState, raw, emit);
+  const Association next = fState->association;
   LinkEvent link = {};
   link.down = next.authorized ? 0 : 1;
   link.rssi = next.rssi;
