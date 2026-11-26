@@ -45,14 +45,15 @@ The official actions run on Node.js 24 (`checkout@v7`, `upload-artifact@v7`, `do
 
 The Adreno830 host suite fetches the public `ArmSmmu4K`, `AdrenoPM4` and `AdrenoFirmware` source kits with
 `scripts/fetch-pins.py --only`. It verifies each checkout's HEAD against `unixnu.lock` and adds PianoA830's
-`ArmSmmu4KPaged.c/.h` to the staged SMMU kit. The kits and test binaries share the suite's temporary directory.
+`ArmSmmu4KPaged.c/.h` to the staged SMMU kit. The ArmSmmu4K pin matches the fixed-pool API used by the driver
+([kit provenance](../package/PianoA830/UPSTREAM)). The kits and test binaries share the suite's temporary directory.
 The 1,500-second budget covers fetching, compiling and running the suite with ASan and UBSan.
 
 The suite covers the tier allocator, paged SMMU, PM4 submission, HFI votes and recovery, among other host checks.
-It runs the SHA-256 test vectors and synthetic firmware tests. Validation against stock gen80000 images is local-only
-and requires supplying `--firmware` and its matching `--pins`. The suite skips `test_a830regs`, whose comparison needs
-the unpublished Mesa register export under `docs/inputs/regs`, and the kernel-object check, which needs a built UniXNU tree.
-The standalone register-header checks still run.
+It runs the SHA-256 test vectors and synthetic firmware tests. Validating stock gen80000 images locally requires
+the stock images and the matching pin file, supplied to the runner with `--firmware` and `--pins`. The suite skips
+`test_a830regs`, whose comparison needs the unpublished Mesa register export under `docs/inputs/regs`, and the
+kernel-object check, which needs a built UniXNU tree. The standalone register-header checks still run.
 
 Locally: `python3 scripts/ci/privacy-scan.py [--diff BASE]`, `python3 scripts/ci/self-tests.py [--list] [--only SUBSTR]`,
 `python3 scripts/fetch-pins.py --verify`. To repeat the Adreno830 fetch and suite on a Mac with Xcode:
