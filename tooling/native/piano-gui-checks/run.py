@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mac-side protocol for the installed gui-checks.spec."""
+"""Run a GUI phase using the installed-observe actions environment."""
 import importlib.util
 import json
 import math
@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from grade import brightness_at, parse_luma, parse_panel, visible_change, wifi_off, wifi_ready, wifi_transition
+from grade import brightness_at, parse_luma, parse_panel, visible_change, wifi_evidence, wifi_off, wifi_ready, wifi_transition
 
 
 class CheckError(Exception):
@@ -52,7 +52,7 @@ def save(label, data, wifi=False):
     if wifi:
         data = subprocess.run(["python3", env("GUI_REDACT")], input=data, capture_output=True,
                               timeout=5, check=True).stdout
-    (Path(env("R")) / f"{label}.txt").write_bytes(data)
+    (Path(env("GUI_RESULTS")) / f"{label}.txt").write_bytes(data)
 
 
 def parse_reply(text):
@@ -67,16 +67,24 @@ def remote(op, *args, artifact=None, required=True, limit=24, heartbeat=None):
     # The legacy tsudo interpolates remote arguments in a shell command.
     # Keep the SSID in stdin/staged data, and pass only fixed tokens/paths/levels.
     assert all(re.fullmatch(r"[A-Za-z0-9/_.-]+", str(arg)) for arg in (op, *args))
-    result = bash(f"SSH_T={limit} run_remote", op, *args, timeout=limit + 3, heartbeat=heartbeat)
-    if artifact:
-        save(artifact, result.stdout, wifi)
+    result = bash(f"SSH_T={limit} gui_checks_remote", op, *args, timeout=limit + 3, heartbeat=heartbeat)
     try:
         info = parse_reply(result.stdout.decode(errors="replace"))
     except ValueError:
         info = {"error": "missing GUI receipt"}
-    if required and (result.returncode or "error" in info or info.get("status", 0) != 0):
+    failed = result.returncode or "error" in info or info.get("status", 0) != 0
+    if wifi:
+        evidence = wifi_evidence(info)
+        if artifact:
+            save(artifact, (json.dumps(evidence, sort_keys=True) + "\n").encode(), wifi=True)
+        if required and failed:
+            raise CheckError(f"{op}: action failed or receipt missing")
+        return {} if result.returncode or "error" in info else evidence
+    if artifact:
+        save(artifact, result.stdout)
+    if required and failed:
         raise CheckError(f"{op}: {info.get('error', 'action failed')}")
-    return info
+    return {} if result.returncode else info
 
 
 def known(label, condition):
@@ -115,9 +123,9 @@ def ssid_bytes(path):
 def stage_target():
     target = ssid_bytes(env("GUI_SSID_FILE"))
     dest = env("GUI_TARGET")
-    result = bash("rssh", f"umask 077; /bin/cat > {dest} && test -s {dest}",
+    result = bash("rssh", f"umask 077; /bin/cat > {dest} && test -s {dest} && echo GUI_TARGET_STAGED",
                   body=target)
-    if result.returncode:
+    if result.returncode or b"GUI_TARGET_STAGED" not in result.stdout.splitlines():
         raise CheckError("could not stage the local SSID")
 
 
@@ -150,10 +158,8 @@ def wifi_join():
     target = env("GUI_TARGET")
     menu = remote("wifi-menu", artifact="wifi-menu")
     known("Wi-Fi menu opened", menu.get("menu") is True)
-    shot("wifi-menu")
     row = remote("wifi-find", target, artifact="wifi-row", required=False)
     known("Wi-Fi target row found", row.get("menu") is True and row.get("row") is True)
-    shot("wifi-row")
     before = wifi_state("wifi-before-click")
     if before.get("target") is True:
         # The installed boot can already be joined. Create a non-target baseline without
@@ -166,7 +172,6 @@ def wifi_join():
             time.sleep(.3)
     clicked = remote("wifi-click", target, artifact="wifi-click")
     click_samples = wait_wifi("wifi-join-timeline", clicked, wifi_ready)
-    shot("wifi-join")
     join_ok = wifi_transition(clicked.get("before", {}), click_samples, clicked["t"])
     verdict("PASS" if join_ok else "FAIL", "Wi-Fi row click associated to target with DHCP within 30 s")
     return join_ok
@@ -179,13 +184,10 @@ def wifi_toggle():
         off_state = off_hits[-1][1] if off_hits else {}
         off_ok = bool(off_hits) and off["t"] <= off_hits[-1][0] <= off["t"] + 15 and wifi_off(off_state)
         verdict("PASS" if off_ok else "FAIL", "Wi-Fi menu toggle powered off and dropped the link within 15 s")
-        off_frame_at = time.monotonic()
-        shot("wifi-off")
-        time.sleep(max(0, 5 - (time.monotonic() - off_frame_at)))
+        time.sleep(5)
         before_on = wifi_state("wifi-before-on")
         on = remote("wifi-on", artifact="wifi-on-action")
         on_samples = wait_wifi("wifi-on-timeline", on, wifi_ready)
-        shot("wifi-on")
         on_ok = wifi_off(before_on) and wifi_transition(before_on, on_samples, on["t"])
         verdict("PASS" if on_ok else "FAIL", "Wi-Fi menu toggle powered on and rejoined target with DHCP within 30 s")
         return off_ok and on_ok
@@ -205,17 +207,20 @@ def wifi_check():
     if wifi_state("wifi-initial").get("power") is not True:
         raise CheckError("Wi-Fi must start powered on")
     try:
+        try:
+            key_escape()
+            joined = wifi_join()
+        except (CheckError, subprocess.SubprocessError):
+            verdict("FAIL", "Wi-Fi row click could not be completed")
+            joined = False
+        toggled = wifi_toggle()
+        return joined and toggled
+    finally:
         key_escape()
-        joined = wifi_join()
-    except (CheckError, subprocess.SubprocessError) as error:
-        verdict("FAIL", f"Wi-Fi row click: {error}")
-        joined = False
-    toggled = wifi_toggle()
-    return joined and toggled
 
 
 def read_brightness(label=None):
-    result = bash("SSH_T=8 run_remote", "display-sample", timeout=11)
+    result = bash("SSH_T=8 gui_checks_remote", "display-sample", timeout=11)
     reply = result.stdout.decode(errors="replace")
     # Keep only the readback keys; other registry properties are irrelevant here.
     selected = "\n".join(line for line in reply.splitlines() if re.match(
@@ -252,7 +257,7 @@ def sample(target, label):
 
 
 def load_input():
-    path = Path(env("GUI_REPO")) / "tooling/native/piano-input.py"
+    path = Path(__file__).resolve().parents[1] / "piano-input.py"
     spec = importlib.util.spec_from_file_location("piano_input", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -358,9 +363,9 @@ def prepare_ax():
     # Probe in the same launchctl and sudo chain used by every action.
     ready = remote("ax-trust", artifact="ax-trust", required=False)
     if ready.get("trusted") is not True:
-        seeded = bash("run_remote", "seed", timeout=16)
+        seeded = bash("SSH_T=40 gui_checks_remote", "seed", timeout=43)
         save("ax-seed", seeded.stdout)
-        if b"GUI_TCC_SEEDED\n" not in seeded.stdout:
+        if seeded.returncode or b"GUI_TCC_SEEDED" not in seeded.stdout.splitlines():
             raise CheckError("could not seed the installed SSH-wrapper Accessibility grant")
         for _ in range(5):
             if remote("ax-trust", artifact="ax-trust", required=False).get("trusted") is True:
@@ -392,7 +397,10 @@ def main(phase):
         verdict("PASS" if ok else "FAIL", name)
         return 0 if ok else 1
     except (CheckError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-        verdict("FAIL", f"{name}: {error}")
+        if phase == "wifi":
+            verdict("FAIL", "Wi-Fi GUI phase could not be completed")
+        else:
+            verdict("FAIL", f"{name}: {error}")
         return 1
 
 

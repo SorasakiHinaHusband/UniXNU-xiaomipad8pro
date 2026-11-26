@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse and grade the scalar evidence from the installed GUI checks."""
+"""Parse and grade the receipts collected by gui_checks_installed."""
 import math
 import re
 
@@ -63,6 +63,21 @@ def visible_change(low, high, restored, original):
         return abs(restore_y - original_y) < MIN_LUMA_STEP
     direction = 1 if restore_target > high_target else -1
     return (restore_y - high_y) * direction >= MIN_LUMA_STEP
+
+
+def wifi_evidence(receipt):
+    """Keep scalar Wi-Fi receipts suitable for passing to the harness redactor."""
+    evidence = {key: receipt[key] for key in ("power", "associated", "target", "active", "lease", "menu", "row", "switch")
+                if type(receipt.get(key)) is bool}
+    for key in ("rowCount", "status"):
+        if type(receipt.get(key)) is int:
+            evidence[key] = receipt[key]
+    timestamp = receipt.get("t")
+    if type(timestamp) in (int, float) and math.isfinite(timestamp):
+        evidence["t"] = timestamp
+    if isinstance(receipt.get("before"), dict):
+        evidence["before"] = wifi_evidence(receipt["before"])
+    return evidence
 
 
 def wifi_ready(state):
