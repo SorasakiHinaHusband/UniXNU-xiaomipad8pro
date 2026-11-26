@@ -973,10 +973,16 @@ bool NativeRamBlock::flushWriteBack()
 
 IOReturn NativeRamBlock::synchronizeDirect(IOOptionBits options)
 {
-  if (!__atomic_load_n(&commitGate, __ATOMIC_ACQUIRE))
-    return __atomic_load_n(&online, __ATOMIC_RELAXED) ? kIOReturnSuccess : kIOReturnNotReady;
+  if (!gate) return kIOReturnNotReady;
   DirectEnv env{*this};
   env.lock();
+  // With a single gate, taking it drains the writer in progress. Its FUA
+  // writes are already durable, so an extra device flush is unnecessary.
+  if (!commitGate) {
+    const IOReturn status = !online ? kIOReturnNotReady : directFailed ? kIOReturnIOError : kIOReturnSuccess;
+    env.unlock();
+    return status;
+  }
   if (!admission.beginFence(env)) { env.unlock(); return kIOReturnNotReady; }
   if (options & kIOStorageSynchronizeOptionBarrier) __atomic_fetch_add(&barriers, 1, __ATOMIC_RELAXED);
   const bool ok = !writeState.failed() && (!writeBack || admission.held || flushWriteBack());

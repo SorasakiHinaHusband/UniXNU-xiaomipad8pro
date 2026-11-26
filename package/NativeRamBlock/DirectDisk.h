@@ -23,6 +23,7 @@ static uint64_t directDiskIOWithPolicy(const Seed &seed, persist::Overlay &ov, S
   if (!stagePages || !length || offset > seed.bytes || length > seed.bytes - offset) return 0;
   if (!ov.active || (write && ov.readOnly)) return 0;
   const uint64_t lastIndex = (offset + length - 1) / 4096;
+  if (lastIndex >= ov.pages) return 0;
   uint64_t done = 0;
   while (done < length) {
     uint64_t at = offset + done, index = at / 4096, skip = at & 4095;

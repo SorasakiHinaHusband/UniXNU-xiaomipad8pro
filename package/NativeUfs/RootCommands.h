@@ -121,10 +121,10 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
     gHost.ready = false;
     return recordTransport (kIOReturnIOError, *ocs);
   }
-  gRootDiagnostic.command++;
+  gRootDiagnostic.command.increment ();
   gRootDiagnostic.type = slot.ucd[0];
   gRootDiagnostic.lun = slot.ucd[2];
-  gRootDiagnostic.opcode = slot.ucd[gRootDiagnostic.type == 1 ? 16 : 12];
+  gRootDiagnostic.opcode = slot.ucd[slot.ucd[0] == 1 ? 16 : 12];
   gRootDiagnostic.scsi = 0xffff;
   gRootDiagnostic.response = 0;
   gRootDiagnostic.protocol = 0;
@@ -243,7 +243,8 @@ static IOReturn hostProtocolError (uint32_t reason)
   gRootDiagnostic.protocol = reason;
   gHost.ready = false;
   gHost.poisoned = true;
-  return recordTransport (kIOReturnIOError, gRootDiagnostic.ocs);
+  // Response validation runs only after a successful transfer (OCS zero).
+  return recordTransport (kIOReturnIOError, 0);
 }
 
 // Validate a completed response before interpreting zero-filled status bytes.
@@ -411,12 +412,9 @@ static uint64_t gSlotWaits = 0;
 struct UfsSlotWaiter { UfsSlotWaiter *next; int slot; bool preferred, bypassed; };
 static UfsSlotWaiter *gSlotWaitHead = nullptr, *gSlotWaitTail = nullptr;
 static unsigned gSlotPreferred = 0;
-// Hybrid completion waits (as Linux's hybrid block polling): a wait polls for its first gSpinUs microseconds, then sleeps on the
-// completion interrupt. Short commands complete while polling; long ones leave the CPU after the budget.
-static uint32_t gSpinUs = 200;
 // Set once by the panic path (native_ufs_log_panic). The CPUs that still run may hold a slot forever, so with one slot it is tried for
 // 200 ms and then used anyway. Commands only poll (TransferPoll.h), so they also run with interrupts masked.
-static bool gHostPanic = false;
+static UfsAtomicField<bool> gHostPanic;
 // UniXNU-piano: the queue hold of a system sleep (RootPower.h, native-ufs-suspend=1; under gSlotLock). While it is set no command
 // takes a slot: a taker waits (counted in gHoldWaits) until the link is back and the hold released, so nothing reaches the
 // controller with the link in Hibern8. The panic path does not wait. Never set without native-ufs-suspend=1.
@@ -538,14 +536,16 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     return kIOReturnBadArgument;
   }
   UfsPrd prd[kMaxPrds];
-  const unsigned prds = blocks <= kXferMax / 4096 ? hostBuildPrds (dst, uint64_t (blocks) * 4096, prd) : 0;
+  // Only callers that can quarantine their buffer may lend it to the controller.
+  const unsigned prds = live && blocks <= kXferMax / 4096 ? hostBuildPrds (dst, uint64_t (blocks) * 4096, prd) : 0;
   if (!prds && blocks > kDataMax / 4096) {
     // Beyond one command: pieces of kXferMax (each tried for zero copy again), or of kDataMax through the data area.
     const uint32_t step = blocks > kXferMax / 4096 ? kXferMax / 4096 : kDataMax / 4096;
-    for (uint32_t done = 0; done < blocks; done += step) {
+    for (uint32_t done = 0; done < blocks;) {
       const uint32_t chunk = blocks - done > step ? step : blocks - done;
       IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096, live, preferRead);
       if (status != kIOReturnSuccess) return status;
+      done += chunk;
     }
     return kIOReturnSuccess;
   }
@@ -613,10 +613,10 @@ static unsigned hostPrdsFromSegments (Segments &segments, uint64_t offset, uint6
 // hostRead4k. The caller cleans the pages before and invalidates them after (dataSynced); nothing is copied.
 // *live (when given): set when the read's own command was rung and did not complete (hostAwait): its pages may still be the
 // controller's (review H1, 2026-11-14: only then may a caller hold them).
-static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const UfsPrd *prd, unsigned prds, bool *live = nullptr)
+static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const UfsPrd *prd, unsigned prds, bool *live)
 {
   if (live) *live = false;
-  if (!gHost.ready || !prd || !prds || prds > kMaxPrds || !blocks || blocks > kXferMax / 4096 || lba > 0xffffffffULL - (blocks - 1))
+  if (!gHost.ready || !live || !prd || !prds || prds > kMaxPrds || !blocks || blocks > kXferMax / 4096 || lba > 0xffffffffULL - (blocks - 1))
     return kIOReturnBadArgument;
   uint64_t sum = 0;
   for (unsigned i = 0; i < prds; ++i) sum += prd[i].bytes;
@@ -699,7 +699,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
     return kIOReturnBadArgument;
   }
   UfsPrd prd[kMaxPrds];
-  const unsigned prds = hostBuildPrds (src, uint64_t (blocks) * 4096, prd);
+  const unsigned prds = live ? hostBuildPrds (src, uint64_t (blocks) * 4096, prd) : 0;
   if (!prds && blocks > kDataMax / 4096) {
     for (uint32_t done = 0; done < blocks; done += kDataMax / 4096) {
       const uint32_t chunk = blocks - done > kDataMax / 4096 ? kDataMax / 4096 : blocks - done;
@@ -712,9 +712,8 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   const UfsSlot slot = hostSlotTake (&pooled);
   gRootDiagnostic.lba = lba;
   if (!prds) {
-    // A tracked store writer may have waited for this slot across another command's fatal timeout.
-    // Check ownership before putting anything in the bounce area.
-    if (live && !hostClearUcd (slot)) {
+    // The transport may have been quarantined while this writer waited.
+    if (!hostClearUcd (slot)) {
       hostSlotGive (slot, pooled);
       return kIOReturnNotReady;
     }

@@ -2132,7 +2132,8 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint32_t bounceBytes[kBounces] = {};
   IOBufferMemoryDescriptor *bounceMd[kBounces] = {};
   uint32_t bounceFree = 0;
-  IOLock *windowLock = nullptr;   // guards bounceFree
+  uint32_t bounceQuarantined = 0;
+  IOLock *windowLock = nullptr;   // guards both bounce masks
   bool online = false;
   bool writable = false;      // development build only (NATIVE_UFS_UNVERIFIED_ROOT)
   IOReturn writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done);
@@ -2142,9 +2143,13 @@ class NativeUfsBlock : public IOBlockStorageDevice {
     const uint64_t waitStart = hostPerfNow ();
     bool waited = false;
     IOLockLock (windowLock);
-    while (!bounceFree) {
+    while (!bounceFree && gHost.ready) {
       waited = true;
       IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+    }
+    if (!gHost.ready) {
+      IOLockUnlock (windowLock);
+      return kBounces;
     }
     const unsigned k = static_cast<unsigned> (__builtin_ctz (bounceFree));
     bounceFree &= ~(1U << k);
@@ -2152,11 +2157,12 @@ class NativeUfsBlock : public IOBlockStorageDevice {
     if (waited) hostPerfSpan (kUfsPerfBounceWait, waitStart, 0);
     return k;
   }
-  void giveBounce (unsigned k)
+  void giveBounce (unsigned k, bool live)
   {
     IOLockLock (windowLock);
-    bounceFree |= 1U << k;
-    IOLockWakeup (windowLock, &bounceFree, true);
+    if (live) bounceQuarantined |= 1U << k;
+    else bounceFree |= 1U << k;
+    IOLockWakeup (windowLock, &bounceFree, gHost.ready);
     IOLockUnlock (windowLock);
   }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -2642,11 +2648,12 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     const vr_view *view;
 #endif
+    bool live = false;
     void lock () {}     // the request's own bounce buffer holds its snapshot
     void unlock () {}
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
       uint64_t t0 = timerTicks ();
-      IOReturn r = hostRead4k (0, lba, blocks, out);
+      IOReturn r = hostRead4k (0, lba, blocks, out, &live);
       __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       return r;
     }
@@ -2691,8 +2698,11 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
   bool held = false;
   if (!gDirect || !readDirect (buffer, block, count, &outcome, &held)) {
     const unsigned bounceIndex = takeBounce ();
-    outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
-    giveBounce (bounceIndex);
+    if (bounceIndex == kBounces) outcome = {kIOReturnNotReady, 0};
+    else {
+      outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
+      giveBounce (bounceIndex, operations.live);
+    }
   }
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
@@ -2792,12 +2802,14 @@ bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt6
 // Development build: 512-byte sectors written onto 4 KiB UFS blocks; partial blocks at the edges are read first.
 IOReturn NativeUfsBlock::writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done)
 {
+  *done = 0;
   const unsigned bounceIndex = takeBounce ();
+  if (bounceIndex == kBounces) return kIOReturnNotReady;
   uint8_t *bounce = bounces[bounceIndex];   // every bounce has at least kDataMax; writes use that much, as before
   const uint64_t start = absolute + block * 512;
   uint64_t remaining = count * 512;
   IOReturn status = kIOReturnSuccess;
-  *done = 0;
+  bool live = false;
   while (remaining) {
     const uint64_t pos = start + *done, lba = pos / 4096, skip = pos % 4096;
     uint64_t blocks = (skip + remaining + 4095) / 4096;
@@ -2805,16 +2817,16 @@ IOReturn NativeUfsBlock::writeWindow (IOMemoryDescriptor *buffer, UInt64 block, 
     uint64_t usable = blocks * 4096 - skip;
     if (usable > remaining) usable = remaining;
     if (skip || (skip + usable) % 4096) {
-      status = hostRead4k (0, lba, static_cast<uint32_t> (blocks), bounce);
+      status = hostRead4k (0, lba, static_cast<uint32_t> (blocks), bounce, &live);
       if (status != kIOReturnSuccess) break;
     }
     if (buffer->readBytes (*done, bounce + skip, usable) != usable) { status = kIOReturnIOError; break; }
-    status = hostWrite4k (0, lba, static_cast<uint32_t> (blocks), bounce);
+    status = hostWrite4k (0, lba, static_cast<uint32_t> (blocks), bounce, false, &live);
     if (status != kIOReturnSuccess) break;
     *done += usable;
     remaining -= usable;
   }
-  giveBounce (bounceIndex);
+  giveBounce (bounceIndex, live);
   return status;
 }
 
@@ -2827,6 +2839,7 @@ void NativeUfsBlock::free ()
   }
 #endif
   for (unsigned k = 0; k < kBounces; ++k) {
+    if (bounceQuarantined & (1U << k)) continue;  // the controller may still own this allocation
     if (bounceMd[k]) bounceMd[k]->release ();
     else if (bounces[k]) IOFree (bounces[k], kDataMax);
     bounceMd[k] = nullptr;

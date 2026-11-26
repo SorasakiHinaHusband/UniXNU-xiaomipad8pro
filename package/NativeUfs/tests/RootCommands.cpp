@@ -170,6 +170,19 @@ int main ()
   assert (m.device[ufsSlotUcdOffset (0) + 16] == 0x2a && m.device[ufsSlotUcdOffset (0) + 17] == 0);
   assert (hostSyncCache () == kIOReturnSuccess && m.syncs == 1);
   assert (m.device[ufsSlotUcdOffset (0) + 16] == 0x35 && m.device[ufsSlotUcdOffset (0) + 17] == 0);
+  // A caller that cannot quarantine its buffer must use the controller-owned staging area.
+  for (bool write : {false, true}) {
+    reset ();
+    assert (hostStoreOpen (100, 64));
+    gTestDmaStage = stage;
+    const auto result = write ? hostWrite4k (0, 100, 1, stage) : hostRead4k (0, 100, 1, stage);
+    assert (result == kIOReturnSuccess);
+    const auto *entry = m.device.data () + ufsSlotUcdOffset (0) + kPrdtOffset;
+    uint32_t low, high;
+    memcpy (&low, entry, sizeof (low));
+    memcpy (&high, entry + 4, sizeof (high));
+    assert ((uint64_t (high) << 32 | low) == gHost.phys + ufsSlotDataOffset (0));
+  }
   // native-ufs-suspend=0 and native-ufs-ahit absent (today's): nothing here ever held the queue, entered Hibern8 or set AHIT.
   assert (!gHostHeld && gHoldWaits == 0 && m.enterCommands == 0 && reg (0x18) == 0 && gPower.suspends == 0);
   puts ("PASS: command slots: per-slot entry, descriptor, tag and data; pool; busy and task-set-full retries; panic slot; one-slot fallback");
