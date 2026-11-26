@@ -2,7 +2,7 @@
 
 The dark-wake fix-image gate is **HOLD**. [Current gate](#fix-image-gate)
 
-**Root cause closed by y12o qual2b.** INTF2 accepted the disable request, but its effective timing and both live counters continued tracking INTF1 throughout the 40 ms wait. The slave-first sequence waits for a stop that depends on the master, then rolls back before reaching that master. Ubuntu v1.4.0 stops the master first and hands off the shared CTL before stopping the slave’s local timing. The native retained-route variant needs hardware qualification.
+**The historical stop-order cause is closed; the optical dark-wake cause remains open.** y12o qual2b isolated the slave-first stop dependency. The master-first shared-CTL handoff now stops both engines on `v131y12u-m5obs2`. That run restores the sampled DPU route and PHY/PLL configuration but develops DSI underflow flags and later command/video contention. `RESET +0x118` loses `0x1c00`, but the pinned XML does not define those bits and Linux uses the same literal reset writes. The evidence does not justify preserving that value as a fix. [Current hardware analysis](#v131y12u-m5obs2-register-divergence)
 
 ## References and topology
 
@@ -288,14 +288,14 @@ crossed phases together. `static_changes` contains the remaining differences, in
 live status values. The `phy-drift` flag uses unexplained PHY changes.
 Compare same-phase repeats to check unexplained live register differences. The snapshots are sequential
 MMIO reads. Native panel sleep was disabled for this display-sleep reference. The dark-wake observation
-with `piano-dpu-panel=1` remains pending.
+with `piano-dpu-panel=1` is analyzed [below](#v131y12u-m5obs2-register-divergence).
 
 The `v131y12u-m5obs1` pre-observation confirmed the bright control (`gop-shot` `mean=224.0`,
 `grade_m5_dsi.py PASS`). With standalone `piano-dpu-panel=1`, `DpuSlices::readSliceArgs()` chose the
 `piano-dpu-ahb-vote` default before parsing the panel flag, so startup exited at the GCC display AHB clock gate.
 Commit `2516bd2f` confines the fix to the argument order and AHB vote default in slice startup.
 The wake capture needs a `caffeinate -u` user-activity assertion because macOS re-blanked after 10 s.
-The live read-only M5 dark-wake capture on `v131y12u-m5obs2` remains required before any M5 fix image.
+The subsequent `v131y12u-m5obs2` capture reached M5 and reproduced the dark wake; its remaining evidence gap is identified below.
 [M5 RAM pre-observation](../results-2026-11-27.md#m5-read-only-pre-observation)
 
 ### Read-only RAM check plan
@@ -305,6 +305,298 @@ The live read-only M5 dark-wake capture on `v131y12u-m5obs2` remains required be
 3. Diff each link against its own bright sample. Compare stable `CTRL`, clock, trigger, timing, lane-map, compression, PHY and PLL settings word for word. Compare live counters, busy/stop-state bits, IRQ/error latches and FIFO occupancy in the context of scan phase and repeated samples. Require the common and link gates to be open when grading a stable bright/dark pair. Preserve closed gates, unexpected all-ones reads and PLL `unread` as unavailable evidence. The live SM8750 `lp-timer=ffffffff` is valid. On a PHY1 external-clock configuration, grade PLL0 lock and PHY1 mux/global clock plus lane and FIFO evidence together. A change isolated to PHY1's local lock bit is insufficient to call the bonded clock lost.
 4. Pair the dark optical exposure with a successful, stable active-scanout capture of the same pattern. If capture returns `EBUSY`, retain its reason and retry at the same static workload while the same state persists. Record buffer generation and timing from the existing diagnostics. With a confirmed bright pixel source, a reproducible host or PHY change identifies a register to correlate with the transition. A matched bright source plus matching sampled host/PHY state still requires panel or link evidence, such as externally observed HS traffic or an independently qualified panel status measurement. Missing source pixels leave the outcome unclassified.
 
+## v131y12u-m5obs2 register divergence
+
+This analysis uses the supplied November 27 RAM transcript for commit `411825dd`, BOE `35-02-0b`,
+`piano-dpu-panel=1 piano-dpu-ahb-vote=1 piano-dpu-snapshot=1`, 60 Hz macOS presentation and 120 Hz live scanout.
+The run returned `rc=0`, logged in at +49 s, retained its WindowServer PID, and recorded zero crashes,
+GPU faults or panics. C920 health was `ok` across 21,179 frames at 29.999 fps. Startup reached
+`DpuSlices serving with panel on`, the active panel flag and verified moving INTF counters after `2516bd2f`.
+The extended snapshots report 254 loads, zero stores and an open gate; observation did not clear the error latches.
+This closes the m5obs1 startup blocker, not the dark wake. [Run result](../results-2026-11-27.md#v131y12u-m5obs2-2026-11-27)
+
+Native line references in this section describe the files at `411825dd`; the audited files match this checkout.
+Linux citations remain pinned to `83f0f89bed14`. The local Linux checkout's HEAD is newer; a path-limited
+comparison against that pin found no differences in the host/manager/config, panel, 7 nm PHY or two XML files
+used here. No inference below relies on the newer HEAD or on a register name from a different DSI generation.
+
+### Path and capture chronology
+
+Path: IOMFB's combined system/API display-power gate → NativeGopDisplay's serialized copy worker → confirmed
+dual backlight blank and touch park → `PianoDpuPanel` → `panelOff` (LP `28`, 20 ms, LP `10`, 100 ms,
+master stop, CTL reset/slave route submission, slave stop, fetch off) → retained-power sleep → `panelOn`
+(quiescent hosts, host reset, CMD-only `11`, 120 ms, `29`, 10 ms, saved host mode, fetch/route/INTF restart)
+→ PCC replay, touch release and display/backlight publication. The later serial-3 off fails before either
+timing engine is stopped. [IOMFB gate](../../package/NativeGopDisplay/NativeGopDisplay.cpp#L1585-L1623) ·
+[Worker and callout](../../package/NativeGopDisplay/NativeGopDisplay.cpp#L1739-L1791) ·
+[Worker serialization](../../package/NativeGopDisplay/NativeGopDisplay.cpp#L2356-L2379) ·
+[DPU sleep/wake ownership](../../package/PianoDpu/DpuSlices.cpp#L807-L864) ·
+[Panel transaction](../../package/PianoDpu/DpuPanel.h#L562-L725)
+
+| Ordered evidence | What it establishes |
+| --- | --- |
+| Bright `m5-bright1`: YAVG 102.13, panel `awake` | Positive optical control. CTL0 ACTIVE/MASTER `6/2`, both INTFs `EN/STATUS=1/1`. Bright active FIFO `1010/1010`. |
+| Serial 1 off: `ok=1 step=5 restored=0 rows=135 dropped=0` | Both `28` and `10` trigger and finish on both links in 1,268 µs each, `porch=1`, INTR `00010001/00010001`, ACK masks `3→3` with zero errors. The first command changes FIFO `11111010→1010`; the second retains `1010`. Host completion does not prove panel receipt. |
+| Serial 1 rows 122, 133, 134 | `stop2` precedes `fetch-off` and `end`. Both final EN/STATUS pairs are zero; CTL TOP/ACTIVE `f0000000/4`, MASTER 0. The earlier stop-order fault is absent. |
+| `m5-asleep1/2`, before any wake reset | YAVG 8.80, panel `asleep`, both EN/STATUS zero and counters frozen across 3.9 s. **DSI0 already has FIFO `99991090`, STATUS0 `2005`, CLK_STATUS `8077c3`; DSI1 has `11111010`, `2000`, `6343`. Both RESET words are still `1c00`.** |
+| Serial 2 wake | Software success and restored scanout are reported. Its full per-command register report is not in the supplied extracts. The next serial's saved FIFO values are already `99991090/99991090` before its DSI FIFO setup. This brackets the DSI1 change between sleep and serial-3 entry; it does not locate it within serial 2. |
+| Serial 3 off, before `m5-wake1` | `ok=0 step=1 restored=0 rows=82 dropped=0`. DCS `28` triggers, `done=0`, 50,683 µs, INTR `00010000/00010000`. Rows 0→80 still have both INTFs running, ACTIVE `6`, clear flushes and advancing counters. This is a command timeout, not another failed timing stop. |
+| `m5-wake1/2/3` after serial 3 | YAVG 20.24/20.26 despite an awake assertion, both KTZ8866 ICs lit (`1496/1496`, enables `127/127`) and display power Yes. Panel property `fault` follows serial 3. The DPU route/timing, static host setup and all sampled PHY/PLL words equal bright; both INTFs keep counting at 120 Hz (frame samples 8806→9297). All six source captures return `EBUSY: scanout kept changing`. |
+
+The last optical/register samples are **post-timeout**, not an uncontaminated observation immediately after
+serial 2. They prove a dark display and a faulted host command path at that time. The supplied optical
+ordering does not independently establish the panel's pixels before serial 3's `28`. Source-buffer contents
+remain unverified because every dark `gop-shot` refused capture.
+
+### Offset audit, including the 6G shift
+
+Linux sets `DSI_6G_REG_SHIFT=4` (`dsi_cfg.h:39`), adds `cfg->io_offset` to `ctrl_base`
+(`dsi_host.c:2067–2068`), and reads/writes `ctrl_base + reg` (`193–201`). Native `dsiReg` adds its
+already-shifted offset directly to physical DSI0/1 bases `0x0ae94000/0x0ae96000`.
+**Do not add another four bytes.** `6G_HW_VERSION` is the special unshifted word at physical base+0.
+The host's 6G v2.x version handling and the SM8750 v7.2 force-clock implementation do not supply an
+alternative RESET field layout. [Shift constant](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_cfg.h#L39) ·
+[Linux base adjustment](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_host.c#L2067-L2068) ·
+[Native addresses](../../package/PianoDpu/DpuHw.h#L20-L25) · [Native address helper](../../package/PianoDpu/DpuSlices.h#L49-L59)
+
+The following inventory covers every DSI host offset used or declared by `DpuHw.h:157–170`, the panel's
+imported `DpuSlices.h:51–59` constants, and `DpuSnapshot.h:29–44,173–196`. Corresponding entries on each
+row are in the same order. All XML-defined offsets match; the raw extensions remain explicitly unverified.
+The DPU/CTL/INTF, DISPCC and SMMU registers in those files belong to other register domains, not `dsi.xml`.
+
+| Physical host offset | Pinned XML offset and name | Exact XML lines |
+| --- | --- | --- |
+| `000`; `004`, `008`, `00c` | `000 6G_HW_VERSION` (unshifted); `000 CTRL`, `004 STATUS0`, `008 FIFO_STATUS` | 90–144 |
+| `010`, `020` | `00c VID_CFG0`, `01c VID_CFG1` | 145–163 |
+| `024`, `028`, `02c`, `030`, `034`, `038` | `020 ACTIVE_H`, `024 ACTIVE_V`, `028 TOTAL`, `02c ACTIVE_HSYNC`, `030 ACTIVE_VSYNC_HPOS`, `034 ACTIVE_VSYNC_VPOS` | 164–187 |
+| `03c`, `040`, `044`, `04c` | `038 CMD_DMA_CTRL`, `03c CMD_CFG0`, `040 CMD_CFG1`, `048 DMA_LEN` | 189–208 |
+| `068`, `084`, `090` | `064 ACK_ERR_STATUS`, `080 TRIG_CTRL`, `08c TRIG_DMA` | 227–238 |
+| `0a4`, `0a8`, `0ac`, `0b0` | `0a0 MISR_VIDEO_CTRL`, `0a4 LANE_STATUS`, `0a8 LANE_CTRL`, `0ac LANE_SWAP_CTRL` | 264–287 |
+| `0b4`, `0b8`, `0bc`, `0c0`, `0c4`, `0cc` | `0b0 DLN0_PHY_ERR`, `0b4 LP_TIMER_CTRL`, `0b8 HS_TIMER_CTRL`, `0bc TIMEOUT_STATUS`, `0c0 CLKOUT_TIMING_CTRL`, `0c8 EOT_PACKET_CTRL` | 239–263 |
+| `10c`, `110`, **`118`**, `11c`, `120` | `108 ERR_INT_MASK0`, `10c INTR_CTRL`, **`114 RESET`**, `118 CLK_CTRL`, `11c CLK_STATUS` | 288–318 |
+| `15c`, `180`, `1f4` | `158 TEST_PATTERN_GEN_CTRL`, `17c T_CLK_PRE_EXTEND`, `1f0 VERSION` | 330–349,370–372 |
+| `2a0`, `2a8`, `2ac` | `29c VIDEO_COMPRESSION_MODE_CTRL`, `2a4 COMMAND_COMPRESSION_MODE_CTRL`, `2a8 COMMAND_COMPRESSION_MODE_CTRL2` | 374–394 |
+| `17c`, `390` | Would require XML `178`, `38c`: neither exists. Native FIFO payload port and second DMA control word come from the separate PeripheralIO path, not this XML. | `DpuSlices.h:53–59`; `DpuPanel.h:187–191` |
+| `1e4`, `1e8`, `1ec` | Would require XML `1e0`, `1e4`, `1e8`: none exists. Native raw timing-shadow words; the completed-DCS cleanup pulses `1ec`. Its designation as a FIFO reset is **not established by this pin**. | `DpuHw.h:167–170`; `DpuPanel.h:123–137` |
+
+Source: [pinned host XML](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L90-L394) ·
+[Native host constants](../../package/PianoDpu/DpuHw.h#L157-L170) ·
+[Snapshot offsets and loads](../../package/PianoDpu/DpuSnapshot.h#L29-L67).
+For disambiguation, `RDBK_DATA[0..3]` are XML `068/06c/070/074`, physical `06c/070/074/078`
+(`dsi.xml:228–230`); `RDBK_DATA3` is **not** physical `118`. PHY reset is XML `128`, physical `12c`
+(`319–321`), separate from controller RESET. There is no separately named `DSI_SOFT_RESET` register in this
+XML: `dsi_sw_reset()` drives `REG_DSI_RESET` (`dsi_host.c:1151–1178`).
+
+Every PHY/PLL offset in `DpuSnapshot.h:45–54` also matches its **unshifted, separate resource**:
+common `010/014/01c` = `CLK_CFG0/1/RBUF_CTRL`; `024/028/02c/030/1b0` = `CTRL_0/1/2/3/5`;
+`034/038/03c` = `LANE_CFG0/1/PLL_CNTRL`; `0a0/0a4` = `LANE_CTRL0/1`;
+`0b4…0e8` in four-byte steps = `TIMING_CTRL_0…13`; `140/148/14c` = `PHY_STATUS/LANE_STATUS0/1`.
+PLL resource `1b0` is `COMMON_STATUS_ONE`, not common `CTRL_5`.
+These are `dsi_phy_7nm.xml:12–61,74–76,201`, not host offsets plus four.
+[PHY/PLL XML](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi_phy_7nm.xml#L12-L76)
+
+### Bit decode of all five divergent registers
+
+The tables account for every set bit, every XML-defined clear field and the remaining undefined bits.
+“Undefined” means the pinned sources give no semantics; it does not mean that hardware ignores the bit.
+
+**RESET, physical `+0x118`: `00001c00 → 00000000`.** XML line 291 declares a raw 32-bit `RESET`
+with **no fields**. In the bright and pre-wake asleep samples, bits **10, 11 and 12** are each 1;
+all other bits, including bit 0, are 0. Afterwards all 32 bits read 0. Linux's literal `1→0` sequence
+establishes bit 0's software reset use; it gives no name, retention contract or writable-mask information
+for bits 10–12. Both the generic reset (`dsi_host.c:1170–1172`, 20 ms) and the SM8750 post-sync reset
+(`2625–2628`, 1 µs) write the whole word without preserving `1c00`.
+[RESET declaration](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L291) ·
+[SM8750 reset](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_host.c#L2591-L2635)
+
+Native likewise writes literal 1, waits 1 µs, writes 0, and requires a zero readback
+(`DpuPanel.h:511–515`); its guard permits only 0/1 (`DpuSlices.h:90`). Thus the observed loss on both
+links is consistent with a write both executed during wake. Neither serial-1 sleep nor snapshots write
+RESET, explaining why the inherited bright value remains during sleep. The agent that originally set
+`1c00` and the silicon meaning of its three bits are **unknown**. Their loss is not proof of erased video
+configuration or a requirement to restore them. No pinned source supports calling them FIFO reset enables.
+
+**FIFO_STATUS, physical `+0x00c`.** The full field mapping is `dsi.xml:118–144`.
+[FIFO fields](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L118-L144)
+
+| Bit(s), XML meaning | `00001010` bright active | `11111010` bright VFP / DSI1 asleep | `99991090` DSI0 asleep / both pre-serial-3 | `88881090` post-timeout |
+| --- | --- | --- | --- | --- |
+| 0 VIDEO_MDP overflow; 3 VIDEO_MDP underflow | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| **4 undefined** | 1 | 1 | 1 | 1 |
+| **7 CMD_MDP underflow** | 0 | 0 | **1** | **1** |
+| 8/9 CMD_DMA read/write watermark; 10 CMD_DMA underflow | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| 12 lane-0 LP empty; 13 LP full; 14 LP overflow | 1 / 0 / 0 | 1 / 0 / 0 | 1 / 0 / 0 | 1 / 0 / 0 |
+| 16/20/24/28 lanes 0/1/2/3 HS empty | all 0 | all 1 | all 1 | all 0 |
+| 17/21/25/29 lanes 0/1/2/3 HS full | all 0 | all 0 | all 0 | all 0 |
+| 18/22/26/30 lanes 0/1/2/3 HS overflow | all 0 | all 0 | all 0 | all 0 |
+| **19/23/27/31 lanes 0/1/2/3 HS underflow** | all 0 | all 0 | **all 1** | **all 1** |
+| 1/2/5/6/11/15 undefined | all 0 | all 0 | all 0 | all 0 |
+
+Arithmetic checks: `11111010 = 1010 | 11110000`; `99991090 = 11111010 | 88880080`;
+`88881090 = 99991090 & ~11110000`. The last transition removes the four **empty** indications,
+not the four HS-underflow flags or CMD_MDP underflow. Neither fault word asserts the XML's VIDEO_MDP
+underflow bit 3 or CMD_DMA underflow bit 10. Calling it simply a video-input FIFO underflow loses that distinction.
+Linux writes FIFO status back on its error path (`dsi_host.c:1650–1664`) and specifically queues
+`dsi_sw_reset` for CMD_MDP underflow (`1591–1599`). These are error indications, not just VFP occupancy.
+They can describe a prior event; a passive snapshot does not timestamp the event or prove continuous starvation.
+[Linux FIFO error handling](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_host.c#L1591-L1664)
+
+**STATUS0, physical `+0x008`.** XML lines 109–116 define only busy bits 0–4 and contention bit 31.
+[STATUS0 fields](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L109-L116)
+
+| Bit, meaning | Bright DSI0 `2008` | Bright DSI1 `8` | Asleep DSI0 `2005` | Asleep DSI1 `2000` | Both post-timeout `8000a00f` |
+| --- | --- | --- | --- | --- | --- |
+| 0 CMD engine busy | 0 | 0 | **1** | 0 | **1** |
+| 1 CMD DMA busy | 0 | 0 | 0 | 0 | **1** |
+| 2 CMD MDP busy | 0 | 0 | **1** | 0 | **1** |
+| 3 VIDEO engine busy | 1 | 1 | 0 | 0 | **1** |
+| 4 DSI_BUSY | 0 | 0 | 0 | 0 | 0 |
+| 13 undefined | 1 | 0 | 1 | 1 | 1 |
+| 15 undefined | 0 | 0 | 0 | 0 | **1** |
+| 31 INTERLEAVE_OP_CONTENTION | 0 | 0 | 0 | 0 | **1** |
+| 5–12,14,16–30 undefined | all 0 | all 0 | all 0 | all 0 | all 0 |
+
+`8000a00f = BIT(31) | BIT(15) | BIT(13) | 0xf`: the documented low bits are all four engine-busy
+flags, not DSI_BUSY. Linux treats bit 31 as an error and writes it back (`dsi_host.c:1667–1677`).
+Neither XML nor the audited host's 6G/v7.2 paths defines STATUS0 bits 13 or 15. The asleep sample proves
+DSI0's command engine/MDP were busy while video-busy and command-DMA-busy were clear; it does **not** show
+an outstanding command DMA then. The post-timeout sample shows a blocked command DMA alongside video
+busy and recorded contention. The exact time contention first asserted is unmeasured.
+
+**CLK_STATUS, physical `+0x120`.** XML lines 301–318 give the following complete decode.
+[Clock fields](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L301-L318)
+
+| Bits and fields | `008067c3` bright active | `008077c3` DSI0 asleep / both post-timeout | `00006343` DSI1 asleep |
+| --- | --- | --- | --- |
+| 0 AON AHBM, 1 DYN AHBM | 1 / 1 | 1 / 1 | 1 / 1 |
+| 2 AON AHBS, 3 DYN AHBS, 4 AON DSI, 5 DYN DSI | all 0 | all 0 | all 0 |
+| 6 AON BYTE, 7 DYN BYTE | 1 / 1 | 1 / 1 | 1 / 0 |
+| 8 AON ESC, 9 AON pixel, 10 DYN pixel | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 0 |
+| **12 DSI_DYN_CMD_PCLK_ACTIVE** | **0** | **1** | 0 |
+| 13 DSI_CMD_PCLK_ACTIVE, 14 DSI_VID_PCLK_ACTIVE | 1 / 1 | 1 / 1 | 1 / 1 |
+| 15 CAM_BIST pixel, 16 PLL_UNLOCKED | 0 / 0 | 0 / 0 | 0 / 0 |
+| 23 undefined | 1 | 1 | 0 |
+| 11,17–22,24–31 undefined | all 0 | all 0 | all 0 |
+
+The active bright→dark XOR is exactly `00001000`, **dynamic command pixel clock active**, not PLL
+unlock, missing byte clock, ULPS or clock failure. Its presence on asleep DSI0 is consistent with its
+busy command/MDP engines, but does not explain why they became busy. PLL_UNLOCKED is bit 16 and clear;
+the independent PLL0 lock remains 1. PLL1's local lock 0 is already present in the bright control and
+fits the external-clock bonded role; it is not a new dark-wake failure.
+
+**TEST_PATTERN_GEN_CTRL, physical `+0x15c`: `0 → 00030006`.** XML lines 71–76,330–337 decode
+bit 1 `CMD_DMA_TPG_EN=1`, bit 2 `TPG_DMA_FIFO_MODE=1`, and bits 17:16
+`CMD_DMA_PATTERN_SEL=3` (custom pattern / DMA FIFO). Bit 0 `EN=0`, VIDEO_PATTERN_SEL bits 5:4=0,
+CMD_MDP_STREAM0_PATTERN_SEL bits 9:8=0; every other bit (3,6–7,10–15,18–31) is zero.
+The two zero pattern selectors mean PRBS (`dsi.xml:59–69`), with their generation disabled.
+This is the command FIFO route, not enabled video test-pattern generation.
+[TPG fields](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/registers/display/dsi.xml#L330-L337)
+
+`sendDcs` writes this exact value to both links before the trigger (`DpuPanel.h:183–191`), then skips
+restoration for a link without DMA_DONE (`227–232`). Serial 3 has no completed links, so the observed
+TPG residue follows deterministically. It cannot explain FIFO `99991090/99991090` sampled **before**
+that setup. The separate sixth difference, DSI1 DMA_LEN `84→4` (132→4 bytes), is also compatible with
+serial 3 writing four bytes and skipping restoration; its pre-serial-3 value is not supplied. It is not a
+changed pixel timing or DSC slice size (`dsi.xml:208`; `DpuPanel.h:89,191,228`).
+
+**The serial-3 printed trailing zeros are not hardware evidence.** ACK mask `3:0/0 → 0:0/0` means
+both before reads exist and neither after read exists. `Sent` initializes `fifoAfter` and `ackAfter` to
+zero (`DpuPanel.h:112`); the timeout skips the only read sites (`228–232`). Thus its printed
+`fifo=99991090/99991090>00000000/00000000` does not show FIFO clearing. The formatter emits the fields
+regardless (`DpuSlices.cpp:780–786`). [Transfer and cleanup](../../package/PianoDpu/DpuPanel.h#L103-L241) ·
+[Trace formatting](../../package/PianoDpu/DpuSlices.cpp#L775-L792)
+
+### Wake comparison and check matrix
+
+The Linux sequence is a full power cycle, while M5 retains power. Missing full-cycle operations are
+candidate differences, not automatically requirements for light sleep. The SM8750 post-sync controller
+reset is distinct from the generic 20 ms reset and the PHY resync FIFO toggle.
+
+| Native operation and exact lines | Pinned Linux counterpart and exact lines | Check and implication |
+| --- | --- | --- |
+| `panelOn:668–677`: require saved bonded path, CTRL match, readable clocks, TPG free and CMD_DMA not busy | `dsi_manager.c:224–270`: power/program hosts and both PHYs before IRQ/commands | **ours-OK** for admission and retained configuration reads. **ours-missing** for checking CMD engine/MDP busy, contention and FIFO-underflow flags. Asleep DSI0's `2005/99991090` is admitted because DMA bit 1 is clear. This is a proven diagnostic/readiness gap, not proof that rejecting it would repair the panel. |
+| `resetDsiHosts:499–508`: prove both INTFs disabled and quiescent; clear CTRL bits 0–2 on both; force saved clocks | `dsi_host.c:2614–2624`: clear identical CTRL bits, force saved CLK_CTRL with `23f | BIT(8) | BIT(9) | BIT(11) | BIT(21)` | **ours-OK** for address, force mask and disable-before-clock ordering. Native mask `200b3f` includes bit 9 via `23f` (`DpuSlices.h:57`). With saved `23f`, CTRL goes `1f7→1f0`, clocks `23f→200b3f`. Each native store has `dsb sy` (`DpuSlices.cpp:199,295–308`), so Linux's explicit barriers are not an omitted native ordering step. |
+| `resetDsiHosts:509–523`: DSI0 then DSI1 RESET `1→1 µs→0`, require RESET zero and DMA/video idle, restore clocks | `dsi_host.c:2625–2633`: identical pulse and clock restore, then restore CTRL | **ours-OK** for SM8750 post-sync reset sequence. Native defers CTRL restore to CMD-only at `527–535`. A missing separately addressed SOFT_RESET is ruled out. Generic `dsi_sw_reset:1151–1178` is a different 20 ms helper; longer reset is not established as needed here. **unknown** whether the pulse clears earlier error latches or internal FIFO state; native tests only STATUS bits 1/3, not 0/2/31 or FIFO. |
+| `setDsiMode:527–535`, called at `680`: restore enable/lanes/clock with VIDEO clear and CMD set (`1f5`) | `dsi_manager.c:323–335`, `dsi_host.c:1181–1203,2473–2489`: enable host video before prepare; transfer ORs ENABLE/CMD at `2222–2227` | **ours-OK** for both hosts configured before either command. **unknown** for behavioral equivalence of native CMD-only versus Linux's enabled, idle video host with CMD overlaid. No measured mismatch of final CTRL (`1f7`) closes a transient mode error. |
+| `panelOn:689–699`, `sendDcs:152–232`: paired LP FIFO `11`, 120 ms, `29`, 10 ms, no porch wait in CMD-only | `dsi_manager.c:523–583`, `dsi_host.c:1220–1259,1464–1495,2400–2410`: prepare both, memory-backed DMA, DSI0→DSI1 triggers, VIDEO_DONE wait when busy; P81 panel `652–654` sends `11→120 ms→29` | **ours-OK** for command order, wait, paired trigger order and software success as reported. Full serial-2 DMA/ACK/FIFO fields are **unknown** in these extracts. CMD_DMA_DONE is host completion, not a panel ACK. Native's raw `17c/390/1ec` transport extensions are outside the XML and require independent validation. |
+| `panelOn:703–721`: on owned wake-command failure reset stopped hosts, restore transfer words; restore saved CTRL before start | `dsi_manager.c:560–564`, `dsi_host.c:2236–2252`: restore both prepared hosts after transfer returns | **ours-OK** for explicit abort/cleanup on the stopped-host wake path. This code does not run for serial-3 `panelOff` failure at step 1 (`590–594`). Its un-restored TPG/length are a **closed secondary effect**, not the earliest failure. Arbitrary restoration while its DMA owns the FIFO is not a justified fix. |
+| `startEngines:371–472`, called at `715`: reset stopped CTL, restore fetch, submit saved route, latch flush, start pair and measure lockstep | `dpu_encoder.c:1862–1913,2253–2272`, `dpu_encoder_phys_vid.c:668–683`: configure/flush before timing | **ours-OK** on hardware for ACTIVE/MASTER `6/2`, static CTL/DSC/pipe/fetch/INTF matches and moving lockstep counters. These checks do not prove DSI packet emission or panel decoding. |
+| No PHY writes in the M5 path | `dsi_manager.c:244–259`, `dsi_phy_7nm.c:468–488`: both RBUF_CTRL `0→1`, release CLK_EN_SEL, then host reset | **ours-missing** for resync/release during wake. **unknown** whether retained PHYs need them: common RBUF reads 1 and all sampled PHY words equal bright. Unchanged control/lock words cannot prove FIFO phase alignment, and host HS-underflow flags do not identify the common RBUF FIFO. |
+| No panel reset/init/PPS replay; only four short DCS allowed (`77–96,148–150`) | P81 `panel-novatek-nt36532.c:473–673,821–852`: vendor init, PWM/CABC, mode, `11/29`, then PPS with BPG 13 and range-0 max QP 8 | **ours-missing** for PPS/vendor/brightness replay. **unknown** whether BOE loses these over retained-power sleep. Matching `VIDEO_COMPRESSION=06400b11` and DPU DSC registers cannot read panel PPS. PPS loss could explain dark pixels but no pinned source ties it deterministically to CMD_MDP/HS FIFO underflow or contention. |
+| No Linux-style DSI error IRQ worker/status clearing in this M5 transaction | `dsi_host.c:1591–1599,1650–1689`: FIFO writeback, CMD_MDP-underflow reset, contention writeback, PLL-unlock check | **ours-missing** for equivalent fault handling. **unknown** whether error clearing/reset would restore useful traffic or merely discard evidence. DSI0 underflow before reset with `RESET=1c00` disproves treating loss of that word as the origin of every observed error. |
+
+Sources: [native reset/mode](../../package/PianoDpu/DpuPanel.h#L496-L535) ·
+[native wake](../../package/PianoDpu/DpuPanel.h#L655-L725) ·
+[Linux host reset](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_host.c#L2591-L2635) ·
+[Linux manager prepare](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_manager.c#L212-L335) ·
+[PHY resync](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c#L468-L490) ·
+[P81 wake and PPS](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/panel/panel-novatek-nt36532.c#L652-L673).
+
+### Root cause closure and the minimal remaining observation
+
+**Closed:** the register-address ambiguity; the historical DPU stop-order failure; literal reset writes as
+the software operation consistent with losing `1c00`; serial-3 timeout as the cause of the un-restored
+command FIFO route and four-byte length; and the false interpretation of its unread trailing zeros.
+**Not closed:** the physical cause of the dark pixels or the first DSI underflow event. The observed host
+failure class is CMD_MDP plus all four lane HS underflow flags, followed by an unfinished command DMA and
+interleave contention while the DPU continues scanning. That localizes a real host-side error indication;
+it does not establish one deterministic repair or exclude a concurrent source/panel problem.
+
+The asymmetry has a measured time ordering, not a proven silicon explanation. Serial 1 drains and stops
+the master, resets/submits the slave route and retires the slave's local frame. DSI0 has command/MDP busy,
+dynamic command clock and underflow flags after that sequence; DSI1 is idle with empty HS FIFOs.
+Linux explicitly warns that INTF disable can leave a DSI video engine blocking commands
+(`dsi_host.c:2501–2505`), supporting stale host state as a candidate. Here asleep **video-busy is clear**,
+so that comment does not fully explain DSI0's command/MDP busy state. No host samples bracket the individual
+stop/handoff stores. The master/slave drain histories differ, but attribution of DSI0's exact onset to a
+specific store is **unknown**. [Linux disable rationale](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14/drivers/gpu/drm/msm/dsi/dsi_host.c#L2493-L2507)
+
+Both hosts then undergo the same wake reset, command window and video restart; by serial-3 entry both
+show underflow. Whether DSI0's indication survived reset or reasserted, and whether DSI1 first faulted
+during reset, `11/29`, FIFO cleanup or video restart, cannot be read from the supplied samples. The reset
+bits' meanings, PHY phase, emitted traffic and panel PPS/brightness state remain unknown. A shared final
+fault word cannot distinguish these alternatives. In particular, neither changing RESET to preserve
+`1c00`, adding RBUF toggles, extending reset/Sleep Out, adding a speculative video-FIFO reset nor replaying
+PPS is justified as **the** fix by this capture.
+
+The minimal next read-only check is to recover **serial 2's existing report from the saved console**:
+its `pre-reset status`, both `dcs 11`/`dcs 29` records (trig/done/porch/INTR, ACK masks, before/after FIFO),
+and `host 11`/`host 29` CTRL/STATUS/lane/clock records. The existing printer emits these before each indexed
+trace (`DpuSlices.cpp:775–792`). `before` is collected before FIFO setup; `after` is read only after a
+completed link's restore, including the `1ec` pulse. Compare **each link** before reset → first command
+entry after reset → first command cleanup → second command entry/cleanup → first video snapshot.
+This can locate the DSI1 fault relative to the command window; it still cannot separate reset from the
+mode write, or DMA completion from cleanup, without an intervening sample.
+
+If serial 2 was overwritten in the property and absent from the console, repeat an **observation-only**
+qualification with the same driver image and hold user activity **before waking** to avoid the serial-3
+auto-off. Save the wake property immediately and take fresh, open-gate repeated snapshots plus optical
+samples before any further transition. Match active scan phases, retain snapshot serial/timestamps, and
+obtain a successful stable bright-pattern source capture with the existing diagnostics. This is not a
+proposal to clear status, poke RESET/RBUF, send new DCS or edit the driver. If the available records still
+cannot bracket the onset, report that limitation and keep HOLD; a second snapshot alone cannot invent
+missing intra-reset evidence. A definition for RESET bits 10–12 would require a separately qualified
+v7.2 register specification, not a guessed decode from the raw XML declaration.
+
 ## Fix-image gate
 
-**ONE change: HOLD.** The next evidence is the read-only DSI/PHY snapshot on RAM, paired with bright and dark optical samples, a stable active-scanout capture and the existing M5 trace. A wake-fix image stays gated on that evidence and a supported failure mechanism. Panel PPS, brightness/CABC, lane re-arm and longer waits remain hypotheses for the retained-power path.
+Path: IOMFB power intent → NativeGopDisplay worker/backlight/touch handoff → bonded `panelOff` → retained
+DSI/PHY sleep → reset and command-only `panelOn` → DPU route/INTF restart → PCC/display power/backlight.
+Serial 3 then times out on `28` before any new engine stop. [Full path and chronology](#path-and-capture-chronology)
+
+Checks: **ours-OK** for real startup, successful dual-engine stop/freeze, restored sampled CTL/DSC/fetch/INTF
+and host static words, unchanged sampled PHY/PLL0 lock, and paired software wake. **ours-missing** for
+CMD_MDP/contention/FIFO readiness/error handling, cold-path PHY resync and panel PPS/init replay; these are
+not individually proven light-sleep requirements. **unknown** for serial-2 intra-wake fault onset, RESET
+bits 10–12, on-wire traffic, active source pixels and panel state. Post-timeout TPG residue is explained.
+[Check matrix](#wake-comparison-and-check-matrix)
+
+Root cause: **Optical dark-wake cause OPEN.** The capture proves pre-wake DSI0 underflow while RESET still
+reads `1c00`, both-host underflow before serial 3, and post-timeout DMA/video busy plus contention. Linux
+defines these fault bits but leaves RESET bits 10–12 undefined and performs the same literal `1→0` pulse.
+Neither their loss nor a missing resync/PPS replay closes one deterministic host-side cause.
+
+ONE change: **HOLD — no fix image.** First inspect serial 2's existing full wake report; if unavailable,
+repeat the same-image observation with user activity held before wake, preserving the report and first
+post-wake snapshots/optical/source capture before another off edge. No driver or hardware-write change
+is authorized by this analysis. [Exact next check and limits](#root-cause-closure-and-the-minimal-remaining-observation)
