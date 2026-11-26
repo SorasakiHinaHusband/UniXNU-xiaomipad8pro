@@ -112,7 +112,7 @@ uint32_t NativeAdrenoRing::readShadow()
 {
     if(cache_.acquire && cache_.acquire(cache_.cookie,fence_,16)) {poison();return rptr_shadow_;}
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    rptr_shadow_=fence_[0];
+    rptr_shadow_=__atomic_load_n(&fence_[0],__ATOMIC_ACQUIRE);
     return rptr_shadow_;
 }
 IOReturn NativeAdrenoRing::ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const
@@ -389,7 +389,7 @@ NativeAdrenoRingFence NativeAdrenoRing::poll(uint32_t fence,const NativeAdrenoRi
     for(;;) {
         if(cache_.acquire && cache_.acquire(cache_.cookie,fence_,16)) {poison();return NativeAdrenoRingFencePoisoned;}
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        const uint32_t value=fence_[A830_MEMPTRS_FENCE/4];
+        const uint32_t value=__atomic_load_n(&fence_[A830_MEMPTRS_FENCE/4],__ATOMIC_ACQUIRE);
         if(observed)*observed=value;
         if((int32_t)(value-issued)>0) {poison();return NativeAdrenoRingFencePoisoned;}   /* a fence never issued */
         if((int32_t)(value-fence)>=0) {
@@ -465,8 +465,11 @@ IOReturn NativeAdrenoRing::recover(uint32_t *last,const uint32_t *restart)
         const uint32_t issued=seqno_;
         /* A restart fence past the last one issued is none: every waiter wakes, as without one. */
         const uint32_t to=restart && (int32_t)(issued-*restart)>=0?*restart:issued;
-        fence_[A830_MEMPTRS_RPTR/4]=0;fence_[A830_MEMPTRS_BV_RPTR/4]=0;
-        fence_[A830_MEMPTRS_FENCE/4]=to;fence_[NativeAdrenoRingFenceBvOffset/4]=to;
+        /* Fence waiters and the watchdog still read memptrs while the ring is halted. */
+        __atomic_store_n(&fence_[A830_MEMPTRS_RPTR/4],0u,__ATOMIC_RELAXED);
+        __atomic_store_n(&fence_[A830_MEMPTRS_BV_RPTR/4],0u,__ATOMIC_RELAXED);
+        __atomic_store_n(&fence_[NativeAdrenoRingFenceBvOffset/4],to,__ATOMIC_RELAXED);
+        __atomic_store_n(&fence_[A830_MEMPTRS_FENCE/4],to,__ATOMIC_RELEASE);
         __atomic_thread_fence(__ATOMIC_RELEASE);
         if(io_.barrier(io_.cookie))status=kIOReturnIOError;
         next_=rptr_shadow_=0;
