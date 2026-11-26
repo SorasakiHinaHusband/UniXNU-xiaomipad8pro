@@ -659,8 +659,7 @@ class PianoTouch : public IOService {
   TouchPower fPower;
   pianoirq::Waiter fWake = {};
   volatile bool fSystemOff = false, fParked = false, fServing = false, fFramesStopped = false;
-  enum PanelHold : uint32_t { panelReleased, panelRequested, panelHeld };
-  uint32_t fPanelHold = panelReleased;
+  PanelPark fPanelPark;
   bool fJoined = false;
   IOService *fDisplay = nullptr;
   uint64_t fDisplayReadMs = 0, fDisplayLookupMs = 0;
@@ -669,6 +668,8 @@ class PianoTouch : public IOService {
   uint32_t fXfers = 0, fXferErrors = 0;
   // serving statistics
   uint64_t fStartMs = 0, fLastReadMs = 0, fLastStatsMs = 0;
+  uint64_t fLastDecodedMs = 0;
+  bool fLastReadDecoded = false;
   uint32_t fEdges = 0, fReads = 0, fData = 0, fGood = 0, fBad = 0, fInconsistent = 0, fHand = 0, fWdt = 0, fReadErrors = 0;
   uint32_t fConsecutive = 0, fWdtRun = 0, fDownloads = 0, fGaps = 0, fShown = 0, fSent = 0, fSendErrors = 0;
   uint32_t fTypes[8] = {}, fTypeCount[8] = {};
@@ -1568,21 +1569,21 @@ IOReturn PianoTouch::callPlatformFunction(const OSSymbol *name, bool wait, void 
 {
   if (name && name->isEqualTo(pianotouch::kFunctionPanel)) {
     if (p1) {
-      __atomic_store_n(&fPanelHold, panelReleased, __ATOMIC_RELEASE);
+      fPanelPark.release();
       fWake.kick();
       return kIOReturnSuccess;
     }
     if (!__atomic_load_n(&fServing, __ATOMIC_ACQUIRE)) return kIOReturnNotReady;
-    uint32_t released = panelReleased;
-    __atomic_compare_exchange_n(&fPanelHold, &released, panelRequested, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    fPanelPark.request();
     fWake.kick();
     const uint64_t end = nowMs() + 600;
     do {
-      if (__atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE) == panelHeld ||
+      if (fPanelPark.state() == PanelPark::held ||
           __atomic_load_n(&fParked, __ATOMIC_ACQUIRE)) return kIOReturnSuccess;
       IOSleep(1);
     } while (nowMs() < end);
-    return kIOReturnTimeout;
+    if (fPanelPark.cancelRequest()) fWake.kick();
+    return fPanelPark.state() == PanelPark::held ? kIOReturnSuccess : kIOReturnTimeout;
   }
   if (name && name->isEqualTo(pianotouch::kFunctionContact)) {   // PianoTouchClient.h: one word, no lock, no wait
     if (!p1) return kIOReturnBadArgument;
@@ -2215,6 +2216,8 @@ void PianoTouch::frame(uint32_t readUs)
     note("matrix: reference of %u frames of type %d (%u x %u) after %u good frames; decoding", fMatrix->refCount, fMatrix->refType,
          fMatrix->rows, fMatrix->cols, fGood);
   if (!fPower.reporting()) return;   // the display off: the reference follows the drift, nothing is tracked or reported
+  fLastReadDecoded = true;
+  fLastDecodedMs = fLastReadMs;
   const uint64_t now = nowMs();
   trackerUpdate(fTracker, fMatrix->points, fMatrix->pointCount, now);
   contacts(now);
@@ -2273,7 +2276,7 @@ void PianoTouch::serve()
   trackerReset(fTracker, trackConfig());
   gestureReset(fGesture, gestureConfig());
   const uint64_t begin = nowMs();
-  fLastReadMs = fLastStatsMs = fPrevReadMs = begin;
+  fLastReadMs = fLastDecodedMs = fLastStatsMs = fPrevReadMs = begin;
   if (!fStartedMs) fQuiet.started(fStartedMs = begin);
   // The GPIO transport reads at most 10 frames a second (each takes ~45 ms of a CPU); GENI one per announced frame.
   const uint64_t minGapMs = fBus == BusKind::gpio ? 100 : 0;
@@ -2283,6 +2286,9 @@ void PianoTouch::serve()
   bool rest = false;   // the pace's state after the last pass
   pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
   uint32_t readsAtWindow = 0, sleepsAtWindow = 0;
+  const auto liveContact = [&] {
+    return trackerLive(fTracker) || !gestureIdle(fGesture) || !mtIdle(fMt) || !nativeIdle(fNative);
+  };
   note("frames: serving over %s, %s", fBus == BusKind::geni ? "GENI" : "SPI by hand",
        gArgs.level >= 2 ? "the gestures go to macOS" : "contacts and gestures are logged only (piano-touch=2 gives them to macOS)");
   if (!pace.blindMs)
@@ -2297,17 +2303,15 @@ void PianoTouch::serve()
   for (;;) {
     const uint64_t now = nowMs();
     const uint32_t panelWakeSeen = fWake.now();
-    const uint32_t hold = __atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE);
-    if (hold != panelReleased) {
-      if (hold == panelRequested) {
+    const PanelPark::State hold = fPanelPark.state();
+    if (hold != PanelPark::released) {
+      if (hold == PanelPark::requested) {
         if (fPower.mode != PowerMode::suspended) powerStep(fPower.step(false, 0, true), mc, now);
         if (fIrqLive) fPin.mask();
-        uint32_t requested = panelRequested;
-        if (__atomic_compare_exchange_n(&fPanelHold, &requested, panelHeld, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-          note("panel sleep: touch SPI parked");
+        if (fPanelPark.acknowledge()) note("panel sleep: touch SPI parked");
       }
       if (__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) powerStep(fPower.step(true, 0, true), mc, now);
-      if (__atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE) != panelReleased) fWake.wait(panelWakeSeen, 1000);
+      if (fPanelPark.state() != PanelPark::released) fWake.wait(panelWakeSeen, 1000);
       continue;
     }
     // The power states (TouchPower.h): the system's (setPowerState; a suspend parks the thread in powerStep) and the display's.
@@ -2361,6 +2365,7 @@ void PianoTouch::serve()
       fReadOn = on;
       fPrevReadMs = fLastReadMs;
       fLastReadMs = now;
+      fLastReadDecoded = false;
       ++fReads;
       ++fReadsSinceStats;
       const uint64_t t0 = nowUs();
@@ -2431,17 +2436,19 @@ void PianoTouch::serve()
     if (fQuiet.quiet && !fMatrix->haveReference && matrixSettle(*fMatrix))
       note("matrix: reference of %u frames of type %d (%u x %u), formed once the controller went quiet (TouchMatrix.h matrixSettle)",
            fMatrix->refCount, fMatrix->refType, fMatrix->rows, fMatrix->cols);
-    // A contact or a gesture without frames (TouchPace.h kStallMs): the controller idles only when nobody touches it, so its
-    // silence is taken as the lift (an empty frame: a short touch still clicks); what is still going on after it is released.
-    if (stalled(trackerLive(fTracker) || !gestureIdle(fGesture), pass, fLastReadMs)) {
+    // Silence after a decoded frame means the controller idled. Continued unusable frames cancel without synthesizing a tap.
+    const StallAction stall = contactStall(liveContact(), pass, fLastDecodedMs, fLastReadDecoded);
+    if (stall != StallAction::none) {
       ++fStalls;
       if (fStalls <= 20 || fStalls % 20 == 0)
-        note("frames: no frame for %llu ms with a contact or a gesture on (%u times): taken as the lift", (unsigned long long)(pass - fLastReadMs),
-             fStalls);
-      trackerUpdate(fTracker, nullptr, 0, pass);
-      contacts(pass);
-      gestures(pass);
-      if (trackerLive(fTracker) || !gestureIdle(fGesture)) lost(pass);
+        note("frames: no decoded frame for %llu ms with a contact or a gesture on (%u times): %s",
+             (unsigned long long)(pass - fLastDecodedMs), fStalls, stall == StallAction::lift ? "taken as the lift" : "cancelled");
+      if (stall == StallAction::lift) {
+        trackerUpdate(fTracker, nullptr, 0, pass);
+        contacts(pass);
+        gestures(pass);
+      }
+      if (liveContact()) lost(pass);
     }
     const uint64_t age = now - begin;
     if (now - fLastStatsMs >= (age < 30000 ? 5000 : 60000)) stats(now);
@@ -2555,7 +2562,8 @@ void PianoTouch::playInject(const MatrixConfig &mc)
     trackerUpdate(fTracker, pts, n, now);
     contacts(now);
     gestures(now);
-    fLastReadMs = now;
+    fLastReadDecoded = true;
+    fLastReadMs = fLastDecodedMs = now;
     ++frames;
     if (t >= sc.totalMs) break;
     const uint64_t due = t0 + t + gArgs.injectMs, cur = nowMs();
@@ -2568,7 +2576,8 @@ void PianoTouch::playInject(const MatrixConfig &mc)
     trackerUpdate(fTracker, nullptr, 0, now);
     contacts(now);
     gestures(now);
-    fLastReadMs = now;
+    fLastReadDecoded = true;
+    fLastReadMs = fLastDecodedMs = now;
     ++frames;
   }
   ++fInjectPlayed;
