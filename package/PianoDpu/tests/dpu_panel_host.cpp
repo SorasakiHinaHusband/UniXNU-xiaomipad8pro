@@ -216,7 +216,7 @@ static void testZeroCounterReadback()
     m.regs[intfReg(i, kIntfCountEn)] = 0;
     m.countEnableIgnored[i - 1] = true;
     m.regs[intfReg(i, kIntfConfig)] = kIntfConfigProgFetch;
-    m.regs[intfReg(i, kIntfProgFetch)] = 2290 * model::kHtotal;
+    m.intf[i].fetch = m.regs[intfReg(i, kIntfProgFetch)] = 2290 * model::kHtotal;   // the merged model (M3) keeps the fetch per INTF
   }
   LivePath p = readPath(m);
   const CounterInit init = initCounters(m, p);
