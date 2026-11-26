@@ -2684,8 +2684,8 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
   }
   if (e & PIANO_CHG_EV_TYPE) note("policy: the source's type is now %s (%d)", piano_mca_type_name(in.type), in.type);
   if ((e & PIANO_CHG_EV_DETACH) && !fLink.plan.own_bus)
-    note("policy: the source is gone: the firmware's own input limit (100 mA) and charge current (500 mA) back where written, a "
-         "stop of ours lifted");
+    note("policy: the source is gone: restoring firmware current limits (100 mA input, 500 mA charge) where written; %s",
+         fLink.st.hold ? "health inhibit stays active" : "any stop of ours is released");
   // piano-power-own-bus=1: the decisions that took the bus as our own boost's, once per change
   if (o.decided && (fLink.plan.own_bus != 0) != fOwnBusLogged) {
     fOwnBusLogged = fLink.plan.own_bus != 0;

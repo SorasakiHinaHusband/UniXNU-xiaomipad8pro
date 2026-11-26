@@ -331,6 +331,29 @@ static void healthStress(Adapter adapter) {
   CHECK(b.stops == 2);
 }
 
+static void detachedHealth() {
+  scenario = "health inhibit without a cable";
+  Bench b(sdp);
+  b.cable(false);
+  b.soc(79, 80);
+  b.expectHeld = true;
+  b.tick();
+  b.checkHeld();
+  CHECK(b.stops == 1);
+
+  // Firmware can restore the enable bit while disconnected. Reassert the hold
+  // after the normal readback threshold, before the next cable attach.
+  b.enable = 1;
+  b.soc(78, 77);
+  b.ticks(2);
+  b.checkHeld();
+  CHECK(b.stops == 2);
+  b.cable(true);
+  b.tick();
+  b.checkHeld();
+  CHECK(!b.resumes);
+}
+
 static void ppsCadence() {
   scenario = "PPS 4 s cadence";
   Bench b(pps);
@@ -512,6 +535,7 @@ static void defaults() {
 int main() {
   defaults();
   for (const auto &adapter : {sdp, rp, fixed, pps, qc2, qc3}) healthStress(adapter);
+  detachedHealth();
   ppsCadence();
   ppsWithdrawal(PpsFault::silent, "MCA refresh reply missing");
   ppsWithdrawal(PpsFault::late, "MCA refresh reply late");

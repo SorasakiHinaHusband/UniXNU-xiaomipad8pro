@@ -2807,8 +2807,9 @@ static void testLinkSleepShutdown()
   r.period();
   r.period();
   CHECK(r.relinks == 1 && r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && r.link.hold);
-  // nothing attached: the handover is ready at once
+  // Nothing is attached and there is no SOC hold: the handover is ready at once.
   LinkRig n(o);
+  n.soc(60);
   n.d.props[PIANO_MCA_BUS_VOLTAGE] = 0;
   n.period();
   n.sleep = true;

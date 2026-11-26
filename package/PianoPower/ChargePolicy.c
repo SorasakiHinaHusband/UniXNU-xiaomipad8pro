@@ -1566,6 +1566,7 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     s->stop_noted = s->fw_noted = 0;
     /* The firmware keeps the last limits for the next source: restore its own where we wrote. Keep the battery's SOC
      * inhibit across detach so a replug cannot restart charging before the first decision. */
+    if (s->hold && !p->own_bus) plan_enable(c, in, s, p, now, 0);
     const int rb_raised = (in->valid & PIANO_CHG_IN_ICL) && in->icl_ma > (int32_t)PIANO_CHG_ICL_DEFAULT + ICL_SLACK_MA;
     if (((s->touched & (1u << PIANO_CHG_S_ICL)) || rb_raised) && s->icl_set != PIANO_CHG_ICL_DEFAULT)
         plan_write(c, s, p, now, PIANO_CHG_S_ICL, PIANO_CHG_ICL, PIANO_CHG_ICL_DEFAULT, 4);
