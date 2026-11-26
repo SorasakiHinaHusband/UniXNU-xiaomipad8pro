@@ -105,7 +105,6 @@ uint32_t argNumber(const char *name, uint32_t fallback, uint32_t lo, uint32_t hi
 void readSliceArgs()
 {
   if (gArgsRead) return;
-  gArgsRead = true;
   gA.level = argNumber("piano-dpu", 0, 0, 100);
   char s[32] = {};
   if (PE_parse_boot_arg_str("piano-dpu-refresh", s, sizeof s)) {
@@ -164,6 +163,7 @@ void readSliceArgs()
   gA.panelEngines = argNumber("piano-dpu-panel-engines", 1, 0, 1);
   gA.panelHs = argNumber("piano-dpu-panel-hs", 0, 0, 1);
   gA.panelTest = argNumber("piano-dpu-panel-test", 0, 0, 1000);
+  gArgsRead = true;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1010,9 +1010,10 @@ void worker(void *, wait_result_t)
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------- the interface
+void dpuSlicesReadArgs() { readSliceArgs(); }
+
 bool dpuSlicesWanted()
 {
-  readSliceArgs();
   return gA.refresh || modesEnabled() || gA.pcc || gA.panel || gA.nightShift;
 }
 
