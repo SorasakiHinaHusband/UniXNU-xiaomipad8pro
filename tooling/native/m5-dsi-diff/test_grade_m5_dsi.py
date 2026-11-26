@@ -84,6 +84,17 @@ def blanking_words(text):
     return text
 
 
+def run_grader(baseline, candidate, *options):
+    with tempfile.TemporaryDirectory() as temporary:
+        before = Path(temporary) / "bright.txt"
+        after = Path(temporary) / "wake.txt"
+        before.write_text(baseline, encoding="utf-8")
+        if candidate is not None:
+            after.write_text(candidate, encoding="utf-8")
+        cmd = [sys.executable, "-I", str(GRADER), str(before), str(after), *options]
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", check=False)
+
+
 class GradeM5DsiTests(unittest.TestCase):
     bright = capture()
     wake = capture(2, 700_000, (124, 125), line=30)
@@ -112,6 +123,7 @@ class GradeM5DsiTests(unittest.TestCase):
                 self.assertEqual(report["flags"], [])
                 self.assertEqual(report["static_changes"], [])
                 self.assertEqual(report["transient_changes"], [])
+                self.assertNotIn("counter_reset", report)
 
     def test_lp_timer_all_ones_is_a_valid_register_value(self):
         for link in ("dsi0", "dsi1"):
@@ -161,7 +173,10 @@ class GradeM5DsiTests(unittest.TestCase):
         self.assertEqual(report["candidate"]["phase"], "mixed")
         self.assertEqual([row["block"] for row in report["transient_changes"]], ["dsi0"] * 3)
         self.assertCountEqual([row["block"] for row in report["static_changes"]], ["ctl"] * 3 + ["dsi1"] * 3)
-        self.assertEqual(report["flags"], [{"kind": "phy-drift", "link": "dsi1", "registers": ["lane-status"]}])
+        self.assertEqual(report["flags"], [
+            {"kind": "phy-drift", "link": "dsi1", "registers": ["lane-status"]},
+            {"kind": "host-error", "link": "dsi1", "registers": ["fifo"]},
+        ])
 
     def test_ctl_changes_across_a_route_change_stay_visible(self):
         report = self.grade(self.blanking.replace("ctl0:", "ctl1:"))
@@ -225,7 +240,25 @@ class GradeM5DsiTests(unittest.TestCase):
             ("dsc-mismatch", "dsi1"): {"cmd-compression2"},
             ("phy-drift", "dsi0"): {"phy-status"},
             ("phy-drift", "dsi1"): {"lane-status1", "phy-timing-13"},
+            ("host-error", "dsi1"): {"fifo"},
         })
+
+    def test_host_error_registers_are_grouped_by_link(self):
+        wake = self.wake
+        for name in ("ack-err", "phy-err", "timeout", "err-mask"):
+            wake = edit_row(wake, "dsi1 m5:", f"{name} 00000000", f"{name} 00000001")
+        wake = edit_row(wake, "dsi0:", "intr 00000000", "intr 00000001")
+        report = self.grade(wake)
+        self.assertEqual(report["verdict"], "DRIFT")
+        self.assertEqual(report["flags"], [
+            {"kind": "host-error", "link": "dsi1", "registers": ["ack-err", "phy-err", "timeout"]},
+        ])
+
+    def test_cleared_tpg_is_drift_without_tpg_active(self):
+        bright = edit_row(self.bright, "dsi0:", "tpg 00000000", "tpg 00030006")
+        report = compare(parse_snapshot(bright), parse_snapshot(self.wake))
+        self.assertEqual(report["verdict"], "DRIFT")
+        self.assertEqual(report["flags"], [])
 
     def test_pll_loss_either_indication_and_slave_status_drift(self):
         for prefix, old, new, expected in (
@@ -255,6 +288,95 @@ class GradeM5DsiTests(unittest.TestCase):
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 self.grade(wake)
 
+    def test_cli_counter_reset_requires_opt_in(self):
+        bright = capture(frames=(242673, 242674))
+        wake = capture(2, 700_000, (8806, 8807))
+        strict = run_grader(bright, wake)
+        self.assertEqual(strict.returncode, 2, strict.stdout + strict.stderr)
+        self.assertEqual(json.loads(strict.stdout), {
+            "verdict": "VOID", "reason": "intf1 frame counter did not advance", "changes": [], "flags": [],
+        })
+        opted_in = run_grader(bright, wake, "--allow-counter-reset")
+        self.assertEqual(opted_in.returncode, 0, opted_in.stdout + opted_in.stderr)
+        report = json.loads(opted_in.stdout)
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertIs(report["counter_reset"], True)
+        self.assertEqual(report["frame_advance"], {"intf1": 8806, "intf2": 8807})
+        self.assertIn("counter reset", opted_in.stderr)
+
+        wake2 = capture(3, 4_791_667, (9297, 9298))
+        followup = compare(parse_snapshot(wake), parse_snapshot(wake2), allow_counter_reset=True)
+        self.assertEqual(followup["verdict"], "PASS")
+        self.assertEqual(followup["frame_advance"], {"intf1": 491, "intf2": 491})
+        self.assertNotIn("counter_reset", followup)
+
+    def test_counter_reset_preserves_other_interface_advance_and_wrap(self):
+        candidate = parse_snapshot(capture(2, 700_000, (7, 5)))
+        mixed = compare(parse_snapshot(capture(frames=(242673, 0xfffffffc))), candidate, allow_counter_reset=True)
+        self.assertEqual(mixed["verdict"], "PASS")
+        self.assertIs(mixed["counter_reset"], True)
+        self.assertEqual(mixed["frame_advance"], {"intf1": 7, "intf2": 9})
+        wrapped = compare(parse_snapshot(capture(frames=(0xffffffff, 0xfffffffc))), candidate, allow_counter_reset=True)
+        self.assertEqual(wrapped["verdict"], "PASS")
+        self.assertEqual(wrapped["frame_advance"], {"intf1": 8, "intf2": 9})
+        self.assertNotIn("counter_reset", wrapped)
+
+    def test_cli_counter_reset_rejects_invalid_pairs(self):
+        bright = capture(2, 500_000, (242673, 242674))
+        wake = capture(3, 700_000, (8806, 8807))
+        for candidate, reason in (
+            (capture(3, 700_000, (0, 8807)), "intf1 candidate frame counter must be positive"),
+            (capture(3, 700_000, (8806, 0)), "intf2 candidate frame counter must be positive"),
+            (capture(3, 700_000, (8806, 242674)), "intf2 frame counter did not advance"),
+            (capture(3, 700_000, (8806, 242674 + 2**31)), "intf2 frame counter did not advance"),
+            (edit_row(wake, "intf1:", "en 00000001", "en 00000002"), "candidate intf1 timing engine is disabled"),
+            (edit_row(wake, "intf2:", "status 00000001", "status 00000002"), "candidate intf2 timing engine is disabled"),
+            (wake.replace("snapshot 3", "snapshot 2"), "cached, stale or reversed"),
+            (wake.replace("700000 us", "500000 us"), "cached, stale or reversed"),
+            (wake.replace(BOOT, BOOT[:-1] + "c"), "boot UUID changed"),
+            (wake.replace("0 stores", "1 stores"), "requires 0 stores"),
+            (wake.replace("gate open", "gate closed"), "gate is closed"),
+        ):
+            with self.subTest(reason=reason):
+                result = run_grader(bright, candidate, "--allow-counter-reset")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["verdict"], "VOID")
+                self.assertIn(reason, report["reason"])
+                self.assertNotIn("counter_reset", report)
+
+        disabled = edit_row(bright, "intf2:", "en 00000001", "en 00000000")
+        result = run_grader(disabled, wake, "--allow-counter-reset")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"], "baseline intf2 timing engine is disabled")
+
+    def test_cli_wake_errors_after_counter_reset(self):
+        bright = capture(frames=(242673, 242674))
+        wake = capture(2, 700_000, (8806, 8807))
+        for link, status, fifo in (("dsi0", "00002008", "88881090"), ("dsi1", "00000008", "99991090")):
+            bright = edit_row(bright, link + ":", "status0 00000000", f"status0 {status}")
+            bright = edit_row(bright, link + " m5:", "reset 00000000", "reset 00001c00")
+            wake = edit_row(wake, link + ":", "status0 00000000", "status0 8000a00f")
+            wake = edit_row(wake, link + ":", "tpg 00000000", "tpg 00030006")
+            wake = edit_row(wake, link + " m5:", "fifo 00001010", f"fifo {fifo}")
+            wake = edit_row(wake, link + " m5:", "clk-status 008067c3", "clk-status 008077c3")
+
+        result = run_grader(bright, wake, "--allow-counter-reset")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["verdict"], "DRIFT")
+        self.assertIs(report["counter_reset"], True)
+        self.assertCountEqual(report["flags"], [
+            {"kind": kind, "link": link, "registers": registers}
+            for link in ("dsi0", "dsi1")
+            for kind, registers in (("host-error", ["fifo", "status0"]), ("reset-drift", ["reset"]),
+                                    ("tpg-active", ["tpg"]))
+        ])
+        self.assertCountEqual([(row["block"], row["register"]) for row in report["static_changes"]], [
+            (link, name) for link in ("dsi0", "dsi1") for name in ("status0", "fifo", "reset", "tpg", "clk-status")
+        ])
+        self.assertEqual(report["transient_changes"], [])
+
     def test_invalid_capture(self):
         for text, reason in (
             ("gop-shot: EBUSY\n", "EBUSY"),
@@ -282,30 +404,21 @@ class GradeM5DsiTests(unittest.TestCase):
                 parse_snapshot(text)
 
     def test_cli_json_and_one_line_summary_for_all_exit_codes(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            baseline = Path(temporary) / "bright.txt"
-            candidate = Path(temporary) / "wake.txt"
-            baseline.write_text(self.bright, encoding="utf-8")
-            for text, code, verdict in (
-                (self.wake, 0, "PASS"),
-                (self.wake.replace("video-compression 03200b81", "video-compression 00000000"), 1, "DRIFT"),
-                (self.blanking, 1, "DRIFT"),
-                ("EBUSY\n", 2, "VOID"),
-                (None, 2, "VOID"),
-            ):
-                with self.subTest(code=code, text_present=text is not None):
-                    if text is None:
-                        candidate.unlink()
-                    else:
-                        candidate.write_text(text, encoding="utf-8")
-                    cmd = [sys.executable, "-I", str(GRADER), str(baseline), str(candidate)]
-                    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", check=False)
-                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
-                    self.assertEqual(json.loads(result.stdout)["verdict"], verdict)
-                    self.assertEqual(len(result.stderr.splitlines()), 1)
-                    self.assertTrue(result.stderr.startswith(verdict))
-                    if text == self.blanking:
-                        self.assertIn("0 unexplained, 9 scan-phase", result.stderr)
+        for text, code, verdict in (
+            (self.wake, 0, "PASS"),
+            (self.wake.replace("video-compression 03200b81", "video-compression 00000000"), 1, "DRIFT"),
+            (self.blanking, 1, "DRIFT"),
+            ("EBUSY\n", 2, "VOID"),
+            (None, 2, "VOID"),
+        ):
+            with self.subTest(code=code, text_present=text is not None):
+                result = run_grader(self.bright, text)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["verdict"], verdict)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertTrue(result.stderr.startswith(verdict))
+                if text == self.blanking:
+                    self.assertIn("0 unexplained, 9 scan-phase", result.stderr)
 
 
 if __name__ == "__main__":

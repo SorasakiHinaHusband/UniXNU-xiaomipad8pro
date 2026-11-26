@@ -57,6 +57,7 @@ DSI_DOMAINS = {
     "errors-fifo": "status0 intr err-mask ack-err fifo phy-err timeout",
 }
 DSI_REGISTER_DOMAIN = {name: domain for domain, names in DSI_DOMAINS.items() for name in names.split()}
+HOST_ERROR_WORDS = {"status0", "fifo", "ack-err", "phy-err", "timeout"}
 PHY_STATUS_WORDS = {"phy-status", "lane-status", "lane-status0", "lane-status1"}
 LINKS = ("dsi0", "dsi1")
 INTERFACES = ("intf1", "intf2")
@@ -258,20 +259,28 @@ def is_phase_change(baseline, candidate, block, name, old, new):
     return False
 
 
-def compare(baseline, candidate):
+def compare(baseline, candidate, allow_counter_reset=False):
+    """Compare parsed captures, using the post-reset count for a restarted counter's advance."""
     if baseline.boot != candidate.boot:
         raise ValueError("boot UUID changed")
     if candidate.serial <= baseline.serial or candidate.time_us <= baseline.time_us:
         raise ValueError("snapshot pair is cached, stale or reversed")
 
     advances = {}
+    counter_reset = False
     for block, frame in baseline.frames.items():
         for role, snap in (("baseline", baseline), ("candidate", candidate)):
             if not (snap.registers[block, "en"] & snap.registers[block, "status"] & 1):
                 raise ValueError(f"{role} {block} timing engine is disabled")
-        advance = (candidate.frames[block] - frame) % U32
+        current = candidate.frames[block]
+        if allow_counter_reset and current <= 0:
+            raise ValueError(f"{block} candidate frame counter must be positive")
+        advance = (current - frame) % U32
         if not 0 < advance < U32 // 2:
-            raise ValueError(f"{block} frame counter did not advance")
+            if not (allow_counter_reset and current < frame):
+                raise ValueError(f"{block} frame counter did not advance")
+            advance = current
+            counter_reset = True
         advances[block] = advance
 
     before, after = baseline.registers, candidate.registers
@@ -294,15 +303,25 @@ def compare(baseline, candidate):
         flags.append({"kind": "pll-loss", "link": "dsi0", "registers": pll_lost})
     for link in LINKS:
         dsc = [row["register"] for row in changes if row["block"] == link and row["domain"] == "dsc-compression"]
-        phy = [row["register"] for row in static_changes if row["block"] == link
-               and (row["domain"] == "phy-timing" or row["register"] in PHY_STATUS_WORDS)]
+        static = [row["register"] for row in static_changes if row["block"] == link]
+        phy = [name for name in static if name in PHY_TIMING or name in PHY_STATUS_WORDS]
+        host_errors = [name for name in static if name in HOST_ERROR_WORDS]
         if dsc:
             flags.append({"kind": "dsc-mismatch", "link": link, "registers": dsc})
         if phy:
             flags.append({"kind": "phy-drift", "link": link, "registers": phy})
-    return {"verdict": "DRIFT" if changes else "PASS", "baseline": baseline.metadata(), "candidate": candidate.metadata(),
-            "frame_advance": advances, "changes": changes, "flags": flags,
-            "static_changes": static_changes, "transient_changes": transient_changes}
+        if host_errors:
+            flags.append({"kind": "host-error", "link": link, "registers": host_errors})
+        if "reset" in static:
+            flags.append({"kind": "reset-drift", "link": link, "registers": ["reset"]})
+        if "tpg" in static and after[link, "tpg"] != 0:
+            flags.append({"kind": "tpg-active", "link": link, "registers": ["tpg"]})
+    report = {"verdict": "DRIFT" if changes else "PASS", "baseline": baseline.metadata(), "candidate": candidate.metadata(),
+              "frame_advance": advances, "changes": changes, "flags": flags,
+              "static_changes": static_changes, "transient_changes": transient_changes}
+    if counter_reset:
+        report["counter_reset"] = True
+    return report
 
 
 def read_snapshot(path, role):
@@ -321,14 +340,17 @@ def main(argv=None):
         description=__doc__,
         epilog="Each file holds one complete, newline-terminated snapshot and its boot UUID as a 'boot UUID' or "
                "'kern.bootsessionuuid: UUID' row. Supply a newer sample from the same boot with both INTF timing engines "
-               "enabled and their frame counters advancing. JSON goes to stdout and a one-line verdict to stderr. "
+               "enabled. By default, both frame counters must advance. JSON goes to stdout and a one-line verdict to stderr. "
                "Exit codes are 0 PASS, 1 DRIFT, and 2 VOID. All register changes count toward DRIFT.",
     )
     parser.add_argument("baseline", type=Path, help="saved bright reference snapshot")
     parser.add_argument("candidate", type=Path, help="saved dark or post-wake snapshot")
+    parser.add_argument("--allow-counter-reset", action="store_true",
+                        help="accept a frame counter reset across sleep/wake if both candidate counters are positive")
     args = parser.parse_args(argv)
     try:
-        report = compare(read_snapshot(args.baseline, "baseline"), read_snapshot(args.candidate, "candidate"))
+        report = compare(read_snapshot(args.baseline, "baseline"), read_snapshot(args.candidate, "candidate"),
+                         allow_counter_reset=args.allow_counter_reset)
     except ValueError as error:
         report = {"verdict": "VOID", "reason": str(error), "changes": [], "flags": []}
 
@@ -341,6 +363,8 @@ def main(argv=None):
                    f"({len(report['static_changes'])} unexplained, {len(report['transient_changes'])} scan-phase)")
         if report["flags"]:
             summary += " (" + ", ".join(f"{flag['link']} {flag['kind']}" for flag in report["flags"]) + ")"
+    elif report.get("counter_reset"):
+        summary = "registers match and both INTF timing engines are scanning after a counter reset"
     else:
         summary = "registers match and both INTF frame counters advanced"
     print(f"{verdict} — {summary}", file=sys.stderr)
