@@ -29,6 +29,11 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 | `Dwc3Regs.h`, `PianoUsbHw.h` | register facts, with their sources |
 | `tests/` | host tests: the gadget core (2 and 3 ports, with and without NCM), ACM descriptor bytes, EP0 recovery, sleep and re-enumeration, NTB16 framing, TX flow control, HID reports and rings, SMMU setup, the log cursor, idle tiers, hand-off and cold start. `tests/run.sh` and the standalone C++ build lines use ASan, UBSan and warnings as errors. |
 
+`tests/usbnet_txflow_model_host.cpp` exercises the daily `piano-usb-net-txflow=1` contract by moving 69 MiB through the portable
+frame rings and gadget with delayed host completions. It also checks NTB bounds and reassembly, stale completions, and reconnect
+after reset, unplug, sleep, and a controller loan. The offline receiver enforces disjoint datagrams and table ranges, and the loan
+model supplies the queue flush at release. Live throughput and controller-loan teardown remain tablet qualification items.
+
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
 Battery: the USB thread's wait adapts to the link (`piano-usb-idle=0`: the old 1 ms loop); `piano-usb-irq=1` adds the core's
