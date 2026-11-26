@@ -14,7 +14,16 @@ set -u
 PATH=${PIANO_DC_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 out=${PIANO_DC_OUT:-/dev/console} status=${PIANO_DC_STATUS:-/private/var/run/piano-data-concurrent.status}
 wait_s=${PIANO_DC_WAIT:-180} period=${PIANO_DC_PERIOD:-2}
-say() { printf 'piano-data-concurrent: %.230s\n' "$1" >> "$out" 2> /dev/null; printf '%s\n' "$1" > "$status" 2> /dev/null; }
+say() {
+  # Readers see the last complete result even if this process dies while recording it.
+  (
+    temp=$(mktemp "${status}.XXXXXX") || exit 1
+    trap 'rm -f "$temp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    printf '%s\n' "$1" > "$temp" && chmod 0644 "$temp" && [ ! -d "$status" ] && mv -f "$temp" "$status"
+  ) 2> /dev/null || :
+  printf 'piano-data-concurrent: %.230s\n' "$1" 2> /dev/null >> "$out" || :
+}
 
 [ "${PIANO_DATA_CONCURRENT_AT_BOOT:-0}" = 1 ] || { say "off (PIANO_DATA_CONCURRENT_AT_BOOT is not 1): nothing switched"; exit 0; }
 data_mounted() { mount 2> /dev/null | grep -q ' on /System/Volumes/Data (apfs'; }
@@ -35,10 +44,13 @@ case "$io" in
   *) say "machdep.piano_data_io is not the direct store in single-gate mode (${io%% inflight*}): nothing switched"; exit 0 ;;
 esac
 data_mounted || { say "the Data volume disappeared before the switch: nothing switched"; exit 0; }
-if sysctl -w machdep.piano_data_concurrent=1 > /dev/null 2>&1 && [ "$(sysctl -n machdep.piano_data_concurrent 2> /dev/null)" = 1 ]; then
+written=0
+sysctl -w machdep.piano_data_concurrent=1 > /dev/null 2>&1 && written=1
+cur=$(sysctl -n machdep.piano_data_concurrent 2> /dev/null) || cur=
+if [ "$written" = 1 ] && [ "$cur" = 1 ]; then
   io=$(sysctl -n machdep.piano_data_io 2> /dev/null)
   say "switched: machdep.piano_data_concurrent=1 (store state 2, ${io%% inflight*}) after ${w} s; rollback: sudo sysctl -w machdep.piano_data_concurrent=0"
 else
-  say "switch FAILED: machdep.piano_data_concurrent stays $(sysctl -n machdep.piano_data_concurrent 2> /dev/null) (serial)"
+  say "switch not confirmed: machdep.piano_data_concurrent=${cur:-unreadable}"
 fi
 exit 0

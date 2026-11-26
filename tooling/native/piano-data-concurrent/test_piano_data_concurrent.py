@@ -25,6 +25,7 @@ n=$(cat "$T/polls" 2>/dev/null || echo 0)
 case "$2" in
   machdep.piano_data_concurrent)
     [ -f "$T/mode" ] && [ "$n" -ge "$(cat "$T/mode_after")" ] || exit 1
+    if [ -f "$T/unreadable" ] && [ -f "$T/calls" ] && grep -q 'sysctl -w' "$T/calls"; then exit 1; fi
     cat "$T/mode" ;;
   machdep.piano_data_io)
     [ -f "$T/io" ] || exit 1
@@ -39,11 +40,12 @@ if [ -f "$T/mounted" ] && [ "$n" -ge "$(cat "$T/mounted")" ] && [ "$n" -lt "$(ca
   echo "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)"
 fi''',
     'sleep': 'echo "sleep $1" >> "$T/calls"; exit 0',
+    'mv': '[ ! -f "$T/refuse_status" ] || exit 1\nexec /bin/mv "$@"',
 }
 
 
 def run(mode='0', io='mode=single-gate depth=1 inflight_max=1 waits=0', state='2', mounted='0', mode_after='0',
-        unmount_after='100', enable='1', refuse=False, wait='20'):
+        unmount_after='100', enable='1', refuse=False, wait='20', unreadable=False, refuse_status=False):
     with tempfile.TemporaryDirectory() as t:
         T = Path(t); b = T / 'bin'; b.mkdir()
         for k, v in STUBS.items():
@@ -55,10 +57,15 @@ def run(mode='0', io='mode=single-gate depth=1 inflight_max=1 waits=0', state='2
         (T / 'unmount_after').write_text(unmount_after)
         if mounted is not None: (T / 'mounted').write_text(mounted)
         if refuse: (T / 'refuse').write_text('')
+        if unreadable: (T / 'unreadable').touch()
+        if refuse_status:
+            (T / 'refuse_status').touch()
+            (T / 'status').write_text('previous complete result\n')
         env = {'PATH': '/usr/bin:/bin', 'PIANO_DC_PATH': f'{b}:/usr/bin:/bin', 'PIANO_DC_OUT': str(T / 'out'), 'PIANO_DC_STATUS': str(T / 'status'),
                'PIANO_DC_WAIT': wait, 'PIANO_DC_PERIOD': '2'}
         if enable is not None: env['PIANO_DATA_CONCURRENT_AT_BOOT'] = enable
         r = subprocess.run(['/bin/sh', str(SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
+        assert not list(T.glob('status.*')), 'temporary status files remain'
         rd = lambda n: (T / n).read_text() if (T / n).exists() else ''
         return r.returncode, rd('out'), rd('status'), rd('calls'), rd('mode').strip()
 
@@ -88,7 +95,11 @@ check(m == '0' and 'sysctl -w' not in calls and 'not mounted after 6 s' in out, 
 rc, out, st, calls, m = run(io='mode=volatile depth=1 inflight_max=0')
 check(m == '0' and 'sysctl -w' not in calls and 'not the direct store in single-gate mode (mode=volatile depth=1)' in out, 'volatile Data (the RAM qual): nothing switched')
 rc, out, st, calls, m = run(refuse=True)
-check(m == '0' and 'switch FAILED' in out and 'stays 0' in out, 'the write refused (EIO / ENXIO): logged, left serial')
+check(m == '0' and 'switch not confirmed' in out and 'concurrent=0' in out, 'the write refused (EIO / ENXIO): logged, left serial')
+rc, out, st, calls, m = run(unreadable=True)
+check(m == '1' and 'concurrent=unreadable' in out, 'failed readback does not report serial mode after a successful write')
+rc, out, st, calls, m = run(refuse_status=True)
+check(m == '1' and 'switched:' in out and st == 'previous complete result\n', 'failed status replacement preserves the previous result and logs to console')
 rc, out, st, calls, m = run()
 check('=0' not in calls, 'never writes 0')
 print('piano-data-concurrent host test:', 'PASS' if not failures else f'{len(failures)} FAIL')
