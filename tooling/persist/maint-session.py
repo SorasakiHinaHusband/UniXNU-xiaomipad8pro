@@ -7,6 +7,9 @@ persistent-boot-plan.md, with the owner's 2026-11-11 06:42 rules).
   maint-session.py STEP [STEP ...]                    run the steps (no per-step question)
   maint-session.py [--dry-run] rollback STEP
 
+An entry named HOLD in PIANO_PERSIST_OUT (default out/persistent) blocks real sessions containing install writes before
+contacting the tablet. Read-only sessions, dry runs and rollbacks are allowed while the hold is active.
+
 Rules every write step follows (it aborts on the first failure, before or after the write):
   1. before: every region it writes has a VERIFIED BACKUP on the NAS (step `backup`): exported from the tablet over one TCP
      connection into PIANO_BACKUP_DIR/persistent-boot-<time>/ (read from ~/.config/piano/env at run time, never printed or
@@ -2935,9 +2938,12 @@ def main():
         return
     s = Session(a)
     s.log(f'== {time.strftime("%Y-%m-%d %H:%M:%S")} {"RUN" if s.execute else "DRY RUN"}: {" ".join(a.steps)}')
-    localnet_preflight(s)
     todo = [('rollback', n) for n in a.steps[1:]] if a.steps[0] == 'rollback' else [('step', n) for n in a.steps]
     try:
+        hold = OUT / 'HOLD'
+        if s.execute and any(kind == 'step' and STEPS.get(name, {}).get('writes') for kind, name in todo) and os.path.lexists(hold):
+            raise Stop(f'install writes are on HOLD ({hold})')
+        localnet_preflight(s)
         for kind, name in todo:
             table = ROLLBACKS if kind == 'rollback' else STEPS
             if name not in table:
