@@ -53,6 +53,7 @@ struct Dpu {
   uint32_t dropValue = 0;
   unsigned dropCount = 0;
   unsigned underrunAfterDma = 0;       // inject one underrun after this many bonded commands
+  uint32_t minFetchLineNs = 0;          // inject recurring SSPP starvation below this line-time budget
   bool handleUnderrunIrq = false;
   uint32_t irqUnderruns = 0;
   bool resetPccOnTimingChange = false;
@@ -71,6 +72,7 @@ struct Dpu {
     uint32_t frames = 1000, period = 2310 * kHtotal, shadow = 2310 * kHtotal, cur = 2310 * kHtotal;
     uint32_t htotal = kHtotal;
     uint32_t fetch = 0;
+    uint64_t underrunAt = UINT64_MAX;
   } intf[3];
   struct Dsi {
     uint32_t total = 2309u << 16 | 575, shadow = 2309u << 16 | 575;
@@ -162,10 +164,19 @@ struct Dpu {
       uint64_t next = UINT64_MAX;
       for (unsigned i = 1; i <= 2; ++i)
         if (intf[i].on && intf[i].start + frameNs(i) < next) next = intf[i].start + frameNs(i);
+      for (unsigned i = 1; i <= 2; ++i)
+        if (intf[i].underrunAt < next) next = intf[i].underrunAt;
       for (unsigned l = 0; l < 2; ++l)
         if (dsi[l].dmaPending && dsi[l].dmaAt < next) next = dsi[l].dmaAt;
       if (next > t) break;
       ns = next;
+      for (unsigned i = 1; i <= 2; ++i) {
+        if (intf[i].underrunAt != next) continue;
+        intf[i].underrunAt = UINT64_MAX;
+        const uint32_t bit = 1u << kIntrIntfUnderrun[i];
+        if (handleUnderrunIrq) irqUnderruns |= bit;
+        else topStatus |= bit;
+      }
       for (unsigned l = 0; l < 2; ++l)
         if (dsi[l].dmaPending && dsi[l].dmaAt == next) finishDma(l);
       bool started[3] = {false, false, false};
@@ -190,6 +201,9 @@ struct Dpu {
           d.armed = false;
         }
         checkFrame(i);
+        const uint64_t lineNs = uint64_t(intf[i].htotal) * kLineNs / kHtotal;
+        if (lineNs < minFetchLineNs)
+          intf[i].underrunAt = next + (kVActiveEnd - 1) * lineNs;
       }
     }
     ns = t;

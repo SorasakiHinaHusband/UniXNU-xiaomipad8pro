@@ -244,6 +244,26 @@ void rollback()
   CHECK(io.dcs.empty());
 }
 
+void qual1Underrun()
+{
+  auto io = m1();
+  for (unsigned l = 0; l < 2; ++l) {
+    io.countEnableIgnored[l] = true;
+    io.intf[l + 1].counting = true;
+  }
+  io.minFetchLineNs = 3300;
+  io.handleUnderrunIrq = true;
+  CHECK(switchOk(io, 60));
+  checkMode(io, 60);
+
+  const auto r = m::switchTiming(io, 144, {});
+  CHECK(r.from == 60 && r.reverted && r.timingTouched && r.rate.lockstep);
+  CHECK(r.why && std::strcmp(r.why, "an INTF underran") == 0);
+  CHECK(r.restoreWhy && std::strcmp(r.restoreWhy, "an INTF underran") == 0);
+  CHECK(io.dcs.size() == 16 && io.glitches == 0);
+  checkMode(io, 60);  // The old timing and group came back despite the failed recovery check.
+}
+
 void sleepAndFetch()
 {
   for (bool stopEngines : {true, false}) {
@@ -355,6 +375,7 @@ int main()
   refusals();
   counterAndFlushGate();
   rollback();
+  qual1Underrun();
   sleepAndFetch();
   nightShiftAndCleanEpochs();
   std::printf("PianoDpu M3 mode switch: %u checks, %u failures\n", checks, failures);
