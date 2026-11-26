@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Exercise both file analyzers without opening an audio device."""
 
+from argparse import Namespace
 import array
+from contextlib import redirect_stdout
+import io
 import math
 from pathlib import Path
 import random
+import struct
 import subprocess
 import sys
 import tempfile
 import wave
+
+import analyze
 
 RATE = 48000
 SECONDS = 3
@@ -39,6 +45,48 @@ def tone_measurements(output):
 
 def pcm_sample(value):
     return min(32767, max(-32768, round(value * 32768)))
+
+
+def test_extensible_wav(folder):
+    def chunk(name, payload):
+        return struct.pack("<4sI", name, len(payload)) + payload + bytes(len(payload) % 2)
+
+    def riff(*chunks):
+        return chunk(b"RIFF", b"WAVE" + b"".join(chunks))
+
+    def analyze_tone(path):
+        with redirect_stdout(io.StringIO()) as output:
+            status = analyze.analyze_wav(path, Namespace(mode="tone", seconds=1))
+        assert status == 0, output.getvalue()
+        return output.getvalue()
+
+    rate = 16000
+    standard = folder / "standard-pcm16.wav"
+    write_wav(standard, (round(4096 * math.sin(math.tau * 1000 * i / rate)) for i in range(rate)), rate)
+    with wave.open(str(standard), "rb") as wav:
+        pcm = wav.readframes(rate)
+
+    pcm_guid = bytes.fromhex("01000000 0000 1000 8000 00aa00389b71")
+    fmt = struct.pack("<HHIIHHHHI16s", 0xfffe, 1, rate, rate * 2, 2, 16, 22, 16, 4, pcm_guid)
+    data_chunk = chunk(b"data", pcm)
+    extensible = folder / "extensible-pcm16.wav"
+    fixture = riff(chunk(b"JUNK", b"\x00"), chunk(b"fmt ", fmt), data_chunk)
+    extensible.write_bytes(fixture)
+    # Read both fixtures directly so afconvert cannot change their format tags.
+    assert analyze_tone(extensible) == analyze_tone(standard)
+
+    for description, invalid in (
+        ("truncated RIFF", fixture[:-1]),
+        ("short extensible format", riff(chunk(b"fmt ", fmt[:-1]), data_chunk)),
+        ("non-PCM GUID", riff(chunk(b"fmt ", fmt[:-1] + b"\x00"), data_chunk)),
+        ("non-16-bit container", riff(chunk(b"fmt ", fmt[:14] + b"\x18\x00" + fmt[16:]), data_chunk)),
+        ("partial PCM frame", riff(chunk(b"fmt ", fmt), chunk(b"data", pcm[:-1]))),
+    ):
+        try:
+            analyze.read_pcm16_header(io.BytesIO(invalid))
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {description}")
 
 
 def test_capture_levels(binary, host, folder):
@@ -130,6 +178,7 @@ def test_replay(host, folder):
 
 def main(binary, stimulus, folder):
     host = [sys.executable, Path(__file__).with_name("analyze.py")]
+    test_extensible_wav(folder)
     with wave.open(stimulus, "rb") as wav:
         assert (wav.getframerate(), wav.getnframes(), wav.getsampwidth(), wav.getnchannels()) == (
             RATE, 2 * RATE, 2, 1

@@ -7,11 +7,11 @@ import array
 import math
 from pathlib import Path
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
 from typing import NamedTuple
-import wave
 
 INPUT_MIN_DBFS = -85.0
 TONE_MIN_DBFS = -55.0
@@ -26,6 +26,7 @@ QUIET_MAX_DBFS = -25.0
 QUIET_PEAK_MAX_DBFS = -6.0
 PCM_SCALE = 32768
 PCM_POWER_SCALE = PCM_SCALE ** 2
+PCM_SUBFORMAT_GUID = bytes.fromhex("01000000 0000 1000 8000 00aa00389b71")
 
 
 def power_db(power):
@@ -133,10 +134,59 @@ def tone_in_window(samples, rate, mean, ac, allow_clipping=False):
     return Tone(best.frequency, level, sinad, level - power_db(residual))
 
 
+def read_pcm16_header(wav):
+    """Read a PCM16 RIFF header and leave the stream at the sample data."""
+    # afconvert can write WAVE_FORMAT_EXTENSIBLE, which Python 3.9's wave rejects.
+    header = wav.read(12)
+    if header[:4] != b"RIFF" or header[8:] != b"WAVE":
+        raise ValueError("expected a RIFF/WAVE file")
+    riff_end = 8 + struct.unpack_from("<I", header, 4)[0]
+    if not 12 <= riff_end <= wav.seek(0, 2):
+        raise ValueError("invalid or truncated RIFF size")
+    wav.seek(12)
+
+    block_align = 0
+    while wav.tell() < riff_end:
+        header = wav.read(min(8, riff_end - wav.tell()))
+        if len(header) != 8:
+            raise ValueError("truncated WAV chunk header")
+        chunk, size = struct.unpack("<4sI", header)
+        chunk_end = wav.tell() + size + (size & 1)
+        if chunk_end > riff_end:
+            raise ValueError("WAV chunk extends past the RIFF boundary")
+
+        if chunk == b"fmt ":
+            fmt = wav.read(min(size, 40))
+            if len(fmt) < 16:
+                raise ValueError("truncated WAV format chunk")
+            tag, channels, rate, byte_rate, block_align, bits = struct.unpack_from("<HHIIHH", fmt)
+            if tag == 0xfffe:
+                if len(fmt) < 40:
+                    raise ValueError("truncated extensible WAV format")
+                extra_size, valid_bits = struct.unpack_from("<HH", fmt, 16)
+                if not 22 <= extra_size <= size - 18 or valid_bits > bits:
+                    raise ValueError("invalid extensible WAV format")
+                if fmt[24:40] == PCM_SUBFORMAT_GUID:
+                    tag = 1
+            if tag != 1 or bits != 16:
+                raise ValueError("expected 16-bit PCM WAV")
+            if not channels or not rate or block_align != channels * 2 or byte_rate != rate * block_align:
+                raise ValueError("invalid PCM WAV format")
+        elif chunk == b"data":
+            if not block_align:
+                raise ValueError("missing WAV format before data")
+            if size % block_align:
+                raise ValueError("partial PCM frame in WAV data")
+            return rate, channels, size // block_align
+        wav.seek(chunk_end)
+
+    raise ValueError("missing WAV data chunk")
+
+
 def analyze_wav(path, args):
-    with wave.open(str(path), "rb") as wav:
-        rate, frames = wav.getframerate(), wav.getnframes()
-        if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or not 4000 <= rate <= 192000:
+    with open(path, "rb") as wav:
+        rate, channels, frames = read_pcm16_header(wav)
+        if channels != 1 or not 4000 <= rate <= 192000:
             raise ValueError("expected mono 16-bit PCM at 4–192 kHz")
         if not frames:
             raise ValueError("recording contains no frames")
@@ -152,7 +202,7 @@ def analyze_wav(path, args):
         for second, offset in enumerate(range(0, frames, rate)):
             count = min(rate, frames - offset)
             samples = array.array("h")
-            samples.frombytes(wav.readframes(count))
+            samples.frombytes(wav.read(count * 2))
             if len(samples) != count:
                 raise ValueError("truncated PCM data")
             if sys.byteorder == "big":
@@ -206,13 +256,13 @@ def analyze_wav(path, args):
 
 def replay_pairs(path, seconds):
     """Measure adjacent 200 ms windows from a complete, native C920 WAV."""
-    with wave.open(str(path), "rb") as wav:
-        rate, frames = wav.getframerate(), wav.getnframes()
-        if (rate, wav.getnchannels(), wav.getsampwidth()) != (C920_RATE, 1, 2):
+    with open(path, "rb") as wav:
+        rate, channels, frames = read_pcm16_header(wav)
+        if (rate, channels) != (C920_RATE, 1):
             raise ValueError(f"{path}: expected 16 kHz mono 16-bit PCM")
         if abs(frames / rate - seconds) > 0.25:
             raise ValueError(f"{path}: recorded {frames / rate:.3f} s, expected {seconds} s")
-        samples = array.array("h", wav.readframes(frames))
+        samples = array.array("h", wav.read(frames * 2))
         if len(samples) != frames:
             raise ValueError(f"{path}: truncated PCM data")
         if sys.byteorder == "big":
@@ -278,7 +328,7 @@ def main():
                 check=True,
             )
             return analyze_wav(pcm, args)
-    except (EOFError, OSError, ValueError, subprocess.CalledProcessError, wave.Error) as error:
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"analyze: {error}", file=sys.stderr)
         print("grade=error")
         return 2
