@@ -112,6 +112,7 @@ struct Settings {
   uint32_t fps = 30, bitrate = 2000000, gop = 9, profile = ProfileHigh, level = Level50;
   unsigned frames = 10;
 };
+constexpr unsigned kMaxFrames = 120;
 
 // ------------------------------------------------------------------------------------------------------- the properties
 struct Prop {
@@ -170,7 +171,7 @@ inline Script capabilities(const Settings &c)
 inline bool admitted(const Settings &c)
 {
   return c.fps >= 1 && c.fps <= 60 && c.bitrate >= 100000 && c.bitrate <= 40000000 && c.gop >= 1 && c.gop <= 300 &&
-         c.frames >= 2 && c.frames <= 120;
+         c.frames >= 2 && c.frames <= kMaxFrames;
 }
 
 // ------------------------------------------------------------------------------------------------------------- the arena
@@ -224,8 +225,9 @@ inline unsigned scanAnnexB(const uint8_t *b, uint32_t n, Nal *out, unsigned cap,
   unsigned count = 0;
   *bad = false;
   auto start = [&](uint32_t i, uint32_t *len) {
-    if (i + 3 <= n && !b[i] && !b[i + 1] && b[i + 2] == 1) { *len = 3; return true; }
-    if (i + 4 <= n && !b[i] && !b[i + 1] && !b[i + 2] && b[i + 3] == 1) { *len = 4; return true; }
+    const uint32_t remaining = n - i;
+    if (remaining >= 3 && !b[i] && !b[i + 1] && b[i + 2] == 1) { *len = 3; return true; }
+    if (remaining >= 4 && !b[i] && !b[i + 1] && !b[i + 2] && b[i + 3] == 1) { *len = 4; return true; }
     return false;
   };
   uint32_t len = 0;

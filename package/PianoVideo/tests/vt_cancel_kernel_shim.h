@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 using task_t=void *;
@@ -28,12 +29,19 @@ inline void IOLockLock(IOLock *p){p->mutex.lock();}
 inline void IOLockUnlock(IOLock *p){p->mutex.unlock();}
 inline void IOLockWakeup(IOLock *p,void *,bool){p->cv.notify_all();}
 inline void IOLockSleep(IOLock *p,void *,int){std::unique_lock<std::mutex> l(p->mutex,std::adopt_lock);p->cv.wait(l);l.release();}
-inline void IOSleep(unsigned ms){std::this_thread::sleep_for(std::chrono::milliseconds(ms));}
+inline thread_local std::function<void()> beforeKernelSleep;
+inline std::atomic<uint64_t> testClockMs{0};
+inline void IOSleep(unsigned ms){if(beforeKernelSleep)beforeKernelSleep();std::this_thread::sleep_for(std::chrono::milliseconds(ms));}
 inline void *IOMalloc(size_t n){return std::malloc(n);}
 inline void *IOMallocZero(size_t n){return std::calloc(1,n);}
 inline void IOFree(void *p,size_t){std::free(p);}
 inline void IOLog(const char *,...){}
-inline void clock_get_uptime(uint64_t *t){*t=uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());}
+inline void clock_get_uptime(uint64_t *t){
+  const uint64_t ms=testClockMs.load();
+  const auto ticks=ms?std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(ms)):
+    std::chrono::steady_clock::now().time_since_epoch();
+  *t=uint64_t(ticks.count());
+}
 inline void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns){*ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::duration(t)).count());}
 inline thread_t current_thread(){return nullptr;}
 inline void thread_set_thread_name(thread_t,const char *){}
@@ -46,12 +54,12 @@ extern "C" inline task_t proc_task(proc_t){return nullptr;}
 inline int proc_name(int,void *,int){return 0;}
 inline proc_t proc_find(int){return nullptr;}
 inline void proc_rele(proc_t){}
-// Hashing and firmware/surface copying are outside this scripted cancel test.
-// Aborting here prevents a test from accidentally claiming to exercise them.
+// Hashes are diagnostic only. Allow a stub digest when driving wire admission.
+inline thread_local bool stubAdmissionHash=false;
 struct SHA256_CTX {};
-inline void SHA256_Init(SHA256_CTX *){std::abort();}
-inline void SHA256_Update(SHA256_CTX *,const void *,size_t){std::abort();}
-inline void SHA256_Final(uint8_t *,SHA256_CTX *){std::abort();}
+inline void SHA256_Init(SHA256_CTX *){assert(stubAdmissionHash);}
+inline void SHA256_Update(SHA256_CTX *,const void *data,size_t bytes){assert(stubAdmissionHash&&data&&bytes);}
+inline void SHA256_Final(uint8_t *digest,SHA256_CTX *){assert(stubAdmissionHash);std::memset(digest,0,32);}
 class OSObject {
   std::atomic<unsigned> refs{1};
 public:

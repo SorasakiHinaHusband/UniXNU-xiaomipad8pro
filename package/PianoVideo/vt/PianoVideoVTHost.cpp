@@ -4,6 +4,7 @@
 // One exclusive, bounded AVC/HEVC stream. Selector3 snapshots,
 // validates and enqueues. The worker pumps HFI during asynchronous guest waits;
 // output lookups/maps are scoped to a copy. Synchronous completion stays on the worker.
+#ifndef PIANO_VIDEO_VT_HOST_TEST
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
 #include <sys/proc.h>
@@ -13,6 +14,7 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <libkern/crypto/sha2.h>
+#endif
 #include "PianoVideoVTWire.h"
 #include "PianoVideoVTContract.h"
 #include "PianoVideoVTSurface.h"

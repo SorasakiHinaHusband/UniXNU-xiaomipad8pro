@@ -18,7 +18,6 @@ namespace enc
 {
 constexpr uint32_t Open = 0x01000003, Close = 0x01000004, Start = 0x01000005, Stop = 0x01000006, Drain = 0x01000007,
                    Buffers = 0x01000009;
-constexpr unsigned kMaxFrames = 120;
 struct FrameRecord {
   uint32_t bytes = 0, picture = 0, offset = 0;
   uint64_t etbUs = 0, ebdUs = 0, fbdUs = 0;
@@ -30,7 +29,7 @@ struct Result {
   unsigned etb = 0, ebd = 0, ftb = 0, fbd = 0, empty = 0, idr = 0, sps = 0, pps = 0, slices = 0, badNal = 0;
   uint32_t streamBytes = 0, errorType = 0, errorFlags = 0, errorPort = 0;
   bool drainAck = false, last = false, stopBitstream = false, stopRaw = false, closed = false, truncated = false;
-  bool pass() const { return !error && !close && closed && fbd >= etb && etb && idr >= 1 && sps >= 1 && pps >= 1 && !badNal; }
+  bool pass() const { return !error && !close && closed && fbd >= etb && etb && idr >= 1 && sps >= 1 && pps >= 1 && !badNal && !truncated; }
 };
 enum Stage : unsigned { Prepared = 0, Opening, InputConfig, InputStart, OutputConfig, OutputStart, Frames, Draining, Stopping, Closing, Finished };
 
@@ -116,7 +115,7 @@ public:
     session::Buffer *b = layout.find(v[0], v[1]);
     o.hw.note("E1 completion type %u index %u port %u iova %08x size %u data-offset %u data-size %u timestamp %08x%08x flags %08x "
               "picture %08x", v[0], v[1], p[4], v[2], v[5], v[6], v[7], v[9], v[8], v[10], picture);
-    if (!b || b->port != p[4] || v[2] != b->iova() || v[3] || v[4] || v[5] > b->size || v[6] > b->size || v[7] > b->size - v[6]) {
+    if (!b || b->port != p[4] || v[2] != b->iova() || v[3] || v[4] || v[5] > b->size || v[6] > v[5] || v[7] > v[5] - v[6]) {
       fail(kErrHfi, Buffers, p[2], p[4]);
       return;
     }
@@ -302,7 +301,7 @@ public:
   static constexpr uint32_t ComvCountValue = ComvCount;
   int transaction()
   {
-    if (!g.width || !admitted(set) || set.frames > kMaxFrames) return fail(kErrArgument);
+    if (!g.width || !admitted(set)) return fail(kErrArgument);
     o.hw.note("E1 encode %ux%u stride %u scanlines %u uv %u raw %u bitstream %u coded %ux%u fps %u bitrate %u gop %u frames %u profile %u "
               "level %u arena %u entries %u", g.width, g.height, g.stride, g.scanlines, g.uvOffset, g.rawBytes, g.bitstreamBytes,
               g.codedWidth, g.codedHeight, set.fps, set.bitrate, set.gop, set.frames, set.profile, set.level, layout.bytes, layout.used);

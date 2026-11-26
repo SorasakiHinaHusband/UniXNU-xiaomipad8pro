@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Leo Zhang.
 // Scripted firmware peer for the real persistent HFI state machine. These are
 // ownership/protocol checks, not evidence that any frame decoded on hardware.
+// c++ -std=c++20 -O2 -Wall -Wextra -Werror -I .. -I ../../include stream_host.cpp -o /tmp/stream_host && /tmp/stream_host
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>

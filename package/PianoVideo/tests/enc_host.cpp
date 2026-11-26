@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cstring>
+#include <charconv>
 #include <string>
 #include <vector>
 #include "VideoBringup.h"
@@ -52,6 +53,7 @@ struct TestOps {
 struct Sent {
   uint32_t type, flags, port, payload, words, v0, v1;
 };
+enum class OutputReply { Normal, AtCapacity, Empty, WrongIova, BadCapacity, BadOffset, BadLength, Wraparound };
 // The encoder firmware as iris_hfi_gen2_response.c expects it to answer: no OPEN/START acks, RAW back after a frame, BITSTREAM
 // with the picture type before it, DRAIN ack + an empty LAST bitstream, STOP and CLOSE acks.
 struct Peer {
@@ -68,21 +70,30 @@ struct Peer {
   std::vector<uint32_t> uc;
   std::vector<uint8_t> arena;
   std::vector<Sent> sent;
+  std::vector<uint32_t> openedSessions, closedSessions;
   std::vector<std::vector<uint32_t>> bitstreamQueue;   // queued BITSTREAM buffer packets (v[0..15])
   std::vector<std::vector<uint32_t>> rawPending;       // raw frames waiting for an output buffer
   Geometry g;
+  session::Layout *layout = nullptr;
+  uint64_t expectedFrameUs = 33333;
   unsigned frame = 0, patternOk = 0, patternBad = 0;
-  bool opened = false, sessionErrorOnProp = false, dropLast = false, dropCloseAck = false, systemError = false, wrongIova = false,
-       badBitstream = false, bigFrames = false;
+  bool sessionErrorOnProp = false, dropLast = false, dropCloseAck = false, systemError = false, badBitstream = false;
   bool faultOnRaw = false, watchdogOnStop = false;
+  OutputReply firstOutput = OutputReply::Normal;
   uint32_t sessionErrorProp = 0;
-  Peer() : uc(kUcBytes / 4), arena(session::kAvcArenaBytes, 0)
+  Peer() : uc(kUcBytes / 4)
   {
     mem.uc = uc.data();
-    dma.arena = arena.data();
     hfi::initQueues(mem);
     plan.bank = 3;
     plan.pages = 128;
+  }
+  void bind(const Geometry &geometry, session::Layout &l)
+  {
+    g = geometry;
+    layout = &l;
+    arena.resize(l.bytes);
+    dma.arena = arena.data();
   }
   static std::vector<uint32_t> packet(uint32_t type, uint32_t flags, uint32_t port, uint32_t payload, const std::vector<uint32_t> &v = {})
   {
@@ -113,15 +124,28 @@ struct Peer {
       for (unsigned i = 0; i < n; ++i) nal.push_back(uint8_t(0x80 | (i & 0x7f)));
     };
     const bool idr = raw[8] == 0;
+    const auto mode = idr ? firstOutput : OutputReply::Normal;
+    const uint32_t dataOffset = mode == OutputReply::AtCapacity ? 4 : 0;
     if (badBitstream) nal = {0x12, 0x34, 0x56};
-    else if (idr) { put(7, 12); put(8, 4); put(5, bigFrames ? 300000 : 3000); }
-    else put(1, bigFrames ? 200000 : 800);
-    CHECK(nal.size() <= out[5]);
+    else if (idr) {
+      put(7, 12); put(8, 4); put(5, 3000);
+      if (mode == OutputReply::AtCapacity) nal.resize(out[5] - dataOffset, 0x80);
+    } else put(1, 800);
+    CHECK(nal.size() <= out[5] - dataOffset);
     const uint32_t off = out[2] - session::kArenaBase;
-    std::memcpy(arena.data() + off, nal.data(), nal.size());
-    out[2] = wrongIova ? out[2] + 4096 : out[2];
-    out[6] = 0;
+    std::memcpy(arena.data() + off + dataOffset, nal.data(), nal.size());
+    out[6] = dataOffset;
     out[7] = uint32_t(nal.size());
+    switch (mode) {
+    case OutputReply::Empty: out[7] = 0; break;
+    case OutputReply::WrongIova: out[2] += 4096; break;
+    case OutputReply::BadCapacity: out[5] = out[7] - 1; break;
+    case OutputReply::BadOffset: out[6] = out[5] + 1; out[7] = 0; break;
+    case OutputReply::BadLength: out[6] = 4; out[7] = out[5] - 3; break;
+    case OutputReply::Wraparound: out[6] = out[5]; out[7] = UINT32_MAX; break;
+    case OutputReply::Normal:
+    case OutputReply::AtCapacity: break;
+    }
     out[8] = raw[8];
     out[9] = raw[9];
     reply({packet(PropPictureType, 2, PortBitstream, 1, {idr ? PictureIdr : PictureP}),
@@ -140,11 +164,13 @@ struct Peer {
     if (systemError && sent.size() == 6) { reply({packet(0x05000001, 8, 0, 0)}, 0); return 0; }
     if (type == Open) {
       CHECK(!data[1] && port == 0 && flags == 3 && payload == PayloadU32 && p[8]);
+      CHECK(!activeSid && bitstreamQueue.empty() && rawPending.empty());
       activeSid = p[8];
-      opened = true;
+      openedSessions.push_back(activeSid);
+      frame = 0;
       return 0;
     }
-    CHECK(opened && data[1] == activeSid);
+    CHECK(activeSid && data[1] == activeSid);
     if (type > 0x03000000 && type < 0x03ffffff) {
       if (sessionErrorOnProp && type == sessionErrorProp) reply({packet(type, 4 | 1, port, 0)});
       return 0;
@@ -152,6 +178,9 @@ struct Peer {
     std::vector<uint32_t> v(p + 8, p + 8 + words);
     if (type == Buffers) {
       CHECK(words == 16 && flags == 1 && payload == 5 && v[10] == kHostNonSecure);
+      const auto *b = layout->find(v[0], v[1]);
+      CHECK(b && v[2] == b->iova() && v[5] == b->capacity && port == b->port);
+      CHECK(!v[3] && !v[4] && !v[6]);
       if (v[0] == BufBitstream) {
         CHECK(port == PortBitstream && !v[7]);
         bitstreamQueue.push_back(v);
@@ -159,10 +188,11 @@ struct Peer {
       } else if (v[0] == BufRaw) {
         CHECK(port == PortRaw && v[7] == g.rawBytes);
         // The frame really is the pattern of its timestamp's frame number (active pixels and the padding).
-        const uint32_t f = v[8] / 33333;
+        const uint64_t timestamp = uint64_t(v[9]) << 32 | v[8];
+        CHECK(timestamp == frame * expectedFrameUs);
         const uint8_t *base = arena.data() + (v[2] - session::kArenaBase);
         bool same = true;
-        pattern(g, f, [&](uint32_t at, uint8_t want) { same &= base[at] == want; });
+        pattern(g, frame, [&](uint32_t at, uint8_t want) { same &= base[at] == want; });
         (same ? patternOk : patternBad)++;
         ++frame;
         if (!emit(v)) rawPending.push_back(v);
@@ -189,18 +219,27 @@ struct Peer {
       if (watchdogOnStop) ops.watchdog = true;
       // STOP hands back what the port still holds (the output buffers), then acknowledges.
       std::vector<std::vector<uint32_t>> r;
-      if (port == PortBitstream)
+      if (port == PortBitstream) {
         for (auto &out : bitstreamQueue) {
           out[7] = 0;
           r.push_back(packet(Buffers, 1, PortBitstream, 5, out));
         }
-      bitstreamQueue.clear();
+        bitstreamQueue.clear();
+      } else {
+        for (const auto &in : rawPending) r.push_back(packet(Buffers, 1, PortRaw, 5, in));
+        rawPending.clear();
+      }
       r.push_back(packet(Stop, 1, port, 0));
       reply(r);
       return 0;
     }
     if (type == Close) {
-      if (!dropCloseAck) reply({packet(Close, 1, 0, 0)});
+      CHECK(bitstreamQueue.empty() && rawPending.empty());
+      if (!dropCloseAck) {
+        reply({packet(Close, 1, 0, 0)});
+        closedSessions.push_back(activeSid);
+        activeSid = 0;
+      }
       return 0;
     }
     return 0;   // START: no mandatory ack
@@ -232,11 +271,11 @@ struct Run {
   std::vector<uint8_t> stream;
   EncodeSelfTest<Peer> t;
   int rc = 0;
-  Run(uint32_t w, uint32_t h, uint32_t cap = 256 * 1024) : stream(cap), t(peer, layout)
+  Run(uint32_t w, uint32_t h, uint32_t cap = 256 * 1024) : stream(cap + 1, 0xa5), t(peer, layout)
   {
     CHECK(t.g.configure(w, h));
-    peer.g = t.g;
     CHECK(buildLayout(layout, t.g));
+    peer.bind(t.g, layout);
     t.stream = stream.data();
     t.streamCap = cap;
   }
@@ -257,25 +296,38 @@ static void bootGateTests()
 
 static void geometryTests()
 {
+  const struct {
+    uint32_t width, height, stride, yRows, uvRows, yBytes, uvBytes, rawBytes, bitstreamBytes, codedHeight, vpssBytes;
+  } cases[] = {
+      {320, 240, 384, 256, 128, 98304, 49152, 147456, 245760, 240, 131072},
+      {640, 480, 640, 480, 240, 307200, 153600, 462848, 921600, 480, 0},
+      {1280, 720, 1280, 736, 368, 942080, 471040, 1413120, 708608, 720, 1449984},
+      {1920, 1080, 1920, 1088, 544, 2088960, 1044480, 3133440, 1568768, 1088, 3158016},
+  };
   Geometry g;
-  CHECK(g.configure(640, 480));
-  CHECK(g.stride == 640 && g.scanlines == 480 && g.uvScanlines == 240 && g.uvOffset == 307200);
-  CHECK(g.rawBytes == 462848);         // ALIGN(640*480 + 640*240, 4096)
-  CHECK(g.bitstreamBytes == 921600);   // 640*480*3, at most 720p: not reduced
-  CHECK(g.codedWidth == 640 && g.codedHeight == 480 && g.codedCrop() == 0);
-  CHECK(g.configure(1920, 1080));
-  CHECK(g.stride == 1920 && g.scanlines == 1088 && g.uvScanlines == 544 && g.codedHeight == 1088 && g.codedCrop() == 8);
-  CHECK(g.bitstreamBytes == 1568768);   // ALIGN((1920*1088*3) >> 2 = 1566720, 4096)
-  CHECK(g.configure(320, 240) && g.stride == 384 && g.scanlines == 256 && g.uvScanlines == 128);
-  CHECK(g.configure(1280, 720) && g.scanlines == 736 && g.codedHeight == 720);
-  CHECK(!g.configure(800, 600) && !g.configure(0, 0) && !g.configure(641, 480));
-  // The size table holds the four supported geometries.
-  CHECK(kInternalCount == 4 && kInternal[1].bin == 23787008 && kInternal[1].vpss == 0 && kInternal[3].dpb == 12636160);
+  CHECK(kInternalCount == 4 && kInternal[1].bin == 23787008 && kInternal[3].dpb == 12636160);
   // Layouts: no overlap, guards between buffers, inside the AVC arena, every byte of every buffer mapped.
-  for (const auto &row : kInternal) {
+  for (const auto &c : cases) {
+    CHECK(g.configure(c.width, c.height));
+    CHECK(g.stride == c.stride && g.scanlines == c.yRows && g.uvScanlines == c.uvRows);
+    CHECK(g.uvOffset == c.yBytes && g.stride * g.uvScanlines == c.uvBytes);
+    CHECK(g.rawBytes == c.rawBytes && g.bitstreamBytes == c.bitstreamBytes);
+    CHECK(g.codedWidth == c.width && g.codedHeight == c.codedHeight && g.internal.vpss == c.vpssBytes);
+    const Script in = inputConfig(g), out = outputConfig(g, Settings{});
+    CHECK(in.p[1].v[0] == (c.width << 16 | c.height));
+    CHECK(in.p[3].v[0] == (c.stride << 16 | c.yRows) && in.p[3].v[1] == (c.stride << 16 | c.uvRows));
+    CHECK(out.p[0].id == PropBitstreamResolution && out.p[0].v[0] == (c.width << 16 | c.codedHeight));
+    CHECK(out.p[1].id == PropCrop && out.p[1].payload == Payload64Packed && out.p[1].words == 2);
+    CHECK(out.p[1].v[0] == 0 && out.p[1].v[1] == c.codedHeight - c.height);
+
     session::Layout l;
-    CHECK(g.configure(row.width, row.height) && buildLayout(l, g));
-    CHECK(l.used == 9u + (row.vpss ? 1u : 0u) && l.bytes <= session::kAvcArenaBytes && l.arenaBytes() == session::kAvcArenaBytes);
+    CHECK(buildLayout(l, g));
+    CHECK(l.used == 9u + (c.vpssBytes ? 1u : 0u) && l.bytes <= 256u * 1024 * 1024 && l.arenaBytes() == 256u * 1024 * 1024);
+    for (unsigned i = 0; i < 2; ++i) {
+      const auto *raw = l.find(BufRaw, i), *bits = l.find(BufBitstream, i);
+      CHECK(raw && raw->capacity == c.rawBytes && raw->port == PortRaw);
+      CHECK(bits && bits->capacity == c.bitstreamBytes && bits->port == PortBitstream);
+    }
     for (unsigned i = 0; i < l.used; ++i) {
       const auto &b = l.buf[i];
       CHECK(!(b.off & 16383) && b.capacity == b.size);
@@ -283,8 +335,38 @@ static void geometryTests()
       CHECK(!l.mapped((b.off + ((b.capacity + 16383) & ~16383u)) / 4096));   // the guard after it
       for (unsigned j = i + 1; j < l.used; ++j) CHECK(l.buf[j].off >= b.off + b.capacity);
     }
-    CHECK(l.find(BufRaw, 0) && l.find(BufRaw, 1) && l.find(BufBitstream, 1) && l.find(BufDpb, 0) && !l.find(BufRaw, 2));
+    const auto *vpss = l.find(BufVpss, 0);
+    CHECK(c.vpssBytes ? vpss && vpss->capacity == c.vpssBytes && vpss->port == PortRaw : !vpss);
+    const struct { uint32_t type, bytes; } internals[] = {
+        {BufBin, g.internal.bin}, {BufComv, g.internal.comv}, {BufNonComv, g.internal.nonComv},
+        {BufLine, g.internal.line}, {BufDpb, g.internal.dpb},
+    };
+    for (const auto &internal : internals) {
+      const auto *b = l.find(internal.type, 0);
+      CHECK(b && b->capacity == internal.bytes && b->port == PortBitstream);
+    }
+    CHECK(!l.find(BufRaw, 2) && !l.find(BufBitstream, 2));
   }
+
+  const uint32_t invalid[][2] = {
+      {0, 0}, {0, 480}, {640, 0}, {641, 480}, {640, 481}, {800, 600}, {320, 480}, {1920, 1088},
+      {1922, 1080}, {1920, 1082}, {3840, 2160}, {65536 + 640, 480}, {640, 65536 + 480},
+      {UINT32_MAX, 480}, {640, UINT32_MAX}, {0xffffff80, 0xffffffe0},
+  };
+  session::Layout rejected;
+  for (const auto &size : invalid) {
+    CHECK(g.configure(1920, 1080) && buildLayout(rejected, g));
+    CHECK(!g.configure(size[0], size[1]));
+    CHECK(!g.width && !g.height && !g.stride && !g.scanlines && !g.uvScanlines && !g.uvOffset);
+    CHECK(!g.rawBytes && !g.bitstreamBytes && !g.codedResolution() && !g.codedCrop() && !g.internal.bin);
+    CHECK(!buildLayout(rejected, g) && !rejected.used && !rejected.bytes);
+  }
+  for (uint32_t capacity : {0u, 256u * 1024 * 1024, UINT32_MAX}) {
+    CHECK(g.configure(640, 480));
+    g.rawBytes = capacity;
+    CHECK(!buildLayout(rejected, g) && !rejected.used && !rejected.bytes);
+  }
+
   // The scripts: Linux's order and ports.
   CHECK(g.configure(640, 480));
   const Script in = inputConfig(g), out = outputConfig(g, Settings{}), caps = capabilities(Settings{});
@@ -296,9 +378,6 @@ static void geometryTests()
   for (unsigned i = 0; i < out.n; ++i) CHECK(out.p[i].port == PortBitstream);
   CHECK(caps.n == 14 && caps.p[0].id == PropProfile && caps.p[0].v[0] == 4 && caps.p[1].v[0] == 14 && caps.p[4].port == PortNone);
   CHECK(caps.p[6].id == PropTotalBitrate && caps.p[6].port == PortRaw && caps.p[13].id == PropRequestSyncFrame);
-  Settings bad;
-  bad.frames = 500;
-  CHECK(admitted(Settings{}) && !admitted(bad));
 }
 
 static void residentArenaTests()
@@ -347,14 +426,138 @@ static void scanTests()
   bool bad = true;
   Nal n[8];
   CHECK(scanAnnexB(s, sizeof s, n, 8, &bad) == 3 && !bad);
-  CHECK(n[0].type == 7 && n[0].size == 3 && n[1].type == 8 && n[1].offset == 10 && n[2].type == 5 && n[2].size == 4);
+  CHECK(n[0].type == 7 && n[0].offset == 4 && n[0].size == 3);
+  CHECK(n[1].type == 8 && n[1].offset == 10 && n[1].size == 2);
+  CHECK(n[2].type == 5 && n[2].offset == 16 && n[2].size == 4 && n[2].offset + n[2].size == sizeof s);
   const FrameNals f = classify(s, sizeof s);
   CHECK(f.sps == 1 && f.pps == 1 && f.idr == 1 && !f.slice && !f.bad);
   const uint8_t junk[] = {1, 2, 3};
   CHECK(scanAnnexB(junk, 3, n, 8, &bad) == 0 && bad);
   const uint8_t empty[] = {0, 0, 1, 0, 0, 1, 0x41};
   CHECK(scanAnnexB(empty, sizeof empty, n, 8, &bad) == 0 && bad);
-  CHECK(scanAnnexB(s, 0, n, 8, &bad) == 0 && !bad);
+  CHECK(scanAnnexB(nullptr, 0, nullptr, 0, &bad) == 0 && !bad);
+  CHECK(scanAnnexB(s, sizeof s, nullptr, 0, &bad) == 3 && !bad);
+  for (unsigned cap : {1u, 2u, 3u}) {
+    std::vector<Nal> limited(cap);
+    CHECK(scanAnnexB(s, sizeof s, limited.data(), cap, &bad) == 3 && !bad);
+    CHECK(limited.back().offset == n[cap - 1].offset);
+  }
+  for (const std::vector<uint8_t> &prefix : {std::vector<uint8_t>{0}, {0, 0}, {0, 0, 1}, {0, 0, 0, 1}}) {
+    CHECK(scanAnnexB(prefix.data(), uint32_t(prefix.size()), n, 8, &bad) == 0 && bad);
+  }
+  const uint8_t emptyTail[] = {0, 0, 1, 0x67, 0, 0, 0, 1};
+  CHECK(scanAnnexB(emptyTail, sizeof emptyTail, n, 1, &bad) == 1 && bad);
+  CHECK(classify(emptyTail, sizeof emptyTail).bad);
+  const uint8_t escaped[] = {0, 0, 0, 1, 0x65, 0, 0, 3, 1};
+  CHECK(scanAnnexB(escaped, sizeof escaped, n, 8, &bad) == 1 && !bad && n[0].size == 5);
+}
+
+static void settingsAndReopenTests()
+{
+  Peer peer;
+  Geometry g;
+  session::Layout layout;
+  CHECK(g.configure(320, 240) && buildLayout(layout, g));
+  peer.bind(g, layout);
+  const Settings invalid[] = {
+      {.fps = 0}, {.fps = 61}, {.fps = 65536}, {.fps = UINT32_MAX},
+      {.bitrate = 0}, {.bitrate = 99999}, {.bitrate = 40000001}, {.bitrate = UINT32_MAX},
+      {.gop = 0}, {.gop = 301}, {.gop = UINT32_MAX},
+      {.frames = 0}, {.frames = 1}, {.frames = 121}, {.frames = UINT32_MAX},
+  };
+  CHECK(admitted(Settings{}));
+  for (const auto &settings : invalid) {
+    EncodeSelfTest<Peer> t(peer, layout);
+    t.g = g;
+    t.set = settings;
+    CHECK(!admitted(settings));
+    CHECK(t.run() == kErrArgument && t.r.failedStage == Prepared && !t.r.etb && peer.sent.empty());
+  }
+
+  std::vector<uint8_t> stream(128 * 1024);
+  const Settings supported[] = {{.fps = 1, .bitrate = 100000, .gop = 1, .frames = 2},
+                                {.fps = 60, .bitrate = 40000000, .gop = 300, .frames = 120}};
+  constexpr uint64_t expectedFrameUs[] = {1000000, 16666};
+  for (unsigned run = 0; run < 2; ++run) {
+    const auto &settings = supported[run];
+    CHECK(buildLayout(layout, g));  // Native reopen rebuilds layout ownership and uses a fresh transaction.
+    for (unsigned i = 0; i < layout.used; ++i) CHECK(!layout.buf[i].queued && !layout.buf[i].pendingRelease);
+    EncodeSelfTest<Peer> t(peer, layout);
+    t.g = g;
+    t.set = settings;
+    t.sessionId += run;
+    t.stream = stream.data();
+    t.streamCap = uint32_t(stream.size());
+    peer.expectedFrameUs = expectedFrameUs[run];
+    const unsigned from = unsigned(peer.sent.size()), patternsBefore = peer.patternOk;
+    CHECK(admitted(settings) && t.run() == 0 && t.r.pass());
+    CHECK(t.r.etb == settings.frames && t.r.ebd == settings.frames && t.r.fbd == settings.frames);
+    CHECK(t.r.ftb == settings.frames + 2 && t.r.empty == 2 && t.r.drainAck && t.r.last);
+    CHECK(t.r.stopBitstream && t.r.stopRaw && t.r.closed && t.frames[0].offset == 0);
+    CHECK(t.r.sps == 1 && t.r.pps == 1 && t.r.idr == 1 && t.r.slices == settings.frames - 1);
+    CHECK(t.r.streamBytes == 3031 + (settings.frames - 1) * 805);
+    CHECK(t.frames[settings.frames - 1].ebdUs >= t.frames[settings.frames - 1].etbUs);
+    CHECK(peer.patternOk - patternsBefore == settings.frames && !peer.patternBad);
+    CHECK(!peer.activeSid && peer.bitstreamQueue.empty() && peer.rawPending.empty());
+    CHECK(peer.mem.ld(hfi::qhdr(hfi::kMsgq) + hfi::kQRead) == peer.mem.ld(hfi::qhdr(hfi::kMsgq) + hfi::kQWrite));
+    for (unsigned i = 0; i < layout.used; ++i)
+      if (layout.buf[i].type == BufRaw || layout.buf[i].type == BufBitstream) CHECK(!layout.buf[i].queued);
+
+    const struct { uint32_t id, port, payload, value; unsigned count; } wire[] = {
+        {0x0300010c, 1, 8, settings.fps * 65536, 1},      // Q16 fps
+        {0x0300013b, 2, 1, settings.bitrate, 2},          // RAW target bitrate in bits/s
+        {0x0300012a, 1, 9, 0, 2},                       // BITSTREAM VBR_CFR
+        {0x03000146, 2, 1, settings.gop, 2},              // RAW GOP length
+    };
+    for (const auto &p : wire) {
+      unsigned count = 0;
+      for (unsigned i = from; i < peer.sent.size(); ++i) {
+        const auto &s = peer.sent[i];
+        if (s.type != p.id) continue;
+        CHECK(s.port == p.port && s.payload == p.payload && s.words == 1 && s.v0 == p.value);
+        ++count;
+      }
+      CHECK(count == p.count);
+    }
+  }
+  const std::vector<uint32_t> epochs = {0x56340e01, 0x56340e02};
+  CHECK(peer.openedSessions == epochs && peer.closedSessions == epochs);
+}
+
+static void outputBoundsTests()
+{
+  constexpr uint32_t firstBytes = 3031, totalBytes = firstBytes + 805;
+  std::vector<uint8_t> complete;
+  for (uint32_t cap : {totalBytes, 0u, 2u, firstBytes - 1, firstBytes, totalBytes - 1}) {
+    Run r(320, 240, cap);
+    r.t.set.frames = 2;
+    CHECK(r.go() == 0 && r.t.r.closed && r.t.r.last && r.t.r.empty == 2);
+    CHECK(r.t.r.fbd == 2 && r.t.r.streamBytes == cap && !r.t.r.badNal);
+    CHECK(r.t.r.truncated == (cap < totalBytes) && r.t.r.pass() == (cap == totalBytes));
+    CHECK(r.t.frames[0].bytes == firstBytes && r.t.frames[1].bytes == 805);
+    CHECK(r.t.frames[0].nals.idr == (cap >= firstBytes ? 1u : 0u));
+    CHECK(r.t.frames[1].nals.slice == (cap == totalBytes ? 1u : 0u));
+    CHECK(r.stream[cap] == 0xa5);
+    if (cap == totalBytes) complete = r.stream;
+    else CHECK(!std::memcmp(r.stream.data(), complete.data(), cap));
+  }
+  {
+    Run r(320, 240, 245760 + 805 - 4);
+    r.t.set.frames = 2;
+    r.peer.firstOutput = OutputReply::AtCapacity;
+    CHECK(r.go() == 0 && r.t.r.pass());
+    CHECK(r.t.frames[0].bytes == 245760 - 4 && r.t.frames[1].offset == r.t.frames[0].bytes);
+    CHECK(r.t.frames[0].nals.idr == 1 && r.stream[4] == 0x67 && r.stream[245760 - 5] == 0x80);
+    CHECK(r.t.r.streamBytes == r.t.streamCap && r.stream.back() == 0xa5);
+  }
+  for (auto mode : {OutputReply::Empty, OutputReply::WrongIova, OutputReply::BadCapacity,
+                    OutputReply::BadOffset, OutputReply::BadLength, OutputReply::Wraparound}) {
+    Run r(320, 240);
+    r.peer.firstOutput = mode;
+    CHECK(r.go() == kErrHfi && r.t.r.failedStage == Frames && !r.t.r.pass());
+    CHECK(r.t.r.closed && !r.t.r.last && r.t.r.etb == 1 && r.t.r.ebd == 1);
+    CHECK(r.t.r.fbd == 0 && r.t.r.ftb == 2 && r.t.r.streamBytes == 0 && r.stream[0] == 0xa5);
+  }
 }
 
 static void patternTests()
@@ -398,8 +601,9 @@ static void sessionTests()
     CHECK(r.t.r.streamBytes > 3000 && r.stream[4] == 0x67 && r.t.frames[1].offset == r.t.frames[0].bytes);
     CHECK(r.peer.hw.log.find("E1 result PASS") != std::string::npos);
   }
-  {  // 320x240 queues VPSS on the raw port before START raw
-    Run r(320, 240);
+  for (const auto &size : {kInternal[0], kInternal[2], kInternal[3]}) {
+    Run r(size.width, size.height);
+    r.t.set.frames = 2;
     CHECK(r.go() == 0 && r.t.r.pass());
     const unsigned vpss = bufferIndex(r.peer, BufVpss);
     CHECK(vpss != ~0u && r.peer.sent[vpss].port == PortRaw && vpss < indexOf(r.peer, Start, PortRaw));
@@ -427,22 +631,11 @@ static void sessionTests()
     CHECK(r.go() == kErrSysError && !r.t.r.pass());
     CHECK(indexOf(r.peer, Stop, PortRaw) == ~0u && indexOf(r.peer, Close, PortNone) == ~0u);
   }
-  {  // the export is bounded; a full buffer is flagged and frames past it are not parsed
-    Run r(640, 480, 64 * 1024);
-    r.peer.bigFrames = true;
-    r.go();
-    CHECK(r.t.r.truncated && r.t.r.streamBytes == 64 * 1024 && !r.t.r.pass());
-  }
   {  // a bitstream that is not Annex B fails the NAL gate
     Run r(640, 480);
     r.peer.badBitstream = true;
     r.go();
     CHECK(r.t.r.badNal > 0 && !r.t.r.pass());
-  }
-  {  // a completion for an address we never queued is a protocol error
-    Run r(640, 480);
-    r.peer.wrongIova = true;
-    CHECK(r.go() == kErrHfi && !r.t.r.pass());
   }
   {  // an SMMU fault during frame submission leaves the DMA state held for quarantine
     Run r(640, 480);
@@ -463,7 +656,7 @@ static void sessionTests()
 static int writePattern(const char *file, uint32_t w, uint32_t h, unsigned n)
 {
   Geometry g;
-  if (!g.configure(w, h)) return 2;
+  if (!g.configure(w, h) || !n || n > kMaxFrames) return 2;
   FILE *f = std::fopen(file, "wb");
   if (!f) return 2;
   std::vector<uint8_t> nv12(g.rawBytes), packed(w * h * 3 / 2);
@@ -471,21 +664,32 @@ static int writePattern(const char *file, uint32_t w, uint32_t h, unsigned n)
     pattern(g, k, [&](uint32_t at, uint8_t v) { nv12[at] = v; });
     for (uint32_t y = 0; y < h; ++y) std::memcpy(&packed[y * w], &nv12[y * g.stride], w);
     for (uint32_t y = 0; y < h / 2; ++y) std::memcpy(&packed[w * h + y * w], &nv12[g.uvOffset + y * g.stride], w);
-    std::fwrite(packed.data(), 1, packed.size(), f);
+    if (std::fwrite(packed.data(), 1, packed.size(), f) != packed.size()) {
+      std::fclose(f);
+      return 2;
+    }
   }
-  std::fclose(f);
-  return 0;
+  return std::fclose(f) ? 2 : 0;
 }
 
 int main(int argc, char **argv)
 {
-  if (argc == 6 && !std::strcmp(argv[1], "--pattern"))
-    return writePattern(argv[2], uint32_t(std::atoi(argv[3])), uint32_t(std::atoi(argv[4])), unsigned(std::atoi(argv[5])));
+  if (argc == 6 && !std::strcmp(argv[1], "--pattern")) {
+    uint32_t args[3];
+    for (unsigned i = 0; i < 3; ++i) {
+      const char *begin = argv[3 + i], *end = begin + std::strlen(begin);
+      const auto parsed = std::from_chars(begin, end, args[i]);
+      if (parsed.ec != std::errc{} || parsed.ptr != end) return 2;
+    }
+    return writePattern(argv[2], args[0], args[1], args[2]);
+  }
   bootGateTests();
   geometryTests();
   residentArenaTests();
   scanTests();
   patternTests();
+  settingsAndReopenTests();
+  outputBoundsTests();
   sessionTests();
   if (failures) {
     std::printf("enc_host: %u FAILED\n", failures);
