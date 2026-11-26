@@ -156,6 +156,24 @@ class GitDiff(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertNotIn('Traceback', result.stderr)
 
+    def test_staged_scan_uses_index_blobs_and_refuses_outputs(self):
+        path = self.root / 'café "staged".txt'
+        path.write_text('prior fixture\n')
+        self.commit()
+        path.write_text('prior fixture\nnew line ' + J(['172.', '20.3.4']) + '\n')
+        output = self.root / 'staged.DMG'
+        output.touch()
+        self.git('add', '-A')
+        path.write_text('safe working copy\n')
+        output.unlink()
+        (self.root / 'unstaged.txt').write_text(J(['192.', '168.1.20']) + '\n')
+        result = subprocess.run([sys.executable, str(self.script), '--staged'],
+                                cwd=self.root, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{path.name}:2: LAN address', result.stdout)
+        self.assertIn('staged.DMG: file type not allowed', result.stdout)
+        self.assertIn('1 hits, 1 refused files', result.stdout)
+
 
 if __name__ == '__main__':
     sys.exit(unittest.main())

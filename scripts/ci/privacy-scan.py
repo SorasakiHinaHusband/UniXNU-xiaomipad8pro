@@ -3,6 +3,7 @@
 """Privacy scan for the public repository: generic pattern classes only.
 
     python3 scripts/ci/privacy-scan.py                 # every tracked text file
+    python3 scripts/ci/privacy-scan.py --staged        # only additions to the index
     python3 scripts/ci/privacy-scan.py --diff BASE     # only lines added since BASE (and the commit messages BASE..HEAD)
 
 The maintainer's own pre-publish audit has a private list of literal values; it is not here and must never be. This scan only
@@ -95,10 +96,10 @@ def is_text(data):
     return b'\0' not in data[:8192]
 
 
-def changed_blobs(base):
-    # NUL-delimited raw records preserve all path names and give us the committed blob IDs.
+def changed_blobs(*revisions):
+    # NUL-delimited raw records preserve all path names and give us the blob IDs.
     records = iter(git('diff', '--raw', '-z', '--no-abbrev', '--find-renames', '--no-ext-diff',
-                       '--diff-filter=AMRT', base, 'HEAD', '--').split(b'\0')[:-1])
+                       '--diff-filter=AMRT', *revisions, '--').split(b'\0')[:-1])
     for header, path in zip(records, records):
         old_mode, new_mode, old_oid, new_oid, status = header.decode('ascii').split()
         if status.startswith('R'):
@@ -128,8 +129,8 @@ def added_lines(old, new, data):
                 lineno += 1
 
 
-def scan_diff(base, merge_base, allow, hits, bad):
-    for path, old, new in changed_blobs(merge_base):
+def scan_changed_files(revisions, allow, hits, bad):
+    for path, old, new in changed_blobs(*revisions):
         data = git('cat-file', 'blob', new) if new else None
         text = data is not None and is_text(data)
         lower = path.lower()
@@ -140,6 +141,9 @@ def scan_diff(base, merge_base, allow, hits, bad):
         if text:
             for n, line in added_lines(old, new, data):
                 scan_line(path, n, line, allow, hits, diff=True)
+
+
+def scan_commit_messages(base, allow, hits):
     log = git('log', '--no-notes', '--no-show-signature', '--format=%H%n%B%x00', f'{base}..HEAD', '--')
     for msg in log.decode('utf-8', errors='replace').split('\0'):
         if msg.strip():
@@ -183,7 +187,9 @@ def redact(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--diff', metavar='BASE', help='scan only what BASE..HEAD adds')
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument('--diff', metavar='BASE', help='scan only what BASE..HEAD adds')
+    mode.add_argument('--staged', action='store_true', help='scan only additions to the index')
     ap.add_argument('--show', action='store_true', help='print the matched text in full (local use only, never in CI logs)')
     a = ap.parse_args()
     allow = load_allow()
@@ -197,14 +203,18 @@ def main():
             merge_base = git('merge-base', base, 'HEAD').decode('ascii').strip()
         except subprocess.CalledProcessError:
             ap.error('--diff base and HEAD have no common ancestor')
-        scan_diff(base, merge_base, allow, hits, bad)
+        scan_changed_files((merge_base, 'HEAD'), allow, hits, bad)
+        scan_commit_messages(base, allow, hits)
+    elif a.staged:
+        scan_changed_files(('--cached',), allow, hits, bad)
     else:
         scan_worktree(allow, hits)
     for path, n, name, text in hits:
         print(f'{path}:{n}: {name}: {text if a.show else redact(text)}')
     for f in bad:
         print(f'{f}: file type not allowed in the public repository (Apple payload, encrypted blob or build output)')
-    print(f'privacy scan: {len(hits)} hits, {len(bad)} refused files' + (f' (lines added since {a.diff})' if a.diff else ''))
+    suffix = f' (lines added since {a.diff})' if a.diff else ' (staged changes)' if a.staged else ''
+    print(f'privacy scan: {len(hits)} hits, {len(bad)} refused files{suffix}')
     return 1 if hits or bad else 0
 
 
