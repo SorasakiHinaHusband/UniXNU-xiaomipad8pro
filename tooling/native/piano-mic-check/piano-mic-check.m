@@ -72,11 +72,10 @@ static int report_tcc(void)
     return status == AVAuthorizationStatusAuthorized ? OK : NoPermission;
 }
 
-// Match the Core Audio default that AVAudioRecorder opens, including the input stream's client format.
-static AudioDeviceID default_input(void)
+static AudioDeviceID default_device(AudioObjectPropertySelector selector)
 {
     AudioObjectPropertyAddress address = {
-        kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
     };
     AudioDeviceID device = kAudioObjectUnknown;
     UInt32 size = sizeof(device);
@@ -85,26 +84,34 @@ static AudioDeviceID default_input(void)
     return device;
 }
 
-static BOOL report_input(AudioDeviceID device)
+static NSString *device_name(AudioDeviceID device)
 {
     if (device == kAudioObjectUnknown)
-        return NO;
+        return nil;
     AudioObjectPropertyAddress address = {
         kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
     };
     CFStringRef name = NULL;
     UInt32 size = sizeof(name);
     if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &name) != noErr || !name)
-        return NO;
+        return nil;
     NSString *deviceName = CFBridgingRelease(name);
-    deviceName = [[deviceName componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
-                  componentsJoinedByString:@" "];
+    return [[deviceName componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
+            componentsJoinedByString:@" "];
+}
+
+static BOOL report_input(AudioDeviceID device)
+{
+    NSString *deviceName = device_name(device);
     if (deviceName.length == 0)
         return NO;
     printf("input_device=%s\n", deviceName.UTF8String);
 
-    address.mSelector = kAudioDevicePropertyStreams;
-    address.mScope = kAudioObjectPropertyScopeInput;
+    // Report HAL input streams' client formats alongside the encoded file format.
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain
+    };
+    UInt32 size;
     if (AudioObjectGetPropertyDataSize(device, &address, 0, NULL, &size) != noErr ||
         size < sizeof(AudioStreamID))
         return NO;
@@ -118,7 +125,8 @@ static BOOL report_input(AudioDeviceID device)
     for (size_t i = 0; i < size / sizeof(*ids); ++i) {
         AudioStreamBasicDescription format;
         UInt32 bytes = sizeof(format);
-        if (AudioObjectGetPropertyData(ids[i], &address, 0, NULL, &bytes, &format) != noErr)
+        if (AudioObjectGetPropertyData(ids[i], &address, 0, NULL, &bytes, &format) != noErr ||
+            !isfinite(format.mSampleRate) || format.mSampleRate <= 0 || format.mChannelsPerFrame == 0)
             return NO;
         printf("input_format=%.0f Hz %u ch %u bit id=0x%08x flags=0x%x\n",
                format.mSampleRate, (unsigned)format.mChannelsPerFrame, (unsigned)format.mBitsPerChannel,
@@ -337,10 +345,20 @@ static int capture(NSURL *output, long seconds, BOOL tone, BOOL playback)
 {
     if (report_tcc() != OK)
         return NoPermission;
-    AudioDeviceID device = default_input();
+    AudioDeviceID device = default_device(kAudioHardwarePropertyDefaultInputDevice);
     if (!report_input(device)) {
         fprintf(stderr, "record: no named default input with a readable stream format\n");
         return Error;
+    }
+    AudioDeviceID speaker = kAudioObjectUnknown;
+    if (tone || playback) {
+        speaker = default_device(kAudioHardwarePropertyDefaultOutputDevice);
+        NSString *name = device_name(speaker);
+        if (name.length == 0) {
+            fprintf(stderr, "record: no named default output\n");
+            return Error;
+        }
+        printf("output_device=%s\n", name.UTF8String);
     }
 
     // The recorder owns a fresh path; publish the finalized file without replacing any prior result.
@@ -366,8 +384,12 @@ static int capture(NSURL *output, long seconds, BOOL tone, BOOL playback)
         } else {
             printf("recording_published=yes\n");
             status = analyze(output, tone, seconds);
-            if (default_input() != device) {
+            if (default_device(kAudioHardwarePropertyDefaultInputDevice) != device) {
                 fprintf(stderr, "record: default input changed during capture\n");
+                status = Error;
+            }
+            if (speaker != kAudioObjectUnknown && default_device(kAudioHardwarePropertyDefaultOutputDevice) != speaker) {
+                fprintf(stderr, "record: default output changed during capture\n");
                 status = Error;
             }
             if (playback && status == OK && !play_recording(output))
