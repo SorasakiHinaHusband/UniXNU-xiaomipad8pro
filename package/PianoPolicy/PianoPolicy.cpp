@@ -252,12 +252,12 @@ struct sysctl_oid gOidStatus, gOidLpm, gOidHpm, gOidLidArm, gOidLidSleepAC;
 SYSCTL_DECL(_machdep);
 
 namespace {
-void fillOid(struct sysctl_oid &o, const char *name, int kind, int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *),
-             const char *fmt, const char *descr)
+void fillOid(struct sysctl_oid &o, const char *name, uint32_t kind,
+             int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *), const char *fmt, const char *descr)
 {
   o.oid_parent = &sysctl__machdep_children;
   o.oid_number = OID_AUTO;
-  o.oid_kind = kind | CTLFLAG_OID2;
+  o.oid_kind = static_cast<int>(kind | CTLFLAG_OID2);
   o.oid_arg1 = nullptr;
   o.oid_arg2 = 0;
   o.oid_name = name;
