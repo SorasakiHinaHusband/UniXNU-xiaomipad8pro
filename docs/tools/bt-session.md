@@ -19,7 +19,7 @@ export BT_SESSION_SSH="$HOME/piano-harness/bin/tsudo"
 export REDACT_WIFI="$HOME/piano-harness/bin/redact-wifi.py"
 CAP=tooling/native/bt-session-capture.sh
 
-btroot() { "$BT_SESSION_SSH" --raw "$1" 2>&1 | python3 "$REDACT_WIFI"; }
+btroot() (set -o pipefail; "$BT_SESSION_SSH" --raw "$1" 2>&1 | python3 "$REDACT_WIFI")
 ```
 
 Run the following checks using that same shell. The output shows the live boot, staged files, mounted bytes, service state
@@ -112,6 +112,7 @@ The main session enters the capture commands on the Mac. For each attempt, sampl
 Mark `*-pairing` as the pairing LED starts and `*-connect` just before the owner clicks Connect. Use `*-outcome` with the
 visible result, then allow six seconds for the driver's five-second counter refresh before sampling after. In the note, record
 the model or device role, LED behavior, UI state and input outcome. Keep network names, peer addresses and passkeys out of notes.
+Record the initial Wi-Fi setting. If it was off, turn it on for the baseline and mark `wifi-on 'initially off'`.
 
 | Time | Owner actions and what success looks like | Main session capture |
 |---|---|---|
@@ -130,7 +131,8 @@ until the trace establishes it. Report the two devices separately. A Bluetooth r
   `SPBluetoothDataType`, HCI controller and transport registry entries, PianoBt state and relevant sysctls.
   Each `*.counters.txt` holds the per-attempt registry counters, Wi-Fi power and daemon PID. Compare only samples from the
   same boot, and use the counter differences over the matched windows.
-- `bluetoothd.log` is `log show --start` from the tablet's session-start event through session-end. Find the pairing interval
+- `bluetoothd.log` is `log show --start` from the tablet's session-start event through session-end. If the start timestamp
+  is unavailable, the first confirmed tablet marker after it is used. Find the pairing interval
   using `*-pairing`, `*-connect` and `*-outcome`. Find the corresponding handle and its events in `hci.txt`. That file records
   PacketLogger event counts by code and LE subevent per file, selected command and event timestamps, requested and negotiated
   interval/latency/supervision timeout, length, PHY, and initial ATT/SMP activity. It contains field summaries without packet
@@ -143,7 +145,8 @@ until the trace establishes it. Report the two devices separately. A Bluetooth r
   or capture gaps, and the relevant counter changes in any shared summary.
 
 If the preparation enabled tracing, restore its previous state **after** finish. Leave existing tracing alone when it was
-already active. Keep the backup path from the preparation in the same Mac shell.
+already active. Keep the backup path from the preparation in the same Mac shell. The restored preference applies on the
+next normal daemon start. Keep the current daemon running to preserve any session-local pairing state.
 
 ```bash
 if [[ ${trace_backup:-} =~ ^/private/var/tmp/bt-session-trace\.[A-Za-z0-9]+$ ]]; then
@@ -154,7 +157,6 @@ if [ -f \"\$backup/had-domain\" ]; then
 else
     /usr/bin/defaults delete \"\$domain\" || exit 1
 fi
-/bin/launchctl kickstart -k system/com.apple.bluetoothd || exit 1
 /bin/rm -f \"\$backup/original.plist\" \"\$backup/had-domain\"
 /bin/rmdir \"\$backup\"" > "$RUN/trace-restore.txt"
 fi
@@ -176,7 +178,7 @@ with the same peripheral, pairing channel and position is the closest comparison
 
 | Hypothesis | Evidence to look for in the marked attempt |
 |---|---|
-| The keyboard stopped advertising, was on the wrong channel, or reconnected elsewhere | Owner confirms the pairing LED and isolates other hosts. With radio reports still arriving, no matching row and no LE Create Connection after the click put the failure before initiation. Aggregate RSSI alone cannot identify the peer. |
+| The keyboard stopped advertising, was on the wrong channel, or reconnected elsewhere | Owner confirms the pairing LED and isolates other hosts. A missing row puts the failure in discovery. A visible row and a marked click with no LE Create Connection point to UI or daemon initiation. Aggregate RSSI alone cannot identify the peer. |
 | Wi-Fi activity is starving Bluetooth, or the Bluetooth RF path is weak | Compare `piano-bt-radio-le-rssi`, `piano-bt-radio-le-reports`, `piano-bt-radio-classic-results` and `piano-bt-radio-inquiries` deltas with Wi-Fi on and off at the same distance. A stronger histogram plus a successful link off Wi-Fi supports coexistence. The same weak pattern in both windows leaves antenna, controller RF and peer behavior open. |
 | Controller initiation or first connection events fail | Find LE Create Connection or Extended Create Connection, its Command Status, then LE Connection Complete. A rejected command, no completion, a nonzero completion such as `0x3e`, and a successful completion followed by Disconnection Complete reason `0x08` are different boundaries. Check requested and negotiated interval, latency and supervision timeout before attributing `0x08` to the link-ready wait. |
 | The mask change is missing after daemon startup or reset | Look for a positive `piano-bt-h4-le-masks-patched` counter and the boot console's `LE event mask ...101f -> ...185f` (or another mask with bits 6 and 11 set). When the trace includes startup or reset, check HCI `0x2001` Command Complete status `0x00`. A host-side trace records the command before PianoBt rewrites it. |

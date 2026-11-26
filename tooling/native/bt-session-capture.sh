@@ -40,6 +40,10 @@ except subprocess.TimeoutExpired:
     os.killpg(child.pid, signal.SIGKILL)
     child.wait()
     sys.exit(124)
+except KeyboardInterrupt:
+    os.killpg(child.pid, signal.SIGKILL)
+    child.wait()
+    sys.exit(130)
 ' "$1" "$ssh_helper" --raw "$2"
 }
 
@@ -179,7 +183,9 @@ def command(data):
         return
     prefix = f"CMD 0x{opcode:04x} {commands[opcode]}"
     p = data[3:]
-    if opcode == 0x200D and len(p) >= 25:
+    if opcode == 0x2001 and len(p) == 8:
+        yield f"{prefix} host_mask=0x{int.from_bytes(p, 'little'):016x}"
+    elif opcode == 0x200D and len(p) >= 25:
         yield f"{prefix} {requested(p, 13)}"
     elif opcode in (0x2043, 0x2085) and len(p) >= (12 if opcode == 0x2085 else 10):
         offset = 12 if opcode == 0x2085 else 10
@@ -216,7 +222,8 @@ def event(code, p):
                  0x36: "Simple Pairing Complete", 0x59: "Encryption Change v2"}
         # Simple Pairing Complete contains an address at this offset, not a handle.
         link = "" if code == 0x36 else f" {handle(p, 1)}"
-        return f"{names[code]} status=0x{p[0]:02x}{link}"
+        enabled = f" enabled=0x{p[3]:02x}" if code in (0x08, 0x59) and len(p) >= 4 else ""
+        return f"{names[code]} status=0x{p[0]:02x}{link}{enabled}"
     if code == 0x10 and p:
         return f"Hardware Error code=0x{p[0]:02x}"
     if code != 0x3E or not p:
@@ -344,6 +351,7 @@ REMOTE
         fi
     done <<< "$paths"
     if (( ! found )); then
+        printf '\ncoverage=no complete HCI trace with events in the marked window\n' >> "$run/hci.txt"
         record_status hci "no_complete_trace_with_events"
     fi
 }
@@ -375,7 +383,7 @@ case "$1" in
             marker session-end || :
         fi
         save_text after.txt 55 "$counts"$'\n'"$snapshot" || :
-        start_epoch=$(/usr/bin/awk -F '\t' '$1 == "session-start" { print $3 }' "$run/markers.tsv")
+        start_epoch=$(/usr/bin/awk -F '\t' '$1 != "session-end" && $3 ~ /^[0-9]+$/ { print $3; exit }' "$run/markers.tsv")
         end_epoch=$(/usr/bin/awk -F '\t' '$1 == "session-end" && $3 != "unavailable" { print $3; exit }' "$run/markers.tsv")
         if [[ $start_epoch =~ ^[0-9]{10}$ && $end_epoch =~ ^[0-9]{10}$ && $end_epoch -ge $start_epoch ]]; then
             start_time=$(date -u -r "$start_epoch" '+%Y-%m-%d %H:%M:%S+0000')
