@@ -92,7 +92,7 @@ metal_sustain_installed() {
   else
     grade_rc=$?
   fi
-  if [ "$grade_rc" -eq 2 ]; then
+  if [ "$grade_rc" -eq 2 ] && grep -q '^VOID installed Metal sustain (CONFOUND):' "$result/grade.txt"; then
     verdict 'VOID metal-sustain: external interaction in bounded console capture (metal-sustain/grade.txt)'
     return 2
   fi

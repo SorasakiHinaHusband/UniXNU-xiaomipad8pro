@@ -87,12 +87,12 @@ def grade(root):
     markers = list(CONSOLE_MARKER.finditer(console))
     require(len(markers) == 2 and markers[0][1] == markers[1][1] and
             [marker[2] for marker in markers] == ['BEGIN', 'END'], 'incomplete console window')
-    console = console[markers[0].end():markers[1].start()]
-    touches, browser_opens, confound_ranges = console_confounds(console)
+    bounded_console = console[markers[0].end():markers[1].start()]
+    touches, browser_opens, confound_ranges = console_confounds(bounded_console)
     print(f'Console confounds touch_contacts={touches} browser_accelerator_opens={browser_opens}')
     fault = FAULT.search(console)
     require(fault is None, f'GPU hang/reset/error in console window: {fault.group() if fault else ""}')
-    require(re.search(r'R3b LV .*\blvl=\d+ .*\bmhz=\d+', console), 'no in-window GPU console heartbeat')
+    require(re.search(r'R3b LV .*\blvl=\d+ .*\bmhz=\d+', bounded_console), 'no in-window GPU console heartbeat')
 
     before_boot, before_freq, before_recovery = snapshot(root / 'before.txt')
     after_boot, after_freq, after_recovery = snapshot(root / 'after.txt')
@@ -217,9 +217,9 @@ def grade(root):
     floor_failure = low_fps_windows or slow_windows
     floor_details = f'fps < {FPS_MIN:g} in {low_fps_windows}, p99 > {P99_MAX_MS:g} ms in {slow_windows}'
     if touches or browser_opens:
-        print('VOID installed Metal sustain (CONFOUND): external interaction in bounded console capture')
         if floor_failure:
             print(f'Performance floor missed ({floor_details})')
+        print('VOID installed Metal sustain (CONFOUND): external interaction in bounded console capture')
         return 2
     require(not floor_failure, f'performance floor: {floor_details}')
     print('PASS installed Metal sustain')
