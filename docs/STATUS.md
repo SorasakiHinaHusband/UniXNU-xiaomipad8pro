@@ -1,6 +1,6 @@
 English | [简体中文](STATUS.zh-CN.md)
 
-# Support status (2026-11-26)
+# Support status (2026-11-27)
 
 One row per feature. Every status comes from a run on the tablet; host tests, analyses and "built, not run" work do not count.
 
@@ -11,23 +11,23 @@ One row per feature. Every status comes from a run on the tablet; host tests, an
 
 The installed daily build is **v13.1y12q** (2026-11-26). Data concurrent mode and USB debug network TX flow control are on by
 default. The display stays at 60 Hz, with Night Shift routing, native panel sleep and refresh switching off.
-"Verified" names the build and date of the newest run that showed the result. Daily results are in
-[results-2026-11-26.md](results-2026-11-26.md), including the [evening RAM checks](results-2026-11-26.md#evening),
-and the earlier `results-*.md` pages.
+"Verified" names the build and date of the run that showed the result. Daily results are in
+[results-2026-11-27.md](results-2026-11-27.md), [results-2026-11-26.md](results-2026-11-26.md) and the earlier
+`results-*.md` pages.
 
 ✅ fully supported · 🟡 partial / in progress · ❌ not supported
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-26 | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | installed v13.1y12q and RAM v13.1y12s, 2026-11-26 | PianoDpu flips on the boot framebuffer and native screenshots are enabled. Daily v13.1y12q has neutral colours, with Night Shift routing, native panel sleep and refresh switching off. The fixed 120 Hz and 144 Hz profiles remain RAM-only. On v13.1y12s, the PCC fix changed the visible Night Shift tint from blue to orange, but the panel still looked warm with Night Shift off. v13.1y12s was held pending tablet verification of the off-state unity fix (`ns-base`). M5 logged 9/10 master-first sleeps and 9/10 bonded DSI wakes as OK, but the panel stayed dark in all three post-wake stills. Analysis continues. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-27 | Both disk boots reached the login window at +32 s and verified that the owner's Data store resumed. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | installed v13.1y12q, 2026-11-26; RAM v131y12t-qual1, 2026-11-27 | PianoDpu flips on the boot framebuffer and native screenshots are enabled. Daily v13.1y12q has neutral colours at 60 Hz. On RAM, DPU clock/RPMh readback passed, and Night Shift graded unity (R/G/B 1.000) while off and warm after wake. Screen auto-lock interrupted the mid-run warm transition. In M5R, the compression-route registers matched the bright desktop after wake, but the panel stayed dark. The fix-image gate is HOLD. Night Shift routing, native panel sleep and refresh switching stay off in daily use. The fixed 120 Hz and 144 Hz profiles remain RAM-only. |
 | 120 Hz / 144 Hz | 🟡 Partial | RAM m120c-120 and m120c-144, 2026-11-26 | Fixed scanout on both links reached 120.004 Hz and, with the MM0 bandwidth vote, a stable 144.146 Hz, with zero interface underruns in both runs. Both profiles are off by default. App cadence was about 48–60 callbacks/s. At 120 Hz, all 153 type-3 packets were accepted with zero transport errors and monotonic timestamps. The app latched 51.2 distinct new surfaces/s and all 3562 drawables reported zero `presentedTime`. Swap-service pipelining passed host tests and awaits tablet validation. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
 | Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
 | Wi-Fi | 🟡 Works (installed), partial | v13.1y12l, 2026-11-26; v13.1x, 2026-11-21 | Joins at boot (WPA2, DHCP, DNS); radio off/on from the switch rejoins; a forced link loss rejoins within seconds; country code set. Pending: joining by clicking a network row by hand, auto-rejoin after a hotspot goes away and comes back, and a multi-access-point office network. |
-| Bluetooth | ❌ Not yet (in progress) | owner session on an installed v13.1 build, 2026-11-20; v13.1y12m, 2026-11-26 | Discovery works; a Bluetooth LE connection timed out (HCI 0x08) before the link was ready, so keyboards and mice did not pair. The LE event-mask fix is now on the daily line (v13.1y12m: the controller is ready and the mask is set at the Bluetooth daemon's start); pairing a keyboard and a mouse still needs a hands-on test. The radio coexistence with Wi-Fi (the shared antenna) is under analysis. Bluetooth audio not started. |
-| Speakers | ✅ Works (installed) | v13.1u, 2026-11-21 (audible tone) | Playback, volume and mute; speaker protection at gain 243 and the stock Dolby "Movie" processing run on the DSP. Since 2026-11-23, installs are silent by request, so later installs check the output device without a tone. |
-| Microphone | 🟡 Partial | v13.1y12l, 2026-11-26; noise reduction on RAM mic-ns4b, 2026-11-23 | The raw "Mic" device (the default input) and a "Mic (noise reduced)" device (RNNoise) are in the audio system on the installed boot. The recording-during-playback stutter was fixed on the installed system (2026-11-21). An app recording (QuickTime) played back by hand is pending. |
+| Bluetooth | ❌ Not yet (in progress) | v13.1y12q, 2026-11-27; owner session on installed v13.1, 2026-11-20 | Installed preflight reported BT_PREFLIGHT READY (32/32 after 48 s), with the controller published and powered on and LE event mask bits 6 and 11 set. Discovery worked in the earlier owner session, but the LE connection timed out (HCI 0x08). Keyboard and mouse pairing awaits the owner's 20-minute hands-on session. Wi-Fi coexistence is under analysis. Bluetooth audio is open. |
+| Speakers | ✅ Works (installed) | v13.1u, 2026-11-21 (audible tone); v13.1y12q, 2026-11-27 (read-only) | Playback, volume and mute work. Speaker protection at gain 243 and the stock Dolby "Movie" processing run on the DSP. Installs have been silent by request since 2026-11-23. The read-only daily check confirmed speaker and MiPlay readiness at timing profile 0. Concurrent playback and recording still need an active check. |
+| Microphone | 🟡 Partial | RAM v131y12t-qual1, 2026-11-27; installed v13.1y12l, 2026-11-26; noise reduction on RAM mic-ns4b, 2026-11-23 | Installed audio exposes the raw "Mic" (default input) and "Mic (noise reduced)" (RNNoise). The recording-during-playback stutter was fixed on the installed line on 2026-11-21. On RAM, unattended AVFoundation recording captured the 1002.06 Hz tone, with hard clipping. A clean RAM recheck and hands-on QuickTime recording and playback are pending. |
 | Cameras: Photo Booth | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Live front preview with no prompt; the effects grid opens. |
 | Cameras: QuickTime | 🟡 Partial | v13.1y12l, 2026-11-26 | 10 s H.264 movies from the front and rear cameras record (AVFoundation, the QuickTime High preset). A New Movie Recording saved and played back by hand is pending. Encoding is in software. |
 | Cameras: FaceTime | 🟡 Not yet verified | permissions pre-granted, v13.1y12l, 2026-11-26 | Both cameras are listed and FaceTime has Camera and Microphone access; a FaceTime self-view has not been checked. |
@@ -35,8 +35,8 @@ and the earlier `results-*.md` pages.
 | Charging: PD 9 V (buck) | ✅ Works (installed) | v13.1y12d, 2026-11-24 | On by default. Fixed 9 V PD on the stock charger: 9 V / 1.6 A (about 14 W, the current the charger firmware requests, as on Ubuntu). PPS 9 V (up to 2.5 A) is built but not run. |
 | Charging: 80 % hold | ✅ Works | RAM chg-buck6, 2026-11-17; in every installed profile since | Stops at 80 %, resumes at 75 %. |
 | Charging: charge pump / MiPPS | ❌ Not yet | first attended try, 2026-11-24 | Off by default. The first attempt stayed at a 100 mA input limit (an unmapped vendor power object); fixed in the build, the next attended test is pending. |
-| Battery percentage | ✅ Works (installed) | installed ESP v2, 2026-11-14 and RAM m120c-120, 2026-11-26 | The installed system shows battery percentage and power state. On RAM the battery registry reported 122 cycles, 9200 mAh design capacity and 8781 mAh full capacity. System Information showed 122 cycles and “Service Recommended”, with Maximum Capacity absent. The condition fix passed host tests and awaits tablet validation. |
-| Sleep and wake | 🟡 Partial | v13.1y12m, 2026-11-26 (installed policy and RAM qualification) | Suspend-to-idle with a timer wake works. Wi-Fi and the USB link recover and the lock screen appears. The installed build arms the cover and power-key policy. RAM tests simulated a cover close on the charger (locks without suspending) and a power-key press (sleeps and wakes). The physical keys and closing the cover on battery still need attended checks. |
+| Battery percentage | ✅ Works (installed) | installed ESP v2, 2026-11-14; RAM m120c-120, 2026-11-26; RAM v131y12t-qual1, 2026-11-27 | The installed system shows battery percentage and power state. On m120c-120, the battery registry reported 122 cycles, 9200 mAh design capacity and 8781 mAh full capacity. System Information showed 122 cycles and “Service Recommended” and omitted Maximum Capacity. The opt-in BH-2 RAM check published `AppleSmartBatteryPack`. Its gate is HOLD after the `powerd` persistent storage write returned `kIOReturnIOError`. |
+| Sleep and wake | 🟡 Partial | v13.1y12m, 2026-11-26 (installed policy and RAM checks); RAM v131y12t-qual1, 2026-11-27 | The v13.1y12m checks recorded Wi-Fi and USB recovery and return to the lock screen after wake. The installed build arms the cover and power-key policy. The latest RAM qualification passed suspend-to-idle with timer wake and simulated power-key and lid policies. Earlier RAM checks covered charging with the lid closed (locks without suspending) and simulated power-key sleep and wake. The physical power key and closing the cover on battery still need attended checks. |
 | Brightness: manual | 🟡 Partial | keys on installed v12, 2026-11-19; slider path on v13.1i | Brightness keys work. The slider path through the system's brightness control works; a hand drag in Control Center is pending. |
 | Brightness: automatic | ✅ Works (installed) | v13.1y12l, 2026-11-26 | The light sensor drives automatic brightness; manual moves do not end automatic mode. A real light-change span is pending. |
 | GPU: Metal (Adreno 830) | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Our Metal plug-in runs WindowServer, the desktop and apps; ImageIO, Core Image on Metal, MetalKit texture loading and Quick Look thumbnails pass: 30 of 30 graded paths, including the 4032-pixel Core Image and HEIC texture paths that ran out of memory before; Preview opens a 4032-pixel photo. |
@@ -46,45 +46,46 @@ and the earlier `results-*.md` pages.
 | Safari: WebGL 2 and WebGPU | ✅ Works (installed) | v13.1y12o, 2026-11-26 | WebGL 2 and WebGPU passed again. On v13.1y12m, the WebGPU adapter was "adreno" and the test page ran at about 52 fps with correct readback. |
 | Safari: hardware video decode | ✅ Works (installed) | v13.1y12o, 2026-11-26; v13.1y12i, 2026-11-25 | H.264 up to 1920x1088 decodes on the Iris video core. The 1080p test again reported zero dropped frames. |
 | Safari: HEVC and 4K | ✅ Works (installed), software | v13.1y12j, 2026-11-25; HEVC replayed on v13.1y12o | HEVC 2160p 600/0 at 29.9 fps and H.264 2160p 591/5 on v13.1y12j, in Apple's software decoders. VP9 and AV1 are not supported. |
-| Chrome: GPU acceleration | ✅ Works (installed) | v13.1y12o, 2026-11-26; earlier tests on v13.1y12m and v13.1y12l | WebGL measured 37.7 fps through ANGLE on Metal (Adreno 830) with the GPU sandbox on and no flags. Earlier checks covered GPU compositing, canvas 2D at 56 fps, scrolling at 60 fps with no frame over 34 ms, and video playback with 0-1 dropped frames: H.264 and HEVC at 1080p and 2160p, VP9 and AV1 at 1080p (HEVC through VideoToolbox, the others in Chrome's software decoders). Those checks produced no crash report. Chrome can exhaust the RAM-backed Data disk on RAM boots. |
-| Chrome: WebGPU | ✅ Works (installed) | v13.1y12o, 2026-11-26 | Without flags, 6 of 6 WebGPU contexts opened on Qualcomm "adreno-8xx", with correct compute results and frame readback. Kernel patch 0075 gives processes a 47-bit user address space. All 17 Chrome processes reported secure V8 sandbox mode and a 1152 GB reservation, resolving the transient v13.1y12m finding. |
+| Chrome: GPU acceleration | ✅ Works (installed) | v13.1y12q, 2026-11-27; v13.1y12o, 2026-11-26; earlier tests on v13.1y12m and v13.1y12l | Flags-free WebGL 2 measured 37.89 fps at 3200 × 1738 through ANGLE Metal (Adreno 830, `GraphiteDawnMetal`). Chrome played H.264 and HEVC at 1080p and 4K and VP9 and AV1 at 1080p with 0–1 dropped frames. HEVC went through VideoToolbox. The run recorded zero crashes, PianoA830 failures or sandbox denies. Earlier checks with the GPU sandbox on covered GPU compositing, canvas 2D at 56 fps and scrolling at 60 fps with no frame over 34 ms. Chrome can exhaust the RAM-backed Data disk on RAM boots. |
+| Chrome: WebGPU | ✅ Works (installed) | v13.1y12q, 2026-11-27; v13.1y12o, 2026-11-26 | Without GPU, WebGPU or sandbox flags, 6/6 contexts opened on `qualcomm` / `adreno-8xx` (`fallback_adapter = false`), with correct compute and exact offscreen and canvas `bgra8unorm` pixel readback. Context-provider, ring-buffer and transfer-buffer errors were all zero. Kernel patch 0075 supplied 47-bit user VA. All 17 Chrome processes reported secure V8 sandbox mode (bucket 0) and a 1152 GB reservation. |
 | Video playback (QuickTime) | ✅ Works (installed) | v13.1x, 2026-11-21 | AVC High and HEVC Main10 decoded in hardware; about 100 s each with 0 transient or dark frames on the webcam. |
 | Energy modes | 🟡 Partial | v13.1y12l, 2026-11-26 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified by hand. |
 | Login window idle CPU | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
 | App launches | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
-| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12q (installed), 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue used to drop frames during large single transfers; TX flow control (66/66 exact transfers in its test) is on by default since v13.1y12q. |
+| USB debug (console, root shell, ssh) | ✅ Works (installed) | installed v13.1y12q and RAM v131y12t-qual1, 2026-11-27; installed v13.1y12q, 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. TX flow control is on by default since v13.1y12q and was active on the November 27 disk check. The November 27 RAM matrix passed 66/66 exact transfers with zero driver drops. |
 | OS switcher (Android / macOS) | 🟡 RAM only, read-only | RAM v13.1y12e, 2026-11-24 | The boot-flag sysctls read the flag; writes are refused by design. A full switch has not been run. |
 | USB host / OTG | ❌ Not yet | RAM usb-a2d, 2026-11-18 (empty port) | Host mode starts on an empty port; VBUS supply and a real device are not done. |
 | External display (USB-C DP) | ❌ Not yet | none | Design only. |
-| Auto-rotate and other sensors | ❌ Not yet | RAM, 2026-11-19 (accelerometer sample) | The light sensor works; auto-rotate is off in the daily profile and in analysis. |
+| Auto-rotate and other sensors | ❌ Not yet | RAM v131y12t-qual1, 2026-11-27 | The light sensor works. The RAM check passed the accelerometer stream and the `piano-rotated` boot-argument read past 1024 bytes. Auto-rotate remains off in the daily profile and in analysis. |
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
 | Memory (16 GB) | 🟡 Partial | installed v13.1y12l and RAM m120c-120 and ram16g-hevc1, 2026-11-26 | The installed system uses 13 GiB (13310 MiB). At idle it had 47% free, with no compression, swap or memory pressure. The EFI audit classified 319/322 two-MiB slabs as non-runtime (CMA 128/128, DXE 184/186, FD 7/8), released 0 MiB and awaits owner verification. The 684 MiB mixed HEVC arena (274 MiB from region 0 and 410 MiB from XNU) passed its RAM reservation self-test. All 24/24 decoded 4K Main10 frames matched the golden P010 hashes, 12 on first open and 12 on resident reopen, with no video faults. The GPU memory tier and driver pools remain in progress. |
-| Internal storage (UFS) | 🟡 Partial | installed v13.1y12q (concurrent mode), v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | The first installed Data benchmark reached 1435 MB/s sequential read and 519 MB/s sequential write at 4 MiB. Compared with serial mode, concurrent 4 KiB random-read IOPS reached 4.9× at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential read and write throughput reached 4.8× and 1.5×, and 4 KiB random-write IOPS reached 0.9×. Mixed-load read p99 fell from 2528 to 269 µs. The canary survived a clean reboot. In scratch-window tests, concurrent, write-back and queue modes each preserved all 32 records acknowledged after `F_FULLFSYNC` across a direct reset. The unacknowledged tail could be lost. Concurrent mode switches on after Data mounts on v13.1y12q. Write-back and queue modes stay off. |
+| Internal storage (UFS) | 🟡 Partial | installed v13.1y12q (concurrent mode), 2026-11-27; installed v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | The first installed Data benchmark reached 1435 MB/s sequential read and 519 MB/s sequential write at 4 MiB. Compared with serial mode, concurrent 4 KiB random-read IOPS reached 4.9× at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential read and write throughput reached 4.8× and 1.5×, and 4 KiB random-write IOPS reached 0.9×. Mixed-load read p99 fell from 2528 to 269 µs. The canary survived a clean reboot. In scratch-window tests, concurrent, write-back and queue modes each preserved all 32 records acknowledged after `F_FULLFSYNC` across a direct reset. The unacknowledged tail could be lost. Concurrent mode switches on after Data mounts on v13.1y12q. Write-back and queue modes stay off. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 ## Known gaps
 
-- Bluetooth pairing (the LE event-mask fix is on the daily line; a hands-on keyboard and mouse test is pending; radio coexistence
-  under analysis) and Bluetooth audio.
+- Bluetooth preflight is ready on the daily build. The owner's 20-minute keyboard and mouse pairing session is pending.
+  Radio coexistence is under analysis, and Bluetooth audio remains open.
 - Physical power-key checks, closing the cover on battery, the Energy Mode picker and hand-testing the brightness slider.
 - Chrome on RAM boots.
 - Charge pump / MiPPS fast charging; PPS 9 V.
 - Fixed 120 Hz and 144 Hz scanout work on RAM. High-refresh app presentation and positive `presentedTime` at 120 Hz remain
   unverified. Swap-service pipelining awaits a RAM check on the tablet. Both fixed profiles and refresh switching are off by default.
-- The v13.1y12s RAM boot verified the Night Shift PCC colour fix. The off-state was still warm, so v13.1y12s was held. The
-  off-state unity fix awaits a RAM check on the tablet. The M5 bonded DSI wakes logged as OK still left the panel dark.
-  Night Shift routing and native panel sleep stay off on the installed v13.1y12q.
-- The battery condition fix awaits a RAM check on the tablet. System Information still showed “Service Recommended” and
-  omitted Maximum Capacity in the m120c-120 run.
+- Night Shift awaits an unlocked `ns-base` recheck and owner approval for daily routing. The M5 panel stayed dark after wake,
+  leaving the fix-image gate on HOLD. Night Shift routing and native panel sleep stay off on the installed v13.1y12q.
+  [RAM qualification](results-2026-11-27.md#ram-qualification)
+- The opt-in BH-2 check is on HOLD pending the owner's decision on 27.3 `powerd` analysis. System Information showed
+  “Service Recommended” and omitted Maximum Capacity in the earlier m120c-120 run.
 - The EFI audit awaits owner verification and released 0 MiB. Mixed 4K Main10 HEVC passed on RAM. The GPU memory tier and
   driver pools remain in progress.
 - Data concurrent mode is live on the installed build. At QD8, 4 KiB random writes ran at 0.9× the serial rate in testing.
-  Write-back and queue modes stay off. [Afternoon storage results](results-2026-11-26.md#data-storage)
+  The Disk M5 throughput A/B remains pending, and write-back and queue modes stay off. [Afternoon storage results](results-2026-11-26.md#data-storage)
 - USB host devices, external display, auto-rotate (in analysis), hardware video encode, VP9/AV1 in Safari.
 - Validation of the install guide on other units.
-- Hand checks pending on the installed system: microphone recording in an app, QuickTime recording by hand, FaceTime self-view,
-  joining a Wi-Fi network from the menu, Wi-Fi auto-rejoin after the network returns.
+- The clean RAM microphone recheck and the active installed duplex ledger remain pending. The installed system also awaits
+  hands-on microphone recording in an app, QuickTime movie recording, FaceTime self-view, joining a Wi-Fi network from the
+  menu and Wi-Fi auto-rejoin when the network returns.
 
 ## Showcase
 
