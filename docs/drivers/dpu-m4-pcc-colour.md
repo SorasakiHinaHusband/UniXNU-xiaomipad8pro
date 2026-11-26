@@ -117,6 +117,27 @@ optical capture is still needed. The first warm matrix was already in the
 registers before the reported visible change at login, so the console
 alone cannot explain why the lock screen appeared correct.
 
+## Host verification
+
+`dpu_pcc_host.cpp` drives the actual matrix decode, correction, PCC
+programmer and read-back against the register model. The #1 raw log
+ends partway through the final row, so the last two inputs are
+reconstructed at PCC precision from its matching snapshot. The
+post-login input is reconstructed at the same precision from the
+74111–74112 snapshot. The expected words below are ordered by
+increasing offset from `+0x10` through `+0x30` on both halves.
+
+| Input | Expected PCC words in register order |
+| --- | --- |
+| Identity, enabled unity base | `08000 00000 00000 \| 00000 08000 00000 \| 00000 00000 08000` |
+| First captured matrix, unity correction | `074a0 3ff8a 3ff14 \| 009af 06c84 3fca7 \| 001b2 00039 05ba9` |
+| Stronger post-login matrix, unity correction | `05349 3fe15 3fdb0 \| 027d9 030d5 3f8c3 \| 004de 00067 01125` |
+
+The test checks that red gain is at least blue gain and that equal RGB
+inputs yield R ≥ G ≥ B, with all three channels present. The existing
+state test also exercises scalar changes, firmware base composition,
+bypass restoration, rollback and replay.
+
 ## Fix-image gate
 
 Path: CoreBrightness → WindowServer/QuartzCore 27.3 → IOMobileFramebuffer selectors 0x37/0x32 → NativeGopDisplay → PianoDpu worker → DSPP0/1 PCC v6 → CTL0 latch → both panel halves. The Linux CTM and Qualcomm downstream paths and the sheng handoff are compared above.

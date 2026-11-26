@@ -179,9 +179,10 @@ panel's rate group (B2/B3 over the DSI command path while video runs). Risks: a 
 (Ubuntu's full-modeset 60 Hz was grey until the stock order was used); the TDDI touch follows display timing (watch touch at 60 Hz);
 the DSI shadow offsets are confirmed by B1a's raw `timing words`.
 
-**4.4 Legacy PCC experiment (B1d).** PCC in DSPP0 and DSPP1 (both halves, same matrix): output R from (R,G,B) at +0x10/+0x14/+0x18, G
-+0x1c/+0x20/+0x24, B +0x28/+0x2c/+0x30 (msm's PCC_<input>_<output>_OFF names), S3.15; enable +0 bit 0; flush CTL_DSPP0/1_FLUSH bit 4
-+ CTL_FLUSH b29, latched with the frame. A warm white point is a diagonal (e.g. 3400 K ≈ 1.0, 0.73, 0.45). macOS reaches the display through IOMFB's `swap_set_color_matrix` (slot
+**4.4 Legacy PCC experiment (B1d).** DSPP0 and DSPP1 each take the same S3.15 matrix. Input R contributes to outputs R/G/B at
++0x10/+0x14/+0x18, input G at +0x1c/+0x20/+0x24, and input B at +0x28/+0x2c/+0x30. Enable is +0 bit 0.
+CTL_DSPP0/1_FLUSH bit 4 and CTL_FLUSH bit 29 latch the words with the frame. A warm white point can use a diagonal
+(e.g. 3400 K ≈ 1.0, 0.73, 0.45). macOS reaches the display through IOMFB's `swap_set_color_matrix` (slot
 343) and `set_gamma_table` (slot 307), both stubs in NativeGopDisplay unless `piano-dpu-pcc` is given.
 A per-channel linear gamma ramp maps onto a PCC diagonal. A non-linear one needs GC v2 via REGDMA.
 Re-applied at display-on; no CPU cost per frame. Needs the DSPP in ABL's path (B1a reads the PCC/GC enables; LM n → DSPP n is the
@@ -204,10 +205,11 @@ windows contained no logged matrix changes. The M1 observer counted repeats and 
 need both counts and PCC snapshots to distinguish a repeat from a missing callback.
 
 The Linux reference is the piano kernel at `b5100d5f2e0b`, under `drivers/gpu/drm/msm/disp/dpu1`.
+The [M4 PCC colour analysis](dpu-m4-pcc-colour.md) gives the full register comparison and the y12q blue-cast evidence.
 
 | Linux reference | M4 path | Comparison |
 |---|---|---|
-| `dpu_crtc.c:45–46,794–817` converts DRM's sign-magnitude S31.32 CTM to row-major PCC coefficients | `DpuPcc.h` and `DpuNightShift.h` decode Apple's two's-complement words and apply the unsigned Q16.16 correction | Same channel ordering. Linux's macro drops the input sign. M4 preserves it with bit 17 of the PCC word as the sign. The signed encoding and transfer domain need optical verification. |
+| `dpu_crtc.c:45–46,794–817` converts DRM's sign-magnitude S31.32 CTM and discards the sign | `DpuPcc.h` and `DpuNightShift.h` decode Apple's two's-complement S31.32 and apply the unsigned Q16.16 correction | M4 writes signed 18-bit two's-complement words and follows Qualcomm SDE's input-grouped register layout. Optical verification is pending. |
 | `dpu_hw_dspp.c:15–26,58–76` programs the nine coefficients and enable or bypasses PCC | `DpuPcc.h` uses the same offsets and restores the captured enable and coefficient words | Same register sequence. M4 retains the firmware base when the input returns to neutral. |
 | `dpu_crtc.c:862–863,894–911` stages PCC for every mixer on a colour change or modeset | `DpuSlices.cpp` serializes colour, mode and wake requests on its worker | Same modeset replay, with display-wake replay and retention across silent slider changes. |
 | `dpu_hw_ctl.c:144–180,394–413` stages DSPP sub-block flushes and triggers CTL once | `DpuPcc.h` stages both DSPP PCC masks before one CTL flush, waits for its latch and reads back both halves | Same order. M4 checks the latch and both sets of register words. |
@@ -221,8 +223,8 @@ An OFF operation with no usable matrix or correction leaves the previous transfo
 the selected matrix. M1 received unity alongside its non-identity matrix.
 
 Display wake, a successful `set_digital_out_mode`, and a successful PianoDpu refresh switch replay the desired state. The PCC
-transaction holds the same lock as the flip engine until the latch and read-back finish. On a failed transaction the worker
-attempts to restore the last verified words on both DSPPs.
+transaction holds the same lock as the flip engine until the latch and read-back finish. Each changed program logs both DSPPs'
+verified words in ascending register order. On a failed transaction the worker attempts to restore the last verified words on both DSPPs.
 
 **4.5 Panel off/on (B1e, M5a).** With the default display sleep, the backlight goes dark and the DPU keeps scanning. M5a adds
 light sleep and stops fetch using the B1e command path. The DCS packet uses the host command FIFO described by the DSI0 FIFO
@@ -692,7 +694,7 @@ the GUI session and live flips before running the reads. Use M1's `nightshift.js
    Capture a white window spanning both halves with the C920. Keep the window, exposure and white balance fixed.
 2. Run `nightshift.js on 1.0` and wait for the transition to settle. Save the same snapshot, callback counts and C920 frame.
    Look for accepted `set_matrix #` at location 9, `setBrightnessCorrection #` if sent, and
-   `PianoDpu: night shift:` reporting one CTL flush and read-back on both DSPPs. Confirm that both halves warm consistently.
+   `PianoDpu: night shift: PCC read back` with the latched words from both DSPPs. Confirm that both halves warm consistently.
 3. Run `nightshift.js strength 0.5`, then `strength 1.0`. Take the same readings after each step. A new matrix or a changed
    correction should update PCC. A repeated or absent callback should keep both sets of words and the measured colour stable.
    Compare the IORegistry counters to distinguish repeats from no callbacks. Record the CoreBrightness log as the positive

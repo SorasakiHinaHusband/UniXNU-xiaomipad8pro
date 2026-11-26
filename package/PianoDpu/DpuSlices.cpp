@@ -523,8 +523,7 @@ void pccStart()
     enabled[d] = gIo.rd(pccReg(d, 0)) & 1u;
     for (unsigned o = 0; o < 3; ++o)
       for (unsigned i = 0; i < 3; ++i) {
-        int32_t v = int32_t(gIo.rd(pccReg(d, kPccCoef[o][i])) & 0x3ffffu);
-        if (v & 0x20000) v -= 0x40000;
+        const int32_t v = pccSignedQ15(gIo.rd(pccReg(d, kPccCoef[o][i])));
         found[d].m[o][i] = enabled[d] ? v * 2 : (o == i ? pcc::kOne : 0);
       }
     if (first < 0) first = int(d);
@@ -575,7 +574,8 @@ void nightShiftUpdateLocked(bool replay, const char *why)
   const pcc::NightShift state = gS.nightShift;
   IOLockUnlock(gLock);
   const pcc::PanelPcc wanted = pcc::nightShiftPrograms(gNightShiftBase, state);
-  if (!replay && pcc::same(wanted, gNightShiftLast)) return;
+  const bool changed = !pcc::same(wanted, gNightShiftLast);
+  if (!replay && !changed) return;
 
   const LivePath path = readPath(gIo, gA.ahbVote == 1);
   const pcc::NightShiftApply update = pcc::updateNightShift(gIo, path, wanted, gNightShiftLast, replay);
@@ -587,9 +587,18 @@ void nightShiftUpdateLocked(bool replay, const char *why)
   const pcc::Apply &a = update.result;
   ++gPccApplies;
   if (a.ok) {
-    if (replay || gPccApplies <= 32 || gPccApplies % 100 == 0)
+    if (changed) {
+      const auto &l = a.readback[0], &r = a.readback[1];
+      // Ascending offsets +0x10..+0x30, grouped by input R/G/B.
+      note("night shift: PCC read back apply %u, %s, en %x/%x, %d us; DSPP0 %05x %05x %05x | %05x %05x %05x | %05x %05x %05x; "
+           "DSPP1 %05x %05x %05x | %05x %05x %05x | %05x %05x %05x",
+           gPccApplies, why, a.enable[0], a.enable[1], a.latchUs,
+           l[0][0], l[1][0], l[2][0], l[0][1], l[1][1], l[2][1], l[0][2], l[1][2], l[2][2],
+           r[0][0], r[1][0], r[2][0], r[0][1], r[1][1], r[2][1], r[0][2], r[1][2], r[2][2]);
+    } else if (replay) {
       note("night shift: %s, %s; DSPP0/1 read back (enable %x/%x), one CTL flush latched in %d us, apply %u",
            why, state.neutral() ? "base" : "matrix and correction", a.enable[0], a.enable[1], a.latchUs, gPccApplies);
+    }
   } else {
     ++gPccFailures;
     gPccBroken = !update.restored || gPccFailures >= 3;

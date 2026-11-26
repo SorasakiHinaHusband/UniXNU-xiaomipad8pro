@@ -108,15 +108,21 @@ constexpr uint32_t lmStage(unsigned s) { return 0x40 + 0x30 * s; }
 constexpr uint32_t kLmBlendOp = 0x0, kLmFgSrcSel = 0x4, kLmConstAlpha = 0x8;
 
 // ------------------------------------------------------------------------------------------------------------------- DSPP
-// DSPP0..3 at 0x54000 + 0x2000 n (len 0x1800). PCC (v6) at +0x1700: enable +0 bit 0; coefficients, S3.15 (0x8000 = 1.0) (msm
-// CONVERT_S3_15): output R from inputs (R,G,B) at +0x10/+0x14/+0x18, G +0x1c/+0x20/+0x24, B +0x28/+0x2c/+0x30 (msm dpu_hw_dspp.c's
-// PCC_<input>_<output>_OFF names with dpu_crtc.c's CTM mapping: cfg->g.r = matrix[1], the output-R/input-G term, goes to
-// PCC_GREEN_R_OFF 0x14). GC (v2) at +0x17c0: enable +0 bit 0, LUT swap +0x1c; its LUT is written through REGDMA's hardware-indexed
-// port (msm dpu_hw_gcv2.c), not read here.
+// DSPP0..3 at 0x54000 + 0x2000 n (len 0x1800). PCC v6 at +0x1700, enable bit 0.
+// Qualcomm SDE groups coefficients by input R, G, B, with outputs R, G, B at +0/+4/+8 in each group.
+// See docs/drivers/dpu-m4-pcc-colour.md for the Linux CTM comparison and the signed 18-bit word evidence.
+// GC v2 at +0x17c0: enable bit 0, LUT swap +0x1c, indexed LUT uploads through REGDMA.
 constexpr uint32_t kDsppBase = 0x54000, kDsppStride = 0x2000;
 constexpr unsigned kDsppCount = 4;
 constexpr uint32_t kPcc = 0x1700, kGc = 0x17c0;
-constexpr uint32_t kPccCoef[3][3] = {{0x10, 0x14, 0x18}, {0x1c, 0x20, 0x24}, {0x28, 0x2c, 0x30}};   // [out][in]
+constexpr uint32_t kPccCoef[3][3] = {{0x10, 0x1c, 0x28}, {0x14, 0x20, 0x2c}, {0x18, 0x24, 0x30}};   // [out][in]
+constexpr uint32_t kPccWordMask = 0x3ffffu;
+
+inline int32_t pccSignedQ15(uint32_t raw)
+{
+  const int32_t word = int32_t(raw & kPccWordMask);
+  return word & 0x20000 ? word - 0x40000 : word;
+}
 
 // ---------------------------------------------------------------------------------------------------------- MERGE_3D, DSC
 constexpr uint32_t kMerge3dBase[4] = {0x4e000, 0x4f000, 0x50000, 0x51000};   // MUX +0, MODE +4 (msm dpu_hw_merge3d.c)

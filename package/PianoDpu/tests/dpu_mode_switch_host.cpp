@@ -428,7 +428,7 @@ void nightShiftAndCleanEpochs()
   auto checkColor = [&] {
     for (unsigned d = 0; d < 2; ++d) {
       CHECK(io.pccActive[d][0] == 1 && io.pccActive[d][4] == 0x4000);
-      CHECK(io.pccActive[d][5] == 0x0800 && io.pccActive[d][12] == 0x2000);
+      CHECK(io.pccActive[d][7] == 0x0800 && io.pccActive[d][12] == 0x2000);
     }
   };
   checkColor();
