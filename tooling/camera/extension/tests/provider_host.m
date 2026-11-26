@@ -379,9 +379,9 @@ static void timer(void)
     const uint64_t startMs = monotonicMs();
     assert([source startStreamAndReturnError:NULL]);
     assert(waitForCount(source, 6, 640, 2500));
-    const uint64_t elapsedMs = monotonicMs() - startMs;
     NSUInteger firstCount = 0;
     @synchronized (source) { firstCount = source.observations.count; }
+    const uint64_t elapsedMs = monotonicMs() - startMs;
     // Check the upper rate bound with room for timer coalescing.
     assert(firstCount >= 6 && firstCount <= elapsedMs * firstFps / 1000 + 3);
     assert(set(source, @0, kCMTimeInvalid, kCMTimeInvalid));
