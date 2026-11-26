@@ -88,26 +88,13 @@ SPE = load_reader()
 # ------------------------------------------------------------------------------------------------------------------ the ACDB
 def spf_blocks(acdb, data_off, want_sg):
     """{parameter id: [u32 words]} of want_sg's graph-open parameters in the graph's subgraph data."""
-    o = acdb.at('POOL', data_off)
-    _, n = acdb.u32(o, 2)
-    o += 8
-    for _ in range(n):
-        sg, size = acdb.u32(o, 2)
-        o += 8
-        end = o + size
-        if sg == want_sg:
-            p = o + 4 + acdb.u32(o)
-            spf_end = p + 4 + acdb.u32(p)
-            p += 4
-            out = {}
-            while p < spf_end:
-                _, pid, psz = acdb.u32(p, 3)
-                p += 12
-                out[pid] = acdb.words(p, psz // 4)
-                p += psz + (-psz % 8)
-            return out
-        o = end
-    raise DolbyError(f'subgraph {want_sg:#x} has no data in this graph')
+    out = {}
+    for pid, start, end in acdb.spf_blocks(data_off, want_sg):
+        size = end - start
+        if size % 4 or pid in out:
+            raise DolbyError('unaligned or duplicate graph-open parameter')
+        out[pid] = acdb.words(start, size // 4, end=end)
+    return out
 
 
 def check_graph(acdb):
@@ -117,24 +104,35 @@ def check_graph(acdb):
         raise DolbyError(f'subgraph {SG_MIP:#x} is not in the deep-buffer speaker graph')
     b = spf_blocks(acdb, data_off, SG_MIP)
     w = b.get(0x08001001, [])
-    props = {w[3 + 3 * k]: w[5 + 3 * k] for k in range(w[2])} if len(w) >= 3 and w[0] == 1 and w[1] == SG_MIP else {}
+    props = {}
+    if w[:3] == [1, SG_MIP, len(SG_CONFIG)] and len(w) == 3 + 3 * w[2]:
+        props = {w[3 + 3 * k]: w[5 + 3 * k] for k in range(w[2])}
     if props != SG_CONFIG:
         raise DolbyError('the subgraph configuration is not the one PianoAudio sends')
     w = b.get(0x08001000, [])
     cont = {}
-    if len(w) >= 3 and w[0] == 1 and w[1] == CONTAINER[0]:
+    if w[:3] == [1, CONTAINER[0], len(CONTAINER[1])]:
         k = 3
         for _ in range(w[2]):
-            pid, size = w[k], w[k + 1]
-            cont[pid] = tuple(w[k + 2:k + 2 + size // 4])
-            k += 2 + size // 4
+            if k + 2 > len(w):
+                raise DolbyError('truncated container property header')
+            pid, size = w[k:k + 2]
+            end = k + 2 + size // 4
+            if size % 4 or end > len(w):
+                raise DolbyError('unaligned or truncated container property')
+            cont[pid] = tuple(w[k + 2:end])
+            k = end
+        if k != len(w):
+            raise DolbyError('trailing container data')
     if cont != CONTAINER[1]:
         raise DolbyError('the container is not the one PianoAudio sends')
     w = b.get(0x08001002, [])
     mods = {}
-    if len(w) >= 4 and w[0] == 1 and w[1] == SG_MIP and w[2] == CONTAINER[0]:
+    if w[:4] == [1, SG_MIP, CONTAINER[0], len(MODULES)] and len(w) == 4 + 2 * w[3]:
         mods = {w[5 + 2 * k]: w[4 + 2 * k] for k in range(w[3])}
     w = b.get(0x08001003, [])
+    if not w or w[0] != len(MODULES) or len(w) != 1 + 6 * w[0]:
+        raise DolbyError('the module properties are incomplete')
     ports = {}
     for k in range(w[0] if w else 0):
         iid, n, pid, _, i, o = w[1 + 6 * k:7 + 6 * k]
@@ -144,8 +142,10 @@ def check_graph(acdb):
     if {iid: (mods.get(iid),) + ports.get(iid, (None, None)) for iid in MODULES} != MODULES or len(mods) != len(MODULES):
         raise DolbyError('the modules or their ports are not the ones PianoAudio sends')
     w = b.get(0x08001004, [])
-    links = {tuple(w[1 + 4 * k:5 + 4 * k]) for k in range(w[0] if w else 0)}
-    if links != LINKS or (w and w[0] != len(LINKS)):
+    if not w or w[0] != len(LINKS) or len(w) != 1 + 4 * w[0]:
+        raise DolbyError('the links are not the ones PianoAudio sends')
+    links = {tuple(w[1 + 4 * k:5 + 4 * k]) for k in range(w[0])}
+    if links != LINKS:
         raise DolbyError('the links are not the ones PianoAudio sends')
     if set(b) - {0x08001001, 0x08001000, 0x08001002, 0x08001003, 0x08001004}:
         raise DolbyError('graph data PianoAudio does not send (a control link or another block)')
@@ -298,7 +298,10 @@ def build_values(dax, row):
     if kind == 'bands':
         return band_values(list(e), arg, what)
     if kind == 'matrix':
-        nout = int(dax.tuning.get('output_channels', '0'))
+        try:
+            nout = int(dax.tuning.get('output_channels', '0'))
+        except ValueError as e:
+            raise DolbyError(f'{what}: invalid output_channels') from e
         for m in e.iter('element'):
             v = ints(m.get('value', ''), what)
             if len(v) >= 2 and str(v[0]) == arg:
@@ -659,6 +662,14 @@ def self_test():
     refused(lambda: build(blob, SYN_DAX.replace('<t-chan-d value="1,2,3,4,5,6"/>', '<t-chan-d value="1"/>').encode(), SYN_MAP, 'Syn'),
             'different lengths')
     refused(lambda: build(blob, b'<device_data', SYN_MAP, 'Syn'), 'does not parse')
+    refused(lambda: build(blob, SYN_DAX.replace('output_channels="1"', 'output_channels="x"').encode(), SYN_MAP, 'Syn'),
+            'invalid output_channels')
+    acdb = SPE.Acdb(blob)
+    _, data_off = acdb.find_graph(MIP_GKV)
+    start = next(start for pid, start, _ in acdb.spf_blocks(data_off, SG_MIP) if pid == 0x08001001)
+    malformed = bytearray(blob)
+    struct.pack_into('<I', malformed, start + 8, 0xffffffff)
+    refused(lambda: check_graph(SPE.Acdb(malformed)), 'subgraph configuration')
     refused(lambda: merge(cal, {0x20001: ('aaaa', 'speaker', [2 ** 31])}, 0), 'outside 32 bits')
     refused(lambda: merge(cal, {}, 0x20003), 'pregain')
     for bad in (data[:-4], data + bytes(4), b'PMIQ' + data[4:], data[:12] + struct.pack('<I', 0x20004) + data[16:]):
