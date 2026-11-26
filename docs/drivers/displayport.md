@@ -3,9 +3,9 @@
 ## Status as of 2026-11-27
 
 **External DisplayPort remains design-only (B8).** The tracked `PianoDp` level 1 is a read-only survey and port-event decoder.
-D6 is a RAM-backed second display for testing the macOS display path. Tablet qualification of DisplayPort is open, as are
-PHY table extraction with provenance, AUX and link training, and external scanout and hot-plug. B8 depends on B1's DPU path
-and B7's Type-C host work. [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
+D6 is a RAM-backed second display for testing the macOS display path. The QMP PHY tuning tables are extracted with provenance
+and host-checked under `data/dp/`. AUX and link training, external scanout and hot-plug, and tablet qualification remain open.
+B8 depends on B1's DPU path and B7's Type-C host work. [PHY tables](../../data/dp/README.md) · [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
 
 **Built-in panel.** Installed v13.1y12q uses PianoDpu flips at 60 Hz, with native screenshots and neutral colours. Night Shift
 routing, native panel sleep and refresh switching are off in the daily profile. Fixed scanout at 120.004 Hz and 144.146 Hz
@@ -321,12 +321,13 @@ display port and the panel's lines are what they were; a D6 display that cannot 
 
 ### 11. Licence note
 
-The msm DP/DPU drivers, the QMP combo PHY, DISPCC, pmic_glink_altmode, fsa4480 and dwc3-qcom (GPL-2.0) are the specification only
-(offsets, fields, sequences). The QMP DP serdes/TX tables (about 20 register/value pairs per rate, plus the 4×4 swing and
-pre-emphasis matrices) are vendor tuning values that exist only as tables in that driver. The owner decided on **2026-11-12** that the DP PHY tables may be committed as extracted data, in their own directory with a provenance note and our own extractor and format ([BACKLOG-hardware.md](../BACKLOG-hardware.md) §4); they are **not extracted yet**. The clean alternative is to measure them:
-dump the DP PHY's registers on the tablet while Ubuntu drives a monitor at each rate (reads only, values of the hardware's state).
-No Apple binary is read beyond the facts already in `native-gop-display.md` (the framework's behaviour observed in the VM); no vendor
-blob. As built (`package/PianoDp/UPSTREAM`): offsets, bit names, the clock order, the notification layout, the pin-to-mode mapping
-and the DIO4485 words were taken as facts; no serdes/TX table, swing/pre-emphasis matrix or AUX_CFG init word is in the code (D1 reads
-AUX_CFG0..9 as found and logs them, which is the measurement route). D6 uses the IOMFB ABI NativeGopDisplay already generates;
-nothing new was read from Apple binaries.
+The msm DP/DPU drivers, the QMP combo PHY, DISPCC, pmic_glink_altmode, fsa4480 and dwc3-qcom (GPL-2.0) supply the register
+and sequencing facts used in the design. Under the owner's **2026-11-12** decision, `data/dp/` holds the extracted QMP
+DP tuning data in the project's own format with the pinned kernel commit and source file hashes. It contains the common serdes table,
+four rate tables, shared TX writes, ten AUX init values and four swing and pre-emphasis matrices. HBR3 is present in the
+SM8750 data and piano's DT caps the link at HBR2. The host test checks the manifest and compiles a consumer of the generated header.
+The extraction carries no Linux functions, comments or C structures. [Owner decision](../BACKLOG-hardware.md#4-owner-decisions) · [Data and provenance](../../data/dp/README.md)
+
+D1 reads and logs the existing AUX_CFG0..9 as part of its read-only survey. D6 uses the IOMFB ABI NativeGopDisplay already
+generates from the framework behaviour observed in the VM. The provenance of these slices is recorded in
+[`package/PianoDp/UPSTREAM`](../../package/PianoDp/UPSTREAM).
