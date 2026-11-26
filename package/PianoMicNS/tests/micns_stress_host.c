@@ -33,18 +33,28 @@ static float output[4096 + 2], saved[4096];
 static float *const pcm = output + 1;
 static const float sentinel = 2.0f;
 
+typedef int16_t (*Source)(uint64_t);
+static int16_t tag(uint64_t i) {return (int16_t)(1 + i % 30000u);}
+static int16_t silence(uint64_t i) {(void)i; return 0;}
+static int16_t high(uint64_t i) {(void)i; return INT16_MAX;}
+static int16_t low(uint64_t i) {(void)i; return INT16_MIN;}
+static int16_t square(uint64_t i) {return i % 97u < 48u ? INT16_MAX : INT16_MIN;}
+
 // Track per-instance allocations even on ASan runtimes without LeakSanitizer.
 // RNNoise's shared FFT table is a process-lifetime allocation in kiss_fft.c.
-static unsigned allocations, noise_calls;
-static int inject_floats;
+static unsigned allocations, allocation_calls, noise_calls;
+static uint64_t tagged_frames;
+static int check_tags, inject_floats;
 void *stress_malloc(size_t size)
 {
+    ++allocation_calls;
     void *p = malloc(size);
     allocations += p != NULL;
     return p;
 }
 void *stress_calloc(size_t count, size_t size)
 {
+    ++allocation_calls;
     void *p = calloc(count, size);
     allocations += p != NULL;
     return p;
@@ -59,6 +69,8 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in)
 {
     static const float invalid[] = {NAN, INFINITY, -INFINITY, FLT_TRUE_MIN, -FLT_TRUE_MIN, 65536.0f, -65536.0f, 16384.0f};
     ++noise_calls;
+    if (check_tags)
+        for (uint32_t i = 0; i < MICNS_BLOCK; ++i) CHECK(in[i] == tag(tagged_frames++));
     const float vad = stress_real_frame(st, out, in);
     // The ABI carries S16, so fault injection belongs at the processor's float output.
     if (inject_floats)
@@ -92,13 +104,6 @@ static uint32_t read_core(uint32_t n)
     check_zero(got, n);
     return got;
 }
-
-typedef int16_t (*Source)(uint64_t);
-static int16_t tag(uint64_t i) {return (int16_t)(1 + i % 30000u);}
-static int16_t silence(uint64_t i) {(void)i; return 0;}
-static int16_t high(uint64_t i) {(void)i; return INT16_MAX;}
-static int16_t low(uint64_t i) {(void)i; return INT16_MIN;}
-static int16_t square(uint64_t i) {return i % 97u < 48u ? INT16_MAX : INT16_MIN;}
 
 static void feed_mono(PianoTapHeader *tap, uint32_t n, Source source, uint32_t gain, int muted)
 {
@@ -167,6 +172,8 @@ static void test_stream(uint32_t n, int stereo, int bypass)
     audio_tap_init(tap);
     if (stereo) open_stereo(tap);
     CHECK(micns_init(&core, tap, bypass, NULL) == 0);
+    check_tags = !bypass;
+    tagged_frames = 0;
     CHECK(read_core(n) == 0);
     // Prime at the exact threshold so the normal initial trim discards no PCM.
     feed_stream(tap, MICNS_RESERVE + n - 1, stereo);
@@ -193,6 +200,8 @@ static void test_stream(uint32_t n, int stereo, int bypass)
     CHECK(core.s.delivered == consumed && written == consumed + MICNS_RESERVE + n);
     CHECK(core.s.startup == 2u * n && core.s.prime_target == MICNS_RESERVE + n);
     CHECK(core.s.blocks * MICNS_BLOCK + core.block_fill == consumed + MICNS_RESERVE);
+    if (check_tags) CHECK(tagged_frames == core.s.blocks * MICNS_BLOCK);
+    check_tags = 0;
     CHECK(core.s.anchors == 1 && !core.s.excess && !core.s.lapped);
     CHECK(!core.s.drops && !core.s.repeats && !core.s.missing);
     if (stereo) {
@@ -267,6 +276,7 @@ static void test_capture_restart(void)
     CHECK(core.s.first_sound && core.block_fill && micns_fill(&core) == MICNS_RESERVE);
 
     // A new DSP capture run on the same mapping must start with fresh denoiser history.
+    const unsigned before_reset = allocation_calls;
     __atomic_add_fetch(&tap->run, 1u, __ATOMIC_RELEASE);
     CHECK(read_core(n) == 0 && micns_fill(&core) == 0);
     CHECK(core.s.runs == 1 && core.s.anchors == 2);
@@ -276,6 +286,7 @@ static void test_capture_restart(void)
         CHECK(read_core(n) == n);
         check_zero(0, n);
     }
+    CHECK(allocation_calls == before_reset);
     micns_free(&core);
     CHECK(!allocations);
 }
@@ -331,6 +342,8 @@ static void test_hal_churn(void)
 
     for (iteration = 0; iteration < 128; ++iteration) {
         const uint32_t n = sizes[iteration % COUNT(sizes)];
+        // The first primed read crosses the 16384-frame HAL cache boundary after 31 frames.
+        const uint64_t sample = 16384u - n - 31u;
         PianoTapHeader *tap = &devices[(iteration / 2u) % COUNT(devices)].header;
         const int bypass = iteration % 2u;
         piano_micns_test_bypass = bypass;
@@ -340,31 +353,33 @@ static void test_hal_churn(void)
         CHECK((*driver)->StartIO(driver, 2, 1) == 0 && (*driver)->StartIO(driver, 2, 2) == 0);
         CHECK(bypass ? allocations == 0 : allocations > 0);
         check_format(rates[iteration % COUNT(rates)]);
-        read_hal(1, 0, n);
+        read_hal(1, sample, n);
         check_zero(0, n);
 
-        const Source source = bypass ? low : square;
+        const uint64_t first = audio_tap_written(tap);
+        const Source source = bypass ? tag : square;
         feed_mono(tap, MICNS_RESERVE + n, source, 32767, 0);
-        read_hal(1, n, n);
+        read_hal(1, sample + n, n);
         memcpy(saved, pcm, n * sizeof *pcm);
-        read_hal(2, n, n);
+        read_hal(2, sample + n, n);
         CHECK(!memcmp(saved, pcm, n * sizeof *pcm));
-        if (bypass) for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == -1.0f);
+        if (bypass) for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == tag(first + i) / 32768.0f);
         CHECK(bypass ? noise_calls == previous_calls : noise_calls > previous_calls);
 
         CHECK((*driver)->StopIO(driver, 2, 1) == 0);
         feed_mono(tap, n, source, 32767, 1);
-        read_hal(2, 2u * n, n);
+        read_hal(2, sample + 2u * n, n);
         check_zero(0, n);
         feed_mono(tap, n, source, 16384, 0);
-        read_hal(2, 3u * n, n);
-        if (bypass) for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == -16384.0f / 32767.0f);
+        read_hal(2, sample + 3u * n, n);
+        if (bypass)
+            for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == tag(first + 2u * n + i) / 32768.0f * (16384.0f / 32767.0f));
         feed_mono(tap, n, source, 32767, 0);
-        read_hal(2, 4u * n, n);
-        if (bypass) for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == -1.0f);
+        read_hal(2, sample + 4u * n, n);
+        if (bypass) for (uint32_t i = 0; i < n; ++i) CHECK(pcm[i] == tag(first + 3u * n + i) / 32768.0f);
 
         CHECK((*driver)->StopIO(driver, 2, 2) == 0 && allocations == 0);
-        read_hal(2, 4u * n, n); // even the previously cached input time is silent after StopIO
+        read_hal(2, sample + 4u * n, n); // even the previously cached input time is silent after StopIO
         check_zero(0, n);
     }
     (*driver)->Release(driver);

@@ -38,7 +38,7 @@ enum {kPlugIn = kAudioObjectPlugInObject, kDevice = 2, kInStream = 3};
 #define kDeviceName "Mic (noise reduced)"
 static const Float64 kRate = PIANO_TAP_RATE;
 static const UInt32 kZeroPeriod = 16384;          // frames between time stamps (more than a safety offset plus an IO cycle)
-static const UInt32 kRingFrames = 16384;          // the output ring, by sample time (a power of two)
+enum { kRingFrames = 16384, kProduceFrames = 4096 };  // output ring indexed by sample time, and the largest core read
 static const UInt32 kLatency = MICNS_RESERVE + 2 * MICNS_BLOCK;   // the FIFO's reserve, a block in RNNoise, a block of slack
 
 static AudioServerPlugInHostRef gHost;
@@ -56,7 +56,7 @@ static mach_vm_size_t gTapSize;
 static const PianoTapHeader *gTap;
 static MicNs gCore;
 static int gCoreReady;
-static float gRing[16384];
+static float gRing[kRingFrames + kProduceFrames - 1];  // extra space for a core read crossing the ring boundary
 static uint64_t gProducedStart, gProducedEnd;
 static int gProducedValid;
 static UInt64 gIoCycles, gNextTick;
@@ -380,10 +380,12 @@ static OSStatus BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID o, 
 static void produce(uint64_t end) {
     while (gProducedEnd < end) {
         const uint32_t at = (uint32_t)gProducedEnd & (kRingFrames - 1);
-        uint64_t n = end - gProducedEnd;
-        if (n > kRingFrames - at) n = kRingFrames - at;
-        if (n > 4096) n = 4096;
-        (void)micns_read(&gCore, gRing + at, (uint32_t)n);
+        const uint64_t remaining = end - gProducedEnd;
+        const uint32_t n = remaining > kProduceFrames ? kProduceFrames : (uint32_t)remaining;
+        // Keep the core read whole so priming uses the full request when the cache wraps.
+        (void)micns_read(&gCore, gRing + at, n);
+        if (at + n > kRingFrames)
+            memcpy(gRing, gRing + kRingFrames, (at + n - kRingFrames) * sizeof *gRing);
         gProducedEnd += n;
     }
 }
