@@ -17,6 +17,7 @@ import time
 PHASES = {"volatile": (0, 0), "control": (0, 0), "writeback": (1, 0),
           "queue": (0, 1), "combined": (1, 1)}
 ROWS = ("plain", "fsync", "full", "barrier")
+SYNCED_ROWS = ("fsync", "full", "barrier")
 OPS, READS, RECORDS, BLOCK = 32, 4096, 32, 4096
 COUNTERS = ("fua", "cached", "store_sync", "flushes", "barriers", "forced",
             "store_rd", "bitmap_publications", "accepted", "finished", "callbacks", "full")
@@ -172,14 +173,19 @@ def measure(lines, phase, run, window=None):
     else:
         require(fill["fua"] and fill["bitmap_publications"], "first-touch FUA/bitmap known-positive absent")
         require(mixed["store_rd"] and mixed["fua"] + mixed["cached"], "mixed UFS I/O known-positive absent")
-        require(all((a + b)["cached"] + (a + b)["fua"] for a, b in evidence.values()),
-                "write row has no provider write evidence")
+        # A plain pwrite row has no sync: APFS may hold its data until a later fence (m5dur-m4cc-cut3 on the tablet: plain fua +0,
+        # fsync +41, full +450, barrier +420), so the plain row reports whatever APFS submits (docs/tools/durability.md) and only
+        # the synced rows must show provider writes in their own window.
+        require(all((a + b)["cached"] + (a + b)["fua"] for row, (a, b) in evidence.items() if row in SYNCED_ROWS),
+                "synced write row has no provider write evidence")
         if wb:
-            require(sum(a["cached"] for a, _ in evidence.values()) > 0,
-                    "write-back overwrites did not use cached WRITE", Fail)
             for row in ("full", "barrier"):
                 syncs = evidence[row][1]
                 require(syncs["store_sync"] and syncs["flushes"], f"{row} has no Data cache sync", Fail)
+            # APFS can defer provider writes until sync, even with F_NOCACHE on the file.
+            cached = mixed["cached"] + sum(writes["cached"] + syncs["cached"]
+                                           for writes, syncs in evidence.values())
+            require(cached > 0, "overwrite workload has no cached WRITE evidence")
         else:
             require(not total["cached"] and not total["flushes"], "write-through sent write-back I/O", Fail)
         if queue:

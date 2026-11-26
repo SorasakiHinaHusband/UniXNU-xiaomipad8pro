@@ -51,22 +51,28 @@ class Fake:
         return self.lines + ["DUR END", "HOST EXIT rc=0"]
 
 
-def measurement(phase, *, flush=True, positive=True, overlap=READS):
+def measurement(phase, *, flush=True, positive=True, overlap=READS, plain_deferred=False,
+                silent_row=None, cache_at="write"):
     f = Fake("measure", phase)
     direct = phase != "volatile"
     wb, queue = PHASES[phase]
     f.snap("fill", "before")
     first_touch = int(direct and positive)
-    f.snap("fill", "after", fua=2 * first_touch, bitmap_publications=first_touch)
+    f.snap("fill", "after", fua=2 * first_touch, bitmap_publications=first_touch,
+           cached=int(wb and cache_at == "fill"))
     for row in ROWS:
+        # A plain write can defer all its I/O until a later row's sync.
+        quiet = ((plain_deferred or cache_at == "after") and row == "plain") or row == silent_row
+        write = int(direct and not quiet)
+        cached = int(wb and cache_at in ("write", "after")) * write
         for i in range(OPS):
             f.snap(row, "before", i)
-            f.snap(row, "write", i, fua=int(direct and not wb), cached=wb)
+            f.snap(row, "write", i, fua=write - cached, cached=cached if cache_at == "write" else 0)
             sync = int(wb and flush and row in ("full", "barrier"))
-            f.snap(row, "after", i, store_sync=sync, flushes=sync)
+            f.snap(row, "after", i, store_sync=sync, flushes=sync, cached=cached if cache_at == "after" else 0)
         f.lines.append(event("DUR", "ROW", row=row, ops=OPS))
     f.snap("mixed", "before")
-    f.snap("mixed", "after", store_rd=READS if direct else 0, fua=int(direct),
+    f.snap("mixed", "after", store_rd=READS if direct else 0, fua=int(direct), cached=int(wb and cache_at == "mixed"),
            accepted=100 * queue, finished=100 * queue, callbacks=100 * queue)
     f.lines.append(event("DUR", "MIX", reads=READS, writes=64, overlap=overlap,
                          p99_ns=112500, duration_ns=500000000))
@@ -108,6 +114,30 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual(p99, 112500)
                 self.assertEqual(counts["full"][1]["store_sync"], OPS if PHASES[phase][0] else 0)
 
+    def test_plain_row_deferred_by_apfs_passes(self):
+        for phase in ("control", "writeback", "queue", "combined"):
+            with self.subTest(phase=phase):
+                measure(measurement(phase, plain_deferred=True), phase, RUN, WINDOW)
+
+    def test_synced_row_without_provider_writes_is_void(self):
+        for row in ("fsync", "full", "barrier"):
+            with self.subTest(row=row), self.assertRaisesRegex(Void, "synced write row has no provider write evidence"):
+                measure(measurement("control", plain_deferred=True, silent_row=row), "control", RUN, WINDOW)
+
+    def test_cached_writes_deferred_until_sync_pass(self):
+        for phase in ("writeback", "combined"):
+            with self.subTest(phase=phase):
+                _, _, _, counts = measure(measurement(phase, cache_at="after"), phase, RUN, WINDOW)
+                self.assertTrue(all(writes["cached"] == 0 for writes, _ in counts.values()))
+                self.assertEqual(counts["full"][1]["cached"], OPS)
+
+    def test_cached_writes_in_prefilled_mixed_row_pass(self):
+        measure(measurement("writeback", cache_at="mixed"), "writeback", RUN, WINDOW)
+
+    def test_cached_writes_only_in_fill_leave_measurement_void(self):
+        with self.assertRaisesRegex(Void, "overwrite workload has no cached WRITE evidence"):
+            measure(measurement("writeback", cache_at="fill"), "writeback", RUN, WINDOW)
+
     def test_missing_known_positive_is_void(self):
         with self.assertRaisesRegex(Void, "first-touch"):
             measure(measurement("combined", positive=False), "combined", RUN, WINDOW)
@@ -118,7 +148,7 @@ class MeasurementTests(unittest.TestCase):
 
     def test_missing_full_sync_on_live_writeback_fails(self):
         with self.assertRaisesRegex(Fail, "full has no Data cache sync"):
-            measure(measurement("writeback", flush=False), "writeback", RUN, WINDOW)
+            measure(measurement("writeback", flush=False, cache_at="after"), "writeback", RUN, WINDOW)
 
     def test_truncated_capture_is_void(self):
         with self.assertRaises(Void):

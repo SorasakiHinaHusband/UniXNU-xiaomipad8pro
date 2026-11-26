@@ -355,6 +355,9 @@ timebase. Data `inflight_max` is the stage peak. UFS `ufs_peak` is the shared sl
 
 ### Expected gain from M1
 
+The later [APFS analysis](m5-apfs.md) found cached traffic in scratch sync and mixed intervals. Installed row
+eligibility is still undetermined, and the write-back switch remains a scratch experiment.
+
 - **Write-back.** QD1 sustained 6,494 writes/s, or about 154 µs per write. The 4 KiB write/read p50 gap was 33 µs
   (103 vs 70 µs). If removing FUA saves 33 µs per eligible overwrite, the estimate is about 8.3k IOPS (+27%)
   with all writes eligible, or 7.3k (+12%) with half eligible, before extra flush time. This is a sensitivity
