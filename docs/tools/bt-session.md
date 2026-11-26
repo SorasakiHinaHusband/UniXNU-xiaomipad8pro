@@ -18,51 +18,33 @@ running tablet from the Mac over the existing root SSH harness. Capture files be
 export BT_SESSION_SSH="$HOME/piano-harness/bin/tsudo"
 export REDACT_WIFI="$HOME/piano-harness/bin/redact-wifi.py"
 CAP=tooling/native/bt-session-capture.sh
+GRADE=tooling/native/bt-preflight-grade.py
 
 btroot() (set -o pipefail; "$BT_SESSION_SSH" --raw "$1" 2>&1 | python3 "$REDACT_WIFI")
 ```
 
-Run the following checks using that same shell. The output shows the live boot, staged files, mounted bytes, service state
-and a powered controller. Keep the check output in `preflight.txt` in the session folder using the command below.
+With `piano-bt-delay=60`, PianoBluetooth starts bringup after a 60-second delay. The Path A startup job then replaces
+the stock `bluetoothd` with the patched daemon. During that restart, launchd can briefly report `spawn scheduled`
+and the LE mask counter can still be zero.
+
+The read-only preflight polls for host readiness, a running `bluetoothd` with a PID, and a positive LE mask patch counter.
+It waits up to 90 seconds by default and records the elapsed settle time and status in the redacted `preflight.txt`
+before saving the full snapshot. Pass `--wait-seconds N` to change the poll budget, or `--wait-seconds 0` to take
+an immediate snapshot. The full snapshot has its own SSH deadline.
 
 ```bash
-bt_preflight=$(cat <<'TABLET'
-/usr/bin/sw_vers
-/usr/sbin/sysctl kern.bootsessionuuid
-/usr/sbin/sysctl -n kern.piano_bootargs | /usr/bin/tr ' ' '\n' |
-    /usr/bin/grep -E '^piano-(bt(=|-)|usb-net=|wifi(=|-ps=))'
-/usr/sbin/sysctl machdep.piano_bt_boot machdep.piano_bt_firmware machdep.piano_bt_lemask machdep.piano_bt_lerdy
-/bin/ls -l /dev/cu.BLTH
-/usr/sbin/ioreg -r -c PianoBluetooth -d 1 -l -w0 |
-    /usr/bin/grep -E 'piano-bt-(state|host-ready|h4-le-masks|radio-le-rssi)'
-/usr/sbin/ioreg -r -c IOBluetoothHCIController -d 1 -w0
-/usr/sbin/ioreg -r -n bluetooth -d 1 -w0
-/usr/sbin/ioreg -p IODeviceTree -r -n bluetooth -d 1 -l -w0 |
-    /usr/bin/grep -E 'transport-(encoding|speed)'
-(
-    cd /private/var/piano/bluetooth-path1 &&
-    /usr/bin/shasum -a 256 -c runtime.sha256 &&
-    /usr/bin/cmp bin/bluetoothd /usr/sbin/bluetoothd &&
-    /usr/bin/cmp bin/BlueTool /usr/sbin/BlueTool &&
-    /usr/bin/cmp bin/PianoBluetooth.runtime /usr/sbin/PianoBluetooth.runtime &&
-    /usr/bin/cmp lib/QcaBTType0.dylib /usr/lib/QcaBTType0.dylib &&
-    /bin/echo 'staged and mounted runtime match'
-)
-/bin/ls -l /usr/local/libexec/piano-bluetooth-start /usr/local/libexec/piano-bt-runtime-mount \
-    /usr/local/libexec/piano-bt-probe /Library/LaunchDaemons/com.unixnu.piano-bluetooth-path1.plist
-/sbin/mount | /usr/bin/grep -E 'on /usr/(sbin|lib) '
-for job in com.unixnu.piano-bluetooth-path1 com.apple.BlueTool com.apple.bluetoothd; do
-    /bin/launchctl print "system/$job" |
-        /usr/bin/grep -E 'system/|state =|pid =|program =|last exit code'
-done
-/usr/local/libexec/piano-bt-probe --status
-/usr/sbin/system_profiler -timeout 12 SPBluetoothDataType
-/usr/bin/log show --last boot --style compact --info --no-pager \
-    --predicate 'process == "kernel" AND eventMessage CONTAINS "bt-lemask1: LE event mask"'
-TABLET
-)
-btroot "$bt_preflight"
+BT_RESULTS="$PWD/private/bt-results"
+mkdir -p "$BT_RESULTS"
+PREFLIGHT=$(mktemp -d "$BT_RESULTS/preflight.XXXXXXXX")
+"$CAP" preflight "$PREFLIGHT"
+python3 "$GRADE" "$PREFLIGHT/preflight.txt"
 ```
+
+If the LE mask line is missing from the unified log, pass the saved console log from the same boot as the grader's second
+argument. For example, use `python3 "$GRADE" "$PREFLIGHT/preflight.txt" "$BOOT_CONSOLE"` with `BOOT_CONSOLE`
+set to that log. The grader exits 0 for `READY`, 1 for `NOT-READY` (a failed check or settle timeout) and 2 for
+`VOID` (incomplete capture or unreadable input). Confirm the boot UUID identifies the intended installed boot and
+perform the UI check below.
 
 | Check | Required result |
 |---|---|
@@ -72,9 +54,8 @@ btroot "$bt_preflight"
 | Userland active | All four runtime hashes pass, staged and mounted copies compare equal, both bindfs views are read-only, all helper paths exist, and launchd has the three jobs. `bluetoothd` is running with a PID. The startup job and BlueTool can exit after completing startup. |
 | Controller on | The status line contains `default_object=1 power=1` and System Profiler reports Bluetooth on. Confirm the owner can open the Bluetooth pane and a blank TextEdit document using touch or the cover. |
 
-Check that an HCI trace exists and can grow before relying on it for packet parameters. Read the preferences and the file
-listing with `btroot '/usr/bin/defaults read com.apple.MobileBluetooth.debug; /bin/ls -lt /private/var/root/Library/Logs/Bluetooth/*.pklg'`.
-Confirm a fresh or growing file while the Bluetooth pane is open. If tracing is absent, arm the same harness configuration
+The preflight `@@ trace` section records the HCI trace preference and file listing. Confirm a fresh or growing file while
+the Bluetooth pane is open before relying on it for packet parameters. If tracing is absent, arm the same harness configuration
 before the owner arrives. Save the prior preference domain for restoration. This optional preparation restarts bluetoothd once.
 
 ```bash
@@ -94,13 +75,13 @@ TABLET
 )")
 ```
 
-Recheck the powered controller, positive mask counter and trace listing after startup. If the kernel, runtime or controller
-gates fail, preserve `preflight.txt` and the before/after snapshots, and save the owner slot. If only the trace is missing,
-proceed with the UI and counter observations. The log and registry can still locate several failure boundaries.
+If you enabled tracing, rerun preflight and the grader, then check for a growing trace. Preserve `preflight.txt` and
+defer the owner session if a readiness gate fails. If only the trace is missing, proceed with the UI and counter observations.
+The log and registry can still locate several failure boundaries.
 
 ```bash
-RUN=$("$CAP" start "$PWD/private/bt-results")
-btroot "$bt_preflight" > "$RUN/preflight.txt"
+RUN=$("$CAP" start "$BT_RESULTS")
+cp "$PREFLIGHT/preflight.txt" "$RUN/preflight.txt"
 printf 'Bluetooth results: %s\n' "$RUN"
 m() { "$CAP" mark "$RUN" "$@"; }
 s() { "$CAP" sample "$RUN" "$1"; }

@@ -128,30 +128,33 @@ REMOTE
 )
 
 capture_preflight() {
-    local results=$1 wait_seconds=$2 started=$SECONDS remaining deadline sample stage
+    local results=$1 wait_seconds=$2 remaining deadline sample elapsed stage
     local settle=skipped
     local -a rc=(0 0)
     mkdir -p -- "$results"
-    stage=$(mktemp "$results/.preflight.XXXXXXXX")
 
+    SECONDS=0
     if (( wait_seconds > 0 )); then
         settle=timeout
-        while (( (remaining = wait_seconds - (SECONDS - started)) > 0 )); do
+        while (( (remaining = wait_seconds - SECONDS) > 0 )); do
             deadline=$(( remaining < 5 ? remaining : 5 ))
             if sample=$(remote "$deadline" "$preflight_reads"$'\n''piano_status && launchd_status com.apple.bluetoothd' 2>/dev/null) &&
                 grep -Eq '^[[:blank:]]*"piano-bt-host-ready" = Yes$' <<< "$sample" &&
                 grep -Eq '^[[:blank:]]*"piano-bt-h4-le-masks-patched" = [0-9]*[1-9][0-9]*$' <<< "$sample" &&
                 grep -Eq $'^\tstate = running$' <<< "$sample" &&
-                grep -Eq $'^\tpid = [1-9][0-9]*$' <<< "$sample"; then
+                grep -Eq $'^\tpid = [1-9][0-9]*$' <<< "$sample" &&
+                (( SECONDS < wait_seconds )); then
                 settle=ready
                 break
             fi
-            (( SECONDS - started < wait_seconds )) || break
+            (( SECONDS < wait_seconds )) || break
             sleep 1
         done
     fi
+    elapsed=$SECONDS
+    stage=$(mktemp "$results/.preflight.XXXXXXXX")
     printf 'BT_PREFLIGHT_SETTLE status=%s elapsed_seconds=%s wait_seconds=%s\n' \
-        "$settle" "$((SECONDS - started))" "$wait_seconds" > "$stage"
+        "$settle" "$elapsed" "$wait_seconds" > "$stage"
 
     remote 75 "$preflight_reads"$'\n'"$preflight_snapshot" 2>&1 | redact >> "$stage" || rc=( "${PIPESTATUS[@]}" )
     if (( rc[1] != 0 )); then
