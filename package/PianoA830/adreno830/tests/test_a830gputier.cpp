@@ -99,6 +99,21 @@ static void testFragmentation(const Run (&runs)[3], uint64_t limit) {
   CHECK(tier.alloc(0, pieces, 3, limit) == 0 && tier.alloc(kSlab, nullptr, 3, limit) == 0);
   CHECK(tier.alloc(kSlab, pieces, 0, limit) == 0 && tier.freeBytes() == capacity);
 
+  // The BO path's 64-span limit must reject 65 holes without consuming any of them.
+  Span alternating[130]{};
+  for (Span &slab : alternating) { CHECK(tier.alloc(kSlab, &slab, 1, limit) == 1); }
+  Span tail[3]{};
+  const unsigned tailCount = tier.alloc(tier.freeBytes(), tail, 3, limit);
+  CHECK(tailCount == 3 && tier.freeBytes() == 0);
+  for (unsigned i = 0; i < 130; i += 2) { CHECK(tier.release(alternating + i, 1)); }
+  Span fragmented[65]{};
+  CHECK(tier.alloc(65 * kSlab, fragmented, 64, limit) == 0 && tier.freeBytes() == 65 * kSlab);
+  CHECK(tier.alloc(65 * kSlab, fragmented, 65, limit) == 65 && tier.freeBytes() == 0);
+  for (unsigned i = 0; i < 65; ++i) { CHECK(fragmented[i].pa == alternating[2 * i].pa && fragmented[i].bytes == kSlab); }
+  CHECK(tier.release(fragmented, 65) && tier.release(tail, tailCount));
+  for (unsigned i = 1; i < 130; i += 2) { CHECK(tier.release(alternating + i, 1)); }
+  CHECK(tier.freeBytes() == capacity);
+
   // Adjacent physical runs still have independent qualification and release boundaries.
   const Run adjacent[] = {{runs[0].base, kSlab}, {runs[0].base + kSlab, kSlab}};
   tier.init(adjacent, 2, limit, probe, &ctx, nullptr);
@@ -169,13 +184,13 @@ int main() {
   }
   CHECK(t.totalBytes() == 874 * MiB && t.freeBytes() == 874 * MiB && ctx.lines.size() == 3);
   CHECK(ctx.lines[0] == "gpu tier: run 0 0x880000000+512 MiB self-test ok");
-  Span s[8];
+  Span s[8]{};
   CHECK(t.alloc(1, s, 8, limit) == 1 && s[0].pa == 0x880000000ull && s[0].bytes == 2 * MiB);
   CHECK(t.freeBytes() == 872 * MiB);
-  Span big[8];
+  Span big[8]{};
   unsigned bn = t.alloc(600 * MiB, big, 8, limit);                     /* rest of run 0 (510 MiB) + 90 MiB of run 1 */
   CHECK(bn == 2 && big[0].pa == 0x880200000ull && big[0].bytes == 510 * MiB && big[1].pa == 0x8a0400000ull && big[1].bytes == 90 * MiB);
-  struct Piece { uint64_t offset, physical, bytes; } pc[2];
+  struct Piece { uint64_t offset, physical, bytes; } pc[8]{};
   asPieces(big, bn, pc);
   CHECK(pc[0].offset == 0 && pc[0].physical == 0x880200000ull && pc[1].offset == 510 * MiB && pc[1].physical == 0x8a0400000ull && pc[1].bytes == 90 * MiB);
   CHECK(t.owns(0x8a0400000ull) && !t.owns(0x8c0000000ull) && !t.owns(0x87fe00000ull));
@@ -209,9 +224,11 @@ int main() {
   u.init(sm.data(), 3, limit, probe, &bad, line);
   CHECK(u.runPassed(0) && !u.runPassed(1) && u.runPassed(2));
   CHECK(bad.lines[1] == "gpu tier: run 1 0x8a0400000+256 MiB self-test FAIL" && u.totalBytes() == 618 * MiB);
-  Span w[8]; unsigned wn = u.alloc(600 * MiB, w, 8, limit);
+  Span w[8]{}; unsigned wn = u.alloc(600 * MiB, w, 8, limit);
   CHECK(wn == 2 && w[0].pa == 0x880000000ull && w[1].pa == 0x8b0400000ull && !u.owns(0x8a0400000ull));
   CHECK(u.release(w, wn) && u.freeBytes() == u.totalBytes());
+  const Span failedRun{sm[1].base, kSlab};
+  CHECK(!u.release(&failedRun, 1) && !u.runPassed(3) && u.freeBytes() == u.totalBytes());
   Ctx failed;
   for (const auto &run : region1) { failed.badProbe.push_back(run.base); }
   u.init(region1, 3, limit, probe, &failed, line);

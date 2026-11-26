@@ -1534,12 +1534,19 @@ int sysctlGpuTier(struct sysctl_oid *,void *,int,struct sysctl_req *req)
 {
   if(req->newptr)return EPERM;
   const auto tier=NativeAdrenoMemory::tierStats();
-  char line[256];
+  char line[640];
   const int n=snprintf(line,sizeof line,
-      "mode=%u state=%s runs=%u checked=%u pass=%u fail=%u pass-mask=%#x free-mib=%llu used-mib=%llu refusals=%llu allocs=%llu",
+      "mode=%u state=%s runs=%u checked=%u pass=%u fail=%u pass-mask=%#x free-mib=%llu used-mib=%llu refusals=%llu allocs=%llu "
+      "legacy-small=%llu legacy-large=%llu contiguous=%llu private-req=%llu host-import=%llu scanout-import=%llu "
+      "cpu-maps=%llu tier-import-denied=%llu tier-cpu-map-denied=%llu",
       tier.mode,tier.state,tier.runs,tier.tested,tier.passed,tier.tested-tier.passed,tier.pass_mask,
       (unsigned long long)(tier.free_bytes>>20),(unsigned long long)(tier.used_bytes>>20),
-      (unsigned long long)tier.refusals,(unsigned long long)tier.allocations);
+      (unsigned long long)tier.refusals,(unsigned long long)tier.allocations,
+      (unsigned long long)tier.requests[NativeAdrenoTierLegacySmall],(unsigned long long)tier.requests[NativeAdrenoTierLegacyLarge],
+      (unsigned long long)tier.requests[NativeAdrenoTierContiguous],(unsigned long long)tier.requests[NativeAdrenoTierPrivate],
+      (unsigned long long)tier.requests[NativeAdrenoTierHostImport],(unsigned long long)tier.requests[NativeAdrenoTierScanoutImport],
+      (unsigned long long)tier.requests[NativeAdrenoTierCpuMap],(unsigned long long)tier.requests[NativeAdrenoTierImportDenied],
+      (unsigned long long)tier.requests[NativeAdrenoTierCpuMapDenied]);
   if(n<0 || size_t(n)>=sizeof line)return EIO;
   return SYSCTL_OUT(req,line,size_t(n)+1);
 }
