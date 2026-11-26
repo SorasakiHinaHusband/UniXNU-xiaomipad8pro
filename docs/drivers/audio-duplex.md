@@ -25,13 +25,40 @@ the baseline, unless explicitly qualified as a reference revision.
   copied. `unixnu.lock` does not pin this Ubuntu release; the older references in
   `docs/drivers/audio.md` and `package/PianoAudio/UPSTREAM` are distinguished.
 
+## Installed v13.1y12q baseline (2026-11-27)
+
+`inst-y12q-obs3` is a read-only, idle pre-login capture from installed
+`v13.1y12q`, booted from disk on macOS 27.3 (`26C5035r`).
+
+- The daily profile uses `machdep.piano_audio_timing=0` (standard 240-frame
+  mode). Optional `batch480` uses `timing=1`. `ioreg` for `PianoAudio` reports
+  `piano-audio-timing-contract`
+  `ring7680/period240/zero7680/ioring7680` and
+  `piano-audio-notification-contract` `counted-cval64:raw-integer`. The
+  `output safety offset` is 480 frames, `input latency` is 2640 frames,
+  `io buffer frame size` is 7680 frames and `clock domain` is 1.
+- `machdep.piano_audio_age=1`, `machdep.piano_audio_duplex_hold=0` and
+  `machdep.piano_audio_gain=243`.
+- Speaker protection (`machdep.piano_audio_spk=3`) and MIPLAY
+  (`machdep.piano_audio_miplay=1`) both report `ready=1`, `active=0`,
+  `failed=0`, `starts=0` and `fallbacks=0` for their respective requests.
+- `machdep.piano_glink_fifo` and `machdep.piano_glink_owner` report
+  `stage=20 mapped=1 owner_consistent=1 broken=0 tx_blocked=0 rx_messages=2814 tx_messages=2702`.
+  `adsp_apps` reports `up=1 size=512 fixed_count=20 fill=0`.
+- `machdep.piano_audio_ledger` reports
+  `speaker-ledger1 written=0 overwritten=0 capacity=128`.
+
+This verifies the idle contract and readiness. Timing latches at StartIO, and
+the active ledger from concurrent playback and recording remains pending.
+
 ## Decision
 
 **HOLD a new fix image.** The historical duplex root cause is confirmed and
-already fixed by default. A second, conditional speaker FIFO defect is proven
-below in the optional 480-frame engine mode. The failing installed boot's mode
-is unknown. Input wake delay is real, but the saved metric does not identify
-its source. There is no evidence for a shared Speaker/Mic device-lock deadlock.
+already fixed by default. The host-modeled speaker FIFO defect below requires
+the optional `batch480` mode. The installed daily profile uses `timing=0`, and
+diagnosing the reported stutter requires an active duplex window. Input wake
+delay is real, but the saved metric does not identify its source. There is no
+evidence for a shared Speaker/Mic device-lock deadlock.
 
 The leading classification is therefore:
 
@@ -53,17 +80,16 @@ have identical code. Reference links:
 [Linux qdsp6](https://github.com/yzddmr6/linux-sm8750-piano/tree/83f0f89bed14a0cb7d582a26e72bced0387870f4/sound/soc/qcom/qdsp6),
 [Linux packet router](https://github.com/yzddmr6/linux-sm8750-piano/blob/83f0f89bed14a0cb7d582a26e72bced0387870f4/drivers/soc/qcom/apr.c).
 
-Evidence labels below identify saved runs and artifact basenames only; no
-private location, PCM, calibration, credentials or raw console is committed.
+The historical evidence below is identified by run label and date.
 
 | Evidence | What was actually read | Limit |
 |---|---|---|
-| `aud-mic4`, November 17 | `0-provenance.txt`, `SCORE-aud-mic4.md`, `MAIN-NOTE.md`, original `console.out` and its saved microphone window | KC provenance identifies commit `4ca0b595a2`; diagnostic root IOKit capture, not normal-app/installed acceptance |
+| `aud-mic4`, November 17 | Provenance, run score, main notes, original console and saved microphone window | KC provenance identifies commit `4ca0b595a2`; diagnostic root IOKit capture, not normal-app/installed acceptance |
 | `aud-mic4` original console, lines 6220–6221 and 6777–6778 | Run 1: requested 3014400, delivered 2994240, startup 20160, missing 0, unavailable 0, fault 0; run 2: 177600 / 157440 / 20160 / 0 / 0 / 0 | 12560 and 740 engine batches respectively; 469/12560 = 3.73%, 25/740 = 3.38% late; WAV duration and engine request duration need not coincide |
 | `aud-mic4` original console, lines 6455 and 6975 | READ health at release: 7749/7749 and 1839/1839 sent/returned, errors/late/alignment/origin/range all 0; short READs 2 and 3 | Release includes idle capture after the HAL stopped; these are not counts within just the recording window |
-| November 21 duplex round-3 analysis | `DUPLEX-R3.md`: comparison of HAL nonzero periods, our DMA nonzero periods, and 20 ms acoustic fade envelopes | Historical analysis includes inferred timings; those estimates are not lock measurements |
-| November 21 `duplex-age1` | Original `RESULT.md` and `verdict.txt`: signed B blocks 0/0/0 acoustic dip windows; old control 85/17/60; signed C and direct-Mic D also 0; no protection fallback | Same frozen RAM image, not current installed acceptance. The text “starved 18 lines” is a parser summary; the actual `z0` fields mean zero depth-0 observations, not 18 starvation events |
-| November 24 audio review | `ANALYSIS.md`, `TABLET-CHECKLIST.md` | Reports signed age enabled on installed y12c, protection 3 and MIPLAY 1; later silent-install checks skipped audible duplex. The proposed silent probe is not present in this branch |
+| November 21 duplex round-3 analysis | Comparison of HAL nonzero periods, our DMA nonzero periods, and 20 ms acoustic fade envelopes | Historical analysis includes inferred timings; those estimates are not lock measurements |
+| November 21 `duplex-age1` | Original results and verdict show 0/0/0 acoustic dip windows for signed B, 85/17/60 for the old control, zero for signed C and direct-Mic D, and zero protection fallbacks | Same frozen RAM image, not current installed acceptance. The text “starved 18 lines” is a parser summary; the actual `z0` fields mean zero depth-0 observations, not 18 starvation events |
+| November 24 audio review | Analysis and tablet checklist | Reports signed age enabled on installed y12c, protection 3 and MIPLAY 1; later silent-install checks skipped audible duplex. The proposed silent probe is not present in this branch |
 
 The original score called the long run about 12544 periods; the arithmetic above
 uses the original engine request count. No claim is made that the late-wake
@@ -371,13 +397,12 @@ supported recommendation, **not a recorded live Ubuntu duplex hw_params**.
 Our 1920-byte / 10 ms READs are smaller; successful recorded READ returns prove
 their acceptance on this firmware, not a shared Linux minimum constraint.
 
-## Exact remaining observations (specified, not executed)
+## Remaining observations during active duplex
 
-This job never connects to, boots, records on, or changes the tablet. A future
-authorized observer can read the following on the **already installed failing
-boot**, without installing an image or writing a control. ENOENT is an absent
-observer, not a zero counter. Knob readback is not proof of a currently running
-engine's settings: timing is latched at StartIO and graph requests at startup.
+A future authorized observer can collect the following read-only observations
+on the **already installed boot** during concurrent playback and recording.
+ENOENT indicates an absent observer. Timing is latched at StartIO and graph
+requests at startup, so readback should be paired with the active window logs.
 
 | Read / saved event | Required interpretation / hypothesis it settles |
 |---|---|
@@ -475,14 +500,14 @@ cc -std=c11 -Wall -Wextra -Werror -I package/PianoAudio \
   package/PianoAudio/AudioSafety.c package/PianoAudio/AudioDspLink.c \
   -o /tmp/duplex_schedule_host
 /tmp/duplex_schedule_host
-python3 scripts/ci/privacy-scan.py --diff 3fcf74f4
+python3 scripts/ci/privacy-scan.py --diff f360f3bd
 ```
 
 Expected reserve-model output: mode 0 skipped 0 / short-reads 0 / missing 0;
 mode 1 skipped 1 / short-reads 2 / missing 960. That passing assertion records
 the existing optional-mode defect, not a fix or a hardware stutter waveform.
-Privacy scan: **0 hits, 0 refused files**. Only this analysis and the offline
-test are changed; driver/build/firmware/image files remain untouched.
+The 2026-11-27 installed-baseline update reran `duplex_schedule_host` from
+`f360f3bd` and passed all 1,871,588 checks with those refill results.
 
 ## Fix-image gate
 
@@ -496,26 +521,22 @@ PCM pumps, default signed age and mode240 burst reserve. `ours-missing`:
 mode480 burst reserve, completion-triggered worker wake and separate engine
 wait/lock/body observations. `ours-contended`: synchronous shared-worker local
 actions, physical GLINK/ADSP resources and client enqueue lock. `unknown`:
-installed failing KC and active engine mode/policy, current stutter signature,
+KC and latched engine mode/policy during the reported stutter, its signature,
 actual lock/service latencies, HAL/firmware scheduling and downstream clocks.
-Existing host tests and the added production-boundary model pass; privacy
-scan against `3fcf74f4` returns 0 hits, 0 refused files.
 
-Root cause: Historical unsigned timestamp race caused false-silence fades;
-the signed-age correction is already in this baseline and saved same-boot A/B
-confirmed it. Optional mode480 still has a statically proven trim/burst deficit
-(2880 -> 960 before 1920-frame demand, two short reads / 960 missing frames),
-but its involvement in the installed complaint is unconfirmed. Input host wake
-lateness is measured after wait plus lock acquisition; scheduling, previous
-body and lock delay remain indistinguishable from existing totals. Saved
-simplex PCM has missing 0 and DSP late/errors 0. No new causal claim about the
-installed system is closed by those historical counters.
+The historical unsigned timestamp race caused false-silence fades. The saved
+same-boot A/B confirmed the signed-age correction already in this baseline.
+The host model reproduces the optional `batch480` trim from 2880 to 960 frames
+before a 1920-frame refill, causing two short reads and 960 missing frames.
+Input host wake lateness is measured after wait plus lock acquisition.
+Scheduling, previous-body work and lock delay remain indistinguishable from
+existing totals. Saved simplex PCM has missing 0 and DSP late/errors 0.
 
-ONE change: HOLD. No driver edit or fix image. First obtain the specified
-read-only installed provenance, latched engine mode, age/fade, refill ledger,
-transport and matching input health/wake observations. If mode480 and its
-four-slot trim signature match, the candidate ONE change is to apply the
-existing epoch/burst reserve policy to both batch sizes, with this reproducer
-changed to demand zero active shortage. Otherwise reclassify from the actual
-failure layer; do not reapply the age fix or combine speculative timer,
-priority, clock-vote and buffer changes.
+**HOLD pending an active speaker ledger from concurrent playback and
+recording.** The idle daily `timing=0` baseline warrants no driver change.
+The active ledger needs the latched mode, age/fade, transport and matching
+input health/wake observations from the same window. If that window shows
+`batch480` and its four-slot trim signature, the candidate single change is to
+apply the existing epoch/burst reserve policy to both batch sizes and update
+the host model to require zero active shortage. For `timing=0`, classify the
+stutter from the synchronized observations before choosing any driver change.
