@@ -31,7 +31,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import tomllib
 
 RENAMES = {
     "Mu-Silicium": "Mu-Silicium-piano",
@@ -52,10 +51,16 @@ def out(cmd, cwd=None):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True).stdout.strip()
 
 
+def checkout_head(dest):
+    if os.path.exists(os.path.join(dest, ".git")):
+        return out(["git", "-C", dest, "rev-parse", "HEAD"])
+    return ""
+
+
 def fetch_commit(dest, url, commit, blobs=True):
     """dest's HEAD at commit: a shallow fetch of exactly that commit (a full fetch when the server refuses one)."""
     os.makedirs(dest, exist_ok=True)
-    if not os.path.isdir(os.path.join(dest, ".git")):
+    if not os.path.exists(os.path.join(dest, ".git")):
         sh(["git", "init", "-q", dest])
         sh(["git", "-C", dest, "remote", "add", "origin", url])
     else:
@@ -88,17 +93,24 @@ def submodule_url(dest, sub):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--verify", action="store_true", help="fetch each pinned commit without a checkout (blobs left out)")
-    ap.add_argument("--outdated", action="store_true", help="report pins behind their upstream branch")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--verify", action="store_true", help="fetch each pinned commit without a checkout (blobs left out)")
+    mode.add_argument("--outdated", action="store_true", help="report pins behind their upstream branch")
     ap.add_argument("--lock", default=os.path.join(REPO, "unixnu.lock"))
     args = ap.parse_args()
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        ap.error("reading unixnu.lock requires Python 3.11 or later")
 
     root = os.environ.get("UNIXNU_RESEARCH", os.path.join(os.getcwd(), "unixnu-research"))
     with open(args.lock, "rb") as f:
         lock = tomllib.load(f)
     pins = lock.get("pin", {})
-    only = set(args.only.split(",")) if args.only else None
+    only = {name.strip() for name in args.only.split(",")} if args.only is not None else None
+    if only is not None and (unknown := only - pins.keys()):
+        ap.error("unknown pin(s): " + ", ".join(repr(name) for name in sorted(unknown)))
     failed, moved = [], []
 
     for name, spec in pins.items():
@@ -146,23 +158,30 @@ def main():
         dest = os.path.join(root, RENAMES.get(name, name))
         if name == "k27":
             if args.dry_run:
-                print(f"would fetch the k27 tree -> {dest} @ {commit[:10]} + patches/k27-tree")
+                print(f"would fetch the k27 tree -> {dest} @ {commit[:10]} + {spec['patches']}")
                 continue
-            sh(["bash", os.path.join(REPO, "tooling/k27/fetch-k27-tree.sh"), dest])
+            sh(["bash", os.path.join(REPO, "tooling/k27/fetch-k27-tree.sh"), dest, args.lock])
             continue
-        if os.path.isdir(os.path.join(dest, ".git")):
-            head = out(["git", "-C", dest, "rev-parse", "HEAD"])
-            if head == commit:
-                print(f"ok   {name} @ {head[:10]}")
-                continue
+        head = checkout_head(dest)
+        if head == commit:
+            print(f"ok   {name} @ {head[:10]}")
+        elif head:
             print(f"stale {name}: {head[:10]} != {commit[:10]}")
-        if args.dry_run:
+        if args.dry_run and head != commit:
             print(f"would fetch {name} -> {dest} @ {commit[:10]}")
             continue
-        fetch_commit(dest, url, commit)
+        if head != commit:
+            fetch_commit(dest, url, commit)
         for sub, sub_commit in (spec.get("submodules") or {}).items():
             sub_dest = os.path.join(dest, sub)
+            if checkout_head(sub_dest) == sub_commit:
+                continue
+            if args.dry_run:
+                print(f"would fetch {name}/{sub} -> {sub_dest} @ {sub_commit[:10]}")
+                continue
             sub_url = submodule_url(dest, sub)
+            if not sub_url:
+                sys.exit(f"{name}: submodule {sub} not in .gitmodules")
             sh(["git", "-C", dest, "submodule", "init", "--", sub], quiet=True)
             fetch_commit(sub_dest, sub_url, sub_commit)
 

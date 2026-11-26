@@ -20,12 +20,12 @@ import io
 import json
 import os
 import re
+import shlex
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 import uuid
 import zlib
@@ -343,14 +343,49 @@ class Scripts(unittest.TestCase):
             self.assertIn(command, got.stdout)
         self.assertIn('K273_ROOT_PART=linux_data PIANO_GPU=2 PIANO_DATA_PERSIST=0 PIANO_RESET_AFTER=900', got.stdout)
 
+    def test_entry_dry_run_keeps_manifest_path_as_one_argument(self):
+        with tempfile.TemporaryDirectory() as t:
+            inputs = Path(t) / 'input files'
+            root = inputs / 'root'
+            root.mkdir(parents=True)
+            manifest = root / 'systemos.manifest.json'
+            manifest.write_text('{}\n')
+            env = dict(os.environ, K273_INPUTS=str(inputs), SUDO='sudo -A', REMOVE_AEA='0')
+            got = subprocess.run(['bash', str(R / 'fetch-and-build.sh'), '--dry-run', 'inputs', 'systemos', 'root'],
+                                 capture_output=True, text=True, env=env, timeout=30, check=True)
+            self.assertEqual(list(root.iterdir()), [manifest])
+        commands = [shlex.split(line[len('would run: '):]) for line in got.stdout.splitlines()
+                    if line.startswith('would run: ')]
+        self.assertIn(['python3', '-I', 'tooling/repro/verify-root.py', str(root), '--manifest-json', str(manifest)], commands)
+        self.assertTrue(any(cmd[:4] == ['sudo', '-A', 'python3', '-I'] for cmd in commands))
+        self.assertNotIn('AEA archives removed after decryption', got.stdout)
+
+    def test_fetch_pins_refuses_conflicting_modes(self):
+        for option in ('--verify', '--outdated'):
+            got = subprocess.run([sys.executable, str(D / 'scripts/fetch-pins.py'), '--dry-run', option],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(got.returncode, 2, got.stderr)
+            self.assertIn('not allowed with argument --dry-run', got.stderr)
+
     def test_fetch_pins_dry_run_plans_locked_checkouts(self):
-        pins = tomllib.loads((D / 'unixnu.lock').read_text())['pin']
         with tempfile.TemporaryDirectory() as t:
             research = Path(t) / 'unixnu-research'
             env = dict(os.environ, UNIXNU_RESEARCH=str(research))
-            got = subprocess.run([sys.executable, str(D / 'scripts/fetch-pins.py'), '--dry-run'], cwd=t, env=env,
-                                 capture_output=True, text=True, timeout=30, check=True)
+            command = [sys.executable, str(D / 'scripts/fetch-pins.py'), '--dry-run']
+            got = subprocess.run(command, cwd=t, env=env, capture_output=True, text=True, timeout=30)
             self.assertFalse(research.exists())
+            if sys.version_info < (3, 11):
+                self.assertEqual(got.returncode, 2, got.stderr)
+                self.assertIn('reading unixnu.lock requires Python 3.11 or later', got.stderr)
+                return
+            self.assertEqual(got.returncode, 0, got.stderr)
+            unknown = subprocess.run([*command, '--only', 'missing-pin'], cwd=t, env=env,
+                                     capture_output=True, text=True, timeout=30)
+            self.assertEqual(unknown.returncode, 2, unknown.stderr)
+            self.assertIn('unknown pin(s)', unknown.stderr)
+        import tomllib
+
+        pins = tomllib.loads((D / 'unixnu.lock').read_text())['pin']
         expected_checkouts = {'UniXNU': 'UniXNU', 'Mu-Silicium': 'Mu-Silicium-piano',
                               'piano-uefi': 'piano-uefi-UniXNU-piano'}
         for name, checkout in expected_checkouts.items():
