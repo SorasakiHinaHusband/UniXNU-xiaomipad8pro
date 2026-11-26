@@ -371,18 +371,37 @@ def brightness_check(method):
 
 def prepare_ax():
     # Probe in the same launchctl and sudo chain used by every action.
-    ready = remote("ax-trust", artifact="ax-trust", required=False)
-    if ready.get("trusted") is not True:
-        seeded = bash("SSH_T=40 gui_checks_remote", "seed", timeout=43)
-        save("ax-seed", seeded.stdout)
-        if seeded.returncode or b"GUI_TCC_SEEDED" not in seeded.stdout.splitlines():
-            raise CheckError("could not seed the installed SSH-wrapper Accessibility grant")
-        for _ in range(5):
-            if remote("ax-trust", artifact="ax-trust", required=False).get("trusted") is True:
-                break
-            time.sleep(1)
-        else:
-            raise CheckError("console-user Accessibility probe did not become trusted")
+    def probe():
+        trusted = remote("ax-trust", required=False).get("trusted")
+        receipt = {True: b'GUI {"trusted":true}\n', False: b'GUI {"trusted":false}\n'}
+        save("ax-trust", receipt[trusted] if type(trusted) is bool else b"")
+        return trusted is True
+
+    if probe():
+        verdict("INFO", "gui-checks console-user Accessibility was already trusted")
+        return
+
+    outcomes = {
+        b"GUI_TCC_SEEDED": (0, "temporary Accessibility grant inserted"),
+        b"GUI_TCC_ALREADY_TRUSTED": (0, "existing Accessibility grant matched"),
+        b"GUI_TCC_EXISTING_POLICY": (2, "existing Accessibility policy differs"),
+    }
+    seeded = bash("SSH_T=40 gui_checks_remote", "seed", timeout=43)
+    receipts = [line for line in seeded.stdout.splitlines() if line in outcomes]
+    if len(receipts) != 1 or seeded.returncode != outcomes[receipts[0]][0]:
+        raise CheckError("could not confirm the installed SSH-wrapper Accessibility policy")
+    receipt, = receipts
+    status, summary = outcomes[receipt]
+    save("ax-seed", receipt + b"\n")
+    verdict("INFO", f"gui-checks {summary}")
+    if status:
+        raise CheckError("existing SSH-wrapper Accessibility policy requires authorization")
+
+    for _ in range(5):
+        if probe():
+            return
+        time.sleep(1)
+    raise CheckError("console-user Accessibility probe did not become trusted")
 
 
 def main(phase):

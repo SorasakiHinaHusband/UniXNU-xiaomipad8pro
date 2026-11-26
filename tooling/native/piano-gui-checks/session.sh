@@ -105,7 +105,7 @@ if [[ $op == cleanup-locked ]]; then
         echo GUI_ENERGY_RECOVERY_UNCONFIRMED
         exit 2  # Keep the original preferences and helper so cleanup can be retried.
     fi
-    rm -f "$dir/gui" "$dir/seed-owner" "$dir/session.sh" "$dir/session-lock" "$dir"/req.* \
+    rm -f "$dir/gui" "$dir/seed-owner" "$dir/seed-existing" "$dir/session.sh" "$dir/session-lock" "$dir"/req.* \
           "$dir/energy-original" "$dir/energy-original.incoming" "$dir/energy-opened" "$dir/energy-finished"
     rmdir "$dir"
     [[ $restart_failed == 0 ]]
@@ -122,7 +122,7 @@ case $op in
     seed-locked)
         # The RAM seed also sets Camera rows. On installed Data, touch only the Accessibility row,
         # preserve an existing policy, and remember the exact temporary row for cleanup.
-        [[ -f $db && ! -L $db && ! -e "$dir/seed-owner" ]]
+        [[ -f $db && ! -L $db && ! -e "$dir/seed-owner" && ! -e "$dir/seed-existing" ]]
         reqfile=$(mktemp "$dir/req.XXXXXXXX")
         trap 'unlink "$reqfile"' EXIT
         printf 'identifier "com.apple.sshd-keygen-wrapper" and anchor apple\n' | csreq -r- -b "$reqfile"
@@ -132,7 +132,7 @@ case $op in
         # Write the root-only ownership receipt before committing. A write failure
         # aborts the transaction. An existing policy leaves no ownership receipt.
         umask 077
-        sql <<SQL
+        observed=$(sql <<SQL
             CREATE TEMP TABLE receipt (bytes INTEGER NOT NULL CHECK(bytes > 0));
             BEGIN IMMEDIATE;
             INSERT INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags, last_modified)
@@ -141,11 +141,29 @@ case $op in
             INSERT INTO receipt
                 SELECT writefile('$dir/seed-owner', rowid || ' ' || last_modified || ' ' || lower(hex(csreq)) || char(10))
                 FROM access WHERE rowid=last_insert_rowid() AND changes()=1;
+            SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM receipt) THEN 'GUI_TCC_SEEDED'
+                WHEN count(*)=1 AND sum(auth_value=2 AND csreq=X'$req')=1 THEN 'GUI_TCC_ALREADY_TRUSTED'
+                ELSE 'GUI_TCC_EXISTING_POLICY'
+            END FROM access WHERE $where;
             COMMIT;
 SQL
-        [[ -s "$dir/seed-owner" ]] || { echo GUI_TCC_EXISTING_POLICY; exit 2; }
-        restart_tccd
-        echo GUI_TCC_SEEDED
+        )
+        case $observed in
+            GUI_TCC_SEEDED)
+                [[ -s "$dir/seed-owner" ]]
+                restart_tccd
+                ;;
+            GUI_TCC_ALREADY_TRUSTED)
+                printf 'existing-unchanged\n' > "$dir/seed-existing"
+                ;;
+            GUI_TCC_EXISTING_POLICY)
+                echo "$observed"
+                exit 2
+                ;;
+            *) exit 2 ;;
+        esac
+        echo "$observed"
         ;;
     wifi-state|wifi-disassociate)
         "$dir/gui" "$op" "$@"
