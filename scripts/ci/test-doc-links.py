@@ -15,6 +15,8 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER_INDEX = 'docs/drivers/README.md'
+# Vendored upstream README whose relative links point into its original repository.
+VENDORED_SKIP = {'package/PianoA830/adreno830/README.md'}
 FENCE = re.compile(r' {0,3}(`{3,}|~{3,})(.*)')
 QUOTE = re.compile(r' {0,3}>[ \t]?')
 ITEM = re.compile(r' {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}')
@@ -300,6 +302,8 @@ def main():
     indexed = set()
     link_count = anchor_count = 0
     for path, (_, links) in documents.items():
+        if path in VENDORED_SKIP:
+            continue
         for number, destination_text, image in links:
             resolved = resolve_link(path, destination_text)
             if resolved is None:
