@@ -1,5 +1,22 @@
 # Cameras (B11): PianoCamera, the level ladder
 
+## Daily status (2026-11-27)
+
+The **v13.1y12q** daily line carries the camera support verified on installed **v13.1y12l** on November 26. Photo Booth
+showed live front preview without a prompt and opened the effects grid. AVFoundation recorded **10 s H.264 movies**
+from both the front **OV32D40** and rear **S5KJN1** using the QuickTime High preset and software encoding.
+[November 26 installed checks](../results-2026-11-26.md#install) · [Support status](../STATUS.md)
+
+Both cameras are listed, and FaceTime has Camera and Microphone access. Hands-on FaceTime self-view and saving and
+playing back a QuickTime New Movie Recording are pending. [Camera app check](../tools/cam-apps-check.md)
+
+Iris H.264 encode **E1** is host-ready. The host check still needs to be recorded, and the self-test awaits
+tablet qualification. [Hardware backlog, B10 and B11](../BACKLOG-hardware.md#2-backlog-b1b15) · [Iris video driver](video.md)
+
+## Historical camera bring-up
+
+The notes below record early sensor, RAW capture, CoreMediaIO and app compatibility work and its test state at the time.
+
 2026-11-19, compatibility output (host verified; tablet preview pending): index 1 now advertises and delivers
 640×480 `420v` at 15–30 fps. The provider synchronously converts its complete BGRA working frame into BT.709 video-range
 Y and interleaved CbCr planes, using each plane's reported stride, before sending the retained sample. Native index 0
@@ -59,14 +76,14 @@ ran the whole rear path to stream-on and, by its timing, two frames, then **abor
 §11); the multimedia votes are shared with PianoVideo (`package/include/PianoMmVotes.h`, §4.3.1). Backlog item B11
 (`../BACKLOG-hardware.md`). Template: `README.md`.
 
-## 1. Purpose and gate
+### 1. Purpose and gate
 
 Ubuntu v0.3.0 brought both cameras up (rear S5KJN1SQ03, fixed focus; front OV32D40), v0.10.0 fixed auto-exposure; its daemon
 publishes 1920×1440 NV12 at 30 fps to every app through v4l2loopback, and takes photos with the rear torch. Natively: FaceTime,
 Photo Booth, QuickTime and browsers should see "Rear Camera" and "Front Camera". No login milestone depends on it; the owner made it
 a high priority on 2026-11-12. Every level is inert below its boot argument `piano-camera=N`.
 
-## 2. Hardware facts
+### 2. Hardware facts
 
 Sources: the boot DT ("DT", `out/inputs/piano-boot.dtb`); the Ubuntu piano kernel piano/dev 7f8d6bed (GPL, facts only; fetched
 with pinned hashes by `tooling/camera/fetch-ubuntu-camera-sources.sh`): `sm8750-xiaomi-piano-camera.dtsi` ("KDTS"), `camss*.c`,
@@ -90,7 +107,7 @@ facts as code, each with its source.
 | Firmware | **none** on this path (no `request_firmware`; no ICP/CDM users); `camera_mem` carve-outs exist but are unused | msm, device `source.json` | verified (source) |
 | Focus | GT9764 at CCI0 m1 0x0c, **disabled** ("register protocol unverified"): fixed focus, as in Ubuntu | DT | verified |
 
-## 3. Ubuntu as the specification
+### 3. Ubuntu as the specification
 
 **The pixel path, not raw.** Ubuntu's daemon (`piano-camerad`) routes sensor → CSIPHY → CSID → IPP → **TFE 980 pixel pipeline** →
 NV12 (rear csiphy1/csid0/tfe0, front csiphy4/csid1/tfe1): demux, black level 64, white-balance gains, demosaic, GTM, a 64-entry gamma,
@@ -105,7 +122,7 @@ V4L2 does not turn the torch off).
 **The bring-up order** (`camss-*.c`, `s5kjn1.c`, `ov32d40.c`): CCI0 is up from its probe (clocks, pins, reset, timing) before any
 sensor powers; a sensor's runtime resume is its power-on sequence (§2); streaming is VFE → CSID → CSIPHY → sensor last.
 
-## 4. Design: the ladder
+### 4. Design: the ladder
 
 | Level | `piano-camera=` | What it does | Writes | Pass | State |
 |---|---|---|---|---|---|
@@ -115,7 +132,7 @@ sensor powers; a sensor's runtime resume is its power-on sequence (§2); streami
 | L4 | 4 | a software ISP: black level, white balance, demosaic, colour matrix, gamma, simple AE → NV12 at 1280×960 / 1920×1440 | + the sensor's exposure/gain registers | a usable image; AE converges within 1 s | designed (§4.4) |
 | L5 | 5 | a macOS camera device for apps: the kext's user client + a CoreMediaIO camera extension | + the user client's ring | Photo Booth/FaceTime/QuickTime/Safari list and use both cameras | designed (§4.5); C5 test first |
 
-### 4.1 L1: the survey (built)
+#### 4.1 L1: the survey (built)
 
 `CameraSurvey.h` loads, in this order: GCC's camera branches (AHB, XO, the MCLK controller's AHB, HF/SF AXI, QMIP) and QUP2's vote
 word with SE1's branches; **CAMCC only while GCC clocks its AHB** (GDSCs with their CFG words, 21 branches, 11 clock sources with
@@ -134,7 +151,7 @@ CSIPHY LDOs enabled, the pins in their sleep states, no SMMU group for 0x1c00. *
 GCC's three branches are off (the AHBs hardware-gated), so CAMCC and the MCLK controller stay unread at level 1 (a load needs their
 AHB enabled: a store, which is level 2's step 201).
 
-### 4.2 L2: power one sensor, read its chip ID, power it down (built)
+#### 4.2 L2: power one sensor, read its chip ID, power it down (built)
 
 `CameraPower.h` (`Session`) runs each sensor in turn (`piano-camera-sensor=1` rear, 2 front, 3 both, rear first):
 
@@ -216,7 +233,7 @@ GDSCR, the four critical branches, the top AHB and CCI0 branches, the slow AHB s
 MCLK controller's MCLK1/MCLK4 sources and branches and PLL0's registers; the ten camera pins' CFG/IO; CCI0's registers. Never: any
 QUP vote word, any other GDSC, the CSIPHY/CSID/TFE blocks, the SMMU, any other pin.
 
-### 4.3 L3: RAW frames into memory (built, host-tested; c3rp/c3r ran, fixed after them)
+#### 4.3 L3: RAW frames into memory (built, host-tested; c3rp/c3r ran, fixed after them)
 
 `CameraStream.h` (`Stream`, over level 2's ops) for one sensor: `piano-camera=3` (the rear by default, `piano-camera-sensor=2` the
 front). Specification: `camss.c` `*_res_8750`, `camss-csiphy-3ph-1-0.c`, `camss-csid-980.c`, `camss-vfe-gen4.c`, `camcc-sm8750.c`,
@@ -318,7 +335,7 @@ attached (polled), the front has no test pattern (its driver's 0x4308 is unverif
 tables' defaults), the frame is analysed in the kernel and not exported (L4's user client carries frames). `piano-camera-stop=3xx`
 stops after any step with the full power-down.
 
-#### 4.3.1 The shared multimedia votes (`package/include/PianoMmVotes.h`)
+##### 4.3.1 The shared multimedia votes (`package/include/PianoMmVotes.h`)
 
 MXC, MMCX and BCM MM1 are voted from apps DRV-2 by PianoVideo (V1-V3) and PianoCamera (levels 2-3); one RPMh vote per resource per
 DRV replaces that DRV's earlier one, so without coordination one driver's release (PianoVideo's MXC 0 and MM1 off at its
@@ -334,7 +351,7 @@ against PianoVideo's previous rules over every sequence of up to six operations)
 of these three, and only defines the words. Host tests: `package/include/tests/mm_votes_host.cpp` (one and two clients, floors,
 failures, the lock bound, a lost lock, two threads, the cmd-db reader) and PianoVideo's `testSharedVotes`.
 
-### 4.4 L4: the software ISP (designed)
+#### 4.4 L4: the software ISP (designed)
 
 Where: in user space (the camera extension of L5, or first a test tool `tooling/native/piano-camera-dump` run over the USB root shell),
 never in the kernel. Input: one RAW10 MIPI-packed frame from the ring with its exposure, gain and Bayer order. Steps, per output pixel
@@ -352,7 +369,7 @@ Cost: ~3.1 M quads a frame for the rear at 30 fps is ~94 M quads/s: NEON (vImage
 rear runs at 15 fps on NEON and at 30 on the A830 through a Metal compute kernel once the GPU path is up (the front's 2 M quads at
 30 fps fit NEON). A first version can drop to 1/4-resolution quads (1020×768) to stay simple.
 
-### 4.5 L5: a macOS camera device (designed; its kernel side's first version built, §4.5.1)
+#### 4.5 L5: a macOS camera device (designed; its kernel side's first version built, §4.5.1)
 
 Research of 2026-11-12 (public documentation and developer reports, sources at the end of this section; no Apple binary read):
 
@@ -407,7 +424,7 @@ Research of 2026-11-12 (public documentation and developer reports, sources at t
   from 14.1); OBS Studio's `plugins/mac-virtualcam` (its camera extension's entitlements and Info.plist); Apple developer forums
   threads 706184, 716181, 725481, 795835, 823200; the SDKs' CoreMediaIO headers (26.5 and 27.2). Reports, not tested here.
 
-#### 4.5.1 Level 5's first version (built 2026-11-13, image `c5`): the kernel side and a command-line client
+##### 4.5.1 Level 5's first version (built 2026-11-13, image `c5`): the kernel side and a command-line client
 
 What the next boot verifies, without any app or system extension: `piano-camera=5` (4 as well: level 4, the ISP, is user space)
 publishes `IOUserClientClass` = `PianoCameraUserClient` on the PianoCamera service; after the survey the camera thread waits for
@@ -424,7 +441,7 @@ averaged, the black level, grey-world balance, a digital gain to the 99th percen
 816x459 front at scale 2), and prints its lines and a 64-pixel thumbnail on the console; `tooling/camera/console-thumb.py LOG` turns
 the thumbnails of the console capture or the mailbox copy into PNGs on the Mac, so the first pictures need no shell on the tablet.
 
-#### 4.5.2 The order to Photo Booth and FaceTime
+##### 4.5.2 The order to Photo Booth and FaceTime
 
 | Step | What | Verified by |
 |---|---|---|
@@ -441,14 +458,14 @@ system, docs/userland.md 7); the files reach Data only through the system layer 
 the approval is the one attended step; the user client of steps 1-3 needs root (the grab tool runs as root), step 4 replaces that
 with the entitlement check.
 
-## 5. Dependencies
+### 5. Dependencies
 
 L1/L2: PianoA830 (its DRV-2 and GCC lock words, the shared votes' words), PianoPower's `SpmiObserver.h`, PianoKeyboard's `CmdDb.h`,
 `package/include/PianoMmVotes.h` (§4.3.1). L3 (all in place): the shared votes (MXC, MM1; with PianoVideo), an SMMU route for 0x1c00
 (the boot chain's bypass or our window: PianoWifi's `WifiSmmuWindow.h`, copied), the CSIPHY table as data (`data/camera`). L4: the A830 Metal path for 30 fps on the rear (optional). L5: C5 (the extension
 installs on our boot), PianoTorch (the photo flash, B12, built).
 
-## 6. Boot args
+### 6. Boot args
 
 | Argument | Default | Meaning |
 |---|---|---|
@@ -476,7 +493,7 @@ installs on our boot), PianoTorch (the photo flash, B12, built).
 | `piano-camera-timeout-ms` | 3000 | level 3: the stream's hard bound from stream-on (500..10000) |
 | `piano-camera-gain` | 64 | level 3: the rear's analogue gain code (32 = 1×; 32..2048) |
 
-## 7. Kernel collection
+### 7. Kernel collection
 
 `package/PianoCamera` + `tooling/k27/build-native-piano-camera.sh`: the tables' tool self-test, `data/camera` against its MANIFEST,
 the tables' header into `out/native-kexts/PianoCamera/gen`, the host tests (`tests/camera_host.cpp`: a board model whose CAMCC,
@@ -502,9 +519,9 @@ CameraPower.h and CameraStream.h store only through their allowlisted `put()`/`p
 Write), the objects (with the generated tables' header), the import check (PianoA830's lock and vote words). `PianoCamera` is in
 `configs/k27-native-kexts.txt` after PianoA830.
 
-## 8. Hardware test plan (RAM boots)
+### 8. Hardware test plan (RAM boots)
 
-### 8.1 The images
+#### 8.1 The images
 
 `tooling/k27/build-camera-test-images.sh` (the GPU profile of the other test images: PianoA830, the Turnip stage, `vmm-present 0`,
 the USB console, `piano-reset-after` as the backstop, the Gunyah watchdog behind it; `CAM_PROFILE=plain` for a KC built without the
@@ -563,7 +580,7 @@ down; (5) a power-down step that fails: `power down INCOMPLETE` with its warning
 reset at the latest. None of these can damage the sensors (the drivers' own voltages and order) or anything else (nothing shared is
 written). The torch, the display and the battery are not involved.
 
-### 8.2 Expected lines
+#### 8.2 Expected lines
 
 **c1** (`..` = values to record):
 ```
@@ -745,7 +762,7 @@ no frame time behind it), BUF_DONE times closer than ~33 ms, rows with `0 of 510
 a written extent of 0 with frames counted (BUF_DONE without data). An abort (`Unhandled implementation specific error`) in step
 340: the last `write` line names the store; everything found was printed before it.
 
-### 8.3 Level 3 unattended?
+#### 8.3 Level 3 unattended?
 
 **Yes, in the order of §8.1** (`c3rp` only after `c2r24` passed, then `c3r`, `c3rs`, `c3f`), with the residual risks below; no
 step can damage hardware or leave persistent state. What it changes beyond level 2: CAMCC's PLL0 and the stream's clocks (camera
@@ -774,7 +791,7 @@ run (`c3r`) is the first time anything natively drives CAMSS: attended is not re
 keeping (the display should not change at all). **c3rp and c3r ran unattended on 2026-11-12** (§8.4): risks (1)-(4) did not happen
 (no stall on any CAMSS access, PLL0 locked under MXC low_svs, the window took); (5) did, as a reboot.
 
-### 8.4 Results
+#### 8.4 Results
 
 **c1, 2026-11-12** (queue run 11:21-11:27, image 016d85c229315fe4; `logs/usb-console/20261112-112113-port0.txt`): no hang, `done: 166
 MMIO loads, 0 stores`, 32 observer reads, 0 map failures. GCC: camera AHB 0x88000002 (off, hardware-gated), XO 0x88000000 (off),
@@ -850,12 +867,12 @@ black level with read noise); c3f: **the front's first frames**, two at 3264x183
 stream-on, 33.3 ms apart, means 64/64/64/63 (min 61, max 67-71). Why the scenes are black: §4.3 "After cplan" (the front: no
 controls written, *inferred* the cause; the rear: *inferred* facing the desk). Next: `cae`.
 
-## 9. Fallback
+### 9. Fallback
 
 Without `piano-camera` nothing is mapped. A refusal writes nothing for that sensor. Any failure runs the full power-down. A
 system sleep during a sequence waits for its power-down (the kext joins the power tree at level 2).
 
-## 10. Open questions
+### 10. Open questions
 
 1. CAMCC and the MCLK controller readable at the boot rails (MMCX on for the display; MXC unknown)? → `c1`: not readable at all
    (their GCC AHB off); level 2 enables the AHB and, for CAMCC, votes MXC first → `c1b`/`c2r`: **answered**, both readable then.
@@ -878,7 +895,7 @@ system sleep during a sequence waits for its power-down (the kext joins the powe
 8. Does sysextd activate an ad-hoc, trust-cached camera extension on 27 (C5)? → before L5.
 9. QUP2 SE1's GENI firmware (protocol 3?) for a hardware I2C later → `c1`'s `qup2 se1` line (only when clocked).
 
-## 11. Licence and the tables (owner decision, 2026-11-12)
+### 11. Licence and the tables (owner decision, 2026-11-12)
 
 The camss, sensor, CCI, clock, pinctrl drivers and the piano DT (GPL-2.0) are the specification only (addresses, fields, sequences,
 timings); no code, comment or structure is copied; PianoCamera is BSD-2-Clause-Patent (`package/PianoCamera/UPSTREAM`). **The
