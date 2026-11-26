@@ -38,12 +38,4 @@ if got != want:
     raise SystemExit('test-piano-bootargs: %s does not add %s byte for byte' % (patch.split('/')[-1], header.split('/')[-1]))
 print('test-piano-bootargs: the 0066 patch carries piano_bootargs_policy.h unchanged (%d lines)' % len(out))
 EOF
-# The standalone ADT suite uses hashlib.file_digest (Python 3.11+).
-# Keep the k27 patch check above on the caller's python3.
-for adt_python in python3 python3.15 python3.14 python3.13 python3.12 python3.11; do
-  if command -v "$adt_python" >/dev/null && "$adt_python" -c 'from hashlib import file_digest' 2>/dev/null; then
-    exec "$adt_python" "$D/tooling/adt/boot_args.py" --self-test
-  fi
-done
-echo 'test-piano-bootargs: the ADT self-test requires Python 3.11 or later on PATH' >&2
-exit 1
+exec python3 "$D/tooling/adt/boot_args.py" --self-test

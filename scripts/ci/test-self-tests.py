@@ -22,7 +22,7 @@ class SuiteTests(unittest.TestCase):
     def test_python_host_runner_is_discovered(self):
         runner = 'package/Example/tests/run-example-host.py'
         with patch.object(self_tests, 'tracked', return_value=[runner]):
-            tests, unrunnable = self_tests.collect('Example', {})
+            tests, unrunnable = self_tests.collect(['Example'], {})
         self.assertEqual(tests, [('py', runner, None)])
         self.assertEqual(unrunnable, [])
 
@@ -34,7 +34,7 @@ class SuiteTests(unittest.TestCase):
             patch.object(self_tests, 'tracked', return_value=[runner, member, unregistered]),
             patch.object(self_tests, 'build_line', return_value=None),
         ):
-            tests, unrunnable = self_tests.collect('Example', {member: f'SUITE: {runner}'})
+            tests, unrunnable = self_tests.collect(['Example'], {member: f'SUITE: {runner}'})
 
         self.assertEqual(tests, [('sh', runner, None), ('c', member, None)])
         self.assertEqual(unrunnable, [unregistered])
@@ -97,6 +97,18 @@ class SuiteTests(unittest.TestCase):
                      redirect_stdout(output):
                     self.assertEqual(self_tests.main(), 0)
                 self.assertEqual(stale in output.getvalue(), not choice)
+
+    def test_repeated_filters_select_the_union_without_duplicates(self):
+        k27 = 'tooling/k27/test-one.py'
+        k273 = 'tooling/k273/test-two.py'
+        other = 'tooling/elsewhere/test-three.py'
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['self-tests.py', '--list', '--only', 'tooling/k273', '--only', 'test-one',
+                                       '--only', 'test-two']), \
+             patch.object(self_tests, 'tracked', return_value=[k27, k273, other]), \
+             patch.object(self_tests, 'load_skips', return_value={}), redirect_stdout(output):
+            self.assertEqual(self_tests.main(), 0)
+        self.assertEqual([line.split()[-1] for line in output.getvalue().splitlines()], [k27, k273])
 
     def test_junit_escapes_attributes_and_handles_non_xml_output(self):
         failed = 'scripts/ci/test-"failure".py'

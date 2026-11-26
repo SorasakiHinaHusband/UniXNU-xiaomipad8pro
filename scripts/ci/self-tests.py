@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """The repository's self-tests: the host tests that need no Apple content, no build output (out/) and no tablet.
 
-    python3 scripts/ci/self-tests.py [--list] [--only SUBSTR] [--jobs N] [--junit FILE]
+    python3 scripts/ci/self-tests.py [--list] [--only SUBSTR ...] [--jobs N] [--junit FILE]
 
 What runs:
   - Python test scripts (test-*.py, test_*.py, run-*-tests.py, run-*-host.py) under package/, tooling/, firmware/, scripts/;
@@ -78,7 +78,7 @@ def collect(only, skips):
     for p in tracked():
         if not p.startswith(('package/', 'tooling/', 'firmware/', 'scripts/')):
             continue
-        if only and only not in p:
+        if only and not any(pattern in p for pattern in only):
             continue
         if PY_RE.search(p):
             tests.append(('py', p, None))
@@ -152,7 +152,7 @@ def write_junit(path, results, skipped):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--list', action='store_true')
-    ap.add_argument('--only')
+    ap.add_argument('--only', action='append', metavar='SUBSTR', help='select paths matching any supplied substring')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--junit')
     a = ap.parse_args()
