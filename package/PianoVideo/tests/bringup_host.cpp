@@ -1732,6 +1732,11 @@ static void testQueues()
   CHECK(hfi::read(m, 2, out, sizeof out, &bytes, bar) == -1);
   m.st(hfi::qhdr(2) + hfi::kQWrite, end);
   CHECK(hfi::read(m, 2, out, sizeof out, &bytes, bar) == -3);
+  const uint32_t invalidWords = (UINT32_MAX / 4u) + 1;
+  m.st(hfi::qhdr(2) + hfi::kQRead, 0);
+  m.st(hfi::qhdr(2) + hfi::kQWrite, invalidWords);
+  CHECK(hfi::read(m, 2, out, sizeof out, &bytes, bar) == -3 && bytes == 0);
+  CHECK(hfi::write(m, 2, pkt, sizeof pkt, bar) == -2 && m.ld(hfi::qhdr(2) + hfi::kQWrite) == invalidWords);
 }
 
 static void testPackets()
@@ -1765,6 +1770,13 @@ static void testPackets()
   a[8] = 32;
   a[0] = 60;
   CHECK(!hfi::parse(a, 64, bad));
+  a[0] = 64;
+  a[7] = 0;
+  CHECK(!hfi::parse(a, 64, bad));
+  a[7] = 1;
+  a[0] = 68;
+  hfi::Reply trailing;
+  CHECK(!hfi::parse(a, 68, trailing) && trailing.malformed == 1 && !trailing.initDone && !trailing.packets);
   a[0] = 64;
   a[1] = 3;     // a session's message: not ours to answer yet, counted
   hfi::Reply s;

@@ -192,17 +192,7 @@ class Bringup {
   {
     // Native sessions retain binary TX/RX history and parsed error evidence.
     // The ladder's duplicate packet dump must not serialize first-picture work.
-    if (opt.level == 6 && bytes >= kHfiHeaderBytes && !(bytes & 3) && buf[0] == bytes &&
-        buf[7] && buf[7] <= (bytes-kHfiHeaderBytes)/kHfiPacketBytes) {
-      uint32_t at=kHfiHeaderBytes;
-      unsigned n=0;
-      for (;n<buf[7] && at<=bytes && bytes-at>=kHfiPacketBytes;++n) {
-        const uint32_t size=buf[at/4];
-        if (size<kHfiPacketBytes || (size&3) || size>bytes-at) break;
-        at+=size;
-      }
-      if (n==buf[7] && at==bytes) return; // malformed diagnostics still get the original dump
-    }
+    if (opt.level == 6 && hfi::validFraming(buf, bytes)) return;
     if (bytes < kHfiHeaderBytes) {
       hw.note("V3 %s %u short header bytes %u word0 %08x", direction, seq, bytes, bytes >= 4 ? buf[0] : 0);
       return;
