@@ -12,3 +12,14 @@ assert re.search(r'oqService\(net->fQueue,\s*IOBasicOutputQueue::kServiceAsync\)
 start = source.split('void PianoUsbNet::startTxQueue()', 1)[1].split('}', 1)[0]
 assert re.search(r'oqStart\(fQueue\);\s*oqSetCapacity\(fQueue, kOutputPackets\);', start)
 print('PianoUsbNet TX: asynchronous service and start before admitting packets')
+
+# A stalled-queue reset can hold the RX thread off the byte ring across a
+# down/up pair. Clear buffered RX at each boundary and serialize admission
+# with the clear, including an OUT completion racing interface disable.
+assert re.search(r'gToHost\.clear\(\);[^\n]*\s+gFromHost\.clear\(\);', source)
+for start, end in [('IOReturn disable(', '// The thread that starts us'), ('void link(', 'void status(')]:
+    boundary = source.split(start, 1)[1].split(end, 1)[0]
+    assert boundary.index('IOLockLock(gNetLock)') < boundary.index('gFromHost.clear()') < boundary.index('IOLockUnlock(gNetLock)')
+rx = source.split('bool rxFrame(', 1)[1].split('}', 1)[0]
+assert re.search(r'IOLockLock\(gNetLock\);\s+const bool ok = gLinkUp && gEnabled && gFromHost\.put\(src, length\);', rx)
+print('PianoUsbNet RX: link-down and disable flush buffered frames under the admission lock')

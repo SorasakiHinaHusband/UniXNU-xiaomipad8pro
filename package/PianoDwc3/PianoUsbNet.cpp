@@ -42,7 +42,7 @@ pianonet::Counters gCount;
 bool gTxFlow;                  // immutable after init
 bool gLinkUp, gLinkChanged;     // under gNetLock
 uint32_t gLinkBps;
-volatile bool gEnabled;         // the interface is up (enable() .. disable())
+bool gEnabled;                  // written under gNetLock, read atomically outside it
 uint8_t *gFrame;                // the receive thread's frame buffer
 
 uint64_t nowNs()
@@ -101,7 +101,7 @@ public:
   IOReturn enable(IONetworkInterface *) override
   {
     IOLockLock(gNetLock);
-    gEnabled = true;
+    __atomic_store_n(&gEnabled, true, __ATOMIC_RELAXED);
     IOLockUnlock(gNetLock);
     startTxQueue();
     return kIOReturnSuccess;
@@ -109,8 +109,9 @@ public:
   IOReturn disable(IONetworkInterface *) override
   {
     IOLockLock(gNetLock);
-    gEnabled = false;
+    __atomic_store_n(&gEnabled, false, __ATOMIC_RELAXED);
     gToHost.clear();
+    gFromHost.clear();
     IOLockUnlock(gNetLock);
     resetTxQueue();
     return kIOReturnSuccess;
@@ -240,7 +241,7 @@ UInt32 PianoUsbNet::sendFrame(mbuf_t packet, bool flow)
 // The receive thread only (inputPacket calls must be serialized).
 void PianoUsbNet::deliver(const uint8_t *frame, uint32_t length)
 {
-  if (!fInterface || !gEnabled) { ++gCount.notUp; return; }
+  if (!fInterface || !__atomic_load_n(&gEnabled, __ATOMIC_RELAXED)) { ++gCount.notUp; return; }
   mbuf_t m = allocatePacket(length);
   if (!m || mbuf_copyback(m, 0, length, frame, MBUF_DONTWAIT) != 0) {
     if (m) freePacket(m);
@@ -293,7 +294,8 @@ void counts(char *line, unsigned size)
   snprintf(line, size, "link %s, %s %s; to the Mac %llu frames %llu bytes (%u NTBs), from the Mac %llu frames %llu bytes (%u NTBs); "
            "NTB errors %u%s%s, bad datagrams %u; drops: send %llu (+%llu bad length), receive %u (queue) %llu (no mbuf) %llu (not up); "
            "TX stalls %llu, restarts %llu, queue drops %u",
-           g.alt == 1 ? "up" : "down", bsdName() ? bsdName() : "(no name yet)", gEnabled ? "up" : "down", gCount.sent, gCount.sentBytes,
+           g.alt == 1 ? "up" : "down", bsdName() ? bsdName() : "(no name yet)",
+           __atomic_load_n(&gEnabled, __ATOMIC_RELAXED) ? "up" : "down", gCount.sent, gCount.sentBytes,
            g.txNtbs, gCount.received, gCount.receivedBytes, g.rxNtbs, g.ntbErrors, g.lastError ? ", last: " : "",
            g.lastError ? g.lastError : "", g.badDatagrams, gCount.sendDrops, gCount.sendRefused, g.rxDrops, gCount.receiveDrops, gCount.notUp,
            gCount.txStalls, gCount.txRestarts, gNet ? gNet->queueDrops() : 0);
@@ -399,9 +401,8 @@ unsigned rxSpace()
 
 bool rxFrame(const uint8_t *src, unsigned length)
 {
-  if (!gEnabled) return false;   // nobody to take it: dropped now, nothing stale later
   IOLockLock(gNetLock);
-  const bool ok = gFromHost.put(src, length);
+  const bool ok = gLinkUp && gEnabled && gFromHost.put(src, length);
   IOLockUnlock(gNetLock);
   return ok;
 }
@@ -421,6 +422,7 @@ void link(bool up, uint32_t bitsPerSecond)
   gLinkChanged = true;
   if (!up) {
     gToHost.clear();   // nothing stale for the next session
+    gFromHost.clear();
     if (gTxFlow) gTxGate.requestReset();
   }
   IOLockWakeup(gNetLock, &gFromHost, false);
