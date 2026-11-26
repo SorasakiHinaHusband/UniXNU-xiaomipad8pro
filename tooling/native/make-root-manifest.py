@@ -5,6 +5,7 @@ will be written into a partition at 1 MiB-aligned windows. Runs anywhere; hashin
 Writes OUT_DIR/manifest.bin (4096 bytes) and OUT_DIR/layout.json {name, offset, size, sha256}; the writer then puts the
 manifest at byte 0 of the partition and each image at its offset (dd ... seek=offset/1MiB bs=1M conv=notrunc)."""
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -78,11 +79,34 @@ def main():
             staging = Path(tmp)
             (staging / 'layout.json').write_text(json.dumps(layout, indent=2))
             (staging / 'manifest.bin').write_bytes(header)
-            (staging / 'layout.json').replace(args.out / 'layout.json')
-            (staging / 'manifest.bin').replace(args.out / 'manifest.bin')
+            publish(staging, args.out)
     except (OSError, ValueError) as exc:
         parser.exit(1, f'make-root-manifest: {exc}\n')
     print('image_bytes', layout['image_bytes'], 'manifest', hashlib.sha256(header).hexdigest())
+
+
+def publish(staging, out):
+    # Serialize writers and keep the previous receipt if publishing the manifest fails.
+    fd = os.open(out, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        layout = out / 'layout.json'
+        backup = staging / 'previous-layout.json'
+        try:
+            os.link(layout, backup, follow_symlinks=False)
+        except FileNotFoundError:
+            backup = None
+        (staging / 'layout.json').replace(layout)
+        try:
+            (staging / 'manifest.bin').replace(out / 'manifest.bin')
+        except OSError:
+            if backup is None:
+                layout.unlink()
+            else:
+                backup.replace(layout)
+            raise
+    finally:
+        os.close(fd)
 
 
 if __name__ == '__main__':

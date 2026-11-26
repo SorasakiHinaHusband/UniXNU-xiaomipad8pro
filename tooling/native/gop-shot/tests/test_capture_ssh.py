@@ -40,7 +40,8 @@ class Capture(unittest.TestCase):
             command = ['/bin/bash', str(CAPTURE), '--10bit', str(tool), str(remote)]
             result = subprocess.run([*command, ''], env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 2, result.stderr)
-            for contents, expected in ((b'', 1), (PNG[:-12], 1), (PNG, 0)):
+            damaged = PNG[:41] + bytes([PNG[41] ^ 1]) + PNG[42:]  # IDAT data changed without updating its CRC.
+            for contents, expected in ((b'', 1), (PNG[:-12], 1), (damaged, 1), (PNG, 0)):
                 with self.subTest(length=len(contents)):
                     remote.write_bytes(contents)
                     result = subprocess.run([*command, str(output)], env=env, text=True, capture_output=True)

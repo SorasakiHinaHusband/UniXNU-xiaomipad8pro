@@ -33,9 +33,10 @@ def evaluate(folder, start=0):
     source, text = (complete or positive or [("none", "")])[0]
     rows = []
 
-    def check(label, pattern, minimum=1):
+    def check(label, pattern, minimum=1, distinct=False):
         matches = list(re.finditer(pattern, text))
-        rows.append((label, len(matches) >= minimum, len(matches), minimum, pattern,
+        hits = len({m[1] for m in matches}) if distinct else len(matches)
+        rows.append((label, hits >= minimum, hits, minimum, pattern,
                      text[max(0, text.rfind("\n", 0, matches[0].start()) + 1):text.find("\n", matches[0].end()) if "\n" in text[matches[0].end():] else len(text)][:239] if matches else "(none)"))
         return matches
 
@@ -53,8 +54,8 @@ def evaluate(folder, start=0):
     check("TCR2 defined fields", r"PianoVideo: smmu: verify TCR2 want [0-9a-f]+ got [0-9a-f]+ mask 0003801f mismatch 00000000 PASS")
     check("ASID/owner stability", r"PianoVideo: smmu: owners before-routes [0-9a-f]+->[0-9a-f]+ ASID [0-9]+ result 1")
     check("both S2CRs before matching", r"PianoVideo: smmu: verify S2CR .* mismatch 00000000 PASS", 2)
-    check("exact SID 1940", r"PianoVideo: smmu: verify SMR want 80001940 got 80001940 mask ffffffff mismatch 00000000 PASS")
-    check("exact SID 1947", r"PianoVideo: smmu: verify SMR want 80001947 got 80001947 mask ffffffff mismatch 00000000 PASS")
+    check("both exact SID matches", r"PianoVideo: smmu: verify SMR want (8000194[07]) got \1 mask ffffffff mismatch 00000000 PASS",
+          2, distinct=True)
     check("both matches invalidated", r"PianoVideo: smmu: verify release-SMR .* mismatch 00000000 PASS", 2)
     check("both legal S2CR releases", r"PianoVideo: smmu: release group .* result 1", 2)
     check("legal M0 bank release", r"PianoVideo: smmu: release bank [0-9]+ M0 1 .* result 1")

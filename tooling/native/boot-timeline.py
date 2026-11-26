@@ -15,6 +15,7 @@ The decoded mailbox has DRAM bit damage: names can be garbled, so a missing mile
 """
 import argparse
 import datetime
+import math
 import re
 import sys
 from pathlib import Path
@@ -55,7 +56,10 @@ def read(path):
     for raw in Path(path).read_bytes().decode('utf-8', 'replace').split('\n'):
         stamp, tab, text = raw.partition('\t')
         if tab and re.fullmatch(r'\d+\.\d{3}', stamp):
-            rows.append((float(stamp), text))
+            arrival = float(stamp)
+            if not math.isfinite(arrival):
+                raise ValueError('invalid console arrival timestamp')
+            rows.append((arrival, text))
         else:
             rows.append((None, raw))
     return rows

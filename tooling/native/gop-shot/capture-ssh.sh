@@ -31,16 +31,36 @@ python3 "$here/../../persist/fetch-chunks.py" rsudo "$remote_png" "$scratch/fram
 # The verified file and destination share a filesystem. Publish without replacing an existing path.
 python3 - "$scratch/frame.png" "$local_png" <<'PY'
 import os
+import struct
 import sys
+import zlib
 
 source, dest = sys.argv[1:]
 with open(source, 'rb') as png:
-    header = png.read(16)
-    size = png.seek(0, os.SEEK_END)
-    if size < 57 or header != b'\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR':
+    size = os.fstat(png.fileno()).st_size
+    if png.read(16) != b'\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR':
         sys.exit('capture-ssh: invalid or empty PNG')
-    png.seek(-12, os.SEEK_END)
-    if png.read(12) != b'\x00\x00\x00\x00IEND\xaeB\x60\x82':
+    png.seek(8)
+    have_data = complete = False
+    while size - png.tell() >= 12:
+        length, kind = struct.unpack('>I4s', png.read(8))
+        if length > size - png.tell() - 4:
+            break
+        have_data |= kind == b'IDAT' and length > 0
+        crc = zlib.crc32(kind)
+        remaining = length
+        while remaining:
+            block = png.read(min(remaining, 1 << 20))
+            if not block:
+                sys.exit('capture-ssh: incomplete PNG')
+            crc = zlib.crc32(block, crc)
+            remaining -= len(block)
+        if png.read(4) != struct.pack('>I', crc):
+            sys.exit('capture-ssh: corrupt PNG chunk')
+        if kind == b'IEND':
+            complete = length == 0 and png.tell() == size
+            break
+    if not complete or not have_data:
         sys.exit('capture-ssh: incomplete PNG')
 os.link(source, dest)
 PY
