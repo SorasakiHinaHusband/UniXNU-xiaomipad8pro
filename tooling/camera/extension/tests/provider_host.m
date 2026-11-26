@@ -1,11 +1,34 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
 // Exercise the actual CMIO metadata/setter and pattern timer without opening camera hardware.
+#ifdef PIANO_CAMERA_HOST_HEAP
+#import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
+
+// The CI host may deny IOSurface's IOKit service. Exercise the same provider and CoreVideo operations with local buffers.
+static CVReturn heapPoolCreate(CFAllocatorRef a, CFDictionaryRef options, CFDictionaryRef attributes, CVPixelBufferPoolRef *pool)
+{
+  NSMutableDictionary *local = [(__bridge NSDictionary *)attributes mutableCopy];
+  [local removeObjectForKey:(id)kCVPixelBufferIOSurfacePropertiesKey];
+  [local removeObjectForKey:(id)kCVPixelBufferMetalCompatibilityKey];
+  return CVPixelBufferPoolCreate(a, options, (__bridge CFDictionaryRef)local, pool);
+}
+#define CVPixelBufferPoolCreate heapPoolCreate
+#endif
 #define main pianoCameraProviderMain
 #include "../PianoCameraExtension.m"
 #undef main
 #include <assert.h>
 #include <unistd.h>
+
+static NSDictionary *testPixelAttributes(void)
+{
+#ifdef PIANO_CAMERA_HOST_HEAP
+  return nil;
+#else
+  return @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+#endif
+}
 
 @interface OutputProbe : PianoStreamSource
 @property(nonatomic, strong) NSMutableArray<NSDictionary *> *observations;
@@ -62,7 +85,7 @@
   for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
     CVPixelBufferRef pb = NULL;
     assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
-                               (__bridge CFDictionaryRef)@{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}}, &pb));
+                               (__bridge CFDictionaryRef)testPixelAttributes(), &pb));
     assert(!CVPixelBufferLockBaseAddress(pb, 0));
     uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
     const size_t stride = CVPixelBufferGetBytesPerRow(pb);
@@ -93,7 +116,7 @@
     if (sequence == 7) usleep(450000);
     CVPixelBufferRef pb = NULL;
     assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
-                               (__bridge CFDictionaryRef)@{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}}, &pb));
+                               (__bridge CFDictionaryRef)testPixelAttributes(), &pb));
     assert(!CVPixelBufferLockBaseAddress(pb, 0));
     uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
     const size_t stride = CVPixelBufferGetBytesPerRow(pb);
@@ -152,8 +175,9 @@ static void state(PianoStreamSource *source, unsigned index, int fps, int maximu
 static void metadata(void)
 {
   const int widths[] = {1280, 816, 1020}, heights[] = {720, 459, 768};
+  const uint32_t sensors[] = {0, kPianoCameraFront, kPianoCameraRear};
   for (unsigned i = 0; i < 3; ++i) {
-    PianoStreamSource *source = [[PianoStreamSource alloc] initWithWidth:widths[i] height:heights[i] sensor:i];
+    PianoStreamSource *source = [[PianoStreamSource alloc] initWithWidth:widths[i] height:heights[i] sensor:sensors[i]];
     assert(source && source.formats.count == 2);
     for (unsigned j = 0; j < 2; ++j) {
       CMIOExtensionStreamFormat *f = source.formats[j];
@@ -187,6 +211,108 @@ static void metadata(void)
     state(source, 1, 24, 15);
     assert(set(source, @0, kCMTimeInvalid, kCMTimeInvalid));
     state(source, 0, 15, 15);
+  }
+}
+
+static void invalidFrames(void)
+{
+  assert(![[PianoStreamSource alloc] initWithWidth:0 height:720 sensor:0]);
+  assert(![[PianoStreamSource alloc] initWithWidth:1280 height:-1 sensor:0]);
+  assert(![[PianoStreamSource alloc] initWithWidth:INT32_MAX height:INT32_MAX sensor:0]);
+  assert(![[PianoStreamSource alloc] initWithWidth:816 height:612 sensor:kPianoCameraFront]);
+  assert(![[PianoStreamSource alloc] initWithWidth:816 height:459 sensor:3]);
+  const PianoCameraLiveFrame front = { .version = kPianoCameraLiveVersion, .sensor = kPianoCameraFront,
+      .slot = kPianoCameraSlots - 1, .width = 3264, .height = 1836, .stride = 4080, .bayer = kPianoCameraBGGR, .black = 64,
+      .bytes = 7490880, .sequence = 1, .sofTicks = 1 };
+  const uint64_t end = (uint64_t)front.slot * kPianoCameraSlotBytes + front.bytes;
+  assert(validLiveFrame(&front, kPianoCameraFront, end, 0));
+  assert(!validLiveFrame(NULL, kPianoCameraFront, end, 0));
+  assert(!validLiveFrame(&front, kPianoCameraRear, end, 0));
+  assert(!validLiveFrame(&front, kPianoCameraFront, end - 1, 0));
+  assert(!validLiveFrame(&front, kPianoCameraFront, end, 1));
+  PianoCameraLiveFrame invalid = front;
+  invalid.width = 6528; invalid.height = 4896; invalid.stride = 8160; invalid.bytes = 39951360;
+  assert(!validLiveFrame(&invalid, kPianoCameraFront, UINT64_MAX, 0));
+  invalid = front; invalid.height = 2448; invalid.bytes = 9987840;
+  assert(!validLiveFrame(&invalid, kPianoCameraFront, UINT64_MAX, 0));
+  invalid = front; invalid.slot = UINT32_MAX;
+  assert(!validLiveFrame(&invalid, kPianoCameraFront, UINT64_MAX, 0));
+  invalid = front; invalid.black = 1023;
+  assert(!validLiveFrame(&invalid, kPianoCameraFront, end, 0));
+}
+
+@interface LifecycleProbe : PianoStreamSource
+@property(nonatomic, strong) dispatch_semaphore_t opening, allowOpen, stopReading;
+@property(nonatomic) BOOL failOpen, reportUnclean, readFinished;
+@property(nonatomic) unsigned opens, stops, closes;
+@end
+
+@implementation LifecycleProbe
+- (BOOL)openLiveAndReturnError:(NSError **)outError
+{
+  ++self.opens;
+  self.readFinished = NO;
+  if (self.opening) {
+    dispatch_semaphore_signal(self.opening);
+    assert(!dispatch_semaphore_wait(self.allowOpen, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)));
+  }
+  return self.failOpen ? ioResult(kIOReturnNoMemory, outError) : YES;
+}
+- (void)readLive
+{
+  assert(!dispatch_semaphore_wait(self.stopReading, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)));
+  self.readFinished = YES;
+}
+- (IOReturn)stopLive:(PianoCameraLiveStatus *)state
+{
+  ++self.stops;
+  state->state = kPianoCameraStopped;
+  state->cleanOff = !self.reportUnclean;
+  dispatch_semaphore_signal(self.stopReading);
+  return kIOReturnSuccess;
+}
+- (void)closeLive
+{
+  assert(self.readFinished);
+  ++self.closes;
+}
+@end
+
+static void lifecycle(void)
+{
+  LifecycleProbe *source = [[LifecycleProbe alloc] initWithWidth:816 height:459 sensor:kPianoCameraFront];
+  source.failOpen = YES;
+  NSError *error = nil;
+  assert(![source startStreamAndReturnError:&error] && error.code == kIOReturnNoMemory);
+  assert([source stopStreamAndReturnError:NULL] && source.stops == 0);
+  source.failOpen = NO;
+  source.stopReading = dispatch_semaphore_create(0);
+  source.opening = dispatch_semaphore_create(0);
+  source.allowOpen = dispatch_semaphore_create(0);
+  dispatch_semaphore_t stopping = dispatch_semaphore_create(0), stopped = dispatch_semaphore_create(0);
+  dispatch_group_t group = dispatch_group_create();
+  dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+  dispatch_group_async(group, queue, ^{ assert([source startStreamAndReturnError:NULL]); });
+  assert(!dispatch_semaphore_wait(source.opening, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+  dispatch_group_async(group, queue, ^{
+    dispatch_semaphore_signal(stopping);
+    assert([source stopStreamAndReturnError:NULL]);
+    dispatch_semaphore_signal(stopped);
+  });
+  assert(!dispatch_semaphore_wait(stopping, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+  assert(dispatch_semaphore_wait(stopped, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)));
+  dispatch_semaphore_signal(source.allowOpen);
+  assert(!dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)));
+  assert(source.opens == 2 && source.stops == 1 && source.closes == 1);
+
+  source.opening = nil;
+  for (unsigned round = 0; round < 3; ++round) {
+    source.reportUnclean = round == 0;
+    assert([source startStreamAndReturnError:NULL] && [source startStreamAndReturnError:NULL]);
+    if (round == 0) assert(![source stopStreamAndReturnError:&error] && error.code == kIOReturnIOError);
+    else assert([source stopStreamAndReturnError:NULL]);
+    assert([source stopStreamAndReturnError:NULL]);
+    assert(source.opens == round + 3 && source.stops == round + 2 && source.closes == round + 2);
   }
 }
 
@@ -299,7 +425,11 @@ static void poolMemory(void)
     for (unsigned i = 0; i < kPianoDeliveryBuffers; ++i) {
       held[i] = borrowPixel(pool, kPianoDeliveryBuffers);
       assert(held[i]);
+#ifdef PIANO_CAMERA_HOST_HEAP
+      bytes += CVPixelBufferGetDataSize(held[i]);
+#else
       bytes += IOSurfaceGetAllocSize(CVPixelBufferGetIOSurface(held[i]));
+#endif
     }
     assert(!borrowPixel(pool, kPianoDeliveryBuffers));
     printf("pool bound %s: %u buffers, %.1f MB at most\n", pools[p].what, (unsigned)kPianoDeliveryBuffers, bytes / 1048576.0);
@@ -343,6 +473,8 @@ int main(void)
   @autoreleasepool {
     gLog = os_log_create("com.unixnu.PianoCamera", "host-tests");
     metadata();
+    invalidFrames();
+    lifecycle();
     boundedPools();
     timer();
     repeatedAndStalled();

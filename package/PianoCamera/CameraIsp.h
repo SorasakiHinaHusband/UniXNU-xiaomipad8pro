@@ -8,6 +8,7 @@
 //   sRGB transfer curve. Output w = width / 2 / scale, h = height / 2 / scale, RGB bytes row by row.
 #pragma once
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -21,7 +22,7 @@ typedef struct {
 // One 10-bit pixel of a MIPI-packed RAW10 line.
 static inline uint32_t pianoRaw10(const uint8_t *line, uint32_t x)
 {
-  const uint8_t *g = line + x / 4 * 5;
+  const uint8_t *g = line + (size_t)(x / 4) * 5;
   const uint32_t k = x & 3u;
   return (uint32_t)g[k] << 2 | ((uint32_t)(g[4] >> (2 * k)) & 3u);
 }
@@ -41,12 +42,37 @@ static inline uint8_t pianoSrgb8(float v)
   return (uint8_t)(s * 255.f + 0.5f);
 }
 
-// `work`: 3 floats per output pixel. Returns 0, or -1 for a size that does not fit.
-static inline int pianoIsp(const uint8_t *raw, uint32_t width, uint32_t height, uint32_t stride, uint32_t bayer, uint32_t black,
-                           uint32_t scale, float *work, uint8_t *rgb, PianoIspStats *st)
+typedef struct {
+  uint32_t width, height;
+  size_t samples;  // elements in each output, with three channels per pixel
+} PianoIspLayout;
+
+static inline int pianoIspLayout(uint32_t width, uint32_t height, uint32_t stride, size_t rawBytes,
+                                 uint32_t scale, PianoIspLayout *out)
 {
-  if (!scale || width < 4 * scale || height < 2 * scale || stride < width / 4 * 5) return -1;
+  const uint64_t packed = (uint64_t)(width / 4) * 5;
+  if (!out || !scale || (width & 3u) || scale > width / 4 || scale > height / 2 || packed > stride ||
+      (uint64_t)stride * height > rawBytes) return -1;
   const uint32_t ow = width / 2 / scale, oh = height / 2 / scale;
+  const uint64_t pixels = (uint64_t)ow * oh;
+  if (pixels > UINT32_MAX || pixels > SIZE_MAX / 3 / sizeof(float)) return -1;
+  out->width = ow;
+  out->height = oh;
+  out->samples = (size_t)pixels * 3;
+  return 0;
+}
+
+// `workCount` is in floats and `rgbBytes` is in bytes. Returns -1 before accessing invalid buffers or geometry.
+static inline int pianoIsp(const uint8_t *raw, size_t rawBytes, uint32_t width, uint32_t height, uint32_t stride,
+                           uint32_t bayer, uint32_t black, uint32_t scale, float *work, size_t workCount,
+                           uint8_t *rgb, size_t rgbBytes, PianoIspStats *st)
+{
+  PianoIspLayout layout;
+  if (!raw || !work || !rgb || !st || bayer > 3 || black >= 1023 ||
+      pianoIspLayout(width, height, stride, rawBytes, scale, &layout) ||
+      workCount < layout.samples || rgbBytes < layout.samples) return -1;
+  const uint32_t ow = layout.width, oh = layout.height;
+  const float area = (float)((uint64_t)scale * scale);
   const float full = (float)(1023u - black);
   double sum[3] = {0, 0, 0};
   for (uint32_t oy = 0; oy < oh; ++oy)
@@ -67,7 +93,7 @@ static inline int pianoIsp(const uint8_t *raw, uint32_t width, uint32_t height, 
       }
       float *w = work + ((uint64_t)oy * ow + ox) * 3;
       for (int ch = 0; ch < 3; ++ch) {
-        w[ch] = c[ch] / (float)(scale * scale);
+        w[ch] = c[ch] / area;
         sum[ch] += w[ch];
       }
     }
@@ -108,7 +134,8 @@ static inline void pianoThumb(const uint8_t *rgb, uint32_t w, uint32_t h, uint32
 {
   for (uint32_t ty = 0; ty < th; ++ty)
     for (uint32_t tx = 0; tx < tw; ++tx) {
-      const uint32_t x0 = tx * w / tw, x1 = (tx + 1) * w / tw, y0 = ty * h / th, y1 = (ty + 1) * h / th;
+      const uint32_t x0 = (uint64_t)tx * w / tw, x1 = (uint64_t)(tx + 1) * w / tw,
+                     y0 = (uint64_t)ty * h / th, y1 = (uint64_t)(ty + 1) * h / th;
       uint64_t s[3] = {0, 0, 0}, c = 0;
       for (uint32_t y = y0; y < y1; ++y)
         for (uint32_t x = x0; x < x1; ++x, ++c)

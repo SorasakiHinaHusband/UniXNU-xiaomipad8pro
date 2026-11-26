@@ -13,6 +13,38 @@ playing back a QuickTime New Movie Recording are pending. [Camera app check](../
 Iris H.264 encode **E1** is host-ready. The host check still needs to be recorded, and the self-test awaits
 tablet qualification. [Hardware backlog, B10 and B11](../BACKLOG-hardware.md#2-backlog-b1b15) · [Iris video driver](video.md)
 
+## Host audit of RAW10 geometry and teardown
+
+The driver selects front 3264×1836 and rear 4080×3072. The daily app profile uses 640×480 `420v` at 15 fps. The other
+register tables are available for host sizing and ISP tests. [Sensor tables](../../data/camera/README.md)
+
+| Sensor mode | 16-byte-aligned stride | RAW payload | DMA allocation with guard | Fits current 16 MiB buffers |
+|---|---:|---:|---:|---|
+| Front OV32D40 3264×1836 | 4,080 B | 7,490,880 B | 8 MiB | Yes, selected |
+| Front OV32D40 3264×2448 | 4,080 B | 9,987,840 B | 10 MiB | Yes, table only |
+| Front OV32D40 6528×4896 | 8,160 B | 39,951,360 B | 40 MiB | No |
+| Rear S5KJN1 4080×3072 | 5,104 B | 15,679,488 B | 16 MiB | Yes, selected |
+| Rear S5KJN1 8160×6144 | 10,208 B | 62,717,952 B | 62 MiB | No |
+
+The DMA allocation includes at least 256 KiB of guard and rounds up to 2 MiB. All five allocations fit the SMMU window's
+512 MiB at IOVA `0x20000000`. The driver also checks the physical range against the write master's address width and the
+SMMU's reported output width. Frame mode queues an address for each target and programs `FRAME_INCR` in 256-byte units.
+Allocation and guard sizing use the full padded payload, including the front 3264×1836 mode's final 64 bytes past the last
+full increment unit. The software ISP checks RAW10 grouping, row stride, input length, black level, scaling and both output
+capacities before accessing buffers.
+
+Live cancellation drains a submitted DMA target to completion before stopping. Teardown disables the write master and RDI,
+sends sensor stream-off, then resets the CSIPHY and CSID before releasing the translation while the camera NoC is still
+clocked. If the sensor's off table fails, the driver asserts the sensor reset line. An unconfirmed DMA stop or receiver reset
+faults the stream and retains the DMA lease. A failed SMMU release also retains the lease. Sleep blocks new hardware work
+and waits for the active sequence to unwind.
+
+Host tests cover those paths and exercise the CMIO stream's malformed frame checks and overlapping start and stop callbacks.
+Camera CI runs the provider with local CoreVideo buffers. The full provider runner also tests retained IOSurface samples
+and movie files on a host with the corresponding macOS services. The default selector keeps existing real-camera preferences
+during automatic login and checks QuickTime's own saved choice before AVFoundation history. Synthetic approval tests verify
+malformed records and seed write ordering. Tablet timing and stock application behavior still require hardware verification.
+
 ## Historical camera bring-up
 
 The notes below record early sensor, RAW capture, CoreMediaIO and app compatibility work and its test state at the time.
@@ -249,7 +281,7 @@ its own (TITAN_TOP only) and fewer clocks than a full TFE (whose RDI0 is write m
 | 303 | CAMCC PLL0 (Taycan ELU): when not running, Linux's configuration (L 0x3e with CAL_L 0x44, alpha 0x8000: 1200 MHz; CONFIG_CTL 0x19660387/0x098060a0/0xb416cb20; USER_CTL 0x8400: even /2, odd /3; USER_CTL_U 2; OUTCTRL off, standby, RESET_N); then RESET_N, RUN, LOCK_DET [1.5 ms], the three outputs, OUTCTRL. A PLL0 found running must be at L 0x3e (else refused); one in FSM vote mode is refused |
 | 304 | the sources, each switched with its root forced on [0.5 ms each wait]: `cphy_rx`, the PHY's timer, `ife_lite`, `ife_lite_csid` at 400 MHz (PLL0 main / 3), `camnoc_rt_axi` at 200 MHz (PLL0 even / 3); the AHBs stay on the XO (Linux gives them no rate). Then eleven branches: top fast AHB, the CSIPHY and its timer, CAMNOC RT/NRT AXI, CAMNOC RT IFE-lite, IFE-lite AHB, IFE-lite, IFE-lite CSID, IFE-lite CPHY RX, QDSS debug XO [CLK_OFF clear within 500 µs; NRT AXI is voted/hardware-gated: not waited on] |
 | 305 | CSID-lite0's and TFE-lite0's HW_VERSION (logged) |
-| 306 | the SMMU route of stream 0x1c00 (`CameraSmmu.h` planRoute, loads only): **bypass** when one group covers it and bypasses (S2CR type 1, or a bank with translation off and VA64: PianoDwc3's rule); **our window** when no group covers it (c1's case) or its own exact group faults: a free group and a free bank (`CameraSmmuWindow.h`, PianoWifi's IOVA window: stage 1, a 32-bit input space, the buffer's 2 MiB blocks at IOVA 0x20000000, nothing else mapped); **refused** for several groups, a masked group that does not bypass, a bank with translation on (someone's tables), no free group or bank |
+| 306 | the SMMU route of stream 0x1c00 (`CameraSmmu.h` planRoute, loads only): **our window** when no group covers it (c1's case) or its own exact group faults: a free group and a free bank (`CameraSmmuWindow.h`, stage 1, a 32-bit input space, the buffer's 2 MiB blocks at IOVA 0x20000000). Capture is refused for a bypass, multiple matches, a masked group, an existing translating bank, or lack of a free group or bank |
 | 307 | the frame buffer: one physically contiguous range, 2 MiB aligned, below 1 TiB (the write master's reach), of the mode's 16-byte-aligned stride × height plus a guard of at least 256 KiB, rounded to 2 MiB (16 MiB for the rear's 4080×3072, 8 MiB for the front's 3264×1836); the frame zeroed, the guard filled with 0xa5 (a canary), cleaned to the PoC; for the window: its two table pages built and checked by a software walk (first, last, one past), cleaned, the bank programmed whole before the one store that points the stream at it |
 | 308 | CSID-lite0 reset: TOP mask/clear RST_DONE + BUF_DONE, BUF_DONE mask/clear RDI0, IRQ_CMD, RST_CFG 0x11, RST_CMD 0x5 [RST_DONE within 500 ms] |
 | 309 | TFE-lite0's bus: CGC override 0x7ffffff, test bus off; write master 0: FRAME_INCR stride × height >> 8, IMAGE_CFG_0/2 0xffff, packer 0, IRQ subsample 0/1, MMU prefetch 1/0xffffffff, CFG = enable + frame mode, IMAGE_ADDR = the bus address >> 8 (Linux's order: the VFE before the CSID) |
@@ -257,7 +289,7 @@ its own (TITAN_TOP only) and fewer clocks than a full TFE (whose RDI0 is write m
 | 311 | the CSIPHY: reset (CTRL0 = 1, 8 ms, 0), version (CTRL6 = SHOW_REV_ID, STATUS12..15), CTRL5 = 0xd5 (clock + data lanes 0-3), CTRL6 = 1, CTRL7 = 2, CTRL0 = 0; the 103-entry lane table from `data/camera/csiphy-v2.4.tbl` (87 written, five with 209 µs after them, the five settle entries take **29** = (85 ns + 6 × UI/2) / 2.5 ns − 6 for both sensors' link rates at a 400 MHz timer; the 16 skew-calibration entries not written, as the driver); CTRL11..21 = 0 (interrupts masked) |
 | 312 | the sensor: its `start`, `init` and mode tables (rear `4080x3072`: 315 writes over CCI0, the CCI's own register stores counted, not logged; front `3264x1836`: 866 over the software I2C), the rear's controls (orientation 0 (native), exposure 0x0202 = the mode's 3840 lines, analogue gain 0x0204 = `piano-camera-gain` (64: 2×), frame length 0x0340 = 4288, test pattern 0x0600 = 2 colour bars unless `piano-camera-pattern=0`), then `on` (stream on, last) |
 | 320 | before the stream-on table: CSID-lite0's four status words read, logged (`stream: before stream-on: ...`) and cleared; then the stream: TOP/BUF_DONE/RX/RDI0 status polled every 100 µs (each cleared when seen), SOF/EOF/RUP_DONE/error bits counted; a BUF_DONE less than 1 ms after stream-on or after the previous frame is **stale** (counted apart, not a frame: a sensor frame takes 33 ms); per frame the times of its SOF, EOF and BUF_DONE and the RDI0/RX words since the frame before; the first CSI2 RX word and the first RDI0 error bits with their times; each frame re-arms the write master with the same buffer (IMAGE_ADDR, AUP); `piano-camera-frames` (2) frames [the first within 1 s, each next within 200 ms, all within `piano-camera-timeout-ms` (3000)]; the CSIPHY's status words 0-10 at the first frame and at the end |
-| 330 | stop: write master 0 off first (read back: nothing more reaches memory), RDI0 stopped and disabled, the PHY's CTRL5/CTRL6 = 0, the sensor's `off` table; late BUF_DONEs counted for 100 ms (three frame times: the write master and the CSID idle after it) |
+| 330 | stop write master 0 and confirm readback, stop RDI0, send the sensor's `off` table, disable and reset the PHY, count late BUF_DONEs, then reset and acknowledge CSID-lite0 |
 | 331 | the statistics (the buffer invalidated from the caches first): per Bayer position (row/column parity) min/mean/max and an 8-bin histogram (128 a bin), the eight vertical bands' means per position (the colour bars' step pattern), the written extent and the stride it implies (packed 5100 bytes or padded 5104 for the rear: the open question 7, settled by the first frame), the guard (intact, or the first changed byte), the first 32 bytes, rows 0-3 and the last (each: how many of its bytes are not the fill, its first 16); then the window's bank FSR/FAR and **the whole report, before the power-down** (`level 3 (before the power-down): ...`) |
 | 340 | down, nothing touched after its clock, power or vote is gone: **the SMMU window first**, while MM1, GCC's HF AXI and the CAMNOC branches still run (its TLB invalidate and sync reach the camera's TBU, *inferred*): the stream made to fault, the group's SMR as found, its S2CR as found only when a configuration of this SMMU (else left at fault), the bank's SCTLR (translation off), our faults cleared, its other words as found, CBAR/CBA2R as found only when a context type this SMMU implements (else our stage-1 words stay), TLBIALLNSNH and the sync; then the branches (reverse), the sources back to what they were (before PLL0 stops), PLL0 (OUTCTRL off, outputs off, standby; its configuration stays, as Linux's probe leaves it), GCC's HF AXI, MM1; level 2's power-down (sensor, bus, TITAN_TOP collapsed: the CSID/TFE/CSIPHY registers with it, MCLK, rails, pins, GCC, CAMCC's domains last); the buffer freed only when the write master read back stopped and its IFE-lite clock stopped and the window is released (else kept and said so) |
 
@@ -323,11 +355,9 @@ already lit), the lighting (DARK). Host-tested on the model's lit scene (its val
 sensors converge from too bright, too dim and much too bright, with the rear's padded lines; DARK with no light; saturated at the
 minimum; no loop for the colour bars or with `piano-camera-ae=0`.
 
-**Memory safety.** On c1's tablet the route is our window: the write master can reach only the buffer's 16 MiB (anything else
-faults in the SMMU, logged from the bank's FSR/FAR before the release), the guard catches an overflow inside it, and the buffer is
-not freed while the write master could still run. With a boot-chain bypass (not the tablet's case) the write master sees physical
-memory: frame mode writes what the sensor sends, so only the mode's table, one latched address per frame and the write master
-stopped first bound it; the guard reports an overflow after the fact.
+**Memory safety.** The write master can reach only the guarded allocation through the SMMU window. Writes past that allocation
+fault in the SMMU and are logged from the bank's FSR/FAR. A guard change or a translation fault prevents publishing the RAW frame.
+Capture requires a bounded translation because frame mode writes the bytes it receives from the sensor.
 
 **Not done here, on purpose:** MM0, SH0/MC0/ACV (DDR) and CN0 are not voted (the display's MM0 from the boot and PianoA830's DDR at
 its host level hold them above a bounded RAW stream's 470 MB/s; Linux's hf_mnoc vote is 472/926 MB/s), the CSID's IRQ line is not
@@ -462,7 +492,7 @@ with the entitlement check.
 
 L1/L2: PianoA830 (its DRV-2 and GCC lock words, the shared votes' words), PianoPower's `SpmiObserver.h`, PianoKeyboard's `CmdDb.h`,
 `package/include/PianoMmVotes.h` (§4.3.1). L3 (all in place): the shared votes (MXC, MM1; with PianoVideo), an SMMU route for 0x1c00
-(the boot chain's bypass or our window: PianoWifi's `WifiSmmuWindow.h`, copied), the CSIPHY table as data (`data/camera`). L4: the A830 Metal path for 30 fps on the rear (optional). L5: C5 (the extension
+(our bounded window: PianoWifi's `WifiSmmuWindow.h`, copied), the CSIPHY table as data (`data/camera`). L4: the A830 Metal path for 30 fps on the rear (optional). L5: C5 (the extension
 installs on our boot), PianoTorch (the photo flash, B12, built).
 
 ### 6. Boot args
@@ -506,8 +536,8 @@ bus, a PLL that never locks, a stop step), refusals that store nothing, the allo
 header against MANIFEST (the PHY table's 103 entries too); c1's tablet state (`testTabletC1`); level 3 against CAMCC PLL0, the
 stream's clock sources, the CAMSS blocks (reset by TITAN_TOP's collapse), the SMMU with a page-table walk, memory and a write master
 that writes the model's frames only when the sensor streams, the PHY's table and settle count are right, CSID-lite0 is configured
-for that PHY and the write master is armed: the colour bars band by band, padded and unpadded lines, a scene, the front, a boot-chain
-bypass, a refused route, failures at each step, every stop step, overflows into the guard and past the buffer, the allowlist,
+for that PHY and the write master is armed: the colour bars band by band, padded and unpadded lines, a scene, the front, rejection of a
+boot-chain bypass and other incompatible routes, failures at each step, every stop step, overflows into the guard and past the buffer, the allowlist,
 everything as found after each); since c2f/c3: every register access with its block's clock, power domain and votes held (a CAMSS
 block also needs CAMCC's domains), the tablet's SMMU (IDR0 0x4c017e7f, five groups in use, the free S2CRs at 0x0300006e) aborting
 the stores c3r did and any stage-2 CBAR, TLB maintenance only with the camera NoC voted and clocked, MM1/HF AXI/CAMNOC/TITAN_TOP
