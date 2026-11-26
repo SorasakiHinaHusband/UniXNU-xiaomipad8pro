@@ -87,6 +87,7 @@ of each file are listed in [media/SOURCES.md](media/SOURCES.md).
 
 | Scene | Media | Status |
 | --- | --- | --- |
+| Safari video playback, a 12 s clip (24 native frames, 0.5 s apart) | <img src="media/y12m-safari-video-clip.gif" width="320" alt="Safari video clip"> | ✅ native capture, v13.1y12m |
 | About This Mac (Snapdragon 8 Elite, 13 GB visible, macOS 27.3) | <img src="media/y12m-about.jpg" width="320" alt="About This Mac"> | ✅ native capture, v13.1y12m |
 | Displays settings (built-in display, brightness, True Tone, Night Shift) | <img src="media/y12m-display-settings.jpg" width="320" alt="Displays settings"> | ✅ native capture, v13.1y12m |
 | Battery settings (charging, Energy Mode High Power) | <img src="media/y12m-battery-settings.jpg" width="320" alt="Battery settings"> | ✅ native capture, v13.1y12m |

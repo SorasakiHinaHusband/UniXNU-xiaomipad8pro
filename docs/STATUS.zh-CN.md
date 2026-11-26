@@ -82,6 +82,7 @@
 
 | 场景 | 媒体 | 状态 |
 | --- | --- | --- |
+| Safari 播放视频，12 秒短片（24 帧原生截图，间隔 0.5 秒） | <img src="media/y12m-safari-video-clip.gif" width="320" alt="Safari 视频短片"> | ✅ 原生截图，v13.1y12m |
 | 关于本机（Snapdragon 8 Elite、可见 13 GB、macOS 27.3） | <img src="media/y12m-about.jpg" width="320" alt="关于本机"> | ✅ 原生截图，v13.1y12m |
 | 显示器设置（内建显示器、亮度、原彩、夜览） | <img src="media/y12m-display-settings.jpg" width="320" alt="显示器设置"> | ✅ 原生截图，v13.1y12m |
 | 电池设置（充电中、能耗模式为高功率） | <img src="media/y12m-battery-settings.jpg" width="320" alt="电池设置"> | ✅ 原生截图，v13.1y12m |
