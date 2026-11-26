@@ -2,6 +2,21 @@
 # SPDX-License-Identifier: MIT
 # Source for the boot-arg test, or run a hash-verified copy as root on the tablet.
 
+mic_check_bootargs() {
+  local args quote
+  if args=$(LC_ALL=C /usr/sbin/sysctl -n kern.piano_bootargs 2>&1); then
+    printf "%s\n" "$args"
+    return 0
+  fi
+  # This function is also sent through the text-mode SSH wrapper.
+  quote=$(printf "\\047")
+  if [ "$args" = "sysctl: unknown oid ${quote}kern.piano_bootargs${quote}" ]; then
+    /usr/sbin/sysctl -n kern.bootargs 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 mic_check_boot_enabled() {
   /usr/bin/awk '
     {
@@ -26,8 +41,7 @@ mic_tcc_seed_apply() (
      "$stage" =~ ^/private/var/tmp/piano-mic-check\.[A-Za-z0-9]{8}$ &&
      "$cdhash" =~ ^[0-9a-f]{40}$ ]] || { mic_tcc_seed_error 'invalid boot, stage or code hash'; return 1; }
   [ "$EUID" -eq 0 ] || { mic_tcc_seed_error 'root required'; return 1; }
-  args=$(/usr/sbin/sysctl -n kern.piano_bootargs 2>/dev/null ||
-    /usr/sbin/sysctl -n kern.bootargs) || return 1
+  args=$(mic_check_bootargs) || return 1
   mic_check_boot_enabled "$args" || { mic_tcc_seed_error 'piano-mic-unattended=1 required'; return 1; }
   [ "$(/usr/sbin/sysctl -n kern.bootsessionuuid)" = "$boot" ] ||
     { mic_tcc_seed_error 'boot identity changed'; return 1; }

@@ -259,6 +259,7 @@ class Controller {
       fail(r, kRegChanEn, mask, 0, "the channel mask is not one to four of the module's channels");
       return r;
     }
+    if (!channelsAvailable(r, mask)) return r;
     const uint8_t maxItarget = maxItargetForMask(mask, kTorchStepUa);
     if (clamp > maxItarget) clamp = maxItarget;
     if (itarget > clamp) itarget = clamp;
@@ -288,6 +289,7 @@ class Controller {
       fail(r, kRegTimer0, timerTicks, 0, "the FLASH pulse arguments are outside the bounded diagnostic range");
       return r;
     }
+    if (!channelsAvailable(r, mask)) return r;
     const uint8_t maxItarget = maxItargetForMask(mask, kFlashStepUa);
     if (itarget > maxItarget) itarget = maxItarget;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
@@ -337,6 +339,17 @@ class Controller {
   }
 
  private:
+  bool channelsAvailable(StepResult &r, uint8_t mask)
+  {
+    uint8_t enabled = 0;
+    if (!bus_.read(bus_.ctx, kRegChanEn, &enabled, 1))
+      return fail(r, kRegChanEn, 0, 0, "the channel enables could not be read before activation");
+    const uint8_t unexpected = enabled & 0x0f & ~mask;
+    if (unexpected)
+      return fail(r, kRegChanEn, 0, unexpected, "a channel outside the requested set is already enabled");
+    return true;
+  }
+
   static uint8_t maxItargetForMask(uint8_t mask, unsigned stepUa)
   {
     unsigned channels = 0;

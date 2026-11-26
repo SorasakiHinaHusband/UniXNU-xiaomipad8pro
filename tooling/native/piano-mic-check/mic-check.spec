@@ -121,9 +121,9 @@ mic_check_block() (
   source "$tools/mic-tcc-seed.sh" || return 1
   # These variables and substitutions run on the remote shell.
   # shellcheck disable=SC2016
-  rssh '
+  rssh "$(declare -f mic_check_bootargs)"$'\n''
     boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) &&
-    args=$(/usr/sbin/sysctl -n kern.piano_bootargs 2>/dev/null || /usr/sbin/sysctl -n kern.bootargs) &&
+    args=$(mic_check_bootargs) &&
     printf "MIC_BOOT=%s\nMIC_BOOTARGS=%s\n" "$boot" "$args"
   ' </dev/null > "$results/boot.txt" 2>&1 || return 1
   boot=$(sed -n 's/^MIC_BOOT=//p' "$results/boot.txt")

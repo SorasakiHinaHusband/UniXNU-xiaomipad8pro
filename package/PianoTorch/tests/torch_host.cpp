@@ -347,6 +347,16 @@ static void testOnOff()
   for (unsigned ch = 0; ch < kChannels4ch; ++ch)
     CHECK((a.flash(kRegItarget0 + ch) & kItargetMask) == 1);   // 4 x 25 mA in FLASH mode
   CHECK(c.off(allChannels).ok);
+
+  // An earlier spare-pair shutdown can disable the module while leaving a
+  // channel bit set. Neither activation may turn the module back on then.
+  a.r(kPpid, kRegChanEn) = 0x04;
+  a.writes.clear();
+  const StepResult staleTorch = c.on(9, 9);
+  CHECK(!staleTorch.ok && staleTorch.failedReg == kRegChanEn && a.writes.empty());
+  a.r(kPpid, kRegChanEn) = 0x04;
+  const StepResult staleFlash = c.flashPulse(3, 8);
+  CHECK(!staleFlash.ok && staleFlash.failedReg == kRegChanEn && a.writes.empty());
 }
 
 static void testFailures()

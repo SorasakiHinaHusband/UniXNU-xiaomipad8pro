@@ -48,6 +48,10 @@ sleep() {
     SECONDS=$((SECONDS + $1))
     wait_for_file "$FIXTURE_REMOTE/frames.pid"
     wait_for_file "$FIXTURE_REMOTE/ready"
+    if [[ "$mode" = interrupted ]]; then
+        kill -TERM "$$"
+        return 97
+    fi
     if [[ "$mode" = success || "$mode" = error ||
           ( "$mode" = at-deadline && $(wc -l < "$fixture/sleeps") -eq 36 ) ]]; then
         if [[ "$mode" = error ]]; then
@@ -170,6 +174,13 @@ printf '%s/piano-metal-sustain --onscreen\n' "$FIXTURE_REMOTE"
         self.assertIn('timed out after 720s, sent SIGTERM', result.stderr)
         self.assertEqual(len((self.fixture / 'sleeps').read_text().splitlines()), 36)
         self.assertTrue((self.remote / 'frames.stop').exists())
+        self.assert_frames(143)
+
+    def test_interrupted_host_stops_detached_benchmark(self):
+        result = self.run_spec('interrupted')
+        self.assertTrue((self.remote / 'frames.stop').exists(), result.stderr)
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(result.stdout, '')
         self.assert_frames(143)
 
     def test_deadline_collects_completed_status_before_signalling(self):

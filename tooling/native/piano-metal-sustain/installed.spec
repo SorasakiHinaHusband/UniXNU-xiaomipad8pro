@@ -84,6 +84,24 @@ metal_sustain_probe() {
 }
 
 metal_sustain_run() {
+  local dir=$1 rc=0 saved_traps
+  saved_traps=$(trap -p HUP INT TERM)
+  trap 'metal_sustain_interrupted "$dir" 129' HUP
+  trap 'metal_sustain_interrupted "$dir" 130' INT
+  trap 'metal_sustain_interrupted "$dir" 143' TERM
+  metal_sustain_poll "$dir" || rc=$?
+  trap - HUP INT TERM
+  eval "$saved_traps"
+  return "$rc"
+}
+
+metal_sustain_interrupted() {
+  trap '' HUP INT TERM
+  metal_sustain_probe "$1" stop >&2 || true
+  exit "$2"
+}
+
+metal_sustain_poll() {
   local dir=$1 launch status progress start next delay elapsed action
   launch=$(metal_sustain_detach "$dir" | tr -d '\r') || true
   if ! grep -qx METAL_SUSTAIN_LAUNCH_QUEUED <<< "$launch"; then
