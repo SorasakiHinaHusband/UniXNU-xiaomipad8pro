@@ -238,6 +238,15 @@ dropped the community 12 s keep-alive (`docs/power-irq.md` §6.11): a candidate 
 attach/auth frames of the same shape, the pointer, the I2C engine, cmd-db, descriptors), stages the pinned image, builds the
 objects and prints `out/k27/kext/PianoKeyboard.json` for `PIANO_EXTRA_KEXTS` (after the kext list, so PianoA830 links first).
 
+`python3 scripts/ci/self-tests.py --only package/PianoKeyboard/tests/` also runs the standalone ASan/UBSan
+[cover HID suite](../../package/PianoKeyboard/tests/cover_hid_gestures_model_host.cpp). It exercises the keyboard and consumer
+reports, Caps Lock LED commands, clickpad gestures, and input release on detach, fold and suspend. Four- and five-contact packets
+exercise the three primary slots and the ignored continuation. Strict additive-checksum rejection, coordinate clamping and
+UART-style resynchronization of replayed I²C frames are policies of the offline fixture.
+
+Goal 3 hardware verification remains **HOLD** for the physical brightness keys, Caps Lock LED and hall fold state pending
+hands-on checks. Daily boot defaults are unchanged.
+
 ### 8. Hardware test plan (tonight, owner present, cable to the Mac, RAM boots only)
 
 Build all three images first (each `build-native-image.sh` rewrites `out/ram` and `out/ram-dump`, so copy each away):
