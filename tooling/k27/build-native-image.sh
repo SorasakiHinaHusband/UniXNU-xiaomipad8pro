@@ -2,10 +2,14 @@
 # One command after a NativeUfs/NativeRamBlock or k27 change: native kexts -> KC, the ADT -> the macOS RAM image (FD A) in out/ram, and the
 # loop's dump image in out/ram-dump (the same with piano-reset-after=1: it only lets our UEFI read the previous run's log).
 set -euo pipefail
+# The kext name list is split on whitespace, with pathname expansion disabled.
+set -f
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
+# shellcheck source=tooling/k27/k27-tree.sh
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 mkdir -p out/k27
-LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk 'NF {print $1}')
+LIST=$(awk '{sub(/#.*/, ""); if (NF) print $1}' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}")
+LIST=${LIST//$'\n'/ }
 # PIANO_BASE_SEED / PIANO_BASE_TRUST: the OS line's Data seed and trust cache the stages start from (default out/inputs/: the 27.0.1
 # line's; the 27.3 line's are made by tooling/k273/, docs/k273-line.md).
 BASE_SEED=${PIANO_BASE_SEED:-out/inputs/scratch-data.img}
@@ -57,15 +61,28 @@ for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
   case $k in PianoUsbHostStack|PianoUsbHostStackA2) continue ;; esac   # codeless (a plist entry only): nothing to build
   case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoIR) b=piano-ir ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; PianoXhciHost) b=piano-xhcihost ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
-  tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
+  tooling/k27/build-native-"$b".sh > "out/k27/build-native-$b.log" 2>&1 || { tail -20 "out/k27/build-native-$b.log" >&2; exit 1; }
 done
 # PIANO_STOP_AFTER=kexts: the kexts' objects only (out/native-kexts; CI's tooling/ci/build-kexts.sh), no collection, ADT or image.
 if [ "${PIANO_STOP_AFTER:-}" = kexts ]; then echo "kexts built (out/native-kexts), PIANO_STOP_AFTER=kexts"; exit 0; fi
 # A descriptor of a kext the list already links (e.g. PIANO_EXTRA_KEXTS=.../PianoA830.json from before PianoA830 was listed) is not
 # linked twice.
-EXTRA=
-for e in ${PIANO_EXTRA_KEXTS:-}; do
-  case " $LIST " in *" $(basename "$e" .json) "*) echo "PIANO_EXTRA_KEXTS: $(basename "$e" .json) is in the kext list already" >&2 ;; *) EXTRA="$EXTRA $e" ;; esac
+EXTRA=${PIANO_EXTRA_KEXTS:-}
+EXTRA_PATHS=()
+if [ -f "$EXTRA" ]; then
+  EXTRA_PATHS=("$EXTRA")
+else
+  read -r -a EXTRA_PATHS <<< "${EXTRA//$'\n'/ }"
+fi
+EXTRA_NATIVE=()
+for e in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+  name=${e##*/}
+  name=${name%.json}
+  case " $LIST " in
+    *" $name "*) echo "PIANO_EXTRA_KEXTS: $name is in the kext list already" >&2; continue ;;
+  esac
+  case $e in /*) ;; *) e=$D/$e ;; esac
+  EXTRA_NATIVE+=("$e")
 done
 # PIANO_GPU=N (default 0): piano-gpu=N and piano-gpu-delay=${PIANO_GPU_DELAY:-20} in the images' arguments (docs/drivers/gpu.md §6).
 # PianoA830 is in the kext list and inert without them. A GPU session also needs the NativeAdrenoMetal plugin in the Data seed (the
@@ -161,8 +178,22 @@ if [ "$A830_METAL" = 1 ]; then
 fi
 fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
-mkdir -p out/k27/kext; NATIVE=
-for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
+mkdir -p out/k27/kext
+# shellcheck disable=SC2086  # LIST is a whitespace-separated name list, with globbing disabled.
+python3 - "$D/out" $LIST <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, *names = sys.argv[1:]
+root = json.dumps(out)[1:-1]
+for name in names:
+    src = Path('tooling/k27/kext') / f'{name}.json'
+    dest = Path(out) / 'k27/kext' / src.name
+    dest.write_text(src.read_text(encoding='utf-8').replace('@OUT@', root), encoding='utf-8')
+PY
+DESCRIPTORS=()
+for k in $LIST; do DESCRIPTORS+=("$D/out/k27/kext/$k.json"); done
 # When an explicit USB host profile owns the shared consumer libraries, retain
 # its original personalities and gate checks. Bluetooth owns only its Family.
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
@@ -177,8 +208,8 @@ if p.is_file():
     p.write_text(json.dumps(d, indent=2) + '\n')
 PY
 fi
-NATIVE="$NATIVE $EXTRA" \
-  tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
+NATIVE='' tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin \
+  ${DESCRIPTORS[@]+"${DESCRIPTORS[@]}"} ${EXTRA_NATIVE[@]+"${EXTRA_NATIVE[@]}"} > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # The Bluetooth daemon requires the real consumer UC, while its hardware dependencies
 # must stay inert on this board. Check the linked metadata, not just the descriptor.
 if [ "$BT_STACK_CHECK" = 1 ]; then
@@ -198,7 +229,10 @@ COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-
 # The dump image only lets our UEFI read the previous run's log; its XNU never touches the Data store (data-persist=0), so a dump
 # image with another seed cannot reset the store of the installed system (docs/persistent-boot.md).
 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump > out/k27/build-ram-dump.log 2>&1 &
+DUMP_PID=$!
 # RAM16G R1 uses an opt-in placeholder in the primary RAM payload.
 if [ "${PIANO_EXTRA_RAM:-0}" = 1 ]; then COMMON+=(--extra-ram); fi
-python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram | tail -1
-wait $! || { tail -3 out/k27/build-ram-dump.log; exit 1; }
+RAM_STATUS=0
+python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram | tail -1 || RAM_STATUS=$?
+wait "$DUMP_PID" || { tail -3 out/k27/build-ram-dump.log >&2; exit 1; }
+exit "$RAM_STATUS"
