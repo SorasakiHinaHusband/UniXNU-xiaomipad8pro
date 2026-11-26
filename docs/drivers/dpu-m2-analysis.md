@@ -1,7 +1,8 @@
 # DPU M2: conditional scanout cache clean
 
-Analysis and host implementation, 2026-11-26. The November 27 RAM A/B measured
-live WC coverage and performance. Automated optical qualification is pending.
+Analysis and host implementation, 2026-11-26. On November 27, `v131y12u-m2opt2`
+earned a RAM-qualified **`M2 PASS` (`rc=0`)** with automated C920 optical grading
+and a reverse-order sanity check. M2 awaits install promotion.
 
 ## Decision
 
@@ -12,7 +13,8 @@ backing pages' effective cache attributes. A retained, initialized backing
 whose CPU writers remain write-combined can skip repeated pixel cleans.
 CPU-write absence is neither required for that case nor established by M1.
 
-The policy is implemented behind `piano-dpu-clean-skip=1`, off by default.
+The policy is implemented behind `piano-dpu-clean-skip=1`. The daily default is
+**OFF** (`piano-dpu-clean-skip=0`) on installed **v13.1y12q**.
 
 ## Baseline and scope
 
@@ -391,9 +393,25 @@ at B's shown count. Attribute checks took 721,749 µs in B. Client
 zero underruns, GOP copies, returns to the boot framebuffer and WindowServer crashes.
 
 C920 stills looked clean in both arms. `grade-dpu-m2.py` returned **`M2 VOID`**
-solely because `optical_checks=0`. The automated optical follow-up
-`v131y12u-m2opt` is queued. The daily default stays **OFF** (`piano-dpu-clean-skip=0`).
+solely because the initial run had `optical_checks=0`.
 [November 27 counters and cadence results](../results-2026-11-27.md#dpu-m2-strict-wc-clean-skip)
+
+## Automated optical qualification on v131y12u-m2opt2
+
+The follow-up used the same frozen RAM image at 60 Hz. The ordered A/B grader
+returned **`M2 PASS` (`rc=0`, 0 FAIL, 0 VOID)**. A forced a full clean on all 2518
+shown flips. B initialized once and skipped **2466/2467** verified-WC flips
+(**99.96%**). Pixel-clean time dropped from **3864.24 to 0.95 µs per shown flip**
+(**99.98%**), saving **9.53 s** of kernel CPU cache-clean time over 38 s.
+
+Automated C920 grading counted six checks per arm with zero mismatches. Each
+arm checked three cadence frames for liveness and three borderless fullscreen
+native RGB frames for colour. `flicker-scan` found zero transient frames across
+12,370 frames. The reverse-order B → A sanity check passed both policy
+transitions and two optical checks with zero mismatches. WindowServer held PID
+102 throughout, with zero crashes, GPU faults, kernel panics, underruns, GOP copy
+fallbacks or returns to the boot framebuffer.
+[Full automated qualification results](../results-2026-11-27.md#v131y12u-m2opt2-2026-11-27)
 
 ## Fix-image gate
 
@@ -409,9 +427,9 @@ Checks: ours-OK on host: geometry, retention, SMMU/TLB maintenance, the
 WC-preserving aperture view, the effective-page predicate and epoch, strict
 failure handling, counters and tests, and the pinned kernel import check.
 The existing NativeGopDisplay fence path reports confirmed completion to
-PianoDpu. The RAM A/B above measured effective WC coverage, clean time and
-attribute check cost for the cadence workload. Automated optical coverage
-and the mixed-use RAM coherency result remain open.
+PianoDpu. The RAM A/B measured effective WC coverage, clean time and attribute
+check cost for the cadence workload and passed automated optical grading. The
+broader mixed-use RAM coherency result remains open.
 
 Root cause: the legacy `Flipper::flipSurface` cleans each accepted frame although QuartzCore's
 display allocator explicitly requests WC on its normal branch. The current
@@ -425,4 +443,3 @@ preserve and verify WC backing, initialize by a successful acquisition clean,
 skip subsequent pixel cleans within that valid epoch with publication/DSB
 preserved, and retain the full clean or refuse/copy on any failed predicate or
 maintenance failure. Default/cached/real-time/unknown buffers remain conservative.
-The RAM qualification procedure above still requires automated optical coverage.

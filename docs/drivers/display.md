@@ -7,11 +7,12 @@ Native `gop-shot` captures are enabled. The November 26 root-only capture check 
 8-bit decoder. Night Shift routing, native panel sleep and refresh switching are off in the daily profile.
 [November 26 native screenshot check](../results-2026-11-26.md#also-on-the-daily-line) · [Native capture](native-gop-display.md#9-native-still-capture-for-the-showcase) · [PianoDpu](dpu.md)
 
-- **M2 cache clean.** The November 27 `v131y12u-ram1` A/B skipped cache cleans on 99.96% of verified-WC flips,
-  reduced clean time per shown flip by 99.98% and lowered drawable wait p95 from 16.37 to 0.92 ms.
-  The C920 stills looked clean. The grader returned `M2 VOID` solely for `optical_checks=0`.
-  Automated optical grading is pending and the daily default stays off (`piano-dpu-clean-skip=0`).
-  [M2 analysis](dpu-m2-analysis.md#ram-ab-on-v131y12u-ram1-2026-11-27)
+- **M2 cache clean.** The November 27 `v131y12u-m2opt2` run earned a RAM-qualified **`M2 PASS` (`rc=0`)**.
+  The ordered A/B skipped cache cleans on 99.96% of verified-WC flips and reduced clean time per shown flip by
+  99.98%. Automated C920 grading found zero mismatches in six checks per arm. `flicker-scan` found no transients
+  in 12,370 frames, and the reverse-order sanity check passed. M2 awaits install promotion, with the daily default
+  **OFF** (`piano-dpu-clean-skip=0`) on installed **v13.1y12q**.
+  [M2 analysis](dpu-m2-analysis.md#automated-optical-qualification-on-v131y12u-m2opt2)
 - **M3 high refresh.** On November 26, RAM `m120c-120` and `m120c-144` reached **120.004 Hz** and **144.146 Hz** on both
   links without underruns. The 144 Hz run used the MM0 bandwidth vote. At 120 Hz, all 153 type-3 packets were accepted
   with monotonic timestamps and zero transport errors. The app latched 51.2 distinct new surfaces/s, and all 3562 drawables
