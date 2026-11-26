@@ -4,6 +4,8 @@
 import copy
 import importlib.util
 import json
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,6 +66,30 @@ def changed(index, **changes):
     return descriptors
 
 
+def native_shape():
+    """Invented descriptor boundaries with the documented 128/184/7 slab counts.
+
+    This is not the 112-descriptor capture. The FD mixture independently models
+    its nine runtime pages so byte accounting cannot equate a slab to one type.
+    """
+    desc = [DESCRIPTORS[0],
+            (4, 0xbda00000, (0xd3c00000 - 0xbda00000) // 4096, 8),
+            (5, 0xd3c00000, 0x400, (1 << 63) | 8),
+            (4, 0xd4000000, 0xe00, 8),
+            (4, 0xa7000000, 0x601, 8),
+            (6, 0xa7601000, 1, (1 << 63) | 8),
+            (4, 0xa7602000, 3, 8),
+            (6, 0xa7605000, 8, (1 << 63) | 8),
+            (4, 0xa760d000, 0x9f3, 8)]
+    overrides = {base: dict(efi='runtime', runtime_type=1, runtime_attr=1)
+                 for base in (0xd3c00000, 0xd3e00000)}
+    return fixture(desc, overrides)
+
+
+def exclusion(kind='dt-reserved', base=0xe3800000, end=0xe3801000, **extra):
+    return json.dumps(dict(schema=1, exclusions=[dict(kind=kind, base=base, end=end, **extra)]))
+
+
 # Invented addresses, sizes and counters; interleaving and CRLF mimic log transport.
 CONSOLE = '\r\n'.join([
     'noise PASSED; no owner receipt',
@@ -94,6 +120,199 @@ CONSOLE = '\r\n'.join([
 
 
 class AuditTest(unittest.TestCase):
+    def test_reviewed_sources_and_scoped_static_partition(self):
+        report = owners.audit(native_shape(), '')
+        inventory = report['static_inventory']
+        self.assertTrue(all(s['status'] == 'verified' for s in inventory['sources'].values()))
+        self.assertEqual((report['schema'], report['one_change'], report['gate'], report['released_mib']),
+                         (2, 'HOLD', 'HOLD', 0))
+        self.assertEqual(report['summary'], {'CMA': {'non-runtime': 128},
+                                           'DXE': {'non-runtime': 184, 'runtime': 2},
+                                           'FD': {'non-runtime': 7, 'runtime': 1}})
+        buckets = report['bucket_dispositions']
+        self.assertEqual([b['non_runtime_mib'] for b in buckets], [256, 368, 14])
+        self.assertEqual(sum(b['non_runtime_slabs'] for b in buckets), 319)
+        self.assertEqual([b['dt_memory_covered_slabs'] for b in buckets], [128, 186, 8])
+        self.assertEqual([b['slab_dispositions'] for b in buckets],
+                         [{'unknown': 128}, {'excluded': 186}, {'excluded': 8}])
+        for bucket in buckets:
+            checks = bucket['static_checks']
+            self.assertEqual(checks['dt-reserved']['status'], 'scoped-disjoint')
+            self.assertEqual(checks['dt-hole']['overlap_slabs'], 0)
+            self.assertEqual(checks['smmu-reachable']['overlap_slabs'], bucket['total_slabs'])
+            self.assertEqual(checks['firmware-policy']['overlap_slabs'],
+                             0 if bucket['name'] == 'CMA' else bucket['total_slabs'])
+            self.assertEqual(checks['hypervisor-physical']['status'], 'unknown')
+            self.assertEqual(bucket['static_proof'], 'scoped-only')
+            self.assertEqual(set(bucket['hypervisor'].values()), {'unknown'})
+            self.assertEqual(bucket['open_proofs'], list(owners.OPEN_PROOFS))
+            self.assertEqual((bucket['disposition'], bucket['admitted_slabs'], bucket['released_mib']),
+                             ('HOLD', 0, 0))
+
+    def test_mixed_fd_runtime_pages_and_uefi_contract(self):
+        buckets = {b['name']: b for b in owners.audit(native_shape(), '')['bucket_dispositions']}
+        self.assertEqual(buckets['CMA']['uefi']['type_pages'], {'7': 65536})
+        self.assertEqual(buckets['DXE']['uefi']['type_pages'], {'4': 94208, '5': 1024})
+        self.assertEqual(buckets['FD']['uefi']['type_pages'], {'4': 4087, '6': 9})
+        self.assertEqual(buckets['FD']['efi_receipts'], {'observed': 7, 'excluded': 1})
+        self.assertEqual(buckets['CMA']['uefi']['publication'], 'stage-2-blocked-by-stage-1-cap')
+        self.assertEqual(buckets['DXE']['uefi']['publication'], 'excluded-by-tracked-policy')
+        for bucket in buckets.values():
+            self.assertEqual(bucket['uefi']['ebs_receipt'], 'unknown')
+            self.assertEqual(bucket['uefi']['cpu_last_reference'], 'unknown')
+
+    def test_tracked_reservation_boundaries_and_partial_native_dts(self):
+        inventory = owners.static_inventory()
+        reservations = inventory['exclusions']
+        self.assertEqual(sum(x['source'] == 'native-dts' for x in reservations), 4)
+        self.assertIn('included dtsi not audited', inventory['native_dts_scope'])
+        fixed = [x for x in reservations if x['source'] == 'running-dt']
+        self.assertTrue(any((x['base'], x['end']) == (0xd4e23000, 0xd5100000) for x in fixed))
+        self.assertEqual(0xd4e23000 - owners.RANGES['DXE'][1], 0x23000)
+        self.assertTrue(any((x['base'], x['end']) == (owners.RANGES['CMA'][1], 0xf8800000)
+                            for x in fixed))
+        self.assertTrue(any((x['base'], x['end']) == (0xb8200000, 0xbd980000) for x in fixed))
+        self.assertEqual(owners.RANGES['DXE'][0] - 0xbd980000, 0x80000)
+
+    def test_embedded_ranges_match_their_tracked_sources(self):
+        inventory = owners.static_inventory()
+        source = (SCRIPT.parents[2] / owners.SOURCES['native-dts'][0]).read_text()
+        reserved = source.split('reserved-memory {', 1)[1]
+        cells = re.findall(r'reg = <(0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+)>;', reserved)
+        expected = set()
+        for high, low, size_high, size_low in cells:
+            base = (int(high, 16) << 32) | int(low, 16)
+            size = (int(size_high, 16) << 32) | int(size_low, 16)
+            expected.add((base, base + size))
+        self.assertEqual({(x['base'], x['end']) for x in inventory['exclusions'] if x['source'] == 'native-dts'}, expected)
+        source = (SCRIPT.parents[2] / owners.SOURCES['dpu-identity'][0]).read_text()
+        match = re.search(r'kIdentityBase = (0x[0-9a-f]+)ull, kIdentityEnd = (0x[0-9a-f]+)ull', source)
+        identity = next(x for x in inventory['exclusions'] if x['source'] == 'dpu-identity')
+        self.assertEqual((identity['base'], identity['end']), tuple(int(x, 16) for x in match.groups()))
+        self.assertIn('l1[2] = blockDesc(t.stage, kIdentityBase, true);', source)
+        self.assertIn('l1[3] = blockDesc(t.stage, kIdentityBase + 0x40000000ull, true);', source)
+
+    def test_publication_contract_matches_tracked_cap_and_cma_stage(self):
+        policy = json.loads((SCRIPT.parents[2] / owners.SOURCES['firmware-policy'][0]).read_text())
+        cma = next(row for row in policy['allow'] if row['name'] == 'cma-block')
+        self.assertEqual((int(cma['base'], 16), int(cma['size'], 16), cma['stage']),
+                         (0xe3800000, 0x10000000, 2))
+        self.assertFalse(any(int(row['base'], 16) == owners.RANGES['DXE'][0] for row in policy['allow']))
+        source = (SCRIPT.parents[2] / owners.SOURCES['publication-contract'][0]).read_text()
+        self.assertIn('#define DARWIN_EXTRA_RAM_REGION0_STAGE 1u', source)
+        self.assertIn('if (Allowed->stage > Stage)', source)
+        self.assertIn('{{0xe3800000ULL, 0x10000000ULL, 0, 0}, 2, "cma-block"}', source)
+        self.assertIn('AllocatePages (AllocateAddress, EfiLoaderData', source)
+
+    def test_static_streams_are_not_live_translations_or_ipa_proof(self):
+        report = owners.audit(fixture(), '')
+        streams = report['static_inventory']['streams']
+        self.assertTrue(any(s['smmu'] == 0x15000000 and s['sid'] == 0x800 and s['mask'] == 2
+                            for s in streams))
+        self.assertTrue(any(s['sid'] == 0x801 and s['smmu'] is None and s['mask'] is None for s in streams))
+        self.assertTrue(any(s['smmu'] == 0x3da0000 and s['sid'] == 5 for s in streams))
+        self.assertTrue(any(s['sid'] == 0xc01 and s['mask'] == 0x40 for s in streams))
+        self.assertTrue(all(b['hypervisor']['hlos_ipa'] == 'unknown' for b in report['bucket_dispositions']))
+        self.assertTrue(all(r['disposition'] == 'unknown' for r in report['slabs'] if r['range'] == 'CMA'))
+
+    def test_missing_sources_never_become_negative_owner_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = owners.audit(fixture(), '', source_root=directory)
+        for bucket in report['bucket_dispositions']:
+            self.assertEqual(bucket['static_proof'], 'unknown')
+            self.assertEqual(set(bucket['missing_sources']), set(owners.SOURCES))
+            self.assertEqual(bucket['dt_memory_covered_slabs'], 0)
+            self.assertEqual(bucket['static_checks']['dt-reserved']['status'], 'unknown')
+            self.assertEqual(bucket['static_checks']['smmu-reachable']['status'], 'unknown')
+            self.assertEqual(bucket['uefi']['publication'], 'unknown')
+            self.assertEqual(bucket['disposition'], 'HOLD')
+        self.assertNotIn(directory, json.dumps(report))
+
+    def test_changed_source_requires_new_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, _ in owners.SOURCES.values():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SCRIPT.parents[2] / path, target)
+            path = root / owners.SOURCES['firmware-policy'][0]
+            path.write_text(path.read_text() + '\n')
+            report = owners.audit(fixture(), '', source_root=root)
+        self.assertEqual(report['static_inventory']['sources']['firmware-policy']['status'], 'unknown')
+        self.assertFalse(any(x['kind'] == 'firmware-policy' for x in report['static_inventory']['exclusions']))
+        self.assertTrue(all(b['static_proof'] == 'unknown' for b in report['bucket_dispositions']))
+        self.assertTrue(all(b['uefi']['publication'] == 'unknown' for b in report['bucket_dispositions']))
+        self.assertEqual(report['released_mib'], 0)
+
+    def test_supplemental_half_open_overlap_and_unknown_owner(self):
+        for base, end, count in ((0xe3600000, 0xe3800000, 0),
+                                 (0xe3800000, 0xe3800001, 1),
+                                 (0xe39fffff, 0xe3a00001, 2),
+                                 (0xf3800000, 0xf3801000, 0)):
+            with self.subTest(base=base):
+                report = owners.audit(fixture(), '', exclusions_text=exclusion(base=base, end=end,
+                                       owner='unrecognized-owner-label'))
+                cma = report['bucket_dispositions'][0]
+                self.assertEqual(cma['static_checks']['dt-reserved']['overlap_slabs'], count)
+                self.assertEqual(cma['slab_dispositions'].get('excluded', 0), count)
+                self.assertNotIn('unrecognized-owner-label', json.dumps(report))
+                self.assertEqual(report['static_inventory']['exclusions'][-1]['owner'], 'unknown')
+                self.assertEqual(report['released_mib'], 0)
+
+    def test_additive_exclusions_cannot_replace_firmware_or_close_live_proofs(self):
+        for kind in owners.EXCLUSION_KINDS:
+            report = owners.audit(fixture(), '', exclusions_text=exclusion(kind=kind))
+            cma, dxe, fd = report['bucket_dispositions']
+            self.assertEqual(cma['slab_dispositions'].get('excluded', 0), 0 if kind == 'smmu-reachable' else 1)
+            self.assertEqual(dxe['static_checks']['firmware-policy']['overlap_slabs'], 186)
+            self.assertEqual(fd['static_checks']['firmware-policy']['overlap_slabs'], 8)
+            self.assertEqual(cma['open_proofs'], list(owners.OPEN_PROOFS))
+            self.assertEqual((report['gate'], report['released_mib']), ('HOLD', 0))
+        report = owners.audit(fixture(), '', exclusions_text=json.dumps(dict(schema=1, exclusions=[])))
+        self.assertEqual(report['bucket_dispositions'][1]['slab_dispositions'], {'excluded': 186})
+
+    def test_invalid_exclusions_rejected_without_address_space_guess(self):
+        invalid = [dict(base='0xe3800000'), dict(base=True), dict(base=-1), dict(base=1.5),
+                   dict(end=0xe3800000), dict(end=1 << 65), dict(owner=None),
+                   dict(kind='iova'), dict(kind='free'), dict(iova=0xe3800000),
+                   dict(complete=True), dict(source='operator-label')]
+        for fields in invalid:
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                owners.audit(fixture(), '', exclusions_text=exclusion(**fields))
+        for text in ('[]', '{}', '{', '{"schema":true,"exclusions":[]}',
+                     '{"schema":1,"schema":1,"exclusions":[]}',
+                     '{"schema":1,"exclusions":[],"gate":"PASS"}',
+                     '{"schema":1,"exclusions":[{"base":1,"base":2}]}'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                owners.audit(fixture(), '', exclusions_text=text)
+
+    def test_empty_and_overflow_console_extents_are_unknown(self):
+        for base, size in ((0xe3800000, 0), ((1 << 64) - 1, 2)):
+            log = f'PianoSensors: arena: {base:#x} + {size:#x} mapped write-combined'
+            report = owners.audit(fixture(), log)
+            self.assertEqual(report['observations'][0]['kind'], 'physical-buffer-unknown')
+            self.assertFalse(any(r['native_overlaps'] for r in report['slabs']))
+
+    def test_cli_additive_report_and_invalid_exclusion_redaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            map_path, console_path, exclusions_path = (root / name for name in ('map', 'console', 'exclusions'))
+            map_path.write_text(native_shape())
+            console_path.write_text('')
+            exclusions_path.write_text(exclusion(kind='dma-physical'))
+            command = [sys.executable, str(SCRIPT), '--efi-map', str(map_path),
+                       '--owners-console', str(console_path), '--exclusions', str(exclusions_path), '--json']
+            completed = subprocess.run(command, capture_output=True, text=True, check=True)
+            report = json.loads(completed.stdout)
+            self.assertEqual(report['bucket_dispositions'][0]['static_checks']['dma-physical']['overlap_slabs'], 1)
+            self.assertNotIn(directory, completed.stdout)
+            exclusions_path.write_text('{"invalid":"unrecognized-private-label"}')
+            completed = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, '')
+            self.assertNotIn(directory, completed.stderr)
+            self.assertNotIn('unrecognized-private-label', completed.stderr)
+
     def test_partition_and_no_release_with_complete_map(self):
         report = owners.audit(fixture(), CONSOLE)
         self.assertEqual(len(report['slabs']), 322)
