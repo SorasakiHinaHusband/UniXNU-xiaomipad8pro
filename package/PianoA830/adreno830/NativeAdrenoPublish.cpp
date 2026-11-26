@@ -2155,10 +2155,11 @@ extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
     if(!submitted || !retired)return false;
     *submitted=*retired=0;
     if(!__atomic_load_n(&g.published,__ATOMIC_ACQUIRE) || !g.ring || lost())return false;
-    const uint32_t handed=g.ring->lastSubmitted(),recorded=g.ring->completedFence();
+    const uint32_t recorded=g.ring->completedFence();
     const volatile uint32_t *memptrs=g.ring->memptrs();
-    const uint32_t written=memptrs?memptrs[1]:recorded;   /* +4: the completed fence the CP writes (struct msm_rbmemptrs) */
-    *submitted=handed;
+    const uint32_t written=memptrs?__atomic_load_n(&memptrs[1],__ATOMIC_ACQUIRE):recorded;
+    /* Read the issued bound after sampling the completion a concurrent reset may have published. */
+    *submitted=g.ring->lastSubmitted();
     *retired=int32_t(written-recorded)>=0?written:recorded;
     return true;
 }
