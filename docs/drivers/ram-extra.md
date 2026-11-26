@@ -8,6 +8,35 @@ classified 319/322 two-MiB slabs as non-runtime, released 0 MiB and awaits owner
 the 684 MiB mixed 4K Main10 HEVC arena exercised region0 and XNU backing for video. GPU tier and other driver pool qualification
 remain open. [Support status](../STATUS.md) · [November 26 memory results](../results-2026-11-26.md#efi-memory-battery-and-video)
 
+### Turnip 0015 private-tier RAM qualification (ram16g-tier3w, 2026-11-27)
+
+On the tablet RAM boot, Turnip 0015 ran with kernel 0077, which loaded three Normal WC `region1` runs for
+`PianoA830`'s `A830GpuTier`. All three runs passed both S8 endpoint probes (`self-test ok` × 3,
+`pass-mask=0x7`, `fail=0`). The tier reported `mode=1 state=ready` with 870 MiB free.
+
+`piano-tier-workload` (`TW`) stepped through **0 → 2 → 6 → 14 → 30 → 62 → 126 MiB** of private residency.
+At peak, `free-mib` fell from 870 to 744, `used-mib=126`, `allocs=6` and `private-req=6`, with `refusals=0`,
+`tier-import-denied=0` and `tier-cpu-map-denied=0`. All 126 MiB returned to the pool after exit.
+Staged and control readbacks were byte-exact across **1,512 MiB (~1.5 GiB)** of reported copies.
+Warm ran 18 iterations (378.0 MiB, GPU time p50 4.71 ms), and hold ran 54 (1134.0 MiB, GPU time p50 4.74 ms).
+Both phases recorded `mismatches=0`, `control-mismatches=0` and `errors=0`.
+
+WindowServer held PID 102 through desktop login, Safari (`BR4`), Metal Image (`M`, 30/30), the 3D bench (`RXL`)
+and `TW`, with zero WindowServer crashes and zero GPU faults or recoveries. BR4 missed its accelerator-open
+marker. The boot log and live kernel records confirmed Safari's GPU connection. The 3D bench issued zero private requests.
+
+- **`TW` (`test/harness`).** Exit 4 reported `require-tier not met: fail-mask=0x2`. That bit marks the harness's
+  `mode=2` requirement on this `mode=1` boot. Allocation, residency, release, readback and denial checks passed.
+- **`RXV` (pre-fix frozen image).** AVC `video-v6` passed 12 phases, then timed out at `cancel-recreate`
+  with eight accepted frames and four pending. The frozen image predates `a426ce70` on `main`, which defers
+  the `dinv` reply in `PianoVideoVTHost.cpp` until terminal `Demt` dispositions are acknowledged.
+  [Pending-cancel analysis](video-hevc-cancel.md)
+- **`RXB` (`test/environment`, known `LT-B4`).** `install-chrome-pad.sh` completed and Chrome launched on RAM-backed
+  volatile Data, then the tablet reset to ABL at +1719 s. The abort matches the known RAM-Data exhaustion reset.
+  Chrome is installed-only, and the like-for-like `ram16g-tctl3` control was underway.
+
+Daily stays **OFF** (`piano-extra-ram=0`, `piano-gpu-tier=0`). This qualification covers the RAM boot only.
+
 ## R1 design and admission checks (2026-11-26)
 
 R1 gives eligible Adreno 830 buffer objects (BOs) access to reserved RAM below
