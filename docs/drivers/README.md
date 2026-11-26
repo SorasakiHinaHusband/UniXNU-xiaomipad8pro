@@ -27,6 +27,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 | 4b | [thermal.md](thermal.md) | `PianoThermal`: TSENS, thermal protection and CPU frequency over SCMI and the CPUCP doorbell | Thermal and Energy Mode policy | Adreno830 `Sm8750Tsens`, K90 SCMI and UniXNU-sheng `CpuFreqProbe` |
 | 4a | [rtc.md](rtc.md) | PMK8550 RTC and calendar offset, plus PianoPower readout | Wall clock across reboots | k27 SPMI reads and PianoPower `SpmiObserver.h` |
 | 4c | [charging-policy.md](charging-policy.md) | `ChargePolicy`: source-dependent limits, PD, thermal steps, 80/75 hold and sleep handover | Battery health and charging policy | Ubuntu xiaomi_mca policy |
+| 4d | [sleep-wake-audit.md](sleep-wake-audit.md) | Native s2idle ordering, path/check matrix and read-only RAM observation plan | Analysis only; fix-image gate HOLD | Pinned Ubuntu kernel and native IOKit power contract |
 | – | [usb-host.md](usb-host.md) | `PianoUsbHost`: Type-C roles, orientation, VBUS and the Apple xHCI integration | USB host and OTG | QcomDwc3, PianoDwc3 and PianoPower DSP |
 | – | [usb-otg-qual.md](usb-otg-qual.md) | B7 USB-C OTG path/check matrix and bounded attended RAM protocol | Fix-image HOLD; real-device qualification pending | PianoUsbHost, PianoXhciHost, PianoDwc3 and PianoPower |
 | – | [video.md](video.md) | `PianoVideo`: Iris video core, power, firmware and HFI, with a VideoToolbox frontend and native Iris backend | Hardware video decode and encode | VM-era VideoToolbox frontend, PianoPower and PianoA830 |
