@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Source from the installed-system qual spec. Uses R, rssh, rsudo, pull, verdict and fexpect.
 # mic_check_block REPO [raw|noise-reduced] runs after the desktop gate.
-# Set MIC_CHECK_REQUEST_ACCESS=1 for an attended first run.
+# piano-mic-unattended=1 enables automatic permission and acoustic replay checks.
+# With the boot arg off, MIC_CHECK_REQUEST_ACCESS=1 permits an attended first run.
 
-mic_check_gui() {   # STAGE RESULT_SUBDIR TAG [APP ARG ...]
-  local stage=$1 name=$2 tag=$3 args rc=0
-  shift 3
+mic_check_gui() {   # STAGE RESULT_SUBDIR BOOT_UUID TAG [APP ARG ...]
+  local stage=$1 name=$2 boot=$3 tag=$4 args rc=0
+  shift 4
   printf -v args ' %q' "$@"
   # Open the actual bundle through LaunchServices to give TCC the app's GUI identity.
   # The text-mode rsudo wrapper encloses its command in single quotes. The app's
   # result line survives wrappers that discard exit status, including open -W.
   SSH_T=95 rsudo "
+    if ! test \"\$(/usr/sbin/sysctl -n kern.bootsessionuuid)\" = \"$boot\"; then
+      echo MIC_BOOT_CHANGED
+      exit 1
+    fi
     u=\$(/usr/bin/stat -f %u /dev/console)
     if ! test \"\$u\" -gt 0 || ! test \"\$u\" = \"\$(/usr/bin/stat -f %u \"$stage\")\"; then
       echo MIC_CONSOLE_UID_MISMATCH
@@ -28,8 +33,37 @@ mic_check_gui() {   # STAGE RESULT_SUBDIR TAG [APP ARG ...]
   return "$rc"
 }
 
+mic_check_seed() {   # TOOLS STAGE RESULT_SUBDIR BOOT_UUID APP_CDHASH
+  local tools=$1 stage=$2 name=$3 boot=$4 cdhash=$5 sha
+  sha=$(/usr/bin/shasum -a 256 < "$tools/mic-tcc-seed.sh") || return 1
+  sha=${sha%% *}
+  if ! /usr/bin/base64 -i "$tools/mic-tcc-seed.sh" | SSH_T=30 rssh "
+    umask 077
+    /usr/bin/base64 -D > '$stage/mic-tcc-seed.sh' && echo MIC_SEED_STAGED
+  " > "$R/$name/tcc-stage.txt" 2>&1 ||
+    ! fexpect "$name/tcc-stage.txt" '^MIC_SEED_STAGED$' 'MIC TCC: seeder transferred'; then
+    return 1
+  fi
+  # rsudo consumes stdin. Pin the executable in a fresh root-owned directory
+  # before invoking it, and verify the receipt even when rsudo drops exit status.
+  SSH_T=60 rsudo "
+    umask 077
+    d=\$(/usr/bin/mktemp -d /private/var/run/piano-mic-tcc.XXXXXXXX) || exit 1
+    /usr/bin/install -m 0700 $stage/mic-tcc-seed.sh \"\$d/seed\" &&
+      sum=\$(/usr/bin/shasum -a 256 < \"\$d/seed\") && test \"\${sum%% *}\" = $sha &&
+      /bin/bash \"\$d/seed\" --apply $boot $stage $cdhash
+    rc=\$?
+    /bin/rm -f -- \"\$d/seed\"
+    /bin/rmdir \"\$d\"
+    exit \"\$rc\"
+  " </dev/null > "$R/$name/tcc-seed.txt" 2>&1 || return 1
+  fexpect "$name/tcc-seed.txt" '^TCC_MIC_APP_OK$' 'MIC TCC: signed bundle grant read back' &&
+    fexpect "$name/tcc-seed.txt" '^TCC_MIC_SEED_COMPLETE$' 'MIC TCC: console tccd signalled'
+}
+
 mic_check_block() (
-  local repo=$1 input=${2:-raw} device name results stage archive sha mode marker label rc=0
+  local repo=$1 input=${2:-raw} tools device name results stage archive sha mode marker label rc=0
+  local boot bootargs unattended=0 cdhash tcc=tcc attempt
   local -a flags
   if [ "${DRY:-0}" = 1 ]; then
     verdict 'INFO MIC: dry run, GUI recording and playback skipped'
@@ -45,6 +79,23 @@ mic_check_block() (
   results=$(mktemp -d "$R/mic-check.XXXXXXXX") || return 1
   name=${results##*/}
   verdict "INFO MIC: evidence directory $results"
+  tools=$repo/tooling/native/piano-mic-check
+  source "$tools/mic-tcc-seed.sh" || return 1
+  rssh '
+    boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) &&
+    args=$(/usr/sbin/sysctl -n kern.piano_bootargs 2>/dev/null || /usr/sbin/sysctl -n kern.bootargs) &&
+    printf "MIC_BOOT=%s\nMIC_BOOTARGS=%s\n" "$boot" "$args"
+  ' </dev/null > "$results/boot.txt" 2>&1 || return 1
+  boot=$(sed -n 's/^MIC_BOOT=//p' "$results/boot.txt")
+  if ! [[ "$boot" =~ ^[0-9A-Fa-f-]{36}$ ]] || ! grep -aq '^MIC_BOOTARGS=' "$results/boot.txt"; then
+    verdict "FAIL HARNESS MIC: tablet boot receipt missing ($name/boot.txt)"
+    return 1
+  fi
+  bootargs=$(sed -n 's/^MIC_BOOTARGS=//p' "$results/boot.txt")
+  if mic_check_boot_enabled "$bootargs"; then
+    unattended=1
+  fi
+
   archive=$results/app.tgz
   trap 'rm -f -- "$archive"' EXIT
   if ! /usr/bin/codesign --verify --strict "$repo/out/piano-mic-check/PianoMicCheck.app" > "$results/build.txt" 2>&1 ||
@@ -73,20 +124,36 @@ mic_check_block() (
     return 1
   fi
 
-  mic_check_gui "$stage" "$name" tcc --tcc || return 1
-  local tcc=tcc
-  if grep -aqx 'mic_status=0' "$results/tcc.txt" && [ "${MIC_CHECK_REQUEST_ACCESS:-0}" = 1 ]; then
+  mic_check_gui "$stage" "$name" "$boot" tcc --tcc || return 1
+  if [ "$unattended" = 1 ] && grep -aqxE 'mic_status=[02]' "$results/tcc.txt"; then
+    cdhash=$(/usr/bin/codesign -d --arch arm64 --verbose=4 "$repo/out/piano-mic-check/PianoMicCheck.app" 2>&1 |
+      sed -n 's/^CDHash=//p')
+    if ! [[ "$cdhash" =~ ^[0-9a-f]{40}$ ]] || ! mic_check_seed "$tools" "$stage" "$name" "$boot" "$cdhash"; then
+      verdict "FAIL HARNESS MIC: could not seed microphone permission ($name/tcc-*.txt)"
+      return 1
+    fi
+    for attempt in 1 2 3; do
+      tcc=tcc-after-$attempt
+      mic_check_gui "$stage" "$name" "$boot" "$tcc" --tcc || return 1
+      if grep -aqx 'mic_status=3' "$results/$tcc.txt"; then
+        break
+      fi
+      sleep 1
+    done
+  elif [ "$unattended" = 0 ] && [ "${MIC_CHECK_REQUEST_ACCESS:-0}" = 1 ] &&
+    grep -aqx 'mic_status=0' "$results/tcc.txt"; then
     tcc=permission
-    mic_check_gui "$stage" "$name" "$tcc" --request-access || return 1
+    mic_check_gui "$stage" "$name" "$boot" "$tcc" --request-access || return 1
   fi
   fexpect "$name/$tcc.txt" '^mic_status=3$' 'MIC: console app has microphone permission' || return 1
+  fexpect "$name/$tcc.txt" '^result=ok$' 'MIC: authorization probe completed' || return 1
 
   for mode in quiet tone; do
     flags=()
     if [ "$mode" = tone ]; then
       flags=(--tone --playback)
     fi
-    mic_check_gui "$stage" "$name" "$mode" 4 "$stage/$mode.m4a" ${flags[@]+"${flags[@]}"} || rc=1
+    mic_check_gui "$stage" "$name" "$boot" "$mode" 4 "$stage/$mode.m4a" ${flags[@]+"${flags[@]}"} || rc=1
     fexpect "$name/$mode.txt" '^result=ok$' "MIC $mode: AVAudioRecorder check completed" || rc=1
     fexpect "$name/$mode.txt" '^mic_status=3$' "MIC $mode: microphone authorized during capture" || rc=1
     fexpect "$name/$mode.txt" "$device" "MIC $mode: selected Piano input is the default device" || rc=1
