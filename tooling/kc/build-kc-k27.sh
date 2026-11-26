@@ -24,12 +24,15 @@ PIANO_REPO=$(cd "$(dirname "$0")/../.." && pwd)   # before any cd
 [ $# = 2 ] || { echo "usage: $0 KERNEL OUTPUT.bin" >&2; exit 2; }
 KERNEL=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 OUT=$(mkdir -p "$(dirname "$2")" && cd "$(dirname "$2")" && pwd)/$(basename "$2")
-. "$PIANO_REPO/tooling/k27/k27-tree.sh"; T=$PIANO_K27_TREE
+# shellcheck source=/dev/null
+. "$PIANO_REPO/tooling/k27/k27-tree.sh"
+T=$PIANO_K27_TREE
 KC_BASE=${KC_BASE:-$T/out/kc/kc27.bin}
 NM=${LLVM_NM:-/opt/homebrew/opt/llvm/bin/llvm-nm}
 cd "$T"
 # The kernel was linked at the segment addresses of k27/segaddrs.sh; the KC layout must agree (else relink after --write).
-if python3 k27/kc27-layout.py "$KC_BASE" "$KERNEL" | grep -q CONFLICT; then
+layout=$(python3 k27/kc27-layout.py "$KC_BASE" "$KERNEL") || exit 1
+if [[ $layout == *CONFLICT* ]]; then
   echo "layout CONFLICT: run k27/kc27-layout.py $KC_BASE $KERNEL --write k27/segaddrs.sh and link again" >&2; exit 1
 fi
 DI="com.apple.driver.DiskImages com.apple.driver.DiskImages.FileBackingStore com.apple.driver.DiskImages.KernelBacked com.apple.driver.DiskImages.RAMBackingStore com.apple.driver.DiskImages.ReadWriteDiskImage com.apple.driver.DiskImages.UDIFDiskImage"
@@ -57,7 +60,10 @@ python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" --kc-log "
 # KC_COMPACT_LINKEDIT=1 (the 27.3 line: tooling/k273/build-k273-image.sh): only the kept entries' symbols in __LINKEDIT
 # (tooling/k273/compact-kc-linkedit.py; 27.3's mac17j base carries the symbols of 370 kexts, 21 MB more than ours keeps).
 if [ "${KC_COMPACT_LINKEDIT:-0}" = 1 ]; then
-  python3 "$PIANO_REPO/tooling/k273/compact-kc-linkedit.py" "$OUT" "$OUT.compact" && mv "$OUT.compact" "$OUT" || { rm -f "$OUT" "$OUT.compact"; exit 1; }
+  if ! python3 "$PIANO_REPO/tooling/k273/compact-kc-linkedit.py" "$OUT" "$OUT.compact" || ! mv "$OUT.compact" "$OUT"; then
+    rm -f "$OUT" "$OUT.compact"
+    exit 1
+  fi
 fi
 "$NM" -n "$KERNEL" > "${OUT%.bin}.nm"
 shasum -a 256 "$KERNEL" "$OUT" | tee "${OUT%.bin}.sha256"

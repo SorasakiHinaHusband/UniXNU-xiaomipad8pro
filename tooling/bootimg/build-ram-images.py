@@ -263,7 +263,7 @@ def boot_entry_args(ba, base, *, force=False):
     return one, smp, tail
 
 
-def data_store_args(seed, kc, extra=()):
+def data_store_args(seed, kc, extra=(), *, exact_mode=None):
     """The Data store arguments of a RAM test image (docs/data-store.md): (arguments, record).
     PIANO_DATA_PERSIST=0|1|2 when set; else 2 only when the image's seed is the installed one (PIANO_INSTALLED_SEED, or
     out/persistent/installed.json), 0 when it is another seed's, and when the installed seed is unknown 2 with a kernel collection that
@@ -278,6 +278,10 @@ def data_store_args(seed, kc, extra=()):
     same = common.same_seed(identity, installed)
     guard = common.kc_has_store_guard(kc)
     explicit = os.environ.get('PIANO_DATA_PERSIST')
+    if exact_mode is not None:
+        if explicit is not None and explicit != exact_mode:
+            raise SystemExit(f'PIANO_EXACT_ARGS says data-persist={exact_mode}, PIANO_DATA_PERSIST={explicit}')
+        explicit = exact_mode
     replace = os.environ.get('PIANO_DATA_STORE_REPLACE', '').strip().lower().removeprefix('0x')
     flatten = os.environ.get('PIANO_DATA_STORE_FLATTEN', '') == '1'
     if explicit is not None and explicit not in ('0', '1', '2'):
@@ -413,6 +417,19 @@ def uefi_payload(work):
     return image
 
 
+def exact_store_mode(args):
+    modes = []
+    for arg in args:
+        key, _, value = arg.partition('=')
+        if key in ('data-store-replace', 'data-store-flatten'):
+            raise SystemExit(f'PIANO_EXACT_ARGS: {key} needs its checked PIANO_DATA_STORE_REPLACE / PIANO_DATA_STORE_FLATTEN option')
+        if key == 'data-persist':
+            modes.append(value)
+    if len(modes) > 1 or (modes and modes[0] not in ('0', '1', '2')):
+        raise SystemExit('PIANO_EXACT_ARGS: data-persist must occur at most once with mode 0, 1 or 2')
+    return modes[0] if modes else '0'
+
+
 def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
     stage = work / 'macos-stage'
     payloads = stage / 'EFI/UniXNU/Payloads'
@@ -453,13 +470,11 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
     if scratch_plan and not exact:
         raise SystemExit('PIANO_SCRATCH_PLAN needs PIANO_EXACT_ARGS (the merged profile with the plan\'s binding; docs/tools/durability.md)')
     if exact:
-        mode = dict(x.split('=', 1) for x in exact if '=' in x).get('data-persist', '0')
-        if os.environ.get('PIANO_DATA_PERSIST', mode) != mode:
-            raise SystemExit(f'PIANO_EXACT_ARGS says data-persist={mode}, PIANO_DATA_PERSIST={os.environ["PIANO_DATA_PERSIST"]}')
-        os.environ['PIANO_DATA_PERSIST'] = mode
-        names = {x.split('=', 1)[0] for x in extra}
+        mode = exact_store_mode(exact)
+        names = {'data-persist'} | {x.split('=', 1)[0] for x in extra}
         base = [x for x in exact if x != 'sheng-smp=1' and x.split('=', 1)[0] not in names] + extra
-        persist, store_record = data_store_args(seed, kc, base if scratch_plan else exact + extra)
+        persist, store_record = data_store_args(seed, kc, base, exact_mode=mode)
+        base += persist
     else:
         persist, store_record = data_store_args(seed, kc, extra)
         base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
@@ -562,7 +577,10 @@ def main():
     p.add_argument('--extra-ram', action='store_true', help='add the shared extra-RAM reservation placeholder to the payload ADT')
     p.add_argument('--utc', type=int, default=int(time.time()))
     a = p.parse_args()
-    if a.extra_ram and not all((a.kc, a.trust, a.seed, a.adt)):
+    macos_inputs = (a.kc, a.trust, a.seed, a.adt)
+    if any(macos_inputs) and not all(macos_inputs):
+        p.error('--kc, --trust, --seed and --adt must be supplied together')
+    if a.extra_ram and not all(macos_inputs):
         p.error('--extra-ram requires --kc, --trust, --seed and --adt')
     if sha(MKBOOTIMG) != MKBOOTIMG_SHA256:
         raise SystemExit(f'{MKBOOTIMG} is not the Ubuntu RAM set\'s mkbootimg.py')
