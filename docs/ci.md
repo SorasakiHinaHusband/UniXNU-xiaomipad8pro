@@ -50,8 +50,8 @@ DPU clock readback, snapshot and NativeGopDisplay/`gop-shot` models and offline 
 USB, Wi-Fi and Bluetooth, Adreno830, kernel boot arguments (including the long boot-argument layout and k27 ADT merge), DarwinBoot,
 ESP tooling, durability and userland staging checks. The self-test job also fetches the `unixnu.lock` DarwinBoot pin, applies the
 repository patches in a temporary directory and checks extra-RAM and bootloader parsing against synthetic fixtures (locally, set
-`DARWINBOOT` to a checkout containing the pin). The skip list records input and build requirements, suite members and two
-`KNOWN-FAIL` entries. [Self-test runner](../scripts/ci/self-tests.py) · [Skip list](../scripts/ci/self-tests.skip)
+`DARWINBOOT` to a checkout containing the pin). The skip list records input and build requirements and tests covered by other
+suites. [Self-test runner](../scripts/ci/self-tests.py) · [Skip list](../scripts/ci/self-tests.skip)
 
 ### Adreno830 host suite
 
@@ -139,6 +139,6 @@ skill from the user's own IPSW.
    fakeroot stages, the kernelcache fetch and deletion, the release assembly with stand-in binaries, on a desk Mac).
 5. **The Metal plugin** (`tooling/metal/build-turnip-a830.sh`) needs the Mesa work tree and the metal2vulkan bridge, neither pinned in
    `unixnu.lock` yet; not in CI.
-6. **KNOWN-FAIL self-tests.** The older `tooling/k27/run-a830-host-tests.py` wrapper remains on the skip list.
-   `tooling/native/tests/test_desk_login.py` runs in `checks.yml` on every pull request and every push to `main`.
-   [Skip list](../scripts/ci/self-tests.skip)
+6. **Adreno830 local checks.** The local wrapper uses the pinned AdrenoFirmware vote reference and stays on the skip list as
+   `SUITE` because CI runs the shared suite. The local wrapper also runs the macOS build mode, board checks, timing tests and
+   optional stock firmware checks. [Local wrapper](../tooling/k27/run-a830-host-tests.py) · [Skip list](../scripts/ci/self-tests.skip)
