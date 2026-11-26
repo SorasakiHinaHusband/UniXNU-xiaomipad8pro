@@ -48,7 +48,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
   [drawable presentation feedback](presented-time.md).
 - **Display colour and power.** [M4 Night Shift PCC](dpu-m4-pcc-colour.md) and [M5 panel sleep and wake](dpu-m5-analysis.md).
 - **Storage and memory.** [Data concurrency and durability](data-store-m4-m5.md), [APFS write-back eligibility](m5-apfs.md),
-  [RAM16G GPU memory](ram-extra.md) and [RAM16G ownership proof](ram16g-owners.md).
+  [RAM16G GPU memory](ram-extra.md), [GPU tier workload and crash analysis](ram16g-tier-crash.md) and [RAM16G ownership proof](ram16g-owners.md).
 - **Audio and video.** [Audio duplex and input wake](audio-duplex.md), [VideoToolbox cancellation analysis](video-hevc-cancel.md),
   [Iris hardware encode static analysis](video-encode.md) (B10, fix-image gate HOLD) and
   [Iris E1 encode self-test integration](video-encode-e1.md).

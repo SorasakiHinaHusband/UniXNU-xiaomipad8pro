@@ -121,7 +121,7 @@ The GPU passes the same ADT bytes and XNU window bounds to the shared validator.
 It keeps its existing S8 GPU endpoint self-test, BO allocator, and `machdep.piano_gpu_tier` counters.
 
 Switches:
-- `piano-gpu-tier=1` enables eligible paged BOs of at least 2 MiB. Mode 2 also tries smaller BOs. Default is 0.
+- `piano-gpu-tier=1` enables explicitly GPU-private BOs of at least 2 MiB. Mode 2 also tries smaller private BOs. Default is 0.
 - `piano-extra-ram=1` enables shared kernel pools, including PianoVideo. Default is 0.
 - `piano-video-extra-ram=1` turns on video's use. Default is 0.
 - `piano-extra-ram-any=<use>` names the one use served the use-0 runs.
@@ -139,8 +139,8 @@ Path: ABL `/memory` and carve-outs → pianoPkg `MemoryMapLib` and RamManagerDxe
 the XNU window and qualifies region1 GPU runs plus the region0 stage-1 allow-list → fixed-size `/chosen/piano-extra-ram`
 array → `PianoExtraRam.h` validation.
 - GPU → PianoA830 S8 `CP_MEM_WRITE`, fence and physical readback at both run endpoints → S9 Metal publication →
-  macOS 27.3 WindowServer/Metal via NativeAdrenoMetal and the AGX IOKit ABI → `BoAlloc`, qualified slabs, WC Physical64
-  view and CB0 SMMU leaves → fence retirement and `BoFree`. The Linux msm GEM and sheng Adreno740 paths establish the
+  macOS 27.3 Metal via NativeAdrenoMetal and the AGX IOKit ABI → Turnip 0015 private scratch `BoAlloc`, qualified slabs and
+  CB0 SMMU leaves → fence retirement and `BoFree`. The Linux msm GEM and sheng Adreno740 paths establish the
   scatter/gather mapping and descriptor model. See [GPU reference path](drivers/ram-extra.md#reference-path).
 - Video → PianoVideo level 6 `KernelPool::start`, CPU self-test via WC maps, AVC arena takes 128 slabs →
   `kIOMemoryTypePhysical64` WC descriptor → `rememberPage` and `buildArena` Iris SMMU leaves → decoded NV12 →
@@ -167,7 +167,7 @@ both drivers' fallback allocation paths.
 
 ### RAM-boot read list
 
-Use one 27.3 RAM image with DarwinBoot patches 0001 and 0002, both kexts, their firmware, `PIANO_EXTRA_RAM=1` and the
+Use one 27.3 RAM image with DarwinBoot patches 0001 and 0002, kernel 0077, both kexts, their firmware, `PIANO_EXTRA_RAM=1` and the
 volatile Data profile with its boot guard. Start from the desktop paged GPU profile with
 `piano-gpu=2 piano-gpu-mem=paged piano-gpu-user-vm=1 piano-video=6 piano-video-vt=1`. The enabled boot adds
 `piano-gpu-tier=1 piano-extra-ram=1 piano-video-extra-ram=1`. Use the same payload and adjust one argument per control boot.
@@ -185,7 +185,7 @@ the kernel read is clipped, successful login and nonempty captures from this boo
 |---|---|---|
 | Firmware ownership | `DARWINBOOT: window` and `DARWINBOOT: extra-ram` lines, plus `NativeRamBlock: RAM window` | Same XNU window across boots. For each published GPU run, record its successful reservation. Record modem, pil-tail and cma-block decisions. Expect modem and pil-tail to be wholly covered by PIL_Reserved (type 0), and a stage skip for cma-block. |
 | ADT handoff | `ioreg -p IODeviceTree -r -n chosen -d 1 -l -w0 \| grep piano-extra-ram` | Decode the 384-byte value in 24-byte little-endian slots. Match the console reservations to bank 1/use 1, modem `0x89e00000 + 0x11200000` to bank 0/use 3 and pil-tail `0x9ee00000 + 0x04600000` to bank 0/use 2. Unused slots zero. |
-| GPU admission and allocations | Console `PianoA830: gpu tier:` and `adreno830_start:`; `sysctl machdep.piano_gpu_tier machdep.piano_gpu_paged machdep.piano_gpu_pt machdep.piano_gpu_state machdep.piano_gpu_recovery` at desktop idle, under a fixed textured 3D workload, after close and at +10 min | Both endpoints qualify each accepted run and at least one run passes. Match `pass-mask` to console. `allocs` and `used-mib` rise, `free-mib` falls, and workload slabs return on close. Record refusals, faults and recovery counters. |
+| GPU admission and allocations | Console `PianoA830: gpu tier:` and `adreno830_start:`; `sysctl machdep.piano_gpu_tier machdep.piano_gpu_paged machdep.piano_gpu_pt machdep.piano_gpu_state machdep.piano_gpu_recovery` at desktop idle, during [piano-tier-workload](drivers/ram16g-tier-crash.md#positive-tier-workload-piano-tier-workload), after close and at +10 min | Both endpoints qualify each accepted run and at least one run passes. Match `pass-mask` to console. Expect `mode=1 state=ready`. `private-req`, `allocs` and `used-mib` rise, `free-mib` falls, and workload slabs return on close. Record refusals, faults and recovery counters. |
 | AVC admission and DMA | `sudo sysctl machdep.piano_extra_ram_video`; console `RAM16G arena from extra RAM` and `V9h boot reservation ready`; run the [level-6 VT AVC qualification](drivers/video.md#14-v5a-bounded-native-avc-vt-bridge-tablet-qualification-pending) | Modem is `state=ours`, `self-test=pass pages=70144 bad=0`, `used=128 free=9`. The arena line says `128 slabs` and first PA `0x89e00000`. Active NV12 matches `bd230ec4a9cd22c274831d1b526c43d3ceb39a089257c3cb4114fbea0a8102dc`. |
 | Memory and presentation | `sysctl hw.memsize hw.pagesize vm.swapusage`, `vm_stat`, `memory_pressure`; timed presentation intervals and C920 capture during the same GPU workload | Record free and wired memory on the video control (approximately 256 MiB effect) and the GPU control. Compare p50/p95/p99 intervals and frames over 16.67 ms at the same refresh rate. Retain SMMU fault logs and inspect the capture for pixel errors. |
 | Composite smoke | Boot, login, Wi-Fi lease, audio, charging and panic log | The smoke passes with both consumers enabled and on each control. |
