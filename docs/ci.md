@@ -37,21 +37,42 @@ The workflow uses GitHub-hosted runners with read-only contents permission and c
 - **Pinned sources, `ubuntu-24.04`, 20 min.** `scripts/fetch-pins.py --verify` fetches each `unixnu.lock` pin and submodule pin
   by commit. `tooling/k27/fetch-k27-tree.sh` then reconstructs the k27 source tree from upstream and `patches/k27-tree` and checks
   its Git tree ID. [Source verifier](../scripts/fetch-pins.py) · [Lockfile](../unixnu.lock) · [k27 tree reconstruction](../tooling/k27/fetch-k27-tree.sh)
-- **Host self-tests, `macos-26`, 60 min.** Homebrew installs `mtools` and `llvm`. The runner discovers tracked Python, shell and
-  C/C++ host tests under `package/`, `tooling/`, `firmware/` and `scripts/`. It gives each command up to 1,500 seconds, an empty
-  `HOME`, and an environment filtered of `PIANO_*`, `TURNIP_*`, `K27_*` and `K273_*` variables. The log ends with up to ten
-  slowest commands, including compilation time. The `self-tests-report` JUnit artifact is uploaded with 14-day retention.
+- **Host self-tests, `macos-26`, 60 min.** Homebrew installs `mtools` for FAT images, `llvm` for the freestanding selector
+  build, and `ffmpeg` for the video host tests. The runner discovers tracked Python, shell and C/C++ host tests under
+  `package/`, `tooling/`, `firmware/` and `scripts/`. It gives each command up to 1,500 seconds, an empty `HOME`, and an
+  environment filtered of `PIANO_*`, `TURNIP_*`, `K27_*` and `K273_*` variables. The log ends with up to ten slowest commands,
+  including compilation time. The `self-tests-report` JUnit upload runs with `if: always()` and 14-day retention.
   [Self-test runner](../scripts/ci/self-tests.py)
+- **Real APFS pool capture.** The same macOS job separately runs `bash tooling/pool/test-pool-capture-check.sh --real-apfs`
+  after the host suite. It creates and attaches fresh APFS disk images using `hdiutil` and `diskutil`. Test discovery also
+  runs the script in its default mode with simulated disk commands and fixture headers. [Pool capture test](../tooling/pool/test-pool-capture-check.sh)
 
 ### Host test inventory (2026-11-27)
 
-`python3 scripts/ci/self-tests.py --list` discovers the tracked runnable host entries across storage and UFS, display (including
-DPU clock readback, snapshot and NativeGopDisplay/`gop-shot` models and offline clock grader), audio and power, input and sensors,
-USB, Wi-Fi and Bluetooth, Adreno830, kernel boot arguments (including the long boot-argument layout and k27 ADT merge), DarwinBoot,
-ESP tooling, durability and userland staging checks. The self-test job also fetches the `unixnu.lock` DarwinBoot pin, applies the
-repository patches in a temporary directory and checks extra-RAM and bootloader parsing against synthetic fixtures (locally, set
-`DARWINBOOT` to a checkout containing the pin). The skip list records input and build requirements and tests covered by other
-suites. [Self-test runner](../scripts/ci/self-tests.py) · [Skip list](../scripts/ci/self-tests.skip)
+`python3 scripts/ci/self-tests.py --list` reports **162 runnable entries** (68 Python, 34 shell, 60 C/C++), **49 explicit
+skips**, and **97 C/C++ files without a standalone build line** (`none`). The count is of runner entries. Suites can run
+multiple tests, and the real APFS step is outside this count. [Self-test runner](../scripts/ci/self-tests.py)
+
+The skip list contains **39 `SUITE`** entries run by another test, **6 `ARGS`** entries that need arguments from a caller, and
+**4 `INPUT`** entries that need local inputs. `KNOWN-FAIL`, `HEADER` and `TOOL` each have **0** entries.
+[Skip list](../scripts/ci/self-tests.skip)
+
+The self-test job fetches the DarwinBoot pin from `unixnu.lock`. The bootloader host tests apply the repository patches in a
+temporary directory and check extra-RAM and parsing against synthetic fixtures. For a local run, set `DARWINBOOT` to a checkout
+containing the pin. The entries below run through test discovery.
+
+| Area | Discovered entry points |
+| --- | --- |
+| Repository integrity | [`test-repo-manifests.py`](../scripts/ci/test-repo-manifests.py) checks manifests, native descriptors and build wiring, patch hygiene, and shell syntax. [`test-doc-links.py`](../scripts/ci/test-doc-links.py) checks tracked Markdown paths and heading anchors, plus driver-index coverage. |
+| CI tooling | [`test-privacy-scan.py`](../scripts/ci/test-privacy-scan.py) covers scanner rules and Git diffs. [`test-fetch-pins.py`](../scripts/ci/test-fetch-pins.py) uses local Git fixtures for pin validation, fetch and recovery. [`test-self-tests.py`](../scripts/ci/test-self-tests.py) covers discovery, timeouts, JUnit output and duration reporting. |
+| Boot and release | [`test-home-ram-boot.py`](../scripts/ci/test-home-ram-boot.py) checks paths and checksums with simulated fastboot. [`test-verify-ram-images.py`](../tooling/bootimg/test-verify-ram-images.py) exercises the offline image verifier. [`test-partition-safety.py`](../tooling/persist/test-partition-safety.py) covers partition and installed-identity guards with fixtures. [`test-release-assets.py`](../tooling/ci/test-release-assets.py) checks release assembly and refusal cases. |
+| Audio and power | [`PianoAudio/tests/run-audio-host.sh`](../package/PianoAudio/tests/run-audio-host.sh), [`PianoPower/tests/run-platform-host.sh`](../package/PianoPower/tests/run-platform-host.sh), and [`test-extractors.py`](../tooling/audio/test-extractors.py). |
+| Camera | [`PianoCamera/tests/run-camera-host.sh`](../package/PianoCamera/tests/run-camera-host.sh), [`tooling/camera/extension/tests/run-camera-provider-host.sh`](../tooling/camera/extension/tests/run-camera-provider-host.sh), [`test-camera-parsers.py`](../tooling/camera/test-camera-parsers.py), and [`test-diagnostic-host.py`](../tooling/camera/diagnostic/test-diagnostic-host.py). |
+| Graphics, video and display | [`test-metal-host.py`](../tooling/metal/test-metal-host.py), [`PianoVideo/tests/run-bringup-host.sh`](../package/PianoVideo/tests/run-bringup-host.sh), [`PianoDp/tests/run-dp-host.sh`](../package/PianoDp/tests/run-dp-host.sh), [`test-dp-phy-tables.py`](../tooling/dp/test-dp-phy-tables.py), and [`piano-frametime/run-tests.sh`](../tooling/native/piano-frametime/run-tests.sh). |
+| IR, brightness and torch | [`PianoIR/tests/run-ir-host.sh`](../package/PianoIR/tests/run-ir-host.sh), [`piano-brightness-sync/tests/run-sync-host.sh`](../tooling/native/piano-brightness-sync/tests/run-sync-host.sh), and [`piano-torch/test-cli.sh`](../tooling/native/piano-torch/test-cli.sh). |
+
+The inventory also covers UFS and durability, DPU readback and scanout, the GOP display and `gop-shot`, input and sensors,
+USB, Wi-Fi and Bluetooth, long boot arguments and ADT merge, ESP tooling, and userland staging.
 
 ### Adreno830 host suite
 
@@ -80,8 +101,8 @@ SELFTEST_TIMEOUT=1500 python3 scripts/ci/self-tests.py --only package/PianoA830/
 
 `unixnu.lock` `[pin."k27"]` pins upstream [Droid-VM/macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) `abcbc18`; our delta
 is `patches/k27-tree` (two patches, provenance and what was left out: [patches/k27-tree/README.md](../patches/k27-tree/README.md)).
-`tooling/k27/fetch-k27-tree.sh DEST` makes the tree; `scripts/fetch-pins.py` does it for `k27` (as `k27-tree`). Locally nothing
-changes: `PIANO_K27_TREE` still names the tree the build reads.
+`tooling/k27/fetch-k27-tree.sh DEST` makes the tree. `scripts/fetch-pins.py` does it for `k27` (as `k27-tree`). Use
+`PIANO_K27_TREE` to point the local build at the tree. [Local builds](building.md)
 
 ## build.yml
 
@@ -93,7 +114,7 @@ uploads `fd.sha256` and the build log.
 | Stage | From |
 | --- | --- |
 | tree | upstream + `patches/k27-tree` |
-| xnu | apple-oss-distributions/xnu `xnu-12377.121.6` + the tree's `patches/xnu-12377` 0001-0054 + `patches/k27` 0055-0066 (`git am`) |
+| xnu | apple-oss-distributions/xnu `xnu-12377.121.6` + the tree's `patches/xnu-12377` 0001–0054 + `patches/k27` 0055 through `K27_TREE_TOP` (default 0066 in the CI recipes, applied with `git am`) |
 | ld | `ld-classic` (ld64; the kernel links with `-threaded_starts_section`) from the runner's toolchain or `LD_CLASSIC` |
 | kdk | headers of a Kernel Debug Kit: `vars.PIANO_KDK_URL` (+ `secrets.PIANO_KDK_AUTH`, an HTTP header), open item |
 | fakeroot | apple-oss-distributions AvailabilityVersions-157.2, libplatform-375.120.2, libdispatch-1542.100.32 headers; the tree's installhdrs; `libfirehose_kernel.a` built from libdispatch's source |
