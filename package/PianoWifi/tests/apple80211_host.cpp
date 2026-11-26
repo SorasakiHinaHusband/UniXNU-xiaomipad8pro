@@ -118,15 +118,15 @@ struct Rig {
 };
 
 // Replay the request/effect/owner/notification boundary, rather than merely
-// checking handle's effect bit. Firmware stop completion is explicit here;
-// the separate Sta suite verifies its actual command ordering.
+// checking handle's effect bit. A synchronous OFF completes the modeled
+// physical park before it returns and requests the accepted-SET event.
 struct PowerRig : Rig {
   WifiUserControl owner;
   WifiBootPower bootGuard;
   PowerRig() { bootGuard.enabled = false; } // existing unrestricted-lifecycle replays
   unsigned powerEvents = 0, downEvents = 0;
   void publish(bool acceptedPowerSet = false) {
-    const bool on = WifiUserControl::power(owner.read());
+    const bool on = owner.reportedPower(owner.read());
     const bool notify = powerEventRequired(st, on, acceptedPowerSet);
     Association next = st.association;
     if (!owner.allowed(owner.read())) { next = {}; next.result = 2; }
@@ -143,6 +143,7 @@ struct PowerRig : Rig {
     if (!a.error && (a.effects & (kDoPowerChanged | kDoDisassociate))) {
       if (a.effects & kDoDisassociate) owner.disconnect();
       else if (!bootGuard.setPower(owner, a.powerOn)) a.error = EBUSY;
+      else if (!a.powerOn) owner.radioOff(owner.read());
       publish(!a.error && (a.effects & kDoPowerChanged) != 0);
     }
     return a;
@@ -161,6 +162,107 @@ struct PowerRig : Rig {
     return on;
   }
 };
+
+static void testPowerAndAvailabilityEvents()
+{
+  CHECK(kEvPowerChanged == 1 && kEvDriverAvailable == 55);
+  Rig r;
+  for (bool on : {false, true}) {
+    const Power power = powerRecord(on);
+    const DriverAvailability availability = driverAvailabilityRecord(on);
+    const uint8_t powerBytes[24] = {1, 0, 0, 0, 1, 0, 0, 0, uint8_t(on)};
+    const uint8_t availabilityBytes[248] = {0, 0, 0, 0, 0, 0, 0, 0, uint8_t(on)};
+    const LinkEvent link = {};
+    const auto event1 = bsdEventPayload(1, link, true, &power, &availability);
+    const auto event55 = bsdEventPayload(55, link, true, &power, &availability);
+    CHECK(event1.data == &power && event1.size == sizeof powerBytes);
+    CHECK(event55.data == &availability && event55.size == sizeof availabilityBytes);
+    CHECK(std::memcmp(&power, powerBytes, sizeof powerBytes) == 0);
+    CHECK(std::memcmp(&availability, availabilityBytes, sizeof availabilityBytes) == 0);
+    CHECK(kBsdEventHeaderSize + kBsdEventNameSize + event1.size == 64);
+    CHECK(kBsdEventHeaderSize + kBsdEventNameSize + event55.size == kBsdEventMaxSize);
+    const auto missing1 = bsdEventPayload(1, link, true, nullptr, &availability);
+    const auto missing55 = bsdEventPayload(55, link, true, &power);
+    CHECK(!missing1.data && !missing1.size && !missing55.data && !missing55.size);
+
+    observeAssociation(r.st, Association{}, on, false);
+    for (uint32_t length : {1u, 8u, 9u, 23u, 24u, 25u}) {
+      std::memset(r.user.mem.data(), 0xa5, 26);
+      const Answer get = r.ask(false, kPower, length);
+      const uint32_t copied = length < sizeof powerBytes ? length : sizeof powerBytes;
+      CHECK(!get.error && get.wrote == copied && std::memcmp(r.at(0), powerBytes, copied) == 0);
+      for (uint32_t i = copied; i < 26; ++i) CHECK(*r.at(i) == 0xa5);
+    }
+    CHECK(r.ask(false, kPower, 0).error == kErrInval);
+    CHECK(r.ask(false, kPower, 24, false).error == kErrInval);
+    std::memcpy(r.user.mem.data(), powerBytes, sizeof powerBytes);
+    const unsigned sets = r.st.powerSets;
+    CHECK(r.ask(true, kPower, 23).error == kErrInval);
+    CHECK(r.ask(true, kPower, 24, false).error == kErrInval);
+    r.put32(4, 2);
+    CHECK(r.ask(true, kPower, 24).error == kErrInval);
+    r.put32(4, 1);
+    r.put32(8, 2);
+    CHECK(r.ask(true, kPower, 24).error == kErrInval);
+    CHECK(r.st.powerSets == sets);
+  }
+
+  WifiUserControl owner;
+  State state;
+  bool adopted = false, firmwareReady = false;
+  int posted = -1;
+  std::vector<bool> powerEvents, availabilityEvents;
+  auto sample = [&](bool emit = true, bool acceptedSet = false, bool forceAvailable = false) {
+    const bool power = owner.reportedPower(owner.read());
+    const bool notify = powerEventRequired(state, power, acceptedSet);
+    observeAssociation(state, Association{}, power, emit);
+    if (!emit) return;
+    if (notify) powerEvents.push_back(power);
+    const bool usable = firmwareReady && !owner.radioStop();
+    if (driverAvailabilityEventRequired(adopted, posted, usable, forceAvailable)) {
+      posted = int(usable);
+      availabilityEvents.push_back(usable);
+    }
+  };
+  sample(true, false, true);
+  CHECK(availabilityEvents.empty()); // no airportd adopter
+  adopted = true;
+  sample(true, false, true);
+  sample();
+  CHECK(availabilityEvents == std::vector<bool>{false});
+  firmwareReady = true;
+  sample();
+  sample(true, true, true); // repeated SET19 ON and adoption by a new daemon
+  CHECK((availabilityEvents == std::vector<bool>{false, true, true}));
+  CHECK(powerEvents == std::vector<bool>{true});
+
+  for (unsigned cycle = 0; cycle < 3; ++cycle) {
+    const auto powerCount = powerEvents.size();
+    const auto availabilityCount = availabilityEvents.size();
+    const uint32_t off = owner.setPower(false);
+    sample();
+    CHECK(state.power && powerEvents.size() == powerCount);
+    CHECK(availabilityEvents.size() == availabilityCount + 1 && !availabilityEvents.back());
+    firmwareReady = false;
+    owner.radioOff(off);
+    sample(false);
+    sample(false);
+    CHECK(!state.power && state.eventPower && powerEvents.size() == powerCount);
+    sample(true, true);
+    CHECK(powerEvents.size() == powerCount + 1 && !powerEvents.back());
+    sample();
+    CHECK(powerEvents.size() == powerCount + 1 && availabilityEvents.size() == availabilityCount + 1);
+
+    owner.setPower(true);
+    sample(true, true);
+    CHECK(powerEvents.size() == powerCount + 2 && powerEvents.back());
+    CHECK(availabilityEvents.size() == availabilityCount + 1);
+    firmwareReady = true;
+    sample();
+    sample();
+    CHECK(availabilityEvents.size() == availabilityCount + 2 && availabilityEvents.back());
+  }
+}
 
 static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, bool rsn)
 {
@@ -185,6 +287,7 @@ static Bss network(uint8_t last, const char *name, uint32_t freq, int32_t rssi, 
 
 int main()
 {
+  testPowerAndAvailabilityEvents();
   // Replay validated SET19 -> production boot guard -> owner -> coherent GET
   // and accepted-SET event. Early OFF must not create even a pending cycle.
   for (bool explicitArm : {false, true}) {
@@ -401,7 +504,6 @@ int main()
     r.setPowerRecord(false);
     CHECK(!r.control(19, 24).error && !r.getPower() && r.owner.radioStop());
     CHECK(r.powerEvents == 3);
-    r.owner.radioOff(r.owner.read()); // quiesced DMA and physical power-down
     r.setPowerRecord(true);
     CHECK(!r.control(19, 24).error && r.getPower() && r.owner.allowed(r.owner.read()));
     CHECK(r.powerEvents == 4);
@@ -440,7 +542,6 @@ int main()
         oldBoot.setPowerRecord(attachPower(false, preference));
         CHECK(!oldBoot.control(kPower, sizeof(Power)).error);
       }
-      oldBoot.owner.radioOff(oldBoot.owner.read());
       oldBoot.publish();
       CHECK(!oldBoot.getPower() && !oldBoot.owner.allowed(oldBoot.owner.read()));
       CHECK(oldBoot.powerEvents == 2);
@@ -450,7 +551,6 @@ int main()
         fixedBoot.setPowerRecord(attachPower(true, preference));
         CHECK(!fixedBoot.control(kPower, sizeof(Power)).error);
       }
-      if (preference == 0) fixedBoot.owner.radioOff(fixedBoot.owner.read());
       fixedBoot.publish();
       CHECK(fixedBoot.getPower() == (preference != 0));
       CHECK(fixedBoot.owner.allowed(fixedBoot.owner.read()) == (preference != 0));
@@ -459,14 +559,22 @@ int main()
     for (bool finishOffBeforeOn : {false, true}) {
       PowerRig r;
       r.setPowerRecord(false);
-      CHECK(!r.control(kPower, sizeof(Power)).error && !r.getPower());
-      const uint32_t off = r.owner.read();
-      if (finishOffBeforeOn) r.owner.radioOff(off);
+      const Answer request = r.ask(true, kPower, sizeof(Power));
+      CHECK(!request.error && (request.effects & kDoPowerChanged) && !request.powerOn);
+      const uint32_t off = r.owner.setPower(request.powerOn);
+      r.publish(); // OFF is still waiting for physical confirmation
+      CHECK(r.getPower() && r.powerEvents == 0);
+      if (finishOffBeforeOn) {
+        r.owner.radioOff(off);
+        r.publish(true);
+        CHECK(!r.getPower());
+      }
       r.setPowerRecord(true);
       CHECK(!r.control(kPower, sizeof(Power)).error && r.getPower());
       if (!finishOffBeforeOn) {
         CHECK(r.owner.radioStop() && !r.owner.allowed(r.owner.read()));
-        r.owner.radioOff(r.owner.read());
+        r.owner.radioOff(off);
+        r.publish(true); // the delayed OFF returns while the current power is ON
       }
       r.publish();
       CHECK(r.getPower() && r.owner.allowed(r.owner.read()) && !r.owner.radioStop());
@@ -477,7 +585,6 @@ int main()
     PowerRig persistedOff;
     persistedOff.setPowerRecord(false);
     CHECK(!persistedOff.control(kPower, sizeof(Power)).error);
-    persistedOff.owner.radioOff(persistedOff.owner.read());
     for (unsigned poll = 0; poll < 100; ++poll) {
       persistedOff.publish();
       CHECK(!persistedOff.getPower());
@@ -771,15 +878,6 @@ int main()
     CHECK(a.error == 0 && (a.effects & kDoScanStarted) && r.st.scanRequests == 1);
     // The user-client/raw-get loop returns 0 for each complete record, then exactly 5 at the list end.  The tail after the
     // information elements is zeroed even though the caller prefilled it with a marker.
-    {   // DRIVER_AVAILABLE (event 55): the 0xf8-byte record, available at +8, inside the single-mbuf kernel event
-      DriverAvailability availability = {};
-      availability.available = 1;
-      const auto payload = bsdEventPayload(kEvDriverAvailable, LinkEvent{}, false, nullptr, &availability);
-      CHECK(payload.size == 0xf8 && static_cast<const uint8_t *>(payload.data)[8] == 1 &&
-            static_cast<const uint8_t *>(payload.data)[4] == 0);
-      CHECK(kBsdEventHeaderSize + kBsdEventNameSize + payload.size == kBsdEventMaxSize);
-      CHECK(bsdEventPayload(kEvDriverAvailable, LinkEvent{}, false).size == 0);
-    }
     std::memset(r.user.mem.data(), 0, kScanResultBytes27);
     r.st.nowNs = 0x1122334455667788ull;
     std::memcpy(r.user.mem.data() + 0x88c, "request-7", 10);

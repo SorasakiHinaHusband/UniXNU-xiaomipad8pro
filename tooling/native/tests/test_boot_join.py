@@ -340,10 +340,12 @@ int main(int argc,char **argv) {
 #include <time.h>
 #include "package/PianoWifi/WifiProfile.h"
 static uint64_t seconds;
-static unsigned accesses, scans, associations, rawGeneration;
+static unsigned accesses, scans, associations, pauses, rawGeneration;
 static uint64_t currentGeneration;
+static size_t currentSize = sizeof currentGeneration;
 static int currentError = ENOENT;
 static BOOL powered = YES, cachedName, scanMatch, requestedDuringScan;
+static BOOL powerOffDuringScan, publishRawOnAssociate = YES, publishCurrentOnAssociate = YES;
 static const uint8_t fixtureName[7];
 
 @interface FixtureNetwork : NSObject
@@ -370,13 +372,15 @@ static const uint8_t fixtureName[7];
   assert(ssid.length == sizeof fixtureName && error);
   ++scans;
   if (requestedDuringScan) currentGeneration = ++rawGeneration;
+  if (powerOffDuringScan) powered = NO;
   if (scanMatch) return [NSSet setWithObject:(CWNetwork *)[FixtureNetwork new]];
   return [NSSet set];
 }
 - (BOOL)associateToNetwork:(CWNetwork *)network password:(NSString *)password error:(NSError **)error {
   assert(network && !password && error);
   ++associations;
-  currentGeneration = ++rawGeneration;
+  if (publishRawOnAssociate) ++rawGeneration;
+  if (publishCurrentOnAssociate) currentGeneration = rawGeneration;
   return YES;
 }
 @end
@@ -390,6 +394,7 @@ static int fixture_sysctl(const char *name, void *old, size_t *len, void *new, s
     if (currentError) { errno = currentError; return -1; }
     assert(*len == sizeof currentGeneration);
     memcpy(old, &currentGeneration, *len);
+    *len = currentSize;
     return 0;
   }
   assert(!strcmp(name, PIANO_WIFI_PROFILE_SYSCTL));
@@ -405,19 +410,21 @@ static int fixture_sysctl(const char *name, void *old, size_t *len, void *new, s
 #include "tooling/native/piano-wifi-join/piano-wifi-join.m"
 #undef main
 
-static void unexpected_pause(void *context) { (void)context; assert(0); }
+static void fixture_pause(void *context) { (void)context; ++pauses; }
 
 int main(void) {
   @autoreleasepool {
     struct piano_wifi_profile profile = { .ssid_len = sizeof fixtureName };
     struct apple_join a = { .profile = &profile, .kick_time = 100, .location_passed = 1 };
-    struct piano_boot_join_transport transport = { &a, ready, receipt, associate, unexpected_pause };
+    struct piano_boot_join_transport transport = { &a, ready, receipt, associate, fixture_pause };
     seconds = 134;
     assert(ready(&a) == 0 && accesses == 0 && scans == 0);
     seconds = 135;
     assert(ready(&a) == 0 && accesses == 1 && scans == 1);
-    rawGeneration = 9; // Default-off still treats any Apple SET20 receipt as sufficient.
-    assert(ready(&a) == -1 && scans == 1);
+    // With the opt-in OID absent, the historical receipt still suppresses a
+    // duplicate before any CoreWLAN or location work, including after OFF/ON.
+    rawGeneration = 9;
+    assert(ready(&a) == -1 && accesses == 1 && scans == 1);
     rawGeneration = 0;
     cachedName = YES;
     assert(ready(&a) == -1 && scans == 1);
@@ -442,15 +449,45 @@ int main(void) {
 
     currentGeneration = 0; // reported link loss on the same radio pass
     assert(piano_boot_join(&transport, 1) == 0 && associations == 3 && rawGeneration == 3);
-    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 3); // PS change or retained wake
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 3); // PS-only write
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 3); // radio retained across sleep
     currentGeneration = 0; // wake after sleep parked the radio
     assert(piano_boot_join(&transport, 1) == 0 && associations == 4 && rawGeneration == 4);
 
     currentGeneration = 0;
     requestedDuringScan = YES; // airportd publishes SET20 during the helper's scan
     assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 4 && rawGeneration == 5);
+    requestedDuringScan = NO;
+    currentGeneration = 0;
+    powerOffDuringScan = YES;
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 4 && rawGeneration == 5);
+    powerOffDuringScan = NO;
+    powered = YES;
+    assert(pauses == 0);
+
+    // The current generation suppresses duplicates. Confirmation of a helper
+    // request uses a fresh raw generation, even if the receipt expired again.
+    publishRawOnAssociate = NO;
+    assert(piano_boot_join(&transport, 1) == 3 && associations == 5 && rawGeneration == 5);
+    assert(currentGeneration == 5 && pauses == 30);
+    publishRawOnAssociate = YES;
+    publishCurrentOnAssociate = NO;
+    currentGeneration = 0;
+    assert(piano_boot_join(&transport, 1) == 0 && associations == 6 && rawGeneration == 6);
+    assert(currentGeneration == 0 && pauses == 30);
+
+    const unsigned previousAccesses = accesses;
+    rawGeneration = 0;
+    cachedName = NO;
+    currentSize = sizeof(uint32_t);
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && accesses == previousAccesses);
+    currentSize = sizeof currentGeneration;
+    currentGeneration = (uint64_t)UINT32_MAX + 1;
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && accesses == previousAccesses);
+    currentGeneration = 0;
     currentError = EIO;
-    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && associations == 4);
+    assert(piano_boot_join(&transport, 1) == PianoBootJoinSkipped && accesses == previousAccesses);
+    assert(associations == 6 && pauses == 30);
   }
 }
 '''

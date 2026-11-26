@@ -1211,9 +1211,62 @@ static void testUserStopCycles()
   CHECK(starts == 1 && staAppleAssociateResult(m.sta) == 2);
 }
 
+static void testPowerSaveOffRace()
+{
+  WifiUserControl user;
+  WifiJoinRequest join;
+  uint32_t previousOff = user.read();
+  for (uint32_t generation = 1; generation <= 3; ++generation) {
+    const uint32_t restart = generation - 1;
+    Model m;
+    addToList(m.list, beacon(kAp24, kName, sizeof kName, false, false, kDot11CapEss), 2437, -45);
+    StaOptions options = fastOptions();
+    options.holdMs = 0;
+    CHECK(user.join() && user.allowed(user.read()));
+    join.accept(generation, m.now, restart);
+    join.consume();
+    m.begin(options, true, PianoWifiSecOpen);
+    for (unsigned n = 0; n < 5000 && m.sta.step != kStaAssociated; ++n) m.turn();
+    CHECK(staAppleAssociateResult(m.sta) == 1 && m.psMode == kWmiStaPsOff);
+    CHECK(join.finish(generation, 1, m.now, restart));
+    CHECK(join.currentReceipt(m.now, restart, generation, true, m.sta.authorized) == generation);
+
+    // A live station has applied PS=1. The sysctl queues PS=0, then OFF
+    // cancels the station before a worker turn can send the mode change.
+    auto applyMode = [&](uint32_t mode) {
+      WmiWriter writer;
+      uint8_t bytes[32];
+      const uint32_t length = assocBuildPowersaveMode(writer, bytes, sizeof bytes, options.vdevId, mode);
+      CHECK(length != 0);
+      if (length) m.onCommand(bytes, length);
+    };
+    applyMode(kWmiStaPsOn);
+    CHECK(m.psMode == kWmiStaPsOn);
+    CHECK(join.currentReceipt(m.now, restart, generation, true, m.sta.authorized) == generation);
+    const uint32_t psWanted = kWmiStaPsOff;
+    const uint32_t off = user.setPower(false);
+    join.cancel();
+    CHECK(user.serial(off) == user.serial(previousOff) + 1 && !user.join());
+    CHECK(!join.currentReceipt(m.now, restart, generation, true, m.sta.authorized));
+    staStop(m.sta, m.now, 300);
+    if (user.allowed(user.read()) && m.sta.authorized) applyMode(psWanted);
+    CHECK(m.run() == kStaStopped && m.down && m.peerDeleted && m.stopped);
+    CHECK(m.psMode == kWmiStaPsOn && !user.radioOffConfirmed(off));
+
+    user.setPower(true);
+    user.radioOff(previousOff);
+    CHECK(!user.radioOffConfirmed(off) && !user.allowed(user.read()));
+    user.radioOff(off);
+    CHECK(user.radioOffConfirmed(off) && user.allowed(user.read()));
+    CHECK(!join.canStart(m.now)); // ON alone cannot replay SET20
+    previousOff = off;
+  }
+}
+
 int main()
 {
   testUserStopCycles();
+  testPowerSaveOffRace();
   testFrames();
   testAnswers();
   testRsn();

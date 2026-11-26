@@ -154,6 +154,8 @@ struct Power {
 };
 static_assert(sizeof(Power) == 24, "power");
 
+inline Power powerRecord(bool on) { return {1, 1, {on ? 1u : 0u, 0, 0, 0}}; }
+
 // DRIVER_AVAILABLE (BSD event 55). 27.3 airportd's _bsd_80211_event_callback (0x1000723f0) reads the u32 at +8 as `available` (flags at
 // +4, reason at +0x10, subreason at +0x14) into its device node's isDriverAvailable byte; __allowAutoJoinWithTrigger refuses every
 // auto-join ("driver not available", DriverUnavailable) while it is 0, and a node found through interfaceAdded starts at 0 (owner
@@ -167,6 +169,18 @@ static_assert(sizeof(DriverAvailability) == 0xf8 && __builtin_offsetof(DriverAva
               "27.3 driver availability layout");
 static_assert(kBsdEventHeaderSize + kBsdEventNameSize + sizeof(DriverAvailability) <= kBsdEventMaxSize,
               "driver availability kernel event fits");
+
+inline DriverAvailability driverAvailabilityRecord(bool available)
+{
+  DriverAvailability record = {};
+  record.available = available ? 1u : 0u;
+  return record;
+}
+
+inline bool driverAvailabilityEventRequired(bool adopted, int posted, bool usable, bool force)
+{
+  return adopted && (force || posted != int(usable));
+}
 
 inline BsdEventPayload bsdEventPayload(uint32_t code, const LinkEvent &link, bool scanStatus, const Power *power = nullptr,
                                        const DriverAvailability *availability = nullptr)
@@ -1058,11 +1072,8 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     return a;
   }
   case kPower: {
-    Power *p = reinterpret_cast<Power *>(scratch);
-    p->version = 1;
-    p->radios = 1;
-    p->state[0] = s.power ? 1 : 0;
-    a.error = copyOut(rq, io, p, sizeof *p, a);
+    const Power p = powerRecord(s.power);
+    a.error = copyOut(rq, io, &p, sizeof p, a);
     return a;
   }
   case kLinkChangedEventData:

@@ -88,7 +88,7 @@ class PianoWifi80211 : public IO80211Controller {
   unsigned fAttachTries = 0;
   bool fSubtypeTaken = false, fRegistered = false, fSysctl = false;
   int fAirportdPid = 0;
-  int fDriverAvailablePosted = -1;   // the last DRIVER_AVAILABLE value posted (-1: none yet); guarded by fLock
+  int fDriverAvailablePosted = -1;   // the last DRIVER_AVAILABLE value posted (-1: none yet); guarded by fSyncLock
   // counters (under fLock)
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
@@ -127,8 +127,7 @@ class PianoWifi80211 : public IO80211Controller {
   errno_t apple80211(bool set, pianowifi::a80211::Req &rq, const pianowifi::a80211::UserIo *io = nullptr);
   void refreshScanLocked();
   void postEvent(uint32_t code, const pianowifi::a80211::LinkEvent &link = {});
-  void postDriverAvailable(bool available, const char *why);
-  void syncDriverAvailable(bool force, const char *why);
+  void syncDriverAvailableLocked(bool force, const char *why);
   void waitAssociationOutcome();
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
@@ -717,7 +716,9 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq, const p
       if (__atomic_exchange_n(&fAirportdPid, pid, __ATOMIC_ACQ_REL) != pid) {
         setProperty("piano-wifi-airportd-adopted", uint64_t(pid), 32);
         note80211("PianoWifiAirportdAvailabilityV1 adopted pid %d via GET19", pid);
-        syncDriverAvailable(true, "airportd adoption");   // a new airportd's device node starts unavailable
+        IOLockLock(fSyncLock);
+        syncDriverAvailableLocked(true, "airportd adoption");   // a new airportd's device node starts unavailable
+        IOLockUnlock(fSyncLock);
       }
     }
   }
@@ -818,18 +819,12 @@ void PianoWifi80211::postEvent(uint32_t code, const pianowifi::a80211::LinkEvent
   memcpy(name, fIfName, sizeof name);
   Power power = {};
   if (code == kEvPowerChanged) {
-    power.version = 1;
-    power.radios = 1;
     IOLockLock(fLock);
-    power.state[0] = fState->power ? 1 : 0;
+    power = powerRecord(fState->power);
     IOLockUnlock(fLock);
   }
   DriverAvailability availability = {};
-  if (code == kEvDriverAvailable) {
-    IOLockLock(fLock);
-    availability.available = fDriverAvailablePosted > 0 ? 1u : 0u;
-    IOLockUnlock(fLock);
-  }
+  if (code == kEvDriverAvailable) availability = driverAvailabilityRecord(fDriverAvailablePosted > 0);
   const auto payload = bsdEventPayload(code, link, code == kEvScanDone && (ucMode() & kUcEventPayloads),
                                        code == kEvPowerChanged ? &power : nullptr,
                                        code == kEvDriverAvailable ? &availability : nullptr);
@@ -864,24 +859,15 @@ void PianoWifi80211::postEvent(uint32_t code, const pianowifi::a80211::LinkEvent
 
 // DRIVER_AVAILABLE follows the controller's radio usability, once airportd has adopted the interface (before that no airportd
 // device node exists to take it). `force` posts the current value again (a new airportd PID). fSyncLock orders the posts.
-void PianoWifi80211::postDriverAvailable(bool available, const char *why)
+void PianoWifi80211::syncDriverAvailableLocked(bool force, const char *why)
 {
-  IOLockLock(fLock);
-  fDriverAvailablePosted = available ? 1 : 0;
-  IOLockUnlock(fLock);
-  note80211("%s: PianoWifiDriverAvailableV1 %s: driver %savailable", fIfName, why, available ? "" : "not ");
-  postEvent(pianowifi::a80211::kEvDriverAvailable);
-}
-
-void PianoWifi80211::syncDriverAvailable(bool force, const char *why)
-{
-  if (!__atomic_load_n(&fAirportdPid, __ATOMIC_ACQUIRE)) return;
+  const bool adopted = __atomic_load_n(&fAirportdPid, __ATOMIC_ACQUIRE) != 0;
   const bool usable = piano_wifi_assoc_radio_usable() != 0;
-  IOLockLock(fLock);
-  const int posted = fDriverAvailablePosted;
-  IOLockUnlock(fLock);
-  if (!force && posted == (usable ? 1 : 0)) return;
-  postDriverAvailable(usable, force ? why : usable ? "the radio reached level 7" : "the radio went down");
+  if (!pianowifi::a80211::driverAvailabilityEventRequired(adopted, fDriverAvailablePosted, usable, force)) return;
+  fDriverAvailablePosted = usable ? 1 : 0;
+  const char *reason = force ? why : usable ? "the radio reached level 7" : "the radio went down";
+  note80211("%s: PianoWifiDriverAvailableV1 %s: driver %savailable", fIfName, reason, usable ? "" : "not ");
+  postEvent(pianowifi::a80211::kEvDriverAvailable);
 }
 
 // ASSOCIATE returns when the join has an outcome (AUTOJOIN-ON.md, wifi-aj2 2026-11-20): airportd logs SET20's return as "Join
@@ -1142,7 +1128,7 @@ void PianoWifi80211::syncAssociation(bool emit, bool powerSetAccepted)
   // before airportd/configd receive the matching power/association events.
   syncRunning(next.authorized);
   if (powerChanged) postEvent(kEvPowerChanged);
-  syncDriverAvailable(false, nullptr);
+  syncDriverAvailableLocked(false, nullptr);
   if (!changed) { IOLockUnlock(fSyncLock); return; }
   // Emit the association notice before the public link-up sequence, which
   // waits for AUTHORIZE so configd cannot start DHCP early.

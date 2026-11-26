@@ -68,10 +68,16 @@ struct WifiUserControl {
 
   uint32_t read() const { return __atomic_load_n(&word, __ATOMIC_ACQUIRE); }
   static bool power(uint32_t w) { return (w & kPower) != 0; }
+  // GET19 stays ON until the worker confirms physical OFF.
+  static bool reportedPower(uint32_t w) { return (w & (kPower | kCycle)) != 0; }
   static uint32_t serial(uint32_t w) { return w >> 3; }
+  static bool joinRequested(uint32_t w) { return (w & (kPower | kJoin | kCycle)) == (kPower | kJoin); }
   bool pending(uint32_t w) const { return serial(w) != __atomic_load_n(&applied, __ATOMIC_ACQUIRE); }
-  bool allowed(uint32_t w) const { return (w & (kPower | kJoin | kCycle)) == (kPower | kJoin) && !pending(w); }
+  bool allowed(uint32_t w) const { return joinRequested(w) && !pending(w); }
   bool radioStop() const { const uint32_t w = read(); return !power(w) || (w & kCycle); }
+  static bool canReportJoinReceipt(uint32_t w, bool radioUsable, bool stopRequested) {
+    return joinRequested(w) && radioUsable && !stopRequested;
+  }
   bool radioOffConfirmed(uint32_t request) const {
     const uint32_t current = read();
     return serial(current) == serial(request) && !(current & kCycle) && !pending(request);

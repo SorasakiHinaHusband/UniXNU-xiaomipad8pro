@@ -4094,10 +4094,8 @@ int sysctlCurrentJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   uint64_t generation = 0;
   IOLockLock(gProfileLock);
   const uint32_t user = gUserControl.read();
-  if ((user & (WifiUserControl::kPower | WifiUserControl::kJoin | WifiUserControl::kCycle)) ==
-          (WifiUserControl::kPower | WifiUserControl::kJoin) &&
-      __atomic_load_n(&gRadioUsable, __ATOMIC_ACQUIRE) &&
-      !__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
+  if (WifiUserControl::canReportJoinReceipt(user, __atomic_load_n(&gRadioUsable, __ATOMIC_ACQUIRE),
+                                           __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE))) {
     // Sample the same worker state as the Apple80211 snapshot. The pending
     // request may be waiting for old-station teardown, so it need not yet be allowed().
     const bool active = !staFinished(gSta) && !gSta.disconnect && staAppleAssociateResult(gSta) <= 1;
@@ -4114,8 +4112,7 @@ int sysctlCurrentJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 // emits kev transitions when the association generation changes.
 extern "C" int piano_wifi_assoc_radio_usable(void)
 {
-  return __atomic_load_n(&gRadioUsable, __ATOMIC_SEQ_CST) && WifiUserControl::power(gUserControl.read()) &&
-         !gUserControl.radioStop() ? 1 : 0;
+  return __atomic_load_n(&gRadioUsable, __ATOMIC_SEQ_CST) && !gUserControl.radioStop() ? 1 : 0;
 }
 
 extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
@@ -4133,8 +4130,7 @@ extern "C" int piano_wifi_assoc_snapshot(struct piano_wifi_assoc_snapshot *out)
     stationGeneration = gStaProfileGeneration;
     IOLockUnlock(gProfileLock);
   } else user = gUserControl.read();
-  // Keep GET19 and the power event at ON until the worker confirms physical OFF.
-  out->power = (gArgs.level >= 2 && (WifiUserControl::power(user) || (user & WifiUserControl::kCycle))) ? 1 : 0;
+  out->power = (gArgs.level >= 2 && WifiUserControl::reportedPower(user)) ? 1 : 0;
   const bool nativeStation = request.consumed && request.generation == stationGeneration;
   const uint32_t nativeResult = request.result(nowMs());
   out->join_generation = request.generation;
