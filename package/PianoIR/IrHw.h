@@ -121,9 +121,12 @@ inline uint32_t pinCtl(uint32_t found, uint32_t function, uint32_t drive, uint32
 inline uint32_t pinFunction(uint32_t ctl) { return (ctl >> 2) & 0xf; }
 inline uint32_t pinDriveMa(uint32_t ctl) { return (((ctl >> 6) & 7) + 1) * 2; }
 inline bool pinOutput(uint32_t ctl) { return ctl & kOe; }
-// The emitter's line is safe (dark) when GPIO29 is a GPIO driven low, or a GPIO input (the LED's driver has its own pull-down:
-// inferred from the stock idle state, which only ever drives it low).
-inline bool mosiDark(uint32_t ctl, uint32_t io) { return pinFunction(ctl) == kFunctionGpio && (!pinOutput(ctl) || !(io & 2)); }
+// An idle input or a parked output must read low at the pad.
+inline bool mosiDark(uint32_t ctl, uint32_t io)
+{
+  return pinFunction(ctl) == kFunctionGpio && !(io & 1) && (!pinOutput(ctl) || !(io & 2)) &&
+         (!(ctl & kEgpioPresent) || (ctl & kEgpioEnable));
+}
 
 template <class Read, class Write>
 bool parkEmitter(uint32_t found, Read read, Write write)
@@ -131,8 +134,7 @@ bool parkEmitter(uint32_t found, Read read, Write write)
   write(kIo, 0);  // Set the latch low before enabling the GPIO output.
   write(kCtl, pinCtl(found, kFunctionGpio, kDrive2mA, kNoPull, true));
   const uint32_t ctl = read(kCtl), io = read(kIo);
-  return pinFunction(ctl) == kFunctionGpio && pinOutput(ctl) && !(io & 3) &&
-         (!(ctl & kEgpioPresent) || (ctl & kEgpioEnable));
+  return pinOutput(ctl) && mosiDark(ctl, io);
 }
 
 }  // namespace pianoir

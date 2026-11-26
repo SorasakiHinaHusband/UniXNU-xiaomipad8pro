@@ -30,6 +30,7 @@ static inline int ir_duty_valid(uint64_t duty) { return duty >= IR_MIN_DUTY && d
 // Whole milliseconds that fit in one transfer, including the final zero word.
 static inline uint32_t ir_burst_part_ms(uint32_t left, uint32_t rate)
 {
+    if (rate < IR_MIN_RATE || rate > IR_MAX_RATE) return 0;
     const uint32_t fit = (IR_MAX_WAVE_BYTES - 4u) * 8000u / rate;
     const uint32_t limit = fit < 120 ? fit : 120;
     return left < limit ? left : limit;
@@ -76,7 +77,7 @@ static inline uint32_t ir_samples_at(uint64_t us, uint32_t rate) { return (uint3
 // Checks a list and fills the plan (everything but high_samples, which only encoding counts). IR_OK or an ir_error.
 static inline int ir_wave_check(const uint32_t *d, unsigned n, uint32_t carrier, uint32_t duty, uint32_t rate, struct ir_wave_plan *p)
 {
-    if (!n || n > IR_MAX_DURATIONS || !(n & 1u)) return IR_ERR_COUNT;
+    if (!d || !p || !n || n > IR_MAX_DURATIONS || !(n & 1u)) return IR_ERR_COUNT;
     if (rate < IR_MIN_RATE || rate > IR_MAX_RATE) return IR_ERR_RATE;
     if (!ir_carrier_valid(carrier)) return IR_ERR_CARRIER;
     if (!ir_duty_valid(duty)) return IR_ERR_DUTY;
@@ -143,7 +144,7 @@ static inline int ir_wave_bit(const uint8_t *w, uint32_t i) { return (w[i >> 3] 
 #define IR_NEC_PERIOD_US 108000u
 static inline int ir_nec_frame(uint32_t address, uint8_t command, uint32_t *out, unsigned cap)
 {
-    if (cap < IR_NEC_ENTRIES || address > 0xffffu) return IR_ERR_COUNT;
+    if (!out || cap < IR_NEC_ENTRIES || address > 0xffffu) return IR_ERR_COUNT;
     const uint8_t a0 = (uint8_t)address, a1 = address > 0xffu ? (uint8_t)(address >> 8) : (uint8_t)~a0;
     const uint32_t word = (uint32_t)a0 | (uint32_t)a1 << 8 | (uint32_t)command << 16 | (uint32_t)(uint8_t)~command << 24;
     unsigned k = 0;
@@ -158,7 +159,7 @@ static inline int ir_nec_frame(uint32_t address, uint8_t command, uint32_t *out,
 }
 static inline int ir_nec_repeat(uint32_t *out, unsigned cap)
 {
-    if (cap < IR_NEC_REPEAT_ENTRIES) return IR_ERR_COUNT;
+    if (!out || cap < IR_NEC_REPEAT_ENTRIES) return IR_ERR_COUNT;
     out[0] = 9000;
     out[1] = 2250;
     out[2] = 562;

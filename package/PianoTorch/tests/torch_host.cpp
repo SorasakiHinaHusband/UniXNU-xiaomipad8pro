@@ -8,7 +8,7 @@
 //   - off; a read-back mismatch and a denied write (both: off attempted, the state off, a cool-down);
 //   - the guard: the time limit, the boot test, the module's thermal/current/voltage/short bits, the SoC and battery limits,
 //     one unreadable poll tolerated and two not, the enables found off.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoPower torch_host.cpp -o /tmp/torch_host && /tmp/torch_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I../../PianoPower torch_host.cpp -o /tmp/torch_host && /tmp/torch_host
 #include "TorchSpmi.h"
 #include <cstdio>
 #include <cstring>
@@ -36,6 +36,9 @@ struct Arbiter {
   std::vector<std::tuple<uint16_t, uint8_t, unsigned>> reads;   // ppid, reg, bytes
   std::vector<std::tuple<uint16_t, uint8_t, uint8_t>> writes;   // ppid, reg, value
   unsigned failReads = 0;                                       // the next N observer reads fail (status error)
+  unsigned writeAttempts = 0, failWriteAt = 0;
+  uint32_t failedWriteStatus = 0;
+  bool applyFailedWrite = false;
 
   uint8_t &r(uint16_t ppid, uint8_t reg) { return pmic[uint32_t(ppid) << 8 | reg]; }
   uint8_t flash(uint8_t reg) { return r(kPpid, reg); }
@@ -91,13 +94,16 @@ struct Arbiter {
     CHECK((value >> 27) == kOpExtWriteL && (value & 7) == 0);
     const uint8_t reg = uint8_t(value >> 4);
     const uint16_t ppid = apids[apid].ppid;
+    const bool fail = ++writeAttempts == failWriteAt;
     if (apids[apid].owner != 0) {
       chnlStatus[apid] = 0x5;   // done + denied
       return;
     }
-    writes.emplace_back(ppid, reg, uint8_t(chnlData[apid]));
-    if (!ignoresWrites[uint32_t(ppid) << 8 | reg]) r(ppid, reg) = uint8_t(chnlData[apid]);
-    chnlStatus[apid] = 1;
+    if (!fail || applyFailedWrite) {
+      writes.emplace_back(ppid, reg, uint8_t(chnlData[apid]));
+      if (!ignoresWrites[uint32_t(ppid) << 8 | reg]) r(ppid, reg) = uint8_t(chnlData[apid]);
+    }
+    chnlStatus[apid] = fail ? failedWriteStatus : 1;
   }
 };
 
@@ -199,6 +205,51 @@ static void testConstants()
   CHECK(std::strcmp(faults, "SHORT OPEN LOW-SUPPLY") == 0);
   formatFaults(Faults(), faults, sizeof faults);
   CHECK(std::strcmp(faults, "none") == 0);
+}
+
+static void testAllowlist()
+{
+  uint8_t masks[256] = {};
+  for (unsigned ch = 0; ch < 4; ++ch) {
+    masks[kRegTimer0 + ch] = 0xff;
+    masks[kRegItarget0 + ch] = 0x7f;
+    masks[kRegStrobe0 + ch] = 0x7f;
+  }
+  masks[kRegModuleEn] = 0x80;
+  masks[kRegIres] = 0x0f;
+  masks[kRegChanEn] = 0x0f;
+  masks[kRegTorchClamp] = 0x7f;
+  unsigned registers = 0;
+  for (unsigned reg = 0; reg < 256; ++reg) {
+    registers += masks[reg] != 0;
+    for (unsigned mask = 0; mask < 256; ++mask)
+      CHECK(writable(uint8_t(reg), uint8_t(mask)) == (mask && !(mask & ~masks[reg])));
+  }
+  CHECK(registers == 16 && sizeof kWritable / sizeof kWritable[0] == 16);
+}
+
+static void testRequestBoundaries()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Torch t(p.bus, GuardConfig(), UINT32_MAX);
+  const struct { uint64_t request; unsigned current; } cases[] = {
+    {0, 0}, {1, 10}, {9, 10}, {10, 10}, {11, 10}, {99, 90}, {100, 100}, {101, 100},
+    {UINT32_MAX, 100}, {1ull << 32, 100}, {(1ull << 32) + 1, 100}, {UINT64_MAX, 100},
+  };
+  for (const auto &[raw, current] : cases) {
+    const auto o = t.request(0, boundedRequest(raw, kHardMaxMa), boundedRequest(1ull << 32, t.config().maxS), {});
+    CHECK(o.steps.ok && o.lit == (current != 0) && t.ma() == current);
+    CHECK(t.maxMa() == 100 && !(a.flash(kRegChanEn) & ~kPianoChannelMask));
+    if (current) {
+      const uint8_t target = uint8_t(current / 10 - 1);
+      CHECK(a.flash(kRegItarget0) == target && a.flash(kRegItarget0 + 1) == target && a.flash(kRegTorchClamp) == 9);
+      CHECK(a.flash(kRegChanEn) == kPianoChannelMask && (a.flash(kRegModuleEn) & kModuleEnBit));
+      CHECK(t.deadlineMs() == 1800000 && t.turnOff(1, Reason::user).steps.ok);
+    }
+    CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  }
 }
 
 static void testSurvey()
@@ -385,8 +436,10 @@ static void testFailures()
   CHECK(!o.lit && !t.lit() && o.reason == Reason::writeFailed && o.steps.why && o.steps.failedReg == kRegItarget0 + 1);
   CHECK(o.steps.failedWant == 4 && o.steps.failedGot == 0x11);
   CHECK(a.flash(kRegModuleEn) == 0 && a.flash(kRegChanEn) == 0);   // never enabled, and off ran
+  const uint64_t cooldown = t.coolUntilMs();
   o = t.request(1000 + 59000, 50, 0, temps);
-  CHECK(!o.lit && o.reason == Reason::writeFailed && o.steps.writes == 0);   // the cool-down: no write at all
+  CHECK(!o.lit && o.reason == Reason::writeFailed && t.needsOff() && t.coolUntilMs() == cooldown);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);   // still retrying OFF during cooldown
   a.ignoresWrites.clear();
   t.poll(1000 + 59500, temps);
   o = t.request(1000 + 60000, 50, 0, temps);
@@ -518,6 +571,99 @@ static void testGuardRegressions()
   CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
 }
 
+static void testPartialGuardSample()
+{
+  for (uint8_t lost : {kRegChanEn, kRegModuleEn}) {
+    Arbiter a;
+    piano(a);
+    Port p(true);
+    Torch t(p.bus, GuardConfig(), 100);
+    CHECK(t.request(0, 100, 10, {}).lit);
+    a.unreadableRegs[kRegStatus1] = true;
+    a.r(kPpid, lost) = lost == kRegChanEn ? 1 : 0;
+    const auto trip = t.poll(1, {});
+    CHECK(trip.sampled && !trip.live.ok && trip.reason == Reason::lostState && !trip.lit && trip.steps.ok);
+    CHECK(trip.steps.writes == 4 && a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  }
+}
+
+static void testActivationSpmiFaults()
+{
+  // The final channel-enable command may reach the PMIC even if SPMI times out.
+  for (unsigned step = 1; step <= 12; ++step) {
+    for (uint32_t status : {0u, 0x3u}) {
+      Arbiter a;
+      piano(a);
+      Port p(true);
+      Torch t(p.bus, GuardConfig(), 100);
+      a.failWriteAt = step;
+      a.failedWriteStatus = status;
+      a.applyFailedWrite = status == 0;
+      const auto on = t.request(0, 100, 10, {});
+      CHECK(!on.lit && !on.steps.ok && on.reason == Reason::writeFailed && p.port.writeFailures == 1);
+      CHECK(on.steps.writes == step - 1 && on.cleanedUp && on.cleanup.ok && on.cleanup.readbacks == 4);
+      CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+      CHECK(a.flash(kRegItarget0) == 0 && a.flash(kRegItarget0 + 1) == 0);
+      CHECK(!t.needsOff() && t.coolUntilMs() == 60000 && onlyFlash(a));
+    }
+  }
+}
+
+static void testTeardownRetry()
+{
+  Arbiter a;
+  piano(a);
+  Port p(true);
+  Torch t(p.bus, GuardConfig(), 100);
+  CHECK(t.request(0, 100, 10, {}).lit);
+  a.apids[gChApid].owner = 1;   // Neither synchronous OFF attempt can reach the PMIC.
+  const auto sleep = t.quiesce(1, Reason::sleep);
+  CHECK(!sleep.steps.ok && !t.operational() && t.needsOff() && p.port.writeFailures == 8);
+  CHECK(a.flash(kRegChanEn) == kPianoChannelMask && a.flash(kRegModuleEn) == kModuleEnBit);
+  char state[128];
+  t.describe(1, state, sizeof state);
+  CHECK(std::strcmp(state, "off unconfirmed (system sleep)") == 0);
+  a.apids[gChApid].owner = 0;
+  CHECK(!t.request(2, 100, 10, {}).lit && p.port.writeFailures == 8);
+  t.resume();
+  // An ON request arriving before the worker's next poll must service the pending OFF.
+  const auto retry = t.request(3, 100, 10, {});
+  CHECK(!retry.lit && retry.reason == Reason::writeFailed && !t.needsOff());
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  CHECK(t.request(4, 100, 10, {}).lit);
+  a.failWriteAt = a.writeAttempts + 1;
+  a.failedWriteStatus = 0;
+  const auto shutdown = t.quiesce(5, Reason::shutdown);
+  CHECK(shutdown.steps.ok && shutdown.steps.writes == 7 && shutdown.steps.readbacks == 7);
+  CHECK(a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0 && !t.needsOff());
+  t.resume();
+  CHECK(!t.operational() && !t.request(60001, 100, 10, {}).lit);
+}
+
+static void testBootOff()
+{
+  for (bool asleep : {false, true}) {
+    Arbiter a;
+    piano(a);
+    a.r(kPpid, kRegModuleEn) = kModuleEnBit;
+    a.r(kPpid, kRegChanEn) = kPianoChannelMask;
+    Port p(true);
+    Torch t;
+    if (asleep) t.quiesce(0, Reason::sleep);
+    t.configure(p.bus, GuardConfig(), 100);
+    const auto boot = t.checkBootState(1, survey(p.bus));
+    if (asleep) {
+      CHECK(!t.operational() && t.needsOff() && a.writes.empty());
+      t.resume();
+      const auto retry = t.poll(2, {});
+      CHECK(retry.steps.ok && retry.steps.readbacks == 4 && retry.reason == Reason::bootFoundOn);
+    } else {
+      CHECK(boot.steps.ok && boot.steps.readbacks == 4 && boot.reason == Reason::bootFoundOn);
+    }
+    CHECK(!t.lit() && !t.needsOff() && a.flash(kRegChanEn) == 0 && a.flash(kRegModuleEn) == 0);
+  }
+}
+
 static void testProbeReadback()
 {
   Arbiter a;
@@ -611,11 +757,17 @@ int main()
 {
   testProbeOptIn();
   testConstants();
+  testAllowlist();
+  testRequestBoundaries();
   testSurvey();
   testOnOff();
   testFailures();
   testGuard();
   testGuardRegressions();
+  testPartialGuardSample();
+  testActivationSpmiFaults();
+  testTeardownRetry();
+  testBootOff();
   testProbeReadback();
   testProbeSafety();
   testProbePulse();

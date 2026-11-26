@@ -30,6 +30,7 @@ if [ "$(uname)" = Darwin ]; then
     "$D/tooling/native/piano-ir/piano-ir.c" -o "$cli"
 
   # These cases must fail during argument checking, before opening an IOKit service.
+  checks=0
   check_usage() {
     local expected=$1 output rc=0
     shift
@@ -38,16 +39,24 @@ if [ "$(uname)" = Darwin ]; then
       printf 'PianoIR CLI regression (%s): exit %s, %s\n' "$*" "$rc" "$output" >&2
       exit 1
     fi
+    checks=$((checks + 1))
   }
   check_usage 'usage:' raw --carrier 4295005296 1000
   check_usage 'usage:' raw --duty 4294967336 1000
   check_usage 'usage:' raw --carrier 0 1000
   check_usage 'usage:' nec 0x00 0x45 --carrier 56001
   check_usage 'usage:' nec 0x00 0x45 --repeat 99999999999999999999999
+  check_usage 'usage:' nec 0x10000 0xff
+  check_usage 'usage:' nec 0xffff 0x100
   check_usage 'usage:' blink 121
   check_usage 'usage:' status extra
   check_usage 'zero duration' raw 0
+  check_usage 'zero duration' raw +562 -0 +562
+  check_usage 'count (' raw
+  check_usage 'count (' raw - <<< 'pulse space'
+  check_usage 'larger than 32 KiB' raw 262113
+  check_usage 'not a duration' raw 500001
   check_usage 'longer than 500 ms' raw 300000 100000 100001
   check_usage 'not a duration' raw - <<< 'pulse 1000 space xyz pulse 562'
-  echo "PianoIR CLI tests: 10 checks, 0 failures"
+  echo "PianoIR CLI tests: $checks checks, 0 failures"
 fi

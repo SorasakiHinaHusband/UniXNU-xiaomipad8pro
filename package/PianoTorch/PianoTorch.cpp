@@ -232,9 +232,14 @@ void reportSurvey(const Survey &s)
   if (!s.flash) return;
   for (unsigned row = 0; row < 256; row += 16) {
     char line[64];   // "raw xx:" and 16 bytes of " xx"
-    int at = snprintf(line, sizeof line, "raw %02x:", row);
-    for (unsigned i = row; i < row + 16; ++i)
-      at += s.valid[i] ? snprintf(line + at, sizeof line - at, " %02x", s.reg[i]) : snprintf(line + at, sizeof line - at, " --");
+    const int prefix = snprintf(line, sizeof line, "raw %02x:", row);
+    if (prefix < 0) continue;
+    size_t at = size_t(prefix);
+    for (unsigned i = row; i < row + 16; ++i) {
+      const int wrote = s.valid[i] ? snprintf(line + at, sizeof line - at, " %02x", s.reg[i])
+                                  : snprintf(line + at, sizeof line - at, " --");
+      if (wrote > 0) at += size_t(wrote);
+    }
     note("%s", line);
   }
   if (!s.fourChannel) return;
@@ -285,7 +290,7 @@ void probeSnapDiff(const char *label, const Survey &now)
   unsigned changed = 0, unreadable = 0;
   for (unsigned row = 0; row < 256; row += 16) {
     char line[16 * 10 + 1] = {};
-    unsigned at = 0;
+    size_t at = 0;
     for (unsigned i = row; i < row + 16; ++i) {
       if (!now.valid[i] || !gProbeLast.valid[i]) {
         ++unreadable;
@@ -293,7 +298,8 @@ void probeSnapDiff(const char *label, const Survey &now)
       }
       if (now.reg[i] == gProbeLast.reg[i]) continue;
       ++changed;
-      at += snprintf(line + at, sizeof line - at, " %02x:%02x->%02x", i, gProbeLast.reg[i], now.reg[i]);
+      const int wrote = snprintf(line + at, sizeof line - at, " %02x:%02x->%02x", i, gProbeLast.reg[i], now.reg[i]);
+      if (wrote > 0) at += size_t(wrote);
     }
     if (at) note("probe diff %s:%s", label, line);
   }
@@ -521,18 +527,15 @@ void PianoTorch::run()
   const bool t4 = !gArgs.ladder && gArgs.probe && gArgs.test;
   IOLockLock(gLock);
   gTorch.configure(portBus(gPort), g, gArgs.maxMa, t4 && gArgs.probeSpare);
-  gTorch.controller().seed(gSurvey);
   gReady = true;
   gBootDiagnostic = gArgs.ladder || t4;
-  const bool foundLit = gTorch.operational() && (gSurvey.moduleEn() || gSurvey.chanEn());
-  Torch::Outcome o;
-  if (foundLit) o = gTorch.turnOff(nowMs(), Reason::bootFoundOn);
+  const Torch::Outcome o = gTorch.checkBootState(nowMs(), gSurvey);
   gTorch.describe(nowMs(), gState, sizeof gState);
   IOLockUnlock(gLock);
   note("level 2: torch control on channels 1+2 at %u mA (at most %u), auto-off after %u s, off at SoC >= %u C or battery >= %u C; "
        "writes only to PPID %#x, %u allowlisted registers",
        gArgs.ma, gArgs.maxMa, gArgs.timeout, gArgs.socMax, gArgs.battMax, kPpid, unsigned(sizeof kWritable / sizeof kWritable[0]));
-  if (foundLit) logOutcome("it was lit when the driver started", o, 0);
+  if (o.reason == Reason::bootFoundOn) logOutcome("it was lit when the driver started", o, 0);
   publishState(this);
   if (gArgs.ladder) {
     ladder();
@@ -917,7 +920,7 @@ void PianoTorch::serve()
   }
 }
 
-// Synchronous off from a power transition (sleep, shutdown): a few SPMI transactions, well under a millisecond.
+// Verify OFF synchronously before acknowledging the power transition.
 void PianoTorch::offNow(Reason why, const char *what)
 {
   if (!gLock) return;
@@ -928,6 +931,8 @@ void PianoTorch::offNow(Reason why, const char *what)
   if (act) gTorch.describe(nowMs(), gState, sizeof gState);
   IOLockUnlock(gLock);
   if (act) {
+    if (why == Reason::sleep && !o.steps.ok)
+      pianopower::cancelSystemSleep(kServiceClass, "torch OFF unconfirmed");
     logOutcome(what, o, 0);
     publishState(this);
   }

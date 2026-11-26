@@ -177,7 +177,7 @@ private:
   bool geniLoopback();
   bool allocateDma();
   void releaseDma();
-  int finishTransfer(int rc);
+  int finishTransfer(int rc, size_t bytes, bool loopback);
   IOReturn send(const uint32_t *list, unsigned count, uint32_t carrier, uint32_t duty, const char *who);
   IOReturn sendBurst(uint32_t ms, const char *who);
   int transmit(const ir_wave_plan &plan, char *detail, size_t size);
@@ -591,14 +591,15 @@ bool PianoIR::allocateDma()
   IOByteCount contiguous = 0;
   const uint64_t pa = gDma ? gDma->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone) : 0;
   auto *va = gDma ? static_cast<uint8_t *>(gDma->getBytesNoCopy()) : nullptr;
-  if (!dmaSpanValid(uintptr_t(va), pa, contiguous)) {
+  geni_spi::geni_dma dma = {nullptr, dmaClean, dmaCleanInval, dmaInval, nullptr, nullptr, 0, 0, 0};
+  if (!setDmaBuffers(dma, va, pa, contiguous)) {
     note("geni: no aligned, contiguous DMA buffer");
     releaseDma();
     return false;
   }
   bzero(va, 2 * half);
   dmaCache(va, 2 * half, 1);
-  gSpi.dma = {nullptr, dmaClean, dmaCleanInval, dmaInval, va, va + half, pa, pa + half, half};
+  gSpi.dma = dma;
   note("geni: SE DMA, %u-byte aligned-buffer halves", half);
   return true;
 }
@@ -612,49 +613,40 @@ void PianoIR::releaseDma()
 }
 
 // A completed transfer needs both the DMA completion reported by GeniSpi and an idle shifter.
-int PianoIR::finishTransfer(int rc)
+int PianoIR::finishTransfer(int rc, size_t bytes, bool loopback)
 {
-  const auto read = [this](uint32_t reg) { return seRead(this, reg); };
-  const auto wait = [] { IODelay(1); };
-  const bool wasMuxed = gMosiMuxed;
-  const bool idle = !rc && waitForIdle(read, wait);
-  const bool parked = parkMosi();
-  if (!idle) {
-    gDmaIdle = resetTransfer(gSpi.use_dma, read, [this](uint32_t reg, uint32_t v) { seWrite(this, reg, v); }, wait);
-    // Close the transmitter if we cannot prove idle. Keep any DMA pages pinned in that case,
-    // including at stop, so a wedged engine can never access recycled memory.
-    if (!gDmaIdle) {
-      gReady = false;
-      setState("disabled: GENI did not quiesce");
-    }
-  } else {
-    gDmaIdle = true;
+  const TransferEnd end = pianoir::finishTransfer(
+      gSpi, rc, bytes, loopback, gMosiMuxed, [this](uint32_t reg) { return seRead(this, reg); },
+      [this](uint32_t reg, uint32_t v) { seWrite(this, reg, v); }, [] { IODelay(1); }, [this] { return parkMosi(); });
+  gDmaIdle = end.reusable;
+  // Keep DMA pages pinned if a wedged engine could still access them.
+  if (!gDmaIdle) {
+    gReady = false;
+    setState("disabled: GENI did not quiesce");
   }
-  if (!parked) {
+  if (!end.parked) {
     gReady = false;
     setState("disabled: GPIO29 park readback failed");
   }
-  if (!idle || !parked || (!wasMuxed && !(gSpi.last_mode & GENI_SPI_LOOP))) return rc ? rc : GENI_ERR_IO;
-  return rc;
+  return end.status;
 }
 
 bool PianoIR::geniLoopback()
 {
-  if (!parkMosi()) {
-    note("loopback refused: GPIO29 park readback failed");
+  if (!beginLoopback(gSpi, [this] { return parkMosi(); })) {
+    note("loopback refused: could not park GPIO29 or configure GENI");
     return false;
   }
   uint8_t tx[64], rx[64] = {};
   for (unsigned i = 0; i < sizeof tx - 1; ++i) tx[i] = uint8_t(0xa5 ^ (i * 37));
   tx[sizeof tx - 1] = 0;
-  geni_spi_setup(&gSpi, GENI_SPI_LOOP, 0);
   gDelayCalls = 0;
   gSpi.snap_valid = 0;
   gSpi.poll_limit = kSpinPolls + 200;
   const uint64_t t0 = nowUs();
   gPollDeadline = t0 + 20000;
   gDmaIdle = !gSpi.use_dma;
-  const int rc = finishTransfer(geni_spi_transfer(&gSpi, tx, rx, sizeof tx, 0));
+  const int rc = finishTransfer(geni_spi_transfer(&gSpi, tx, rx, sizeof tx, 0), sizeof tx, true);
   if (gDmaIdle) geni_spi_setup(&gSpi, 0, 0);
   unsigned same = 0;
   if (!rc)
@@ -714,8 +706,8 @@ void PianoIR::run()
     setState("not ready: GENI initialization failed (see the console)");
     return;
   }
-  gReady = true;
   stage(3, "ready");
+  gReady = true;
   setState("ready: GENI SE15 at %u Hz", gRate);
   if (gArgs.test) selfTest();
 }
@@ -757,7 +749,7 @@ int PianoIR::transmit(const ir_wave_plan &plan, char *detail, size_t size)
   gPollDeadline = t0 + wireUs + 20000;
   mosiToEngine();
   gDmaIdle = !gSpi.use_dma;
-  const int rc = finishTransfer(geni_spi_transfer(&gSpi, gWave, nullptr, plan.bytes, 0));
+  const int rc = finishTransfer(geni_spi_transfer(&gSpi, gWave, nullptr, plan.bytes, 0), plan.bytes, false);
   restoreOtherPins();
   gSampling = false;
   const uint64_t elapsed = nowUs() - t0;

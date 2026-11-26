@@ -28,7 +28,7 @@ inline bool bootSwitchEnabled(const char *args, const char *name)
     while (*args == ' ' || *args == '\t') ++args;
     const char *end = args;
     while (*end && *end != ' ' && *end != '\t') ++end;
-    const size_t len = end - args;
+    const size_t len = size_t(end - args);
     if (len >= keyLen && memcmp(args, name, keyLen) == 0 && (len == keyLen || args[keyLen] == '='))
       enabled = len == keyLen + 2 && args[keyLen + 1] == '1';
     args = end;
@@ -283,13 +283,13 @@ class Controller {
     if (itarget > clamp) itarget = clamp;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegStrobe0 + ch), kStrobeMask, kStrobeSoftwareLevelHigh);
     ok = ok && put(r, kRegTorchClamp, kClampMask, clamp);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegItarget0 + ch, kItargetMask, itarget);
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegItarget0 + ch), kItargetMask, itarget);
     ok = ok && put(r, kRegIres, mask, mask);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegTimer0 + ch, 0xff, 0);
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegTimer0 + ch), 0xff, 0);
     ok = ok && put(r, kRegModuleEn, kModuleEnBit, kModuleEnBit) && put(r, kRegChanEn, mask, mask);
     return r;
   }
@@ -313,13 +313,13 @@ class Controller {
     if (itarget > maxItarget) itarget = maxItarget;
     bool ok = put(r, kRegChanEn, mask, 0) && put(r, kRegModuleEn, kModuleEnBit, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegStrobe0 + ch, kStrobeMask, kStrobeSoftwareLevelHigh);
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegStrobe0 + ch), kStrobeMask, kStrobeSoftwareLevelHigh);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegItarget0 + ch, kItargetMask, itarget);
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegItarget0 + ch), kItargetMask, itarget);
     // Clear IRESOLUTION for the selected channels: the flash path is 12.5 mA steps.
     ok = ok && put(r, kRegIres, mask, 0);
     for (unsigned ch = 0; ok && ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) ok = put(r, kRegTimer0 + ch, 0xff, uint8_t(kTimerEnable | timerTicks));
+      if (mask & (1u << ch)) ok = put(r, uint8_t(kRegTimer0 + ch), 0xff, uint8_t(kTimerEnable | timerTicks));
     ok = ok && put(r, kRegModuleEn, kModuleEnBit, kModuleEnBit) && put(r, kRegChanEn, mask, mask);
     return r;
   }
@@ -332,7 +332,7 @@ class Controller {
     putMasked(r, kRegChanEn, mask, 0, true);
     putMasked(r, kRegModuleEn, kModuleEnBit, 0, true);
     for (unsigned ch = 0; ch < kChannels4ch; ++ch)
-      if (mask & (1u << ch)) putMasked(r, kRegItarget0 + ch, kItargetMask, 0, true);
+      if (mask & (1u << ch)) putMasked(r, uint8_t(kRegItarget0 + ch), kItargetMask, 0, true);
     return r;
   }
 
@@ -493,10 +493,12 @@ inline Reason judge(const Controller::Live &l, unsigned &unreadable, const Tempe
     if (f.open && l.ok) return Reason::channelOpen;
   }
   if (l.rtOk && (l.rt & kRtFault)) return Reason::pmicFault;
+  // STATUS3 timer expiry is diagnostic. Either enable read can establish lost state.
+  if ((l.moduleOk && !(l.moduleEn & kModuleEnBit)) || (l.channelsOk && (l.chanEn & 0x0f) != mask))
+    return Reason::lostState;
   if (!l.ok) return ++unreadable >= 2 ? Reason::statusUnreadable : Reason::none;
   unreadable = 0;
-  // STATUS3 timer expiry is diagnostic. The enable read-back shows when the output is off.
-  return l.lit(mask) ? Reason::none : Reason::lostState;
+  return Reason::none;
 }
 
 inline bool coolsDown(Reason r)
@@ -529,6 +531,17 @@ class Torch {
     bool sampled = false;
     Controller::Live live;      // the last sample taken before any cleanup
   };
+
+  Outcome checkBootState(uint64_t nowMs, const Survey &s)
+  {
+    ctl_.seed(s);
+    if (!s.moduleEn() && !s.chanEn()) return {};
+    if (operational()) return turnOff(nowMs, Reason::bootFoundOn);
+    // Startup may finish surveying while the power callback has control blocked.
+    mask_ = kPianoChannelMask;
+    lastReason_ = Reason::bootFoundOn;
+    return {};
+  }
 
   // On at ma (clamped) for seconds (0: the default; at most maxS), or off when ma is 0.
   Outcome request(uint64_t nowMs, unsigned ma, unsigned seconds, const Temperatures &t, Reason offReason = Reason::user)
@@ -567,8 +580,11 @@ class Torch {
                            coolReason_ == Reason::channelOpen;
     Reason refused = hot;
     if (powerBlock_ != Reason::none) refused = powerBlock_;
-    else if (needsOff()) refused = Reason::writeFailed;
-    else if (nowMs < coolUntilMs_ && !alternate) refused = coolReason_;
+    else if (needsOff()) {
+      // A stream of ON requests must not starve the OFF retry.
+      o = poll(nowMs, t);
+      refused = Reason::writeFailed;
+    } else if (nowMs < coolUntilMs_ && !alternate) refused = coolReason_;
     if (refused != Reason::none) {
       o.reason = refused;
       o.lit = lit_;

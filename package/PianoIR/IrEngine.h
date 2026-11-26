@@ -17,8 +17,21 @@ inline int setSampleClock(geni_spi &spi, const ir_clock_pick &pick, uint32_t sou
 inline bool dmaSpanValid(uintptr_t va, uint64_t pa, uint64_t contiguous)
 {
   constexpr unsigned alignment = 4096;
+  constexpr unsigned bytes = 2 * IR_MAX_WAVE_BYTES;
   return va && pa && !((va | pa) & (alignment - 1)) &&
-         contiguous >= 2 * IR_MAX_WAVE_BYTES && pa <= UINT64_MAX - (2 * IR_MAX_WAVE_BYTES - 1);
+         contiguous >= bytes && va <= UINTPTR_MAX - bytes && pa <= UINT64_MAX - (bytes - 1);
+}
+
+inline bool setDmaBuffers(geni_spi::geni_dma &dma, uint8_t *va, uint64_t pa, uint64_t contiguous)
+{
+  if (!dmaSpanValid(uintptr_t(va), pa, contiguous)) return false;
+  constexpr unsigned half = IR_MAX_WAVE_BYTES;
+  dma.tx_virt = va;
+  dma.rx_virt = va + half;
+  dma.tx_phys = pa;
+  dma.rx_phys = pa + half;
+  dma.size = half;
+  return true;
 }
 
 template <class Read, class Wait>
@@ -51,6 +64,32 @@ bool resetTransfer(bool dma, Read read, Write write, Wait wait)
     wait();
   }
   return false;
+}
+
+struct TransferEnd {
+  int status;
+  bool parked, reusable;
+};
+
+template <class Park>
+bool beginLoopback(geni_spi &spi, Park park)
+{
+  if (!park()) return false;
+  return geni_spi_setup(&spi, GENI_SPI_LOOP, 0) == 0;
+}
+
+// Re-park before recovery, including when GENI reports completion for only part of a frame.
+template <class Read, class Write, class Wait, class Park>
+TransferEnd finishTransfer(const geni_spi &spi, int rc, size_t bytes, bool loopback, bool muxed,
+                           Read read, Write write, Wait wait, Park park)
+{
+  if (!rc && spi.use_dma && (spi.last_tx_in != bytes || (loopback && spi.last_rx_in != bytes)))
+    rc = GENI_ERR_IO;
+  const bool idle = !rc && waitForIdle(read, wait);
+  const bool parked = park();
+  const bool reusable = idle || resetTransfer(spi.use_dma, read, write, wait);
+  if (!rc && (!idle || !parked || (!loopback && !muxed))) rc = GENI_ERR_IO;
+  return {rc, parked, reusable};
 }
 
 }  // namespace pianoir
