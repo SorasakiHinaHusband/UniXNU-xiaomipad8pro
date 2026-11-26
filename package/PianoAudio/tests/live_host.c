@@ -51,16 +51,17 @@ struct World {
     unsigned nq;
     char cmd[1024][40];
     unsigned ncmd, outstanding;
-    const char *fail_match;           // the first command (after `fail_after` commands) whose line is this: refused or, with drop, lost
+    const char *fail_match;           // matching commands after fail_after, up to fail_limit: refused or, with drop, lost
     unsigned fail_after;
-    int fail_seen, drop;
+    unsigned failures_injected, fail_limit;
+    int drop;
     uint32_t fail_status;
     unsigned writes, write_dones, reads, read_dones;
     int write_error_at, drop_writes_from, drop_writes_until;   // WRITEs by count: refused with status 5; not answered in [from, until)
     double dsp_ppm;                   // the DSP's clock against the host's
     uint64_t play_until_us, cap_until_us;
     unsigned queue_gaps, max_monitor_reads;
-    int clock_on, va_votes, va_mclk, dev_started, str_started, mic_started, cap_started, mic_prepared, cap_prepared;
+    int clock_on, vi_clock, va_votes, va_mclk, dev_started, str_started, mic_started, cap_started, mic_prepared, cap_prepared;
     int vote_on[4];                   // per hardware core: one owner (a second request of a held vote is a violation)
     unsigned prm_while_playing;       // duplex-hold1: PRM requests/releases of the VA clocks while the speaker stream graph runs
     int map_spk, map_mic;
@@ -86,7 +87,7 @@ struct World {
     unsigned nperiods;
     // ---- the amplifiers, the pins, the VA macro
     struct Amp amp[4];
-    unsigned power_ups, unmutes, transfers, gain_cap;
+    unsigned power_ups, unmutes, transfers, gain_cap, gain_writes;
     int pins_on, va_on, va_calls;
     // ---- the devices' engines
     int out_running, in_running, sound_on, strict;
@@ -128,6 +129,7 @@ static uint32_t g_t0;                // the live paths' start (ms)
 static double g_ppm;                 // the next run's device clock against the DSP's
 static const char *g_fail;           // the next run's failing live command (refused, or lost with g_drop)
 static int g_drop, g_queue_full;
+static unsigned g_fail_limit = 1;
 static int g_mic_clock;
 static uint64_t g_mic_missing;
 static unsigned g_wakes;
@@ -145,6 +147,14 @@ static int g_miplay, g_mip_files;
 static uint32_t g_battery_uv = 4012000;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
 static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
+
+/* Optional adapters for the standalone duplex suite. The same DSP and amp
+ * simulator also runs the broader live_host scenarios. */
+static void (*fixture_engine)(void);
+static void (*fixture_capture)(int16_t *, uint32_t);
+static void (*fixture_write)(void);
+static void (*fixture_played)(uint64_t, int32_t);
+static int (*fixture_send)(const uint8_t *, uint32_t);
 
 static void violate(const char *what)
 {
@@ -200,6 +210,7 @@ static int all_unmuted(void)
             return 0;
     return 1;
 }
+static int speaker_clock(void) {return w.clock_on || w.vi_clock;}
 static void amp_defaults(struct Amp *a)
 {
     memset(a->reg, 0, sizeof a->reg);
@@ -210,7 +221,7 @@ static void amp_defaults(struct Amp *a)
 static void amp_derive(struct Amp *a)
 {
     const int on = !(a->reg[FS19XX_REG_PWRCTRL] & FS19XX_PWRCTRL_PWDN) && a->reg[FS19XX_REG_SYSCTRL] == FS19XX_SYSCTRL_ON;
-    const int clocked = w.clock_on && w.dev_started;
+    const int clocked = speaker_clock() && w.dev_started;
     a->reg[FS19XX_REG_DIGSTAT] = on && clocked && a->reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_UNMUTE ? FS19XX_DIGSTAT_DACRUN : 0;
     a->reg[FS19XX_REG_STATUS] = (uint16_t)((clocked ? 0x0040 : 0) | (on && clocked ? 0x0002 : 0) | a->inject);
 }
@@ -242,15 +253,17 @@ static int transfer(void *ctx, uint8_t address, const uint8_t *out, uint32_t out
         const uint16_t v = (uint16_t)(out[1] << 8 | out[2]);
         const int unmuted = !(a->reg[FS19XX_REG_DACCTRL] & FS19XX_DACCTRL_MUTE_BIT);
         // 2026-11-21: 243 (Android's) only while the protection pair's speaker graph is open; 231 otherwise; never above 243
-        const unsigned cap_now = w.gain_cap == FS19XX_GAIN_CAP && w.prot_dev_open ? FS19XX_GAIN_CAP_PROTECTED : w.gain_cap;
+        const int protection_up = w.prot_dev_open && w.vi_started;
+        const unsigned cap_now = w.gain_cap == FS19XX_GAIN_CAP && protection_up ? FS19XX_GAIN_CAP_PROTECTED : w.gain_cap;
+        if (reg == FS19XX_REG_VOLCTRL) w.gain_writes++;
         if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_HARD_LIMIT) violate("an amplifier gain above 243");
-        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP && !w.prot_dev_open) violate("an amplifier gain above 231 without the protection pair");
+        if (reg == FS19XX_REG_VOLCTRL && (v >> 8) > FS19XX_GAIN_CAP && !protection_up) violate("an amplifier gain above 231 without the protection pair");
         if (reg == FS19XX_REG_VOLCTRL && unmuted && (v >> 8) > cap_now) violate("an unmuted amplifier's gain above the level's cap");
         if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT) && (a->reg[FS19XX_REG_VOLCTRL] >> 8) > cap_now)
             violate("an amplifier unmuted at a gain above the level's cap");
         if (reg == FS19XX_REG_PWRCTRL && !(v & (FS19XX_PWRCTRL_PWDN | FS19XX_PWRCTRL_I2CR))) {
             w.power_ups++;
-            if (!w.clock_on || !w.dev_started || !w.str_started) violate("an amplifier powered up without the bit clock and both graphs");
+            if (!speaker_clock() || !w.dev_started || !w.str_started) violate("an amplifier powered up without the bit clock and both graphs");
             if (w.prot_dev_open && !w.vi_started) violate("an amplifier powered up on the protected graph without the V/I graph");
         }
         if (reg == FS19XX_REG_DACCTRL && !(v & FS19XX_DACCTRL_MUTE_BIT)) {
@@ -349,7 +362,7 @@ static void dsp_write(const GprPacket *p)
     const uint8_t *d = p->payload;
     w.writes++;
     if (p->src_port != session.ports->data || p->dst_port != AR_IID_PLAY_SHMEM) violate("a WRITE from the wrong port");
-    if (!w.str_started || !w.dev_started || !w.clock_on) violate("a WRITE without the running graphs");
+    if (!w.str_started || !w.dev_started || !speaker_clock()) violate("a WRITE without the running graphs");
     const uint64_t address = le32(d) | (uint64_t)le32(d + 4) << 32;
     const uint64_t offset = (address & 0xffffffffu) - DMA_PHYS;
     const unsigned slot = (unsigned)(offset / AUDIO_SPK_PERIOD_BYTES);
@@ -360,6 +373,7 @@ static void dsp_write(const GprPacket *p)
     if (w.slot_busy[slot]) violate("a WRITE of a slot the DSP still has");
     w.slot_busy[slot] = 1;
     memcpy(w.slot_copy[slot], g_dma + offset, AUDIO_SPK_PERIOD_BYTES);
+    if (fixture_write) fixture_write();
     const int k = (int)w.writes;
     if (k >= w.drop_writes_from && k < w.drop_writes_until) {w.slot_busy[slot] = 0; return;}   // never played, never answered
     GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = p->dst_port, .dst_port = p->src_port,
@@ -374,7 +388,7 @@ static void dsp_write(const GprPacket *p)
 }
 
 // The DSP plays a speaker slot when its WRITE_DONE is due.
-static void play_slot(unsigned slot)
+static void play_slot(unsigned slot, uint64_t due_us)
 {
     w.slot_busy[slot] = 0;
     const int16_t *pcm = (const int16_t *)(const void *)w.slot_copy[slot];
@@ -390,6 +404,7 @@ static void play_slot(unsigned slot)
         const int v = abs(pcm[i]);
         if (v > peak) peak = v;
     }
+    if (fixture_played) fixture_played(due_us, peak);
     if (peak > live.cfg.ceiling) violate("a sample above the level's ceiling");
     if (peak > w.peak) w.peak = peak;
     if (w.nperiods < MAX_PERIODS) {w.period_at[w.nperiods] = now_ms() - g_t0; w.period_peak[w.nperiods++] = peak;}
@@ -437,6 +452,7 @@ static void fill_capture(unsigned slot, uint32_t bytes, uint32_t offset)
     memset(base, 0x55, AUDIO_MIC_PERIOD_BYTES); /* stale padding must not become PCM */
     int16_t *pcm = (int16_t *)(void *)(base + offset);
     w.cap_bytes += bytes;
+    if (fixture_capture) {fixture_capture(pcm, bytes / 4); return;}
     for (uint32_t i = 0; i < bytes / 4; ++i, ++w.cap_k) {
         const int hi = w.cap_k % 96 < 48;
         pcm[2 * i] = g_route_fixture ? (hi ? INT16_MAX : INT16_MIN) : (int16_t)(hi ? 8000 : -8000);
@@ -449,6 +465,7 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
     (void)ctx;
     w.send_calls++;
     if (w.queue_full_every && w.send_calls % (unsigned)w.queue_full_every == 0) return -1;
+    if (fixture_send && fixture_send(b, n)) return -1;
     if (w.off) w.sends_after_off++;
     GprPacket p;
     CHECK(gpr_decode(b, n, &p) == GprOk && p.size == n && n <= GPR_MAX_PACKET);
@@ -461,13 +478,16 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
     const int prm = p.opcode == AR_OP_PRM_REQUEST || p.opcode == AR_OP_PRM_RELEASE;
     if (p.src_port != (prm ? session.ports->prm : session.ports->apm)) violate("a command from the wrong port");
     uint32_t status = 0;
-    if (w.fail_match && !w.fail_seen && w.ncmd > w.fail_after && !strcmp(line, w.fail_match)) {
-        w.fail_seen = 1;
+    if (w.fail_match && w.failures_injected < w.fail_limit && w.ncmd > w.fail_after && !strcmp(line, w.fail_match)) {
+        w.failures_injected++;
         if (w.drop) return 0;   // lost: no answer will come
         status = w.fail_status;
     }
     if (!status) {
-        if (!strcmp(line, "PRM REQ 0x202 6144000")) w.clock_on = 1;
+        if (!strcmp(line, "PRM REQ 0x202 6144000")) {
+            if (w.vi_clock) violate("a CPU bit-clock request while the V/I endpoint owns it");
+            w.clock_on = 1;
+        }
         if (!strcmp(line, "PRM REL 0x202")) {if (w.dev_started || w.str_started) violate("the bit clock released under running graphs"); w.clock_on = 0;}
         if (!strncmp(line, "PRM VOTE", 8)) {
             const unsigned v = (unsigned)atoi(line + 9) & 3u;
@@ -495,15 +515,27 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         // the protection pair (round 2, Android's order): the speaker graph (SP_RX, SP_TX's control peer) opened before the V/I
         // graph; V/I started before the speaker graph and stopped after it
         if (!strcmp(line, "OPEN 0xb00000d5")) {if (!w.prot_dev_open) violate("the V/I graph opened before the speaker graph"); w.vi_open = 1;}
-        if (!strcmp(line, "START 0xb00000d5")) {if (!w.clock_on || !w.vi_open) violate("the V/I graph started without the bit clock"); w.vi_started = 1;}
+        if (!strcmp(line, "START 0xb00000d5")) {
+            /* spk=3 omits the CPU vote. Model the endpoint's clock lifetime
+             * at the acknowledged V/I START/STOP boundaries. */
+            if (live.spk && (live.spk->plan.variant & SPK_VAR_ENDPOINT_CLOCK)) {
+                if (w.clock_on || w.vi_clock) violate("two owners of the speaker bit clock");
+                w.vi_clock = 1;
+            }
+            if (!speaker_clock() || !w.vi_open) violate("the V/I graph started without the bit clock");
+            w.vi_started = 1;
+        }
         if (!strcmp(line, "OPEN 0xb0000002")) w.prot_dev_open = 1;
         if (!strcmp(line, "START 0xb0000002")) {
-            if (!w.clock_on || !w.vi_started) violate("the protected speaker graph started without the clock or the V/I graph");
+            if (!speaker_clock() || !w.vi_started) violate("the protected speaker graph started without the clock or the V/I graph");
             if (!w.re25_sets) violate("the protected speaker graph started without Re25");
             w.dev_started = 1;
         }
         if (!strcmp(line, "STOP 0xb0000002")) {if (any_powered()) violate("a speaker graph stopped with an amplifier powered up"); w.dev_started = 0;}
-        if (!strcmp(line, "STOP 0xb00000d5")) {if (w.dev_started) violate("the V/I graph stopped under the running speaker graph"); w.vi_started = 0;}
+        if (!strcmp(line, "STOP 0xb00000d5")) {
+            if (w.dev_started || any_powered()) violate("the V/I graph stopped under the running speaker graph or amps");
+            w.vi_started = w.vi_clock = 0;
+        }
         if (!strcmp(line, "CLOSE 0xb0000002")) {if (w.vi_open) violate("the speaker graph closed before the V/I graph"); w.prot_dev_open = 0;}
         if (!strcmp(line, "CLOSE 0xb00000d5")) {if (w.vi_started) violate("the V/I graph closed while running"); w.vi_open = 0;}
         if (!strcmp(line, "CFG 0x4046 0x10001fa7")) {
@@ -724,7 +756,7 @@ static void deliver(int to_live)
             w.nq--;
             if (a.plan) w.outstanding = 0;
             if (a.n >= 24 && le32(a.b + 20) == AR_OP_WRITE_DONE) {w.write_dones++; if (w.str_started) w.stream_dones++;}
-            if (a.read_slot <= -2) play_slot((unsigned)(-2 - a.read_slot));
+            if (a.read_slot <= -2) play_slot((unsigned)(-2 - a.read_slot), a.due_us);
             if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot, le32(a.b + 40), 0); w.read_dones++;}
             if (to_live) audio_live_receive(&live, a.b, a.n, now_ms());
             else audio_session_receive(&session, a.b, a.n, now_ms());
@@ -753,7 +785,8 @@ static void run(const struct Scenario *sc)
     AudioSessionConfig c;
     audio_session_defaults(&c);
     c.level = 6; c.dsp = 1; c.ports = sc->ports; c.preset_any = 1; c.mic = 1; c.silence_ms = 300; c.keep = 1;
-    AudioSessionOps ops = {0};
+    AudioSessionOps ops;
+    memset(&ops, 0, sizeof ops);
     ops.log = log_line; ops.send = dsp_send; ops.lpass_read = lpass_read;
     ops.amps = (AudioAmpsIo){0, &bus, reset_line, 0};
     ops.preset = preset; ops.preset_bytes = preset_bytes;
@@ -789,7 +822,7 @@ static void run(const struct Scenario *sc)
     w.gain_cap = sc->level >= 9 ? FS19XX_GAIN_CAP : AUDIO_AMPS_TEST_GAIN;
     w.engine_ppm = g_ppm;
     w.queue_full_every = g_queue_full;
-    w.fail_match = g_fail; w.drop = g_drop; w.fail_status = 1; w.fail_after = w.ncmd;
+    w.fail_match = g_fail; w.drop = g_drop; w.fail_status = 1; w.fail_after = w.ncmd; w.fail_limit = g_fail_limit;
     AudioLiveConfig lc;
     audio_live_defaults(&lc, sc->level);
     if (sc->gain) lc.gain = sc->gain;
@@ -812,7 +845,8 @@ static void run(const struct Scenario *sc)
     const uint64_t end = w.now_us + (uint64_t)sc->end_ms * 1000u;
     while (!live.finished && w.now_us < end) {
         deliver(1);
-        engine();
+        if (fixture_engine) fixture_engine();
+        else engine();
         if (sc->hook) sc->hook(now_ms() - g_t0);
         if (getenv("LIVE_FILL") && w.now_us % 2000000u == 0)
             fprintf(stderr, "t %u ms: fill %u avg %d drops %u repeats %u played %llu\n", now_ms() - g_t0, audio_ring_fill(&sh.out),
@@ -852,7 +886,7 @@ static void run(const struct Scenario *sc)
     for (int i = 0; i < 4; ++i) CHECK(!w.amp[i].released);
     CHECK(!w.pins_on && !w.va_on);
     for (unsigned i = 0; i < sizeof g_dma; ++i) if (g_dma[i]) {CHECK(!"the buffer is not zeroed at the end"); break;}
-    if (!w.off) CHECK(!w.clock_on && !w.va_votes && !w.va_mclk && !w.map_spk && !w.map_mic && !w.dev_started && !w.str_started);
+    if (!w.off) CHECK(!speaker_clock() && !w.va_votes && !w.va_mclk && !w.map_spk && !w.map_mic && !w.dev_started && !w.str_started);
     if (!w.off) CHECK(!w.vi_open && !w.vi_started && !w.prot_dev_open && !w.mip_open && !w.mip_started && !w.str_open);
     g_setup = 0;
 }
@@ -1560,7 +1594,9 @@ static void testSleepPendingMap(void)
 }
 static void testLedgerOverflow(void)
 {
-    AudioLedger l={0}; uint64_t a[AUDIO_LEDGER_WORDS]={0},b[AUDIO_LEDGER_WORDS];
+    AudioLedger l;
+    memset(&l, 0, sizeof l);
+    uint64_t a[AUDIO_LEDGER_WORDS]={0},b[AUDIO_LEDGER_WORDS];
     for(unsigned n=0;n<AUDIO_LEDGER_CAP+7;++n) {a[0]=n; audio_ledger_put(&l,a);}
     CHECK(l.written==AUDIO_LEDGER_CAP+7 && !audio_ledger_get(&l,0,b));
     CHECK(audio_ledger_get(&l,7,b) && b[0]==7);
@@ -2010,7 +2046,7 @@ static int g_preg_fail;
 static void preg_volume(uint32_t t)
 {
     steady(t);
-    if (t == 2400 && g_preg_fail) {w.fail_match = "CFG 0x411f"; w.fail_after = w.ncmd; w.fail_seen = 0;}   // the monitor's, not the plan's
+    if (t == 2400 && g_preg_fail) {w.fail_match = "CFG 0x411f"; w.fail_after = w.ncmd; w.failures_injected = 0;}   // the monitor's, not the plan's
     if (t == 2500) {audio_live_control(&sh, 50, -1); w.wake = 1;}
 }
 static void testMiplayPregain(void)
@@ -2516,13 +2552,13 @@ static void testProbeMalformedLiveData(void)
 
 static void testSpkLiveBounds(void)
 {
-    AudioLiveSpkStatus status = {.enabled = 1, .live_reads = 1, .live_at = UINT32_MAX - 10};
+    AudioLiveSpkStatus status = {.live_reads = 1, .live_at = UINT32_MAX - 10, .enabled = 1};
     for (unsigned c = 0; c < 4; ++c) status.re25[c] = 10000;
     status.live_data = (SpkLive){
         .re = {7000, 15000, 10000, UINT32_MAX},
+        .temp = {4096, (uint32_t)-4096, 0, (uint32_t)INT32_MIN},
         .f0 = {200 * 256, 2000 * 256, 2000 * 256 + 1, 0},
         .q = {3, 4, 5, UINT32_MAX},
-        .temp = {4096, (uint32_t)-4096, 0, (uint32_t)INT32_MIN},
     };
     char line[640];
     audio_live_spk_live_text(&status, 5, line, sizeof line);
