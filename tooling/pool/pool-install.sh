@@ -186,6 +186,13 @@ refuse() {   # WHY: before any ESP write; the copies made so far undone (pool-de
     exit 1
 }
 
+require_clear_hold() {
+    local hold
+    for hold in "$PIANO_PERSIST_OUT/HOLD" "${POOL_MAIN_LEDGER:-$MAIN/out/persistent}/HOLD"; do
+        [ ! -e "$hold" ] && [ ! -L "$hold" ] || refuse "install writes are on HOLD ($hold)"
+    done
+}
+
 rollback() {   # WHY
     local why=$1 previous=$PHASE r=$ROUND/rollback-$(date +%Y%m%d-%H%M%S) now
     mkdir "$r" || exit 3
@@ -222,9 +229,7 @@ mkdir "$LOCK" 2>/dev/null || { say "the tablet lock $LOCK is held ($(cat "$LOCK/
 LOCKED=1
 printf '%s\n' "$ROUND" > "$LOCK/owner"
 say "pool install $NAME (silent=$PIANO_INSTALL_SILENT) from $WORK"
-for hold in "$PIANO_PERSIST_OUT/HOLD" "${POOL_MAIN_LEDGER:-$MAIN/out/persistent}/HOLD"; do
-    [ ! -e "$hold" ] && [ ! -L "$hold" ] || refuse "install writes are on HOLD ($hold)"
-done
+require_clear_hold
 [ -n "$INVENTORY" ] && [ -d "$INVENTORY" ] || refuse 'no inventory folder (--inventory: tonight'"'"'s INVENTORY-READS.sh output)'
 [ -n "$CAPTURE" ] && [ -f "$CAPTURE/CAPTURE.json" ] || refuse 'no capture (--capture: the windows/ folder of pool-capture.sh with CAPTURE.json)'
 [[ "${POOL_DATA_UUID:-}" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || refuse 'set POOL_DATA_UUID to the expected Data volume UUID'
@@ -279,6 +284,7 @@ battery_preflight || refuse "battery: $(tr '\n' ' ' < "$ROUND/battery.txt")"
 say "  battery: $(head -1 "$ROUND/battery.txt")"
 
 # == device ========================================================================================================================
+require_clear_hold
 phase device
 create_remote || refuse "the round's tablet folder $REMOTE"
 rssh "mkdir -p '$PR/os' '$PR/systemos'" || refuse 'no ssh'

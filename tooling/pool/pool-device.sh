@@ -149,11 +149,11 @@ check_archive() {
 step_preflight() {
     local usage_output
     [ "$("$IDCMD" -u)" = 0 ] || die 'not root (run it through rsudo)'
+    vput preflight no
     [ "$("$SWVERS" -productVersion)" = 27.3 ] || die "not macOS 27.3 ($("$SWVERS" -productVersion))"
     for t in "$AA" "$DISKUTIL" "$PLUTIL" "$MANIFEST_TOOL" /usr/bin/shasum; do [ -x "$t" ] || die "no $t"; done
     usage_output=$("$MANIFEST_TOOL" 2>&1)
     [[ "$usage_output" = 'usage: pool-manifest'* ]] || die 'pool-manifest does not run here'
-    vput preflight no
     check_archive
     [ "$(meta source_volume_uuid)" = "$OLD_UUID" ] || die "the $VOL archive is of volume $(meta source_volume_uuid), not $OLD_UUID"
     format_of > /dev/null || die "the $VOL archive's personality $(meta source_personality) is not APFS"

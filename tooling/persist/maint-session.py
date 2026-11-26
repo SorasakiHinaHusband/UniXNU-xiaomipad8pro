@@ -148,6 +148,22 @@ class Stop(Exception):
     pass
 
 
+def atomic_write_text(path, text):
+    """Replace a file only after its sibling temporary file is fully written."""
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, prefix=f'.{path.name}.',
+                                         suffix='.new', delete=False) as stream:
+            pending = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        pending.replace(path)
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+
+
 def esp_store(record):
     """The Data store an ESP resumes when it is not the 27.0.1 line's (unbound, at the end of linux_rootfs): the record's store
     with its partition and first LBA (tooling/k273/build-k273-esp.py: the 27.3 store, bound to that LBA). None: the legacy store,
@@ -382,9 +398,7 @@ class Session:
 
     def save(self, **values):
         state = dict(self.state, **values)
-        next_path = self.state_path.with_suffix('.json.new')
-        next_path.write_text(json.dumps(state, indent=2) + '\n')
-        next_path.replace(self.state_path)
+        atomic_write_text(self.state_path, json.dumps(state, indent=2) + '\n')
         self.state.update(values)
 
     def log(self, text):
@@ -751,8 +765,9 @@ class Session:
                 lines += [f'{q["stored_sha256"]}  {q["file"]}\n' for q in e['pieces']]
             else:
                 lines.append(f'{e["sha256"]}  {e["file"]}\n')
-        (nas / 'SHA256SUMS').write_text(''.join(lines))
-        (nas / 'manifest.json').write_text(json.dumps({'device': 'piano (Xiaomi Pad 8 Pro), UFS', 'backups': backups}, indent=2) + '\n')
+        manifest = {'device': 'piano (Xiaomi Pad 8 Pro), UFS', 'backups': backups}
+        atomic_write_text(nas / 'SHA256SUMS', ''.join(lines))
+        atomic_write_text(nas / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
 
     def backup(self, key, dev, skip, count, bs, what):
         """A verified NAS backup of one region (see the module doc, rule 1). Skipped when an identical verified one exists."""
@@ -786,8 +801,8 @@ class Session:
         entry = {'file': f'{key}.img', 'sha256': want, 'bytes': total, 'dev': dev, 'skip': skip, 'count': count, 'bs': bs,
                  'what': what, 'verified': True, 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'local': total <= SMALL}
         backups = dict(self.state.get('backups', {}), **{key: entry})
-        self.save(backups=backups)
         self.write_manifest(nas, backups)
+        self.save(backups=backups)
         return want
 
     def restore(self, key, dev, seek, bs):
@@ -1719,10 +1734,8 @@ def refuse_placeholder_esp(record):
 
 def publish_esp_ledger(path, record):
     """Publish a read-back-verified ESP pointer through a sibling file."""
-    pending = path.with_suffix('.json.new')
     try:
-        common.write_json(pending, record)
-        pending.replace(path)
+        atomic_write_text(path, json.dumps(record, indent=2) + '\n')
     except OSError as exc:
         raise Stop('could not publish the verified ESP ledger') from exc
 
@@ -1732,11 +1745,7 @@ def write_esp(s, image_name):
     if not record:
         raise Stop(f'{image_name}: no build record in out/persistent (tooling/persist/build-esp.py)')
     refuse_placeholder_esp(record)
-    r = map_nodes(s)
-    lun0 = s.nodes['lun0']
-    if r:
-        s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp is {r["esp"]}')
-    esp = s.nodes.get('esp') or 'sda37'
+    lun0, esp = esp_write_target(s)
     if s.esp_state()[0]:
         s.require_backup('linux_rootfs-tail-esp')   # the region holds an ESP image of this install; the backup is of before
     else:
@@ -1764,16 +1773,19 @@ def write_esp(s, image_name):
     s.fetch(record['image'], image, record['sha256'])
     if s.write(f'{record["image"]} (default {record["default"]}, profile {record.get("profile")}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
         s.job('esp-write', 'write', record['image'], esp, 0, MiB, timeout=1800)
-    got = s.region_sha(esp, 0, 1024, MiB, name='esp-check')
-    got2 = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
+    blocks = common.ESP_BLOCKS * B // MiB
+    got = s.region_sha(esp, 0, blocks, MiB, name='esp-check')
+    got2 = s.region_sha(lun0, common.ESP_FIRST * B // MiB, blocks, MiB, name='esp-check-lun0')
     s.need(got == record['sha256'] and got2 == record['sha256'] if s.execute else None,
            f'ESP read back through /dev/{esp} and /dev/{lun0}: {got} / {got2} = {record["sha256"][:16]}')
     s.sim['esp'] = record['sha256']
     if s.execute:
         s.save_esp(record['image'], record['sha256'])
         # The installed ESP's seed, which build-ram-images.py and build-esp.py compare theirs with (common.installed_seed).
-        common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
-                                                   'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S')})
+        publish_esp_ledger(OUT / 'installed.json', {
+            'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'], 'inputs': record.get('inputs'),
+            'written': time.strftime('%Y-%m-%d %H:%M:%S'),
+        })
 
 
 @step('esp-delta', 'maintenance, WRITE partition 37: only the MiB in which --esp differs from the installed ESP',

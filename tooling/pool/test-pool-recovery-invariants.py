@@ -243,6 +243,13 @@ class InstallPreflight(Fixture):
             f'APFS Container Reference: userdata\nVolume UUID: {DATA}\n')
         self.assert_refused('inventory gates: INVENTORY CHECK FAIL')
 
+    def test_hold_set_during_preflight_prevents_staging(self):
+        battery = self.executable(self.bin / 'battery-hold', 'touch "$POOL_MAIN_LEDGER/HOLD"\necho 80%\n')
+        self.install(1, 'install writes are on HOLD', POOL_BATTERY=battery)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse(self.remote.exists())
+        self.assertFalse(self.lock.exists())
+
     def test_interrupted_and_bad_readback_copies_preserve_verified_destination(self):
         stage = self.remote / 'pool/os/volume.aar'
         stage.parent.mkdir(parents=True)
@@ -337,6 +344,15 @@ class DeviceRecovery(Fixture):
         for target in PROTECTED:
             with self.subTest(target=target):
                 self.device(1, 'invalid APFS container target', 'create', 'os', POOL_TEST_CONTAINER=target)
+        self.assertFalse(self.calls.exists())
+
+    def test_failed_preflight_invalidates_previous_pass(self):
+        self.device(0, 'PASS', 'preflight', 'os')
+        self.accept_live()
+        self.executable(self.work / 'pool-manifest', 'exit 2\n')
+        self.device(1, 'pool-manifest does not run here', 'preflight', 'os')
+        self.device(1, 'preflight', 'create', 'os')
+        self.assertIn('os_preflight=no\n', self.state.read_text())
         self.assertFalse(self.calls.exists())
 
     def test_interrupted_create_refuses_orphan_and_recovers_with_original_receipt(self):
@@ -448,9 +464,12 @@ class EspRecovery(Fixture):
             return {}
         self.fail(f'unexpected tablet command {command}')
 
-    def job(self, tag, command, name, dev, offset, block, port, **kwargs):
-        self.assertEqual((tag, command, dev, offset, block),
-                         (f'restore-{BACKUP}', 'restore', 'sda', maint.common.ESP_FIRST, self.b))
+    def job(self, tag, command, name, dev, offset, block, port=None, **kwargs):
+        if command == 'write':
+            self.assertEqual((tag, dev, offset, block), ('esp-write', 'sda37', 0, self.b))
+        else:
+            self.assertEqual((tag, command, dev, offset, block),
+                             (f'restore-{BACKUP}', 'restore', 'sda', maint.common.ESP_FIRST, self.b))
         self.writes.append(command)
         self.media.write_bytes(self.transfers[name].read_bytes())
 
@@ -488,7 +507,7 @@ class EspRecovery(Fixture):
                 with self.subTest(field=field, target=target):
                     previous = self.mapping[field]
                     self.mapping[field] = value
-                    for steps in (('esp-delta',), ('rollback', 'esp')):
+                    for steps in (('esp-delta',), ('esp',), ('rollback', 'esp')):
                         self.assert_before_write(*steps, diagnostic='ESP write target')
                     self.mapping[field] = previous
 
@@ -574,10 +593,26 @@ class EspRecovery(Fixture):
         self.assertEqual(self.ledger.read_bytes(), ledger)
         self.assertEqual(self.media.read_bytes(), self.base)
         self.assertEqual(snapshot(self.backups), before)
-        self.assertTrue(self.ledger.with_suffix('.json.new').is_file())
+        self.assertEqual(list(self.out.glob('.installed.json.*.new')), [])
         self.run_session('rollback', 'esp')
         self.assertEqual(json.loads(self.ledger.read_text())['image'], 'esp-y12q.img')
         self.assertEqual(snapshot(self.backups), before)
+
+    def test_full_esp_write_uses_atomic_ledger_after_readback(self):
+        self.run_session('--new-backup', 'esp-delta')
+        self.run_session('rollback', 'esp')
+        ledger = self.ledger.read_bytes()
+        stale = self.ledger.with_suffix('.json.new')
+        stale.write_bytes(b'interrupted older publisher')
+        self.readback = 'sda'
+        self.run_session('esp', code=3, diagnostic='ESP read back')
+        self.assertEqual(self.ledger.read_bytes(), ledger)
+        self.readback = None
+        self.run_session('rollback', 'esp')
+        self.run_session('esp')
+        self.assertEqual(self.writes, ['write'])
+        self.assertEqual(json.loads(self.ledger.read_text())['image'], 'esp-y12q-pool.img')
+        self.assertEqual(stale.read_bytes(), b'interrupted older publisher')
 
     def test_apply_readback_failure_preserves_pointer_and_verified_backups(self):
         for name in ('sda37', 'sda'):
