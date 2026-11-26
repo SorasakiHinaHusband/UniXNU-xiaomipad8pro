@@ -10,7 +10,7 @@
 // BitI2c.h against a bit-level I2C target model
 // (START/STOP, ACK/NACK, repeated START reads, clock stretching), CmdDb.h on a small database, and HidDescriptors.h (parsed item by
 // item: each report is as long as the driver sends it).
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. keyboard_host.cpp -o /tmp/keyboard_host && /tmp/keyboard_host [--no-firmware] [MCU_Upgrade.bin]
+// Build: c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. keyboard_host.cpp -o /tmp/keyboard_host && /tmp/keyboard_host [--no-firmware] [MCU_Upgrade.bin]
 #include "Wn8030Piano.h"
 #include "BitI2c.h"
 #include "CmdDb.h"

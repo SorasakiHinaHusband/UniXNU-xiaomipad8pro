@@ -313,7 +313,8 @@ constexpr uint8_t kModLeftCtrl = 1u << 0, kModRightCtrl = 1u << 4;
 class Keys {
  public:
   bool fnRow = false;
-  void filter(const uint8_t *in, uint8_t out[kKeyboardBytes])
+  // Returns true on rollover, when the input key slots cannot be used to detect new presses.
+  bool filter(const uint8_t *in, uint8_t out[kKeyboardBytes])
   {
     for (unsigned i = 0; i < kKeyboardBytes; ++i) out[i] = in[i];
     bool rollover = false;
@@ -338,6 +339,7 @@ class Keys {
     if (fn_) out[1] &= uint8_t(~kModRightCtrl);
     for (unsigned i = 0; i < 6; ++i) sent_[i] = out[3 + i];
     mods_ = out[1];
+    return rollover;
   }
   // A shortcut, Left Control + usage, on top of what is held: Control down, the key down, the key up, Control up (four reports,
   // so the system sees the modifier before the key). Returns 4.

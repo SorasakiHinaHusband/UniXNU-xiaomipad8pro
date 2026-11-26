@@ -1373,14 +1373,15 @@ void PianoKeyboard::dispatch(const Report &r)
     ++fKeys;
     if (!fGate.pass()) return;   // the cover closed (piano-keyboard-lid-drop=1)
     uint8_t out[kKeyboardBytes];
-    const uint32_t rollovers = fKeyFilter.rollovers();
     const uint64_t now = nowMs();
-    if (Keys::newKey(fLastKeys, r.bytes)) fPointer.keyTyped(now);   // the typing guard
-    if (pianobacklight::keysEnabled()) pianobacklight::step(fBrightness.keyboard(r.bytes), "the cover");   // before the Fn row
-    memcpy(fLastKeys, r.bytes, kKeyboardBytes);
+    const bool rollover = fKeyFilter.filter(r.bytes, out);
+    if (!rollover) {
+      if (Keys::newKey(fLastKeys, r.bytes)) fPointer.keyTyped(now);   // the typing guard
+      if (pianobacklight::keysEnabled()) pianobacklight::step(fBrightness.keyboard(r.bytes), "the cover");   // raw usages
+      memcpy(fLastKeys, r.bytes, kKeyboardBytes);
+    }
     backlight(fBacklight.input(now), "backlight (a key after idle)");
-    fKeyFilter.filter(r.bytes, out);
-    const bool rollover = fKeyFilter.rollovers() != rollovers, changed = memcmp(out, r.bytes, kKeyboardBytes) != 0;
+    const bool changed = memcmp(out, r.bytes, kKeyboardBytes) != 0;
     const IOReturn rc = send(Kind::keyboard, out, kKeyboardBytes);
     if (show)
       note("key %u: %s -> %s%s%s", fKeys, hex(r.bytes, r.length, line, sizeof line), keyList(out, decoded, sizeof decoded),
