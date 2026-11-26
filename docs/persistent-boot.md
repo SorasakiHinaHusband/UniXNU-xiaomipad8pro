@@ -1,18 +1,31 @@
 # Persistent native macOS boot on piano (no `fastboot boot`)
 
+## Partition safety
+
+- Never write Android `userdata`, `super`, `metadata`, any `_b` partition, or firmware partitions such as `xbl`, `abl`,
+  `tz`, `hyp`, `vbmeta`, `dtbo` and `persist`. `boot_b` is backed up only. Confirm the target against the live partition map.
+- Before each authorized write, verify the backup of the affected region against the pre-write SHA-256 and independently
+  read back the saved bytes. After the write, read back the target from the medium and compare its SHA-256 with the expected
+  result. Stop on any mismatch and keep the verified rollback set.
+- Use `data-persist=0` for routine RAM tests and check the effective arguments after the ADT merge. The M5 durability and
+  throughput tests have a separately confirmed, disposable scratch window. The owner's Data store stays protected.
+  M5 `data-store-write-back=1` remains opt-in. Both write-back and queue mode default to `0`.
+
+[Project hard rules](PROJECT-MAP.md#6-hard-rules) · [Data store and scratch tooling](data-store.md#6-tooling)
+
 ## Installed daily profile (2026-11-27)
 
-**v13.1y12q** reached the login window at **+32 s** on both November 27 disk boots, with the owner's Data store resumed and
-verified both times. `boot_a` holds the v5 BootShim and FD. The 27.3-only ESP defaults to `macos-27.3` and boots macOS 27.3
-(26C5035r) as Mac17,11 at EL1, with Gunyah at EL2. The root is on `linux_rootfs` and the 200 GiB Data store is on
-`linux_data`. The v5 FD and ADT pair provides the 13 GiB XNU memory window.
-[November 27 results](results-2026-11-27.md) · [Project map](PROJECT-MAP.md) · [27.3 line](k273-line.md#current-line-2026-11-27)
+**v13.1y12q** reached the login window at **+32 s** on four consecutive November 27 disk boots, with the owner's Data store
+resumed and verified each time. `boot_a` holds the v5 BootShim and FD. The 27.3-only ESP defaults to `macos-27.3` and boots
+macOS 27.3 (26C5035r) as Mac17,11 at EL1, with Gunyah at EL2. The root is on `linux_rootfs` and the 200 GiB Data store is
+on `linux_data`. The v5 FD and ADT pair provides the 13 GiB XNU memory window.
+[November 27 installed results](results-2026-11-27.md#installed-boot) · [Project map](PROJECT-MAP.md) · [27.3 line](k273-line.md#current-line-2026-11-27)
 
 | Setting | Installed default |
 | --- | --- |
-| Kernel | Native k27 patches 0053–0076 and the 27.3 patches. Patch 0075 supplies a 47-bit user address space, verified by `machdep.virtual_address_size = 47`. Patch 0076 exports the full merged boot arguments through `kern.piano_bootargs` for the USB root shell and updated helpers. |
-| Data | Direct store resumes, then M4 concurrent admission switches on after mount. M5 write-back and queue modes stay off. |
-| USB debug | Console, root shell and SSH over USB. Network TX flow control is enabled and was active during the second disk boot. |
+| Kernel | Native k27 patches 0053–0076 and the 27.3 patches. Patch 0075 supplies a 47-bit user address space, verified by `machdep.virtual_address_size = 47`. Patch 0076 exports the full merged boot line, about 3.8 KB, through `kern.piano_bootargs` for the USB root shell and updated helpers. The daily boot uses `cs-native4k-skip=1`, confirmed by the code-signature pre-hash skip counters. |
+| Data | `data-store-concurrent=2` lets Data mount in single-gate mode. `piano-data-concurrent` enables M4 concurrent admission after confirming the mounted store has resumed (`store_state=2`). M5 write-back and queue modes stay off. |
+| USB debug | Console, root shell and SSH over USB. `piano-usb-net-txflow=1` enables TX flow control, confirmed active on the second recorded disk boot. |
 | Display | 60 Hz with neutral colours. Night Shift routing, native panel sleep and refresh switching stay off. Fixed 120 Hz and 144 Hz remain RAM-only. |
 | Network and audio | Built-in Wi-Fi on `en0`, speakers, and the raw and RNNoise microphone inputs. Bluetooth preflight passed on v13.1y12q. Pairing remains an attended check. |
 | Power and input | High Power Energy Mode, 5 V and 9 V PD buck charging, native touch, keyboard cover and trackpad. The cover and power-key sleep policy is armed. Physical checks remain pending. |
@@ -23,7 +36,57 @@ verified both times. `boot_a` holds the v5 BootShim and FD. The 27.3-only ESP de
 For a daily update, qualify the exact payload on RAM, back up affected regions, write only changed parts and verify them by
 read-back. A disk-boot check confirms the expected profile and resumed Data. See the ESP guide for the rollback order when
 an update also changes the Data-side layer. The second-unit guide records the remaining reproduction gaps.
-[Daily updates and rollback](install-esp-v3.md#daily-update-and-rollback) · [Second-unit install guide](../skills/install-piano-macos/SKILL.md)
+[Daily updates and rollback](install-esp-v3.md#daily-update-and-rollback) · [Second-unit install guide](../skills/install-piano-macos/SKILL.md) ·
+[Troubleshooting](troubleshooting.md)
+
+## Current maintenance and verification gates
+
+- **Verified backup and restore.** `maint-session.py` matches the region hash to the backup receipt where the operation
+  requires the original bytes. It also reopens the NAS file and verifies its size and uncached SHA-256 before trusting it.
+  Restore checks the saved offset and length against the destination geometry, verifies the local copy if used, and hashes
+  the restored bytes from the medium. A verified pre-install copy remains the rollback source after an authorized write.
+  [Maintenance session](../tooling/persist/maint-session.py)
+- **LUN 0 GPT.** `build-gpt.py` validates the pinned original copies, their geometry and CRCs, and the resulting non-overlapping
+  entries. The only permitted changes are the `linux_rootfs` end LBA, the new ESP entry, and the entry-array and header CRCs.
+  This preserves the protective MBR and the Android partition entries byte for byte. Before writing, `maint-session.py`
+  reads both live hashes and derives the candidate tables from the revalidated backups. It recognizes an interrupted update
+  with the original primary and new backup copy. The backup GPT is written and verified by SHA-256 before the primary is
+  written. After primary read-back, the session rereads the partition table, checks `sgdisk -v` and validates the remapped
+  `linux_rootfs` and ESP geometry. [GPT builder](../tooling/persist/build-gpt.py) · [Partition safety fixtures](../tooling/persist/test-partition-safety.py)
+- **ESP and installed identity.** The ESP builder checks the seed, store size and kernel store guard. For the current layout,
+  `map`, the ESP write gate and `check` validate the bound store described by the ESP record (see §13.3 and §13.8).
+  `installed_boot_identity.py` checks required arguments against the recorded command line and selected ADT tail, rejecting
+  conflicting values. A live probe brackets `kern.bootargs` and the `/chosen` plist with the same boot UUID. It checks the
+  exact tail, including NUL termination and zero padding, and compares the legacy line to the ESP text or its expected clip.
+  Console evidence must show state `2` and the recorded LBA and seed in both seed fields. Archived console replay needs
+  positive driver evidence for requested keys missing from the intact command-line segment. [ESP builder](../tooling/persist/build-esp.py) ·
+  [Installed boot identity](../tooling/persist/installed_boot_identity.py) · [Partition and identity fixtures](../tooling/persist/test-partition-safety.py)
+- **RAM image preflight.** Run `python3 tooling/bootimg/verify-ram-images.py BUILD_JSON` on the exact image before booting.
+  It checks the Android v2 container, BootShim, FD and DTB, the FAT payload and hashes, and the effective macOS arguments
+  and store settings. `test-verify-ram-images.py` exercises the verifier offline with fixtures. The separately approved M5
+  scratch plan requires a fresh confirmed map, a pinned disposable seed, a window past the root image and its 1024-block guard
+  and below the log reserve, and no overlap with protected extents. Its exact binding is checked again after the ADT split.
+  [Image verifier](../tooling/bootimg/verify-ram-images.py) · [Verifier fixtures](../tooling/bootimg/test-verify-ram-images.py) ·
+  [Scratch-plan fixtures](../tooling/persist/test-scratch-plan.py)
+
+## A2 storage pool tooling
+
+The installed daily still uses the raw root windows in §13.8. A2 provides a gated migration path that copies the System (OS)
+and SystemOS volumes into the Data APFS container. `pool-capture.sh` captures the unmounted source windows in maintenance RAM,
+verifies the per-piece hashes, then verifies the installed base after reboot. `pool-capture-check.sh` validates the saved
+windows on the host, including sizes, SHA-256, APFS superblocks and the expected volume UUIDs from read-only attachments.
+[Pool capture](../tooling/pool/pool-capture.sh) · [Host capture checks](../tooling/pool/pool-capture-check.sh)
+
+`pool-install.sh` first checks that the archive source hashes match the capture and that the archived manifests match the
+live source volumes within the documented tolerances. Both copies must verify before an ESP write. The pool ESP adds
+`macos-27.3-pool` and keeps the base entry. Its disk-boot gates verify the mounted copies and resumed Data. A failed gate
+with a confirmed rollback restores and verifies the base ESP before deleting the new volumes by UUID. Exit `3` is a recovery
+hold in either wrapper. The tablet lock stays held. Inspect the live ESP, Data and saved session state before clearing the
+lock or retrying. [Pool install and rollback](../tooling/pool/pool-install.sh) · [Pool ESP and mock session fixtures](../tooling/persist/test-pool-session.py)
+
+`bash tooling/pool/test-pool-capture-check.sh --real-apfs` exercises the checker using fresh APFS images attached by
+`hdiutil` and inspected by `diskutil` on the Mac. The default test uses simulated disk commands. Both cover valid captures
+and reject changed data, an unexpected volume UUID, wrong sizes and a missing APFS superblock. [Capture test](../tooling/pool/test-pool-capture-check.sh)
 
 ## Historical install record (2026-11-11 to 2026-11-14)
 
