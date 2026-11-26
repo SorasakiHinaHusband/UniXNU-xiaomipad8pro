@@ -238,26 +238,7 @@ public:
   }
 
   // Process the pending events; returns how many.
-  unsigned poll()
-  {
-    using namespace dwc3;
-    uint32_t count = h->rd(GEVNTCOUNT) & 0xffffu;
-    if (!count) return 0;
-    if (count > Layout::kEventBytes || (count & 3)) {
-      h->note("event count %#x out of range", count);
-      count = count > Layout::kEventBytes ? Layout::kEventBytes : count & ~3u;
-      if (!count) return 0;
-    }
-    h->barrier();
-    const volatile uint32_t *ring = reinterpret_cast<const volatile uint32_t *>(h->dma() + Layout::kEvents);
-    for (uint32_t n = 0; n < count; n += 4) {
-      const uint32_t e = ring[ringPos / 4];
-      ringPos = (ringPos + 4) % Layout::kEventBytes;
-      handle(e);
-    }
-    h->wr(GEVNTCOUNT, count);
-    return count / 4;
-  }
+  unsigned poll() { return drainEvents(true); }
 
   // Keep one bulk OUT and one bulk IN transfer queued per port while configured.
   void pump()
@@ -343,14 +324,16 @@ public:
   // RUN_STOP on (the host enumerates afresh). Together what reconnect() does, without its 300 ms wait (the sleep is the gap).
   bool sleepDisconnect()
   {
+    if (!deviceRole()) return false;
     const bool halted = halt(100);
     busReset(false);
     return halted;
   }
   bool sleepConnect()
   {
+    if (!deviceRole()) return false;
     const GadgetStats kept = stats;
-    poll();
+    drainEvents(false);   // old events belong to endpoints that sleepDisconnect() tore down
     const bool ok = initDevice();
     stats = kept;
     return ok && run(50);
@@ -651,6 +634,31 @@ private:
     } else {
       h->note("ev %08x ep %u %s status %x | phase %s", e, phys, types[type], status, phaseName());
     }
+  }
+
+  unsigned drainEvents(bool dispatch)
+  {
+    using namespace dwc3;
+    uint32_t count = h->rd(GEVNTCOUNT) & 0xffffu;
+    if (!count) return 0;
+    if (count > Layout::kEventBytes || (count & 3)) {
+      h->note("event count %#x out of range", count);
+      count = count > Layout::kEventBytes ? Layout::kEventBytes : count & ~3u;
+      if (!count) return 0;
+    }
+    if (dispatch) {
+      h->barrier();
+      const volatile uint32_t *ring = reinterpret_cast<const volatile uint32_t *>(h->dma() + Layout::kEvents);
+      for (uint32_t n = 0; n < count; n += 4) {
+        const uint32_t e = ring[ringPos / 4];
+        ringPos = (ringPos + 4) % Layout::kEventBytes;
+        handle(e);
+      }
+    } else {
+      ringPos = (ringPos + count) % Layout::kEventBytes;
+    }
+    h->wr(GEVNTCOUNT, count);
+    return count / 4;
   }
 
   void handle(uint32_t e)
@@ -1213,22 +1221,30 @@ private:
     startXfer(kNetInPhys, Layout::kNetIn, total, dwc3::TRBCTL_NORMAL, zlp);
   }
 
-  // An NTB from the host: every datagram the parser accepts goes to the Hal; a refused block is counted and its first few logged.
+  // A bulk OUT completion may contain adjacent NTBs. Each block's offsets are relative to its own NTH16.
   void netReceived(uint32_t got)
   {
     if (!got) return;   // a zero-length packet after a block that ended on a packet boundary
-    ++netStats.rxNtbs;
-    const uint8_t *const b = h->dma() + Layout::kNetOut;
-    const ncm::NtbResult r = ncm::parseNtb16(b, got, [&](uint32_t at, uint32_t n) {
-      if (h->netRxFrame(b + at, n)) { ++netStats.rxFrames; netStats.rxBytes += n; }
-      else ++netStats.rxDrops;
-    });
-    netStats.badDatagrams += r.bad;
-    if (r.error) {
-      netStats.lastError = r.error;
-      if (++netStats.ntbErrors <= 5) h->note("net: NTB from the host refused (%s), %u bytes; %u so far", r.error, got, netStats.ntbErrors);
-    }
-    if (r.datagrams) h->netRxDone();
+    const uint8_t *b = h->dma() + Layout::kNetOut;
+    bool datagrams = false;
+    do {
+      ++netStats.rxNtbs;
+      const ncm::NtbResult r = ncm::parseNtb16(b, got, [&](uint32_t at, uint32_t n) {
+        if (h->netRxFrame(b + at, n)) { ++netStats.rxFrames; netStats.rxBytes += n; }
+        else ++netStats.rxDrops;
+      });
+      netStats.badDatagrams += r.bad;
+      datagrams |= r.datagrams != 0;
+      if (r.error) {
+        netStats.lastError = r.error;
+        if (++netStats.ntbErrors <= 5) h->note("net: NTB from the host refused (%s), %u bytes; %u so far", r.error, got, netStats.ntbErrors);
+        break;
+      }
+      b += r.blockBytes;
+      got -= r.blockBytes;
+      // A host can pad the transfer past wBlockLength. Only a following NTH16 starts another block.
+    } while (got >= sizeof(uint32_t) && ncm::rd32(b) == ncm::kNth16);
+    if (datagrams) h->netRxDone();
   }
 
   bool configure()

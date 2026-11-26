@@ -66,6 +66,7 @@
 #include "PianoUsbHw.h"
 #include "Dwc3Gadget.h"
 #include "SmmuStream.h"
+#include "ByteRing.h"
 #include "HidInput.h"
 #include "HidDescriptors.h"   // package/PianoKeyboard: the keyboard (+ consumer) and pointer report descriptors, shared
 #include "UsbNet.h"           // the network function's macOS side (PianoUsbNet.cpp)
@@ -303,28 +304,7 @@ bool qsWrite(uint32_t offset, uint32_t value);
 volatile uint32_t gColdAsk;
 uint64_t gColdAskAtMs;
 
-struct Ring {
-  uint8_t *buf;
-  uint32_t size, head, tail;   // size: a power of two
-  uint64_t dropped;
-  uint32_t used() const { return head - tail; }
-  uint32_t space() const { return size - used(); }
-  uint32_t put(const uint8_t *s, uint32_t n)
-  {
-    if (n > space()) { dropped += n - space(); n = space(); }
-    for (uint32_t i = 0; i < n; ++i) buf[(head + i) & (size - 1)] = s[i];
-    head += n;
-    return n;
-  }
-  uint32_t get(uint8_t *d, uint32_t n)
-  {
-    if (n > used()) n = used();
-    for (uint32_t i = 0; i < n; ++i) d[i] = buf[(tail + i) & (size - 1)];
-    tail += n;
-    return n;
-  }
-};
-Ring gTx[kPorts], gRx1, gRx2, gNotes;   // gRx2: the input port's command bytes (piano-usb-hid=1)
+ByteRing gTx[kPorts], gRx1, gRx2, gNotes;   // gRx2: the input port's command bytes (piano-usb-hid=1)
 volatile bool gHidReleaseWanted;        // the input port closed or the bus reset: the HID thread releases everything
 PianoUsbHID *gHidDevice[2];             // keyboard, pointer (piano-usb-hid=1)
 struct HidCounters {                    // counts only: what was typed is never kept or logged
@@ -335,7 +315,7 @@ uint16_t gLines[kPorts];
 bool gLive = true, gEcho = true;
 volatile bool gAbort;
 
-bool ringAlloc(Ring &r, uint32_t size)
+bool ringAlloc(ByteRing &r, uint32_t size)
 {
   r.buf = static_cast<uint8_t *>(IOMallocData(size));
   r.size = size;

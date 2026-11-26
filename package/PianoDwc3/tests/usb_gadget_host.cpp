@@ -5,7 +5,7 @@
 // descriptor is checked against the bytes of the ACM-only device as it was before the network function existed (golden FNV-1a
 // sums); with it (piano-usb-net=1) the configuration is parsed as a host would, then the NCM requests, the alternate setting, the
 // notifications, NTBs both ways (decoded by this file's own reading of NCM 1.0), the zero-length packet rule and the TX FIFO plan.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. usb_gadget_host.cpp -o /tmp/usb_gadget_host && /tmp/usb_gadget_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined -I.. usb_gadget_host.cpp -o /tmp/usb_gadget_host && /tmp/usb_gadget_host
 #include "Dwc3Gadget.h"
 #include <cassert>
 #include <cstdarg>
@@ -503,6 +503,19 @@ static void netScenario(FakeHal &h, G &g, unsigned P)
   step(g);
   CHECK(h.eps[kNetOutPhys].active);
 
+  // Two NTBs can share a completion when the first ends on a full USB packet.
+  const std::string first = bytes(484, 21), second = bytes(61, 22);
+  const std::string packet = hostNtb({first}, 2);
+  CHECK(packet.size() == 512);
+  std::string last = hostNtb({second}, 3);
+  put16(last, 8, 0);   // this block runs to the short packet at the end of the transfer
+  h.netRx.clear();
+  const unsigned ntbs = g.netStats.rxNtbs, done = h.netDone;
+  h.complete(kNetOutPhys, packet + last);
+  step(g);
+  CHECK((h.netRx == std::vector<std::string>{first, second}));
+  CHECK(g.netStats.rxNtbs == ntbs + 2 && h.netDone == done + 1 && g.netStats.ntbErrors == 1);
+
   // To the host: queued frames go out as one NTB16, decoded here as a host would; the next NTB has the next sequence number.
   const std::vector<std::string> out = {bytes(60, 5), bytes(1514, 6), bytes(100, 7)};
   for (const std::string &f : out) h.netTx.push_back(f);
@@ -917,12 +930,13 @@ static void scenario(unsigned P, bool net, bool quiet)
 // A system sleep without a host kept (UsbSleep.h quiesce): sleepDisconnect halts the core (RUN_STOP off), ends every transfer and
 // forgets the configuration; sleepConnect after the wake runs again with SETUP armed and the counters kept; the host's new
 // enumeration configures the device as at the first attach.
-static void sleepCycle(bool quiet)
+static void sleepCycle(bool net, bool quiet)
 {
   FakeHal h;
   h.quiet = quiet;
   G g{};
-  g.bind(&h, 2, kProduct, 0, false);
+  const unsigned ports = net ? 3 : 2;
+  g.bind(&h, ports, kProduct, 0, net);
   h.regs[DSTS] = DSTS_DEVCTRLHLT;
   CHECK(g.init() && g.run(10));
   auto attach = [&](uint16_t address) {
@@ -935,6 +949,11 @@ static void sleepCycle(bool quiet)
   };
   attach(5);
   CHECK(g.configured() && g.stats.address == 5);
+  if (net) {
+    controlNoData(h, g, setupBytes(0x01, 0x0b, 1, 2 * ports + 1, 0));
+    controlOut(h, g, setupBytes(0x21, ncm::SET_NTB_INPUT_SIZE, 0, 2 * ports, 4), le32(2048));
+    CHECK(g.netLinkUp() && h.linkUp && g.netStats.ntbInSize == 2048 && h.eps[kNetOutPhys].active);
+  }
   const unsigned resets = g.stats.resets, setups = g.stats.setups;
   bool busy = false;
   for (unsigned phys = 2; phys < kPhys; ++phys) busy = busy || h.eps[phys].active;
@@ -946,18 +965,29 @@ static void sleepCycle(bool quiet)
   CHECK(g.takeInUnconfirmed(0) == 300 && g.takeInUnconfirmed(0) == 0);   // ended unfinished by the disconnect: counted once
   CHECK(!(h.regs[DCTL] & DCTL_RUN_STOP) && (h.regs[DSTS] & DSTS_DEVCTRLHLT));
   CHECK(!g.configured() && g.stats.address == 0 && ((h.regs[DCFG] >> 3) & 0x7f) == 0);
+  CHECK(!g.netLinkUp() && !h.linkUp && g.netStats.alt == 0 && g.netStats.ntbInSize == ncm::kNtbMax);
   for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(!h.eps[phys].active);
   g.pump();   // nothing queued while disconnected
   for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(!h.eps[phys].active);
+  // Events queued before the halt must be acknowledged without rearming the old EP0.
+  h.devEvent(DEVT_RESET);
+  h.devEvent(DEVT_DISCONNECT);
   const unsigned startcfg = h.count(CMD_DEPSTARTCFG, 0);
+  const unsigned setupStarts = h.count(CMD_STARTTRANSFER, 0);
   CHECK(g.sleepConnect());
+  CHECK(h.regs[GEVNTCOUNT] == 0 && h.count(CMD_STARTTRANSFER, 0) == setupStarts + 1);
   CHECK((h.regs[DCTL] & DCTL_RUN_STOP) && !(h.regs[DSTS] & DSTS_DEVCTRLHLT));
   CHECK(h.count(CMD_DEPSTARTCFG, 0) == startcfg + 1 && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP);
   CHECK(g.stats.resets == resets && g.stats.setups == setups);   // the counters kept across the sleep
   attach(6);
   CHECK(g.configured() && g.stats.address == 6 && g.stats.resets == resets + 1);
+  if (net) {
+    CHECK(!g.netLinkUp() && !h.eps[kNetOutPhys].active);
+    controlNoData(h, g, setupBytes(0x01, 0x0b, 1, 2 * ports + 1, 0));
+    CHECK(g.netLinkUp() && h.linkUp && h.eps[kNetOutPhys].active);
+  }
   CHECK(g.stats.cmdErrors == 0 && g.stats.cmdTimeouts == 0 && g.stats.startErrors == 0);
-  std::printf("sleep cycle: disconnected, connected again, enumerated afresh\n");
+  std::printf("sleep cycle%s: disconnected, connected again, enumerated afresh\n", net ? " with network" : "");
 }
 
 // EP0 left the controller's way and the controller recovery (USB-WEDGE.md), against the FakeHal's model of the core's control state
@@ -1204,10 +1234,12 @@ static void hostRoleRefused()
     h.regs[GCTL] = gctl;
     h.regs[DCTL] = 0x10f00000;
     h.regs[DCFG] = 0x0048080c;
-    G g;
+    h.regs[DALEPENA] = 0;
+    G g{};
     g.bind(&h, 3, 0x0001);
     uint32_t waited = 7;
     CHECK(!g.halt(10) && !g.softReset(true, &waited) && waited == 0 && !g.init() && !g.initDevice() && !g.run(10));
+    CHECK(!g.sleepDisconnect() && !g.sleepConnect() && h.regs[DALEPENA] == 0);
     CHECK(h.cmds.empty() && h.regs[DCTL] == 0x10f00000 && h.regs[DCFG] == 0x0048080c && h.regs[GCTL] == gctl);
   }
 }
@@ -1216,7 +1248,8 @@ int main(int argc, char **argv)
 {
   (void)argv;
   hostRoleRefused();
-  sleepCycle(argc < 2);
+  sleepCycle(false, argc < 2);
+  sleepCycle(true, argc < 2);
   wedgeScenarios(argc < 2);
   goldenDescriptors();
   scenario(2, false, argc < 2);

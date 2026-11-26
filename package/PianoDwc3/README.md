@@ -27,7 +27,7 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 | `UsbHandoff.h` | the controller hand-off to PianoUsbHost's host mode (`piano-usb-handoff=1`, default off): the platform function's asks and states, the USB thread's decision, portable (`docs/drivers/usb-host.md` §6.6) |
 | `UsbCold.h` | the cold start (`piano-usb-cold`, default auto): the inherited state read and judged, then GDSC/clocks, stop, the rails (RPMh under PianoA830's DRV-2 lock), the eUSB2 repeater and the M31 PHY from this driver's own tables; the test hook (`piano-usb-cold-sim`) and the link watch, portable (`docs/drivers/usb-device-debug.md` §17) |
 | `Dwc3Regs.h`, `PianoUsbHw.h` | register facts, with their sources |
-| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes; EP0's recoveries and the controller recovery against a model of the core's control state machine), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers, the hand-off decisions, the cold start against a model of the USB hardware (`tests/run.sh`) |
+| `tests/` | host tests: the gadget core (2 and 3 ports, with and without NCM), ACM descriptor bytes, EP0 recovery, sleep and re-enumeration, NTB16 framing, TX flow control, HID reports and rings, SMMU setup, the log cursor, idle tiers, hand-off and cold start. `tests/run.sh` and the standalone C++ build lines use ASan, UBSan and warnings as errors. |
 
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
