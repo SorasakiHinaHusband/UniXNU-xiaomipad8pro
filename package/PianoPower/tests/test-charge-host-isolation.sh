@@ -5,9 +5,10 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/charge-host-isolation.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/repo/package/PianoPower/tests"
+mkdir -p "$work/repo/package/PianoPower/tests" "$work/repo/scripts/ci"
 suite="$work/repo/package/PianoPower/tests/run-charge-host.sh"
 cp "$here/run-charge-host.sh" "$suite"
+cp "$here/../../../scripts/ci/host-test-jobs.sh" "$work/repo/scripts/ci/host-test-jobs.sh"
 
 cat > "$work/cc" <<'EOF'
 #!/bin/bash
