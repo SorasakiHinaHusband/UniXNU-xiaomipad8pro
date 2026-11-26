@@ -11,7 +11,7 @@ builds or checks a 27.0.1 image.
   `tooling/native/native-loop.sh`, `tooling/persist/maint-session.py`, `tooling/native/desk-ssh.sh`, any `/tmp/run-*.sh` helper.
 - **Never run** a line build or an ESP build: `tooling/k27/build-native-image.sh`, `tooling/k273/build-k273-image.sh`,
   `tooling/persist/build-esp.py`, `tooling/k273/build-dual-esp.py`, `tooling/bootimg/build-ram-images.py`.
-- **Never publish**: no `private/publish.sh`, no `git push`, no commits. Leave tracked files unchanged; if a check writes into
+- **Never publish**: no publishing helper, no `git push`, no commits. Leave tracked files unchanged; if a check writes into
   `out/`, that is listed below.
 - Do not run two checks that write `out/native-kexts/` at the same time, and none while someone builds in the same checkout.
 - Working directory for every item: the repository root of the main checkout (`UniXNU-piano/`). Start the shell with
@@ -19,7 +19,7 @@ builds or checks a 27.0.1 image.
   variables exported to the scripts; `python3` must be 3.11 or newer for `tomllib`: check `python3 --version`; the kext
   compiles must not see an `SDKROOT`) and use `bash` for shell snippets.
 - In the tables, `\|` is Markdown's escape of `|`: type a plain `|` in the shell.
-- **Results:** make one directory per session, `R=private/host-checks/$(date +%Y%m%d-%H%M); mkdir -p "$R"` (`private/` is
+- **Results:** make one directory per session, `R=out/host-checks/$(date +%Y%m%d-%H%M); mkdir -p "$R"` (`out/` is
   git-ignored). Each item writes `"$R"/NN-name.log` (its full output, `2>&1`). At the end write `"$R"/SUMMARY.md` with one line
   per item: number, name, PASS / FAIL / KNOWN (a listed known failure) / SKIPPED (with the reason), and for a FAIL the last
   20 lines of its log. Report only the summary; do not try to fix anything.
@@ -95,7 +95,7 @@ write the output to `"$R"/5N-*.log`.
 | # | Command | Pass |
 |---|---|---|
 | 6.1 | Broken relative links in README and docs: the snippet below | last line `broken 0`; otherwise the list (no fixing) |
-| 6.2 | Privacy audit of the tracked tree without publishing: `P=$(sed -n "s/^P='\(.*\)'$/\1/p" private/publish.sh); git grep -I -l -E "$P" HEAD -- . > "$R"/62-privacy.log; wc -l < "$R"/62-privacy.log` | `0` (no tracked file matches the private-inventory pattern). Do not print the pattern itself into any shared place |
+| 6.2 | Privacy audit of the tracked tree without publishing: with the maintainer's audit pattern in `P`, run `git grep -I -l -E "$P" HEAD -- . > "$R"/62-privacy.log; wc -l < "$R"/62-privacy.log` | `0` (no tracked file matches the pattern). Do not print the pattern itself into any shared place |
 | 6.3 | Working tree clean: `git status --short > "$R"/63-status.log; wc -l < "$R"/63-status.log` | `0` before and after the session (the checks above must not change tracked files) |
 | 6.4 | README states the current system: `grep -n -E "macOS 27\.3 \(26C5035r\)" README.md > "$R"/64-readme.log` | at least one line |
 | 6.5 | The native kext list and its descriptors agree: `python3 tooling/k27/check-native-kexts.py . tooling/k27/kext/*.json > "$R"/65-kext-list.log 2>&1` | exit 0. It needs section 2's objects in `out/native-kexts/`: run it after section 2 passed; if section 2 failed, record SKIPPED |

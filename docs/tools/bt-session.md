@@ -150,7 +150,7 @@ On November 20, LE Connection Complete succeeded and bluetoothd read the peer ve
 The November 26 installed results confirmed controller startup and the LE event-mask change. The change makes Data Length Change
 and PHY Update Complete visible to bluetoothd when the controller emits them. The first keyboard attempt should test that change
 on the daily configuration. [Driver notes §8.5](../drivers/bluetooth.md#85-le-link-ready-2026-11-21-host-tested-tablet-result-pending)
-· [November 26 results](../results-2026-11-26.md#v131y12m-installed)
+· [November 26 results](../results-2026-11-26.md#also-on-the-daily-line)
 
 The November 22 trace gives a second lead. About 90% of LE reports were at or below −101 dBm, stronger reports clustered near Wi-Fi
 scans, and 121 Classic inquiry completions yielded zero results. The shared 2.4 GHz front end is a hypothesis. A matched retry
