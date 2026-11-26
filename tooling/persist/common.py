@@ -328,6 +328,130 @@ def check_store_size(seed, args=()):
                          'data-persist=0, or PIANO_DATA_STORE_RELAYOUT=1 for a deliberate re-layout (docs/data-store.md section 8)')
 
 
+# The M5 durability scratch store (docs/tools/durability.md, "Store and boot preflight"): a disposable bound Data window in the unused
+# tail of linux_rootfs, for RAM qualification images only. check_store_size above keeps refusing any bound window on linux_rootfs;
+# build-ram-images.py takes this path instead only with PIANO_SCRATCH_PLAN (a plan confirmed against a fresh maintenance map).
+SCRATCH_KC_STRINGS = (b'data-store-lba', b'data-store-part', b'data-store-replace', b'piano-durability', b'data-store-write-back',
+                      b'data-store-queue', b'data-store-concurrent')
+
+
+def scratch_window(plan):
+    """(first LBA, blocks) of the only window a scratch plan allows; SystemExit otherwise. The same rules as
+    tooling/native/piano-durability/run_durability.py scratch_window: extents [first, count] in 4 KiB blocks, the window
+    W = 1 + ceil(P / 32768) + P at partition end - 256 * reserve_mib - W, inside the approved interval, which starts after the root
+    image and its 1024-block guard; clear of every protected extent."""
+    def extent(name, value):
+        if not (isinstance(value, list) and len(value) == 2 and all(type(x) is int for x in value) and
+                0 < value[0] < value[0] + value[1] <= 0xFFFFFFFF):
+            raise SystemExit(f'scratch plan: invalid {name} extent {value}')
+        return value[0], value[0] + value[1]
+
+    if not isinstance(plan, dict):
+        raise SystemExit('scratch plan: not an object')
+    part_first, part_end = extent('linux_rootfs', plan.get('linux_rootfs'))
+    approved_first, approved_end = extent('approved', plan.get('approved'))
+    root, pages, reserve = (plan.get(k) for k in ('root_blocks', 'seed_pages', 'reserve_mib'))
+    if not (all(type(x) is int and x > 0 for x in (root, pages, reserve)) and 288 <= reserve <= 16384):
+        raise SystemExit('scratch plan: invalid root_blocks, seed_pages or reserve_mib')
+    protected = plan.get('protected')
+    if not isinstance(protected, list) or not protected:
+        raise SystemExit('scratch plan: no protected extents (the owner store must be one)')
+    size = store_blocks(pages)
+    end = part_end - reserve * 256
+    start = end - size
+    if not part_first + root + 1024 <= approved_first <= start < end <= approved_end <= part_end:
+        raise SystemExit(f'scratch plan: the window {start}+{size} does not fit the approved interval {plan["approved"]} after the '
+                         f'root ({root} blocks + 1024) inside linux_rootfs {plan["linux_rootfs"]}')
+    for value in protected:
+        lo, hi = extent('protected', value)
+        if not (end <= lo or hi <= start):
+            raise SystemExit(f'scratch plan: the window {start}+{size} overlaps the protected extent {value}')
+    return start, size
+
+
+def installed_store(out=None):
+    """The installed ESP's Data store (its build record's "store": partition, first_lba, blocks), from OUT/installed.json and the
+    record beside it; None when unknown."""
+    base = Path(out or os.environ.get('PIANO_PERSIST_OUT', DEVICE / 'out/persistent'))
+    try:
+        name = json.loads((base / 'installed.json').read_text())['image']
+        return json.loads((base / (Path(name).stem + '.json')).read_text()).get('store')
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def check_scratch_plan(path, seed, args, kc, out=None):
+    """The record of a RAM image's scratch store, or SystemExit. PATH: the plan JSON (status CONFIRMED by the M5 confirm-map step
+    against a fresh maintenance map); SEED: seed_info of the image's seed; ARGS: the image's kernel arguments; KC: its collection.
+    Refused unless: the window is scratch_window's; the seed is the plan's pinned seed (page count and identity) and not the
+    installed store's; the arguments bind exactly that window (native-ufs-root=1, root and store on linux_rootfs, data-store-lba,
+    log-reserve = reserve_mib, log off, data-persist=2, data-store-concurrent=1|2, piano-durability=1, a piano-reset-after deadline
+    to the bootloader) with no data-store-replace / -flatten / sheng-data-reset; the installed store is known and lies inside one
+    protected extent; the collection knows the binding and the M5 switches."""
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+        plan = json.loads(raw)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f'PIANO_SCRATCH_PLAN={path}: {e}')
+    if not isinstance(plan, dict):
+        raise SystemExit('scratch plan: not an object')
+    if plan.get('status') != 'CONFIRMED':
+        raise SystemExit(f'PIANO_SCRATCH_PLAN={path.name}: status {plan.get("status")!r}, not CONFIRMED (confirm-map.py on a fresh '
+                         'maintenance map first)')
+    start, size = scratch_window(plan)
+    if plan.get('window') not in (None, [start, size]):
+        raise SystemExit(f'scratch plan: its recorded window {plan.get("window")} is not the computed {start}+{size}')
+    want = (plan.get('seed') or {}).get('identity_sha256')
+    if seed['pages'] != plan['seed_pages'] or seed['identity_sha256'] != want:
+        raise SystemExit(f'scratch plan: the image\'s seed ({seed["pages"]} pages, {seed["identity_sha256"][:16]}) is not the plan\'s '
+                         f'({plan["seed_pages"]} pages, {str(want)[:16]})')
+    installed, _ = installed_seed(out)
+    if installed and seed['identity_sha256'].startswith(installed.lower()[:64]):
+        raise SystemExit('scratch plan: the seed is the installed store\'s seed: a scratch store needs its own seed')
+    need = {'data-persist': '2', 'native-ufs-root': '1', 'native-ufs-root-part': 'linux_rootfs', 'data-store-part': 'linux_rootfs',
+            'data-store-lba': str(start), 'log-reserve': str(plan['reserve_mib']),
+            'piano-durability': '1', 'piano-reset-to': 'bootloader'}
+    checked = need.keys() | {'log', 'data-store-concurrent', 'piano-reset-after', 'data-store-write-back', 'data-store-queue'}
+    forbidden = {'data-store-replace', 'data-store-flatten', 'sheng-data-reset'}
+    named = {}
+    for arg in args:
+        key, sep, value = arg.partition('=')
+        if key in forbidden:
+            raise SystemExit(f'scratch plan: {key} is refused on a scratch store')
+        if key in checked:
+            if key in named or not sep:
+                raise SystemExit(f'scratch plan: {key} must have a single explicit value')
+            named[key] = value
+    wrong = {k: named.get(k) for k, v in need.items() if named.get(k) != v}
+    if wrong:
+        raise SystemExit(f'scratch plan: the arguments must bind the window: {", ".join(f"{k}={need[k]} (has {v})" for k, v in wrong.items())}')
+    # 1 starts concurrent before Data mounts; 2 (the daily line's) arms the switch and starts serial: the qualification turns
+    # machdep.piano_data_concurrent on at run time before it measures (the durability tool refuses anything but mode=concurrent)
+    if named.get('data-store-concurrent') not in ('1', '2'):
+        raise SystemExit(f'scratch plan: data-store-concurrent=1 or =2 (has {named.get("data-store-concurrent")})')
+    if named.get('log', '0') != '0':
+        raise SystemExit('scratch plan: log must stay off (log=0): the log writes inside the reserve')
+    if not re.fullmatch(r'[1-9][0-9]{0,4}', named.get('piano-reset-after', '')):
+        raise SystemExit('scratch plan: piano-reset-after=N (the direct PSCI reset deadline) is required')
+    owner = installed_store(out)
+    if (not isinstance(owner, dict) or owner.get('partition') != 'linux_data' or
+            any(type(owner.get(k)) is not int or owner[k] <= 0 for k in ('first_lba', 'blocks'))):
+        raise SystemExit('scratch plan: the installed store is unknown (PIANO_PERSIST_OUT with installed.json and its ESP record)')
+    lo, hi = owner['first_lba'], owner['first_lba'] + owner['blocks']
+    if not any(p[0] <= lo and hi <= p[0] + p[1] for p in plan['protected']):
+        raise SystemExit(f'scratch plan: the installed store {lo}+{owner["blocks"]} is not inside a protected extent')
+    if not (start + size <= lo or hi <= start):
+        raise SystemExit('scratch plan: the window overlaps the installed store')
+    blob = Path(kc).read_bytes()
+    missing = [s.decode() for s in SCRATCH_KC_STRINGS if s not in blob]
+    if missing:
+        raise SystemExit(f'{kc}: the collection lacks {", ".join(missing)} (the scratch binding and the M5 switches)')
+    return {'plan': str(path), 'plan_sha256': hashlib.sha256(raw).hexdigest(), 'partition': 'linux_rootfs', 'window': [start, size],
+            'reserve_mib': plan['reserve_mib'], 'seed_identity': seed['identity_sha256'], 'seed_pages': seed['pages'],
+            'owner_store': [lo, owner['blocks']], 'protected': plan['protected'], 'confirmed_by': plan.get('confirmed_by')}
+
+
 def store_header(raw):
     """Block 0 of a Data store window (PersistOverlay.h; at least its first 128 bytes): the version 1 header and the UniXNU-piano
     extension. state: 'blank' (no SHNGDATA), 'damaged' (version, size or CRC), 'valid'. A self-contained store (data-store-flatten)

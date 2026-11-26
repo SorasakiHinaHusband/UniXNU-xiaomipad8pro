@@ -281,7 +281,22 @@ def data_store_args(seed, kc, extra=()):
     if (replace or flatten) and not guard:
         raise SystemExit(f'{kc}: no store guard in this kernel collection (NativeRamBlock before docs/data-store.md): it knows neither '
                          'data-store-replace nor data-store-flatten')
-    if mode == '2':
+    # PIANO_SCRATCH_PLAN (M5 durability, docs/tools/durability.md): a confirmed scratch plan replaces the size gate for a bound
+    # store on linux_rootfs's unused tail; RAM images only, never with replace/flatten, never the installed seed (check_scratch_plan).
+    plan = os.environ.get('PIANO_SCRATCH_PLAN', '').strip()
+    scratch = None
+    if plan:
+        if mode != '2':
+            raise SystemExit('PIANO_SCRATCH_PLAN: the scratch store needs data-persist=2')
+        if replace or flatten:
+            raise SystemExit('PIANO_SCRATCH_PLAN: no PIANO_DATA_STORE_REPLACE / PIANO_DATA_STORE_FLATTEN on a scratch store')
+        if os.environ.get('PIANO_BOOT_ARGS_SPLIT', '0') != '1':
+            raise SystemExit('PIANO_SCRATCH_PLAN: PIANO_BOOT_ARGS_SPLIT=1 (the RAM selector piano-boot-args=ram on the image)')
+        binding = list(extra)
+        if not any(x.split('=', 1)[0] == 'data-persist' for x in binding):
+            binding.append(f'data-persist={mode}')
+        scratch = common.check_scratch_plan(plan, info, binding, kc)
+    elif mode == '2':
         common.check_store_size(info, extra)
     if mode == '2' and not same and not guard and not replace:
         raise SystemExit(f'data-persist=2 with seed {this} and a kernel collection WITHOUT the store guard: its NativeRamBlock would '
@@ -302,6 +317,11 @@ def data_store_args(seed, kc, extra=()):
                 'Data is volatile. PIANO_DATA_PERSIST=2 opens the store (the guard keeps another seed\'s store: the RAM test of the guard)')
     else:
         note = f'data-persist={mode} (asked for): seed {this}'
+    if scratch:
+        note = (f'data-persist=2 on the M5 SCRATCH store: seed {this}, window LBA {scratch["window"][0]}+{scratch["window"][1]} on '
+                f'linux_rootfs (plan {Path(scratch["plan"]).name} {scratch["plan_sha256"][:16]}, confirmed by '
+                f'{(scratch.get("confirmed_by") or {}).get("map_set")}); the owner store {scratch["owner_store"]} is protected and '
+                'never opened by this image')
     if replace:
         note += (f'\nPIANO_DATA_STORE_REPLACE={replace}: data-store-replace: a store of another seed is STARTED OVER for seed {this}: '
                  'the owner\'s Data changes of that store are dropped')
@@ -314,7 +334,8 @@ def data_store_args(seed, kc, extra=()):
     if flatten:
         args.append('data-store-flatten=1')
     return args, {'data_persist': int(mode), 'seed_identity': identity, 'installed_seed': installed, 'installed_seed_from': source,
-                  'same_seed': same, 'kc_has_store_guard': guard, 'replace': replace or None, 'flatten': flatten}
+                  'same_seed': same, 'kc_has_store_guard': guard, 'replace': replace or None, 'flatten': flatten,
+                  'scratch': scratch}
 
 
 def sha(path):
@@ -416,14 +437,17 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
     if any(x.split('=', 1)[0] == ba.PROP for x in exact + extra):
         raise SystemExit(f'PIANO_EXACT_ARGS / PIANO_EXTRA_ARGS: no {ba.PROP}= (give the whole arguments: an entry record\'s merged line; '
                          'this tool makes the selector and the ADT set)')
+    scratch_plan = os.environ.get('PIANO_SCRATCH_PLAN', '').strip()
+    if scratch_plan and not exact:
+        raise SystemExit('PIANO_SCRATCH_PLAN needs PIANO_EXACT_ARGS (the merged profile with the plan\'s binding; docs/tools/durability.md)')
     if exact:
         mode = dict(x.split('=', 1) for x in exact if '=' in x).get('data-persist', '0')
         if os.environ.get('PIANO_DATA_PERSIST', mode) != mode:
             raise SystemExit(f'PIANO_EXACT_ARGS says data-persist={mode}, PIANO_DATA_PERSIST={os.environ["PIANO_DATA_PERSIST"]}')
         os.environ['PIANO_DATA_PERSIST'] = mode
-        persist, store_record = data_store_args(seed, kc, exact + extra)
         names = {x.split('=', 1)[0] for x in extra}
         base = [x for x in exact if x != 'sheng-smp=1' and x.split('=', 1)[0] not in names] + extra
+        persist, store_record = data_store_args(seed, kc, base if scratch_plan else exact + extra)
     else:
         persist, store_record = data_store_args(seed, kc, extra)
         base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
@@ -443,6 +467,12 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
         merged, status = ba.merged(smp, adt_file.read_bytes())
         if status != 'appended':
             raise SystemExit(f'piano-boot-args: the payload ADT does not give the kernel its set ({status})')
+        if scratch_plan:
+            pc = persist_common()
+            effective = pc.check_scratch_plan(scratch_plan, pc.seed_info(payloads / 'scratch-data.img'), merged.split(),
+                                              payloads / 'kernel.macho')
+            if effective != store_record['scratch']:
+                raise SystemExit('PIANO_SCRATCH_PLAN: the effective payload differs from the checked scratch plan')
         boot_args = {'set': BOOT_ARGS_SET, 'property': ba.prop_name(BOOT_ARGS_SET), 'tail': ' '.join(tail),
                      'tail_bytes': len(' '.join(tail)), 'boot_args_8cpu': merged, 'boot_args_bytes_8cpu': len(merged),
                      'adt_sha256': sha(adt_file)}
@@ -450,7 +480,10 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
               f'{len(one)}/{len(smp)} bytes, boot-args {len(merged)} bytes (8 CPUs)', file=sys.stderr)
     resumes = store_record['data_persist'] == 2
     seed_reader_source = seed if not resumes or not store_record['same_seed'] else None
-    ba.check_userland({'macos-1cpu': one, 'macos-8cpu': smp}, adt_file.read_bytes(), kc, seed=seed_reader_source, live=resumes)
+    # a scratch store (PIANO_SCRATCH_PLAN) holds only its own seed's userland: no installed layer is ever applied to it, so the
+    # seed's record alone tells which boot-argument readers run (the owner store's live layer is not on this boot)
+    live = resumes and not store_record.get('scratch')
+    ba.check_userland({'macos-1cpu': one, 'macos-8cpu': smp}, adt_file.read_bytes(), kc, seed=seed_reader_source, live=live)
     entry = ('[[entry]]\nid = "{id}"\ntitle = "{title}"\ntype = "xnu"\npath = "Payloads/kernel.macho"\n'
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     (stage / 'EFI/UniXNU/unixnu.toml').write_text(
