@@ -82,9 +82,11 @@ jobs:
       - name: k27 tree, xnu source, ld-classic
         run: bash tooling/ci/k27-kernel.sh tree xnu ld
       - name: KDK headers
+        env:
+          KDK_AUTH: ${{ secrets.PIANO_KDK_AUTH }}
         run: |
           [ -n "$KDK_URL" ] || { echo "::error::vars.PIANO_KDK_URL is not set: the kernel needs a Kernel Debug Kit's headers (docs/ci.md, owner decision)"; exit 1; }
-          curl -fL --retry 3 -o "$RUNNER_TEMP/kdk.dmg" "$KDK_URL"
+          curl -fL --retry 3 ${KDK_AUTH:+-H "$KDK_AUTH"} -o "$RUNNER_TEMP/kdk.dmg" "$KDK_URL"
           KDK_DMG="$RUNNER_TEMP/kdk.dmg" bash tooling/ci/k27-kernel.sh kdk
           rm -f "$RUNNER_TEMP/kdk.dmg"
       - name: Fakeroot (Apple OSS, libfirehose_kernel from source)
