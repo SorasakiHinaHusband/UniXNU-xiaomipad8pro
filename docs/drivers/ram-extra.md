@@ -1,12 +1,21 @@
 # RAM16G R1 region1 GPU memory
 
+## Status as of 2026-11-27
+
+**The region1 GPU tier remains in qualification.** Installed v13.1y12q uses the 13 GiB XNU window (13310 MiB, measured on
+installed v13.1y12l on November 26). The EFI audit classified 319/322 two-MiB slabs as non-runtime and released 0 MiB pending
+owner verification. The November 26 RAM pass for the 684 MiB mixed 4K Main10 HEVC arena used region0 and XNU pages. It covers
+video backing. GPU tier and other driver pool qualification remain open. [Support status](../STATUS.md) · [November 26 memory results](../results-2026-11-26.md#efi-memory-battery-and-video)
+
+## R1 design and admission checks (2026-11-26)
+
 R1 gives eligible Adreno 830 buffer objects (BOs) access to reserved RAM below
 XNU's single contiguous RAM window. The captured memory layout has three
 candidate ranges totalling 870 MiB after rounding inward to 2 MiB boundaries.
 DarwinBoot's live UEFI map determines the reservations. Only GPU-qualified runs
 become allocatable.
 
-## Reference path
+### Reference path
 
 Ubuntu v1.4.0 pins Linux `83f0f89bed14` in `kernel/source.json`. The Linux and
 sheng paths below establish the GPU allocation and mapping model. The 27.3
@@ -22,7 +31,7 @@ or Turnip. The Android capture has no stock allocator source for this path.
 | CPU view | Linux `msm_gem.c:357–361,1192–1194` sets write combining for WC objects. sheng's Adreno740 `NativeAdrenoPublish.cpp:532` creates a Physical64 descriptor with `withAddressRanges`. | Same write-combined CPU access and Physical64 ranges. Tier views use the factory's designated initializer in a descriptor that enforces WC because IOKit accepts caller-supplied cache bits. |
 | Admission | Linux GEM obtains already-managed pages. | Different ownership. DarwinBoot reserves the runs before ExitBootServices. PianoA830 validates the handoff and probes both endpoint pages with the GPU before exposing a run. |
 
-## GPU tier controls
+### GPU tier controls
 
 The combined analysis gate and RAM-boot reads are in [RAM16G extra RAM](../extra-ram.md).
 PianoA830 validates the shared 24-byte records against its physical window and uses bank 1/use 1 only.

@@ -1,19 +1,33 @@
 # USB-C DisplayPort Alt Mode (B8): design
 
+## Status as of 2026-11-27
+
+**External DisplayPort remains design-only (B8).** The tracked `PianoDp` level 1 is a read-only survey and port-event decoder.
+D6 is a RAM-backed second display for testing the macOS display path. Tablet qualification of DisplayPort is open, as are
+PHY table extraction with provenance, AUX and link training, and external scanout and hot-plug. B8 depends on B1's DPU path
+and B7's Type-C host work. [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
+
+**Built-in panel.** Installed v13.1y12q uses PianoDpu flips at 60 Hz, with native screenshots and neutral colours. Night Shift
+routing, native panel sleep and refresh switching are off in the daily profile. Fixed 120/144 Hz scanout is RAM-only. The November 27
+DPU clock and RPMh readback and the unlocked Night Shift sweep also passed on RAM. M5R woke with matching compression-route registers
+and a dark panel, so the panel-sleep fix-image gate remains HOLD. [Support status](../STATUS.md) · [November 26 display results](../results-2026-11-26.md#evening) · [November 27 RAM qualification](../results-2026-11-27.md#ram-qualification) · [Night Shift RAM results](../results-2026-11-27.md#unlocked-night-shift-ns-base)
+
+## Original DisplayPort design and bring-up plan (2026-11-11 to 2026-11-12)
+
 Status, 2026-11-11: **design, and the first slices built offline** (host-tested and linked, not run): `package/PianoDp` level 1
 (D1 the read-only survey, D2 the DSP's port notifications through PianoPower's new read-only fan-out) and D6 (a fake second display
 in NativeGopDisplay, no hardware), all inert without `piano-dp=N` (§8.1); the batched tablet test list is §8.2. No DP register is
 written. Backlog item B8 (`../BACKLOG-hardware.md`); it builds on B1 (the DPU, `dpu.md`) and B7 (the Type-C port, `usb-host.md`).
 Template: `README.md`.
 
-## 1. Purpose and gate
+### 1. Purpose and gate
 
 Ubuntu v0.6.0 drives an external display over the USB-C port: both plug orientations, hot-plug, a 4K 60 Hz extended desktop;
 v1.1.0 recovers USB after a DisplayPort-only unplug. Natively nothing drives DP: the boot stages never light it, so every register is
 programmed from scratch. Gate: daily use with a monitor or a dock. Not on any login milestone, after B1b (zero-copy flips and the
 display SMMU window) and B7's Type-C half (the DSP's port notifications decoded).
 
-## 2. Hardware facts
+### 2. Hardware facts
 
 Sources: the piano boot DT ("DT"); the Ubuntu piano kernel piano/dev 7f8d6bed (GPL, facts only): `drm/msm/dp/*`, the DPU 12.0
 catalog `dpu_12_0_sm8750.h`, `phy-qcom-qmp-combo.c`, `dispcc-sm8750.c`, `pmic_glink_altmode.c`, `fsa4480.c`, `dwc3-qcom.c` ("msm",
@@ -37,7 +51,7 @@ catalog `dpu_12_0_sm8750.h`, `phy-qcom-qmp-combo.c`, `dispcc-sm8750.c`, `pmic_gl
 | SMMU | all MDSS fetch uses stream 0x800 (`iommus = <0x800 0x2>`): an external display's pipes use **the same bank as the panel**, i.e. B1b's windows | DT, `dpu.md` §4.2 | verified |
 | Bandwidth | MDSS interconnects `mdp0-mem` (MDP → EBI1) and `cpu-cfg`; no `mdp1-mem` on piano; 4K60 ARGB fetch ≈ 2.0 GB/s on top of the panel's 3.28 | DT | verified (DT); the vote path natively: open |
 
-## 3. Ubuntu as the specification
+### 3. Ubuntu as the specification
 
 - **Bring-up** (`dp_display.c` plug, `dp_ctrl.c`, `dp_aux.c`, `dp_panel.c`, `dp_link.c`): plug → runtime PM on → AUX on → PHY init (DP
   mode, orientation) → DPCD receiver caps (0x000–0x00f, LTTPR) → EDID over I2C-over-AUX (address 0x50, 128-byte blocks) → link
@@ -53,7 +67,7 @@ catalog `dpu_12_0_sm8750.h`, `phy-qcom-qmp-combo.c`, `dispcc-sm8750.c`, `pmic_gl
 - **Open in Ubuntu**: DP (and the hub) after resume: the DP link clock fails to enable (device.md issue #21). Natively: unplug the
   stream before s2idle and re-train on wake; never carry DP across a sleep at first.
 
-## 4. Design
+### 4. Design
 
 **4.1 Owners.** A new kext **PianoDp** owns the DP controller, the DP half of the QMP PHY and the DIO4485's DP states. **PianoDpu**
 owns every DPU register (dpu.md §4.1) and grows an "external path" API. **PianoPower** owns the DSP and hands PianoDp each port
@@ -105,7 +119,7 @@ external one dark until plugged).
 **4.6 Power.** DP lit ≈ the QMP PHY + DP controller + a second DPU path + its DDR traffic: *inferred* 0.4–0.8 W at 4K60; nothing when
 unplugged (PHY powered down, DISPCC DP clocks off, CTL1 idle). Unplug before s2idle (§3 open issue).
 
-## 5. Dependencies
+### 5. Dependencies
 
 - **B1b** (hard): the SMMU bank of stream 0x800 reprogrammed in place with IOVA windows, the flip path and vblank IRQ; B1a's
   allocation of CTL/LM/PP/MERGE_3D on the panel.
@@ -114,7 +128,7 @@ unplugged (PHY powered down, DISPCC DP clocks off, CTL1 idle). Unplug before s2i
 - I2C to the DIO4485 (QUP1 SE3 pins gpio44/45: bit-banged as PianoBacklight's `BitI2c.h`, or a GENI I2C helper).
 - An RPMh/ICC path for the MMCX corner and the DDR bandwidth vote (shared need with B10 video, B11 camera).
 
-## 6. Boot args
+### 6. Boot args
 
 Built (2026-11-11), all off without `piano-dp`:
 
@@ -135,7 +149,7 @@ Built (2026-11-11), all off without `piano-dp`:
 Planned for the later levels: `piano-dp=2` AUX (DPCD + EDID), 3 train, 4 test pattern, 5 mirror, 6 extended; `piano-dp-rate=1620|2700|5400`
 (cap below HBR2), `piano-dp-lanes=1|2|4`, `piano-dp-mode=WxH@Hz` (override EDID).
 
-## 7. Kernel collection
+### 7. Kernel collection
 
 Built: `package/PianoDp` (`PianoDp.cpp`; portable `DpHw.h`, `DpSurvey.h`, `DpPort.h`, `DpFake.h`; `tests/dp_host.cpp`),
 `tooling/k27/build-native-piano-dp.sh` (host tests, a store check of the portable headers and of the kext source, the objects, the
@@ -149,7 +163,7 @@ Later levels add host tests for the AUX transaction encoder, an EDID parser (bas
 state machine against a DPCD model, MSA/TU arithmetic and mode fitting from EDID against the link budget (the standard-mode budget is
 there already).
 
-## 8. Ladder and effort (RAM boots, owner present with a monitor and a USB-C/DP cable or dock)
+### 8. Ladder and effort (RAM boots, owner present with a monitor and a USB-C/DP cable or dock)
 
 | Step | What | Pass | Effort |
 |---|---|---|---|
@@ -168,7 +182,7 @@ there already).
 extended desktop is the real unknown (D6 settles it early and cheaply). Total ≈ **9–13 weeks** of work after B1b and B7 H2, about
 half of it attended. A mirror (D0–D5) is ≈ 5–7 weeks and needs no macOS change.
 
-### 8.1 The first slices as built (2026-11-11, offline: host-tested and linked, not run)
+#### 8.1 The first slices as built (2026-11-11, offline: host-tested and linked, not run)
 
 **D1, the survey** (`piano-dp=1`; `package/PianoDp/DpSurvey.h`, every access a load, no store in the file or in the kext). Order and
 gates: PianoDpu's display gate (GCC display AHB → DISPCC; MDSS GDSC, AHB, MDP); DISPCC's DP branches and RCGs (only DISPCC's own
@@ -257,7 +271,7 @@ desktop picture or a window; the panel's thumbnails of the same run for comparis
 while the panel's swaps go on; **broken** = WindowServer restarts (a second `display on` of the panel, `first swap submitted` again) or
 a panic. `PianoDp: D6 fake display (...)` repeats the configuration in PianoDp's log.
 
-### 8.2 The batched tablet test list
+#### 8.2 The batched tablet test list
 
 Unattended boots first, then one attended session. RAM boots only, each from `fastboot boot` with `piano-reset-after` as the backstop
 (Ubuntu and ABL return on the next boot), the USB console capturing (`tooling/native/usb-console.py --capture SECS`) and the pstore
@@ -280,7 +294,7 @@ D1 and the D6 boots are independent: D6 needs neither D1 nor any DP code, and ru
 the port there is no USB console: boot 6 is read from the dump image (the pstore mailbox), and the tablet runs from its battery except
 on the dock (`piano-power-write=0`: the DSP keeps its own input limit, as image G2 showed about 400 mA drawn, so a dock barely charges).
 
-## 9. Fallback
+### 9. Fallback
 
 Without `piano-dp` nothing is touched; the port stays USB (PianoDwc3 / PianoUsbHost). Any failure parks the external path (CTL1 off,
 PHY down, DIO4485 back to USB) and leaves the panel untouched; the panel path never depends on DP. As built: PianoDp declines in
@@ -288,7 +302,7 @@ probe() without `piano-dp` (no thread, no mapping, no client registration); Pian
 notification without a client; NativeGopDisplay's second personality refuses silently without D6's arguments, the nub reports one
 display port and the panel's lines are what they were; a D6 display that cannot start puts the nub back to one port.
 
-## 10. Open questions
+### 10. Open questions
 
 1. Does WindowServer accept a hot-plugged second paravirt-type IOMFB as an extended display? → D6 (§8.2 boots 2–5: hot-plugged,
    fixed from boot, the other `primary`, cycles).
@@ -304,7 +318,7 @@ display port and the panel's lines are what they were; a D6 display that cannot 
    piano's D+/D- pass through the DIO4485 at all? → the USB-only words come first at level 2, and D8's "USB keyboard still works".
 9. What does WindowServer take `primary` to mean on a second paravirt-type display (an index, or a flag)? → D6 boots 2 and 4.
 
-## 11. Licence note
+### 11. Licence note
 
 The msm DP/DPU drivers, the QMP combo PHY, DISPCC, pmic_glink_altmode, fsa4480 and dwc3-qcom (GPL-2.0) are the specification only
 (offsets, fields, sequences). The QMP DP serdes/TX tables (about 20 register/value pairs per rate, plus the 4×4 swing and
