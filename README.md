@@ -18,7 +18,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 ## State (2026-11-26)
 
 Native macOS **27.3 (26C5035r)** boots on the tablet from power-on as well as from a RAM image. The current daily
-install is **v13.1y12p** (2026-11-26), with display and power fixes behind switches that default to off. The machine
+install is **v13.1y12q** (2026-11-26; install check 75 PASS / 0 FAIL), with Data concurrent mode and USB debug network TX flow control on by default; display fixes stay behind switches that default to off. The machine
 identifies as Mac17,11, shown as "Xiaomi Pad 8 Pro" with a
 "Snapdragon 8 Elite" chip. Root is on `linux_rootfs`; the owner's Data store is on `linux_data`. High Power is the daily
 Energy Mode. The Android-aligned CPU/GPU frequency curve and PD buck charging (9 V) are on by default; the charge pump
@@ -33,12 +33,12 @@ smooth scrolling and video, with its GPU sandbox on) and, since v13.1y12m, Chrom
 47-bit user address space). Also on the daily line since v13.1y12m: the cover and power-key sleep policy (closing the cover on
 the charger locks without sleeping; the power key sleeps and wakes), native screenshots from the display driver, and the
 Bluetooth LE event-mask fix. The installed system uses a 13 GiB memory window. Not yet: Bluetooth pairing (needs a hands-on
-test), fast disk writes, charge-pump fast charging, 120 Hz in daily use, USB host devices and external displays. In progress:
+test), disk write-back caching, charge-pump fast charging, 120 Hz in daily use, USB host devices and external displays. In progress:
 native panel sleep, Night Shift and refresh switching (built, off by default, in qualification), Bluetooth keyboards and mice,
 closing the cover on battery (attended check), disk speed, auto-rotate, and the install guide for other units.
 
 Kernel patch 0076 lets the USB debug shell and other updated helpers read the full boot line, including arguments past
-the legacy 1024-byte cut. The next daily build will enable Data concurrent mode and USB debug network TX flow control.
+the legacy 1024-byte cut. Pending tablet checks: the Night Shift colour fix (the blue tint on qualification boots) and the native panel sleep DSI fix, both in v13.1y12s.
 CI now runs the Adreno830 GPU host suite with pinned public kits. [Afternoon results](docs/results-2026-11-26.md#afternoon-storage-power-cut-tests-120-hz-ci)
 
 ### Hardware support
@@ -50,8 +50,8 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12p, 2026-11-26 | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | v13.1y12p, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on. Native panel sleep, Night Shift and refresh switching are off by default. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-26 (install check 75/0) | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | v13.1y12q, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on; colours on the installed desktop are correct (webcam check after the install). Native panel sleep, Night Shift and refresh switching are off by default. Night Shift routing turned the desktop blue on qualification boots: the colour-matrix (PCC) coefficients were written with the cross terms transposed and negative values in sign-magnitude form, which the hardware reads as two's complement. The fix (v13.1y12s) passes the host tests; the tablet check is pending. The native panel sleep fix (DSI controller state after wake) is also pending its tablet check. |
 | 120 Hz | 🟡 Partial | v13.1y12p and v13.1y12q test profiles, 2026-11-26 | macOS offers 120 Hz on the fixed-120 profile and both panel links scan at 120.0 Hz. The profile is off by default. Apps reach roughly 58–60 fps. Swaps take about 13 ms against an 8.33 ms period due to GPU-fence wait and vblank acceptance. A fix is under analysis. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
 | Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
@@ -83,7 +83,7 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 | Energy modes | 🟡 Partial | v13.1y12l, 2026-11-26 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified by hand. |
 | Login window idle CPU | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
 | App launches | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
-| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12o (installed) and flow-control test, 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue dropped frames during large single transfers. The flow-control fix passed 66/66 exact transfers and goes into the next daily build. |
+| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12q (installed), 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue used to drop frames during large single transfers; TX flow control (66/66 exact transfers in its test) is on by default since v13.1y12q. |
 | OS switcher (Android / macOS) | 🟡 RAM only, read-only | RAM v13.1y12e, 2026-11-24 | The boot-flag sysctls read the flag; writes are refused by design. A full switch has not been run. |
 | USB host / OTG | ❌ Not yet | RAM usb-a2d, 2026-11-18 (empty port) | Host mode starts on an empty port; VBUS supply and a real device are not done. |
 | External display (USB-C DP) | ❌ Not yet | none | Design only. |
@@ -91,7 +91,7 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
 | Memory (16 GB) | 🟡 Partial | v13.1y12l, 2026-11-26 | The installed system uses a 13 GiB window (13310 MiB; was 8 GiB). At idle: 47 % free, no compression, no swap, no memory pressure. In progress: the GPU memory tier and the driver pools. |
-| Internal storage (UFS) | 🟡 Partial | v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode goes into the next daily build. Write-back and queue modes stay off. |
+| Internal storage (UFS) | 🟡 Partial | v13.1y12q (installed: concurrent mode live); v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode is on in the installed v13.1y12q (switched on after the Data mount). Write-back and queue modes stay off. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 Details (status definitions, known gaps, showcase): [docs/STATUS.md](docs/STATUS.md).

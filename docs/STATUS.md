@@ -9,7 +9,7 @@ One row per feature. Every status comes from a run on the tablet; host tests, an
 - **Partial**: works, with the gaps named in the note.
 - **Not yet**: not working, or never run on the tablet.
 
-The installed daily build is **v13.1y12p** (2026-11-26), with display and power fixes behind switches that default to off.
+The installed daily build is **v13.1y12q** (2026-11-26; install check 75/0), with Data concurrent mode and USB debug network TX flow control on by default; display fixes stay behind switches that default to off.
 "Verified" names the build and date of the newest run that showed the result. Daily results are in
 [results-2026-11-26.md](results-2026-11-26.md) and the earlier `results-*.md` pages.
 
@@ -17,8 +17,8 @@ The installed daily build is **v13.1y12p** (2026-11-26), with display and power 
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12p, 2026-11-26 | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | v13.1y12p, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on. Native panel sleep, Night Shift and refresh switching are off by default. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-26 (install check 75/0) | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | v13.1y12q, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on; colours on the installed desktop are correct (webcam check after the install). Native panel sleep, Night Shift and refresh switching are off by default. Night Shift routing turned the desktop blue on qualification boots: the colour-matrix (PCC) coefficients were written with the cross terms transposed and negative values in sign-magnitude form, which the hardware reads as two's complement. The fix (v13.1y12s) passes the host tests; the tablet check is pending. The native panel sleep fix (DSI controller state after wake) is also pending its tablet check. |
 | 120 Hz | 🟡 Partial | v13.1y12p and v13.1y12q test profiles, 2026-11-26 | macOS offers 120 Hz on the fixed-120 profile and both panel links scan at 120.0 Hz. The profile is off by default. Apps reach roughly 58–60 fps. Swaps take about 13 ms against an 8.33 ms period due to GPU-fence wait and vblank acceptance. A fix is under analysis. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
 | Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
@@ -50,7 +50,7 @@ The installed daily build is **v13.1y12p** (2026-11-26), with display and power 
 | Energy modes | 🟡 Partial | v13.1y12l, 2026-11-26 | Low Power, Automatic and High Power (the daily setting) set with `pmset` reach the power and thermal policy. The picker in System Settings is not verified by hand. |
 | Login window idle CPU | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Fixed: an audio daemon looped at the login window (about 1.3 cores); it is now held until the login. |
 | App launches | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Calculator, TextEdit and Notes open their first window in under 2.5 s. |
-| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12o (installed) and flow-control test, 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue dropped frames during large single transfers. The flow-control fix passed 66/66 exact transfers and goes into the next daily build. |
+| USB debug (console, root shell, ssh) | ✅ Works (installed) | v13.1y12q (installed), 2026-11-26 | USB-C debug console, root shell and SSH over the cable work. Patch 0076 lets the shell read boot arguments past the legacy 1024-byte cut. A full TX queue used to drop frames during large single transfers; TX flow control (66/66 exact transfers in its test) is on by default since v13.1y12q. |
 | OS switcher (Android / macOS) | 🟡 RAM only, read-only | RAM v13.1y12e, 2026-11-24 | The boot-flag sysctls read the flag; writes are refused by design. A full switch has not been run. |
 | USB host / OTG | ❌ Not yet | RAM usb-a2d, 2026-11-18 (empty port) | Host mode starts on an empty port; VBUS supply and a real device are not done. |
 | External display (USB-C DP) | ❌ Not yet | none | Design only. |
@@ -58,7 +58,7 @@ The installed daily build is **v13.1y12p** (2026-11-26), with display and power 
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
 | Memory (16 GB) | 🟡 Partial | v13.1y12l, 2026-11-26 | The installed system uses a 13 GiB window (13310 MiB; was 8 GiB). At idle: 47 % free, no compression, no swap, no memory pressure. In progress: the GPU memory tier and the driver pools. |
-| Internal storage (UFS) | 🟡 Partial | v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode goes into the next daily build. Write-back and queue modes stay off. |
+| Internal storage (UFS) | 🟡 Partial | v13.1y12q (installed: concurrent mode live); v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode is on in the installed v13.1y12q (switched on after the Data mount). Write-back and queue modes stay off. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 ## Known gaps
@@ -70,9 +70,8 @@ The installed daily build is **v13.1y12p** (2026-11-26), with display and power 
 - Charge pump / MiPPS fast charging; PPS 9 V.
 - The fixed 120 Hz profile drives the panel at 120 Hz, with app cadence still around 58–60 fps. Native panel sleep, Night Shift
   and refresh switching are built, off by default and in qualification. The GPU memory tier and driver pools are in progress.
-- Large single transfers over USB debug networking can drop on the installed build. The tested TX flow-control fix goes into
-  the next daily build.
-- Data concurrency goes into the next daily build. At QD8, 4 KiB random writes ran at 0.9× the serial rate in testing.
+- Data concurrent mode is live on the installed build; at QD8, 4 KiB random writes ran at 0.9× the serial rate in testing. Write-back and queue modes stay off.
+- Night Shift colour fix (blue tint on qualification boots) and native panel sleep DSI fix: built (v13.1y12s), tablet check pending.
 - USB host devices, external display, auto-rotate (in analysis), hardware video encode, VP9/AV1 in Safari.
 - The install guide for other units (in progress).
 - Hand checks pending on the installed system: microphone recording in an app, QuickTime recording by hand, FaceTime self-view,
