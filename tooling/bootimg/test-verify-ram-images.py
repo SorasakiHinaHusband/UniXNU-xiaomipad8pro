@@ -131,6 +131,13 @@ class VerifyRamImages(unittest.TestCase):
         del self.info['trust_sha256']
         self.check_result(1, 'missing or invalid trust_sha256')
 
+    def test_verifies_every_xnu_entry_with_inline_toml_comments(self):
+        self.macos('data-persist=0', guard=True)
+        self.info['data_store'] = {'data_persist': 0}
+        menu = 'EFI/UniXNU/unixnu.toml'
+        self.files[menu] += b'[[entry]]\ntype = "xnu" # additional boot option\nargs = "data-persist=2"\n'
+        self.check_result(1, 'FAIL  boot data-persist=2 matches the build record')
+
     def test_effective_store_guard_and_warm_seed(self):
         self.macos('piano-boot-args=ram', tail='data-persist=2')
         self.info['data_store'] = {'data_persist': 2, 'same_seed': True, 'kc_has_store_guard': True}

@@ -210,9 +210,13 @@ def check_store(settings, store, warm, has_guard):
 
 
 def check_entries(config, macos, adt, ramdisk, info, kc_name):
-    # The builder emits one single-line, double-quoted args assignment per XNU entry.
-    entries = re.split(r'^\s*\[\[entry\]\]\s*$', config, flags=re.M)[1:]
-    xnu = [entry for entry in entries if re.search(r'^\s*type\s*=\s*"xnu"\s*$', entry, re.M)]
+    spec = importlib.util.spec_from_file_location('persist_common', ROOT / 'tooling/persist/common.py')
+    common = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(common)
+    entries = common.toml_loads(config).get('entry', [])
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError('expected boot menu entry tables')
+    xnu = [entry for entry in entries if entry.get('type') == 'xnu']
     check(bool(xnu) == macos, 'XNU boot entries match the presence of a macOS payload')
     if not xnu or adt is None:
         return
@@ -224,10 +228,10 @@ def check_entries(config, macos, adt, ramdisk, info, kc_name):
     warm = info['seed_sha256'] in registry
     has_guard = None
     for entry in xnu:
-        args = re.findall(r'^\s*args\s*=\s*"([^"\r\n]*)"\s*$', entry, re.M)
-        if len(args) != 1:
-            raise ValueError('expected one args line in each XNU boot entry')
-        merged, status = ba.merged(args[0], adt)
+        args = entry.get('args')
+        if not isinstance(args, str) or not args.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in args):
+            raise ValueError('expected printable ASCII args in each XNU boot entry')
+        merged, status = ba.merged(args, adt)
         print(f'    boot-args ({status}): {merged}')
         check(status in ('appended', 'none', 'off'), 'ADT boot arguments resolve')
         settings = store_arguments(merged)
