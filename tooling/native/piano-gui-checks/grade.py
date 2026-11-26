@@ -23,7 +23,7 @@ def parse_panel(text):
     ranges = re.findall(r'"BrightnessMilliNits"=\{([^{}]*)\}', text)
     if len(codes) != 3 or len(lit) != 3 or len(ranges) != 1:
         raise ValueError("incomplete PianoBacklight readback")
-    nits = dict(re.findall(r'"(min|max|value)"=([0-9]+)', ranges[0]))
+    nits = parse_fields(ranges[0], r'"(min|max|value)"=([0-9]+)')
     code = int(codes["code"])
     if len(nits) != 3 or not 0 < code <= 2047:
         raise ValueError("invalid PianoBacklight readback")

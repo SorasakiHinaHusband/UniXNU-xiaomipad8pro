@@ -177,7 +177,7 @@ def wifi_toggle():
         off = remote("wifi-off", artifact="wifi-off-action")
         off_hits = wait_wifi("wifi-off-timeline", off, wifi_off, 15)
         off_state = off_hits[-1][1] if off_hits else {}
-        off_ok = bool(off_hits) and off_hits[-1][0] <= off["t"] + 15 and wifi_off(off_state)
+        off_ok = bool(off_hits) and off["t"] <= off_hits[-1][0] <= off["t"] + 15 and wifi_off(off_state)
         verdict("PASS" if off_ok else "FAIL", "Wi-Fi menu toggle powered off and dropped the link within 15 s")
         off_frame_at = time.monotonic()
         shot("wifi-off")
@@ -340,13 +340,18 @@ def brightness_check(method):
         verdict("PASS" if observed else "FAIL", f"brightness-{method} visible C920 luminance change and return")
         return baseline_ok and all(ok for ok, _ in results) and observed
     finally:
-        if not restored:
-            # Attempt a restore through the same path even when a step failed.
-            remote("display-open")
-            action(original, f"brightness-{method}-cleanup")
-            if not brightness_at(original, *read_brightness(f"brightness-{method}-cleanup")):
-                verdict("FAIL", f"brightness-{method} original level recovery")
-        key_escape()
+        try:
+            if not restored:
+                # If the action moved the slider, restore it through the same path.
+                level = remote("display-open")["slider"]
+                if abs(level - original) > .01:
+                    action(original, f"brightness-{method}-cleanup")
+                if not brightness_at(original, *read_brightness(f"brightness-{method}-cleanup")):
+                    verdict("FAIL", f"brightness-{method} original level recovery")
+        except (CheckError, KeyError, subprocess.SubprocessError):
+            verdict("FAIL", f"brightness-{method} original level recovery could not be confirmed")
+        finally:
+            key_escape()
 
 
 def prepare_ax():

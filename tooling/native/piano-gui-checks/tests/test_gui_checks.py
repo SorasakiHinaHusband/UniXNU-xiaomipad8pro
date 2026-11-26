@@ -104,6 +104,29 @@ class WorkflowReceipts(unittest.TestCase):
                                    (250, 40, True), "P 0 0 0"])
         self.assertTrue(all(item.args == ("display-read",) for item in probe.call_args_list))
 
+    def test_hid_port_releases_on_interrupted_drag(self):
+        source = Mock()
+        source.InputError = RuntimeError
+        port = source.Port.return_value
+        with (patch.object(run, "load_input", return_value=source),
+              patch.object(run, "drag_on_port", side_effect=RuntimeError("HID refused"))):
+            with self.assertRaisesRegex(run.CheckError, "HID refused"):
+                run.drag(.70, "fixture")
+        port.send.assert_called_once_with("R")
+        port.close.assert_called_once()
+
+    def test_spec_attempts_both_brightness_paths_after_wifi_failure(self):
+        result = subprocess.run(["/bin/bash", "-c", """
+            note() { :; }
+            verdict() { :; }
+            fexpect() { return 0; }
+            python3() { printf '%s\\n' "$2"; test "$2" != wifi; }
+            source "$1"
+            steps
+            """, "fixture", FIXTURES.parent / "gui-checks.spec"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.splitlines(), ["ax-trust", "wifi", "brightness-ax", "brightness-hid"])
+
 
 @unittest.skipUnless(platform.system() == "Darwin" and platform.machine() == "arm64", "arm64 macOS SDK required")
 class NativeParser(unittest.TestCase):
