@@ -12,10 +12,12 @@
   [November 27 duplex baseline](../results-2026-11-27.md#audio-duplex-baseline) · [Duplex analysis](audio-duplex.md)
 - **Microphone.** The daily line exposes the raw **Mic** as the default input and a CPU RNNoise **Mic (noise reduced)**
   device. Both devices were verified on installed v13.1y12l on November 26. The noise-reduction recording test ran on RAM
-  `mic-ns4b` on November 23. The November 27 unattended AVFoundation check on RAM `v131y12t-qual1` captured the real
-  **1002.06 Hz** tone but hard-clipped with a −18 dBFS stimulus. The analyzer was corrected and the stimulus lowered to
-  −36 dBFS. A clean RAM recheck and hands-on QuickTime recording and playback are pending.
-  [November 27 RAM results](../results-2026-11-27.md#ram-qualification) · [Mic check](../tools/mic-check.md)
+  `mic-ns4b` on November 23. **RAM qualification on `y12t-obs1` (2026-11-27)** passed the unattended AVFoundation
+  app check with the calibrated −36 dBFS stimulus. It captured **1002.09 Hz** with zero clipped samples and 22.21 dB
+  SNR and SINAD, resolving the clipping at −18 dBFS on `v131y12t-qual1`. The C920 acoustic playback check passed at
+  18.09 dB SNR and 39.48 dB above the quiet control. Hands-on QuickTime and Voice Memos recording and playback on
+  the installed system remain open.
+  [November 27 mic RAM results](../results-2026-11-27.md#calibrated-microphone-and-c920-playback) · [Mic check](../tools/mic-check.md)
 
 [November 26 installed checks](../results-2026-11-26.md#install) · [Support status](../STATUS.md) · [Hardware backlog](../BACKLOG-hardware.md)
 

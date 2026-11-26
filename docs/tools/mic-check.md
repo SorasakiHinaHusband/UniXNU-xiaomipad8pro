@@ -4,6 +4,14 @@
 
 The VPIO probe's `avrec` mode uses the same recorder and its `--tcc` reports the same AVFoundation authorization value. `piano-hal-rec` captures through the HAL's AudioQueue, `piano-mic-diag` reads the PianoAudio input before the HAL, and `audio-listen.py` captures the tablet's speaker output with the Mac's C920 microphone. [VPIO probe](../../tooling/native/piano-vpio-probe/piano-vpio-probe.m) · [Piano mic diagnostics](../../tooling/native/piano-mic-diag.md)
 
+## RAM qualification on y12t-obs1 (2026-11-27)
+
+The unattended **AVFoundation app recording** passed with the calibrated −36 dBFS stimulus, `piano-mic-unattended=1` and TCC pre-seeded for the signed app. The quiet and tone captures used the default **Mic** and **Speaker** at 48 kHz mono. The quiet control passed with zero clipped samples. The 4.000 s `tone.m4a` measured −12.90 dBFS RMS and −4.55 dBFS peak in the `second=1` window. The tone fit was 1002.09 Hz with 22.21 dB SNR and SINAD. Zero samples clipped, resolving the clipping from the earlier −18 dBFS run on `v131y12t-qual1`.
+
+The **C920 acoustic playback check** also passed. In `replay.grade.txt`, the tone was −9.50 dBFS at 1 kHz with 18.09 dB SNR. It was 39.48 dB above the clean quiet control (−48.98 dBFS at 1 kHz).
+
+Hands-on QuickTime and Voice Memos recording and playback on the installed system and the active installed duplex ledger remain open. [November 27 mic RAM results](../results-2026-11-27.md#calibrated-microphone-and-c920-playback)
+
 ## Ubuntu mainline comparison
 
 References are from the local `XiaomiPad8Pro-Ubuntu` clones at `xiaomipad-8pro-mainline` commit `b43fc2b` and `linux-sm8750-piano` commit `b5100d5f2e0b`.
@@ -42,7 +50,7 @@ The preflight checks the staged app with `--tcc` in the console user's LaunchSer
 
 The block stages the signed bundle in a private, fresh directory using `rssh` and verifies the archive hash and app signature on the tablet. It uses `rsudo` to get the current UID from `/dev/console`, enters its bootstrap session with `/bin/launchctl asuser`, and drops to that UID with `sudo -n -u "#$u"`, as in the frametime check. It opens the bundle through LaunchServices so TCC can identify the GUI app, and reads the app's result line from its redirected standard output. [Frametime console launch](frametime.md#build-and-run)
 
-The block records four seconds of room noise, then four seconds with the stimulus. The bundled WAV has a half-second of silence, a one-second burst at −36 dBFS peak with 20 ms ramps, and another half-second of silence. A qualification capture with the previous −18 dBFS stimulus clipped at both PCM rails. Its unclipped zero crossings suggest a peak near +8 dBFS before saturation. At the same speaker volume and mic gain, the 18 dB reduction projects a peak near −10 dBFS, with tone RMS about 31 dB above the measured −44 dBFS quiet floor. The new level's capture headroom and C920 audibility still need a live run.
+The block records four seconds of room noise, then four seconds with the stimulus. The bundled WAV has a half-second of silence, a one-second burst at −36 dBFS peak with 20 ms ramps, and another half-second of silence. [Measured capture headroom and C920 replay levels](#ram-qualification-on-y12t-obs1-2026-11-27)
 
 After both saved recordings pass the tablet and host checks, the block opens `quiet.m4a` and `tone.m4a` in separate AVAudioPlayer launches. Each launch waits for a first-sample receipt from a fresh 18-second C920 take. Each replay must finish on the tablet's **Speaker** while the C920 is still recording.
 
