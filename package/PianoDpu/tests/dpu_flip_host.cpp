@@ -1142,7 +1142,7 @@ static void testConditionalClean()
   CHECK(show(c) == kPianoDpuFlipShown && r.f.st.cleanInits == 6);
   r.hw.failCleanBytes = allocation;   // the required initial clean fails; the scanout-only fallback works
   CHECK(show(d) == kPianoDpuFlipShown && r.f.st.cleanReasons[unsigned(CleanReason::initialClean)] == 1);
-  CHECK(r.f.st.cleanFailures == 1 && r.f.st.cleanInits == 6);
+  CHECK(r.f.st.cleanFailures == 1 && r.f.st.cleanInits == 6 && r.f.st.cleanFull == 5);
   r.hw.failCleanBytes = UINT64_MAX;
   CHECK(show(e) == kPianoDpuFlipClean && r.f.st.cleanFailures == 3 && !r.f.st.uncleaned);
   CHECK(r.f.slots.slot[r.f.slots.shown].key == &d && r.f.st.cleanSkips == 14);
@@ -1162,7 +1162,10 @@ static void testConditionalClean()
   // The failed replacement invalidated e's old epoch. Initialize it again before testing a failed skip.
   CHECK(show(e) == kPianoDpuFlipShown && r.f.st.cleanInits == 11);
   r.dpu.latchNever = true;
-  CHECK(show(a) == kPianoDpuFlipLatch && r.f.st.cleanSkips == 14);
+  // A successful acquisition clean preceding a failed latch is a pass, but never a shown initialization.
+  c.cacheMode = kSurfaceWriteCombined;
+  CHECK(show(c) == kPianoDpuFlipLatch && r.f.st.cleanInits == 11 && r.f.st.cleanSkips == 14 && r.f.st.cleanFull == 5);
+  CHECK(r.f.st.flips + r.f.st.reshows == r.f.st.cleanInits + r.f.st.cleanSkips + r.f.st.cleanFull);
 }
 
 static void testVariants()
@@ -1281,12 +1284,13 @@ static void testSafety()
   {   // the watch: an underrun the handler cleared (sticky bits)
     Rig r;
     CHECK(r.ready());
+    r.f.cfg.cleanSkip = true;
     FakeSurface a(0x8d0000000ull, 2136ull * 12800);
     PianoDpuFlipRequest q = req(&a);
     CHECK(r.f.request(q) == kPianoDpuFlipShown);
     r.hw.sticky |= 1u << 28;
     r.f.watch();
-    CHECK(r.f.state == State::failed && r.hw.said("underrun"));
+    CHECK(r.f.state == State::failed && r.hw.said("underrun") && r.f.st.cleanUnderruns == 1);
   }
 }
 

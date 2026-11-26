@@ -721,12 +721,17 @@ bool flipFunction(const OSSymbol *name, void *request, void *handoff, IOReturn *
   return true;
 }
 
-bool flipStatsSnapshot(flip::Stats &stats)
+bool flipStatsSnapshot(flip::Stats &stats, flip::CleanQualification &clean)
 {
   IOLock *lock = __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
   if (!lock) return false;
   IOLockLock(lock);
   stats = gFlipper.st;
+  if (gFlipper.cfg.cleanSkip) {
+    clean.policy = !gFlipper.cfg.forceFullClean;
+    clean.serving = gFlipper.state == flip::State::ready;
+    clean.pendingUnderruns = flipPendingUnderruns(false);
+  }
   IOLockUnlock(lock);
   return true;
 }
@@ -745,6 +750,7 @@ int cleanSkipSysctl(struct sysctl_oid *oid, void *, int, struct sysctl_req *req)
   if (value != 0 && value != 1) return EINVAL;
   IOLockLock(lock);
   gFlipper.cfg.forceFullClean = !value;
+  ++gFlipper.st.cleanPolicyWrites;
   // Restart epoch qualification even for a slot that is idle during the control.
   flipInvalidateCleanEpochs();
   IOLockUnlock(lock);

@@ -216,7 +216,15 @@ void refresh()
   Out out;
   snapshot::format(s, ++gSerial, at, out);
   flip::Stats stats;
-  if (flipStatsSnapshot(stats)) stats.formatClean([&](auto... args) { out.line(args...); });
+  flip::CleanQualification clean;
+  if (flipStatsSnapshot(stats, clean)) {
+    stats.formatClean([&](auto... args) { out.line(args...); });
+    if (clean.policy >= 0)
+      out.line("clean: m2 policy %d writes %llu latched %llu full %llu to-boot %llu underruns %llu pending %08x serving %u",
+               clean.policy, (unsigned long long)stats.cleanPolicyWrites, (unsigned long long)stats.flips,
+               (unsigned long long)stats.cleanFull, (unsigned long long)stats.toBoot, (unsigned long long)stats.cleanUnderruns,
+               clean.pendingUnderruns, unsigned(clean.serving));
+  }
   if (gClockRead) {
     clkread::format(clocks, out);
     if (!gSnapshotOn) formatVotes(out);
