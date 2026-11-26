@@ -35,6 +35,8 @@ with zero driver drops. [Installed boot](../results-2026-11-27.md#installed-boot
 > `piano-usb-handoff=1`). Tablet list with expected lines: §8.3.
 > Test images and expected lines: §8. Template: `README.md`.
 
+See the [USB host2 integration and Phase U qualification gates](usb-host2-qualification.md).
+
 ### 1. Purpose and gate
 
 Ubuntu made the single USB-C port a dual-role port (v0.5.0, v0.6.0, v1.1.0): USB sticks, keyboards, mice and powered docks with
@@ -356,10 +358,10 @@ What "we source VBUS" looks like, the witnesses to read on the tablet (all read 
 | PianoPower `[Ns] mca: bus … mV` | about 5000 mV (our own boost) with the bus current our load | the source's | 0x20002 |
 | the device | a stick's LED, a keyboard's LEDs at power-up | — | eyes |
 
-A gap to know: PianoPower's built-in policy sees a bus above 4 V and counts it as a source attached; with our own 5 V on the bus it
-would write its input limit and charge current for "a source" of unknown type (500 mA in, the 5 V row). Harmless for the boost as far
-as the source says (the firmware's reverse mode does not take input), but it is a policy decision for PianoPower's owner (charging.md):
-ignore the bus while 0x200d reads boosting, or while UCSI says we are the provider.
+PianoPower's built-in policy counts a bus above 4 V as an attached source. On host levels 3–6, `piano-power-policy=1` with
+`piano-power-own-bus=1` treats positively identified sourced VBUS as a detach. The guard preserves active charge stops and excludes
+sourced VBUS from AC reporting. It uses fresh UCSI provider status or, when that status is unavailable, the PMIC's Rd reading.
+An observed Rp takes precedence so a powered hub still supplies external power.
 
 #### 6.5 Debugging while the port is a host
 
@@ -495,7 +497,18 @@ our probe or Apple's xHCI first (the switch is default off; do not combine it wi
 | `piano-usbhost-handoff=0/5/6` | 0 | levels 3/4: **the role switch**: 0 the decision published only ("would switch"); 5 host sessions with our probe; 6 with Apple's xHCI on the nub (`PIANO_USBHOST_STACK=1`). With `piano-usb>=2` it also needs PianoDwc3's `piano-usb-handoff=1`, else refused at start |
 | `piano-usbhost-debounce=MS` | 1000 | levels 3/4: how long the decision must read host before the switch (at most 10000); device is at once |
 | `piano-usbhost-uor=0/1/2` | 0 | level 4, a test switch: SET_UOR once per generation at the first connected status: 1 ask for DFP (we host), 2 for UFP |
+| `piano-usbhost-sinkhost=0/1` | 0 | levels 3/4 with `-handoff=6`, the real path (U1: the first real-device session; no `piano-usbhost-test-loan`): 0 host only for a UFP partner while we source VBUS (OTG adapter, bus-powered device); 1 also while the partner powers the bus (a hub or dock with PD pass-through after its data-role swap). `PortRole.h hostGate`; logged `usb-host2: ... [PianoUsbHost2V1]` (the gate, and the power direction on `loan BEGIN`). The loan stays bounded by `piano-usbhost-back`; the unplug, a role change, a stale snapshot or the deadline returns the core to device mode. With `piano-power-own-bus=1` PianoPower takes our own VBUS as no source (Q17) |
 | `piano-usb-handoff=0/1` (PianoDwc3) | 0 | PianoDwc3 answers PianoUsbHost's release/reclaim (UsbHandoff.h) and registers its service for it; 0: the controller is PianoDwc3's for the whole boot |
+
+`PIANO_KEXT_PROFILE=usbhost-a2` (`tooling/k27/build-native-image.sh`) selects `PIANO_USBHOST_A2=1` on the full native list
+(including PianoTouch, PianoCamera and PianoDp), so the KC
+carries PianoXhciHost, PianoUsbHostStackA2 and through it Apple's hub, composite, HID, mass-storage and USB-Ethernet class drivers,
+gated (`check-usbhost-stack.py`). The daily list stays without them. Two gaps of the earlier A2 collection are closed in
+`PianoUsbHostStackA2.json` (2026-11-21): `IOSCSIBlockCommandsDevice` (IOSCSIPeripheralDeviceType00: without it a stick ends at its
+IOSCSIPeripheralDeviceNub, no IOMedia), and a kernel HID path (Apple's IOUSBHostHIDDevice matches only boot keyboards, deferred
+until the IOKit daemon is up; stock macOS serves other HID interfaces with driver extensions, untested here): IOUSBHostHIDDevice on
+HID interfaces and IOHIDFamily's IOHIDEventDriver for USB keyboards, mice and consumer controls. The three fallback personalities
+require a `PianoUsbHostNub` ancestor, leaving the gadget's USB-transport HID devices outside their match.
 
 Levels 5 and 6 refuse (and run the level 1 survey) while PianoDwc3 owns the controller (`piano-usb>=2`). The one exception is level
 5's **hand-off by time**: `piano-usbhost-back=S` and `piano-usb-delay >= piano-usbhost-delay + S + 30`: the host session ends, the core
@@ -861,7 +874,7 @@ controller for its own device mode). Later, the role manager (H8) returns the co
     only" or "none"?), and does its orientation agree with gpio61 in both plug orientations? → U0/A1 `port: notification` lines.
 16. Does PianoDwc3's takeover run cleanly a second time after a host session (event buffer, FIFOs, the UTMI selection kept), and
     does the Mac's CDC-ACM driver enumerate it again? → A2.
-17. PianoPower's built-in policy counts our own 5 V as a source attached while we source (§6.4): its owner's decision.
+17. Does the opt-in PianoPower guard exclude sourced VBUS while preserving charge holds (§6.4)? → Phase U4 and U5.
 
 ### 11. Licence note
 

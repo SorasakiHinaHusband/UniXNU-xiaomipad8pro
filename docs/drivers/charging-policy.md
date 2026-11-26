@@ -292,6 +292,11 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
    answer is awaited, §15.3); `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`
    (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-b4pd=1` (attended first step: fixed-PDO/PPS/QC3 requests);
    `piano-power-kick=0|1` (1, the default: the charging restart, §17);
+   `piano-power-own-bus=0|1` (0, the default; [VBUS witnesses](usb-host.md#64-vbus-h3)): with `piano-usbhost=3` through `6`, 1
+   excludes the DSP's sourced VBUS from external power. A fresh UCSI provider status or, without one, a PMIC Rd reading supplies
+   the evidence. An observed Rp takes precedence. The policy retires the previous attach and revokes unsent writes. It can reduce
+   limits while preserving charge stops. The battery publisher excludes sourced VBUS from the AC state. The transition logs
+   `PianoOwnBusGuardV1`.
    `piano-power-write=0` decides for the log only (nothing is sent). Not offered yet:
    `piano-power-fv`, the stage B ceilings, `sleep_charge`, the `setProperties()` switch. `piano-power-unsuspend` stays the built-in
    policy's.

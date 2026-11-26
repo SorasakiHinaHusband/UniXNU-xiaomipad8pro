@@ -115,7 +115,7 @@ struct Args {
   uint32_t level, period, gauge, write, hv, b4pd, unsuspend, ps, psFloor, psInject, board, ucsi, pdoMca;
   bool psGuard;
   uint32_t policy, rp, health, healthStop, healthResume;
-  uint32_t ramp, rpMax, writeMs, kick;
+  uint32_t ramp, rpMax, writeMs, kick, ownBus;
   uint32_t wdog, chgen, chgfix, chgwatch;
   uint32_t hvOrder, hvCaps, qc, fvHot;   // charge/pd1 (charging-policy.md §21), each 0 by default
   uint32_t cp;                           // piano-power-cp=1: the SC8541 driver probes and may be armed (ChargePump.h)
@@ -205,6 +205,11 @@ void readArgs()
   // with the policy: the charging restart (ChargePolicy cfg.kick, charging-policy.md §17): 0x2003 = 0 then 1 when the packs stay at
   // 0 mA with input to spare; piano-power-kick=0 leaves it out
   gArgs.kick = bootArg("piano-power-kick", 1);
+  // with the policy (usb-host.md section 6.4, Q17; default 0): our own VBUS (the DSP's boost for a USB device on the port: UCSI says we
+  // are the provider, or the PMIC sees a sink's Rd and no Rp) is no source for ChargePolicy (decided as nothing attached) nor for the
+  // battery's power source (no "on power" from the bus voltage alone). Require a USB host level that can manage the port.
+  const uint32_t usbHostLevel = bootArg("piano-usbhost", 0);
+  gArgs.ownBus = usbHostLevel >= 3 && usbHostLevel <= 6 && bootArg("piano-power-own-bus", 0) == 1;
   // the charger PMIC's BARK/BITE watchdog (ChargerWdog.h, charging-policy.md §18): 0 read and log only, 1 pet it, 2 (default) pet it
   // and clear "a bite disables charging" (MISC +0x53 bit 7), as Linux's host driver for the SCHG family does
   gArgs.wdog = bootArg("piano-power-wdog", 2);
@@ -538,6 +543,7 @@ class PianoPower : public IOService {
   // piano-power-policy=1 (ChargeLink.h): ChargePolicy decides the charger writes. All of it runs on the thread; setPowerState and
   // systemWillShutdown only raise the asks below and wait for (or are acknowledged by) the thread.
   bool fPolicyOn = false, fPolicyEnded = false;
+  bool fOwnBusLogged = false;   // the last decision's plan.own_bus as logged (piano-power-own-bus)
   ChargeLink fLink;
   uint64_t fPackMs = 0;                       // when the packs were last read (the decisions take them for 3 periods)
   uint32_t fPsPublishCycles = 0;              // publisher cycles, including deterministic ps-inject A/B cycles
@@ -649,6 +655,8 @@ bool PianoPower::start(IOService *provider)
          "(order: mode 1 the fixed 9 V PDO else an APDO, mode 2 the APDO else the PDO; caps: 9 V rows PD 1600/3000, PPS 2500/3500, "
          "QC3 1600/3500, QC2 1200/2600 mA, FCC <= 2 x ICL; qc: 0x2011 9 V for type 5-8 with a non-PD UCSI status; fv-hot: 4060 mV "
          "from 48 C, held at that float; all within the strict session's gates)", gArgs.hvOrder, gArgs.hvCaps, gArgs.qc, gArgs.fvHot);
+    if (gArgs.ownBus)
+      note("piano-power-own-bus=1: sourced VBUS is excluded from charging policy and AC reporting [PianoOwnBusGuardV1]");
   }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
@@ -872,6 +880,11 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("MiPPSVersion", gMipps.version); n("MiPPSCleared", gMipps.cleared);
   for (unsigned i = 0; i < 7; ++i) {char key[20]; snprintf(key, sizeof key, "SourcePDO%u", i + 1); n(key, c.source_pdo[i]);}
   n("RpMA", x.rp_ma); n("TypeCSource", x.typec_source);
+  if (fLink.cfg.own_bus) {
+    n("OwnBusInput", (x.valid & PIANO_CHG_IN_OWN_BUS) ? 1u : 0u);
+    n("OwnBusGuard", fLink.cfg.own_bus);
+    n("OwnBus", p.own_bus);
+  }
   n("InputValid", x.valid); n("Safety", x.safety); n("SafetyValid", fSafetyValid);
   n("CPControl", fCpCtrl);
   if (const pianopower::Sc8541 *cp = gCpHook) {
@@ -1915,7 +1928,11 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
   clock_usec_t usec = 0;
   clock_get_calendar_microtime(&sec, &usec);
   const uint32_t nowSec = sec > 1600000000 ? uint32_t(sec) : 0;   // before 2020: the calendar is not up yet
-  BatteryValues v = mapBattery(fPack, 2, published, port, gArgs.psFloor, &real, nowSec, gArgs.psGuard);
+  const bool ownBusNow = fPolicyOn && gArgs.ownBus && ownBus(&fContract, port, nowMs());
+  PortState sourcing;
+  sourcing.ok = true;   // a known port with no external source, even when the PMIC read failed
+  BatteryValues v = mapBattery(fPack, 2, published, ownBusNow ? &sourcing : port,
+                               gArgs.psFloor, &real, nowSec, gArgs.psGuard);
   if (fPolicyOn) {
     const PianoChargeState &s = fLink.st;
     v.healthEnabled = fLink.cfg.limit != 0; v.healthStop = fLink.cfg.stop_pct; v.healthResume = fLink.cfg.resume_pct;
@@ -1926,7 +1943,7 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     const bool ucsiPower = piano_contract_status_fresh(&fContract, now) &&
                            fContract.connected && fContract.sink;
     const bool busPower = piano_mca_has(&fMca, McaBusVoltage) && fMca.value[McaBusVoltage] >= 4000000;
-    if (ucsiPower || busPower) v.external = v.chargeCapable = true;
+    if (!ownBusNow && (ucsiPower || busPower)) v.external = v.chargeCapable = true;
     const bool enableKnown = piano_mca_has(&fMca, McaChargeEnable);
     const bool enable = enableKnown && fMca.value[McaChargeEnable] == 1;
     v.healthApplied = enableKnown && !s.pending && !fMca.queued && enable == (fLink.plan.charge != 0);
@@ -2128,6 +2145,7 @@ void PianoPower::startCharger()
     o.hvCaps = gArgs.hvCaps != 0;
     o.qc = gArgs.qc != 0;
     o.fvHot = gArgs.fvHot != 0;
+    o.ownBus = gArgs.ownBus != 0;
     fLink.configure(fMca, o);
     if (fLink.healthRefused)
       note("policy: piano-power-health-stop=%u / -resume=%u refused (stop 50..100, resume 40..stop - 1): battery health stays off",
@@ -2665,9 +2683,19 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
     note("policy: a source is attached: bus %d mV, type %s%s", in.bus_mv, (in.valid & PIANO_CHG_IN_TYPE) ? piano_mca_type_name(in.type) : "?", rp);
   }
   if (e & PIANO_CHG_EV_TYPE) note("policy: the source's type is now %s (%d)", piano_mca_type_name(in.type), in.type);
-  if (e & PIANO_CHG_EV_DETACH)
+  if ((e & PIANO_CHG_EV_DETACH) && !fLink.plan.own_bus)
     note("policy: the source is gone: the firmware's own input limit (100 mA) and charge current (500 mA) back where written, a "
          "stop of ours lifted");
+  // piano-power-own-bus=1: the decisions that took the bus as our own boost's, once per change
+  if (o.decided && (fLink.plan.own_bus != 0) != fOwnBusLogged) {
+    fOwnBusLogged = fLink.plan.own_bus != 0;
+    if (fOwnBusLogged)
+      note("policy: the bus is our own (%s; bus %d mV): no source for the policy, decided as nothing attached, nothing raised "
+           "[PianoOwnBusGuardV1]", piano_contract_status_fresh(&fContract, nowMs()) ? "UCSI: we are the provider" : "the PMIC: a sink's Rd, no Rp",
+           (in.valid & PIANO_CHG_IN_BUS) ? in.bus_mv : -1);
+    else
+      note("policy: our own bus is gone: the bus is decided as a source again [PianoOwnBusGuardV1]");
+  }
   if (e & PIANO_CHG_EV_HV_ASKED) note("policy: asking the PD source for 9 V (%s)", fLink.st.hv_pps ? "its PPS APDO" : "its fixed 9 V PDO");
   if (e & PIANO_CHG_EV_HV_ON) note("policy: the bus is at %d mV: 9 V on", in.bus_mv);
   if (e & PIANO_CHG_EV_HV_BLOCKED) note("policy: 9 V not reached, lost or refused: 5 V until the source is detached");

@@ -757,12 +757,12 @@ int sysctlBootflag(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 // Filled at run time (arm64e signs the parent and handler pointers), as PianoPolicy's.
 struct sysctl_oid gOidSdamSurvey, gOidBootflag;
 
-void fillBootflagOid(struct sysctl_oid &o, const char *name, int kind, int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *),
+void fillBootflagOid(struct sysctl_oid &o, const char *name, uint32_t kind, int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *),
                      const char *fmt, const char *descr)
 {
   o.oid_parent = &sysctl__machdep_children;
   o.oid_number = OID_AUTO;
-  o.oid_kind = kind | CTLFLAG_OID2;
+  o.oid_kind = int(kind | CTLFLAG_OID2);
   o.oid_arg1 = nullptr;
   o.oid_arg2 = 0;
   o.oid_name = name;
@@ -833,13 +833,13 @@ void execute(const char *line)
     }
     usbStatus();
   } else if (word(s, "spmi")) {   // PianoSpmi.h: the shared words (every kext's counts) and this kext's own
-    char line[300], owner[5];
+    char spmiLine[300], owner[5];
     piano_spmi_tag_text(__atomic_load_n(&piano_spmi_words.owner, __ATOMIC_ACQUIRE), owner);
     cprintf("SPMI lock: owner now %s, depth %u\n", owner, piano_spmi_words.depth);
-    pianospmi::format(line, sizeof line, PianoSpmiLineAll);
-    cprintf("%s\n", line);
-    pianospmi::format(line, sizeof line, PianoSpmiLineOurs);
-    cprintf("PianoDwc3's: %s\n", line);
+    pianospmi::format(spmiLine, sizeof spmiLine, PianoSpmiLineAll);
+    cprintf("%s\n", spmiLine);
+    pianospmi::format(spmiLine, sizeof spmiLine, PianoSpmiLineOurs);
+    cprintf("PianoDwc3's: %s\n", spmiLine);
   } else if (word(s, "ioreg")) {
     if (!parseNumber(s, &a) || a > 32) a = 32;
     dumpEntry(IORegistryEntry::getRegistryRoot(), 0, unsigned(a));
@@ -1042,7 +1042,7 @@ void shellThread(void *, wait_result_t)
   // filt_specattach: EINVAL, so poll() answers POLLNVAL at once): unmarked, pianousb-shell's poll() loop spun and never read
   // (desk-dev, 2026-11-12). puSelect keeps the contract (a count when ready, selrecord otherwise). The helper uses select() anyway.
   const int kq = cdevsw_setkqueueok(gMajor, &gCdev, 0);
-  gDevNode = devfs_make_node(makedev(gMajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pianousb");
+  gDevNode = devfs_make_node(makedev(uint32_t(gMajor), 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pianousb");
   note("/dev/pianousb %s (major %d): port 1 is the user pipe; select%s", gDevNode ? "created" : "NOT created", gMajor,
        kq == 0 ? ", poll and kqueue" : " only (cdevsw_setkqueueok refused)");
 }

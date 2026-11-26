@@ -1569,12 +1569,13 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     const int rb_raised = (in->valid & PIANO_CHG_IN_ICL) && in->icl_ma > (int32_t)PIANO_CHG_ICL_DEFAULT + ICL_SLACK_MA;
     if (((s->touched & (1u << PIANO_CHG_S_ICL)) || rb_raised) && s->icl_set != PIANO_CHG_ICL_DEFAULT)
         plan_write(c, s, p, now, PIANO_CHG_S_ICL, PIANO_CHG_ICL, PIANO_CHG_ICL_DEFAULT, 4);
-    if ((s->touched & (1u << PIANO_CHG_S_FCC)) && s->fcc_set != PIANO_CHG_FCC_DEFAULT)
+    if ((s->touched & (1u << PIANO_CHG_S_FCC)) && s->fcc_set != PIANO_CHG_FCC_DEFAULT &&
+        (!p->own_bus || s->fcc_set > PIANO_CHG_FCC_DEFAULT))
         plan_write(c, s, p, now, PIANO_CHG_S_FCC, PIANO_CHG_FCC, PIANO_CHG_FCC_DEFAULT, 4);
-    if (s->disabled) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
+    if (s->disabled && !p->own_bus) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
     p->icl_ma = PIANO_CHG_ICL_DEFAULT;
     p->fcc_ma = PIANO_CHG_FCC_DEFAULT;
-    p->charge = 1;
+    p->charge = (uint8_t)(!p->own_bus || (s->charge_ok && !s->disabled));
     wedge_check(in, s, p, now);
 }
 
@@ -1753,6 +1754,20 @@ static void decide_inner(const PianoChargeConfig *c, const PianoChargeInput *in,
     }
     const int charge_ok = protection(c, in, s, p, &t, now);
     if (charge_ok != s->charge_ok) {s->charge_ok = (uint8_t)charge_ok; s->off_since_ms = now; s->stop_noted = 0;}
+    /* Independent Type-C evidence identifies our sourced VBUS even when the codec has no bus reading.
+     * Retire the old attach without releasing its charge inhibit. A real source gets a fresh decision. */
+    if (c->own_bus && (in->valid & PIANO_CHG_IN_OWN_BUS)) {
+        p->own_bus = 1;
+        detached(c, in, s, p, now);
+        s->hold_awake = 0;
+        if (!charge_ok && p->why_off != PIANO_CHG_OFF_FIRMWARE) plan_enable(c, in, s, p, now, 0);
+        if (in->sleep == PIANO_CHG_WILL_SLEEP) {
+            if (!s->sleeping) p->events |= PIANO_CHG_EV_SLEEP;
+            s->sleeping = 1;
+            p->sleep_ready = p->writes == 0 && s->pending == 0 && !s->handover_fault;
+        } else s->sleeping = 0;
+        return;
+    }
     if (in->sleep == PIANO_CHG_WILL_SLEEP) {handover(c, in, s, p, &t, now); return;}
     s->sleeping = 0;
     p->hold_awake = s->hold_awake;

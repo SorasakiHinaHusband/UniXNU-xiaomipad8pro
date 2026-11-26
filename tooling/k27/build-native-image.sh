@@ -4,6 +4,7 @@
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
+mkdir -p out/k27
 LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk 'NF {print $1}')
 # PIANO_BASE_SEED / PIANO_BASE_TRUST: the OS line's Data seed and trust cache the stages start from (default out/inputs/: the 27.0.1
 # line's; the 27.3 line's are made by tooling/k273/, docs/k273-line.md).
@@ -21,6 +22,19 @@ BASE_TRUST=${PIANO_BASE_TRUST:-out/inputs/kernel.macho.trustcache}
 # subclass PianoXhciHost (three overrides of the collection's AppleUSBXHCI; it carries the stack's libraries and the gate, so the
 # codeless bundle loses its personality: PianoUsbHostStackA2). Exactly one automatic client on the nub either way
 # (check-usbhost-stack.py refuses two). The A2 subclass is matched by piano-usbhost=6 piano-usbhost-a2=1.
+# PIANO_KEXT_PROFILE=usbhost-a2 (U1, the first attended real-device USB host session; default: no profile, the list as it is): PIANO_USBHOST_A2=1
+# on the WHOLE list (nothing dropped: PianoTouch, PianoCamera and PianoDp stay), i.e. the list's kexts + PianoUsbHostStackA2 +
+# PianoXhciHost. The stack bundle's libraries bring Apple's hub (AppleUSBHub), composite, HID (IOUSBHostHIDDevice), mass-storage
+# (IOUSBMassStorageDriver + the SCSI/storage families) and USB-Ethernet class drivers, their boot personalities behind the gate resource
+# PianoUsbHostStack, which only PianoUsbHost's handoff 6 publishes: inert without piano-usbhost=4 piano-usbhost-handoff=6.
+case ${PIANO_KEXT_PROFILE:-} in
+  '') ;;
+  usbhost-a2) PIANO_USBHOST_A2=1; PIANO_USBHOST_STACK_DROP=; echo "PIANO_KEXT_PROFILE=usbhost-a2: the A2 USB host stack on the whole list" >&2 ;;
+  *) echo "PIANO_KEXT_PROFILE=$PIANO_KEXT_PROFILE: unknown (usbhost-a2, or unset)" >&2; exit 1 ;;
+esac
+# PIANO_KC_ONLY=1: stop after the collection and its checks (out/k27/kc-k27-native.bin, build-kc.log); no seed staging, no image. For
+# host checks of a kext list (e.g. a profile) without a boot image.
+KC_ONLY=${PIANO_KC_ONLY:-0}
 if [ "${PIANO_USBHOST_A2:-0}" = 1 ]; then
   export PIANO_USBHOST_A2
   PIANO_USBHOST_STACK=1
@@ -60,6 +74,7 @@ done
 if [ "${PIANO_GPU:-0}" != 0 ]; then
   export PIANO_EXTRA_ARGS="piano-gpu=$PIANO_GPU piano-gpu-delay=${PIANO_GPU_DELAY:-20} ${PIANO_EXTRA_ARGS:-}"
 fi
+if [ "$KC_ONLY" != 1 ]; then
 # PIANO_VMM_PRESENT=0|1: the ADT's /defaults vmm-present for this build (else configs/k27-adt.toml's; docs/drivers/soft-metal.md §9).
 # PIANO_SENSOR_PACK=PACK (docs/drivers/sensors.md §5b): the RAM images carry this unit's sensor pack for PianoSensors (DarwinBoot's
 # addon slot, build-ram-images.py); their ADT then has the GpuAddon slot and is made as out/adt/piano-k27-addon.adt, so the ADT an ESP
@@ -144,6 +159,7 @@ if [ "$A830_METAL" = 1 ]; then
   PIANO_SEED=${PIANO_SEED:-out/turnip-a830/stage/scratch-data.img}
   PIANO_TRUST=${PIANO_TRUST:-out/turnip-a830/stage/kernel.macho.trustcache}
 fi
+fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
@@ -172,6 +188,7 @@ fi
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   python3 tooling/k27/check-usbhost-stack.py out/k27/kc-k27-native.bin >&2 || { rm -f out/k27/kc-k27-native.bin; exit 1; }
 fi
+if [ "$KC_ONLY" = 1 ]; then echo "PIANO_KC_ONLY=1: out/k27/kc-k27-native.bin ($(wc -c < out/k27/kc-k27-native.bin | tr -d ' ') bytes), no image" >&2; exit 0; fi
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
 # The Data store (docs/data-store.md): out/ram opens it (data-persist=2) only when its seed is the installed one (PIANO_INSTALLED_SEED in
 # ~/.config/piano/env), else Data is volatile; build-ram-images.py prints which on stderr. PIANO_DATA_PERSIST=0|1|2 overrides it,

@@ -124,6 +124,8 @@ typedef struct {
     uint8_t fv_hot;        /* piano-power-fv-hot: the warm-cell float voltage in the strict session: 4060 mV from 48 degC (the
                             * warmest reading) until below 46, the firmware's 4400 otherwise, and charging held while the higher pack
                             * is within 5 mV of that float (released 150 mV below) */
+    uint8_t own_bus;       /* piano-power-own-bus (usb-host.md §6.4, Q17; default 0): while PIANO_CHG_IN_OWN_BUS says the bus is our
+                            * own boost's (we source VBUS for a USB device), it is no source: decided as nothing attached */
 } PianoChargeConfig;
 
 /* writes on, hv off, float off, limit off (80/75 kept for when it is turned on), sleep stop, the stage A ceilings, no steps, the
@@ -154,6 +156,8 @@ enum {
      * firmware's PD engine at 5 V. Never a contract (no 9 V, no PPS, no pump); at a 5 V bus the vSafe5V row applies, not 100 mA. */
     PIANO_CHG_IN_PD_UNMAPPED = 1u << 19,
     PIANO_CHG_IN_SKIN = 1u << 20,  /* PianoThermal's virtual skin reading */
+    PIANO_CHG_IN_OWN_BUS = 1u << 21,   /* the bus is our own boost's: UCSI's fresh status says we are the provider, or (none fresh) the
+                                        * PMIC's Type-C block sees a sink's Rd; never with a source's Rp (ChargeLink.h ownBus) */
 };
 enum {PIANO_CHG_SAFE_BOARD = 1u, PIANO_CHG_SAFE_CP_OFF = 2u, PIANO_CHG_SAFE_LPD_DRY = 4u,
       PIANO_CHG_SAFE_DTPT = 8u, PIANO_CHG_SAFE_ALL = 15u};
@@ -397,6 +401,7 @@ typedef struct {
     uint32_t kick_events;
     uint8_t kick_stage, kick_count;
     int32_t kick_ibat_ma, kick_spare_ma;
+    uint8_t own_bus;       /* cfg.own_bus and PIANO_CHG_IN_OWN_BUS: this decision took the bus as our own (nothing attached) */
 } PianoChargePlan;
 
 void piano_charge_init(PianoChargeState *s);

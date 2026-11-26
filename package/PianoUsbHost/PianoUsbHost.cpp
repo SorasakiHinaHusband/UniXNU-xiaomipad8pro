@@ -43,6 +43,11 @@
 // -irq=0|1 (polled, SPI 133; default 1; -attach=3 tries the personality and then the allocation, one boot for both),
 // -probe=0|1 (our No-Op probe before Apple's driver, default 1), -a2=0|1 (default 0:
 // Apple's class itself; 1: our PianoXhciHost subclass, which needs a PIANO_USBHOST_A2=1 collection).
+// The real path (levels 3/4 with piano-usbhost-handoff=6, no piano-usbhost-test-loan; U1, the first real-device session): a fresh UCSI snapshot that says a
+// UFP partner (a device, a hub, a dock's data side) lends the controller to Apple's xHCI for at most piano-usbhost-back s; the unplug,
+// a role change, a stale snapshot or the deadline gives it back to PianoDwc3. By default only while we source VBUS (an OTG adapter, a
+// bus-powered device); piano-usbhost-sinkhost=1 also while the partner powers the bus (a PD pass-through hub after its data-role
+// swap). Nothing here sources VBUS: the DSP's firmware does that by itself on a sink's Rd (usb-host.md section 6.4).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -90,6 +95,7 @@ struct Args {
   uint32_t level, delay, xhci, qmp, spmi, watch, period;
   uint32_t back, csr, utmi, reset, smmu, slots, attach, irq, probe, a2;   // levels 5 and 6 (a2: our own subclass, path A2)
   uint32_t handoff, debounce, uor;                                    // levels 3 and 4
+  uint32_t sinkHost;                                                  // the real path: host also while we sink (a PD hub)
 };
 Args gArgs;
 uint64_t gHostDeadline;
@@ -139,6 +145,9 @@ void readArgs()
   if (gArgs.debounce > 10000) gArgs.debounce = 10000;
   gArgs.uor = bootArg("piano-usbhost-uor", 0);           // level 4: SET_UOR once per generation (1 DFP, 2 UFP); a test switch
   if (gArgs.uor > 2) gArgs.uor = 0;
+  // the real path's host gate (PortRole.h hostGate): 0 (default) host only while we source VBUS; 1 also while the partner powers
+  // the bus (a hub or dock with PD pass-through after its data-role swap: we sink, the partner is a UFP)
+  gArgs.sinkHost = bootArg("piano-usbhost-sinkhost", 0) != 0;
   if (gArgs.handoff && (gArgs.level == 3 || gArgs.level == 4)) {
     gArgs.smmu = bootArg("piano-usbhost-smmu", gArgs.handoff == 6 ? 2 : 1);
     if (gArgs.smmu > 2) gArgs.smmu = 2;
@@ -1488,7 +1497,7 @@ bool sharedDomain(bool baseline)
   note("usb-a2b borrower domain %s bank %u ASID %u CDC %u net %u baseline-required %u", ok ? "ready" : "NOT ready",
        info.bank, info.asid, info.configured, info.net, baseline);
   note("usb-a2b domain fault raw %08x fault_bits %08x", info.fsr, info.fsr & kFsrFaults);
-  return ok && (!baseline || (info.configured && info.net));
+  return loanDomainReady(ok, baseline, info.configured, info.net);
 }
 volatile uint32_t gLoanRequest;
 uint64_t gLoanRequestAt;
@@ -1813,6 +1822,7 @@ void portManager(IOService *self)
   PortWitnesses w;
   PortView v;
   bool ready = false, uorSent = false;
+  int lastGateWhy = 0;
   uint32_t generation = 0, moves = 0, panLogged = 0;
   uint8_t lastPan[3] = {0xff, 0xff, 0xff};
   char line[400], lastLine[400] = "";
@@ -1821,6 +1831,11 @@ void portManager(IOService *self)
     // must never consume a controller loan or erase its own failure evidence.
     if (!controllerClassPresent()) { stage(-40, "A2 class unavailable before release"); return; }
     if (bootArg("piano-usbhost-test-loan", 0)) registerLoanSysctl();
+    note("usb-host2: real loan %s: host for a UFP partner %s; at most %u s per loan (piano-usbhost-back); the unplug, a role change, "
+         "a stale snapshot or the deadline returns the core to device mode; no VBUS write [PianoUsbHost2V1]",
+         bootArg("piano-usbhost-test-loan", 0) ? "OFF (piano-usbhost-test-loan=1: the diagnostic sysctl only)" : "armed",
+         gArgs.sinkHost ? "in either power direction (piano-usbhost-sinkhost=1)" : "only while we source VBUS (piano-usbhost-sinkhost=0)",
+         gArgs.back);
   }
   PianoUsbcObservation previous = {};
   if (shared && gArgs.uor) note("ucsi: SET_UOR disabled: PianoPower owns the mailbox");
@@ -1933,7 +1948,17 @@ void portManager(IOService *self)
     // A diagnostic request is allowed once only after CDC + ssh baseline;
     // it does not claim to have negotiated VBUS or a Type-C host partner.
     bool diagnostic = __atomic_load_n(&gLoanRequest, __ATOMIC_ACQUIRE) == 1;
-    const bool hostWitness = ready && v.known && v.connected && v.vbus == 1 && v.role.role == Role::host;
+    const bool hostWitness = hostGate(ready, v, gArgs.handoff == 6 && gArgs.sinkHost);
+    // A UFP partner the gate keeps in device mode (we sink without piano-usbhost-sinkhost=1, or an unknown direction): once per change.
+    const int gateWhy = gArgs.handoff != 6 || !ready || !v.connected || v.role.role != Role::host
+                        ? 0 : hostWitness ? 1 : v.vbus == 0 ? 2 : 3;
+    if (gateWhy != lastGateWhy) {
+      if (gateWhy == 1) note("usb-host2: host gate open: partner UFP, %s [PianoUsbHost2V1]", powerName(v.vbus));
+      else if (gateWhy == 2) note("usb-host2: host gate closed: partner UFP but we sink (the partner powers the bus): device mode kept "
+                                  "(piano-usbhost-sinkhost=0) [PianoUsbHost2V1]");
+      else if (gateWhy == 3) note("usb-host2: host gate closed: partner UFP, power direction unknown: device mode kept [PianoUsbHost2V1]");
+      lastGateWhy = gateWhy;
+    }
     SwitchAction a = rs.step(hostWitness ? Role::host : Role::device, v.connected, now);
     if (!v.connected && !diagnostic) gLoan.disconnected();
     if (bootArg("piano-usbhost-test-loan", 0)) a = SwitchAction::none;
@@ -1948,10 +1973,11 @@ void portManager(IOService *self)
       } else if (gLoan.diagnostic) a = SwitchAction::none;
     }
     if (a == SwitchAction::toHost) {
-      if (!dwc3Owns || (gArgs.handoff == 6 && !sharedDomain(true))) {
+      if (!dwc3Owns || (gArgs.handoff == 6 && !sharedDomain(diagnostic))) {
         rs.defer(nowMs() + 2000);
       } else if (gLoan.begin(nowMs(), gArgs.back * 1000, diagnostic)) {
-        note("usb-a2b loan BEGIN budget-s %u diagnostic %u VBUS-witness %d", gArgs.back, diagnostic, v.vbus);
+        note("usb-a2b loan BEGIN budget-s %u diagnostic %u VBUS-witness %d power %s sinkhost %u [PianoUsbHost2V1]", gArgs.back, diagnostic,
+             v.vbus, powerName(v.vbus), gArgs.sinkHost);
         __atomic_store_n(&gLoanRequest, 2u, __ATOMIC_RELEASE);
         uint32_t st = dwc3Ask(pianousb::kAskRelease, 2000);
         if (st == pianousb::kHoDevice) st = dwc3Ask(pianousb::kAskState, 0);

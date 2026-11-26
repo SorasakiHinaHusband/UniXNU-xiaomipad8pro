@@ -44,6 +44,7 @@ struct Sim {
   bool refuseIcl = false, ignoreFv = false, ackWrites = true, readsOk = true, bothGauges = true;
   // the source
   bool source = true, follows9v = true, typecSource = true, pdosOk = true;
+  bool ownBus = false;   // PIANO_CHG_IN_OWN_BUS: the bus is our own boost's (a USB device on the port)
   int type = PIANO_CHG_T_DCP;
   std::vector<std::vector<uint32_t>> pdos;
   int busMv = 5000;
@@ -82,9 +83,10 @@ struct Sim {
     in.generation = generation;
     in.wakes = wakes;
     in.sleep = sleep;
+    if (ownBus) in.valid |= PIANO_CHG_IN_OWN_BUS;
     if (!readsOk) return;
-    in.valid = PIANO_CHG_IN_BUS | PIANO_CHG_IN_TYPE | PIANO_CHG_IN_ICL | PIANO_CHG_IN_ENABLE | PIANO_CHG_IN_FV | PIANO_CHG_IN_VERIFY |
-               PIANO_CHG_IN_TBAT | PIANO_CHG_IN_TYPEC;
+    in.valid |= PIANO_CHG_IN_BUS | PIANO_CHG_IN_TYPE | PIANO_CHG_IN_ICL | PIANO_CHG_IN_ENABLE | PIANO_CHG_IN_FV | PIANO_CHG_IN_VERIFY |
+                PIANO_CHG_IN_TBAT | PIANO_CHG_IN_TYPEC;
     in.bus_mv = source ? busMv : 0;
     if (charger > 0) {
       // the battery's share: nothing while stuck or disabled, else what the charge current and the input left after the system allow
@@ -2443,8 +2445,84 @@ static void testT14NotifyCycle()
   }
 }
 
+// piano-power-own-bus (usb-host.md section 6.4, Q17): our own boost's 5 V (a USB device on the port: no Rp, the bus at 5 V, a type
+// the firmware reads for it) is a source without the guard (the old rule: an attach and the row written); with the guard nothing is
+// attached: no attach, no write, plan.own_bus. A charger before it is detached as by an unplug; one after it is attached as before,
+// and battery health stops it again at the limit (the 80 % policy is the same before and after).
+static void testOwnBus()
+{
+  {   // the old rule, kept without the guard
+    Sim s;
+    s.typecSource = false; s.type = PIANO_CHG_T_TYPEC; s.ownBus = true;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_ATTACH) && s.wrote(PIANO_CHG_ICL, 500) && !s.plan.own_bus);
+  }
+  {   // the guard: nothing attached, nothing written, for as long as it lasts
+    Sim s;
+    s.cfg.own_bus = 1;
+    s.typecSource = false; s.type = PIANO_CHG_T_TYPEC; s.ownBus = true;
+    for (int i = 0; i < 6; ++i) {
+      s.step();
+      CHECK(s.plan.own_bus && s.plan.writes == 0 && !(s.plan.events & PIANO_CHG_EV_ATTACH) && !s.st.attached && !s.plan.hold_awake);
+    }
+    CHECK(s.icl == 100 && s.fcc == 0 && s.enable == 1);
+    // the device out, a charger in (its Rp, the bit gone): attached as before
+    s.ownBus = false; s.typecSource = true; s.type = PIANO_CHG_T_DCP;
+    s.step();
+    CHECK(!s.plan.own_bus && (s.plan.events & PIANO_CHG_EV_ATTACH) && s.wrote(PIANO_CHG_ICL, 1500) && s.wrote(PIANO_CHG_FCC, 1500));
+  }
+  {   // a charger, then our own bus (the charger out, an OTG adapter in): the charger's values back as at a detach
+    Sim s;
+    s.cfg.own_bus = 1;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 1500));
+    s.ownBus = true; s.typecSource = false; s.type = PIANO_CHG_T_TYPEC;
+    s.step();
+    CHECK(s.plan.own_bus && (s.plan.events & PIANO_CHG_EV_DETACH) && s.wrote(PIANO_CHG_ICL, 100) && s.wrote(PIANO_CHG_FCC, 500));
+    s.step();
+    CHECK(s.plan.own_bus && s.plan.writes == 0);
+  }
+  {   // The sourced bus never lifts an 80/75 hold, including while handing off to sleep.
+    Sim s;
+    s.cfg.own_bus = 1;
+    CHECK(piano_charge_config_limit(&s.cfg, 1, 80, 75) == 0);
+    s.soc = 80;
+    s.step(); s.step();
+    CHECK(s.enable == 0 && s.st.hold);
+    s.ownBus = true; s.typecSource = false; s.type = PIANO_CHG_T_TYPEC;
+    s.soc = 76;
+    s.step();
+    CHECK(s.plan.own_bus && s.enable == 0 && s.st.hold && !s.plan.hold_awake);
+    s.sleep = PIANO_CHG_WILL_SLEEP;
+    s.step();
+    CHECK(s.plan.own_bus && s.plan.sleep_ready && s.enable == 0 && s.st.hold);
+    s.sleep = PIANO_CHG_AWAKE;
+    s.readsOk = false;
+    s.step();
+    CHECK(s.plan.own_bus && s.enable == 0 && s.st.hold && !s.st.attached);
+    s.readsOk = true;
+    s.ownBus = false; s.typecSource = true; s.type = PIANO_CHG_T_DCP;
+    s.step(); s.step();
+    CHECK(!s.plan.own_bus && s.enable == 0 && s.st.hold);
+    s.soc = 75;
+    s.step();
+    CHECK(s.enable == 1 && !s.st.hold);
+  }
+  {   // strict (production) mode: no contract (we are the provider), the guard: no write raises anything
+    StrictSim s;
+    s.cfg.own_bus = 1;
+    s.contractValid = s.sourceValid = false; s.typecSource = false; s.type = PIANO_CHG_T_UNKNOWN; s.ownBus = true; s.pdos.clear();
+    for (int i = 0; i < 6; ++i) {
+      s.step();
+      CHECK(s.plan.own_bus && !s.st.attached && s.icl <= 100 && s.fcc <= 500 && !s.wrote(PIANO_CHG_PD_FIXED) && !s.wrote(PIANO_CHG_PPS));
+    }
+    CHECK(s.busMv == 5000);
+  }
+}
+
 int main()
 {
+  testOwnBus();
   testT14FiveVoltMax();
   testT14NineVolt();
   testT14NotifyCycle();

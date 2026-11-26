@@ -46,6 +46,7 @@ struct LinkOptions {
   bool hvCaps = false;             // piano-power-hv-caps: the stock 9 V rows at a validated 9 V contract (cfg.hv_caps)
   bool qc = false;                 // piano-power-qc: QC2/QC3 9 V through 0x2011 (cfg.qc)
   bool fvHot = false;              // piano-power-fv-hot: 4060 mV from 48 degC and the warm hold (cfg.fv_hot)
+  bool ownBus = false;             // piano-power-own-bus: our own VBUS (a USB device on the port) is no source (cfg.own_bus)
 };
 
 // What the owner knows besides the codec, for one decision.
@@ -91,6 +92,16 @@ struct LinkOutcome {
 
 inline int32_t milliToDeci(int32_t mc) { return mc >= 0 ? mc / 100 : -((-mc + 99) / 100); }
 
+// The bus is our own boost's (usb-host.md section 6.4, Q17): a USB device on the port and the DSP's firmware sourcing VBUS for it.
+// A source's Rp on the PMIC's Type-C block never is (a charger, a computer, a dock); else UCSI's fresh status decides (connected and
+// we are the provider, not the sink); without one, the PMIC: a sink's Rd (we source). Unknown is never ours.
+inline bool ownBus(const PianoChargeContract *c, const PortState *p, uint64_t nowMs)
+{
+  if (p && p->ok && p->sourceSeen) return false;
+  if (c && piano_contract_status_fresh(c, nowMs)) return c->connected && !c->sink;
+  return p && p->ok && p->sinkSeen;
+}
+
 // The contract's "the gauges' I2C idle" (docs/power.md 4): from the sleep handover's acknowledgement to the wake no report runs (the
 // gauges' bit-banged I2C, the Type-C block and the RTC over SPMI), so the freeze cuts none of them in the middle; the report that
 // fell due meanwhile runs right after the wake. The codec's DSP traffic is not paused (the DSP stays as it is). update() once per
@@ -132,6 +143,7 @@ class ChargeLink {
     cfg.hv_caps = o.strictContract && o.hvCaps ? 1 : 0;
     cfg.qc = o.strictContract && o.qc ? 1 : 0;
     cfg.fv_hot = o.strictContract && o.fvHot ? 1 : 0;
+    cfg.own_bus = o.ownBus ? 1 : 0;
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
     // 0x2003 = 0 through the codec only for battery health's stop and the charging restart's
@@ -152,7 +164,7 @@ class ChargeLink {
     return age <= v.nowMs && v.nowMs - age >= v.chargerPdUpMs;
   }
 
-  static void fill(PianoChargeInput &x, const PianoMca &m, const LinkView &v)
+  static void fill(PianoChargeInput &x, const PianoMca &m, const LinkView &v, bool ownBusGuard = false)
   {
     x = PianoChargeInput();
     x.now_ms = v.nowMs;
@@ -267,6 +279,7 @@ class ChargeLink {
       x.typec_source = v.port->sourceSeen ? 1 : 0;
       x.rp_ma = v.port->sourceSeen ? rpMilliamps(v.port->rpBits) : 0;
     }
+    if (ownBusGuard && ownBus(v.contract, v.port, v.nowMs)) x.valid |= PIANO_CHG_IN_OWN_BUS;
     // PianoThermal's: each temperature only with its valid bit (missing = unknown, never cool). The charger thermistor only from a
     // reading taken after charger_pd came up: its pin is the DSP firmware's, and before that firmware runs the channel reads the
     // pin's load (59.5-60.8 C at an idle board, 2026-11-12 queue5 P12; PianoThermal also holds it out while the pin is not
@@ -332,7 +345,9 @@ class ChargeLink {
     answersAtDecision_ = answers;
     const bool buckPps = st.volt_want_prop == PIANO_CHG_PPS;
     syncPpsOption(m);
-    fill(in, m, v);
+    const bool wasOwnBus = (in.valid & PIANO_CHG_IN_OWN_BUS) != 0;
+    fill(in, m, v, cfg.own_bus != 0);
+    if (!wasOwnBus && (in.valid & PIANO_CHG_IN_OWN_BUS)) cancelQueued(m);
     if (v.shutdown) piano_charge_shutdown(&cfg, &in, &st, &plan);
     else piano_charge_decide(&cfg, &in, &st, &plan);
     if (buckPps && (handover || st.volt_want_prop != PIANO_CHG_PPS ||

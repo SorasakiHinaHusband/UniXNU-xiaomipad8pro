@@ -5,6 +5,13 @@
 namespace pianousbhost {
 enum class LoanPhase:uint8_t { idle, starting, host, returning, device, held };
 enum class LoanEnd:uint8_t { none, timeout, unplug, role, relay, failure };
+
+inline bool loanDomainReady(bool verified, bool requireGadgetLink, bool configured, bool network)
+{
+  // A diagnostic loan proves the gadget link before interrupting it. A real UFP can arrive after that link has already dropped.
+  return verified && (!requireGadgetLink || (configured && network));
+}
+
 struct ControllerLoan {
   LoanPhase phase=LoanPhase::idle;
   uint64_t deadline=0;

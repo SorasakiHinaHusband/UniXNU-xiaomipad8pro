@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang. Model observed apps-SMMU semantics, not ideal MMIO.
+//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 smmu_identity_host.cpp -o /tmp/smmu_identity_host && /tmp/smmu_identity_host
 #include "SmmuIdentity.h"
 #include "UsbDomain.h"
 #include "ControllerLoan.h"
