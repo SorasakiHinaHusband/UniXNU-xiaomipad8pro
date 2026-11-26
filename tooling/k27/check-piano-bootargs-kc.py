@@ -9,7 +9,7 @@ FILE is the unstripped native kernel (Mach-O; its symbol table is read) or, with
     argument sit past the 1024-byte kern.bootargs clip);
   - k27 0066's console format `piano-boot-args: /chosen/` is there too (0076 exports 0066's merge; the known positive of the string
     search);
-  - kernel only: the handler symbol _sysctl_piano_bootargs and its OID _sysctl__kern_piano_bootargs exist, next to
+  - kernel only: the handler symbol _sysctl_piano_bootargs and its OID _sysctl__kern_piano_bootargs are defined, next to
     _sysctl__kern_bootargs (the known positive of the symbol read).
 --baseline checks a kernel without 0076 (0075 cddd1ff2, the known negative) the other way round: 0066's string and kern.bootargs
 are there, the 0076 strings and symbols are not.
@@ -22,6 +22,7 @@ DESC = b'Piano merged boot arguments (0066 ADT tail)\0'
 MARK_0066 = b'piano-boot-args: /chosen/'
 MH_MAGIC_64 = 0xFEEDFACF
 LC_SYMTAB = 0x2
+N_STAB, N_TYPE, N_SECT = 0xE0, 0x0E, 0x0E
 
 
 def symbols(data):
@@ -35,7 +36,7 @@ def symbols(data):
             symoff, nsyms, stroff, _ = struct.unpack_from('<IIII', data, off + 8)
             for i in range(nsyms):
                 strx, ntype = struct.unpack_from('<IB', data, symoff + 16 * i)
-                if ntype & 0xE0:
+                if ntype & N_STAB or ntype & N_TYPE != N_SECT:
                     continue
                 end = data.index(b'\0', stroff + strx)
                 names.add(data[stroff + strx:end].decode(errors='replace'))
