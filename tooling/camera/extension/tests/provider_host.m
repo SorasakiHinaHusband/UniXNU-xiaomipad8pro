@@ -33,16 +33,17 @@ static NSDictionary *testPixelAttributes(void)
 @interface OutputProbe : PianoStreamSource
 @property(nonatomic, strong) NSMutableArray<NSDictionary *> *observations;
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *flags;
+@property(nonatomic) uint64_t publishingSequence;
 @end
 @implementation OutputProbe
-- (void)deliverSample:(CMSampleBufferRef)sample discontinuity:(CMIOExtensionStreamDiscontinuityFlags)flags hostTime:(uint64_t)ns
-{
-  @synchronized (self) { [self.flags addObject:@(flags)]; }
-  [super deliverSample:sample discontinuity:flags hostTime:ns];
-}
 - (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
 {
+  self.publishingSequence = sequence;
   [super publish:pb ticks:ticks sequence:sequence drops:drops];
+}
+- (void)deliverSample:(CMSampleBufferRef)sample discontinuity:(CMIOExtensionStreamDiscontinuityFlags)flags hostTime:(uint64_t)ns
+{
+  CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sample);
   assert(!CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly));
   const size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
   if (CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA) {
@@ -51,6 +52,7 @@ static NSDictionary *testPixelAttributes(void)
     for (size_t y = 0; y < h; ++y)
       for (size_t x = 0; x < w; ++x) assert(bytes[y * stride + x * 4 + 3] == 255);
   } else {
+    assert(CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
     assert(CVPixelBufferGetPlaneCount(pb) == 2);
     assert(CVPixelBufferGetWidthOfPlane(pb, 0) == w && CVPixelBufferGetHeightOfPlane(pb, 0) == h);
     assert(CVPixelBufferGetWidthOfPlane(pb, 1) == w / 2 && CVPixelBufferGetHeightOfPlane(pb, 1) == h / 2);
@@ -63,75 +65,56 @@ static NSDictionary *testPixelAttributes(void)
   }
   CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
   @synchronized (self) {
-    [self.observations addObject:@{@"width": @(w), @"height": @(h), @"ticks": @(ticks), @"sequence": @(sequence)}];
+    [self.flags addObject:@(flags)];
+    [self.observations addObject:@{@"width": @(w), @"height": @(h), @"ns": @(ns), @"sequence": @(self.publishingSequence),
+                                  @"duration": timeDictionary(CMSampleBufferGetDuration(sample))}];
   }
+  [super deliverSample:sample discontinuity:flags hostTime:ns];
 }
 @end
 
-// Supply exactly three native source frames at 15 fps, then stall without stopping output.
+@implementation PianoStreamSource (HostTick)
+- (void)hostTick:(uint64_t)now
+{
+  dispatch_sync(_outputQueue, ^{ [self tickAtSourceTime:now]; });
+}
+@end
+
 @interface SyntheticSource : OutputProbe
+@property(nonatomic) uint64_t now;
+- (void)feed:(uint64_t)sequence drops:(uint64_t)drops;
 @end
 @implementation SyntheticSource
 - (BOOL)openLiveAndReturnError:(NSError **)outError { return YES; }
+- (void)readLive {}
+- (void)tick {} // The test drives the output queue explicitly.
+- (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
+{
+  [super publish:pb ticks:CMClockConvertHostTimeToSystemUnits(CMTimeMake(self.now, NSEC_PER_SEC))
+         sequence:sequence drops:drops];
+}
 - (IOReturn)stopLive:(PianoCameraLiveStatus *)state
 {
   state->state = kPianoCameraStopped;
   state->cleanOff = 1;
   return kIOReturnSuccess;
 }
-- (void)readLive
+- (void)feed:(uint64_t)sequence drops:(uint64_t)drops
 {
-  usleep(50000);
-  for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
-    CVPixelBufferRef pb = NULL;
-    assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
-                               (__bridge CFDictionaryRef)testPixelAttributes(), &pb));
-    assert(!CVPixelBufferLockBaseAddress(pb, 0));
-    uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
-    const size_t stride = CVPixelBufferGetBytesPerRow(pb);
-    for (unsigned y = 0; y < 459; ++y)
-      for (unsigned x = 0; x < 816; ++x) {
-        uint8_t *pixel = bytes + y * stride + x * 4;
-        pixel[0] = (uint8_t)sequence; pixel[1] = pixel[2] = 37; pixel[3] = 255;
-      }
-    CVPixelBufferUnlockBaseAddress(pb, 0);
-    CMTime timestamp = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(mach_absolute_time()), NSEC_PER_SEC,
-                                         kCMTimeRoundingMethod_RoundHalfAwayFromZero);
-    [self acceptSource:pb sequence:sequence drops:0 sourceNs:(uint64_t)timestamp.value];
-    CVPixelBufferRelease(pb);
-    usleep(66667);
-  }
-}
-@end
-
-// The front source at 15 fps whose kernel drop counter changes with every frame (the rear drops 8-10 % on the tablet), then a
-// 450 ms stall (past the 250 ms source age), then four more frames.
-@interface DroppingSource : SyntheticSource
-@end
-@implementation DroppingSource
-- (void)readLive
-{
-  usleep(50000);
-  for (uint64_t sequence = 1; sequence <= 10; ++sequence) {
-    if (sequence == 7) usleep(450000);
-    CVPixelBufferRef pb = NULL;
-    assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
-                               (__bridge CFDictionaryRef)testPixelAttributes(), &pb));
-    assert(!CVPixelBufferLockBaseAddress(pb, 0));
-    uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
-    const size_t stride = CVPixelBufferGetBytesPerRow(pb);
-    for (unsigned y = 0; y < 459; ++y)
-      for (unsigned x = 0; x < 816; ++x) {
-        uint8_t *pixel = bytes + y * stride + x * 4;
-        pixel[0] = (uint8_t)sequence; pixel[1] = pixel[2] = 37; pixel[3] = 255;
-      }
-    CVPixelBufferUnlockBaseAddress(pb, 0);
-    CMTime timestamp = CMTimeConvertScale(CMClockMakeHostTimeFromSystemUnits(mach_absolute_time()), NSEC_PER_SEC,
-                                         kCMTimeRoundingMethod_RoundHalfAwayFromZero);
-    [self acceptSource:pb sequence:sequence drops:sequence * 3 sourceNs:(uint64_t)timestamp.value];
-    CVPixelBufferRelease(pb);
-    usleep(66667);
-  }
+  CVPixelBufferRef pb = NULL;
+  assert(!CVPixelBufferCreate(kCFAllocatorDefault, 816, 459, kCVPixelFormatType_32BGRA,
+                             (__bridge CFDictionaryRef)testPixelAttributes(), &pb));
+  assert(!CVPixelBufferLockBaseAddress(pb, 0));
+  uint8_t *bytes = CVPixelBufferGetBaseAddress(pb);
+  const size_t stride = CVPixelBufferGetBytesPerRow(pb);
+  for (unsigned y = 0; y < 459; ++y)
+    for (unsigned x = 0; x < 816; ++x) {
+      uint8_t *pixel = bytes + y * stride + x * 4;
+      pixel[0] = (uint8_t)sequence; pixel[1] = pixel[2] = 37; pixel[3] = 255;
+    }
+  CVPixelBufferUnlockBaseAddress(pb, 0);
+  [self acceptSource:pb sequence:sequence drops:drops sourceNs:self.now];
+  CVPixelBufferRelease(pb);
 }
 @end
 
@@ -142,11 +125,11 @@ static NSDictionary *testPixelAttributes(void)
 @property(nonatomic, strong) NSMutableArray *held;
 @end
 @implementation HoldingProbe
-- (void)publish:(CVPixelBufferRef)pb ticks:(uint64_t)ticks sequence:(uint64_t)sequence drops:(uint64_t)drops
+- (void)deliverSample:(CMSampleBufferRef)sample discontinuity:(CMIOExtensionStreamDiscontinuityFlags)flags hostTime:(uint64_t)ns
 {
-  [super publish:pb ticks:ticks sequence:sequence drops:drops];
+  [super deliverSample:sample discontinuity:flags hostTime:ns];
   @synchronized (self) {
-    [self.held addObject:(__bridge id)pb];
+    [self.held addObject:(__bridge id)CMSampleBufferGetImageBuffer(sample)];
     while (self.held.count > self.hold) [self.held removeObjectAtIndex:0];
   }
 }
@@ -193,6 +176,9 @@ static void metadata(void)
     assert(!set(source, @2, kCMTimeInvalid, kCMTimeInvalid));
     assert(!set(source, @(-1), kCMTimeInvalid, kCMTimeInvalid));
     assert(!set(source, @0.5, kCMTimeInvalid, kCMTimeInvalid));
+    assert(!set(source, @(NAN), kCMTimeInvalid, kCMTimeInvalid));
+    assert(!set(source, @(INFINITY), kCMTimeInvalid, kCMTimeInvalid));
+    assert(!set(source, @(UINT64_MAX), kCMTimeInvalid, kCMTimeInvalid));
     assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
     state(source, 1, 30, 30);
     assert(!set(source, nil, CMTimeMake(1, 31), kCMTimeInvalid));
@@ -359,44 +345,61 @@ static BOOL waitForCount(OutputProbe *source, NSUInteger target, size_t widthFil
   }
 }
 
+static void checkTimeline(OutputProbe *source)
+{
+  assert(source.flags.count == source.observations.count);
+  uint64_t previous = 0;
+  NSUInteger width = 0;
+  CMTime duration = kCMTimeInvalid;
+  for (NSUInteger i = 0; i < source.observations.count; ++i) {
+    NSDictionary *frame = source.observations[i];
+    const uint64_t now = [frame[@"ns"] unsignedLongLongValue];
+    const NSUInteger nextWidth = [frame[@"width"] unsignedIntegerValue];
+    const CMTime nextDuration = CMTimeMakeFromDictionary((__bridge CFDictionaryRef)frame[@"duration"]);
+    const uint64_t interval = (uint64_t)llround(CMTimeGetSeconds(nextDuration) * NSEC_PER_SEC);
+    assert(now > previous);
+    const BOOL discontinuity = previous && (width != nextWidth || CMTimeCompare(duration, nextDuration) != 0 ||
+                                            now - previous > PIANO_OUTPUT_MAX_SOURCE_AGE_NS + interval);
+    assert(source.flags[i].unsignedIntValue == (discontinuity ? CMIOExtensionStreamDiscontinuityFlagSampleDropped :
+                                                               CMIOExtensionStreamDiscontinuityFlagNone));
+    previous = now;
+    width = nextWidth;
+    duration = nextDuration;
+  }
+}
+
 static void timer(void)
 {
   OutputProbe *source = [[OutputProbe alloc] initWithWidth:1280 height:720 sensor:0];
   source.observations = [NSMutableArray array];
   source.flags = [NSMutableArray array];
   for (unsigned round = 0; round < 3; ++round) {
-    assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
+    const int firstFps = round == 0 ? 15 : 30;
+    assert(set(source, @1, CMTimeMake(1, firstFps), CMTimeMake(1, firstFps)));
     const uint64_t startMs = monotonicMs();
     assert([source startStreamAndReturnError:NULL]);
     assert(waitForCount(source, 6, 640, 2500));
     const uint64_t elapsedMs = monotonicMs() - startMs;
     NSUInteger firstCount = 0;
     @synchronized (source) { firstCount = source.observations.count; }
-    // Prove 30 fps pacing (not unthrottled spinning) while tolerating CI runner scheduling jitter.
-    assert(firstCount >= 6 && firstCount <= (elapsedMs / 25ULL) + 6ULL);
+    // Check the upper rate bound with room for timer coalescing.
+    assert(firstCount >= 6 && firstCount <= elapsedMs * firstFps / 1000 + 3);
     assert(set(source, @0, kCMTimeInvalid, kCMTimeInvalid));
     assert(waitForCount(source, 3, 1280, 2500));
     const NSUInteger compatBeforeResume = countMatchingWidth(source, 640);
     assert(set(source, @1, CMTimeMake(1, 24), CMTimeMake(1, 24)));
     assert(waitForCount(source, compatBeforeResume + 3, 640, 2500));
     assert([source stopStreamAndReturnError:NULL]);
-    NSUInteger stoppedCount = source.observations.count;
-    usleep(100000);
-    assert(source.observations.count == stoppedCount);
+    checkTimeline(source);
     unsigned compat = 0, native = 0;
-    uint64_t last = 0;
     for (NSDictionary *frame in source.observations) {
-      uint64_t ticks = [frame[@"ticks"] unsignedLongLongValue];
-      assert(ticks > last);
-      last = ticks;
-      if ([frame[@"width"] unsignedIntValue] == 640) { ++compat; assert([frame[@"height"] unsignedIntValue] == 480); }
+      const BOOL isCompat = [frame[@"width"] unsignedIntValue] == 640;
+      const int fps = isCompat ? (native ? 24 : firstFps) : 15;
+      assert(CMTimeCompare(CMTimeMakeFromDictionary((__bridge CFDictionaryRef)frame[@"duration"]), CMTimeMake(1, fps)) == 0);
+      if (isCompat) { ++compat; assert([frame[@"height"] unsignedIntValue] == 480); }
       else { ++native; assert([frame[@"width"] unsignedIntValue] == 1280 && [frame[@"height"] unsignedIntValue] == 720); }
     }
     assert(compat >= 9 && native >= 3);
-    // the two live format changes of the round, and nothing else, break the timeline
-    unsigned flagged = 0;
-    for (NSNumber *flag in source.flags) flagged += flag.unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagSampleDropped;
-    assert(source.flags.count == source.observations.count && flagged == 2);
     [source.observations removeAllObjects];
     [source.flags removeAllObjects];
   }
@@ -417,29 +420,9 @@ static void encoderHold(void)
     NSUInteger sent = source.observations.count;
     printf("encoder hold index=%u: %lu frames delivered while the client held the last 18\n", index, (unsigned long)sent);
     assert(sent >= 26);   // 30 or 15 fps; with the old 4-buffer bound this stopped at 4
-    for (NSNumber *flag in source.flags) assert(flag.unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagNone);
+    checkTimeline(source);
     [source.held removeAllObjects];
   }
-}
-
-static void droppingTimeline(void)
-{
-  DroppingSource *source = [[DroppingSource alloc] initWithWidth:816 height:459 sensor:kPianoCameraFront];
-  source.observations = [NSMutableArray array];
-  source.flags = [NSMutableArray array];
-  assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
-  assert([source startStreamAndReturnError:NULL]);
-  usleep(1500000);
-  assert([source stopStreamAndReturnError:NULL]);
-  unsigned flagged = 0, firstAfterStall = 0;
-  for (NSUInteger i = 0; i < source.flags.count; ++i) {
-    if (source.flags[i].unsignedIntValue != CMIOExtensionStreamDiscontinuityFlagSampleDropped) continue;
-    ++flagged;
-    firstAfterStall = [source.observations[i][@"sequence"] unsignedIntValue];
-  }
-  // the kernel drop counter changed on every frame: no break for it; one break after the 450 ms stall, at its first frame
-  printf("dropping source: %lu samples, %u discontinuity at sequence %u\n", (unsigned long)source.flags.count, flagged, firstAfterStall);
-  assert(source.flags.count == source.observations.count && source.flags.count >= 20 && flagged == 1 && firstAfterStall == 7);
 }
 
 static void poolMemory(void)
@@ -477,30 +460,44 @@ static void repeatedAndStalled(void)
 {
   SyntheticSource *source = [[SyntheticSource alloc] initWithWidth:816 height:459 sensor:kPianoCameraFront];
   source.observations = [NSMutableArray array];
+  source.flags = [NSMutableArray array];
   assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
   assert([source startStreamAndReturnError:NULL]);
-  usleep(20000);
-  @synchronized (source) { assert(!source.observations.count); } // no source, no uninitialized output
-  usleep(500000);
-  NSUInteger count;
-  @synchronized (source) { count = source.observations.count; }
-  usleep(180000);
-  @synchronized (source) { assert(source.observations.count == count); } // timer keeps running, stale source does not repeat
-  assert([source stopStreamAndReturnError:NULL]);
-  assert(count >= 8 && count <= 15);
-  uint64_t previous = 0, ticks = 0;
-  unsigned repeated = 0, unique = 0;
-  for (NSDictionary *frame in source.observations) {
-    uint64_t sequence = [frame[@"sequence"] unsignedLongLongValue];
-    uint64_t current = [frame[@"ticks"] unsignedLongLongValue];
-    assert(sequence >= 1 && sequence <= 3 && current > ticks);
-    assert([frame[@"width"] unsignedIntValue] == 640 && [frame[@"height"] unsignedIntValue] == 480);
-    if (sequence == previous) ++repeated;
-    else ++unique;
-    previous = sequence;
-    ticks = current;
+  const uint64_t interval = NSEC_PER_SEC / 30;
+  source.now = NSEC_PER_SEC;
+  [source hostTick:source.now];
+  assert(source.observations.count == 0);
+  uint64_t lastSourceTime = 0;
+  for (unsigned sequence = 1; sequence <= 3; ++sequence) {
+    source.now += interval;
+    lastSourceTime = source.now;
+    [source feed:sequence drops:sequence * 3];
+    [source hostTick:source.now];
+    source.now += interval;
+    [source hostTick:source.now];
   }
-  assert(repeated >= 4 && unique == 3);
+  assert(source.observations.count == 6 && source.flags.count == 6);
+  for (unsigned i = 0; i < 6; ++i) {
+    assert([source.observations[i][@"sequence"] unsignedIntValue] == 1 + i / 2);
+    assert(source.flags[i].unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagNone);
+  }
+  source.now = lastSourceTime + PIANO_OUTPUT_MAX_SOURCE_AGE_NS;
+  [source hostTick:source.now];
+  assert(source.observations.count == 7 && source.flags[6].unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagNone);
+  ++source.now;
+  [source hostTick:source.now];
+  assert(source.observations.count == 7);
+  source.now += interval;
+  [source feed:4 drops:12];
+  [source hostTick:source.now];
+  assert(source.observations.count == 8 && [source.observations[7][@"sequence"] unsignedIntValue] == 4);
+  assert(source.flags[7].unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagSampleDropped);
+  source.now += interval;
+  [source hostTick:source.now];
+  assert(source.observations.count == 9 && source.flags[8].unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagNone);
+  assert([source stopStreamAndReturnError:NULL]);
+  [source hostTick:source.now + interval];
+  assert(source.observations.count == 9);
 }
 
 int main(void)
@@ -514,7 +511,6 @@ int main(void)
     timer();
     repeatedAndStalled();
     encoderHold();
-    droppingTimeline();
     poolMemory();
     puts("camera provider metadata/transitions/pattern/cancellation/repeats/stall/pool-bounds/encoder-hold/drop-timeline PASS");
   }

@@ -171,10 +171,12 @@ static BOOL validDuration(NSUInteger index, CMTime time)
   __block BOOL accepted = NO;
   __block NSDictionary *changed;
   dispatch_sync(_outputQueue, ^{
-    NSUInteger next = index ? index.unsignedIntegerValue : self->_activeFormat;
+    NSUInteger next = self->_activeFormat;
+    if ([index isEqualToNumber:@0]) next = 0;
+    else if ([index isEqualToNumber:@1]) next = 1;
+    else if (index) return;
     CMTime duration = requested ? CMTimeMakeFromDictionary((__bridge CFDictionaryRef)requested) : self->_duration;
     CMTime maximum = requestedMax ? CMTimeMakeFromDictionary((__bridge CFDictionaryRef)requestedMax) : self->_maxDuration;
-    if (next > 1 || (index && index.doubleValue != (double)next)) return;
     // A format-only transition chooses a valid duration before notifying the client.
     if (!requested && !validDuration(next, duration)) duration = CMTimeMake(1, kPianoNativeFps);
     if (!requestedMax && !validDuration(next, maximum)) maximum = CMTimeMake(1, kPianoNativeFps);
@@ -217,11 +219,12 @@ static BOOL validDuration(NSUInteger index, CMTime time)
 - (BOOL)authorizedToStartStreamForClient:(CMIOExtensionClient *)client { return YES; }
 
 // Eight moving bars, a sweeping line and 24 clipped counter squares.
-- (void)fill:(CVPixelBufferRef)pb
+- (BOOL)fill:(CVPixelBufferRef)pb
 {
   uint8_t *base = CVPixelBufferGetBaseAddress(pb);
   const size_t stride = CVPixelBufferGetBytesPerRow(pb);
   const int32_t width = (int32_t)CVPixelBufferGetWidth(pb), height = (int32_t)CVPixelBufferGetHeight(pb);
+  if (!base || width <= 0 || height <= 0 || !pianoOutputRowsValid(stride, (uint64_t)width * 4, height)) return NO;
   static const uint8_t bars[8][3] = {{255, 255, 255}, {0, 255, 255}, {255, 255, 0}, {0, 255, 0},
                                      {255, 0, 255}, {0, 0, 255},   {255, 0, 0},   {16, 16, 16}};
   const uint32_t shift = (uint32_t)(_frame * 8 % width), sweep = (uint32_t)(_frame * 6 % height);
@@ -243,6 +246,7 @@ static BOOL validDuration(NSUInteger index, CMTime time)
         px[0] = px[1] = px[2] = v;
       }
   }
+  return YES;
 }
 
 static IOReturn liveCall(io_connect_t connection, uint32_t op, const void *in, size_t inSize, void *out, size_t size)
@@ -328,8 +332,12 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
 
 - (void)tick
 {
+  [self tickAtSourceTime:clock_gettime_nsec_np(CLOCK_UPTIME_RAW)];
+}
+
+- (void)tickAtSourceTime:(uint64_t)now
+{
   if (!atomic_load(&_running)) return;
-  const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   if (_sensor && (!_latest || !pianoOutputSourceFresh(now, _latestSourceNs))) {
     ++_staleTicks;
     if (_latest && !_stalled) {
@@ -346,7 +354,7 @@ static CVPixelBufferRef borrowPixel(CVPixelBufferPoolRef pool, unsigned threshol
   if (!pb) { ++_dropped; return; }
   if (!CVPixelBufferLockBaseAddress(pb, 0)) {
     BOOL initialized = YES;
-    if (!_sensor) [self fill:pb];
+    if (!_sensor) initialized = [self fill:pb];
     else if (CVPixelBufferLockBaseAddress(_latest, kCVPixelBufferLock_ReadOnly)) initialized = NO;
     else {
       initialized = pianoOutputScaleBGRA(CVPixelBufferGetBaseAddress(_latest), _nativeWidth, _nativeHeight,
