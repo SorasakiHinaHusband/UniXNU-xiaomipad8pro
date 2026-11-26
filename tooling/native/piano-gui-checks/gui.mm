@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "WifiApple80211.h"
@@ -418,6 +419,222 @@ static NSDictionary *brightness()
     return @{@"level": @(level), @"nits": nits};
 }
 
+static uint64_t uptimeUs()
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+}
+
+static int energyReply(NSString *op, NSString *token, NSDictionary *fields, int rc = 0)
+{
+    NSMutableDictionary *reply = [fields mutableCopy];
+    reply[@"op"] = op;
+    reply[@"token"] = token;
+    reply[@"t_us"] = @(uptimeUs());
+    return emit(reply, rc);
+}
+
+static NSString *powerSourceLine()
+{
+    return [[readCommand("/usr/bin/pmset -g batt") componentsSeparatedByString:@"\n"] firstObject];
+}
+
+static int energyState(NSString *op, NSString *token)
+{
+    const uint64_t started = uptimeUs();
+    NSMutableDictionary *state = [@{@"started_us": @(started)} mutableCopy];
+    const struct { NSString *key; const char *command; } probes[] = {
+        {@"pmset", "/usr/bin/pmset -g"},
+        {@"custom", "/usr/bin/pmset -g custom"},
+        {@"lpm", "/usr/bin/notifyutil -g com.apple.system.lowpowermode"},
+        {@"hpm", "/usr/bin/notifyutil -g com.apple.system.highpowermode"},
+        {@"policy_lpm", "/usr/sbin/sysctl -n machdep.piano_policy_lpm"},
+        {@"policy_hpm", "/usr/sbin/sysctl -n machdep.piano_policy_hpm"},
+        {@"cpu", "/usr/sbin/sysctl -n machdep.piano_cpufreq_state"},
+        {@"gpu", "/usr/sbin/sysctl -n machdep.piano_gpu_state"},
+        {@"policy", "/usr/sbin/sysctl -n machdep.piano_policy"},
+    };
+    state[@"source"] = powerSourceLine();
+    for (const auto &probe : probes) state[probe.key] = readCommand(probe.command);
+    state[@"source_after"] = powerSourceLine();
+    // Report the relevant argument only. The rest of kern.bootargs stays on the device.
+    NSString *args = readCommand("/usr/sbin/sysctl -n kern.bootargs");
+    if (args) {
+        NSString *rule = @"1";
+        for (NSString *arg in [args componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet])
+            if ([arg hasPrefix:@"piano-policy-profile="]) {
+                rule = [arg substringFromIndex:[@"piano-policy-profile=" length]];
+                break;
+            }
+        state[@"profile_rule"] = rule;
+    }
+    return energyReply(op, token, state);
+}
+
+static NSArray<NSRunningApplication *> *settingsApps()
+{
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.systempreferences"];
+}
+
+static id settingsApplication()
+{
+    NSArray<NSRunningApplication *> *apps = settingsApps();
+    if (apps.count != 1) return nil;
+    id app = CFBridgingRelease(AXUIElementCreateApplication(apps.firstObject.processIdentifier));
+    AXUIElementSetMessagingTimeout((__bridge AXUIElementRef)app, 1.0);
+    return app;
+}
+
+static NSArray *settingsWindows()
+{
+    id app = settingsApplication();
+    if (!app) return @[];
+    id focused = attribute(app, kAXFocusedWindowAttribute) ?: attribute(app, kAXMainWindowAttribute);
+    return focused ? @[focused] : children(app, kAXWindowsAttribute);
+}
+
+static int energyMode(NSString *name)
+{
+    if ([name isEqual:@"Automatic"] || [name isEqual:@"Automatic Mode"]) return 0;
+    if ([name isEqual:@"Low Power"] || [name isEqual:@"Low Power Mode"]) return 1;
+    if ([name isEqual:@"High Power"] || [name isEqual:@"High Power Mode"]) return 2;
+    return -1;
+}
+
+static int pickerMode(id node)
+{
+    if (!node) return -1;
+    id value = attribute(node, kAXValueAttribute);
+    int mode = [value isKindOfClass:NSString.class] ? energyMode(value) : -1;
+    if (mode >= 0) return mode;
+    for (NSString *label in labels(node)) {
+        NSString *ending = [[[label componentsSeparatedByString:@": "] lastObject]
+            componentsSeparatedByString:@", "].lastObject;
+        mode = energyMode(ending);
+        if (mode >= 0) return mode;
+    }
+    return -1;
+}
+
+static BOOL powerLabel(id node, NSString *source)
+{
+    NSString *name = [source isEqual:@"ac"] ? @"On power adapter" : @"On battery";
+    return labeled(node, name) ||
+        (role(node, @"AXStaticText") && [attribute(node, kAXValueAttribute) isEqual:name]);
+}
+
+static BOOL sourcePicker(id node, NSString *source)
+{
+    if (powerLabel(node, source)) return YES;
+    id title = attribute(node, kAXTitleUIElementAttribute);
+    if (title && powerLabel(title, source)) return YES;
+    for (id linked in children(node, kAXLinkedUIElementsAttribute))
+        if (powerLabel(linked, source)) return YES;
+    // Some AX rows expose their source as a sibling label rather than a title.
+    id row = attribute(node, kAXParentAttribute);
+    NSString *other = [source isEqual:@"ac"] ? @"battery" : @"ac";
+    for (unsigned depth = 0; row && depth < 3; ++depth, row = attribute(row, kAXParentAttribute)) {
+        NSArray *siblings = children(row, kAXChildrenAttribute);
+        if ([siblings indexOfObjectPassingTest:^BOOL(id item, NSUInteger, BOOL *) {
+            return powerLabel(item, other);
+        }] != NSNotFound) return NO;
+        if (powerLabel(row, source) || [siblings indexOfObjectPassingTest:^BOOL(id item, NSUInteger, BOOL *) {
+            return powerLabel(item, source);
+        }] != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static id energyPicker(NSArray *windows, NSString *source)
+{
+    NSArray *pickers = matching(tree(windows), ^BOOL(id node) {
+        return (role(node, @"AXPopUpButton") || role(node, @"AXMenuButton")) &&
+            ![attribute(node, CFSTR("AXHidden")) boolValue] && pickerMode(node) >= 0 && hasPress(node);
+    });
+    id picker = only(pickers, ^BOOL(id node) { return sourcePicker(node, source); });
+    if (picker) return picker;
+    return pickers.count == 1 && labeled(pickers.firstObject, @"Energy Mode") ? pickers.firstObject : nil;
+}
+
+static void axHierarchy(id node, unsigned depth, NSMutableArray *lines, NSMutableSet *visited)
+{
+    if (lines.count >= 220 || [visited containsObject:node]) return;
+    [visited addObject:node];
+    NSMutableDictionary *line = [@{@"depth": @(depth), @"labels": labels(node)} mutableCopy];
+    line[@"role"] = attribute(node, kAXRoleAttribute);
+    id identifier = attribute(node, kAXIdentifierAttribute);
+    if ([identifier isKindOfClass:NSString.class]) line[@"identifier"] = identifier;
+    if (role(node, @"AXPopUpButton") || role(node, @"AXMenuButton"))
+        line[@"mode"] = @(pickerMode(node));
+    [lines addObject:line];
+    for (id child in children(node, kAXChildrenAttribute))
+        axHierarchy(child, depth + 1, lines, visited);
+}
+
+static int energyAxError(NSString *op, NSString *token, NSString *reason, NSArray *roots)
+{
+    NSMutableArray *lines = [NSMutableArray array];
+    NSMutableSet *visited = [NSMutableSet set];
+    for (id root in roots) axHierarchy(root, 0, lines, visited);
+    return energyReply(op, token, @{@"error": reason, @"ax": lines}, 2);
+}
+
+static NSArray *energyMenu(NSArray *nodes)
+{
+    NSMutableArray *items = [NSMutableArray array];
+    for (int mode = 0; mode < 3; ++mode) {
+        id item = only(nodes, ^BOOL(id node) {
+            if (!role(node, @"AXMenuItem")) return NO;
+            for (NSString *label in labels(node))
+                if (energyMode(label) == mode) return YES;
+            return NO;
+        });
+        if (!hasPress(item)) return nil;
+        [items addObject:item];
+    }
+    return items;
+}
+
+static int energyUI(NSString *op, NSString *token, NSString *source, int before, int target)
+{
+    const BOOL opening = [op isEqual:@"energy-open"];
+    NSString *expected = [source isEqual:@"ac"] ? @"Now drawing from 'AC Power'" :
+                                                  @"Now drawing from 'Battery Power'";
+    if (![powerSourceLine() isEqual:expected])
+        return energyReply(op, token, @{@"error": @"power-source-changed"}, 2);
+    if (opening && ![NSWorkspace.sharedWorkspace openURL:
+                     [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Battery-Settings.extension"]])
+        return energyAxError(op, token, @"battery-pane-open", settingsWindows());
+    id picker = opening ? waitFor(8, ^id { return energyPicker(settingsWindows(), source); }) :
+                          energyPicker(settingsWindows(), source);
+    if (!picker) return energyAxError(op, token, @"energy-picker-missing-or-ambiguous", settingsWindows());
+    const int mode = pickerMode(picker);
+    if (opening) return energyReply(op, token, @{@"source": source, @"mode": @(mode)});
+    if (mode != before) return energyAxError(op, token, @"energy-picker-baseline-changed", settingsWindows());
+    if (press(picker) != kAXErrorSuccess)
+        return energyAxError(op, token, @"energy-picker-press", settingsWindows());
+    NSArray *items = waitFor(3, ^id {
+        NSArray *menu = energyMenu(tree(children(picker, kAXChildrenAttribute)));
+        if (menu) return menu;
+        id app = settingsApplication();
+        NSMutableArray *roots = [settingsWindows() mutableCopy];
+        if (app) {
+            id focused = attribute(app, kAXFocusedUIElementAttribute);
+            for (unsigned depth = 0; focused && depth < 3; ++depth, focused = attribute(focused, kAXParentAttribute))
+                if (role(focused, @"AXMenu")) { [roots addObject:focused]; break; }
+        }
+        return energyMenu(tree(roots));
+    });
+    if (!items) return energyAxError(op, token, @"energy-picker-options", @[picker]);
+    const uint64_t pressed = uptimeUs();
+    const AXError status = press(items[target]);
+    if (status == kAXErrorSuccess)
+        waitFor(3, ^id { return pickerMode(energyPicker(settingsWindows(), source)) == target ? @YES : nil; });
+    const int after = pickerMode(energyPicker(settingsWindows(), source));
+    return energyReply(op, token, @{@"source": source, @"before": @(before), @"target": @(target),
+                                    @"pressed_us": @(pressed), @"status": @(status), @"mode": @(after)});
+}
+
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
@@ -446,9 +663,31 @@ int main(int argc, const char *argv[])
             CFRelease(event);
             return emit(@{@"x": @(cursor.x), @"y": @(cursor.y)});
         }
+        if ([op isEqual:@"energy-state"] && argc == 3) return energyState(op, @(argv[2]));
+        if ([op isEqual:@"energy-finish"] && argc == 5) {
+            return energyReply(op, @(argv[2]), @{@"closed": @([@(argv[3]) isEqual:@"true"]),
+                                                @"restored": @([@(argv[4]) isEqual:@"true"])});
+        }
+        if ([op isEqual:@"energy-quit"] && argc == 2 && getuid() != 0) {
+            for (NSRunningApplication *app in settingsApps()) [app terminate];
+            return waitFor(5, ^id { return settingsApps().count == 0 ? @YES : nil; }) ? 0 : 2;
+        }
         BOOL trusted = AXIsProcessTrusted();
         if ([op isEqual:@"ax-trust"]) return emit(@{@"trusted": @(trusted)}, trusted ? 0 : 2);
         if (!trusted || getuid() == 0) return fail(@"console-user-ax-trust");
+        if (([op isEqual:@"energy-open"] && argc == 4) || ([op isEqual:@"energy-select"] && argc == 6)) {
+            NSString *source = @(argv[3]);
+            if (![source isEqual:@"ac"] && ![source isEqual:@"battery"]) return fail(@"energy-source");
+            int before = -1, target = -1;
+            if (argc == 6) {
+                if (strspn(argv[4], "012") != 1 || strlen(argv[4]) != 1 ||
+                    strspn(argv[5], "012") != 1 || strlen(argv[5]) != 1 || argv[4][0] == argv[5][0])
+                    return fail(@"energy-mode");
+                before = argv[4][0] - '0';
+                target = argv[5][0] - '0';
+            }
+            return energyUI(op, @(argv[2]), source, before, target);
+        }
         id app = controlCenter();
         if (!app) return fail(@"control-center-process");
         if ([@[@"wifi-menu", @"wifi-off", @"wifi-on"] containsObject:op] && argc == 2)

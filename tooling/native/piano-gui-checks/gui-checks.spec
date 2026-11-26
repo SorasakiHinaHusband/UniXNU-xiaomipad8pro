@@ -3,6 +3,11 @@
 gui_checks_installed() (
     set +x
     set -o pipefail
+    local checks=${1:-default}
+    if [[ $checks != default && $checks != energy-picker ]]; then
+        verdict 'FAIL HARNESS unknown gui-checks mode'
+        return 2
+    fi
     if [[ ${DRY:-0} == 1 ]]; then
         verdict 'INFO gui-checks dry run'
         return 0
@@ -21,8 +26,12 @@ gui_checks_installed() (
     local identity token name src hash receipt gui_hash session_hash helper
     tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || return 2
     binary=${GUI_BIN:-out/piano-gui-checks/gui}
-    if [[ ! -f "$binary" || ! -x "$binary" || ! -r ${GUI_SSID_FILE:-} || ! -r ${GUI_REDACT:-} ]]; then
-        verdict 'FAIL HARNESS gui-checks requires the host build, SSID file and Wi-Fi redactor'
+    if [[ ! -f "$binary" || ! -x "$binary" ]]; then
+        verdict 'FAIL HARNESS gui-checks requires the native helper build'
+        return 2
+    fi
+    if [[ $checks == default && ( ! -r ${GUI_SSID_FILE:-} || ! -r ${GUI_REDACT:-} ) ]]; then
+        verdict 'FAIL HARNESS gui-checks requires the SSID file and Wi-Fi redactor'
         return 2
     fi
     GUI_RESULTS=$R/gui-checks
@@ -39,13 +48,14 @@ gui_checks_installed() (
 
     # shellcheck disable=SC2329
     gui_checks_cleanup() {
-        local rc=$? reply
+        local rc=$? reply cleanup_timeout=45
         trap - EXIT
         trap '' INT TERM
         set +e
         if [[ -n "$GUI_REMOTE" ]]; then
             # session.sh is published only after both root copies pass verification.
-            reply=$(SSH_T=45 rsudo "if [ -x $GUI_REMOTE/session.sh ]; then
+            if [[ $checks == energy-picker ]]; then cleanup_timeout=65; fi
+            reply=$(SSH_T=$cleanup_timeout rsudo "if [ -x $GUI_REMOTE/session.sh ]; then
                 $GUI_REMOTE/session.sh cleanup $GUI_BOOT $GUI_UID
               else
                 /bin/rm -f $GUI_REMOTE/gui $GUI_REMOTE/session.incoming &&
@@ -54,6 +64,9 @@ gui_checks_installed() (
               fi" </dev/null 2>&1) || true
             if grep -Fqx GUI_CLEANUP_OK <<< "$reply"; then
                 verdict 'INFO gui-checks remote cleanup confirmed'
+            elif grep -Fqx GUI_ENERGY_RECOVERY_UNCONFIRMED <<< "$reply"; then
+                verdict 'FAIL HARNESS gui-checks Energy Mode recovery unconfirmed'
+                rc=1
             else
                 verdict 'FAIL HARNESS gui-checks remote cleanup unconfirmed'
                 rc=2
@@ -152,6 +165,10 @@ gui_checks_installed() (
         return 2
     fi
     verdict 'PASS gui-checks console-user Accessibility verified'
+    if [[ $checks == energy-picker ]]; then
+        python3 "$tools/run.py" energy-picker || return $?
+        return 0
+    fi
     python3 "$tools/run.py" wifi || failed=1
     python3 "$tools/run.py" brightness-ax || failed=1
     python3 "$tools/run.py" brightness-hid || failed=1

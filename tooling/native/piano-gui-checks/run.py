@@ -390,6 +390,9 @@ def main(phase):
     def interrupted(signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
+    if phase == "energy-picker":
+        from energy_picker import check
+        return check(bash, parse_reply, verdict, Path(env("GUI_RESULTS")) / "energy-picker.json")
     if phase == "ax-trust":
         try:
             prepare_ax()

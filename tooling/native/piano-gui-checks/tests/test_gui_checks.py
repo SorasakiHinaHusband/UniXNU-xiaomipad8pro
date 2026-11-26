@@ -163,6 +163,11 @@ class InstalledSpec(unittest.TestCase):
             unset GUI_BIN GUI_SSID_FILE GUI_REDACT
         fi
         [[ "$MOCK_CASE" != recording ]] || REC_C920=1
+        check=
+        if [[ "$MOCK_CASE" == energy-* ]]; then
+            check=energy-picker
+            unset GUI_SSID_FILE GUI_REDACT
+        fi
         event() { printf '%s\n' "$1" >> "$MOCK_EVENTS"; }
         export -f event
         trap 'event parent-exit' EXIT
@@ -193,7 +198,11 @@ class InstalledSpec(unittest.TestCase):
                 *GUI_INSTALL_OK*) event root-install
                     [[ "$MOCK_CASE" != root-lost ]] && echo GUI_INSTALL_OK || true ;;
                 *GUI_CLEANUP_OK*) event remote-cleanup
-                    [[ "$MOCK_CASE" != cleanup-lost ]] && echo GUI_CLEANUP_OK || true ;;
+                    case "$MOCK_CASE" in
+                        cleanup-lost) ;;
+                        energy-recovery-lost) echo GUI_ENERGY_RECOVERY_UNCONFIRMED; return 2 ;;
+                        *) echo GUI_CLEANUP_OK ;;
+                    esac ;;
                 *'session.sh ax-trust '*) event remote-ax-trust; echo 'GUI {"trusted":true}' ;;
                 *) event unexpected-rsudo; return 99 ;;
             esac
@@ -205,12 +214,13 @@ class InstalledSpec(unittest.TestCase):
                 ax-trust) command python3 "$@" ;;
                 wifi) [[ "$MOCK_CASE" != wifi-failure ]] ;;
                 brightness-ax|brightness-hid) ;;
+                energy-picker) [[ "$MOCK_CASE" != energy-void ]] || return 2 ;;
                 *) return 99 ;;
             esac
         }
         source "$1"
         rc=0
-        gui_checks_installed || rc=$?
+        gui_checks_installed "$check" || rc=$?
         steps
         exit "$rc"
     """
@@ -262,6 +272,12 @@ class InstalledSpec(unittest.TestCase):
 
     def test_continuous_recording_refused_before_remote_access(self):
         self.assertIn("requires camera stills", self.invoke("recording", 2, []))
+
+    def test_energy_opt_in_has_no_wifi_fixtures_or_other_phases(self):
+        events = self.staging + self.phases[:-3] + ["phase:energy-picker"] + self.cleanup
+        for scenario, status in (("energy-normal", 0), ("energy-void", 2), ("energy-recovery-lost", 1)):
+            with self.subTest(scenario=scenario):
+                self.invoke(scenario, status, events)
 
     def test_fragment_has_no_tablet_lock_access(self):
         lock_path = "/tmp/piano-tablet." + "lock"

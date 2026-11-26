@@ -23,12 +23,74 @@ restart_tccd() {
     [[ $pid =~ ^[0-9]+$ ]] && kill -KILL "$pid"
 }
 
-if [[ $op == seed || $op == cleanup ]]; then
-    # A timed-out SSH command can still be finishing the seed on the tablet.
-    exec /usr/bin/lockf -k -t 20 "$dir/session-lock" "$dir/session.sh" "$op-locked" "$boot" "$uid"
+asuser() { launchctl asuser "$uid" /usr/bin/sudo -n -u "#$uid" -- "$dir/gui" "$@"; }
+
+energy_preferences() {
+    local prefs
+    prefs=$(/usr/bin/pmset -g custom) || return 1
+    awk '
+        /^Battery Power:[[:space:]]*$/ { source="battery"; battery++ }
+        /^AC Power:[[:space:]]*$/ { source="ac"; ac++ }
+        /^[^[:space:]].*:[[:space:]]*$/ && !/^(Battery|AC) Power:/ { source="" }
+        $1=="powermode" {
+            if (source=="" || NF!=2 || $2 !~ /^[012]$/ || seen[source]++) bad=1
+            mode[source]=$2
+        }
+        END {
+            if (bad || ac!=1 || battery!=1 || !seen["ac"] || !seen["battery"]) exit 1
+            print mode["ac"], mode["battery"]
+        }' <<< "$prefs"
+}
+
+energy_finish() {
+    local ac battery current current_ac current_battery blocked=0
+    closed=false restored=false
+    # Disable late AX requests before closing the app and restoring powerd preferences.
+    (umask 077; : > "$dir/energy-finished") || blocked=1
+    closed=true
+    if [[ -e "$dir/energy-opened" ]]; then
+        if asuser energy-quit; then rm -f "$dir/energy-opened"; else closed=false; fi
+    fi
+    if [[ -f "$dir/energy-original" ]]; then
+        read -r ac battery < "$dir/energy-original" || return 1
+        [[ $ac =~ ^[012]$ && $battery =~ ^[012]$ ]] || return 1
+        if current=$(energy_preferences); then
+            read -r current_ac current_battery <<< "$current"
+        else
+            current_ac='' current_battery=''
+        fi
+        # Try both sources even when the first write fails.
+        [[ $current_ac == "$ac" ]] || /usr/bin/pmset -c powermode "$ac" || true
+        [[ $current_battery == "$battery" ]] || /usr/bin/pmset -b powermode "$battery" || true
+        if [[ $(energy_preferences) == "$ac $battery" ]]; then restored=true; fi
+    else
+        restored=true
+    fi
+    [[ $blocked == 0 && $closed == true && $restored == true ]]
+}
+
+case $op in
+    seed|cleanup|energy-begin|energy-open|energy-select|energy-finish)
+        # A lost reply can leave a mutation running. Cleanup takes the same lock.
+        lock_timeout=40
+        if [[ $op == seed || ( $op == cleanup && ! -e "$dir/energy-original" ) ]]; then lock_timeout=20; fi
+        exec /usr/bin/lockf -k -t "$lock_timeout" "$dir/session-lock" "$dir/session.sh" "$op-locked" "$boot" "$uid" "$@"
+        ;;
+esac
+
+if [[ $op == energy-finish-locked ]]; then
+    [[ $# == 1 && $1 =~ ^[a-f0-9]{32}$ ]]
+    rc=0
+    energy_finish || rc=2
+    "$dir/gui" energy-finish "$1" "$closed" "$restored"
+    exit "$rc"
 fi
 
 if [[ $op == cleanup-locked ]]; then
+    energy_failed=0
+    if [[ -e "$dir/energy-opened" || -e "$dir/energy-original" ]]; then
+        energy_finish || energy_failed=1
+    fi
     restart_failed=0
     if [[ -s "$dir/seed-owner" ]]; then
         read -r row stamp req < "$dir/seed-owner"
@@ -39,7 +101,12 @@ if [[ $op == cleanup-locked ]]; then
              AND csreq=X'$req'; SELECT changes();")
         if [[ $deleted == 1 ]]; then restart_tccd || restart_failed=1; fi
     fi
-    rm -f "$dir/gui" "$dir/seed-owner" "$dir/session.sh" "$dir/session-lock" "$dir"/req.*
+    if [[ $energy_failed == 1 ]]; then
+        echo GUI_ENERGY_RECOVERY_UNCONFIRMED
+        exit 2  # Keep the original preferences and helper so cleanup can be retried.
+    fi
+    rm -f "$dir/gui" "$dir/seed-owner" "$dir/session.sh" "$dir/session-lock" "$dir"/req.* \
+          "$dir/energy-original" "$dir/energy-original.incoming" "$dir/energy-opened" "$dir/energy-finished"
     rmdir "$dir"
     [[ $restart_failed == 0 ]]
     echo GUI_CLEANUP_OK
@@ -51,7 +118,6 @@ pgrep -u "$uid" -x Finder >/dev/null
 launchctl print "gui/$uid" >/dev/null
 registry=$(ioreg -n Root -d1 -w0)
 [[ $registry == *IOConsoleUsers* && $registry != *'"CGSSessionScreenIsLocked"=Yes'* ]]
-asuser() { launchctl asuser "$uid" /usr/bin/sudo -n -u "#$uid" -- "$dir/gui" "$@"; }
 case $op in
     seed-locked)
         # The RAM seed also sets Camera rows. On installed Data, touch only the Accessibility row,
@@ -83,6 +149,28 @@ SQL
         ;;
     wifi-state|wifi-disassociate)
         "$dir/gui" "$op" "$@"
+        ;;
+    energy-state)
+        [[ $# == 1 && $1 =~ ^[a-f0-9]{32}$ ]]
+        "$dir/gui" "$op" "$@"
+        ;;
+    energy-begin-locked)
+        [[ $# == 3 && $1 =~ ^[a-f0-9]{32}$ && $2 =~ ^[012]$ && $3 =~ ^[012]$ ]]
+        [[ ! -e "$dir/energy-finished" && ! -e "$dir/energy-original" ]]
+        [[ $(energy_preferences) == "$2 $3" ]]
+        umask 077
+        printf '%s %s\n' "$2" "$3" > "$dir/energy-original.incoming"
+        mv "$dir/energy-original.incoming" "$dir/energy-original"
+        printf 'GUI {"op":"energy-begin","token":"%s","armed":true}\n' "$1"
+        ;;
+    energy-open-locked|energy-select-locked)
+        [[ ${1:-} =~ ^[a-f0-9]{32}$ && -s "$dir/energy-original" && ! -e "$dir/energy-finished" ]]
+        if [[ $op == energy-open-locked ]]; then
+            (umask 077; : > "$dir/energy-opened")
+        else
+            [[ -e "$dir/energy-opened" ]]
+        fi
+        asuser "${op%-locked}" "$@"
         ;;
     display-sample)
         asuser "$op"
