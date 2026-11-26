@@ -1,5 +1,7 @@
 # Project map — Xiaomi Pad 8 Pro (piano)
 
+The reference tablet's daily install is **v13.1y12q**, running native macOS 27.3. [Current bring-up state](#7-current-bring-up-state-2026-11-27)
+
 ## 中文摘要
 
 三个公开仓库都在 GitHub 账号 [lenzhang](https://github.com/lenzhang) 下，全部公开。
@@ -59,7 +61,7 @@ Pins live in [unixnu.lock](../unixnu.lock) and [feeds.toml](../feeds.toml). Keep
 | Ubuntu / mainline | [yzddmr6/xiaomipad-8pro-mainline](https://github.com/yzddmr6/xiaomipad-8pro-mainline), [yzddmr6/linux-sm8750-piano](https://github.com/yzddmr6/linux-sm8750-piano) | Send Ubuntu fixes here |
 
 [`scripts/fetch-pins.py`](../scripts/fetch-pins.py) fetches the lockfile's checkouts by commit, including the reconstructed
-`k27-tree`. `--verify` checks that the pinned sources can be fetched. [CI pin checks](ci.md#checks-yml)
+`k27-tree`. `--verify` checks that the pinned sources can be fetched. [CI pin checks](ci.md#checksyml)
 
 ## 3. Checkout layout and host checks
 
