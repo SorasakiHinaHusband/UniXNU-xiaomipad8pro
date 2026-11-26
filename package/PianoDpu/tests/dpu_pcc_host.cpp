@@ -61,6 +61,12 @@ static void testDecode()
   CHECK(decodeS3132(raw).m.m[0][1] == 0);
   raw[1] = 1ull << 63;                            // -0 in sign-magnitude
   CHECK(decodeS3132(raw).ok && decodeS3132(raw).m.m[0][1] == 0);
+  const uint64_t invalidWords[] = {kS3132Limit + 1, 0ull - kS3132Limit - 1,
+                                   0x7ff8000000000000ull, 0xfff8000000000000ull};
+  for (uint64_t invalid : invalidWords) {
+    raw[1] = invalid;
+    CHECK(!decodeS3132(raw).ok);
+  }
 }
 
 static void testMath()
@@ -113,6 +119,21 @@ static void testWords()
   CHECK(w.w[0][1] == 0x3c000 && w.clampedNegative == 0 && pccMilli(w.w[0][1]) == -500);
   n.m[0][1] = -8 * kOne;
   CHECK(pccWords(n, true).w[0][1] == 0x20000 && pccWords(n, true).saturated == 1);
+  w = pccWords(diagonal(INT32_MAX, INT32_MIN, -1), true);
+  CHECK(w.w[0][0] == 0x1ffff && w.w[1][1] == 0x20000 && w.w[2][2] == 0x3ffff && w.saturated == 2);
+
+  const Matrix minRow{{{INT32_MIN, INT32_MIN, INT32_MIN}, {}, {}}};
+  const Matrix extremes{{{INT32_MIN, INT32_MAX, INT32_MAX},
+                         {INT32_MIN, INT32_MAX, 1},
+                         {INT32_MAX, INT32_MAX, INT32_MIN}}};
+  const Matrix product = multiply(minRow, extremes);
+  CHECK(product.m[0][0] == 8 * kOne && product.m[0][1] == -8 * kOne && product.m[0][2] == 0);
+  const Matrix rounded = multiply(diagonal(1, -1, 1), diagonal(kOne / 2, kOne / 2, kOne / 2 - 1));
+  CHECK(same(rounded, diagonal(1, -1, 0)));
+  Matrix extremeCrossTerm = identity();
+  extremeCrossTerm.m[0][1] = INT32_MIN;
+  CHECK(!isDiagonal(extremeCrossTerm, INT32_MIN));
+  CHECK(same(multiply(identity(), identity(), INT32_MIN), Matrix{}));
 }
 
 static void testApply()
@@ -271,6 +292,27 @@ static void testNightShift()
   CHECK(nightShiftPrograms(base, state).dspp[0].words.w[0][0] == 0x18000);
   state.setCorrection(UINT32_MAX);
   CHECK(state.corrected().m[0][0] == 4 * kOne && state.corrected().m[1][0] == -4 * kOne);
+  state.setCorrection(0);
+  CHECK(same(state.corrected(), Matrix{}) && !state.neutral());
+  CHECK(state.setMatrix(blank) == NightShift::Input::blank && !state.neutral());
+  CHECK(state.setMatrix(unity) == NightShift::Input::accepted && state.neutral());
+  CHECK(same(state.corrected(), identity()));
+
+  model::Dpu enabled;
+  const LivePath enabledPath = readPath(enabled);
+  CHECK(apply(enabled, enabledPath, identity(), true).ok);
+  PanelPcc enabledBase;
+  CHECK(capturePanelPcc(enabled, enabledPath, enabledBase));
+  PanelPcc enabledLast = enabledBase;
+  CHECK(state.setMatrix(warm) == NightShift::Input::accepted);
+  CHECK(updateNightShift(enabled, enabledPath, nightShiftPrograms(enabledBase, state), enabledLast, false).result.ok);
+  CHECK(state.setMatrix(unity) == NightShift::Input::accepted);
+  CHECK(updateNightShift(enabled, enabledPath, nightShiftPrograms(enabledBase, state), enabledLast, false).result.ok);
+  for (unsigned d = 0; d < 2; ++d) {
+    CHECK(enabled.pccActive[d][0] == 1);
+    for (unsigned k = 0; k < 9; ++k)
+      CHECK(enabled.pccActive[d][4 + k] == (k % 4 == 0 ? 0x8000u : 0u));
+  }
 
   LivePath incomplete = path;
   incomplete.dspps = 1;

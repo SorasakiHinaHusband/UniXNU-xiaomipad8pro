@@ -131,6 +131,11 @@ void repeatedSwitches()
 void refusals()
 {
   auto io = m1();
+  bool transmitted = false;
+  const auto timing = m::plan(m::geometry(m::readTiming(io, readPath(io).link[0], 0)), *m::modeByHz(120));
+  CHECK(m::sendRateGroup(io, m::rateGroup(*m::modeByHz(144), true), {}, transmitted));
+  CHECK(m::sendRateGroup(io, {}, timing, transmitted));
+  CHECK(!transmitted && io.stores.empty());
   CHECK(m::switchTiming(io, 75, kAllTimings).why);
   CHECK(m::switchTiming(io, 60, {refresh::Db::direct}).why);
   io.regs[kGcc + kGccDispAhb] = 0x80000000;
@@ -170,6 +175,21 @@ void counterAndFlushGate()
   CHECK(io.rd(intfReg(1, kIntfCountEn)) == 0 && io.rd(intfReg(2, kIntfCountEn)) == 0);
   CHECK(io.glitches == 0 && io.commandsInFrame == 0 && io.refused.empty());
 
+  auto wrapped = m1();
+  for (unsigned i = 1; i <= 2; ++i) wrapped.intf[i].frames = UINT32_MAX - 1;
+  const auto acrossWrap = m::switchTiming(wrapped, 60, {});
+  CHECK(!acrossWrap.why && acrossWrap.counters.moving && acrossWrap.rate.lockstep);
+  CHECK(wrapped.intf[1].frames < 10 && wrapped.intf[2].frames < 10);
+
+  auto disabled = m1();
+  const m::Options off{.fixedHz = m::bootModeHz(0)};
+  const auto unexpected = [] { CHECK(false); };
+  for (unsigned hz : {0u, 60u, 120u, 144u}) {
+    const auto r = m::switchTo(disabled, hz, off, unexpected, unexpected);
+    CHECK(r.why && !r.timingTouched && !r.counters.sampled);
+  }
+  CHECK(disabled.stores.empty() && disabled.dcs.empty() && disabled.bandwidthVotes.empty() && disabled.ns == 0);
+
   auto checkRefusal = [](model::Dpu &blocked, const char *expected) {
     const auto unexpected = [] { CHECK(false); };
     const auto r = m::switchTo(blocked, 60, {}, unexpected, unexpected);
@@ -195,6 +215,21 @@ void counterAndFlushGate()
   io.ctlFlush = kFlushIntf;
   io.flushStuck = true;
   checkRefusal(io, "mode: 120 -> 60 Hz: CTL flush is pending (CTL0, CTL_FLUSH 0x80000000); refused");
+}
+
+void commandClockWrap()
+{
+  struct WrappedDpu : model::Dpu {
+    uint64_t nowUs() { return (UINT64_MAX - 8250) + model::Dpu::nowUs(); }
+  } io;
+  static_cast<model::Dpu &>(io) = m1();
+  io.intf[1].counting = io.intf[2].counting = true;
+  const auto &mode = *m::modeByHz(120);
+  const auto path = readPath(io);
+  const auto timing = m::plan(m::geometry(m::readTiming(io, path.link[0], 0)), mode);
+  bool transmitted = false;
+  CHECK(!m::sendRateGroup(io, m::rateGroup(mode, true), timing, transmitted));
+  CHECK(transmitted && io.dcs.size() == 8 && io.commandsInFrame == 0);
 }
 
 void rollback()
@@ -529,6 +564,7 @@ int main()
   repeatedSwitches();
   refusals();
   counterAndFlushGate();
+  commandClockWrap();
   rollback();
   qual1Underrun();
   fixed120Boot();

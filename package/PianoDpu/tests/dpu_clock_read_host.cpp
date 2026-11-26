@@ -74,6 +74,10 @@ int main()
   CHECK(c::capture(gate, load).mdpHz == 19200000);
   words[rcg + 4] = 2;
   CHECK(c::capture(gate, load).mdpHz == 12800000);
+  words[rcg + 4] = 31;
+  CHECK(c::capture(gate, load).mdpHz == 1200000);
+  static_assert(c::dividerX2(0) == 2 && c::dividerX2(1) == 2 && c::dividerX2(UINT32_MAX) == 32);
+  static_assert(c::pllRate(0xabcdffff, 0x1234ffff) == 1'258'291'199'707);
   words[rcg] = 1;
   CHECK(!c::capture(gate, load).mdpHz);
   words[rcg] = 0x80000000;

@@ -661,6 +661,19 @@ static void testTables()
   CHECK(sm::kTcrS1 == 0x00800020u && sm::tcr2S1(5) == 0x00038005u && sm::tcrS2(5) == 0x00050060u);
 }
 
+static void testSlotClockWrap()
+{
+  sm::Slots windows;
+  int keys[sm::kSlots] = {};
+  windows.clock = UINT64_MAX - 2;
+  for (unsigned i = 0; i < sm::kSlots; ++i)
+    windows.take(i, &keys[i], &keys[i], nullptr, 1);
+  windows.shown = 3;
+  windows.pending = 1;
+  CHECK(windows.clock == 1 && windows.victim() == 0);
+  CHECK(windows.find(&keys[0], &keys[0]) == 0 && windows.victim() == 2);
+}
+
 static void testPlan()
 {
   {   // the expected case: bank off, stage 1, VA64
@@ -1137,7 +1150,10 @@ static void testConditionalClean()
   CHECK(show(c) == kPianoDpuFlipShown && r.f.st.cleanInits == 5);
 
   r.f.cfg.forceFullClean = true;
+  r.hw.cleanEvents.clear();
   CHECK(show(c) == kPianoDpuFlipShown && r.f.st.cleanReasons[unsigned(CleanReason::forced)] == 1);
+  CHECK(std::count(r.hw.cleanEvents.begin(), r.hw.cleanEvents.end(), "clean") == 1);
+  CHECK(r.f.st.cleanSkips == 14 && !r.f.cleanEpochs[r.f.slots.shown].initialized);
   r.f.cfg.forceFullClean = false;
   CHECK(show(c) == kPianoDpuFlipShown && r.f.st.cleanInits == 6);
   r.hw.failCleanBytes = allocation;   // the required initial clean fails; the scanout-only fallback works
@@ -1424,6 +1440,19 @@ static void testCadence()
   h.bands(band);
   CHECK(band[0] == 90 && band[1] == 0 && band[2] == 9 && band[3] == 0 && band[4] == 0 && band[5] == 1);
   CHECK(h.atMost(9500) == 90 && h.atMost(8250) == 0 && h.atMost(8333) == 90);
+  Hist edges;
+  for (uint64_t us : {0, 250, 251, 9500, 9501, 50000, 50001}) edges.add(us);
+  edges.bands(band);
+  CHECK(edges.atMost(250) == 2 && edges.atMost(50000) == 6 && edges.atMost(50001) == 7);
+  CHECK(edges.pct(1000) == 50001 && band[0] == 4 && band[1] == 1 && band[5] == 2);
+  Hist full;
+  full.b[0] = UINT32_MAX;
+  full.n = UINT32_MAX;
+  full.add(1);
+  full.add(UINT64_MAX);
+  full.add(251);
+  CHECK(full.atMost(250) == UINT32_MAX && full.n == uint64_t(UINT32_MAX) + 2 && full.sumUs == UINT64_MAX);
+  CHECK(full.pct(1000) == UINT64_MAX);
   Hist one;
   one.add(12);
   CHECK(one.pct(500) == 250 && one.pct(999) == 250);
@@ -1440,6 +1469,10 @@ static void testCadence()
       CHECK(ok && at == bytes);
     }
   CHECK(cleanBand(100, 3, 2, 64).end == 0 && cleanBand(100, 0, 0, 64).end == 0);
+  const Band large = cleanBand(UINT64_MAX, UINT32_MAX - 1, UINT32_MAX, 1);
+  CHECK(large.begin == UINT64_MAX - (uint64_t(UINT32_MAX) + 2) && large.end == UINT64_MAX);
+  const Band partial = cleanBand(UINT64_MAX, 7, 8, 64);
+  CHECK(partial.begin == (UINT64_MAX / 8 + 1) * 7 && partial.end == UINT64_MAX);
   // the flipper: two surfaces in turn, one flip per frame (8333 us), then one flip every 10 ms (each lands a frame later)
   Rig r;
   CHECK(r.ready());
@@ -1500,6 +1533,7 @@ int main(int argc, char **argv)
     return 0;
   }
   testTables();
+  testSlotClockWrap();
   testPlan();
   testEnable();
   testBankOn();

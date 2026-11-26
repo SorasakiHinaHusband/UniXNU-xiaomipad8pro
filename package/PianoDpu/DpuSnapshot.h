@@ -321,6 +321,10 @@ void format(const Snapshot &s, uint64_t serial, uint64_t atUs, Out &out)
     const modes::LinkWords now = liveWords(s.live[0]);
     for (const Mode &m : kModes) {
       const modes::LinkWords w = modes::plan(geo, m);
+      if (!w.hz) {
+        out.line("plan %u Hz: timing cannot be represented", m.hz);
+        continue;
+      }
       out.line("plan %u Hz: hsync %08x period %08x vwidth %08x dv %08x-%08x dhctl %08x prog-fetch %08x; dsi total %08x active-h %08x "
                "active-v %08x; intf clock %llu Hz; words changed from live %03x",
                m.hz, w.hsyncCtl, w.period, w.vsyncWidth, w.dispVStart, w.dispVEnd, w.dispHctl, w.progFetch, w.dsiTotal, w.dsiActiveH,
