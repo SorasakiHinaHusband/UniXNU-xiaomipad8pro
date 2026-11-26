@@ -90,9 +90,10 @@ static inline unsigned bootArgMode(const char *args) {
     const char *end = s;
     while (*end && *end != ' ' && *end != '\t') { ++end; }
     constexpr size_t keyLen = sizeof key - 1;
-    const size_t len = end - s;
+    const size_t len = static_cast<size_t>(end - s);
     if (len >= keyLen && __builtin_memcmp(s, key, keyLen) == 0) {
-      mode = len == keyLen + 1 && (s[keyLen] == '1' || s[keyLen] == '2') ? s[keyLen] - '0' : 0;
+      mode = len == keyLen + 1 && (s[keyLen] == '1' || s[keyLen] == '2') ?
+          static_cast<unsigned>(s[keyLen] - '0') : 0u;
     }
     s = end;
   }

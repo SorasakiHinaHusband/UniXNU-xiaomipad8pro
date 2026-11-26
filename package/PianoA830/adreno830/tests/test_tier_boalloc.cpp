@@ -210,6 +210,39 @@ static void testFullTier(Path &path,size_t poolFree)
     CHECK(fixture.live.size()==liveDescriptors && fixture.metadata.size()==metadata && !path.client.liveObjects());
 }
 
+static void testModeOneWorkload(Path &path,size_t poolFree)
+{
+    configure(1,7,fullRuns);
+    checkCapability(path,true);
+    constexpr uint64_t capacity=870*MiB;
+    constexpr uint64_t usedMiB[]={0,2,6,14,30,62,126};
+    uint64_t handles[std::size(usedMiB)-1]{};
+    const auto liveDescriptors=fixture.live.size();
+    const auto metadata=fixture.metadata.size();
+    auto stats=NativeAdrenoMemory::tierStats();
+    CHECK(stats.mode==1 && std::strcmp(stats.state,"ready")==0 && stats.pass_mask==7);
+    CHECK(stats.free_bytes==capacity && !stats.used_bytes && !stats.allocations && !stats.refusals);
+    for (auto count:stats.requests) CHECK(count==0);
+
+    for (size_t i=0;i<std::size(handles);++i) {
+        const uint64_t previous=usedMiB[i]*MiB;
+        const uint64_t used=usedMiB[i+1]*MiB;
+        auto *memory=allocate(path,used-previous,NativeAdrenoBoAllocGpuPrivate,handles[i]);
+        CHECK(memory->tier() && memory->spanCount()==1);
+        CHECK(memory->spans()[0].physical==kRegionLo+previous && memory->spans()[0].bytes==used-previous);
+        stats=NativeAdrenoMemory::tierStats();
+        CHECK(stats.used_bytes==used && stats.free_bytes==capacity-used && stats.allocations==i+1);
+        CHECK(stats.requests[NativeAdrenoTierPrivate]==i+1 && !stats.refusals);
+        CHECK(!stats.requests[NativeAdrenoTierImportDenied] && !stats.requests[NativeAdrenoTierCpuMapDenied]);
+    }
+    CHECK(path.client.liveObjects()==std::size(handles));
+    CHECK(path.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
+    stats=NativeAdrenoMemory::tierStats();
+    CHECK(stats.free_bytes==capacity && !stats.used_bytes && stats.allocations==std::size(handles));
+    CHECK(!path.client.liveObjects() && NativeAdrenoMemory::poolFreeBytes()==poolFree);
+    CHECK(fixture.live.size()==liveDescriptors && fixture.metadata.size()<metadata && !memoryDepth);
+}
+
 int main()
 {
     NativeAdrenoMemory::setUnmappedUser(true);
@@ -348,7 +381,7 @@ int main()
     fixture.metadata_fail=false;
     CHECK(NativeAdrenoMemory::tierStats().free_bytes==2*kSlab && NativeAdrenoMemory::tierStats().refusals==1);
     CHECK(fixture.live.size()==liveDescriptors && fixture.metadata.size()==metadata && !path.client.liveObjects());
-    CHECK(path.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
-    std::puts("PASS: tier BoAlloc/BoFree: 870 MiB exhausted and reused, pageable fallback, mode and S8 isolation, "
-              "GPU map, CPU-map and import alias denial, slab zeroing and metadata rollback");
+    testModeOneWorkload(path,poolFree);
+    std::puts("PASS: tier BoAlloc/BoFree: mode-1 residency through 126 MiB and disconnect, 870 MiB exhausted and reused, "
+              "pageable fallback, mode and S8 isolation, CPU-map and import alias denial, GPU map, slab zeroing and metadata rollback");
 }
