@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Host test of PianoGpuCeiling.h (docs/policy.md §5.3): one slot per caller, the lowest non-zero slot wins, clearing one leaves the
 // others in force, an unknown client changes nothing, a repeat changes nothing, the holder on a tie is the lowest id.
+// c++ -std=c++20 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. test_gpu_ceiling.cpp -o /tmp/test_gpu_ceiling && /tmp/test_gpu_ceiling
 #include "PianoGpuCeiling.h"
 #include <cstdio>
 #include <cstdlib>
