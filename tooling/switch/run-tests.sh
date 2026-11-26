@@ -12,6 +12,7 @@ python3 -I tooling/switch/test-pack-selector.py "$out/selector.bin" \
 bash tooling/switch/test-bootflag-sh.sh
 bash tooling/switch/test-sign-props.sh
 python3 -I tooling/switch/check-fd-patch.py
-c++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter -I package/PianoDwc3 package/PianoDwc3/tests/bootflag_sdam_host.cpp -o "$out/bootflag_sdam_host"
+c++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+  -I package/PianoDwc3 package/PianoDwc3/tests/bootflag_sdam_host.cpp -o "$out/bootflag_sdam_host"
 "$out/bootflag_sdam_host"
 echo "ALL SWITCH HOST TESTS PASS"
