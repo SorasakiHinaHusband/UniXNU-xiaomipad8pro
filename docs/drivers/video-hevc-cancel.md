@@ -1,353 +1,387 @@
-# ram16g-hevc1: pending AVC cancellation
+# ram16g-hevc1 / ram16g-hctl1: pending AVC cancellation
 
-Status: **HOLD**, analysis only. The 2026-11-26 failure is an unfinished
-pending-cancel operation above a **completed native teardown**, followed by a
-host SSH timeout. It is **not HEVC phases exhausting the AVC time budget**.
-The exact public VT wait and its causal defect remain unproved. No code,
-image, harness budget, or tablet state was changed for this analysis.
+The `ram16g-hctl1` control **exonerates RAM16G mixed HEVC backing**. Both
+runs reach the same eight-accepted/four-pending AVC cancellation boundary,
+complete native teardown, and lose public progress. Apple 27.3 disassembly
+establishes the missing contract: accepted asynchronous frames need terminal
+`Demt` dispositions **processed before the `dinv` reply clears the guest's
+callback target**. Native STOP/CLOSE and `dinv=0` alone do not retire them.
 
-## Established evidence
+The fix below implements that contract and has host regression coverage.
+Tablet qualification of the fix is still outstanding. This investigation
+only read archived evidence and local binaries; it did not access the tablet,
+build a fix image, change budgets, or push anything.
 
-Evidence names below refer to the archived `ram16g-hevc1` run, without its
-private storage location. Source for the image is commit `1da1485af7`
-(`run.log:2`); the analysis checkout starts at `3fcf74f4`. The qualification
-program is `tooling/native/video-v6.mm`, not
-`package/PianoVideo/tests/video-v6.mm`. The image revision has the mixed HEVC
-implementation; this checkout does not have all of those changes. Read the
-image revision with `git show 1da1485af7:<repo-relative-path>` when comparing
-its mixed backing.
+## Deciding control evidence
 
-- `RESULT.md:130-140`: the AVC invocation lacks its exit marker after twelve
-  phase passes; the separate HEVC invocation passes with 24 callbacks.
-- `ram16g-hevc1.spec:2018`: `SSH_T=360` wraps
-  `video-v6 --qualify <fixtures>; echo V6_TOOL_EXIT=$?`.
-- `ram16g-hevc1.spec:2031`: a subsequent, separate `SSH_T=420` invocation runs
-  `video-v6 --qualify-hevc <hevc-fixtures>; echo HEVC_TOOL_EXIT=$?`.
-- `rx-v6.txt:1`: tool start is monotonic `583841549` microseconds.
-- `rx-v6.txt:1949-1988`: `cancel-recreate` creates epoch 20, accepts eight
-  samples, has four pending public callbacks, then stops printing during its
-  close helper. The last line is the host wrapper's `Alarm clock: 14`.
-- `rx-v6-console.txt:12933-12995`: `dinv` request 115 reaches the frontend;
-  both HFI STOPs and CLOSE succeed; session `56360012` closes with result 0,
-  seven ETBs/EBDs/decoded pictures, zero loans/watchdog/fault bits; the worker
-  reports four cancellations and zero maps; `invalidate safe worker-joined 1`
-  is printed and a successful `dinv` reply is queued. A subsequent `dfin`
-  request 116 receives `-12903` and its reply is queued.
+Evidence labels in this section mean the archived **2026-11-27
+`ram16g-hctl1`** run. They deliberately omit its storage location.
 
-Source line numbers below are at `1da1485af7` unless explicitly identified as
-the analysis checkout. The cancel worker/teardown and `dfin`/`dinv` handlers
-are unchanged between those revisions; the HEVC capability and copy/backing
-changes must be read at the image revision. No mixed implementation was
-imported into this branch.
+- `run.log:2`: image commit **`1da1485af7`**, the same image source as
+  `ram16g-hevc1`. `ba2.txt:4` and the archived chosen properties contain
+  `piano-extra-ram=0`, `piano-video-extra-ram=0`, and
+  `piano-video-extra-ram-hevc=0`.
+- `RESULT.md:59-65,211-217`: extra pool disabled, no mixed reservation,
+  **268435456-byte XNU arena**, 1080p HEVC admission cap retained, boot
+  reservation ready. This is a real backing control, not a zero-pending run.
+- `run.log:37-40`: unchanged payload pin `252cb0d465e6…`, tool pin
+  `b0072c969490…`, twelve AVC phase passes, then the separate HEVC control.
+  The qualification tool is [tooling/native/video-v6.mm](../../tooling/native/video-v6.mm).
+- `rx-v6.txt:1`: AVC process **PID 3908**, start **608742734 us** uptime.
+  Lines 2-1948 contain exactly twelve phase passes: rejection, manifest,
+  two demux, two audit, decoder-spec, single-regression, ibp-async,
+  ip-temporal, ibp-temporal, and ibp-no-output. No HEVC phase consumes this
+  invocation's budget.
+- `rx-v6.txt:1949-1987`: epoch 20 creates in **64249 us**. Public tokens
+  **85899345921-85899345928** are accepted; the first four have image
+  callbacks, the last four remain pending. The exact boundary is
+  `cancel-begin epoch=20 accepted=8 pending=4 no-wait-before-invalidate=1`,
+  followed by `PASS cancel-had-accepted-work` and `PASS cancel-had-pending`.
+- `rx-v6.txt:1988`: host SSH wrapper **`Alarm clock: 14`**; no
+  `V6_TOOL_EXIT`, `cancel-joined`, epoch-21 recreate, or qualification pass.
+  `RESULT.md:123,126-127` independently records the missing exit marker,
+  twelve passes and 248 native submits with zero video-parser issues.
 
-## Time budget and phase accounting
+The exact **PID 3908** native-session breakdown in `rx-v6-console.txt` is:
 
-The host wrapper is `tmo.sh:3`:
+| Native session | Phase | Open uptime (us) / line | Close line | ETB/EBD/decoded |
+| --- | --- | --- | --- | --- |
+| `56360001` | single-regression | 608866095 / 131 | 727 | 1/1/1 |
+| `56360002` | ibp-async | 609280618 / 780 | 3765 | 60/60/60 |
+| `56360003` | ip-temporal | 609980556 / 3812 | 6794 | 60/60/60 |
+| `56360004` | ibp-temporal | 610679195 / 6841 | 9800 | 60/60/60 |
+| `56360005` | ibp-no-output | 611390918 / 9847 | 12789 | 60/60/60 |
+| **`56360006`** | **epoch-20 cancel-pending** | **612090883 / 12836** | **13272** | **7/7/7** |
 
-```sh
-s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"
-```
+Epoch 20 is selected for PID 3908 at console line **12812**. Its **wire**
+tokens 1-8 correspond to the eight public source-frame tokens above; these
+are different identifier domains. At lines **13215-13232**, token 5 is in
+`Dbuf`/surface lookup, token 8's held admission is successfully published,
+and `dinv` request **115** arrives. Token 8 never reaches ETB. Only tokens
+1-4 sent successful `Demt`/received callbacks. The remaining records span
+surface delivery, submitted firmware work, and queued-before-submit work.
 
-The ordinary `rssh` path in `tabletrun.sh:186-187` invokes that wrapper with
-`SSH_T`, then suppresses its failure with `|| true`. Thus the 360-second
-alarm applies to the **host SSH command**, not directly to the remote
-`video-v6` process. `Alarm clock: 14` identifies host SIGALRM; it is not an
-Iris watchdog or a video process exit status. The grading check at spec line
-2020 only requires an exit marker with digits; its absence is the single
-FAIL. It does not by itself establish where the remote process blocked.
+Lines **13230-13285** are the deciding teardown, not the later background
+sessions:
 
-There is also a **300-second process alarm** in `video-v6.mm:531`, with a
-handler at line 35 that writes `FAIL process-timeout status=124` and exits
-124. Neither that message nor `V6_TOOL_EXIT` was received. An unlabelled
-`invalidate safe` line between kernel uptime 883.784 and 883.848 seconds
-(`rx-v6-console.txt:19931-19943`) is 299.942451–300.006451 seconds after
-tool start. This is consistent with process-alarm cleanup, but is not
-PID-labelled proof of process death. The SSH connection can outlive the
-remote process; the missing output/exit status remains an observation gap.
+1. Token 5's acquired surface is disposed without a successful frame emit;
+   lookup/invalidate/release totals are **5/5/5**, held=0, maps=0,
+   surface-open/close=1/1 (13231-13238).
+2. STOP RAW, STOP input and CLOSE succeed. Session **`56360006`** closes
+   with result=0, loans=0, watchdog=0, fault-bits=0, no quarantine; nine
+   resident HFI ledger entries are released on close (13246-13272).
+3. Worker reports **cancelled 4**, pending0; **`invalidate safe
+   worker-joined 1` at 13274** precedes **`dinv` 115 status 0 at 13275**.
+   The reply is enqueued at 13276.
+4. The next request is **`dfin` 116**, **PID 3908**, answered **-12903**
+   at 13282 and enqueued at 13283. No `-dec` for this session or epoch-21
+   create follows before the public stall.
 
-The host `run.log` records payload verification at **23:23:07** and the
-post-AVC verdict at **23:29:10**, a **363-second command block** including
-mark/health/SSH setup. The configured wrapper lifetime is **360 seconds**.
-There is no timestamp on wrapper launch, `cancel-begin`, or the alarm line,
-so an exact process runtime or exact cancel-to-alarm duration cannot be
-recovered. Calling 363 seconds the decoder runtime would be incorrect.
+First native input is at 612166524 us (13026); `dinv`/close/`dfin` all
+precede the next clock marker **612285718 us** (13286). Thus the clean
+teardown is already over by **3.542984 seconds after tool start**, leaving
+hundreds of seconds of the nominal 360-second SSH budget. The 363-second
+`run.log:37-38` block includes setup/capture and is not decoder runtime.
 
-These are the twelve passed phases, in order (`rx-v6.txt`):
+**Other processes must not be merged into that session.** Lines
+**17638-18466** contain **sixteen PID 2751 HEVC decoder selections** and
+short-lived rejected sessions, each using `dinv` request **104** and then
+`-dec`; none opens a native session. Their `invalidate safe` lines are not
+epoch 20 completing. The unlabelled `invalidate safe` at **19654**, near
+908.69 seconds uptime (about 300 seconds after AVC start), is consistent
+with process-alarm cleanup, but does not identify a PID or prove a public
+invalidate return. No sampled Apple thread stack or independent remote exit
+status exists in this archive.
 
-| Phase | Lines | Recorded duration / limit |
-| --- | --- | --- |
-| `rejection-contract` | 2–7 | No individual clock stamp |
-| `manifest` | 8–10 | No individual clock stamp |
-| `demux-ip` | 11–19 | No individual clock stamp |
-| `demux-ibp` | 20–28 | No individual clock stamp |
-| `audit-ip` | 29–36 | No individual clock stamp; private serializer unavailable |
-| `audit-ibp` | 37–44 | No individual clock stamp; private serializer unavailable |
-| `decoder-spec` | 46–48 | No individual clock stamp |
-| `single-regression` | 49–97 | Create **154.002 ms**; valid golden callback **31.266 ms** latency; no whole-phase timer |
-| `ibp-async` | 98–561 | Create **93.058 ms**; summary **700.245 ms**, including create |
-| `ip-temporal` | 562–1023 | Create **81.942 ms**; summary **681.812 ms**, including create |
-| `ibp-temporal` | 1024–1485 | Create **76.806 ms**; summary **672.771 ms**, including create |
-| `ibp-no-output` | 1486–1948 | Create **86.219 ms**; summary **674.951 ms**, including create |
+The independent HEVC control is **PID 3970**, not PID 2751 or PID 3908:
+`rx-hevc.txt:1,49-59` passes fixture validation and **`hevc-control`**, rejects
+the wide 4K format with **-12910**, creates no decoded frames, and ends
+**`HEVC_TOOL_EXIT=0`**. `RESULT.md:128-134` confirms that verdict. Its
+no-native-AVC-marker grading failures are in this deliberately declining
+HEVC window, not missing AVC evidence. `rx-grade-compare.txt` passes final
+wired delta **-131 MiB** and postx **-279 MiB**, but fails idle/postload/
+postvideo deltas **-416/-477/-374 MiB**; those coarse memory comparisons
+are not a cancellation diagnosis and are not being relabelled as passes.
 
-The first seven phases together finish before the first native open at
-583.974527 seconds, **less than 132.978 ms** after the tool's start stamp.
-That bound also includes part of single-regression creation; it is not a
-measurement of each preflight phase. The four stream summaries total exactly
-**2.729779 seconds**. Their timers start before create and end after the
-finish/wait barriers, before `close()` and its 20 ms observation sleep
-(`video-v6.mm:384-410`). Adding create times again would double-count them.
+For comparison, the **2026-11-26 `ram16g-hevc1`** run used the mixed arena
+(274 MiB region0 + 410 MiB XNU). Its AVC PID **3876**, cancel session
+**`56360012`**, `dinv` **115**, `dfin` **116**, eight admissions/four image
+callbacks/seven ETBs and four local cancellations are the same pattern
+(`rx-v6.txt:1949-1988`, `rx-v6-console.txt:12933-12995`). Clean teardown
+finished by elapsed **4.304066 seconds**. Separate HEVC PID **3932** passed
+24 golden P010 callbacks/reopen and `HEVC_TOOL_EXIT=0`; background HEVC PID
+**2783** was unrelated to AVC qualification. Both captures therefore
+exclude HEVC phase budget exhaustion. Reproduction with the XNU-only arena
+also excludes mixed backing as the cause of this stall.
 
-Native opens give a separate check on whole-cycle progress. These are exact
-**open-to-next-open** differences, not phase begin/end durations:
+## Apple 27.3 binary contract
 
-| Session / phase | Native open, seconds uptime | Until next native open |
-| --- | ---: | ---: |
-| `5636000d` / single | 583.974527 | 213.644 ms |
-| `5636000e` / ibp-async | 584.188171 | 745.262 ms |
-| `5636000f` / ip-temporal | 584.933433 | 729.965 ms |
-| `56360010` / ibp-temporal | 585.663398 | 720.833 ms |
-| `56360011` / ibp-no-output | 586.384231 | 721.279 ms |
-| `56360012` / cancel-pending | 587.105510 | Subsequent public recreate never appears |
+The supplied decoded **arm64e** cache was inspected directly with
+`ipsw dyld macho -n/-l`, `ipsw dyld disass -i`, and `ipsw dyld dump -a`.
+Addresses below are **unslid virtual addresses in these exact binaries**,
+not addresses from a running tablet or guesses from symbol names:
 
-The `V9g native open` stamps are in `rx-v6-console.txt` at lines 98, 496,
-3529, 6538, 9548, and 12537. They confirm seconds, not minutes, of preceding
-work.
+| In-cache install path | Identity |
+| --- | --- |
+| `/System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox` | version **3395.5.1**, UUID **DE6D299C-3D76-3F97-9A24-9F9C78F779C7**, macOS MinOS/SDK **27.3** |
+| `/System/Library/PrivateFrameworks/VideoToolboxParavirtualizationSupport.framework/Versions/A/VideoToolboxParavirtualizationSupport` | UUID **76809DA1-E06B-3EAB-BABB-73C2112C13C0**, macOS MinOS/SDK **27.3** |
 
-The thirteenth phase, `cancel-recreate`, creates epoch 20 in **85.647 ms**
-and accepts eight samples with flags 9 (asynchronous plus temporal
-processing), with four public callbacks and four still pending. Its last
-public line is `cancel-had-pending`; `cancel-joined`, `recreate-at-idr`, and
-the qualification verdict never appear.
+The supplied root and cryptex trees contain no additional VideoToolbox or
+paravirtual-video component. `AppleVideoToolboxParavirtualizationDriver`
+and `AppleVideoToolboxParavirtualizationUserClient` are the service names
+used by the support framework and implemented by our kext. The decoder
+itself is **`ParavirtualizedVideoDecoder` inside VideoToolbox**, not a
+separate userspace library named AppleVideoToolboxParavirtualization.
+No extracted dylib or binary/disassembly dump is tracked.
 
-| Event | Uptime / elapsed from start | Evidence and precision |
-| --- | --- | --- |
-| Tool starts | 583.841549 s / 0 | Exact `stamp-us`, `rx-v6.txt:1` |
-| Cancel first native input | 587.201774 s / 3.360225 s | Exact V9j3 stamp, console slice line 12731 |
-| `dinv` received, both STOPs and HFI CLOSE acknowledged | After that input, before 587.256086 s / before 3.414537 s | Ordered records, slice lines 12933–12963; CLOSE precedes the GPU clock marker |
-| Native close, worker join, successful `dinv`, then `dfin=-12903` | After 587.257738 and before 588.145615 s / 3.416189–4.304066 s | Neighbouring clock markers; slice lines 12973–12996 |
-| Possible process-alarm cleanup | 883.784–883.848 s / about 300 s | Unlabelled teardown; inference only |
-| Host alarm | 360 s after host wrapper launch | Alarm line has no clock stamp |
+### Invalidate, finish, and the outstanding-frame semaphore
 
-On the approximation that remote start and host wrapper launch coincide,
-cancel-to-host-alarm is **356.585–356.640 seconds**, and cancel-to-the-inner
-300-second alarm is **296.585–296.640 seconds**. These are estimates: there
-is unmeasured SSH/startup time, and `cancel-begin` itself is unstamped. The
-hard result is that native teardown completed with **over 350 seconds of
-the nominal outer budget still available**. The transcript's adjacent
-`cancel-begin` and alarm lines conceal several minutes without public output.
+| Function / address | Instructions establishing the behavior |
+| --- | --- |
+| `VTDecompressionSessionInvalidate` **0x196dfd5bc** | **0x196dfd848-0x196dfd89c** calls the decoder CMBaseObject base-class Invalidate slot (+0x18); **0x196dfd8a4** calls `VTDecompressionSessionWaitForAsynchronousFrames`; only afterwards does **0x196dfd8b0** `CFRelease` the decoder. |
+| `kParavirtualizedVideoDecoderVTable` **0x1e4028848**, base class **0x1e4028880** | Decoded pointer dump maps base-class Invalidate to **0x1972fba08** and Finalize to **0x1972fbbc4**. This closes the indirect call above. |
+| `ParavirtualizedVideoDecoder_Invalidate` **0x1972fba08** | Builds `dinv`, request flags=1 (**0x1972fba44-0x1972fba60**), calls **`VTParavirtualizationGuestSendMessageToHostAndCopyReplySync` at 0x1972fba84**, reads `,err`, then locks storage+0x10 and **zeros both callback/session targets at storage+0/+8** (**0x1972fbaac-0x1972fbabc**). It does not decrement outstanding frames or consume a list of cancelled tokens from `dinv`. |
+| `VTDecompressionSessionWaitForAsynchronousFrames` **0x196dfb2f0** | Calls `VTDecompressionSessionFinishDelayedFrames` at **0x196dfb3e0**, ignores that return value, then waits on **public session+0x40** with `FigSemaphoreWaitRelative` (**0x196dfb3e4-0x196dfb3ec**). Timeout **-12792** retries with doubled intervals (**0x196dfb3f0-0x196dfb458**), initially **5 seconds**, with no total deadline. It re-signals the semaphore before returning 0. This is a frame-accounting semaphore, not the reply-clerk semaphore. |
+| `vtDecompressionDuctDecodeSingleFrame` **0x196e1ad28** | **0x196e1ae70-0x196e1ae90** increments **public session+0x38**; the transition to 1 consumes session+0x40's semaphore. **0x196e1b070-0x196e1b0c4** records a fresh frame token in duct+0x38's tracking dictionary before calling the decoder. |
+| `vtDecompressionDuctEmitDecodedFrame` **0x196e189b4** | **0x196e18f58-0x196e18f90** finds/removes that token, decrements **public session+0x38**, and signals **session+0x40 only when the count reaches zero**. A `dinv` status reply cannot execute this path. |
+| `ParavirtualizedVideoDecoder_FinishDelayedFrames` **0x196e12190** | Sends **`dfin` synchronously at 0x196e1221c**, reads `,err` at **0x196e12234**, logs a nonzero result and returns it. It does not complete pending tokens on failure. |
+| `ParavirtualizedVideoDecoder_Finalize` **0x1972fbbc4** | Sends **`-dec` asynchronously at 0x1972fbcf4**, then removes the UUID handler. This follows decoder release, which public invalidate has not reached while waiting for outstanding frames. |
 
-### Where the HEVC work actually ran
+The PV invalidator itself waits for the **`dinv` reply**, not a per-token
+PV dispatch group. The **public VT layer then waits for its outstanding
+frame count to reach zero through token completions**. Rejected `dfrm`
+transport/admission errors have their own completion path; after a successful
+asynchronous `dfrm` admission, the host owns terminal `Demt` delivery.
+`ParavirtualizedVideoDecoder_DecodeFrameWithOptions` **0x1972fbe6c** builds
+`dfrm` with `,frm` and `,dfl` (**0x1972fc3d4-0x1972fc400**), receives its
+admission reply synchronously (**0x1972fc520**), reads status and info flags
+(**0x1972fc528-0x1972fc568**), and preserves asynchronous completion ownership
+on a successful async reply. Admission is not an image completion.
 
-No HEVC phase ran inside the failing `--qualify` process (PID 3876).
-`video-v6.mm:508-525` selects the AVC phases above; HEVC has its own mode
-dispatch and phase sequence at lines 482–505 and 532–541.
+This explains **why `dfin` arrives after `dinv`** in both failed and
+successful sessions: it is the public invalidate implementation's subsequent
+`WaitForAsynchronousFrames` call. **-12903 (`kVTInvalidSessionErr`)** is
+returned by our invalidating state and propagated by PV FinishDelayedFrames;
+the public waiter ignores it and still waits on the frame semaphore. In an
+already-empty session the semaphore is available and destruction proceeds.
+With four abandoned tokens it is unavailable. Changing `dfin` to 0 would
+not decrement the count and cannot fix this defect.
 
-There are four one-frame HEVC sessions in the AVC **console window**,
-`56360013`–`56360016`, selected for **PID 2783**, starting at uptime
-819.874640 seconds, long after the pending-cancel teardown. They close
-normally by approximately 821.6 seconds. They are another process's work,
-not extra qualification phases before cancel. They also show that the
-native session lease and HFI remained usable while the public test stalled.
-The window's 252 submits are consistent with 1 single + 240 streamed AVC +
-7 cancel AVC + these 4 HEVC submits.
+### Exact `Demt` disposition and ordering
 
-The separate RXH command uses PID 3932 and starts after the outer timeout.
-`rx-hevc.txt` records `hevc-fixture` (lines 2–49), `hevc-first` (51–149),
-and `hevc-reopen` (150–245). The two creates take **160.286 ms** and
-**105.447 ms**. No whole-phase durations are printed. Native opens are
-947.425155 and 948.220887 seconds, **795.732 ms** apart; final close lies
-after 948.850 and before 949.371 seconds (`console.out:45857-45884`).
-Both sessions return all twelve P010 hashes and close cleanly;
-`HEVC_TOOL_EXIT=0`. The entire post-AVC-to-HEVC-verdict block is about six
-seconds in `run.log`, including grading/capture. Its 420-second budget is
-independent of the failing AVC command's 360 seconds.
+The handler is the registered block
+**`___ParavirtualizedVideoDecoder_CreateInstanceWithSpecification_block_invoke`
+at 0x196e0f328**. Its switch compares **`0x44656d74` (`Demt`) at
+0x196e0f3d4-0x196e0f3e0** and branches to **0x196e0f874**. That case:
 
-## End-to-end path and checks
+1. Reads **`,frm` as SInt64** at **0x196e0f894-0x196e0f8a8**,
+   **`,err` as SInt32** at **0x196e0f8b0-0x196e0f8c8**, and
+   **`,inf` as UInt32** at **0x196e0f8cc-0x196e0f8e4**.
+2. Copies optional **`,uui`** at **0x196e0f8e8-0x196e0f904**. When
+   absent/null, **0x196e0fedc sets the pixel buffer to NULL**. The reader
+   `VTParavirtualizationMessageCopyCFUUID` **0x1973087c4** accepts absence:
+   **0x197308850-0x197308858** calls the outlined zero-result/NULL-output
+   helper **0x196ff994c**. When present,
+   the UUID must name a pending pixel buffer; the handler removes it from
+   the pixel-buffer dictionary and applies attachments. A fabricated UUID
+   or a reference to a released surface is not an error-frame substitute.
+3. Under the target lock, loads storage+0 and, if non-NULL, calls
+   **`VTDecoderSessionEmitDecodedFrame(target, token, status, info, image)`
+   at 0x196e0fee0-0x196e0ff00**. There is **no whitelist or special comparison
+   for -12903, -12911, or cancellation status** here: the signed status and
+   info flags are passed through. `VTDecoderSessionEmitDecodedFrame`
+   **0x196dfc0f8** routes to `vtDecoderSessionEmitDecodedFrameCommon`
+   **0x196e19388**; its **0x196e1951c-0x196e1953c** nulls the image for
+   nonzero status or the dropped-output bit, and its transferred-frame path
+   **0x196e1b7b8-0x196e1b7cc** reaches the token retirement above.
+4. If storage+0 is already NULL, **0x196e0feec branches to 0x196e1015c**:
+   no emit/accounting happens, **but the handler still sends an ACK with
+   status 0**. A late `Demt` ACK after `dinv` is therefore not proof of token
+   retirement. The normal ACK is a guest reply, flags **8**, with `,err`
+   equal to the **emit handler's result**, not the frame's decode error
+   (**0x196e10168-0x196e1019c**).
 
-`ours-OK` means the indicated source check exists and/or the stated run
-witness is present. It does not imply that Apple's private decoder contract
-is validated. `ours-missing` identifies an absent check, disposition, or
-measurement; `unknown` identifies behavior not established by this capture.
+The valid error disposition used by this fix is a **112-byte** big-endian
+message, with the same session UUID and the accepted **wire** token:
 
-The public caller uses Apple's built-in paravirtual decoder, advertised as
-`com.unixnu.pianovideo.decoder.avc`. Our endpoint is the kext service
-`AppleVideoToolboxParavirtualizationDriver` and its
-`AppleVideoToolboxParavirtualizationUserClient`. There is no separate
-`PianoVideoUserClient` class or repository-owned userspace VT decoder plug-in
-on this path (see [video.md](video.md), sections on V0b/V5a).
+| Atom / field | Value |
+| --- | --- |
+| `vtpv` header | 48 bytes, type `Demt`, flags **2** (host request), fresh request ID |
+| `para ,frm` | `=s64`, original accepted wire token (24-byte atom) |
+| `para ,err` | `=s32`, **-12911 (`kVTVideoDecoderMalfunctionErr`)** (20-byte atom) |
+| `para ,inf` | `=u32`, **3 = asynchronous (1) + frame dropped (2)** (20-byte atom) |
+| Image/attachments | **No `,uui`, no image, no surface ID or attachments**; `image=0` |
 
-| Hop / state | Check and observed result | Classification |
-| --- | --- | --- |
-| `video-v6.mm:329-344,429-436`: require hardware/PV, submit epoch 20 | Hardware required and reported; eight submissions return 0; pending=4 captured under the context mutex, then mutex released before close | **ours-OK** |
-| `close()`, lines 375–378 | Calls `VTDecompressionSessionInvalidate`, then locks context/releases retained surfaces, calls `CFRelease`, sleeps 20 ms, checks callback stability | **ours-missing** timestamps/return markers between these operations; **unknown** which public call or release blocks |
-| Apple's PV decoder → wire `dinv` request 115 | AVC selected for the right PID; `dinv` reaches our transport | **ours-OK** wire arrival; **unknown** internal VT cancellation/join and pending-token accounting |
-| `PianoVideoVTParavirt.cpp:255-305,322-365`: selector 3 | Bounded snapshot, wire/atom shape, owned UUID and surface IDs checked; dispatch returns status 0 | **ours-OK**; no envelope/ownership rejection on this request |
-| `PianoVideoVTHost.cpp:838` → `teardown():618-627` | Sets invalidating/stopping under lock, wakes worker, sleeps until workerRunning=false, closes residual native/surface owners | **ours-OK** joined in this run; **ours-missing** independent deadline on the worker join, which is not the observed long wait |
-| Worker cancellation, lines 571–604 | Cancels guest request; synchronous originals and held admissions get error replies; already accepted asynchronous records get no error `Demt` during invalidation (`if (!invalidated)`); then `frames.cancel()` clears local pending | **ours-OK** local stop/no-late-success fence; **ours-missing** terminal notification for four accepted async tokens; **unknown** whether Apple cancels them itself |
-| Surface/RAW/input cleanup, lines 605–612 | Cancel native pump, close surface client, release outstanding RAW loan, free staged input buffers, close native session | **ours-OK**: final lookup/invalidate/release counts 5/5/5, held=0, maps=0, open/close=1/1 |
-| `PianoVideo.cpp:1120-1123`: `native_cancel` | Matching session marks tx.cleanup; it does not wait for drain or firmware EOS | **ours-OK** cancellation path; no HFI flush command required here |
-| `native_frame_release():1111-1118` / native owner gate | Descriptor loan released before close; `closing(sid,loans)` refuses foreign sessions or outstanding loans | **ours-OK**: native close reports loans=0 |
-| `native_close():1147-1190` | Checks owner/tx/core error, watchdog, real fault bits, quarantine; cancels tx ledger and calls `shutdown(true)` only on clean path | **ours-OK**: result=0, watchdog=0, fault-bits=0, no quarantine |
-| `VideoSession.h:694-709,906-950`: STOP RAW, STOP input, CLOSE | Response-required commands; each wait defaults to 1000 ms, pumps HFI, checks first error, fails closed; one bounded late-message pump | **ours-OK**: STOP 1/1, CLOSE 1; **unknown** unexecuted error branches on this hardware |
-| HFI buffer ledger, lines 951–970 | Successful fail-closed CLOSE clears queued/readonly/pending-release ownership; logged queued count is collected **before** clearing | **ours-OK**: nine entries explicitly `released-on-close 1`, readonly=0, pending=0; queued=9 is not a leak |
-| Resident mixed arena / native lease | Boot backing and SMMU stay resident; NativeOwner refers to global gBringup; successful close deletes only owner and returns lease to Idle | **ours-OK**: arena-retained=1, dma-held=1 are intentional; next native session opens with previous-close=0/previous-teardown=0 |
-| Worker exit → `dinv` response | Sets native=0, workerRunning=false and wakes join; handler queues status 0 after join | **ours-OK**: `invalidate safe worker-joined 1`, request 115 reply enqueued, no transport DROP |
-| Post-invalidation `dfin` request 116 | `VideoStreamState.h:13-19` returns BadState while invalidating; frontend replies -12903, queue enqueue succeeds | **ours-OK** implemented state check; **unknown** guest-side consequences with four outstanding tokens |
-| Shared reply queue → public VT completion → destroy/recreate | Queue notification/selector-4 acknowledgements exist; no `-dec` for this session or public `cancel-joined`/epoch 21 before stall | **ours-missing** token-specific guest retirement/receipt evidence; **unknown** public wait/deadlock and exact process lifetime |
+-12903 is not required as a `Demt` cancellation code. The inspected handler
+accepts nonzero OSStatus values, including -12903 or -12911; this fix uses
+our existing **`kDecodeError=-12911`**, and explicitly sets dropped output.
+The exact SDK name is **`kVTDecodeInfo_FrameDropped` (1 << 1)**, paired with
+**`kVTDecodeInfo_Asynchronous` (1 << 0)**; dropped output is an info flag,
+not an OSStatus. The names/status values were also checked in the local
+SDK's `VideoToolbox.framework/Headers/VTErrors.h`. Apple's own
+`VTParavirtualizationHostDecoderSessionEmitDecodedFrame` **0x197208d78**
+builds the same fields, omits UUID/attachments for NULL images
+(**0x197208e5c-0x197208e68**, **0x197209044**), and **waits synchronously for
+the guest ACK at 0x197208ebc**. This corroborates the receiver, rather than
+inferring a wire format from our implementation.
 
-### Mixed backing release is not the missing completion
+Ordering is part of the contract, not just payload shape:
 
-At the image revision, `VideoMixedArena.h:25-37` allocates a 684 MiB arena
-as **274 MiB from region0 plus 410 MiB from XNU**. `PianoVideo.cpp:591-640`
-checks slabs, builds the two-owner descriptor, validates each physical page
-and uniqueness, and creates one CPU alias; boot alias self-test passes.
-`loanArena():643-656` validates a descriptor crossing the seam. Resident
-session prepare at lines 993–1008 zeros the active layout and cleans the
-mixed Normal-memory alias to PoC. These are **ours-OK** source checks, with
-boot self-test and later 4K golden/reopen witnesses in this run.
+- Guest dispatch **`___vtParavirtualizationGuestSetup_block_invoke_3`
+  0x19730a020** tests reply flag bit 2 at **0x19730a174-0x19730a178**.
+  Non-replies, including `Demt`, go to **`dispatch_channel_async` at
+  0x19730a1d8**, then the registered decoder handler. Replies, including
+  `dinv`, go **directly to `VTParavirtualizationReplyClerkDeliverReply` at
+  0x19730a270**, bypassing that handler queue.
+- Consequently, enqueueing four errors and then `dinv=0` is insufficient:
+  the reply can wake the invalidator, which clears storage+0, before a
+  queued error reaches its emit call. **Wait for terminal ACKs before
+  replying to `dinv` while the callback target is still live.**
+- In the support binary, **`VTParavirtualizationGuestSupportSendRawMessageToHost`
+  0x1a7f27dd0** holds a global unfair lock from **0x1a7f27e34**, including
+  **selector 3's `IOConnectCallScalarMethod` at 0x1a7f27f50**, until unlock
+  after **0x1a7f27f5c**. Our UC also holds its external-method lock while
+  dispatching selector 3. Waiting for a guest ACK inside the `dinv`
+  selector would deadlock that ACK's send. The selector must return;
+  the worker can own the deferred invalidate reply.
+- The default timeout at **0x19735c068** is CMTime **11/10 seconds**;
+  decoder creation copies it to storage+0x74 at **0x1972fb4b0-0x1972fb4c4**.
+  `VTParavirtualizationReplyClerkWaitForReply` **0x196ff758c** uses a
+  separate dispatch semaphore. A timed-out `dinv` also clears the target,
+  so ACKs must precede that timeout, not merely precede our eventual reply.
 
-Successful session close relinquishes firmware ownership, not the boot
-reservation. It neither returns region0 slabs nor unmaps/reallocates the
-mixed arena. Physical destruction is `KernelHw::dmaFree():846-864`: release
-CPU/multi descriptors, complete/release XNU/extra owners, give slabs back,
-then release UC/table/ledger owners. The full-core teardown gates that call
-on PAS shutdown, legal SMMU detach/TLB completion and power-off
-(`VideoBringup.h:435-503`); quarantine retains dependencies and DMA. Those
-guards are **ours-OK** by inspection; actual physical mixed-arena free is
-**unknown/not exercised** in the successful resident close. There is no
-evidence of a wait in this allocator/destructor during epoch 20.
+## Comparison with PianoVideo and the minimal fix
 
-The native count of two cancelled records and frontend count of four refer
-to different ownership ledgers. Eight accepted public tokens need not mean
-eight ETBs: token 8 was admitted but cancellation prevented its hardware
-submit. Seven ETBs/EBDs/decoded pictures and only four public callbacks are
-consistent with the captured pipeline. Firmware completion alone does not
-retire the remaining public tokens.
+The actual source path is
+[package/PianoVideo/vt/PianoVideoVTHost.cpp](../../package/PianoVideo/vt/PianoVideoVTHost.cpp).
+The image revision's worker cleanup at **lines 571-627** is unchanged in
+base `48e75b94`; compare with `git show 1da1485af7:package/PianoVideo/vt/PianoVideoVTHost.cpp`.
+Those cancellation/teardown regions were compared byte for byte. This branch
+starts at `48e75b94` and does not import the image revision's other mixed HEVC
+changes; read `1da1485af7` when inspecting that image's backing implementation.
 
-## Root-cause boundary and reference comparison
+Before this fix, teardown set invalidating/stopping and synchronously joined
+the worker inside selector 3. Worker cleanup suppressed accepted asynchronous
+error `Demt` via **`if (!invalidated)`**, then **`frames.cancel()`** erased
+local records. It still replied to synchronous originals/held admissions,
+released surfaces and loans, closed HFI, and returned `dinv=0`. Local pending
+became zero while Apple's outstanding count remained four. Apple then sent
+`dfin`, ignored -12903, and waited on the unsignalled frame semaphore.
 
-**Confirmed:** the host wrapper reached its timeout while pending-cancel
-never completed publicly. HFI STOP/CLOSE, descriptor cleanup and frontend
-worker join had already returned within the first 4.304066 seconds. No
-PianoVideo HFI timeout, watchdog, fault, transport drop or quarantine appears
-for this cancel session. The matching full-console witness is
-`console.out:36079-36142`, including successful close at line 36127.
+This is a **general frontend/PV pending-cancel contract defect**. It is
+independent of AVC versus HEVC backing allocation. Resident arena retention
+is intentional and is not the missing public completion. Native cancelled=2
+and frontend cancelled=4 are separate ledgers; seven ETBs for eight accepted
+public samples are consistent with cancellation before token 8 submission.
+Linux's separate ERROR buffer completion after hardware stop is a useful
+analogy, but the Apple binary above, not V4L2 behavior, establishes this fix.
 
-**Leading hypothesis:** accepted async tokens 5–8 remain outstanding in
-Apple's PV/session machinery after our invalidation path clears its local
-ledger without terminal `Demt` dispositions. All eight admission replies
-were sent/published; only tokens 1–4 emitted successful `Demt` and received
-public callbacks. Token 5's surface lookup completed, then cancellation
-disposed it without a public completion. This is a concrete source/evidence
-gap, but there is no captured Apple thread stack or deterministic host peer
-that proves it causes the wait.
+The one production change is an acknowledged, error-only cancellation
+transaction:
 
-`dfin=-12903` alone is **not** a diagnosis: the same post-`dinv` reply is
-followed by normal `-dec` destruction in earlier successful AVC sessions
-and later HEVC sessions. Do not change it to success simply to hide the
-state transition. Also do not drain or wait before invalidating: that
-would remove the pending-work case the test is meant to exercise.
+- `dinv` atomically fences success/admission, records its request ID and
+  **returns selector 3**. The existing worker performs cancellation; no
+  extra thread, boot argument, timeout increase, pre-invalidate drain or
+  backing change is introduced.
+- Worker finishes any in-progress surface disposal, cancels native work,
+  closes surface owners, releases the RAW loan and staged inputs, and
+  closes the native session. Error dispositions contain only token/status/
+  flags, so they never refer to a released surface.
+- Already-sent `Demt` messages keep their sole completion ownership; the
+  worker joins their ACK instead of sending a second message. Every other
+  successfully admitted async token receives exactly one null-image error
+  `Demt`. Synchronous originals and unpublished held admissions keep their
+  original error-reply path, with no duplicate `Demt`.
+- Only matching, unexpired **`Demt` ACKs** remain admissible while stopping.
+  Each ACK wait uses the existing **2-second guest deadline**, capped during
+  invalidate by **900 ms from `dinv` arrival**, leaving 200 ms inside Apple's
+  default reply timeout. Send failure, malformed ACK, ACK error or either
+  deadline makes `dinv` fail; it cannot claim a successful
+  cancellation. Client destruction explicitly abandons guest waits.
+- After all dispositions/ACKs, local records are cancelled and the worker
+  publishes the deferred `dinv` status and its exit under the session lock.
+  Destroy/recreate joins that exit before releasing the session. No success
+  frame can be sent after the cancellation fence. Subsequent `dfin` retains
+  **-12903**.
 
-The reference was checked locally at Ubuntu **v1.4.0**, repository revision
-`5b7b8a5cada36c43eed2cc153ab430bea69c6b00`, whose `kernel/source.json` pins
-Linux `83f0f89bed14a0cb7d582a26e72bced0387870f4`. In that exact kernel:
-
-- `drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c:866-891,1149-1175`
-  sends response-required CLOSE/STOP; STOP waits for a bounded response.
-- `iris_utils.c:70-86` releases the instance mutex around
-  `wait_for_completion_timeout`, retakes it and reports timeout as error.
-- `iris_common.c:201-234` stops the port and flushes deferred buffers even
-  on the error path. `iris_vb2.c:231-256` then completes remaining client
-  buffers with `VB2_BUF_STATE_ERROR`; `iris_utils.c:55-68` removes each
-  queued buffer and calls `v4l2_m2m_buf_done`.
-
-Our observed HFI close is consistent with those bounded teardown semantics.
-The reference also separates hardware stop from client-buffer disposition;
-our accepted-async invalidation path lacks an equivalent explicit terminal
-notification. Linux's V4L2 completion contract does not establish Apple's
-private PV invalidation contract, so it supports investigation, not a
-blind port or a verified fix. No copied reference code is part of this change.
-
-## Control and next deciding evidence
-
-`ram16g-hctl1.spec` already pins the **same tool** (`b0072c969490…`) and
-payload (`252cb0d465e6…`), uses the **same 360-second AVC / 420-second HEVC
-budgets**, and sets `piano-extra-ram=0`, `piano-video-extra-ram=0`,
-`piano-video-extra-ram-hevc=0`. Its separate HEVC command is
-`--expect-hevc-decline`. No archived hctl1 RESULT/run/transcript was found
-in the supplied dated run directory. Nothing was run on the tablet here.
-
-The deciding control is the unchanged `video-v6 --qualify <fixtures>` on
-**ram16g-hctl1**, retaining those pins and budgets. Require
-`cancel-joined`, `recreate-at-idr` with correct hashes and epoch separation,
-`phase-pass name=cancel-recreate`, `PASS qualification`, and
-**`V6_TOOL_EXIT=0`** (the existing digits-only exit check is insufficient).
-Compare accepted/pending token counts at invalidate, not only total phase
-counts. A control that happens to have zero pending work does not exercise
-this failure.
-
-If hctl1 stalls with the same clean close and four missing dispositions,
-mixed backing is excluded and the frontend/PV cancellation contract becomes
-the target. If hctl1 passes, compare that exact pending case against the
-mixed run; a pass alone does not prove mixed memory is defective. Neither
-outcome retroactively makes the HEVC phases part of the AVC budget.
-
-A future diagnostic capture needs monotonic markers immediately before and
-after **invalidate, retained-surface release, and CFRelease separately**,
-plus the blocked public thread stack, terminal disposition for every
-accepted token, and independent process exit/status capture across the
-300/360-second alarms. This would distinguish a VT join from a release
-wait and from lost SSH output. These are proposed checks, not changes made
-or tablet operations performed by this job.
-
-Only after that evidence identifies a causal code change should a regression
-exercise the real cancellation/completion boundary: eight accepted async
-requests, four retired/four pending, cancellation during Dbuf, one terminal
-disposition per token, no late success, joined close, and epoch-21 reuse.
-A test that only asserts local `Ledger::cancel()` sets pending=0 would
-repeat the implementation and cannot validate this hypothesis.
+The binary establishes the causal contract defect and predicts the archived
+public wait. It does not retrospectively supply a sampled thread stack or
+prove the remote process's final lifetime/output delivery. The inner
+300-second process alarm and the outer 360-second **host SSH** alarm remain
+distinct; `Alarm clock: 14` alone is not a decoder exit status.
 
 ## Host validation
 
-Existing `session_host`, `stream_host`, `vt_sync_host`, and `vt_surface_host`
-were compiled with C++20, `-O2 -Wall -Wextra -Werror` and all passed in the
-analysis checkout. They cover scripted HFI stop/close, ownership, sync
-completion and surface cancellation. They do not run Apple's PV decoder or
-prove public pending-async cancellation completes. An independent arithmetic
-check confirmed twelve phase passes, no HEVC phases in `rx-v6.txt`, and the
-2,729,779 microsecond stream-summary sum, eight published cancel admissions,
-four public completions and seven cancel ETBs. No implementation or test
-source was changed. `git diff --check`, full diff review, and checks for
-private host paths, network addresses and secret assignments passed;
-tracked content contains only sanitized evidence labels and source pins.
+[vt_cancel_host.cpp](../../package/PianoVideo/tests/vt_cancel_host.cpp)
+includes the **production VTHost translation unit**, with kernel API and
+native/surface substitutes in
+[vt_cancel_kernel_shim.h](../../package/PianoVideo/tests/vt_cancel_kernel_shim.h).
+There is no copied cancellation loop or second worker in the test. Four image
+completions are primed through the real emitter/ACK/retirement functions;
+the production worker then executes the pending cancellation.
+
+The scripted peer accounts each accepted token and clears its callback target
+on the `dinv` reply, reproducing the exact binary-derived ordering constraint.
+Tests cover eight accepted async tokens, four image completions, four pending
+(including a paused **real `lookupSurface` call** and queued-before-submit
+input), four exactly-once **112-byte** error dispositions, zero late-success
+emits, no duplicate completions, resource release before error emission,
+clean worker join, `dinv=0`, post-invalidate `dfin=-12903`, and a fresh
+**epoch-21 UUID/session with an image completion**. The test deliberately
+holds an ACK to prove `dinv` cannot race ahead of it. It also covers an image
+already delivered with its ACK still outstanding, wrong-ID/UUID and duplicate
+ACKs, repeat invalidate, held admissions, synchronous originals, enqueue
+failure, malformed/nonzero ACK, lost-ACK and late-successful-ACK deadlines,
+and client abandonment.
+
+`bash package/PianoVideo/tests/run-bringup-host.sh` runs all C/C++ host suites
+with **C++20/C11, -O1 -g -Wall -Wextra -Werror,
+-fsanitize=address,undefined -fno-sanitize-recover=all**, plus owned AVC/HEVC
+fixture checks and the native CoreMedia serializer check on Darwin. The
+optional owner's firmware-file check remains skipped when no firmware is
+supplied; scripted firmware checks still run. These tests are protocol and
+ownership evidence, not Apple guest execution or tablet decode evidence.
+
+The modified kext translation unit was also compiled using
+`tooling/k27/build-native-kext.py PianoVideo package/PianoVideo/vt/PianoVideoVTHost.cpp --out <local-output>`:
+the configured kernel **IOPlatformExpert C++ recipe**, target
+**arm64e-apple-ios**, real kernel headers, and the builder's
+**-Wall -Wextra -Werror** flags. Output is a Mach-O **arm64e** object;
+no compiler warnings or errors. No image or KC was built.
+
+Validation on **2026-11-27**: the complete host runner exited **0**, including
+the production-worker regression, with no ASan/UBSan findings. Privacy scan
+against `48e75b94` found **0 hits/0 refused files**; repository document links
+had **0 errors**; `git diff --check` had **0 issues**.
 
 ## Fix-image gate
 
-Path: `video-v6 cancel-recreate` → public VT invalidate/release → Apple's PV
-decoder → our paravirtual user client → frontend cancellation/worker join →
-native loan release → HFI STOP RAW/STOP input/CLOSE → retained mixed arena →
-successful `dinv` reply → unresolved public pending-token retirement and
-destroy/recreate. **HOLD**, analysis only.
+Path: public `VTDecompressionSessionInvalidate` → PV synchronous `dinv` →
+frontend success fence/selector return → native/surface/loan cleanup →
+terminal error `Demt` for accepted async work → matching guest ACKs while
+callback target is live → deferred `dinv` reply/worker exit → public `dfin`
+(-12903) → outstanding-count semaphore → decoder release/`-dec` → epoch 21.
 
-Checks: **ours-OK**: hardware/PV admission, bounded transport validation,
-surface/RAW cleanup, clean HFI close, worker join, reply enqueue and resident
-backing/lease reuse. **ours-missing**: terminal dispositions for accepted
-async tokens on invalidate, per-call close timestamps, guest retirement
-evidence and an independent worker-join deadline. **unknown**: Apple's
-pending-cancel contract, exact blocked public call, remote exit/output
-delivery and physical arena destruction in this resident run. Four existing
-host tests pass; they do not reproduce this public wait. Keep the image/tool
-pins and 360/420-second budgets for the `ram16g-hctl1` pending-work control.
+Checks: **ours-OK**: both archived runs, PID/session attribution, XNU-only
+control, clean native teardown, exact 27.3 vtable/call/wait/accounting/handler/
+reply-order trace, terminal wire contract, production-worker regression,
+ASan/UBSan host suites and arm64e kernel compile. **Still required on the fix
+image**: public `cancel-joined`, epoch-21 IDR/golden hashes and separation,
+`phase-pass name=cancel-recreate`, `PASS qualification`, **`V6_TOOL_EXIT=0`**,
+plus the separate correct HEVC mode/verdict. Keep the existing tool/image
+provenance discipline and **360/420-second budgets**. The mixed-backing fix
+image must also preserve its HEVC golden/reopen results.
 
-Root cause: **Partially closed**: pending cancellation stops progressing
-publicly after successful native teardown at elapsed 3.416–4.304 seconds;
-the host SSH wrapper later reaches its 360-second alarm. Added HEVC phase
-budget exhaustion is ruled out. Missing async terminal notification is the
-leading hypothesis, not a confirmed host-reproducible defect or proof of an
-infinite VT deadlock. HOLD until `ram16g-hctl1` and the deciding completion
-evidence distinguish the remaining causes.
+Root cause: **Closed at the contract/source boundary**. `if (!invalidated)`
+omitted four terminal async dispositions and `frames.cancel()` discarded
+only our ledger; Apple waits on a different count. A `dinv` success reply
+neither decrements that count nor cancels the wait, and it clears the target
+needed by later `Demt`. `dfin=-12903` is a consequence of invalidate order,
+not the cause. RAM16G mixed HEVC backing and HEVC phase budget exhaustion
+are excluded by the control and time accounting.
 
-ONE change: **HOLD — no production change, timeout increase or fix image**.
-Keep this commit documentation-only; the unchanged `ram16g-hctl1` control
-and a regression of the actual pending-token contract must justify one
-minimal default-safe cancellation fix before implementation.
+ONE change: **READY for a cancellation fix image, not tablet-qualified** —
+defer `dinv` until the existing worker has released resources and obtained
+terminal `Demt` ACKs for its accepted async work. The implementation and
+host regression are local; no fix image was built or run, no tablet state
+was changed, and nothing was pushed.
