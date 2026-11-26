@@ -4,9 +4,9 @@
 //     blanking (by the hardware's block or, without it, triggered in the front porch), every word restored as found; the
 //     refusals (not video mode, the FIFO in use, no software trigger, a command that is not a sleep command, a busy DMA);
 //   - counter setup from disabled, ten cycles with advancing counters despite zero COUNT_EN, and the logged refusal when stuck;
-//   - y12n's slave timeout and recovery with both possible enable readbacks, the trace rows, and poll timing with tracing on/off;
-//   - display sleep: 0x28, >= 20 ms, 0x10, >= 100 ms, INTF2 stopped before INTF1, both stopped, the panel halves asleep; wake:
-//     the INTF flush, INTF1 and INTF2 started together and in phase, counting in lockstep, 0x11, >= 120 ms, 0x29; 50 cycles;
+//   - y12o's observed slave timeout, master timeout recovery, and poll timing with tracing on/off;
+//   - display sleep: 0x28, >= 20 ms, 0x10, >= 100 ms, master stop, CTL handoff, slave stop, both halves asleep; wake:
+//     the bonded route and INTF flush, INTF1 and INTF2 started together and in phase, counting in lockstep, 0x11, >= 120 ms, 0x29; 50 cycles;
 //   - the failures: a DMA that never finishes (the link left alone, nothing after it), an engine that does not stop (the panel
 //     brought back), an engine that does not start; DCS only; high speed;
 //   - nothing written outside the guard's registers: never TLMM (the panel's reset and supply pins).
@@ -17,6 +17,8 @@
 #include "../../NativeGopDisplay/GopPanelPower.h"
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 using namespace pianodpu;
 using namespace pianodpu::panel;
@@ -87,6 +89,10 @@ static void testSend()
 
 static void testRefusals()
 {
+  CHECK(storeAllowed(ctlReg(0, kCtlSwReset), 1, false, 0) && storeAllowed(ctlReg(0, kCtlStart), 1, false, 0));
+  CHECK(!storeAllowed(ctlReg(0, kCtlSwReset), 1) && !storeAllowed(ctlReg(0, kCtlStart), 1, true));
+  CHECK(!storeAllowed(ctlReg(1, kCtlSwReset), 1, false, 0) && !storeAllowed(ctlReg(0, kCtlSwReset), 2, false, 0));
+  CHECK(!storeAllowed(ctlReg(0, kCtlIntfActive), 0, false, 0) && !storeAllowed(ctlReg(0, kCtlIntfMaster), kDsiIntfSlave, false, 0));
   {
     model::Dpu m;
     m.regs[dsiReg(1, kDsiCtrl)] = 0x1f5;   // DSI1 in command mode
@@ -113,8 +119,9 @@ static void testRefusals()
   {
     model::Dpu m;
     m.blockDma = false;
-    m.regs[intfReg(1, kIntfHsyncCtl)] = 0;  // no usable porch geometry
-    const Result r = panelOff(m, readPath(m), Options());
+    const LivePath p = readPath(m);
+    m.regs[intfReg(1, kIntfHsyncCtl)] = 0;  // no usable porch geometry at command preparation
+    const Result r = panelOff(m, p, Options());
     CHECK(!r.ok && r.safeAwake && m.dcs.empty() && m.storesTo(dsiReg(0, kDsiTrigDma)) == 0 &&
           m.rd(dsiReg(0, kDsiTpgCtrl)) == 0);
     CHECK(!r.dcs[0].triggerAttempted && r.dcs[0].dmaDoneMask() == 0 && r.dcs[0].ackAfterMask == 3);
@@ -144,14 +151,18 @@ static void testSleepWake()
   CHECK(d28 && d10 && e28 && e10);
   if (d28 && d10) CHECK(d10->ns - d28->ns >= 20000000ull);
   const int stop2 = m.firstStore(intfReg(2, kIntfEn), 0), stop1 = m.firstStore(intfReg(1, kIntfEn), 0);
-  CHECK(stop2 >= 0 && stop1 > stop2);                                  // the slave first
+  const int reset = m.firstStore(ctlReg(0, kCtlSwReset), 1);
+  const int handoff = m.firstStore(ctlReg(0, kCtlStart), 1);
+  CHECK(stop1 >= 0 && stop1 < reset && reset < handoff && handoff < stop2);
+  CHECK(m.rd(ctlReg(0, kCtlIntfActive)) == kDsiIntfSlave && m.rd(ctlReg(0, kCtlIntfMaster)) == 0);
+  CHECK(readPath(m).ctl < 0 && readPath(m, false, true).ctl == p.ctl);
   for (unsigned i = 1; i <= 2; ++i) {
     const int disable = m.firstStore(intfReg(i, kIntfConfig), config & ~kIntfConfigProgFetch);
-    CHECK(disable > stop1);
+    CHECK(disable > stop2);
     CHECK(m.rd(intfReg(i, kIntfConfig)) == (config & ~kIntfConfigProgFetch));
     m.regs[intfReg(i, kIntfProgFetch)] = 0;   // prove the wake uses the saved registers
   }
-  if (d10 && stop2 >= 0) CHECK(m.stores[size_t(stop2)].ns - d10->ns >= 100000000ull);   // 100 ms after sleep-in
+  if (d10 && stop1 >= 0) CHECK(m.stores[size_t(stop1)].ns - d10->ns >= 100000000ull);   // 100 ms after sleep-in
   CHECK(!m.intf[1].on && !m.intf[2].on && m.half[0].sleeping && m.half[1].sleeping && !m.half[0].displayOn);
   const uint32_t f1 = m.intf[1].frames, f2 = m.intf[2].frames;
   m.sleepMs(1000);   // asleep: no frames, no fetch
@@ -159,14 +170,20 @@ static void testSleepWake()
   const size_t before = m.stores.size();
   Result on = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
   CHECK(on.ok && on.engines.ok && on.engines.rate.lockstep && on.engines.latchUs >= 0);
+  CHECK(m.stores.size() >= before + 12);
+  if (!on.ok || m.stores.size() < before + 12) return;
   for (unsigned i = 1; i <= 2; ++i) {
-    CHECK(m.stores[before + 2 * (i - 1)].pa == intfReg(i, kIntfProgFetch));
-    CHECK(m.stores[before + 2 * (i - 1) + 1].pa == intfReg(i, kIntfConfig));
+    CHECK(m.stores[before + 1 + 2 * (i - 1)].pa == intfReg(i, kIntfProgFetch));
+    CHECK(m.stores[before + 2 + 2 * (i - 1)].pa == intfReg(i, kIntfConfig));
     CHECK(m.rd(intfReg(i, kIntfConfig)) == config && m.rd(intfReg(i, kIntfProgFetch)) == (2290 + i) * model::kHtotal);
   }
-  CHECK(m.stores[before + 4].pa == ctlReg(0, kCtlIntfFlush) && m.stores[before + 5].pa == ctlReg(0, kCtlFlush));
-  CHECK(m.stores[before + 6].pa == intfReg(1, kIntfEn) && m.stores[before + 7].pa == intfReg(2, kIntfEn));
-  CHECK(m.stores[before + 7].ns - m.stores[before + 6].ns < 1000 && m.desync == 0);
+  CHECK(m.stores[before].pa == ctlReg(0, kCtlSwReset));
+  CHECK(m.stores[before + 5].pa == ctlReg(0, kCtlIntfActive) && m.stores[before + 5].v == kIntfFlushDsi);
+  CHECK(m.stores[before + 6].pa == ctlReg(0, kCtlIntfMaster) && m.stores[before + 6].v == kDsiIntfMaster);
+  CHECK(m.stores[before + 7].pa == ctlReg(0, kCtlIntfFlush) && m.stores[before + 8].pa == ctlReg(0, kCtlFlush));
+  CHECK(m.stores[before + 9].pa == ctlReg(0, kCtlStart));
+  CHECK(m.stores[before + 10].pa == intfReg(1, kIntfEn) && m.stores[before + 11].pa == intfReg(2, kIntfEn));
+  CHECK(m.stores[before + 11].ns - m.stores[before + 10].ns < 1000 && m.desync == 0);
   CHECK(m.intf[1].on && m.intf[2].on && m.intf[1].frames > f1 && m.intf[1].frames - f1 == m.intf[2].frames - f2);
   const model::Dcs *d11 = m.firstDcs(0x11, 0), *d29 = nullptr;
   for (const model::Dcs &x : m.dcs)
@@ -273,19 +290,19 @@ static void testUnavailablePanel()
 
 struct TraceIo : model::Dpu {
   uint64_t sampleStartNs = 0, maxSampleNs = 0, maxPollOverrunNs = 0;
-  std::vector<uint64_t> slavePollNs;
-  bool slaveStop = false;
+  std::vector<uint64_t> masterPollNs;
+  bool masterStop = false;
 
-  bool wr(uint64_t pa, uint32_t value)
+  bool wr(uint64_t pa, uint32_t value, int panelCtl = -1)
   {
-    if (pa == intfReg(2, kIntfEn) && value == 0) slaveStop = true;
-    return Dpu::wr(pa, value);
+    if (pa == intfReg(1, kIntfEn) && value == 0) masterStop = true;
+    return Dpu::wr(pa, value, panelCtl);
   }
 
   uint32_t rd(uint64_t pa)
   {
     const uint32_t value = Dpu::rd(pa);
-    if (slaveStop && pa == intfReg(2, kIntfStatus) && slavePollNs.size() < 41) slavePollNs.push_back(ns);
+    if (masterStop && pa == intfReg(1, kIntfStatus) && masterPollNs.size() < 41) masterPollNs.push_back(ns);
     return value;
   }
 
@@ -303,25 +320,11 @@ struct TraceIo : model::Dpu {
   }
 };
 
-struct LateAlignmentIo : TraceIo {
-  bool forceLate = true;
-
-  uint32_t rd(uint64_t pa)
-  {
-    if (forceLate && pa == intfReg(1, kIntfLineCount) && (ctlFlush & kFlushIntf) && intf[1].on && !intf[2].on) {
-      forceLate = false;
-      const uint64_t late = intf[1].start + 3 * kLineNs - 1000;
-      advanceTo(late > ns ? late : late + frameNs(1));
-    }
-    return TraceIo::rd(pa);
-  }
-};
-
-static Result replayY12n(TraceIo &m, bool dropped, TraceRing *ring)
+static Result masterStopTimeout(TraceIo &m, bool dropped, TraceRing *ring)
 {
   m.blockDma = false;
-  m.engineStuck[1] = !dropped;
-  m.dropStore = intfReg(2, kIntfEn);
+  m.engineStuck[0] = !dropped;
+  m.dropStore = intfReg(1, kIntfEn);
   m.dropCount = dropped ? 1 : 0;
   for (unsigned i = 1; i <= 2; ++i) {
     m.regs[intfReg(i, kIntfCountEn)] = 0;
@@ -341,15 +344,15 @@ static Result replayY12n(TraceIo &m, bool dropped, TraceRing *ring)
   CHECK(offAdmitted(true, true));   // first runtime off, with dual blank and touch park confirmed
   const Result r = panelOff(m, p, Options(), ring);
   CHECK(!r.ok && r.step == 3 && r.restored && !r.enginesStopped && !r.safeAwake);
-  CHECK(std::strcmp(r.why, "INTF2's timing engine did not stop within 40 ms") == 0);
+  CHECK(std::strstr(r.why, "the master did not stop both timing engines"));
   CHECK(r.dcs[0].command == 0x28 && r.dcs[1].command == 0x10);
   for (const Sent &s : r.dcs) {
     CHECK(s.ok && s.waitedBlanking && s.dmaDoneMask() == 3 && s.doneUs > 0 && s.doneUs < 2000);
     CHECK(s.ackBeforeMask == 3 && s.ackAfterMask == 3 && !s.before[0].ack && !s.before[1].ack && !s.ackAfter[0] && !s.ackAfter[1]);
     CHECK((s.intrPoll[0] & kIntDmaDone) && (s.intrPoll[1] & kIntDmaDone));
   }
-  CHECK(m.firstStore(intfReg(1, kIntfEn), 0) < 0);
-  CHECK((m.firstStore(intfReg(2, kIntfEn), 1) >= 0) == !dropped);
+  CHECK(m.firstStore(intfReg(2, kIntfEn), 0) < 0 && m.firstStore(ctlReg(0, kCtlSwReset), 1) < 0);
+  CHECK((m.firstStore(intfReg(1, kIntfEn), 1) >= 0) == !dropped);
   CHECK(m.dcs.size() == 8 && m.firstDcs(0x11, 1) && m.firstDcs(0x29, 1));
   CHECK(m.intf[1].on && m.intf[2].on && m.half[0].displayOn && m.half[1].displayOn && clean(m));
   gate.ready = r.ok;
@@ -363,23 +366,23 @@ static Result replayY12n(TraceIo &m, bool dropped, TraceRing *ring)
   return r;
 }
 
-static void testY12nTrace()
+static void testStopTimeoutTrace()
 {
   uint64_t maxSampleNs = 0, maxPollShiftNs = 0;
   for (bool dropped : {false, true}) {
     TraceRing ring;
     TraceIo logged, baseline;
-    const Result plain = replayY12n(baseline, dropped, nullptr);
-    const Result traced = replayY12n(logged, dropped, &ring);
-    CHECK(traced.step == plain.step && traced.engines.status[1] == plain.engines.status[1]);
+    const Result plain = masterStopTimeout(baseline, dropped, nullptr);
+    const Result traced = masterStopTimeout(logged, dropped, &ring);
+    CHECK(traced.step == plain.step && traced.engines.status[0] == plain.engines.status[0]);
     CHECK(logged.stores.size() == baseline.stores.size());
     for (size_t i = 0; i < logged.stores.size() && i < baseline.stores.size(); ++i) {
       CHECK(logged.stores[i].pa == baseline.stores[i].pa && logged.stores[i].v == baseline.stores[i].v);
     }
-    CHECK(logged.slavePollNs.size() == 41 && logged.slavePollNs.size() == baseline.slavePollNs.size());
-    for (size_t i = 1; i < logged.slavePollNs.size() && i < baseline.slavePollNs.size(); ++i) {
-      const uint64_t withTrace = logged.slavePollNs[i] - logged.slavePollNs[0];
-      const uint64_t withoutTrace = baseline.slavePollNs[i] - baseline.slavePollNs[0];
+    CHECK(logged.masterPollNs.size() == 41 && logged.masterPollNs.size() == baseline.masterPollNs.size());
+    for (size_t i = 1; i < logged.masterPollNs.size() && i < baseline.masterPollNs.size(); ++i) {
+      const uint64_t withTrace = logged.masterPollNs[i] - logged.masterPollNs[0];
+      const uint64_t withoutTrace = baseline.masterPollNs[i] - baseline.masterPollNs[0];
       CHECK(withTrace == withoutTrace);
       const uint64_t shift = withTrace > withoutTrace ? withTrace - withoutTrace : withoutTrace - withTrace;
       if (shift > maxPollShiftNs) maxPollShiftNs = shift;
@@ -388,7 +391,7 @@ static void testY12nTrace()
     CHECK(logged.maxPollOverrunNs == 0);
 
     CHECK(ring.size() == ring.total && ring.size() > 41);
-    CHECK(ring.at(0).boundary && ring.at(0).step == TraceStep::displayOff);
+    CHECK(ring.at(0).boundary && ring.at(0).step == TraceStep::drain);
     const TraceSample &last = ring.at(ring.size() - 1);
     CHECK(last.boundary && last.step == TraceStep::end && last.link[1].en == 1 && last.link[1].status == 1);
     const TraceSample *firstStopPoll = nullptr, *lastStopPoll = nullptr;
@@ -398,16 +401,16 @@ static void testY12nTrace()
       const TraceSample &s = ring.at(i);
       CHECK(s.top == 0xf0000000u && s.active == 0x6);
       CHECK(!i || s.us >= ring.at(i - 1).us);
-      CHECK(s.step != TraceStep::stopMaster);
-      if (s.step == TraceStep::stopSlave) {
-        CHECK(s.link[0].en == 1 && s.link[0].status == 1 && s.link[1].status == 1 && !s.flush && !s.intfFlush);
-        CHECK(s.link[1].en == (s.boundary || dropped ? 1u : 0u));
+      CHECK(s.step != TraceStep::stopSlave && s.step != TraceStep::handoff);
+      if (s.step == TraceStep::stopMaster) {
+        CHECK(s.link[1].en == 1 && s.link[0].status == 1 && s.link[1].status == 1 && !s.flush && !s.intfFlush);
+        CHECK(s.link[0].en == (s.boundary || dropped ? 1u : 0u));
         if (s.boundary) continue;
         ++stopPolls;
         if (!firstStopPoll) firstStopPoll = &s;
         lastStopPoll = &s;
       }
-      if (s.step == TraceStep::undo) undo = s.boundary && s.link[1].en == unsigned(dropped) && s.link[1].status == 1;
+      if (s.step == TraceStep::undo) undo = s.boundary && s.link[0].en == unsigned(dropped) && s.link[0].status == 1;
       if (s.step == TraceStep::flush && (s.flush & kFlushIntf)) flushed |= s.intfFlush == kIntfFlushDsi;
       if (s.step == TraceStep::flush && s.flush == 0) latched = true;
       if (s.step == TraceStep::rate && !s.boundary) verified = true;
@@ -428,7 +431,7 @@ static void testY12nTrace()
   CHECK(off.ok && ring.at(ring.size() - 1).link[1].status == 0);
   ring.reset();
   const Result on = panelOn(io, p, Options(), off.enginesStopped, off.fetch, &ring);
-  CHECK(on.ok && on.engines.rate.lockstep && ring.at(0).step == TraceStep::fetchOn);
+  CHECK(on.ok && on.engines.rate.lockstep && ring.at(0).step == TraceStep::ctlReset);
   CHECK(ring.at(ring.size() - 1).link[1].status == 1 && io.desync == 0);
   CHECK(io.maxPollOverrunNs == 0);
   ring.reset();
@@ -439,6 +442,132 @@ static void testY12nTrace()
   CHECK(maxSampleNs > 0 && maxSampleNs < kLineNs && maxPollShiftNs < kLineNs / 10);
   std::printf("M5 trace model: max in-wait sample %llu ns, added stop poll drift %llu ns (line %u ns)\n",
               (unsigned long long)maxSampleNs, (unsigned long long)maxPollShiftNs, kLineNs);
+}
+
+// Qual2b off, wake property and console were identical. The fixture keeps all
+// sampled words and intervals, with only the timestamp origin rebased.
+static std::vector<TraceSample> readY12oTrace()
+{
+  // beside this source file, whatever the working directory (build-native-piano-dpu.sh runs the tests from the repo root)
+  const std::string src = __FILE__;
+  const std::size_t slash = src.find_last_of('/');
+  std::ifstream file((slash == std::string::npos ? std::string() : src.substr(0, slash + 1)) + "m5-y12o-off.trace");
+  std::string line;
+  std::getline(file, line);
+  CHECK(line == "m5 1 off ctl0 ok=0 step=3 restored=1 rows=216 dropped=0");
+  for (const char *report : {"m5 1 dcs 28 trig=1 done=3 us=1245 porch=1", "m5 1 dcs 10 trig=1 done=3 us=1270 porch=1"}) {
+    std::getline(file, line);
+    CHECK(line.starts_with(report));
+  }
+  std::vector<TraceSample> rows;
+  while (std::getline(file, line)) {
+    TraceSample s{};
+    unsigned index = 0;
+    unsigned long long us = 0;
+    char step[16] = {}, kind = 0;
+    auto &a = s.link[0], &b = s.link[1];
+    const int n = std::sscanf(line.c_str(), "m5 1 %u %llu %15s %c %x/%x/%x/%x %x/%x/%x/%x %x/%x/%x/%x",
+                              &index, &us, step, &kind, &a.en, &a.status, &a.frame, &a.line,
+                              &b.en, &b.status, &b.frame, &b.line, &s.top, &s.active, &s.flush, &s.intfFlush);
+    CHECK(n == 16 && index == rows.size() && (kind == 'B' || kind == 'P'));
+    if (n != 16) return {};
+    s.us = us;
+    s.boundary = kind == 'B';
+    unsigned tag = 0;
+    for (; tag <= unsigned(TraceStep::end); ++tag)
+      if (!std::strcmp(step, traceStepName(TraceStep(tag)))) break;
+    CHECK(tag <= unsigned(TraceStep::end));
+    s.step = TraceStep(tag);
+    rows.push_back(s);
+  }
+  CHECK(rows.size() == 216);
+  return rows;
+}
+
+static int64_t scanPosition(uint32_t frame, uint32_t line)
+{
+  return int64_t(frame) * kVtotal120 + line;
+}
+
+static void testY12oTrace()
+{
+  const auto rows = readY12oTrace();
+  if (rows.size() != 216) return;
+  model::Dpu replay;
+  const auto &stop = rows[4];
+  const auto &firstPoll = rows[5];
+  const auto &lastPoll = rows[38];
+  CHECK(stop.step == TraceStep::stopSlave && stop.boundary && firstPoll.step == stop.step && !firstPoll.boundary);
+  CHECK(lastPoll.step == stop.step && !lastPoll.boundary && lastPoll.us - firstPoll.us == 40229);
+  // Seed the clock at the recorded stop boundary and run every row at its
+  // captured time. Reproduce the legacy timing and flush stores.
+  const uint64_t originNs = replay.frameNs(1);
+  replay.advanceTo(originNs);
+  for (unsigned i = 1; i <= 2; ++i) {
+    const auto &atStop = stop.link[i - 1];
+    const auto &atStart = rows[0].link[i - 1];
+    const uint64_t endPositionNs = uint64_t(scanPosition(atStop.frame, atStop.line)) * kLineNs;
+    const uint64_t linePosition = (endPositionNs - stop.us * 1000) / kLineNs;
+    replay.intf[i].frames = atStart.frame;
+    CHECK(linePosition / kVtotal120 == atStart.frame);
+    replay.intf[i].start = replay.ns - linePosition % kVtotal120 * kLineNs;
+  }
+  model::Dpu run = replay;
+  for (size_t index = 0; index < rows.size(); ++index) {
+    const auto &s = rows[index];
+    CHECK(!index || s.us > rows[index - 1].us);
+    replay.advanceTo(originNs + s.us * 1000);
+    if (index == 5) CHECK(replay.wr(intfReg(2, kIntfEn), 0));
+    if (index == 42) {
+      CHECK(replay.wr(ctlReg(0, kCtlIntfFlush), kIntfFlushDsi));
+      CHECK(replay.wr(ctlReg(0, kCtlFlush), kFlushIntf));
+      CHECK(replay.wr(intfReg(2, kIntfEn), 1));
+    }
+    CHECK(replay.rd(ctlReg(0, kCtlTop)) == s.top && replay.rd(ctlReg(0, kCtlIntfActive)) == s.active);
+    CHECK(replay.rd(ctlReg(0, kCtlFlush)) == s.flush && replay.rd(ctlReg(0, kCtlIntfFlush)) == s.intfFlush);
+    for (unsigned i = 1; i <= 2; ++i) {
+      const auto &l = s.link[i - 1];
+      CHECK(replay.rd(intfReg(i, kIntfEn)) == l.en && replay.rd(intfReg(i, kIntfStatus)) == l.status);
+      const auto observed = scanPosition(l.frame, l.line);
+      const auto simulated = scanPosition(replay.intf[i].frames, replay.line(i));
+      // The nominal model clock and per-register read times differ slightly
+      // from the capture. Even near a frame boundary compare linear position.
+      CHECK(simulated >= observed - 12 && simulated <= observed + 12);
+      if (index) {
+        const auto &before = rows[index - 1].link[i - 1];
+        CHECK(observed > scanPosition(before.frame, before.line));
+      }
+    }
+  }
+
+  run.blockDma = false;
+  for (unsigned i = 1; i <= 2; ++i) {
+    run.countEnableIgnored[i - 1] = true;
+    run.regs[intfReg(i, kIntfCountEn)] = 0;
+    run.regs[intfReg(i, kIntfConfig)] = kIntfConfigProgFetch;
+    run.intf[i].fetch = run.regs[intfReg(i, kIntfProgFetch)] = 2290 * model::kHtotal;
+  }
+  LivePath p = readPath(run);
+  const CounterInit init = initCounters(run, p);
+  CHECK(p.ok && !init.enabled && init.moving);
+  run.sleepMs(3);
+  TraceRing ring;
+  const Result off = panelOff(run, p, Options(), &ring);
+  CHECK(off.ok && off.enginesStopped && off.dcs[0].dmaDoneMask() == 3 && off.dcs[1].dmaDoneMask() == 3);
+  if (!off.ok) return;
+  CHECK(off.dcs[0].waitedBlanking && off.dcs[1].waitedBlanking);
+  CHECK(ring.total == ring.size() && ring.at(ring.size() - 1).active == kDsiIntfSlave);
+  const Frames asleep = readFrames(run);
+  const uint32_t asleepLine[2] = {run.rd(intfReg(1, kIntfLineCount)), run.rd(intfReg(2, kIntfLineCount))};
+  run.sleepMs(100);
+  for (unsigned i = 1; i <= 2; ++i) {
+    CHECK(run.rd(intfReg(i, kIntfEn)) == 0 && run.rd(intfReg(i, kIntfStatus)) == 0);
+    CHECK(run.rd(intfReg(i, kIntfFrameCount)) == asleep.f[i - 1] && run.rd(intfReg(i, kIntfLineCount)) == asleepLine[i - 1]);
+  }
+  ring.reset();
+  const Result on = panelOn(run, p, Options(), off.enginesStopped, off.fetch, &ring);
+  CHECK(on.ok && on.engines.rate.lockstep && run.half[0].displayOn && run.half[1].displayOn && clean(run));
+  CHECK(ring.total == ring.size() && ring.at(ring.size() - 1).active == kIntfFlushDsi && run.latchedMaster == kDsiIntfMaster);
 }
 
 static void testFailures()
@@ -461,29 +590,51 @@ static void testFailures()
     const Result r = panelOff(m, readPath(m), Options());
     CHECK(!r.ok && r.step == 2 && !r.restored && m.storesTo(intfReg(2, kIntfEn)) == 0);
   }
-  {   // INTF2 does not stop: brought back (EN = 1 again), sleep-out, display-on
+  {   // INTF2 never drains once it has its own route. Keep the display dark.
     model::Dpu m;
     m.engineStuck[1] = true;
-    m.sleepMs(3);
     const Result r = panelOff(m, readPath(m), Options());
-    CHECK(!r.ok && r.step == 3 && r.restored && std::strstr(r.why, "INTF2"));
-    CHECK(m.half[0].displayOn && !m.half[0].sleeping && m.rd(intfReg(2, kIntfEn)) == 1 && m.intf[1].on && m.intf[2].on);
-    CHECK(m.firstStore(intfReg(1, kIntfEn), 0) < 0);   // the master was never stopped
+    CHECK(!r.ok && r.step == 4 && !r.restored && std::strstr(r.why, "INTF2"));
+    CHECK(!m.intf[1].on && m.intf[2].on && m.storesTo(ctlReg(0, kCtlSwReset)) == 1 && m.dcs.size() == 4);
   }
-  {   // INTF1 does not stop: INTF2 (stopped) started again at INTF1's frame start, in phase; the panel back
-    LateAlignmentIo m;
-    TraceRing ring;
-    m.engineStuck[0] = true;
-    m.sleepMs(3);
-    const Result r = panelOff(m, readPath(m), Options(), &ring);
-    CHECK(!r.ok && r.step == 4 && r.restored && m.desync == 0 && m.intf[1].on && m.intf[2].on && m.half[1].displayOn);
-    const int enable = m.firstStore(intfReg(2, kIntfEn), 1);
-    CHECK(!m.forceLate && enable >= 0 && m.stores[enable].line <= 2);
-    const TraceSample *lastAlign = nullptr;
-    for (unsigned i = 0; i < ring.size(); ++i)
-      if (ring.at(i).step == TraceStep::align) lastAlign = &ring.at(i);
-    CHECK(lastAlign && !lastAlign->boundary && lastAlign->link[1].en == 1);
-    CHECK(m.maxPollOverrunNs == 0);
+  {   // The selected video CTL must have INTF1 as its only timing master.
+    model::Dpu m;
+    m.regs[ctlReg(0, kCtlIntfMaster)] = kDsiIntfSlave;
+    const Result r = panelOff(m, readPath(m), Options());
+    CHECK(!r.ok && r.safeAwake && std::strstr(r.why, "master") && m.stores.empty());
+  }
+  {   // Fence any in-flight submission before blanking the panel or stopping timing.
+    model::Dpu m;
+    m.ctlFlush = kFlushDspp;
+    m.flushStuck = true;
+    const Result r = panelOff(m, readPath(m), Options());
+    CHECK(!r.ok && r.safeAwake && std::strstr(r.why, "drain") && m.stores.empty());
+  }
+  {   // A stuck reset cannot consume a route submission.
+    model::Dpu m;
+    m.ctlResetStuck = true;
+    const Result r = panelOff(m, readPath(m), Options());
+    CHECK(!r.ok && !r.restored && std::strstr(r.why, "reset") && m.dcs.size() == 4);
+    CHECK(m.storesTo(ctlReg(0, kCtlIntfActive)) == 0 && m.storesTo(ctlReg(0, kCtlStart)) == 0);
+  }
+  {   // A handoff without a latched START must neither stop the slave nor run wake DCS.
+    model::Dpu m;
+    m.dropStore = ctlReg(0, kCtlStart);
+    m.dropValue = m.dropCount = 1;
+    const Result r = panelOff(m, readPath(m), Options());
+    CHECK(!r.ok && !r.restored && std::strstr(r.why, "handoff did not flush") && m.dcs.size() == 4);
+    CHECK(m.latchedMaster == kDsiIntfMaster && m.storesTo(intfReg(2, kIntfEn)) == 0);
+  }
+  {   // Fetch failed after the handoff. Undo restores both the route and saved fetch.
+    model::Dpu m;
+    m.regs[intfReg(2, kIntfConfig)] = kIntfConfigProgFetch;
+    m.intf[2].fetch = m.regs[intfReg(2, kIntfProgFetch)] = 2290 * model::kHtotal;
+    m.dropStore = intfReg(2, kIntfConfig);
+    m.dropValue = 0;
+    m.dropCount = 1;
+    const Result r = panelOff(m, readPath(m), Options());
+    CHECK(!r.ok && r.restored && std::strstr(r.why, "programmable fetch") && m.dcs.size() == 8);
+    CHECK(m.latchedMaster == kDsiIntfMaster && readPath(m).ok && m.half[0].displayOn && clean(m));
   }
   {   // the engines do not start at the wake: reported, no DCS sent into a stopped link
     model::Dpu m;
@@ -496,7 +647,7 @@ static void testFailures()
     const Result r = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
     CHECK(!r.ok && r.step == 1 && std::strstr(r.why, "running") && m.dcs.size() == dcs);
   }
-  {   // both engines count but the INTF flush never latched
+  {   // the bonded wake route never latches
     model::Dpu m;
     const LivePath p = readPath(m);
     const Result off = panelOff(m, p, Options());
@@ -504,7 +655,7 @@ static void testFailures()
     m.flushStuck = true;
     const size_t dcs = m.dcs.size();
     const Result wake = panelOn(m, p, Options(), off.enginesStopped, off.fetch);
-    CHECK(!wake.ok && std::strstr(wake.why, "flush") && m.dcs.size() == dcs);
+    CHECK(!wake.ok && std::strstr(wake.why, "flush") && m.dcs.size() == dcs && !m.intf[1].on && !m.intf[2].on);
   }
   {   // DCS only: the engines keep running
     model::Dpu m;
@@ -556,7 +707,8 @@ int main()
   testSleepWake();
   testZeroCounterReadback();
   testUnavailablePanel();
-  testY12nTrace();
+  testStopTimeoutTrace();
+  testY12oTrace();
   testFailures();
   testHeldOnFailedOrSupersededWake();
   if (failures) {

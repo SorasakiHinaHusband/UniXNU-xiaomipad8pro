@@ -233,9 +233,9 @@ struct KernelIo {
     ++gLoads;
     return rd32(va + uintptr_t(pa & 0xfff));
   }
-  bool wr(uint64_t pa, uint32_t v)
+  bool wr(uint64_t pa, uint32_t v, int panelCtl = -1)
   {
-    if (!storeAllowed(pa, v, modesEnabled())) {
+    if (!storeAllowed(pa, v, modesEnabled(), gA.panel && gA.panelEngines ? panelCtl : -1)) {
       if (++gRefused <= 8) note("REFUSED store %#llx = %08x (not a register of the slices)", (unsigned long long)pa, v);
       return false;
     }
@@ -740,7 +740,7 @@ bool panelSleep()
   panel::TraceRing *trace = beginPanelTrace();
   const panel::Result r = panel::panelOff(gIo, gPath, gPanelOptions, trace);
   finishPanelTrace(trace, false, r);
-  logPanel("sleep (display off 0x28, 20 ms, sleep in 0x10, 100 ms, INTF2 then INTF1 stopped)", r);
+  logPanel(gPanelOptions.engines ? "sleep (DCS 28/10, master-first CTL handoff)" : "sleep (DCS 28/10)", r);
   if (r.ok) {
     gAsleep = true;
     gEnginesStopped = r.enginesStopped;
@@ -760,8 +760,9 @@ bool panelWake()
 {
   if (!gAsleep || gPanelUnsafe) return !gPanelUnsafe;
   flipPanelBegin();
-  const LivePath live = readPath(gIo, gA.ahbVote == 1);
-  if (live.ctl != gPath.ctl || (live.link[0].dsiCtrl & 3u) != 3u || (live.link[1].dsiCtrl & 3u) != 3u) {
+  const LivePath live = readPath(gIo, gA.ahbVote == 1, gEnginesStopped);
+  if (live.ctl != gPath.ctl || (gEnginesStopped && live.intfActive != kDsiIntfSlave) ||
+      (live.link[0].dsiCtrl & 3u) != 3u || (live.link[1].dsiCtrl & 3u) != 3u) {
     flipPanelEnd(true);
     note("panel: wake refused: DSI video path unavailable (%s, ctl%d)", live.why, live.ctl);
     return false;
@@ -769,7 +770,7 @@ bool panelWake()
   panel::TraceRing *trace = beginPanelTrace();
   const panel::Result r = panel::panelOn(gIo, gPath, gPanelOptions, gEnginesStopped, gPanelFetch, trace);
   finishPanelTrace(trace, true, r);
-  logPanel("wake (INTF flush, INTF1 + INTF2 on, sleep out 0x11, 120 ms, display on 0x29)", r);
+  logPanel(gEnginesStopped ? "wake (bonded route and timing, DCS 11/29)" : "wake (DCS 11/29)", r);
   gAsleep = false;
   gEnginesStopped = false;
   const bool ok = r.ok && reread("the wake");

@@ -2,14 +2,11 @@
 // PianoDpu B1e: the panel's light sleep with the display (docs/drivers/dpu.md §4.5), portable (tests/dpu_panel_host.cpp).
 //
 // Off (after PianoBacklight turned the backlight off on the same display-power change): DCS display-off (0x28), 20 ms, sleep-in
-// (0x10), 100 ms (the panel's stock term sequence and Ubuntu's P81 shutdown timing, K:72cfce4c86e5), then the timing engines
-// stopped, INTF2 (the slave) before INTF1, each until INTF_STATUS bit 0 clears (at most 40 ms, Ubuntu's slave poll, K:c55958fa09dd):
-// clear programmable fetch once timing has stopped. The DPU stops fetching (3.28 GB/s at 120 Hz). The DSI controllers, the PHYs, MDSS,
-// the CTL (never reset while anything scans), the panel's reset gpio98 and its supplies (vddio L12B; AVDD/AVEE from the KTZ8866's
-// bias, ENP/ENN = gpio117/118) all stay as they are (DpuSlices.h's store guard cannot reach TLMM at all).
-// On: restore the live fetch starts and enable bits, CTL_INTF_FLUSH + CTL_FLUSH bit 31, then INTF1 and INTF2 enabled back to back
-// (msm's order: flush before the timing engine,
-// master first), both counting again in lockstep, then DCS sleep-out (0x11), 120 ms, display-on (0x29), 10 ms; the caller re-applies
+// (0x10), 100 ms, then stop INTF1 and hand off the CTL to INTF2 before stopping INTF2 (Ubuntu 1.4.0, K:1fead1793340).
+// Reset the CTL only after both effective engines are quiescent. Keep the pixel resources bound through the slave's final frame
+// and clear programmable fetch after both engines stop. The DSI controllers, PHYs, panel reset and supplies stay as they are.
+// On: restore the fetch registers and bonded route, latch the shared CTL flush, then enable INTF1 and INTF2 back to back.
+// Verify both count in lockstep, then DCS sleep-out (0x11), 120 ms, display-on (0x29), 10 ms; the caller re-applies
 // the PCC and PianoBacklight lights the panel.
 // The DCS commands go out while the video stream runs (the command engine sends in the vertical blanking; its DMA reads the
 // controller's own command FIFO, so no buffer has to be reachable by the DSI's DMA through the SMMU), on both links, one trigger each
@@ -247,7 +244,8 @@ bool programFetch(Io &io, const Fetch &fetch, bool enable, Engines &e)
   }
   return !e.refused;
 }
-// Stop one INTF's engine (index 1 or 2) and wait until it reports stopped.
+// Stop one engine. With INTF1 selected as shared master, its final frame
+// must also retire on INTF2 before the CTL can be reset.
 template <class Io>
 int32_t stopEngine(Io &io, unsigned intf, Engines &e, const Trace &trace)
 {
@@ -260,15 +258,81 @@ int32_t stopEngine(Io &io, unsigned intf, Engines &e, const Trace &trace)
   for (;;) {
     const uint64_t pa = intfReg(intf, kIntfStatus);
     const uint32_t st = e.status[intf - 1] = io.rd(pa);
+    PollRead slave;
+    if (intf == 1) slave = {intfReg(2, kIntfStatus), e.status[1] = io.rd(intfReg(2, kIntfStatus))};
+    const bool stopped = !((st | slave.value) & kIntfStatusOn) && io.rd(intfReg(intf, kIntfEn)) == 0;
     const uint64_t elapsed = io.nowUs() - t0;
-    const bool stopped = !(st & kIntfStatusOn);
     if (stopped || elapsed >= kEngineStopUs) {
-      trace.sample(io, {pa, st});
+      trace.sample(io, {pa, st}, slave);
       return stopped ? int32_t(elapsed) : -1;
     }
-    trace.pause(io, 1000, true, {pa, st});
+    trace.pause(io, 1000, true, {pa, st}, slave);
   }
 }
+
+template <class Io>
+bool timingQuiescent(Io &io)
+{
+  uint32_t frame[2], line[2];
+  for (unsigned i = 1; i <= 2; ++i) {
+    if (io.rd(intfReg(i, kIntfStatus)) & kIntfStatusOn) return false;
+    frame[i - 1] = io.rd(intfReg(i, kIntfFrameCount));
+    line[i - 1] = io.rd(intfReg(i, kIntfLineCount));
+    if (frame[i - 1] == UINT32_MAX || line[i - 1] == UINT32_MAX) return false;
+  }
+  io.delayUs(100);
+  for (unsigned i = 1; i <= 2; ++i)
+    if ((io.rd(intfReg(i, kIntfStatus)) & kIntfStatusOn) ||
+        io.rd(intfReg(i, kIntfFrameCount)) != frame[i - 1] ||
+        io.rd(intfReg(i, kIntfLineCount)) != line[i - 1]) return false;
+  return true;
+}
+
+template <class Io>
+bool panelStore(Io &io, const LivePath &p, uint32_t offset, uint32_t value, Engines &e)
+{
+  ++e.stores;
+  if (io.wr(ctlReg(unsigned(p.ctl), offset), value, p.ctl)) return true;
+  ++e.refused;
+  return false;
+}
+
+template <class Io>
+bool resetPanelCtl(Io &io, const LivePath &p, Engines &e, Trace &trace)
+{
+  const unsigned ctl = unsigned(p.ctl);
+  const uint64_t reset = ctlReg(ctl, kCtlSwReset);
+  trace.boundary(io, TraceStep::ctlReset);
+  if (io.rd(ctlReg(ctl, kCtlFlush)) || (io.rd(reset) & 1u) || !timingQuiescent(io) ||
+      !panelStore(io, p, kCtlSwReset, 1, e)) return false;
+  const uint64_t end = io.nowUs() + 2000;  // the reference CTL soft reset bound
+  do {
+    if (!(io.rd(reset) & 1u)) {
+      trace.sample(io);
+      return io.rd(ctlReg(ctl, kCtlTop)) == p.ctlTop && (io.rd(ctlReg(ctl, kCtlLayerActive)) & 0xffu) == p.lms;
+    }
+    trace.pause(io, 50, false);
+  } while (io.nowUs() < end);
+  trace.sample(io);
+  return false;
+}
+
+template <class Io>
+int32_t submitPanelRoute(Io &io, const LivePath &p, uint32_t active, uint32_t master, Engines &e, Trace &trace)
+{
+  const unsigned ctl = unsigned(p.ctl);
+  const uint64_t flush = ctlReg(ctl, kCtlFlush), intfFlush = ctlReg(ctl, kCtlIntfFlush);
+  if (!panelStore(io, p, kCtlIntfActive, active, e) || !panelStore(io, p, kCtlIntfMaster, master, e) ||
+      io.rd(ctlReg(ctl, kCtlIntfActive)) != active || io.rd(ctlReg(ctl, kCtlIntfMaster)) != master ||
+      !panelStore(io, p, kCtlIntfFlush, kIntfFlushDsi, e) || !panelStore(io, p, kCtlFlush, kFlushIntf, e) ||
+      io.rd(intfFlush) != kIntfFlushDsi || io.rd(flush) != kFlushIntf) return -1;
+  trace.sample(io);
+  if (!panelStore(io, p, kCtlStart, 1, e)) return -1;
+  const int32_t latched = waitFlush(io, ctl, UINT32_MAX, kEngineStopUs, trace);
+  if (latched < 0 || io.rd(ctlReg(ctl, kCtlIntfActive)) != active || io.rd(ctlReg(ctl, kCtlIntfMaster)) != master) return -1;
+  return latched;
+}
+
 // Both on again: the CTL's INTF flush first, then INTF1 and INTF2 with nothing in between; running and in lockstep. After a failed
 // stop one engine may still run: INTF2 alone is started at INTF1's frame start (its line counter wrapping), so the halves stay in
 // phase; INTF1 alone (INTF2 running) cannot be aligned that way and is reported.
@@ -276,6 +340,18 @@ template <class Io>
 Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace)
 {
   Engines e;
+  const unsigned ctl = unsigned(p.ctl);
+  const uint32_t active = io.rd(ctlReg(ctl, kCtlIntfActive)), master = io.rd(ctlReg(ctl, kCtlIntfMaster));
+  const bool handedOff = active == kDsiIntfSlave && master == 0;
+  if ((!handedOff && (active != p.intfActive || master != p.intfMaster)) || io.rd(ctlReg(ctl, kCtlTop)) != p.ctlTop ||
+      (io.rd(ctlReg(ctl, kCtlSwReset)) & 1u) || io.rd(ctlReg(ctl, kCtlFlush))) {
+    e.why = "the shared CTL is not ready to restart";
+    return e;
+  }
+  if (handedOff && (io.rd(intfReg(1, kIntfEn)) || io.rd(intfReg(2, kIntfEn)) || !resetPanelCtl(io, p, e, trace))) {
+    e.why = "could not reset the stopped CTL for the bonded wake";
+    return e;
+  }
   trace.boundary(io, TraceStep::fetchOn);
   if (!programFetch(io, fetch, true, e)) {
     e.why = "could not restore programmable fetch";
@@ -285,12 +361,25 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
     ++e.stores;
     if (!io.wr(pa, v)) ++e.refused;
   };
+  if (handedOff) {
+    trace.boundary(io, TraceStep::routeOn);
+    e.latchUs = submitPanelRoute(io, p, p.intfActive, p.intfMaster, e, trace);
+    if (e.latchUs < 0) {
+      e.why = "the bonded wake route did not flush";
+      return e;
+    }
+  } else {
+    wr(ctlReg(ctl, kCtlIntfFlush), kIntfFlushDsi);
+    wr(ctlReg(ctl, kCtlFlush), kFlushIntf);
+    if (e.refused) {
+      e.why = "the store guard refused the INTF wake flush";
+      return e;
+    }
+  }
   trace.boundary(io, TraceStep::enable);
   const bool on1 = io.rd(intfReg(1, kIntfStatus)) & kIntfStatusOn, on2 = io.rd(intfReg(2, kIntfStatus)) & kIntfStatusOn;
-  wr(ctlReg(unsigned(p.ctl), kCtlIntfFlush), kIntfFlushDsi);
-  wr(ctlReg(unsigned(p.ctl), kCtlFlush), kFlushIntf);
-  if (e.refused) {
-    e.why = "the store guard refused the INTF wake flush";
+  if ((!on1 && on2) || (handedOff && on1)) {
+    e.why = "a timing engine is running outside the bonded wake sequence";
     return e;
   }
   const char *phase = nullptr;
@@ -302,10 +391,7 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
     const uintptr_t irq = io.irqOff();
     wr(intfReg(2, kIntfEn), 1);
     io.irqRestore(irq);
-    trace.sample(io);
-  } else if (!on1 && on2) {
-    wr(intfReg(1, kIntfEn), 1);
-    phase = "INTF1 started beside a running INTF2: the halves may be out of phase";
+    trace.sample(io);   // review-y12o 29a9ce72: record the line at the actual enable store
   } else if (!on1 && !on2) {
     const uintptr_t irq = io.irqOff();
     wr(intfReg(1, kIntfEn), 1);
@@ -332,8 +418,10 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
       trace.pause(io, 1000, true, a, b);
     }
   }
-  trace.step = TraceStep::flush;
-  e.latchUs = waitFlush(io, unsigned(p.ctl), kFlushIntf, 60000, trace);
+  if (!handedOff) {
+    trace.step = TraceStep::flush;
+    e.latchUs = waitFlush(io, ctl, kFlushIntf, 60000, trace);
+  }
   if (on) {
     trace.step = TraceStep::rate;
     e.rate = measureRate(io, 100, trace);
@@ -341,6 +429,7 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
   if (e.refused) e.why = "the store guard refused a store";
   else if (!on) e.why = "a timing engine did not report running within 50 ms";
   else if (e.latchUs < 0) e.why = "the INTF wake flush did not latch";
+  else if (io.rd(intfReg(1, kIntfEn)) != 1 || io.rd(intfReg(2, kIntfEn)) != 1) e.why = "both INTF enable requests did not read back";
   else if (!e.rate.milliHz) e.why = "the frame counter did not move after the start";
   else if (!e.rate.lockstep) e.why = "INTF2 does not count INTF1's frames (the halves are out of step)";
   else if (phase) e.why = phase;
@@ -400,6 +489,19 @@ Result panelOff(Io &io, const LivePath &p, const Options &o, TraceRing *ring = n
     trace.boundary(io, TraceStep::end);
     return r;
   };
+  if (o.engines) {
+    const unsigned ctl = unsigned(p.ctl);
+    if (!p.ok || p.intfActive != kIntfFlushDsi || p.intfMaster != kDsiIntfMaster) {
+      r.safeAwake = true;
+      return finish("INTF1 is not the master of the validated two-link CTL");
+    }
+    trace.boundary(io, TraceStep::drain);
+    Frames edge;
+    if (waitFlush(io, ctl, UINT32_MAX, kEngineStopUs, trace) < 0 || !waitFrameEdge(io, kEngineStopUs, &edge, trace)) {
+      r.safeAwake = true;
+      return finish("the master did not drain a frame with no pending CTL flush");
+    }
+  }
   r.step = 1;
   r.tUs[0] = io.nowUs() - t0;
   trace.boundary(io, TraceStep::displayOff);
@@ -428,24 +530,33 @@ Result panelOff(Io &io, const LivePath &p, const Options &o, TraceRing *ring = n
   }
   r.step = 3;
   r.tUs[2] = io.nowUs() - t0;
-  trace.boundary(io, TraceStep::stopSlave);
+  trace.boundary(io, TraceStep::stopMaster);
   for (unsigned i = 0; i < 2; ++i) {
     r.fetch.config[i] = io.rd(intfReg(i + 1, kIntfConfig));
     r.fetch.start[i] = io.rd(intfReg(i + 1, kIntfProgFetch));
   }
-  r.engines.us[1] = stopEngine(io, 2, r.engines, trace);   // the slave first
-  r.enginesStopped = true;
-  if (r.engines.us[1] < 0) {
-    undoOff(io, p, o, r, true, trace);
-    return finish(r.engines.refused ? "the store guard refused a store" : "INTF2's timing engine did not stop within 40 ms");
-  }
-  r.step = 4;
-  r.tUs[3] = io.nowUs() - t0;
-  trace.boundary(io, TraceStep::stopMaster);
   r.engines.us[0] = stopEngine(io, 1, r.engines, trace);
   if (r.engines.us[0] < 0) {
     undoOff(io, p, o, r, true, trace);
-    return finish(r.engines.refused ? "the store guard refused a store" : "INTF1's timing engine did not stop within 40 ms");
+    return finish(r.engines.refused ? "the store guard refused a store" : "the master did not stop both timing engines within 40 ms");
+  }
+  r.step = 4;
+  r.tUs[3] = io.nowUs() - t0;
+  if (!resetPanelCtl(io, p, r.engines, trace)) {
+    undoOff(io, p, o, r, true, trace);
+    return finish("could not reset the stopped CTL for the slave handoff");
+  }
+  trace.boundary(io, TraceStep::handoff);
+  r.engines.latchUs = submitPanelRoute(io, p, kDsiIntfSlave, 0, r.engines, trace);
+  if (r.engines.latchUs < 0) {
+    undoOff(io, p, o, r, true, trace);
+    return finish("the slave handoff did not flush");
+  }
+  trace.boundary(io, TraceStep::stopSlave);
+  r.engines.us[1] = stopEngine(io, 2, r.engines, trace);
+  if (r.engines.us[1] < 0 || io.rd(intfReg(1, kIntfEn)) != 0 || !timingQuiescent(io)) {
+    undoOff(io, p, o, r, true, trace);
+    return finish(r.engines.refused ? "the store guard refused a store" : "INTF2 did not quiesce after the handoff");
   }
   // Keep prefetch active for the last scanned frame. The wake flush latches
   // the restored configuration before the first complete frame is sent.
@@ -456,6 +567,7 @@ Result panelOff(Io &io, const LivePath &p, const Options &o, TraceRing *ring = n
     return finish("could not disable programmable fetch");
   }
   r.tUs[4] = io.nowUs() - t0;
+  r.enginesStopped = true;
   r.ok = true;
   return finish("ok");
 }

@@ -622,15 +622,15 @@ DSPP is not in ABL's path (the survey's dspp lines say what was found); `pcc: of
 PianoDpu: panel: dsi0 command path: ctrl ........ status ........ fifo ........ cmd-dma ........ dma1 ........ length ........ trig ........ (dma trigger 4 software, DMA blocked within the frame) intr ........ tpg 00000000 ack ........
 PianoDpu: panel: dsi1 command path: ...
 PianoDpu: panel: piano-dpu-panel=1: sleep with the display (low-power DCS, then the timing engines stopped); nothing of the panel's reset or supplies is touched
-PianoDpu: panel: sleep (display off 0x28, 20 ms, sleep in 0x10, 100 ms, INTF2 then INTF1 stopped): ok (step 5); dcs 28 sent in ... us, 10 sent in ... us; engines intf1 ... us intf2 ... us status 0/0; at 0/2./12./13. ms
-PianoDpu: panel: wake (INTF flush, INTF1 + INTF2 on, sleep out 0x11, 120 ms, display on 0x29): ok (step 3); dcs 11 sent in ... us, 29 sent in ... us; engines intf1 ... us intf2 ... us status 1/1, counting in lockstep; at 0/1../2../2.. ms
+PianoDpu: panel: sleep (DCS 28/10, master-first CTL handoff): ok (step 5); dcs 28 sent in ... us, 10 sent in ... us; engines intf1 ... us intf2 ... us status 0/0; at 0/2./12./13. ms
+PianoDpu: panel: wake (bonded route and timing, DCS 11/29): ok (step 3); dcs 11 sent in ... us, 29 sent in ... us; engines intf1 ... us intf2 ... us status 1/1, counting in lockstep; at 0/1../2../2.. ms
 PianoDpu: panel: test cycle 1 of 3 done                                         (three times)
 ```
 Pass: the picture goes black, comes back whole (no garbled frame, both halves aligned) each time; the survey's samples
 (`piano-dpu-repeat=2`) show the INTF1 counter stopped while asleep (sample during the 5 s). The DSI command path line answers open
 question 8 (`(dma trigger 4 software, ...)`; `no block: triggered in the front porch` works too). Failure lines: `sleep ...: DSI1's
 command DMA did not finish within 50 ms (step 1)` (the FIFO route does not take the command: nothing else was done; report the
-command-path lines), `INTF2's timing engine did not stop within 40 ms (step 3), the panel brought back`, `wake ...: a timing engine
+command-path lines), `the master did not stop both timing engines within 40 ms (step 3)`, `the slave handoff did not flush (step 4)`, `wake ...: a timing engine
 did not report running within 50 ms (step 1)` followed by `panel: WAKE FAILED: the panel may stay dark until a reset
 (piano-reset-after)`.
 
@@ -643,10 +643,15 @@ apply line, then the backlight. Check that the tint survives every wake, touch a
 
 The daily display-power callback blanks the KTZ8866 backlight while INTF1 and INTF2 continue scanning the active framebuffer. M5a uses the existing `piano-dpu-panel=1` opt-in to stop fetch at that boundary. The path is WindowServer and IOKit power → NativeGopDisplay's gated power callback and copy worker → PianoBacklight and PianoTouch → PianoDpu's panel sequence → dual DPU INTF and DSI video → NT36532. Pending swaps stay in the display's retained job queue until scanout can latch them again.
 
-The qualification failure occurred before the first DCS command. INTF1 and INTF2 were scanning, programmable fetch was enabled,
+The y12m qualification failure occurred before the first DCS command. INTF1 and INTF2 were scanning, programmable fetch was enabled,
 and subsequent M1 snapshots showed the frames and lines advancing with `count-en 0/0`. The slice requested the Linux enable bits
 and interpreted their zero readback as proof that the counters had stopped. It then advertised panel readiness after disabling
 M5a, so requests returned `kIOReturnIOError` from the worker and the engines stayed on in all ten cycles.
+
+The y12o trace captured the next failure after the readiness fix. INTF2's enable request read back zero, yet the live status and counters showed
+that it kept scanning with INTF1 for the entire 40 ms stop timeout. The stop sequence now follows Ubuntu's shared-CTL handoff and
+restores the inherited route on wake. The row-by-row decode, reference comparison and fix-image gate are in the
+[M5 analysis](dpu-m5-analysis.md).
 
 Counter setup comparison for the Ubuntu v1.4.0 kernel (`83f0f89bed14`) and UniXNU-sheng (`00ba909`)
 
@@ -661,14 +666,15 @@ Counter setup comparison for the Ubuntu v1.4.0 kernel (`83f0f89bed14`) and UniXN
 | `drm_panel.c:764–862` blanks after notifying touch and enables the backlight before notifying touch | `NativeGopDisplay::do_power_state_change_gated` posts a backlight request in both directions before the panel request | Blank promptly at the logical display-off, then confirm both ICs and touch are quiet before DCS. Release the backlight only after the panel can display a frame. |
 | `nt36532e-thp/core.c:621–658` quiesces touch SPI before panel disable and starts it after panel enable | `PianoTouch::powerStep` mutes reporting and still reads announced frames | Park touch transfers before DCS and release the touch worker once video is ready. |
 | `panel-novatek-nt36532.c:169–198,821–853` sends display-off, waits 20 ms, sends sleep-in, waits 100 ms, then powers down | `DpuPanel.h::panelOff` uses the same DCS sequence | Keep the command order and retain reset, power and PHY state for light sleep. |
-| `32d04280` disables the slave first. `8b53b972` delays shared CTL cleanup until both engines stop. `dsi_manager.c:275–277,284–298` powers down the slave DSI host first | `DpuPanel.h::stopEngine` waits for INTF2 before stopping INTF1 | Keep the slave-first timing stop and keep the shared CTL and DSI hosts configured. |
+| `dpu_encoder_phys_vid.c:611–663` and `dpu_encoder.c:1385–1421,1450–1462` drain and stop the master, verify both effective stops, then reset, remove INTF1 and submit the slave route | `DpuPanel.h::panelOff`, `stopEngine`, `resetPanelCtl` and `submitPanelRoute` use the same order and retire the prior flush and a live master frame with polls | Same handoff. Native uses STATUS and raw counter freeze as the stop proof for the inherited display. |
+| `dpu_encoder.c:1476–1498,2433–2457` waits for the slave's independent stop, then unbinds and flushes the empty CTL | `DpuPanel.h::panelOff` verifies both requests are off and the counters are frozen, then clears programmable fetch | Different cleanup. Native retains the slave route and all pixel resources for light sleep. |
 | `dpu_hw_intf.c:285–305` sets FETCH_START before setting CONFIG bit 31 | B1e only stops and starts timing | Save both live fetch configurations, clear their enable bits for sleep and restore the saved starts and enable state before the wake flush. |
-| `panel-novatek-nt36532.c:652–654` sends sleep-out, waits 120 ms, then sends display-on | `DpuPanel.h::panelOn` flushes and restarts timing before DCS | Verify both engines and the flush. Restore configured PCC before releasing the display-power clients. |
+| `dpu_encoder.c:1862–1919` submits a shared flush once and `dpu_encoder_phys_vid.c:668–683` enables timing afterward. `panel-novatek-nt36532.c:652–654` sends sleep-out, waits 120 ms, then sends display-on | `DpuPanel.h::startEngines` restores the saved route and fetch, waits for the shared flush, then starts the pair. `panelOn` sends wake DCS after lockstep. | Same flush-before-enable order. The retained-route wake restores the original CTL while both engines are off and replays PCC before releasing the display-power clients. |
 
 RAM-boot read list for the lead session
 
 1. Use the daily flip profile on a volatile Data RAM boot with `piano-dpu-panel=1 piano-dpu-snapshot=1`. Record the boot args, DPU flip-serving line, `panel: INTF counters` (raw enable values before and after the enable request, plus the motion verdict), and `slices: serving` with `panel on`. Take two awake `sudo sysctl -n machdep.piano_dpu_snapshot` reads and record both backlight IC states. Verify both frame and line counters move with both engines running. A zero enable readback is acceptable with observed motion. If the live check fails, capture the `panel: sleep refused` line and verify the backlight-only wake, with both engines still running. Use a matched default-off run as the power control.
-2. With a working desktop and the C920 capturing continuously, start with ten cycles of `pmset displaysleepnow` and keyboard-cover wake. Take two snapshot reads at least 100 ms apart in each sleep after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and frame counters unchanged across the reads. Pair each success with a wake and confirm both engines restart before the next cycle. Verify there was no flip timeout or permanent copy fallback. Extend to 50 cycles for the full qualification, sampling the remaining cycles.
+2. With a working desktop and the C920 capturing continuously, start with ten cycles of `pmset displaysleepnow` and keyboard-cover wake. Take two snapshot reads at least 100 ms apart in each sleep after the `PianoDpu: panel: sleep` success line and before wake. Expect both INTF enable and status bits clear, programmable fetch disabled and both frame and line counters stable. The selected CTL should be at ACTIVE 0x4, MASTER 0, with FLUSH clear. Save the first off and wake traces using the [M5 read list](dpu-m5-analysis.md#trace-read-list). Pair each success with a wake and confirm both engines restart before the next cycle. Verify there was no flip timeout or permanent copy fallback. Extend to 50 cycles for the full qualification, sampling the remaining cycles.
 3. On wake compare the snapshot with the awake baseline, including both programmable fetch starts and enable bits. Verify scanout counters advance, a pending swap can latch, keyboard and trackpad work, and touch tap and scroll work. Check the C920 recording across all 50 wakes for garbled or split frames, flashes and stalls.
 4. Record awake and asleep steady-state power with the same brightness, CPU/GPU workload, peripherals and measurement interval for both runs. Use a USB-C meter with identical charger conditions, or run unplugged and sample `Voltage` and signed `InstantAmperage` from `ioreg -r -c AppleSmartBattery -l` (`piano-power-ps=1`). Compare asleep with M5a disabled and enabled. Save the per-cycle results and wattage, including the measurement source.
 

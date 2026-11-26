@@ -30,7 +30,8 @@ constexpr uint32_t kTopIntrClear = 0x018;
 constexpr uint32_t kUnderrunBits = (1u << kIntrIntfUnderrun[1]) | (1u << kIntrIntfUnderrun[2]);
 // CTL flush (msm dpu_hw_ctl.c): CTL_FLUSH bit 31 = the INTFs named in CTL_INTF_FLUSH (bit n = INTF n), bit 29 = the DSPPs named in
 // CTL_DSPP_n_FLUSH (bit 4 = PCC). The hardware clears a bit when its registers latched, at the next frame start in video mode.
-constexpr uint32_t kFlushIntf = 1u << 31, kFlushDspp = 1u << 29, kIntfFlushDsi = (1u << 1) | (1u << 2), kDsppFlushPcc = 1u << 4;
+constexpr uint32_t kDsiIntfMaster = 1u << 1, kDsiIntfSlave = 1u << 2, kIntfFlushDsi = kDsiIntfMaster | kDsiIntfSlave;
+constexpr uint32_t kFlushIntf = 1u << 31, kFlushDspp = 1u << 29, kDsppFlushPcc = 1u << 4;
 // INTF (msm dpu_hw_intf.c): INTF_STATUS bit 0 = the timing engine runs (get_status, core >= 5); INTF_CONFIG bit 31 = programmable
 // fetch on (setup_prg_fetch); INTF_FRAME_LINE_COUNT_EN = 3 turns both counters on (setup_timing_engine writes 3).
 constexpr uint32_t kIntfStatusOn = 1u, kIntfConfigProgFetch = 1u << 31, kCountersOn = 3u;
@@ -54,10 +55,16 @@ constexpr uint32_t kDsiCmdDmaCtrl = 0x03c, kDsiDmaLength = 0x04c, kDsiAckErr = 0
                    kDsiTpgCtrl = 0x15c, kDsiTpgFifo = 0x17c, kDsiDmaCtrl1 = 0x390, kDsiShadow[3] = {0x1e4, 0x1e8, 0x1ec};
 
 // ------------------------------------------------------------------------------------------------------------ the guard
-inline bool storeAllowed(uint64_t pa, uint32_t v, bool modeTiming = false)
+inline bool storeAllowed(uint64_t pa, uint32_t v, bool modeTiming = false, int panelCtl = -1)
 {
   if (pa & 3u) return false;
   if (pa == kMdp + kTopIntrClear) return v && !(v & ~kUnderrunBits);
+  if (panelCtl >= 0 && unsigned(panelCtl) < kCtlCount) {
+    const unsigned c = unsigned(panelCtl);
+    if (pa == ctlReg(c, kCtlSwReset) || pa == ctlReg(c, kCtlStart)) return v == 1;
+    if (pa == ctlReg(c, kCtlIntfActive)) return v == kIntfFlushDsi || v == kDsiIntfSlave;
+    if (pa == ctlReg(c, kCtlIntfMaster)) return v == kDsiIntfMaster || v == 0;
+  }
   for (unsigned c = 0; c < kCtlCount; ++c)
     if (pa == ctlReg(c, kCtlFlush) || pa == ctlReg(c, kCtlIntfFlush) || (pa >= ctlReg(c, kCtlDspp0Flush) && pa < ctlReg(c, kCtlDspp0Flush + 16)))
       return true;
@@ -122,9 +129,10 @@ void readLink(Io &io, unsigned i, Link &k)
   k.dsiTrig = io.rd(dsiReg(i, kDsiTrigCtrl));
 }
 
-// hwGatedAhb: the survey's gate rule (piano-dpu-ahb-vote, DpuSurvey.h surveyClocks).
+// hwGatedAhb: the survey's gate rule. Wake and snapshots can see the retained
+// slave-only route when the bonded CTL is absent.
 template <class Io>
-LivePath readPath(Io &io, bool hwGatedAhb = false)
+LivePath readPath(Io &io, bool hwGatedAhb = false, bool allowSlaveRoute = false)
 {
   LivePath p;
   unsigned loads = 0;
@@ -138,14 +146,19 @@ LivePath readPath(Io &io, bool hwGatedAhb = false)
       p.why = l ? "DSI1's byte or pixel clock is off: nothing of it is read" : "DSI0's byte or pixel clock is off: nothing of it is read";
       return p;
     }
-  for (unsigned c = 0; c < kCtlCount && p.ctl < 0; ++c) {
+  for (unsigned c = 0; c < kCtlCount; ++c) {
     const uint32_t active = io.rd(ctlReg(c, kCtlIntfActive)), top = io.rd(ctlReg(c, kCtlTop));
-    if ((active & 0x6u) != 0x6u || ((top >> 17) & 1u)) continue;
+    if ((top >> 17) & 1u) continue;
+    const bool bonded = (active & kIntfFlushDsi) == kIntfFlushDsi;
+    if (!bonded && (!allowSlaveRoute || active != kDsiIntfSlave || p.ctl >= 0)) continue;
+    const uint32_t master = io.rd(ctlReg(c, kCtlIntfMaster));
+    if (!bonded && master) continue;
     p.ctl = int(c);
     p.ctlTop = top;
     p.intfActive = active;
-    p.intfMaster = io.rd(ctlReg(c, kCtlIntfMaster));
+    p.intfMaster = master;
     p.lms = io.rd(ctlReg(c, kCtlLayerActive)) & 0xffu;
+    if (bonded) break;
   }
   if (p.ctl < 0) {
     p.why = "no video-mode CTL drives INTF1+INTF2 (the dual-DSI panel)";
@@ -154,7 +167,8 @@ LivePath readPath(Io &io, bool hwGatedAhb = false)
   p.dspps = p.lms & 0xfu;
   for (unsigned i = 0; i < 2; ++i) readLink(io, i, p.link[i]);
   const Link &a = p.link[0], &b = p.link[1];
-  if (!a.engine() || !b.engine()) p.why = "an INTF timing engine is off (the panel is not scanned)";
+  if (p.intfActive == kDsiIntfSlave) p.why = "the bonded CTL is parked on the slave route";
+  else if (!a.engine() || !b.engine()) p.why = "an INTF timing engine is off (the panel is not scanned)";
   else if (!a.htotal || a.htotal != b.htotal || !a.vtotal || a.vtotal != b.vtotal) p.why = "INTF1 and INTF2 timings differ or are not whole lines";
   else if ((a.dsiCtrl & 3u) != 3u || (b.dsiCtrl & 3u) != 3u) p.why = "a DSI controller is not enabled in video mode";
   else {

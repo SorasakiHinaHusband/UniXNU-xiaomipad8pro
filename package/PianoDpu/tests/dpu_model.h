@@ -2,8 +2,9 @@
 // A timed register model of piano's panel path for the B1c/B1d/B1e host tests (dpu_refresh_host.cpp, dpu_pcc_host.cpp,
 // dpu_panel_host.cpp): the Io of DpuSlices.h over simulated time. What it models, from the facts in DpuHw.h / DpuSlices.h:
 //   - INTF1/INTF2 timing engines: frame length and line time at a fixed pixel clock, frame and line counters, INTF_STATUS;
-//     EN = 0 stops an engine at its frame end, EN = 1 starts it at once; VSYNC_PERIOD_F0 is a shadow taken at a CTL INTF flush;
-//   - the CTL: FLUSH bits set by writing ones, latched (and cleared) at INTF1's frame start, or at the engines' start when stopped;
+//     INTF1 gates INTF2 while bonded. A handed-off slave latches EN = 0 at its own frame end.
+//     VSYNC_PERIOD_F0 is a shadow taken at a CTL INTF flush;
+//   - the CTL: FLUSH bits latch at INTF1's frame start. A stopped CTL consumes a route change after SW_RESET and START.
 //   - the DSPPs' PCC words: shadows taken at a CTL DSPP flush (CTL_DSPP_n_FLUSH bit 4);
 //   - each DSI controller's video TOTAL with its timing shadow (DB mode, flush) at one of the two candidate places (DbHw), latched at
 //     its INTF's frame start; a frame whose DSI and INTF totals differ, or a TOTAL that changes inside a frame, is a glitch and sets
@@ -59,6 +60,7 @@ struct Dpu {
   bool resetPccOnTimingChange = false;
   unsigned lateDmas = 0;               // delay this many DMA completions past a short front porch
   bool countEnableIgnored[2] = {false, false};   // COUNT_EN writes do not change the readback or live counters
+  bool ctlResetStuck = false;
   // ---- state
   uint64_t ns = 0;
   std::map<uint64_t, uint32_t> regs;
@@ -83,6 +85,8 @@ struct Dpu {
     uint32_t intr = 0x00000002;   // the DMA done enable bit on, status clear
   } dsi[2];
   uint32_t ctlFlush = 0, ctlIntfFlush = 0, dsppFlush[4] = {0, 0, 0, 0};
+  uint32_t latchedMaster = kDsiIntfMaster;
+  uint64_t ctlResetDoneNs = 0;
   uint32_t pccShadow[4][13] = {}, pccActive[4][13] = {};
   uint32_t topStatus = 0;
   struct Half {
@@ -185,6 +189,10 @@ struct Dpu {
         if (intf[i].stopPending) {
           intf[i].on = false;
           intf[i].stopPending = false;
+          if (i == 1 && latchedMaster == kDsiIntfMaster) {
+            intf[2].on = false;
+            intf[2].stopPending = false;
+          }
           continue;
         }
         if (intf[i].counting) ++intf[i].frames;
@@ -289,6 +297,7 @@ struct Dpu {
     }
     if (pa == ctlReg(0, kCtlFlush)) return ctlFlush;
     if (pa == ctlReg(0, kCtlIntfFlush)) return ctlIntfFlush;
+    if (pa == ctlReg(0, kCtlSwReset)) return ns < ctlResetDoneNs ? 1 : 0;
     for (unsigned d = 0; d < 4; ++d) {
       if (pa == ctlReg(0, kCtlDspp0Flush + 4 * d)) return dsppFlush[d];
       if (pa >= pccReg(d, 0) && pa <= pccReg(d, 0x30)) return pccShadow[d][(pa - pccReg(d, 0)) / 4];
@@ -306,10 +315,10 @@ struct Dpu {
   }
   uint32_t dbModeWord() const { return dbHw == DbHw::sunuefi ? kDsiShadow[2] : kDsiShadow[1]; }
   uint32_t dbFlushWord() const { return dbHw == DbHw::sunuefi ? kDsiShadow[1] : kDsiShadow[0]; }
-  bool wr(uint64_t pa, uint32_t v)
+  bool wr(uint64_t pa, uint32_t v, int panelCtl = -1)
   {
     tick(150);
-    if (!storeAllowed(pa, v, modeWrites)) {
+    if (!storeAllowed(pa, v, modeWrites, panelCtl)) {
       refused.push_back(pa);
       return false;
     }
@@ -332,7 +341,8 @@ struct Dpu {
       }
       if (pa == intfReg(i, kIntfEn)) {
         regs[pa] = v;
-        if (!v && intf[i].on && !engineStuck[i - 1]) intf[i].stopPending = true;
+        const bool gatedSlave = i == 2 && latchedMaster == kDsiIntfMaster;
+        if (!v && intf[i].on && !engineStuck[i - 1] && !gatedSlave) intf[i].stopPending = true;
         if (v && !intf[i].on && !engineDead[i - 1]) {
           intf[i].on = true;
           intf[i].stopPending = false;
@@ -352,6 +362,23 @@ struct Dpu {
         if (v) intf[i].stopPending = false;
         return true;
       }
+    }
+    if (pa == ctlReg(0, kCtlSwReset)) {
+      if (intf[1].on || intf[2].on || ctlFlush) ++glitches;
+      ctlResetDoneNs = ctlResetStuck ? UINT64_MAX : ns + 30000;
+      return true;
+    }
+    if (pa == ctlReg(0, kCtlStart)) {
+      if (!ctlResetDoneNs || ns < ctlResetDoneNs || !ctlFlush || flushStuck) return true;
+      ctlResetDoneNs = 0;
+      const uint32_t active = regs[ctlReg(0, kCtlIntfActive)];
+      latchedMaster = regs[ctlReg(0, kCtlIntfMaster)];
+      latchCtl();
+      if (active == kDsiIntfSlave && !latchedMaster && regs[intfReg(2, kIntfEn)]) {
+        intf[2].on = true;
+        intf[2].start = ns;
+      }
+      return true;
     }
     if (pa == ctlReg(0, kCtlFlush)) {
       ctlFlush |= v;

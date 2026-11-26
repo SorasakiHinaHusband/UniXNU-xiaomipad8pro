@@ -86,7 +86,7 @@ constexpr uint32_t kSrcSize = 0x00, kSrcXy = 0x08, kOutSize = 0x0c, kOutXy = 0x1
 // only names the active pipes and LMs (msm dpu_hw_ctl.c, core_major_ver >= 12).
 constexpr uint32_t kCtlBase = 0x15000, kCtlStride = 0x1000;
 constexpr unsigned kCtlCount = 6;
-constexpr uint32_t kCtlTop = 0x014, kCtlFlush = 0x018, kCtlStart = 0x01c, kCtlPrepare = 0x0d0, kCtlMerge3dActive = 0x0e4,
+constexpr uint32_t kCtlTop = 0x014, kCtlFlush = 0x018, kCtlStart = 0x01c, kCtlSwReset = 0x030, kCtlPrepare = 0x0d0, kCtlMerge3dActive = 0x0e4,
                    kCtlDscActive = 0x0e8, kCtlWbActive = 0x0ec, kCtlCwbActive = 0x0f0, kCtlIntfActive = 0x0f4,
                    kCtlCdmActive = 0x0f8, kCtlFetchActive = 0x0fc, kCtlMerge3dFlush = 0x100, kCtlDscFlush = 0x104,
                    kCtlIntfFlush = 0x110, kCtlPeriphFlush = 0x128, kCtlPipeActive = 0x12c, kCtlLayerActive = 0x130,
