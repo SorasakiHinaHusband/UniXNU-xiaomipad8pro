@@ -11,7 +11,7 @@
 //     the right edge; a finger joining and one leaving; palms (a palm at the start, a finger turning palm mid-gesture); the two-finger
 //     tap's right click; one finger untouched by the path (tap and drag as before); disabled = no claim; the rotation's axes;
 //   - TouchInject.h: scripts parsed (errors at the right character), interpolation, palm areas, the bounding box.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. touch_mt_host.cpp -o /tmp/touch_mt_host && /tmp/touch_mt_host
+// Build: c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. touch_mt_host.cpp -o /tmp/touch_mt_host && /tmp/touch_mt_host
 #include "TouchMt.h"
 #include "TouchInject.h"
 #include "TouchTrack.h"

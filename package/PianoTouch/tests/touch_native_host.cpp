@@ -14,7 +14,7 @@
 //     while the other moves), eight plus one fingers, a palm resting (never a touch), a finger turning palm (a cancel of every touch,
 //     then nothing until every contact is up), frames lost (nativeCancel), all four corners at every rotation in both axis modes, idle
 //     (no report at rest), path indices under BackBoard's 30.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. touch_native_host.cpp -o /tmp/touch_native_host && /tmp/touch_native_host
+// Build: c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. touch_native_host.cpp -o /tmp/touch_native_host && /tmp/touch_native_host
 #include "TouchNative.h"
 #include "TouchScreenHid.h"
 #include "TouchInject.h"

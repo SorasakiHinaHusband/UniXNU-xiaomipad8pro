@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Offline Pen/Stylus HID, synthetic HOGP and NT36532E, and touch handoff.
-// c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. stylus_hid_host.cpp -o /tmp/stylus_hid_host && /tmp/stylus_hid_host
+// Build: c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. stylus_hid_host.cpp -o /tmp/stylus_hid_host && /tmp/stylus_hid_host
 #include "StylusHidModel.h"
 #include "TouchNative.h"
 #include <array>

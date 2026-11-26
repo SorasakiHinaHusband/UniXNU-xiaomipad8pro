@@ -9,7 +9,7 @@
 //     partition downloaded into the model must pass the model's CRC check (byte-exact SRAM contents); nothing of an image is printed;
 //   - TouchMatrix.h on synthetic frames (type lock, median reference, line noise, centroid, Y flip, release) and the tip debounce;
 //   - TouchHid.h's descriptor (parsed: one 5-byte input report) and the report scaling; Se2Bus.h's clock decoding.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 touch_host.cpp -o /tmp/touch_host && /tmp/touch_host [IMAGE.bin ...]
+// Build: c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. -I../../PianoDwc3 touch_host.cpp -o /tmp/touch_host && /tmp/touch_host [IMAGE.bin ...]
 #include "Nt36532.h"
 #include "TouchMatrix.h"
 #include "TouchTrack.h"
