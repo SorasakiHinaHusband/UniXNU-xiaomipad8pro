@@ -114,8 +114,8 @@ def manifest_tests(tmp):
     print('1. manifest')
     plan = stage.load_manifest(D / 'configs/userland.toml')
     names = {u['name']: u for u in plan['units']}
-    check(set(names) >= {'pianousb-shell', 'piano-policy-agent', 'piano-rotated', 'piano-torch', 'piano-pmset-defaults',
-                         'piano-still-wallpaper', 'piano-wifi'}, 'configs/userland.toml: the seven units')
+    check(set(names) >= {'pianousb-shell', 'piano-policy-agent', 'piano-rotated', 'piano-torch', 'piano-ir', 'piano-pmset-defaults',
+                         'piano-still-wallpaper', 'piano-wifi'}, 'configs/userland.toml: the expected units')
     wall = {f['dest']: f for f in names['piano-still-wallpaper']['files']}
     check(sorted(wall) == ['/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist', '/usr/local/libexec/piano-still-wallpaper',
                            '/usr/local/share/piano/wallpaper/Index.plist', '/usr/local/share/piano/wallpaper/Metadata.plist',
@@ -1093,12 +1093,13 @@ def live_tests(tmp):
         real = json.loads((tmp / 'real/live/live.json').read_text())
         machos = {f['dest']: f['cdhash'] for f in real['files'] if f['cdhash']}
         check(set(machos) == {'/usr/local/libexec/pianousb-shell', '/usr/local/libexec/piano-rotated', '/usr/local/bin/piano-torch',
+                              '/usr/local/bin/piano-ir',
                               '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab',
                               '/usr/local/libexec/piano-wifi-supplicant', '/usr/local/bin/piano-camera-default',
                               '/usr/local/bin/piano-camera-runtime', '/usr/local/bin/piano-charge-config',
                               '/usr/local/bin/piano-coreimage-compat', '/usr/local/libexec/piano-brightness-sync',
                               '/usr/local/libexec/piano-login-readiness', '/usr/local/libexec/piano-wifi-controls'},
-              'thirteen Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
+              'fourteen Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
         jobs = {}
         for f in real['files']:
             if f['kind'] in ('daemon', 'agent'):
@@ -1128,9 +1129,10 @@ def live_tests(tmp):
                 'system/com.unixnu.piano-brightness-sync', 'system/com.unixnu.piano-charge-config', 'system/com.unixnu.piano-keyboard-type',
                 'system/com.unixnu.piano-lw-quiet', 'system/com.unixnu.piano-wifi-controls'}
         check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file() and
+              rig.root('/usr/local/bin/piano-ir').is_file() and
               rig.root('/usr/local/share/piano/wallpaper/still.png').read_bytes()[:8] == b'\x89PNG\r\n\x1a\n',
               f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): fourteen daemons (the '
-              'airportd-kick of 88f4171e counted) and the six agents loaded (the slim session poster counted; the retired coreimage-compat off), piano-torch in /usr/local/bin, '
+              'airportd-kick of 88f4171e counted) and the six agents loaded (the slim session poster counted; the retired coreimage-compat off), piano-torch and piano-ir in /usr/local/bin, '
               'the still picture in /usr/local/share/piano/wallpaper')
         code, out = rig.run('--check')
         check(code == 0, 'and --check passes on it')

@@ -31,6 +31,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 | – | [displayport.md](displayport.md) | `PianoDp`: USB-C DP Alt Mode, QMP PHY, hotplug events, second DPU path and second framebuffer | External displays | PianoDpu, PianoUsbHost and PianoPower |
 | – | [camera.md](camera.md) | `PianoCamera`: front and rear camera control, RAW capture, software ISP and CMIOExtension | Camera apps | Ubuntu camera and CCI reference, PianoTorch and CMIOExtension |
 | – | [torch.md](torch.md) | `PianoTorch`: PM8550 flash LED control, read-back, time limit and thermal guard | Rear flashlight | PianoPower `SpmiObserver.h` and PianoBacklight |
+| – | [ir.md](ir.md) | `PianoIR`: opt-in SE15 IR remote transmitter | Built and host-tested | PianoTouch GENI SPI and PianoDwc3 SMMU helpers |
 | – | [bluetooth.md](bluetooth.md) | `PianoBluetooth`: WCN7860 over UART, shared rails with PianoWifi and HCI transport to macOS | Keyboards, mice and audio | UniXNU-sheng `BluetoothProbe` / `WcnPower` and PianoWifi |
 | – | [usb-device-debug.md](usb-device-debug.md) | `PianoDwc3`: USB device mode with console, monitor and user pipe | Debugging and maintenance | Native gadget core and Project-SunUEFI takeover order |
 

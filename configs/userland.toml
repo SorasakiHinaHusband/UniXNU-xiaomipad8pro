@@ -250,6 +250,21 @@ dest = "/usr/local/bin/piano-torch"
 mode = "0755"
 
 [[unit]]
+name = "piano-ir"
+about = "the IR transmitter from macOS (docs/drivers/ir.md section 3): sudo piano-ir status|raw|nec|blink; sends need PianoIR at piano-ir=2"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-ir/piano-ir.c"
+build = "cc"
+arch = "arm64"
+cflags = ["-I", "package/PianoIR"]
+inputs = ["package/PianoIR/IrWave.h", "package/PianoIR/PianoIRClient.h"]
+frameworks = ["IOKit", "CoreFoundation"]
+dest = "/usr/local/bin/piano-ir"
+mode = "0755"
+
+[[unit]]
 name = "piano-camera-grab"
 about = "one capture per camera through PianoCamera's user client (docs/drivers/camera.md section 4.5): sudo piano-camera-grab [front|rear|both] writes /private/var/tmp/piano-camera-<sensor>.ppm; its job runs once at boot only with the kernel arguments piano-camera=5 piano-camera-grab=1 and prints its results and thumbnails on the console"
 default_on = true
