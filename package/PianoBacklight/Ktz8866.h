@@ -602,7 +602,8 @@ class Controller {
     limited("write %s: BL_EN 0x08 = 0x%02x (was 0x%02x): backlight %s, sinks 0x%02x kept; %s", kIcName[i], value, found, on ? "ON" : "OFF",
             found & kEnSinks, !wrote ? "WRITE FAILED" : !readBack ? "read back failed" : good ? "read back ok" : "READ BACK DIFFERS");
     if (readBack && !good) access(i, false);
-    if (readBack) recordEnable(i, back);
+    // A mismatched reply can be stale. Rollback must read the chip again before treating it as dark.
+    if (good) recordEnable(i, back);
     return good;
   }
   void recordEnable(unsigned i, uint8_t value)
