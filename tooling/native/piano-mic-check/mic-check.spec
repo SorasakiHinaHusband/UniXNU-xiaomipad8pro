@@ -61,9 +61,45 @@ mic_check_seed() {   # TOOLS STAGE RESULT_SUBDIR BOOT_UUID APP_CDHASH
     fexpect "$name/tcc-seed.txt" '^TCC_MIC_SEED_COMPLETE$' 'MIC TCC: console tccd signalled'
 }
 
+mic_check_replay_take() {   # AUDIO_LISTEN STAGE RESULT_SUBDIR BOOT_UUID TAKE SECONDS
+  local listener=$1 stage=$2 name=$3 boot=$4 mode=$5 seconds=$6
+  local tag=replay-$mode pcm pid attempt ready=0 rc=0
+  pcm=$R/$name/c920-$mode.wav
+  C920_AUDIO_READY="$pcm.started" python3 "$listener" record --seconds "$seconds" --out "$pcm" \
+    --device 'HD Pro Webcam C920' --progress > "$pcm.record.txt" 2>&1 &
+  pid=$!
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    if [ -f "$pcm.started" ] || grep -aqE '^out_time_us=[1-9][0-9]*$' "$pcm.record.txt"; then
+      ready=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [ "$ready" = 0 ] || ! kill -0 "$pid" 2>/dev/null; then
+    verdict "FAIL HARNESS MIC $tag: C920 produced no live PCM receipt ($name/c920-$mode.wav.record.txt)"
+    wait "$pid" || true
+    return 1
+  fi
+  mic_check_gui "$stage" "$name" "$boot" "$tag" --replay "$stage/$mode.m4a" || rc=1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    verdict "FAIL HARNESS MIC $tag: C920 capture ended before the playback receipt"
+    rc=1
+  fi
+  if ! wait "$pid"; then
+    verdict "FAIL HARNESS MIC $tag: C920 capture failed ($name/c920-$mode.wav.record.txt)"
+    rc=1
+  fi
+  fexpect "$name/$tag.txt" '^result=ok$' "MIC $tag: app completed replay" || rc=1
+  fexpect "$name/$tag.txt" '^output_device=Speaker$' "MIC $tag: replay routed to the tablet Speaker" || rc=1
+  fexpect "$name/$tag.txt" '^playback_complete=yes$' "MIC $tag: player completion callback" || rc=1
+  return "$rc"
+}
+
 mic_check_block() (
   local repo=$1 input=${2:-raw} tools device name results stage archive sha mode marker label rc=0
   local boot bootargs unattended=0 cdhash tcc=tcc attempt
+  local replay_seconds=18
   local -a flags
   if [ "${DRY:-0}" = 1 ]; then
     verdict 'INFO MIC: dry run, GUI recording and playback skipped'
@@ -151,7 +187,8 @@ mic_check_block() (
   for mode in quiet tone; do
     flags=()
     if [ "$mode" = tone ]; then
-      flags=(--tone --playback)
+      flags=(--tone)
+      [ "$unattended" = 1 ] || flags+=(--playback)
     fi
     mic_check_gui "$stage" "$name" "$boot" "$mode" 4 "$stage/$mode.m4a" ${flags[@]+"${flags[@]}"} || rc=1
     fexpect "$name/$mode.txt" '^result=ok$' "MIC $mode: AVAudioRecorder check completed" || rc=1
@@ -162,7 +199,9 @@ mic_check_block() (
       fexpect "$name/$mode.txt" '^output_device=Speaker$' 'MIC tone: tablet Speaker is the default output' || rc=1
       fexpect "$name/$mode.txt" '^stimulus_complete=yes$' 'MIC tone: stimulus played through the default output' || rc=1
       fexpect "$name/$mode.txt" '^tone_detected=yes$' 'MIC tone: stimulus found in the saved recording' || rc=1
-      fexpect "$name/$mode.txt" '^playback_complete=yes$' 'MIC tone: saved recording played to completion' || rc=1
+      if [ "$unattended" = 0 ]; then
+        fexpect "$name/$mode.txt" '^playback_complete=yes$' 'MIC tone: saved recording played to completion' || rc=1
+      fi
     fi
     if ! fexpect "$name/$mode.txt" '^recording_published=yes$' "MIC $mode: saved M4A produced" ||
        ! pull "$name/$mode.m4a" "$stage/$mode.m4a" ||
@@ -184,5 +223,14 @@ mic_check_block() (
     fexpect "$name/$mode.grade.txt" "$marker" "$label" || rc=1
     fexpect "$name/$mode.grade.txt" '^grade=pass$' "MIC $mode: host grade passed" || rc=1
   done
+  if [ "$unattended" = 1 ] && [ "$rc" = 0 ]; then
+    for mode in quiet tone; do
+      mic_check_replay_take "$repo/tooling/native/audio-listen.py" "$stage" "$name" "$boot" "$mode" "$replay_seconds" ||
+        return 1
+    done
+    python3 "$tools/analyze.py" "$results/c920-tone.wav" --mode replay --control "$results/c920-quiet.wav" \
+      --seconds "$replay_seconds" > "$results/replay.grade.txt" 2>&1 || rc=1
+    fexpect "$name/replay.grade.txt" '^grade=pass$' 'MIC replay: C920 hears the saved tone above the quiet take' || rc=1
+  fi
   return "$rc"
 )

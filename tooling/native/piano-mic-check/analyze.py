@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Grade a pulled piano-mic-check M4A or WAV on a macOS host."""
+"""Grade a pulled piano-mic-check take or a pair of C920 replay recordings."""
 
 import argparse
 import array
@@ -15,6 +15,9 @@ import wave
 INPUT_MIN_DBFS = -85.0
 TONE_MIN_DBFS = -55.0
 TONE_MIN_SNR_DB = 12.0
+REPLAY_MIN_DBFS = -75.0
+REPLAY_MIN_MARGIN_DB = 10.0
+C920_RATE = 16000
 QUIET_MAX_DBFS = -25.0
 QUIET_PEAK_MAX_DBFS = -6.0
 PCM_SCALE = 32768
@@ -112,17 +115,69 @@ def analyze_wav(path, args):
     return 0 if passed else 1
 
 
+def replay_pairs(path, seconds):
+    """Measure adjacent 200 ms windows from a complete, native C920 WAV."""
+    with wave.open(str(path), "rb") as wav:
+        rate, frames = wav.getframerate(), wav.getnframes()
+        if (rate, wav.getnchannels(), wav.getsampwidth()) != (C920_RATE, 1, 2):
+            raise ValueError(f"{path}: expected 16 kHz mono 16-bit PCM")
+        if abs(frames / rate - seconds) > 0.25:
+            raise ValueError(f"{path}: recorded {frames / rate:.3f} s, expected {seconds} s")
+        samples = array.array("h", wav.readframes(frames))
+        if len(samples) != frames:
+            raise ValueError(f"{path}: truncated PCM data")
+        if sys.byteorder == "big":
+            samples.byteswap()
+    if min(samples) == max(samples):
+        raise ValueError(f"{path}: constant PCM")
+
+    window = rate // 5
+    previous = None
+    for start in range(0, frames - window + 1, window):
+        segment = samples[start:start + window]
+        mean, ac = ac_power(segment)
+        _, level, snr = tone_in_window(segment, rate, mean, ac)
+        if previous is not None:
+            yield min(previous[0], level), min(previous[1], snr), (start - window) / rate
+        previous = level, snr
+
+
+def analyze_replay(replay, control, seconds):
+    quiet = list(replay_pairs(control, seconds))
+    quiet_ceiling = max(level for level, _, _ in quiet)
+    quiet_clean = not any(level >= REPLAY_MIN_DBFS and snr >= TONE_MIN_SNR_DB for level, snr, _ in quiet)
+    pairs = list(replay_pairs(replay, seconds))
+    above_snr = [pair for pair in pairs if pair[1] >= TONE_MIN_SNR_DB]
+    level, snr, at = max(above_snr or pairs)
+    margin = level - quiet_ceiling
+    detected = level >= REPLAY_MIN_DBFS and snr >= TONE_MIN_SNR_DB
+    passed = quiet_clean and detected and margin >= REPLAY_MIN_MARGIN_DB
+    print(f"quiet_1khz_dbfs={quiet_ceiling:.2f} quiet_control_clean={'yes' if quiet_clean else 'no'}")
+    print(f"replay_start_s={at:.2f} replay_1khz_dbfs={level:.2f} replay_snr_db={snr:.2f} "
+          f"replay_above_quiet_db={margin:.2f}")
+    print(f"replay_tone_detected={'yes' if detected else 'no'}")
+    print(f"grade={'pass' if passed else 'fail'}")
+    return 0 if passed else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recording", type=Path)
-    parser.add_argument("--mode", choices=("tone", "quiet"), required=True)
+    parser.add_argument("--mode", choices=("tone", "quiet", "replay"), required=True)
+    parser.add_argument("--control", type=Path, help="C920 quiet-replay WAV for replay mode")
     parser.add_argument("--seconds", type=int, help="expected capture duration")
     args = parser.parse_args()
     if args.seconds is not None and args.seconds < 1:
         parser.error("--seconds must be positive")
+    if args.mode == "replay" and (args.control is None or args.seconds is None):
+        parser.error("replay mode requires --control and --seconds")
+    if args.mode != "replay" and args.control is not None:
+        parser.error("--control is for replay mode")
     if args.recording.suffix.lower() not in (".m4a", ".wav"):
         parser.error("expected an .m4a or .wav")
     try:
+        if args.mode == "replay":
+            return analyze_replay(args.recording, args.control, args.seconds)
         if not args.recording.is_file() or args.recording.stat().st_size == 0:
             raise ValueError("missing or empty recording")
         with tempfile.TemporaryDirectory(prefix="piano-mic-check.") as folder:

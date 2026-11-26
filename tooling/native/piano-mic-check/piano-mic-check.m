@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../../../package/include/PianoBootArgs.h"
 
 enum { OK = 0, Error = 1, Usage = 2, NoPermission = 3, Silence = 4, ToneMissing = 5 };
 static const double kMinInputDBFS = -85.0;
@@ -285,6 +286,45 @@ static BOOL play_recording(NSURL *url)
     return completion.succeeded;
 }
 
+static BOOL unattended_enabled(void)
+{
+    char args[PIANO_BOOT_ARGS_MAX];
+    pianoBootArgs(args);
+    unsigned count = 0, enabled = 0;
+    char *state = NULL;
+    for (char *word = strtok_r(args, " \t", &state);
+         word; word = strtok_r(NULL, " \t", &state)) {
+        if (strcmp(word, "piano-mic-unattended") == 0 ||
+            strncmp(word, "piano-mic-unattended=", sizeof("piano-mic-unattended=") - 1) == 0)
+            ++count;
+        if (strcmp(word, "piano-mic-unattended=1") == 0)
+            ++enabled;
+    }
+    return count == 1 && enabled == 1;
+}
+
+static int replay(NSURL *url)
+{
+    if (!unattended_enabled()) {
+        fprintf(stderr, "replay: piano-mic-unattended=1 required\n");
+        return Error;
+    }
+    AudioDeviceID output = default_device(kAudioHardwarePropertyDefaultOutputDevice);
+    NSString *name = device_name(output);
+    printf("output_device=%s\n", name.UTF8String ?: "unknown");
+    if (![name isEqualToString:@"Speaker"]) {
+        fprintf(stderr, "replay: select the tablet Speaker as the default output\n");
+        return Error;
+    }
+    if (!play_recording(url))
+        return Error;
+    if (default_device(kAudioHardwarePropertyDefaultOutputDevice) != output) {
+        fprintf(stderr, "replay: default output changed during playback\n");
+        return Error;
+    }
+    return OK;
+}
+
 static int record_to(NSURL *url, long seconds, BOOL tone)
 {
     NSDictionary *settings = @{
@@ -427,6 +467,11 @@ static int run(int argc, char **argv)
         if (path.length)
             return analyze([NSURL fileURLWithPath:path], argc == 4, 0);
     }
+    if (argc == 3 && strcmp(argv[1], "--replay") == 0) {
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
+        if ([path.pathExtension.lowercaseString isEqualToString:@"m4a"])
+            return replay([NSURL fileURLWithPath:path]);
+    }
     if (argc >= 3 && argc <= 5) {
         char *end = NULL;
         long seconds = strtol(argv[1], &end, 10);
@@ -447,6 +492,7 @@ static int run(int argc, char **argv)
         }
     }
     fprintf(stderr, "usage: piano-mic-check --tcc | --request-access | --analyze FILE [--tone]\n"
+                    "       piano-mic-check --replay FILE.m4a (piano-mic-unattended=1)\n"
                     "       piano-mic-check SECONDS OUTPUT.m4a [--tone] [--playback]\n"
                     "       SECONDS is 1–300 (at least 3 with --tone)\n");
     return argc == 2 && strcmp(argv[1], "--help") == 0 ? OK : Usage;

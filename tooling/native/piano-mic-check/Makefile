@@ -19,7 +19,7 @@ $(CONTENTS)/Info.plist: Info.plist
 	mkdir -p "$(CONTENTS)"
 	cp "$<" "$@"
 
-$(BINARY): piano-mic-check.m Makefile
+$(BINARY): piano-mic-check.m ../../../package/include/PianoBootArgs.h Makefile
 	test -n "$(MACOS_SDK)" && test -d "$(MACOS_SDK)"
 	mkdir -p "$(CONTENTS)/MacOS"
 	$(CC) $(CFLAGS) -arch arm64 -isysroot "$(MACOS_SDK)" -mmacosx-version-min=14.0 -fobjc-arc \

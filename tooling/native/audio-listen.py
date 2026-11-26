@@ -10,13 +10,34 @@ neighbouring probe frequencies (0.8 and 1.25 x FREQ) and above the recording's q
 the file), duration, the tone's level (dBFS) and its margin. Then a summary line: `tones: N` and the levels in order, which
 docs/drivers/audio.md's tone walk (four slots TL, TR, BL, BR, about 3 s each) maps to the speakers by order and timing.
 """
-import argparse, array, math, subprocess, sys, wave
+import argparse, array, math, subprocess, sys, time, wave
 
 
 def record(args):
-    cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'avfoundation', '-i', ':' + args.device,
-           '-t', str(args.seconds), '-ac', '1', '-ar', '16000', '-y', args.out]
-    return subprocess.call(cmd)
+    loglevel = 'info' if args.progress else 'error'
+    cmd = ['ffmpeg', '-hide_banner', '-loglevel', loglevel, '-f', 'avfoundation', '-i', ':' + args.device,
+           '-t', str(args.seconds)]
+    if args.progress:
+        if not math.isfinite(args.seconds) or args.seconds <= 0:
+            print('audio-listen: expected a positive recording duration', file=sys.stderr)
+            return 2
+        # Keep the input and duration arguments in the C920 shim's order.
+        # Its GUI daemon watches ashowinfo for PCM; direct callers see progress.
+        cmd += ['-af', 'ashowinfo', '-progress', 'pipe:1', '-stats_period', '0.2']
+    cmd += ['-ac', '1', '-ar', '16000', '-y', args.out]
+    if not args.progress:
+        return subprocess.call(cmd)
+
+    start = time.monotonic()
+    try:
+        status = subprocess.run(cmd, timeout=args.seconds + 15).returncode
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f'audio-listen: {error}', file=sys.stderr)
+        return 2
+    if status == 0 and time.monotonic() - start < args.seconds - 0.25:
+        print('audio-listen: capture ended before the requested wall-clock duration', file=sys.stderr)
+        return 2
+    return status
 
 
 def goertzel_power(samples, start, n, freq, rate):
@@ -81,6 +102,7 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('record'); r.add_argument('--seconds', type=float, required=True); r.add_argument('--out', required=True)
     r.add_argument('--device', default='HD Pro Webcam C920')
+    r.add_argument('--progress', action='store_true', help='emit ffmpeg progress and bound the capture time')
     d = sub.add_parser('detect'); d.add_argument('file'); d.add_argument('--freq', type=float, default=1000.0)
     d.add_argument('--window', type=float, default=0.05); d.add_argument('--min-db', type=float, default=10.0)
     d.add_argument('--min-len', type=float, default=0.3)

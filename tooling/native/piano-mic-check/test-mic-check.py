@@ -14,12 +14,12 @@ RATE = 48000
 SECONDS = 3
 
 
-def write_wav(path, samples):
+def write_wav(path, samples, rate=RATE):
     pcm = array.array("h", samples)
     if sys.byteorder == "big":
         pcm.byteswap()
     with wave.open(str(path), "wb") as wav:
-        wav.setparams((1, 2, RATE, 0, "NONE", "not compressed"))
+        wav.setparams((1, 2, rate, 0, "NONE", "not compressed"))
         wav.writeframes(pcm.tobytes())
 
 
@@ -29,6 +29,48 @@ def run(command, status, *markers):
         f"{command}: exit={result.returncode}, expected {status} and {markers}\n"
         f"{result.stdout}\n{result.stderr}"
     )
+
+
+def test_replay(host, folder):
+    rate = 16000
+    rng = random.Random(72)
+
+    def take(name, noise=12, amplitude=0, frequency=1000, length=0.8, seconds=SECONDS):
+        path = folder / f"c920-{name}.wav"
+        samples = []
+        for i in range(seconds * rate):
+            at = i / rate
+            signal = amplitude * math.sin(math.tau * frequency * at) if 0.65 <= at < 0.65 + length else 0
+            samples.append(round(signal) + rng.randint(-noise, noise))
+        write_wav(path, samples, rate)
+        return path
+
+    quiet = take("quiet")
+    tone = take("tone", amplitude=180)
+    contaminated = take("contaminated", amplitude=100)
+    low_snr = take("low-snr", noise=360, amplitude=180)
+    transient = take("transient", amplitude=1800, length=0.2)
+    wrong = take("wrong", amplitude=220, frequency=1300)
+    tone_near_control = take("tone-near-control", noise=1, amplitude=11)
+    weak_control = take("weak-control", noise=1, amplitude=5)
+    blank = take("blank", noise=0)
+    short = take("short", seconds=2)
+    truncated = take("truncated")
+    truncated.write_bytes(truncated.read_bytes()[:-256])
+    for replay, control, status, marker in (
+        (tone, quiet, 0, "replay_tone_detected=yes"),
+        (quiet, quiet, 1, "replay_tone_detected=no"),
+        (low_snr, quiet, 1, "replay_tone_detected=no"),
+        (transient, quiet, 1, "replay_tone_detected=no"),
+        (wrong, quiet, 1, "replay_tone_detected=no"),
+        (tone, contaminated, 1, "quiet_control_clean=no"),
+        (tone_near_control, weak_control, 1, "replay_tone_detected=yes"),
+        (tone, blank, 2, "grade=error"),
+        (short, quiet, 2, "grade=error"),
+        (truncated, quiet, 2, "grade=error"),
+    ):
+        run([*host, replay, "--mode", "replay", "--control", control, "--seconds", str(SECONDS)],
+            status, marker, ("grade=pass", "grade=fail", "grade=error")[status])
 
 
 def main(binary, stimulus, folder):
@@ -78,7 +120,9 @@ def main(binary, stimulus, folder):
     corrupt.write_bytes(b"invalid audio")
     run([*host, corrupt, "--mode", "tone"], 2, "grade=error")
     run([binary, "--analyze", corrupt, "--tone"], 1, "result=error")
-    print("mic-check host tests passed (WAV, PCM M4A, tone, quiet, and failure paths)")
+    run([binary, "--replay", stimulus], 2, "result=usage")
+    test_replay(host, folder)
+    print("mic-check host tests passed (WAV, PCM M4A, capture grades and C920 replay controls)")
 
 
 if __name__ == "__main__":
