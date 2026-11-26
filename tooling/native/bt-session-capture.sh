@@ -122,7 +122,7 @@ printf '%s\n' '@@ lemask-log'
     --predicate 'process == "kernel" AND eventMessage CONTAINS "bt-lemask1: LE event mask"'
 printf '%s\n' '@@ trace'
 /usr/bin/defaults read com.apple.MobileBluetooth.debug
-/bin/ls -lt /private/var/root/Library/Logs/Bluetooth/*.pklg
+/bin/ls -lt /private/var/root/Library/Logs/Bluetooth/
 printf '%s\n' '@@ end' BT_PREFLIGHT_DONE
 REMOTE
 )

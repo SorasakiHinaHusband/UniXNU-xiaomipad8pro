@@ -80,7 +80,7 @@ def mock_reads(counter, daemon):
         '/usr/bin/log show --last boot --style compact --info --no-pager --predicate '
         'process == "kernel" AND eventMessage CONTAINS "bt-lemask1: LE event mask"': MASK_LINE,
         "/usr/bin/defaults read com.apple.MobileBluetooth.debug": "{\n    HCIFileTraces = 0;\n}",
-        f"/bin/ls -lt {TRACE_DIR}/*.pklg": "total 0",
+        f"/bin/ls -lt {TRACE_DIR}/": "total 0",
     }
     reads.update({f"/usr/bin/cmp {source} {mounted}": "" for source, mounted in RUNTIME.items()})
     for job in JOBS:
@@ -114,8 +114,15 @@ def mock_ssh():
     # Route each tablet program through a local read-only fixture. Shell helpers
     # still execute, so the tests cover the actual filtering and section markers.
     cases = []
-    for invocation, output in mock_reads(counter, daemon).items():
-        action = f"printf '%s\\n' {shlex.quote(output)}" if output else ":"
+    reads = mock_reads(counter, daemon)
+    if mode == "no-trace":
+        reads["/usr/bin/defaults read com.apple.MobileBluetooth.debug"] = None
+        reads[f"/bin/ls -lt {TRACE_DIR}/"] = None
+    for invocation, output in reads.items():
+        if output is None:
+            action = "printf '%s\\n' 'trace unavailable' >&2; return 1"
+        else:
+            action = f"printf '%s\\n' {shlex.quote(output)}" if output else ":"
         cases.append(f"{shlex.quote(invocation)}) {action} ;;")
     fixture = (
         "set -f\nmock_read() {\ncase \"$*\" in\n" + "\n".join(cases)
@@ -226,10 +233,12 @@ class PreflightTests(unittest.TestCase):
         result = self.capture("ready", "--wait-seconds", "-1")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse((self.directory / "calls").exists())
-        result = self.capture("ready", "--wait-seconds", "0")
+        result = self.capture("no-trace", "--wait-seconds", "0")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["snapshot"])
-        self.assertIn("INFO BT-settle status=skipped", self.grade(0))
+        grade = self.grade(0)
+        self.assertIn("INFO BT-settle status=skipped", grade)
+        self.assertIn("INFO BT-trace HCI trace preference armed=0, pklg files=0", grade)
 
     def test_console_fallback_and_legacy_capture(self):
         result = self.capture("ready", "--wait-seconds", "0")
