@@ -112,6 +112,10 @@ class Snapshot:
         return {"serial": self.serial, "time_us": self.time_us, "loads": self.loads, "stores": 0}
 
 
+# DSI_HOST_LP_TIMER is programmed to 0xffffffff (max/disabled LP RX timeout) by firmware on live SM8750 panels.
+ALLOWED_ALL_ONES_REGISTERS = {"lp-timer"}
+
+
 def parse_snapshot(text):
     if BUSY.search(text):
         raise ValueError("capture reported EBUSY")
@@ -182,7 +186,7 @@ def parse_snapshot(text):
             raise ValueError(f"{link} PLL status and local-lock disagree")
 
     for (block, name), value in registers.items():
-        if value == U32 - 1:
+        if value == U32 - 1 and name not in ALLOWED_ALL_ONES_REGISTERS:
             raise ValueError(f"{block} {name} is unreadable (ffffffff)")
     return Snapshot(boot_id, header["serial"], header["time-us"], header["loads"], frames, registers)
 

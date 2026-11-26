@@ -39,7 +39,7 @@ def capture(serial=1, time_us=500_000, frames=(100, 101), line=10):
             "(dma trigger software, block-in-frame 1) intr 00000000 tpg 00000000 +390 00000000; "
             "clk-ctrl 00200b3f lanes 00001f00/00000000; video-compression 03200b81",
             f"dsi{link} m5: vid-cfg0 00000000 vid-cfg1 00000000 hsync 00000008 vsync-hpos 00000000 "
-            "vsync-vpos 00000002 lp-timer 00000000 hs-timer 00000000 clkout 00000f20 eot 00000001 lane-swap 00000000 "
+            "vsync-vpos 00000002 lp-timer ffffffff hs-timer 00000000 clkout 00000f20 eot 00000001 lane-swap 00000000 "
             "t-clk-pre-extend 00000000 cmd-compression 00000000/00000000 clk-status 00000007 err-mask 00000000 "
             "ack-err 00000000 fifo 00000000 phy-err 00000000 timeout 00000000",
             f"dsi{link} m5: cmd-cfg0 00000000 cmd-cfg1 00000000 dma-length 00000000 reset 00000000 misr-ctrl 00000000",
