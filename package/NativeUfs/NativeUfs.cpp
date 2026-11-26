@@ -492,7 +492,7 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     rootDiagnosticFailure (failure);
     panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
-           gRootDiagnostic.cba2r);
+           gRootDiagnostic.cba2r.load ());
   }
   report[0] = index | (bank << 16);
   report[1] = cbar;
@@ -1142,6 +1142,7 @@ static uint32_t gSpinTicksUs = ~0U;
 static bool gPerf = false, gDirect = false;
 static unsigned gReadWorkers = 0;
 static uint32_t gBounceBytes = kDataMax, gMaxIoBytes = 0, gNapUs = 0, gNapSpinUs = 30;
+static UfsAtomicField<uint32_t> gSpinUs = 200;
 static uint64_t gNapSpinTicks = 0;
 static thread_t gReadThread[16];
 static unsigned gReadThreads = 0;
@@ -1195,7 +1196,7 @@ static void hostPerfDepth (int delta) { perfDepth (gPerfCommands, delta); }
 
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
 {
-  const uint32_t spinUs = *static_cast<volatile uint32_t *> (&gSpinUs);
+  const uint32_t spinUs = gSpinUs.load ();
   if (spinUs != gSpinTicksUs) { nanoseconds_to_absolutetime (uint64_t (spinUs) * 1000, &gSpinTicks); gSpinTicksUs = spinUs; }
   if (!hostInterruptMode () || mach_absolute_time () - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
     // native-ufs-nap=US: a read worker past its spin budget sleeps between polls (a timed wait without leeway; nothing wakes it
@@ -2246,7 +2247,8 @@ static void rootDiagnosticFailure (const char *reason)
 {
   // Kept even when the panic diagnostic is off, so the boot page can say why nothing was published.
   native_ufs_root_failure = reason;
-  IOLog ("NativeUfs: FAILED at %s: %s\n", gRootDiagnostic.stage ? gRootDiagnostic.stage : "?", reason ? reason : "?");
+  const char *stage = gRootDiagnostic.stage.load ();
+  IOLog ("NativeUfs: FAILED at %s: %s\n", stage ? stage : "?", reason ? reason : "?");
   if (!gRootDiagnosticEnabled) return;
   gRootDiagnostic.published = native_ufs_blocks_published;
   gRootDiagnostic.reads = native_ufs_block_reads;
@@ -2988,7 +2990,7 @@ static void publishThread (void *, wait_result_t)
   } operations;
   UfsRootPublicationResult result = ufsPublishRootWindows (operations, gPublicationPlan);
   if (result.phase != UfsRootPhase::Complete) {
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
+    gRootDiagnostic.result = static_cast<uint32_t> (result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout);
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
       (!strcmp (gPendingDevice[result.index]->windowLabel (), "SystemOS") ?
        "SystemOS signed volume not found" : "signed root window volume not found");
@@ -3667,8 +3669,8 @@ bool NativeUfs::startRoot (IOService *provider)
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
     gPending = 0;
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
-      result.phase == UfsRootPhase::Schedule ? kIOReturnNoResources : kIOReturnError;
+    gRootDiagnostic.result = static_cast<uint32_t> (result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
+      result.phase == UfsRootPhase::Schedule ? kIOReturnNoResources : kIOReturnError);
     IOLog ("NativeUfs: root preparation failed phase=%u window=%u; nothing published\n",
            static_cast<unsigned> (result.phase), result.index);
     IOService::stop (provider);
