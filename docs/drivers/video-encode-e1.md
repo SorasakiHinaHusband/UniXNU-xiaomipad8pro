@@ -1,21 +1,41 @@
 # PianoVideo E1 integration
 
-E1 is host-tested and built for arm64e on `main` base `3d1548df2`. The first
-real-hardware capture, `v131y12u-m5obs1` (RAM, 2026-11-27), failed at stage 5:
-START(BITSTREAM=1) returned a session-error flag. Encode qualification remains
-pending. The [stage-5 analysis](#stage-5-static-analysis) and
-[fix-image gate](#fix-image-gate) below supersede any assumption that the host
-tests established firmware-complete encoder startup.
+The first tablet capture, `v131y12u-m5obs1` (RAM, 2026-11-27), failed at stage 5
+when START(BITSTREAM=1) returned a session error. Commit `2bd83f8ad` implements
+the five host-side conformance fixes from the
+[stage-5 analysis](#stage-5-static-analysis). Tablet qualification is pending
+the next [RAM run](#fix-image-gate).
 
 - E1 starts only with one literal `piano-video-enc=1` token, level 6 and a successful boot reservation. It waits for the decoder's exclusive lease and reuses the arena with its current backing. On firmware system error, watchdog or SMMU fault, the worker stops issuing HFI commands and quarantines the core with its DMA backing held for the rest of the boot.
 - AVC and HEVC continue to use the existing decode path, VT inventory and borrow policy. The RAM16G reservation and XNU fallback still serve decode. See the [driver guide](video.md#18-e1-bounded-native-h264-encode-self-test).
 
 ## Host results
 
-- `run-bringup-host.sh` runs E1 scripted HFI alongside the existing AVC, HEVC and VT suites under ASan/UBSan. The VT cancellation regression covers the deferred `dinv` reply. The E1 arena regression switches AVC → E1 → Main10 → AVC over both XNU and region0 backing and restores the original AVC page tables. The FFmpeg check grades a synthetic reference stream and rejects truncated and wrong-size samples.
-- The native build completed the firmware loader, shared extra-RAM and PianoVideo host tests and compiled all 12 arm64e objects
-  with zero warnings. The import check against `kernel-k273-0070-s0001-native.macho` reported 431 kernel imports, six declared
-  library imports and zero unresolved imports.
+- The ASan/UBSan suite checks the exact ARP and capability packets, four
+  simultaneous RAW and BITSTREAM slots, and nanosecond PTS recovery at 30 and
+  60 fps, including out-of-order returns. It verifies default-off bring-up,
+  ARP quarantine and exact AVC page table restoration after
+  AVC → E1 → Main10 → AVC on both XNU and region0 backings. The AVC, HEVC
+  and VT suites pass. The FFmpeg checker accepts its reference stream and
+  rejects truncated and wrong-size samples. The CI runner reports 11
+  passed and zero failed. The two existing suite entries run inside
+  `run-bringup-host.sh`.
+- The native build compiled all 12 arm64e objects with zero warnings.
+  The import check against `kernel-k273-0070-s0001-native.macho` found 431
+  kernel imports, six declared library imports and zero unresolved imports.
+
+All admitted E1 layouts fit the 256 MiB reservation. The pinned VPU33
+sizing code compares padded RAW and coded AVC dimensions for standalone
+VPSS. At 1080p both formats are 1920×1088, so VPSS is zero and BIN is
+21,661,184 bytes at the padded coded height. The 640×480 scratch and
+reconstruction capacities are the same as in the original capture.
+
+| Active size | Padded RAW | Coded AVC | VPSS bytes | Entries | Guarded bytes |
+| --- | --- | --- | ---: | ---: | ---: |
+| 640×480 | 640×480 | 640×480 | 0 | 14 | 32,980,992 |
+| 1280×720 | 1280×736 | 1280×720 | 1,449,984 | 15 | 27,557,888 |
+| 1920×1080 | 1920×1088 | 1920×1088 | 0 | 14 | 56,180,736 |
+| 320×240 | 384×256 | 320×240 | 131,072 | 15 | 9,732,096 |
 
 ## RAM batch E qualification
 
@@ -36,7 +56,7 @@ Use the same 27.3 RAM payload, pinned Iris firmware addon, fixed display profile
 
 ## Stage-5 static analysis
 
-Analysis only, recorded 2026-11-27 against native base `411825dd4` and Linux
+Historical analysis, recorded 2026-11-27 against native base `411825dd4` and Linux
 **K = `yzddmr6/linux-sm8750-piano b5100d5f2e0bb80e1191d521a48596674608eb3d`**.
 The inspected Linux Iris directory matches K (no local Iris changes). The
 native header's older `7f8d6bedde479` comment is provenance, not the pin used
@@ -429,56 +449,19 @@ not treat an ARP-only fix as closure of all known gates.
 
 ## Fix-image gate
 
-Path: **STATIC TRACE COMPLETE; IMPLEMENTATION PENDING.**
-`PianoVideo.cpp:856–910` → `VideoEncode.h:82–108,130–196` →
-`VideoEncodeSession.h:302–325` → `VideoHfi.h:143–166` → HFI gen2.
-Compare K's `iris_vb2.c:133–145,183–213` →
-`iris_venc.c:481–538` → `iris_ctrls.c:1710–1728` →
-`iris_buffer.c:750–778` (ARP) and per-port allocations →
-`iris_common.c:49–59,142–144` →
-`iris_hfi_gen2_command.c:1122–1146,1293–1353`.
-Exact linked citations and all captured TX rows are above.
+**Host implementation complete. Tablet qualification pending.** The
+encoder queues ARP once on NONE before START(RAW=2). Both STOPs preserve
+ARP ownership. A successful CLOSE fences the session's DMA, while a
+failed CLOSE or a device fault leaves the backing in quarantine. Linux
+keeps ARP outside the port tables and destroys it after session CLOSE.
+[Iris persistent buffer lifecycle](https://github.com/yzddmr6/linux-sm8750-piano/blob/b5100d5f2e0bb80e1191d521a48596674608eb3d/drivers/media/platform/qcom/iris/iris_buffer.c#L661-L706)
+[Iris session CLOSE](https://github.com/yzddmr6/linux-sm8750-piano/blob/b5100d5f2e0bb80e1191d521a48596674608eb3d/drivers/media/platform/qcom/iris/iris_vidc.c#L312-L325)
 
-Checks: **HOLD image construction in this analysis job.** Packet fields,
-port mapping, selected encoder properties/subscriptions, VPU35-selected
-sizes, counts, guarded arena arithmetic and stream-on ordering have been
-checked statically against K. Before a later fix image, require one
-reviewed native change with independent host checks for all five findings:
-ARP allocation/mapping/one-time queue/ownership through close; both missing
-control packets with exact type/port/payload/value/order on both
-stream-ons; four external entries per queue; nanosecond frame PTS and
-correct EBD frame indexing. Cover the corrected guarded arena on both
-existing backings and preserve cleanup/error quarantine. No production or
-test source is changed by this document. Documentation verification is
-recorded below. Firmware activation and ten-frame Annex B qualification
-remain hardware gates: require successful START replies on both ports,
-no session/system error, no watchdog/SMMU fault, complete buffer ownership
-recovery, ten nonempty outputs with SPS/PPS/IDR, DRAIN/LAST, both STOPs and
-CLOSE, then the existing independent stream checker described above.
-
-Root cause: **Confirmed missing session ARP (9 / NONE=0 / 204,800 bytes),
-plus omitted DEBLOCKING_MODE (port 1 / PACKED32 / `00060600`) and
-TIME_DELTA_BASED_RATE_CONTROL (port 1 / U32 / 0).** ARP is the leading
-explanation for stage-5 activation rejection; firmware-specific first
-predicate remains unknown. Also confirmed: undersized external pool
-counts (2 instead of 4 on each queue) and microsecond HFI PTS instead of
-nanoseconds. The five existing internal capacities and port/start mapping
-are correct for this 640×480 capture.
-
-ONE change: **One coherent E1 encoder-conformance implementation**, with
-its independent host regressions, closing all five gaps together: add and
-map one session ARP, queue it on NONE before the first START and retain it
-through proven quiescence; insert both exact missing control writes in the
-capability sequence on each stream-on; allocate/use four RAW and four
-BITSTREAM slots while keeping host-max=64 and COMV-count=4 distinct;
-correct HFI PTS generation and returned-frame indexing to nanoseconds.
-Preserve the verified five scratch/reconstruction sizes, gen2 port
-mapping, input-first START order, default-off admission and exclusive
-owner. Recheck any additionally admitted resolution against its padded
-geometry; this analysis proves the 640×480 row. Review/build/test that
-single change before producing a fix image; use one subsequent authorized
-RAM capture to test all known gates together. This documentation commit
-neither implements the fix nor establishes a firmware PASS.
+The next RAM run must show successful START replies on both ports, ten
+input returns, ten nonempty outputs with SPS/PPS/IDR, DRAIN/LAST, both STOPs
+and CLOSE, with no session or system errors, watchdog or SMMU fault. Run the
+independent Annex B checker and capture the default-off decode controls
+described in [RAM batch E qualification](#ram-batch-e-qualification).
 
 ### Documentation verification
 
