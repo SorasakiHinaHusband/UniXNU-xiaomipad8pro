@@ -166,7 +166,9 @@ int32_t ps_als_step_curve(PsAls *a, PsAlsCurve curve, uint16_t floor, int have_s
             a->published = target;
             return (int32_t)target;
         }
-        if (distance(target, a->goal) >= PS_ALS_HYSTERESIS) a->goal = target;
+        /* A gradual sweep can leave the last goal within the deadband of an endpoint forever. */
+        if (lux == 0 || lux >= ps_als_end_lux(curve) || distance(target, a->goal) >= PS_ALS_HYSTERESIS)
+            a->goal = target;
     }
     if (!a->has) return -1;
     if (now_ms > a->last_ms) {

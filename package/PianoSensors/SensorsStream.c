@@ -151,7 +151,7 @@ static void apply(SsEngine *e, uint64_t at)
     e->ch[SS_LIGHT].why = held ? held : !c->light_consumer ? "no consumer" : c->display == 0 ? "display off"
                         : c->lid == 0 ? "lid closed" : 0;
     const int accel = !held && ss_accel_wanted(c);
-    if (!accel && e->accel.want && e->cfg.accel_sample_time) {
+    if (!accel && e->accel.want) {
         /* A quick gate cycle can leave the same SSC session on. Its edge and dwell still expire. */
         reset_accel(e);
     }
@@ -304,8 +304,15 @@ void ss_from_list(SsEngine *e, const ScClient *list)
 
 void ss_conditions(SsEngine *e, const SsConditions *c)
 {
+    const int cover_changed = (e->cond.attached == 1) != (c->attached == 1);
     e->cond = *c;
-    apply(e, now(e));
+    const uint64_t at = now(e);
+    if (cover_changed) {
+        /* Bench acquisition stays on through a cover change. Its orientation must still start over. */
+        reset_accel(e);
+        set_edge(e, PS_EDGE_NONE, at);
+    }
+    apply(e, at);
 }
 
 void ss_sleep(SsEngine *e, int asleep)
@@ -348,7 +355,7 @@ static void observe(SsEngine *e, int i, uint64_t at)
     SntText t;
     if (i == SS_LIGHT && (s->state == PAS_FAILED || s->dirty ||
         (s->state != PAS_ON && s->state != PAS_ENABLING))) light_invalid(e, s->state == PAS_FAILED);
-    if (i == SS_ACCEL && e->cfg.accel_sample_time && (s->dirty || (s->state != PAS_ON && s->state != PAS_ENABLING))) {
+    if (i == SS_ACCEL && (s->dirty || (s->state != PAS_ON && s->state != PAS_ENABLING))) {
         reset_accel(e);
         set_edge(e, PS_EDGE_NONE, at);
     }
