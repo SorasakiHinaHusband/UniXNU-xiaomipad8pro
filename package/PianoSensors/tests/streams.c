@@ -737,6 +737,9 @@ static void test_accel_sample_time(int sample_time)
     // The duplicate's conflicting vector at 1300 must not replace the candidate.
     report_at(SS_ACCEL, &kAccel, batch, 4, dense);
     CHECK(out.edge == (sample_time ? PS_EDGE_LEFT : PS_EDGE_NONE));
+    char status[320];
+    ss_status(&eng, SS_ACCEL, status, sizeof status);
+    CHECK(!!strstr(status, "qtimer=") == sample_time);
 
     fresh(&cfg);
     bring_up(0);
@@ -765,6 +768,57 @@ static void test_accel_sample_time(int sample_time)
     CHECK(out.edge == PS_EDGE_LEFT && out.seq == seq);
     CHECK(clean() == 0 && results_bad == 0 && hub[SS_LIGHT].requests == 0);
     printf("PASS accel sample time: batched dwell, gap boundary, missing, duplicate and backwards timestamps\n");
+}
+
+static void test_accel_wake_sample_time(void)
+{
+    SsConfig cfg;
+    ss_defaults(&cfg);
+    cfg.accel_sample_time = 1;
+    const float left[3] = {0, 9.81f, 0};
+    const float top[3] = {9.81f, 0, 0};
+    const HubEvent portrait = sensor_event(left, 3, 3, 1);
+    const HubEvent landscape = sensor_event(top, 3, 3, 1);
+    const uint64_t starts[] = {1100, 4000000, 40};  // continuous, jump forward, and wrap/reset
+    for (unsigned i = 0; i < sizeof starts / sizeof starts[0]; ++i) {
+        fresh(&cfg);
+        bring_up(0);
+        conditions(0, 1, 1, 1, 0);
+        run(40);
+        const uint64_t before[] = {850, 950, 1050};
+        for (unsigned k = 0; k < sizeof before / sizeof before[0]; ++k)
+            report_at(SS_ACCEL, &kAccel, &portrait, 1, &before[k]);
+        CHECK(out.edge == PS_EDGE_NONE);
+        ss_sleep(&eng, 1);
+        const uint64_t dropped = 1125;
+        report_at(SS_ACCEL, &kAccel, &portrait, 1, &dropped);
+        CHECK(out.edge == PS_EDGE_NONE && eng.ch[SS_ACCEL].dropped == 1);
+        if (i != 0) run(40);                // complete the disable on the real suspend path
+        clock_ms += 10000;                  // AP receive time never counts towards SSC dwell
+        ss_sleep(&eng, 0);
+        if (i != 0) run(40);
+        CHECK(hub[SS_ACCEL].enables == (i == 0 ? 1u : 2u));
+        const uint64_t after[] = {starts[i], starts[i] + 100, starts[i] + 200, starts[i] + 249, starts[i] + 250};
+        for (unsigned k = 0; k < sizeof after / sizeof after[0]; ++k) {
+            report_at(SS_ACCEL, &kAccel, &portrait, 1, &after[k]);
+            CHECK(out.edge == (k == 4 ? PS_EDGE_LEFT : PS_EDGE_NONE));
+        }
+        conditions(0, 1, 1, 1, 1);            // accepted edge also expires when the cover briefly closes the gate
+        CHECK(out.edge == PS_EDGE_NONE);
+        conditions(0, 1, 1, 1, 0);
+        for (unsigned k = 0; k < sizeof after / sizeof after[0]; ++k) {
+            const uint64_t ticks_ms = after[k] + 350;
+            report_at(SS_ACCEL, &kAccel, &portrait, 1, &ticks_ms);
+            CHECK(out.edge == (k == 4 ? PS_EDGE_LEFT : PS_EDGE_NONE));
+        }
+        const uint64_t stale = starts[i] + 200;
+        report_at(SS_ACCEL, &kAccel, &landscape, 1, &stale);
+        CHECK(out.edge == PS_EDGE_LEFT && clean() == 0);
+        const HubEvent error = error_event(3);
+        report(SS_ACCEL, &kAccel, &error, 1);
+        CHECK(out.edge == PS_EDGE_NONE && eng.last_accel_ticks == 0);
+    }
+    printf("PASS accel wake sample time: quick and full sleep, QTimer jump/reset, fresh dwell, same pose after cover bounce\n");
 }
 
 // ---------------------------------------------------------------- guard and strikes
@@ -1176,6 +1230,7 @@ int main(int argc, char **argv)
     test_accel(1);
     test_accel_sample_time(0);
     test_accel_sample_time(1);
+    test_accel_wake_sample_time();
     test_accel_cover_acquisition();
     test_guard();
     test_sleep();

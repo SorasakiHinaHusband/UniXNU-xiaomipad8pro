@@ -687,7 +687,7 @@ class PianoTouch : public IOService {
   // The display's rotation (piano-touch-rotate=1): requested by callPlatformFunction / setProperties, taken by the frame thread at a
   // touch-down (TouchRotation.h). Without the argument it stays 0 and every report is as before.
   PatRotation fRotation = {0, 0, 0};
-  const char *volatile fRotationSource = "none";
+  const char *fRotationSource = "none";
   // The uptime (ms) of the last frame with a finger on the screen (not a palm), for "PianoTouchContact" (PianoTouchClient.h).
   volatile uint64_t fLastContactMs = 0;
   // After a download and start: its first edge (TouchPace.h StartGrace; under piano-touch-noedge no read without one before it).
@@ -1592,7 +1592,7 @@ IOReturn PianoTouch::callPlatformFunction(const OSSymbol *name, bool wait, void 
   if (!name || !name->isEqualTo(PAT_FUNCTION)) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
   if (!gArgs.rotate) return kIOReturnUnsupported;
   if (!pat_request(&fRotation, uint32_t(uintptr_t(p1)))) return kIOReturnBadArgument;
-  fRotationSource = p2 ? static_cast<const char *>(p2) : "a kernel caller";
+  __atomic_store_n(&fRotationSource, p2 ? static_cast<const char *>(p2) : "a kernel caller", __ATOMIC_RELAXED);
   return kIOReturnSuccess;
 }
 
@@ -1607,7 +1607,7 @@ IOReturn PianoTouch::setProperties(OSObject *properties)
       IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeConsoleUser) != kIOReturnSuccess)
     return kIOReturnNotPrivileged;
   if (degrees->unsigned64BitValue() > 270 || !pat_request(&fRotation, degrees->unsigned32BitValue())) return kIOReturnBadArgument;
-  fRotationSource = "setProperties";
+  __atomic_store_n(&fRotationSource, "setProperties", __ATOMIC_RELAXED);
   return kIOReturnSuccess;
 }
 
@@ -1679,10 +1679,11 @@ void PianoTouch::gestures(uint64_t now)
   if (fScreen && (fNativeWant >= 0 || fAxesWant >= 0) && !trackerActive(fTracker, false) && gestureIdle(fGesture) && mtIdle(fMt) &&
       nativeIdle(fNative))
     nativeSwitch();
-  if (gArgs.rotate && gestureIdle(fGesture) && nativeIdle(fNative) && trackerActive(fTracker, true)) {
+  if (gArgs.rotate && gestureIdle(fGesture) && mtIdle(fMt) && nativeIdle(fNative) && trackerActive(fTracker, true)) {
     const uint32_t was = fRotation.shown;
     if (pat_latch(&fRotation, 1) != was) {
-      note("rotation: %u degrees from this touch on (was %u; from %s, change %u)", fRotation.shown, was, fRotationSource,
+      note("rotation: %u degrees from this touch on (was %u; from %s, change %u)", fRotation.shown, was,
+           __atomic_load_n(&fRotationSource, __ATOMIC_RELAXED),
            fRotation.changes);
       setProperty(PAT_PROPERTY, uint64_t(fRotation.shown), 32);
     }
@@ -2295,7 +2296,7 @@ void PianoTouch::serve()
   __atomic_store_n(&fServing, true, __ATOMIC_RELEASE);
   for (;;) {
     const uint64_t now = nowMs();
-    const uint32_t seen = fWake.now();
+    const uint32_t panelWakeSeen = fWake.now();
     const uint32_t hold = __atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE);
     if (hold != panelReleased) {
       if (hold == panelRequested) {
@@ -2306,7 +2307,7 @@ void PianoTouch::serve()
           note("panel sleep: touch SPI parked");
       }
       if (__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) powerStep(fPower.step(true, 0, true), mc, now);
-      if (__atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE) != panelReleased) fWake.wait(seen, 1000);
+      if (__atomic_load_n(&fPanelHold, __ATOMIC_ACQUIRE) != panelReleased) fWake.wait(panelWakeSeen, 1000);
       continue;
     }
     // The power states (TouchPower.h): the system's (setPowerState; a suspend parks the thread in powerStep) and the display's.

@@ -213,7 +213,13 @@ const char *ps_edge_name(int edge)
 int ps_accel_sample(SnoState *s, const SfxAxes *axes, const uint32_t bits[3], uint64_t now_ms)
 {
     int32_t in[3], out[3];
-    for (unsigned i = 0; i < 3; ++i) in[i] = sfx_accel_ios(bits[i]);
+    for (unsigned i = 0; i < 3; ++i) {
+        if ((bits[i] & 0x7f800000u) == 0x7f800000u) {
+            s->candidate = s->state;
+            return -1;
+        }
+        in[i] = sfx_accel_ios(bits[i]);
+    }
     sfx_axes_apply(axes, in, out);
     return sno_update(s, out[0], out[1], out[2], now_ms);
 }
