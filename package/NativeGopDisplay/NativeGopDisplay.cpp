@@ -324,7 +324,7 @@ private:
     // get_timing_attributes_gated at one fRefreshHz period (the family's answers 1/60 s whatever the mode), IOMFBDisplayRefresh published
     // from it before the service registers, and the VBL tick on absolute deadlines. Off: the family's slot and the relative tick, as before.
     bool fRefreshContract = false;
-    bool fDpuModes = false;
+    unsigned fDpuModeHz = 0;
     IOReturn setPianoDpuMode(unsigned hz);
     mutable uint32_t fTimingAttributeCalls = 0;
     // The panel's physical size (ADT panel-width-mm / panel-height-mm, boot-arg native-gop-display-mm=WIDTHxHEIGHT; default piano's
@@ -816,7 +816,7 @@ bool NativeGopDisplay::start(IOService *provider)
         fRefreshHz = 60;
     uint32_t modes = 0;
     PE_parse_boot_argn("piano-dpu-modes", &modes, sizeof(modes));
-    fDpuModes = modes == 1 && !fExternal;
+    fDpuModeHz = fExternal ? 0 : pianodpu::modes::bootModeHz(modes);
     uint32_t builtin = 0;
     PE_parse_boot_argn("native-gop-display-builtin", &builtin, sizeof(builtin));
     fBuiltin = builtin == 1 && !fExternal;   // D6's second display stays external
@@ -1158,7 +1158,7 @@ bool NativeGopDisplay::start_hardware()
 {
     if (!createDisplayAttributes())
         return false;
-    if (fDpuModes)
+    if (fDpuModeHz)
         GOPLOG("M3: display attributes published (one %lux%lu@%u timing, 8-bit SDR sRGB)\n",
                fVideo.v_width, fVideo.v_height, fRefreshHz);
     else
@@ -3091,12 +3091,13 @@ IOReturn NativeGopDisplay::setPianoDpuMode(unsigned hz)
 // All timings share one 8-bit SDR sRGB color element.
 bool NativeGopDisplay::createDisplayAttributes()
 {
-    if (fDpuModes) {
+    if (fDpuModeHz) {
+        using namespace pianodpu::modes;
         IOReturn status = kIOReturnUnsupported;
         if (fVideo.v_width == pianodpu::kPanelWidth && fVideo.v_height == pianodpu::kPanelHeight) {
-            // The survey and flip ladder run on separate threads. Establish 60 Hz before the family registers us.
+            // The survey and flip ladder run on separate threads. Verify scanout before the family registers us.
             for (unsigned attempt = 0; attempt < 80; ++attempt) {
-                status = setPianoDpuMode(pianodpu::modes::kBootModeHz);
+                status = setPianoDpuMode(fDpuModeHz);
                 if (status != kIOReturnNotReady)
                     break;
                 IOSleep(50);
@@ -3106,11 +3107,16 @@ bool NativeGopDisplay::createDisplayAttributes()
             GOPLOG("M3: scanout recovery could not be verified\n");
             return false;
         }
-        fDpuModes = status == kIOReturnSuccess || status == kIOReturnAborted;
-        if (fDpuModes) {
-            fRefreshHz = status == kIOReturnSuccess ? pianodpu::modes::kBootModeHz : pianodpu::modes::kInheritedModeHz;
+        if (status == kIOReturnSuccess || status == kIOReturnAborted) {
+            // Aborted means the other member of the 60/120 pair was restored and verified.
+            fRefreshHz = status == kIOReturnSuccess ? fDpuModeHz : (fDpuModeHz == kBootModeHz ? kInheritedModeHz : kBootModeHz);
             fRefreshContract = true;
         } else {
+            if (fDpuModeHz == kInheritedModeHz) {
+                GOPLOG("M3 initial %u Hz mode could not be verified (%#x)\n", fDpuModeHz, status);
+                return false;
+            }
+            fDpuModeHz = 0;
             GOPLOG("M3 initial 60 Hz mode refused (%#x), publishing the boot profile's single timing\n", status);
         }
     }
@@ -3125,7 +3131,7 @@ bool NativeGopDisplay::createDisplayAttributes()
                static_cast<unsigned long long>(words[goprefresh::kMinFixed]),
                static_cast<unsigned long long>(goprefresh::periodNs(fRefreshHz)), static_cast<unsigned long long>(words[goprefresh::kMinAbs]));
         if (!published) {   // never a half-told rate: the old contract whole (60 Hz timing, the family's slot, the relative tick)
-            if (fDpuModes)
+            if (fDpuModeHz)
                 return false;
             fRefreshContract = false;
             fRefreshHz = 60;
@@ -3148,7 +3154,7 @@ bool NativeGopDisplay::createDisplayAttributes()
         at<uint32_t>(color, kElementScore) = kColorID;
         if (!colors->setObject(color) || !timingColors->setObject(color))
             break;
-        const auto *mode = fDpuModes ? pianodpu::modes::modeByHz(fRefreshHz) : nullptr;
+        const auto *mode = fDpuModeHz ? pianodpu::modes::modeByHz(fRefreshHz) : nullptr;
         if (!appendTiming(timings, timingColors, kTimingID, width, height, fRefreshHz, mode))
             break;
         // The serial number is the size: WindowServer keeps the chosen mode per display identity. LegacyManufacturerID is the EDID
@@ -3240,12 +3246,12 @@ IOReturn NativeGopDisplay::set_digital_out_mode(unsigned int colorID, unsigned i
     if (colorID != kColorID)
         return kIOReturnBadArgument;
     if (timingID != kTimingID)
-        return fDpuModes ? kIOReturnUnsupported : kIOReturnBadArgument;
+        return fDpuModeHz ? kIOReturnUnsupported : kIOReturnBadArgument;
     at<uint32_t>(this, kDisplayWidth) = static_cast<uint32_t>(fVideo.v_width);
     at<uint32_t>(this, kDisplayHeight) = static_cast<uint32_t>(fVideo.v_height);
     setProperty("DisplayWidth", fVideo.v_width, 32);
     setProperty("DisplayHeight", fVideo.v_height, 32);
-    if (!setProperty("DPTimingModeId", timingID, 32) && fDpuModes)
+    if (!setProperty("DPTimingModeId", timingID, 32) && fDpuModeHz)
         return kIOReturnNoResources;
     if (fDpuNightShift)
         nightShiftCall("PianoDpuNightShiftModeSet");

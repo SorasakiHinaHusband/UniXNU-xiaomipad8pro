@@ -304,6 +304,56 @@ void qual1Underrun()
   CHECK(io.stores.size() == inheritedStores);
 }
 
+void fixed120Boot()
+{
+  static_assert(m::bootModeHz(1) == 60 && m::bootModeHz(120) == 120);
+  static_assert(!m::bootModeHz(0) && !m::bootModeHz(60) && !m::bootModeHz(90) && !m::bootModeHz(144));
+  const m::Options options{.fixedHz = m::bootModeHz(120)};
+  auto io = m1();
+  for (unsigned l = 0; l < 2; ++l) {
+    io.countEnableIgnored[l] = true;
+    io.intf[l + 1].counting = true;
+  }
+  io.minFetchLineNs = 3300;  // the inherited resources can feed 120 but would underrun at 144
+  const auto unexpected = [] { CHECK(false); };
+  const auto inherited = m::switchTo(io, 120, options, unexpected, unexpected);
+  CHECK(!inherited.why && inherited.from == 120 && !inherited.timingTouched && !inherited.reverted);
+  CHECK(inherited.rate.lockstep && inherited.rate.milliHz >= 117600 && inherited.rate.milliHz <= 122400);
+  for (const auto &s : io.stores)
+    CHECK(s.pa == intfReg(1, kIntfCountEn) || s.pa == intfReg(2, kIntfCountEn));
+  checkMode(io, 120);
+
+  const auto stores = io.stores.size();
+  for (unsigned hz : {60u, 90u, 144u}) {
+    const auto refused = m::switchTo(io, hz, options, unexpected, unexpected);
+    CHECK(refused.why && !refused.timingTouched && !refused.reverted);
+  }
+  CHECK(io.stores.size() == stores && io.dcs.empty());
+
+  // The measurement must catch starvation even when all inherited timing words already match.
+  io.minFetchLineNs = 3700;
+  const auto starved = m::switchTo(io, 120, options, unexpected, unexpected);
+  CHECK(starved.why && std::strcmp(starved.why, "an INTF underran") == 0);
+  CHECK(!starved.timingTouched && !starved.reverted && starved.rate.lockstep);
+
+  io = m1();
+  io.minFetchLineNs = 3300;
+  CHECK(switchOk(io, 60, {}));
+  auto fail = io;
+  const auto up = m::switchTiming(io, 120, options);
+  CHECK(!up.why && up.from == 60 && up.timingTouched && !up.reverted && up.rate.lockstep);
+  CHECK(io.dcs.empty() && !io.glitches && !io.modeUnderruns() && io.refused.empty());
+  checkMode(io, 120);
+
+  fail.dropStore = intfReg(2, kIntfProgFetch);
+  fail.dropValue = 0x13b6c1;
+  fail.dropCount = 1;
+  const auto restored = m::switchTiming(fail, 120, options);
+  CHECK(restored.why && restored.from == 60 && restored.reverted && !restored.restoreWhy);
+  CHECK(fail.dcs.empty() && !fail.modeUnderruns());
+  checkMode(fail, 60);
+}
+
 void sleepAndFetch()
 {
   for (bool stopEngines : {true, false}) {
@@ -416,6 +466,7 @@ int main()
   counterAndFlushGate();
   rollback();
   qual1Underrun();
+  fixed120Boot();
   sleepAndFetch();
   nightShiftAndCleanEpochs();
   std::printf("PianoDpu M3 mode switch: %u checks, %u failures\n", checks, failures);

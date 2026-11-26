@@ -175,7 +175,7 @@ constexpr unsigned kHsync = 32, kHbp = 32, kVsync = 2, kVbp = 104;
 constexpr unsigned modeHtotal(const Mode &m) { return kPanelWidth + m.hfp + kHsync + kHbp; }
 constexpr unsigned modeVtotal(const Mode &m) { return kPanelHeight + m.vfp + kVsync + kVbp; }
 
-// The DDR vote of the boot framebuffer at 120 Hz (DT chosen/framebuffer opp: avg 3 280 896 kB/s, peak 4 257 792 kB/s).
+// Ubuntu's simplefb 120 Hz OPP reference (chosen/framebuffer). PianoDpu does not issue this vote.
 constexpr uint64_t kSplashAvgKBps = 3280896, kSplashPeakKBps = 4257792;
 
 }  // namespace pianodpu

@@ -7,7 +7,7 @@
 //   piano-dpu-refresh=plan|60|120|auto   plan: the verdict and the stores a switch would make, nothing written; 60 / 120: switch
 //                                        once at the start and stay; auto: the idle policy (DpuRefresh.h) fed by NativeGopDisplay's
 //                                        swaps (it calls PianoDpuSwap when it has the same argument)
-//   piano-dpu-modes=1                    M3 verified fixed 60 Hz, established synchronously by the slices worker
+//   piano-dpu-modes=1|120                M3 verified fixed 60 or 120 Hz, established synchronously by the slices worker
 //   piano-dpu-refresh-db=0|1|2           the DSI timing shadow: 1 SunUEFI's place (default), 2 downstream's, 0 none (TOTAL directly)
 //   piano-dpu-refresh-test=N             first N round trips 120 -> 60 -> 120, one second at each rate (stops at an anomaly)
 //   piano-dpu-refresh-idle=MS, -burst=N, -window=MS, -dwell=MS   the policy (1000, 2, 250, 200)
@@ -23,7 +23,7 @@
 //   piano-dpu-panel-test=N               standalone level-1 DCS test, 5 s asleep and 5 s awake each
 // Platform functions (IOService::callPlatformFunction on the PianoDpu service, registered when a slice is on; no link dependency):
 //   "PianoDpuSwap"          no parameters: a frame was shown
-//   "PianoDpuMode"          p1 = 60 Hz, returns Aborted for a verified restore to 120 Hz or Offline if recovery failed
+//   "PianoDpuMode"          p1 = configured fixed rate, returns Aborted for a verified restore or Offline if recovery failed
 //   "PianoDpuColorMatrix"   p1 = the 72 bytes of an IOMFBColorFixedMatrix (9 uint64_t), p2 = its IOMFBColorMatrixFunction, p3 = the
 //                           call's third argument (logged)
 //   "PianoDpuGammaTable"    p1 = the table's 32-bit words, p2 = how many (fitted when piano-dpu-pcc=2 and 771 words)
@@ -77,7 +77,7 @@ constexpr unsigned kRefreshOff = 0, kRefreshAuto = 1, kRefreshPlan = 2;
 struct SliceArgs {
   unsigned level = 0;
   unsigned refresh = kRefreshOff, refreshDb = 1, refreshTest = 0;
-  bool modes = false;
+  unsigned modeHz = 0;
   refresh::PolicyConfig policy;
   unsigned pcc = 0, pccEncode = 1, pccNegative = 0;
   bool nightShift = false;
@@ -93,7 +93,7 @@ SliceArgs gA;
 panel::TraceRing *gPanelTrace = nullptr;
 bool gArgsRead;
 
-bool modesEnabled() { return gA.modes && !gA.refresh && gA.refreshDb; }
+bool modesEnabled() { return gA.modeHz && !gA.refresh && gA.refreshDb; }
 
 uint32_t argNumber(const char *name, uint32_t fallback, uint32_t lo, uint32_t hi)
 {
@@ -114,7 +114,7 @@ void readSliceArgs()
     else if (!strcmp(s, "120")) gA.refresh = 120;
   }
   gA.refreshDb = argNumber("piano-dpu-refresh-db", 1, 0, 2);
-  gA.modes = argNumber("piano-dpu-modes", 0, 0, 100) == 1;
+  gA.modeHz = modes::bootModeHz(argNumber("piano-dpu-modes", 0, 0, UINT32_MAX));
   gA.refreshTest = argNumber("piano-dpu-refresh-test", 0, 0, 1000);
   gA.policy.idleMs = argNumber("piano-dpu-refresh-idle", 1000, 100, 60000);
   gA.policy.burstSwaps = argNumber("piano-dpu-refresh-burst", 2, 1, 8);
@@ -616,10 +616,11 @@ IOReturn doModeSwitch(unsigned hz)
   IOLock *flipLock = flipTransactionLock();
   if (!flipLock) return kIOReturnNoResources;
   IOLockLock(flipLock);
-  const auto r = modes::switchTo(gIo, hz, {refresh::Db(gA.refreshDb), gBoe, gA.ahbVote == 1, panelUnavailable},
-                                 flipInvalidateCleanEpochs, [] {
-                                   if (gA.nightShift) nightShiftUpdateLocked(true, "M3 mode switch");
-                                 });
+  const modes::Options options{.db = refresh::Db(gA.refreshDb), .boe = gBoe, .hwGatedAhb = gA.ahbVote == 1,
+                               .panelUnavailable = panelUnavailable, .fixedHz = gA.modeHz};
+  const auto r = modes::switchTo(gIo, hz, options, flipInvalidateCleanEpochs, [] {
+    if (gA.nightShift) nightShiftUpdateLocked(true, "M3 mode switch");
+  });
   IOLockUnlock(flipLock);
   if (r.why) {
     if (panelUnavailable) {
@@ -640,11 +641,11 @@ IOReturn doModeSwitch(unsigned hz)
   if (r.timingTouched) {
     reread("M3");
     ++gSwitches;
-    unsigned whole, frac;
-    milliHz(r.rate.milliHz, &whole, &frac);
-    note("mode: %u -> %u Hz verified, both links, %u.%03u Hz (%u/%u frames); switch %u",
-         r.from, hz, whole, frac, r.rate.frames[0], r.rate.frames[1], gSwitches);
   }
+  unsigned whole, frac;
+  milliHz(r.rate.milliHz, &whole, &frac);
+  note("mode: %u -> %u Hz verified, both links, %u.%03u Hz (%u/%u frames); switch %u",
+       r.from, hz, whole, frac, r.rate.frames[0], r.rate.frames[1], gSwitches);
   publish();
   return kIOReturnSuccess;
 }
@@ -958,7 +959,8 @@ void worker(void *, wait_result_t)
       gHz = modes::classify(live).hz;
       gBoe = (id & 1u) != 0;
       modeReady = true;
-      note("mode: piano-dpu-modes=1, %s, %s, DSI timing shadow %s", panelModule(id), rateOrder(id),
+      note("mode: piano-dpu-modes=%u, %s, %s, DSI timing shadow %s",
+           gA.modeHz == modes::kBootModeHz ? 1u : gA.modeHz, panelModule(id), rateOrder(id),
            refresh::dbName(refresh::Db(gA.refreshDb)));
     } else {
       note("mode: panel ID unavailable; switching off");
@@ -1003,7 +1005,8 @@ void worker(void *, wait_result_t)
   }
   piano_dpu_slices_stage = 6;
   const char *refreshState = gRefreshBroken ? "off" : gA.refresh == kRefreshAuto ? "auto" : "fixed";
-  note("slices: serving (refresh %s, pcc %s, panel %s)", modeReady ? "M3 fixed 60 Hz" : refreshState,
+  if (modeReady) refreshState = gA.modeHz == modes::kBootModeHz ? "M3 fixed 60 Hz" : "M3 fixed 120 Hz";
+  note("slices: serving (refresh %s, pcc %s, panel %s)", refreshState,
        gPccBroken ? "off" : gA.nightShift ? "Night Shift" : gA.pcc ? "on" : "off", gA.panel && !gPanelBroken ? "on" : "off");
   publish();
   IOLockLock(gLock);
@@ -1046,7 +1049,7 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
 {
   if (name && name->isEqualTo("PianoDpuMode")) {
     const uintptr_t hz = uintptr_t(p1);
-    if (!modesEnabled() || hz != modes::kBootModeHz) *result = kIOReturnUnsupported;
+    if (!modesEnabled() || hz != gA.modeHz) *result = kIOReturnUnsupported;
     else if (!gLock) *result = kIOReturnNotReady;
     else {
       IOLockLock(gLock);

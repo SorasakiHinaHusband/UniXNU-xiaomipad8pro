@@ -56,6 +56,7 @@ struct Options {
   bool hwGatedAhb = false;
   bool panelUnavailable = false;
   bool allowUnqualified = false;  // host model exercise of all hardware timings
+  unsigned fixedHz = kBootModeHz;
 };
 
 struct Result {
@@ -273,7 +274,7 @@ template <class Io>
 Result switchTiming(Io &io, unsigned hz, const Options &o)
 {
   Result r;
-  if (!o.allowUnqualified && hz != kBootModeHz) {
+  if (!o.allowUnqualified && hz != o.fixedHz) {
     r.why = "the requested mode is not qualified";
     return r;
   }

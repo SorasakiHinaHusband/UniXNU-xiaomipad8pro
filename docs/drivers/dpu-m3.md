@@ -1,7 +1,7 @@
 # Piano DPU M3 refresh modes
 
 M3 keeps the 60, 90, 120 and 144 Hz hardware timing plans for the internal 3200 × 2136 display. The M3 boot path
-publishes one fixed 60 Hz timing after verification. The 27.3 RAM boot captured for M1 was
+publishes one fixed timing after verification. The 27.3 RAM boot captured for M1 was
 scanning at 120 Hz with programmable fetch enabled on both interfaces. Each fetch start was `0x0013b6c1`, 24 lines before the
 end of the frame. The DSI timing-shadow words at +0x1e4/+0x1e8/+0x1ec were idle (zero). Both command engines were configured for
 software triggering with the in-frame DMA block clear.
@@ -166,14 +166,16 @@ persisting underrun still fails recovery.
 ## Driver and boot arguments
 
 `piano-dpu-modes=1` establishes the verified 60 Hz mode before NativeGopDisplay offers it as the single
-`TimingElements` entry (ID 1000, color ID 100). The DPU worker admits only 60 Hz from the inherited 120 Hz
-mode or an already running 60 Hz mode. 90 Hz and a runtime return to 120 Hz have no directed qualification.
+`TimingElements` entry (ID 1000, color ID 100). `piano-dpu-modes=120` requests the same fixed contract at 120 Hz.
+It verifies the inherited 120 Hz or the VFP-only return from 60 before publication.
+See [the 120 and 144 Hz analysis](dpu-m3-144.md) for the high-refresh hardware qualification gate.
 A stale higher timing ID returns `kIOReturnUnsupported` to IOMFB before a mode service call, property update or VBL change.
 A request for the published timing remains idempotent. The 60 Hz VFP-only commit changes DSI TOTAL, the INTF
 period and the enabled fetch starts. It retains the known 120 Hz line and link clocks and the inherited resources.
-Omit `piano-dpu-refresh` on the M3 boot. A refusal before staging keeps the boot profile fallback. A verified
-rollback returns `kIOReturnAborted` to startup and leaves the inherited 120 Hz mode as the single fixed timing.
-An unverified rollback returns `kIOReturnOffline` and prevents timing registration.
+Omit `piano-dpu-refresh` on the M3 boot. With `=1`, a refusal before staging keeps the boot profile fallback.
+With `=120`, timing registration requires a verified mode. A verified rollback returns `kIOReturnAborted` to
+startup and publishes its measured 60 or 120 Hz as the single fixed timing. An unverified rollback returns
+`kIOReturnOffline` and prevents timing registration.
 
 | Refresh | Expected INTF clock | Frame interval | INTF programmable fetch start with M1's 24-line lead |
 | --- | ---: | ---: | --- |

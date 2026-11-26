@@ -277,7 +277,7 @@ request and wakes the slices' thread):
 | Function | Caller | Parameters |
 |---|---|---|
 | `PianoDpuSwap` | NativeGopDisplay's `program_hardware_gated`, each frame shown (`piano-dpu-refresh=auto`) | none |
-| `PianoDpuMode` | NativeGopDisplay startup, synchronously (`piano-dpu-modes=1`) | p1 = 60 Hz |
+| `PianoDpuMode` | NativeGopDisplay startup, synchronously (`piano-dpu-modes=1` or `=120`) | p1 = configured fixed rate, 60 or 120 Hz |
 | `PianoDpuColorMatrix` | NativeGopDisplay's `swap_set_color_matrix`, each new matrix of a function (`piano-dpu-pcc`) | p1 = the 72 bytes, p2 = the function, p3 = the third argument |
 | `PianoDpuGammaTable` | NativeGopDisplay's `set_gamma_table`, each new table (`piano-dpu-pcc`) | p1 = the words, p2 = 771 with `piano-dpu-pcc=2`, else 0 (logged only) |
 | `PianoDpuPanel` | NativeGopDisplay's copy worker, synchronously, outside the display gate (`piano-dpu-panel=1`) | p1 = on |
@@ -306,7 +306,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-measure=MS` | 1000 | the frame-counter interval (20..10000) |
 | `piano-dpu-delay=S`, `piano-dpu-repeat=S`, `piano-dpu-samples=N` | 0, 0, 3 | wait first; re-measure every S s, N times (after WindowServer starts, across display sleep) |
 | `piano-dpu-refresh=plan\|60\|120\|auto` | off | B1c (needs `piano-dpu` >= 1): plan = the verdict and the twelve stores logged, nothing written; 60/120 = switch once at the start; auto = the idle policy (NativeGopDisplay reports swaps with the same argument) |
-| `piano-dpu-modes=1` | 0 | M3 verifies 60 Hz before publishing a single fixed timing for the internal display. Leave `piano-dpu-refresh` unset. `piano-dpu-refresh-db` selects the DSI shadow layout. [M3 qualification](dpu-m3.md) |
+| `piano-dpu-modes=1` or `=120` | 0 | M3 verifies the requested 60 or 120 Hz before publishing a single fixed timing for the internal display. Leave `piano-dpu-refresh` unset. `piano-dpu-refresh-db` selects the DSI shadow layout. [M3 qualification](dpu-m3.md) · [High-refresh analysis](dpu-m3-144.md) |
 | `piano-dpu-refresh-db=0\|1\|2` | 1 | the DSI timing shadow: 1 SunUEFI's place (DB + 0x1ec, flush + 0x1e8), 2 downstream's (+ 0x1e8, + 0x1e4), 0 TOTAL written directly |
 | `piano-dpu-refresh-test=N` | 0 | first N round trips 120 → 60 → 120, a second at each rate; stops at an anomaly |
 | `piano-dpu-refresh-idle=MS`, `-burst=N`, `-window=MS`, `-dwell=MS` | 1000, 2, 250, 200 | the policy |
