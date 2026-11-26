@@ -39,6 +39,8 @@ static inline const char *parseName(Parse p) {
 static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xnuBase, uint64_t xnuSize,
                              Run out[kMaxRuns], unsigned &n) {
   n = 0;
+  if (!property) { return Parse::absent; }
+  if (length != pianoxram::kMaxRuns * pianoxram::kRecordBytes) { return Parse::badLength; }
   if (xnuSize > UINT64_MAX - xnuBase) { return Parse::rejected; }
   pianoxram::Pool parsed;
   pianoxram::Config config;
@@ -46,12 +48,15 @@ static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xn
   config.xnuBase = xnuBase;
   config.xnuSize = xnuSize;
   parsed.load(property, length, config);
-  if (parsed.formatBad) { return Parse::badLength; }
   if (!parsed.count) { return Parse::absent; }
-  if (parsed.dropped) { return Parse::rejected; }
   for (unsigned i = 0; i < parsed.count; ++i) {
+    // DarwinBoot packs the nonempty records before the padding, as required by pmap.
+    const auto *record = property + i * pianoxram::kRecordBytes;
+    if (!(pianoxram::rd64(record) | pianoxram::rd64(record + 8) | pianoxram::rd64(record + 16))) {
+      return Parse::rejected;
+    }
     const auto &run = parsed.runs[i].run;
-    if (run.size > UINT64_MAX - run.base) { return Parse::rejected; }
+    if (!run.size || run.size > UINT64_MAX - run.base) { return Parse::rejected; }
   }
 
   unsigned count = 0;
@@ -59,7 +64,8 @@ static inline Parse loadRuns(const uint8_t *property, size_t length, uint64_t xn
     const auto &entry = parsed.runs[i];
     const auto &run = entry.run;
     if (run.bank != pianoxram::Region1 || run.use != pianoxram::UseGpu) { continue; }
-    if (entry.state != pianoxram::StateOurs || (run.base | run.size) & (kSlab - 1) || count == kMaxRuns) {
+    if (entry.state != pianoxram::StateOurs || (run.base | run.size) & (kSlab - 1) ||
+        run.base >= xnuBase || run.size > xnuBase - run.base || count == kMaxRuns) {
       return Parse::rejected;
     }
     // The shared parser checks earlier records. Later records also reserve their range, even with a different use tag.

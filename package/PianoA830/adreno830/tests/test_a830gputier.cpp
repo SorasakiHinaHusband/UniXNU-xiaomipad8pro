@@ -144,6 +144,10 @@ int main() {
   CHECK(loadRuns(nullptr, 0, 0, 0, r, n) == Parse::absent && n == 0);
   CHECK(load(prop({})) == Parse::absent && n == 0);
   CHECK(load(std::vector<uint8_t>(136, 0)) == Parse::badLength && n == 0);
+  auto shortProperty = prop({a});
+  shortProperty.resize(pianoxram::kRecordBytes);
+  CHECK(load(shortProperty) == Parse::badLength && n == 0);
+  CHECK(load(prop({a, {}, b})) == Parse::rejected && n == 0);
   CHECK(load(prop({modem, pil, {modem.base, modem.size, Region0, UseGpu},
                   {a.base, a.size, Region1, UseAny}, {b.base, b.size, Region1, UseVideo}})) == Parse::ok && n == 0);
   CHECK(load(prop({{0x880001000ull, 4 * MiB, Region1, UseGpu}})) == Parse::rejected && n == 0);
@@ -159,6 +163,7 @@ int main() {
   CHECK(load(prop({wrapping, a})) == Parse::rejected && n == 0);
   const auto mixed = prop({a, modem, pil});
   CHECK(loadRuns(mixed.data(), mixed.size(), 0x880000000ull, MiB, r, n) == Parse::rejected && n == 0);
+  CHECK(loadRuns(mixed.data(), mixed.size(), a.base - kSlab, MiB, r, n) == Parse::rejected && n == 0);
   CHECK(loadRuns(mixed.data(), mixed.size(), a.base, UINT64_MAX, r, n) == Parse::rejected && n == 0);
   /* 2 */
   CHECK(!bootArgMode(nullptr)); CHECK(!bootArgMode("")); CHECK(!bootArgMode("piano-dpu=2 piano-gpu-user-vm=1"));
