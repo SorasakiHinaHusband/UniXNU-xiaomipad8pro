@@ -168,8 +168,9 @@ bool PianoUsbNet::start(IOService *provider)
 void PianoUsbNet::startTxQueue()
 {
   if (!fQueue) return;
-  oqSetCapacity(fQueue, kOutputPackets);
+  // Start at zero capacity after creation or a flush so start() cannot drain on this thread.
   oqStart(fQueue);
+  oqSetCapacity(fQueue, kOutputPackets);
 }
 
 void PianoUsbNet::resetTxQueue()
@@ -196,8 +197,9 @@ IOReturn PianoUsbNet::serviceTxAction(OSObject *owner, void *, void *, void *, v
     net->resetTxQueue();
     if (enabled) net->startTxQueue();
   } else if (restart && enabled) {
-    // IOBasicOutputQueue also handles service arriving before its in-flight callback commits the stall.
-    oqService(net->fQueue, 0);
+    // Let the family drain TX on its callout thread so this thread can keep delivering RX.
+    // Service still invalidates a stall from an in-flight callback.
+    oqService(net->fQueue, IOBasicOutputQueue::kServiceAsync);
   }
   return kIOReturnSuccess;
 }
