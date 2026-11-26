@@ -245,7 +245,8 @@ def register_value(block, name, value):
 
 def is_phase_change(baseline, candidate, block, name, old, new):
     if block == "ctl" and name in PHASE_CTL_WORDS:
-        return (baseline.registers["ctl", "index"] == candidate.registers["ctl", "index"]
+        ctl = baseline.registers["ctl", "index"]
+        return (ctl >= 0 and ctl == candidate.registers["ctl", "index"]
                 and {baseline.phase, candidate.phase} == {"active", "blanking"})
     if block in LINKS and name in PHASE_DSI_WORDS:
         intf = INTERFACES[LINKS.index(block)]

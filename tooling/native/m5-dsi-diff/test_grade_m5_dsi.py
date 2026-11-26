@@ -163,6 +163,12 @@ class GradeM5DsiTests(unittest.TestCase):
         self.assertCountEqual([row["block"] for row in report["static_changes"]], ["ctl"] * 3 + ["dsi1"] * 3)
         self.assertEqual(report["flags"], [{"kind": "phy-drift", "link": "dsi1", "registers": ["lane-status"]}])
 
+    def test_ctl_changes_across_a_route_change_stay_visible(self):
+        report = self.grade(self.blanking.replace("ctl0:", "ctl1:"))
+        self.assertCountEqual([(row["block"], row["register"]) for row in report["static_changes"]],
+                              [("ctl", name) for name in ("index", "flush", "top-intr-en", "top-intr-status")])
+        self.assertEqual(len(report["transient_changes"]), 6)
+
     def test_static_drift_and_unexpected_live_values_stay_visible_across_phases(self):
         wake = self.blanking
         for prefix, old, new in (

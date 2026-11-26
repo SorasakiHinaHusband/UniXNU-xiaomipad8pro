@@ -285,9 +285,9 @@ positions report `unknown`.
 `transient_changes` identifies the table's exact DSI value pairs when that link's INTF crossed phases.
 It also identifies `ctl.flush`, `ctl.top-intr-en` and `ctl.top-intr-status` on the same CTL when both links
 crossed phases together. `static_changes` contains the remaining differences, including unexplained
-live status values, and the known lane-status transition does not trigger a `phy-drift` flag.
+live status values. The `phy-drift` flag uses unexplained PHY changes.
 Compare same-phase repeats to check unexplained live register differences. The snapshots are sequential
-MMIO reads. This display-sleep reference used native panel sleep disabled. The dark-wake observation
+MMIO reads. Native panel sleep was disabled for this display-sleep reference. The dark-wake observation
 with `piano-dpu-panel=1` remains pending.
 
 ### Read-only RAM check plan
