@@ -118,7 +118,7 @@ ONE change: Replace the independent slave-first timing polls under `piano-dpu-pa
 
 ## y12p qual1 first wake
 
-The run reached the runtime display block. The console records dual backlight blank, touch parked and a successful off transaction at lines 75033–75337. The wake attempt and C920 grade both recorded a failure before the runner found ABL. The snapshot text for the two DSI reads is empty of register data. Refer to the console for the transition. No panic stack, watchdog-pet timeline or reset-cause record survived in this capture.
+The run reached the runtime display block. The console records dual backlight blank, touch parked and a successful off transaction at lines 75033–75337. The wake attempt and C920 grade both recorded a failure before the runner found ABL. The snapshot text for the two DSI reads is empty of register data. Refer to the console for the transition. No panic stack, watchdog-pet timeline or reset-cause record survived in this capture. The runner skipped the mailbox dump because it had no qualified pre-USB reset path (run-ram.log:1–5).
 
 | Serial and rows | Time from its row 0 (µs) | Observed result |
 | --- | ---: | --- |
