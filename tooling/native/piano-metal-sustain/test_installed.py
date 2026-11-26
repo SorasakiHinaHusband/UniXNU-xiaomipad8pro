@@ -42,10 +42,15 @@ wait_for_file() {
     return 1
 }
 
-# Advance the host clock while the real local worker controls PID and rc files.
+# Advance the virtual host clock while the real local worker controls PID and rc files.
+FAKE_SECONDS=0
+metal_sustain_now() {
+    REPLY=$FAKE_SECONDS
+}
+
 sleep() {
     printf '%s\n' "$1" >> "$fixture/sleeps"
-    SECONDS=$((SECONDS + $1))
+    FAKE_SECONDS=$((FAKE_SECONDS + $1))
     wait_for_file "$FIXTURE_REMOTE/frames.pid"
     wait_for_file "$FIXTURE_REMOTE/ready"
     if [[ "$mode" = interrupted ]]; then

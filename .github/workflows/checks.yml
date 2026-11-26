@@ -58,8 +58,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Host tools the tests call (mtools for the FAT images, llvm for the freestanding selector build)
-        run: brew install mtools llvm
+      - name: Host tools the tests call (mtools for the FAT images, llvm for the freestanding selector build, ffmpeg for video host tests)
+        run: brew install mtools llvm ffmpeg
       - name: Fetch the pinned DarwinBoot source for the bootloader host tests
         env:
           UNIXNU_RESEARCH: ${{ runner.temp }}/self-test-sources

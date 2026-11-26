@@ -101,8 +101,12 @@ metal_sustain_interrupted() {
   exit "$2"
 }
 
+metal_sustain_now() {
+  REPLY=$SECONDS
+}
+
 metal_sustain_poll() {
-  local dir=$1 launch status progress start next delay elapsed action
+  local dir=$1 launch status progress start next delay elapsed action REPLY
   launch=$(metal_sustain_detach "$dir" | tr -d '\r') || true
   if ! grep -qx METAL_SUSTAIN_LAUNCH_QUEUED <<< "$launch"; then
     printf 'metal-sustain: detached launch receipt missing\n' >&2
@@ -110,12 +114,15 @@ metal_sustain_poll() {
     return 1
   fi
 
-  start=$SECONDS
+  metal_sustain_now
+  start=$REPLY
   next=$start
   while :; do
-    delay=$((next - SECONDS))
+    metal_sustain_now
+    delay=$((next - REPLY))
     if ((delay > 0)); then sleep "$delay"; fi
-    elapsed=$((SECONDS - start))
+    metal_sustain_now
+    elapsed=$((REPLY - start))
     action=poll
     # The final probe checks for completion first, then requests cancellation.
     if ((elapsed >= 720)); then action=stop; fi
