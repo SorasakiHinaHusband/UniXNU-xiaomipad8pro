@@ -42,6 +42,7 @@ import errno
 import fcntl
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -52,6 +53,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zlib
 from pathlib import Path
 
@@ -425,9 +427,19 @@ class Session:
         if not self.execute:
             self.log(f'  check verified NAS backup of {key} exists (step backup)')
             return entry
-        if not entry or not entry.get('verified') or (sha and entry['sha256'] != sha):
+        if not entry or entry.get('verified') is not True or (sha is not None and entry.get('sha256') != sha):
             raise Stop(f'no verified NAS backup of {key}{" with sha256 " + sha[:16] if sha else ""}: run step backup first')
-        self.log(f'  ok    verified NAS backup of {key}: {entry["file"]} sha256 {entry["sha256"][:16]}')
+        name, file, digest = self.state.get('backup_name'), entry.get('file'), entry.get('sha256')
+        if not all(isinstance(n, str) and n not in ('', '.', '..') and Path(n).name == n for n in (name, file)):
+            raise Stop(f'invalid NAS backup location for {key}')
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise Stop(f'invalid NAS backup hash for {key}')
+        path = self.backup_root() / name / file
+        try:
+            valid = path.is_file() and path.stat().st_size == entry.get('bytes') and self.sha_nocache(path) == digest
+        except OSError as exc:
+            raise Stop(f'cannot read the verified NAS backup of {key}') from exc
+        self.need(valid, f'NAS backup of {key}: {file} still matches the verified size and SHA-256 {digest[:16]}')
         return entry
 
     # -- tablet --------------------------------------------------------------------------------------------------------
@@ -732,9 +744,10 @@ class Session:
         entry = self.state.get('backups', {}).get(key)
         if entry and entry.get('verified'):
             if entry['sha256'] == want:
-                self.log(f'  ok    already backed up and verified (sha256 {want[:16]})')
+                self.require_backup(key, want)
                 return want
             if self.written_by_install(key):
+                self.require_backup(key)
                 self.log(f'  info  {key} was written by this install since its backup; the verified backup of before '
                          f'({entry["sha256"][:16]}) stays the rollback source')
                 return entry['sha256']
@@ -760,7 +773,13 @@ class Session:
         nas, _ = self.nas()
         source = (self.dir / entry['file']) if self.execute and entry.get('local') else (nas / entry['file'] if nas else None)
         if self.execute:
-            self.need(self.sha_nocache(source) == entry['sha256'], f'{key}: the backup still hashes to {entry["sha256"][:16]}')
+            skip, count, saved_bs = (entry.get(field) for field in ('skip', 'count', 'bs'))
+            self.need(all(type(x) is int for x in (skip, count, saved_bs, seek, bs)) and
+                      skip >= 0 and count > 0 and saved_bs > 0 and seek >= 0 and bs > 0 and
+                      skip * saved_bs == seek * bs and entry['bytes'] == count * saved_bs and entry['bytes'] % bs == 0,
+                      f'{key}: restore region matches the verified backup geometry')
+            if entry.get('local'):
+                self.need(self.sha_nocache(source) == entry['sha256'], f'{key}: the local copy still hashes to {entry["sha256"][:16]}')
         self.serve({f'{key}.img': source or Path(f'{key}.img')})
         if self.write(f'backup {key} -> /dev/{dev} at block {seek} of {bs} bytes'):
             self.job(f'restore-{key}', 'restore', f'{key}.img', dev, seek, bs, self.a.http_port, timeout=4 * 3600)
@@ -1512,35 +1531,67 @@ def backup_step(s):
 def gpt_step(s):
     """The new tables (out/persistent/gpt-head.bin, gpt-tail.bin; gpt-diff.txt): linux_rootfs ends at 71527423, partition 37 esp
     at 71527424-71789567. Each copy read back; then the kernel rereads the table, sgdisk verifies it, sysfs shows both."""
-    map_nodes(s)
+    mapped = map_nodes(s)
     lun0 = s.nodes['lun0']
-    if s.execute and s.state.get('gpt_state') == 'new':
-        s.log('  info  the GPT is already the new one')
-        return
-    s.require_backup('lun0-gpt-primary', s.state.get('gpt_head') if s.execute else None)
-    s.require_backup('lun0-gpt-backup', s.state.get('gpt_tail') if s.execute else None)
     head, tail = s.gpt['gpt-head.bin']['sha256'], s.gpt['gpt-tail.bin']['sha256']
-    s.fetch('gpt-tail.bin', OUT / 'gpt-tail.bin', tail)
-    s.fetch('gpt-head.bin', OUT / 'gpt-head.bin', head)
-    if s.write(f'gpt-tail.bin -> /dev/{lun0} LBA {TAIL_LBA} (backup GPT)'):
-        s.t('write', 'gpt-tail.bin', lun0, TAIL_LBA, B)
-    got = s.region_sha(lun0, TAIL_LBA, 5)
-    s.need(got == tail if s.execute else None, f'backup GPT read back {got} = {tail[:16]}')
-    if s.write(f'gpt-head.bin -> /dev/{lun0} LBA 0 (protective MBR + primary GPT)'):
-        s.t('write', 'gpt-head.bin', lun0, 0, B)
-    got = s.region_sha(lun0, 0, 6)
-    s.need(got == head if s.execute else None, f'primary GPT read back {got} = {head[:16]}')
+    already_written = False
     if s.execute:
-        s.save(gpt_state='new')
+        s.need(bool(mapped) and mapped.get('lun0_block_size') == str(B) and mapped.get('lun0_bytes') == str(LUN0_BYTES) and
+               mapped.get('mounted') == '0', 'LUN 0 is unmounted and has the expected geometry')
+        now_head = s.region_sha(lun0, 0, 6)
+        now_tail = s.region_sha(lun0, TAIL_LBA, 5)
+        already_written = (now_head, now_tail) == (head, tail)
+        if already_written and s.state.get('gpt_state') == 'new':
+            s.log('  info  the GPT is already the new one')
+            return
+        s.need(already_written or (now_head == common.GPT_PRIMARY_SHA256 and now_tail in (common.GPT_BACKUP_SHA256, tail)),
+               'live GPT is the known original, the complete update, or the original primary with the new backup copy')
+        validate_gpt_update(s, head, tail)
+    else:
+        s.require_backup('lun0-gpt-primary')
+        s.require_backup('lun0-gpt-backup')
+    if not already_written:
+        s.fetch('gpt-tail.bin', OUT / 'gpt-tail.bin', tail)
+        s.fetch('gpt-head.bin', OUT / 'gpt-head.bin', head)
+        if s.write(f'gpt-tail.bin -> /dev/{lun0} LBA {TAIL_LBA} (backup GPT)'):
+            s.t('write', 'gpt-tail.bin', lun0, TAIL_LBA, B)
+        got = s.region_sha(lun0, TAIL_LBA, 5)
+        s.need(got == tail if s.execute else None, f'backup GPT read back {got} = {tail[:16]}')
+        if s.write(f'gpt-head.bin -> /dev/{lun0} LBA 0 (protective MBR + primary GPT)'):
+            s.t('write', 'gpt-head.bin', lun0, 0, B)
+        got = s.region_sha(lun0, 0, 6)
+        s.need(got == head if s.execute else None, f'primary GPT read back {got} = {head[:16]}')
     s.t('rereadpt', lun0)
     v = s.shell(f'sgdisk -v /dev/{lun0}')
     s.need('No problems found' in v if v is not None else None, 'sgdisk -v: No problems found')
     s.shell(f'sgdisk -p /dev/{lun0} | tail -4')
     r = map_nodes(s)
+    s.need(bool(r) if s.execute else None, 'the kernel reports the remapped partitions')
     if r:
         s.need(r['linux_rootfs'].split()[1:] == [str(common.ROOTFS_FIRST * 8), str((common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1) * 8)],
                f'linux_rootfs now {r["linux_rootfs"]}')
         s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp {r["esp"]}')
+    if s.execute:
+        s.save(gpt_state='new', gpt_head=head, gpt_tail=tail)
+
+
+def validate_gpt_update(s, head, tail):
+    primary = s.require_backup('lun0-gpt-primary', common.GPT_PRIMARY_SHA256)
+    backup = s.require_backup('lun0-gpt-backup', common.GPT_BACKUP_SHA256)
+    nas = s.backup_root() / s.state['backup_name']
+    spec = importlib.util.spec_from_file_location('build_gpt', Path(__file__).with_name('build-gpt.py'))
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    try:
+        guid = uuid.UUID(s.gpt['esp_guid'])
+        expected_head, expected_tail, *_ = builder.build_tables((nas / primary['file']).read_bytes(),
+                                                                (nas / backup['file']).read_bytes(), guid)
+    except (KeyError, ValueError, OSError, SystemExit) as exc:
+        raise Stop(f'cannot derive the safe GPT update from the verified backups: {exc}') from exc
+    for name, data, digest in (('gpt-head.bin', expected_head, head), ('gpt-tail.bin', expected_tail, tail)):
+        path = OUT / name
+        s.need(hashlib.sha256(data).hexdigest() == digest and path.is_file() and path.stat().st_size == len(data) and
+               path.read_bytes() == data, f'{name} matches the permitted offline GPT update')
 
 
 @rollback('gpt')
@@ -1633,8 +1684,8 @@ def write_esp(s, image_name):
     if not record:
         raise Stop(f'{image_name}: no build record in out/persistent (tooling/persist/build-esp.py)')
     refuse_placeholder_esp(record)
-    lun0 = s.nodes['lun0']
     r = map_nodes(s)
+    lun0 = s.nodes['lun0']
     if r:
         s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp is {r["esp"]}')
     esp = s.nodes.get('esp') or 'sda37'
@@ -1659,7 +1710,10 @@ def write_esp(s, image_name):
         s.pair(s.tablet_boot_a(), record, f'{record["image"]} asks for {window >> 20} MiB')
     else:
         s.log(f'  info  {record["image"]}: RAM window {window >> 20 if window else "-"} MiB, which every DarwinBoot takes')
-    s.fetch(record['image'], OUT / record['image'], record['sha256'])
+    image = OUT / record['image']
+    if s.execute:
+        s.need(image.is_file() and image.stat().st_size == common.ESP_BLOCKS * B, 'ESP image fits the exact write region')
+    s.fetch(record['image'], image, record['sha256'])
     if s.write(f'{record["image"]} (default {record["default"]}, profile {record.get("profile")}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
         s.job('esp-write', 'write', record['image'], esp, 0, MiB, timeout=1800)
     got = s.region_sha(esp, 0, 1024, MiB, name='esp-check')
@@ -1727,7 +1781,7 @@ def esp_delta(s):
             s.save(backups=backups)
             s.write_manifest(nas, backups)
         else:
-            s.log(f'  ok    the backup set holds {old_name} already (sha256 {old["sha256"][:16]})')
+            s.require_backup('linux_rootfs-tail-esp', old['sha256'])
     else:
         s.log(f'  check {old_name} stored in the backup set as linux_rootfs-tail-esp (re-read without cache = its sha256)')
     runs = []

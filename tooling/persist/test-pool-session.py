@@ -29,7 +29,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -89,7 +88,7 @@ def verify_pool(base_img, pool_img, uuids, entry='macos-27.3', pool_entry='macos
     b, p = fb['files'], fp['files']
     root = 'EFI/UniXNU/'
     toml = root + 'unixnu.toml'
-    cb, cp = tomllib.loads(b[toml].decode()), tomllib.loads(p[toml].decode())
+    cb, cp = common.toml_loads(b[toml].decode()), common.toml_loads(p[toml].decode())
     e = next(x for x in cb['entry'] if x['id'] == entry)
     kc, pk = root + e['path'], root + 'Payloads/k273p/kernel.macho'
     if set(p) != set(b) | {pk, pk + '.adt', pk + '.trustcache'}:
@@ -341,7 +340,7 @@ def inventory(path, os_sha, sys_sha, **over):
 DISK_BOOT = r'''#!/usr/bin/env python3
 """The fake disk boot: the default entry of the ESP on the fake tablet decides which volumes / runs on (its ADT's root-matching and
 owner-systemos-uuid); a volume the mock does not have = no root (exit 1, as the boot guard's reset into ABL)."""
-import os, re, sys, tempfile, tomllib
+import os, re, sys, tempfile
 sys.path.insert(0, {persist!r})
 import common
 B = common.LBA
@@ -352,7 +351,7 @@ with open(os.path.join(os.environ['FAKE_ROOT'], 'lun0.img'), 'rb') as f:
 with tempfile.NamedTemporaryFile() as t:
     t.write(region); t.flush()
     files = common.fat32_read(t.name)['files']
-cfg = tomllib.loads(files['EFI/UniXNU/unixnu.toml'].decode())
+cfg = common.toml_loads(files['EFI/UniXNU/unixnu.toml'].decode())
 entry = next(e for e in cfg['entry'] if e['id'] == cfg['boot']['default'])
 adt = files['EFI/UniXNU/' + entry['path'] + '.adt']
 root = re.search(rb'<key>UUID</key><string>([0-9A-F-]{{36}})</string>', adt).group(1).decode()

@@ -16,6 +16,15 @@ from pathlib import Path
 DEVICE = Path(__file__).resolve().parents[2]
 BACKUP = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/CRITICAL-BACKUP'
 
+
+def toml_loads(text):
+    """Parse a boot menu. Python 3.9 and 3.10 use the tomli backport."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    return tomllib.loads(text)
+
 # LUN 0 (4096-byte LBAs), CRITICAL-BACKUP/gpt-after.json = new-primary.bin / new-backup.bin (the tables on the tablet since
 # 2026-11-08). Entry indexes are 0-based (index 34 is partition 35).
 LBA = 4096

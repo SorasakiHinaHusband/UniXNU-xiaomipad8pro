@@ -232,8 +232,7 @@ def test_builder(tmp):
     check(set(files) == set(want) | {'EFI/UniXNU/unixnu.toml'}, f'nothing else: no 27.0.1 payload, no unpinned firmware ({sorted(files)})')
     check(sorted(rec['dropped']) == sorted(p for p in base['files'] if p not in want and p != 'EFI/UniXNU/unixnu.toml'),
           'the record lists the dropped files')
-    import tomllib
-    menu = tomllib.loads(files['EFI/UniXNU/unixnu.toml'].decode())
+    menu = common.toml_loads(files['EFI/UniXNU/unixnu.toml'].decode())
     ids = [e['id'] for e in menu['entry']]
     k = next(e for e in menu['entry'] if e['id'] == 'macos-27.3')
     fb = next(e for e in menu['entry'] if e['id'] == 'fastboot')
