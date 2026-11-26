@@ -148,13 +148,16 @@ static uint32_t g_battery_uv = 4012000;
 static uint32_t now_ms(void) {return (uint32_t)(w.now_us / 1000u);}
 static uint32_t g_play_ahead_ms;   // duplex-age1: the producer stamps its sound this many ms after the worker's clock
 
-/* Optional adapters for the standalone duplex suite. The same DSP and amp
- * simulator also runs the broader live_host scenarios. */
+/* Optional adapters for the standalone stress suites. */
 static void (*fixture_engine)(void);
 static void (*fixture_capture)(int16_t *, uint32_t);
 static void (*fixture_write)(void);
 static void (*fixture_played)(uint64_t, int32_t);
 static int (*fixture_send)(const uint8_t *, uint32_t);
+static void (*fixture_receive)(const uint8_t *, uint32_t);
+static void (*fixture_poll)(void);
+static void (*fixture_live_data)(unsigned, uint32_t *);
+static void (*fixture_session_setup)(AudioSessionConfig *);
 
 static void violate(const char *what)
 {
@@ -616,7 +619,8 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         else {
             if (le32(o) != SPK_IID_SP_RX || le32(o + 4) != SPK_PID_LIVE || le32(o + 8) != SPK_LIVE_BYTES) violate("a live-data GET of another header");
             for (unsigned c = 0; g_live_header_bad != EmptyLiveData && c < 4; ++c) {
-                const uint32_t words[6] = {g_re25_q12[c] * 102u / 100u, 31u + c, 0, (800u + 10u * c) * 256u, 3u + c, 0};
+                uint32_t words[6] = {g_re25_q12[c] * 102u / 100u, 31u + c, 0, (800u + 10u * c) * 256u, 3u + c, 0};
+                if (fixture_live_data) fixture_live_data(c, words);
                 for (unsigned k = 0; k < 6; ++k) for (unsigned b = 0; b < 4; ++b) o[16 + 24 * c + 4 * k + b] = (uint8_t)(words[k] >> (8 * b));
             }
             if (g_live_header_bad == BadLiveHeader) o[4] ^= 1;
@@ -758,12 +762,14 @@ static void deliver(int to_live)
             if (a.n >= 24 && le32(a.b + 20) == AR_OP_WRITE_DONE) {w.write_dones++; if (w.str_started) w.stream_dones++;}
             if (a.read_slot <= -2) play_slot((unsigned)(-2 - a.read_slot), a.due_us);
             if (a.read_slot >= 0) {fill_capture((unsigned)a.read_slot, le32(a.b + 40), 0); w.read_dones++;}
-            if (to_live) audio_live_receive(&live, a.b, a.n, now_ms());
+            if (to_live && fixture_receive) fixture_receive(a.b, a.n);
+            else if (to_live) audio_live_receive(&live, a.b, a.n, now_ms());
             else audio_session_receive(&session, a.b, a.n, now_ms());
             continue;
         }
         ++i;
     }
+    if (to_live && fixture_poll) fixture_poll();
 }
 
 static void (*g_setup)(AudioLiveConfig *);
@@ -785,6 +791,7 @@ static void run(const struct Scenario *sc)
     AudioSessionConfig c;
     audio_session_defaults(&c);
     c.level = 6; c.dsp = 1; c.ports = sc->ports; c.preset_any = 1; c.mic = 1; c.silence_ms = 300; c.keep = 1;
+    if (fixture_session_setup) fixture_session_setup(&c);
     AudioSessionOps ops;
     memset(&ops, 0, sizeof ops);
     ops.log = log_line; ops.send = dsp_send; ops.lpass_read = lpass_read;
