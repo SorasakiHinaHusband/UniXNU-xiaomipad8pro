@@ -45,7 +45,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 
 - **Display pipeline and refresh.** [M2 cache clean](dpu-m2-analysis.md), [M3 modes](dpu-m3.md), [144 Hz qualification](dpu-m3-144.md),
   [144 Hz bandwidth and MM0 vote](dpu-m3-bandwidth.md), [DPU clock and DRV-2 readback](dpu-clkread.md), [120 Hz composition throughput](m120-throughput.md) and
-  [drawable presentation feedback](presented-time.md).
+  [drawable presentation feedback](presented-time.md); [27.3 120 Hz swap / frame-info static analysis](m120-swap-frameinfo-analysis.md) (both fix-image gates HOLD).
 - **Display colour and power.** [M4 Night Shift PCC](dpu-m4-pcc-colour.md) and [M5 panel sleep and wake](dpu-m5-analysis.md).
 - **Storage and memory.** [Data concurrency and durability](data-store-m4-m5.md), [APFS write-back eligibility](m5-apfs.md),
   [RAM16G GPU memory](ram-extra.md), [GPU tier workload and crash analysis](ram16g-tier-crash.md) and [RAM16G ownership proof](ram16g-owners.md).
