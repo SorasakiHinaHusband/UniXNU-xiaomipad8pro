@@ -13,16 +13,18 @@ _Static_assert(MICNS_MAX_READ + MICNS_RESERVE + MICNS_EXCESS + 2u * MICNS_BLOCK 
 static uint32_t fifo_fill(const MicNs *m) {return (uint32_t)(m->head - m->tail);}
 static uint64_t now(const MicNs *m) {return m->ticks ? m->ticks() : 0;}
 
+static void prime_state(DenoiseState *st)
+{
+    float in[MICNS_BLOCK] = {0}, out[MICNS_BLOCK];
+    (void)rnnoise_process_frame(st, out, in);
+}
+
 static void new_state(MicNs *m)
 {
     if (m->st) {rnnoise_destroy(m->st); m->st = 0;}
     if (m->bypass) return;
     m->st = rnnoise_create(0);
-    if (m->st) {   /* Prime RNNoise with one silent frame before the first tap samples. */
-        float in[MICNS_BLOCK], out[MICNS_BLOCK];
-        memset(in, 0, sizeof in);
-        (void)rnnoise_process_frame(m->st, out, in);
-    }
+    if (m->st) prime_state(m->st);
 }
 
 int micns_init(MicNs *m, const PianoTapHeader *tap, int bypass, uint64_t (*ticks)(void))
@@ -72,6 +74,11 @@ uint32_t micns_fill(const MicNs *m)
 
 static void anchor(MicNs *m, uint64_t written)
 {
+    if (m->anchored && m->st) {
+        /* A discontinuity discards the denoiser's history as well as the queued PCM. */
+        rnnoise_reset(m->st);
+        prime_state(m->st);
+    }
     m->cursor = written;
     m->run = __atomic_load_n(&m->tap->run, __ATOMIC_ACQUIRE);
     m->anchored = 1;

@@ -329,6 +329,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cl
         const kern_return_t kr = tapOpen();
         if (kr != KERN_SUCCESS) r = kAudioHardwareNotRunningError;
         else {
+            gCore.bypass = MICNS_BYPASS;
             if (micns_start(&gCore, gTap)) os_log_error(gLog, "PianoMicNS: start: RNNoise state NOT allocated: passthrough");
             gProducedValid = 0; gProducedStart = gProducedEnd = 0;
             memset(gRing, 0, sizeof gRing);

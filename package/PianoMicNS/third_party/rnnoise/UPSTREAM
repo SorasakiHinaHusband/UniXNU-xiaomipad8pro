@@ -9,6 +9,7 @@ Taken from upstream (original sha256 below): COPYING, AUTHORS, README, include/r
 (the model's weights as the project publishes them), pitch.c, kiss_fft.c, celt_lpc.c and their headers. Not taken: rnn_reader.c
 (models from a file), the training tools (training/, src/rnn_train.py, src/compile.sh), the autotools files, examples/, doc/.
 Local changes in denoise.c and kiss_fft.c propagate allocation failure during setup so the driver can fall back to passthrough.
+denoise.c and rnnoise.h also provide an allocation-free reset for a discontinuity in the tap.
   e2f59ff41d9d03adc3dcf3deff170f8c8cf4a6eb4a9b174762a7656d23200ffa  COPYING
   348b0956050157b718a11e1464633619b709b19b45172f336cef2205aa0cec63  AUTHORS
   ab97c68d2b59aeca4ccc7df2be1a4d2af03ebaa9ec5e51aca93b8d12233069db  README
