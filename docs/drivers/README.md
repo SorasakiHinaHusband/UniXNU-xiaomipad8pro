@@ -17,6 +17,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 | 2 | [ufs.md](ufs.md) | `NativeUfs` for `qcom,sm8750-ufshc` | M3: root and Data on disk | `ShengUfs` |
 | 3 | [touch.md](touch.md) | `PianoTouch`: NT36532E over GENI SPI, contact tracking, gestures and palm rejection | Login by touch | Project-SunUEFI touch producer and NativeGeniSpi |
 | 3a | [keyboard.md](keyboard.md) | `PianoKeyboard`: keyboard and trackpad via Nanosic WN8030 over software I2C, plus the folio hall sensor | Login with the keyboard cover | UniXNU-sheng `Wn8030` and `KeyboardCover` |
+| 3b | [stylus.md](stylus.md) | Xiaomi Focus Pen / M80p: static analysis of PianoTouch, PianoBluetooth and PianoPower paths | HOLD: daily items, Goal 11 BT pairing and owner-attended pen hardware | Ubuntu kernel `7f8d6bedde479a01f4a05d6d0581b43c7fd20a01` |
 | 4 | [charging.md](charging.md) | `PianoPower`: fuel gauges, the charger PMIC and DSP charger firmware over PAS, GLINK and MCA | Battery reporting and charging | UniXNU-sheng ADSP/GLINK/QRTR, Adreno830 `Sm8750Scm`, Project-SunUEFI PMIH010x |
 | 5 | [gpu.md](gpu.md) | `PianoA830`: k27 native Adreno830 KMD, piano board glue and AGXAccelerator for the Metal plugin | M5: GPU-composited desktop | `Adreno830`, `Sm8750Platform` and `AdrenoMetal` |
 | 5a | [gpu-userspace.md](gpu-userspace.md) | `NativeAdrenoMetal.bundle`: the Metal plugin with Turnip on Adreno830 ABI v2 | M5: GPU userspace | VM-era plugin and Mesa pin (`tooling/metal/UPSTREAM`) |
