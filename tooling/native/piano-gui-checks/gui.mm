@@ -67,7 +67,8 @@ static NSArray<NSString *> *labels(id node)
 static BOOL labeled(id node, NSString *name)
 {
     for (NSString *label in labels(node))
-        if ([label isEqualToString:name] || [label hasPrefix:[name stringByAppendingString:@", "]])
+        if ([label isEqualToString:name] || [label hasPrefix:[name stringByAppendingString:@", "]] ||
+            [label hasPrefix:[name stringByAppendingString:@": "]])
             return YES;
     return NO;
 }
@@ -123,9 +124,10 @@ static id menuExtra(id app, BOOL wifi)
     }
     [roots addObjectsFromArray:children(app, kAXChildrenAttribute)];
     return only(tree(roots), ^BOOL(id node) {
-        return role(node, @"AXMenuBarItem") &&
+        return (role(node, @"AXMenuBarItem") || role(node, @"AXMenuButton")) &&
             (identified(node, wifi ? @".wifi" : @".controlcenter") ||
-             labeled(node, wifi ? @"Wi-Fi" : @"Control Center"));
+             labeled(node, wifi ? @"Wi-Fi" : @"Control Center") ||
+             (wifi && (labeled(node, @"WiFi") || labeled(node, @"Wi‑Fi"))));
     });
 }
 
@@ -143,7 +145,8 @@ static id wifiSwitch(NSArray *nodes)
         return (role(node, @"AXCheckBox") || role(node, @"AXSwitch") ||
                 role(node, @"AXToggle") || role(node, @"AXButton")) &&
             hasPress(node) &&
-            (labeled(node, @"Wi-Fi") || identified(node, @".wifi.toggle")) &&
+            (labeled(node, @"Wi-Fi") || labeled(node, @"Wi‑Fi") ||
+             identified(node, @".wifi.toggle")) &&
             [attribute(node, kAXValueAttribute) isKindOfClass:NSNumber.class];
     });
 }
@@ -197,12 +200,9 @@ static NSString *readCommand(const char *command)
     return pclose(pipe) ? nil : [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding];
 }
 
-static BOOL dhcpLease()
+static BOOL hasDhcpLease(NSString *address, NSString *packet)
 {
-    NSString *address = [readCommand("/usr/sbin/ipconfig getifaddr en0 2>/dev/null")
-        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!address.length || [address hasPrefix:@"169.254."] || [address hasPrefix:@"0."]) return NO;
-    NSString *packet = readCommand("/usr/sbin/ipconfig getpacket en0 2>/dev/null");
     if (!packet) return NO;
     NSString *escaped = [NSRegularExpression escapedPatternForString:address];
     NSString *yiaddr = [NSString stringWithFormat:@"(?m)^\\s*yiaddr\\s*=\\s*%@$", escaped];
@@ -225,14 +225,20 @@ static NSDictionary *wifiState(NSData *target, BOOL checkLease)
     uint8_t ssid[32];
     length = sizeof ssid;
     BOOL associated = wifiGet(fd, a80211::kSsid, ssid, &length);
-    valid = valid && (associated ? length > 0 && length <= sizeof ssid : errno == ENOENT);
+    valid = valid && (associated ? length > 0 && length <= sizeof ssid :
+                      errno == ENOENT || (!power.state[0] && errno == EPWROFF));
     close(fd);
     if (!valid) return nil;
     BOOL matches = associated && length == target.length && !memcmp(ssid, target.bytes, length);
     NSString *state = readCommand("/sbin/ifconfig en0 2>/dev/null");
     if (!state) return nil;
     BOOL active = [state rangeOfString:@"(?m)^\\s*status: active$" options:NSRegularExpressionSearch].location != NSNotFound;
-    BOOL lease = checkLease && active && associated && dhcpLease();
+    BOOL lease = NO;
+    if (checkLease && active && associated) {
+        NSString *address = [readCommand("/usr/sbin/ipconfig getifaddr en0 2>/dev/null")
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        lease = hasDhcpLease(address, readCommand("/usr/sbin/ipconfig getpacket en0 2>/dev/null"));
+    }
     return @{@"power": @(power.state[0] != 0), @"associated": @(associated), @"target": @(matches),
              @"active": @(active), @"lease": @(lease), @"t": @(NSProcessInfo.processInfo.systemUptime)};
 }
@@ -244,7 +250,7 @@ static BOOL rowLabel(id node, NSString *name)
         [attribute(node, kAXValueAttribute) isEqual:name]) return YES;
     for (id text in children(node, kAXChildrenAttribute))
         if (role(text, @"AXStaticText") && [attribute(text, kAXValueAttribute) isEqual:name]) return YES;
-    return [attribute(node, kAXDescriptionAttribute) isEqual:name];
+    return [labels(node) containsObject:name];
 }
 
 static BOOL networkRow(id node)
@@ -254,10 +260,23 @@ static BOOL networkRow(id node)
         role(node, @"AXCheckBox") || role(node, @"AXRow") || role(node, @"AXRadioButton");
 }
 
+static NSString *rowName(id node)
+{
+    NSString *label = labels(node).firstObject;
+    if (label) return label;
+    for (id text in children(node, kAXChildrenAttribute)) {
+        id value = attribute(text, kAXValueAttribute);
+        if (role(text, @"AXStaticText") && [value isKindOfClass:NSString.class] && [value length])
+            return value;
+    }
+    return nil;
+}
+
 static NSArray *rows(NSArray *nodes, id toggle)
 {
     return matching(nodes, ^BOOL(id node) {
-        return ![node isEqual:toggle] && networkRow(node) && labels(node).count &&
+        return ![node isEqual:toggle] && networkRow(node) && rowName(node) &&
+            ![attribute(node, CFSTR("AXHidden")) boolValue] &&
             !labeled(node, @"Wi-Fi Settings") && !labeled(node, @"Other Networks") &&
             !labeled(node, @"Other…") && !labeled(node, @"Join Other Network");
     });
@@ -289,7 +308,7 @@ static int wifiUI(NSString *op, id app, NSData *ssid)
     NSArray *(^inventory)(void) = ^{ return rows(panel(app, extra), toggle); };
     if ([op isEqual:@"wifi-list"]) {
         NSMutableArray *names = [NSMutableArray array];
-        for (id row in inventory()) [names addObject:labels(row).firstObject];
+        for (id row in inventory()) [names addObject:rowName(row)];
         return emit(@{@"menu": @YES, @"rows": names});
     }
     id (^find)(void) = ^id { return only(inventory(), ^BOOL(id row) { return rowLabel(row, name); }); };
@@ -320,7 +339,8 @@ static NSDictionary *sliderGeometry(id slider)
     id value = attribute(slider, kAXValueAttribute);
     id min = attribute(slider, kAXMinValueAttribute);
     id max = attribute(slider, kAXMaxValueAttribute);
-    if (![value isKindOfClass:NSNumber.class]) return nil;
+    if (![value isKindOfClass:NSNumber.class] || (min && ![min isKindOfClass:NSNumber.class]) ||
+        (max && ![max isKindOfClass:NSNumber.class])) return nil;
     // Apple's normalized AX sliders may omit their min and max attributes.
     double low = min ? [min doubleValue] : 0;
     double high = max ? [max doubleValue] : 1;
@@ -330,13 +350,16 @@ static NSDictionary *sliderGeometry(id slider)
     id position = attribute(slider, kAXPositionAttribute), size = attribute(slider, kAXSizeAttribute);
     CGPoint origin{};
     CGSize extent{};
-    if (!position || !size ||
+    if (!position || !size || CFGetTypeID((__bridge CFTypeRef)position) != AXValueGetTypeID() ||
+        CFGetTypeID((__bridge CFTypeRef)size) != AXValueGetTypeID() ||
         !AXValueGetValue((__bridge AXValueRef)position, kAXValueTypeCGPoint, &origin) ||
         !AXValueGetValue((__bridge AXValueRef)size, kAXValueTypeCGSize, &extent) ||
         extent.width < 60 || extent.height <= 0 || extent.height >= extent.width) return nil;
     return @{@"slider": @((current - low) / (high - low)), @"min": @(low), @"max": @(high),
              @"x": @(origin.x), @"y": @(origin.y), @"width": @(extent.width), @"height": @(extent.height)};
 }
+
+static NSDictionary *brightness();
 
 static int displayUI(NSString *op, id app, double level)
 {
@@ -357,6 +380,11 @@ static int displayUI(NSString *op, id app, double level)
     if (!slider) return fail(@"display-brightness-slider");
     NSDictionary *geometry = sliderGeometry(slider);
     if (!geometry) return fail(@"display-slider-geometry");
+    if ([op isEqual:@"display-sample"]) {
+        NSDictionary *core = brightness();
+        if (!core) return fail(@"corebrightness-readback");
+        return emit(@{@"slider": geometry[@"slider"], @"level": core[@"level"], @"nits": core[@"nits"]});
+    }
     if (![op isEqual:@"display-set"]) return emit(geometry);
     if (!isfinite(level) || level < 0 || level > 1) return fail(@"display-target");
     Boolean settable = false;
@@ -368,31 +396,31 @@ static int displayUI(NSString *op, id app, double level)
     return emit(@{@"action": op, @"status": @(status)}, status ? 2 : 0);
 }
 
-static int brightness()
+static NSDictionary *brightness()
 {
     CGDirectDisplayID displays[32], builtin = 0;
     uint32_t count = 0;
-    if (CGGetOnlineDisplayList(32, displays, &count)) return fail(@"display-list");
+    if (CGGetOnlineDisplayList(32, displays, &count)) return nil;
     for (uint32_t i = 0; i < count; i++) {
         if (!CGDisplayIsBuiltin(displays[i])) continue;
-        if (builtin) return fail(@"multiple-builtin-displays");
+        if (builtin) return nil;
         builtin = displays[i];
     }
-    if (!builtin) return fail(@"builtin-display");
+    if (!builtin) return nil;
     void *ds = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/Versions/A/DisplayServices",
                       RTLD_LOCAL | RTLD_NOW);
     auto get = reinterpret_cast<int32_t (*)(CGDirectDisplayID, float *)>(ds ? dlsym(ds, "DisplayServicesGetBrightness") : nullptr);
     float level = NAN;
     if (!get || get(builtin, &level) || !isfinite(level) || level < 0 || level > 1)
-        return fail(@"display-services-read");
+        return nil;
     NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreBrightness.framework"];
     Class cls = [bundle load] ? NSClassFromString(@"DisplayServicesClient") : Nil;
     id<BrightnessReader> client = [[cls alloc] init];
-    if (![(id)client respondsToSelector:@selector(copyPropertyForKey:)]) return fail(@"corebrightness-client");
+    if (![(id)client respondsToSelector:@selector(copyPropertyForKey:)]) return nil;
     id nits = [client copyPropertyForKey:@"DisplayNitsKey"];
     if (![nits isKindOfClass:NSNumber.class] || !isfinite([nits doubleValue]) || [nits doubleValue] <= 0)
-        return fail(@"corebrightness-nits");
-    return emit(@{@"level": @(level), @"nits": nits});
+        return nil;
+    return @{@"level": @(level), @"nits": nits};
 }
 
 int main(int argc, const char *argv[])
@@ -401,6 +429,11 @@ int main(int argc, const char *argv[])
         alarm(32);
         if (argc < 2) return fail(@"usage");
         NSString *op = @(argv[1]);
+        if ([op isEqual:@"fixture-lease"] && argc == 4) {
+            NSString *packet = [NSString stringWithContentsOfFile:@(argv[3]) encoding:NSUTF8StringEncoding error:nil];
+            BOOL lease = hasDhcpLease(@(argv[2]), packet);
+            return emit(@{@"lease": @(lease)}, lease ? 0 : 2);
+        }
         if ([op isEqual:@"wifi-state"] && argc == 3) {
             NSDictionary *state = wifiState(ssidFile(argv[2]), YES);
             return state ? emit(state) : fail(@"wifi-driver-state");
@@ -411,7 +444,6 @@ int main(int argc, const char *argv[])
             [wifi disassociate];
             return emit(@{@"action": op, @"status": @0});
         }
-        if ([op isEqual:@"brightness"]) return brightness();
         if ([op isEqual:@"cursor"]) {
             CGEventRef event = CGEventCreate(nullptr);
             if (!event) return fail(@"cursor");
@@ -428,7 +460,7 @@ int main(int argc, const char *argv[])
             return wifiUI(op, app, nil);
         if ([@[@"wifi-find", @"wifi-click"] containsObject:op] && argc == 3)
             return wifiUI(op, app, ssidFile(argv[2]));
-        if ([@[@"display-open", @"display-read"] containsObject:op] && argc == 2)
+        if ([@[@"display-open", @"display-read", @"display-sample"] containsObject:op] && argc == 2)
             return displayUI(op, app, NAN);
         if ([op isEqual:@"display-set"] && argc == 3) {
             char *end = nullptr;

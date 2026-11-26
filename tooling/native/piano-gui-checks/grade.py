@@ -66,7 +66,7 @@ def visible_change(low, high, restored, original):
 
 
 def wifi_ready(state):
-    return all(state.get(key) is True for key in ("power", "target", "active", "lease"))
+    return all(state.get(key) is True for key in ("power", "associated", "target", "active", "lease"))
 
 
 def wifi_off(state):
@@ -76,6 +76,7 @@ def wifi_off(state):
 
 def wifi_transition(before, samples, started, deadline=30):
     """A complete associated sample must follow a known disconnected baseline."""
-    return before.get("target") is False and any(
+    baseline_t = before.get("t")
+    return type(baseline_t) in (int, float) and baseline_t <= started and before.get("target") is False and any(
         started <= ts <= started + deadline and wifi_ready(sample) for ts, sample in samples
     )
