@@ -965,8 +965,7 @@ def entries_using_rootfs(s, record):
             raise Stop(f'{image.name}: its unixnu.toml is not its record\'s')
     elif s.execute:
         raise Stop(f'{record["image"]} is not in {OUT}: its menu cannot be read from the bytes on the tablet')
-    import tomllib   # Python 3.11 (here only: the other steps run on older ones too)
-    entries = tomllib.loads(text).get('entry', []) if text else []
+    entries = common.toml_loads(text).get('entry', []) if text else []
     return {e['id']: why for e in entries if (why := common.entry_uses_rootfs(e))}
 
 

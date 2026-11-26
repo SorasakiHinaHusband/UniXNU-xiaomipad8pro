@@ -22,7 +22,10 @@ def toml_loads(text):
     try:
         import tomllib
     except ModuleNotFoundError:
-        import tomli as tomllib
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            from pip._vendor import tomli as tomllib
     return tomllib.loads(text)
 
 # LUN 0 (4096-byte LBAs), CRITICAL-BACKUP/gpt-after.json = new-primary.bin / new-backup.bin (the tables on the tablet since

@@ -30,16 +30,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        from pip._vendor import tomli as tomllib
-    # The shared ESP builder also imports the TOML parser.
-    sys.modules.setdefault('tomllib', tomllib)
-
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
 import common  # noqa: E402
@@ -134,7 +124,7 @@ def build(a, base_json, base, base_img, image):
         text = toml_path.read_text()
         if text != base['unixnu_toml']:
             raise SystemExit(f'{base_img}: unixnu.toml differs from its record')
-        config = tomllib.loads(text)
+        config = common.toml_loads(text)
         entries = config['entry']
         ids = [e['id'] for e in entries]
         if a.id in ids:
@@ -173,7 +163,7 @@ def build(a, base_json, base, base_img, image):
         if text.count(marker) != 1:
             raise SystemExit(f'{base_img}: unixnu.toml has no single fastboot entry to insert before')
         new_text = text.replace(marker, '[[entry]]\n' + entry_text(entry) + marker)
-        parsed = tomllib.loads(new_text)
+        parsed = common.toml_loads(new_text)
         if [e for e in parsed['entry'] if e['id'] != a.id] != entries or parsed['boot'] != config['boot']:
             raise SystemExit('the base\'s entries or boot settings changed: refused')
         toml_path.write_text(new_text)

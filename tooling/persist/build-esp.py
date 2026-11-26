@@ -80,11 +80,6 @@ import tempfile
 import time
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    import tomli as tomllib
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 import firmware  # noqa: E402

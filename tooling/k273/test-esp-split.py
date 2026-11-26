@@ -28,16 +28,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        from pip._vendor import tomli as tomllib
-    # The shared ESP builder also imports the TOML parser.
-    sys.modules.setdefault('tomllib', tomllib)
-
 HERE = Path(__file__).resolve().parent
 D = HERE.parents[1]
 sys.path.insert(0, str(D / 'tooling/persist'))
@@ -236,7 +226,7 @@ def main():
                   [x for x in merged.split() if x.split('=', 1)[0] not in ('piano-gpu-delay', 'cs-native4k-skip')] +
                   ['piano-gpu-delay=0', 'cs-native4k-skip=1'])),
               'the image\'s ADT carries the edited tail; full_bytes is the edited, reassembled line')
-        menu = tomllib.loads(common.fat32_read(out / 'esp-v6.img')['files'][TOML].decode())
+        menu = common.toml_loads(common.fat32_read(out / 'esp-v6.img')['files'][TOML].decode())
         ids = [e['id'] for e in menu['entry']]
         diag = next(e for e in menu['entry'] if e['id'] == 'macos-27.3-diag')
         fb = next(e for e in menu['entry'] if e['id'] == 'fastboot')

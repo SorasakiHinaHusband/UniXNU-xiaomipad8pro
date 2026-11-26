@@ -24,16 +24,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        from pip._vendor import tomli as tomllib
-    # The shared ESP builder also imports the TOML parser.
-    sys.modules.setdefault('tomllib', tomllib)
-
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
 import common  # noqa: E402
@@ -163,7 +153,7 @@ def build(a, base, base_img, image, state, uuids, state_sha):
     text = files[TOML].decode()
     if text != base['unixnu_toml']:
         raise SystemExit(f'{base_img}: unixnu.toml differs from its record')
-    config = tomllib.loads(text)
+    config = common.toml_loads(text)
     if config['boot']['default'] != a.entry:
         raise SystemExit(f'{base_img}: its default is {config["boot"]["default"]}, not {a.entry}')
     entry = next((e for e in config['entry'] if e['id'] == a.entry), None)
@@ -192,7 +182,7 @@ def build(a, base, base_img, image, state, uuids, state_sha):
     new_text = (head.replace(default_line, f'default = "{a.pool_entry}"\n') +
                 f'# T-20 (tooling/k273/build-pool-esp.py): {a.pool_entry} = {a.entry} with System {uuids["os"]} and SystemOS '
                 f'{uuids["systemos"]} in the Data container; {a.entry} is the rollback\n' + block + '[[entry]]\n' + rest)
-    parsed = tomllib.loads(new_text)
+    parsed = common.toml_loads(new_text)
     if (parsed['boot']['default'] != a.pool_entry or parsed['entry'][0] != pool or parsed['entry'][1:] != config['entry'] or
             {k: v for k, v in parsed['boot'].items() if k != 'default'} != {k: v for k, v in config['boot'].items() if k != 'default'} or
             parsed.get('kits') != config.get('kits')):

@@ -46,16 +46,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        from pip._vendor import tomli as tomllib
-    # The shared ESP builder also imports the TOML parser.
-    sys.modules.setdefault('tomllib', tomllib)
-
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
 import common  # noqa: E402
@@ -185,7 +175,7 @@ def build(a, base_json, base, base_img, image):
     text = files[TOML].decode()
     if text != base['unixnu_toml']:
         raise SystemExit(f'{base_img}: unixnu.toml differs from its record')
-    config = tomllib.loads(text)
+    config = common.toml_loads(text)
     entry = next((e for e in config['entry'] if e['id'] == a.entry), None)
     if not entry or entry.get('type') != 'xnu':
         raise SystemExit(f'{base_img}: no xnu entry {a.entry} (entries: {[e["id"] for e in config["entry"]]})')
@@ -374,7 +364,7 @@ def build(a, base_json, base, base_img, image):
         boot_args.check_userland({e['id']: e['args'] for e in entries if e['id'] != 'fastboot'},
                                  adt.read_bytes(), kc, seed=a.seed, live=True)
         new_text = config_text(base['image'], config['boot']['timeout'], entries, store, seed)
-        parsed = tomllib.loads(new_text)
+        parsed = common.toml_loads(new_text)
         if parsed['boot']['default'] != a.entry or parsed['entry'][0] != (k_entry if (overrides or edits or a.drop_arg or split) else entry):
             raise SystemExit('the 27.3 entry changed in the new unixnu.toml: refused')
         rootfs = {e['id']: why for e in parsed['entry'] if (why := common.entry_uses_rootfs(e))}
@@ -430,7 +420,7 @@ def build(a, base_json, base, base_img, image):
         tails = boot_args.sets(new['files'].get(payload['adt'], b''))
         if tails.get(split['property']) != split['tail']:
             problems.append(f'{payload["adt"]}: /chosen/{split["property"]} is not the tail ({tails.get(split["property"])!r})')
-    back_config = tomllib.loads(new['files'].get(TOML, b'').decode())
+    back_config = common.toml_loads(new['files'].get(TOML, b'').decode())
     back_entry = next((e for e in back_config.get('entry', []) if e['id'] == a.entry), {})
     if back_entry.get('args') != line or back_entry != k_entry or back_config['boot']['default'] != a.entry:
         problems.append(f'the {a.entry} entry read back is not the base\'s (line {len(back_entry.get("args", ""))} bytes)')

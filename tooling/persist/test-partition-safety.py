@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import plistlib
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -26,6 +28,19 @@ def load(name):
 gpt = load('build-gpt')
 maint = load('maint-session')
 B = common.LBA
+
+
+class BootMenuCompatibility(unittest.TestCase):
+    def test_direct_esp_builder_starts(self):
+        builder = Path(__file__).with_name('build-esp.py')
+        result = subprocess.run([sys.executable, str(builder), '--help'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_maintenance_parses_the_standalone_boot_menu(self):
+        record = {'image': 'unused-boot-menu-fixture.img',
+                  'unixnu_toml': '[[entry]]\nid = "test"\ntype = "action"\naction = "reset"\n'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(maint, 'OUT', Path(tmp)):
+            self.assertEqual(maint.entries_using_rootfs(SimpleNamespace(execute=False), record), {})
 
 
 def sha(data):
