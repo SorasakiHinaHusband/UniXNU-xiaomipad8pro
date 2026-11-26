@@ -406,9 +406,11 @@ static IOLock *gSlotLock = nullptr;
 // Pool statistics (under gSlotLock): slots taken now, the most taken at once, takes that had to wait for a slot.
 static uint32_t gSlotsBusy = 0, gSlotsPeak = 0;
 static uint64_t gSlotWaits = 0;
-// With the pool empty, takers queue in arrival order and a freed slot goes straight to the oldest of them (no thread can be passed over).
-struct UfsSlotWaiter { UfsSlotWaiter *next; int slot; };
+// With the pool empty, takers queue in arrival order. On a one-slot host an eligible
+// queued Data read may pass the head at a command boundary, at most once per head.
+struct UfsSlotWaiter { UfsSlotWaiter *next; int slot; bool preferred, bypassed; };
 static UfsSlotWaiter *gSlotWaitHead = nullptr, *gSlotWaitTail = nullptr;
+static unsigned gSlotPreferred = 0;
 // Hybrid completion waits (as Linux's hybrid block polling): a wait polls for its first gSpinUs microseconds, then sleeps on the
 // completion interrupt. Short commands complete while polling; long ones leave the CPU after the budget.
 static uint32_t gSpinUs = 200;
@@ -429,7 +431,7 @@ static void hostSlotsInit (unsigned count, IOLock *lock)
 }
 
 // Returns the slot to use; *pooled says whether it must be given back.
-static UfsSlot hostSlotTake (bool *pooled)
+static UfsSlot hostSlotTake (bool *pooled, bool preferRead = false)
 {
   *pooled = false;
   if (gHostPanic) {
@@ -456,7 +458,8 @@ static UfsSlot hostSlotTake (bool *pooled)
     gSlotFree &= ~(1U << index);
   } else {
     ++gSlotWaits;
-    UfsSlotWaiter waiter = { nullptr, -1 };
+    UfsSlotWaiter waiter = { nullptr, -1, preferRead && gSlotCount == 1, false };
+    if (waiter.preferred) ++gSlotPreferred;
     if (gSlotWaitTail) gSlotWaitTail->next = &waiter; else gSlotWaitHead = &waiter;
     gSlotWaitTail = &waiter;
     while (waiter.slot < 0) IOLockSleep (gSlotLock, &waiter, THREAD_UNINT);
@@ -475,8 +478,19 @@ static void hostSlotGive (const UfsSlot &slot, bool pooled)
   IOLockLock (gSlotLock);
   --gSlotsBusy;
   if (UfsSlotWaiter *waiter = gSlotWaitHead) {
-    gSlotWaitHead = waiter->next;
-    if (!gSlotWaitHead) gSlotWaitTail = nullptr;
+    UfsSlotWaiter *previous = nullptr;
+    if (gSlotPreferred && !waiter->preferred && !waiter->bypassed) {
+      for (auto *it = waiter; it->next; it = it->next) {
+        if (!it->next->preferred) continue;
+        waiter->bypassed = true;
+        previous = it;
+        waiter = it->next;
+        break;
+      }
+    }
+    if (previous) previous->next = waiter->next; else gSlotWaitHead = waiter->next;
+    if (gSlotWaitTail == waiter) gSlotWaitTail = previous;
+    if (waiter->preferred) --gSlotPreferred;
     waiter->slot = static_cast<int> (slot.index);
     IOLockWakeup (gSlotLock, waiter, true);
   } else {
@@ -517,7 +531,7 @@ static unsigned hostBuildPrds (const void *buffer, uint64_t bytes, UfsPrd *prd)
 
 // Read `blocks` 4096-byte blocks of LUN `lun` starting at `lba` into dst: one command of up to kXferMax straight into dst when it
 // qualifies for zero copy, else commands of up to kDataMax through the slot's data area.
-static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst, bool *live = nullptr)
+static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst, bool *live = nullptr, bool preferRead = false)
 {
   if (live) *live = false;
   if (!gHost.ready || !dst || !blocks || lba > 0xffffffffULL - (blocks - 1)) {
@@ -530,14 +544,14 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     const uint32_t step = blocks > kXferMax / 4096 ? kXferMax / 4096 : kDataMax / 4096;
     for (uint32_t done = 0; done < blocks; done += step) {
       const uint32_t chunk = blocks - done > step ? step : blocks - done;
-      IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096, live);
+      IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096, live, preferRead);
       if (status != kIOReturnSuccess) return status;
     }
     return kIOReturnSuccess;
   }
   bool pooled;
   const uint64_t takeStart = hostPerfNow ();
-  const UfsSlot slot = hostSlotTake (&pooled);
+  const UfsSlot slot = hostSlotTake (&pooled, preferRead);
   hostPerfSpan (kUfsPerfTake, takeStart, 0);
   const uint64_t commandStart = hostPerfNow ();
   gRootDiagnostic.lba = lba;

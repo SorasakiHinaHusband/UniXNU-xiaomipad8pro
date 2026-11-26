@@ -157,7 +157,7 @@ interface](https://developer.apple.com/library/archive/documentation/System/Conc
 [IOBlockStorageDriver](https://github.com/apple-oss-distributions/IOStorageFamily/blob/main/IOBlockStorageDriver.cpp#L1601-L1639)
 · [APFS format reference](https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf)
 
-| Request or declaration | Provider obligation for a cached Data disk | Current direct Data |
+| Request or declaration | Provider obligation for a cached Data disk | Direct Data with write-back off |
 | --- | --- | --- |
 | `getWriteCacheState` / `WriteCacheState` | Report enabled before publication when ordinary completion may leave volatile data. A fixed boot mode can refuse `setWriteCacheState` | Reports disabled, setter unsupported |
 | Ordinary `fsync` | Waits for the filesystem work it requests. The provider must honor any sync and ordered writes APFS actually submits. A file-level `fsync` call alone is insufficient evidence of a LUN flush | Completed direct writes use FUA |
@@ -180,8 +180,8 @@ semantics](https://developer.apple.com/videos/play/wwdc2019/419/)
 
 ### Linux and Android on this part
 
-The Ubuntu v1.4.0 release pins kernel `83f0f89bed14`. The checks below compare that source with the local
-implementation. The `a43f79c` manifest's kernel pin `1c21cb9895d6` has the same sd, block flush and UFS core sources.
+The Ubuntu v1.4.0 release pins kernel `83f0f89bed14`. The checks below compare that source with the M4 baseline
+from before write-back. The `a43f79c` manifest's kernel pin `1c21cb9895d6` has the same sd, block flush and UFS core sources.
 The Android capture on the KIOXIA THGJFLT2G46BATPB shows a write-back block queue, FUA capability 0, WriteBooster
 enabled with both buffer-flush flags set, and configured MCQ depth 64. The cause of the Android FUA setting and
 effective occupancy during the benchmark are unknown. Linux reads WCE and DPOFUA from MODE SENSE and can mask FUA for
@@ -318,12 +318,106 @@ under either lock, and no reuse of quarantined stages. Compare the observable di
 serial transcript. A device test then repeats M1's D5 mixed rows with queue/dispatch/UFS/completion timestamps to
 distinguish software delay from the physical command tail.
 
+## M5 switches and instrumentation
+
+- `data-store-write-back=1` opts a read-write direct Data disk into write-back. The advertised cache state is fixed at
+  publication. Only an ordinary write whose entire provider request is already present uses WRITE(10) without FUA.
+  First touches, mixed present/clear requests, the bitmap and store setup use FUA. A forced write drains older I/O
+  and flushes any dirty epoch before using FUA. The provider accepts both media sync entry points and the barrier
+  option as a whole-LUN SYNCHRONIZE CACHE(10) with IMMED clear. Barrier and FUA advertisement stay off while APFS
+  negotiation and physical durability are qualified. IOKit file-level sync behavior depends on the calls APFS
+  actually issues.
+- `data-store-queue=1` arms the worker queue when `data-store-concurrent=1` or `=2` supplies at least two stages. It
+  is active only in concurrent mode. The workers can overlap disjoint IOKit requests from the same workload,
+  including several outstanding reads or writes where the UFS data slot count permits. Each individual request
+  retains its 128 KiB command boundaries and page-range ownership. A QD1 synchronous syscall stream submits one
+  request at a time. Each direction has 64 preallocated records and its own workers and stages. The writer count
+  leaves a UFS slot for reads when two or more transport data slots exist and other traffic allows. On a single
+  slot, a waiting Data read can pass the head of the transport wait list once per head at a command boundary.
+  Pool exhaustion returns `kIOReturnNoResources` without a provider callback. The completion thread can reenter
+  submission or sync while workers continue draining I/O.
+- An explicit sync drains accepted requests, including pending queue entries, before the flush. Mode changes
+  also flush a dirty epoch. Sleep drains and flushes before the UFS link hold and vetoes suspend on failure.
+  IOBlockStorageDriver's public shutdown path calls the provider sync on writable media. The provider returns
+  flush errors and logs transport failure. The public shutdown caller waits up to five seconds and ignores the
+  return value, so qualification requires a captured successful flush. Stop drains
+  I/O, finishes callbacks via retained references and logs any dirty epoch it cannot confirm. Check shutdown
+  dispatch and remount on 27.3 during qualification.
+  [IOBlockStorageDriver shutdown](https://github.com/apple-oss-distributions/IOStorageFamily/blob/main/IOBlockStorageDriver.cpp#L226-L287)
+
+`machdep.piano_data_io` shows `queue`, worker counts, `pending`, `accepted`, `finished`, callback starts and queue-full
+returns. Its three queue timing sums cover acceptance to dispatch, dispatch to I/O finish and I/O finish to callback.
+It also shows `write_back`, `dirty`, write-back flush attempts, forced requests and barrier options received.
+`fua` and `cached` count tracked runtime write accessors and their timing sums include slot wait and transfer.
+`store_rd` and `store_sync` include setup and power calls, so use per-row deltas. Convert ticks using the host
+timebase. Data `inflight_max` is the stage peak. UFS `ufs_peak` is the shared slot peak since boot. Use the
+`native-ufs-perf=1` per-window transport samples in a matching trace to attribute physical overlap.
+
+### Expected gain from M1
+
+- **Write-back.** QD1 sustained 6,494 writes/s, or about 154 µs per write. The 4 KiB write/read p50 gap was 33 µs
+  (103 vs 70 µs). If removing FUA saves 33 µs per eligible overwrite, the estimate is about 8.3k IOPS (+27%)
+  with all writes eligible, or 7.3k (+12%) with half eligible, before extra flush time. This is a sensitivity
+  estimate. The p50 gap includes filesystem and device work, and write-back can introduce new flushes. At an
+  illustrative 1.7 ms per added flush, each flush consumes the savings from about 52 such overwrites. Measure the
+  actual eligible share and flush rate. Android's 36.7k QD1 IOPS is a 5.65× comparison from a different stack.
+- **Queue depth.** M1's 15,696 QD8 4 KiB reads/s is within 1% of QD1. Two fully utilized commands at M1's per-command
+  rate would yield about 31k IOPS, four about 62k, before sharing device service time, CPU and APFS dependencies.
+  Android's QD8 88.7k is 5.65× M1. Use M4 concurrent write-through as the queue's control and measure the increment
+  over it. The M1 mixed p99 penalty was 2,240 µs above the 85 µs idle reader. Eight 128 KiB runs from a 1 MiB writer
+  can account for an entire request wait. A 128 KiB run at M1's 478 MB/s averages about 274 µs. Reserved read dispatch
+  targets queueing behind the whole writer, with a remaining device tail measured separately. A 50% reduction from
+  M1 would put mixed p99 near 1.16 ms. Report the measured difference from both M1 and the M4 control.
+
+### Installed tablet A/B read list
+
+1. Qualify M4 first. Run write-back feature and command tracing, clean remount, and controlled cold-power recovery
+   on a disposable store before touching the owner store. Show APFS's ordinary fsync, full sync, barrier and
+   checkpoint requests and identify which reached the provider and completed SYNCHRONIZE CACHE. Require cache
+   coherence, device cache/FUA capability evidence, and verified recovery. Keep the daily installer exclusion.
+2. For installed testing, take a fresh, verified sparse backup with the maintenance sequence above. Use the
+   installed-from-disk identity and pinned seed and store window. Save the ESP and matching build record.
+   Use an authorized diagnostic installed entry with a verified rollback. Compare A–B–A for each switch on the same
+   KC, changing only that switch's boot argument. Keep `data-store-concurrent=1` in all phases so both controls
+   use concurrent write-through. Set only `data-store-write-back=1` in the write-policy B and only
+   `data-store-queue=1` in the queue B. Run the combined configuration only after both standalone comparisons.
+   Use this document as the image spec's `ANALYSIS`. Confirm effective args including ADT spillover, boot UUID,
+   the intended provider chain, state 2, unchanged
+   generation, exact seed and bound window. Verify `write_back` and `queue` against the intended phase before reads.
+3. Run the same hash-verified M1 `dskbench`, 1 GiB span and seed for every phase. For each phase capture the read list
+   below under `--ro "$DATA_FIXTURE"`, then under `--ro "$ROOT_RAW"` on the independently identified root window.
+   Hash the nonsparse Data fixture outside timed windows and require positive `store_rd` deltas on Data.
+
+   ```text
+   randr:4k:1:10,randr:4k:8:10,randr:4k:32:10,seqr:128k:1,seqr:1m:1,seqr:1m:8
+   ```
+
+4. Use a new benchmark-owned `--dir` for each pass. Compare fill separately from its pre-filled overwrite rows.
+   Capture the following rows with the same settings. `mixed:10` emits the QD1 reader-alone and reader-with-1 MiB
+   writer p99 as well as writer throughput. Preserve the dskbench BEGIN/END and verification output.
+
+   | Comparison | Rows |
+   | --- | --- |
+   | Write-back | `randw:4k:1:10,randw:4k:8:10,randw:128k:1:8,sync:none:500,sync:fsync:300,sync:full:100,sync:barrier:300,mixed:10` |
+   | Queue depth | `randw:4k:1:10,randw:4k:8:10,seqw:1m:8,mixed:10,sync:full:100,sync:barrier:300` |
+
+5. Record p50/p95/p99, operations, bytes, IOPS, throughput and `inflight_max` before and after each switch.
+   Capture the Data sysctl and transport window around each row, link and WriteBooster evidence, queue acceptance,
+   completions, full returns, accessors and bitmap publications. Count physical overlap separately from userspace
+   QD and Data stages. For write-back require cached traffic on overwrites, data and bitmap FUA on new pages,
+   a positive completed sync on full/barrier or a captured APFS equivalent, and checksum survival across clean
+   remount. For queue depth require accepted off-caller work, physical overlap at QD8 where slots permit, a lower
+   mixed reader tail, and stable QD1 and raw root controls. Record a performance miss as a result when the path
+   and evidence are valid. Stop on any short I/O, queue refusal under the benchmark, degraded store, quarantine,
+   unexpected reset, checksum or APFS error. Preserve the console and use the saved boot or verified rollback
+   procedure from the M4 preflight.
+
 ## Fix-image gate
 
-Path: decoded 27.3 libsystem_kernel pread/pwrite/fsync/fcntl → XNU VFS/UBC → APFS Data → IOMedia/IOBlockStorageDriver → NativeRamBlock doAsyncReadWrite → DirectDisk/ConcurrentDirect and PersistOverlay → native_ufs_store_read/write/sync → UTRL slots/CDB/validated completion → KIOXIA UFS. Sheng RamBlock 525abe5 is the caller-thread concurrency reference. Ubuntu v1.4.0 sd/UFS and the Android capture supply the device comparison.
+Path: decoded 27.3 libsystem_kernel pread/pwrite/fsync/fcntl → XNU VFS/UBC → APFS Data → IOMedia/IOBlockStorageDriver → NativeRamBlock doAsyncReadWrite / doSynchronize / doSynchronizeCache → ordered admission and DirectDisk / PersistOverlay → tracked NativeUfs store I/O → UTRL slots, WRITE(10), SYNCHRONIZE CACHE(10), validated completion → KIOXIA UFS. Sheng RamBlock 525abe5 supplies the caller-thread reference. The Ubuntu v1.4.0 sd/UFS comparison is above.
 
-Checks: ours-OK for the scoped comparison: installed-bound seed/window and guard, existing range admission and stage isolation, data FUA before bitmap FUA, checked UFS completion, boot-argument opt-in, drain before switch and stop, tracked DMA quarantine, and the host scheduler and storage models. Ours-missing before this change: arm the runtime switch while mounting in serial mode. Ours-missing in later lanes: off-caller execution/completion and a write-back flush contract. Unknown: achieved Data/UFS depth and mixed-tail change on this device, APFS recovery under concurrent faults, exact APFS 27.3 durability calls and physical FUA/flush behavior. Use the verified sparse backup, boot provenance, A/B and post-boot checks above to qualify M4. Keep the daily exclusion in force.
+Checks: ours-OK in the host models for the bound store format, stage and range ownership, data FUA before bitmap FUA, cached overwrites and fenced sync, failed flush handling, queued dispatch and completion, the read reserve, one-slot fairness, and tracked DMA quarantine. Both provider sync entry points and the barrier option compile for arm64e. Unknown on 27.3 hardware includes APFS's exact fsync and checkpoint calls including shutdown, device cache/FUA and cold-power durability, UFS occupancy under load, and APFS recovery with either switch. The first write-back run uses a disposable store. The installed comparison requires the fresh verified backup, effective-arg and boot checks, and recovery plan above.
 
-Root cause: M1's 85 → 2,325 µs mixed read p99 and unchanged 4 KiB QD8 throughput follow the full-request Data gate, which covers all 128 KiB stages and FUA publications of the writer. WriteBooster was already on. The magnitude of the FUA write penalty and remaining device queue contention require separate measurements.
+Root cause: M1 measured a whole-request Data gate, 15,696 QD8 read IOPS against 15,580 at QD1 and an 85 → 2,325 µs mixed-reader p99. The gate covers all writer stages and bitmap publications. It can hide free transport slots. Data also incurs FUA on every overwrite, which is a candidate for part of the 6,494 vs 36,693 QD1 write gap. The FUA share is unmeasured and WriteBooster was already enabled.
 
-ONE change: add the default-off `data-store-concurrent=2` arm-only startup mode for the first M4 diagnostic RAM boot. It allocates the existing stages, starts in the single-gate control and permits the existing root sysctl to select concurrent write-through after the store passes preflight. `=1` retains its existing immediate opt-in. The first image uses the current FUA/bitmap protocol and caller-thread completion; M5 and queued execution require separate qualification.
+ONE change: M5 caches only ordinary overwrites of fully present request ranges behind `data-store-write-back=1`, with synchronous whole-LUN fences and the existing first-touch protocol. Qualify the independent queue-depth follow-on with write-back off. Its sole change is bounded off-caller dispatch and completion under `data-store-queue=1`, preserving write-through. Both switches default off.

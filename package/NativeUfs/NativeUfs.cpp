@@ -1775,6 +1775,11 @@ extern "C" int native_ufs_store_ready (void)
   return native_ufs_root_failure ? -1 : 0;
 }
 
+extern "C" unsigned native_ufs_store_data_slots (void)
+{
+  return gSlotCount > 1 ? gSlotCount - 1 : 1;   // exclude the panic slot
+}
+
 // Store window commands, in mach_absolute_time ticks: count and time of reads, writes and cache flushes, and the longest single call.
 extern "C" volatile uint64_t native_ufs_store_rd_ops = 0, native_ufs_store_rd_ticks = 0, native_ufs_store_wr_ops = 0,
                              native_ufs_store_wr_ticks = 0, native_ufs_store_sync_ops = 0, native_ufs_store_sync_ticks = 0,
@@ -1789,7 +1794,7 @@ static void storeAccount (volatile uint64_t *ops, volatile uint64_t *ticks, uint
 }
 
 // Tracked calls let direct Data quarantine exactly those buffers that can still DMA after a timeout.
-extern "C" int native_ufs_store_read_tracked (uint64_t rel, uint32_t blocks, void *dst, bool *live)
+static int storeRead (uint64_t rel, uint32_t blocks, void *dst, bool *live, bool preferRead)
 {
   if (live) *live = false;
   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
@@ -1797,13 +1802,23 @@ extern "C" int native_ufs_store_read_tracked (uint64_t rel, uint32_t blocks, voi
   int ok = 1;
   while (blocks) {
     uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
-    if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst, live) != kIOReturnSuccess) { ok = 0; break; }
+    if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst, live, preferRead) != kIOReturnSuccess) { ok = 0; break; }
     dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
   }
   storeAccount (&native_ufs_store_rd_ops, &native_ufs_store_rd_ticks, t0);
   return ok;
+}
+
+extern "C" int native_ufs_store_read_tracked (uint64_t rel, uint32_t blocks, void *dst, bool *live)
+{
+  return storeRead (rel, blocks, dst, live, false);
+}
+
+extern "C" int native_ufs_store_read_queued (uint64_t rel, uint32_t blocks, void *dst, bool *live)
+{
+  return storeRead (rel, blocks, dst, live, true);
 }
 
 extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
@@ -1840,11 +1855,10 @@ extern "C" int native_ufs_store_write_tracked (uint64_t rel, uint32_t blocks, co
   return storeWrite (rel, blocks, src, true, live);
 }
 
-// No forced unit access: the device may keep the blocks in its volatile write cache until native_ufs_store_sync. For a
-// write-back overlay, which makes its pages durable with a sync before it writes the bitmap blocks that name them.
-extern "C" int native_ufs_store_write_cached (uint64_t rel, uint32_t blocks, const void *src)
+// Data uses this for already-present pages. Track caller DMA just as for FUA writes.
+extern "C" int native_ufs_store_write_cached_tracked (uint64_t rel, uint32_t blocks, const void *src, bool *live)
 {
-  return storeWrite (rel, blocks, src, false);
+  return storeWrite (rel, blocks, src, false, live);
 }
 
 extern "C" int native_ufs_store_sync (void)
@@ -2067,7 +2081,10 @@ extern "C" int native_ufs_dme_get (uint32_t attribute, uint32_t selector, uint32
 // Command slots: in use, the most taken at once, takes that waited for a free slot (RootCommands.h), for the log.
 extern "C" void native_ufs_slot_stats (uint32_t *slots, uint32_t *peak, uint64_t *waits)
 {
+  auto *lock = gSlotLock;
+  if (lock) IOLockLock (lock);
   *slots = gSlotCount; *peak = gSlotsPeak; *waits = gSlotWaits;
+  if (lock) IOLockUnlock (lock);
 }
 
 extern "C" int native_ufs_log_sync (void)
