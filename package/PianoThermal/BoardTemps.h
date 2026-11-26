@@ -65,8 +65,9 @@ inline int fillBoardTemps(const Snapshot &s, uint64_t nowUs, piano_board_temps *
   for (unsigned r = 0; r < PIANO_BOARD_TEMP_COUNT; ++r) {
     t->milli_c[r] = 0;
     t->age_ms[r] = 0;
-    const int i = roleIndex(Role(r));
-    if (i < 0) continue;
+    const int channel = roleIndex(Role(r));
+    if (channel < 0) continue;
+    const unsigned i = unsigned(channel);
     if (s.disabledMask & (1u << i)) t->disabled |= 1u << r;
     const uint64_t ageMs = sampleAgeMs(s, i, nowUs);
     if (!usableSample(s, i, ageMs, kFreshPeriods)) continue;
@@ -84,8 +85,10 @@ inline bool fillGpuTemps(const Snapshot &s, uint64_t nowUs, piano_gpu_temps *t)
   t->state = s.state; t->valid = t->disabled = 0; t->period_ms = s.periodMs; t->rounds = s.rounds;
   const int channels[2] = {channelIndex("msm"), channelIndex("quiet")};
   for (unsigned r = 0; r < 2; ++r) {
-    const int i = channels[r];
     t->milli_c[r] = 0; t->age_ms[r] = 0; t->sample_us[r] = 0;
+    const int channel = channels[r];
+    if (channel < 0) continue;
+    const unsigned i = unsigned(channel);
     if (s.disabledMask & (1u << i)) t->disabled |= 1u << r;
     if (!(s.validMask & (1u << i)) || s.state != PIANO_BOARD_TEMPS_RUNNING) continue;
     const uint64_t age = sampleAgeMs(s, i, nowUs);
@@ -105,9 +108,10 @@ inline bool fillSkinTemps(const Snapshot &s, uint64_t nowUs, piano_skin_temps *t
   const int channels[PIANO_SKIN_COUNT] = {channelIndex("batt"), channelIndex("quiet"), channelIndex("charger"), channelIndex("wifi"),
                                           channelIndex("msm"), channelIndex("xo")};
   for (unsigned r = 0; r < PIANO_SKIN_COUNT; ++r) {
-    const int i = channels[r];
     t->milli_c[r] = 0; t->age_ms[r] = 0; t->sample_us[r] = 0;
-    if (i < 0) continue;
+    const int channel = channels[r];
+    if (channel < 0) continue;
+    const unsigned i = unsigned(channel);
     if (s.disabledMask & (1u << i)) t->disabled |= 1u << r;
     if (!(s.validMask & (1u << i)) || s.state != PIANO_BOARD_TEMPS_RUNNING) continue;
     const uint64_t age = sampleAgeMs(s, i, nowUs);

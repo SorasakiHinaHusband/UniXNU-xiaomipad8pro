@@ -559,7 +559,7 @@ void registerAndroidCpu()
 {
   gAndroidOid.oid_parent = &sysctl__machdep_children;
   gAndroidOid.oid_number = OID_AUTO;
-  gAndroidOid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+  gAndroidOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
   gAndroidOid.oid_name = "piano_cpufreq_android";
   gAndroidOid.oid_handler = sysctlAndroidCpu;
   gAndroidOid.oid_fmt = "I";
@@ -677,11 +677,11 @@ int sysctlPerfState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 
 void registerPerf()
 {
-  auto fill = [](struct sysctl_oid &oid, const char *name, int kind, int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *),
+  auto fill = [](struct sysctl_oid &oid, const char *name, unsigned kind, int (*handler)(struct sysctl_oid *, void *, int, struct sysctl_req *),
                  int arg2, const char *fmt, const char *descr) {
     oid.oid_parent = &sysctl__machdep_children;
     oid.oid_number = OID_AUTO;
-    oid.oid_kind = kind;
+    oid.oid_kind = int(kind);
     oid.oid_name = name;
     oid.oid_handler = handler;
     oid.oid_arg2 = arg2;
@@ -795,7 +795,7 @@ void registerBoost()
 {
   gBoostOid.oid_parent = &sysctl__machdep_children;
   gBoostOid.oid_number = OID_AUTO;
-  gBoostOid.oid_kind = CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2;
+  gBoostOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
   gBoostOid.oid_name = "piano_cpufreq_boost";
   gBoostOid.oid_handler = sysctlBoost;
   gBoostOid.oid_fmt = "I";
