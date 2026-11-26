@@ -26,10 +26,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'scripts'))
+from repo_manifest import load_manifest
+
 PACKAGE = REPO / 'package/PianoA830'
 KNOWN = {
     'test_sha256 gen80000_sqe.fw': "13T's built-in pin table (test only)",
@@ -191,7 +193,7 @@ def firmware_kit(out, override):
     name = 'AdrenoFirmware'
     files = ('AdrenoHfiVotes.c', 'AdrenoHfiVotes.h')
     if override is None:
-        pin = tomllib.loads((REPO / 'unixnu.lock').read_text())['pin'][name]['commit']
+        pin = load_manifest(REPO / 'unixnu.lock')['pin'][name]['commit']
         research = Path(os.environ.get('UNIXNU_RESEARCH', REPO / 'unixnu-research'))
         legacy = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'
         for root in (research, legacy):
