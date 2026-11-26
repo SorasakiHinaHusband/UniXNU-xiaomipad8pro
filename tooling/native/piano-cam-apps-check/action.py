@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from grade import movie, reduce_log, stream
+from grade import frame_stats, movie, reduce_log, stream
 
 MOVIES = Path("/private/var/tmp/cam-apps")
 CRASH_DIRS = (Path.home() / "Library/Logs/DiagnosticReports", Path("/Library/Logs/DiagnosticReports"))
@@ -190,14 +190,59 @@ class App:
             self.discard_recording = False
 
 
+def face_time_frames(probe, binary):
+    if not Path(binary).is_absolute():
+        raise Invalid("gop_shot_path")
+    frames = []
+    geometry = probe.read("geometry-ft")
+    for index in range(2):
+        if index:
+            time.sleep(1.5)
+            if probe.read("geometry-ft") != geometry:
+                raise Invalid("facetime_capture_geometry")
+        result = command(["/usr/bin/sudo", "-n", "--", binary, "--stdout"], timeout=8, binary=True)
+        if result.returncode != 0 or not result.stdout:
+            raise Invalid("gop_shot_capture")
+        if probe.read("geometry-ft") != geometry:
+            raise Invalid("facetime_capture_geometry")
+        frames.append(result.stdout)
+    return frames, geometry
+
+
+def face_time_capture(probe, binary, before):
+    frames, geometry = face_time_frames(probe, binary)
+    finished = time.time()
+    receipt = {"before": before}
+    # Counter records arrive periodically and can reach the unified log after the capture.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        probe.call("window-ft")
+        counts = [event for event in camera_events(finished, time.time()) if event["kind"] == "count"]
+        if counts:
+            receipt["after"] = counts[-1]
+            break
+        time.sleep(0.25)
+    receipt["frames"] = [frame_stats(frame, geometry) for frame in frames]
+    return receipt
+
+
 def face_time(probe, evidence, since):
+    binary = os.environ.get("CAM_APPS_GOP_SHOT")
+    if binary:
+        evidence["gop_shot"] = None
     probe.poll("window-ft")
     evidence["window"] = True
     deadline = time.monotonic() + 14
     while time.monotonic() < deadline:
         probe.call("window-ft")
-        state, _ = stream(camera_events(since, time.time()), front=True, stopped=False)
-        if state == "PASS" or state == "FAIL":
+        events = camera_events(since, time.time())
+        state, _ = stream(events, front=True, stopped=False, require_luma=not binary)
+        if state == "PASS" and binary:
+            try:
+                evidence["gop_shot"] = face_time_capture(probe, binary, events[-1])
+            except Invalid:
+                pass
+        if state in ("PASS", "FAIL"):
             return
         time.sleep(0.75)
 

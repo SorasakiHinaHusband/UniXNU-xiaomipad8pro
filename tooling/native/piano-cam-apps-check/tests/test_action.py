@@ -10,7 +10,9 @@ TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 
 import action
-from test_grade import good_evidence
+from grade import grade_phase
+from test_frames import GEOMETRY, capture_events, make_bmp, make_png, scene
+from test_grade import good_evidence, logs
 
 
 class ActionTests(unittest.TestCase):
@@ -58,6 +60,70 @@ class ActionTests(unittest.TestCase):
         result = action.phase(self.probe, "ft")
         self.assertEqual(result["outcome"], "void")
         self.assertNotIn("quit-ft", [entry.args[0] for entry in self.probe.call.call_args_list])
+
+    @patch.dict(action.os.environ, {"CAM_APPS_GOP_SHOT": "/usr/local/bin/gop-shot"})
+    @patch.object(action, "command")
+    @patch.object(action, "camera_events")
+    @patch.object(action, "crash_reports", return_value=set())
+    @patch.object(action.time, "sleep")
+    def test_face_time_capture_brackets_two_in_memory_frames(self, sleep, _crashes, read_log, command):
+        events = capture_events()
+        read_log.side_effect = [events[:3], events[3:4], events]
+        self.probe.read.return_value = GEOMETRY
+        command.side_effect = [subprocess.CompletedProcess([], 0, image)
+                               for image in (make_png(scene()), make_bmp(scene(shift=1)))]
+
+        result = action.phase(self.probe, "ft")
+
+        self.assertEqual(grade_phase("facetime", result)[0], "PASS")
+        self.assertEqual(result["gop_shot"]["before"], events[2])
+        self.assertEqual(result["gop_shot"]["after"], events[3])
+        self.assertEqual(len(result["gop_shot"]["frames"]), 2)
+        for sample in result["gop_shot"]["frames"]:
+            self.assertEqual(set(sample), {"mean_luma", "nonblack_fraction", "luma_variance"})
+        for call in command.call_args_list:
+            self.assertEqual(call.args[0], ["/usr/bin/sudo", "-n", "--", "/usr/local/bin/gop-shot", "--stdout"])
+            self.assertEqual(call.kwargs, {"timeout": 8, "binary": True})
+        self.assertEqual(command.call_count, 2)
+        sleep.assert_any_call(1.5)
+        self.assertEqual(read_log.call_args_list[0].args[0], read_log.call_args_list[2].args[0])
+        self.assertGreaterEqual(read_log.call_args_list[1].args[0], read_log.call_args_list[0].args[1])
+        self.assertEqual([call.args[0] for call in self.probe.mock_calls],
+                         ["prerequisites", "idle", "launch-ft", "window-ft", "window-ft", "geometry-ft", "geometry-ft",
+                          "geometry-ft", "geometry-ft", "window-ft", "quit-ft"])
+        self.probe.call.assert_called_with("quit-ft", cleanup=True)
+
+    @patch.dict(action.os.environ, {"CAM_APPS_GOP_SHOT": "/usr/local/bin/gop-shot"})
+    @patch.object(action, "command")
+    @patch.object(action, "camera_events")
+    @patch.object(action, "crash_reports", return_value=set())
+    @patch.object(action.time, "sleep")
+    def test_unavailable_capture_is_void_even_with_legacy_luma(self, _sleep, _crashes, read_log, command):
+        events = logs()
+        for geometry, status, stdout in (([action.Invalid("geometry-ft")], 0, b"unused"),
+                                         ([GEOMETRY], 1, b""),
+                                         ([GEOMETRY], 0, b""),
+                                         ([GEOMETRY, dict(GEOMETRY, window=[0, 0, 10, 10])], 0, b"partial")):
+            with self.subTest(geometry=geometry, status=status, stdout=stdout):
+                read_log.side_effect = [events[:3], events]
+                self.probe.read.side_effect = geometry
+                command.return_value = subprocess.CompletedProcess([], status, stdout)
+                result = action.phase(self.probe, "ft")
+                self.assertEqual(grade_phase("facetime", result)[0], "VOID")
+                self.assertTrue(result["cleanup"])
+                self.probe.call.assert_called_with("quit-ft", cleanup=True)
+
+    @patch.dict(action.os.environ, {"CAM_APPS_GOP_SHOT": ""})
+    @patch.object(action, "camera_events")
+    @patch.object(action, "crash_reports", return_value=set())
+    @patch.object(action.time, "sleep")
+    def test_capture_disabled_keeps_legacy_face_time_path(self, _sleep, _crashes, read_log):
+        events = logs()
+        read_log.side_effect = [events[:3], events]
+        result = action.phase(self.probe, "ft")
+        self.assertNotIn("gop_shot", result)
+        self.probe.read.assert_not_called()
+        self.assertEqual(grade_phase("facetime", result)[0], "PASS")
 
     @patch.object(action, "camera_events", return_value=[])
     @patch.object(action, "crash_reports", return_value=set())

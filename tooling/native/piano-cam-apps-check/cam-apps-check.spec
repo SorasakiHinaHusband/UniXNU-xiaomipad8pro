@@ -26,7 +26,7 @@ cam_apps_check_installed() (
     fi
     umask 077
     report=$R/cam-apps-evidence.json
-    if PYTHONDONTWRITEBYTECODE=1 "$python" "$here/action.py" "$binary" "$report"; then
+    if CAM_APPS_GOP_SHOT=${CAM_APPS_GOP_SHOT-} PYTHONDONTWRITEBYTECODE=1 "$python" "$here/action.py" "$binary" "$report"; then
         status=0
     else
         status=$?
@@ -36,7 +36,7 @@ cam_apps_check_installed() (
         return 2
     fi
     local grades line
-    if grades=$("$python" "$here/grade.py" "$report"); then
+    if grades=$(PYTHONDONTWRITEBYTECODE=1 "$python" "$here/grade.py" "$report"); then
         status=0
     else
         status=$?

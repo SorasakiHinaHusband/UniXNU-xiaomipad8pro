@@ -122,15 +122,87 @@ static id ax(AXUIElementRef element, CFStringRef attr)
     return CFBridgingRelease(value);
 }
 
+static BOOL standardWindow(AXUIElementRef window)
+{
+    return [ax(window, kAXSubroleAttribute) isEqual:(__bridge NSString *)kAXStandardWindowSubrole] &&
+           [ax(window, kAXMinimizedAttribute) isEqual:@NO];
+}
+
 static BOOL visibleWindow(AXUIElementRef app)
 {
     NSArray *windows = ax(app, kAXWindowsAttribute);
     for (id item in windows) {
-        AXUIElementRef window = (__bridge AXUIElementRef)item;
-        if ([ax(window, kAXSubroleAttribute) isEqual:(__bridge NSString *)kAXStandardWindowSubrole] &&
-            [ax(window, kAXMinimizedAttribute) isEqual:@NO]) return YES;
+        if (standardWindow((__bridge AXUIElementRef)item)) return YES;
     }
     return NO;
+}
+
+static CGDirectDisplayID internalDisplay(void)
+{
+    CGDirectDisplayID displays[32], internal = 0;
+    uint32_t count = 0;
+    if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess || count == 32) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!CGDisplayIsBuiltin(displays[i])) continue;
+        if (internal) return 0;
+        internal = displays[i];
+    }
+    return internal;
+}
+
+static BOOL axWindowBounds(AXUIElementRef window, CGRect *bounds)
+{
+    id position = ax(window, kAXPositionAttribute), size = ax(window, kAXSizeAttribute);
+    return position && size &&
+           CFGetTypeID((__bridge CFTypeRef)position) == AXValueGetTypeID() &&
+           CFGetTypeID((__bridge CFTypeRef)size) == AXValueGetTypeID() &&
+           AXValueGetValue((__bridge AXValueRef)position, kAXValueTypeCGPoint, &bounds->origin) &&
+           AXValueGetValue((__bridge AXValueRef)size, kAXValueTypeCGSize, &bounds->size);
+}
+
+static NSNumber *onScreenWindow(pid_t pid, CGRect bounds)
+{
+    NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    // Quartz and AX share top-left global coordinates. Allow point rounding at window edges.
+    const CGFloat edge = 1;
+    CGRect interior = CGRectInset(bounds, edge, edge);
+    for (NSDictionary *window in windows) {
+        if ([window[(__bridge NSString *)kCGWindowAlpha] doubleValue] <= 0) continue;
+        CGRect rect;
+        id geometry = window[(__bridge NSString *)kCGWindowBounds];
+        if (!geometry || !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)geometry, &rect)) return nil;
+        if ([window[(__bridge NSString *)kCGWindowOwnerPID] isEqual:@(pid)] &&
+            [window[(__bridge NSString *)kCGWindowLayer] isEqual:@0] &&
+            CGRectContainsRect(CGRectInset(rect, -edge, -edge), bounds) &&
+            CGRectContainsRect(CGRectInset(bounds, -edge, -edge), rect))
+            return window[(__bridge NSString *)kCGWindowNumber];
+        if (CGRectIntersectsRect(rect, interior)) return nil;
+    }
+    return nil;
+}
+
+static NSArray *rectPoints(CGRect rect)
+{
+    return @[@(rect.origin.x), @(rect.origin.y), @(rect.size.width), @(rect.size.height)];
+}
+
+static int faceTimeGeometry(NSRunningApplication *app, AXUIElementRef element)
+{
+    if (app.hidden || !app.active) return 2;
+    id main = ax(element, kAXMainWindowAttribute);
+    AXUIElementRef window = (__bridge AXUIElementRef)main;
+    CGRect bounds;
+    if (!window || !standardWindow(window) || !axWindowBounds(window, &bounds) ||
+        bounds.size.width <= 2 || bounds.size.height <= 2) return 2;
+    CGDirectDisplayID display = internalDisplay();
+    if (!display || CGDisplayRotation(display) != 0 || CGDisplayIsInMirrorSet(display)) return 2;
+    CGRect screen = CGDisplayBounds(display);
+    if (!CGRectContainsRect(screen, bounds)) return 2;
+    NSNumber *number = onScreenWindow(app.processIdentifier, bounds);
+    if (!number) return 2;
+    return emit(@{@"window": rectPoints(bounds), @"screen": rectPoints(screen),
+                  @"window_number": number, @"display": @(display)});
 }
 
 static AXUIElementRef findNewMovieItem(AXUIElementRef element, unsigned depth)
@@ -304,7 +376,8 @@ static int gui(NSString *op, NSString *path)
     if ([op isEqual:@"idle"]) return idleCameras();
     if ([op isEqual:@"launch-ft"]) return launch(FaceTime);
     if ([op isEqual:@"launch-qt"]) return launch(QuickTime);
-    BOOL faceTime = [op isEqual:@"window-ft"];
+    BOOL geometry = [op isEqual:@"geometry-ft"];
+    BOOL faceTime = geometry || [op isEqual:@"window-ft"];
     NSArray<NSRunningApplication *> *apps = running(faceTime ? FaceTime : QuickTime);
     if (apps.count != 1) return 1;
     NSRunningApplication *app = apps.firstObject;
@@ -313,7 +386,9 @@ static int gui(NSString *op, NSString *path)
     AXUIElementRef element = AXUIElementCreateApplication(app.processIdentifier);
     AXUIElementSetMessagingTimeout(element, 0.5);
     int result;
-    if (faceTime || [op isEqual:@"window-qt"])
+    if (geometry)
+        result = faceTimeGeometry(app, element);
+    else if (faceTime || [op isEqual:@"window-qt"])
         result = !app.hidden && visibleWindow(element) ? 0 : 3;
     else
         result = quickCommand(op, path, element, app.processIdentifier);

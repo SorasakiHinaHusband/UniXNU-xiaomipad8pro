@@ -19,23 +19,35 @@ FaceTime's front camera selected, and QuickTime's High quality preset. Account s
 configuration outside this check.
 
 - **FaceTime** opens the app, observes its window, and waits for a single front-camera stream with increasing source and
-  delivered-frame counters. The probe reads the window and requests an ordinary quit.
+  delivered-frame counters. Its only GUI operations are opening the app, reading window metadata, and requesting an
+  ordinary quit. The check makes zero calls and enters zero accounts or contacts.
 - **QuickTime** presses the New Movie Recording menu item through Accessibility. Once live counters advance, it records
   for about five seconds, saves a fresh movie, then quits and reopens the exact file in QuickTime Player. The muted
   playback clock must advance by more than 1.5 seconds over about three seconds. AVFoundation checks the QuickTime
   container and H.264 track. If its decoder is unavailable, the action uses a local FFmpeg software decode when present
   at `/opt/homebrew/bin/ffmpeg` or the absolute path in `CAM_APPS_FFMPEG`.
 - **Evidence** includes filtered PianoCamera lifecycle counters, the new camera-stack crash report count, timing and
-  movie metadata, and SHA-256 hashes of three sample luminance grids. Frame buffers and raw logs stay in memory.
+  movie metadata, SHA-256 hashes of three sample movie luminance grids, and scalar FaceTime crop statistics when captured.
+  Frame buffers and raw logs stay in memory.
   QuickTime's movie is staged in an owner-only run directory under `/private/var/tmp/cam-apps/`. The action quits each
   app it starts and removes the run directory on completion or interruption. Both checks require a confirmed clean exit
   and zero new crash reports.
 
-The FaceTime luminance check expects a cumulative `nonblack=N` field on periodic `camera output sensor=2` events in
-`com.unixnu.PianoCamera`'s `extension` category. That field must count delivered frames with non-black image content.
-The current provider source emits frame and source counts without luminance. FaceTime is VOID without that telemetry,
-even when frames advance. The installed 27.3 app paths are pending verification.
-[Provider output counters](../../tooling/camera/extension/PianoCameraExtension.m)
+## FaceTime framebuffer capture on v13.1y12q
+
+The installed v13.1y12q display path already has `native-gop-display-shot=1`. Build the userland CLI with
+`make -C tooling/native/gop-shot all` and set `CAM_APPS_GOP_SHOT` to the absolute path of the trusted
+`gop-shot` executable on the system running the GUI check. The console user needs existing noninteractive sudo access
+to that executable with the single argument `--stdout`. The capture uses the existing display interface and requires
+zero camera kext changes. [Native scanout capture](../drivers/native-gop-display.md#9-native-still-capture-for-the-showcase)
+
+Keep FaceTime frontmost, unobscured, and fully on the internal display. The action reads two PNGs about 1.5 seconds
+apart and maps the AX window from logical screen points to image pixels. It samples the right-hand interior
+(55–90% across, 25–75% down), away from window chrome and the sidebar. Each crop needs mean 8-bit luma ≥24,
+at least 10% of pixels at luma ≥32, and luma variance ≥64. PianoCamera source and delivery counters must
+advance across the captures and the stream must stop cleanly. Failed captures, unavailable bounds, and out-of-screen
+windows are VOID. With `CAM_APPS_GOP_SHOT` unset, FaceTime uses the original cumulative `nonblack=N` telemetry
+path and is VOID if that telemetry is unavailable. The installed app paths are pending on-device verification.
 
 The harness grades `$R/cam-apps-evidence.json` through `grade.py`. Exit 0 means both apps passed, 1 means a known
 failure with complete observation, and 2 means at least one result is VOID due to missing or ambiguous evidence,
@@ -53,6 +65,5 @@ bash -n "$dir/cam-apps-check.spec"
 shellcheck -s bash "$dir/build.sh" "$dir/cam-apps-check.spec"
 ```
 
-The host tests use mocked app and log evidence. With the built probe and FFmpeg, the native file test generates bright and
-black H.264 QuickTime files and exercises wrong-container and corrupt-file cases. The development host's locked macOS
-27.2.1 session returned VOID before either app launched.
+The host tests use mocked app and log evidence and synthetic PNG/BMP frames. With the built probe and FFmpeg, the
+native file test generates bright and black H.264 QuickTime files and exercises wrong-container and corrupt-file cases.

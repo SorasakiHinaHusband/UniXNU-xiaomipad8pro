@@ -6,7 +6,10 @@ import json
 import math
 import re
 import sys
+import zlib
 from pathlib import Path
+
+from frame_image import read_frame
 
 APPS = {"facetime": "FaceTime", "quicktime": "QuickTime"}
 START = re.compile(r"camera stream start sensor=([012]) index=[0-9]+ ")
@@ -16,6 +19,10 @@ STOP = re.compile(r"camera stream stop sensor=([012]) result=(0x[0-9a-f]+|0) sta
 FAULT = re.compile(r"camera (?:stream start|RAW wait|RAW lease release) failed sensor=([012]) ")
 HASH = re.compile(r"[0-9a-f]{64}")
 LOG_TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)(?:\.(\d+))?([+-]\d\d):?(\d\d)$")
+MIN_MEAN_LUMA = 24
+NONBLACK_LUMA = 32
+MIN_NONBLACK_FRACTION = 0.10
+MIN_LUMA_VARIANCE = 64
 
 
 def natural(value):
@@ -64,7 +71,7 @@ def reduce_log(rows, since, until):
     return [event for _, event in sorted(events, key=lambda pair: pair[0])]
 
 
-def stream(events, *, front=False, stopped=True):
+def stream(events, *, front=False, stopped=True, require_luma=True):
     """Require one isolated hardware stream and increasing live source and delivery counters."""
     if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
         return "VOID", "camera log unavailable"
@@ -109,7 +116,7 @@ def stream(events, *, front=False, stopped=True):
         return "VOID", "too few live counter samples"
     if live[-1]["sent"] <= live[0]["sent"] or live[-1]["sources"] <= live[0]["sources"]:
         return "FAIL", "live camera source or delivery count stalled"
-    if front:
+    if front and require_luma:
         lit = [event.get("nonblack") for event in live]
         if not all(natural(count) and count <= event["sent"] for count, event in zip(lit, live)):
             return "VOID", "front stream lacks non-black telemetry"
@@ -118,6 +125,82 @@ def stream(events, *, front=False, stopped=True):
         if lit[-1] - lit[0] < 2:
             return "FAIL", "front stream did not deliver multiple non-black frames"
     return "PASS", "live source and delivery counters advanced"
+
+
+def rect(value):
+    if (not isinstance(value, list) or len(value) != 4 or
+            not all(type(point) in (int, float) and -1_000_000 <= point <= 1_000_000 for point in value) or
+            min(value[2:]) <= 0):
+        raise ValueError("invalid window or screen bounds")
+    return value
+
+
+def preview_crop(geometry, width, height):
+    x, y, w, h = rect(geometry.get("window"))
+    sx, sy, sw, sh = rect(geometry.get("screen"))
+    x, y = x - sx, y - sy
+    if x < 0 or y < 0 or x + w > sw or y + h > sh:
+        raise ValueError("window extends beyond the captured screen")
+    # FaceTime's video is on the right. Keep comfortably inside the image area,
+    # clear of the left sidebar, window chrome and bottom call controls.
+    left = math.ceil((x + 0.55 * w) * width / sw)
+    right = math.floor((x + 0.90 * w) * width / sw)
+    top = math.ceil((y + 0.25 * h) * height / sh)
+    bottom = math.floor((y + 0.75 * h) * height / sh)
+    if right - left < 16 or bottom - top < 16:
+        raise ValueError("window crop too small")
+    return left, top, right, bottom
+
+
+def frame_stats(data, geometry):
+    """Return only aggregate pixel statistics, or None for unusable capture evidence."""
+    if not isinstance(geometry, dict):
+        return None
+    try:
+        width, height, layout, rows = read_frame(data)
+        left, top, right, bottom = preview_crop(geometry, width, height)
+        channels = len(layout)
+        red, blue = (2, 0) if layout.startswith("B") else (0, 2)
+        gray, alpha = layout.startswith("L"), layout.endswith("A")
+        total = squared = nonblack = 0
+        for y, row in enumerate(rows):
+            if top <= y < bottom:
+                for x in range(left * channels, right * channels, channels):
+                    luma = row[x] if gray else (54 * row[x + red] + 183 * row[x + 1] + 19 * row[x + blue] + 128) >> 8
+                    if alpha:
+                        luma = (luma * row[x + channels - 1] + 127) // 255
+                    total += luma
+                    squared += luma * luma
+                    nonblack += luma >= NONBLACK_LUMA
+    except (ValueError, zlib.error):
+        return None
+    count = (right - left) * (bottom - top)
+    return {"mean_luma": total / count, "nonblack_fraction": nonblack / count,
+            "luma_variance": (squared * count - total * total) / (count * count)}
+
+
+def frame_grades(capture, events):
+    frames = capture.get("frames") if isinstance(capture, dict) else None
+    if not isinstance(frames, list) or len(frames) != 2:
+        return "VOID", "two FaceTime framebuffer captures with window bounds are required"
+    for frame in frames:
+        if not isinstance(frame, dict) or not all(
+            type(frame.get(key)) in (int, float) and 0 <= frame[key] <= maximum
+            for key, maximum in (("mean_luma", 255), ("nonblack_fraction", 1), ("luma_variance", 255 ** 2 / 4))
+        ):
+            return "VOID", "FaceTime framebuffer capture or crop unavailable"
+    before, after = capture.get("before"), capture.get("after")
+    live = events[1:-2]
+    if before not in live or after not in live:
+        return "VOID", "live front-camera counters did not bracket the captures"
+    if after["sent"] <= before["sent"] or after["sources"] <= before["sources"]:
+        return "FAIL", "front-camera counters did not advance across the captures"
+    for frame in frames:
+        if frame["mean_luma"] < MIN_MEAN_LUMA or frame["nonblack_fraction"] < MIN_NONBLACK_FRACTION:
+            return "FAIL", "FaceTime self-view crop was black or too dark"
+        if frame["luma_variance"] < MIN_LUMA_VARIANCE:
+            return "FAIL", "FaceTime self-view crop lacked spatial luminance variation"
+    return "PASS", "two non-black FaceTime self-view crops with advancing front-camera counters"
 
 
 def movie(stats):
@@ -167,8 +250,11 @@ def grade_phase(key, phase):
         return "VOID", "crash report count unavailable"
     if phase.get("window") is not True:
         return ("FAIL", "app window missing") if phase.get("window") is False else ("VOID", "app window evidence missing")
-    live = stream(phase.get("events"), front=key == "facetime")
+    captured = key == "facetime" and "gop_shot" in phase
+    live = stream(phase.get("events"), front=key == "facetime", require_luma=not captured)
     if key == "facetime":
+        if captured and live[0] == "PASS":
+            return frame_grades(phase["gop_shot"], phase["events"])
         return live
     preview = stream(phase.get("preview"), stopped=False)
     checks = (live, preview, movie(phase.get("movie")), playback(phase.get("playback")))
