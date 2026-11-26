@@ -81,6 +81,8 @@ def avb_info(data):
     if f[:4] != b'AVBf':
         return None
     _, _, orig, vb_off, vb_size = struct.unpack_from('>IIQQQ', f, 4)
+    if not (0 < orig <= vb_off and 256 <= vb_size and vb_off + vb_size <= len(data) - 64):
+        fail('invalid AVB image bounds')
     v = data[vb_off:vb_off + vb_size]
     if v[:4] != b'AVB0':
         fail('AVB footer without vbmeta')
@@ -162,7 +164,9 @@ def pack(a):
     if avb['partition_name'] != 'boot' or avb['partition_size'] != BOOT_PARTITION:
         fail(f"unexpected AVB partition {avb['partition_name']} / size {avb['partition_size']}")
     boot = read_boot(adata[:avb['original_size']])
-    uefi_boot = read_boot(open(a.uefi, 'rb').read())
+    uefi_data = open(a.uefi, 'rb').read()
+    uefi_avb = avb_info(uefi_data)
+    uefi_boot = read_boot(uefi_data[:uefi_avb['original_size']] if uefi_avb else uefi_data)
     if uefi_boot['ramdisk']:
         fail('UEFI input carries a ramdisk; use a persistent macOS-set v4 image')
     uefi = uefi_boot['kernel']

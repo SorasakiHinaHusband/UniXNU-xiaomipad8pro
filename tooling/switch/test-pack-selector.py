@@ -159,6 +159,14 @@ def main(t):
     open(p('truncated-uefi.img'), 'wb').write(boot(uefi)[:-PAGE])
     refuse('a truncated UEFI payload', [p('android.img'), sel, p('truncated-uefi.img'), '-o', p('x.img')],
            'truncated boot image sections')
+    open(p('truncated-signed-uefi.img'), 'wb').write(with_footer(boot(uefi)[:-PAGE], PROPS, part=8 << 20))
+    refuse('a UEFI payload truncated before AVB padding',
+           [p('android.img'), sel, p('truncated-signed-uefi.img'), '-o', p('x.img')], 'truncated boot image sections')
+    with open(p('truncated-signed-uefi.img'), 'r+b') as f:
+        f.seek(-52, os.SEEK_END)  # original image size in the AVB footer
+        f.write(struct.pack('>Q', 8 << 20))
+    refuse('an AVB original size extending past vbmeta',
+           [p('android.img'), sel, p('truncated-signed-uefi.img'), '-o', p('x.img')], 'invalid AVB image bounds')
     open(p('uefi-ram.img'), 'wb').write(boot(uefi, rd))
     refuse('a UEFI RAM image whose ramdisk would be dropped',
            [p('android.img'), sel, p('uefi-ram.img'), '-o', p('x.img')], 'UEFI input carries a ramdisk')
