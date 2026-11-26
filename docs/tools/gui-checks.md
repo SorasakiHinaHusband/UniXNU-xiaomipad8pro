@@ -46,7 +46,7 @@ The session journals both original preferences before opening Settings. On succe
 The private capture is `gui-checks/energy-picker.json` under the harness results directory. When the picker or menu is missing or ambiguous, the receipt includes a bounded AX hierarchy with roles, labels and identifiers. Those labels can contain desktop account details. The pure-Python grader can replay the capture offline.
 
 ```sh
-python3 tooling/native/piano-gui-checks/grade_energy_picker.py "$R/gui-checks/energy-picker.json"
+python3 tooling/native/piano-gui-checks/grade.py energy-picker "$R/gui-checks/energy-picker.json"
 ```
 
 **PASS** (0) requires three genuine selections and verified cleanup. **FAIL** (1) means usable evidence shows a wrong selection, propagation mismatch or cleanup failure. **VOID** (2) means the action or its evidence could not establish a result, such as a missing picker, stale sample or empty capture. The host tests build the native helper and exercise the harness with mocked transport and AX receipts. A desktop run is still needed to validate the live Battery AX hierarchy and the installed picker.

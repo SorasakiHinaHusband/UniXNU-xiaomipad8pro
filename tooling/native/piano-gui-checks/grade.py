@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Parse and grade the receipts collected by gui_checks_installed."""
+import argparse
+import json
 import math
+from pathlib import Path
 import re
 
 READBACK_TOLERANCE = 0.05
@@ -95,3 +98,23 @@ def wifi_transition(before, samples, started, deadline=30):
     return type(baseline_t) in (int, float) and baseline_t <= started and before.get("target") is False and any(
         started <= ts <= started + deadline and wifi_ready(sample) for ts, sample in samples
     )
+
+
+def main():
+    from grade_energy_picker import EXIT_CODES, grade_capture
+
+    parser = argparse.ArgumentParser(description="Replay a GUI check capture offline.")
+    parser.add_argument("check", choices=("energy-picker",))
+    parser.add_argument("capture", type=Path)
+    args = parser.parse_args()
+    try:
+        capture = json.loads(args.capture.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        capture = None
+    status, reason = grade_capture(capture)
+    print(f"{status} Energy Mode picker: {reason}")
+    return EXIT_CODES[status]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

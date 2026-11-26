@@ -1,9 +1,5 @@
-#!/usr/bin/env python3
 """Grade the Energy Mode picker capture without running any commands."""
-import argparse
 from dataclasses import dataclass
-import json
-from pathlib import Path
 import re
 
 from grade import parse_fields
@@ -250,20 +246,3 @@ def grade_capture(capture):
         except Void as error:
             return ("FAIL" if outcome[0] == "FAIL" else "VOID"), f"{outcome[1]}; {error}" if outcome[0] != "PASS" else str(error)
     return outcome
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("capture", type=Path)
-    args = parser.parse_args()
-    try:
-        capture = json.loads(args.capture.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        capture = None
-    status, reason = grade_capture(capture)
-    print(f"{status} Energy Mode picker: {reason}")
-    return EXIT_CODES[status]
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

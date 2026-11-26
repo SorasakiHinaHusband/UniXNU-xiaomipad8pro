@@ -234,7 +234,7 @@ class PickerWorkflow(unittest.TestCase):
             path = Path(temp) / "capture.json"
             for text, expected, status in ((json.dumps(capture), 0, "PASS"), ("", 2, "VOID")):
                 path.write_text(text)
-                result = subprocess.run([sys.executable, TOOLS / "grade_energy_picker.py", path],
+                result = subprocess.run([sys.executable, TOOLS / "grade.py", "energy-picker", path],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertTrue(result.stdout.startswith(status))
