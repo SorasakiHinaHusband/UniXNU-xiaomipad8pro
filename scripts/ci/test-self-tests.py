@@ -3,11 +3,15 @@
 """Host tests for the self-test runner's discovery and duration summary."""
 import importlib.util
 import io
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 spec = importlib.util.spec_from_file_location('self_tests', Path(__file__).with_name('self-tests.py'))
 self_tests = importlib.util.module_from_spec(spec)
@@ -34,6 +38,81 @@ class SuiteTests(unittest.TestCase):
 
         self.assertEqual(tests, [('sh', runner, None), ('c', member, None)])
         self.assertEqual(unrunnable, [unregistered])
+
+    def test_tracked_paths_with_non_ascii_and_quotes(self):
+        path = 'scripts/ci/test-é"quoted.py'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tracked = root / path
+            tracked.parent.mkdir(parents=True)
+            tracked.touch()
+            subprocess.run(['git', 'init', '-q', tmp], check=True)
+            subprocess.run(['git', '-C', tmp, 'add', '--', path], check=True)
+            with patch.object(self_tests, 'ROOT', root):
+                self.assertEqual(self_tests.collect(None, {}), ([('py', path, None)], []))
+
+    def test_build_line_quotes_scratch_path_and_keeps_other_arguments(self):
+        class Scratch:
+            def __enter__(self):
+                return str(root / 'scratch folder')
+
+            def __exit__(self, *exc):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'scratch folder').mkdir()
+            fake = root / 'cc'
+            fake.write_text('#!/bin/sh\ncp ./program "$2"\n')
+            fake.chmod(0o755)
+            program = root / 'program'
+            program.write_text('#!/bin/sh\nprintf "%s" "$1"\n')
+            program.chmod(0o755)
+            line = 'cc -o /tmp/example && /tmp/example /tmp/example.extra'
+            with patch.object(self_tests, 'ROOT', root), \
+                 patch.object(self_tests.tempfile, 'TemporaryDirectory', return_value=Scratch()), \
+                 patch.dict(os.environ, {'PATH': tmp + os.pathsep + os.environ['PATH']}):
+                _, ok, _, output = self_tests.run_one('c', 'example.c', line)
+
+        self.assertTrue(ok, output)
+        self.assertEqual(output, '/tmp/example.extra')
+
+    def test_timeout_preserves_output_from_both_streams(self):
+        err = subprocess.TimeoutExpired([], 1, output=b'stdout\xff', stderr=b'stderr')
+        with patch.object(self_tests.subprocess, 'run', side_effect=err):
+            _, ok, _, output = self_tests.run_one('py', 'test-example.py', None)
+        self.assertFalse(ok)
+        self.assertIn('stdout\ufffd', output)
+        self.assertIn('stderr', output)
+
+    def test_list_reports_stale_skips_only_when_unfiltered(self):
+        kept = 'scripts/ci/test-actual.py'
+        stale = 'scripts/ci/test-obsolete.py'
+        for choice in ([], ['--only', 'actual']):
+            with self.subTest(choice=choice):
+                output = io.StringIO()
+                with patch.object(sys, 'argv', ['self-tests.py', '--list', *choice]), \
+                     patch.object(self_tests, 'tracked', return_value=[kept]), \
+                     patch.object(self_tests, 'load_skips', return_value={kept: 'reason', stale: 'reason'}), \
+                     redirect_stdout(output):
+                    self.assertEqual(self_tests.main(), 0)
+                self.assertEqual(stale in output.getvalue(), not choice)
+
+    def test_junit_escapes_attributes_and_handles_non_xml_output(self):
+        failed = 'scripts/ci/test-"failure".py'
+        skipped = 'scripts/ci/test-"skip".py'
+        reason = 'quoted "skip" & reason'
+        with tempfile.TemporaryDirectory() as tmp:
+            junit = Path(tmp) / 'test.xml'
+            with patch.object(sys, 'argv', ['self-tests.py', '--junit', str(junit)]), \
+                 patch.object(self_tests, 'tracked', return_value=[failed, skipped]), \
+                 patch.object(self_tests, 'load_skips', return_value={skipped: reason}), \
+                 patch.object(self_tests, 'run_one', return_value=(failed, False, 1, 'bad\x1b < output')), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(self_tests.main(), 1)
+            cases = {case.attrib['name']: case for case in ElementTree.parse(junit).getroot()}
+        self.assertEqual(cases[failed].find('failure').text, 'bad\ufffd < output')
+        self.assertEqual(cases[skipped].find('skipped').attrib['message'], reason)
 
 
 class SlowestTests(unittest.TestCase):

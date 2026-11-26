@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from xml.sax.saxutils import escape
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
 SKIP_FILE = ROOT / 'scripts/ci/self-tests.skip'
@@ -38,12 +38,16 @@ PY_RE = re.compile(r'(^|/)(test[-_][^/]*\.py|run-[^/]*(?:tests?|-host)\.py)$')
 SH_RE = re.compile(r'(^|/)(test-[^/]*\.sh|run-tests\.sh|run-[^/]*-host\.sh|tests/run\.sh)$')
 C_RE = re.compile(r'^package/.*/tests/[^/]+\.(c|cc|cpp)$')
 # a build line in the first lines of a host test: `c++ ... -o /tmp/NAME && /tmp/NAME [args]`
-BUILD_RE = re.compile(r'((?:xcrun\s+)?(?:c\+\+|clang\+\+|clang|cc)\s+[^\n]*?-o\s+(\S+)\s*&&\s*\2\b[^\n]*)')
+BUILD_RE = re.compile(
+    r'((?:xcrun\s+)?(?:c\+\+|clang\+\+|clang|cc)\s+[^\n]*?-o\s+'
+    r'(?P<output>\S+)\s*&&\s*(?P<run>(?P=output))(?=\s|$)[^\n]*)'
+)
+INVALID_XML = re.compile(r'[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]')
 
 
 def tracked():
-    out = subprocess.run(['git', '-C', str(ROOT), 'ls-files'], capture_output=True, text=True, check=True).stdout
-    return [p for p in out.splitlines() if p]
+    out = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '-z'])
+    return [os.fsdecode(p) for p in out.split(b'\0') if p]
 
 
 def load_skips():
@@ -115,16 +119,34 @@ def run_one(kind, path, line):
             os.mkdir(out)
             # the binary goes to the temporary directory, not /tmp: parallel runs and other users stay apart
             m = BUILD_RE.search(line)
-            exe = m.group(2)
-            line = line.replace(exe, os.path.join(out, os.path.basename(exe)))
+            exe = shlex.quote(os.path.join(out, os.path.basename(m['output'])))
+            for group in ('run', 'output'):
+                lo, hi = m.span(group)
+                line = line[:lo] + exe + line[hi:]
             cmd, cwd = ['bash', '-c', line], full.parent
         try:
-            r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=TIMEOUT,
+            r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, encoding='utf-8', errors='replace', timeout=TIMEOUT,
                                stdin=subprocess.DEVNULL)
             ok, output = r.returncode == 0, (r.stdout + r.stderr)
         except subprocess.TimeoutExpired as e:
-            ok, output = False, f'timeout after {TIMEOUT} s\n{(e.stdout or b"")!s}'
+            partial = b'\n'.join(stream for stream in (e.stdout, e.stderr) if stream)
+            ok, output = False, f'timeout after {TIMEOUT} s\n' + partial.decode('utf-8', errors='replace')
     return path, ok, time.monotonic() - start, output
+
+
+def write_junit(path, results, skipped):
+    suite = ElementTree.Element('testsuite', name='self-tests', tests=str(len(results) + len(skipped)),
+                                failures=str(sum(not ok for _, ok, _, _ in results)))
+    for test, ok, secs, output in results:
+        case = ElementTree.SubElement(suite, 'testcase', classname='selftest',
+                                      name=INVALID_XML.sub('\ufffd', test), time=f'{secs:.1f}')
+        if not ok:
+            failure = ElementTree.SubElement(case, 'failure', message='failed')
+            failure.text = INVALID_XML.sub('\ufffd', output[-20000:])
+    for test, reason in skipped:
+        case = ElementTree.SubElement(suite, 'testcase', classname='selftest', name=INVALID_XML.sub('\ufffd', test))
+        ElementTree.SubElement(case, 'skipped', message=INVALID_XML.sub('\ufffd', reason))
+    ElementTree.ElementTree(suite).write(path, encoding='utf-8', xml_declaration=True)
 
 
 def main():
@@ -134,15 +156,20 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--junit')
     a = ap.parse_args()
+    if a.jobs < 1:
+        ap.error('--jobs must be at least 1')
     skips = load_skips()
     tests, unrunnable = collect(a.only, skips)
-    stale = sorted(set(skips) - {p for _, p, _ in tests} - set(unrunnable))
+    stale = sorted(set(skips) - {p for _, p, _ in tests}) if not a.only else []
+    stale_message = 'skip entries that name no test any more: ' + ', '.join(stale) if stale else ''
     run = [t for t in tests if t[1] not in skips]
     if a.list:
         for kind, p, line in tests:
             print(f'{"skip" if p in skips else "run ":4} {kind:2} {p}' + (f'  ({skips[p]})' if p in skips else ''))
         for p in unrunnable:
             print(f'none    {p}  (no build line in its header)')
+        if stale_message:
+            print(stale_message)
         return 0
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
@@ -156,18 +183,10 @@ def main():
     failed = [r for r in results if not r[1]]
     print(f'\n{len(results) - len(failed)} passed, {len(failed)} failed, {len(tests) - len(run)} skipped '
           f'(scripts/ci/self-tests.skip), {len(unrunnable)} C/C++ tests without a build line')
-    if stale and not a.only:
-        print('skip entries that name no test any more: ' + ', '.join(stale))
+    if stale_message:
+        print(stale_message)
     if a.junit:
-        cases = []
-        for path, ok, secs, output in results:
-            body = '' if ok else f'<failure message="failed">{escape(output[-20000:])}</failure>'
-            cases.append(f'<testcase classname="selftest" name="{escape(path)}" time="{secs:.1f}">{body}</testcase>')
-        for kind, p, _ in tests:
-            if p in skips:
-                cases.append(f'<testcase classname="selftest" name="{escape(p)}"><skipped message="{escape(skips[p])}"/></testcase>')
-        Path(a.junit).write_text(f'<?xml version="1.0"?>\n<testsuite name="self-tests" tests="{len(cases)}" '
-                                 f'failures="{len(failed)}">{"".join(cases)}</testsuite>\n')
+        write_junit(a.junit, results, [(p, skips[p]) for _, p, _ in tests if p in skips])
     if results:
         slowest = sorted(results, key=lambda result: (-result[2], result[0]))[:10]
         print(f'\nSlowest {len(slowest)} tests:')
