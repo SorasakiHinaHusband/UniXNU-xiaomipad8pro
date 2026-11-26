@@ -10,6 +10,34 @@ and HID enumeration with real peripherals remain open. [Support status](../STATU
 default and was active on the November 27 disk check. The same day's `v131y12t-qual1` RAM check passed 66/66 exact transfers
 with zero driver drops. [Installed boot](../results-2026-11-27.md#installed-boot) · [RAM qualification](../results-2026-11-27.md#ram-qualification)
 
+## B7 offline role, VBUS and xHCI model
+
+**Fix-image gate HOLD.** SC8541 sourcing and discharge, live controller hand-off, and real-device enumeration still require an
+attended owner OTG session with a USB-C OTG adapter and USB peripherals. The header is included by the standalone sanitizer suite.
+[Owner qualification protocol](usb-otg-qual.md) · [Model](../../package/PianoUsbHost/UsbRoleVbusModel.h) · [Host test](../../package/PianoUsbHost/tests/role_vbus_host.cpp)
+
+The model borrows the pinned SM8750 USB stream ID `0x40`, the DWC3 halt and role fields, and the xHCI Run/Stop, Halted and PORTSC
+fields from the existing headers. It reads the owner snapshot's UCSI connector 1 status and a full 32-byte GLINK port 0
+notification. It requires matching orientation when UCSI 2.0 reports it, USB data capability, and the USB-only mux. DFP, UFP and
+powered-cable-plus-UFP determine data role independently of power direction. Only Source/Host qualifies for this loan. The
+fixture pairs PAN with the owner's generation and sequence, uses `0xff` for absent PAN orientation, and requires a fresh
+observation after wake. [SM8750 USB definitions](../../package/PianoDwc3/PianoUsbHw.h) · [DWC3 registers](../../package/PianoDwc3/Dwc3Regs.h) · [xHCI registers](../../package/PianoUsbHost/UsbHostHw.h) · [UCSI and GLINK codec](../../package/PianoUsbHost/Ucsi.h) · [Owner snapshot](../../package/include/PianoUsbcContract.h)
+
+Confirmed gadget release, a matching verified SID and bank, and an unpowered bus with charging and external sink VBUS absent
+permit the synthetic 5 V request. A fault drops the request and starts teardown in the same transition. The host keeps DMA
+ownership until Run/Stop reads clear, Halted reads set, and the bus reports discharged. DWC3 then confirms its device role
+and reclaims the same domain. A missing halt, discharge or reclaim proof leaves the model held. A fault or failed attempt
+requires a clean Type-C detach and a safe bus before re-arming.
+
+The context bank number, correlation tokens, and VBUS levels are fixture inputs. The levels carry no voltage thresholds or
+SC8541 programming values. The synthetic deadlines are 10 ms for attach debounce, 50 ms for device release, 20 ms for VBUS
+ramp, 30 ms per reset attempt with a cap of two attempts, 50 ms for enumeration, 20 ms for halt, 40 ms for discharge, 50 ms for
+reclaim while awake, and 500 ms for the entire host loan from the release request. The xHCI fixture uses default speed IDs 3
+and 4 for High-Speed and SuperSpeed. It models USB2 port reset, USB3 link-up or warm reset, and address and descriptor
+completion. These are synthetic port outcomes, including the SuperSpeed path.
+
+Run the sanitizer suite with `python3 scripts/ci/self-tests.py --only package/PianoUsbHost/tests/`.
+
 ## Original design and bring-up (2026-11-11 to 2026-11-14)
 
 > **2026-11-11 build snapshot.** PianoUsbHost was built, host-tested and linked ahead of tablet qualification.
