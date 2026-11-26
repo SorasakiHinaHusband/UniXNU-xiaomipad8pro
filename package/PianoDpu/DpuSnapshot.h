@@ -29,10 +29,55 @@ using slices::LivePath;
 struct DsiWords {
   bool read = false;
   uint32_t ctrl = 0, status0 = 0, total = 0, activeH = 0, activeV = 0, shadow[3] = {0, 0, 0}, cmdDmaCtrl = 0, trigCtrl = 0, intrCtrl = 0,
-           tpgCtrl = 0, dmaCtrl1 = 0, clkCtrl = 0, laneStatus = 0, laneCtrl = 0;
+           tpgCtrl = 0, dmaCtrl1 = 0, clkCtrl = 0, laneStatus = 0, laneCtrl = 0, videoCompression = 0;
 };
+// dsi.xml (with the host's 6G +4 shift) and dsi_phy_7nm.xml (unshifted common block),
+// as pinned in dpu-m5-analysis.md. Preserve the raw words for bright/dark comparisons.
+enum M5HostWord {
+  VidCfg0, VidCfg1, Hsync, VsyncHpos, VsyncVpos, Fifo, AckErr, LaneSwap, PhyErr,
+  LpTimer, HsTimer, Timeout, Clkout, Eot, ErrMask, ClkStatus, TClkPre, CmdComp, CmdComp2, HostWordCount
+};
+constexpr uint32_t kM5HostOffsets[HostWordCount] = {
+    kDsiVidCfg0, kDsiVidCfg1, kDsiActiveHsync, kDsiVsyncHpos, kDsiVsyncVpos, kDsiFifoStatus, slices::kDsiAckErr,
+    0x0b0, 0x0b4, 0x0b8, 0x0bc, 0x0c0, 0x0c4, 0x0cc, kDsiErrIntMask0, kDsiClkStatus, 0x180, 0x2a8, 0x2ac};
+enum M5PhyWord { ClkCfg0, ClkCfg1, RbufCtrl, PhyStatus, LaneStatus0, LaneStatus1, PhyWordCount };
+constexpr uint32_t kM5PhyOffsets[PhyWordCount] = {0x010, 0x014, 0x01c, 0x140, 0x148, 0x14c};
+
+template <uint32_t Bytes, const auto &Offsets, class Io, unsigned N>
+void readM5Words(Io &io, uint64_t base, uint32_t (&words)[N])
+{
+  static_assert(N == sizeof Offsets / sizeof Offsets[0]);
+  static_assert([] {
+    for (uint32_t offset : Offsets)
+      if (offset % sizeof(uint32_t) || offset > Bytes - sizeof(uint32_t)) return false;
+    return true;
+  }());
+  for (unsigned i = 0; i < N; ++i) words[i] = io.rd(base + Offsets[i]);
+}
+
+struct M5LinkWords {
+  bool read = false;
+  uint32_t host[HostWordCount] = {}, phy[PhyWordCount] = {};
+};
+
+template <class Io>
+bool m5LinkClocked(Io &io, unsigned link, bool hwGatedAhb)
+{
+  const auto enabled = [](uint32_t cbcr) { return branchOn(cbcr) && (cbcr & kCbcrEnable); };
+  const uint32_t gccAhb = io.rd(kGcc + kGccDispAhb);
+  if (!enabled(gccAhb) && !(hwGatedAhb && branchHwGated(gccAhb))) return false;
+  const uint32_t gdsc = io.rd(kDispCc + kCcMdssGdsc);
+  constexpr uint32_t kSwCollapse = 1u;  // GDSCR SW_COLLAPSE (qcom gdsc.c)
+  // Both PHYs' DT iface clock is DISP_CC_MDSS_AHB_CLK. Require a valid
+  // powered MDSS domain and explicitly running, enabled AHB and link branches.
+  return gdscOn(gdsc) && !(gdsc & kSwCollapse) &&
+         enabled(io.rd(kDispCc + kCcAhb)) && enabled(io.rd(kDispCc + kCcMdp)) &&
+         enabled(io.rd(kDispCc + (link == 0 ? kCcByte0 : kCcByte1))) &&
+         enabled(io.rd(kDispCc + (link == 0 ? kCcPclk0 : kCcPclk1)));
+}
 struct IntfWords {
-  uint32_t vsyncWidth = 0, dispVStart = 0, dispVEnd = 0, dispHctl = 0, skew = 0, progFetch = 0, intrStatus = 0;
+  uint32_t vsyncWidth = 0, dispVStart = 0, dispVEnd = 0, dispHctl = 0, skew = 0, progFetch = 0, intrStatus = 0,
+           config2 = 0, dataHctl = 0;
 };
 struct DsppWords {
   uint32_t pcc[13] = {};
@@ -43,8 +88,11 @@ struct Snapshot {
   bool readable = false;       // the gate passed: the DPU was read
   IntfWords intf[2];
   DsiWords dsi[2];
+  bool m5 = false;
+  M5LinkWords m5Link[2];
   DsppWords dspp[2];
   uint32_t ctlFlush = 0, ctlIntfFlush = 0, ctlDsppFlush[2] = {0, 0};
+  uint32_t ctlDscActive = 0, ctlDscFlush = 0, ctlPipeActive = 0, ctlFetchActive = 0;
   uint32_t topIntrEn = 0, topIntrStatus = 0, mdssIntrStatus = 0;
   uint32_t panelIdIo = 0;
   modes::LinkLive live[2];
@@ -55,7 +103,7 @@ struct Snapshot {
 
 // The snapshot itself. hwGatedAhb: the survey's gate rule as piano-dpu-ahb-vote set it (1 on piano: enabled + hardware-gated = on).
 template <class Load>
-void take(Snapshot &s, Load load, bool hwGatedAhb)
+void take(Snapshot &s, Load load, bool hwGatedAhb, bool m5 = false)
 {
   struct Io {
     Load &ld;
@@ -66,6 +114,7 @@ void take(Snapshot &s, Load load, bool hwGatedAhb)
       return ld(pa);
     }
   } io{load, s.loads};
+  s.m5 = m5;
   s.panelIdIo = io.rd(kTlmm + uint64_t(kPanelIdGpio) * kTlmmStride + 4);
   s.path = slices::readPath(io, hwGatedAhb, true);
   if (!s.path.clocks.readable) {
@@ -85,11 +134,17 @@ void take(Snapshot &s, Load load, bool hwGatedAhb)
     w.skew = io.rd(slices::intfReg(i + 1, kIntfHsyncSkew));
     w.progFetch = io.rd(slices::intfReg(i + 1, kIntfProgFetch));
     w.intrStatus = io.rd(slices::intfReg(i + 1, kIntfIntrStatus));
+    w.config2 = io.rd(slices::intfReg(i + 1, kIntfConfig2));
+    w.dataHctl = io.rd(slices::intfReg(i + 1, kIntfDataHctl));
   }
   if (s.path.ctl >= 0) {
     const unsigned c = unsigned(s.path.ctl);
     s.ctlFlush = io.rd(slices::ctlReg(c, kCtlFlush));
     s.ctlIntfFlush = io.rd(slices::ctlReg(c, kCtlIntfFlush));
+    s.ctlDscActive = io.rd(slices::ctlReg(c, kCtlDscActive));
+    s.ctlDscFlush = io.rd(slices::ctlReg(c, kCtlDscFlush));
+    s.ctlPipeActive = io.rd(slices::ctlReg(c, kCtlPipeActive));
+    s.ctlFetchActive = io.rd(slices::ctlReg(c, kCtlFetchActive));
     for (unsigned d = 0; d < 2; ++d) s.ctlDsppFlush[d] = io.rd(slices::ctlReg(c, kCtlDspp0Flush + 4 * d));
   }
   for (unsigned d = 0; d < 2; ++d) {
@@ -115,6 +170,13 @@ void take(Snapshot &s, Load load, bool hwGatedAhb)
     d.clkCtrl = io.rd(slices::dsiReg(l, kDsiClkCtrl));
     d.laneStatus = io.rd(slices::dsiReg(l, kDsiLaneStatus));
     d.laneCtrl = io.rd(slices::dsiReg(l, kDsiLaneCtrl));
+    d.videoCompression = io.rd(slices::dsiReg(l, kDsiVidCompress));
+    // Recheck immediately before accessing the PHY common block and host probe words.
+    if (!s.m5 || !m5LinkClocked(io, l, hwGatedAhb)) continue;
+    M5LinkWords &m = s.m5Link[l];
+    readM5Words<kDsiPhyBytes, kM5PhyOffsets>(io, kDsiPhy[l], m.phy);
+    readM5Words<kDsiBytes, kM5HostOffsets>(io, kDsi[l], m.host);
+    m.read = true;
   }
   for (unsigned i = 0; i < 2; ++i) {
     modes::LinkLive &v = s.live[i];
@@ -180,13 +242,16 @@ void format(const Snapshot &s, uint64_t serial, uint64_t atUs, Out &out)
            "status %08x; mdss intr %08x; path %s",
            s.path.ctl, s.path.ctlTop, s.path.intfActive, s.path.intfMaster, s.path.lms, s.ctlFlush, s.ctlIntfFlush, s.ctlDsppFlush[0],
            s.ctlDsppFlush[1], s.topIntrEn, s.topIntrStatus, s.mdssIntrStatus, s.path.why);
+  if (s.path.ctl >= 0)
+    out.line("scanout ctl%d: dsc-active %08x dsc-flush %08x pipe-active %08x fetch-active %08x",
+             s.path.ctl, s.ctlDscActive, s.ctlDscFlush, s.ctlPipeActive, s.ctlFetchActive);
   for (unsigned i = 0; i < 2; ++i) {
     const Link &k = s.path.link[i];
     const IntfWords &w = s.intf[i];
     out.line("intf%u: en %08x status %08x config %08x hsync %08x period %08x vwidth %08x dv %08x-%08x dhctl %08x skew %08x "
-             "prog-fetch %08x intr %08x; counters en %08x frame %u line %u (htotal %u vtotal %u)",
+             "prog-fetch %08x intr %08x; counters en %08x frame %u line %u (htotal %u vtotal %u); config2 %08x data-hctl %08x",
              i + 1, k.en, k.status, k.config, k.hsyncCtl, k.period, w.vsyncWidth, w.dispVStart, w.dispVEnd, w.dispHctl, w.skew,
-             w.progFetch, w.intrStatus, k.countEn, k.frame, k.line, k.htotal, k.vtotal);
+             w.progFetch, w.intrStatus, k.countEn, k.frame, k.line, k.htotal, k.vtotal, w.config2, w.dataHctl);
   }
   for (unsigned l = 0; l < 2; ++l) {
     const DsiWords &d = s.dsi[l];
@@ -195,9 +260,26 @@ void format(const Snapshot &s, uint64_t serial, uint64_t atUs, Out &out)
       continue;
     }
     out.line("dsi%u: ctrl %08x status0 %08x total %08x active-h %08x active-v %08x; timing shadow +1e4 %08x +1e8 %08x +1ec %08x; "
-             "cmd-dma %08x trig %08x (dma trigger %s, block-in-frame %u) intr %08x tpg %08x +390 %08x; clk-ctrl %08x lanes %08x/%08x",
+             "cmd-dma %08x trig %08x (dma trigger %s, block-in-frame %u) intr %08x tpg %08x +390 %08x; clk-ctrl %08x lanes %08x/%08x; "
+             "video-compression %08x",
              l, d.ctrl, d.status0, d.total, d.activeH, d.activeV, d.shadow[0], d.shadow[1], d.shadow[2], d.cmdDmaCtrl, d.trigCtrl,
-             trigName(d.trigCtrl), (d.trigCtrl >> 12) & 1u, d.intrCtrl, d.tpgCtrl, d.dmaCtrl1, d.clkCtrl, d.laneStatus, d.laneCtrl);
+             trigName(d.trigCtrl), (d.trigCtrl >> 12) & 1u, d.intrCtrl, d.tpgCtrl, d.dmaCtrl1, d.clkCtrl, d.laneStatus, d.laneCtrl,
+             d.videoCompression);
+    if (!s.m5) continue;
+    const M5LinkWords &m = s.m5Link[l];
+    if (!m.read) {
+      out.line("dsi%u m5: host and PHY probe skipped (clock gate closed or unreadable)", l);
+      continue;
+    }
+    const auto &h = m.host;
+    const auto &p = m.phy;
+    out.line("dsi%u m5: vid-cfg0 %08x vid-cfg1 %08x hsync %08x vsync-hpos %08x vsync-vpos %08x "
+             "lp-timer %08x hs-timer %08x clkout %08x eot %08x lane-swap %08x t-clk-pre-extend %08x "
+             "cmd-compression %08x/%08x clk-status %08x err-mask %08x ack-err %08x fifo %08x phy-err %08x timeout %08x",
+             l, h[VidCfg0], h[VidCfg1], h[Hsync], h[VsyncHpos], h[VsyncVpos], h[LpTimer], h[HsTimer], h[Clkout], h[Eot],
+             h[LaneSwap], h[TClkPre], h[CmdComp], h[CmdComp2], h[ClkStatus], h[ErrMask], h[AckErr], h[Fifo], h[PhyErr], h[Timeout]);
+    out.line("dsi%u phy: clk-cfg0 %08x clk-cfg1 %08x rbuf-ctrl %08x phy-status %08x lane-status0 %08x lane-status1 %08x",
+             l, p[ClkCfg0], p[ClkCfg1], p[RbufCtrl], p[PhyStatus], p[LaneStatus0], p[LaneStatus1]);
   }
   for (unsigned d = 0; d < 2; ++d) {
     const DsppWords &p = s.dspp[d];

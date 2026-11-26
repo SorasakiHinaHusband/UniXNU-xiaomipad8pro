@@ -5,7 +5,8 @@
 // reads the display path's registers fresh at the call and returns them as text, one line per block; the same lines go to the
 // console ("PianoDpu: snap: ..."), so a run whose ssh capture fails still has them. The ordinary snapshot uses only loads.
 // Its page maps are device memory, made on first use and kept for the boot (at most kMaxPages pages).
-// piano-dpu-clkread=1 also registers this sysctl and appends clock, CRM and RPMh readback. RPMh reads use the ACTIVE TCS transport.
+// piano-dpu-clkread=1 also registers this sysctl and appends clock and CRM readback. RPMh readback uses the ACTIVE TCS transport
+// and is available only when piano-dpu-snapshot is off.
 // Root only (EPERM otherwise); at most one fresh read per 100 ms (a quicker call returns the previous text with its serial).
 // The gate: the survey's rule as piano-dpu-ahb-vote has it (1, the default at piano-dpu >= 2: GCC's display AHB branch enabled and
 // hardware-gated counts as on); a closed gate reads nothing of MDSS, the DPU or DSI.
@@ -43,7 +44,7 @@ struct Page {
 Page gPages[kMaxPages];
 unsigned gPageCount, gMapFailures;
 IOLock *gLock;
-bool gHwGatedAhb = true, gRegistered, gClockRead;
+bool gHwGatedAhb = true, gRegistered, gClockRead, gSnapshotOn;
 uint64_t gSerial, gLastUs;
 char gText[(snapshot::kMaxLines + 10) * kLineBytes];
 size_t gTextLen;
@@ -208,7 +209,7 @@ void refresh()
   static snapshot::Snapshot s;   // ~1 KiB, under gLock
   s = snapshot::Snapshot();
   const uint64_t at = nowUs();
-  snapshot::take(s, load, gHwGatedAhb);
+  snapshot::take(s, load, gHwGatedAhb, gSnapshotOn);
   const auto clocks = gClockRead ? clkread::capture(s.path.clocks, load) : clkread::Clocks{};
   gTextLen = 0;
   gText[0] = 0;
@@ -218,7 +219,8 @@ void refresh()
   if (flipStatsSnapshot(stats)) stats.formatClean([&](auto... args) { out.line(args...); });
   if (gClockRead) {
     clkread::format(clocks, out);
-    formatVotes(out);
+    if (!gSnapshotOn) formatVotes(out);
+    else out.line("clkread_rpmh status=unavailable (ACTIVE transport requires stores)");
   }
   if (gMapFailures) out.line("snapshot: %u page maps failed so far (those words read as ffffffff)", gMapFailures);
   gLastUs = gClockRead ? nowUs() : at;
@@ -245,9 +247,9 @@ void dpuSnapshotStart(uint32_t level, uint32_t ahbVote)
 {
   if (gRegistered) return;
   uint32_t on = 0, clockRead = 0;
-  const bool snapshotOn = PE_parse_boot_argn("piano-dpu-snapshot", &on, sizeof on) && on == 1;
+  gSnapshotOn = PE_parse_boot_argn("piano-dpu-snapshot", &on, sizeof on) && on == 1;
   gClockRead = PE_parse_boot_argn("piano-dpu-clkread", &clockRead, sizeof clockRead) && clockRead == 1;
-  if (!snapshotOn && !gClockRead) return;
+  if (!gSnapshotOn && !gClockRead) return;
   gHwGatedAhb = ahbVote == 1;
   gLock = IOLockAlloc();
   if (!gLock) {
@@ -266,6 +268,6 @@ void dpuSnapshotStart(uint32_t level, uint32_t ahbVote)
   sysctl_register_oid(&gOid);
   gRegistered = true;
   IOLog("PianoDpu: snap: %s=1: machdep.piano_dpu_snapshot registered (root, read only, %s; gate rule %s; piano-dpu=%u)\n",
-        snapshotOn ? "piano-dpu-snapshot" : "piano-dpu-clkread", gClockRead ? "clock/CRM loads and RPMh queries" : "loads only",
+        gSnapshotOn ? "piano-dpu-snapshot" : "piano-dpu-clkread", gClockRead && !gSnapshotOn ? "clock/CRM loads and RPMh queries" : "loads only",
         gHwGatedAhb ? "enabled + hardware-gated display AHB counts as on" : "strict", level);
 }

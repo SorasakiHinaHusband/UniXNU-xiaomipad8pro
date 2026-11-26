@@ -41,6 +41,11 @@ sudo /usr/sbin/sysctl -n machdep.piano_dpu_snapshot
 - `clkread_arc` gives the apps DRV-2 MMCX/MXC votes as raw hardware indices and
   cmd-db virtual corner levels. Level 0 represents no vote from this voter.
 
+When `piano-dpu-snapshot=1` is also set, the sysctl reports clock and CRM
+words and suppresses RPMh queries so the M5 snapshot makes zero MMIO stores.
+Use `piano-dpu-clkread=1` alone for the full vote readback.
+[M5 snapshot](dpu-m5-analysis.md#read-only-m5-snapshot-and-capture-diagnostics)
+
 The sysctl accepts reads only. RPMh queries program the existing ACTIVE TCS
 transport with the command write bit clear. The query writes no vote payload.
 The shared DRV-2 lock serializes each query with existing voters. After a

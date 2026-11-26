@@ -588,17 +588,26 @@ void publish(const char *what)
 
 }  // namespace
 
-IOReturn scanoutRead(PianoDpuScanoutRequest *request)
+IOReturn scanoutRead(PianoDpuScanoutRequest *request, PianoDpuScanoutDiagnostics *diagnostics)
 {
   if (!request || !request->read) return kIOReturnBadArgument;
   IOLock *lock = __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
   if (!lock) return kIOReturnNotFound;   // no flip engine
-  if (!IOLockTryLock(lock)) return kIOReturnBusy;
+  if (!IOLockTryLock(lock)) {
+    if (diagnostics) diagnostics->busy = PianoDpuScanoutBusy::initialLock;
+    return kIOReturnBusy;
+  }
 
   const auto target = gFlipper.current;
   const auto state = gFlipper.state;
   const auto generation = [] { return gFlipper.st.flips + gFlipper.st.reshows + gFlipper.st.toBoot; };
+  const auto sample = [] {
+    const auto &t = gFlipper.current;
+    const auto &st = gFlipper.st;
+    return PianoDpuScanoutSample{true, t.surface, t.base, t.stride, uint32_t(gFlipper.state), st.flips, st.reshows, st.toBoot};
+  };
   const uint64_t before = generation();
+  if (diagnostics) diagnostics->before = sample();
   const int shown = gFlipper.slots.shown;
   Cookie *cookie = nullptr;
   uint64_t offset = 0;
@@ -623,8 +632,15 @@ IOReturn scanoutRead(PianoDpuScanoutRequest *request)
   gHw.surfaceRelease(cookie);
   if (request->error) return kIOReturnSuccess;
 
-  if (!IOLockTryLock(lock)) return kIOReturnBusy;
+  if (!IOLockTryLock(lock)) {
+    if (diagnostics) diagnostics->busy = PianoDpuScanoutBusy::finalLock;
+    return kIOReturnBusy;
+  }
   const bool stable = state == gFlipper.state && before == generation() && flip::sameTarget(target, gFlipper.current);
+  if (diagnostics) {
+    diagnostics->after = sample();
+    if (!stable) diagnostics->busy = PianoDpuScanoutBusy::changed;
+  }
   IOLockUnlock(lock);
   return stable ? kIOReturnSuccess : kIOReturnBusy;
 }

@@ -59,6 +59,7 @@
 #include "GopRefresh.h"                        // the fixed refresh contract (native-gop-display-120=1; tests/gop_host.cpp)
 #include "GopColorLog.h"                       // the Night Shift observer (native-gop-display-color-log=1; tests/gop_host.cpp)
 #include "GopShot.h"
+#include "GopShotDiagnostics.h"
 #include "CopyRows.h"
 #include "../include/PianoGpuQualificationDisplay.h"
 static void qualificationDisplay(const PianoGpuQualificationDisplay *evidence) {
@@ -383,8 +384,9 @@ private:
     uint64_t fVideoPhys;
     IOMemoryMap *fScanoutMap;
     uint8_t *fScanout;
-    bool fShotEnabled, fShotRegistered;
+    bool fShotEnabled, fShotRegistered, fShotDiagnostics;
     uint64_t fShotEpoch;   // odd during a copy-thread presentation, even when idle
+    gopshot::BusyCounts fShotBusy;
     struct sysctl_oid fShotOid;
     void registerShot();
     static int shotSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
@@ -1088,8 +1090,11 @@ bool NativeGopDisplay::start(IOService *provider)
     }
     unsigned shot = 0;
     fShotEnabled = !fExternal && PE_parse_boot_argn("native-gop-display-shot", &shot, sizeof shot) && shot == 1;
+    unsigned snapshot = 0;
+    fShotDiagnostics = fShotEnabled && PE_parse_boot_argn("piano-dpu-snapshot", &snapshot, sizeof snapshot) && snapshot == 1;
     fShotRegistered = false;
     fShotEpoch = 0;
+    fShotBusy = {};
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {
@@ -2486,6 +2491,7 @@ static void invalidateForRead(const uint8_t *start, uint64_t length, bool barrie
 struct GopShotRead {
     NativeGopDisplay *display;
     struct sysctl_req *req;
+    size_t *pixelBytes;
 };
 
 int NativeGopDisplay::shotRead(void *context, const OSObject *surface, IOMemoryMap *map, uint64_t offset, uint32_t stride)
@@ -2513,9 +2519,10 @@ int NativeGopDisplay::shotRead(void *context, const OSObject *surface, IOMemoryM
     const GopShotHeader header{GOP_SHOT_VERSION, GOP_SHOT_WIDTH, GOP_SHOT_HEIGHT, format,
                                surface ? GOP_SHOT_FLIP : GOP_SHOT_BOOT};
     int error = SYSCTL_OUT(read->req, &header, sizeof header);
-    for (size_t position = 0; !error;) {
+    size_t position = 0, count = 0;
+    while (!error) {
         uint64_t at = 0;
-        const size_t count = gop_shot_chunk(position, stride, &at);
+        count = gop_shot_chunk(position, stride, &at);
         if (!count)
             break;
         if (cached)
@@ -2523,6 +2530,8 @@ int NativeGopDisplay::shotRead(void *context, const OSObject *surface, IOMemoryM
         error = SYSCTL_OUT(read->req, bytes + at, count);
         position += count;
     }
+    if (read->pixelBytes)
+        *read->pixelBytes = error ? position - count : position;   // completed pixel chunks
     return error;
 }
 
@@ -2536,23 +2545,55 @@ int NativeGopDisplay::shotSysctl(struct sysctl_oid *, void *arg, int, struct sys
         return SYSCTL_OUT(req, nullptr, GOP_SHOT_BYTES);
     if (req->oldlen < GOP_SHOT_BYTES)
         return ENOMEM;
+    const auto nowUs = [] {
+        uint64_t ns;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        return ns / 1000;
+    };
+    const bool diagnose = display->fShotDiagnostics;
+    const uint64_t startUs = diagnose ? nowUs() : 0;
     const uint64_t epoch = __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE);
-    if (epoch & 1)
+    PianoDpuScanoutDiagnostics dpuDiagnostics;
+    size_t pixelBytes = 0;
+    const auto busy = [&](gopshot::BusyReason reason, uint64_t endEpoch) {
+        if (diagnose) {
+            const uint64_t endUs = nowUs();
+            const auto wide = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+            const auto &before = dpuDiagnostics.before;
+            const auto &after = dpuDiagnostics.after;
+            IOLog("NativeGopDisplay: gop-shot EBUSY reason=%s count=%llu start-us=%llu end-us=%llu epoch=%llu/%llu bytes=%zu "
+                  "before=%u target=%s/%08x/%u state=%u flips=%llu reshows=%llu to-boot=%llu "
+                  "after=%u target=%s/%08x/%u state=%u flips=%llu reshows=%llu to-boot=%llu\n",
+                  gopshot::busyReasonName(reason), wide(display->fShotBusy.record(reason)), wide(startUs), wide(endUs),
+                  wide(epoch), wide(endEpoch), pixelBytes,
+                  unsigned(before.available), before.surface ? "surface" : "boot", before.base, before.stride, before.state,
+                  wide(before.flips), wide(before.reshows), wide(before.toBoot),
+                  unsigned(after.available), after.surface ? "surface" : "boot", after.base, after.stride, after.state,
+                  wide(after.flips), wide(after.reshows), wide(after.toBoot));
+        }
         return EBUSY;
-    GopShotRead read{display, req};
+    };
+    if (epoch & 1)
+        return busy(gopshot::BusyReason::oddEpoch, diagnose ? __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE) : epoch);
+    GopShotRead read{display, req, diagnose ? &pixelBytes : nullptr};
     PianoDpuScanoutRequest request{shotRead, &read, 0};
     OSDictionary *match = IOService::serviceMatching(kPianoDpuServiceClass);
     IOService *dpu = match ? IOService::copyMatchingService(match) : nullptr;
     OSSafeReleaseNULL(match);
-    const IOReturn result = dpu ? dpu->callPlatformFunction(kPianoDpuScanoutFunction, false, &request, nullptr, nullptr, nullptr)
+    const IOReturn result = dpu ? dpu->callPlatformFunction(kPianoDpuScanoutFunction, false, &request,
+                                                          diagnose ? &dpuDiagnostics : nullptr, nullptr, nullptr)
                                 : kIOReturnNotFound;
     OSSafeReleaseNULL(dpu);
     if (result == kIOReturnNotFound)
         request.error = shotRead(&read, nullptr, nullptr, 0, 0);
+    else if (result == kIOReturnBusy)
+        return busy(gopshot::dpuBusyReason(dpuDiagnostics.busy),
+                    diagnose ? __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE) : epoch);
     else if (result != kIOReturnSuccess)
-        return result == kIOReturnBusy ? EBUSY : ENXIO;
+        return ENXIO;
     __atomic_thread_fence(__ATOMIC_ACQ_REL);
-    return epoch == __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE) ? request.error : EBUSY;
+    const uint64_t endEpoch = __atomic_load_n(&display->fShotEpoch, __ATOMIC_ACQUIRE);
+    return epoch == endEpoch ? request.error : busy(gopshot::BusyReason::finalEpoch, endEpoch);
 }
 
 void NativeGopDisplay::registerShot()

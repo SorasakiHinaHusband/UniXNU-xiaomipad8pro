@@ -38,6 +38,7 @@
 #include "GopCompose.h"
 #include "GopFence.h"
 #include "GopRefresh.h"
+#include "GopShotDiagnostics.h"
 #include "../PianoDpu/PianoDpuFlipClient.h"           // pianoPrepareSurface: how the copy's kept maps prepare a surface
 #include "../../PianoDpu/tests/prepare_model.h"       // XNU's read-only prepare rule, modelled
 
@@ -2010,8 +2011,27 @@ static void testColorLog()
     CHECK(logged(1) && logged(16) && !logged(17) && logged(100) && !logged(101));
 }
 
+static void testShotBusyDiagnostics()
+{
+    using namespace gopshot;
+    CHECK(dpuBusyReason(PianoDpuScanoutBusy::initialLock) == BusyReason::initialLock);
+    CHECK(dpuBusyReason(PianoDpuScanoutBusy::finalLock) == BusyReason::finalLock);
+    CHECK(dpuBusyReason(PianoDpuScanoutBusy::changed) == BusyReason::scanoutChanged);
+    CHECK(dpuBusyReason(PianoDpuScanoutBusy::none) == BusyReason::dpuBusy);
+    CHECK(!std::strcmp(busyReasonName(BusyReason::oddEpoch), "odd-epoch"));
+    CHECK(!std::strcmp(busyReasonName(BusyReason::finalEpoch), "final-epoch"));
+
+    BusyCounts counts;
+    for (unsigned i = 0; i < unsigned(BusyReason::count); ++i) CHECK(counts.record(BusyReason(i)) == 1);
+    CHECK(counts.record(BusyReason::scanoutChanged) == 2);
+    CHECK(counts.record(BusyReason::initialLock) == 2);
+    CHECK(counts.record(BusyReason::scanoutChanged) == 3);
+    CHECK(counts.byReason[unsigned(BusyReason::finalEpoch)] == 1);
+}
+
 int main()
 {
+    testShotBusyDiagnostics();
     testRefreshContract();
     testFencePoll();
     testColorLog();

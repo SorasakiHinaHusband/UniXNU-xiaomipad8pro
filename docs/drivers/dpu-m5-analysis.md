@@ -1,5 +1,7 @@
 # DPU M5 panel sleep analysis
 
+The dark-wake fix-image gate is **HOLD**. [Current gate](#fix-image-gate)
+
 **Root cause closed by y12o qual2b.** INTF2 accepted the disable request, but its effective timing and both live counters continued tracking INTF1 throughout the 40 ms wait. The slave-first sequence waits for a stop that depends on the master, then rolls back before reaching that master. Ubuntu v1.4.0 stops the master first and hands off the shared CTL before stopping the slave’s local timing. The native retained-route variant needs hardware qualification.
 
 ## References and topology
@@ -155,7 +157,7 @@ The concrete stuck edge is `setPanelPower` returning false before touch release,
 
 The boot enabled a 32 s Gunyah bite and a 6,900 s scheduled reset. Patch `0063` shows that `piano_reset_tick` pets the watchdog every 10 s from a high-priority kernel thread call and does not take either display lock. A watchdog bite fits the interval if pets stopped, and an abandoned DMA or interconnect fault remains a candidate. Returning to ABL is common to several reset sources given this boot's restart reason. The reset occurred well before the scheduled reset, there is no panic line, and the actual last pet, reset source and blocking thread are **unknown**. The confirmed indefinitely blocked path is display presentation, independent of the reset attribution.
 
-## Fix-image gate
+## Historical y12p wake-sequencing proposal
 
 Path: WindowServer/IOMobileFramebuffer API and IOMFB family system/API gate → NativeGopDisplay publishes off, queues intent and drains the copy job → PianoBacklight confirms dual BL_EN and PianoTouch parks → PianoDpu worker drains and stops the shared CTL, resets the retained DSI hosts for LP commands, then restores bonded video → PCC replay, touch release, display power, backlight and VBL on the copy/work-loop boundary. Ubuntu and sheng counterparts are listed above.
 
@@ -164,3 +166,39 @@ Checks: **ours-OK** in the capture for the master-first sleep, two LP DMA comple
 Root cause: Confirmed sequencing bug. The baseline parks the shared DPU path without resetting either DSI video engine, restarts both timing engines, then overlays CMD mode and relies on a front-porch DMA. DSI0 times out despite the restored CTL and moving INTF counters. Ubuntu specifically requires a host reset for the video-engine blockage created by INTF disable. A retained stale DSI video FSM is the best-supported hardware mechanism and needs confirmation from the next wake with host status sampled. The failure reply permanently parks the display copy/VBL path. The reset mechanism is still unproven.
 
 ONE change: Under `piano-dpu-panel=1`, restore the retained panel in one bonded command window before restarting timing. With both INTFs quiescent, disable video and software-reset both DSI hosts with the pinned SM8750 clock mask, send the paired LP 11 → 120 ms → 29 sequence in command-only mode, restore the saved host controls, then restore fetch, the shared CTL route and lockstep timing. On wake failure, bound the reply, relinquish touch and presentation through the existing backlight path, and latch M5 off for the boot. Abort any timed-out command owned by the stopped-host path before restoring controls. Attempt scanout restoration once when the path remains safe. A link that fails to deliver wake cannot guarantee the glass left sleep, so the fallback guarantees progress of the software path, with the panel-side result requiring qualification.
+
+## Read-only M5 snapshot and capture diagnostics
+
+M5R passed on the `v131y12t-qual1` RAM qualification run on 2026-11-27.
+The sampled CTL, DSC, INTF and DSI routing matched the bright control and
+the backlight inputs recovered. The ten post-wake source captures returned
+`EBUSY`, so the active scanout pixels at the dark exposures remain unknown.
+
+The root-only `machdep.piano_dpu_snapshot` reports CTL DSC active and flush,
+pipe and fetch active, both INTF CONFIG2 and DATA_HCTL words, and both DSI
+video compression controls. With `piano-dpu-snapshot=1` it also reports the
+additional DSI host configuration and PHY common status words. Each link
+requires a powered MDSS domain, enabled AHB and MDP clocks, and that link's
+running byte and pixel clocks. A closed gate leaves the corresponding probe
+unread. The snapshot makes zero MMIO stores, including when
+`piano-dpu-clkread=1` also enables passive clock reads. Enable clock readback
+alone for the RPMh queries, which program the ACTIVE TCS transport.
+[Snapshot code](../../package/PianoDpu/DpuSnapshot.h) · [Clock readback](dpu-clkread.md)
+
+With both `native-gop-display-shot=1` and `piano-dpu-snapshot=1`, a refused
+`gop-shot` attempt logs why it returned `EBUSY`. The reasons cover a copy
+already in flight, an unavailable initial or final DPU lock, a changed
+scanout target or generation, and a copy epoch that changed during capture.
+The log includes the timing, completed pixel bytes and the DPU state samples
+available from successful try-locks. The host model checks the read gates,
+zero stores and detection of a lost compression word with both INTFs still
+running. [Snapshot host tests](../../package/PianoDpu/tests/dpu_snapshot_host.cpp) ·
+[Capture diagnostics](../../package/NativeGopDisplay/GopShotDiagnostics.h)
+
+## Fix-image gate
+
+**HOLD.** The scope is read-only observation. A stable active-scanout capture
+paired with the optical sample is still needed to establish the source
+pixels, followed by panel or link evidence if a bright source and matching
+host route coincide with a dark panel. The probe leaves the existing M5
+power, DCS, PPS and PHY sequencing intact.

@@ -8,6 +8,7 @@
 class IOService;
 class OSSymbol;
 struct PianoDpuScanoutRequest;
+struct PianoDpuScanoutDiagnostics;
 
 namespace pianodpu {
 
@@ -21,7 +22,7 @@ void flipRun(IOService *owner, const Survey &s, const SmmuSurvey &m, uint32_t sm
 // PianoDpu::callPlatformFunction: true when name is "PianoDpuFlip" (PianoDpuFlipClient.h), with *result set.
 bool flipFunction(const OSSymbol *name, void *request, void *handoff, IOReturn *result);
 bool flipStatsSnapshot(flip::Stats &stats);
-IOReturn scanoutRead(PianoDpuScanoutRequest *request);
+IOReturn scanoutRead(PianoDpuScanoutRequest *request, PianoDpuScanoutDiagnostics *diagnostics);
 
 // Serializes timing and PCC transactions with flips.
 IOLock *flipTransactionLock();
