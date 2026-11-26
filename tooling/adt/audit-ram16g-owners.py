@@ -140,7 +140,10 @@ def supplemental_exclusions(text):
             raise ValueError('duplicate exclusion fields')
         return result
 
-    data = json.loads(text, object_pairs_hook=unique)
+    try:
+        data = json.loads(text, object_pairs_hook=unique)
+    except RecursionError:
+        raise ValueError('excessively nested exclusions') from None
     if (not isinstance(data, dict) or set(data) != {'schema', 'exclusions'} or
             type(data['schema']) is not int or data['schema'] != 1 or
             not isinstance(data['exclusions'], list) or len(data['exclusions']) > 4096):
@@ -179,6 +182,13 @@ def bucket_dispositions(slabs, inventory):
     result = []
     for name, (base, end) in RANGES.items():
         group = [slabs[b] for b in range(base, end, SLAB)]
+        non_runtime_ranges = []
+        for row in group:
+            if row['efi'] == 'non-runtime':
+                if non_runtime_ranges and non_runtime_ranges[-1]['end'] == row['base']:
+                    non_runtime_ranges[-1]['end'] = row['end']
+                else:
+                    non_runtime_ranges.append(dict(base=row['base'], end=row['end']))
         categories = {}
         for kind in EXCLUSION_KINDS:
             indices = [i for i, x in enumerate(inventory['exclusions'])
@@ -197,6 +207,7 @@ def bucket_dispositions(slabs, inventory):
         result.append(dict(name=name, base=base, end=end, total_slabs=len(group),
                            non_runtime_slabs=sum(r['efi'] == 'non-runtime' for r in group),
                            non_runtime_mib=2 * sum(r['efi'] == 'non-runtime' for r in group),
+                           non_runtime_ranges=non_runtime_ranges,
                            efi_receipts=dict(Counter(r['R-EFI'] for r in group)),
                            disposition='HOLD', released_mib=0, admitted_slabs=0,
                            slab_dispositions=dict(Counter(r['disposition'] for r in group)),
@@ -494,6 +505,7 @@ def matrix(report):
              'ONE change: HOLD',
              'Observed means map fact only. Partial/unknown receipts cannot admit memory.',
              'R-DMA partial means scoped console evidence only; R-SEC/R-VM/R-CPU/R-DUMP remain unknown.',
+             '',
              '| Bucket | Non-runtime slabs / MiB | DT reserved overlap slabs | Firmware policy overlap slabs | SMMU reachable slabs | Disposition |',
              '|---|---:|---:|---:|---:|---|']
     for row in report['bucket_dispositions']:
@@ -501,7 +513,7 @@ def matrix(report):
         lines.append(f"| {row['name']} | {row['non_runtime_slabs']} / {row['non_runtime_mib']} | "
                      f"{checks['dt-reserved']['overlap_slabs']} | {checks['firmware-policy']['overlap_slabs']} | "
                      f"{checks['smmu-reachable']['overlap_slabs']} | HOLD ({row['static_proof']}) |")
-    lines += ['Zero overlap is scoped to verified inputs; missing sources and live owners stay unknown.',
+    lines += ['', 'Zero overlap is scoped to verified inputs; missing sources and live owners stay unknown.', '',
              '| Class | Slabs | R-EFI observed/excluded/unknown | R-DMA | R-DPU | R-CPU | R-SEC | R-VM |',
              '|---|---:|---|---|---|---|---|---|']
     for row in report['classes']:

@@ -131,6 +131,10 @@ class AuditTest(unittest.TestCase):
                                            'FD': {'non-runtime': 7, 'runtime': 1}})
         buckets = report['bucket_dispositions']
         self.assertEqual([b['non_runtime_mib'] for b in buckets], [256, 368, 14])
+        self.assertEqual([b['non_runtime_ranges'] for b in buckets], [
+            [dict(base=0xe3800000, end=0xf3800000)],
+            [dict(base=0xbda00000, end=0xd3c00000), dict(base=0xd4000000, end=0xd4e00000)],
+            [dict(base=0xa7000000, end=0xa7600000), dict(base=0xa7800000, end=0xa8000000)]])
         self.assertEqual(sum(b['non_runtime_slabs'] for b in buckets), 319)
         self.assertEqual([b['dt_memory_covered_slabs'] for b in buckets], [128, 186, 8])
         self.assertEqual([b['slab_dispositions'] for b in buckets],
@@ -312,6 +316,22 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(completed.stdout, '')
             self.assertNotIn(directory, completed.stderr)
             self.assertNotIn('unrecognized-private-label', completed.stderr)
+
+    def test_excessively_nested_exclusions_fail_without_traceback(self):
+        text = '[' * 2000 + '0' + ']' * 2000
+        with self.assertRaises(ValueError):
+            owners.supplemental_exclusions(text)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, data in (('map', fixture()), ('console', ''), ('exclusions', text)):
+                (root / name).write_text(data)
+            completed = subprocess.run([sys.executable, str(SCRIPT), '--efi-map', str(root / 'map'),
+                                        '--owners-console', str(root / 'console'),
+                                        '--exclusions', str(root / 'exclusions')], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, '')
+            self.assertNotIn('Traceback', completed.stderr)
+            self.assertNotIn(directory, completed.stderr)
 
     def test_partition_and_no_release_with_complete_map(self):
         report = owners.audit(fixture(), CONSOLE)
