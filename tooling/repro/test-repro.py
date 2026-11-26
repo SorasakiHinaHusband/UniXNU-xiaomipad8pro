@@ -10,6 +10,7 @@
   - verify-root.py on a small synthetic root image: PASS, and FAIL on a changed window byte or a wrong manifest;
   - unit-profile.py on synthetic GPTs: the reference layout is SAME-LAYOUT, a moved partition DIFFERENT;
   - boot-dtb.py's v2 parser; fetch-and-build.sh --dry-run runs nothing.
+  - scripts/fetch-pins.py --dry-run plans the locked source checkouts without creating them.
 
   python3 tooling/repro/test-repro.py
 """
@@ -24,6 +25,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 import uuid
 import zlib
@@ -328,15 +330,33 @@ class Scripts(unittest.TestCase):
 
     def test_entry_dry_run_runs_nothing(self):
         with tempfile.TemporaryDirectory() as t:
-            env = dict(os.environ, K273_INPUTS=str(Path(t) / 'in'))
+            inputs = Path(t) / 'in'
+            env = dict(os.environ, K273_INPUTS=str(inputs), K273_ROOT_PART='linux_data', PIANO_GPU='2',
+                       PIANO_DATA_PERSIST='2', PIANO_RESET_AFTER='900')
             got = subprocess.run(['bash', str(R / 'fetch-and-build.sh'), '--dry-run', 'inputs', 'systemos', 'root', 'kernel', 'fd', 'image'],
                                  capture_output=True, text=True, env=env, timeout=120)
+            self.assertFalse(inputs.exists())
         self.assertEqual(got.returncode, 0, got.stderr[-500:])
         self.assertIn('dry run: nothing was fetched, built or written', got.stdout)
         self.assertNotIn('\nrun: ', got.stdout)
         for command in ('make-systemos.sh', 'make-root-image.sh', 'prepare-k27-tree.sh', 'build-fd.sh', 'build-k273-image.sh'):
             self.assertIn(command, got.stdout)
-        self.assertFalse((Path(t) / 'in').exists())
+        self.assertIn('K273_ROOT_PART=linux_data PIANO_GPU=2 PIANO_DATA_PERSIST=0 PIANO_RESET_AFTER=900', got.stdout)
+
+    def test_fetch_pins_dry_run_plans_locked_checkouts(self):
+        pins = tomllib.loads((D / 'unixnu.lock').read_text())['pin']
+        with tempfile.TemporaryDirectory() as t:
+            research = Path(t) / 'unixnu-research'
+            env = dict(os.environ, UNIXNU_RESEARCH=str(research))
+            got = subprocess.run([sys.executable, str(D / 'scripts/fetch-pins.py'), '--dry-run'], cwd=t, env=env,
+                                 capture_output=True, text=True, timeout=30, check=True)
+            self.assertFalse(research.exists())
+        expected_checkouts = {'UniXNU': 'UniXNU', 'Mu-Silicium': 'Mu-Silicium-piano',
+                              'piano-uefi': 'piano-uefi-UniXNU-piano'}
+        for name, checkout in expected_checkouts.items():
+            self.assertIn(f'would fetch {name} -> {research / checkout} @ {pins[name]["commit"][:10]}', got.stdout)
+        self.assertIn(f'would fetch the k27 tree -> {research / "k27-tree"} @ '
+                      f'{pins["k27"]["commit"][:10]} + {pins["k27"]["patches"]}', got.stdout)
 
 
 if __name__ == '__main__':
