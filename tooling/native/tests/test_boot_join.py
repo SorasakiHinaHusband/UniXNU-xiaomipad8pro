@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # Copyright (c) 2026, Leo Zhang. All rights reserved.
 """Offline acceptance of the actual boot transaction and SET22 owner latch."""
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 W = Path(__file__).resolve().parents[3]
+HOST_FLAGS = ['-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 
 class BootJoinTests(unittest.TestCase):
     def test_airportd_kick_starts_fallback_once(self):
@@ -239,7 +241,7 @@ int main(void) {
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)
             (path / 'test.m').write_text(source)
-            subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-I', str(W),
+            subprocess.run(['xcrun', 'clang', *HOST_FLAGS, '-fobjc-arc', '-I', str(W),
                             str(path / 'test.m'), '-framework', 'Foundation', '-framework', 'CoreWLAN',
                             '-framework', 'Security', '-framework', 'CoreLocation', '-o', str(path / 'test')],
                            check=True, capture_output=True)
@@ -281,7 +283,7 @@ int main() {
 '''
         with tempfile.TemporaryDirectory() as d:
             path=Path(d); (path/'test.cpp').write_text(source)
-            subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-Werror','-I',str(W),str(path/'test.cpp'),'-o',str(path/'test')],check=True,capture_output=True)
+            subprocess.run(['c++','-std=c++17',*HOST_FLAGS,'-I',str(W),str(path/'test.cpp'),'-o',str(path/'test')],check=True,capture_output=True)
             subprocess.run([str(path/'test')],check=True,capture_output=True)
 
     def test_actual_profile_safety(self):
@@ -316,7 +318,7 @@ int main(int argc,char **argv) {
  assert(!kick_completed(argv[2],boot) && !kick_completed(argv[3],boot));
  chmod(argv[1],0644); assert(!kick_completed(argv[1],boot)); chmod(argv[1],0600);
  chmod(argv[1],0644); assert(safe_open(argv[1])<0); chmod(argv[1],0600);
- assert(safe_open(argv[2])==-2); assert(safe_open(argv[3])<0);
+ assert(safe_open(argv[2])==-2); assert(safe_open(argv[3])<0); assert(safe_open(argv[4])<0);
  struct piano_wifi_profile p; const char *good="ssid=fixture\nsecurity=wpa2-psk\npsk=fixture-only\n";
  assert(!piano_wifi_profile_parse((const uint8_t*)good,(uint32_t)strlen(good),&p)); piano_wifi_profile_wipe(&p);
  assert(piano_wifi_profile_parse((const uint8_t*)good,(uint32_t)strlen(good)-1,&p)); piano_wifi_profile_wipe(&p);
@@ -325,10 +327,11 @@ int main(int argc,char **argv) {
         with tempfile.TemporaryDirectory() as d:
             path=Path(d); path.chmod(0o700); profile=path/'profile';profile.write_text('fixture\n');profile.chmod(0o600)
             (path/'link').symlink_to(profile);(path/'test.m').write_text(source)
-            subprocess.run(['xcrun','clang','-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation',
+            os.mkfifo(path / 'fifo', 0o600)
+            subprocess.run(['xcrun','clang',*HOST_FLAGS,'-fobjc-arc','-I',str(W),str(path/'test.m'),'-framework','Foundation',
                             '-framework','CoreWLAN','-framework','Security','-framework','CoreLocation',
                             '-o',str(path/'test')],check=True,capture_output=True)
-            subprocess.run([str(path/'test'),str(profile),str(path/'missing'),str(path/'link')],check=True,capture_output=True)
+            subprocess.run([str(path/'test'),str(profile),str(path/'missing'),str(path/'link'),str(path/'fifo')],check=True,timeout=15,capture_output=True)
 
     def test_fallback_receipt_sequences(self):
         source = r'''
@@ -341,6 +344,8 @@ int main(int argc,char **argv) {
 #include "package/PianoWifi/WifiProfile.h"
 static uint64_t seconds;
 static unsigned accesses, scans, associations, pauses, rawGeneration;
+static const char *rawReply;
+static size_t rawSize;
 static uint64_t currentGeneration;
 static size_t currentSize = sizeof currentGeneration;
 static int currentError = ENOENT;
@@ -398,9 +403,11 @@ static int fixture_sysctl(const char *name, void *old, size_t *len, void *new, s
     return 0;
   }
   assert(!strcmp(name, PIANO_WIFI_PROFILE_SYSCTL));
-  const int written = rawGeneration ? snprintf(old, *len, "set (generation %u): source apple-set20", rawGeneration)
-                                    : snprintf(old, *len, "not set");
+  const int written = rawReply ? snprintf(old, *len, "%s", rawReply) :
+      rawGeneration ? snprintf(old, *len, "set (generation %u): source apple-set20", rawGeneration) :
+                      snprintf(old, *len, "not set");
   assert(written > 0 && (size_t)written < *len);
+  *len = rawSize ? rawSize : (size_t)written + 1;
   return 0;
 }
 #define CWWiFiClient FixtureClient
@@ -417,6 +424,22 @@ int main(void) {
     struct piano_wifi_profile profile = { .ssid_len = sizeof fixtureName };
     struct apple_join a = { .profile = &profile, .kick_time = 100, .location_passed = 1 };
     struct piano_boot_join_transport transport = { &a, ready, receipt, associate, fixture_pause };
+    rawReply = "set (generation 4294967295): source apple-set20";
+    assert(receipt(NULL) == UINT32_MAX);
+    rawSize = strlen(rawReply); // success with a short reply missing its terminator
+    assert(!receipt(NULL));
+    rawSize = 0;
+    const char *bad[] = {
+      "set (generation 9: source apple-set20",
+      "set (generation 4294967297): source apple-set20",
+      "set (generation +9): source apple-set20",
+      "set (generation 9): source apple-set20-truncated",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; ++i) {
+      rawReply = bad[i];
+      assert(!receipt(NULL));
+    }
+    rawReply = NULL;
     seconds = 134;
     assert(ready(&a) == 0 && accesses == 0 && scans == 0);
     seconds = 135;
@@ -494,7 +517,7 @@ int main(void) {
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)
             (path / 'test.m').write_text(source)
-            subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-I', str(W),
+            subprocess.run(['xcrun', 'clang', *HOST_FLAGS, '-fobjc-arc', '-I', str(W),
                             str(path / 'test.m'), '-framework', 'Foundation', '-framework', 'CoreWLAN',
                             '-framework', 'Security', '-framework', 'CoreLocation', '-o', str(path / 'test')],
                            check=True, capture_output=True)

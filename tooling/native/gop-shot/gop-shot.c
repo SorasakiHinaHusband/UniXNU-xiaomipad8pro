@@ -88,7 +88,7 @@ int main(int argc, char **argv)
         override_layout = GOP_SHOT_LAYOUT_BGRA8;
     else if (argc == 3 && strcmp(argv[1], "--10bit") == 0)
         override_layout = GOP_SHOT_LAYOUT_PACKED10;
-    const char *output = argv[argc - 1];
+    const char *output = argc > 1 ? argv[argc - 1] : "";
     const bool to_stdout = strcmp(output, "--stdout") == 0;
     if ((argc != 2 && override_layout == GOP_SHOT_LAYOUT_AUTO) ||
         (!to_stdout && output[0] == '-') || !output[0]) {
