@@ -33,6 +33,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 | – | [video.md](video.md) | `PianoVideo`: Iris video core, power, firmware and HFI, with a VideoToolbox frontend and native Iris backend | Hardware video decode and encode | VM-era VideoToolbox frontend, PianoPower and PianoA830 |
 | – | [displayport.md](displayport.md) | `PianoDp`: USB-C DP Alt Mode, QMP PHY, hotplug events, second DPU path and second framebuffer | External displays | PianoDpu, PianoUsbHost and PianoPower |
 | – | [camera.md](camera.md) | `PianoCamera`: front and rear camera control, RAW capture, software ISP and CMIOExtension | Camera apps | Ubuntu camera and CCI reference, PianoTorch and CMIOExtension |
+| – | [camera-raw-isp.md](camera-raw-isp.md) | B11 full-resolution RAW10, DMA/SMMU, CPU/Metal and hardware ISP, AE/AWB and app verification analysis | Fix-image gate HOLD; daily path unchanged | Pinned Ubuntu camera/CAMSS reference and native camera sources |
 | – | [torch.md](torch.md) | `PianoTorch`: PM8550 flash LED control, read-back, time limit and thermal guard | Rear flashlight | PianoPower `SpmiObserver.h` and PianoBacklight |
 | – | [ir.md](ir.md) | `PianoIR`: opt-in SE15 IR remote transmitter | Built and host-tested | PianoTouch GENI SPI and PianoDwc3 SMMU helpers |
 | – | [bluetooth.md](bluetooth.md) | `PianoBluetooth`: WCN7860 over UART, shared rails with PianoWifi and HCI transport to macOS | Keyboards, mice and audio | UniXNU-sheng `BluetoothProbe` / `WcnPower` and PianoWifi |
