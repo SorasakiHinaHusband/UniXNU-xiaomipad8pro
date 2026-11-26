@@ -11,7 +11,7 @@ payload files (its path, path.adt, path.trustcache and its initrd, the 27.3 coll
 table (id, title, type, path, initrd, args: the line) and the firmware files its collection pins. Nothing of the 27.0.1 line: no
 other payload file, no other OS entry. The new menu:
   macos-27.3        the base's entry, the default (the base's timeout)
-  macos-27.3-diag   only when the line + piano-reset-after/-to stays under DarwinBoot's 1000 bytes (the 989-byte line does not)
+  macos-27.3-diag   only when the line + piano-reset-after/-to fits the loader-line budget
   fastboot          the same payload, reset into ABL fastboot after 1 s: no UFS root, no Data store (data-persist=0), no piano-* driver
                     and no pstore console (the last run's log stays)
   reset, shutdown, tools
@@ -36,6 +36,7 @@ that tail, the tail taken from the base record's boot_args_split or read out of 
 exist; a loud refusal when the tail is in neither -- never a selector left pointing at a tail a fresh --adt does not carry, which
 would drop every piano-* argument without a word). The reassembled line takes the edits and is split again; each argument name is
 given at most once over --arg/--seed/--root-part (twice is refused, not silently duplicated).
+--arg piano-long-boot-args=1 opts into the layout in docs/boot-args-length.md.
 """
 import argparse
 import hashlib
@@ -62,7 +63,6 @@ spec.loader.exec_module(build_esp)
 ROOT = 'EFI/UniXNU/'
 TOML = ROOT + 'unixnu.toml'
 PAYLOADS = ROOT + 'Payloads/'
-LINE_MAX = 1000                      # DarwinBoot passes at most 1023 bytes; the tools keep every line under 1000
 # The fastboot entry: the line without the root, the store, the console mirror and every piano-* driver, then a reset after 1 s.
 FASTBOOT_DROP = ('native-ufs-root', 'native-ufs-root-part', 'native-ufs-diagnostics', 'pstore-console', 'pstore-console-size',
                  'data-persist', 'data-store-lba', 'data-store-replace', 'data-store-flatten', 'sheng-smp')
@@ -94,6 +94,29 @@ def diag_line(line, secs):
     return ' '.join(args + [f'piano-reset-after={secs}', 'piano-reset-to=bootloader', 'sheng-smp=1'])
 
 
+def diag_budget(line, tail_bytes):
+    size = len(line.encode())
+    limit = boot_args.line_max(line.split())
+    if size > limit:
+        return {'bytes': size, 'included': False,
+                'why': f'{size} bytes with piano-reset-after/-to: the builder allows {limit}'}
+    if limit == boot_args.LONG_LINE_MAX and tail_bytes and size + 1 + tail_bytes > boot_args.MERGED_MAX:
+        return {'bytes': size, 'included': False,
+                'why': f'the diagnostic reset and the ADT tail exceed {boot_args.MERGED_MAX} merged bytes'}
+    return {'bytes': size, 'included': True}
+
+
+def split_line(line, *, force=False):
+    """Loader line and ADT tail. None means the line needs no ADT edit."""
+    words = line.split()
+    limit = boot_args.line_max(words)
+    long_layout = limit == boot_args.LONG_LINE_MAX
+    if not (long_layout or force or len(line.encode()) > limit):
+        return line, None
+    kept, tail = boot_args.fit(words, 'macos', force=force or not long_layout)
+    return ' '.join(kept), None if long_layout and not tail else tail
+
+
 def config_text(base_name, timeout, entries, store, seed):
     text = ('# piano persistent boot (docs/persistent-boot.md): the ESP on UFS LUN 0, partition 37. boot_a holds only BootShim + FD; a\n'
             '# "fastboot boot" image with its own payload still wins (firmware/patches/unixnu/0001).\n'
@@ -116,13 +139,14 @@ def main():
     p.add_argument('--adt', type=Path, help='its ADT (the same build)')
     p.add_argument('--trust', type=Path, help='a new trust cache (it must cover the seed\'s and the system\'s code)')
     p.add_argument('--seed', type=Path, help='a new Data seed: a new store (its window from the seed\'s size, data-store-lba set)')
-    p.add_argument('--arg', action='append', default=[], metavar='NAME=VALUE', help='one more argument for the entry (replaces NAME)')
+    p.add_argument('--arg', action='append', default=[], metavar='NAME=VALUE',
+                   help='one more argument for the entry (replaces NAME); piano-long-boot-args=1 opts into the 1008-byte layout')
     p.add_argument('--drop-arg', action='append', default=[], metavar='NAME', help='an argument of the base line left out')
     p.add_argument('--root-part', metavar='NAME', help='the root image\'s partition (native-ufs-root-part; the store then stays on '
                    'linux_data through data-store-part): linux_rootfs for the whole-disk layout of 2026-11-14')
     p.add_argument('--split', action='store_true', help='move the piano-* arguments into the ADT (k27 0066) even when the line fits')
     p.add_argument('--diag-reset-after', type=int, default=240, metavar='SECS',
-                   help='the -diag entry\'s reset (only built when its line stays under 1000 bytes)')
+                   help='the -diag entry\'s reset (included when its loader line fits the selected layout)')
     p.add_argument('--firmware-dir', type=Path, metavar='DIR',
                    help='pinned firmware the base lacks, added from DIR/<pin path> (out/firmware\'s layout), size and SHA-256 '
                         'checked against the pin (a private pin\'s hash checked, never shown or recorded)')
@@ -272,14 +296,14 @@ def main():
 
         # -- the arguments past DarwinBoot's line: the ADT's /chosen/piano-boot-args-macos (k27 0066) -----------------------------
         split = None
-        if len(line.encode()) >= LINE_MAX or a.split or base_split:   # a reassembled (split) base is split again
+        kept, tail = split_line(line, force=bool(a.split or base_split))   # a reassembled base is split again
+        if tail is not None:
             if b'piano-boot-args: /chosen/' not in kc.read_bytes():
                 raise SystemExit(f'{a.entry}: a {len(line)}-byte line needs the ADT tail, and this collection\'s kernel lacks k27 0066')
-            kept, tail = boot_args.fit(line.split(), 'macos', force=True)
             adt.write_bytes(boot_args.with_set(adt.read_bytes(), 'macos', tail))
             split = {'set': 'macos', 'property': boot_args.prop_name('macos'), 'tail': ' '.join(tail), 'tail_bytes': len(' '.join(tail)),
-                     'line_bytes': len(' '.join(kept)), 'full_bytes': len(line)}
-            line = ' '.join(kept)
+                     'line_bytes': len(kept), 'full_bytes': len(line)}
+        line = kept
 
         # -- firmware the 27.3 collection pins; other non-payload files stay; the 27.0.1 payload goes --------------------------
         # non-payload files only: the payload is staged above (with --kc/--adt/--trust/--seed and the ADT tail) and must not be
@@ -324,17 +348,16 @@ def main():
         k_entry['args'] = line
         entries = [k_entry]
         diag = diag_line(line, a.diag_reset_after)
-        diag_info = {'bytes': len(diag.encode()), 'included': len(diag.encode()) < LINE_MAX}
+        diag_info = diag_budget(diag, split['tail_bytes'] if split else 0)
         if diag_info['included']:
             entries.append({**k_entry, 'id': f'{a.entry}-diag', 'title': f'macOS 27.3, reset to fastboot after {a.diag_reset_after} s',
                             'args': diag})
-        else:
-            diag_info['why'] = f'{len(diag)} bytes with piano-reset-after/-to: DarwinBoot\'s lines stay under {LINE_MAX}'
         fb = fastboot_line(line)
         entries.append({**k_entry, 'id': 'fastboot', 'title': 'Reset into fastboot (ABL)', 'args': fb})
         for e in entries:
-            if len(e['args']) >= LINE_MAX or '"' in e['args'] or '\\' in e['args']:
-                raise SystemExit(f'{e["id"]}: kernel command line of {len(e["args"])} bytes, or a quote or backslash in it')
+            args = e['args']
+            if len(args.encode()) > boot_args.line_max(args.split()) or '"' in args or '\\' in args:
+                raise SystemExit(f'{e["id"]}: kernel command line of {len(args.encode())} bytes, or a quote or backslash in it')
         boot_args.check_userland({e['id']: e['args'] for e in entries if e['id'] != 'fastboot'},
                                  adt.read_bytes(), kc, seed=a.seed, live=True)
         new_text = config_text(base['image'], config['boot']['timeout'], entries, store, seed)

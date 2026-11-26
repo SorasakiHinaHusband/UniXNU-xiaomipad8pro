@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """k27 0066's host side: the kernel arguments beyond DarwinBoot's budget live in the ADT (docs/bringup-debugging.md §5.2).
 
-DarwinBoot passes at most 1023 bytes of command line, and the tools keep the line under LINE_MAX (1000). With k27 0066 in the kernel,
+DarwinBoot passes at most 1023 bytes of command line, and the tools normally keep the line under LINE_MAX (1000). With k27 0066 in the kernel,
 the line's piano-boot-args=NAME makes it append the ADT's /chosen/piano-boot-args-NAME to the boot-args (piano-boot-args=0 none; no
 selector: /chosen/piano-boot-args), and every PE_parse_boot_argn() sees both (tooling/k27/piano-bootargs/piano_bootargs_policy.h).
 
@@ -20,6 +20,9 @@ piano-reset-to, piano-boot-guard*, and the selector itself); everything else (th
 droidvm-*, cpus, sheng-smp) stays on the line. static-if keys (validation_disables, serverperfmode, lcks, wdt) must stay on the
 line: static_if_init() reads it before the device tree is up. Order is kept within each part, and the kernel appends the tail after
 the line, so for one name the last value still wins as before.
+
+piano-long-boot-args=1 selects a 1008-byte loader line and keeps early and legacy-reader arguments on it. Display arguments
+with only post-merge PE readers may also move to the ADT. See docs/boot-args-length.md.
 """
 import argparse
 import hashlib
@@ -35,9 +38,11 @@ from pathlib import Path
 DEVICE = Path(__file__).resolve().parents[2]
 HEADER = DEVICE / 'tooling/k27/piano-bootargs/piano_bootargs_policy.h'
 LINE_MAX = 1000        # the tools' budget for DarwinBoot's line (it passes at most 1023 bytes)
+LONG_LINE_MAX = 1008   # inclusive, including the ADT selector and the entry suffix
 LEGACY_MAX = 1023     # BOOT_LINE_LENGTH - 1, k27 0066's kern.bootargs clip
 MERGED_MAX = 4095      # PIANO_BOOT_ARGS_SIZE - 1
 PROP = 'piano-boot-args'
+LONG_ARG = 'piano-long-boot-args'
 SET_MAX = 15           # PIANO_BOOT_ARGS_SET_MAX
 KC_MARKER = b'piano-boot-args: /chosen/%s (%u bytes): %u bytes appended'
 MERGED_SYSCTL_MARKER = b'Piano merged boot arguments (0066 ADT tail)\0'
@@ -64,6 +69,9 @@ LEGACY_READERS = {
     'settime.sh': ('droidvm-utc', 'droidvm-tz'),
 }
 SHORT_READERS = {'NativeSoftMetal', 'NativeAdrenoMetal'}  # pass 1023 bytes to sysctl, including the NUL
+LEGACY_KEYS = {key for keys in LEGACY_READERS.values() for key in keys}
+ADT_DISPLAY_KEYS = {'native-gop-display-builtin', 'native-gop-display-flip-lossless',
+                    'native-gop-display-shot', 'native-gop-display-night-shift'}
 
 
 def name_of(arg):
@@ -75,6 +83,19 @@ def movable(arg):
     return n.startswith('piano-') and n not in KEEP and not n.startswith('piano-boot-guard-')
 
 
+def line_max(args):
+    mode = next((word for word in reversed(args) if name_of(word) == LONG_ARG), None)
+    return LONG_LINE_MAX if mode == f'{LONG_ARG}=1' else LINE_MAX - 1
+
+
+def movable_long(arg):
+    name = name_of(arg)
+    if name in ADT_DISPLAY_KEYS:
+        return True
+    return (movable(arg) and name not in LEGACY_KEYS and name not in (LONG_ARG, 'piano-extra-ram-stage')
+            and not name.startswith(('piano-metal-', 'piano-tu-')))
+
+
 def prop_name(set_name):
     if set_name is None:
         return PROP
@@ -84,23 +105,35 @@ def prop_name(set_name):
 
 
 def fit(args, set_name, reserve=0, force=False):
-    """(line args, tail args) for ARGS: unchanged with an empty tail when ' '.join(ARGS) + RESERVE bytes stays under LINE_MAX (and
-    not FORCE); else the movable arguments go to the tail and the line gets piano-boot-args=SET_NAME. SystemExit when the line still
+    """(line args, tail args) for ARGS: unchanged with an empty tail when the line plus RESERVE fits (and
+    not FORCE). Otherwise movable arguments go in the tail with piano-boot-args=SET_NAME in the line. SystemExit when the line still
     does not fit, or the merged boot-args would not fit the kernel's buffer."""
     args = list(args)
     if any(name_of(x) == PROP for x in args):
         raise SystemExit(f'the arguments already have {PROP}=: give the whole (merged) arguments, the tools make the selector')
     line = ' '.join(args)
-    if not force and len(line.encode()) + reserve < LINE_MAX:
-        return args, []
-    tail = [x for x in args if movable(x)]
-    if not tail:
-        return args, []
-    kept = [x for x in args if not movable(x)] + [f'{PROP}={set_name}']
-    prop_name(set_name)
-    line = ' '.join(kept)
     line_bytes = len(line.encode()) + reserve
-    if line_bytes >= LINE_MAX:
+    limit = line_max(args)
+    long_layout = limit == LONG_LINE_MAX
+    if long_layout and any(not 0x20 <= ord(c) <= 0x7e or c in '"\\' for c in line):
+        raise SystemExit(f'{LONG_ARG}=1 needs printable ASCII arguments without quotes or backslashes')
+    if not force and line_bytes <= limit:
+        return args, []
+    moves = movable_long if long_layout else movable
+    kept, tail = [], []
+    for word in args:
+        (tail if moves(word) else kept).append(word)
+    if not tail:
+        if long_layout and line_bytes > limit:
+            raise SystemExit(f'required bootloader prefix is {line_bytes} bytes; {LONG_ARG}=1 allows {limit}')
+        return args, []
+    prop_name(set_name)
+    kept.append(f'{PROP}={set_name}')
+    line_bytes = len(' '.join(kept).encode()) + reserve
+    if line_bytes > limit:
+        if long_layout:
+            raise SystemExit(f'required bootloader prefix, selector and entry suffix are {line_bytes} bytes; '
+                             f'{LONG_ARG}=1 allows {limit}')
         raise SystemExit(f'kernel command line is {line_bytes} bytes even with every piano-* argument in the ADT '
                          f'({len(" ".join(tail))} bytes); DarwinBoot passes at most 1023 (the tools keep it under {LINE_MAX})')
     text = ' '.join(tail)
@@ -282,8 +315,9 @@ def check_userland(entries, adt, kc, *, seed=None, live=False, layer=None):
     readers = None
     for entry, line in entries.items():
         raw = line.encode()
-        if len(raw) >= LINE_MAX or b'\0' in raw:
-            raise SystemExit(f'{entry}: bootloader argument line must stay under {LINE_MAX} bytes without embedded NUL')
+        limit = line_max(line.split())
+        if len(raw) > limit or b'\0' in raw:
+            raise SystemExit(f'{entry}: bootloader argument line must have at most {limit} bytes without embedded NUL')
         full, status = merged(line, adt)
         if status not in ('appended', 'none', 'off'):
             raise SystemExit(f'{entry}: kernel rejects the ADT boot-argument tail ({status})')

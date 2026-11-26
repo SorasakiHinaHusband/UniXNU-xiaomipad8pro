@@ -15,6 +15,7 @@ the FAT payload (UniXNU payload layout, written with UniXNU's payload.write_volu
   build-ram-images.py --fd FD --fd-name NAME --out DIR [--kc KC --trust T --seed S --adt ADT] [--utc SECONDS] [--extra-ram]
 
 --extra-ram adds the shared extra-RAM reservation placeholder to the payload ADT (docs/extra-ram.md).
+Add piano-long-boot-args=1 to PIANO_EXTRA_ARGS for the loader/ADT layout in docs/boot-args-length.md.
 
 The Data store (docs/data-store.md): a macOS image opens the tablet's store (data-persist=2) only when its seed is the installed one
 (PIANO_INSTALLED_SEED in ~/.config/piano/env, or out/persistent/installed.json), else it runs Data volatile (data-persist=0), with a
@@ -54,9 +55,6 @@ from pathlib import Path
 DEVICE = Path(__file__).resolve().parents[2]
 RESEARCH = Path(os.environ.get('UNIXNU_RESEARCH', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'))
 sys.path.insert(0, str(RESEARCH / 'UniXNU/scripts'))
-from unixnu.bootimg import compile_shim  # noqa: E402
-from unixnu.config import load_toml  # noqa: E402
-from unixnu.payload import write_volume  # noqa: E402
 
 MU = RESEARCH / 'Mu-Silicium-piano'
 # UniXNU's BootShim (uefi-sheng 66421cb): image size covers shim + FD, the copied FD is cleaned to PoC and the I-cache
@@ -247,10 +245,22 @@ def boot_args_module():
     return module
 
 
-# k27 0066 (tooling/adt/boot_args.py): when a line would reach DarwinBoot's budget (or PIANO_BOOT_ARGS_SPLIT=1), the piano-* arguments
-# but the reset and guard ones go into the payload ADT's /chosen/piano-boot-args-ram and both lines say piano-boot-args=ram; the
-# kernel appends the set to the boot-args before anything reads them. Needs 0066 in the collection's kernel (checked).
+# k27 0066 (tooling/adt/boot_args.py): fit the loader line by moving arguments into the payload ADT's /chosen/piano-boot-args-ram.
+# PIANO_BOOT_ARGS_SPLIT=1 forces the split, and piano-long-boot-args=1 selects the layout in docs/boot-args-length.md.
 BOOT_ARGS_SET = 'ram'
+
+
+def boot_entry_args(ba, base, *, force=False):
+    """Two loader lines sharing one ADT tail. Reserve the longer CPU suffix when sizing the prefix."""
+    base, tail = ba.fit(base, BOOT_ARGS_SET, reserve=len(' sheng-smp=1'), force=force)
+    one = ' '.join(base + ['cpus=1'])
+    smp = ' '.join(base + ['sheng-smp=1'])
+    limit = ba.line_max(base)
+    for line in (one, smp):
+        size = len(line.encode())
+        if size > limit:
+            raise SystemExit(f'kernel command line is {size} bytes; the builder allows {limit} (DarwinBoot allows 1023)')
+    return one, smp, tail
 
 
 def data_store_args(seed, kc, extra=()):
@@ -376,6 +386,8 @@ def sensor_pack_addon(adt):
 
 
 def payload(stage, image, label, size_mib):
+    from unixnu.payload import write_volume
+
     # mtools stamps the directories it creates with the current time unless SOURCE_DATE_EPOCH is set (mtools 4.0.50):
     # without it two builds a minute apart differ in two bytes of the FAT.
     os.environ['SOURCE_DATE_EPOCH'] = str(EPOCH)
@@ -452,12 +464,7 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
         persist, store_record = data_store_args(seed, kc, extra)
         base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
         base = [x for x in base if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
-    base, tail = ba.fit(base, BOOT_ARGS_SET, reserve=len(' sheng-smp=1'), force=os.environ.get('PIANO_BOOT_ARGS_SPLIT', '0') == '1')
-    one = ' '.join(base + ['cpus=1'])
-    smp = ' '.join(base + ['sheng-smp=1'])
-    for line in (one, smp):
-        if len(line) >= ba.LINE_MAX:
-            raise SystemExit(f'kernel command line is {len(line)} bytes; DarwinBoot passes at most 1023')
+    one, smp, tail = boot_entry_args(ba, base, force=os.environ.get('PIANO_BOOT_ARGS_SPLIT', '0') == '1')
     boot_args = None
     if tail:
         if not ba.kc_has_boot_args(kc):
@@ -512,6 +519,9 @@ def macos_payload(work, kc, trust, seed, adt, utc, extra_ram=False):
 
 def kernel_field(fd, dtb, work, name):
     """The kernel field every piano boot image carries (RAM images and tooling/persist's flashed boot_a): BootShim + FD + DTB."""
+    from unixnu.bootimg import compile_shim
+    from unixnu.config import load_toml
+
     config = load_toml(MU / 'Resources/Configs/piano.toml')
     base, size = config['uefi_fd']['base'], config['uefi_fd']['size']
     firmware = Path(fd).read_bytes()

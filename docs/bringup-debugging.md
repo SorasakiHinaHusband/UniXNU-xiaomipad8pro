@@ -179,7 +179,7 @@ These are the bring-up and diagnostic switches relevant to the daily profile and
 | `piano-dpu-modes=120`, `piano-dpu-modes=144` | RAM qualification | Selects the fixed-rate scanout profiles. Daily stays at 60 Hz. [Refresh profiles](drivers/dpu-m3.md) |
 | `piano-boot-args=NAME` | Split boot arguments | Selects `/chosen/piano-boot-args-NAME`. `=0` skips the tail. With no selector, 0066 looks for `/chosen/piano-boot-args`. |
 
-DarwinBoot passes at most 1023 text bytes. The builders keep its line under 1000 bytes and can move eligible
+DarwinBoot passes at most 1023 text bytes. By default, the builders keep its line under 1000 bytes and can move eligible
 `piano-*` arguments to the ADT. `piano-reset-after`, `piano-reset-to`, `piano-boot-guard*` and the selector
 stay on the line, as do `native-ufs-*`, `data-*`, `pstore-*`, `droidvm-*` and `sheng-smp`. The early
 `static_if_init()` keys (`validation_disables`, `serverperfmode`, `lcks`, `wdt`) also belong on the line.
@@ -198,6 +198,9 @@ stay on the line, as do `native-ufs-*`, `data-*`, `pstore-*`, `droidvm-*` and `s
   previews the merged line with `--line LINE`. [`test-piano-bootargs.sh`](../tooling/k27/test-piano-bootargs.sh)
   covers split, merge and clipping. [`test-esp-split.py`](../tooling/k273/test-esp-split.py) covers rebuilding a
   split ESP with host fixtures.
+
+`piano-long-boot-args=1` opts into a 1008-byte loader line and supports up to
+4095 bytes after the ADT merge. [Boot argument length and reader placement](boot-args-length.md)
 
 **Historical split-line test (2026-11-13).** The first long-line RAM test of 0066 used a 663-byte DarwinBoot line
 and a 407-byte ADT tail, producing 1071 bytes in XNU. The test plan compared the console's full `args` output
