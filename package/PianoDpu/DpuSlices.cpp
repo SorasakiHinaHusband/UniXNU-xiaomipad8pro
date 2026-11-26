@@ -126,7 +126,10 @@ void readSliceArgs()
   PE_parse_boot_argn("native-gop-display-night-shift", &nightShift, sizeof nightShift);
   gA.nightShift = nightShift == 1;
   if (gA.nightShift) gA.pcc = 0;   // the two experiments share one PCC
-  gA.ahbVote = argNumber("piano-dpu-ahb-vote", (gA.nightShift || modesEnabled()) && gA.level >= 2 ? 1 : 0, 0, 2);
+  const unsigned panelArg = argNumber("piano-dpu-panel", 0, 0, UINT32_MAX);
+  gA.panel = panelArg != 0;
+  gA.panelTrace = panelArg == 1;
+  gA.ahbVote = argNumber("piano-dpu-ahb-vote", (gA.nightShift || modesEnabled() || gA.panel) && gA.level >= 2 ? 1 : 0, 0, 2);
   gA.pccEncode = argNumber("piano-dpu-pcc-encode", 1, 0, 1);
   gA.pccNegative = argNumber("piano-dpu-pcc-negative", 0, 0, 1);
   memset(s, 0, sizeof s);
@@ -154,9 +157,6 @@ void readSliceArgs()
     }
     gA.pccTest = ok && k == 3;
   }
-  const unsigned panelArg = argNumber("piano-dpu-panel", 0, 0, UINT32_MAX);
-  gA.panel = panelArg != 0;
-  gA.panelTrace = panelArg == 1;
   if (gA.panelTrace && !gPanelTrace) {   // zero-filled = an empty ring (total 0)
     gPanelTrace = static_cast<panel::TraceRing *>(IOMallocZero(sizeof(panel::TraceRing)));
     if (!gPanelTrace) {
