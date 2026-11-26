@@ -46,7 +46,6 @@ struct Session {
   bool finishWanted=false;
   uint64_t finishRequest=0;
   int firstError=0, closeError=0, completionError=0;
-  uint64_t nextRequest=100;
   pianovideo::stream::Guest guest;
   uint32_t replySurfaceID=0;
   bool replyHasSurface=false;
@@ -72,6 +71,9 @@ struct Client {
   int pid = 0;
   IOLock *lock = nullptr;
   Session *session = nullptr;
+  // A new session may reuse its predecessor's UUID on this transport.
+  uint64_t nextRequest = 100;
+  uint64_t takeRequest() { return nextRequest ? nextRequest++ : 0; }
 };
 void failure(Session *s, uint32_t stage, int error) {
   droidvm_vthost_errors = droidvm_vthost_errors + 1;
@@ -258,7 +260,7 @@ bool lookupSurface(Session *s,uint32_t id,contract::Surface &v) {
     OSSafeReleaseNULL(root);
     if(s->surfaces)++s->surfaceOpens;
     IOLog("PianoVideoVT V5a: IOSurfaceRoot type0 pid %d status %08x client %u\n",s->client->pid,rc,unsigned(s->surfaces!=nullptr));
-    if(rc || !s->surfaces){failure(s,40,int(rc));return false;}
+    if(rc || !s->surfaces){failure(s,40,rc?int(rc):kBadState);return false;}
   }
   uint8_t *result=static_cast<uint8_t *>(IOMallocZero(bytes));if(!result){failure(s,41,kNoMemory);return false;}
   uint32_t resultBytes=bytes;
@@ -373,8 +375,7 @@ bool copyFrame(Session *s,const Frame &f,const contract::Surface &lookup) {
 }
 uint64_t nowMs(){uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);return ns/1000000;}
 bool releaseSurface(Session *s){
-  // An unsuccessful unlock remains owned until session client close. Never
-  // invalidate a handle or advertise another picture while its write is live.
+  // Keep the lookup alive while an unsuccessful unlock still owns the write.
   if(s->writeSurfaceID)return false;
   struct Methods {
     Session *s;
@@ -393,8 +394,17 @@ bool releaseSurface(Session *s){
 }
 void closeSurface(Session *s){
   OSSafeReleaseNULL(s->kernelSurface);
-  if(s->surfaces){if(!s->surfacesBorrowed)s->surfaces->clientClose();OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;
-    ++s->surfaceCloses;s->surfaceLease.closed();s->writeSurfaceID=0;}
+  if(!s->surfaces)return;
+  if(s->surfacesBorrowed){
+    // The foreign client stays open. Retry only the obligations still held.
+    const bool unlocked=unlockSurfaceWrite(s);
+    const bool released=!s->surfaceLease.held()||releaseSurface(s);
+    if(!unlocked||!released)s->completionError=kDecodeError;
+  }else{
+    s->surfaces->clientClose();++s->surfaceCloses;
+  }
+  OSSafeReleaseNULL(s->surfaces);s->surfacesBorrowed=false;
+  s->surfaceLease.closed();s->writeSurfaceID=0;
 }
 bool request(Session *s,Writer &w,const uint8_t *b,uint64_t id,uint32_t type){
   // Queue transport while holding the cancellation fence. The send callback
@@ -420,7 +430,7 @@ void emitFrame(Session *s,int error,const uint8_t *uuid=nullptr){
   const bool allowed=!s->stopping&&!s->invalidating&&!s->firstError&&(!record||(!record->completion.expired(nowMs())&&record->completion.claimEmit()));
   const uint32_t async=record?(record->flags&1):1;IOLockUnlock(s->lock);
   if(!allowed)return;
-  uint8_t b[192];const uint64_t id=s->nextRequest++;Writer w(b,sizeof b);
+  uint8_t b[192];const uint64_t id=s->client->takeRequest();Writer w(b,sizeof b);
   w.header(cc("Demt"),FlagHostRequest,s->uuid,id);w.s64(cc(",frm"),int64_t(s->currentToken));w.s32(cc(",err"),error);
   // Asynchronous=1, FrameDropped=2. A NULL no-output completion has no Dbuf UUID.
   w.u32(cc(",inf"),contract::completionInfo(async,uuid!=nullptr,error));if(uuid)w.uuid(cc(",uui"),uuid);
@@ -477,7 +487,7 @@ bool waitForTerminalAck(Session *s){
 // UUID, never retries a delivered Demt, and never reopens the success fence.
 bool emitTerminalError(Session *s,uint64_t token,pianovideo::stream::Record *record=nullptr){
   if(s->abandoning)return false;
-  uint8_t b[160];const uint64_t id=s->nextRequest++;Writer w(b,sizeof b);
+  uint8_t b[160];const uint64_t id=s->client->takeRequest();Writer w(b,sizeof b);
   w.header(cc("Demt"),FlagHostRequest,s->uuid,id);w.s64(cc(",frm"),int64_t(token));
   w.s32(cc(",err"),kDecodeError);w.u32(cc(",inf"),3);
   s->replyError=kDecodeError;s->replyHasSurface=false;
@@ -567,7 +577,7 @@ void worker(void *arg,wait_result_t){
           const int released=piano_video_native_frame_release(s->native,&s->frame);
           if(released){failure(s,74,released);break;}emitFrame(s,0);
         }else{
-          uint8_t b[128];const uint64_t id=s->nextRequest++;Writer w(b,sizeof b);
+          uint8_t b[128];const uint64_t id=s->client->takeRequest();Writer w(b,sizeof b);
           w.header(cc("Dbuf"),FlagHostRequest,s->uuid,id);w.s64(cc(",frm"),int64_t(s->currentToken));request(s,w,b,id,cc("Dbuf"));
         }
       }
@@ -781,15 +791,18 @@ int droidvm_vthost_message(void *host,const uint8_t *m,uint32_t n,const uint32_t
   Session *s=c->session;
   if(h.flags==FlagGuestReply){
     if(!s||memcmp(s->uuid,h.uuid,16))return -1;
-    IOLockLock(s->lock);const bool expected=s->guest.matches(h.request,h.type)&&!s->guest.expired(nowMs())&&!s->abandoning&&(!s->stopping||h.type==cc("Demt"));IOLockUnlock(s->lock);
-    if(!expected)return -1;
     int32_t error=kDecodeError;paramS32(m,n,cc(",err"),error);Param uuid;bool hasSurface=false;
     if(h.type==cc("Dbuf")&&!error){
-      hasSurface=surfaces==1&&param(m,n,cc(",uui"),uuid)&&uuid.type==cc("=uui")&&uuid.size==16;
+      hasSurface=surfaces==1&&ids&&ids[0]&&param(m,n,cc(",uui"),uuid)&&uuid.type==cc("=uui")&&uuid.size==16;
       if(!hasSurface)error=kDecodeError;
     }
     IOLockLock(s->lock);
-    if(s->guest.matches(h.request,h.type)&&!s->guest.expired(nowMs())&&!s->abandoning&&(!s->stopping||h.type==cc("Demt"))){s->replyError=error;s->replyHasSurface=hasSurface;if(hasSurface){s->replySurfaceID=ids[0];memcpy(s->replyUuid,uuid.value,16);}s->guest.reply(h.request,h.type);}
+    if(!s->guest.matches(h.request,h.type)||s->guest.expired(nowMs())||s->abandoning||(s->stopping&&h.type!=cc("Demt"))){
+      IOLockUnlock(s->lock);return -1;
+    }
+    s->replyError=error;s->replyHasSurface=hasSurface;
+    if(hasSurface){s->replySurfaceID=ids[0];memcpy(s->replyUuid,uuid.value,16);}
+    s->guest.reply(h.request,h.type);
     IOLockUnlock(s->lock);
     IOLog("PianoVideoVT V5a: guest reply %c%c%c%c request %llu status %d surface %u\n",int(h.type>>24),int((h.type>>16)&255),int((h.type>>8)&255),int(h.type&255),h.request,error,unsigned(hasSurface));return 0;
   }

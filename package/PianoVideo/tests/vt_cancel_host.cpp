@@ -209,7 +209,7 @@ struct Harness {
       s->surfaces=new TestSurface;s->surfaceOpens=1;s->current=s->currentAccepted=true;s->currentToken=token(5);
       s->frames.find(token(5))->phase=pianovideo::stream::Phase::Delivering;
       s->frame.memory=new IOMemoryDescriptor;s->frame.token=token(5);native.loans=1;
-      assert(s->guest.begin(s->nextRequest++,cc("Dbuf"),nowMs()));
+      assert(s->guest.begin(s->client->takeRequest(),cc("Dbuf"),nowMs()));
       assert(s->guest.reply(s->guest.request,cc("Dbuf")));s->replyError=0;s->replyHasSurface=true;s->replySurfaceID=69;
     }
   }
@@ -309,12 +309,50 @@ static void epochCases(){
   h.holdAck=true;beginInvalidate(205);h.launch();
   while(h.terminalHeaders.size()==PublishedWindow)h.pump();
   const Header fresh=h.terminalHeaders.back();
-  assert(old.request==fresh.request&&std::memcmp(old.uuid,fresh.uuid,16));
+    assert(old.request<fresh.request&&std::memcmp(old.uuid,fresh.uuid,16));
   assert(h.acknowledge(old)==-1);
   IOLockLock(s->lock);assert(s->guest.matches(fresh.request,fresh.type));IOLockUnlock(s->lock);
   assert(!h.invalidateReplies.count(205));
   h.holdAck=false;assert(!h.acknowledge(fresh));finishInvalidate(205);
   assert(h.errors==PublishedWindow+1&&s->frames.cancelled==1&&h.completions.at(h.token(1))==1);
+}
+
+static void sameUuidEpochCase(){
+  Harness h;h.drain();
+  const auto sendFrame=[&] {
+    auto *s=h.session();s->native=0;s->current=true;s->currentToken=h.token(1);
+    emitFrame(s,kDecodeError);
+    Header reply={cc("Demt"),FlagGuestReply,{},s->guest.request};
+    std::memcpy(reply.uuid,s->uuid,16);
+    assert(reply.request);
+    return reply;
+  };
+  const Header old=sendFrame();
+  assert(!h.acknowledge(old));
+  h.requestType(cc("-dec"),120);h.create();
+  const Header fresh=sendFrame();
+  assert(h.acknowledge(old)==-1);
+  assert(!h.acknowledge(fresh));
+}
+
+static void borrowedSurfaceCleanupCase(){
+  struct BorrowedSurface : IOUserClient {
+    unsigned invalidates=0,releases=0,closes=0;
+    IOReturn callExternalMethod(uint32_t selector,IOExternalMethodArguments *) override {
+      if(selector==pianovideo::vtsurface::Invalidate){++invalidates;return 0;}
+      assert(selector==pianovideo::vtsurface::Release);
+      return ++releases==1?kIOReturnNotPermitted:0;
+    }
+    IOReturn clientClose() override {++closes;return 0;}
+  };
+  Harness h;auto *s=h.session();s->native=0;
+  auto *surface=new BorrowedSurface;
+  surface->retain();s->surfaces=surface;s->surfacesBorrowed=true;
+  assert(s->surfaceLease.acquire(69) && !releaseSurface(s));
+  closeSurface(s);
+  assert(surface->invalidates==1 && surface->releases==2 && !surface->closes);
+  assert(!s->surfaces && !s->surfaceLease.held() && !s->surfaceCloses);
+  surface->release();
 }
 
 static void deadlineCases(){
@@ -389,6 +427,8 @@ static void failureCases(){
 int main(){
   for(bool midLookup:{false,true}){Harness h;h.boundary(midLookup);h.invalidate(midLookup);h.reopen();}
   epochCases();
+  sameUuidEpochCase();
+  borrowedSurfaceCleanupCase();
   deadlineCases();
   failureCases();
   std::puts("VT cancel host PASS real-worker Dbuf wire-admission credits8 empty/full-invalidate ACK-deadline consecutive-epochs");

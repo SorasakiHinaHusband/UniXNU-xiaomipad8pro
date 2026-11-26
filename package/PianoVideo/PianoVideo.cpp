@@ -1076,14 +1076,18 @@ extern "C" int piano_video_native_poll(uint32_t sid,native::Frame *frame)
   NativeOwner &o=*gNativeOwner;
   // Caller may already hold one output loan during a guest request. Pumping
   // continues without replacing it; other RAW completions remain in the ledger.
+  if (o.tx.r.error) return o.tx.r.error;
   const int rc=o.tx.pump();if(rc)return rc;
   if(frame->memory)return 1;
-  session::SelfTest<Bringup<KernelHw>>::OutputFrame f;
-  if(!o.tx.popOutput(f))return 1;
-  auto *b=o.core.layout.find(session::Raw,f.index);
-  if(!b||b->queued||b->pendingRelease||b->readonly||o.loans[f.index])return kErrHfi;
+  const auto *next=o.tx.nextOutput();
+  if(!next)return 1;
+  auto *b=o.core.layout.find(session::Raw,next->index);
+  if(!b||b->queued||b->pendingRelease||b->readonly||!o.tx.ledger.ownsRaw(next->index,next->token)||o.loans[next->index])
+    return o.tx.fail(kErrHfi);
   auto *loan=IOSubMemoryDescriptor::withSubRange(o.core.hw.arenaDesc,b->off,b->size,kIODirectionInOut);
   if(!loan)return kErrNoMemory;
+  session::SelfTest<Bringup<KernelHw>>::OutputFrame f;
+  if(!o.tx.popOutput(f)){loan->release();return o.tx.fail(kErrHfi);}
   o.loans[f.index]=loan;
   frame->memory=loan;frame->cpu=o.core.dma.arena+b->off;frame->length=b->size;
   frame->iova=b->iova();frame->token=f.token;frame->index=f.index;
@@ -1107,7 +1111,7 @@ extern "C" int piano_video_native_frame_release(uint32_t sid,native::Frame *fram
 {
   if(!frame||!frame->memory||!gNativeOwner||!gNativeState.owns(sid)||frame->index>=stream::Raws)return -22;
   NativeOwner &o=*gNativeOwner;
-  if(o.loans[frame->index]!=frame->memory)return -22;
+  if(o.loans[frame->index]!=frame->memory||!o.tx.ledger.ownsRaw(frame->index,frame->token))return -22;
   const auto index=frame->index;const auto token=frame->token;
   o.loans[index]->release();o.loans[index]=nullptr;*frame=native::Frame{};
   return o.tx.releaseOutput(index,token);
