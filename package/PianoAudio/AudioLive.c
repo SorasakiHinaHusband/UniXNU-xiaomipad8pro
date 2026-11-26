@@ -376,32 +376,54 @@ static void lt_i(LiveText *t, int32_t v)
     lt_u(t, (uint32_t)v);
 }
 
-unsigned audio_live_spk_live_text(const AudioLive *l, uint32_t now, char *buf, unsigned cap)
+void audio_live_spk_status(const AudioLive *l, AudioLiveSpkStatus *status)
+{
+    *status = (AudioLiveSpkStatus){
+        .requests = l->probe_requests,
+        .runs = l->probe_runs,
+        .refused = l->probe_refused,
+        .until = l->probe_until,
+        .reads = l->probing ? l->live_reads - l->probe_reads_from : l->probe_reads,
+        .live_reads = l->live_reads,
+        .live_at = l->live_at,
+        .enabled = l->cfg.spk_probe,
+        .probing = l->probing,
+        .prot_active = l->prot_active,
+        .why = l->probe_why,
+        .live_data = l->live_data,
+    };
+    if (l->spk) {
+        for (unsigned c = 0; c < 4; ++c) status->re25[c] = l->spk->prot.re25[c];
+    }
+}
+
+unsigned audio_live_spk_live_text(const AudioLiveSpkStatus *status, uint32_t now, char *buf, unsigned cap)
 {
     if (!cap) return 0;
     LiveText t = {buf, 0, cap};
     buf[0] = 0;
-    lt_s(&t, "probe "); lt_s(&t, l->cfg.spk_probe ? "enabled" : "disabled");
-    lt_s(&t, " requests "); lt_u(&t, l->probe_requests);
-    lt_s(&t, " runs "); lt_u(&t, l->probe_runs);
-    lt_s(&t, " refused "); lt_u(&t, l->probe_refused);
-    lt_s(&t, " until-ms "); lt_u(&t, probe_on(l, now) ? l->probe_until - now : 0u);
-    lt_s(&t, " reads "); lt_u(&t, l->probing ? l->live_reads - l->probe_reads_from : l->probe_reads);
-    lt_s(&t, " why "); lt_s(&t, l->probe_why ? l->probe_why : "-");
-    lt_s(&t, "; prot "); lt_s(&t, l->prot_active ? "active" : "idle");
-    lt_s(&t, " reads "); lt_u(&t, l->live_reads);
-    if (!l->live_reads) {lt_s(&t, " age-ms - (no live data this boot)"); return t.n;}
-    lt_s(&t, " age-ms "); lt_u(&t, now - l->live_at);
+    const int32_t left = (int32_t)(status->until - now);
+    lt_s(&t, "probe "); lt_s(&t, status->enabled ? "enabled" : "disabled");
+    lt_s(&t, " requests "); lt_u(&t, status->requests);
+    lt_s(&t, " runs "); lt_u(&t, status->runs);
+    lt_s(&t, " refused "); lt_u(&t, status->refused);
+    lt_s(&t, " until-ms "); lt_u(&t, status->probing && left > 0 ? (uint32_t)left : 0u);
+    lt_s(&t, " reads "); lt_u(&t, status->reads);
+    lt_s(&t, " why "); lt_s(&t, status->why ? status->why : "-");
+    lt_s(&t, "; prot "); lt_s(&t, status->prot_active ? "active" : "idle");
+    lt_s(&t, " reads "); lt_u(&t, status->live_reads);
+    if (!status->live_reads) {lt_s(&t, " age-ms - (no live data this boot)"); return t.n;}
+    lt_s(&t, " age-ms "); lt_u(&t, now - status->live_at);
     for (unsigned c = 0; c < 4; ++c) {
-        const uint32_t re25 = l->spk ? l->spk->prot.re25[c] : 0;
-        const uint32_t pm = re25 ? (uint32_t)((uint64_t)l->live_data.re[c] * 1000u / re25) : 0;
-        const uint32_t f0 = l->live_data.f0[c] / 256u;
-        const int32_t dc = (int32_t)(((int64_t)(int32_t)l->live_data.temp[c] * 10) / 4096);
+        const uint32_t re25 = status->re25[c];
+        const uint32_t pm = re25 ? (uint32_t)((uint64_t)status->live_data.re[c] * 1000u / re25) : 0;
+        const uint32_t f0 = status->live_data.f0[c] / 256u;
+        const int32_t dc = (int32_t)(((int64_t)(int32_t)status->live_data.temp[c] * 10) / 4096);
         const int ok = pm >= AUDIO_SPK_LIVE_OK_MIN && pm <= AUDIO_SPK_LIVE_OK_MAX && f0 >= AUDIO_SPK_F0_OK_MIN && f0 <= AUDIO_SPK_F0_OK_MAX;
         lt_s(&t, "; amp"); lt_u(&t, c);
         lt_s(&t, " r0-permille "); lt_u(&t, pm);
         lt_s(&t, " f0 "); lt_u(&t, f0);
-        lt_s(&t, " q "); lt_u(&t, l->live_data.q[c]);
+        lt_s(&t, " q "); lt_u(&t, status->live_data.q[c]);
         lt_s(&t, " t-dC "); lt_i(&t, dc);
         lt_s(&t, ok ? " ok" : " check");
     }

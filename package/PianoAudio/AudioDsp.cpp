@@ -353,11 +353,26 @@ int spkState(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 // Writes return ENOENT while protection is not ready. Read: the ms left of the running probe.
 // machdep.piano_audio_spk_live (read only): the probe's state and the last live data per amplifier, relative values only.
 struct sysctl_oid gSpkProbeOid, gSpkLiveOid;
+AudioLiveSpkStatus gSpkLiveStatus;
+
+void publishSpkLive()
+{
+    AudioLiveSpkStatus status;
+    audio_live_spk_status(gLive, &status);
+    IOLockLock(gWakeLock);
+    gSpkLiveStatus = status;
+    IOLockUnlock(gWakeLock);
+}
+
 int spkProbeControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
     if (!gLive || !gShared) return ENXIO;
-    const int32_t left = int32_t(gLive->probe_until - nowMs());
-    int value = gLive->probing && left > 0 ? left : 0;
+    IOLockLock(gWakeLock);
+    const bool probing = gSpkLiveStatus.probing;
+    const uint32_t until = gSpkLiveStatus.until;
+    IOLockUnlock(gWakeLock);
+    const int32_t left = probing ? int32_t(until - nowMs()) : 0;
+    int value = left > 0 ? left : 0;
     const int err = sysctl_handle_int(oidp, &value, 0, req);
     if (err || !req->newptr) return err;
     if (!gLive->cfg.spk_probe) return EPERM;
@@ -371,8 +386,11 @@ int spkLive(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
     if (req->newptr) return EPERM;
     if (!gLive) return ENXIO;
-    char line[480];
-    const unsigned n = audio_live_spk_live_text(gLive, nowMs(), line, sizeof line);
+    IOLockLock(gWakeLock);
+    const AudioLiveSpkStatus status = gSpkLiveStatus;
+    IOLockUnlock(gWakeLock);
+    char line[640];
+    const unsigned n = audio_live_spk_live_text(&status, nowMs(), line, sizeof line);
     return SYSCTL_OUT(req, line, size_t(n) + 1);
 }
 // MIPLAY (AudioSpkProt.h): machdep.piano_audio_miplay asks for the Dolby/MiSound subgraph inside the protection plan from its next start
@@ -416,6 +434,7 @@ void registerSpk()
     gMiplayOid.oid_version = SYSCTL_OID_VERSION;
     sysctl_register_oid(&gMiplayOid);
     if (!gLive->cfg.spk_probe || gLive->cfg.level < 9) return;
+    publishSpkLive();
     bzero(&gSpkLiveOid, sizeof gSpkLiveOid);
     gSpkLiveOid.oid_parent = &sysctl__machdep_children; gSpkLiveOid.oid_number = OID_AUTO;
     gSpkLiveOid.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2);
@@ -691,6 +710,7 @@ void liveRun(const PianoAudioLevelArgs *a)
                 __atomic_store_n(&gPmAck,request,__ATOMIC_RELEASE); handled=request;
             }
         }
+        if (lc.spk_probe) publishSpkLive();
         const uint32_t word = liveWord(*gLive);
         piano_audio_live_word = word;
         if (word != lastWord || (lc.mic && now - registryAt >= 1000)) {

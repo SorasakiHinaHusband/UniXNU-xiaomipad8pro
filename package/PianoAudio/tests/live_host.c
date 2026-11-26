@@ -2312,7 +2312,9 @@ static void probe_hook(uint32_t t)
     w.sound_on = g_probe_snd_to && t >= g_probe_snd_from && t < g_probe_snd_to;
     if (t == g_probe_at) g_probe_rc = audio_live_spk_probe(&sh, g_probe_req);
     if (t == g_probe_at + 5000) {
-        audio_live_spk_live_text(&live, now_ms(), g_probe_text, sizeof g_probe_text);
+        AudioLiveSpkStatus status;
+        audio_live_spk_status(&live, &status);
+        audio_live_spk_live_text(&status, now_ms(), g_probe_text, sizeof g_probe_text);
         g_probe_text_ok = strstr(g_probe_text, "amp0 r0-permille 1020 f0 800 q 3 t-dC 0 ok") &&
                           strstr(g_probe_text, "why running") && strstr(g_probe_text, "prot active");
     }
@@ -2347,11 +2349,13 @@ static void testSpkProbe(void)
     CHECK(g_probe_text_ok && g_probe_down_after && !live.probing && !live.probe_noamps);
     {   // the text after the run: the outcome and four amplifiers, relative values only (no ohms)
         char t[480];
-        audio_live_spk_live_text(&live, now_ms(), t, sizeof t);
+        AudioLiveSpkStatus status;
+        audio_live_spk_status(&live, &status);
+        audio_live_spk_live_text(&status, now_ms(), t, sizeof t);
         CHECK(strstr(t, "probe enabled requests 1 runs 1 refused 0 until-ms 0 reads ") && strstr(t, "why done: the pair came up and the monitor read"));
         CHECK(strstr(t, "; amp3 r0-permille 1020 f0 830 q 6 t-dC 0 ok") && !strstr(t, "ohm"));
         char small[24];
-        CHECK(audio_live_spk_live_text(&live, now_ms(), small, sizeof small) == sizeof small - 1 && small[sizeof small - 1] == 0);
+        CHECK(audio_live_spk_live_text(&status, now_ms(), small, sizeof small) == sizeof small - 1 && small[sizeof small - 1] == 0);
     }
     // B: the default configuration refuses the request and starts nothing.
     spk_reset(); spk_files(); g_spk = 1; probe_reset();

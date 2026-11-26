@@ -361,10 +361,19 @@ int audio_live_mic_record(AudioLive *l, int on, AudioMicWindow *backing);
 const AudioMicWindow *audio_live_mic_window(const AudioLive *l);
 void audio_live_mic_report(AudioLive *l, const char *event, uint32_t now_ms);
 const char *audio_live_state(int state);
+typedef struct {
+    uint32_t requests, runs, refused, until, reads, live_reads, live_at;
+    int enabled, probing, prot_active;
+    const char *why;
+    SpkLive live_data;
+    uint32_t re25[4];
+} AudioLiveSpkStatus;
+/* Capture on the worker. Readers format a copy of this snapshot. */
+void audio_live_spk_status(const AudioLive *l, AudioLiveSpkStatus *status);
 /* spk-probe1: the probe's state and the last live data per amplifier as one line, relative values only (r0 in permille of that
  * amplifier's Re25, f0 Hz, Q, coil temperature in 0.1 C, the read's age in ms at now, a plausibility word): never the calibration
  * itself. Returns the length written (always terminated when cap > 0). */
-unsigned audio_live_spk_live_text(const AudioLive *l, uint32_t now, char *buf, unsigned cap);
+unsigned audio_live_spk_live_text(const AudioLiveSpkStatus *status, uint32_t now, char *buf, unsigned cap);
 #define AUDIO_SPK_LIVE_OK_MIN 700u       /* permille of Re25 */
 #define AUDIO_SPK_LIVE_OK_MAX 1500u
 #define AUDIO_SPK_F0_OK_MIN 200u         /* Hz */
