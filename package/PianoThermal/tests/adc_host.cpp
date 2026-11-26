@@ -13,7 +13,7 @@
 //   adc_host --map          print the channel map for tooling/k27/check-adc-map.py
 //   adc_host --ntc          print the curve's derivation
 //   adc_host --curve R ...  print the curve's milli-degrees C at each resistance R (ohms), for tooling/k27/check-ntc-curve.py
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../include adc_host.cpp -o /tmp/adc_host && /tmp/adc_host
+// Build: c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I../../include adc_host.cpp -o /tmp/adc_host && /tmp/adc_host
 #include "AdcChannels.h"
 #include "BoardTemps.h"
 #include "Ntc.h"

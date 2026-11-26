@@ -11,7 +11,7 @@
 //     test, the poll tiers (the fast-clock rule fast only when warm); Tsens.h's interrupt encoders and the suspend mask.
 //   thermal_host         run the tests
 //   thermal_host --map   print the sensor map for tooling/k27/check-thermal-map.py
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
+// Build: c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
 #include "Cluster.h"
 #include "Governor.h"
 #include "Perf.h"
