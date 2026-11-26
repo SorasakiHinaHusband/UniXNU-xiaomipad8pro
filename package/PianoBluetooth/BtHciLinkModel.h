@@ -48,6 +48,7 @@ inline bool patchLeEventMask(std::span<uint8_t> frame, bool enabled)
 
 struct LeFeatures {
   std::array<uint8_t, 8> bytes{};
+  // Core 5.4, Vol 6 Part B §4.6, feature bits 5 and 8.
   bool dataLengthExtension() const { return (bytes[0] & 0x20) != 0; }
   bool phy2M() const { return (bytes[1] & 0x01) != 0; }
 };
@@ -76,7 +77,9 @@ class HciLinkModel {
   Snapshot snapshot() const
   {
     const std::lock_guard lock(mutex_);
-    return state_;
+    Snapshot snapshot = state_;
+    snapshot.bonded = bond_.has_value();
+    return snapshot;
   }
 
   // The epoch belongs to the transport, outside the H4 bytes. Tag queued work when it is
@@ -90,7 +93,8 @@ class HciLinkModel {
       if (state_.power != Power::ready || state_.handle == kNoHandle || state_.waitingForLinkLoss ||
           state_.procedure == kDisconnect || state_.pending == kDisconnect || !state_.aclCredits()) return false;
       const uint16_t handleAndFlags = le16(frame.data() + 1);
-      if ((handleAndFlags & 0x0fff) != state_.handle || (handleAndFlags & 0xc000)) return false;
+      // LE host TX allows point-to-point first fragments (PB=0) and continuations (PB=1).
+      if ((handleAndFlags & 0x0fff) != state_.handle || (handleAndFlags >> 12) > 1) return false;
       ++state_.aclInFlight;
       return true;
     }
@@ -221,10 +225,7 @@ class HciLinkModel {
     const std::lock_guard lock(mutex_);
     if (!linkReady(linkId) || state_.security != Security::pairing) return false;
     state_.security = key ? Security::encrypted : Security::idle;
-    if (key) {
-      bond_ = Bond{peer_, *key};
-      state_.bonded = true;
-    }
+    if (key) bond_ = Bond{peer_, *key};
     return true;
   }
 
@@ -288,9 +289,10 @@ class HciLinkModel {
 
   void updateDeadline()
   {
-    if (state_.power == Power::ready || state_.power == Power::wakeMask)
-      deadlineMs_ = state_.pending || state_.procedure || state_.waitingForLinkLoss ||
-                    !state_.commandCredit || state_.power == Power::wakeMask ? kResponseMs : 0;
+    if (state_.power != Power::ready && state_.power != Power::wakeMask) return;
+    const bool waiting = state_.pending || state_.procedure || state_.waitingForLinkLoss ||
+                         !state_.commandCredit || state_.power == Power::wakeMask;
+    deadlineMs_ = waiting ? kResponseMs : 0;
   }
 
   // A credit-only event may change idle flow control. It cannot extend the response
@@ -357,7 +359,7 @@ class HciLinkModel {
   {
     if (p.empty()) return false;
     switch (p[0]) {
-    case 0x01: return connected(p, 19);
+    case 0x01: return state_.procedure == kCreate && connected(p, 19);
     case 0x0a: return connected(p, 31);
     case 0x29: return connected(p, 34);
     case 0x04: return remoteComplete(kReadRemoteFeatures, p.subspan(1));
@@ -465,6 +467,8 @@ class HciLinkModel {
 
   void preparePowerDown(bool forced)
   {
+    // On expiry these are host-side discards. Only the ensuing power cycle can
+    // reset the controller where an HCI Reset did not complete.
     releaseLink();
     state_.pending = 0;
     state_.commandCredit = false;

@@ -678,6 +678,36 @@ LE Advertising Report, LE Extended Advertising Report, Inquiry Result with RSSI,
 No address is kept. A healthy receiver with Apple devices in the room puts most LE reports above -90 dBm; the 11-22 boot would
 have read `55/10/81/23/1570 best=-41`.
 
+#### 8.7 Goal 11 offline HCI link model
+
+The [host model](../../package/PianoBluetooth/BtHciLinkModel.h) exercises one LE central link to an explicitly addressed
+peer. The WCN7860 board reference is the pinned Ubuntu `piano/dev` tree in §3, with H4 on QUP2 SE6 at 3.2 Mbit/s for the
+level 5 path. H4 indicators, HCI opcodes and event layouts, feature bits, and errors `0x08` and `0x3e` use Bluetooth Core
+5.4. [UART framing](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/uart-transport-layer.html) ·
+[HCI and flow control](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html) ·
+[Controller errors](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/architecture%2C-mixing%2C-and-conventions/controller-error-codes.html)
+
+- The model accepts exactly one CMD, ACL, SCO, or EVT frame at a time, using the existing decoder's 1024-byte payload
+  limit for ACL. It matches command replies by event kind, exact length, and little-endian opcode. Its event-mask patch
+  uses the same `H4LeMaskPatcher` as level 5. It adds bits 6 and 11 to an eligible `0x2001` command and preserves local
+  and remote feature masks byte for byte. The test supplies controller events explicitly.
+- The fixture permits three create attempts per request. `0x08` and `0x3e` allow retries after 20 ms and 40 ms of
+  simulated time. A successful Disconnection Complete releases the handle and credits for its unacknowledged ACL
+  packets. A lost response or stuck command credit requires a power cycle. The attempt count, timings, three ACL
+  buffers, peer addresses, handles, and bond keys are synthetic fixture values.
+- Suspend closes admission to HCI TX and ACL TX immediately. The normal sequence drains outstanding work, waits for
+  Reset Command Complete, then permits power-off. If a deadline expires, the model discards outstanding host work
+  and requires power-off before reinitialization. Wake waits for fresh Reset and LE Set Event Mask completions.
+  A mutex serializes transitions and a transport epoch rejects queued work from before wake.
+- The fixture represents SMP outcomes and HOGP setup as host callbacks. It keeps one peer's successful bond in
+  memory across power cycles. Each new link requires encryption and HOGP setup before it can accept HID input.
+  The test covers failed pairing, wrong peers and keys, and stale callbacks even when the controller reuses a handle.
+
+Run the [ASan/UBSan host test](../../package/PianoBluetooth/tests/hci_link_model_host.cpp) with
+`python3 scripts/ci/self-tests.py --only package/PianoBluetooth/tests/`.
+**Fix-image gate: HOLD.** Real keyboard and mouse pairing, HID input, and reconnect after wake still require the
+owner's hands-on session. [Owner session checklist](../tools/bt-session.md)
+
 ### 9. Fallback
 
 `piano-bt=0` (the default): nothing runs, the controller stays off (BT_EN low), the shared rails as PianoWifi leaves them. A level that

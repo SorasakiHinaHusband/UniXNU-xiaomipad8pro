@@ -67,6 +67,10 @@ static Packet connection(uint8_t subevent, uint8_t result = 0, uint16_t handle =
   const Packet prefix = {4, 0x3e, length, subevent, result, uint8_t(handle), uint8_t(handle >> 8), 0};
   std::copy(prefix.begin(), prefix.end(), p.begin());
   std::copy(peer.begin(), peer.end(), p.begin() + 8);
+  const size_t interval = subevent == 1 ? 15 : 27;
+  p[interval] = 12;   // 15 ms
+  p[interval + 4] = 20;   // 200 ms supervision timeout
+  if (subevent == 0x29) std::fill(p.end() - 3, p.end(), 0xff);   // no advertising or sync handle
   return p;
 }
 
@@ -101,8 +105,8 @@ static Packet completed(uint16_t handle, uint16_t count)
 
 static Packet acl(uint16_t handle = kHandle)
 {
-  // First fragment with L2CAP CID 0x0006, for the ACL accounting fixture.
-  return {2, uint8_t(handle), uint8_t((handle >> 8) | 0x20), 5, 0, 1, 0, 6, 0, 1};
+  // First fragment with an SMP Pairing Request on L2CAP CID 0x0006.
+  return {2, uint8_t(handle), uint8_t(handle >> 8), 11, 0, 7, 0, 6, 0, 1, 3, 0, 0x09, 16, 0, 0};
 }
 
 static bool send(HciLinkModel &m, uint64_t epoch, Packet frame)
@@ -201,11 +205,7 @@ static void testFramesAndMasks()
   auto classicFeatures = leFeatures;
   classicFeatures[4] = 0x03;
   classicFeatures[5] = 0x10;
-  auto featureCommand = raw;
-  featureCommand[4] = 0x5f;
-  featureCommand[1] = 0x74;   // LE Set Host Feature; adjusted below to its 2-byte parameters
-  featureCommand[3] = 2;
-  featureCommand.resize(6);
+  const auto featureCommand = command(0x2074, {0x20, 1});   // LE Set Host Feature
   auto aclLookalike = Packet{2, 0xa5, 0x22, uint8_t(raw.size()), 0};
   aclLookalike.insert(aclLookalike.end(), raw.begin(), raw.end());
   for (const auto &unchanged : {command(0x0c01, Packet(8, 0x1f)), command(0x0c63, Packet(8, 0x1f)),
@@ -315,6 +315,7 @@ static void testTimeoutRecovery()
   CHECK(!send(m, epoch, create(kExtendedCreate, kOtherPeer)));
   CHECK(send(m, epoch, create(kExtendedCreate)));
   CHECK(m.receive(epoch, status(kExtendedCreate)));
+  CHECK(!m.receive(epoch, connection(1)));
   CHECK(m.receive(epoch, connection(0x0a, kFailedToEstablish, 0xffff, kOtherPeer)));
   checkReleased(m);
   CHECK(m.snapshot().retryMs == 40);
@@ -328,7 +329,13 @@ static void testTimeoutRecovery()
   CHECK(m.receive(epoch, status(kReadRemoteVersion)));
   CHECK(m.receive(epoch, version()));
 
-  for (unsigned n = 0; n < HciLinkModel::kAclCapacity; ++n) CHECK(send(m, epoch, acl()));
+  auto fragment = acl();
+  fragment[2] |= 0x20;
+  CHECK(!m.transmit(epoch, fragment));   // auto-flushable start is invalid for LE host TX
+  CHECK(send(m, epoch, acl()));
+  fragment[2] = uint8_t((kHandle >> 8) | 0x10);
+  CHECK(m.transmit(epoch, fragment));   // continuation with the same 12-bit handle
+  for (unsigned n = 2; n < HciLinkModel::kAclCapacity; ++n) CHECK(send(m, epoch, acl()));
   CHECK(!send(m, epoch, acl()));
   CHECK(!m.receive(epoch, completed(kOtherHandle, 1)));
   CHECK(!m.receive(epoch, completed(kHandle, HciLinkModel::kAclCapacity + 1)));
@@ -430,6 +437,22 @@ static void testBondAndOrderedSuspend()
   CHECK(!m.finishPairing(otherLink, HciLinkModel::Key{9}));
   const auto finalLink = connect(m, wake);
   CHECK(m.restoreEncryption(finalLink, kKey));
+}
+
+static void testDrainAsyncDisconnect()
+{
+  HciLinkModel m;
+  const auto epoch = boot(m);
+  connect(m, epoch);
+  CHECK(send(m, epoch, acl()) && send(m, epoch, linkCommand(kDisconnect)));
+  CHECK(m.beginSuspend(epoch));
+  CHECK(!m.resetAfterDrain(epoch));
+  CHECK(m.receive(epoch, status(kDisconnect)));
+  CHECK(!m.resetAfterDrain(epoch));   // Command Status leaves the procedure in flight
+  CHECK(m.receive(epoch, disconnected()));   // completes the procedure and flushes the ACL credit
+  checkReleased(m);
+  CHECK(!m.powerOff(epoch) && m.resetAfterDrain(epoch));
+  CHECK(m.receive(epoch, complete(kReset)) && m.powerOff(epoch));
 }
 
 static void testRecoveryDeadlines()
@@ -534,6 +557,7 @@ int main()
   testRepliesAndConnection();
   testTimeoutRecovery();
   testBondAndOrderedSuspend();
+  testDrainAsyncDisconnect();
   testRecoveryDeadlines();
   testRaces();
   std::puts("PASS offline H4 framing, LE mask and features, timeout recovery, SMP/HOGP and ordered sleep/wake");
