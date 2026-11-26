@@ -62,3 +62,5 @@ Commit `716fd73e` uses the last full key bounded by space or tab and evaluates t
 ## Host verification
 
 PianoDpu, PianoDwc3, 0066 merge and clipping, ESP split fixtures, and the USB shell and address helper suites passed. The rotation and brightness helpers built for arm64 macOS, and their host suites passed. The review uses Apple source and timed host models for the queue and panel paths. Live USB, display and sysctl behavior still require target testing.
+
+The final `python3 scripts/ci/self-tests.py` run reported 96 passed, three failed and 16 skipped. The sandbox denies process enumeration for `test-desk-reports.py`, the `hw.memsize` query for `test-ram-m0.sh`, and the loopback bind needed by the fake backup in `test-k273-only.py`. The fake backup failure also reproduced at `0ea7e24d`. The rerun used a detached worktree with scratch beside it inside the clone, so the sensor-pack and private Wi-Fi fixtures could test paths outside the checked-out tree.
