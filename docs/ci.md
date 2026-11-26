@@ -43,8 +43,23 @@ The official actions run on Node.js 24 (`checkout@v7`, `upload-artifact@v7`, `do
   test command up to 1,500 seconds. The log ends with the ten slowest tests (or all tests for smaller runs) and their elapsed times,
   including compilation for C/C++ tests. A JUnit report is the only upload from `checks.yml`.
 
+The Adreno830 host suite fetches the public `ArmSmmu4K`, `AdrenoPM4` and `AdrenoFirmware` source kits with
+`scripts/fetch-pins.py --only`. It verifies each checkout's HEAD against `unixnu.lock` and adds PianoA830's
+`ArmSmmu4KPaged.c/.h` to the staged SMMU kit. The kits and test binaries share the suite's temporary directory.
+The 1,500-second budget covers fetching, compiling and running the suite with ASan and UBSan.
+
+The suite covers the tier allocator, paged SMMU, PM4 submission, HFI votes and recovery, among other host checks.
+It runs the SHA-256 test vectors and synthetic firmware tests. Validation against stock gen80000 images is local-only
+and requires supplying `--firmware` and its matching `--pins`. The suite skips `test_a830regs`, whose comparison needs
+the unpublished Mesa register export under `docs/inputs/regs`, and the kernel-object check, which needs a built UniXNU tree.
+The standalone register-header checks still run.
+
 Locally: `python3 scripts/ci/privacy-scan.py [--diff BASE]`, `python3 scripts/ci/self-tests.py [--list] [--only SUBSTR]`,
-`python3 scripts/fetch-pins.py --verify`.
+`python3 scripts/fetch-pins.py --verify`. To repeat the Adreno830 fetch and suite on a Mac with Xcode:
+
+```sh
+SELFTEST_TIMEOUT=1500 python3 scripts/ci/self-tests.py --only package/PianoA830/adreno830/tests/run-host-tests.py
+```
 
 ## The k27 tree
 

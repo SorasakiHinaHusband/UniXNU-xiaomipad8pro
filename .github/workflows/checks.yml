@@ -56,9 +56,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Host tools the tests call (mtools for the FAT images, llvm for the freestanding selector build)
         run: brew install mtools llvm
-      - name: Host tests (no Apple content, no out/, no tablet)
+      - name: Host tests (including Adreno830 with pinned public kits)
         # the charge integration test takes ~270 s and test-k273-only ~150 s on an M-series Mac; the hosted runner is slower
         env:
           SELFTEST_TIMEOUT: "1500"

@@ -31,6 +31,7 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parents[2]
 SKIP_FILE = ROOT / 'scripts/ci/self-tests.skip'
+A830_HOST_TESTS = 'package/PianoA830/adreno830/tests/run-host-tests.py'
 TIMEOUT = int(os.environ.get('SELFTEST_TIMEOUT', '600'))
 PY_RE = re.compile(r'(^|/)(test[-_][^/]*\.py|run-[^/]*tests?\.py)$')
 SH_RE = re.compile(r'(^|/)(test-[^/]*\.sh|run-tests\.sh|run-[^/]*-host\.sh|tests/run\.sh)$')
@@ -100,7 +101,9 @@ def run_one(kind, path, line):
         home = os.path.join(tmp, 'home'); os.mkdir(home)
         env = env_for(home)
         full = ROOT / path
-        if kind == 'py':
+        if path == A830_HOST_TESTS:
+            cmd, cwd = [sys.executable, str(ROOT / 'scripts/ci/adreno830-host.py'), tmp], ROOT
+        elif kind == 'py':
             cmd, cwd = [sys.executable, str(full)], ROOT
         elif kind == 'sh':
             cmd, cwd = ['bash', str(full)], ROOT
