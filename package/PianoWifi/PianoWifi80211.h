@@ -1248,18 +1248,13 @@ void PianoWifi80211::setGapMode(uint32_t mode, const char *why)
 // service. XX remains the explicit fallback until that event has appeared.
 void PianoWifi80211::refreshRegulatoryCountry()
 {
-  if (!fWifi) return;
-  OSString *country = OSDynamicCast(OSString, fWifi->copyProperty("piano-wifi-regulatory-country"));
-  if (!country) return;
-  const char *text = country->getCStringNoCopy();
-  if (text && country->getLength() >= 2 && text[0] >= 'A' && text[0] <= 'Z' && text[1] >= 'A' && text[1] <= 'Z') {
-    IOLockLock(fLock);
-    fState->country[0] = text[0];
-    fState->country[1] = text[1];
-    fState->country[2] = 0;
-    IOLockUnlock(fLock);
-  }
-  country->release();
+  OSObject *property = fWifi ? fWifi->copyProperty("piano-wifi-regulatory-country") : nullptr;
+  OSString *country = OSDynamicCast(OSString, property);
+  IOLockLock(fLock);
+  pianowifi::a80211::setRegulatoryCountry(fState->country, country ? country->getCStringNoCopy() : nullptr,
+                                        country ? country->getLength() : 0);
+  IOLockUnlock(fLock);
+  OSSafeReleaseNULL(property);
 }
 
 // Every open logged, whoever asks and whatever it asks for: that is the question wm3 answers.

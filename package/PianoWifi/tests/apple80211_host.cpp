@@ -4,7 +4,7 @@
 // what airportd's bind and the menu ask, and the answers read back field by field: the identity, the power off/on and what it
 // stops, the channel list, a scan and its results until the end, the cache clear, the not-associated answers, the unknown
 // request, the scan list's address parse and the rebuilt elements, and the log's one-line-per-kind table.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. apple80211_host.cpp -o /tmp/apple80211_host && /tmp/apple80211_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. apple80211_host.cpp -o /tmp/apple80211_host && /tmp/apple80211_host
 #include "WifiApple80211.h"
 #include "PianoWifiUcTransport.h"
 #include "WifiUserControl.h"
@@ -695,6 +695,23 @@ int main()
     r.user.mem[6] = 0; r.put32(0, 2);
     CHECK(r.ask(true, kCountryCode, 8).error == kErrInval);
     CHECK(r.ask(true, kCountryCode, 8, false).error == kErrInval);
+    r.st.gaps = kGapAll;
+    const char alpha2[] = {'D', 'E'};
+    setRegulatoryCountry(r.st.country, alpha2, sizeof alpha2);
+    CHECK(r.ask(false, kCountryCode, 3).error == 0 && std::memcmp(r.at(0), "DE", 3) == 0);
+    r.put32(0, 1);
+    std::memcpy(r.user.mem.data() + 4, "DE", 3);
+    CHECK(r.ask(true, kCountryCode, 8).error == 0);
+    r.user.mem[4] = 'd';
+    CHECK(r.ask(true, kCountryCode, 8).error == kErrInval);
+    r.user.mem[4] = 0;
+    CHECK(r.ask(true, kCountryCode, 8).error == kErrInval);
+    struct Country { const char *text; uint32_t length; };
+    for (Country malformed : {Country{nullptr, 2}, {"", 0}, {"D", 1}, {"DEU", 3}, {"dE", 2}, {"0E", 2}, {"D\0", 2}}) {
+      setRegulatoryCountry(r.st.country, alpha2, sizeof alpha2);
+      setRegulatoryCountry(r.st.country, malformed.text, malformed.length);
+      CHECK(r.ask(false, kCountryCode, 3).error == 0 && std::memcmp(r.at(0), "XX", 3) == 0);
+    }
     CHECK(r.ask(true, kPowerSave, 8).error == 0);
   }
 
@@ -807,6 +824,29 @@ int main()
     CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
     std::memcpy(&joined, r.at(0), sizeof joined);
     CHECK(joined.beaconInterval == 125 && joined.rssi == -47 && joined.elements[joined.elementsLength - 4] == 48);
+    const uint32_t withoutRsn = joined.elementsLength - 4;
+    r.st.association.authType = 1;
+    candidate.capability = 0x11;
+    CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
+    std::memcpy(&joined, r.at(0), sizeof joined);
+    CHECK(joined.elementsLength == withoutRsn && (joined.capability & 0x11) == 1);
+    r.st.association.authType = 2;
+    for (uint8_t length : {0, 1, 2, 3, 5, 65}) {
+      candidate.rsnLength = length;
+      candidate.rsn[1] = length >= 2 ? length - 2 : 0;
+      CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
+      std::memcpy(&joined, r.at(0), sizeof joined);
+      CHECK(joined.elementsLength == withoutRsn && (joined.capability & 0x11) == 0x11);
+    }
+    candidate.rsnLength = 3;
+    candidate.rsn[1] = 2;
+    CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
+    std::memcpy(&joined, r.at(0), sizeof joined);
+    CHECK(joined.elementsLength == withoutRsn && (joined.capability & 0x11) == 0x11);
+    CHECK(r.ask(true, kScanCacheClear, 0).error == 0);
+    CHECK(r.ask(false, kCurrentNetwork, kScanResultBytes27).error == 0);
+    std::memcpy(&joined, r.at(0), sizeof joined);
+    CHECK(joined.elementsLength == withoutRsn && joined.beaconInterval == 100 && (joined.capability & 0x11) == 0x11);
     CHECK(r.associate().error == 0 && r.ask(true, kDisassociate, 0).error == 0);
   }
 

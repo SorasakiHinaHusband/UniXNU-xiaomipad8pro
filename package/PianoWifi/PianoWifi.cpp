@@ -3055,11 +3055,13 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
          gLink.reg.status, gLink.reg.numPhy, gLink.reg.minBw24, gLink.reg.maxBw24, gLink.reg.minBw5, gLink.reg.maxBw5,
          gLink.reg.rules24 + gLink.reg.rules5, gLink.reg.rules24, gLink.reg.rules5, gLink.reg.ruleCount,
          gLink.reg.rulesDropped, gLink.reg.extended ? " (the extended event)" : "");
-  if (gLink.reg.seen)
+  if (gLink.reg.seen) {
     owner->setProperty("piano-wifi-regulatory-country", gLink.reg.alpha2);
-  else
+  } else {
+    owner->removeProperty("piano-wifi-regulatory-country");
     note("level 6: the regulatory domain: the firmware sent no regulatory event%s",
          (gArgs.l6pre & kPreChanList) ? " (the channel list is this driver's own)" : "");
+  }
   for (uint32_t i = 0; i < gLink.reg.ruleCount && i < 8; ++i)
     note("level 6: regulatory rule %u: %u-%u MHz, up to %u MHz wide, %d dBm, flags %#x%s%s%s", i, gLink.reg.rule[i].startKhz,
          gLink.reg.rule[i].endKhz, gLink.reg.rule[i].maxBwMhz, int(gLink.reg.rule[i].powerDbm), gLink.reg.rule[i].flags,
@@ -3211,8 +3213,6 @@ volatile uint32_t gParkedFor;
 void parkRadio()
 {
   const uint32_t sleep = __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST);
-  gStopWhy = "suspend";
-  __atomic_store_n(&gStopRequested, 1u, __ATOMIC_SEQ_CST);
   const uint64_t started = nowMs(), deadline = started + 3500;
   while (__atomic_load_n(&gParkedFor, __ATOMIC_SEQ_CST) < sleep && nowMs() < deadline) IOSleep(10);
   if (__atomic_load_n(&gParkedFor, __ATOMIC_SEQ_CST) >= sleep) {
@@ -3807,7 +3807,7 @@ bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length);
 // do, and the list is published at its end.
 enum : uint32_t { kBgScanNone = 0, kBgScanArmed, kBgScanSent, kBgScanOver };
 uint32_t gBgScan, gBgScanIdNow, gBgScanSeed, gBgScanCount;
-bool gBgScanDone, gBgScanRefused;
+bool gBgScanDone, gBgScanCompleted;
 uint64_t gBgScanAt, gBgScanNext;
 // 2026-11-23 (20261123-wifi-rejoin/ANALYSIS.md, PianoWifiScanExpireV1): an idle background scan (no station) ends its round
 // with scanExpire; the access point of an association that ended by itself is its suspect, and until gBgScanQuickUntil the
@@ -3823,8 +3823,10 @@ bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
   // both background ids are taken (a late event of a scan an earlier pass left behind ends nothing of this one: review #5)
   if (!wmiParseScanEvent(ev, payload, length) || (ev.scanId != kBgScanId && ev.scanId != kBgScanId + 1)) return false;
   if (gBgScan != kBgScanSent || ev.scanId != gBgScanIdNow) return true;
-  if (ev.type & kWmiScanEvStartFailed) gBgScanRefused = true;
-  if (ev.type & (kWmiScanEvCompleted | kWmiScanEvDequeued | kWmiScanEvStartFailed)) gBgScanDone = true;
+  if (!gBgScanDone && (ev.type & (kWmiScanEvCompleted | kWmiScanEvDequeued | kWmiScanEvStartFailed))) {
+    gBgScanDone = true;
+    gBgScanCompleted = wmiScanCompleted(ev);
+  }
   return true;
 }
 
@@ -5248,7 +5250,7 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     const uint32_t n = wmiBuildStartScan(w, gL8Out, sizeof gL8Out, request);
     const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
     if (rc == 0) return;   // the transport is busy: the next turn
-    gBgScanDone = gBgScanRefused = false;
+    gBgScanDone = gBgScanCompleted = false;
     gBgScanAt = now;
     gBgScanSeed = gLink.scan.count;
     ++gBgScanCount;
@@ -5273,7 +5275,7 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     uint32_t expired = 0;
     if (gBgScanIdle) {
       gBgScanIdle = false;
-      if (gBgScanDone && !gBgScanRefused) {
+      if (gBgScanCompleted) {
         const bool onNetwork = gSta.vdevUp && !gSta.disconnect;
         const bool looked = gLink.scan.roundFrames != 0;
         expired = scanExpire(gLink.scan, kScanExpireRounds, gBgSuspectSet ? gBgSuspect : nullptr, onNetwork ? gSta.bssid : nullptr);
@@ -5283,8 +5285,8 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
                gBgSuspectSet ? (looked ? "; the lost access point looked for" : "; the lost access point kept: nothing heard") : "",
                gLink.scan.count);
         if (looked) gBgSuspectSet = false;
-      } else if (gLink.scan.round) {
-        --gLink.scan.round;
+      } else {
+        scanRoundCancel(gLink.scan);
       }
     }
     // (review of ee9980a, #1 and #6) a list is published only from a scan that ran to its end and found more than it began
@@ -5292,9 +5294,9 @@ __attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64
     // the boot's whole list)
     // (a list that began with more than the fast pass's one seeded entry is published refreshed even when it did not grow: its
     // entries' signals and ages are the scan's; and one that forgot a network is published, so that airportd stops seeing it)
-    const bool publish = gBgScanDone && !gBgScanRefused && (gLink.scan.count > gBgScanSeed || gBgScanSeed > 1 || expired);
+    const bool publish = gBgScanCompleted && (gLink.scan.count > gBgScanSeed || gBgScanSeed > 1 || expired);
     note("level 7: the background scan %s after %llu ms: %u network(s) in the list (%u before it), %s",
-         gBgScanRefused ? "was refused at its start" : gBgScanDone ? "ended" : stopping ? "was cut short by the stop" : "ran out of time",
+         gBgScanCompleted ? "ended" : gBgScanDone ? "did not complete" : stopping ? "was cut short by the stop" : "ran out of time",
          (unsigned long long)(now - gBgScanAt), gLink.scan.count, gBgScanSeed,
          publish ? "published" : "not published: the list published before stays");
     if (publish) publishScan(owner, gLink.scan, gArgs.bssid != 0);
@@ -5575,7 +5577,7 @@ __attribute__((noinline)) void userStopScans()
     note("PianoWifiPowerLifecycleV1 stop scan: %s", rc == 1 ? "sent" : "transport refused or timed out");
   }
   // an idle round cut short counts for nothing (PianoWifiScanExpireV1)
-  if (gBgScanIdle && gBgScan == kBgScanSent && gLink.scan.round) --gLink.scan.round;
+  if (gBgScanIdle && gBgScan == kBgScanSent) scanRoundCancel(gLink.scan);
   gBgScanIdle = false;
   gBgScan = kBgScanNone;
   gBgScanNext = 0;
@@ -6187,6 +6189,8 @@ IOReturn PianoWifi::setPowerState(unsigned long state, IOService *)
   if (gArgs.level >= 8 && gArgs.sleepOff == 2 && !gRadioStopped) {
     if (state == pianopower::kOff) {
       const uint32_t n = __atomic_add_fetch(&gSleeps, 1u, __ATOMIC_SEQ_CST);
+      gStopWhy = "suspend";
+      __atomic_store_n(&gStopRequested, 1u, __ATOMIC_SEQ_CST);
       IOLog("PianoWifi: power: a system sleep (%u): the radio is stopped and powered down; the wake brings it up again "
             "(piano-wifi-sleepoff=2)\n",
             n);
@@ -6684,14 +6688,16 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
       if (off) gUserControl.radioOff(user);
       userParked = true;
     }
-    if (userParked && WifiUserControl::power(gUserControl.read()) && !gUserControl.radioStop() &&
-        !__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
-      userRestart = true;
-      break;
+    const bool systemParkRequested = __atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST) != 0;
+    if (userParked && !systemParkRequested) {
+      if (!gUserControl.radioStop()) {
+        userRestart = true;
+        break;
+      }
+      IOSleep(20);
+      continue;
     }
-    if (userParked && !WifiUserControl::power(gUserControl.read()) &&
-        !__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) { IOSleep(20); continue; }
-    if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
+    if (systemParkRequested) {
       if (!parked) {
         if (chipOn) {
           chipDown(power, opt);
@@ -6715,7 +6721,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
           parked = false;
           continue;
         }
-        if (!WifiUserControl::power(gUserControl.read())) { IOSleep(20); continue; }
+        if (gUserControl.radioStop()) { IOSleep(20); continue; }
         woke = true;
         break;
       }
@@ -6725,7 +6731,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
         userRestart = true;
         break;
       }
-      if (!untilWake && nowMs() >= until) break;
+      if (!untilWake && !gUserControl.radioStop() && nowMs() >= until) break;
     }
     IOSleep(50);
   }

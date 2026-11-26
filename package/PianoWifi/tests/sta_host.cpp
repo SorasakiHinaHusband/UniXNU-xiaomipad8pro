@@ -4,7 +4,7 @@
 // reorder queues' descriptors, the data interface's peer map, and the whole step machine against a model of the firmware and
 // an access point — the order of the commands, every field the firmware reads, the waits, the retries, the refusals, a
 // disconnect, a stop, and the teardown each time.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. sta_host.cpp -o /tmp/sta_host && /tmp/sta_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. sta_host.cpp -o /tmp/sta_host && /tmp/sta_host
 #include "WifiProfile.h"
 #include "WifiSta.h"
 #include "WifiUserControl.h"
@@ -249,12 +249,19 @@ static void testRsn()
   const uint8_t v[] = {1, 0};
   wmiParseRsn(s, v, sizeof v);
   CHECK(s.rsn && s.groupCipher == kRsnCipherCcmp && s.pairwise == (1u << kRsnCipherCcmp) && s.akm == (1u << kRsnAkmPsk));
+  const uint8_t partialGroup[] = {1, 0, 0x00, 0x0f, 0xac};
+  ScanSecurity partial;
+  wmiParseRsn(partial, partialGroup, sizeof partialGroup);
+  CHECK(partial.rsn && partial.truncated);
   // WPA2/WPA3 transition: PSK and SAE, MFP capable but not required
   ScanSecurity t;
   const uint8_t trans[] = {1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00, 0x0f, 0xac, 8,
                            0x80, 0};
   wmiParseRsn(t, trans, sizeof trans);
   CHECK(t.akm == ((1u << kRsnAkmPsk) | (1u << kRsnAkmSae)) && t.rsnCaps == kRsnCapMfpCapable && !t.truncated);
+  ScanSecurity partialCaps;
+  wmiParseRsn(partialCaps, trans, sizeof trans - 1);
+  CHECK(partialCaps.rsn && partialCaps.truncated);
   // a count that runs past the element
   ScanSecurity c;
   const uint8_t cut[] = {1, 0, 0x00, 0x0f, 0xac, 4, 9, 0, 0x00, 0x0f, 0xac, 4};
@@ -409,6 +416,15 @@ static void testChoice()
   Sta rOk = chooser(list, &reg);
   c = stadetail::choose(rOk);
   CHECK(c.found && c.index == 2 && c.radar && c.passive && c.powerDbm == 23);
+  for (uint32_t invalid : {2400u, 2413u, 4900u, 5955u, UINT32_MAX}) {
+    list.entries[2].freq = invalid;
+    c = stadetail::choose(s);
+    CHECK(c.found && c.index == 1 && c.candidates == 1);
+  }
+  list.entries[2].freq = 5200;
+  reg.rule[1].flags = kRegRuleFlagDisabled;
+  c = stadetail::choose(rOk);
+  CHECK(c.found && c.index == 1);
   // nothing of the name
   ScanList empty;
   Sta e = chooser(empty, nullptr);

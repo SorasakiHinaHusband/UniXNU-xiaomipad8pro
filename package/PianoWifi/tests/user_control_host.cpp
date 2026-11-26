@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
-// c++ -std=c++20 -Wall -Wextra -Werror -I.. user_control_host.cpp -o /tmp/user_control_host && /tmp/user_control_host
+// c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. user_control_host.cpp -o /tmp/user_control_host && /tmp/user_control_host
 #include "WifiUserControl.h"
 #include "WifiApple80211.h"
 #include <cstdio>
@@ -133,10 +133,34 @@ static void joinReceipt()
   CHECK(!readReceipt(deadline * 3));
 }
 
+static void sleepDuringPowerCycle()
+{
+  WifiUserControl owner;
+  WifiJoinRequest request;
+  request.accept(1, 0, 0);
+  request.consume();
+  CHECK(request.finish(1, 1, 1, 0));
+  const uint32_t off = owner.setPower(false);
+  request.cancel();
+  owner.setPower(true);
+  const uint32_t sleepLeave = owner.disconnect();
+  CHECK(owner.power(sleepLeave) && owner.radioStop() && !owner.allowed(sleepLeave));
+  // The sleep-preparation leave shares the pending physical cycle. The
+  // worker can acknowledge the original OFF after verifying the pins.
+  owner.radioOff(off);
+  CHECK(owner.radioOffConfirmed(off) && !owner.radioStop() && !owner.allowed(owner.read()));
+  CHECK(!request.canStart(2) && !request.currentReceipt(2, 1, 1, true, true));
+  owner.setPower(true);
+  CHECK(owner.allowed(owner.read()) && !request.canStart(2));
+  request.accept(2, 3, 1);
+  CHECK(request.canStart(3));
+}
+
 int main()
 {
   radioCycles();
   joinReceipt();
+  sleepDuringPowerCycle();
   WifiUserControl u;
   CHECK(u.allowed(u.read()));
   // Sleep preparation can disconnect without changing logical radio power.

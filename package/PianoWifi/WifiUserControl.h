@@ -74,7 +74,8 @@ struct WifiUserControl {
   static bool joinRequested(uint32_t w) { return (w & (kPower | kJoin | kCycle)) == (kPower | kJoin); }
   bool pending(uint32_t w) const { return serial(w) != __atomic_load_n(&applied, __ATOMIC_ACQUIRE); }
   bool allowed(uint32_t w) const { return joinRequested(w) && !pending(w); }
-  bool radioStop() const { const uint32_t w = read(); return !power(w) || (w & kCycle); }
+  static bool radioStop(uint32_t w) { return !power(w) || (w & kCycle); }
+  bool radioStop() const { return radioStop(read()); }
   static bool canReportJoinReceipt(uint32_t w, bool radioUsable, bool stopRequested) {
     return joinRequested(w) && radioUsable && !stopRequested;
   }
@@ -97,7 +98,9 @@ struct WifiUserControl {
     uint32_t old = read(), next;
     do {
       if (!(old & kJoin)) return old;
-      next = (old + kSerial) & ~kJoin;
+      // A pending physical cycle already tears down the station. Keep its
+      // serial so a sleep-preparation leave cannot invalidate its OFF ack.
+      next = ((old & kCycle) ? old : old + kSerial) & ~kJoin;
     } while (!__atomic_compare_exchange_n(&word, &old, next, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
     return next;
   }
