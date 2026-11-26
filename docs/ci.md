@@ -53,7 +53,9 @@ The suite covers the tier allocator, paged SMMU, PM4 submission, HFI votes and r
 It runs the SHA-256 test vectors and synthetic firmware tests. Validating stock gen80000 images locally requires
 the stock images and the matching pin file, supplied to the runner with `--firmware` and `--pins`. The suite skips
 `test_a830regs`, whose comparison needs the unpublished Mesa register export under `docs/inputs/regs`, and the
-kernel-object check, which needs a built UniXNU tree. The standalone register-header checks still run.
+kernel-object check, which needs a built UniXNU tree. The standalone register-header checks still run. Two timing tests run
+only locally: `test_a830fence` (a sliced wait of at least 40 ms) and `test_p1wire` (a parallel wiring speedup), which a loaded
+3-core hosted runner cannot guarantee.
 
 Locally: `python3 scripts/ci/privacy-scan.py [--diff BASE]`, `python3 scripts/ci/self-tests.py [--list] [--only SUBSTR]`,
 `python3 scripts/fetch-pins.py --verify`. To repeat the Adreno830 fetch and suite on a Mac with Xcode:
