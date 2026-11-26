@@ -8,6 +8,10 @@
   limit. The November 26 installed v13.1y12l check recorded no GPU open refusals or page faults and passed **30/30** graded
   ImageIO, Core Image on Metal, MetalKit texture and Quick Look paths, including the 4032-pixel JPEG and HEIC cases.
   [Support status](../STATUS.md) · [Docked table default](../../package/PianoA830/board/PianoA830.cpp) · [November 26 Metal results](../results-2026-11-26.md#core-image-and-metal)
+- **Sustained Metal 3D on installed v13.1y12q, November 27.** The ten-minute Goal 12 run on `inst-y12q-obs4` completed
+  **35,985 frames at 59.98 fps**. The GPU sustained **967–1050 MHz** with **zero recoveries or faults**. Drawable
+  `presentedTime` was unavailable (`presented=0`), so FPS measures Metal completions.
+  [Full benchmark and SSH wrapper outcome](../results-2026-11-27.md#sustained-metal-3d-installed-v131y12q)
 - **Chrome on installed v13.1y12q, November 27.** With no GPU, WebGPU or sandbox flags, **6/6 WebGPU contexts** opened on
   `qualcomm` / `adreno-8xx` with `fallback_adapter = false`, correct compute results and exact pixel readback. **WebGL 2 reached
   37.89 fps** at 3200 × 1738 through ANGLE Metal. All 17 Chrome processes reported secure V8 sandbox mode.
@@ -16,7 +20,7 @@
   and awaits owner verification. Qualification of the extra-RAM GPU tier and driver pools is still pending.
   [November 26 memory results](../results-2026-11-26.md#memory) · [EFI audit](../results-2026-11-26.md#efi-memory-battery-and-video) · [Extra-RAM GPU tier](ram-extra.md)
 
-Installed Metal sustain and Chrome on RAM boots remain pending.
+Chrome on RAM boots remains pending.
 [November 27 results](../results-2026-11-27.md) · [Support status](../STATUS.md)
 
 ## Historical bring-up notes

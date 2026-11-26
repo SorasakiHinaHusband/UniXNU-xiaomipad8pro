@@ -18,7 +18,8 @@ with no GPU open refusals or page faults. [November 26 Metal results](../results
 - **Safari on installed v13.1y12o, November 26.** WebGPU and WebGL 2 passed. On the earlier v13.1y12m check the WebGPU
   page ran at about 52 fps with correct readback. [November 26 browser follow-up](../results-2026-11-26.md#v131y12o-installed)
 
-Installed Metal sustain and Chrome on RAM boots remain open. [Support status](../STATUS.md) · [Hardware backlog](../BACKLOG-hardware.md) · [Metal sustain check](../tools/metal-sustain.md)
+The installed ten-minute Metal sustain run is complete. Chrome on RAM boots remains open.
+[Installed Metal sustain results](../results-2026-11-27.md#sustained-metal-3d-installed-v131y12q) · [Support status](../STATUS.md) · [Hardware backlog](../BACKLOG-hardware.md) · [Metal sustain check](../tools/metal-sustain.md)
 
 ## Historical GPU bring-up
 

@@ -1,6 +1,25 @@
 # Installed Metal 3D sustain test
 
-Goal 12 calls for a real 3D workload on the installed system, with frame-level timing and a sustained run free of GPU hangs and resets. The November 23 RAM run used the historical `piano-gpubench` app on `gpu/bench3d-1` (`3f1217fa`), at 3200×2136 with 4,096 lit icospheres. Its 600-second pass reported 51.78 completed frames/s and a 25.31 ms completion p99. It spent 534 of 600 seconds at 734 MHz. Drawable callbacks supplied zero presentation timestamps, so those figures describe rendering throughput. See [status](../STATUS.md) and [presentation feedback](../drivers/presented-time.md).
+Goal 12 calls for a real 3D workload on the installed system, with frame-level timing and a sustained run free of GPU hangs and resets.
+
+## Measured results
+
+- **2026-11-27, installed v13.1y12q (`inst-y12q-obs4`).** On Adreno 830 in High Power mode, the onscreen 1920 × 1280 workload
+  with 257 draw calls per frame recorded `METAL_SUSTAIN_END rc=0` at **600.000 s**. It completed **35,985 frames** at **59.98 fps**
+  across **60/60 undisturbed windows**, with a **59.80 fps** minimum 10 s window, **19.97 ms** worst-window completion p99 and
+  **0 stalls > 50 ms**. The GPU sustained **967–1050 MHz** with **0 faults or recoveries**. Drawable `presentedTime` was unavailable
+  (`presented=0`), so FPS and frame intervals measure Metal completions. [Full November 27 results](../results-2026-11-27.md#sustained-metal-3d-installed-v131y12q)
+- **2026-11-23, historical RAM baseline.** `piano-gpubench` on `gpu/bench3d-1` (`3f1217fa`) rendered at 3200 × 2136 with 4,096 lit
+  icospheres. Its 600-second pass reported **51.78 completed frames/s** and a **25.31 ms** completion p99. It spent 534 of 600 seconds
+  at 734 MHz. Drawable callbacks supplied zero presentation timestamps, so those figures describe rendering throughput.
+  [Support status](../STATUS.md) · [Presentation feedback](../drivers/presented-time.md)
+
+The installed run's SSH wrapper hit its 650 s silent-connection timeout after the benchmark logged `METAL_SUSTAIN_END rc=0`.
+`run.txt` lacked `METAL_SUSTAIN_REMOTE_RC=0`. The full `frames.csv`, `summary.log`, before/after GPU state and counter snapshots,
+and console audit were pulled intact. The recovered evidence passed every numeric, fault and confound gate in `grade.py`
+and all thermal checks. An automated `PASS` from the checked-in grader also requires the wrapper receipt.
+
+## Implementation
 
 | Existing source | Role in the installed test |
 | --- | --- |
