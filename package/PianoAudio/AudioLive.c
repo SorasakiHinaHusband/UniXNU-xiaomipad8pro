@@ -14,6 +14,9 @@ static unsigned rd32(const uint8_t *p) {return (unsigned)p[0] | (unsigned)p[1] <
 static int load(const int *p) {return __atomic_load_n(p, __ATOMIC_ACQUIRE);}
 static void store(int *p, int v) {__atomic_store_n(p, v, __ATOMIC_RELEASE);}
 
+#define PROBE_RESERVED UINT32_MAX
+#define PROBE_CLOSED (UINT32_MAX - 1u)
+
 static void ledger(AudioLive *l, unsigned event, uint32_t before, uint32_t after, uint32_t want, uint32_t got, int slip)
 {
     if (!l->ledger) return;
@@ -291,9 +294,10 @@ int audio_live_spk_select(AudioLiveShared *sh, int on)
 int audio_live_spk_probe(AudioLiveShared *sh, uint32_t request)
 {
     const uint32_t secs = request > AUDIO_SPK_PROBE_AMPS ? request - AUDIO_SPK_PROBE_AMPS : request;
-    if (!secs || secs > AUDIO_SPK_PROBE_MAX_S) return -1;
-    __atomic_store_n(&sh->spk_probe, request, __ATOMIC_RELEASE);
-    return 0;
+    if (!secs || secs > AUDIO_SPK_PROBE_MAX_S) return EINVAL;
+    uint32_t idle = 0;
+    if (__atomic_compare_exchange_n(&sh->spk_probe, &idle, request, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    return idle == PROBE_CLOSED ? ENXIO : EBUSY;
 }
 
 int audio_live_miplay_select(AudioLiveShared *sh, int request)
@@ -360,6 +364,12 @@ static void probe_end(AudioLive *l, const char *why)
     LOG(l, PROBE ": probe %u over: %s (live reads %u, amplifiers %s)", l->probe_runs, l->probe_why, l->probe_reads,
         l->probe_amps ? "up muted" : "down");
 }
+
+static void probe_close(AudioLive *l, const char *why)
+{
+    __atomic_exchange_n(&l->sh->spk_probe, PROBE_CLOSED, __ATOMIC_ACQ_REL);
+    if (l->probing) probe_end(l, why);
+}
 /* spk-probe1's text: a freestanding append (no libc formatting in this file) */
 typedef struct {char *b; unsigned n, cap;} LiveText;
 static void lt_s(LiveText *t, const char *s) {while (*s && t->n + 1 < t->cap) t->b[t->n++] = *s++; t->b[t->n] = 0;}
@@ -417,10 +427,12 @@ unsigned audio_live_spk_live_text(const AudioLiveSpkStatus *status, uint32_t now
     lt_s(&t, " age-ms "); lt_u(&t, now - status->live_at);
     for (unsigned c = 0; c < 4; ++c) {
         const uint32_t re25 = status->re25[c];
-        const uint32_t pm = re25 ? (uint32_t)((uint64_t)status->live_data.re[c] * 1000u / re25) : 0;
+        const uint64_t scaled_re = (uint64_t)status->live_data.re[c] * 1000u;
+        const uint32_t pm = re25 ? (uint32_t)(scaled_re / re25) : 0;
         const uint32_t f0 = status->live_data.f0[c] / 256u;
         const int32_t dc = (int32_t)(((int64_t)(int32_t)status->live_data.temp[c] * 10) / 4096);
-        const int ok = pm >= AUDIO_SPK_LIVE_OK_MIN && pm <= AUDIO_SPK_LIVE_OK_MAX && f0 >= AUDIO_SPK_F0_OK_MIN && f0 <= AUDIO_SPK_F0_OK_MAX;
+        const int ok = re25 && scaled_re >= (uint64_t)AUDIO_SPK_LIVE_OK_MIN * re25 && scaled_re <= (uint64_t)AUDIO_SPK_LIVE_OK_MAX * re25 &&
+            status->live_data.f0[c] >= AUDIO_SPK_F0_OK_MIN * 256u && status->live_data.f0[c] <= AUDIO_SPK_F0_OK_MAX * 256u;
         lt_s(&t, "; amp"); lt_u(&t, c);
         lt_s(&t, " r0-permille "); lt_u(&t, pm);
         lt_s(&t, " f0 "); lt_u(&t, f0);
@@ -462,14 +474,23 @@ static const char *op_name(uint32_t op)
 }
 
 /* ------------------------------------------------------------------------------------------------ the plans (one command at a time) */
-static void plan_start(AudioLive *l, AudioLivePlan *p, const char *name, const ArStep *steps, unsigned count, uint32_t token_base,
-                       void *context)
+_Static_assert(SPK_MAX_STEPS <= AR_SEQ_TOKEN_SPAN / 2u, "speaker plan exceeds its token range");
+
+static void plan_init(AudioLive *l, AudioLivePlan *p, const ArStep *steps, unsigned count, void *context)
 {
-    ar_seq_init(&p->seq, steps, count, l->ports->apm, l->ports->prm, token_base, context);
-    p->name = name;
+    /* Every graph attempt and monitor round gets its own range, including the undo tokens. */
+    ar_seq_init(&p->seq, steps, count, l->ports->apm, l->ports->prm, l->plan_token, context);
+    l->plan_token += AR_SEQ_TOKEN_SPAN;
+    if (l->plan_token == 0) l->plan_token = 0x8000u;
     p->active = 1;
     p->in_flight = 0;
     p->unsent = 0;
+}
+
+static void plan_start(AudioLive *l, AudioLivePlan *p, const char *name, const ArStep *steps, unsigned count, void *context)
+{
+    plan_init(l, p, steps, count, context);
+    p->name = name;
     p->quiet = 0;
     LOG(l, "live: plan %s: %u steps (APM from port %#x, PRM from port %#x)", name, count, l->ports->apm, l->ports->prm);
 }
@@ -502,6 +523,17 @@ static void plan_send(AudioLive *l, AudioLivePlan *p, uint32_t now)
         ar_seq_timeout(&p->seq);
     }
     if (p->in_flight || l->held || others_busy(l, p)) return;
+    if (p == &l->splan && l->spk_state == LiveStarting && l->probe_only && !l->probing) {
+        /* Keep the answer to a submitted command, especially the map handle.
+         * A forward command still queued locally owns no DSP resources. */
+        if (p->unsent && !p->pending_undo) {
+            p->unsent = 0;
+            p->seq.state = ArSeqIdle;
+        }
+        ar_seq_stop(&p->seq);
+        l->spk_state = LiveStopping;
+        l->spk_reason = l->aborting ? AudioGuardOwner : AudioGuardOk;
+    }
     if (!p->unsent) {
         const uint32_t n = ar_seq_next(&p->seq, p->pkt, sizeof p->pkt);
         if (!n) return;
@@ -587,7 +619,7 @@ static int hold_gate(AudioLive *l, const char *who)
         want == (int)(AR_HOLD_VOTES | AR_HOLD_MCLK) ? "the LPASS macro and digital codec votes, then the VA mclk 19.2 MHz" :
         "the LPASS macro and digital codec votes (the Mic's plan still requests the mclk)",
         path_idle(l->spk_state) ? "is down (the votes come before its TDM clock)" : "plays (requested while it plays, as without the hold)");
-    plan_start(l, &l->hplan, "duplex-hold", steps, count, 0xB000u + (l->sleep_generation << 16), 0);
+    plan_start(l, &l->hplan, "duplex-hold", steps, count, 0);
     return 0;
 }
 
@@ -740,11 +772,12 @@ static void live_report(AudioLive *l, uint32_t now)
 {
     SpkLive v;
     const uint8_t *slot = l->ops.dma + AUDIO_DMA_PARAM + l->spk->plan.live_slot;
-    if (spk_live_parse(slot, &v)) {
-        if (!l->live_bad)
+    const int result = spk_live_parse(slot, SPK_LIVE_SLOT, &v);
+    if (result) {
+        if (!l->live_bad && result == SpkLiveInvalid)
             LOG(l, PROT " live: the answer's header is not the live data's (iid %#x param %#x size %u error %#x)", rd32(slot), rd32(slot + 4),
                 rd32(slot + 8), rd32(slot + 12));
-        l->live_bad = 1;
+        l->live_bad = result;
         return;
     }
     l->live_data = v;
@@ -780,7 +813,8 @@ static void mon_tick(AudioLive *l, uint32_t now)
             return;
         }
         l->mon_preg = 0;
-        l->prot_why = l->live_bad ? "live data under another header" : "a monitor command refused or unanswered";
+        l->prot_why = l->live_bad == SpkLiveEmpty ? "an empty live-data reply" :
+            l->live_bad == SpkLiveInvalid ? "live data under another header" : "a monitor command refused or unanswered";
         LOG(l, PROT ": monitor: %s (%s, status %#x): FSADSP error", l->prot_why,
             l->live_bad ? "live data from SP_RX" : ar_seq_step_name(&l->xplan.seq, l->xplan.seq.failed_step), l->xplan.seq.error_status);
         l->prot_fallback = 1;
@@ -809,11 +843,9 @@ static void mon_tick(AudioLive *l, uint32_t now)
     }
     unsigned count;
     const ArStep *steps = spk_monitor_plan(l->mon.vbat_uv != 0, l->mon_preg, &count);
-    ar_seq_init(&l->xplan.seq, steps, count, l->ports->apm, l->ports->prm, 0xA000u + (l->sleep_generation << 16), &l->mon);
+    plan_init(l, &l->xplan, steps, count, &l->mon);
     l->xplan.name = "speaker-protection monitor";
-    l->xplan.active = l->xplan.quiet = 1;
-    l->xplan.in_flight = 0;
-    l->xplan.unsent = 0;
+    l->xplan.quiet = 1;
     plan_send(l, &l->xplan, now);
 }
 
@@ -911,13 +943,13 @@ static void spk_begin(AudioLive *l, uint32_t now)
         LOG(l, PROT ": variant %u: %s (round 2)", l->spk->plan.variant | 1u, spk_variant_text(l->spk->plan.variant, variant, sizeof variant));
         mip_report(l, mip_off);
         LOG(l, "live: speaker: sound from the Speaker device: the speaker-protection plan (start %u)", l->spk_starts);
-        plan_start(l, &l->splan, "speaker-protection", l->spk->plan.steps, l->spk->plan.count, 0x8000 + (l->sleep_generation << 16), &l->spk->plan);
+        plan_start(l, &l->splan, "speaker-protection", l->spk->plan.steps, l->spk->plan.count, &l->spk->plan);
     } else {
         unsigned count;
         const ArStep *steps = ar_speaker_steps(&count);
         mip_report(l, 0);
         LOG(l, "live: speaker: sound from the Speaker device: the speaker plan (start %u)", l->spk_starts);
-        plan_start(l, &l->splan, "speaker", steps, count, 0x8000 + (l->sleep_generation << 16), &l->speaker);
+        plan_start(l, &l->splan, "speaker", steps, count, &l->speaker);
     }
     l->spk_state = LiveStarting;
     (void)now;
@@ -1295,12 +1327,13 @@ static void spk_stream_tick(AudioLive *l, uint32_t now)
 
 static void probe_tick(AudioLive *l, uint32_t now)
 {
-    if (__atomic_load_n(&l->sh->spk_probe, __ATOMIC_ACQUIRE)) {
-        const uint32_t r = __atomic_exchange_n(&l->sh->spk_probe, 0u, __ATOMIC_ACQ_REL);
+    uint32_t r = __atomic_load_n(&l->sh->spk_probe, __ATOMIC_ACQUIRE);
+    if (r && r < PROBE_CLOSED &&
+        __atomic_compare_exchange_n(&l->sh->spk_probe, &r, PROBE_RESERVED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         l->probe_requests++;
         const char *no = !l->cfg.spk_probe ? "refused: not enabled (piano-audio-spk-probe=1)" :
             l->cfg.level < 9 ? "refused: below level 9" : l->sleeping ? "refused: the system sleeps" :
-            l->probing ? "refused: a probe runs" : !(load(&l->sh->spk_prot) & 1) ? "refused: protection not asked for" :
+            !(load(&l->sh->spk_prot) & 1) ? "refused: protection not asked for" :
             !l->prot_ready ? "refused: protection not ready" : l->prot_failed ? "refused: a protection fallback of this boot" :
             l->spk_state == LiveOff || l->aborting ? "refused: the speaker path is off" :
             l->spk_state != LiveDown ? "refused: the speaker path is busy" : 0;
@@ -1395,6 +1428,8 @@ static void spk_tick(AudioLive *l, uint32_t now)
             ar_seq_step_name(&l->splan.seq, l->splan.seq.failed_step), l->splan.seq.error_status);
         l->splan.active = 0;
         l->prot_active = 0;
+        l->mip_active = 0;
+        l->probe_only = l->probe_noamps = 0;
         l->spk_state = LiveOff;
         audio_amps_hold(l->amps);
         return;
@@ -1539,7 +1574,7 @@ static void mic_begin(AudioLive *l)
     LOG(l, HOLD ": Mic start %u: hold %u, speaker %s: %s", l->mic_starts, l->mic_held, audio_live_state(l->spk_state),
         l->mic_held == (AR_HOLD_VOTES | AR_HOLD_MCLK) ? "no PRM request (the votes and the mclk are held)" :
         l->mic_held ? "the mclk requested, the votes held" : "the votes and the mclk requested by this plan");
-    plan_start(l, &l->mplan, "microphone", steps, count, 0x9000 + (l->sleep_generation << 16), &l->micplan);
+    plan_start(l, &l->mplan, "microphone", steps, count, &l->micplan);
     l->mic_state = LiveStarting;
 }
 
@@ -1552,7 +1587,7 @@ static void capture_begin(AudioLive *l, uint32_t now)
     l->mic_at = now;
     if (l->mic_recording) l->mic_recording->start_ms = now;
     l->mic_diag_at = now;
-    l->mic_idle_at = 0;
+    l->mic_idle = 0;
     if (ar_pump_init_capture(&l->cap, base, l->mplan.seq.handle, l->ports->data, AUDIO_MIC_SLOTS, AUDIO_MIC_PERIOD_BYTES,
                              AUDIO_LIVE_MIC_DEPTH, AUDIO_LATE_MS))
         l->cap_error = 1;
@@ -1696,12 +1731,16 @@ static void capture_tick(AudioLive *l, uint32_t now)
     if (r && l->sleeping) {l->sleep_failed=1; return;}
     if (r) {mic_fault(l, r, now); return;}
     if (l->mic_recording && now - l->mic_recording->start_ms >= AUDIO_MIC_DIAG_MS) mic_window_end(l, "limit", now);
-    if (l->sleeping) l->mic_ending = 1;
     if (l->mic_recording && (mic_control(l->sh) & MicWindowStop)) mic_window_end(l, "input-stop", now);
     if (now - l->mic_diag_at >= 1000) {audio_live_mic_report(l, "tick", now); l->mic_diag_at = now;}
-    if (mic_wanted(l->sh)) l->mic_idle_at = 0;
-    else if (!l->mic_idle_at) l->mic_idle_at = now ? now : 1;
-    if (l->mic_idle_at && now - l->mic_idle_at >= l->cfg.idle_ms) l->mic_ending = 1;
+    if (mic_wanted(l->sh)) {
+        l->mic_idle = 0;
+        l->mic_ending = 0;   /* StartIO arrived while the running graph was still draining. */
+    } else if (!l->mic_idle) {
+        l->mic_idle = 1;
+        l->mic_idle_at = now;
+    } else if (now - l->mic_idle_at >= l->cfg.idle_ms) l->mic_ending = 1;
+    if (l->sleeping) l->mic_ending = 1;
     if (l->cap_unsent) {
         if (l->ops.send(l->ops.ctx, l->cpkt, l->cap_len)) {l->queue_full++; return;}
         l->cap_unsent = 0;
@@ -1772,7 +1811,7 @@ static void mic_tick(AudioLive *l, uint32_t now)
 /* ------------------------------------------------------------------------------------------------ the whole */
 static void finish(AudioLive *l, uint32_t now)
 {
-    if (l->probing) probe_end(l, "cancelled: the audio worker stopped");
+    probe_close(l, "cancelled: the audio worker stopped");
     mic_window_end(l, "finish", now);
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)(MicGraphReleased | MicWindowArmed), __ATOMIC_ACQ_REL);
     store(&l->sh->accepting, 0);
@@ -1783,7 +1822,8 @@ static void finish(AudioLive *l, uint32_t now)
     if (l->ops.tdm_pins) (void)l->ops.tdm_pins(l->ops.ctx, 0);
     l->splan.active = l->mplan.active = l->xplan.active = l->hplan.active = 0;
     l->hold_mask = 0;
-    l->prot_active = 0;
+    l->prot_active = l->mip_active = l->unmuted = 0;
+    l->probe_only = l->probe_noamps = 0;
     if (l->spk_state != LiveOff) l->spk_state = LiveDown;
     if (l->mic_state != LiveOff) l->mic_state = LiveDown;
     LOG(l, "live: done after %u ms: the amplifiers held in reset, the TDM pins given back; speaker %s (%u starts, %u periods, %u with "
@@ -1818,6 +1858,7 @@ int audio_live_init(AudioLive *l, const AudioLiveConfig *c, const AudioSession *
     zero(l, sizeof *l);
     if (!s || !s->kept || !s->guard || !s->ops.dma || !sh || !sh->out.data || !sh->in.data) return -1;
     l->cfg = *c;
+    l->plan_token = 0x8000u;
     __atomic_store_n(&sh->spk_probe, 0u, __ATOMIC_RELEASE);
     if (l->cfg.level < 8) l->cfg.level = 8;
     if (l->cfg.level > 10) l->cfg.level = 10;
@@ -1945,6 +1986,10 @@ uint32_t audio_live_tick(AudioLive *l, const AdgObservation *o, uint32_t now_ms)
         mic_tick(l, now_ms);
         hold_tick(l, now_ms);
     }
+    if (!l->probing && !l->probe_only) {
+        uint32_t reserved = PROBE_RESERVED;
+        __atomic_compare_exchange_n(&l->sh->spk_probe, &reserved, 0u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
     if (l->aborting && l->spk_state != LiveStarting && l->spk_state != LiveRunning && l->spk_state != LiveStopping &&
         l->mic_state != LiveStarting && l->mic_state != LiveRunning && l->mic_state != LiveStopping && !l->hold_mask)
         finish(l, now_ms);
@@ -2014,6 +2059,7 @@ void audio_live_receive(AudioLive *l, const uint8_t *packet, uint32_t length, ui
 void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
 {
     if (l->finished) return;
+    probe_close(l, "cancelled: the audio worker stopped");
     LOG(l, "live: stopped by the owner%s", hard ? " (without DSP commands)" : "");
     store(&l->sh->accepting, 0);
     store(&l->sh->capturing, 0);
@@ -2030,7 +2076,8 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
     /* soft: each plan's undo commands; the owner ticks on until both are down (or stops hard) */
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
     l->aborting = 1;
-    if (l->splan.active && l->splan.seq.state != ArSeqDown && l->splan.seq.state != ArSeqFailed) {
+    const int probe_starting = l->spk_state == LiveStarting && l->probe_only;
+    if (!probe_starting && l->splan.active && l->splan.seq.state != ArSeqDown && l->splan.seq.state != ArSeqFailed) {
         ar_seq_abort(&l->splan.seq, ArSeqErrAbort, 0);
         l->spk_state = LiveStopping;
         l->spk_reason = AudioGuardOwner;
@@ -2041,14 +2088,14 @@ void audio_live_abort(AudioLive *l, int hard, uint32_t now_ms)
         l->mic_reason = AudioGuardOwner;
     }
     /* duplex-hold1: a hold is released by hold_tick once both paths are down (never before the Mic's own undo touched the VA macro) */
-    if (l->spk_state != LiveStopping && l->mic_state != LiveStopping && !l->hold_mask) finish(l, now_ms);
+    if (!probe_starting && l->spk_state != LiveStopping && l->mic_state != LiveStopping && !l->hold_mask) finish(l, now_ms);
 }
 
 
 void audio_live_sleep(AudioLive *l, uint32_t generation)
 {
     if (l->sleeping) return;
-    if (l->probing) probe_end(l, "cancelled: the system sleeps");
+    probe_close(l, "cancelled: the system sleeps");
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
     mic_window_end(l, "sleep", l->now);
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicWindowArmed, __ATOMIC_ACQ_REL);
@@ -2096,6 +2143,7 @@ int audio_live_rearm(AudioLive *l)
     drift_reset(&l->spk_drift); drift_reset(&l->mic_drift);
     l->status_poll_active=0; l->stream_unsent=l->cap_unsent=0;
     l->sleeping=l->parked=0;
+    __atomic_store_n(&l->sh->spk_probe, 0u, __ATOMIC_RELEASE);
     if (l->cfg.mic) __atomic_fetch_or(&l->sh->mic_control, MicGraphReleased, __ATOMIC_RELEASE);
     ledger(l,AlRearm,0,0,0,0,0);
     return 0;
@@ -2103,6 +2151,7 @@ int audio_live_rearm(AudioLive *l)
 
 void audio_live_sleep_fail(AudioLive *l)
 {
+    probe_close(l, "cancelled: the system sleeps");
     __atomic_fetch_and(&l->sh->mic_control, ~(uint64_t)MicGraphReleased, __ATOMIC_ACQ_REL);
     mic_window_end(l, "sleep-failed", l->now);
     l->sleeping=1; l->sleep_failed=1;

@@ -53,6 +53,8 @@ static int injection(uint64_t deadline)
 static Result run(unsigned batch, unsigned burst, unsigned delay, enum DelaySite site)
 {
     audio_live_shared_init(&sh, out, in, AUDIO_Q15_ONE);
+    const uint32_t origin = UINT32_MAX - 1023u;
+    sh.in.head = sh.in.tail = origin;
     audio_live_running(&sh, 0, 1);
     sh.capturing = 1;
     const uint64_t period_us = (uint64_t)batch * 1000000u / PIANO_AUDIO_RATE;
@@ -90,6 +92,7 @@ static Result run(unsigned batch, unsigned burst, unsigned delay, enum DelaySite
     CHECK(r.delivered + r.startup + r.missing == done);
     CHECK(r.missing == 0 && sh.in.overruns == 0 && sh.in.underruns == 0);
     CHECK(r.produced == r.delivered + r.remaining);
+    CHECK(sh.in.head == origin + (uint32_t)r.produced && sh.in.tail == origin + (uint32_t)r.delivered);
     return r;
 }
 

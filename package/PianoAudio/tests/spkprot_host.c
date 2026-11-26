@@ -293,13 +293,22 @@ static void testPackets(void)
     spk_live_stage(slot);
     CHECK(le32(slot) == 0x4046 && le32(slot + 4) == 0x10001fab && le32(slot + 8) == 96 && le32(slot + 12) == 0);
     for (unsigned i = 16; i < SPK_LIVE_SLOT; ++i) CHECK(!slot[i]);
+    SpkLive live = {.re = {123}};
+    CHECK(spk_live_parse(slot, sizeof slot, &live) == SpkLiveEmpty && live.re[0] == 123);
+    for (uint32_t bytes = 0; bytes < sizeof slot; ++bytes) {
+        uint8_t *short_slot = malloc(bytes + 1u);
+        CHECK(short_slot);
+        memcpy(short_slot, slot, bytes);
+        CHECK(spk_live_parse(short_slot, bytes, &live) == SpkLiveInvalid && live.re[0] == 123);
+        free(short_slot);
+    }
     for (unsigned c = 0; c < 4; ++c) for (unsigned k = 0; k < 6; ++k) put32(slot + 16 + 24 * c + 4 * k, 100 * c + k + 1);
-    SpkLive live;
-    CHECK(spk_live_parse(slot, &live) == 0 && live.re[0] == 1 && live.temp[1] == 102 && live.w2[2] == 203 && live.f0[3] == 304);
+    CHECK(spk_live_parse(slot, sizeof slot, &live) == 0 && live.re[0] == 1 && live.temp[1] == 102 && live.w2[2] == 203 && live.f0[3] == 304);
     CHECK(live.q[0] == 5 && live.w5[3] == 306);
-    put32(slot + 12, 0x12); CHECK(spk_live_parse(slot, &live) == -1);   // the DSP's per-parameter error
-    put32(slot + 12, 0); put32(slot + 8, 48); CHECK(spk_live_parse(slot, &live) == -1);
-    put32(slot + 8, 96); put32(slot + 4, 0x10001fb6); CHECK(spk_live_parse(slot, &live) == -1);
+    put32(slot + 12, 0x12); CHECK(spk_live_parse(slot, sizeof slot, &live) == SpkLiveInvalid);
+    put32(slot + 12, 0); put32(slot + 8, 48); CHECK(spk_live_parse(slot, sizeof slot, &live) == SpkLiveInvalid);
+    put32(slot + 8, UINT32_MAX); CHECK(spk_live_parse(slot, sizeof slot, &live) == SpkLiveInvalid);
+    put32(slot + 8, 96); put32(slot + 4, 0x10001fb6); CHECK(spk_live_parse(slot, sizeof slot, &live) == SpkLiveInvalid);
     // the stream's link to the MFC
     n = ar_open_playback_stream_to(pkt, sizeof pkt, AR_PORT_APM, 3, SPK_IID_MFC);
     CHECK(n && gpr_decode(pkt, n, &p) == GprOk && p.opcode == AR_OP_GRAPH_OPEN);

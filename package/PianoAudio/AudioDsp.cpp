@@ -378,7 +378,8 @@ int spkProbeControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req
     if (err || !req->newptr) return err;
     if (!gLive->cfg.spk_probe) return EPERM;
     if (!gLive->prot_ready) return ENOENT;
-    if (value < 0 || audio_live_spk_probe(gShared, uint32_t(value))) return EINVAL;
+    const int queued = audio_live_spk_probe(gShared, uint32_t(value));
+    if (queued) return queued;
     piano_audio_log("spk-probe1: request %d (taken at the worker's next tick)", value);
     liveWake();
     return 0;

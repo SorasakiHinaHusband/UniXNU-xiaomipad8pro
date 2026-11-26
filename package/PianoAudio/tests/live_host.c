@@ -67,6 +67,7 @@ struct World {
     // the speaker-protection pair (AudioSpkProt.h)
     int vi_open, vi_started, prot_dev_open, re25_sets, oob_cfgs;
     unsigned vbat_sets, live_gets;
+    struct Answer live_reply;
     // MIPLAY (AudioSpkProt.h): its graph's state, the driver's configuration and the monitor's pregain updates
     int str_open, mip_open, mip_started, mip_rotation;
     unsigned mip_cfgs, preg_sets;
@@ -134,6 +135,7 @@ static int g_mark;
 // speaker protection: the synthetic private files the session's ops carry, and the gauge's voltage
 static uint8_t g_spk_file[8192], g_spk_re25[16];
 static uint32_t g_spk_bytes, g_re25_bytes = 16, g_re25_q12[4] = {27000, 27500, 28000, 28500};
+enum {BadLiveHeader = 1, ShortLiveHeader, EmptyLiveData};
 static int g_spk, g_spk_files, g_live_header_bad;
 // MIPLAY: the synthetic private file, the request
 static uint8_t g_mip_file[8192];
@@ -581,16 +583,19 @@ static int dsp_send(void *ctx, const uint8_t *b, uint32_t n)
         if (!o || !w.dev_started) violate("a live-data GET outside the running protected graph");
         else {
             if (le32(o) != SPK_IID_SP_RX || le32(o + 4) != SPK_PID_LIVE || le32(o + 8) != SPK_LIVE_BYTES) violate("a live-data GET of another header");
-            for (unsigned c = 0; c < 4; ++c) {
+            for (unsigned c = 0; g_live_header_bad != EmptyLiveData && c < 4; ++c) {
                 const uint32_t words[6] = {g_re25_q12[c] * 102u / 100u, 31u + c, 0, (800u + 10u * c) * 256u, 3u + c, 0};
                 for (unsigned k = 0; k < 6; ++k) for (unsigned b = 0; b < 4; ++b) o[16 + 24 * c + 4 * k + b] = (uint8_t)(words[k] >> (8 * b));
             }
-            if (g_live_header_bad) o[4] ^= 1;
+            if (g_live_header_bad == BadLiveHeader) o[4] ^= 1;
+            if (g_live_header_bad == ShortLiveHeader) o[8] = SPK_LIVE_BYTES - 24;
         }
         w.live_gets++;
         r.opcode = AR_OP_RSP_GET_CFG;
         const uint32_t ok = 0;
-        queue(due, &r, &ok, 1)->plan = 1;
+        struct Answer *reply = queue(due, &r, &ok, 1);
+        reply->plan = 1;
+        if (w.live_gets == 1) w.live_reply = *reply;
         return 0;
     }
     r.opcode = p.opcode == AR_OP_PRM_REQUEST ? AR_OP_PRM_REQUEST_DONE : p.opcode == AR_OP_PRM_RELEASE ? AR_OP_PRM_RELEASE_DONE : GPR_OP_BASIC_RESULT;
@@ -1673,6 +1678,30 @@ static void testMicShortRestart(void)
     CHECK(logged("mic release: run 2 down 1 va 0"));
 }
 
+static int g_mic_restarted_during_drain;
+static void duplex_mic_restart(uint32_t t)
+{
+    if (t == 100 && !w.out_running) device(1, 1);
+    w.amplitude = 20000;
+    w.sound_on = 1;
+    if (t == 2000 && w.in_running) device(1, 0);
+    if (live.mic_ending && live.cap.in_flight && !w.in_running && !g_mic_restarted_during_drain) {
+        CHECK(live.mic_state == LiveRunning && live.unmuted);
+        g_mic_restarted_during_drain = 1;
+        device(1, 1);
+    }
+}
+
+static void testDuplexMicRestartDuringDrain(void)
+{
+    const struct Scenario sc = {10, 0, 0, 600, 5500, AudioPortsUbuntu, 1, duplex_mic_restart};
+    g_mic_restarted_during_drain = 0;
+    run(&sc);
+    CHECK(g_mic_restarted_during_drain && !w.violations && w.mic_bad == 0);
+    CHECK(sh.input_runs == 2 && sh.epoch == 1 && live.mic_starts == 1 && live.spk_starts == 1 && w.unmutes == 4);
+    CHECK(sh.input_hal.delivered > PIANO_AUDIO_RATE && !sh.input_hal.missing && !live.cap.errors);
+}
+
 static void mic_clock(uint32_t t)
 {
     if (t == 100) device(0, 1);
@@ -2310,7 +2339,7 @@ static void probe_hook(uint32_t t)
     if (g_probe_sleep_at && t == g_probe_sleep_at) audio_live_sleep(&live, 1);
     w.amplitude = 20000;
     w.sound_on = g_probe_snd_to && t >= g_probe_snd_from && t < g_probe_snd_to;
-    if (t == g_probe_at) g_probe_rc = audio_live_spk_probe(&sh, g_probe_req);
+    if (t == g_probe_at && g_probe_rc == -2) g_probe_rc = audio_live_spk_probe(&sh, g_probe_req);
     if (t == g_probe_at + 5000) {
         AudioLiveSpkStatus status;
         audio_live_spk_status(&live, &status);
@@ -2331,8 +2360,9 @@ static void testSpkProbe(void)
     const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_hook};
     // the request's range
     audio_live_shared_init(&sh, g_out_ring, g_in_ring, AUDIO_Q15_ONE);
-    CHECK(audio_live_spk_probe(&sh, 0) == -1 && audio_live_spk_probe(&sh, 31) == -1 && audio_live_spk_probe(&sh, 100) == -1);
-    CHECK(audio_live_spk_probe(&sh, 131) == -1 && audio_live_spk_probe(&sh, 1) == 0 && audio_live_spk_probe(&sh, 130) == 0);
+    CHECK(audio_live_spk_probe(&sh, 0) == EINVAL && audio_live_spk_probe(&sh, 31) == EINVAL && audio_live_spk_probe(&sh, 100) == EINVAL);
+    CHECK(audio_live_spk_probe(&sh, 131) == EINVAL && audio_live_spk_probe(&sh, UINT32_MAX) == EINVAL);
+    CHECK(audio_live_spk_probe(&sh, 1) == 0 && audio_live_spk_probe(&sh, 130) == EBUSY);
     // A: no device, no sound, amplifiers down: the pair up, the monitor read, nothing powered, nothing played, down at the end
     spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
     run(&sc);
@@ -2405,6 +2435,108 @@ static void testSpkProbe(void)
     spk_reset(); g_setup = 0;
 }
 
+static void probe_reentry(uint32_t t)
+{
+    probe_hook(t);
+    if (t == g_probe_at) CHECK(audio_live_spk_probe(&sh, 130) == EBUSY);
+    if (t == 5000) {
+        CHECK(live.probing && !any_powered());
+        CHECK(audio_live_spk_probe(&sh, 130) == EBUSY);
+    }
+}
+
+static void testProbeReentry(void)
+{
+    const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_reentry};
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+    run(&sc);
+    CHECK(!w.violations && live.probe_runs == 1 && g_probe_down_after && live.probe_reads >= 2);
+    CHECK(power_ups_after_session() == 0 && !w.unmutes && !w.sound_periods);
+    spk_reset();
+}
+
+static void probe_abort_pending_map(uint32_t t)
+{
+    probe_hook(t);
+    if (!live.aborting && live.splan.in_flight && live.splan.seq.pending_opcode == AR_OP_MEM_MAP)
+        audio_live_abort(&live, 0, now_ms());
+}
+
+static void testProbeAbortPendingMap(void)
+{
+    const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_abort_pending_map};
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+    g_probe_req = 106;
+    run(&sc);
+    CHECK(!w.violations && live.probe_runs == 1 && !live.probing && !live.timeouts);
+    CHECK(count_cmd("UNMAP 0x55", live_from()) == 1 && power_ups_after_session() == 0);
+    CHECK(!w.unmutes && !w.sound_periods && logged("cancelled: the audio worker stopped"));
+    CHECK(audio_live_spk_probe(&sh, 30) == ENXIO);
+    spk_reset();
+}
+
+static unsigned g_old_monitor_injected;
+static void probe_old_monitor_reply(uint32_t t)
+{
+    probe_hook(t);
+    if (!g_old_monitor_injected && w.live_gets == 2 && live.xplan.in_flight) {
+        CHECK(live.live_reads == 1 && w.live_reply.n > 0);
+        audio_live_receive(&live, w.live_reply.b, w.live_reply.n, now_ms());
+        CHECK(live.xplan.in_flight && live.live_reads == 1);
+        g_old_monitor_injected = 1;
+    }
+}
+
+static void testProbeOldMonitorReply(void)
+{
+    const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_old_monitor_reply};
+    spk_reset(); spk_files(); mip_files(); g_spk = g_miplay = 1; probe_reset(); g_setup = probe_setup;
+    g_old_monitor_injected = 0;
+    run(&sc);
+    CHECK(g_old_monitor_injected && live.mip_starts == 1 && !live.mip_fallbacks && !live.prot_fallbacks);
+    CHECK(live.live_reads == w.live_gets && live.probe_reads >= 2 && g_probe_down_after);
+    CHECK(!w.violations && !power_ups_after_session() && !w.sound_periods);
+    spk_reset();
+}
+
+static void testProbeMalformedLiveData(void)
+{
+    const struct Scenario sc = {9, 0, 0, 0, 12000, AudioPortsUbuntu, 1, probe_hook};
+    for (int bad = ShortLiveHeader; bad <= EmptyLiveData; ++bad) {
+        spk_reset(); spk_files(); mip_files(); g_spk = g_miplay = 1; probe_reset(); g_setup = probe_setup;
+        g_live_header_bad = bad;
+        run(&sc);
+        CHECK(!w.violations && live.mip_fallbacks == 1 && live.prot_fallbacks == 1 && live.spk_starts == 2);
+        CHECK(live.live_reads == 0 && live.probe_reads == 0 && !live.probing && g_probe_down_after);
+        CHECK(!power_ups_after_session() && !w.sound_periods && !w.unmutes && count_cmd("OPEN 0x4005", live_from()) == 0);
+        CHECK(logged(bad == EmptyLiveData ? "an empty live-data reply" : "live data under another header"));
+    }
+    spk_reset();
+}
+
+static void testSpkLiveBounds(void)
+{
+    AudioLiveSpkStatus status = {.enabled = 1, .live_reads = 1, .live_at = UINT32_MAX - 10};
+    for (unsigned c = 0; c < 4; ++c) status.re25[c] = 10000;
+    status.live_data = (SpkLive){
+        .re = {7000, 15000, 10000, UINT32_MAX},
+        .f0 = {200 * 256, 2000 * 256, 2000 * 256 + 1, 0},
+        .q = {3, 4, 5, UINT32_MAX},
+        .temp = {4096, (uint32_t)-4096, 0, (uint32_t)INT32_MIN},
+    };
+    char line[640];
+    audio_live_spk_live_text(&status, 5, line, sizeof line);
+    CHECK(strstr(line, "age-ms 16"));
+    CHECK(strstr(line, "amp0 r0-permille 700 f0 200 q 3 t-dC 10 ok"));
+    CHECK(strstr(line, "amp1 r0-permille 1500 f0 2000 q 4 t-dC -10 ok"));
+    CHECK(strstr(line, "amp2 r0-permille 1000 f0 2000 q 5 t-dC 0 check"));
+    CHECK(strstr(line, "amp3 r0-permille 429496729 f0 0 q 4294967295 t-dC -5242880 check"));
+    status.live_data.f0[2] = 200 * 256;
+    status.live_data.re[2] = 15001;
+    audio_live_spk_live_text(&status, 5, line, sizeof line);
+    CHECK(strstr(line, "amp2 r0-permille 1500 f0 200 q 5 t-dC 0 check"));
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -2433,6 +2565,7 @@ int main(void)
     testMicRoutePendingAndFailedRelease();
     testInputControlsAndWrap();
     testMicShortRestart();
+    testDuplexMicRestartDuringDrain();
     testQueueFull();
     testLoadedMonitor();
     testSleepCycles();
@@ -2442,6 +2575,11 @@ int main(void)
     testEpochStarts();
     testProtection();
     testSpkProbe();
+    testProbeReentry();
+    testProbeAbortPendingMap();
+    testProbeOldMonitorReply();
+    testProbeMalformedLiveData();
+    testSpkLiveBounds();
     testProtPlanFallback();
     testProtRunningFallback();
     testProtFiles();

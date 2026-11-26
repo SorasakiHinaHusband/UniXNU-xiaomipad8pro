@@ -107,7 +107,7 @@ typedef struct {
     int miplay;                           /* MIPLAY asked for (spk_miplay_valid: the boot argument, then the sysctl); taken at a start */
     uint32_t miplay_gen;                  /* every request: a new one clears a MIPLAY fallback of this boot */
     /* spk-probe1: a silent protection probe asked for (audio_live_spk_probe), taken by the worker */
-    uint32_t spk_probe;                   /* pending request, or 0 when consumed; a newer write can replace it before the tick */
+    uint32_t spk_probe;                   /* atomic mailbox: idle, pending request, reserved, or closed for teardown */
     /* The microphone tap (AudioTap.h): its shared header and ring (null: no tap), and how many tap clients are open; while one is,
      * the capture plan runs as if the Mic device did, and every capture period also goes into the tap. */
     PianoTapHeader *tap;
@@ -140,7 +140,8 @@ int audio_live_age_select(AudioLiveShared *sh, int signed_age);
  * not stop it, the amplifiers stay powered down (or, with + AUDIO_SPK_PROBE_AMPS, are powered up and held MUTED); the monitor runs
  * (battery voltage, live data); then the path goes down as after idle. Real sound during a probe takes over as usual (without the
  * amplifiers, that start ends first and the path comes back with them). Taken at the worker's next tick when the speaker path is
- * down and protection is asked for and ready; sleep cancels it. -1 for another value. */
+ * down and protection is asked for and ready; sleep cancels it. Returns EINVAL for another value, EBUSY while a request is pending
+ * or a probe owns the path, and ENXIO while the worker is asleep or stopped. */
 #define AUDIO_SPK_PROBE_MAX_S 30u
 #define AUDIO_SPK_PROBE_AMPS 100u
 int audio_live_spk_probe(AudioLiveShared *sh, uint32_t request);
@@ -269,7 +270,7 @@ typedef struct {
     uint32_t prot_starts, prot_fallbacks;
     AudioLivePlan xplan;                 /* the monitor: battery voltage, live data */
     SpkMonitor mon;
-    uint32_t mon_at;
+    uint32_t mon_at, plan_token;
     int mon_stopping, live_bad, vbat_noted;
     SpkLive live_data;
     uint32_t live_reads, vbat_sends, vbat_uv;
@@ -299,6 +300,7 @@ typedef struct {
     ArPump cap;
     uint8_t cpkt[GPR_MAX_PACKET];
     uint32_t cap_len, mic_at, mic_idle_at;
+    int mic_idle;
     AudioLiveDrift mic_drift;
     int16_t mono[AUDIO_PERIOD_FRAMES + 1];
     uint32_t mic_starts, mic_periods, mic_drops, mic_repeats, mic_full;
