@@ -1,11 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Run independent compile-and-test tasks from a wrapper with set -e enabled.
-run_host_jobs() {
-  local scratch=$1 run=$2
-  shift 2
-  local limit=${CI_SUBJOBS:-2} cpus i test status failed=0
-  local -a tests=("$@") pids
+host_job_limit() {
+  local limit=${CI_SUBJOBS:-2} cpus
   case $limit in
     [1-4]) ;;
     0*|*[!0-9]*)
@@ -20,7 +16,16 @@ run_host_jobs() {
   if [[ ${SELFTEST_SUBJOB_LIMIT:-} =~ ^[1-9][0-9]*$ ]] && (( limit > SELFTEST_SUBJOB_LIMIT )); then
     limit=$SELFTEST_SUBJOB_LIMIT
   fi
+  printf '%d\n' "$limit"
+}
 
+# Run independent compile-and-test tasks from a wrapper with set -e enabled.
+run_host_jobs() {
+  local scratch=$1 run=$2
+  shift 2
+  local limit i test status failed=0
+  local -a tests=("$@") pids
+  limit=$(host_job_limit)
   if (( limit == 1 )); then
     for test in "${tests[@]}"; do
       "$run" "$test"
