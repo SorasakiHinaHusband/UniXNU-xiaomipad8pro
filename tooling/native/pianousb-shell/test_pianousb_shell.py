@@ -97,7 +97,17 @@ int gateSysctl(const char *name, void *answer, size_t *size, void *newValue, siz
   return 0;
 }
 
-int main(int argc, char **argv) { return shellMain(argc, argv); }
+int main(int argc, char **argv)
+{
+  if (argc == 3) {
+    size_t length;
+    const char *value = pianoBootArgValue(argv[1], argv[2], &length);
+    if (!value) return 1;
+    printf("%.*s", (int)length, value);
+    return 0;
+  }
+  return shellMain(argc, argv);
+}
 '''
 
 
@@ -169,6 +179,12 @@ class PianoUsbShellTest(unittest.TestCase):
                 (legacy + ' ' + switch, legacy, 42),
                 ('x' * (4095 - len(switch) - 1) + ' ' + switch, legacy, 42),
                 ('piano-usb-shell=0', switch, 0),
+                ('piano-usb-shell=0 ' + switch, '', 42),
+                (switch + ' piano-usb-shell=0', switch, 0),
+                ('quiet\t' + switch, '', 42),
+                ('piano-usb-shell-extra=1 other=' + switch, '', 0),
+                ('piano-usb-shell=\t1', '', 0),
+                ('x' * 4096 + ' ' + switch, switch, 0),
                 ('EPERM', switch, 0),
                 (None, switch, 42),
                 (None, legacy, 0)):
@@ -179,6 +195,16 @@ class PianoUsbShellTest(unittest.TestCase):
                     env['PIANO_TEST_MERGED'] = merged
                 result = subprocess.run([str(self.gate)], env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_shared_parser_matches_complete_keys(self):
+        for line, key, expected in (
+                ('piano-rotated=3 other=piano-rotate=2', 'piano-rotate', None),
+                ('piano-rotate=2 piano-rotated=3\tpiano-rotate=0', 'piano-rotate', '0'),
+                ('piano-backlight-auto=1 piano-backlight-auto-requested=1 piano-backlight-auto=0', 'piano-backlight-auto', '0'),
+                ('piano-backlight-native', 'piano-backlight-native', '1')):
+            with self.subTest(line=line, key=key):
+                result = subprocess.run([str(self.gate), line, key], capture_output=True, text=True, timeout=5)
+                self.assertEqual((result.returncode, result.stdout), (1, '') if expected is None else (0, expected))
 
     def test_relays_both_ways_without_spinning(self):
         self.proc = subprocess.Popen([str(self.helper), self.device, '/bin/sh'], env=self.env, stdin=subprocess.DEVNULL,

@@ -57,14 +57,11 @@ static NSString *const kStatusDir = @"/private/var/db/piano-userland/brightness-
 
 static uint64_t nowMs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
 
-static int bootArg(const char *word)
+static int bootArgEnabled(const char *args, const char *name)
 {
-  char args[PIANO_BOOT_ARGS_MAX];
-  pianoBootArgs(args);
-  const size_t n = strlen(word);
-  for (char *p = args; (p = strstr(p, word)); p += n)
-    if ((p == args || p[-1] == ' ') && (p[n] == ' ' || !p[n])) return 1;
-  return 0;
+  size_t length;
+  const char *value = pianoBootArgValue(args, name, &length);
+  return value && length == 1 && value[0] == '1';
 }
 
 static int has(io_service_t s, CFStringRef key)
@@ -78,8 +75,10 @@ static int has(io_service_t s, CFStringRef key)
 // piano-backlight-auto-requested (from its first publication, shortly after it registers). The boot arguments still count.
 static int kextReady(io_service_t s)
 {
-  return (has(s, CFSTR("piano-backlight-native-implementation")) && has(s, CFSTR("piano-backlight-auto-requested"))) ||
-         (bootArg("piano-backlight-native=1") && bootArg("piano-backlight-auto=1"));
+  if (has(s, CFSTR("piano-backlight-native-implementation")) && has(s, CFSTR("piano-backlight-auto-requested"))) return 1;
+  char args[PIANO_BOOT_ARGS_MAX];
+  pianoBootArgs(args);
+  return bootArgEnabled(args, "piano-backlight-native") && bootArgEnabled(args, "piano-backlight-auto");
 }
 
 static id<PianoDisplayServicesClient> client(void)

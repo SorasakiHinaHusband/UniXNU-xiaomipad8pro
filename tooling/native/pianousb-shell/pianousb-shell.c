@@ -37,12 +37,12 @@ static int shellArgument(void)
 {
   char args[PIANO_BOOT_ARGS_MAX];
   pianoBootArgs(args);
-  static const char key[] = "piano-usb-shell=";
-  for (char *p = args; (p = strstr(p, key)) != NULL; p += sizeof key - 1) {
-    if (p != args && p[-1] != ' ') continue;
-    return strtoul(p + sizeof key - 1, NULL, 0) != 0;
-  }
-  return 0;
+  size_t length;
+  const char *value = pianoBootArgValue(args, "piano-usb-shell", &length);
+  if (!value || !length) return 0;
+  char *end;
+  const unsigned long number = strtoul(value, &end, 0);
+  return end == value + length && number != 0;
 }
 
 static int copy(int from, int to)

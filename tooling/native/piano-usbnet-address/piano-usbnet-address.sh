@@ -24,8 +24,8 @@ wait_s=${PIANO_USBNET_WAIT:-300} guard_s=${PIANO_USBNET_GUARD:-600} period=${PIA
 say() { printf 'piano-usbnet-address: %.230s\n' "$1" >> "$out" 2> /dev/null; }
 
 . "$(dirname "$0")/piano-bootargs.sh"
-case " $(piano_bootargs) " in
-  *" piano-usb-net="[1-9]*) ;;
+case "$(piano_bootarg piano-usb-net)" in
+  [1-9]*) ;;
   *) exit 0 ;;
 esac
 

@@ -60,12 +60,13 @@ def run(bootargs, inet, service=None, replace_after=None, guard=4, wait=4, merge
         (t / 'merged').write_text(merged + '\n')
     if denied:
         (t / 'denied').touch()
+    (t / 'piano-usb-net=1').touch()  # a wildcard value must not expand to this file
     (t / 'inet').write_text(inet + '\n' if inet else '')
     if service:
         (t / 'service').write_text(service + '\n')
     env = dict(os.environ, T=str(t), PIANO_USBNET_PATH=f'{stubs}:/usr/bin:/bin', PIANO_USBNET_OUT=str(t / 'console'),
                PIANO_USBNET_WAIT=str(wait), PIANO_USBNET_GUARD=str(guard), PIANO_USBNET_PERIOD='1')
-    p = subprocess.Popen(['/bin/sh', str(SCRIPT)], env=env)
+    p = subprocess.Popen(['/bin/sh', str(SCRIPT)], env=env, cwd=t)
     if replace_after is not None:
         time.sleep(replace_after)
         (t / 'inet').write_text('169.254.33.7\n')   # configd's own configuration: a self-assigned address instead of the fixed one
@@ -83,6 +84,15 @@ rc, console, calls, *_ = run('piano-usb-net=1', '169.254.80.2', merged='piano-us
 check(rc == 0 and console == '' and calls == '', 'the merged OID takes precedence over the legacy value')
 rc, console, calls, *_ = run('piano-usb-net=1', '169.254.80.2', denied=True)
 check(rc == 0 and console == '' and calls == '', 'permission errors keep the helper inactive')
+
+for args, active in (
+        ('piano-usb-net=1 piano-usb-net=0', False),
+        ('piano-usb-net=0 piano-usb-net=1', True),
+        ('quiet\tpiano-usb-net=1', True),
+        ('piano-usb-net-txflow=1 other=piano-usb-net=1', False),
+        ('piano-usb-net=*', False)):
+    rc, console, calls, *_ = run('', '', merged=args, wait=0)
+    check(rc == 0 and bool(console) == active and not calls, f'exact last boot argument, as data: {args!r}')
 
 legacy = 'a=' + 'x' * 1013
 rc, console, calls, manual, inet, service = run(legacy, '169.254.80.2', service='Ethernet Adaptor', replace_after=1.5,

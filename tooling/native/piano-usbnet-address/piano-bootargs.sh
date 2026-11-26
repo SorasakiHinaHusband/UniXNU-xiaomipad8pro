@@ -10,3 +10,18 @@ piano_bootargs() {
     return 1
   fi
 }
+
+# Select the last exact key. Split on PE's separators and keep patterns in the line literal.
+piano_bootarg() (
+  local args word value=
+  args=$(piano_bootargs) || return 1
+  IFS=' 	'
+  set -f
+  for word in $args; do
+    case "$word" in
+      "$1") value=1 ;;
+      "$1="*) value=${word#*=} ;;
+    esac
+  done
+  printf '%s\n' "$value"
+)

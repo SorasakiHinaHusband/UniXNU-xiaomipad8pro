@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/sysctl.h>
 
 /* k27 0066's merged line, including the terminating NUL. */
@@ -26,6 +27,30 @@ pianoBootArgs(char args[PIANO_BOOT_ARGS_MAX])
         args[size - 1] = '\0';
     else
         args[0] = '\0';
+}
+
+/* Like PE's named options: space/tab separators, an exact key and the last occurrence. */
+static inline const char *
+pianoBootArgValue(const char *args, const char *name, size_t *length)
+{
+    const char *value = NULL;
+    const size_t key = strlen(name);
+    *length = 0;
+    while (*args) {
+        args += strspn(args, " \t");
+        const size_t word = strcspn(args, " \t");
+        if (word >= key && !strncmp(args, name, key)) {
+            if (word == key) {
+                value = "1";
+                *length = 1;
+            } else if (args[key] == '=') {
+                value = args + key + 1;
+                *length = word - key - 1;
+            }
+        }
+        args += word;
+    }
+    return value;
 }
 
 #endif /* PIANO_BOOT_ARGS_H */

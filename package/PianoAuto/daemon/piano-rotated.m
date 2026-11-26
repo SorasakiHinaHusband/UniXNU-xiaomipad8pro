@@ -90,25 +90,13 @@ static void readBootArgs(void)
 // NAME=VALUE (or a bare NAME, "1") from the boot arguments, or NULL.
 static const char *bootArg(const char *name, char *out, size_t cap)
 {
-    const size_t len = strlen(name);
-    for (const char *p = gBootArgs; *p;) {
-        while (*p == ' ') ++p;
-        const char *word = p;
-        while (*p && *p != ' ') ++p;
-        const size_t n = (size_t)(p - word);
-        if (n == len && !strncmp(word, name, len)) {
-            snprintf(out, cap, "1");
-            return out;
-        }
-        if (n > len && !strncmp(word, name, len) && word[len] == '=') {
-            size_t v = n - len - 1;
-            if (v >= cap) v = cap - 1;
-            memcpy(out, word + len + 1, v);
-            out[v] = 0;
-            return out;
-        }
-    }
-    return NULL;
+    size_t length;
+    const char *value = pianoBootArgValue(gBootArgs, name, &length);
+    if (!value || !cap) return NULL;
+    if (length >= cap) length = cap - 1;
+    memcpy(out, value, length);
+    out[length] = 0;
+    return out;
 }
 
 static long bootNumber(const char *name, long fallback, long lo, long hi)
