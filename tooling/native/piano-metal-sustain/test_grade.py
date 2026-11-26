@@ -139,3 +139,7 @@ class GradeTests(unittest.TestCase):
                 self.assertIn(diagnostic, result.stdout)
                 self.assertIn('touch_contacts=1 browser_accelerator_opens=0', result.stdout)
                 self.assertNotIn('VOID', result.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()
