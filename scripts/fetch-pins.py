@@ -18,8 +18,7 @@ Special cases, matching tooling/unixnu.sh:
                    setup-deps.sh expect); its submodules are pinned in the lockfile too.
   piano-uefi    -> checked out as piano-uefi-UniXNU-piano, branch "unixnu" (the lockfile records it).
   k27           -> the k27 tree: upstream Droid-VM/macOS-DroidVM at the pinned commit with this repository's
-                   patches/k27-tree on top, checked out as k27-tree. The helper in tooling/k27/ uses
-                   Python 3.11+ from PATH for the checkout.
+                   patches/k27-tree on top, checked out as k27-tree by the helper in tooling/k27/.
 Commits are fetched by their SHA-1 with depth 1 (GitHub serves any reachable commit that way), so a
 pin costs one commit's tree, not the history.
 
