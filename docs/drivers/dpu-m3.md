@@ -168,14 +168,16 @@ persisting underrun still fails recovery.
 `piano-dpu-modes=1` establishes the verified 60 Hz mode before NativeGopDisplay offers it as the single
 `TimingElements` entry (ID 1000, color ID 100). `piano-dpu-modes=120` requests the same fixed contract at 120 Hz.
 It verifies the inherited 120 Hz or the VFP-only return from 60 before publication.
-See [the 120 and 144 Hz analysis](dpu-m3-144.md) for the high-refresh hardware qualification gate.
-See [the M3 bandwidth analysis](dpu-m3-bandwidth.md) for the active Ubuntu vote, the native MM0 gap and the 144 Hz qualification proposal.
+`piano-dpu-modes=144` selects the experimental fixed 144 Hz profile. The worker waits for the MM0 vote before staging
+timing. After a clean rollback it reports the restored 60 or 120 Hz to NativeGopDisplay for the single timing. A refusal
+before staging or a failed rollback leaves timing registration unavailable on this profile. The switch is off by default.
+See [the M3 bandwidth analysis](dpu-m3-bandwidth.md) and [the earlier high-refresh analysis](dpu-m3-144.md).
 A stale higher timing ID returns `kIOReturnUnsupported` to IOMFB before a mode service call, property update or VBL change.
 A request for the published timing remains idempotent. The 60 Hz VFP-only commit changes DSI TOTAL, the INTF
 period and the enabled fetch starts. It retains the known 120 Hz line and link clocks and the inherited resources.
 Omit `piano-dpu-refresh` on the M3 boot. With `=1`, a refusal before staging keeps the boot profile fallback.
-With `=120`, timing registration requires a verified mode. A verified rollback returns `kIOReturnAborted` to
-startup and publishes its measured 60 or 120 Hz as the single fixed timing. An unverified rollback returns
+With `=120` or `=144`, timing registration requires a verified mode. A verified rollback returns `kIOReturnAborted` to
+startup with the verified 60 or 120 Hz rate for the single fixed timing. An unverified rollback returns
 `kIOReturnOffline` and prevents timing registration.
 
 | Refresh | Expected INTF clock | Frame interval | INTF programmable fetch start with M1's 24-line lead |
@@ -213,6 +215,11 @@ panel acceptance during rate-group changes remain open. [Qualcomm command path](
 2. Restart the GUI session and enumerate again. A saved higher rate must resolve to the offered 60 Hz timing. Check
    flip cadence, Night Shift, panel sleep/wake and touch on the fixed mode. Confirm that wake restores both 60 Hz fetch starts.
 3. On a control boot with the M3 argument absent, check the existing single timing and zero M3 stores.
+4. For `piano-dpu-modes=144`, capture the completion status and encoded X/Y of the MM0 command before the mode latch.
+   Compare to a fixed-120 control with the same workload. Verify applied MM0/LLCC/DDR and MDP core/MMCX, then check
+   per-INTF underruns through the transition, sustained idle and motion, and panel wake. Confirm a single fixed timing
+   and matching delivered cadence after verification. If the transition fails, identify the failing interval and the
+   rate that passed rollback verification.
 
 The following Swift probe enumerates modes and can exercise a sequence through CoreGraphics. Run it in the logged-in GUI session.
 It selects the internal panel by the Xiaomi vendor and product IDs, then keeps the active logical resolution when switching.

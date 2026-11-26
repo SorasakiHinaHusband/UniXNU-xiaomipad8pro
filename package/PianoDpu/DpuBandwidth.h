@@ -9,7 +9,7 @@ namespace pianodpu::modes {
 // The 35-line prefill fits into VBP + VSYNC, so the base fetch sets the vote.
 constexpr uint32_t scanoutAvgKBps(const Mode &mode)
 {
-  return uint32_t(uint64_t(kSplashStride) * modeVtotal(mode) * mode.hz * 120 / 100 / 1000);
+  return uint32_t(uint64_t(kPanelWidth) * 4 * modeVtotal(mode) * mode.hz * 120 / 100 / 1000);
 }
 
 // Keep the reference splash peak when taking over the same DRV-2 resource.
