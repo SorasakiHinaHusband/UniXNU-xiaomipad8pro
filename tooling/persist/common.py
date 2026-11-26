@@ -2,6 +2,7 @@
 (package/NativeUfs, package/NativeRamBlock/PersistOverlay.h), the seed identity NativeRamBlock writes into the store header, a small
 independent FAT32 reader for checking the ESP image, and build-ram-images.py loaded as a module (K27_ARGS, kernel_field, mkbootimg).
 Nothing here touches a device."""
+import argparse
 import contextlib
 import hashlib
 import importlib.util
@@ -223,6 +224,14 @@ INSTALLED_STORE_PAGES = 3145728
 def k273_store_first(seed):
     """The first LBA of the 27.3 line's store window for SEED (seed_info): the end of linux_data below the reserve."""
     return store_first(DATA_LAST, seed['store_blocks'])
+
+
+def boot_arg_edit(value):
+    """An ESP command-line edit replaces one whole boot argument."""
+    name, sep, _ = value.partition('=')
+    if not name or not sep or any(c.isspace() or not c.isprintable() or c in '"\\' for c in value):
+        raise argparse.ArgumentTypeError(f'expected one NAME=VALUE boot argument, got {value!r}')
+    return value
 
 
 def store_args_of(args):

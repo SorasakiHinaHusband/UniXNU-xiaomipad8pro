@@ -150,6 +150,20 @@ def test_pool_readback(out, inputs):
           common.sha(out / base['image']) == base['sha256'], 'pool output preserves the rollback payload and base image')
 
 
+def test_edit_syntax():
+    builders = [
+        ('build-k273-esp.py', []),
+        ('build-dual-esp.py', ['--kc', 'unused', '--adt', 'unused', '--trust', 'unused', '--seed', 'unused']),
+    ]
+    invalid = ('=5', 'piano-x', 'piano-x=1 piano-y=2', 'piano-x=1\tpiano-y=2', 'piano-x="yes"')
+    for builder, required in builders:
+        for value in invalid:
+            result = subprocess.run([sys.executable, str(HERE / builder), *required, '--base', 'missing.json',
+                                     '--arg', value], capture_output=True, text=True, timeout=10)
+            check(result.returncode == 2 and 'one NAME=VALUE' in result.stderr,
+                  f'{builder} rejects malformed --arg {value!r} before reading a base')
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--keep', type=Path)
@@ -157,6 +171,7 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix='piano-esp-split-')) if not a.keep else a.keep
     tmp.mkdir(parents=True, exist_ok=True)
     try:
+        test_edit_syntax()
         out = tmp / 'out'
         out.mkdir()
         inputs = split_inputs()
@@ -203,12 +218,17 @@ def main():
         merge2 = len(' '.join(base2['cmdlines']['macos-27.3'].split()[:-1] + base2['boot_args_split']['tail'].split()))
         check(rc == 0 and base2['boot_args_split'] and base2['cmdlines']['macos-27.3'].split()[-1] == 'piano-boot-args=macos'
               and merge2 >= 1000, f'a {len(long_line)}-B base line: split by size alone (its merge is {merge2} B)')
-        rc, log = tk.build(out, 'esp-split2', '--arg', 'piano-gpu=8', '--name', 'esp-v6l')
+        rc, log = tk.build(out, 'esp-split2', '--arg', 'piano-gpu=8', '--arg', 'test-label=é', '--name', 'esp-v6l')
         v6l = json.loads((out / 'esp-v6l.json').read_text())
         check(rc == 0 and v6l['boot_args_split'] and v6l['cmdlines']['macos-27.3'].split()[-1] == 'piano-boot-args=macos' and
-              arg_map(whole_of(v6l)) == dict(arg_map(whole_of(base2)), **{'piano-gpu': '8'}) and
+              arg_map(whole_of(v6l)) == dict(arg_map(whole_of(base2)), **{'piano-gpu': '8', 'test-label': 'é'}) and
               'piano-gpu=8' in v6l['boot_args_split']['tail'].split() and v6l['base_split_rebuilt'] is not None,
               'rebuilt from the size-split base without --split: split again by size, the edit in the tail')
+        v6l_line = v6l['cmdlines']['macos-27.3']
+        check(v6l['boot_args_split']['line_bytes'] == len(v6l_line.encode()) and
+              v6l['boot_args_split']['full_bytes'] == len(' '.join(
+                  v6l_line.split()[:-1] + v6l['boot_args_split']['tail'].split()).encode()),
+              'the split record counts UTF-8 bytes')
 
         # -- edits, the v6 story -------------------------------------------------------------------------------------------------------------------
         rc, log = tk.build(out, 'esp-split', '--split', '--arg', 'piano-gpu-delay=0', '--arg', 'cs-native4k-skip=1',

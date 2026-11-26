@@ -137,7 +137,7 @@ def main():
     p.add_argument('--adt', type=Path, help='its ADT (the same build)')
     p.add_argument('--trust', type=Path, help='a new trust cache (it must cover the seed\'s and the system\'s code)')
     p.add_argument('--seed', type=Path, help='a new Data seed: a new store (its window from the seed\'s size, data-store-lba set)')
-    p.add_argument('--arg', action='append', default=[], metavar='NAME=VALUE',
+    p.add_argument('--arg', action='append', default=[], type=common.boot_arg_edit, metavar='NAME=VALUE',
                    help='one more argument for the entry (replaces NAME); piano-long-boot-args=1 opts into the 1008-byte layout')
     p.add_argument('--drop-arg', action='append', default=[], metavar='NAME', help='an argument of the base line left out')
     p.add_argument('--root-part', metavar='NAME', help='the root image\'s partition (native-ufs-root-part; the store then stays on '
@@ -257,8 +257,8 @@ def build(a, base_json, base, base_img, image):
                 dup = sorted({n for n in names if names.count(n) > 1})
                 raise SystemExit(f'{base_img}: {a.entry}\'s line and its ADT\'s /chosen/{prop} both carry {dup}: refused rather '
                                  'than quietly let the later one win')
-            base_split = {'set': sel, 'property': prop, 'line_bytes': len(line), 'tail_bytes': len(tail),
-                          'full_bytes': len(' '.join(whole)), 'from': 'the base line + the base ADT tail, reassembled'}
+            base_split = {'set': sel, 'property': prop, 'line_bytes': len(line.encode()), 'tail_bytes': len(tail.encode()),
+                          'full_bytes': len(' '.join(whole).encode()), 'from': 'the base line + the base ADT tail, reassembled'}
             line = ' '.join(whole)
 
         edits = list(a.arg) + ([f'data-store-lba={common.k273_store_first(seed)}'] if a.seed else [])
@@ -267,8 +267,6 @@ def build(a, base_json, base, base_img, image):
                 raise SystemExit('--root-part: linux_data or linux_rootfs')
             edits += [f'native-ufs-root-part={a.root_part}'] + (['data-store-part=linux_data'] if a.root_part != 'linux_data' else [])
         edit_names = [name_of(x) for x in edits]
-        if any(not n for n in edit_names):
-            raise SystemExit(f'--arg {edits[edit_names.index("")]!r}: an argument is NAME=VALUE')
         if len(set(edit_names)) != len(edit_names):
             dup = sorted({n for n in edit_names if edit_names.count(n) > 1})
             raise SystemExit(f'{dup} given more than once over --arg/--seed/--root-part: one value per name (the base\'s '
@@ -302,10 +300,11 @@ def build(a, base_json, base, base_img, image):
         kept, tail = split_line(line, force=bool(a.split or base_split))   # a reassembled base is split again
         if tail is not None:
             if b'piano-boot-args: /chosen/' not in kc.read_bytes():
-                raise SystemExit(f'{a.entry}: a {len(line)}-byte line needs the ADT tail, and this collection\'s kernel lacks k27 0066')
+                raise SystemExit(f'{a.entry}: a {len(line.encode())}-byte line needs the ADT tail, and this collection\'s kernel lacks k27 0066')
             adt.write_bytes(boot_args.with_set(adt.read_bytes(), 'macos', tail))
-            split = {'set': 'macos', 'property': boot_args.prop_name('macos'), 'tail': ' '.join(tail), 'tail_bytes': len(' '.join(tail)),
-                     'line_bytes': len(kept), 'full_bytes': len(line)}
+            tail_text = ' '.join(tail)
+            split = {'set': 'macos', 'property': boot_args.prop_name('macos'), 'tail': tail_text, 'tail_bytes': len(tail_text.encode()),
+                     'line_bytes': len(kept.encode()), 'full_bytes': len(line.encode())}
         line = kept
 
         # -- firmware the 27.3 collection pins; other non-payload files stay; the 27.0.1 payload goes --------------------------

@@ -58,7 +58,8 @@ def main():
         p.add_argument('--' + name, type=Path, required=True, help=f'the 27.3 entry\'s {name}')
     p.add_argument('--id', default='macos-27.3')
     p.add_argument('--title', default='macOS 27.3 (Mac17,11)')
-    p.add_argument('--arg', action='append', default=[], help='one more argument for the 27.3 entry (NAME=VALUE, replaces NAME)')
+    p.add_argument('--arg', action='append', default=[], type=common.boot_arg_edit, metavar='NAME=VALUE',
+                   help='one more argument for the 27.3 entry (replaces NAME)')
     p.add_argument('--root-json', type=Path, default=common.DEVICE / 'out/inputs/k273/root/root.json',
                    help='the 27.3 root image\'s record (tooling/k273/make-root-image.sh): the store must lie after it')
     p.add_argument('--name', default='esp-dual')
