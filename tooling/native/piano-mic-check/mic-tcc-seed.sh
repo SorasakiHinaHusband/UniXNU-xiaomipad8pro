@@ -50,7 +50,7 @@ mic_tcc_seed_apply() (
   # The LaunchServices probe is responsible for its own TCC request. Bind the
   # row to the exact ad-hoc signature staged by this spec.
   requirement="identifier \"$bundle\" and cdhash H\"$cdhash\""
-  /usr/bin/codesign --verify --strict -R "$requirement" "$stage/PianoMicCheck.app" ||
+  /usr/bin/codesign --verify --strict -R="$requirement" "$stage/PianoMicCheck.app" ||
     { mic_tcc_seed_error 'app does not match the staged signing requirement'; return 1; }
   scratch=$(/usr/bin/mktemp -d /private/var/run/piano-mic-csreq.XXXXXXXX) || return 1
   trap '/bin/rm -f -- "$scratch/app.csreq"; /bin/rmdir "$scratch"' EXIT
