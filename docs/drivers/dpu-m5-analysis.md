@@ -276,9 +276,19 @@ samples (`line 2231/2310`) showed normal scan-phase changes in the live host wor
 | `fifo` | `0x00001010` | `0x11111010` |
 
 The grader returned byte-exact **`PASS`** for the register words in the active-video pairs `pre1` → `pre2`,
-`pre1` → `off1` and the active-video post-wake comparison. Compare repeat samples from the same scan phase when
-checking these live words for drift. This is the display-sleep reference with native panel sleep disabled.
-The dark-wake observation with `piano-dpu-panel=1` remains pending.
+`pre1` → `off1` and the active-video post-wake comparison. The current grader reports each INTF's `line`,
+`vtotal` and phase under each snapshot's `timing` field. It uses line 2136 as the active-to-blanking boundary
+for this panel's saved counters. A snapshot with disagreeing INTF phases reports `mixed`. Out-of-range
+positions report `unknown`.
+
+`changes` retains every register difference and any difference still produces **`DRIFT`** (exit 1).
+`transient_changes` identifies the table's exact DSI value pairs when that link's INTF crossed phases.
+It also identifies `ctl.flush`, `ctl.top-intr-en` and `ctl.top-intr-status` on the same CTL when both links
+crossed phases together. `static_changes` contains the remaining differences, including unexplained
+live status values, and the known lane-status transition does not trigger a `phy-drift` flag.
+Compare same-phase repeats to check unexplained live register differences. The snapshots are sequential
+MMIO reads. This display-sleep reference used native panel sleep disabled. The dark-wake observation
+with `piano-dpu-panel=1` remains pending.
 
 ### Read-only RAM check plan
 

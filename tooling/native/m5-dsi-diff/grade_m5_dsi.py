@@ -59,6 +59,15 @@ DSI_DOMAINS = {
 DSI_REGISTER_DOMAIN = {name: domain for domain, names in DSI_DOMAINS.items() for name in names.split()}
 PHY_STATUS_WORDS = {"phy-status", "lane-status", "lane-status0", "lane-status1"}
 LINKS = ("dsi0", "dsi1")
+INTERFACES = ("intf1", "intf2")
+# v131y12u-ram2 bright controls on the 2136-line SM8750 Piano panel.
+ACTIVE_LINES = 2136
+PHASE_CTL_WORDS = {"flush", "top-intr-en", "top-intr-status"}
+PHASE_DSI_WORDS = {
+    "lane-status": (0x00001f00, 0x00001f1f),
+    "clk-status": (0x008067c3, 0x00006343),
+    "fifo": (0x00001010, 0x11111010),
+}
 
 
 def match_row(line, template, label):
@@ -100,6 +109,21 @@ def snapshot_line(line):
 
 
 @dataclass
+class ScanPosition:
+    line: int
+    vtotal: int
+
+    @property
+    def phase(self):
+        if not (ACTIVE_LINES < self.vtotal < U32 and 0 <= self.line < self.vtotal):
+            return "unknown"
+        return "active" if self.line < ACTIVE_LINES else "blanking"
+
+    def metadata(self):
+        return {"line": self.line, "vtotal": self.vtotal, "phase": self.phase}
+
+
+@dataclass
 class Snapshot:
     boot: str
     serial: int
@@ -107,9 +131,18 @@ class Snapshot:
     loads: int
     frames: dict[str, int]
     registers: dict[tuple[str, str], int]
+    timing: dict[str, ScanPosition]
+
+    @property
+    def phase(self):
+        a, b = (self.timing[block].phase for block in INTERFACES)
+        if "unknown" in (a, b):
+            return "unknown"
+        return a if a == b else "mixed"
 
     def metadata(self):
-        return {"serial": self.serial, "time_us": self.time_us, "loads": self.loads, "stores": 0}
+        return {"serial": self.serial, "time_us": self.time_us, "loads": self.loads, "stores": 0,
+                "phase": self.phase, "timing": {block: position.metadata() for block, position in self.timing.items()}}
 
 
 # DSI_HOST_LP_TIMER is programmed to 0xffffffff (max/disabled LP RX timeout) by firmware on live SM8750 panels.
@@ -158,17 +191,18 @@ def parse_snapshot(text):
     registers = {("ctl", name): value for name, value in ctl.items()}
     for name in "gcc-disp-ahb gdsc ahb mdp byte0 byte1 pclk0 pclk1 panel-id-io".split():
         registers["gate", name] = header[name]
-    frames = {}
-    for block in ("intf1", "intf2"):
+    frames, timing = {}, {}
+    for block in INTERFACES:
         intf, = read_rows(
             lines, block + ":",
             block + ": " + words("en status config hsync period vwidth") + " dv {dv-start}-{dv-end} "
-            + words("dhctl skew prog-fetch intr") + "; counters en {counters-en} frame {frame:uint} line {:uint} "
-            "(htotal {:uint} vtotal {:uint}); " + words("config2 data-hctl"),
+            + words("dhctl skew prog-fetch intr") + "; counters en {counters-en} frame {frame:uint} line {line:uint} "
+            "(htotal {:uint} vtotal {vtotal:uint}); " + words("config2 data-hctl"),
         )
         frames[block] = intf.pop("frame")
         if frames[block] >= U32:
             raise ValueError(f"{block} frame is outside the 32-bit counter range")
+        timing[block] = ScanPosition(intf.pop("line"), intf.pop("vtotal"))
         registers.update(((block, name), value) for name, value in intf.items())
 
     for link in LINKS:
@@ -188,7 +222,7 @@ def parse_snapshot(text):
     for (block, name), value in registers.items():
         if value == U32 - 1 and name not in ALLOWED_ALL_ONES_REGISTERS:
             raise ValueError(f"{block} {name} is unreadable (ffffffff)")
-    return Snapshot(boot_id, header["serial"], header["time-us"], header["loads"], frames, registers)
+    return Snapshot(boot_id, header["serial"], header["time-us"], header["loads"], frames, registers, timing)
 
 
 def register_domain(block, name):
@@ -209,6 +243,20 @@ def register_value(block, name, value):
     return f"{value:02x}" if (block, name) == ("ctl", "lms") else f"{value:08x}"
 
 
+def is_phase_change(baseline, candidate, block, name, old, new):
+    if block == "ctl" and name in PHASE_CTL_WORDS:
+        return (baseline.registers["ctl", "index"] == candidate.registers["ctl", "index"]
+                and {baseline.phase, candidate.phase} == {"active", "blanking"})
+    if block in LINKS and name in PHASE_DSI_WORDS:
+        intf = INTERFACES[LINKS.index(block)]
+        active, blanking = PHASE_DSI_WORDS[name]
+        return ((baseline.timing[intf].phase, old), (candidate.timing[intf].phase, new)) in (
+            (("active", active), ("blanking", blanking)),
+            (("blanking", blanking), ("active", active)),
+        )
+    return False
+
+
 def compare(baseline, candidate):
     if baseline.boot != candidate.boot:
         raise ValueError("boot UUID changed")
@@ -226,13 +274,18 @@ def compare(baseline, candidate):
         advances[block] = advance
 
     before, after = baseline.registers, candidate.registers
-    changes = []
+    changes, static_changes, transient_changes = [], [], []
     flags = []
     for block, name in sorted(before.keys() | after.keys()):
         old, new = before.get((block, name)), after.get((block, name))
         if old != new:
-            changes.append({"domain": register_domain(block, name), "block": block, "register": name,
-                            "baseline": register_value(block, name, old), "candidate": register_value(block, name, new)})
+            row = {"domain": register_domain(block, name), "block": block, "register": name,
+                   "baseline": register_value(block, name, old), "candidate": register_value(block, name, new)}
+            changes.append(row)
+            if is_phase_change(baseline, candidate, block, name, old, new):
+                transient_changes.append(row)
+            else:
+                static_changes.append(row)
 
     # PLL_CTRL bit 0 starts the PLL. DSI1 uses the master's clock on the bright bonded path.
     pll_lost = [name for name in ("local-lock", "pll-ctrl") if before["dsi0", name] & 1 and not after["dsi0", name] & 1]
@@ -240,14 +293,15 @@ def compare(baseline, candidate):
         flags.append({"kind": "pll-loss", "link": "dsi0", "registers": pll_lost})
     for link in LINKS:
         dsc = [row["register"] for row in changes if row["block"] == link and row["domain"] == "dsc-compression"]
-        phy = [row["register"] for row in changes if row["block"] == link
+        phy = [row["register"] for row in static_changes if row["block"] == link
                and (row["domain"] == "phy-timing" or row["register"] in PHY_STATUS_WORDS)]
         if dsc:
             flags.append({"kind": "dsc-mismatch", "link": link, "registers": dsc})
         if phy:
             flags.append({"kind": "phy-drift", "link": link, "registers": phy})
     return {"verdict": "DRIFT" if changes else "PASS", "baseline": baseline.metadata(), "candidate": candidate.metadata(),
-            "frame_advance": advances, "changes": changes, "flags": flags}
+            "frame_advance": advances, "changes": changes, "flags": flags,
+            "static_changes": static_changes, "transient_changes": transient_changes}
 
 
 def read_snapshot(path, role):
@@ -267,7 +321,7 @@ def main(argv=None):
         epilog="Each file holds one complete, newline-terminated snapshot and its boot UUID as a 'boot UUID' or "
                "'kern.bootsessionuuid: UUID' row. Supply a newer sample from the same boot with both INTF timing engines "
                "enabled and their frame counters advancing. JSON goes to stdout and a one-line verdict to stderr. "
-               "Exit codes are 0 PASS, 1 DRIFT, and 2 VOID.",
+               "Exit codes are 0 PASS, 1 DRIFT, and 2 VOID. All register changes count toward DRIFT.",
     )
     parser.add_argument("baseline", type=Path, help="saved bright reference snapshot")
     parser.add_argument("candidate", type=Path, help="saved dark or post-wake snapshot")
@@ -282,7 +336,8 @@ def main(argv=None):
     if verdict == "VOID":
         summary = report["reason"]
     elif verdict == "DRIFT":
-        summary = f"{len(report['changes'])} changed registers"
+        summary = (f"{len(report['changes'])} changed registers "
+                   f"({len(report['static_changes'])} unexplained, {len(report['transient_changes'])} scan-phase)")
         if report["flags"]:
             summary += " (" + ", ".join(f"{flag['link']} {flag['kind']}" for flag in report["flags"]) + ")"
     else:

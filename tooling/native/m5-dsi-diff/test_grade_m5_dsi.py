@@ -14,7 +14,7 @@ BOOT = "00000000-0000-4000-8000-0000000000ab"
 GRADER = Path(__file__).with_name("grade_m5_dsi.py")
 
 
-def capture(serial=1, time_us=500_000, frames=(100, 101), line=10):
+def capture(serial=1, time_us=500_000, frames=(100, 101), line=10, vtotal=2310):
     lines = [
         f"boot {BOOT}",
         f"snapshot {serial} at {time_us} us: 238 loads, 0 stores; gate open (gcc disp ahb 80000001, gdsc 80000000, "
@@ -28,7 +28,7 @@ def capture(serial=1, time_us=500_000, frames=(100, 101), line=10):
         lines.append(
             f"intf{intf}: en 00000001 status 00000001 config 00000000 hsync 07200008 period 003db170 vwidth 00000e40 "
             "dv 000054b8-003c1117 dhctl 06530014 skew 00000000 prog-fetch 00000000 intr 00000000; "
-            f"counters en 00000000 frame {frame} line {line} (htotal 1824 vtotal 2217); config2 00000000 data-hctl 00000000"
+            f"counters en 00000000 frame {frame} line {line} (htotal 1824 vtotal {vtotal}); config2 00000000 data-hctl 00000000"
         )
     for link in (0, 1):
         # The clock mux, PHY status and local PLL values are from the supplied bright control.
@@ -40,8 +40,8 @@ def capture(serial=1, time_us=500_000, frames=(100, 101), line=10):
             "clk-ctrl 00200b3f lanes 00001f00/00000000; video-compression 03200b81",
             f"dsi{link} m5: vid-cfg0 00000000 vid-cfg1 00000000 hsync 00000008 vsync-hpos 00000000 "
             "vsync-vpos 00000002 lp-timer ffffffff hs-timer 00000000 clkout 00000f20 eot 00000001 lane-swap 00000000 "
-            "t-clk-pre-extend 00000000 cmd-compression 00000000/00000000 clk-status 00000007 err-mask 00000000 "
-            "ack-err 00000000 fifo 00000000 phy-err 00000000 timeout 00000000",
+            "t-clk-pre-extend 00000000 cmd-compression 00000000/00000000 clk-status 008067c3 err-mask 00000000 "
+            "ack-err 00000000 fifo 00001010 phy-err 00000000 timeout 00000000",
             f"dsi{link} m5: cmd-cfg0 00000000 cmd-cfg1 00000000 dma-length 00000000 reset 00000000 misr-ctrl 00000000",
             f"dsi{link} phy: clk-cfg0 00000051 clk-cfg1 {clk1:08x} rbuf-ctrl 00000001 phy-status {phy_status:08x} "
             "lane-status0 0000001f lane-status1 0000003f",
@@ -69,9 +69,25 @@ def edit_row(text, prefix, old, new):
     return "".join(lines)
 
 
+def blanking_words(text):
+    for prefix, old, new in (
+        ("ctl0:", "lms 03 flush 00000000", "lms 03 flush 80000000"),
+        ("ctl0:", "top intr en 00000000 status 00000000", "top intr en 00000001 status 00000001"),
+        ("dsi0:", "lanes 00001f00", "lanes 00001f1f"),
+        ("dsi1:", "lanes 00001f00", "lanes 00001f1f"),
+        ("dsi0 m5:", "clk-status 008067c3", "clk-status 00006343"),
+        ("dsi1 m5:", "clk-status 008067c3", "clk-status 00006343"),
+        ("dsi0 m5:", "fifo 00001010", "fifo 11111010"),
+        ("dsi1 m5:", "fifo 00001010", "fifo 11111010"),
+    ):
+        text = edit_row(text, prefix, old, new)
+    return text
+
+
 class GradeM5DsiTests(unittest.TestCase):
     bright = capture()
     wake = capture(2, 700_000, (124, 125), line=30)
+    blanking = blanking_words(capture(2, 700_000, (124, 125), line=2231))
 
     def grade(self, candidate):
         return compare(parse_snapshot(self.bright), parse_snapshot(candidate))
@@ -88,9 +104,83 @@ class GradeM5DsiTests(unittest.TestCase):
                 report = self.grade(wake)
                 self.assertEqual(report["verdict"], "PASS")
                 self.assertEqual(report["frame_advance"], {"intf1": 24, "intf2": 24})
-                self.assertEqual(report["baseline"], {"loads": 238, "stores": 0, "serial": 1, "time_us": 500_000})
+                self.assertEqual(report["baseline"], {
+                    "loads": 238, "stores": 0, "serial": 1, "time_us": 500_000, "phase": "active",
+                    "timing": {intf: {"line": 10, "vtotal": 2310, "phase": "active"} for intf in ("intf1", "intf2")},
+                })
                 self.assertEqual(report["changes"], [])
                 self.assertEqual(report["flags"], [])
+                self.assertEqual(report["static_changes"], [])
+                self.assertEqual(report["transient_changes"], [])
+
+    def test_lp_timer_all_ones_is_a_valid_register_value(self):
+        for link in ("dsi0", "dsi1"):
+            self.assertEqual(parse_snapshot(self.bright).registers[link, "lp-timer"], 0xffffffff)
+        report = self.grade(edit_row(self.wake, "dsi1 m5:", "lp-timer ffffffff", "lp-timer fffffffe"))
+        self.assertEqual(report["verdict"], "DRIFT")
+        self.assertEqual(report["static_changes"], [
+            {"domain": "dsi-timing", "block": "dsi1", "register": "lp-timer",
+             "baseline": "ffffffff", "candidate": "fffffffe"},
+        ])
+
+    def test_active_blanking_changes_remain_strict_drift(self):
+        for baseline, candidate in (
+            (self.bright, self.blanking),
+            (blanking_words(capture(line=2231)), self.wake),
+        ):
+            with self.subTest(baseline=baseline.splitlines()[4]):
+                report = compare(parse_snapshot(baseline), parse_snapshot(candidate))
+                self.assertEqual(report["verdict"], "DRIFT")
+                self.assertEqual(report["static_changes"], [])
+                self.assertEqual(report["changes"], report["transient_changes"])
+                self.assertCountEqual(
+                    [(row["block"], row["register"]) for row in report["transient_changes"]],
+                    [("ctl", name) for name in ("flush", "top-intr-en", "top-intr-status")]
+                    + [(link, name) for link in ("dsi0", "dsi1") for name in ("lane-status", "clk-status", "fifo")],
+                )
+                self.assertEqual(report["flags"], [])
+                blank = next(report[role] for role in ("baseline", "candidate") if report[role]["phase"] == "blanking")
+                self.assertEqual(blank["timing"], {
+                    intf: {"line": 2231, "vtotal": 2310, "phase": "blanking"} for intf in ("intf1", "intf2")
+                })
+
+    def test_phase_boundary_and_unclassifiable_positions(self):
+        for line, vtotal, expected in (
+            (0, 2310, "active"), (2135, 2310, "active"), (2136, 2310, "blanking"),
+            (2309, 2310, "blanking"), (2310, 2310, "unknown"), (0, 0, "unknown"),
+            (0xffffffff, 2310, "unknown"), (30, 2**32, "unknown"),
+        ):
+            with self.subTest(line=line, vtotal=vtotal):
+                report = self.grade(capture(2, 700_000, (124, 125), line=line, vtotal=vtotal))
+                self.assertEqual(report["verdict"], "PASS")
+                self.assertEqual(report["candidate"]["timing"]["intf1"],
+                                 {"line": line, "vtotal": vtotal, "phase": expected})
+
+    def test_mixed_link_phases_only_explain_the_blanking_link(self):
+        report = self.grade(edit_row(self.blanking, "intf2:", "line 2231", "line 2135"))
+        self.assertEqual(report["candidate"]["phase"], "mixed")
+        self.assertEqual([row["block"] for row in report["transient_changes"]], ["dsi0"] * 3)
+        self.assertCountEqual([row["block"] for row in report["static_changes"]], ["ctl"] * 3 + ["dsi1"] * 3)
+        self.assertEqual(report["flags"], [{"kind": "phy-drift", "link": "dsi1", "registers": ["lane-status"]}])
+
+    def test_static_drift_and_unexpected_live_values_stay_visible_across_phases(self):
+        wake = self.blanking
+        for prefix, old, new in (
+            ("dsi0:", "lanes 00001f1f", "lanes 00001f1e"),
+            ("dsi0:", "video-compression 03200b81", "video-compression 00000000"),
+            ("dsi1 m5:", "clk-status 00006343", "clk-status 00016343"),
+            ("dsi1 phy timing", "00000020 0000000f", "00000020 000000ff"),
+            ("dsi0 pll:", "00000051 local-lock 1", "00000050 local-lock 0"),
+        ):
+            wake = edit_row(wake, prefix, old, new)
+        report = self.grade(wake)
+        self.assertEqual(report["verdict"], "DRIFT")
+        self.assertCountEqual([(row["block"], row["register"]) for row in report["static_changes"]], [
+            ("dsi0", "lane-status"), ("dsi0", "video-compression"), ("dsi1", "clk-status"),
+            ("dsi1", "phy-timing-13"), ("dsi0", "pll-status"), ("dsi0", "local-lock"),
+        ])
+        self.assertEqual(len(report["transient_changes"]), 7)
+        self.assertEqual({flag["kind"] for flag in report["flags"]}, {"pll-loss", "dsc-mismatch", "phy-drift"})
 
     def test_each_domain_and_per_link_flags(self):
         edits = (
@@ -103,18 +193,20 @@ class GradeM5DsiTests(unittest.TestCase):
              "dsc-compression", "cmd-compression2"),
             ("dsi0 phy:", "phy-status 0000001f", "phy-status 0000001e", "phy-clk-lane", "phy-status"),
             ("dsi1 phy:", "lane-status1 0000003f", "lane-status1 0000001e", "phy-clk-lane", "lane-status1"),
-            ("dsi1 m5:", "clk-status 00000007", "clk-status 00000001", "phy-clk-lane", "clk-status"),
+            ("dsi1 m5:", "clk-status 008067c3", "clk-status 00000001", "phy-clk-lane", "clk-status"),
             ("dsi1 phy timing", "00000020 0000000f", "00000020 000000ff", "phy-timing", "phy-timing-13"),
             ("dsi0 pll:", "00000051", "00000050", "pll-lock", "pll-status"),
             ("dsi0 pll:", "local-lock 1", "local-lock 0", "pll-lock", "local-lock"),
             ("dsi0 phy:", "pll-ctrl 00000001", "pll-ctrl 00000000", "pll-lock", "pll-ctrl"),
-            ("dsi1 m5:", "fifo 00000000", "fifo 00000010", "errors-fifo", "fifo"),
+            ("dsi1 m5:", "fifo 00001010", "fifo 00000010", "errors-fifo", "fifo"),
         )
         wake = self.wake
         for prefix, old, new, _, _ in edits:
             wake = edit_row(wake, prefix, old, new)
         report = self.grade(wake)
         self.assertEqual(report["verdict"], "DRIFT")
+        self.assertEqual(report["changes"], report["static_changes"])
+        self.assertEqual(report["transient_changes"], [])
         self.assertCountEqual([(row["domain"], row["register"]) for row in report["changes"]],
                               [(domain, reg) for _, _, _, domain, reg in edits])
         self.assertIn({"domain": "pll-lock", "block": "dsi0", "register": "local-lock", "baseline": 1, "candidate": 0},
@@ -191,6 +283,7 @@ class GradeM5DsiTests(unittest.TestCase):
             for text, code, verdict in (
                 (self.wake, 0, "PASS"),
                 (self.wake.replace("video-compression 03200b81", "video-compression 00000000"), 1, "DRIFT"),
+                (self.blanking, 1, "DRIFT"),
                 ("EBUSY\n", 2, "VOID"),
                 (None, 2, "VOID"),
             ):
@@ -205,6 +298,8 @@ class GradeM5DsiTests(unittest.TestCase):
                     self.assertEqual(json.loads(result.stdout)["verdict"], verdict)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
                     self.assertTrue(result.stderr.startswith(verdict))
+                    if text == self.blanking:
+                        self.assertIn("0 unexplained, 9 scan-phase", result.stderr)
 
 
 if __name__ == "__main__":
