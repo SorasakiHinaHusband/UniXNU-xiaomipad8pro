@@ -218,62 +218,168 @@ if the accessor cannot be bound, M2 treats the cache mode as unknown and
 cleans every scanout. The NativeGopDisplay host suite and its 27.3 object
 build also passed. No boot image was built.
 
-## RAM-boot read list
+## RAM qualification
 
-Use one frozen image with `piano-dpu=2 piano-dpu-flip=4`,
-`piano-dpu-clean-skip=1 piano-dpu-snapshot=1`, and the known-good
-NativeGopDisplay flip and fence settings. Keep refresh, display mode and
-workload fixed through A/B. The root sysctl selects the control on the same
-boot. Both arms use the same physical-aperture clean implementation.
+### Boot and capture
 
-```sh
-sudo sysctl machdep.piano_dpu_clean_skip=0   # full-clean control
-sudo sysctl -n machdep.piano_dpu_snapshot  # before and after each workload
-sudo sysctl machdep.piano_dpu_clean_skip=1   # WC conditional
-sudo sysctl -n machdep.piano_dpu_snapshot  # before and after each workload
+Use the same frozen macOS 27.3 RAM image for both arms. Merge the following
+display arguments into the combined qualification image once per key.
+Keep the native GPU enabled, `/defaults/vmm-present=0`, and the other
+ride-along settings identical. The timing comparison uses the fixed
+120 Hz profile with adaptive refresh and native panel sleep disabled.
+
+```text
+piano-dpu=2 piano-dpu-smmu=2 piano-dpu-flip=4 piano-dpu-clean-skip=1
+piano-dpu-snapshot=1 piano-dpu-modes=120 piano-dpu-irq=1 piano-dpu-underrun=1
+piano-dpu-watch=10 piano-dpu-latch=50 piano-dpu-panel=0
+native-gop-display-flip=1 native-gop-display-flip-lossless=1
+native-gop-display-cursor=0 native-gop-display-thumb=0 native-gop-display-defer=2
+native-gop-display-gpu-fence=1 native-gop-display-gpu-fence-ms=1000
 ```
 
-1. Verify image provenance, a working console/capture window and a responsive
-   desktop. Save a known-positive flip, fence and snapshot line. On early
-   acquisitions, capture `PianoDpu: clean map` with its acquisition number,
-   backing span, offset, stride, requested IOSurface mode, WC/other/unknown
-   page counts on both sides of SMMU mapping, initialization result and
-   reason. Check the existing flip/layout line for format and planes.
-2. Take counter deltas from the `clean:` lines in snapshots or periodic
-   flip summaries. Record `shown` (including re-shows), `maps`, `evictions`,
-   `passes`, `init`, `skip`, `failed`, `alias-failed`, `without`, the
-   fallback reasons, `pixel-us` and `check-us`. The fallback reasons cover
-   forced control, missing producer completion, unknown or non-WC mode,
-   an unverified page attribute, an invalid backing span and failed
-   initialization. The `backing` reason counts refused geometry. A failed
-   initialization can add both an attempted-clean time and a fallback clean.
-   Require `without=0` in both M2 arms. A failed required fallback clean
-   must produce a flip refusal and the normal copy path.
-3. Run desktop idle, scrolling, window movement, resize, UI animation,
-   video and Metal. In the control, verify zero skips and a clean for each
-   successful flip. In a stable eligible WC pool, verify that clean count
-   follows first-map or reinitialization epochs and that later flips and
-   re-shows accumulate skips. Compare **`Δpixel-us / Δshown`** between arms.
-   Starting cold, the conditional total should approximate the sum of the
-   first-map cleans plus any counted fallback passes. In steady eligible
-   use, the clean mean per flip should approach zero. Also capture
-   `Δcheck-us / Δshown`, frame-time percentiles, latch waits and
-   missed/repeated frames so the scan cost is visible.
-4. Record the C920 pointed at the panel through mixed use in both arms. Use
-   owned test surfaces with visible generation markers in sparse tiles and
-   whole frames. Mix published CPU writes, GPU updates, read-only locks,
-   cached imports, repeated presentation, eviction and reacquisition.
-   Include scrolling and text entry, drag/resize/occlusion, translucency,
-   cursor motion, video/Metal transitions, display sleep/wake and lock/unlock.
-   Compare changed and untouched tiles with the expected generation on each
-   handoff. Require zero stale tiles, flicker or partial-frame residue.
-5. Record GPU fence completions and timeouts, copy fallbacks, SMMU faults,
-   underruns and latch timeouts. Capture both display links in the snapshots
-   and preserve the expected refresh, Night Shift and panel behavior in both
-   arms. Confirm the recorded samples come from that boot and workload.
+Leave `piano-dpu-refresh` unset and keep `machdep.native_gop_fence_deadline=0`
+through both windows. Boot **both** arms with `piano-dpu-clean-skip=1` so
+they share the strict, WC-preserving, single-CPU aperture implementation.
+Booting with `piano-dpu-clean-skip=0` selects the daily alias path and
+yields an invalid control. Set the policy once before each measurement
+window. On one boot run A then B. For paired boots run the same procedure
+with one arm per boot.
 
-If no live pool qualifies, report its mode/page-attribute or handoff counters
-and retain the full-clean fallback. Performance and optical results are open.
+```sh
+sudo sysctl machdep.piano_dpu_clean_skip=0   # A: strict full clean
+sudo sysctl machdep.piano_dpu_clean_skip=1   # B: verified-WC skip
+```
+
+1. Verify RAM image provenance and effective args, a responsive desktop,
+   and continuous console collection. Save the boot evidence separately.
+   Expect `piano-dpu-clean-skip=1: strict WC policy`, `B1b: serving flips`,
+   snapshot registration, the fixed 120 Hz mode on both links, and
+   `NativeGopDisplay: flips through PianoDpu` and
+   `NativeGopDisplay: GPU fences from PianoA830`. Check the `flip '&BGA'`
+   layout line and a `PianoDpu: clean map` line. A WC acquisition should
+   show mode `0x400`, positive WC pages and zero other/unknown pages
+   before and after the SMMU map, and `init 1 reason eligible` during
+   conditional policy. Later re-shows of the same target can skip.
+2. Capture one root snapshot immediately before and one immediately after
+   each workload. Start when the desktop is ready. Use the same
+   approximately 60-second sequence, mode, brightness, power, thermal
+   conditions and display topology in both arms. Include continuous
+   animation or Metal to exercise the hardware latch and repeat the same
+   scrolling, drag/resize/occlusion, translucency and video transitions.
+   Keep the console running from a cumulative GOP flip summary just before
+   the first snapshot until the next summary after the final snapshot.
+   Keep the workload quiet in the padding so it adds at most 25% extra
+   flipped swaps. Save the complete console slice between those summary
+   lines inclusive for each arm. On one boot use separate, ordered slices
+   and switch policy between them. Save the next GOP report before
+   switching policy even if the workload has already ended.
+3. Record the panel optically (for example with a C920) in both arms.
+   Compare against expected visible generation markers on owned test
+   surfaces. Include sparse tile and whole-frame updates, published CPU
+   writes, GPU writes, repeated frames, cached imports, eviction/reacquisition
+   and lock/unlock. Count actual comparisons, including both changed and
+   untouched tiles, and record every stale tile, flicker, partial-frame
+   residue or other mismatch. Run a separate matched sleep/wake check
+   if native panel sleep is being qualified on the combined image.
+4. Check WindowServer's PID at both ends and review crash reports and
+   process restart evidence for the entire console slice. Count new
+   WindowServer crashes in each arm. Record zero only when the evidence
+   covers the window. Retain any DPU revert or nonzero underrun, GPU fence
+   timeout, damage audit mismatch, and GOP flip-copy fallback lines.
+
+For the two captures in each arm, use the following readout in that RAM
+session. Save stdout as the named file. The grader runs offline on the
+host.
+
+```sh
+m2_snapshot() {
+    boot=$(sysctl -n kern.bootsessionuuid) || return 1
+    pid=$(pgrep -x WindowServer) || return 1
+    printf 'boot %s\nwindowserver-pid %s\n' "$boot" "$pid"
+    sudo sysctl -n machdep.piano_dpu_snapshot
+}
+# Surround the A workload with these two reads.
+m2_snapshot > A-before.txt
+m2_snapshot > A-after.txt
+# Surround the B workload with these two reads.
+m2_snapshot > B-before.txt
+m2_snapshot > B-after.txt
+```
+
+### Evidence and verdict
+
+The read-only snapshot prints `clean: shown … passes … init … skip … failed
+… alias-failed … without …`, `clean: fallback …`, `clean: pixel-us …
+check-us …`, and, on an M2 boot, `clean: m2 policy … writes … latched …
+full … to-boot … underruns … pending … serving …`. Use differences of
+the cumulative counts. `shown` includes re-shows. `latched` counts new
+latches, `init` counts shown WC initialization frames and `skip` counts
+shown verified-WC skips. `full` counts shown strict scanout cleans,
+including A's forced control and B's handoff, unknown-mode, non-WC mode
+or attribute reasons. A successful initialization clean followed by a
+changed mode or attributes can add a pass before the fallback pass.
+A required clean failure refuses the frame. The daily path's `without`
+count is distinct from the verified-WC skip count.
+
+`pixel-us` is the cumulative `clean_us` spent doing pixel maintenance.
+The grader reports measured A and B totals, means per shown flip and
+the estimated savings at B's volume, `A_mean × B_shown − B_pixel_us`.
+`check-us` separately exposes the attribute-check cost. Observe latch
+waits and frame-time percentiles alongside this comparison if collecting
+cadence data.
+
+Use GOP's cumulative `flip mode: … swaps flipped … N copied` summaries
+for copy fallbacks. DPU's `to-boot` counts returns to the boot framebuffer.
+The copy damage audit reports `… N differed` and disables damage copies
+on a mismatch. NativeGopDisplay's `notify_crc_ready_gated` is a success-only
+callback. There is no panel CRC measurement on this route. `gop-shot`
+reads source pixels and can return busy on active scanout. Use the optical
+recording as the independent panel evidence.
+
+Save a manifest next to the four snapshot files and two console slices.
+Use the actual SHA-256 of the frozen image and the exact workload ID in
+both entries. Set `console_complete` after verifying each slice and enter
+the measured crash and optical counts. Example values are illustrative.
+
+```json
+{
+  "control": {
+    "before": "A-before.txt",
+    "after": "A-after.txt",
+    "console": "A-console.txt",
+    "console_complete": true,
+    "image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "workload": "mixed-use-60s",
+    "windowserver_crashes": 0,
+    "optical_checks": 120,
+    "optical_mismatches": 0
+  },
+  "treatment": {
+    "before": "B-before.txt",
+    "after": "B-after.txt",
+    "console": "B-console.txt",
+    "console_complete": true,
+    "image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "workload": "mixed-use-60s",
+    "windowserver_crashes": 0,
+    "optical_checks": 120,
+    "optical_mismatches": 0
+  }
+}
+```
+
+```sh
+python3 tooling/native/grade-dpu-m2.py capture.json
+```
+
+| Grade | Thresholds |
+| --- | --- |
+| **PASS (0)** | Each arm spans ≥30 s and ≥300 new DPU latches. Both links advance in the same fixed mode. Arm durations and shown counts differ by at most 25% of the smaller value. Strict policy stays at A=0 or B=1 throughout its window. A shows one forced full clean per shown flip with zero skips. B shows ≥100 verified-WC frames (`skip + init`) and skips ≥90% of those frames. B reduces pixel-clean time per shown flip by ≥50%. Both arms have positive optical coverage and zero reported safety events. B's GOP copy count, GOP copy share (`copied / (flipped + copied)`) and DPU returns to the boot framebuffer each stay at or below A. |
+| **FAIL (1)** | An underrun in either arm (a consumed indication or pending TOP/IRQ bits), DPU revert/SMMU fault/latch failure, WindowServer crash or PID change, fence timeout, optical or GOP damage mismatch, clean/alias failure, invalid backing, uncleaned show, or inconsistent clean accounting. With adequate comparable data, a miss of the skip/time threshold or an increase in fallback fails the run. |
+| **VOID (2)** | Missing, stale, reordered or reset evidence, wrong policy or a policy write inside an arm, unmatched image/workload/mode, unavailable optical or console coverage, insufficient flips or duration, or fewer than 100 verified-WC frames. Each GOP pair must bracket its DPU snapshots with a GOP flip delta between 100% and 125% of DPU shown. Reported failures take precedence over missing evidence. |
+
+If live WC coverage is insufficient, retain the fallback reason counters
+and repeat with a workload that exercises a verified WC pool.
 
 ## Fix-image gate
 
@@ -305,4 +411,4 @@ preserve and verify WC backing, initialize by a successful acquisition clean,
 skip subsequent pixel cleans within that valid epoch with publication/DSB
 preserved, and retain the full clean or refuse/copy on any failed predicate or
 maintenance failure. Default/cached/real-time/unknown buffers remain conservative.
-The RAM read list above is the remaining qualification gate.
+The RAM qualification procedure above is the remaining qualification gate.
