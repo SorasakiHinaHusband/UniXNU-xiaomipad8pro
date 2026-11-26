@@ -28,6 +28,7 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
 | 4a | [rtc.md](rtc.md) | PMK8550 RTC and calendar offset, plus PianoPower readout | Wall clock across reboots | k27 SPMI reads and PianoPower `SpmiObserver.h` |
 | 4c | [charging-policy.md](charging-policy.md) | `ChargePolicy`: source-dependent limits, PD, thermal steps, 80/75 hold and sleep handover | Battery health and charging policy | Ubuntu xiaomi_mca policy |
 | – | [usb-host.md](usb-host.md) | `PianoUsbHost`: Type-C roles, orientation, VBUS and the Apple xHCI integration | USB host and OTG | QcomDwc3, PianoDwc3 and PianoPower DSP |
+| – | [usb-otg-qual.md](usb-otg-qual.md) | B7 USB-C OTG path/check matrix and bounded attended RAM protocol | Fix-image HOLD; real-device qualification pending | PianoUsbHost, PianoXhciHost, PianoDwc3 and PianoPower |
 | – | [video.md](video.md) | `PianoVideo`: Iris video core, power, firmware and HFI, with a VideoToolbox frontend and native Iris backend | Hardware video decode and encode | VM-era VideoToolbox frontend, PianoPower and PianoA830 |
 | – | [displayport.md](displayport.md) | `PianoDp`: USB-C DP Alt Mode, QMP PHY, hotplug events, second DPU path and second framebuffer | External displays | PianoDpu, PianoUsbHost and PianoPower |
 | – | [camera.md](camera.md) | `PianoCamera`: front and rear camera control, RAW capture, software ISP and CMIOExtension | Camera apps | Ubuntu camera and CCI reference, PianoTorch and CMIOExtension |
