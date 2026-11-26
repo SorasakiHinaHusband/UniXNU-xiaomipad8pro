@@ -18,8 +18,9 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 ## State (2026-11-26)
 
 Native macOS **27.3 (26C5035r)** boots on the tablet from power-on as well as from a RAM image. The current daily
-install is **v13.1y12q** (2026-11-26; install check 75 PASS / 0 FAIL), with Data concurrent mode and USB debug network TX flow control on by default; display fixes stay behind switches that default to off. The machine
-identifies as Mac17,11, shown as "Xiaomi Pad 8 Pro" with a
+install is **v13.1y12q** (2026-11-26), with Data concurrent mode and USB debug network TX flow control on by default. The
+display stays at 60 Hz, with Night Shift routing, native panel sleep and refresh switching off. The machine identifies as
+Mac17,11, shown as "Xiaomi Pad 8 Pro" with a
 "Snapdragon 8 Elite" chip. Root is on `linux_rootfs`; the owner's Data store is on `linux_data`. High Power is the daily
 Energy Mode. The Android-aligned CPU/GPU frequency curve and PD buck charging (9 V) are on by default; the charge pump
 stays off.
@@ -30,15 +31,21 @@ percentage, 5 V and 9 V PD charging with the 80 % hold, automatic brightness, Me
 memory and 4 GiB GPU windows (Core Image on 4032-pixel photos), Photo Booth and camera recording, hardware video decode in
 QuickTime and Safari (H.264 up to 1080p), Safari WebGL 2 and WebGPU, and Chrome with GPU acceleration (WebGL, GPU compositing,
 smooth scrolling and video, with its GPU sandbox on) and, since v13.1y12m, Chrome WebGPU without flags (kernel patch 0075, a
-47-bit user address space). Also on the daily line since v13.1y12m: the cover and power-key sleep policy (closing the cover on
-the charger locks without sleeping; the power key sleeps and wakes), native screenshots from the display driver, and the
-Bluetooth LE event-mask fix. The installed system uses a 13 GiB memory window. Not yet: Bluetooth pairing (needs a hands-on
-test), disk write-back caching, charge-pump fast charging, 120 Hz in daily use, USB host devices and external displays. In progress:
-native panel sleep, Night Shift and refresh switching (built, off by default, in qualification), Bluetooth keyboards and mice,
-closing the cover on battery (attended check), disk speed, auto-rotate, and the install guide for other units.
+47-bit user address space). Since v13.1y12m the daily line also includes the cover and power-key sleep policy, native screenshots
+from the display driver and the Bluetooth LE event-mask fix. In RAM qualification, a simulated cover close on the charger locked
+the screen without sleeping, and a simulated power-key press slept and woke the system. The physical keys and closing the cover
+on battery still need attended checks. The installed system uses a 13 GiB memory window. Bluetooth keyboard and mouse pairing,
+disk write-back caching, charge-pump fast charging, USB host devices and external displays remain open. Work continues on disk
+speed, auto-rotate and validating the install guide on other units.
+
+On the v13.1y12s RAM boot, the PCC fix changed the Night Shift tint from blue to orange. The panel still looked warm with
+Night Shift off, so v13.1y12s was held pending a tablet check of the off-state unity fix. M5 logged successful bonded DSI wakes,
+but the panel stayed dark after wake. Analysis continues. Fixed 120 Hz scanout worked on m120c-120, and m120c-144 sustained
+144.146 Hz on both links with the MM0 bandwidth vote and zero underruns. Both fixed profiles are off by default. App cadence
+was still about 48–60 callbacks/s. Swap-service pipelining awaits tablet validation. [Evening results](docs/results-2026-11-26.md#evening)
 
 Kernel patch 0076 lets the USB debug shell and other updated helpers read the full boot line, including arguments past
-the legacy 1024-byte cut. Pending tablet checks: the Night Shift colour fix (the blue tint on qualification boots) and the native panel sleep DSI fix, both in v13.1y12s.
+the legacy 1024-byte cut.
 CI now runs the Adreno830 GPU host suite with pinned public kits. [Afternoon results](docs/results-2026-11-26.md#afternoon-storage-power-cut-tests-120-hz-ci)
 
 ### Hardware support
@@ -50,9 +57,9 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 
 | Feature | Status | Verified (build, date) | Note |
 | --- | --- | --- | --- |
-| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-26 (install check 75/0) | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
-| Display | ✅ Works (installed), 60 Hz | v13.1y12q, 2026-11-26 | PianoDpu flips on the boot framebuffer's pipes and native screenshots are on; colours on the installed desktop are correct (webcam check after the install). Native panel sleep, Night Shift and refresh switching are off by default. Night Shift routing turned the desktop blue on qualification boots: the colour-matrix (PCC) coefficients were written with the cross terms transposed and negative values in sign-magnitude form, which the hardware reads as two's complement. The fix (v13.1y12s) passes the host tests; the tablet check is pending. The native panel sleep fix (DSI controller state after wake) is also pending its tablet check. |
-| 120 Hz | 🟡 Partial | v13.1y12p and v13.1y12q test profiles, 2026-11-26 | macOS offers 120 Hz on the fixed-120 profile and both panel links scan at 120.0 Hz. The profile is off by default. Apps reach roughly 58–60 fps. Swaps take about 13 ms against an 8.33 ms period due to GPU-fence wait and vblank acceptance. A fix is under analysis. |
+| Boot from disk, persistent install | ✅ Works (installed) | v13.1y12q, 2026-11-26 | Boots from disk. Installs write only changed parts after backups, verify them by reading them back, and support rollback to the previous build. |
+| Display | ✅ Works (installed), 60 Hz | installed v13.1y12q and RAM v13.1y12s, 2026-11-26 | PianoDpu flips on the boot framebuffer and native screenshots are enabled. Daily v13.1y12q has neutral colours, with Night Shift routing, native panel sleep and refresh switching off. On v13.1y12s, the PCC fix changed the visible Night Shift tint from blue to orange, but the panel still looked warm with Night Shift off. v13.1y12s was held pending tablet verification of the off-state unity fix. M5 logged 9/10 master-first sleeps and 9/10 bonded DSI wakes as OK, but the panel stayed dark in all three post-wake stills. Analysis continues. |
+| 120 Hz / 144 Hz | 🟡 Partial | RAM m120c-120 and m120c-144, 2026-11-26 | Fixed scanout on both links reached 120.004 Hz and, with the MM0 bandwidth vote, a stable 144.146 Hz, with zero interface underruns in both runs. Both profiles are off by default. App cadence was about 48–60 callbacks/s. At 120 Hz, all 153 type-3 packets were accepted, but apps latched 51.2 distinct new surfaces/s and all 3562 drawables reported zero `presentedTime`. Swap-service pipelining passed host tests and awaits tablet validation. |
 | Touch screen (native) | ✅ Works (installed) | v13.1y12l, 2026-11-26; gestures on RAM touch-native3, 2026-11-23 | A native built-in Touch Screen bound to the display: tap, long press (right click), pan and scroll in scroll views, pinch, rotate, smart magnify, palm rejection, 90 degree axes (44/0 on RAM). Installed: published from boot and acquired by the system. Long use by hand on the native path is pending. |
 | Keyboard cover and trackpad | ✅ Works (installed) | owner hands-on, v12, 2026-11-19; v13.1y12l, 2026-11-26 | Typing and the trackpad work; the cover is known to the login window. |
 | Wi-Fi | 🟡 Works (installed), partial | v13.1y12l, 2026-11-26; v13.1x, 2026-11-21 | Joins at boot (WPA2, DHCP, DNS); radio off/on from the switch rejoins; a forced link loss rejoins within seconds; country code set. Pending: joining by clicking a network row by hand, auto-rejoin after a hotspot goes away and comes back, and a multi-access-point office network. |
@@ -66,8 +73,8 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 | Charging: PD 9 V (buck) | ✅ Works (installed) | v13.1y12d, 2026-11-24 | On by default. Fixed 9 V PD on the stock charger: 9 V / 1.6 A (about 14 W, the current the charger firmware requests, as on Ubuntu). PPS 9 V (up to 2.5 A) is built but not run. |
 | Charging: 80 % hold | ✅ Works | RAM chg-buck6, 2026-11-17; in every installed profile since | Stops at 80 %, resumes at 75 %. |
 | Charging: charge pump / MiPPS | ❌ Not yet | first attended try, 2026-11-24 | Off by default. The first attempt stayed at a 100 mA input limit (an unmapped vendor power object); fixed in the build, the next attended test is pending. |
-| Battery percentage | ✅ Works (installed) | v13.1y12k, 2026-11-25 | Percentage, charging state and the gauge read correctly. Cycle count, health and time-to-full fields are not filled yet. |
-| Sleep and wake | 🟡 Partial | v13.1y12m, 2026-11-26; RAM v13.1y12m qualification, 2026-11-26 | Suspend-to-idle with a timer wake works; Wi-Fi and the USB link recover; the lock screen appears. The cover and power-key policy is armed on the installed system: closing the cover on the charger locks without sleeping (charging goes on), the power key sleeps and wakes (both shown on the RAM qualification). Closing the cover on battery is still an attended check. |
+| Battery percentage | ✅ Works (installed) | installed ESP v2, 2026-11-14 and RAM m120c-120, 2026-11-26 | The installed system shows battery percentage and power state. On RAM the battery registry reported 122 cycles, 9200 mAh design capacity and 8781 mAh full capacity. System Information showed 122 cycles and “Service Recommended”, with Maximum Capacity absent. The condition fix passed host tests and awaits tablet validation. |
+| Sleep and wake | 🟡 Partial | v13.1y12m, 2026-11-26 (installed policy and RAM qualification) | Suspend-to-idle with a timer wake works. Wi-Fi and the USB link recover and the lock screen appears. The installed build arms the cover and power-key policy. RAM tests simulated a cover close on the charger (locks without suspending) and a power-key press (sleeps and wakes). The physical keys and closing the cover on battery still need attended checks. |
 | Brightness: manual | 🟡 Partial | keys on installed v12, 2026-11-19; slider path on v13.1i | Brightness keys work. The slider path through the system's brightness control works; a hand drag in Control Center is pending. |
 | Brightness: automatic | ✅ Works (installed) | v13.1y12l, 2026-11-26 | The light sensor drives automatic brightness; manual moves do not end automatic mode. A real light-change span is pending. |
 | GPU: Metal (Adreno 830) | ✅ Works (installed) | v13.1y12l, 2026-11-26 | Our Metal plug-in runs WindowServer, the desktop and apps; ImageIO, Core Image on Metal, MetalKit texture loading and Quick Look thumbnails pass: 30 of 30 graded paths, including the 4032-pixel Core Image and HEIC texture paths that ran out of memory before; Preview opens a 4032-pixel photo. |
@@ -90,8 +97,8 @@ tablet's disk (the build named in the row); "RAM only" means verified on a RAM b
 | Auto-rotate and other sensors | ❌ Not yet | RAM, 2026-11-19 (accelerometer sample) | The light sensor works; auto-rotate is off in the daily profile and in analysis. |
 | Hardware video encode | ❌ Not yet | camera recordings, 2026-11-25 | Recordings use the software encoder. |
 | IR blaster, stylus, torch | ❌ Not yet | none | Drivers built or designed, not run. |
-| Memory (16 GB) | 🟡 Partial | v13.1y12l, 2026-11-26 | The installed system uses a 13 GiB window (13310 MiB; was 8 GiB). At idle: 47 % free, no compression, no swap, no memory pressure. In progress: the GPU memory tier and the driver pools. |
-| Internal storage (UFS) | 🟡 Partial | v13.1y12q (installed: concurrent mode live); v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | Compared with serial operation on Data, concurrent mode delivered 4.9× the 4 KiB random-read IOPS at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential reads reached 4.8× throughput, 1 MiB sequential writes reached 1.5×, and 4 KiB random writes reached 0.9× IOPS. Mixed-reader p99 fell from 2528 to 269 µs. The reboot canary survived. Concurrent, write-back and queue modes each kept every acknowledged `F_FULLFSYNC` record after a direct reset in scratch-window tests. Concurrent mode is on in the installed v13.1y12q (switched on after the Data mount). Write-back and queue modes stay off. |
+| Memory (16 GB) | 🟡 Partial | installed v13.1y12l and RAM m120c-120 and ram16g-hevc1, 2026-11-26 | The installed system uses 13 GiB (13310 MiB). At idle it had 47% free, with no compression, swap or memory pressure. The EFI audit classified 319/322 two-MiB slabs as non-runtime (CMA 128/128, DXE 184/186, FD 7/8), released 0 MiB and awaits owner verification. The 684 MiB mixed HEVC arena (274 MiB from region 0 and 410 MiB from XNU) passed its RAM reservation self-test. All 24/24 decoded 4K Main10 frames matched the golden P010 hashes, 12 on first open and 12 on resident reopen, with no video faults. The GPU memory tier and driver pools remain in progress. |
+| Internal storage (UFS) | 🟡 Partial | installed v13.1y12q (concurrent mode), v13.1y12o (Data A/B) and scratch-window tests, 2026-11-26 | The first installed Data benchmark reached 1435 MB/s sequential read and 519 MB/s sequential write at 4 MiB. Compared with serial mode, concurrent 4 KiB random-read IOPS reached 4.9× at QD8 and 5.6× at QD32. At QD8, 1 MiB sequential read and write throughput reached 4.8× and 1.5×, and 4 KiB random-write IOPS reached 0.9×. Mixed-load read p99 fell from 2528 to 269 µs. The canary survived a clean reboot. In scratch-window tests, concurrent, write-back and queue modes each preserved all 32 records acknowledged after `F_FULLFSYNC` across a direct reset. The unacknowledged tail could be lost. Concurrent mode switches on after Data mounts on v13.1y12q. Write-back and queue modes stay off. |
 | Fingerprint, NPU | ❌ Deferred | none | No Secure Enclave (no Touch ID); no Core ML backend on this SoC. |
 
 Details (status definitions, known gaps, showcase): [docs/STATUS.md](docs/STATUS.md).
@@ -151,8 +158,7 @@ summary; the skill is the reference.
 ### Sources and pins
 
 - This repository plus the pinned dependencies of `unixnu.lock` / `feeds.toml` (UniXNU core, Mu-Silicium, piano-uefi,
-  DarwinBoot, the SoC module) and the k27 kernel tree (`PIANO_K27_TREE`, in the environment or in `~/.config/piano/env`; pinned
-  in `unixnu.lock`).
+  DarwinBoot, the SoC module) and the k27 kernel tree. Set `PIANO_K27_TREE` to the tree pinned in `unixnu.lock`.
 - **Fetching the pins:** `python3 scripts/fetch-pins.py` fetches every `unixnu.lock` checkout by commit into `$UNIXNU_RESEARCH`
   (`--verify` only checks them; contributed by SorasakiHinaHusband). The k27 kernel tree is upstream
   [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) at its pin plus our [patches/k27-tree](patches/k27-tree/README.md):
@@ -232,7 +238,7 @@ enforces it on every build, before and after the link: no descriptor from elsewh
 - [docs/STATUS.md](docs/STATUS.md): what works, per feature, with the build and date it was verified.
 - [docs/USING.md](docs/USING.md): using, updating and recovering the installed system.
 - [skills/install-piano-macos/SKILL.md](skills/install-piano-macos/SKILL.md): building and installing on another unit (agent guide).
-- [docs/drivers/README.md](docs/drivers/README.md): every driver, its levels and its state.
+- Driver design pages, boot arguments and qualification notes. [Driver index](docs/drivers/README.md)
 - [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md): repositories, local layout, hard rules.
 - [docs/bringup-debugging.md](docs/bringup-debugging.md): the boot chain, debugging without a screen, the test loop, rebuilding.
 - [docs/BACKLOG-hardware.md](docs/BACKLOG-hardware.md): the hardware still to bring up.
