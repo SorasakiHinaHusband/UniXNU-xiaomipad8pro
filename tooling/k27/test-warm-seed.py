@@ -6,10 +6,12 @@ tablet's collector (no single quote: it travels inside sh -c '...'; tar's patter
 root-owned files, the packed seed) runs end to end with `warm-seed.py build --test-pack` on a dummy pack (docs/boot-time.md §10.1)."""
 import importlib.util
 import io
+import os
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 D = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('warm_seed', D / 'tooling/k27/warm-seed.py')
@@ -59,6 +61,23 @@ with tempfile.TemporaryDirectory() as tmp:
         f = got['private/var/folders/zz/h/0/com.apple.LaunchServices.dv/a.csstore']
         assert f.uid == 501 and t.extractfile(f).read() == f.name.encode() and f.pax_headers.get('LIBARCHIVE.xattr.com.apple.test') == 'eA=='
     w.check_owners(dst)   # private, private/var, ... are root's: accepted
+    seed, trust = Path(tmp) / 'seed.img', Path(tmp) / 'trustcache'
+    seed.touch()
+    trust.touch()
+    out = Path(tmp) / 'output'
+    out.mkdir()
+    output_pack = out / 'warm.tar.xz'
+    original = src.read_bytes()
+    os.link(src, output_pack)
+    for copy_all in (False, True):
+        try:
+            w.cmd_build(SimpleNamespace(seed=seed, trust=trust, pack=src, out=out, test_pack=True,
+                                        all=copy_all, include=['never-matches']))
+        except SystemExit as error:
+            assert 'same file as the input pack' in str(error), error
+        else:
+            raise AssertionError('the build accepted a pack aliased to its output')
+        assert src.read_bytes() == original
     for name in ('private/var', './private/var', 'private//var'):
         bad = Path(tmp) / 'bad.tar.xz'
         with tarfile.open(bad, 'w:xz') as t:

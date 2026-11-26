@@ -283,10 +283,12 @@ def cmd_build(a):
             raise SystemExit(f'{f}: missing')
     if a.out.resolve() in (a.seed.resolve().parent, a.trust.resolve().parent):
         raise SystemExit('--out is an input\'s directory: the inputs are only read')
+    filtered = a.out / 'warm.tar.xz'
+    if filtered.exists() and filtered.samefile(a.pack):
+        raise SystemExit(f'{filtered}: output is the same file as the input pack {a.pack}')
     a.out.mkdir(parents=True, exist_ok=True)
     if not a.test_pack:
         check_owners(a.pack)
-    filtered = a.out / 'warm.tar.xz'
     if a.all:
         shutil.copyfile(a.pack, filtered)
     elif not filter_pack(a.pack, filtered, a.include or DEFAULT_INCLUDE):
