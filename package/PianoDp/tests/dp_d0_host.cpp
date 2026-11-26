@@ -23,6 +23,7 @@ static int failures;
 
 static constexpr DpTiming k1080p60{148500, 1920, 280, 88, 44, 1080, 45, 4, 5, true, true};
 static constexpr DpTiming k1440p60{241500, 2560, 160, 48, 32, 1440, 41, 3, 5, true, false};
+static constexpr DpTiming k1440p120{497750, 2560, 160, 48, 32, 1440, 85, 3, 5, true, false};
 static constexpr DpTiming k4k30{297000, 3840, 560, 176, 88, 2160, 90, 8, 10, true, true};
 static constexpr DpTiming k4k60Rb{533250, 3840, 160, 48, 32, 2160, 62, 3, 5, true, false};
 static constexpr DpTiming k4k60Cta{594000, 3840, 560, 176, 88, 2160, 90, 8, 10, true, true};
@@ -153,8 +154,8 @@ static void testEdidTimings()
   auto fullBase = baseBlock(k1080p60, 3);
   for (size_t offset = 72; offset <= 108; offset += 18) putDtd(fullBase, offset, k1440p60);
   seal(fullBase.data());
-  Block fullCta{2, 3, 10, 2, 0x45, 16, 95, 97, 105, 107};
-  for (size_t offset = 10; offset <= 100; offset += 18) putDtd(fullCta, offset, k4k30);
+  Block fullCta{2, 3, 13, 2, 0x48, 16, 93, 94, 95, 97, 98, 105, 107};
+  for (size_t offset = 13; offset <= 103; offset += 18) putDtd(fullCta, offset, k4k30);
   seal(fullCta.data());
   const auto full = wireEdid({fullBase, fullCta, fullCta, fullCta});
   CHECK(parseEdid(full.data(), full.size(), info) == Edid::Ok && info.modeCount == EdidInfo::kMaxModes);
@@ -263,6 +264,158 @@ static void testMalformedEdid()
   }
 }
 
+static void testHdmiVsdb()
+{
+  const auto base = baseBlock(k1080p60, 1);
+  EdidInfo info;
+  auto parse = [&](Block cta) {
+    seal(cta.data());
+    const auto bytes = wireEdid({base, cta});
+    return parseEdid(bytes.data(), bytes.size(), info);
+  };
+  for (uint8_t latency : {0x00, 0x80, 0xc0}) {
+    const unsigned video = latency == 0 ? 8 : latency == 0x80 ? 10 : 12;
+    const unsigned length = video + 6;
+    Block cta{2, 3, uint8_t(5 + length + 4), 0};
+    cta[4] = uint8_t(0x60 | length);
+    cta[5] = 0x03;
+    cta[6] = 0x0c;
+    cta[8] = 0x10; // CEC physical address 1.0.0.0
+    cta[12] = uint8_t(0x20 | latency);
+    cta[5 + video + 1] = 4 << 5;
+    for (uint8_t i = 1; i <= 4; ++i) cta[5 + video + 1 + i] = i;
+    cta[5 + length] = 0x43;
+    cta[6 + length] = 95; // deduplicate the CTA equivalent of HDMI VIC 1
+    cta[7 + length] = 0x90;
+    cta[8 + length] = 0xe1; // extended VIC 225, no native flag
+    CHECK(parse(cta) == Edid::Ok && info.modeCount == 6 && info.hdmiVicBits == 15);
+    CHECK(info.nativeVic(16) && !info.nativeVic(33) && info.hasVic(225));
+    CHECK(info.modes[1].vic == 95 && sameTiming(info.modes[1].timing, k4k30));
+    CHECK(info.modes[2].vic == 94 && info.modes[2].timing.hSyncOffset == 1056);
+    CHECK(info.modes[3].vic == 93 && info.modes[3].timing.hSyncOffset == 1276);
+    CHECK(info.modes[4].vic == 98 && info.modes[4].timing.hActive == 4096);
+
+    auto bad = cta;
+    bad[5 + video + 1] |= 1; // stereo length would run into the next block
+    CHECK(parse(bad) == Edid::BadExtension && !info.hdmiVicBits && !info.modeCount);
+    bad = cta;
+    bad[5 + video + 2] = 5;
+    CHECK(parse(bad) == Edid::BadExtension);
+    bad = cta;
+    bad[12] = 0x60; // interlaced latency without progressive latency
+    CHECK(parse(bad) == Edid::BadExtension);
+  }
+  CHECK(parse(Block{2, 3, 10, 0, 0x65, 0x03, 0x0c, 0, 0x10, 0}) == Edid::Ok && !info.hdmiVicBits);
+  CHECK(parse(Block{2, 3, 8, 0, 0x63, 0xd8, 0x5d, 0xc4}) == Edid::Ok && !info.hdmiVicBits);
+  CHECK(parse(Block{2, 3, 9, 0, 0x64, 0x03, 0x0c, 0, 0x10}) == Edid::BadExtension);
+  CHECK(parse(Block{2, 3, 13, 0, 0x68, 0x03, 0x0c, 0, 0x10, 0, 0, 0, 0x20}) == Edid::BadExtension);
+  CHECK(parse(Block{2, 2, 6, 0, 0x41, 16}) == Edid::BadExtension);
+}
+
+static void sealDisplayId(Block &block)
+{
+  const size_t end = 5 + size_t(block[2]);
+  uint8_t checksum = 0;
+  for (size_t i = 1; i < end; ++i) checksum -= block[i];
+  block[end] = checksum;
+  seal(block.data());
+}
+
+static Block displayIdTimingBlock(bool type7)
+{
+  Block block{0x70, uint8_t(type7 ? 0x20 : 0x13), uint8_t(type7 ? 24 : 23), 3, 0,
+              uint8_t(type7 ? 0x22 : 0x03), uint8_t(type7 ? 0x12 : 0), uint8_t(type7 ? 21 : 20)};
+  // 2560x1440. Type VII adds one byte to the timing stride and uses a 1 kHz clock unit.
+  const uint32_t clock = (type7 ? k1440p120.pixelKhz : k1440p60.pixelKhz / 10) - 1;
+  block[8] = uint8_t(clock);
+  block[9] = uint8_t(clock >> 8);
+  block[10] = uint8_t(clock >> 16);
+  const uint8_t fields[] = {0xff, 9, 159, 0, 47, 0x80, 31, 0, 0x9f, 5, uint8_t(type7 ? 84 : 40), 0, 2, 0, 4, 0};
+  std::copy(std::begin(fields), std::end(fields), block.begin() + 12);
+  sealDisplayId(block);
+  return block;
+}
+
+static void testDisplayId()
+{
+  EdidInfo info;
+  const auto base = baseBlock(k1080p60, 1);
+  constexpr DpLink link{kDpHbr2Khz, 4};
+  auto parse = [&](const Block &displayId) {
+    const auto bytes = wireEdid({base, displayId});
+    return parseEdid(bytes.data(), bytes.size(), info);
+  };
+  for (bool type7 : {false, true}) {
+    const auto block = displayIdTimingBlock(type7);
+    CHECK(parse(block) == Edid::Ok && info.modeCount == 2);
+    CHECK(!info.modes[1].vic && info.modes[1].rgb &&
+          sameTiming(info.modes[1].timing, type7 ? k1440p120 : k1440p60));
+    const auto modes = buildDpExternalModes(info, link, DpPixelFormat::Rgb8);
+    CHECK(modes.count == 2 && modes.modes[1].pixelHz == (type7 ? 497750000u : 241500000u));
+
+    auto special = block;
+    special[11] = 0x80; // Type I preferred, Type VII rev 2 YCbCr 4:2:0
+    sealDisplayId(special);
+    CHECK(parse(special) == Edid::Ok && info.modes[1].rgb == !type7);
+    CHECK(buildDpExternalModes(info, link, DpPixelFormat::Rgb8).count == (type7 ? 1u : 2u));
+    special[11] = 0x10; // interlaced
+    sealDisplayId(special);
+    CHECK(parse(special) == Edid::Ok && info.modes[1].timing.interlaced);
+    CHECK(buildDpExternalModes(info, link, DpPixelFormat::Rgb8).count == 1);
+
+    for (uint8_t length : {0, 19, 22, 255}) {
+      auto bad = block;
+      bad[7] = length;
+      sealDisplayId(bad);
+      CHECK(parse(bad) == Edid::BadExtension && !info.modeCount);
+    }
+    auto bad = block;
+    bad[12] = bad[13] = 0xff; // hActive = 65536
+    sealDisplayId(bad);
+    CHECK(parse(bad) == Edid::BadTiming);
+    bad = block;
+    bad[8] ^= 1;
+    seal(bad.data()); // outer checksum passes while the DisplayID checksum fails
+    CHECK(parse(bad) == Edid::BadChecksum);
+    bad = block;
+    bad[126] = 1;
+    seal(bad.data());
+    CHECK(parse(bad) == Edid::BadExtension);
+
+    Block tile{0x70, block[1], 25, 0, 0, uint8_t(type7 ? 0x28 : 0x12), 0, 22,
+               0x80, 0x02, 0x01, 0xcc, 0x7f, 7, 0x6f, 8};
+    tile[21] = 'T';
+    tile[29] = 42;
+    sealDisplayId(tile);
+    auto first = block;
+    first[4] = 1;
+    sealDisplayId(first);
+    auto sections = [&](const Block &last) {
+      const auto bytes = wireEdid({baseBlock(k1080p60, 2), first, last});
+      return parseEdid(bytes.data(), bytes.size(), info);
+    };
+    CHECK(sections(tile) == Edid::Ok && info.modeCount == 2 && info.tile.multiTile());
+    CHECK(info.tile.columns == 49 && info.tile.rows == 3 && info.tile.column == 48 && info.tile.row == 1);
+    CHECK(info.tile.width == 1920 && info.tile.height == 2160 && info.tile.singleEnclosure);
+    CHECK(info.tile.topologyId[0] == 'T' && info.tile.topologyId[8] == 42);
+    CHECK(!preferredFittingMode(info, link) && !buildDpExternalModes(info, link, DpPixelFormat::Rgb8).count);
+    tile[7] = 21;
+    sealDisplayId(tile);
+    CHECK(sections(tile) == Edid::BadExtension && !info.tile.columns && !info.modeCount);
+    tile[7] = 22;
+    tile[10] = 0x11; // h tile location 49, outside 49 columns
+    sealDisplayId(tile);
+    CHECK(sections(tile) == Edid::BadExtension);
+    CHECK(parse(first) == Edid::BadExtension); // advertised continuation is missing
+  }
+  Block full{0x70, 0x20, 121, 3, 0, 0x7f, 0, 118}; // checksum at byte 126
+  sealDisplayId(full);
+  CHECK(parse(full) == Edid::Ok && info.modeCount == 1);
+  full[2] = 122;
+  seal(full.data());
+  CHECK(parse(full) == Edid::BadExtension);
+}
+
 static void testModeBudget()
 {
   const auto bytes = multiBlockEdid();
@@ -280,7 +433,7 @@ static void testModeBudget()
   CHECK(!edidModeFits(k1440p60, {kDpRbrKhz, 4}) && !edidModeFits(k4k30, {kDpRbrKhz, 4}));
   CHECK(!edidModeFits(k4k60Rb, {kDpHbrKhz, 4}));
   CHECK(!preferredFittingMode(info, {kDpRbrKhz, 1}));
-  CHECK(!edidModeFits(k1080p60, {810000, 4}) && !edidModeFits(k1080p60, {kDpHbr2Khz, 3}));
+  CHECK(edidModeFits(k1080p60, {kDpHbr3Khz, 4}) && !edidModeFits(k1080p60, {kDpHbr2Khz, 3}));
 
   Block cta{2, 3, 8, 1, 0x43, 97, 95, 16};
   seal(cta.data());
@@ -320,6 +473,7 @@ struct Sink {
 
   std::vector<Script> script;
   std::array<uint8_t, 16> caps{0x14, 0x14, 0xc4, 0x01, 0, 0, 1};
+  std::array<uint8_t, 16> extendedCaps{};
   std::vector<Fault> faults;
   std::vector<Pattern> patterns;
   std::vector<DpDrive> drives;
@@ -347,6 +501,11 @@ struct Sink {
     if (const auto fault = inject(false, addr, size); fault != Aux::Ack) return fault;
     if (addr == 0 && size == caps.size()) {
       std::copy(caps.begin(), caps.end(), data);
+      return Aux::Ack;
+    }
+    if (addr == 0x2200 && size == extendedCaps.size()) {
+      CHECK(caps[14] & 0x80);
+      std::copy(extendedCaps.begin(), extendedCaps.end(), data);
       return Aux::Ack;
     }
     if (addr == 0x202 && size == 6 && attempt && attempt <= script.size()) {
@@ -444,13 +603,14 @@ static void testTrainSuccess()
   }
   {
     Sink sink{{{kDpHbr2Khz, 2}, {{0x11}}, {{0x77, 0, 1}}}};
-    sink.caps[1] = 0x1e;  // HBR3 sink, piano's PHY must stay within HBR2
-    sink.caps[3] = 0x80;  // TPS4, no downspread
-    sink.caps[14] = 0x82; // extended cap flag does not change EQ interval
+    sink.caps = {0x12, 0x0a, 0x84, 0, 0, 0, 1};
+    sink.caps[14] = 0xff; // base interval is superseded by the extended block
+    sink.extendedCaps = {0x14, 0x1e, 0x84, 0x80, 0, 0, 1};
+    sink.extendedCaps[14] = 2;
     const auto result = trainDpLink(sink, 2);
     CHECK(result.status == Train::Trained && result.link.rateKhz == kDpHbr2Khz && result.link.lanes == 2);
-    CHECK(!result.downspread && sink.patterns[1] == Pattern::Tps4);
-    CHECK((sink.delays == std::vector{100u, 8000u}));
+    CHECK(!result.downspread && (sink.patterns == std::vector{Pattern::Tps1, Pattern::Tps4, Pattern::Disabled}));
+    CHECK((sink.delays == std::vector{100u, 8000u}) && sink.reads == 4);
   }
   {
     Sink sink{{{kDpRbrKhz, 1}, {{1}}, {{7, 0, 1}}}};
@@ -458,7 +618,8 @@ static void testTrainSuccess()
     sink.caps[1] = 0x06;
     sink.caps[2] = 1;
     sink.caps[14] = 1;
-    CHECK(trainDpLink(sink, 4).status == Train::Trained && sink.patterns[1] == Pattern::Tps2);
+    CHECK(trainDpLink(sink, 4).status == Train::Trained &&
+          (sink.patterns == std::vector{Pattern::Tps1, Pattern::Tps2, Pattern::Disabled}));
     CHECK((sink.delays == std::vector{4000u, 4000u}));
   }
 }
@@ -474,17 +635,28 @@ static void testTrainFallback()
     CHECK(sink.delays.size() == 10 && sink.disableWrites == 3);
   }
   {
-    Sink sink{{{kDpHbr2Khz, 4}, {kCrOk}, noEq}, {{kDpHbr2Khz, 2}, {kCrOk}, noEq}, {{kDpHbr2Khz, 1}}};
-    const auto result = trainDpLink(sink, 4);
-    CHECK(result.status == Train::Trained && result.attempts == 3 && result.link.lanes == 1);
-    CHECK(sink.delays.size() == 16 && sink.disableWrites == 3);
+    Sink sink{{{kDpHbr2Khz, 1}, {kCrOk}, noEq}, {{kDpHbrKhz, 1}}};
+    const auto result = trainDpLink(sink, 1);
+    CHECK(result.status == Train::Trained && result.attempts == 2 && result.link.rateKhz == kDpHbrKhz);
+    CHECK(sink.delays.size() == 9 && sink.disableWrites == 2);
   }
   {
-    Sink sink{{{kDpHbr2Khz, 4}, noCr}, {{kDpHbrKhz, 4}, noCr}, {{kDpRbrKhz, 4}, noCr}, {{kDpHbr2Khz, 2}, noCr}};
+    Sink sink{{{kDpHbr2Khz, 4}, noCr}, {{kDpHbrKhz, 4}, noCr}, {{kDpRbrKhz, 4}, noCr},
+              {{kDpHbr2Khz, 2}, noCr}, {{kDpHbrKhz, 2}}};
     const auto result = trainDpLink(sink, 4);
-    CHECK(result.status == Train::ClockRecoveryFailed && result.attempts == 4);
-    CHECK(result.link.rateKhz == kDpHbr2Khz && result.link.lanes == 2 && sink.delays.size() == 16);
-    CHECK(sink.disableWrites == 4 && sink.current == Pattern::Disabled);
+    CHECK(result.status == Train::Trained && result.attempts == 5);
+    CHECK(result.link.rateKhz == kDpHbrKhz && result.link.lanes == 2 && sink.delays.size() == 18);
+    CHECK(sink.disableWrites == 5 && sink.current == Pattern::Disabled);
+  }
+  {
+    Sink sink{};
+    for (unsigned lanes : {4, 2, 1})
+      for (uint32_t rate : {kDpHbr2Khz, kDpHbrKhz, kDpRbrKhz})
+        sink.script.push_back({{rate, lanes}, noCr});
+    const auto result = trainDpLink(sink, 4);
+    CHECK(result.status == Train::ClockRecoveryFailed && result.attempts == 9);
+    CHECK(result.link.rateKhz == kDpRbrKhz && result.link.lanes == 1 && sink.delays.size() == 36);
+    CHECK(sink.disableWrites == 9 && sink.current == Pattern::Disabled);
   }
   {
     Sink sink{{{kDpHbr2Khz, 4}, {kCrOk}, {{0x77, 0x07, 1}}}, {{kDpHbrKhz, 4}}};
@@ -562,6 +734,59 @@ static void testTrainErrors()
   }
 }
 
+static void testReceiverCaps()
+{
+  DpReceiverCaps caps;
+  constexpr uint8_t rates[] = {0x06, 0x0a, 0x14, 0x1e};
+  constexpr uint32_t clocks[] = {162000, 270000, 540000, 810000};
+  for (uint8_t revision : {0x11, 0x12, 0x13, 0x14}) {
+    for (unsigned r = 0; r < std::size(rates); ++r) {
+      for (uint8_t lanes : {1, 2, 4}) {
+        std::array<uint8_t, 16> bytes{revision, rates[r], uint8_t(0xe0 | lanes), 0x81, 0, 0x15, 1, 0xcf};
+        bytes[13] = 0x0f;
+        bytes[14] = 4;
+        CHECK(parseDpReceiverCaps(bytes.data(), bytes.size(), caps));
+        CHECK(caps.revision == revision && caps.maxLanes == lanes && caps.maxRateKhz == clocks[r]);
+        CHECK(caps.enhancedFraming && caps.downspread && caps.eqDelayUs == 16000);
+        CHECK(caps.crDelayUs == (revision >= 0x14 ? 100u : 16000u));
+        const Pattern eq = revision == 0x11 ? Pattern::Tps2 : revision < 0x14 ? Pattern::Tps3 : Pattern::Tps4;
+        CHECK(caps.eqPattern == eq);
+        CHECK(caps.hasSinkCount() && caps.downstream == DpDownstreamPort::Tmds &&
+              caps.downstreamPorts == 15 && caps.detailedPortCaps);
+        CHECK(caps.edpAlternateScrambler && caps.edpFramingChange && caps.edpDisplayControl && caps.edpMsaIgnored);
+        bytes[5] &= ~1u;
+        CHECK(parseDpReceiverCaps(bytes.data(), bytes.size(), caps));
+        CHECK(!caps.hasSinkCount() && caps.downstream == DpDownstreamPort::None &&
+              !caps.downstreamPorts && !caps.detailedPortCaps);
+      }
+    }
+  }
+  for (uint8_t lanes : {0, 3, 5, 8, 31}) {
+    const std::array<uint8_t, 16> bytes{0x14, 0x14, lanes};
+    CHECK(!parseDpReceiverCaps(bytes.data(), bytes.size(), caps) && !caps.revision && !caps.maxLanes);
+  }
+  for (uint8_t revision : {0x00, 0x0f, 0x1f, 0xff}) {
+    const std::array<uint8_t, 16> bytes{revision, 0x14, 4};
+    CHECK(!parseDpReceiverCaps(bytes.data(), bytes.size(), caps));
+  }
+  const std::array<uint8_t, 16> uhbrOnly{0x20, 0x14, 4, 0, 0, 0, 2};
+  CHECK(!parseDpReceiverCaps(uhbrOnly.data(), uhbrOnly.size(), caps));
+
+  Sink stale{{{kDpHbrKhz, 2}}};
+  stale.caps[1] = 0x0a;
+  stale.caps[14] = 0x80;
+  stale.extendedCaps = {0x12, 0x06, 1};
+  CHECK(trainDpLink(stale, 2).status == Train::Trained && stale.reads == 4);
+
+  Sink malformed{};
+  malformed.caps[14] = 0x80;
+  malformed.extendedCaps = {0x14, 0x14, 0};
+  CHECK(trainDpLink(malformed, 4).status == Train::InvalidCaps && malformed.reads == 2 && !malformed.writes);
+  malformed.faults.push_back({false, 0x2200, Pattern::Disabled, Aux::ShortTransfer});
+  const auto result = trainDpLink(malformed, 4);
+  CHECK(result.status == Train::AuxError && result.auxStatus == Aux::ShortTransfer && !result.attempts && !malformed.writes);
+}
+
 static void testMsaTu()
 {
   struct Case {
@@ -614,6 +839,66 @@ static void testMsaTu()
   CHECK(computeDpMsaTu(edge, {kDpHbr2Khz, 2}, out) && out.validSymbols == 62 && !out.validSymbolsNumerator);
   ++edge.pixelKhz;
   CHECK(edidModeFits(edge, {kDpHbr2Khz, 2}) && !computeDpMsaTu(edge, {kDpHbr2Khz, 2}, out));
+}
+
+static void testBandwidthMatrix()
+{
+  // Each mask is RBR/HBR/HBR2/HBR3 from low to high bit on 1, 2 and 4 lanes.
+  constexpr struct {
+    DpTiming timing;
+    unsigned payload[3], tu[3];
+  } cases[] = {
+    {k1080p60, {0xc, 0xe, 0xf}, {0xc, 0xe, 0xf}},
+    {k1440p120, {0, 0x8, 0xc}, {0, 0x8, 0xc}},
+    {k4k60Rb, {0, 0x8, 0xc}, {0, 0, 0xc}},
+    {k4k60Cta, {0, 0, 0xc}, {0, 0, 0xc}},
+  };
+  constexpr uint32_t rates[] = {kDpRbrKhz, kDpHbrKhz, kDpHbr2Khz, kDpHbr3Khz};
+  constexpr uint32_t payloadPerLane[] = {1296000, 2160000, 4320000, 6480000};
+  DpMsaTu out;
+  for (unsigned l = 0; l < 3; ++l) {
+    const unsigned lanes = 1u << l;
+    for (unsigned r = 0; r < std::size(rates); ++r) {
+      const DpLink link{rates[r], lanes};
+      const uint32_t payload = lanes * payloadPerLane[r];
+      for (const auto &c : cases) {
+        const bool fits = (c.tu[l] >> r) & 1;
+        CHECK(edidModeFits(c.timing, link) == bool((c.payload[l] >> r) & 1));
+        CHECK(computeDpMsaTu(c.timing, link, out) == fits);
+        if (fits) {
+          const uint64_t wanted = uint64_t(c.timing.pixelKhz) * 24 * 64;
+          CHECK(out.validSymbolsDenominator == payload && out.validSymbols <= 62);
+          CHECK(uint64_t(out.validSymbolsFloor) * payload + out.validSymbolsNumerator == wanted);
+          CHECK(out.validSymbols == (wanted + payload - 1) / payload);
+        } else {
+          CHECK(!out.tuSize && !out.mvid && !out.validSymbolsDenominator);
+        }
+      }
+      auto edge = k1080p60;
+      edge.pixelKhz = uint32_t(uint64_t(payload) * 62 / (24 * 64));
+      CHECK(computeDpMsaTu(edge, link, out) && out.validSymbols == 62);
+      ++edge.pixelKhz;
+      CHECK(edidModeFits(edge, link) && !computeDpMsaTu(edge, link, out));
+      edge.pixelKhz = payload / 24;
+      CHECK(edidModeFits(edge, link));
+      ++edge.pixelKhz;
+      CHECK(!edidModeFits(edge, link));
+    }
+  }
+  auto slow = k1080p60;
+  slow.pixelKhz = 12;
+  CHECK(!computeDpMsaTu(slow, {kDpHbr3Khz, 1}, out));
+  ++slow.pixelKhz;
+  CHECK(computeDpMsaTu(slow, {kDpHbr3Khz, 1}, out) && out.mvid == 1);
+
+  EdidInfo edid;
+  edid.modeCount = 2;
+  edid.modes[0].timing = k4k60Rb;
+  edid.modes[1].timing = k1440p120;
+  CHECK(preferredFittingMode(edid, {kDpHbr3Khz, 2}) == &edid.modes[1]); // raw bandwidth alone ranks 4K first
+  CHECK(!buildDpExternalModes(edid, {kDpHbr3Khz, 2}, DpPixelFormat::Rgb8).count); // piano's board cap
+  edid.modes[1].timing.interlaced = true;
+  CHECK(!preferredFittingMode(edid, {kDpHbr3Khz, 2}));
 }
 
 static void testExternalModes()
@@ -711,17 +996,17 @@ struct HotplugSink : Sink {
   std::vector<uint8_t> edid;
   std::vector<Aux> edidReplies;
   size_t nextReply = 0, nextOffset = 0;
-  unsigned edidReads = 0, irqReads = 0, starts = 0, teardowns = 0;
+  unsigned edidReads = 0, countReads = 0, irqReads = 0, starts = 0, teardowns = 0;
+  uint8_t sinkCount = 1, irqVector = 0;
   StatusBytes irqStatus = kEqOk;
-  Aux irqReply = Aux::Ack;
+  Aux irqReply = Aux::Ack, countReply = Aux::Ack;
   DpExternalTiming runningMode{};
   bool auxOpen = false, phyOn = false, streamOn = false, failStream = false;
 
   Aux readEdid(size_t offset, uint8_t *bytes, size_t size)
   {
     ++edidReads;
-    CHECK(!phyOn && !streamOn && offset == nextOffset && size == kDpEdidAuxChunk);
-    auxOpen = true;
+    CHECK(auxOpen && !phyOn && !streamOn && offset == nextOffset && size == kDpEdidAuxChunk);
     if (nextReply < edidReplies.size()) {
       const Aux reply = edidReplies[nextReply++];
       if (reply != Aux::Ack) return reply;
@@ -734,13 +1019,26 @@ struct HotplugSink : Sink {
 
   Aux auxRead(uint32_t addr, uint8_t *bytes, size_t size)
   {
+    if (addr == 0) {
+      CHECK(!auxOpen && !nextOffset && !streamOn);
+      auxOpen = true;
+    }
     CHECK(auxOpen);
-    if (streamOn && addr == 0x202 && size == irqStatus.size()) {
+    if (streamOn && addr == 0x200 && size == 8) {
       ++irqReads;
-      if (irqReply == Aux::Ack) std::copy(irqStatus.begin(), irqStatus.end(), bytes);
+      if (irqReply == Aux::Ack) {
+        bytes[0] = sinkCount;
+        bytes[1] = irqVector;
+        std::copy(irqStatus.begin(), irqStatus.end(), bytes + 2);
+      }
       return irqReply;
     }
-    CHECK(nextOffset == edid.size());
+    if (!streamOn && addr == 0x200 && size == 1) {
+      ++countReads;
+      if (countReply == Aux::Ack) bytes[0] = sinkCount;
+      return countReply;
+    }
+    if (addr == 0x202) CHECK(nextOffset == edid.size());
     return Sink::auxRead(addr, bytes, size);
   }
 
@@ -804,8 +1102,11 @@ static void testHotplug()
   CHECK(port.hpd(sink, true, false, 4) == Hotplug::Active);
   CHECK(sink.edidReads == 34 && !sink.irqReads && !sink.teardowns);
   sink.irqStatus = {0x77, 0, 1};  // the other two lanes are inactive after fallback
+  sink.sinkCount = 0; // direct sinks need not report a count
+  sink.irqVector = 4; // CP_IRQ is diagnostic and does not trigger training
   CHECK(port.hpd(sink, true, true, 4) == Hotplug::Active);
   CHECK(sink.irqReads == 1 && sink.starts == 1 && !sink.teardowns);
+  CHECK(port.lastIrq().linkHealthy && port.lastIrq().serviceVector == 4 && !sink.countReads);
 
   sink.irqStatus = {0x17, 0, 1};  // second active lane lost equalization
   sink.edid = wireEdid({baseBlock(k1080p60)});
@@ -817,6 +1118,7 @@ static void testHotplug()
   CHECK(port.hpd(sink, true, false, 2) == Hotplug::Active);
   CHECK(port.link().lanes == 2 && port.modes().count == 1 && port.modes().modes[0].pixelHz == 297000000);
   CHECK(port.hpd(sink, false, true, 2) == Hotplug::Disconnected && sink.teardowns == 3);
+  CHECK(!port.lastIrq().serviceVector && !port.lastIrq().linkHealthy);
   checkParked(port, sink);
   CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected && sink.teardowns == 3);
 
@@ -841,7 +1143,8 @@ static void testHotplugErrors()
     sink.edidReplies.assign(kDpEdidAuxAttempts, reply);
     const unsigned attempts = reply == Aux::Defer || reply == Aux::Timeout ? kDpEdidAuxAttempts : 1;
     CHECK(port.hpd(sink, true, false, 4) == Hotplug::EdidAuxError);
-    CHECK(sink.edidReads == attempts && sink.delays.size() == attempts - 1 && !sink.reads && !sink.starts && sink.teardowns == 1);
+    CHECK(sink.edidReads == attempts && sink.delays.size() == attempts - 1 && sink.reads == 1 &&
+          !sink.starts && sink.teardowns == 1);
     checkParked(port, sink);
     CHECK(port.hpd(sink, true, false, 4) == Hotplug::EdidAuxError && sink.edidReads == attempts);
     CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected && sink.teardowns == 1);
@@ -850,11 +1153,11 @@ static void testHotplugErrors()
   HotplugSink sink{{{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}};
   sink.edid = wireEdid({baseBlock(k1080p60, kEdidMaxBlocks)});
   CHECK(port.hpd(sink, true, false, 2) == Hotplug::BadEdid);
-  CHECK(sink.edidReads == 8 && !sink.reads);
+  CHECK(sink.edidReads == 8 && sink.reads == 1);
   checkParked(port, sink);
   sink.edid = wireEdid({baseBlock(k1080p60)});
-  ++sink.edid[127];
-  CHECK(port.hpd(sink, true, true, 2) == Hotplug::BadEdid && !sink.reads);
+  sink.edid[126] = 1; // corrupt the checksum and make the extension count plausible
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::BadEdid && sink.edidReads == 16 && sink.reads == 2);
   checkParked(port, sink);
 
   sink.edid = wireEdid({baseBlock(k4k60Cta)});
@@ -873,6 +1176,80 @@ static void testHotplugErrors()
   CHECK(port.hpd(sink, true, true, 2) == Hotplug::TrainFailed && sink.irqReads == 1 && sink.faults[0].used);
   checkParked(port, sink);
   CHECK(port.hpd(sink, false, true, 0) == Hotplug::Disconnected && sink.teardowns == 6);
+}
+
+static void testHpdIrq()
+{
+  const std::array<uint8_t, 8> bytes{0xc1, 0xff, 0x77, 0x07, 0xc1, 0, 0xff, 0xff};
+  DpHpdIrq irq;
+  CHECK(parseDpHpdIrq(bytes.data(), bytes.size(), 0x11, 2, irq));
+  CHECK(irq.sinkCount == 1 && irq.serviceVector == 0x4f && irq.contentProtectionReady &&
+        irq.downstreamChanged && irq.linkStatusUpdated && irq.linkHealthy);
+  CHECK(parseDpHpdIrq(bytes.data(), bytes.size(), 0x12, 4, irq));
+  CHECK(irq.sinkCount == 65 && irq.serviceVector == 0x7f && !irq.linkHealthy);
+  CHECK(!parseDpHpdIrq(bytes.data(), bytes.size(), 0x14, 0, irq));
+  CHECK(!irq.serviceVector && !irq.sinkCount && !irq.linkHealthy);
+  CHECK(!parseDpHpdIrq(nullptr, bytes.size(), 0x14, 4, irq));
+  for (size_t length = 0; length < bytes.size(); ++length) {
+    const std::vector<uint8_t> shortStatus(bytes.begin(), bytes.begin() + length);
+    CHECK(!parseDpHpdIrq(shortStatus.data(), shortStatus.size(), 0x14, 4, irq));
+  }
+  CHECK(dpSinkCount(0xff, 0x14) == 127 && dpSinkCount(0x40, 0x14) == 0);
+}
+
+static void testBranchHotplug()
+{
+  DpHotplug port;
+  HotplugSink sink{{{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}, {{kDpHbr2Khz, 2}}};
+  sink.caps[5] = 0x15; // TMDS branch, detailed port caps
+  sink.caps[7] = 2;
+  sink.sinkCount = 0x40; // CP_READY alone means zero sinks
+  sink.edid = wireEdid({baseBlock(k1080p60)});
+  CHECK(port.hpd(sink, true, false, 2) == Hotplug::NoSink);
+  CHECK(sink.countReads == 1 && !sink.edidReads && !sink.starts && sink.teardowns == 1);
+  checkParked(port, sink);
+  CHECK(port.hpd(sink, true, false, 2) == Hotplug::NoSink && sink.countReads == 1);
+
+  sink.sinkCount = 0x81; // 65, not 1
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::UnsupportedTopology);
+  CHECK(sink.countReads == 2 && !sink.edidReads && !sink.starts && sink.teardowns == 2);
+  checkParked(port, sink);
+  sink.sinkCount = 1;
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active);
+  CHECK(sink.countReads == 3 && sink.starts == 1 && sink.edidReads == 8);
+
+  sink.irqVector = 0x22; // service requests do not change the host SST policy
+  sink.irqStatus[2] = 0x81; // LINK_STATUS_UPDATED while the link is healthy
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active);
+  CHECK(port.lastIrq().serviceVector == 0x22 && port.lastIrq().linkStatusUpdated);
+  CHECK(sink.starts == 1 && sink.teardowns == 2);
+  sink.irqStatus[2] = 0; // both lanes still equalized but alignment lost
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active);
+  CHECK(sink.starts == 2 && sink.teardowns == 3 && sink.countReads == 4);
+
+  sink.irqStatus[2] = 0x41; // downstream changed even though count and link are stable
+  sink.edid = wireEdid({baseBlock(k1440p60)});
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active);
+  CHECK(port.lastIrq().downstreamChanged && port.lastIrq().linkHealthy);
+  CHECK(sink.starts == 3 && sink.teardowns == 4 && sink.countReads == 5);
+  CHECK(port.modes().count == 1 && port.modes().modes[0].pixelHz == 241500000);
+
+  sink.sinkCount = 0;
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::NoSink);
+  CHECK(sink.starts == 3 && sink.teardowns == 5 && sink.countReads == 5 && sink.edidReads == 24);
+  checkParked(port, sink);
+  CHECK(port.hpd(sink, false, false, 0) == Hotplug::Disconnected && sink.teardowns == 5);
+
+  sink.countReply = Aux::ShortTransfer;
+  CHECK(port.hpd(sink, true, false, 2) == Hotplug::TrainFailed);
+  CHECK(sink.edidReads == 24 && sink.teardowns == 6);
+  checkParked(port, sink);
+  sink.countReply = Aux::Ack;
+  sink.sinkCount = 1;
+  CHECK(port.hpd(sink, true, true, 2) == Hotplug::Active);
+  CHECK(sink.starts == 4 && sink.irqReads == 4 && sink.countReads == 7);
+  CHECK(port.hpd(sink, false, true, 0) == Hotplug::Disconnected && sink.teardowns == 7);
+  checkParked(port, sink);
 }
 
 static void testQmpTables()
@@ -908,7 +1285,7 @@ static void testQmpTables()
       }
     }
   }
-  for (uint32_t rate : {0u, kDpRbrKhz - 1, kDpHbr2Khz + 1, 810000u, UINT32_MAX}) {
+  for (uint32_t rate : {0u, kDpRbrKhz - 1, kDpHbr2Khz + 1, kDpHbr3Khz, UINT32_MAX}) {
     CHECK(lookupDpQmpPhy(kDpHbr2Khz, {1, 0}, settings));
     CHECK(!lookupDpQmpPhy(rate, {0, 0}, settings));
     CHECK(!settings.rate && !settings.swing && !settings.preemphasis);
@@ -922,15 +1299,21 @@ int main()
 {
   testEdidTimings();
   testMalformedEdid();
+  testHdmiVsdb();
+  testDisplayId();
   testModeBudget();
   testTrainSuccess();
   testTrainFallback();
   testTrainErrors();
+  testReceiverCaps();
   testMsaTu();
+  testBandwidthMatrix();
   testExternalModes();
   testHotplug();
   testHotplugErrors();
+  testHpdIrq();
+  testBranchHotplug();
   testQmpTables();
-  std::printf("PianoDp D0/D1/D6 host tests: %s\n", failures ? "failed" : "passed");
+  std::printf("PianoDp D0/D1/D2/D6 host tests: %s\n", failures ? "failed" : "passed");
   return failures != 0;
 }

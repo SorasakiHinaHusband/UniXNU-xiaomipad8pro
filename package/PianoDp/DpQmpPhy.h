@@ -6,6 +6,8 @@
 
 namespace pianodp {
 
+static_assert(piano_dp_qmp_piano_max_mbps * 100u == kPianoDpMaxRateKhz);
+
 struct DpQmpPhySettings {
   const PianoDpQmpRate *rate = nullptr;
   uint8_t swing = 0, preemphasis = 0;
@@ -14,7 +16,7 @@ struct DpQmpPhySettings {
 constexpr bool lookupDpQmpPhy(uint32_t rateKhz, DpDrive drive, DpQmpPhySettings &out)
 {
   out = {};
-  if (!validDpLink({rateKhz, 1}) || rateKhz > piano_dp_qmp_piano_max_mbps * 100u ||
+  if (!validDpLink({rateKhz, 1}) || rateKhz > kPianoDpMaxRateKhz ||
       drive.swing > 3 || drive.preemphasis > 3 - drive.swing)
     return false;
 

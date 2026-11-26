@@ -31,18 +31,20 @@ struct DpExternalModes {
 
 constexpr uint32_t kDpExternalMaxPixelKhz = 594000;  // CTA UHD at 60 Hz
 
-// Keep DTDs (including the base preferred timing) before CTA VICs, in EDID
+// Keep detailed timings (including the base preferred timing) before VICs, in EDID
 // order within each group. Identical rasters, clocks and syncs share an ID.
 inline DpExternalModes buildDpExternalModes(const EdidInfo &edid, DpLink link, DpPixelFormat format)
 {
   DpExternalModes table;
-  if (format != DpPixelFormat::Rgb8 || !validDpLink(link) || edid.modeCount > EdidInfo::kMaxModes) return table;
+  if (format != DpPixelFormat::Rgb8 || !validDpLink(link) || link.rateKhz > kPianoDpMaxRateKhz ||
+      edid.modeCount > EdidInfo::kMaxModes || edid.tile.multiTile()) return table;
 
   for (unsigned source = 0; source < 2; ++source) {
     for (size_t i = 0; i < edid.modeCount; ++i) {
       const EdidMode &mode = edid.modes[i];
       const DpTiming &t = mode.timing;
-      if (unsigned(mode.vic != 0) != source || !validFakeRaster(t.hActive, t.vActive) || t.pixelKhz > kDpExternalMaxPixelKhz)
+      if (unsigned(mode.vic != 0) != source || !mode.rgb || !validFakeRaster(t.hActive, t.vActive) ||
+          t.pixelKhz > kDpExternalMaxPixelKhz)
         continue;
       DpMsaTu stream;
       if (!computeDpMsaTu(t, link, stream)) continue;

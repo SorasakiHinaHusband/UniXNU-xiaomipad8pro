@@ -7,6 +7,7 @@ namespace pianodp {
 
 enum class DpAuxStatus : uint8_t { Ack, Nack, Timeout, Defer, ShortTransfer, IoError };
 enum class DpTrainingPattern : uint8_t { Disabled, Tps1, Tps2, Tps3, Tps4 };
+enum class DpDownstreamPort : uint8_t { None, DisplayPort, Analog, Tmds, Other };
 
 struct DpReceiverCaps {
   uint8_t revision = 0;
@@ -15,6 +16,13 @@ struct DpReceiverCaps {
   unsigned crDelayUs = 0, eqDelayUs = 0;
   bool enhancedFraming = false, downspread = false;
   DpTrainingPattern eqPattern = DpTrainingPattern::Tps2;
+  DpDownstreamPort downstream = DpDownstreamPort::None;
+  uint8_t downstreamPorts = 0;
+  bool detailedPortCaps = false;
+  bool edpAlternateScrambler = false, edpFramingChange = false, edpDisplayControl = false, edpMsaIgnored = false;
+  bool extendedCapsPresent = false;
+
+  constexpr bool hasSinkCount() const { return revision >= 0x11 && downstream != DpDownstreamPort::None; }
 };
 
 constexpr size_t kDpReceiverCapBytes = 16;
@@ -22,19 +30,22 @@ constexpr size_t kDpReceiverCapBytes = 16;
 inline bool parseDpReceiverCaps(const uint8_t *dpcd, size_t length, DpReceiverCaps &caps)
 {
   caps = {};
-  if (!dpcd || length < kDpReceiverCapBytes || dpcd[0] < 0x10) return false;
+  if (!dpcd || length < kDpReceiverCapBytes) return false;
+  const uint8_t revision = dpcd[0];
+  if (revision < 0x10 || revision >= 0x30 || (revision & 15) > 9) return false;
+  if ((dpcd[6] & 3) == 2) return false; // receiver advertises only 128b/132b coding
   uint32_t rate;
   switch (dpcd[1]) {
     case 0x06: rate = kDpRbrKhz; break;
     case 0x0a: rate = kDpHbrKhz; break;
     case 0x14: rate = kDpHbr2Khz; break;
-    case 0x1e: rate = 810000; break;
+    case 0x1e: rate = kDpHbr3Khz; break;
     default: return false;
   }
   const unsigned lanes = dpcd[2] & 0x1f;
   const unsigned interval = dpcd[14] & 0x7f;
   if (!validDpLaneCount(lanes) || interval > 4) return false;
-  caps.revision = dpcd[0];
+  caps.revision = revision;
   caps.maxRateKhz = rate;
   caps.maxLanes = lanes;
   caps.crDelayUs = caps.revision >= 0x14 || !interval ? 100 : interval * 4000;
@@ -43,6 +54,16 @@ inline bool parseDpReceiverCaps(const uint8_t *dpcd, size_t length, DpReceiverCa
   caps.downspread = dpcd[3] & 1;
   if (caps.revision >= 0x14 && (dpcd[3] & 0x80)) caps.eqPattern = DpTrainingPattern::Tps4;
   else if (caps.revision >= 0x12 && (dpcd[2] & 0x40)) caps.eqPattern = DpTrainingPattern::Tps3;
+  if (dpcd[5] & 1) {
+    caps.downstream = DpDownstreamPort(1 + ((dpcd[5] >> 1) & 3));
+    caps.downstreamPorts = dpcd[7] & 15;
+    caps.detailedPortCaps = dpcd[5] & 0x10;
+  }
+  caps.edpAlternateScrambler = dpcd[13] & 1;
+  caps.edpFramingChange = dpcd[13] & 2;
+  caps.edpDisplayControl = dpcd[13] & 8;
+  caps.edpMsaIgnored = dpcd[7] & 0x40;
+  caps.extendedCapsPresent = dpcd[14] & 0x80;
   return true;
 }
 
@@ -74,10 +95,32 @@ struct DpTrainResult {
 
 namespace dp_train_detail {
 
-constexpr uint32_t kReceiverCaps = 0x000, kLinkConfig = 0x100, kPatternSet = 0x102, kLaneSet = 0x103;
+constexpr uint32_t kReceiverCaps = 0x000, kExtendedReceiverCaps = 0x2200;
+constexpr uint32_t kLinkConfig = 0x100, kPatternSet = 0x102, kLaneSet = 0x103;
 constexpr uint32_t kDownspreadCtrl = 0x107, kLinkStatus = 0x202;
 constexpr unsigned kCrDone = 1, kEqDone = 7, kAlignDone = 1;
-constexpr unsigned kCrTriesPerSwing = 4, kEqTries = 6, kMaxAttempts = 4;
+constexpr unsigned kCrTriesPerSwing = 4, kEqTries = 6;
+
+template <typename Io>
+bool readReceiverCaps(Io &io, DpReceiverCaps &caps, DpAuxStatus &aux)
+{
+  caps = {};
+  uint8_t base[kDpReceiverCapBytes]{};
+  aux = io.auxRead(kReceiverCaps, base, sizeof base);
+  if (aux != DpAuxStatus::Ack) return false;
+  // The base revision can be older than the actual receiver revision.
+  if (base[14] & 0x80) {
+    uint8_t extended[kDpReceiverCapBytes]{};
+    aux = io.auxRead(kExtendedReceiverCaps, extended, sizeof extended);
+    if (aux != DpAuxStatus::Ack) return false;
+    if (extended[0] >= base[0]) {
+      const bool valid = parseDpReceiverCaps(extended, sizeof extended, caps);
+      caps.extendedCapsPresent = valid;
+      return valid;
+    }
+  }
+  return parseDpReceiverCaps(base, sizeof base, caps);
+}
 
 constexpr uint8_t dpcdPattern(DpTrainingPattern pattern)
 {
@@ -92,14 +135,15 @@ constexpr uint8_t dpcdLaneSet(DpDrive drive)
                  (drive.preemphasis << 3) | (drive.preemphasis == 3 - drive.swing ? 0x20 : 0));
 }
 
-inline bool allLanesHaveStatus(const uint8_t (&status)[6], unsigned lanes, unsigned bits)
+inline bool allLanesHaveStatus(const uint8_t *status, unsigned lanes, unsigned bits)
 {
+  if (!validDpLaneCount(lanes)) return false;
   for (unsigned lane = 0; lane < lanes; ++lane)
     if (((status[lane / 2] >> (4 * (lane % 2))) & bits) != bits) return false;
   return true;
 }
 
-inline bool linkEqualized(const uint8_t (&status)[6], unsigned lanes)
+inline bool linkEqualized(const uint8_t *status, unsigned lanes)
 {
   return (status[2] & kAlignDone) && allLanesHaveStatus(status, lanes, kEqDone);
 }
@@ -193,50 +237,45 @@ struct TrainAttempt {
   }
 };
 
+template <typename Io>
+DpTrainResult trainWithCaps(Io &io, unsigned pinLanes, const DpReceiverCaps &caps)
+{
+  DpTrainResult result{.status = DpTrainStatus::InvalidCaps, .link = {},
+                       .enhancedFraming = caps.enhancedFraming, .downspread = caps.downspread};
+  constexpr uint32_t rates[] = {kDpHbr2Khz, kDpHbrKhz, kDpRbrKhz};
+  static_assert(rates[0] == kPianoDpMaxRateKhz);
+  const unsigned maxLanes = pinLanes < caps.maxLanes ? pinLanes : caps.maxLanes;
+  // Check lower rates before dropping lanes, including when CR passes but EQ fails.
+  for (unsigned lanes = maxLanes; lanes; lanes /= 2) {
+    for (const uint32_t rate : rates) {
+      if (rate > caps.maxRateKhz) continue;
+      result.link = {rate, lanes};
+      ++result.attempts;
+      result.status = TrainAttempt<Io>{io, result, caps}.run();
+      if (result.status != DpTrainStatus::ClockRecoveryFailed &&
+          result.status != DpTrainStatus::ChannelEqualizationFailed) return result;
+    }
+  }
+  return result;
+}
+
 } // namespace dp_train_detail
 
 // Io supplies auxRead/auxWrite(addr, buf, len) returning DpAuxStatus (Ack means
 // the full length), setPhy(rateKhz, lanes, swing, preemphasis) returning bool,
 // setPattern(DpTrainingPattern) and delayUs(us). The adapter owns power and timing
-// prerequisites. The model performs one direct sink's native AUX training.
+// prerequisites. The model trains one upstream link within piano's HBR2 cap.
 template <typename Io>
 DpTrainResult trainDpLink(Io &io, unsigned pinLanes)
 {
-  using namespace dp_train_detail;
   DpTrainResult result{.status = DpTrainStatus::InvalidPinLanes, .link = {}};
   if (!validDpLaneCount(pinLanes)) return result;
-
-  uint8_t bytes[kDpReceiverCapBytes]{};
-  result.auxStatus = io.auxRead(kReceiverCaps, bytes, sizeof bytes);
-  if (result.auxStatus != DpAuxStatus::Ack) {
-    result.status = DpTrainStatus::AuxError;
-    return result;
-  }
   DpReceiverCaps caps;
-  if (!parseDpReceiverCaps(bytes, sizeof bytes, caps)) {
-    result.status = DpTrainStatus::InvalidCaps;
+  if (!dp_train_detail::readReceiverCaps(io, caps, result.auxStatus)) {
+    result.status = result.auxStatus == DpAuxStatus::Ack ? DpTrainStatus::InvalidCaps : DpTrainStatus::AuxError;
     return result;
   }
-  const uint32_t maxRate = caps.maxRateKhz < kDpHbr2Khz ? caps.maxRateKhz : kDpHbr2Khz;
-  DpLink link{maxRate, pinLanes < caps.maxLanes ? pinLanes : caps.maxLanes};
-  result.enhancedFraming = caps.enhancedFraming;
-  result.downspread = caps.downspread;
-
-  while (result.attempts < kMaxAttempts) {
-    result.link = link;
-    ++result.attempts;
-    result.status = TrainAttempt<Io>{io, result, caps}.run();
-    if (result.status == DpTrainStatus::ClockRecoveryFailed && link.rateKhz > kDpRbrKhz) {
-      link.rateKhz = link.rateKhz == kDpHbr2Khz ? kDpHbrKhz : kDpRbrKhz;
-    } else if ((result.status == DpTrainStatus::ClockRecoveryFailed ||
-                result.status == DpTrainStatus::ChannelEqualizationFailed) && link.lanes > 1) {
-      link.lanes /= 2;
-      link.rateKhz = maxRate;  // reference ladder restarts the rate search on the narrower link
-    } else {
-      break;
-    }
-  }
-  return result;
+  return dp_train_detail::trainWithCaps(io, pinLanes, caps);
 }
 
 struct DpMsaTu {
@@ -256,17 +295,12 @@ struct DpMsaTu {
 constexpr bool computeDpMsaTu(const DpTiming &mode, DpLink link, DpMsaTu &out)
 {
   out = {};
-  if (!edidModeFits(mode, link) || mode.interlaced || !mode.separateSync ||
-      mode.hSyncWidth > 0x7fff || mode.vSyncWidth > 0x7fff)
-    return false;
+  if (!dpStreamFits(mode, link)) return false;
 
-  constexpr uint8_t tuSize = 64;
-  constexpr uint32_t nvid = 0x8000;
-  const uint64_t mvid = (uint64_t(mode.pixelKhz) * nvid + link.rateKhz / 2) / link.rateKhz;
-  const uint64_t tuNumerator = uint64_t(mode.pixelKhz) * kDpRgb8BitsPerPixel * tuSize;
-  const uint32_t tuDenominator = uint32_t(payloadMbps(link.lanes, link.rateKhz / 100) * 1000);
+  const uint64_t mvid = (uint64_t(mode.pixelKhz) * kDpNvid + link.rateKhz / 2) / link.rateKhz;
+  const uint64_t tuNumerator = uint64_t(mode.pixelKhz) * kDpRgb8BitsPerPixel * kDpTuSize;
+  const uint32_t tuDenominator = dpLinkPayloadKbps(link);
   const uint64_t validSymbols = (tuNumerator + tuDenominator - 1) / tuDenominator;
-  if (!mvid || mvid > 0xffffff || validSymbols > tuSize - 2u) return false; // allow FS and FE in each full TU
 
   out.hTotal = uint16_t(mode.hActive + mode.hBlank);
   out.vTotal = uint16_t(mode.vActive + mode.vBlank);
@@ -282,8 +316,8 @@ constexpr bool computeDpMsaTu(const DpTiming &mode, DpLink link, DpMsaTu &out)
   out.vSyncPositive = mode.vSyncPositive;
   out.misc0 = 0x20;  // 8 bpc, RGB, asynchronous clock
   out.mvid = uint32_t(mvid);
-  out.nvid = nvid;
-  out.tuSize = tuSize;
+  out.nvid = kDpNvid;
+  out.tuSize = kDpTuSize;
   out.validSymbols = uint8_t(validSymbols);
   out.validSymbolsFloor = uint8_t(tuNumerator / tuDenominator);
   out.validSymbolsNumerator = uint32_t(tuNumerator % tuDenominator);
