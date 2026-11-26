@@ -302,6 +302,7 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
     const uintptr_t irq = io.irqOff();
     wr(intfReg(2, kIntfEn), 1);
     io.irqRestore(irq);
+    trace.sample(io);
   } else if (!on1 && on2) {
     wr(intfReg(1, kIntfEn), 1);
     phase = "INTF1 started beside a running INTF2: the halves may be out of phase";

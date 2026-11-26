@@ -257,10 +257,10 @@ bool waitLines(Io &io, unsigned lo, unsigned hi, unsigned vtotal, uint32_t timeo
   for (;;) {
     const uint64_t pa = intfReg(1, kIntfLineCount);
     const uint32_t line = io.rd(pa);
-    const bool inRange = line >= lo && line <= hi;
-    if (inRange || io.nowUs() >= end) {
+    if (line >= lo && line <= hi) return true;  // the caller may need to issue a store within this window
+    if (io.nowUs() >= end) {
       poll.sample(io, {pa, line});
-      return inRange;
+      return false;
     }
     const uint64_t lines = line < lo ? lo - line : (line < vtotal ? vtotal - line : 0) + lo;
     const uint64_t us = lines * lineNs / 1000;

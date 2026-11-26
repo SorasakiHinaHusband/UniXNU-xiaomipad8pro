@@ -303,6 +303,20 @@ struct TraceIo : model::Dpu {
   }
 };
 
+struct LateAlignmentIo : TraceIo {
+  bool forceLate = true;
+
+  uint32_t rd(uint64_t pa)
+  {
+    if (forceLate && pa == intfReg(1, kIntfLineCount) && (ctlFlush & kFlushIntf) && intf[1].on && !intf[2].on) {
+      forceLate = false;
+      const uint64_t late = intf[1].start + 3 * kLineNs - 1000;
+      advanceTo(late > ns ? late : late + frameNs(1));
+    }
+    return TraceIo::rd(pa);
+  }
+};
+
 static Result replayY12n(TraceIo &m, bool dropped, TraceRing *ring)
 {
   m.blockDma = false;
@@ -457,16 +471,18 @@ static void testFailures()
     CHECK(m.firstStore(intfReg(1, kIntfEn), 0) < 0);   // the master was never stopped
   }
   {   // INTF1 does not stop: INTF2 (stopped) started again at INTF1's frame start, in phase; the panel back
-    TraceIo m;
+    LateAlignmentIo m;
     TraceRing ring;
     m.engineStuck[0] = true;
     m.sleepMs(3);
     const Result r = panelOff(m, readPath(m), Options(), &ring);
     CHECK(!r.ok && r.step == 4 && r.restored && m.desync == 0 && m.intf[1].on && m.intf[2].on && m.half[1].displayOn);
+    const int enable = m.firstStore(intfReg(2, kIntfEn), 1);
+    CHECK(!m.forceLate && enable >= 0 && m.stores[enable].line <= 2);
     const TraceSample *lastAlign = nullptr;
     for (unsigned i = 0; i < ring.size(); ++i)
       if (ring.at(i).step == TraceStep::align) lastAlign = &ring.at(i);
-    CHECK(lastAlign && !lastAlign->boundary && lastAlign->link[0].line <= 2 && lastAlign->link[1].status == 0);
+    CHECK(lastAlign && !lastAlign->boundary && lastAlign->link[1].en == 1);
     CHECK(m.maxPollOverrunNs == 0);
   }
   {   // the engines do not start at the wake: reported, no DCS sent into a stopped link
