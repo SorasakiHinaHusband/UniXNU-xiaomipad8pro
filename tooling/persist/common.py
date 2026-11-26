@@ -2,12 +2,14 @@
 (package/NativeUfs, package/NativeRamBlock/PersistOverlay.h), the seed identity NativeRamBlock writes into the store header, a small
 independent FAT32 reader for checking the ESP image, and build-ram-images.py loaded as a module (K27_ARGS, kernel_field, mkbootimg).
 Nothing here touches a device."""
+import contextlib
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import struct
+import tempfile
 import zlib
 from pathlib import Path
 
@@ -604,6 +606,8 @@ def kc_has_store_guard(kc):
 def fat32_read(image):
     data = Path(image).read_bytes() if not isinstance(image, (bytes, bytearray)) else image
     bs = data[:512]
+    if len(bs) != 512:
+        return {'files': {}, 'problems': ['truncated FAT32 boot sector']}
     (sector, spc, reserved, nfats, root_entries, small, media, fat16_len, _spt, _heads, hidden, big,
      fat_len, ext_flags, fs_version, root_cluster, fsinfo, backup) = struct.unpack_from('<HBHBHHBHHHIIIHHIHH', bs, 11)
     problems = []
@@ -613,15 +617,25 @@ def fat32_read(image):
         problems.append(f'sector size {sector}')
     if spc & (spc - 1) or not spc:
         problems.append(f'sectors per cluster {spc}')
+    if not reserved or not nfats or not fat_len:
+        problems.append('missing reserved sectors or FAT')
     if fat16_len or root_entries or fs_version or ext_flags & 0x80 or media < 0xf8:
         problems.append('not a mirrored FAT32 EDK2 mounts (FsVersion 0, ExtendedFlags bit 7 clear, media >= 0xf8)')
     sectors = small or big
     first_data = reserved + nfats * fat_len
+    if first_data >= sectors or sectors * sector > len(data):
+        problems.append('FAT32 layout exceeds the image or leaves no data sectors')
+    if problems:
+        return {'files': {}, 'problems': problems}
     clusters = (sectors - first_data) // spc
     if clusters < 65525:
         problems.append(f'{clusters} clusters: too few for FAT32')
     if fat_len * sector // 4 < clusters + 2:
         problems.append('FAT shorter than the cluster count')
+    if not 2 <= root_cluster < clusters + 2:
+        problems.append('root cluster outside the data region')
+    if problems:
+        return {'files': {}, 'problems': problems}
     info = data[fsinfo * sector:fsinfo * sector + 512]
     if info[:4] != b'RRaA' or info[484:488] != b'rrAa' or info[508:512] != b'\x00\x00\x55\xaa':
         problems.append('FSInfo signatures')
@@ -633,23 +647,29 @@ def fat32_read(image):
 
     def chain(first):
         out, c, seen = [], first, set()
-        while 2 <= c < 0x0ffffff8:
-            if c in seen or c >= clusters + 2:
+        while True:
+            if c in seen or not 2 <= c < min(clusters + 2, 0x0ffffff0):
                 problems.append(f'bad cluster chain at {c}')
                 break
             seen.add(c)
             out.append(c)
             c = struct.unpack_from('<I', fat, c * 4)[0] & 0x0fffffff
+            if c >= 0x0ffffff8:
+                break
         return out
 
     def read(first, size=None):
         blob = b''.join(data[(first_data + (c - 2) * spc) * sector:(first_data + (c - 1) * spc) * sector] for c in chain(first))
         return blob if size is None else blob[:size]
 
-    files, label = {}, None
+    files, label, directories = {}, None, set()
 
-    def walk(cluster, prefix):
+    def walk(cluster, prefix, depth=0):
         nonlocal label
+        if cluster in directories or depth > 64:
+            problems.append(f'repeated or deeply nested directory at cluster {cluster}')
+            return
+        directories.add(cluster)
         raw, lfn = read(cluster), []
         for off in range(0, len(raw), 32):
             e = raw[off:off + 32]
@@ -676,7 +696,7 @@ def fat32_read(image):
             first = struct.unpack_from('<H', e, 20)[0] << 16 | struct.unpack_from('<H', e, 26)[0]
             size = struct.unpack_from('<I', e, 28)[0]
             if attr & 0x10:
-                walk(first, prefix + name + '/')
+                walk(first, prefix + name + '/', depth + 1)
             else:
                 content = read(first, size) if size else b''
                 if len(content) != size:
@@ -692,3 +712,33 @@ def fat32_read(image):
 
 def write_json(path, obj):
     Path(path).write_text(json.dumps(obj, indent=2) + '\n')
+
+
+def checked_esp_base(record_path, record):
+    image = record_path.with_name(record['image'])
+    size = ESP_BLOCKS * LBA
+    if not image.is_file():
+        raise SystemExit(f'{image}: base ESP image is missing')
+    if image.stat().st_size != size or record.get('bytes') != size:
+        raise SystemExit(f'{image}: base ESP image and record must both be {size} bytes')
+    if sha(image) != record['sha256']:
+        raise SystemExit(f'{image}: not the image its record {record_path.name} names')
+    return image
+
+
+@contextlib.contextmanager
+def stage_esp_output(out, name, base_image, base_record):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
+        raise SystemExit('the output name must be a single file stem')
+    image, record = out / f'{name}.img', out / f'{name}.json'
+    inputs = {base_image.resolve(), base_record.resolve()}
+    if image.resolve() in inputs or record.resolve() in inputs:
+        raise SystemExit('the ESP output would overwrite the rollback base')
+    if image.is_dir() or record.is_dir():
+        raise SystemExit('an ESP output path is a directory')
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.esp-output-', dir=out) as scratch:
+        staged = Path(scratch) / image.name
+        yield staged
+        staged.replace(image)
+        staged.with_suffix('.json').replace(record)

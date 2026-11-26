@@ -268,6 +268,20 @@ class VerifyRoot(unittest.TestCase):
                 vr.main([str(tmp), '--pins', str(pins), '--quick'])
             self.assertIn('block 0', out.getvalue())
 
+    def test_full_verification_checks_padding_against_recorded_image_hash(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            pins = self.build(tmp)
+            with (tmp / 'root.img').open('r+b') as image:
+                image.seek(-1, os.SEEK_END)
+                image.write(b'\x01')
+            args = [str(tmp), '--pins', str(pins)]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(vr.main([*args, '--quick']), 0)
+            with redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+                vr.main(args)
+            self.assertIn('root.json image_sha256', out.getvalue())
+
 
 def gpt_head(parts, blocks, lba=4096):
     """A protective MBR + GPT header + entries (6 blocks) with PARTS [(number, name, first, last)]."""

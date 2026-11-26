@@ -132,6 +132,22 @@ class ReleaseAssets(unittest.TestCase):
         self.write_build_sums(BINARIES[:2])
         self.assert_refused('expected one checksum for each kernel and the kext archive')
 
+    def test_rejects_duplicate_and_outside_checksum_paths(self):
+        for names in ((*BINARIES, KERNEL), (*BINARIES[:2], f'../{self.assets.name}/{BINARIES[2]}')):
+            with self.subTest(names=names):
+                self.write_build_sums(names)
+                self.assert_refused('expected one checksum for each kernel and the kext archive')
+
+    def test_repeat_release_is_byte_identical(self):
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before = {p.name: p.read_bytes() for p in self.assets.iterdir()}
+        for path in self.assets.iterdir():
+            os.utime(path, (1, 1))
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({p.name: p.read_bytes() for p in self.assets.iterdir()}, before)
+
     def test_rejects_changed_binary(self):
         (self.assets / KERNEL).write_bytes(macho(2) + b'changed')
         self.assert_refused(f'{KERNEL}: FAILED')

@@ -5,6 +5,10 @@ import argparse
 from collections import defaultdict
 import importlib.util
 import json
+import struct
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
@@ -78,6 +82,9 @@ def test_boundaries():
     plain = 'f' * (999 - reserve)
     assert ram.boot_entry_args(ba, [plain])[1:] == (plain + ' ' + SMP, [])
     refused('the builder allows 999', ram.boot_entry_args, ba, [plain + 'f'])
+    refused('the builder allows 999', ba.fit, ['é' * 500], 'ram')
+    refused('embedded NUL', ba.fit, ['piano-test=a\0b'], 'ram')
+    assert esp.split_line('plain=1', force=True) == ('plain=1', None)
 
     # 0066's limit includes the selector, space and reserved CPU suffix.
     tail_word = 'piano-test=' + 'z' * (4095 - len(' '.join([OPT_IN, 'piano-boot-args=ram', SMP, 'piano-test='])))
@@ -88,6 +95,35 @@ def test_boundaries():
     assert check_layout(daily, got, 'macos', [OPT_IN, SMP, tail_word[:-2]])[0] == 4095
     assert not esp.diag_budget(esp.diag_line(daily, 240), len(' '.join(got)))['included']
     print('PASS limits, opt-out, required readers, duplicate ordering and ADT round trip')
+
+
+def test_adt_bounds():
+    adt = ba.with_set(ba.tiny_adt(), 'ram', 'piano-test=1')
+    refused('truncated ADT property value or padding', ba.sets, adt[:-1])
+    refused('invalid ADT node header', ba.sets, adt[:7])
+    refused('byte for byte', ba.sets, adt + b'\0')
+    root = ba.load(adt)
+    props, _ = ba.chosen(root)
+    props.append(props[-1])
+    duplicate = ba.serialize(root)
+    refused('duplicate piano-boot-args-ram', ba.sets, duplicate)
+    refused('duplicate piano-boot-args-ram', ba.merged, 'piano-boot-args=ram', duplicate)
+    refused('truncated ADT property header', ba.sets, struct.pack('<II', 1, 0) + bytes(35))
+
+
+def test_identity_overlay():
+    root = ba.load(ba.tiny_adt())
+    root[1].append([[['name', 8, b'product\0', None]], []])
+    with tempfile.TemporaryDirectory() as scratch:
+        source = Path(scratch) / 'in.adt'
+        output = Path(scratch) / 'out.adt'
+        source.write_bytes(ba.serialize(root))
+        result = subprocess.run([sys.executable, str(ROOT / 'tooling/adt/set-identity.py'),
+                                 str(source), str(output), '--identity', 'piano'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        props, _ = ba.load(output.read_bytes())
+        values = {name: value for name, _, value, _ in props}
+        assert values['compatible'] == b'PianoAP\0'
 
 
 def test_qual(record):
@@ -145,6 +181,9 @@ def main():
     parser.add_argument('--daily-record', type=Path, help='record from an existing k27.3 daily ESP')
     args = parser.parse_args()
     test_boundaries()
+    test_adt_bounds()
+    ba.test_userland_visibility()
+    test_identity_overlay()
     if args.qual_record:
         test_qual(args.qual_record)
     if args.daily_record:

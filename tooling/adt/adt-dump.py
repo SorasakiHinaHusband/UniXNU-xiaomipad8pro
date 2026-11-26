@@ -9,19 +9,26 @@ import hashlib, struct, sys
 
 VOLATILE = {'random-seed', 'unique-chip-id'}
 
-def parse(data, offset=0):
+def parse(data, offset=0, depth=0):
+    if depth > 64 or not 0 <= offset <= len(data) - 8:
+        raise ValueError('invalid ADT node header or nesting depth')
     nprops, nchildren = struct.unpack_from('<II', data, offset)
     offset += 8
     props = []
     for _ in range(nprops):
+        if len(data) - offset < 36:
+            raise ValueError('truncated ADT property header')
         name = data[offset:offset + 32].split(b'\0', 1)[0].decode(errors='replace')
         size = struct.unpack_from('<I', data, offset + 32)[0] & 0x7fffffff
+        end = offset + 36 + ((size + 3) & ~3)
+        if end > len(data):
+            raise ValueError('truncated ADT property value or padding')
         value = data[offset + 36:offset + 36 + size]
-        offset += 36 + ((size + 3) & ~3)
+        offset = end
         props.append((name, value))
     children = []
     for _ in range(nchildren):
-        child, offset = parse(data, offset)
+        child, offset = parse(data, offset, depth + 1)
         children.append(child)
     return (props, children), offset
 

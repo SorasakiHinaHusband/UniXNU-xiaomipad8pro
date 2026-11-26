@@ -53,7 +53,7 @@ SOURCES = {
     'firmware-policy': ('firmware/patches/darwinboot/region0-allow.json',
                         '63dff9f5bf7fb802366dd524ff404df60cadd1c29c38438b6ce123fedc224245'),
     'dpu-identity': ('package/PianoDpu/DpuSmmu.h',
-                     '9cc7d830e27084905081222f6ab4ebe17786709dac869649e706504303f1ae30'),
+                     '6e12ab4007e64f4e9a2ea2b29f3d2de4cd2c94d984ae32583ad36e84de0fb3ff'),
     'publication-contract': ('firmware/patches/darwinboot/0002-DarwinBoot-region1-extra-ram-reserve-and-publish.patch',
                              '8c057187bfa07505354f5268254ba7489047688e74520b136a89a1adfe9046dd'),
 }

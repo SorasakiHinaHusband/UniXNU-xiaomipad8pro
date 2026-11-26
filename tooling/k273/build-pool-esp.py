@@ -22,8 +22,12 @@ import json
 import re
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
+    import tomli as tomllib
 
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
@@ -136,14 +140,15 @@ def main():
         state_sha = common.sha(a.state)
 
     base = json.loads(a.base.read_text())
-    base_img = a.base.with_name(base['image'])
-    if common.sha(base_img) != base['sha256']:
-        raise SystemExit(f'{base_img}: not the image its record {a.base.name} names')
+    base_img = common.checked_esp_base(a.base, base)
     name = a.name or (Path(base['image']).stem + ('-pool' if state else '-pool-TEST'))
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
-        raise SystemExit('the output name must be a single file stem')
     if not state and not name.endswith('-TEST'):
         raise SystemExit('a placeholder build\'s name ends in -TEST')
+    with common.stage_esp_output(a.out, name, base_img, a.base) as image:
+        build(a, base, base_img, image, state, uuids, state_sha)
+
+
+def build(a, base, base_img, image, state, uuids, state_sha):
     fat = common.fat32_read(base_img)
     if fat['problems']:
         raise SystemExit(f'{base_img}: the FAT reader finds {fat["problems"]}')
@@ -197,10 +202,6 @@ def main():
     want_files[pool_kc] = files[kc]
     want_files[pool_kc + '.adt'] = new_adt
     want_files[pool_kc + '.trustcache'] = files[trust]
-    a.out.mkdir(parents=True, exist_ok=True)
-    image = a.out / f'{name}.img'
-    if image.resolve() == base_img.resolve() or image.with_suffix('.json').resolve() == a.base.resolve():
-        raise SystemExit('the pool output would overwrite the rollback base')
     with tempfile.TemporaryDirectory(prefix='piano-pool-esp-') as scratch:
         scratch = Path(scratch)
         mt = scratch / 'base-mtools'
@@ -215,7 +216,6 @@ def main():
             (stage / path).write_bytes(data)
         for path in [stage, *stage.rglob('*')]:
             build_esp.os.utime(path, (build_esp.EPOCH, build_esp.EPOCH))
-        image.unlink(missing_ok=True)
         build_esp.mtools('mformat', '-C', '-F', '-S', '5', '-M', '4096', '-T', str(common.ESP_BLOCKS), '-h', '1', '-s', '1', '-c', '1',
                          '-H', str(common.ESP_FIRST), '-v', build_esp.LABEL, '-N', build_esp.SERIAL, '-i', str(image), '::')
         build_esp.mtools('mcopy', '-i', str(image), '-s', '-Q', '-m', str(stage / 'EFI'), '::/')
@@ -228,7 +228,9 @@ def main():
     new = common.fat32_read(image)
     want = {n: h(b) for n, b in want_files.items()}
     got = {n: h(b) for n, b in new['files'].items()}
-    problems = list(new['problems'])
+    if new['problems']:
+        raise SystemExit(f'{image}: the FAT reader finds {new["problems"]}')
+    problems = []
     if image.stat().st_size != common.ESP_BLOCKS * common.LBA:
         problems.append('image size')
     if new['sector_bytes'] != 4096 or new['sectors_per_cluster'] != 1 or new['total_sectors'] != common.ESP_BLOCKS:
@@ -244,8 +246,6 @@ def main():
             problems.append(f'{path} is not the base\'s byte for byte')
     if new['files'].get(pool_kc) != files[kc] or new['files'].get(pool_kc + '.trustcache') != files[trust]:
         problems.append('the pool payload is not the base entry\'s')
-    if boot_args.chosen(boot_args.load(new['files'].get(pool_kc + '.adt', b'')))[0] is None:
-        problems.append('the pool ADT does not parse')
     if problems:
         raise SystemExit(f'{image}: ' + '; '.join(problems))
 
@@ -258,7 +258,7 @@ def main():
         'base_esp': {'image': base['image'], 'sha256': base['sha256'], 'record': a.base.name, 'entry': a.entry},
         'default': a.pool_entry,
         'cmdlines': {a.pool_entry: pool['args'], **(base.get('cmdlines') or {})},
-        'inputs': {role: dict(v, path=f'{name}.img:' + v['path'].split(':', 1)[1]) if isinstance(v, dict) and ':' in v.get('path', '')
+        'inputs': {role: dict(v, path=f'{image.name}:' + v['path'].split(':', 1)[1]) if isinstance(v, dict) and ':' in v.get('path', '')
                    else v for role, v in (base.get('inputs') or {}).items()},
         'files': {n: ('private' if base['files'].get(n) == 'private' else v) for n, v in want.items()},
         'unixnu_toml': new_text,
@@ -270,7 +270,7 @@ def main():
                  'adt_base_sha256': h(files[adt]), 'adt_pool_sha256': h(new_adt), 'adt_diff': adt_diff,
                  'placeholder': not state},
     })
-    common.write_json(a.out / f'{name}.json', record)
+    common.write_json(image.with_suffix('.json'), record)
     print(f'{image.name}: {record["bytes"]} bytes sha256 {record["sha256"]}; {a.pool_entry} (default) = {a.entry} with System '
           f'{uuids["os"]}, SystemOS {uuids["systemos"]} ({adt_diff["bytes_changed"]} ADT bytes in two UUID spans); every base file byte '
           'for byte'

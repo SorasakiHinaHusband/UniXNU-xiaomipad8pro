@@ -32,9 +32,8 @@ refusal, and without --firmware-dir nothing changes.
 
 A base entry whose line is already split (piano-boot-args=SET, k27 0066: its piano-* arguments live in the base ADT's
 /chosen/piano-boot-args-SET) is reassembled before anything else: the whole arguments are the base's line without the selector plus
-that tail, the tail taken from the base record's boot_args_split or read out of the base image's ADT (both must agree when both
-exist; a loud refusal when the tail is in neither -- never a selector left pointing at a tail a fresh --adt does not carry, which
-would drop every piano-* argument without a word). The reassembled line takes the edits and is split again; each argument name is
+the tail from the base image's ADT. The builder requires that tail and checks it against boot_args_split when the record has one.
+The reassembled line takes the edits and is split again, including when given a fresh --adt. Each argument name is
 given at most once over --arg/--seed/--root-part (twice is refused, not silently duplicated).
 --arg piano-long-boot-args=1 opts into the layout in docs/boot-args-length.md.
 """
@@ -45,8 +44,12 @@ import json
 import shutil
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 and 3.10 use the tomli backport.
+    import tomli as tomllib
 
 D = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(D / 'tooling/persist'))
@@ -100,7 +103,7 @@ def diag_budget(line, tail_bytes):
     if size > limit:
         return {'bytes': size, 'included': False,
                 'why': f'{size} bytes with piano-reset-after/-to: the builder allows {limit}'}
-    if limit == boot_args.LONG_LINE_MAX and tail_bytes and size + 1 + tail_bytes > boot_args.MERGED_MAX:
+    if tail_bytes and size + 1 + tail_bytes > boot_args.MERGED_MAX:
         return {'bytes': size, 'included': False,
                 'why': f'the diagnostic reset and the ADT tail exceed {boot_args.MERGED_MAX} merged bytes'}
     return {'bytes': size, 'included': True}
@@ -114,7 +117,7 @@ def split_line(line, *, force=False):
     if not (long_layout or force or len(line.encode()) > limit):
         return line, None
     kept, tail = boot_args.fit(words, 'macos', force=force or not long_layout)
-    return ' '.join(kept), None if long_layout and not tail else tail
+    return ' '.join(kept), tail or None
 
 
 def config_text(base_name, timeout, entries, store, seed):
@@ -161,10 +164,12 @@ def main():
         installed = json.loads((out / 'installed.json').read_text())
         base_json = out / (Path(installed['image']).stem + '.json')
     base = json.loads(base_json.read_text())
-    base_img = base_json.with_name(base['image'])
-    if common.sha(base_img) != base['sha256']:
-        raise SystemExit(f'{base_img}: not the image its record {base_json.name} names')
+    base_img = common.checked_esp_base(base_json, base)
+    with common.stage_esp_output(out, a.name, base_img, base_json) as image:
+        build(a, base_json, base, base_img, image)
 
+
+def build(a, base_json, base, base_img, image):
     # -- the base, read by the independent FAT reader and by mtools ----------------------------------------------------------
     fat = common.fat32_read(base_img)
     if fat['problems']:
@@ -237,15 +242,18 @@ def main():
             recorded = base.get('boot_args_split')
             recorded = recorded if isinstance(recorded, dict) and recorded.get('set') == sel else None
             in_adt = boot_args.sets(files[payload['adt']]).get(prop)
-            if recorded and recorded.get('tail') is not None and in_adt is not None and recorded['tail'] != in_adt:
+            if recorded and recorded.get('tail') is not None and recorded['tail'] != in_adt:
                 raise SystemExit(f'{base_json.name}: its boot_args_split tail is not the /chosen/{prop} of {a.entry}\'s ADT in '
                                  f'{base_img.name} (a stale record or a stale image): refused')
-            tail = recorded['tail'] if recorded and recorded.get('tail') is not None else (in_adt or '')
+            tail = in_adt or ''
             tail_args = tail.split()
             if not tail_args:
-                raise SystemExit(f'{base_img}: {a.entry}\'s line carries piano-boot-args={sel} but its tail is in neither '
-                                 f'{base_json.name} (boot_args_split) nor the base ADT\'s /chosen/{prop}: refused rather than drop '
+                raise SystemExit(f'{base_img}: {a.entry}\'s line carries piano-boot-args={sel} but its tail is missing from '
+                                 f'the base ADT\'s /chosen/{prop}: refused rather than drop '
                                  'its piano-* arguments')
+            _, status = boot_args.merged(line, files[payload['adt']])
+            if status != 'appended':
+                raise SystemExit(f'{base_img}: kernel rejects the base ADT boot-argument tail ({status})')
             if any(name_of(x) == 'piano-boot-args' for x in tail_args):
                 raise SystemExit(f'{base_img}: /chosen/{prop} itself carries piano-boot-args=: refused')
             whole = [x for x in line.split() if name_of(x) != 'piano-boot-args'] + tail_args
@@ -356,8 +364,8 @@ def main():
         entries.append({**k_entry, 'id': 'fastboot', 'title': 'Reset into fastboot (ABL)', 'args': fb})
         for e in entries:
             args = e['args']
-            if len(args.encode()) > boot_args.line_max(args.split()) or '"' in args or '\\' in args:
-                raise SystemExit(f'{e["id"]}: kernel command line of {len(args.encode())} bytes, or a quote or backslash in it')
+            if len(args.encode()) > boot_args.line_max(args.split()) or any(c in args for c in ('"', '\\', '\0')):
+                raise SystemExit(f'{e["id"]}: invalid kernel command line ({len(args.encode())} bytes)')
         boot_args.check_userland({e['id']: e['args'] for e in entries if e['id'] != 'fastboot'},
                                  adt.read_bytes(), kc, seed=a.seed, live=True)
         new_text = config_text(base['image'], config['boot']['timeout'], entries, store, seed)
@@ -374,9 +382,6 @@ def main():
             build_esp.os.utime(path, (build_esp.EPOCH, build_esp.EPOCH))
         want = {str(f.relative_to(stage)): h(f.read_bytes()) for f in sorted(stage.rglob('*')) if f.is_file()}
         staged = {role: (stage / path).read_bytes() for role, path in payload.items()}
-        image = out / f'{a.name}.img'
-        out.mkdir(parents=True, exist_ok=True)
-        image.unlink(missing_ok=True)
         build_esp.mtools('mformat', '-C', '-F', '-S', '5', '-M', '4096', '-T', str(common.ESP_BLOCKS), '-h', '1', '-s', '1', '-c', '1',
                          '-H', str(common.ESP_FIRST), '-v', build_esp.LABEL, '-N', build_esp.SERIAL, '-i', str(image), '::')
         build_esp.mtools('mcopy', '-i', str(image), '-s', '-Q', '-m', str(stage / 'EFI'), '::/')
@@ -389,7 +394,9 @@ def main():
     # -- the image read back ----------------------------------------------------------------------------------------------
     new = common.fat32_read(image)
     got = {n: h(b) for n, b in new['files'].items()}
-    problems = list(new['problems'])
+    if new['problems']:
+        raise SystemExit(f'{image}: the FAT reader finds {new["problems"]}')
+    problems = []
     if image.stat().st_size != common.ESP_BLOCKS * common.LBA:
         problems.append('image size')
     if new['sector_bytes'] != 4096 or new['sectors_per_cluster'] != 1 or new['total_sectors'] != common.ESP_BLOCKS:
@@ -439,7 +446,7 @@ def main():
         'boot_guard': base.get('boot_guard'), 'charging': base.get('charging'), 'fast_boot': base.get('fast_boot'),
         'kc_has_boot_guard': kc_guard, 'kc_has_rtc_calendar': kc_rtc, 'kc_natives': natives,
         'cmdlines': {e['id']: e['args'] for e in entries},
-        'line_bytes': len(line), 'diag': diag_info,
+        'line_bytes': len(line.encode()), 'diag': diag_info,
         # XNU's RAM window the ADT asks for: maint-session.py writes the ESP only onto a boot_a whose DarwinBoot takes it
         'ram_window': window,
         # the payload as it is on the base ESP (IMAGE:PATH; tooling/persist/base-seed.py and common.installed_trust read real files only)
@@ -461,7 +468,7 @@ def main():
                       any(pin['private'] and n == f'{firmware.ESP_DIR}/{pin["path"]}' for pin in fw) else v) for n, v in want.items()},
         'unixnu_toml': new_text,
     }
-    common.write_json(out / f'{a.name}.json', record)
+    common.write_json(image.with_suffix('.json'), record)
     print(f'{image.name}: {record["bytes"]} bytes sha256 {record["sha256"]}; from {base["image"]}: {a.entry} ({len(line)} bytes, '
           f'byte for byte), payload {payload_dir.removeprefix(ROOT)}, store on {part} LBA {lba}-{store["last_lba"]} bound, seed '
           f'{seed["identity_sha256"][:16]}; entries {[e["id"] for e in entries]} + actions'
