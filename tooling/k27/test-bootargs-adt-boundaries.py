@@ -336,27 +336,34 @@ class KextChecks(unittest.TestCase):
         merged_strings = legacy_strings + b'piano_bootargs\0' + ba.MERGED_SYSCTL_MARKER
         with tempfile.TemporaryDirectory() as tmp:
             kernel = Path(tmp) / 'kernel'
-            for baseline, types, expected in (
-                (False, (0x0e, 0x0e, 0x0f), 0),  # Local and external section symbols.
-                (False, (0x0e, 0x01, 0x0f), 1),  # Undefined handler.
-                (False, (0x0e, 0x0e, 0x01), 1),  # Undefined OID.
-                (False, (0x01, 0x0e, 0x0f), 1),  # Undefined legacy OID.
-                (False, (0x0e, 0xee, 0x0f), 1),  # Debug entry with the handler's name.
-                (True, (0x0e,), 0),
+            for baseline, types, sections, short_strings, expected in (
+                (False, (0x0e, 0x0e, 0x0f), (1, 1, 1), False, 0),  # Local and external section symbols.
+                (False, (0x0e, 0x01, 0x0f), (1, 0, 1), False, 1),  # Undefined handler.
+                (False, (0x0e, 0x0e, 0x01), (1, 1, 0), False, 1),  # Undefined OID.
+                (False, (0x01, 0x0e, 0x0f), (0, 1, 1), False, 1),  # Undefined legacy OID.
+                (False, (0x0e, 0xee, 0x0f), (1, 1, 1), False, 1),  # Debug entry with the handler's name.
+                (False, (0x0e, 0x0e, 0x0f), (1, 0, 1), False, 1),  # N_SECT with no section ordinal.
+                (False, (0x0e, 0x0e, 0x0f), (1, 1, 1), True, 1),   # OID name extends beyond the string table.
+                (True, (0x0e,), (1,), False, 0),
             ):
-                with self.subTest(baseline=baseline, types=types):
+                with self.subTest(baseline=baseline, types=types, sections=sections, short_strings=short_strings):
                     symbols, strings = bytearray(), bytearray(b'\0')
-                    for name, kind in zip(names, types):
-                        symbols.extend(struct.pack('<IBBHQ', len(strings), kind, int(bool(kind & 0x0e)), 0, 0))
+                    for name, kind, section in zip(names, types, sections):
+                        symbols.extend(struct.pack('<IBBHQ', len(strings), kind, section, 0, 0))
                         strings.extend(name.encode('ascii') + b'\0')
                     header = struct.pack('<IiiIIIII', 0xfeedfacf, 0x0100000c, 0, 2, 1, 24, 0, 0)
-                    symtab = struct.pack('<6I', 2, 24, 56, len(types), 56 + len(symbols), len(strings))
+                    strsize = len(strings) - int(short_strings)
+                    symtab = struct.pack('<6I', 2, 24, 56, len(types), 56 + len(symbols), strsize)
                     kernel.write_bytes(header + symtab + symbols + strings + (legacy_strings if baseline else merged_strings))
                     args = ['--baseline'] if baseline else []
                     result = subprocess.run([sys.executable, str(kc_check), str(kernel), *args],
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                    self.assertIn('check-piano-bootargs-kc: ' + ('FAIL' if expected else 'PASS'), result.stdout)
+                    message = 'check-piano-bootargs-kc: ' + ('FAIL' if expected else 'PASS')
+                    if short_strings:
+                        self.assertIn('symbol name outside the string table', result.stderr)
+                    else:
+                        self.assertIn(message, result.stdout)
 
 
 if __name__ == '__main__':

@@ -26,20 +26,35 @@ N_STAB, N_TYPE, N_SECT = 0xE0, 0x0E, 0x0E
 
 
 def symbols(data):
-    magic, _, _, _, ncmds, _, _, _ = struct.unpack_from('<IiiIIIII', data, 0)
-    if magic != MH_MAGIC_64:
+    if len(data) < 32 or struct.unpack_from('<I', data)[0] != MH_MAGIC_64:
         raise SystemExit('check-piano-bootargs-kc: not a thin 64-bit Mach-O (give --kc for a kernel collection)')
+    ncmds, command_bytes = struct.unpack_from('<II', data, 16)
+    command_end = 32 + command_bytes
+    if command_end > len(data):
+        raise SystemExit('check-piano-bootargs-kc: truncated load commands')
     off, names = 32, set()
     for _ in range(ncmds):
+        if off + 8 > command_end:
+            raise SystemExit('check-piano-bootargs-kc: truncated load command header')
         cmd, size = struct.unpack_from('<II', data, off)
+        if size < 8 or off + size > command_end:
+            raise SystemExit('check-piano-bootargs-kc: invalid load command size')
         if cmd == LC_SYMTAB:
-            symoff, nsyms, stroff, _ = struct.unpack_from('<IIII', data, off + 8)
+            if size < 24:
+                raise SystemExit('check-piano-bootargs-kc: truncated symbol table command')
+            symoff, nsyms, stroff, strsize = struct.unpack_from('<IIII', data, off + 8)
+            string_end = stroff + strsize
+            if symoff + 16 * nsyms > len(data) or string_end > len(data):
+                raise SystemExit('check-piano-bootargs-kc: truncated symbol or string table')
             for i in range(nsyms):
-                strx, ntype = struct.unpack_from('<IB', data, symoff + 16 * i)
-                if ntype & N_STAB or ntype & N_TYPE != N_SECT:
+                strx, ntype, section = struct.unpack_from('<IBB', data, symoff + 16 * i)
+                if ntype & N_STAB or (ntype & N_TYPE) != N_SECT or not section:
                     continue
-                end = data.index(b'\0', stroff + strx)
-                names.add(data[stroff + strx:end].decode(errors='replace'))
+                start = stroff + strx
+                end = data.find(b'\0', start, string_end)
+                if end == -1:
+                    raise SystemExit('check-piano-bootargs-kc: symbol name outside the string table')
+                names.add(data[start:end].decode(errors='replace'))
         off += size
     return names
 
