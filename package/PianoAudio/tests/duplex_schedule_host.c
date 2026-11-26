@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+// cc -std=c11 -Wall -Wextra -Werror -I.. duplex_schedule_host.c ../AudioSpkProt.c ../AudioSession.c ../AudioAmps.c ../Fs19xx.c ../AudioSha256.c ../AudioSequence.c ../PianoAudioReach.c ../PianoGpr.c ../AudioSafety.c ../AudioDspLink.c -o /tmp/duplex_schedule_host && /tmp/duplex_schedule_host
 /* Offline analysis model. No IOKit, sleeping, hardware, or wall-clock timing.
  * See docs/drivers/audio-duplex.md. Use the actual FIFO/capture implementation;
  * model only PianoAudioDevice.cpp:532-540,557-558's absolute deadline loop.

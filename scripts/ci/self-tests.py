@@ -10,9 +10,9 @@ What runs:
   - C/C++ host tests (package/**/tests/*.c, *.cpp) whose header carries their build line
     (`c++ -std=c++20 ... NAME.cpp -o /tmp/NAME && /tmp/NAME`): compiled in their own directory, the binary in a temporary
     directory, then run.
-Anything listed in scripts/ci/self-tests.skip (one path per line, `#` and a reason after it) is not run: the reason says what it
-needs that a hosted runner does not have (Apple content, out/, the tablet, a Linux host). A test that is neither run nor skipped
-is reported, so a new test cannot fall out of CI unnoticed.
+Entries in scripts/ci/self-tests.skip (one path per line, `#` and a reason after it) are excluded from standalone runs. The
+reason identifies the enclosing suite or explains why a test is left out. A test that is neither run nor skipped is reported,
+so a new test cannot fall out of CI unnoticed.
 
 The tests run with an empty HOME and without PIANO_* variables, so nothing local leaks in. The summary ends with up to ten of
 the slowest tests. Exit status 1 when any test fails.
