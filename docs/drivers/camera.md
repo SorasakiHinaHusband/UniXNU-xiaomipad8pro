@@ -45,6 +45,25 @@ and movie files on a host with the corresponding macOS services. The default sel
 during automatic login and checks QuickTime's own saved choice before AVFoundation history. Synthetic approval tests verify
 malformed records and seed write ordering. Tablet timing and stock application behavior still require hardware verification.
 
+### B11 offline switch and client teardown suite
+
+Run the standalone ASan/UBSan test through the repository self-test runner.
+
+```sh
+python3 scripts/ci/self-tests.py --only package/PianoCamera/tests/cam_switch_privacy_host.cpp
+```
+
+The model uses the ABI 2 frame lifecycle and the driver’s front OV32D40 and rear S5KJN1 identities. It tests front-first
+discovery, overlapping starts, and handoff only after the old receiver and write master quiesce and the SMMU release
+completes. It uses the production SMMU, ISP layout, and output geometry helpers. The model exercises client loss with
+a DMA write and a RAW reader in flight, independent retention of delivered frames, and reopening with fresh clients.
+A simulated TLB sync failure keeps the DMA lease and excludes both sensors. The modeled privacy LED covers the powered
+interval, including drain and unmap, and clears after clean power-down.
+
+The production boot policy and daily 640×480 `420v` at 15 fps are unchanged. **HOLD** remains for attended real-scene
+rear camera and FaceTime checks, including live client-crash teardown and any physical privacy LED behavior.
+[Host test source](../../package/PianoCamera/tests/cam_switch_privacy_host.cpp)
+
 ## Historical camera bring-up
 
 The notes below record early sensor, RAW capture, CoreMediaIO and app compatibility work and its test state at the time.
