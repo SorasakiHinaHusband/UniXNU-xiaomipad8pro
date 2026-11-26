@@ -1,6 +1,7 @@
 # CI and releases
 
-GitHub Actions on GitHub-hosted runners only (no self-hosted runner). Four workflows:
+GitHub Actions runs on GitHub-hosted runners only and uses no configured secrets. The draft release uses the built-in job token.
+The official actions run on Node.js 24 (`checkout@v7`, `upload-artifact@v7`, `download-artifact@v8`).
 
 | Workflow | When | Runner | What |
 | --- | --- | --- | --- |
@@ -61,7 +62,7 @@ uploads `fd.sha256` and the build log.
 | tree | upstream + `patches/k27-tree` |
 | xnu | apple-oss-distributions/xnu `xnu-12377.121.6` + the tree's `patches/xnu-12377` 0001-0054 + `patches/k27` 0055-0066 (`git am`) |
 | ld | `ld-classic` (ld64; the kernel links with `-threaded_starts_section`) from the runner's toolchain or `LD_CLASSIC` |
-| kdk | headers of a Kernel Debug Kit: `vars.PIANO_KDK_URL` (+ `secrets.PIANO_KDK_AUTH`, an HTTP header), open item |
+| kdk | headers of a Kernel Debug Kit from an unauthenticated `vars.PIANO_KDK_URL` (source pending owner decision) |
 | fakeroot | apple-oss-distributions AvailabilityVersions-157.2, libplatform-375.120.2, libdispatch-1542.100.32 headers; the tree's installhdrs; `libfirehose_kernel.a` built from libdispatch's source |
 | platform | ArmDTPlatform and ArmCpu at their `unixnu.lock` pins, compiled with the kernel's own recipes |
 | kernel | `build-k27-piano.sh` with `K27_VARIANT=native` |
@@ -94,9 +95,9 @@ skill from the user's own IPSW.
 
 1. **Kernel Debug Kit (owner decision).** The kernel build includes KDK headers (`KDKROOT`: Kernel.framework, KernelSupport; none of
    the KDK's libraries is linked: BCM2837 is not an SPTM SoC). Apple's KDK download needs an Apple Account, so a hosted runner cannot
-   fetch it from Apple anonymously. Choices: an Apple Account session in a secret (`PIANO_KDK_URL` + `PIANO_KDK_AUTH`), a third-party
-   mirror (upstream macOS-DroidVM uses dortania/KdkSupportPkg; that is Apple content from someone else, outside the rule "fetch it from
-   Apple"), or reduce the build to the few headers it needs and generate them. Until then `build.yml`'s kernel job stops at "kdk".
+   fetch it from Apple anonymously. The build needs either an approved unauthenticated source or generated headers for the subset
+   it uses. Third-party mirrors such as dortania/KdkSupportPkg serve Apple content outside the rule "fetch it from Apple".
+   Until the source is resolved, `build.yml`'s kernel job stops at the KDK step.
 2. **ld-classic.** Xcode 27 has no `ld-classic`; the local build uses Command Line Tools' ld64-957. Whether the macos-26 image's
    Xcode still ships it is checked monthly (`dependencies.yml`); otherwise `LD_CLASSIC` needs a source (ld64 is open source).
 3. **ArmDTPlatform / ArmCpu recipe.** The local libraries were built by the upstream author's unpublished environment; the `platform`
