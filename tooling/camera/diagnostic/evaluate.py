@@ -63,7 +63,9 @@ def mapping(value):
 def presentation_time(meta):
     time = mapping(meta.get("presentationTime"))
     value, scale = time.get("value"), time.get("scale")
-    return (value, scale) if type(value) is int and type(scale) is int and scale > 0 else None
+    if type(value) is int and type(scale) is int and 0 < value < 2**63 and 0 < scale < 2**31:
+        return value, scale
+    return None
 
 
 def cpu_files_complete(files, planes):
@@ -73,7 +75,8 @@ def cpu_files_complete(files, planes):
         plane = mapping(plane)
         row_bytes = plane.get("rowBytes")
         path = files[name]
-        if (type(row_bytes) is not int or row_bytes < FRAME_WIDTH or plane.get("height") != height
+        if (type(row_bytes) is not int or row_bytes < FRAME_WIDTH
+                or type(plane.get("height")) is not int or plane["height"] != height
                 or not path.is_file() or path.stat().st_size != row_bytes * height):
             return False
     return True
@@ -96,16 +99,15 @@ def inspect(output, boot):
     if not re.search(rf"^DIAG_START boot={re.escape(boot)} uid=[1-9][0-9]+$", log, re.M):
         print("VOID client boot UUID does not match the verified SSH boot")
         return
-    expected_complete = "DIAG_COMPLETE COLLECTED" in log
+    expected_complete = "DIAG_COMPLETE COLLECTED" in log.splitlines()
     if not expected_complete:
         print("PARTIAL client completion missing or unsuccessful; review preserved evidence")
     for sensor in ("pattern", "front", "rear"):
         capture = read(f"{sensor}-capture.json")
-        if capture.get("frames") != 32 or not capture.get("activeIndex1"):
+        frames = capture.get("frames")
+        if type(frames) is not int or frames != 32 or capture.get("activeIndex1") is not True:
             print(f"INCONCLUSIVE {sensor} index 1 or frame 32 unverified")
             continue
-        if not capture.get("repeatedSurfaceIDs"):
-            print(f"INCONCLUSIVE {sensor} no observed IOSurface ID reuse before frame 32")
         first = read(f"{sensor}-1-frame.json")
         later = read(f"{sensor}-32-frame.json")
         t1, t32 = presentation_time(first), presentation_time(later)
@@ -115,6 +117,8 @@ def inspect(output, boot):
                 or not all(type(sid) is int and sid > 0 for sid in surface_ids) or surface_ids[0] == surface_ids[-1]):
             print(f"INCONCLUSIVE {sensor} retained first/frame-32 time or surface identity is invalid")
             continue
+        if len(set(surface_ids)) == len(surface_ids):
+            print(f"INCONCLUSIVE {sensor} no observed IOSurface ID reuse through frame 32")
         if sensor == "pattern" and all(mapping(meta.get("pattern")).get("passed") is True for meta in (first, later)):
             counters = [mapping(meta["pattern"].get("rgb")).get("counter") for meta in (first, later)]
             if not all(type(counter) is int and 0 <= counter < 2**24 for counter in counters):
@@ -128,7 +132,8 @@ def inspect(output, boot):
             replay = read(f"{key}-replay.json")
             files = {name: output / (key + name) for name in ("-y.bin", "-uv.bin", "-cpu.png",
                                                             "-A.bgra", "-A.png", "-B.bgra", "-B.png")}
-            if not meta or meta.get("error") or mapping(meta.get("surface")).get("id") != surface_ids[frame - 1]:
+            surface_id = mapping(meta.get("surface")).get("id")
+            if not meta or meta.get("error") or type(surface_id) is not int or surface_id != surface_ids[frame - 1]:
                 print(f"INCONCLUSIVE {key} no valid immutable 420v snapshot")
                 continue
             if not cpu_files_complete(files, meta.get("planes")):
@@ -148,11 +153,11 @@ def inspect(output, boot):
                 print(f"INCONCLUSIVE {key} matched import, immutable seeds or GPU fence/readback control missing")
                 continue
             diff = mapping(replay.get("A_vs_B"))
-            counts = [diff.get(name) for name in ("pixels", "exactRGB", "over20RGB", "over40RGB")]
+            pixels, exact, over20, over40 = (diff.get(name) for name in ("pixels", "exactRGB", "over20RGB", "over40RGB"))
             mean = diff.get("meanAbsoluteRGB")
             if (any(files[name].stat().st_size != BGRA_BYTES for name in ("-A.bgra", "-B.bgra"))
-                    or counts[0] != FRAME_WIDTH * FRAME_HEIGHT
-                    or any(type(count) is not int or not 0 <= count <= counts[0] for count in counts)
+                    or any(type(count) is not int for count in (pixels, exact, over20, over40))
+                    or pixels != FRAME_WIDTH * FRAME_HEIGHT or not 0 <= over40 <= over20 <= pixels - exact <= pixels
                     or type(mean) not in (int, float) or not 0 <= mean <= 255):
                 print(f"VOID {key} incomplete GPU capture files or diff")
                 continue

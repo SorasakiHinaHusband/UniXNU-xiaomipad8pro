@@ -18,7 +18,8 @@ import tempfile
 import zlib
 from pathlib import Path
 
-LINE = re.compile(rb'piano-camera-grab: t (\w+) (\d{1,3})x(\d{1,4}) r(\d{1,4}) p(\d{1,2}) ([0-9a-f]+)(?!\S)')
+LINE = re.compile(rb'piano-camera-grab: t (\w+) (\d{1,3})x(\d{1,4}) r(\d{1,4}) p(\d{1,2})(?:[ \t]+(\S+))?(?!\S)')
+HEX = re.compile(rb'[0-9a-f]+')
 PART_WIDTH = 24
 MAX_WIDTH = 256  # piano-camera-grab's --thumb limit
 MAX_HEIGHT = 4096  # Bound storage even for malformed console logs.
@@ -45,7 +46,7 @@ def decode(data):
             pic = [name, w, h, bytearray(b'\x80' * (w * h * 3)), set()]
             current[name] = pic
             pictures.append(pic)
-        if len(hexes) != 6 * min(PART_WIDTH, w - x):
+        if not hexes or len(hexes) != 6 * min(PART_WIDTH, w - x) or not HEX.fullmatch(hexes):
             continue
         px = bytes.fromhex(hexes.decode())
         at = (row * w + x) * 3
@@ -73,6 +74,12 @@ def self_test():
     cut = log.replace(f'r1 p1 {rgb[(w + 24) * 3:(w + 48) * 3].hex()}'.encode(), b'r1 p1 zz')
     pics = decode(cut)
     assert len(pics) == 1 and pics[0][4] == [1], pics[0][4]
+    first, rest = log.split(b' r0 p0 ', 1)
+    _, rest = rest.split(b'\n', 1)
+    for payload in (b'', b' truncated'):
+        pics = decode(log + first + b' r0 p0' + payload + b'\n' + rest)
+        assert len(pics) == 2 and pics[0][3] == rgb and not pics[0][4]
+        assert pics[1][3][:72] == b'\x80' * 72 and pics[1][3][72:] == rgb[72:] and pics[1][4] == [0]
     prefix = b'piano-camera-grab: t front 25x2 '
     assert decode(prefix + b'r0 p2 000000') == []
     assert not decode(b'piano-camera-grab: t front 999x9999 r0 p0 000000')

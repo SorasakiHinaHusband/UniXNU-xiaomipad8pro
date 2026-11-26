@@ -34,7 +34,7 @@ def observations():
     files = {
         "diag.log": LOG,
         "pattern-capture.json": json.dumps({"frames": 32, "activeIndex1": True, "surfaceIDs": ids,
-                                            "repeatedSurfaceIDs": True}).encode(),
+                                            "repeatedSurfaceIDs": 30}).encode(),
     }
     for frame in (1, 32):
         key = f"pattern-{frame}"
@@ -90,6 +90,47 @@ class DiagnosticHost(unittest.TestCase):
         self.assertIn("VOID pattern-1 incomplete GPU capture files or diff", result.stdout)
         self.assertIn("VOID pattern-32 incomplete CPU capture files", result.stdout)
         self.assertNotIn("OBSERVED pattern", result.stdout)
+
+    def test_invalid_numeric_evidence(self):
+        cases = (
+            ("pattern-capture.json", {"activeIndex1": "false"}, "INCONCLUSIVE pattern index 1"),
+            ("pattern-1-frame.json", {"surface": {"id": True}}, "INCONCLUSIVE pattern-1 no valid immutable"),
+            ("pattern-1-frame.json", {"presentationTime": {"value": 1, "scale": 2**31}},
+             "INCONCLUSIVE pattern retained first/frame-32 time"),
+            ("pattern-1-frame.json", {"planes": [{"rowBytes": WIDTH, "height": float(HEIGHT)},
+                                                 {"rowBytes": WIDTH, "height": HEIGHT // 2}]},
+             "VOID pattern-1 incomplete CPU capture files"),
+        )
+        for i, (name, changes, verdict) in enumerate(cases):
+            with self.subTest(changes=changes):
+                files = observations()
+                meta = json.loads(files[name])
+                meta.update(changes)
+                files[name] = json.dumps(meta).encode()
+                self.output = self.root / f"metadata-{i}"
+                archive(self.archive, files)
+                result = self.evaluate()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(verdict, result.stdout)
+                self.assertNotIn("OBSERVED pattern-1 ", result.stdout)
+
+    def test_invalid_diff_counts_and_nonfinite_mean(self):
+        for i, changes in enumerate((
+            {"over40RGB": 2}, {"exactRGB": WIDTH * HEIGHT}, {"pixels": float(WIDTH * HEIGHT)},
+            {"meanAbsoluteRGB": float("nan")}, {"meanAbsoluteRGB": float("inf")},
+        )):
+            with self.subTest(changes=changes):
+                files = observations()
+                name = "pattern-1-replay.json"
+                replay = json.loads(files[name])
+                replay["A_vs_B"].update(changes)
+                files[name] = json.dumps(replay).encode()
+                self.output = self.root / f"diff-{i}"
+                archive(self.archive, files)
+                result = self.evaluate()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("VOID pattern-1 incomplete GPU capture files or diff", result.stdout)
+                self.assertNotIn("OBSERVED pattern-1 ", result.stdout)
 
     def test_rejects_bad_archives_before_writing(self):
         for kind in ("missing manifest", "cut gzip trailer", "unexpected name"):
