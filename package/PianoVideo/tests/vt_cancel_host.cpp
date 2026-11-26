@@ -91,7 +91,10 @@ struct Harness {
   bool target=true,invalidating=false,holdAck=false,dropAck=false,failSend=false;
   uint64_t epoch=20;
   std::thread workerThread;
-  Harness(){client=static_cast<Client *>(droidvm_vthost_client_open(this,enqueue,nullptr,1));assert(client);create();}
+  explicit Harness(bool createSession=true){
+    client=static_cast<Client *>(droidvm_vthost_client_open(this,enqueue,nullptr,1));assert(client);
+    if(createSession)create();
+  }
   ~Harness(){assert(!workerThread.joinable());droidvm_vthost_client_close(client);}
   Session *session(){return client->session;}
   static bool enqueue(void *p,const uint8_t *b,uint32_t n){
@@ -424,7 +427,25 @@ static void failureCases(){
     while(!h.dinvReplies)h.pump();h.workerThread.join();assert(h.dinvStatus==0&&h.originalErrors==1&&!h.errors&&!h.pending);
   }
 }
+static void emptyEncoderInventory(){
+  Harness h(false);
+  const uint8_t uuid[16]={1};
+  uint8_t bytes[128];Writer w(bytes,sizeof bytes);
+  w.header(cc("encs"),FlagRequest,uuid,900);w.u32(cc(",ver"),6);
+  assert(!h.ingress(w,bytes));
+  assert(h.messages.size()==1);
+  const auto &reply=h.messages.front();
+  Header hdr;Param list;int32_t version=0;
+  assert(header(reply.data(),uint32_t(reply.size()),hdr)&&hdr.type==cc("encs")&&hdr.flags==FlagReply&&hdr.request==900);
+  assert(!memcmp(hdr.uuid,uuid,sizeof uuid)&&!h.session());
+  assert(paramS32(reply.data(),uint32_t(reply.size()),cc(",ver"),version)&&version==6);
+  assert(param(reply.data(),uint32_t(reply.size()),cc(",enc"),list)&&list.type==cc("=pls"));
+  Plist plist;uint8_t empty[64];
+  const auto size=plist.write(plist.array(nullptr,0),empty,sizeof empty);
+  assert(size&&list.size==size&&!memcmp(list.value,empty,size));
+}
 int main(){
+  emptyEncoderInventory();
   for(bool midLookup:{false,true}){Harness h;h.boundary(midLookup);h.invalidate(midLookup);h.reopen();}
   epochCases();
   sameUuidEpochCase();
