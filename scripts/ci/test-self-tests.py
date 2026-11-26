@@ -4,6 +4,8 @@
 import importlib.util
 import io
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -82,32 +84,67 @@ class SuiteTests(unittest.TestCase):
 
     def test_timeout_preserves_output_from_both_streams(self):
         err = subprocess.TimeoutExpired([], 1, output=b'stdout\xff', stderr=b'stderr')
-        with patch.object(self_tests.subprocess, 'run', side_effect=err):
+        with patch.object(self_tests.SuiteProcesses, 'run', side_effect=err):
             _, ok, _, output = self_tests.run_one('py', 'test-example.py', None)
         self.assertFalse(ok)
         self.assertIn('stdout\ufffd', output)
         self.assertIn('stderr', output)
 
     def test_timed_out_wrapper_stops_its_background_jobs(self):
-        path = self_tests.CHARGE_HOST_TESTS
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            wrapper = root / path
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text('sleep 30 &\nprintf "%s\\n" "$!"\nwait\n')
-            with patch.object(self_tests, 'ROOT', root), patch.object(self_tests, 'TIMEOUT', 1):
-                _, ok, _, output = self_tests.run_one('sh', path, None, 2)
-        self.assertFalse(ok)
-        timeout, child = output.splitlines()
-        self.assertEqual(timeout, 'timeout after 1 s')
+        paths = (self_tests.CHARGE_HOST_TESTS, 'tooling/test-ordinary.sh')
+        for path in paths:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                wrapper = root / path
+                wrapper.parent.mkdir(parents=True)
+                wrapper.write_text('sleep 30 &\nprintf "%s\\n" "$!"\nwait\n')
+                with patch.object(self_tests, 'ROOT', root), patch.object(self_tests, 'TIMEOUT', 1):
+                    _, ok, _, output = self_tests.run_one('sh', path, None, 2)
+                self.assertFalse(ok)
+                timeout, child = output.splitlines()
+                self.assertEqual(timeout, 'timeout after 1 s')
+                self.assert_child_stopped(int(child))
+
+    def assert_child_stopped(self, child):
         for _ in range(50):
             try:
-                os.kill(int(child), 0)
+                os.kill(child, 0)
             except ProcessLookupError:
-                break
+                return
             time.sleep(0.02)
-        else:
-            self.fail('background job survived the wrapper timeout')
+        os.kill(child, signal.SIGKILL)
+        self.fail('background job survived suite shutdown')
+
+    def test_signal_stops_active_suite_and_cancels_pending_suite(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = root / 'scripts/ci/self-tests.py'
+                runner.parent.mkdir(parents=True)
+                shutil.copyfile(self_tests.__file__, runner)
+                first = runner.with_name('test-a.sh')
+                first.write_text('sleep 30 &\nprintf "%s\\n" "$!" > active\nwait\n')
+                second = runner.with_name('test-b.sh')
+                second.write_text('touch pending-ran\n')
+                subprocess.run(['git', 'init', '-q', tmp], check=True)
+                subprocess.run(['git', '-C', tmp, 'add', 'scripts'], check=True)
+                active = root / 'active'
+                with subprocess.Popen([sys.executable, str(runner), '--jobs', '1'], stderr=subprocess.PIPE,
+                                      env=dict(os.environ, SELFTEST_TIMEOUT='10')) as process:
+                    deadline = time.monotonic() + 8
+                    while not (active.exists() and active.stat().st_size) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(active.exists() and active.stat().st_size, 'suite did not start')
+                    child = int(active.read_text())
+                    try:
+                        process.send_signal(sig)
+                        _, stderr = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 128 + sig, stderr)
+                        self.assertFalse((root / 'pending-ran').exists())
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                        self.assert_child_stopped(child)
 
     def test_list_reports_stale_skips_only_when_unfiltered(self):
         kept = 'scripts/ci/test-actual.py'
@@ -165,7 +202,7 @@ class SchedulingTests(unittest.TestCase):
         tracked = sorted(priority + fast)
         started = []
 
-        def run_one(_kind, path, _line, _subjob_limit):
+        def run_one(_kind, path, _line, _subjob_limit, _processes):
             started.append(path)
             return path, True, 0, ''
 
@@ -192,7 +229,7 @@ class SchedulingTests(unittest.TestCase):
         fast_started = threading.Event()
         started = []
 
-        def run_one(_kind, path, _line, _subjob_limit):
+        def run_one(_kind, path, _line, _subjob_limit, _processes):
             started.append(path)
             if path in (longest, second):
                 first_wave.wait(timeout=5)
@@ -217,7 +254,7 @@ class SchedulingTests(unittest.TestCase):
         paths = sorted(self_tests.PARALLEL_SHELL_SUITES)
         limits = {}
 
-        def run_one(_kind, path, _line, subjob_limit):
+        def run_one(_kind, path, _line, subjob_limit, _processes):
             limits[path] = subjob_limit
             return path, True, 0, ''
 
@@ -243,7 +280,7 @@ class SlowestTests(unittest.TestCase):
         tests = [('py', path, None) for path in reversed(paths)]
         durations = dict(zip(paths, [2.5, 4.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5]))
 
-        def run_one(_kind, path, _line, _subjob_limit):
+        def run_one(_kind, path, _line, _subjob_limit, _processes):
             ok = path != paths[-1]
             return path, ok, durations[path], '' if ok else 'test failed'
 
