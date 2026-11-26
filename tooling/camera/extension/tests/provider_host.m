@@ -330,6 +330,35 @@ static void boundedPools(void)
   CVPixelBufferPoolRelease(pools[0]); CVPixelBufferPoolRelease(pools[1]);
 }
 
+static uint64_t monotonicMs(void)
+{
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ULL;
+}
+
+static NSUInteger countMatchingWidth(OutputProbe *source, size_t width)
+{
+  NSUInteger matched = 0;
+  @synchronized (source) {
+    for (NSDictionary *frame in source.observations)
+      if ([frame[@"width"] unsignedIntegerValue] == width) ++matched;
+  }
+  return matched;
+}
+
+static BOOL waitForCount(OutputProbe *source, NSUInteger target, size_t widthFilter, uint64_t timeoutMs)
+{
+  const uint64_t deadline = monotonicMs() + timeoutMs;
+  for (;;) {
+    NSUInteger n = widthFilter ? countMatchingWidth(source, widthFilter) : 0;
+    if (!widthFilter) {
+      @synchronized (source) { n = source.observations.count; }
+    }
+    if (n >= target) return YES;
+    if (monotonicMs() >= deadline) return NO;
+    usleep(10000);
+  }
+}
+
 static void timer(void)
 {
   OutputProbe *source = [[OutputProbe alloc] initWithWidth:1280 height:720 sensor:0];
@@ -337,13 +366,19 @@ static void timer(void)
   source.flags = [NSMutableArray array];
   for (unsigned round = 0; round < 3; ++round) {
     assert(set(source, @1, CMTimeMake(1, 30), CMTimeMake(1, 30)));
+    const uint64_t startMs = monotonicMs();
     assert([source startStreamAndReturnError:NULL]);
-    usleep(250000);
-    @synchronized (source) { assert(source.observations.count >= 6 && source.observations.count <= 10); }
+    assert(waitForCount(source, 6, 640, 2500));
+    const uint64_t elapsedMs = monotonicMs() - startMs;
+    NSUInteger firstCount = 0;
+    @synchronized (source) { firstCount = source.observations.count; }
+    // Prove 30 fps pacing (not unthrottled spinning) while tolerating CI runner scheduling jitter.
+    assert(firstCount >= 6 && firstCount <= (elapsedMs / 25ULL) + 6ULL);
     assert(set(source, @0, kCMTimeInvalid, kCMTimeInvalid));
-    usleep(200000);
+    assert(waitForCount(source, 3, 1280, 2500));
+    const NSUInteger compatBeforeResume = countMatchingWidth(source, 640);
     assert(set(source, @1, CMTimeMake(1, 24), CMTimeMake(1, 24)));
-    usleep(200000);
+    assert(waitForCount(source, compatBeforeResume + 3, 640, 2500));
     assert([source stopStreamAndReturnError:NULL]);
     NSUInteger stoppedCount = source.observations.count;
     usleep(100000);
@@ -357,7 +392,7 @@ static void timer(void)
       if ([frame[@"width"] unsignedIntValue] == 640) { ++compat; assert([frame[@"height"] unsignedIntValue] == 480); }
       else { ++native; assert([frame[@"width"] unsignedIntValue] == 1280 && [frame[@"height"] unsignedIntValue] == 720); }
     }
-    assert(compat >= 8 && native >= 2);
+    assert(compat >= 9 && native >= 3);
     // the two live format changes of the round, and nothing else, break the timeline
     unsigned flagged = 0;
     for (NSNumber *flag in source.flags) flagged += flag.unsignedIntValue == CMIOExtensionStreamDiscontinuityFlagSampleDropped;
@@ -377,7 +412,7 @@ static void encoderHold(void)
     source.hold = 18;
     assert(set(source, @(index), CMTimeMake(1, index ? 30 : 15), CMTimeMake(1, index ? 30 : 15)));
     assert([source startStreamAndReturnError:NULL]);
-    usleep(index ? 1200000 : 2000000);
+    assert(waitForCount(source, 26, 0, index ? 4000 : 6000));
     assert([source stopStreamAndReturnError:NULL]);
     NSUInteger sent = source.observations.count;
     printf("encoder hold index=%u: %lu frames delivered while the client held the last 18\n", index, (unsigned long)sent);
