@@ -15,7 +15,7 @@
 //     one deaf at the new speed, a missing rampatch, a pending sleep in the middle of the download;
 //   - and the invariants: no SE6/QUP2 access while unclocked, no byte to the controller before the pins are the engine's, only BT_EN's
 //     five registers written, only this driver's vote bits withdrawn, the rails put on every failure.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoKeyboard -I../../include bt_bringup_host.cpp -o /tmp/bt_bringup_host
+//   c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I../../PianoKeyboard -I../../include bt_bringup_host.cpp -o /tmp/bt_bringup_host && /tmp/bt_bringup_host
 #include "BtBringup.h"
 #include "Address.h"
 #include "BtRpmh.h"
@@ -594,6 +594,13 @@ static void testWifiFirst()
   CHECK(b.railState == (PIANO_WCN_WLAN | PIANO_WCN_BT | PIANO_WCN_UP | (0x3fu << PIANO_WCN_ADDED_SHIFT)));
   safeOff(gB, hw, o);   // Bluetooth sleeps: Wi-Fi still owns the rails, nothing withdrawn
   CHECK(b.rails.allOn() && b.railState == (PIANO_WCN_WLAN | PIANO_WCN_UP | (0x3fu << PIANO_WCN_ADDED_SHIFT)) && !b.powered);
+  safeOff(gB, hw, o);   // repeated teardown does not put a second time
+  CHECK(b.bt.puts == 1 && b.bt.put_unbalanced == 0 && b.pmuOwner == 0 && b.rails.txs == 6);
+  CHECK(bringUp(gB, hw, o, fwFor(b), gNvm, sizeof gNvm) == kBtOk && b.bt.verifies == 2 && b.rails.txs == 6);
+  safeOff(gB, hw, o);
+  CHECK(piano_wcn_rails_owners(&b.wifi) == (PIANO_WCN_WLAN | PIANO_WCN_UP) && b.bt.puts == 2 && b.rails.txs == 6);
+  CHECK(piano_wcn_rails_put(&b.wifi, PIANO_WCN_WLAN | PIANO_WCN_RELEASE) == 0);
+  CHECK(b.railState == 0 && b.pmuOwner == 0 && b.rails.txs == 12 && !b.rails.allOn());
   // Wi-Fi holding the PMU lock past the bound: level 2 stops before anything, nothing written.
   Board c;
   c.pmuOwner = PianoWcnTagWifi;

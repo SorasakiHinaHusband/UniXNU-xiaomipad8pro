@@ -5,7 +5,7 @@
     python3 scripts/ci/self-tests.py [--list] [--only SUBSTR] [--jobs N] [--junit FILE]
 
 What runs:
-  - Python test scripts (test-*.py, test_*.py, run-*-tests.py) under package/, tooling/, firmware/, scripts/;
+  - Python test scripts (test-*.py, test_*.py, run-*-tests.py, run-*-host.py) under package/, tooling/, firmware/, scripts/;
   - shell test scripts (test-*.sh, run-tests.sh, run-*-host.sh, tests/run.sh) there;
   - C/C++ host tests (package/**/tests/*.c, *.cpp) whose header carries their build line
     (`c++ -std=c++20 ... NAME.cpp -o /tmp/NAME && /tmp/NAME`): compiled in their own directory, the binary in a temporary
@@ -32,8 +32,9 @@ from xml.sax.saxutils import escape
 ROOT = Path(__file__).resolve().parents[2]
 SKIP_FILE = ROOT / 'scripts/ci/self-tests.skip'
 A830_HOST_TESTS = 'package/PianoA830/adreno830/tests/run-host-tests.py'
+SANITIZED_SHELL_SUITES = {'package/common/tests/run.sh', 'package/include/tests/run.sh'}
 TIMEOUT = int(os.environ.get('SELFTEST_TIMEOUT', '600'))
-PY_RE = re.compile(r'(^|/)(test[-_][^/]*\.py|run-[^/]*tests?\.py)$')
+PY_RE = re.compile(r'(^|/)(test[-_][^/]*\.py|run-[^/]*(?:tests?|-host)\.py)$')
 SH_RE = re.compile(r'(^|/)(test-[^/]*\.sh|run-tests\.sh|run-[^/]*-host\.sh|tests/run\.sh)$')
 C_RE = re.compile(r'^package/.*/tests/[^/]+\.(c|cc|cpp)$')
 # a build line in the first lines of a host test: `c++ ... -o /tmp/NAME && /tmp/NAME [args]`
@@ -107,6 +108,8 @@ def run_one(kind, path, line):
             cmd, cwd = [sys.executable, str(full)], ROOT
         elif kind == 'sh':
             cmd, cwd = ['bash', str(full)], ROOT
+            if path in SANITIZED_SHELL_SUITES:
+                cmd.append('--sanitize')
         else:
             out = os.path.join(tmp, 'bin')
             os.mkdir(out)

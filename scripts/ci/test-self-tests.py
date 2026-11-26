@@ -15,6 +15,13 @@ spec.loader.exec_module(self_tests)
 
 
 class SuiteTests(unittest.TestCase):
+    def test_python_host_runner_is_discovered(self):
+        runner = 'package/Example/tests/run-example-host.py'
+        with patch.object(self_tests, 'tracked', return_value=[runner]):
+            tests, unrunnable = self_tests.collect('Example', {})
+        self.assertEqual(tests, [('py', runner, None)])
+        self.assertEqual(unrunnable, [])
+
     def test_suite_member_needs_no_standalone_build_line(self):
         runner = 'package/Example/tests/run-example-host.sh'
         member = 'package/Example/tests/covered_host.c'
