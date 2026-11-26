@@ -257,10 +257,16 @@ inline bool gaugeWordCredible(uint8_t command, uint16_t value)
 {
   switch (command) {
     case kGaugeVoltage: return value >= 2500 && value <= 5000;
+    case kGaugeCurrent: case kGaugeAverageCurrent: {
+      // Leave headroom above the 7 A per-pack overcurrent trip while rejecting gross signed-word corruption.
+      constexpr int kMaxCurrentMa = 16000;
+      const int currentMa = asSigned(value);
+      return currentMa >= -kMaxCurrentMa && currentMa <= kMaxCurrentMa;
+    }
     case kGaugeSoc: return value <= 100;
     case kGaugeTemperature: return value > 2332 && value < 3632;
     case kGaugeRemaining: case kGaugeFull: case kGaugeStatus: case kGaugeCycles: return value != 0xffff;
-    default: return true;   // Signed current -1 is a real reading, not an all-ones sentinel.
+    default: return true;
   }
 }
 
@@ -308,7 +314,9 @@ inline GaugeReading readGaugeOnce(I2cBus &bus)
   uint16_t design = 0;
   if (bus.readWord(kGaugeAddress, kGaugeDesign, &design) == I2cResult::ok && design && design != 0xffff) g.designMah = design;
   // A reading no battery can have means the transaction went wrong somewhere (a stuck line reads as 0xffff).
-  g.ok = g.voltageMv >= 2500 && g.voltageMv <= 5000 && g.socPct <= 100 && g.tempDeciC > -400 && g.tempDeciC < 900;
+  g.ok = gaugeWordCredible(kGaugeVoltage, v[0]) && gaugeWordCredible(kGaugeCurrent, v[1]) &&
+         gaugeWordCredible(kGaugeAverageCurrent, v[2]) && gaugeWordCredible(kGaugeSoc, v[3]) &&
+         gaugeWordCredible(kGaugeTemperature, v[6]);
   if (!g.ok) g.failedCommand = 0xff;
   return g;
 }

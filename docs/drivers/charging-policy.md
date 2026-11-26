@@ -176,9 +176,9 @@ then left alone (event). The option turned off after use writes 4400 once. 4540 
   **Read-back.** 0x2003 every cycle (two disagreeing → written again, three writes in all at most); and the verdict that matters: if the
   packs still take > 100 mA a minute after a confirmed stop, a `STOP_LEAK` event (then the firmware's bit does not mean what
   Ubuntu found; turn the mode off and report).
-- **A stop never outlives the driver.** Lifted on detach (the next attach decides again within a cycle) and by
-  `piano_charge_shutdown()` (stop/restart): our FD's stubbed charger DXE does not re-enable charging and a warm reset does not
-  reset the PMIC (charging.md §0, §6).
+- **Cable changes preserve the SOC stop.** Detach restores the firmware's current limits while the health inhibit stays in force.
+  On a clean stop or restart, `piano_charge_shutdown()` hands charging back to firmware. The stubbed charger DXE leaves the
+  enable bit alone, and a warm reset preserves PMIC state (charging.md §0, §6).
 - **The charging hold.** `plan.hold_awake` = writes on, mode on, charge known, a known source attached, charging allowed (below
   the limit, not hot/cold). PianoPower creates one assertion on first use, `getPMRootDomain()->createPMAssertion(
   kIOPMDriverAssertionPreventSystemIdleSleepBit, kIOPMDriverAssertionLevelOff, this, "com.unixnu.driver.PianoPower.charging-hold")`,
@@ -306,8 +306,8 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
 From PianoMca.c's policy today: charge current by type with −300 mA/°C from 49 °C (was 1000 mA, 1500 at 9 V, 500 from 38 °C); type 15 on the
 float row (was DCP); PD without PDOs 500 (was 900); unknown types no write (was 500); 0x2003 = 1 only to lift our own 0 (was:
 whenever it reads 0, 3 times per attach); timers in ms plus decision counts (were cycles). From Ubuntu: no charge reading → charging
-on after 5 min (Ubuntu stops); a stop lifted on detach; demand sleep stops a protected charge instead of refusing the sleep; no
-direct charging from third-party PPS sources (Ubuntu allows 4.1 A); the 5 V limits kept through sleep (Ubuntu v1.1.0, as here).
+on after 5 min (Ubuntu stops). Detach lifts stops without a health hold. Demand sleep stops a protected charge and keeps the
+5 V limits (Ubuntu v1.1.0 also keeps the limits). Direct charging from third-party PPS sources remains off (Ubuntu allows 4.1 A).
 
 ### 10. Tests (host, done)
 
@@ -366,8 +366,8 @@ PianoMca.h at compile time.
 
 - **Unproven writes**: 0x2003 = 0 (Ubuntu's, on the same firmware family; our build may differ), 0x2007, 0x21017, charge currents
   above 1000 mA. Each is opt-in or stage-gated and has the read-back of §7; nothing is written for an unknown source.
-- **A stop that outlives PianoPower** (a panic between the stop and a detach): charging stays off until the next DSP start
-  (every level 2 boot starts it on its defaults). Lifted on detach and shutdown to keep the window short.
+- **A stop that outlives PianoPower** after a panic: charging stays off until the next DSP start
+  (every level 2 boot starts it on its defaults). A clean shutdown restores the firmware's enable state.
 - **Demand sleep below the limit** stops charging for the sleep by default (a night on the charger at 50 % stays at 50 %).
 - **The charge reading**: the higher pack decides; a gauge reading high stops early, one reading low overshoots. No reading for
   5 min ends the limit.
@@ -478,7 +478,7 @@ sagged under 1.6 A or the port cut out: the Mac's port does not deliver its Rp c
 
 **Battery health** (`piano-power-health=1`) is not built as a default image: at 97 % it stops charging at once (0x2003 = 0), and the
 reset at the end of a RAM test bypasses the shutdown handover, so the stop would stay in the PMIC until the next DSP start. Run it as
-§7's session L, attended, at 80–90 %, and unplug the cable before the reset (a detach lifts the stop).
+§7's session L, attended, at 80–90 %. Use a clean shutdown to hand charging back to the firmware.
 
 ### 15. The stepped Type-C current and the write answers (2026-11-12)
 

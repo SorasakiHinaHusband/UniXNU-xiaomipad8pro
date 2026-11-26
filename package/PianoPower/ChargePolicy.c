@@ -1564,18 +1564,18 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     s->volt_set_prop = s->volt_set_value = s->volt_want_prop = s->volt_want_value = 0;   /* the next source starts at 5 V */
     s->fcc_full = 0;
     s->stop_noted = s->fw_noted = 0;
-    /* The firmware keeps the last values for the next source (a weak port would get them): its own back, only where we wrote. A
-     * stop of ours is lifted too: the next attach decides again within a cycle, and a stop must never outlive us. */
+    /* The firmware keeps the last limits for the next source: restore its own where we wrote. Keep the battery's SOC
+     * inhibit across detach so a replug cannot restart charging before the first decision. */
     const int rb_raised = (in->valid & PIANO_CHG_IN_ICL) && in->icl_ma > (int32_t)PIANO_CHG_ICL_DEFAULT + ICL_SLACK_MA;
     if (((s->touched & (1u << PIANO_CHG_S_ICL)) || rb_raised) && s->icl_set != PIANO_CHG_ICL_DEFAULT)
         plan_write(c, s, p, now, PIANO_CHG_S_ICL, PIANO_CHG_ICL, PIANO_CHG_ICL_DEFAULT, 4);
     if ((s->touched & (1u << PIANO_CHG_S_FCC)) && s->fcc_set != PIANO_CHG_FCC_DEFAULT &&
         (!p->own_bus || s->fcc_set > PIANO_CHG_FCC_DEFAULT))
         plan_write(c, s, p, now, PIANO_CHG_S_FCC, PIANO_CHG_FCC, PIANO_CHG_FCC_DEFAULT, 4);
-    if (s->disabled && !p->own_bus) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
+    if (s->disabled && !s->hold && !p->own_bus) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
     p->icl_ma = PIANO_CHG_ICL_DEFAULT;
     p->fcc_ma = PIANO_CHG_FCC_DEFAULT;
-    p->charge = (uint8_t)(!p->own_bus || (s->charge_ok && !s->disabled));
+    p->charge = (uint8_t)(!s->hold && (!p->own_bus || (s->charge_ok && !s->disabled)));
     wedge_check(in, s, p, now);
 }
 

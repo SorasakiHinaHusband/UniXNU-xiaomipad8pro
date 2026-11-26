@@ -755,7 +755,7 @@ static void testLimit()
     t.tCoolDc = 15; t.step(); CHECK(!t.wrote(PIANO_CHG_ENABLE));
     t.tCoolDc = 20; t.step(); CHECK(t.wrote(PIANO_CHG_ENABLE, 1));
   }
-  // a stop of ours is lifted on detach (the next attach decides again) and at shutdown
+  // A health stop survives detach and reattach. Shutdown hands control back to firmware.
   {
     Sim t;
     t.cfg.limit = 1;
@@ -764,10 +764,10 @@ static void testLimit()
     CHECK(t.wrote(PIANO_CHG_ENABLE, 0));
     t.source = false;
     t.step();
-    CHECK(t.wrote(PIANO_CHG_ENABLE, 1));
+    CHECK(!t.wrote(PIANO_CHG_ENABLE) && !t.plan.charge && t.enable == 0);
     t.source = true;
     t.step();
-    CHECK(t.wrote(PIANO_CHG_ENABLE, 0));
+    CHECK(!t.wrote(PIANO_CHG_ENABLE) && !t.plan.charge && t.enable == 0);
     t.fill();
     piano_charge_shutdown(&t.cfg, &t.in, &t.st, &t.plan);
     CHECK(t.wrote(PIANO_CHG_ENABLE, 1) && !t.plan.sleep_ready);
