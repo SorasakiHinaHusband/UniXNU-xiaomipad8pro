@@ -208,25 +208,22 @@ Then compile the kernel translation units/import bindings on the host, without
 building an image, and run the existing DPU and NativeGopDisplay suites. A
 future symbol-layout or SDK mismatch must fail closed to the existing clean.
 
-Host verification used `tooling/k27/build-native-piano-dpu.sh`. All eight
-PianoDpu suites passed, including the five baseline suites, the mode planner,
-the snapshot model and the new conditional-clean suite. The arm64e object
-build and import check passed against the pinned 27.3 kernel with zero
-unresolved imports. The IOSurface accessor was also confirmed in the pinned
-27.3 collection. The object build checks for that definition in `KC_BASE`;
-if the accessor cannot be bound, M2 treats the cache mode as unknown and
-cleans every scanout. The NativeGopDisplay host suite and its 27.3 object
-build also passed. No boot image was built.
+The M2 qualification diagnostics passed all 11 PianoDpu and both
+NativeGopDisplay host suites. The conditional-clean suite also passed
+under ASan/UBSan. Both kexts built as arm64e objects against the pinned
+27.3 target with zero unresolved imports. The object build checks for
+the IOSurface cache-mode accessor in `KC_BASE`. If binding is unavailable,
+M2 treats the cache mode as unknown and cleans every scanout.
 
-## RAM qualification
+## RAM-boot read list
 
 ### Boot and capture
 
-Use the same frozen macOS 27.3 RAM image for both arms. Merge the following
-display arguments into the combined qualification image once per key.
-Keep the native GPU enabled, `/defaults/vmm-present=0`, and the other
-ride-along settings identical. The timing comparison uses the fixed
-120 Hz profile with adaptive refresh and native panel sleep disabled.
+Use the same frozen macOS 27.3 RAM image for both arms. Build the combined
+qualification image with `PIANO_GPU=2` and `PIANO_VMM_PRESENT=0`, and merge
+the following display boot arguments once per key. Keep the other ride-along
+settings identical. The timing comparison uses the fixed 120 Hz profile
+with adaptive refresh and native panel sleep disabled.
 
 ```text
 piano-dpu=2 piano-dpu-smmu=2 piano-dpu-flip=4 piano-dpu-clean-skip=1
@@ -270,9 +267,10 @@ sudo sysctl machdep.piano_dpu_clean_skip=1   # B: verified-WC skip
    the first snapshot until the next summary after the final snapshot.
    Keep the workload quiet in the padding so it adds at most 25% extra
    flipped swaps. Save the complete console slice between those summary
-   lines inclusive for each arm. On one boot use separate, ordered slices
-   and switch policy between them. Save the next GOP report before
-   switching policy even if the workload has already ended.
+   lines inclusive for each arm. GOP reports about every 10 seconds
+   while swaps are active. Trigger a small redraw if an idle desktop
+   delays the closing report. On one boot use separate, ordered slices
+   and switch policy only after saving the closing report for A.
 3. Record the panel optically (for example with a C920) in both arms.
    Compare against expected visible generation markers on owned test
    surfaces. Include sparse tile and whole-frame updates, published CPU
