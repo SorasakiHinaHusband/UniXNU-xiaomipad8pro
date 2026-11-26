@@ -3,9 +3,8 @@
 B13's S6 host deliverables are [PersistExt4Ro.h](PersistExt4Ro.h) and
 [PersistExt4Verify.h](PersistExt4Verify.h). PianoSensors gets its daily file
 tree from the RAM addon's pack or the ESP's `EFI/UniXNU/piano-sensors.pack`.
-The file service serves the validated pack from memory. S6 has no kext call
-site, configuration switch, or build dependency. Any future runtime
-integration needs a separate opt-in design.
+The file service serves the validated pack from memory. S6 runs in the host
+tests. Any future runtime integration needs a separate opt-in design.
 
 ## Reader contract
 
@@ -45,7 +44,7 @@ on work. Symlinks and special files are refused by inode mode.
 - Extent trees use the inode root and up to four external levels. Each
   visited node is checked for magic, depth, capacity, ordering, logical
   ranges inherited from its parent, and physical bounds before binary
-  search. The selected branch cannot repeat a block. Sparse holes and
+  search. No run in a visited node may overlap its ancestor blocks. Sparse holes and
   unwritten extents yield zeros. Without extent mapping, twelve direct
   pointers and the single-, double-, and triple-indirect maps are
   supported. A zero pointer means a hole. Repeated blocks on the selected
@@ -64,9 +63,13 @@ on work. Symlinks and special files are refused by inode mode.
   blocks fit before use. Every callback span is checked against the
   filesystem or, for the initial superblock, the image. File ranges are
   checked against EOF using subtraction to avoid overflow.
-- These are structural checks on metadata used during each read.
-  Filesystem checksums, allocation ownership and unvisited subtrees
-  are outside the reader's validation scope. [Linux ext4 superblock](https://www.kernel.org/doc/html/latest/filesystems/ext4/super.html),
+- With `metadata_csum`, the reader verifies CRC32C for the primary
+  superblock and the group descriptors, Linux inodes, external extents,
+  directory leaves, and htree nodes it reads. It supports UUID-derived and
+  stored checksum seeds. With legacy `gdt_csum`, it verifies group descriptors
+  using CRC16. Allocation ownership, bitmaps, and unvisited subtrees are
+  outside the validation scope. [Linux ext4 checksums](https://www.kernel.org/doc/html/latest/filesystems/ext4/checksums.html),
+  [superblock](https://www.kernel.org/doc/html/latest/filesystems/ext4/super.html),
   [group descriptors](https://www.kernel.org/doc/html/latest/filesystems/ext4/group_descr.html),
   [block maps](https://www.kernel.org/doc/html/latest/filesystems/ext4/ifork.html),
   and [directory records](https://www.kernel.org/doc/html/latest/filesystems/ext4/directory.html)
@@ -96,10 +99,12 @@ The [host suite](tests/persist_ext4_ro_host.cpp) builds synthetic images in
 memory and encodes expected pack entries independently of reader output. It
 exercises block sizes, descriptor widths, high block addresses, extent depths,
 legacy block maps, sparse content, indexed directories, byte equivalence,
-and malformed or truncated inputs under ASan and UBSan. The test is
-discovered by the CI runner via its inline build command.
+checksum corruption, and malformed or truncated inputs under ASan and UBSan.
+The PianoSensors host runner includes it and the CI runner also discovers
+its inline build command.
 
 ```sh
 python3 scripts/ci/self-tests.py --only persist_ext4_ro_host
+python3 package/PianoSensors/tests/run-host-tests.py --only persist
 python3 scripts/ci/self-tests.py --only PianoSensors
 ```

@@ -28,8 +28,9 @@ private:
     friend class Reader;
     const Reader *owner_ = nullptr;
     uint64_t size_ = 0;
-    uint32_t number_ = 0;
+    uint32_t number_ = 0, checksumSeed_ = 0;
     bool directory_ = false, extents_ = false;
+    bool indexed_ = false;
     uint8_t map_[60] = {};
 };
 
@@ -58,12 +59,21 @@ public:
         const uint32_t revision = le32(sb + 0x4c);
         const uint32_t incompat = le32(sb + 0x60), roCompat = le32(sb + 0x64);
         // Flexible block groups, EA inodes, and the checksum seed leave these read paths intact.
-        constexpr uint32_t supportedIncompat = FileType | Extents | Blocks64 | 0x200 | 0x400 | 0x2000;
+        constexpr uint32_t supportedIncompat = FileType | Extents | Blocks64 | 0x200 | 0x400 | ChecksumSeed;
         // Sparse superblocks, large/huge files, GDT checksums, dir_nlink, extra_isize,
         // quota, metadata checksums, read-only, project quota, and verity.
         constexpr uint32_t supportedRo = 0x7b | 0x100 | 0x400 | 0x1000 | 0x2000 | 0x8000;
         if (revision > 1 || (incompat & ~supportedIncompat) || (roCompat & ~supportedRo))
             return Result::Unsupported;
+        metadataCsum_ = (roCompat & 0x400) != 0;
+        gdtCsum_ = (roCompat & 0x10) != 0;
+        if (metadataCsum_) {
+            if (sb[0x175] != 1 || le32(sb + 0x48) != 0) return Result::Unsupported; // CRC32C, Linux inode layout
+            if (crc(UINT32_MAX, sb, 0x3fc) != le32(sb + 0x3fc)) return Result::Corrupt;
+            checksumSeed_ = incompat & ChecksumSeed ? le32(sb + 0x270) : crc(UINT32_MAX, sb + 0x68, 16);
+        } else if (gdtCsum_) {
+            checksumSeed_ = crc(UINT16_MAX, sb + 0x68, 16, Crc16);
+        }
 
         const uint32_t shift = le32(sb + 0x18);
         if (shift > 2) return Result::Unsupported;
@@ -109,15 +119,28 @@ public:
         if (!number || number > inodeCount_) return Result::Corrupt;
         const uint64_t group = (number - 1) / inodesPerGroup_;
         const uint32_t index = (number - 1) % inodesPerGroup_;
-        uint8_t bytes[128];
-        Result rc = readAt(descOffset_ + group * descSize_, descSize_, bytes);
+        uint8_t scratch[128];
+        Result rc = readAt(descOffset_ + group * descSize_, descSize_, scratch);
         if (rc != Result::Ok) return rc;
-        if (le16(bytes + 0x12) & 1) return Result::Corrupt; // BG_INODE_UNINIT
-        uint64_t table = le32(bytes + 8);
-        if (descSize_ == 64) table |= uint64_t(le32(bytes + 0x28)) << 32;
+        if (!validDescriptor(scratch, uint32_t(group))) return Result::Corrupt;
+        if (le16(scratch + 0x12) & 1) return Result::Corrupt; // BG_INODE_UNINIT
+        uint64_t table = le32(scratch + 8);
+        if (descSize_ == 64) table |= uint64_t(le32(scratch + 0x28)) << 32;
         if (!validBlocks(table, inodeTableBlocks_)) return Result::Corrupt;
-        rc = readAt(table * blockSize_ + uint64_t(index) * inodeSize_, sizeof bytes, bytes);
-        if (rc != Result::Ok) return rc;
+
+        const uint64_t offset = uint64_t(index) * inodeSize_;
+        const uint8_t *bytes = scratch;
+        uint32_t seed = 0;
+        if (metadataCsum_) {
+            rc = loadBlock(table + offset / blockSize_);
+            if (rc != Result::Ok) return rc;
+            bytes = block_ + offset % blockSize_;
+            seed = crc(crcWord(checksumSeed_, number), bytes + 0x64, 4); // i_generation
+            if (!validInodeChecksum(bytes, seed)) return Result::Corrupt;
+        } else {
+            rc = readAt(table * blockSize_ + offset, sizeof scratch, scratch);
+            if (rc != Result::Ok) return rc;
+        }
 
         const uint16_t type = le16(bytes) & 0xf000;
         if (!type || !le16(bytes + 0x1a) || le32(bytes + 0x14)) return Result::Corrupt;
@@ -138,8 +161,10 @@ public:
         out.owner_ = this;
         out.size_ = size;
         out.number_ = number;
+        out.checksumSeed_ = seed;
         out.directory_ = directory;
         out.extents_ = extents;
+        out.indexed_ = (flags & 0x1000) != 0; // EXT4_INDEX_FL
         for (size_t i = 0; i < sizeof out.map_; ++i) out.map_[i] = bytes[0x28 + i];
         return Result::Ok;
     }
@@ -177,8 +202,7 @@ public:
             return Result::BadArgument;
         if (dir.size_ > MaxDirectoryBytes) return Result::Limit;
         while (cursor < dir.size_) {
-            const size_t within = cursor % blockSize_, left = blockSize_ - within;
-            if (left < 8) return Result::Corrupt;
+            const size_t within = cursor % blockSize_;
             const uint64_t logical = cursor / blockSize_;
             if (cachedDir_ != dir.number_ || cachedLogical_ != logical || !cachedBlock_) {
                 uint64_t disk;
@@ -187,9 +211,18 @@ public:
                 if (!disk) return Result::Corrupt;
                 rc = loadBlock(disk);
                 if (rc != Result::Ok) return rc;
+                size_t dirBytes = blockSize_;
+                if (metadataCsum_ && !validDirectoryChecksum(dir, logical, dirBytes)) return Result::Corrupt;
                 cachedDir_ = dir.number_;
                 cachedLogical_ = logical;
+                cachedDirBytes_ = dirBytes;
             }
+            if (within == cachedDirBytes_) {
+                cursor += blockSize_ - within;
+                continue;
+            }
+            if (within > cachedDirBytes_ || cachedDirBytes_ - within < 8) return Result::Corrupt;
+            const size_t left = cachedDirBytes_ - within;
 
             const uint8_t *entry = block_ + within;
             const uint32_t number = le32(entry);
@@ -250,7 +283,8 @@ public:
     }
 
 private:
-    static constexpr uint32_t FileType = 0x2, Extents = 0x40, Blocks64 = 0x80;
+    static constexpr uint32_t FileType = 0x2, Extents = 0x40, Blocks64 = 0x80, ChecksumSeed = 0x2000;
+    static constexpr uint32_t Crc32c = 0x82f63b78, Crc16 = 0xa001;
     static constexpr uint64_t LogicalLimit = uint64_t{1} << 32;
     static constexpr unsigned MaxExtentDepth = 4;
 
@@ -258,6 +292,72 @@ private:
     static uint32_t le32(const uint8_t *p) { return uint32_t(le16(p)) | uint32_t(le16(p + 2)) << 16; }
     static uint64_t ceilDiv(uint64_t n, uint64_t d) { return n / d + (n % d != 0); }
     static bool fits(uint64_t at, uint64_t len, uint64_t total) { return at <= total && len <= total - at; }
+
+    static uint32_t crc(uint32_t value, const uint8_t *p, size_t length, uint32_t polynomial = Crc32c)
+    {
+        for (size_t i = 0; i < length; ++i) {
+            value ^= p[i];
+            for (unsigned bit = 0; bit < 8; ++bit) value = (value >> 1) ^ (polynomial & (0u - (value & 1)));
+        }
+        return value;
+    }
+
+    static uint32_t crcWord(uint32_t seed, uint32_t word, uint32_t polynomial = Crc32c)
+    {
+        const uint8_t bytes[] = {uint8_t(word), uint8_t(word >> 8), uint8_t(word >> 16), uint8_t(word >> 24)};
+        return crc(seed, bytes, sizeof bytes, polynomial);
+    }
+
+    bool validDescriptor(const uint8_t *desc, uint32_t group) const
+    {
+        if (!metadataCsum_ && !gdtCsum_) return true;
+        const uint32_t polynomial = metadataCsum_ ? Crc32c : Crc16;
+        const uint8_t zero[2] = {};
+        uint32_t sum = crc(crcWord(checksumSeed_, group, polynomial), desc, 0x1e, polynomial);
+        if (metadataCsum_) sum = crc(sum, zero, sizeof zero);
+        sum = crc(sum, desc + 0x20, descSize_ - 0x20, polynomial);
+        return uint16_t(sum) == le16(desc + 0x1e);
+    }
+
+    bool validInodeChecksum(const uint8_t *inode, uint32_t seed) const
+    {
+        const unsigned extra = inodeSize_ > 128 ? le16(inode + 0x80) : 0;
+        if (extra > inodeSize_ - 128 || extra % 4) return false;
+        const uint8_t zero[2] = {};
+        uint32_t sum = crc(crc(seed, inode, 0x7c), zero, sizeof zero);
+        const uint32_t low = le16(inode + 0x7c);
+        if (extra >= 4) {
+            sum = crc(crc(sum, inode + 0x7e, 4), zero, sizeof zero);
+            sum = crc(sum, inode + 0x84, inodeSize_ - 0x84);
+            return sum == (low | (uint32_t(le16(inode + 0x82)) << 16));
+        }
+        return uint16_t(crc(sum, inode + 0x7e, inodeSize_ - 0x7e)) == low;
+    }
+
+    bool validDirectoryChecksum(const Inode &dir, uint64_t logical, size_t &dataBytes) const
+    {
+        const uint32_t seed = dir.checksumSeed_;
+        size_t entries = 0;
+        if (dir.indexed_) {
+            if (!logical) {
+                if (le16(block_ + 4) != 12 || le16(block_ + 16) != blockSize_ - 12 ||
+                    le32(block_ + 24) || block_[29] != 8) return false;
+                entries = 32;
+            } else if (!le32(block_) && le16(block_ + 4) == blockSize_) {
+                entries = 8;
+            }
+        }
+        if (entries) {
+            const size_t limit = le16(block_ + entries), count = le16(block_ + entries + 2);
+            const size_t tail = entries + limit * 8;
+            if (!count || count > limit || tail != blockSize_ - 8) return false;
+            const uint32_t sum = crc(crc(seed, block_, entries + count * 8), block_ + tail, 4);
+            return crcWord(sum, 0) == le32(block_ + tail + 4);
+        }
+        dataBytes = blockSize_ - 12;
+        const uint8_t *tail = block_ + dataBytes;
+        return !le32(tail) && le32(tail + 4) == 0xde00000c && crc(seed, block_, dataBytes) == le32(tail + 8);
+    }
 
     bool validBlocks(uint64_t first, uint64_t count) const
     {
@@ -302,7 +402,7 @@ private:
     Result map(const Inode &file, uint64_t logical, uint64_t &disk)
     {
         disk = 0;
-        return file.extents_ ? mapExtents(file.map_, logical, disk) : mapIndirect(file.map_, logical, disk);
+        return file.extents_ ? mapExtents(file, logical, disk) : mapIndirect(file.map_, logical, disk);
     }
 
     static const uint8_t *extentEntry(const uint8_t *node, unsigned index) { return node + 12 + index * 12; }
@@ -312,8 +412,9 @@ private:
                      : le32(entry + 8) | (uint64_t(le16(entry + 6)) << 32);
     }
 
-    Result mapExtents(const uint8_t *node, uint64_t logical, uint64_t &disk)
+    Result mapExtents(const Inode &file, uint64_t logical, uint64_t &disk)
     {
+        const uint8_t *node = file.map_;
         unsigned depth = le16(node + 6);
         if (depth > MaxExtentDepth) return Result::Unsupported;
         uint64_t lower = 0, upper = LogicalLimit, visited[MaxExtentDepth] = {};
@@ -324,6 +425,10 @@ private:
             if (le16(node) != 0xf30a || le16(node + 6) != depth || !maximum ||
                 maximum > capacity || entries > maximum || (!entries && (depth || level)))
                 return Result::Corrupt;
+            if (level && metadataCsum_) {
+                const size_t tail = 12 + maximum * 12;
+                if (crc(file.checksumSeed_, node, tail) != le32(node + tail)) return Result::Corrupt;
+            }
 
             // Validate ordering and full spans before trusting the index for binary search.
             uint64_t end = lower;
@@ -332,9 +437,12 @@ private:
                 const uint64_t start = le32(entry);
                 const unsigned encoded = le16(entry + 4);
                 const unsigned count = depth ? 1 : encoded > 32768 ? encoded - 32768 : encoded;
+                const uint64_t physical = extentDisk(entry, depth != 0);
                 if (!count || start < end || !fits(start, count, upper) || (!i && level && start != lower) ||
-                    !validBlocks(extentDisk(entry, depth != 0), count))
+                    !validBlocks(physical, count))
                     return Result::Corrupt;
+                for (unsigned j = 0; j < level; ++j)
+                    if (visited[j] >= physical && visited[j] - physical < count) return Result::Corrupt;
                 end = start + count;
             }
 
@@ -351,18 +459,16 @@ private:
                 const uint64_t delta = logical - le32(entry);
                 if (delta >= le16(entry + 4) || le16(entry + 4) > 32768) return Result::Ok;
                 disk = physical + delta;
-                for (unsigned i = 0; i < level; ++i) if (visited[i] == disk) return Result::Corrupt;
                 return Result::Ok;
             }
 
-            for (unsigned i = 0; i < level; ++i) if (visited[i] == physical) return Result::Corrupt;
             visited[level++] = physical;
             lower = le32(entry);
             if (lo < entries) upper = le32(extentEntry(node, lo));
             const Result rc = loadBlock(physical);
             if (rc != Result::Ok) return rc;
             node = block_;
-            capacity = (blockSize_ - 12) / 12;
+            capacity = (blockSize_ - 12 - (metadataCsum_ ? 4 : 0)) / 12;
             --depth;
         }
     }
@@ -402,8 +508,11 @@ private:
     const void *ctx_ = nullptr;
     uint64_t bytes_ = 0, blocks_ = 0, dataFirst_ = 0, descOffset_ = 0, inodeTableBlocks_ = 0;
     uint32_t blockSize_ = 0, inodeSize_ = 0, descSize_ = 0, inodesPerGroup_ = 0, inodeCount_ = 0, features_ = 0;
+    uint32_t checksumSeed_ = 0;
+    bool metadataCsum_ = false, gdtCsum_ = false;
     uint64_t cachedBlock_ = 0, cachedLogical_ = 0;
     uint32_t cachedDir_ = 0;
+    size_t cachedDirBytes_ = 0;
     uint8_t block_[MaxBlock];
 };
 

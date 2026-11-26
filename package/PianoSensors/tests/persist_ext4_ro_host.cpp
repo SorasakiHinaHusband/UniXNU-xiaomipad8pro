@@ -67,7 +67,6 @@ struct Fixture {
         setSb(0x58, 2, inodeSize);
         setSb(0x5c, 4, legacy ? 0 : 0x2c); // clean journal, xattrs, directory indexing
         setSb(0x60, 4, (legacy ? 0 : 0x42) | (wide ? 0x280 : 0));
-        setSb(0x64, 4, legacy ? 0 : 0x400);
         setSb(0xfe, 2, descSize);
         put(image, group(0) + 8, 4, FirstTable);
         put(image, group(1) + 8, 4, SecondTable);
@@ -529,6 +528,7 @@ static void corruptMetadata()
         {left + 16, 2, 3, Sparse, Result::Corrupt, true}, // overlapping extents
         {left + 28, 2, 32771, Sparse, Result::Corrupt, true}, // extent crosses sibling boundary
         {left + 20, 4, 40, Sparse, Result::Corrupt, true}, // data aliases its index
+        {left + 32, 4, 42, Sparse, Result::Corrupt, true}, // unwritten run aliases its index
         {left + 20, 4, 0, Sparse, Result::Corrupt, true},
         {right + 20, 4, 256, Sparse, Result::Corrupt, true, 4096}, // physical run crosses image end
         {right + 18, 2, 0xffff, Sparse, Result::Corrupt, true, 4096}
@@ -575,6 +575,135 @@ static void corruptMetadata()
     CHECK(reader.open(&src, src.limit, Source::read) == Result::Ok);
     CHECK(reader.inode(Fixture::SparseInode, node) == Result::Ok);
     CHECK(reader.read(node, 0, 1, &byte) == Result::Ok && byte == 0x52);
+}
+
+// Generate reference checksums with a byte lookup table. The reader uses a bit-at-a-time implementation.
+static uint32_t checksum(uint32_t initial, uint32_t polynomial, const Bytes &data, size_t at, size_t length)
+{
+    uint32_t table[256];
+    for (unsigned i = 0; i < 256; ++i) {
+        uint32_t value = i;
+        for (unsigned bit = 0; bit < 8; ++bit) value = (value >> 1) ^ (value & 1 ? polynomial : 0);
+        table[i] = value;
+    }
+    for (size_t i = at; i < at + length; ++i) initial = (initial >> 8) ^ table[uint8_t(initial ^ data.at(i))];
+    return initial;
+}
+
+static void checksumMetadata(Fixture &f, bool storedSeed, bool legacyGdt = false)
+{
+    constexpr uint32_t crc32c = 0x82f63b78, crc16 = 0xa001;
+    const unsigned bs = f.blockSize;
+    for (unsigned i = 0; i < 16; ++i) f.setSb(0x68 + i, 1, 17 * i);
+    f.setSb(0x64, 4, legacyGdt ? 0x10 : 0x400);
+    uint32_t seed = checksum(legacyGdt ? UINT16_MAX : UINT32_MAX, legacyGdt ? crc16 : crc32c, f.image, 1024 + 0x68, 16);
+    if (storedSeed) {
+        seed = 0x76543210;
+        f.setSb(0x60 + 1, 1, 0x20 | (f.descSize == 64 ? 2 : 0));
+        f.setSb(0x270, 4, seed);
+    }
+    for (unsigned group = 0; group < 2; ++group) {
+        Bytes g(4);
+        put(g, 0, 4, group);
+        g.insert(g.end(), f.image.begin() + f.group(group), f.image.begin() + f.group(group) + f.descSize);
+        if (legacyGdt) g.erase(g.begin() + 4 + 0x1e, g.begin() + 4 + 0x20);
+        put(f.image, f.group(group) + 0x1e, 2, uint16_t(checksum(seed, legacyGdt ? crc16 : crc32c, g, 0, g.size())));
+    }
+    if (legacyGdt) return;
+    f.setSb(0x175, 1, 1);
+    f.setSb(0x3fc, 4, checksum(UINT32_MAX, crc32c, f.image, 1024, 0x3fc));
+
+    uint32_t inodeSeed[Fixture::JsonInode + 1] = {};
+    for (unsigned inode : {Fixture::Root, Fixture::Sensors, Fixture::Registry, Fixture::Inner, Fixture::Nested,
+                           Fixture::VersionInode, Fixture::JsonInode, Fixture::TextInode, Fixture::EmptyInode, Fixture::SparseInode,
+                           Fixture::Other}) {
+        const size_t at = f.inodeOffset(inode);
+        Bytes id(8);
+        put(id, 0, 4, inode);
+        put(id, 4, 4, 0x1234 + inode);
+        put(f.image, at + 0x64, 4, 0x1234 + inode);
+        inodeSeed[inode] = checksum(seed, crc32c, id, 0, id.size());
+        // One wide inode uses only the low checksum because i_extra_isize is zero.
+        const bool full = f.inodeSize > 128 && inode != Fixture::JsonInode;
+        if (full) put(f.image, at + 0x80, 2, 32);
+        const uint32_t sum = checksum(inodeSeed[inode], crc32c, f.image, at, f.inodeSize);
+        put(f.image, at + 0x7c, 2, uint16_t(sum));
+        if (full) put(f.image, at + 0x82, 2, sum >> 16);
+    }
+
+    for (unsigned disk : {42u, Fixture::LeftLeaf, Fixture::RightLeaf}) {
+        const size_t at = disk * bs, tail = bs - bs % 12;
+        put(f.image, at + tail, 4, checksum(inodeSeed[Fixture::SparseInode], crc32c, f.image, at, tail));
+    }
+    const unsigned dirs[][2] = {{Fixture::Root, 20}, {Fixture::Sensors, 21}, {Fixture::Registry, 22},
+                               {Fixture::Inner, Fixture::InnerBlock}, {Fixture::Nested, Fixture::NestedBlock}};
+    for (const auto &dir : dirs) {
+        const size_t at = dir[1] * bs, tail = at + bs - 12;
+        if (dir[0] != Fixture::Inner) {
+            size_t pos = at;
+            for (;;) {
+                const size_t record = f.image[pos + 4] + 256u * f.image[pos + 5];
+                CHECK(record && pos + record <= at + bs);
+                if (pos + record == at + bs) {
+                    put(f.image, pos + 4, 2, record - 12);
+                    break;
+                }
+                pos += record;
+            }
+        }
+        put(f.image, tail + 4, 2, 12);
+        put(f.image, tail + 7, 1, 0xde);
+        put(f.image, tail + 8, 4, checksum(inodeSeed[dir[0]], crc32c, f.image, at, bs - 12));
+    }
+    for (unsigned disk : {23u, 25u}) {
+        const size_t at = disk * bs, count = disk == 23 ? 32 : 8;
+        if (disk == 23) put(f.image, at + 29, 1, 8);     // root info length
+        put(f.image, at + count, 2, (bs - count - 8) / 8);
+        put(f.image, at + count + 2, 2, 1);
+        uint32_t sum = checksum(inodeSeed[Fixture::Inner], crc32c, f.image, at, count + 8);
+        sum = checksum(sum, crc32c, f.image, at + bs - 8, 8);
+        put(f.image, at + bs - 4, 4, sum);
+    }
+}
+
+static void metadataChecksums()
+{
+    for (unsigned shift = 0; shift <= 2; ++shift) {
+        Fixture f(shift, shift != 0, 2);
+        checksumMetadata(f, shift == 2);
+        extraction(f);
+
+        const auto expectCorrupt = [&](size_t at, bool superblock) {
+            f.image[at] ^= 1;
+            Source source{f.image, f.image.size()};
+            Reader reader;
+            CHECK(reader.open(&source, source.limit, Source::read) == (superblock ? Result::Corrupt : Result::Ok));
+            if (!superblock) CHECK(verify(reader, makePack(f.files)) == Equivalence::ImageError);
+            f.image[at] ^= 1;
+        };
+        expectCorrupt(1024 + 0x2c, true);                        // superblock mount time
+        expectCorrupt(f.group(1) + 0x1e, false);                 // group descriptor checksum
+        expectCorrupt(f.inodeOffset(Fixture::TextInode) + 0x7c, false);
+        if (shift) {
+            expectCorrupt(f.inodeOffset(Fixture::TextInode) + 0x82, false);
+            expectCorrupt(f.inodeOffset(Fixture::JsonInode) + 0x90, false); // covered despite low-only checksum
+        }
+        expectCorrupt(Fixture::LeftLeaf * f.blockSize + f.blockSize - f.blockSize % 12, false);
+        expectCorrupt((Fixture::NestedBlock + 1) * f.blockSize - 1, false); // leaf checksum
+        expectCorrupt(24 * f.blockSize - 1, false);              // htree root checksum
+        expectCorrupt(26 * f.blockSize - 1, false);              // htree interior checksum
+    }
+    for (bool wide : {false, true}) {
+        Fixture f(1, wide, 2);
+        checksumMetadata(f, false, true);
+        extraction(f);
+        f.image[f.group(1) + 0x1e] ^= 1;
+        Source source{f.image, f.image.size()};
+        Reader reader;
+        Inode node;
+        CHECK(reader.open(&source, source.limit, Source::read) == Result::Ok);
+        CHECK(reader.inode(Fixture::JsonInode, node) == Result::Corrupt);
+    }
 }
 
 static void pathAndDirectoryLimits()
@@ -703,6 +832,7 @@ int main()
     wideAddresses();
     partitionBounds();
     corruptMetadata();
+    metadataChecksums();
     pathAndDirectoryLimits();
     equivalenceFailures();
     mutate();
