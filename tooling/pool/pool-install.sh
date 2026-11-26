@@ -83,6 +83,16 @@ LOCKED=0
 FINISHED=0
 COPIES_MAY_EXIST=0
 [ -d "$PACKAGE" ] && [ -f "$PACKAGE/PACKAGE.tsv" ] || { echo "no pool package $PACKAGE (tooling/pool/mk-pool-package.sh)" >&2; exit 1; }
+# Check the required inputs as well as every listed checksum before sourcing package code.
+(
+    cd "$PACKAGE" &&
+    awk '
+        BEGIN { split("install-functions.sh install-gate.sh pool-host.sh pool-device.sh pool-manifest", files) }
+        { path = $2; sub(/^\*/, "", path); sub(/^\.\//, "", path); seen[path]++ }
+        END { for (i in files) if (seen[files[i]] != 1) exit 1 }
+    ' PACKAGE.sha256 &&
+    shasum -a 256 --strict -c -s PACKAGE.sha256
+) || { echo 'refused: the pool package does not match a complete PACKAGE.sha256' >&2; exit 1; }
 # the package copies of v13.1y10's functions, then the pool's host functions
 source "$PACKAGE/install-functions.sh"
 source "$PACKAGE/install-gate.sh"
@@ -145,10 +155,12 @@ pool_put() {   # LOCAL REMOTE: put (v13.1y10's: five tries, sha256 read back) wi
 put_sized() {
     local source=$1 dest=$2 wanted attempt got
     wanted=$(sha "$source") || return 1
+    [[ "$wanted" =~ ^[0-9a-f]{64}$ ]] || return 1
     for attempt in 1 2 3 4 5; do
+        got=''
         if SSH_T=$SSH_T_PUT rssh "umask 077; cat > '$dest.part'" < "$source"; then
-            got=$(SSH_T=$(( SSH_T_PUT / 4 + 60 )) rssh "/usr/bin/shasum -a 256 '$dest.part' | /usr/bin/awk '{print \$1}'" || true)
-            if [ "$got" = "$wanted" ] && rssh "/bin/mv -f '${dest:?}.part' '${dest:?}'"; then return 0; fi
+            if got=$(SSH_T=$(( SSH_T_PUT / 4 + 60 )) rssh "set -o pipefail; /usr/bin/shasum -a 256 '$dest.part' | /usr/bin/awk '{print \$1}'") &&
+                [ "$got" = "$wanted" ] && rssh "/bin/mv -f '${dest:?}.part' '${dest:?}'"; then return 0; fi
         fi
         say "  copy of $(basename "$source") try $attempt: ${got:-no hash}, want $wanted"
         nap 3
@@ -210,12 +222,16 @@ mkdir "$LOCK" 2>/dev/null || { say "the tablet lock $LOCK is held ($(cat "$LOCK/
 LOCKED=1
 printf '%s\n' "$ROUND" > "$LOCK/owner"
 say "pool install $NAME (silent=$PIANO_INSTALL_SILENT) from $WORK"
+for hold in "$PIANO_PERSIST_OUT/HOLD" "${POOL_MAIN_LEDGER:-$MAIN/out/persistent}/HOLD"; do
+    [ ! -e "$hold" ] && [ ! -L "$hold" ] || refuse "install writes are on HOLD ($hold)"
+done
 [ -n "$INVENTORY" ] && [ -d "$INVENTORY" ] || refuse 'no inventory folder (--inventory: tonight'"'"'s INVENTORY-READS.sh output)'
 [ -n "$CAPTURE" ] && [ -f "$CAPTURE/CAPTURE.json" ] || refuse 'no capture (--capture: the windows/ folder of pool-capture.sh with CAPTURE.json)'
 [[ "${POOL_DATA_UUID:-}" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || refuse 'set POOL_DATA_UUID to the expected Data volume UUID'
 for v in os systemos; do   # the archives: given, else out/pool/<vol>-<first 8 of the capture sha256> (make-volume-archive.sh's folder)
     a=ARCH_$v
     csha=$(json "$CAPTURE/CAPTURE.json" "d['windows']['$v']['sha256']") || refuse "CAPTURE.json has no $v window"
+    [[ "$csha" =~ ^[0-9a-f]{64}$ ]] || refuse "CAPTURE.json has no valid SHA-256 for the $v window"
     [ -n "${!a}" ] || printf -v "$a" '%s' "$WORK/out/pool/$v-${csha:0:8}"
     [ "$(sed -n 's/^source_sha256=//p' "${!a}/archive.env" 2>/dev/null)" = "$csha" ] ||
         refuse "R1a: the $v archive ${!a} is not made from the capture (source $(sed -n 's/^source_sha256=//p' "${!a}/archive.env" 2>/dev/null | cut -c1-16), capture ${csha:0:16})"
@@ -226,16 +242,26 @@ irc=$?
 cat "$ROUND/inventory-gates.txt" >> "$LOG"
 [ "$irc" = 0 ] || refuse "the inventory gates: $(tail -1 "$ROUND/inventory-gates.txt")"
 say "  inventory gates: PASS ($INVENTORY)"
-( cd "$PACKAGE" && shasum -a 256 -c -s PACKAGE.sha256 ) || refuse 'the pool package does not match PACKAGE.sha256'
 for v in os systemos; do
     a=ARCH_$v; a=${!a}
     [ -f "$a/archive.env" ] || refuse "no $a/archive.env"
-    for f in $FILES; do [ -f "$a/$f" ] || refuse "no $a/$f"; done
-    [ "$(shasum -a 256 "$a/volume.aar" | awk '{print $1}')" = "$(sed -n 's/^archive_sha256=//p' "$a/archive.env")" ] || refuse "$a/volume.aar is not its archive.env one"
-    [ "$(shasum -a 256 "$a/expected.manifest" | awk '{print $1}')" = "$(sed -n 's/^manifest_file_sha256=//p' "$a/archive.env")" ] || refuse "$a/expected.manifest is not its archive.env one"
+    for f in $FILES; do [ -f "$a/$f" ] && [ -s "$a/$f" ] || refuse "missing or empty $a/$f"; done
+    for receipt in archive_sha256:volume.aar manifest_file_sha256:expected.manifest; do
+        f=${receipt#*:}
+        want=$(sed -n "s/^${receipt%:*}=//p" "$a/archive.env")
+        [[ "$want" =~ ^[0-9a-f]{64}$ ]] &&
+            got=$(shasum -a 256 "$a/$f" | awk '{print $1}') && [ "$got" = "$want" ] ||
+            refuse "$a/$f is not its archive.env one"
+    done
 done
+python3 "$SELF/pool-live-check.py" check-manifests --os "$ARCH_os/expected.manifest" --systemos "$ARCH_systemos/expected.manifest" > "$ROUND/manifest-check.txt" 2>&1 ||
+    refuse "incomplete or invalid source manifest: $(head -1 "$ROUND/manifest-check.txt")"
+[ -n "$PIANO_BACKUP_DIR" ] && [ -d "$PIANO_BACKUP_DIR" ] && [ -w "$PIANO_BACKUP_DIR" ] ||
+    refuse 'PIANO_BACKUP_DIR is not a writable directory for the ESP rollback backup'
 BASE_IMG=$(json "$PIANO_PERSIST_OUT/installed.json" 'd["image"]') || refuse 'no OUT/installed.json'
-BASE_SHA=$(json "$PIANO_PERSIST_OUT/installed.json" 'd["sha256"]')
+[[ "$BASE_IMG" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.img$ ]] || refuse 'invalid rollback image in OUT/installed.json'
+BASE_SHA=$(json "$PIANO_PERSIST_OUT/installed.json" 'd["sha256"]') || refuse 'no rollback SHA-256 in OUT/installed.json'
+[[ "$BASE_SHA" =~ ^[0-9a-f]{64}$ ]] || refuse 'invalid rollback SHA-256 in OUT/installed.json'
 BASE_JSON=$PIANO_PERSIST_OUT/${BASE_IMG%.img}.json
 [ "$(cache_sha "$PIANO_PERSIST_OUT/$BASE_IMG")" = "$BASE_SHA" ] && [ "$(json "$BASE_JSON" 'd["sha256"]')" = "$BASE_SHA" ] ||
     refuse "the installed ESP $BASE_IMG: its image is not here or not its record's"

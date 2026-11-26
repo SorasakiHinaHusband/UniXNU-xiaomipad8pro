@@ -66,6 +66,7 @@ if [ -s "$INV/apfs-list.txt" ]; then
     if ! [[ "$DATA_UUID" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]]; then
         gate VOID 'R3 set POOL_DATA_UUID to the expected Data volume UUID'
     elif [ -z "$cont" ]; then gate FAIL "R3 the Data volume $DATA_UUID is not in diskutil's APFS list: addVolume has no container to use"
+    elif ! [[ "$cont" =~ ^disk[0-9]+$ ]]; then gate FAIL "R3 invalid APFS container target: $cont"
     elif awk -v c="$cont" '/APFS Container Reference:/ { in_c = ($NF == c) } in_c && /(Fusion|FileVault:[[:space:]]*Yes|Sealed:[[:space:]]*Yes|Encrypted:[[:space:]]*Yes)/ { found = 1 } END { exit !found }' "$INV/apfs-list.txt"; then
         gate FAIL "R3 container $cont: Fusion, FileVault, encrypted or sealed lines: addVolume not taken as usable"
     else

@@ -209,7 +209,7 @@ def main():
     cpu_count = os.cpu_count() or 2
     ap = argparse.ArgumentParser()
     ap.add_argument('--list', action='store_true')
-    ap.add_argument('--only', action='append', metavar='SUBSTR', help='select paths matching any supplied substring')
+    ap.add_argument('--only', '--match', action='append', metavar='SUBSTR', help='select paths matching any supplied substring')
     ap.add_argument('--jobs', type=int, default=cpu_count)
     ap.add_argument('--junit')
     a = ap.parse_args()

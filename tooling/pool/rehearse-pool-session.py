@@ -215,7 +215,7 @@ def rehearse(results, args, OLD, OLD_SHA, old_name, NEW, ledger):
             session.esp = dict(session.esp, sha256='0' * 64)
         if case == 'bad-old-hash':
             session.esp_record = lambda _: dict(load(PERSIST / (OLD + '.json')), sha256='0' * 64)
-        with patch.object(real.subprocess, 'run', host_tool_transport), patch.object(real.common, 'write_json', ledger_boundary):
+        with patch.object(real.subprocess, 'run', host_tool_transport), patch.object(real, 'publish_esp_ledger', ledger_boundary):
             try:
                 real.maint_boot(session)
                 real.map_step(session)

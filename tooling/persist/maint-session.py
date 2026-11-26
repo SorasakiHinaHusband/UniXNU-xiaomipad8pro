@@ -54,6 +54,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -167,6 +168,7 @@ def esp_root_part(record):
 
 # LUN 0 partitions by their GPT name -> the key map_nodes keeps them under (tablet.sh map reports these)
 PART_KEYS = {'linux_rootfs': 'rootfs', 'linux_data': 'linux_data', 'esp': 'esp'}
+ESP_BACKUP = 'linux_rootfs-tail-esp'
 
 
 def read_nocache(path, digest=None):
@@ -379,8 +381,11 @@ class Session:
         return None, None, None
 
     def save(self, **values):
+        state = dict(self.state, **values)
+        next_path = self.state_path.with_suffix('.json.new')
+        next_path.write_text(json.dumps(state, indent=2) + '\n')
+        next_path.replace(self.state_path)
         self.state.update(values)
-        self.state_path.write_text(json.dumps(self.state, indent=2) + '\n')
 
     def log(self, text):
         print(text, flush=True)
@@ -406,13 +411,18 @@ class Session:
     # -- the NAS --------------------------------------------------------------------------------------------------------
     def nas(self):
         """The backup directory of this install on the NAS: PIANO_BACKUP_DIR (runtime only) / persistent-boot-<time>."""
-        name = self.state.get('backup_name') or f'persistent-boot-{time.strftime("%Y%m%d-%H%M%S")}'
+        prefix = f'persistent-boot-{time.strftime("%Y%m%d-%H%M%S")}'
         base = self.backup_root()
         if base is None:
-            return None, name
-        (base / name).mkdir(exist_ok=True)
-        if 'backup_name' not in self.state:
-            self.save(backup_name=name, backups={})
+            return None, self.state.get('backup_name', prefix)
+        name = self.state.get('backup_name')
+        if name is None:
+            folder = Path(tempfile.mkdtemp(prefix=prefix + '-', dir=base))
+            self.save(backup_name=folder.name, backups={})
+            return folder, folder.name
+        if not isinstance(name, str) or name in ('', '.', '..') or Path(name).name != name:
+            raise Stop('invalid NAS backup set name')
+        self.need((base / name).is_dir(), 'the recorded NAS backup set still exists')
         return base / name, name
 
     def written_by_install(self, key):
@@ -438,6 +448,16 @@ class Session:
         if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
             raise Stop(f'invalid NAS backup hash for {key}')
         path = self.backup_root() / name / file
+        if key == ESP_BACKUP:
+            self.need(entry.get('bytes') == common.ESP_BLOCKS * B, 'ESP backup covers the entire ESP region')
+            try:
+                manifest = json.loads(path.with_name('manifest.json').read_text())
+                checksums = path.with_name('SHA256SUMS').read_text()
+                matches = [line for line in checksums.splitlines() if line[66:] == file]
+                complete = checksums.endswith('\n') and manifest['backups'][key] == entry and matches == [f'{digest}  {file}']
+            except (OSError, ValueError, KeyError, TypeError):
+                complete = False
+            self.need(complete, 'ESP backup manifest.json and SHA256SUMS match the verified receipt')
         try:
             valid = path.is_file() and path.stat().st_size == entry.get('bytes') and self.sha_nocache(path) == digest
         except OSError as exc:
@@ -899,6 +919,22 @@ def part_geometry(s, name):
     if not key:
         raise Stop(f'partition {name}: not one that tablet.sh map reports ({", ".join(PART_KEYS)})')
     return s.nodes.get(key), s.starts.get(key), (s.sizes.get(key) or 0) // B
+
+
+def esp_write_target(s, *, allow_missing=False):
+    """Check the live LUN and ESP targets before an ESP update or restore."""
+    mapped = map_nodes(s)
+    if not s.execute:
+        return s.nodes['lun0'], s.nodes.get('esp') or 'sda37'
+    lun = (mapped or {}).get('lun0', '')
+    s.need(re.fullmatch(r'sd[a-z]+', lun) and mapped.get('lun0_block_size') == str(B)
+           and mapped.get('lun0_bytes') == str(LUN0_BYTES) and mapped.get('mounted') == '0',
+           'ESP write target requires the expected unmounted LUN 0')
+    esp = f'{lun}{common.ESP_INDEX + 1}'
+    geometry = f'{esp} {common.ESP_FIRST * (B // 512)} {common.ESP_BLOCKS * (B // 512)}'
+    s.need(mapped.get('esp') == geometry or (allow_missing and mapped.get('esp') == 'none'),
+           'ESP write target is not the expected ESP partition on LUN 0')
+    return lun, esp
 
 
 def bound_store(s, record):
@@ -1681,6 +1717,16 @@ def refuse_placeholder_esp(record):
         raise Stop(f'{record["image"]}: a placeholder pool ESP cannot be installed')
 
 
+def publish_esp_ledger(path, record):
+    """Publish a read-back-verified ESP pointer through a sibling file."""
+    pending = path.with_suffix('.json.new')
+    try:
+        common.write_json(pending, record)
+        pending.replace(path)
+    except OSError as exc:
+        raise Stop('could not publish the verified ESP ledger') from exc
+
+
 def write_esp(s, image_name):
     record = s.esp_record(image_name)
     if not record:
@@ -1743,20 +1789,20 @@ def esp_delta(s):
     if not record:
         raise Stop('esp-delta needs --esp NEW (a build record in out/persistent)')
     refuse_placeholder_esp(record)
-    try:
-        old_name = json.loads((OUT / 'installed.json').read_text())['image']
-    except (OSError, ValueError, KeyError):
+    old_name, old_sha = s.ledger_esp()
+    if not isinstance(old_name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*\.img', old_name):
         raise Stop('no OUT/installed.json: which ESP is installed is not known here (use esp-final)')
     old = s.esp_record(old_name)
     old_img, new_img = OUT / old_name, OUT / record['image']
-    s.need(old is not None and old_img.is_file() and s.sha_nocache(old_img) == old['sha256'],
+    size = common.ESP_BLOCKS * B
+    s.need(old is not None and old.get('sha256') == old_sha and old_img.is_file() and
+           old_img.stat().st_size == size and s.sha_nocache(old_img) == old_sha,
            f'the installed ESP {old_name}: its image is here and hashes to its record ({(old or {}).get("sha256", "")[:16]})')
-    s.need(new_img.is_file() and s.sha_nocache(new_img) == record['sha256'], f'{record["image"]} hashes to its record ({record["sha256"][:16]})')
-    r = map_nodes(s)
-    if r:
-        s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp is {r["esp"]}')
-    esp = s.nodes.get('esp') or 'sda37'
-    now = s.region_sha(esp, 0, 1024, MiB, name='esp-now')
+    s.need(new_img.is_file() and new_img.stat().st_size == size and s.sha_nocache(new_img) == record['sha256'],
+           f'{record["image"]} hashes to its record ({record["sha256"][:16]})')
+    lun, esp = esp_write_target(s)
+    blocks = size // MiB
+    now = s.region_sha(esp, 0, blocks, MiB, name='esp-now')
     s.need(now == old['sha256'] if s.execute else None, f'the tablet\'s ESP = the installed {old_name}: {now}')
     if esp_store(record):
         ok, text = bound_store(s, record)
@@ -1768,27 +1814,35 @@ def esp_delta(s):
     if s.execute:
         nas, _ = s.nas()
         backups = dict(s.state.get('backups', {}))
-        entry = backups.get('linux_rootfs-tail-esp') or {}
+        entry = backups.get(ESP_BACKUP) or {}
         if not (entry.get('verified') and entry.get('sha256') == old['sha256']):
             if entry.get('verified'):   # never write over a verified backup of something else (review 2026-11-14)
                 raise Stop('this backup set holds an ESP-region backup of another image: start a new set (--new-backup)')
-            dest = nas / 'linux_rootfs-tail-esp.img'
-            shutil.copyfile(old_img, dest)
+            dest = nas / f'{ESP_BACKUP}.img'
+            try:
+                with old_img.open('rb') as source, dest.open('xb') as backup_file:
+                    shutil.copyfileobj(source, backup_file, 4 * MiB)
+            except FileExistsError as exc:
+                raise Stop('the ESP backup file already exists without a verified receipt: start a new backup set') from exc
+            except OSError as exc:
+                raise Stop('could not copy the ESP backup') from exc
             again = s.sha_nocache(dest)
             s.need(again == old['sha256'], f'linux_rootfs-tail-esp: {old_name} stored in the backup set, re-read without cache: {again}')
-            backups['linux_rootfs-tail-esp'] = {'file': dest.name, 'sha256': old['sha256'], 'bytes': dest.stat().st_size, 'dev': s.nodes['lun0'],
-                                                'skip': common.ESP_FIRST, 'count': common.ESP_BLOCKS, 'bs': B, 'verified': True, 'local': False,
-                                                'what': f'the installed ESP ({old_name}) = the tablet\'s region, from its image',
-                                                'time': time.strftime('%Y-%m-%d %H:%M:%S')}
-            s.save(backups=backups)
+            backups[ESP_BACKUP] = {
+                'file': dest.name, 'image': old_name, 'sha256': old['sha256'], 'bytes': dest.stat().st_size, 'dev': lun,
+                'skip': common.ESP_FIRST, 'count': common.ESP_BLOCKS, 'bs': B, 'verified': True, 'local': False,
+                'what': f'the installed ESP ({old_name}) = the tablet\'s region, from its image',
+                'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
             s.write_manifest(nas, backups)
+            s.save(backups=backups)
         else:
-            s.require_backup('linux_rootfs-tail-esp', old['sha256'])
+            s.require_backup(ESP_BACKUP, old['sha256'])
     else:
         s.log(f'  check {old_name} stored in the backup set as linux_rootfs-tail-esp (re-read without cache = its sha256)')
     runs = []
     with open(old_img, 'rb') as fa, open(new_img, 'rb') as fb:
-        for i in range(common.ESP_BLOCKS * B // MiB):
+        for i in range(blocks):
             if fa.read(MiB) != fb.read(MiB):
                 if runs and runs[-1][0] + runs[-1][1] == i:
                     runs[-1][1] += 1
@@ -1805,16 +1859,17 @@ def esp_delta(s):
         s.fetch(piece.name, piece, common.sha(piece))
         if s.write(f'{piece.name} ({count} MiB) -> /dev/{esp} at MiB {first}'):
             s.t('write', piece.name, esp, first, MiB, timeout=600)
-    got = s.region_sha(esp, 0, 1024, MiB, name='esp-check')
-    got2 = s.region_sha(s.nodes['lun0'], common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
+    got = s.region_sha(esp, 0, blocks, MiB, name='esp-check')
+    got2 = s.region_sha(lun, common.ESP_FIRST * B // MiB, blocks, MiB, name='esp-check-lun0')
     s.need(got == record['sha256'] and got2 == record['sha256'] if s.execute else None,
-           f'ESP read back through /dev/{esp} and /dev/{s.nodes["lun0"]}: {got} / {got2} = {record["sha256"][:16]}')
+           f'ESP read back through /dev/{esp} and /dev/{lun}: {got} / {got2} = {record["sha256"][:16]}')
     s.sim['esp'] = record['sha256']
     if s.execute:
         s.save_esp(record['image'], record['sha256'])
-        common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
-                                                   'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                                   'by': f'esp-delta over {old_name}'})
+        publish_esp_ledger(OUT / 'installed.json', {
+            'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'], 'inputs': record.get('inputs'),
+            'written': time.strftime('%Y-%m-%d %H:%M:%S'), 'by': f'esp-delta over {old_name}',
+        })
 
 
 @step('esp', 'maintenance, WRITE partition 37 (test-phase ESP)', writes='LUN 0 LBA 71527424-71789567')
@@ -1828,9 +1883,18 @@ def esp_step(s):
 def esp_back(s):
     """The linux_rootfs tail as backed up (linux_rootfs-tail-esp, 1 GiB from the NAS), read back. Refused while boot_a's DarwinBoot
     would not take the backed-up ESP's RAM window (the pair rule)."""
-    map_nodes(s)
-    entry = s.state.get('backups', {}).get('linux_rootfs-tail-esp') or {}
-    record = s.esp_by_sha(entry.get('sha256'))
+    lun, _ = esp_write_target(s, allow_missing=True)
+    entry = s.state.get('backups', {}).get(ESP_BACKUP) or {}
+    image = entry.get('image')
+    if image:
+        try:
+            record = s.esp_record(image) if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*\.img', image) else None
+        except (OSError, ValueError, TypeError):
+            record = None
+        s.need(isinstance(record, dict) and (record.get('image'), record.get('sha256')) == (image, entry.get('sha256')),
+               'the saved rollback ESP build record is present and matches the backup')
+    else:
+        record = s.esp_by_sha(entry.get('sha256'))
     window = s.esp_window(record)
     if window and window > common.OLD_DARWINBOOT_WINDOW_MAX:
         s.pair(s.tablet_boot_a(), record, f'the backed-up ESP {record["image"]} asks for {window >> 20} MiB')
@@ -1842,14 +1906,15 @@ def esp_back(s):
             cleared = image is None if magic is not None else bool(s.state.get('rootfs_cleared'))
             s.need(not cleared, f'the backed-up ESP {record["image"]}\'s default entry {record.get("default")} {why}, which ' +
                    ('holds no root image now: rollback rootfs-clear first' if cleared else 'still holds its root image'))
-    s.restore('linux_rootfs-tail-esp', s.nodes['lun0'], common.ESP_FIRST, B)
+    s.restore(ESP_BACKUP, lun, common.ESP_FIRST, B)
     s.sim['esp'] = entry.get('sha256')
     if s.execute:
         if record:   # an ESP of a build record (an earlier install's): the installed seed is its seed again
             s.save_esp(record['image'], record['sha256'])
-            common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
-                                                       'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                                       'by': 'rollback esp'})
+            publish_esp_ledger(OUT / 'installed.json', {
+                'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'], 'inputs': record.get('inputs'),
+                'written': time.strftime('%Y-%m-%d %H:%M:%S'), 'by': 'rollback esp',
+            })
         else:
             s.save_esp(None, None)
             (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install

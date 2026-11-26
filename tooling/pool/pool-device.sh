@@ -36,7 +36,7 @@
 # Test seams (tooling/pool/test-pool-device.sh, mock-tablet.sh): POOL_DISKUTIL, POOL_MOUNT, POOL_UMOUNT, POOL_AA, POOL_FSTAB,
 # POOL_SWVERS, POOL_ID, POOL_CHFLAGS, POOL_PLUTIL, POOL_RAWDEV_PREFIX, POOL_TEST_CONTAINER (the host proof's stand-in container),
 # POOL_TEST_ROOT_SYSTEMOS.
-set -u
+set -uo pipefail
 STEP=${1:-}
 WORK=${2:-}
 VOL=${3:-}
@@ -93,12 +93,13 @@ sha_of() { /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; }
 data_container() {
     [[ "$DATA_UUID" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] ||
         { echo 'set POOL_DATA_UUID to the expected Data volume UUID' >&2; return 1; }
-    if [ -n "${POOL_TEST_CONTAINER:-}" ]; then echo "$POOL_TEST_CONTAINER"; return 0; fi
-    local uuid cont
-    uuid=$(plist /System/Volumes/Data VolumeUUID)
-    [ "$uuid" = "$DATA_UUID" ] || { echo "the volume at /System/Volumes/Data is $uuid, not the owner's Data $DATA_UUID" >&2; return 1; }
-    cont=$(plist /System/Volumes/Data APFSContainerReference)
-    [ -n "$cont" ] || { echo 'no APFS container for the Data volume' >&2; return 1; }
+    local uuid cont=${POOL_TEST_CONTAINER:-}
+    if [ -z "$cont" ]; then
+        uuid=$(plist /System/Volumes/Data VolumeUUID)
+        [ "$uuid" = "$DATA_UUID" ] || { echo "the volume at /System/Volumes/Data is $uuid, not the owner's Data $DATA_UUID" >&2; return 1; }
+        cont=$(plist /System/Volumes/Data APFSContainerReference) || return 1
+    fi
+    [[ "$cont" =~ ^disk[0-9]+$ ]] || { echo "invalid APFS container target: $cont" >&2; return 1; }
     echo "$cont"
 }
 # DISK UUID NAME lines of every volume of a container (diskutil apfs list CONTAINER, text)
@@ -130,22 +131,32 @@ format_of() {   # the archive's source personality as diskutil's format name
     case "$(meta source_personality)" in APFS) echo APFS;; Case-sensitive_APFS) echo APFSX;; *) return 1;; esac
 }
 
+check_archive() {
+    local receipt file want got
+    [ -s "$V/archive.env" ] || die "no $V/archive.env (the host stages it)"
+    for receipt in archive_sha256:volume.aar manifest_file_sha256:expected.manifest; do
+        file=${receipt#*:}
+        want=$(meta "${receipt%:*}")
+        [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ -s "$V/$file" ] &&
+            got=$(sha_of "$V/$file") && [ "$got" = "$want" ] ||
+            die "$file hashes to ${got:-unavailable}, the archive record says $want"
+        got=''
+    done
+    local fam
+    for fam in $(meta families); do [ -f "$V/afsc-$fam.list" ] || die "no afsc-$fam.list"; done
+}
+
 step_preflight() {
+    local usage_output
     [ "$("$IDCMD" -u)" = 0 ] || die 'not root (run it through rsudo)'
     [ "$("$SWVERS" -productVersion)" = 27.3 ] || die "not macOS 27.3 ($("$SWVERS" -productVersion))"
     for t in "$AA" "$DISKUTIL" "$PLUTIL" "$MANIFEST_TOOL" /usr/bin/shasum; do [ -x "$t" ] || die "no $t"; done
-    "$MANIFEST_TOOL" 2>&1 | grep -q '^usage: pool-manifest' || die 'pool-manifest does not run here'
-    [ -f "$V/archive.env" ] || die "no $V/archive.env (the host stages it)"
+    usage_output=$("$MANIFEST_TOOL" 2>&1)
+    [[ "$usage_output" = 'usage: pool-manifest'* ]] || die 'pool-manifest does not run here'
+    vput preflight no
+    check_archive
     [ "$(meta source_volume_uuid)" = "$OLD_UUID" ] || die "the $VOL archive is of volume $(meta source_volume_uuid), not $OLD_UUID"
     format_of > /dev/null || die "the $VOL archive's personality $(meta source_personality) is not APFS"
-    local want got
-    want=$(meta archive_sha256)
-    got=$(sha_of "$V/volume.aar")
-    [ -n "$want" ] && [ "$got" = "$want" ] || die "volume.aar hashes to $got, the archive record says $want"
-    want=$(meta manifest_file_sha256)
-    got=$(sha_of "$V/expected.manifest")
-    [ "$got" = "$want" ] || die "expected.manifest hashes to $got, the archive record says $want"
-    for fam in $(meta families); do [ -f "$V/afsc-$fam.list" ] || die "no afsc-$fam.list"; done
     local cont free
     cont=$(data_container) || die 'the Data container is not the one the owner chain mounts'
     [ -z "$(get container)" ] || [ "$(get container)" = "$cont" ] || die "the state's container is $(get container), the Data volume's is $cont"
@@ -171,9 +182,9 @@ step_preflight() {
     if [ "${POOL_CHECK_WINDOW:-0}" = 1 ]; then
         local whole wsha t0
         whole=$(plist "$OLD_UUID" APFSPhysicalStores.0.APFSPhysicalStore)
-        [ -n "$whole" ] || die "the old $VOL volume $OLD_UUID: no physical store"
+        [[ "$whole" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || die "the old $VOL volume $OLD_UUID: invalid physical store"
         t0=$(date +%s)
-        wsha=$(dd if="$RAWDEV$whole" bs=4194304 2>/dev/null | /usr/bin/shasum -a 256 | awk '{print $1}')
+        wsha=$(dd if="$RAWDEV$whole" bs=4194304 2>/dev/null | /usr/bin/shasum -a 256 | awk '{print $1}') || die "cannot read the old $VOL window $whole"
         vput window_sha256 "$wsha"
         vput window_read_seconds $(( $(date +%s) - t0 ))
         [ "$wsha" = "$(meta source_sha256)" ] ||
@@ -219,24 +230,27 @@ step_create() {
     if [ "$(vget window_check)" != raw ]; then
         [ -n "$(get live_ok)" ] && [ "$(get live_ok)" = "$(get live_sha256)" ] || die 'R1b: no accepted live comparison (live, then the host verdict, then accept-live)'
     fi
-    local cont mine out disk uuid name fmt
-    cont=$(get container)
+    local cont mine out disk uuid name fmt volumes
+    cont=$(data_container) || die 'the Data container is not the one the owner chain mounts'
+    [ "$cont" = "$(get container)" ] || die 'the Data container changed since preflight'
     mine=$(vget volume_uuid)
     if [ -n "$mine" ]; then
-        disk=$(plist "$mine" DeviceIdentifier)
-        [ -n "$disk" ] && [ "$(plist "$mine" VolumeName)" = "$NAME" ] && [ "$(plist "$mine" APFSContainerReference)" = "$cont" ] ||
-            die "the state names $mine, which is not a $NAME volume of $cont"
+        disk=$(mine_disk) || exit 1
         log "already created: $disk ($mine)"
         return 0
     fi
-    fmt=$(format_of)
+    volumes=$(volumes_of "$cont") || die "cannot list the Data container $cont"
+    [ -z "$(printf '%s\n' "$volumes" | awk -v n="$NAME" '$3 == n')" ] ||
+        die "a $NAME volume of unknown origin in $cont: refused"
+    fmt=$(format_of) || die 'the archive does not declare an APFS personality'
     out=$("$DISKUTIL" apfs addVolume "$cont" "$fmt" "$NAME" -nomount 2>&1) || die "addVolume: $out"
     echo "$out" >> "$WORK/pool-device.log"
     disk=$(echo "$out" | sed -n 's/^Created new APFS Volume \(disk[0-9]*s[0-9]*\).*/\1/p' | tail -1)
     [ -n "$disk" ] || die "addVolume printed no new volume: $out"
     uuid=$(plist "$disk" VolumeUUID)
     name=$(plist "$disk" VolumeName)
-    [ -n "$uuid" ] && [ "$name" = "$NAME" ] && [ "$(plist "$disk" APFSContainerReference)" = "$cont" ] ||
+    [[ "$uuid" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] &&
+        [ "$name" = "$NAME" ] && [ "$(plist "$disk" APFSContainerReference)" = "$cont" ] ||
         die "the new $disk: UUID ${uuid:-?}, name ${name:-?}, not a $NAME volume of $cont"
     case "$uuid" in "$OS_OLD"|"$SYSTEMOS_OLD"|"$DATA_UUID") die "the new volume has the UUID of an existing system volume ($uuid)";; esac
     vput volume_uuid "$uuid"
@@ -290,11 +304,14 @@ mount_rw() {
 }
 unmount() { "$UMOUNT" "$MNT" 2>/dev/null || "$UMOUNT" -f "$MNT" 2>/dev/null; }
 mine_disk() {   # the device of this tool's volume of $VOL, checked by UUID, name and container
-    local uuid disk
+    local uuid disk cont
     uuid=$(vget volume_uuid)
-    [ -n "$uuid" ] || die "no $VOL volume created"
+    [[ "$uuid" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || die "no valid $VOL volume UUID recorded"
+    cont=$(data_container) || die 'the Data container is not the one the owner chain mounts'
+    [ "$cont" = "$(get container)" ] || die 'the Data container changed since preflight'
     disk=$(plist "$uuid" DeviceIdentifier)
-    [ -n "$disk" ] && [ "$(plist "$uuid" VolumeName)" = "$NAME" ] && [ "$(plist "$uuid" APFSContainerReference)" = "$(get container)" ] ||
+    [[ "$disk" =~ ^disk[0-9]+s[0-9]+$ ]] && [ "$(plist "$uuid" VolumeUUID)" = "$uuid" ] &&
+        [ "$(plist "$uuid" VolumeName)" = "$NAME" ] && [ "$(plist "$uuid" APFSContainerReference)" = "$cont" ] ||
         die "$uuid is not this tool's $NAME of $(get container)"
     echo "$disk"
 }
@@ -305,6 +322,7 @@ step_extract() {
     require_inactive_copies '/ runs on a copy (the pool entry): never written while booted'
     vput verified no
     vput extracted no
+    check_archive
     mount_rw "$disk"
     trap unmount EXIT
     # SF_RESTRICTED (0x80000) is on most system entries; root sets it only where SIP lets it. Probed on the target.
@@ -427,7 +445,7 @@ step_fstab() {
 }
 
 step_undo() {
-    local v uuid disk cont out name
+    local v uuid disk cont out name current
     cont=$(get container)
     require_inactive_copies '/ runs on a copy (the pool entry is booted): boot macos-27.3 first'
     if [ -f "$FSTAB" ] && grep -qF "$TAG" "$FSTAB"; then
@@ -443,9 +461,14 @@ step_undo() {
         uuid=$(get "${v}_volume_uuid")
         case "$v" in os) name=PianoOS;; systemos) name=PianoSystemOS;; esac
         [ -n "$uuid" ] || { log "no $v volume of this tool"; continue; }
+        [[ "$uuid" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || die "invalid $v volume UUID: $uuid"
+        current=$(data_container) || die 'the Data container is not the one the owner chain mounts'
+        [ "$current" = "$cont" ] || die 'the Data container changed since preflight'
         disk=$(plist "$uuid" DeviceIdentifier)
         if [ -z "$disk" ]; then log "the $v volume $uuid is gone already"; put "${v}_volume_uuid" ''; continue; fi
-        [ "$(plist "$uuid" VolumeName)" = "$name" ] && [ "$(plist "$uuid" APFSContainerReference)" = "$cont" ] ||
+        [[ "$cont" =~ ^disk[0-9]+$ && "$disk" =~ ^disk[0-9]+s[0-9]+$ ]] &&
+            [ "$(plist "$uuid" VolumeUUID)" = "$uuid" ] && [ "$(plist "$uuid" VolumeName)" = "$name" ] &&
+            [ "$(plist "$uuid" APFSContainerReference)" = "$cont" ] ||
             die "$uuid is not a $name volume of $cont: not deleted"
         unmount
         out=$("$DISKUTIL" apfs deleteVolume "$disk" 2>&1) || die "deleteVolume $disk: $out"

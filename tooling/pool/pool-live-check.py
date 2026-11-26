@@ -22,6 +22,7 @@ Also required: both old volumes mounted on `/` read-only (MOUNT.txt). Exit 0 EQU
 run, a malformed input).
 """
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -30,7 +31,7 @@ from pathlib import Path
 FIRMLINKS = ('private', 'Applications', 'Library', 'Users', 'Volumes', 'cores', 'opt', 'usr/local', 'System/Library/Caches',
              'System/Volumes/Hardware')
 FIELDS = ('path', 'type', 'mode', 'uid', 'gid', 'flags', 'size', 'mtime', 'data', 'link', 'hardlink', 'xattrs', 'acl', 'compression')
-SUMMARY = re.compile(r'# entries (\d{1,20}) files \d{1,20} bytes \d{1,20}(?: missing (\d{1,20}))? sha256 [0-9a-f]{64} errors 0')
+SUMMARY = re.compile(r'# entries (\d{1,20}) files \d{1,20} bytes \d{1,20}(?: missing (\d{1,20}))? sha256 ([0-9a-f]{64}) errors 0')
 
 
 def escape(text):
@@ -39,12 +40,15 @@ def escape(text):
 
 
 def manifest_lines(path, *, live=False):
-    lines = Path(path).read_text(errors='surrogateescape').splitlines()
-    summary = lines.pop() if lines else ''
+    raw = Path(path).read_bytes()
+    body, separator, footer = raw[:-1].rpartition(b'\n')
+    summary = footer.decode(errors='surrogateescape')
     match = SUMMARY.fullmatch(summary)
-    if not match or (match[2] is not None) != live:
+    if not match or not raw.endswith(b'\n') or (match[2] is not None) != live:
         raise SystemExit(f'VOID: {path}: no clean final summary line')
-    return lines, summary, int(match[1]), int(match[2] or 0)
+    if hashlib.sha256(body + separator).hexdigest() != match[3]:
+        raise SystemExit(f'VOID: {path}: manifest SHA-256 does not match its final summary')
+    return body.decode(errors='surrogateescape').splitlines(), summary, int(match[1]), int(match[2] or 0)
 
 
 def load_manifest(path):
@@ -230,16 +234,22 @@ def cmd_compare(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=('list', 'compare'))
+    ap.add_argument('mode', choices=('check-manifests', 'list', 'compare'))
     ap.add_argument('--systemos', required=True)
     ap.add_argument('--os', required=True)
-    ap.add_argument('--mounts', required=True)
+    ap.add_argument('--mounts')
     ap.add_argument('--out')
     ap.add_argument('--list')
     ap.add_argument('--live')
     ap.add_argument('--json')
     a = ap.parse_args()
     try:
+        if a.mode == 'check-manifests':
+            load_manifest(a.os)
+            load_manifest(a.systemos)
+            return
+        if not a.mounts:
+            ap.error(f'{a.mode} needs --mounts')
         if a.mode == 'list':
             if not a.out:
                 ap.error('list needs --out')
@@ -247,6 +257,9 @@ def main():
         if not a.list or not a.live:
             ap.error('compare needs --list and --live')
         sys.exit(cmd_compare(a))
+    except OSError as e:
+        print(f'VOID: {e}')
+        sys.exit(2)
     except SystemExit as e:
         if isinstance(e.code, str):
             print(e.code)
