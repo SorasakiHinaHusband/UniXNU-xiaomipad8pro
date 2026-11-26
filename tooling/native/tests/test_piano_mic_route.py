@@ -4,11 +4,14 @@ import importlib.util
 import math
 from pathlib import Path
 import struct
+import sys
 import tempfile
 import unittest
 import wave
 
-spec = importlib.util.spec_from_file_location('route', Path(__file__).parents[1] / 'piano-mic-route.py')
+NATIVE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(NATIVE))
+spec = importlib.util.spec_from_file_location('route', NATIVE / 'piano-mic-route.py')
 route = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(route)
 
