@@ -20,7 +20,7 @@ mic_tcc_seed_error() {
 }
 
 mic_tcc_seed_apply() (
-  local boot=$1 stage=$2 cdhash=$3 args uid db user_db= tccd now receipt
+  local boot=$1 stage=$2 cdhash=$3 args uid db user_db='' tccd now receipt
   local bundle=com.unixnu.piano-mic-check requirement scratch hex
   [[ "$boot" =~ ^[0-9A-Fa-f-]{36}$ &&
      "$stage" =~ ^/private/var/tmp/piano-mic-check\.[A-Za-z0-9]{8}$ &&
@@ -33,11 +33,13 @@ mic_tcc_seed_apply() (
     { mic_tcc_seed_error 'boot identity changed'; return 1; }
 
   uid=$(/usr/bin/stat -f %u /dev/console) || return 1
-  [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 501 ] &&
+  if ! { [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 501 ] &&
     [ "$uid" = "$(/usr/bin/stat -f %u "$stage")" ] &&
     /usr/bin/pgrep -u "$uid" -x Finder >/dev/null &&
-    /bin/launchctl print "gui/$uid" >/dev/null ||
-    { mic_tcc_seed_error 'staging user must own a live desktop'; return 1; }
+    /bin/launchctl print "gui/$uid" >/dev/null; }; then
+    mic_tcc_seed_error 'staging user must own a live desktop'
+    return 1
+  fi
   tccd=$(/usr/bin/pgrep -u "$uid" -x tccd) || return 1
   [[ "$tccd" =~ ^[0-9]+$ ]] || { mic_tcc_seed_error 'expected one console user tccd'; return 1; }
   for db in /private/var/containers/Data/ProtectedSystem/*/Data/Library/Application\ Support/com.apple.TCC/TCC.db; do

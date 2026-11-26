@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# shellcheck source-path=SCRIPTDIR
 # Source from the installed-system qual spec. Uses R, rssh, rsudo, pull, verdict and fexpect.
 # mic_check_block REPO [raw|noise-reduced] runs after the desktop gate.
 # piano-mic-unattended=1 enables automatic permission and acoustic replay checks.
@@ -116,7 +117,10 @@ mic_check_block() (
   name=${results##*/}
   verdict "INFO MIC: evidence directory $results"
   tools=$repo/tooling/native/piano-mic-check
+  # shellcheck source=mic-tcc-seed.sh
   source "$tools/mic-tcc-seed.sh" || return 1
+  # These variables and substitutions run on the remote shell.
+  # shellcheck disable=SC2016
   rssh '
     boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid) &&
     args=$(/usr/sbin/sysctl -n kern.piano_bootargs 2>/dev/null || /usr/sbin/sysctl -n kern.bootargs) &&
@@ -141,6 +145,7 @@ mic_check_block() (
   fi
   sha=$(/usr/bin/shasum -a 256 < "$archive") || return 1
   sha=${sha%% *}
+  # shellcheck disable=SC2016
   stage=$(rssh 'umask 077; d=$(/usr/bin/mktemp -d /private/var/tmp/piano-mic-check.XXXXXXXX) && echo "MIC_STAGE=$d"' </dev/null |
     sed -nE 's@^MIC_STAGE=(/private/var/tmp/piano-mic-check[.][A-Za-z0-9]{8})$@\1@p' | tail -1) || stage=
   if [ -z "$stage" ]; then
