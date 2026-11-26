@@ -3,7 +3,7 @@
 // PianoVideo E1 (piano-video-enc=1): the portable half of one bounded native H.264 encode session on Iris (VPU35, HFI gen2).
 // Portable (host tests in tests/enc_host.cpp).
 //
-// The specification (GPL-2.0, read only; nothing copied): Linux iris at the Ubuntu reference kernel 7f8d6bedde479
+// The specification (GPL-2.0, read only; nothing copied): Linux Iris at b5100d5f2e0b in linux-sm8750-piano
 // (iris_venc.c streamon order, iris_hfi_gen2_command.c set_codec / set_config_params / get_port_from_buf_type / set_num_comv,
 // iris_hfi_gen2.c inst_fw_cap_sm8550_enc / sm8550_venc_*_config_params / sm8550_enc_*_int_buf_tbl, iris_ctrls.c setters,
 // iris_buffer.c NV12 and bitstream sizes, iris_vpu_buffer.c iris_vpu33_buf_size for the internal buffers). The internal buffer
@@ -42,17 +42,18 @@ inline bool bootEnabled(const char *args)
 enum : uint32_t {
   PropCodec = 0x03000100, PropColorFormat = 0x03000101, PropBitstreamResolution = 0x03000103, PropStride = 0x03000104,
   PropCrop = 0x03000105, PropProfile = 0x03000107, PropLevel = 0x03000108, PropStage = 0x0300010a, PropFrameRate = 0x0300010c,
-  PropCabac = 0x03000121, PropHostMaxCount = 0x03000123, PropRateControl = 0x0300012a, PropIrRandomPeriod = 0x03000131,
+  PropCabac = 0x03000121, PropHostMaxCount = 0x03000123, PropDeblockingMode = 0x03000129, PropRateControl = 0x0300012a,
+  PropTimeDeltaBasedRateControl = 0x0300012b, PropIrRandomPeriod = 0x03000131,
   PropTotalBitrate = 0x0300013b, PropRequestSyncFrame = 0x03000145, PropMaxGopFrames = 0x03000146, PropMaxBFrames = 0x03000147,
   PropSeqHeaderMode = 0x03000149, PropFlip = 0x0300014c, PropColorInfo = 0x03000155, PropPictureType = 0x03000162,
   PropRawResolution = 0x03000178, PropComvCount = 0x03000193,
 };
-enum : uint32_t { PayloadU32 = 1, PayloadQ16 = 8, PayloadEnum = 9, Payload32Packed = 10, Payload64Packed = 13 };
+enum : uint32_t { PayloadU32 = 1, PayloadStructure = 5, PayloadQ16 = 8, PayloadEnum = 9, Payload32Packed = 10, Payload64Packed = 13 };
 enum : uint32_t { PortNone = 0, PortBitstream = 1, PortRaw = 2 };
 enum : uint32_t { CodecEncodeAvc = 2, ColorNv12 = 1, HeaderJoined = 2, RcVbrCfr = 0, SyncWithoutHeader = 1 };
 enum : uint32_t { ProfileHigh = 4, Level50 = 14, Stage2 = 2, HostMaxCount = 64, ComvCount = 4 };
-// HFI buffer types (session::BufferType has the decoder's; the encoder adds VPSS, and DPB is its SCRATCH_2 reconstruction).
-enum : uint32_t { BufBitstream = 1, BufRaw = 2, BufDpb = 6, BufBin = 7, BufLine = 8, BufComv = 10, BufNonComv = 11, BufVpss = 13 };
+// HFI encoder buffer types (DPB is the SCRATCH_2 reconstruction allocation).
+enum : uint32_t { BufBitstream = 1, BufRaw = 2, BufDpb = 6, BufBin = 7, BufLine = 8, BufArp = 9, BufComv = 10, BufNonComv = 11, BufVpss = 13 };
 // Picture types of HFI_PROP_PICTURE_TYPE (gen2): IDR 1, P 2, B 4, I 8.
 enum : uint32_t { PictureIdr = 1, PictureP = 2, PictureB = 4, PictureI = 8 };
 constexpr uint32_t kColorInfoUnspecified = 0x14000003;   // matrix reserved (3), video format unspecified (5 << 26)
@@ -66,7 +67,8 @@ constexpr Internal kInternal[] = {
     {320, 240, 5969408, 41472, 274176, 619776, 626688, 131072},
     {640, 480, 23787008, 147456, 313856, 700928, 1921024, 0},
     {1280, 720, 9563648, 436224, 392448, 834048, 5804032, 1449984},
-    {1920, 1080, 21479936, 983040, 542720, 984576, 12636160, 3158016},
+    // Both padded formats are 1920x1088. Size BIN for the coded height and skip standalone VPSS.
+    {1920, 1080, 21661184, 983040, 542720, 984576, 12636160, 0},
 };
 constexpr unsigned kInternalCount = sizeof kInternal / sizeof kInternal[0];
 
@@ -113,6 +115,19 @@ struct Settings {
   unsigned frames = 10;
 };
 constexpr unsigned kMaxFrames = 120;
+constexpr uint32_t kMaxFps = 60;
+constexpr uint64_t kNsPerSecond = 1000000000ULL;
+
+constexpr uint64_t frameNs(unsigned frame, uint32_t fps) { return uint64_t(frame) * kNsPerSecond / fps; }
+
+inline unsigned frameIndex(uint64_t ns, uint32_t fps)
+{
+  // Bound the timestamp before multiplying. Invert floor(frame * 1e9 / fps)
+  // with a ceiling division, then reject timestamps outside the exact schedule.
+  if (!fps || fps > kMaxFps || ns > frameNs(kMaxFrames - 1, fps)) return kMaxFrames;
+  const unsigned frame = unsigned((ns * fps + kNsPerSecond - 1) / kNsPerSecond);
+  return frameNs(frame, fps) == ns ? frame : kMaxFrames;
+}
 
 // ------------------------------------------------------------------------------------------------------- the properties
 struct Prop {
@@ -162,22 +177,24 @@ inline Script capabilities(const Settings &c)
   s.add(PropRateControl, PortBitstream, PayloadEnum, RcVbrCfr);
   s.add(PropMaxGopFrames, PortRaw, PayloadU32, c.gop);
   s.add(PropCabac, PortBitstream, PayloadU32, 1);
+  s.add(PropDeblockingMode, PortBitstream, Payload32Packed, 0x00060600);   // all boundaries, alpha/beta zero with +6 bias
   s.add(PropFlip, PortRaw, PayloadEnum, 0);
   s.add(PropIrRandomPeriod, PortBitstream, PayloadU32, 0);
   s.add(PropMaxBFrames, PortBitstream, PayloadU32, 0);
   s.add(PropRequestSyncFrame, PortRaw, PayloadEnum, SyncWithoutHeader);
+  s.add(PropTimeDeltaBasedRateControl, PortBitstream, PayloadU32, 0);
   return s;
 }
 inline bool admitted(const Settings &c)
 {
-  return c.fps >= 1 && c.fps <= 60 && c.bitrate >= 100000 && c.bitrate <= 40000000 && c.gop >= 1 && c.gop <= 300 &&
+  return c.fps >= 1 && c.fps <= kMaxFps && c.bitrate >= 100000 && c.bitrate <= 40000000 && c.gop >= 1 && c.gop <= 300 &&
          c.frames >= 2 && c.frames <= kMaxFrames;
 }
 
 // ------------------------------------------------------------------------------------------------------------- the arena
-// One encoder session in the V4 arena (the SMMU maps only these buffers): two raw inputs, two bitstream outputs and the
-// internal buffers of sm8550_enc_ip/op_int_buf_tbl. Raw and bitstream use the decoder's port numbers (raw 2, bitstream 1).
-constexpr unsigned kRaws = 2, kBitstreams = 2;
+// The shared V4 arena maps four buffers per external queue, session ARP, and both per-port internal tables.
+constexpr unsigned kRaws = 4, kBitstreams = 4;
+constexpr uint32_t kArpBytes = 204800;
 inline bool buildLayout(session::Layout &l, const Geometry &g)
 {
   l.used = l.bytes = 0;
@@ -187,6 +204,7 @@ inline bool buildLayout(session::Layout &l, const Geometry &g)
     if (!l.add(BufRaw, i, g.rawBytes, PortRaw)) return false;
   for (unsigned i = 0; i < kBitstreams; ++i)
     if (!l.add(BufBitstream, i, g.bitstreamBytes, PortBitstream)) return false;
+  if (!l.add(BufArp, 0, kArpBytes, PortNone)) return false;
   if (g.internal.vpss && !l.add(BufVpss, 0, g.internal.vpss, PortRaw)) return false;
   return l.add(BufBin, 0, g.internal.bin, PortBitstream) && l.add(BufComv, 0, g.internal.comv, PortBitstream) &&
          l.add(BufNonComv, 0, g.internal.nonComv, PortBitstream) && l.add(BufLine, 0, g.internal.line, PortBitstream) &&

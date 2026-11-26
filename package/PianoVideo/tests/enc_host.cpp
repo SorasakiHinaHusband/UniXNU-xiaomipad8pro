@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cstring>
+#include <algorithm>
 #include <charconv>
 #include <string>
 #include <vector>
@@ -28,9 +29,10 @@ static unsigned failures = 0;
 
 struct TestHw {
   uint64_t clock = 0;
+  int phase = 0;
   std::string log;
   void barrier() {}
-  void stage(int, const char *) {}
+  void stage(int s, const char *) { phase = s; }
   void sleepMs(unsigned n) { clock += uint64_t(n) * 1000; }
   uint64_t nowUs() { return clock += 10; }
   void note(const char *fmt, ...)
@@ -52,9 +54,10 @@ struct TestOps {
 };
 struct Sent {
   uint32_t type, flags, port, payload, words, v0, v1;
+  int stage;
 };
-enum class OutputReply { Normal, AtCapacity, Empty, WrongIova, BadCapacity, BadOffset, BadLength, Wraparound };
-// The encoder firmware as iris_hfi_gen2_response.c expects it to answer: no OPEN/START acks, RAW back after a frame, BITSTREAM
+enum class OutputReply { Normal, AtCapacity, Empty, WrongIova, BadCapacity, BadOffset, BadLength, Wraparound, BadTimestamp };
+// The encoder firmware as iris_hfi_gen2_response.c expects it to answer: RAW back after a frame, BITSTREAM
 // with the picture type before it, DRAIN ack + an empty LAST bitstream, STOP and CLOSE acks.
 struct Peer {
   TestHw hw;
@@ -71,14 +74,20 @@ struct Peer {
   std::vector<uint8_t> arena;
   std::vector<Sent> sent;
   std::vector<uint32_t> openedSessions, closedSessions;
+  std::vector<uint32_t> arp;
+  std::vector<std::vector<uint32_t>> arpPackets;
+  std::vector<std::vector<uint32_t>> internals;
   std::vector<std::vector<uint32_t>> bitstreamQueue;   // queued BITSTREAM buffer packets (v[0..15])
   std::vector<std::vector<uint32_t>> rawPending;       // raw frames waiting for an output buffer
   Geometry g;
   session::Layout *layout = nullptr;
-  uint64_t expectedFrameUs = 33333;
-  unsigned frame = 0, patternOk = 0, patternBad = 0;
+  uint32_t fps = 30;
+  unsigned frame = 0, patternOk = 0, patternBad = 0, rawBatch = 1, peakRaw = 0, peakBitstream = 0;
+  unsigned rawSlots = 0, bitstreamSlots = 0;
   bool sessionErrorOnProp = false, dropLast = false, dropCloseAck = false, systemError = false, badBitstream = false;
   bool faultOnRaw = false, watchdogOnStop = false;
+  bool rejectArp = false, reportArpOnStop = false, errorCloseAck = false, errorBitstreamStart = false;
+  bool reorderFirstBatch = false, wrongRawTimestamp = false;
   OutputReply firstOutput = OutputReply::Normal;
   uint32_t sessionErrorProp = 0;
   Peer() : uc(kUcBytes / 4)
@@ -116,6 +125,7 @@ struct Peer {
     if (bitstreamQueue.empty()) return false;
     std::vector<uint32_t> out = bitstreamQueue.front();
     bitstreamQueue.erase(bitstreamQueue.begin());
+    bitstreamSlots |= 1u << out[1];
     std::vector<uint8_t> nal;
     auto put = [&](uint8_t type, unsigned n) {
       const uint8_t sc[4] = {0, 0, 0, 1};
@@ -143,28 +153,36 @@ struct Peer {
     case OutputReply::BadOffset: out[6] = out[5] + 1; out[7] = 0; break;
     case OutputReply::BadLength: out[6] = 4; out[7] = out[5] - 3; break;
     case OutputReply::Wraparound: out[6] = out[5]; out[7] = UINT32_MAX; break;
+    case OutputReply::BadTimestamp:
     case OutputReply::Normal:
     case OutputReply::AtCapacity: break;
     }
-    out[8] = raw[8];
-    out[9] = raw[9];
+    out[8] = mode == OutputReply::BadTimestamp ? UINT32_MAX : raw[8];
+    out[9] = mode == OutputReply::BadTimestamp ? UINT32_MAX : raw[9];
+    auto returnedRaw = raw;
+    if (wrongRawTimestamp && idr) returnedRaw[8] = 1000000000ULL / fps;
     reply({packet(PropPictureType, 2, PortBitstream, 1, {idr ? PictureIdr : PictureP}),
-           packet(Buffers, 1, PortBitstream, 5, out), packet(Buffers, 1, PortRaw, 5, raw)});
+           packet(Buffers, 1, PortBitstream, 5, out), packet(Buffers, 1, PortRaw, 5, returnedRaw)});
     return true;
+  }
+  void flushRaw()
+  {
+    while (!rawPending.empty() && emit(rawPending.front())) rawPending.erase(rawPending.begin());
   }
   int send(unsigned bytes, const char *)
   {
+    if (rejectArp && tx[9] == 0x01000009 && tx[16] == 9) return kErrHfi;
     CHECK(hfi::write(mem, hfi::kCmdq, tx, bytes, [] {}) == 0);
     uint32_t data[hfi::kBufferWords], size = 0;
     CHECK(hfi::read(mem, hfi::kCmdq, data, sizeof data, &size, [] {}) == 0);
     CHECK(size == bytes && data[7] == 1 && data[0] == bytes);
     const uint32_t *p = data + 8;
     const uint32_t type = p[1], flags = p[2], port = p[4], payload = p[3], words = (p[0] - 32) / 4;
-    sent.push_back({type, flags, port, payload, words, words ? p[8] : 0, words > 1 ? p[9] : 0});
+    sent.push_back({type, flags, port, payload, words, words ? p[8] : 0, words > 1 ? p[9] : 0, hw.phase - 80});
     if (systemError && sent.size() == 6) { reply({packet(0x05000001, 8, 0, 0)}, 0); return 0; }
     if (type == Open) {
       CHECK(!data[1] && port == 0 && flags == 3 && payload == PayloadU32 && p[8]);
-      CHECK(!activeSid && bitstreamQueue.empty() && rawPending.empty());
+      CHECK(!activeSid && arp.empty() && internals.empty() && bitstreamQueue.empty() && rawPending.empty());
       activeSid = p[8];
       openedSessions.push_back(activeSid);
       frame = 0;
@@ -182,28 +200,40 @@ struct Peer {
       CHECK(b && v[2] == b->iova() && v[5] == b->capacity && port == b->port);
       CHECK(!v[3] && !v[4] && !v[6]);
       if (v[0] == BufBitstream) {
-        CHECK(port == PortBitstream && !v[7]);
+        CHECK(port == PortBitstream && v[1] < 4 && !v[7] && !v[8] && !v[9]);
+        CHECK(std::none_of(bitstreamQueue.begin(), bitstreamQueue.end(), [&](const auto &out) { return out[1] == v[1]; }));
         bitstreamQueue.push_back(v);
-        if (!rawPending.empty() && emit(rawPending.front())) rawPending.erase(rawPending.begin());
+        peakBitstream = std::max(peakBitstream, unsigned(bitstreamQueue.size()));
       } else if (v[0] == BufRaw) {
-        CHECK(port == PortRaw && v[7] == g.rawBytes);
+        CHECK(port == PortRaw && v[1] < 4 && v[7] == g.rawBytes);
         // The frame really is the pattern of its timestamp's frame number (active pixels and the padding).
         const uint64_t timestamp = uint64_t(v[9]) << 32 | v[8];
-        CHECK(timestamp == frame * expectedFrameUs);
+        CHECK(timestamp == uint64_t(frame) * 1000000000ULL / fps);
         const uint8_t *base = arena.data() + (v[2] - session::kArenaBase);
         bool same = true;
         pattern(g, frame, [&](uint32_t at, uint8_t want) { same &= base[at] == want; });
         (same ? patternOk : patternBad)++;
         ++frame;
-        if (!emit(v)) rawPending.push_back(v);
+        CHECK(std::none_of(rawPending.begin(), rawPending.end(), [&](const auto &in) { return in[1] == v[1]; }));
+        rawSlots |= 1u << v[1];
+        rawPending.push_back(v);
+        peakRaw = std::max(peakRaw, unsigned(rawPending.size()));
+        if (rawPending.size() == 4 && frame == 4 && reorderFirstBatch) std::swap(rawPending[1], rawPending[2]);
+        if (rawPending.size() >= rawBatch) flushRaw();
         if (faultOnRaw) ops.fault = true;
+      } else if (v[0] == 9) {
+        CHECK(arp.empty() && p[4] == 0 && b->queued);
+        arp.assign(v.begin(), v.end());
+        arpPackets.emplace_back(data, data + size / 4);
       } else {
-        CHECK(v[7] == 0);   // internal buffers carry no data
+        CHECK(!v[7] && !v[8] && !v[9]);
+        internals.push_back(v);
       }
       return 0;
     }
     if (type == Drain) {
       CHECK(port == PortRaw && flags == 7);
+      flushRaw();
       std::vector<std::vector<uint32_t>> r = {packet(Drain, 1, PortRaw, 0)};
       if (!dropLast && !bitstreamQueue.empty()) {
         std::vector<uint32_t> out = bitstreamQueue.front();
@@ -229,20 +259,42 @@ struct Peer {
         for (const auto &in : rawPending) r.push_back(packet(Buffers, 1, PortRaw, 5, in));
         rawPending.clear();
       }
+      for (auto it = internals.begin(); it != internals.end();) {
+        const auto *b = layout->find((*it)[0], (*it)[1]);
+        if (b->port == port) {
+          r.push_back(packet(Buffers, 1, port, 5, *it));
+          it = internals.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (!arp.empty()) {
+        CHECK(layout->find(9, 0)->queued);
+        if (reportArpOnStop) r.push_back(packet(Buffers, 1, 0, 5, arp));
+      }
       r.push_back(packet(Stop, 1, port, 0));
       reply(r);
       return 0;
     }
     if (type == Close) {
       CHECK(bitstreamQueue.empty() && rawPending.empty());
+      if (!arp.empty()) CHECK(layout->find(9, 0)->queued);
       if (!dropCloseAck) {
-        reply({packet(Close, 1, 0, 0)});
-        closedSessions.push_back(activeSid);
-        activeSid = 0;
+        reply({packet(Close, errorCloseAck ? 5 : 1, 0, 0)});
+        if (!errorCloseAck) {
+          arp.clear();
+          internals.clear();
+          closedSessions.push_back(activeSid);
+          activeSid = 0;
+        }
       }
       return 0;
     }
-    return 0;   // START: no mandatory ack
+    if (type == Start) {
+      CHECK(!arp.empty() && layout->find(9, 0)->queued);
+      reply({packet(Start, port == PortBitstream && errorBitstreamStart ? 4 : 1, port, 0)});
+    }
+    return 0;
   }
 };
 
@@ -297,15 +349,20 @@ static void bootGateTests()
 static void geometryTests()
 {
   const struct {
-    uint32_t width, height, stride, yRows, uvRows, yBytes, uvBytes, rawBytes, bitstreamBytes, codedHeight, vpssBytes;
+    uint32_t width, height, stride, yRows, uvRows, yBytes, uvBytes, rawBytes, bitstreamBytes, codedHeight, vpssBytes, guardedBytes;
+    uint32_t bin, comv, nonComv, line, dpb;
   } cases[] = {
-      {320, 240, 384, 256, 128, 98304, 49152, 147456, 245760, 240, 131072},
-      {640, 480, 640, 480, 240, 307200, 153600, 462848, 921600, 480, 0},
-      {1280, 720, 1280, 736, 368, 942080, 471040, 1413120, 708608, 720, 1449984},
-      {1920, 1080, 1920, 1088, 544, 2088960, 1044480, 3133440, 1568768, 1088, 3158016},
+      {320, 240, 384, 256, 128, 98304, 49152, 147456, 245760, 240, 131072, 9732096,
+       5969408, 41472, 274176, 619776, 626688},
+      {640, 480, 640, 480, 240, 307200, 153600, 462848, 921600, 480, 0, 32980992,
+       23787008, 147456, 313856, 700928, 1921024},
+      {1280, 720, 1280, 736, 368, 942080, 471040, 1413120, 708608, 720, 1449984, 27557888,
+       9563648, 436224, 392448, 834048, 5804032},
+      {1920, 1080, 1920, 1088, 544, 2088960, 1044480, 3133440, 1568768, 1088, 0, 56180736,
+       21661184, 983040, 542720, 984576, 12636160},
   };
   Geometry g;
-  CHECK(kInternalCount == 4 && kInternal[1].bin == 23787008 && kInternal[3].dpb == 12636160);
+  CHECK(kInternalCount == 4);
   // Layouts: no overlap, guards between buffers, inside the AVC arena, every byte of every buffer mapped.
   for (const auto &c : cases) {
     CHECK(g.configure(c.width, c.height));
@@ -322,8 +379,8 @@ static void geometryTests()
 
     session::Layout l;
     CHECK(buildLayout(l, g));
-    CHECK(l.used == 9u + (c.vpssBytes ? 1u : 0u) && l.bytes <= 256u * 1024 * 1024 && l.arenaBytes() == 256u * 1024 * 1024);
-    for (unsigned i = 0; i < 2; ++i) {
+    CHECK(l.used == 14u + (c.vpssBytes ? 1u : 0u) && l.bytes == c.guardedBytes && l.arenaBytes() == 256u * 1024 * 1024);
+    for (unsigned i = 0; i < 4; ++i) {
       const auto *raw = l.find(BufRaw, i), *bits = l.find(BufBitstream, i);
       CHECK(raw && raw->capacity == c.rawBytes && raw->port == PortRaw);
       CHECK(bits && bits->capacity == c.bitstreamBytes && bits->port == PortBitstream);
@@ -332,20 +389,23 @@ static void geometryTests()
       const auto &b = l.buf[i];
       CHECK(!(b.off & 16383) && b.capacity == b.size);
       for (uint32_t at = 0; at < b.capacity; at += 4096) CHECK(l.mapped((b.off + at) / 4096));
-      CHECK(!l.mapped((b.off + ((b.capacity + 16383) & ~16383u)) / 4096));   // the guard after it
+      for (uint32_t at = (b.capacity + 4095) & ~4095u; at < ((b.capacity + 16383) & ~16383u) + 16384; at += 4096)
+        CHECK(!l.mapped((b.off + at) / 4096));
       for (unsigned j = i + 1; j < l.used; ++j) CHECK(l.buf[j].off >= b.off + b.capacity);
     }
     const auto *vpss = l.find(BufVpss, 0);
+    CHECK(bool(vpss) == (g.stride != g.codedWidth || g.scanlines != g.codedHeight));
     CHECK(c.vpssBytes ? vpss && vpss->capacity == c.vpssBytes && vpss->port == PortRaw : !vpss);
+    const auto *arp = l.find(9, 0);
+    CHECK(arp && arp->capacity == 204800 && arp->port == 0);
     const struct { uint32_t type, bytes; } internals[] = {
-        {BufBin, g.internal.bin}, {BufComv, g.internal.comv}, {BufNonComv, g.internal.nonComv},
-        {BufLine, g.internal.line}, {BufDpb, g.internal.dpb},
+        {BufBin, c.bin}, {BufComv, c.comv}, {BufNonComv, c.nonComv}, {BufLine, c.line}, {BufDpb, c.dpb},
     };
     for (const auto &internal : internals) {
       const auto *b = l.find(internal.type, 0);
       CHECK(b && b->capacity == internal.bytes && b->port == PortBitstream);
     }
-    CHECK(!l.find(BufRaw, 2) && !l.find(BufBitstream, 2));
+    CHECK(!l.find(BufRaw, 4) && !l.find(BufBitstream, 4));
   }
 
   const uint32_t invalid[][2] = {
@@ -376,8 +436,8 @@ static void geometryTests()
   for (unsigned i = 0; i < in.n; ++i) CHECK(in.p[i].port == PortRaw);
   CHECK(out.n == 3 && out.p[2].id == PropFrameRate && out.p[2].payload == PayloadQ16 && out.p[2].v[0] == (30u << 16));
   for (unsigned i = 0; i < out.n; ++i) CHECK(out.p[i].port == PortBitstream);
-  CHECK(caps.n == 14 && caps.p[0].id == PropProfile && caps.p[0].v[0] == 4 && caps.p[1].v[0] == 14 && caps.p[4].port == PortNone);
-  CHECK(caps.p[6].id == PropTotalBitrate && caps.p[6].port == PortRaw && caps.p[13].id == PropRequestSyncFrame);
+  CHECK(caps.n == 16 && caps.p[0].id == PropProfile && caps.p[0].v[0] == 4 && caps.p[1].v[0] == 14 && caps.p[4].port == PortNone);
+  CHECK(caps.p[6].id == PropTotalBitrate && caps.p[6].port == PortRaw && caps.p[14].id == PropRequestSyncFrame);
 }
 
 static void residentArenaTests()
@@ -386,37 +446,50 @@ static void residentArenaTests()
   Bringup<TestHw> core(hw);
   core.avcWidth = 1920;
   core.avcHeight = 1088;
-  CHECK(core.encGeometry.configure(640, 480));
-
   std::vector<uint64_t> words(vsmmu::kSessionTablePages * 512), uc(vsmmu::kUcPages);
   std::vector<uint64_t> pages(session::kAvcArenaBytes / 4096);
   for (unsigned i = 0; i < uc.size(); ++i) uc[i] = kXnuDramBase + i * 4096ull;
   vsmmu::Tables tables{words.data(), kXnuDramBase + 0x2000000, vsmmu::kSessionTablePages};
   for (uint64_t base : {kXnuDramBase + 0x10000000, kExtraArenaBase}) {
-    for (unsigned i = 0; i < pages.size(); ++i) pages[i] = base + i * 4096ull;
+    for (unsigned i = 0; i < pages.size(); ++i)
+      pages[i] = base + (base == kExtraArenaBase ? i : (i * 7907u) % pages.size()) * 4096ull;
     CHECK(vsmmu::build(tables, uc.data(), unsigned(uc.size()), kXnuDramBase + 0x3000000));
     core.hevc = false;
     core.bitdepth = 8;
+    core.encoder = bootEnabled("piano-video=6 piano-video-enc=0");
     CHECK(core.prepareLayout() && !core.layout.hevc && core.layout.used > 10);
+    CHECK(!core.layout.find(9, 0) && hw.log.find("E1") == std::string::npos);
     CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
     const auto avcLeaves = words;
 
-    core.encoder = true;
-    CHECK(core.prepareLayout() && core.layout.used == 9);
-    CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
-    CHECK(vsmmu::walk(tables, kIovaBase) == uc[0]);
-    CHECK(words != avcLeaves);
+    for (const auto &size : kInternal) {
+      core.encoder = bootEnabled("piano-video=6 piano-video-enc=1");
+      CHECK(core.encGeometry.configure(size.width, size.height));
+      CHECK(core.prepareLayout() && core.layout.used == (size.vpss ? 15u : 14u));
+      CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
+      const auto *arp = core.layout.find(9, 0);
+      if (arp) {
+        for (unsigned i = 0; i < 50; ++i)
+          CHECK(vsmmu::walk(tables, arp->iova() + i * 4096) == pages[arp->off / 4096 + i]);
+        for (unsigned i = 50; i < 56; ++i)
+          CHECK(!vsmmu::walk(tables, arp->iova() + i * 4096));
+      } else {
+        CHECK(arp);
+      }
+      CHECK(vsmmu::walk(tables, kIovaBase) == uc[0]);
+      CHECK(words != avcLeaves);
 
-    core.encoder = false;
-    core.hevc = true;
-    core.bitdepth = 10;
-    CHECK(core.prepareLayout() && core.layout.hevc && core.layout.arenaBytes() == 188 * 1024 * 1024);
-    CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
-    core.hevc = false;
-    core.bitdepth = 8;
-    CHECK(core.prepareLayout());
-    CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
-    CHECK(words == avcLeaves);
+      core.encoder = false;
+      core.hevc = true;
+      core.bitdepth = 10;
+      CHECK(core.prepareLayout() && core.layout.hevc && core.layout.arenaBytes() == 188 * 1024 * 1024);
+      CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
+      core.hevc = false;
+      core.bitdepth = 8;
+      CHECK(core.prepareLayout() && !core.layout.find(9, 0));
+      CHECK(session::buildArena(tables, core.layout, pages.data(), session::kAvcArenaBytes));
+      CHECK(words == avcLeaves);
+    }
   }
 }
 
@@ -475,9 +548,8 @@ static void settingsAndReopenTests()
   }
 
   std::vector<uint8_t> stream(128 * 1024);
-  const Settings supported[] = {{.fps = 1, .bitrate = 100000, .gop = 1, .frames = 2},
+  const Settings supported[] = {{.fps = 1, .bitrate = 100000, .gop = 1, .frames = 6},
                                 {.fps = 60, .bitrate = 40000000, .gop = 300, .frames = 120}};
-  constexpr uint64_t expectedFrameUs[] = {1000000, 16666};
   for (unsigned run = 0; run < 2; ++run) {
     const auto &settings = supported[run];
     CHECK(buildLayout(layout, g));  // Native reopen rebuilds layout ownership and uses a fresh transaction.
@@ -488,20 +560,22 @@ static void settingsAndReopenTests()
     t.sessionId += run;
     t.stream = stream.data();
     t.streamCap = uint32_t(stream.size());
-    peer.expectedFrameUs = expectedFrameUs[run];
+    peer.fps = settings.fps;
     const unsigned from = unsigned(peer.sent.size()), patternsBefore = peer.patternOk;
     CHECK(admitted(settings) && t.run() == 0 && t.r.pass());
     CHECK(t.r.etb == settings.frames && t.r.ebd == settings.frames && t.r.fbd == settings.frames);
-    CHECK(t.r.ftb == settings.frames + 2 && t.r.empty == 2 && t.r.drainAck && t.r.last);
+    CHECK(t.r.ftb == settings.frames + 4 && t.r.empty == 4 && t.r.drainAck && t.r.last);
     CHECK(t.r.stopBitstream && t.r.stopRaw && t.r.closed && t.frames[0].offset == 0);
     CHECK(t.r.sps == 1 && t.r.pps == 1 && t.r.idr == 1 && t.r.slices == settings.frames - 1);
     CHECK(t.r.streamBytes == 3031 + (settings.frames - 1) * 805);
-    CHECK(t.frames[settings.frames - 1].ebdUs >= t.frames[settings.frames - 1].etbUs);
+    for (unsigned f = 0; f < settings.frames; ++f) {
+      CHECK(t.frames[f].ebdUs > t.frames[f].etbUs && t.frames[f].fbdUs > t.frames[f].etbUs);
+      CHECK(t.frames[f].offset == (f ? 3031 + (f - 1) * 805 : 0));
+    }
     CHECK(peer.patternOk - patternsBefore == settings.frames && !peer.patternBad);
     CHECK(!peer.activeSid && peer.bitstreamQueue.empty() && peer.rawPending.empty());
     CHECK(peer.mem.ld(hfi::qhdr(hfi::kMsgq) + hfi::kQRead) == peer.mem.ld(hfi::qhdr(hfi::kMsgq) + hfi::kQWrite));
-    for (unsigned i = 0; i < layout.used; ++i)
-      if (layout.buf[i].type == BufRaw || layout.buf[i].type == BufBitstream) CHECK(!layout.buf[i].queued);
+    for (unsigned i = 0; i < layout.used; ++i) CHECK(!layout.buf[i].queued);
 
     const struct { uint32_t id, port, payload, value; unsigned count; } wire[] = {
         {0x0300010c, 1, 8, settings.fps * 65536, 1},      // Q16 fps
@@ -522,6 +596,24 @@ static void settingsAndReopenTests()
   }
   const std::vector<uint32_t> epochs = {0x56340e01, 0x56340e02};
   CHECK(peer.openedSessions == epochs && peer.closedSessions == epochs);
+  CHECK(peer.arpPackets.size() == epochs.size() && peer.arpPackets[0][1] == epochs[0] && peer.arpPackets[1][1] == epochs[1]);
+}
+
+static void timestampTests()
+{
+  CHECK(frameNs(0, 30) == 0 && frameNs(1, 30) == 33333333 && frameNs(2, 30) == 66666666 && frameNs(3, 30) == 100000000);
+  CHECK(frameNs(1, 60) == 16666666 && frameNs(2, 60) == 33333333 && frameNs(3, 60) == 50000000);
+  CHECK(frameNs(119, 30) == 3966666666 && frameNs(119, 60) == 1983333333 && frameNs(119, 1) == 119000000000);
+  for (uint32_t fps = 1; fps <= 60; ++fps) {
+    for (unsigned f = 0; f < 120; ++f) {
+      const uint64_t timestamp = frameNs(f, fps);
+      CHECK(frameIndex(timestamp, fps) == f);
+      CHECK(frameIndex(timestamp + 1, fps) == kMaxFrames);
+      if (timestamp) CHECK(frameIndex(timestamp - 1, fps) == kMaxFrames);
+    }
+    CHECK(frameIndex(frameNs(120, fps), fps) == kMaxFrames && frameIndex(UINT64_MAX, fps) == kMaxFrames);
+  }
+  CHECK(frameIndex(0, 0) == kMaxFrames && frameIndex(0, UINT32_MAX) == kMaxFrames);
 }
 
 static void outputBoundsTests()
@@ -531,7 +623,7 @@ static void outputBoundsTests()
   for (uint32_t cap : {totalBytes, 0u, 2u, firstBytes - 1, firstBytes, totalBytes - 1}) {
     Run r(320, 240, cap);
     r.t.set.frames = 2;
-    CHECK(r.go() == 0 && r.t.r.closed && r.t.r.last && r.t.r.empty == 2);
+    CHECK(r.go() == 0 && r.t.r.closed && r.t.r.last && r.t.r.empty == 4);
     CHECK(r.t.r.fbd == 2 && r.t.r.streamBytes == cap && !r.t.r.badNal);
     CHECK(r.t.r.truncated == (cap < totalBytes) && r.t.r.pass() == (cap == totalBytes));
     CHECK(r.t.frames[0].bytes == firstBytes && r.t.frames[1].bytes == 805);
@@ -551,12 +643,12 @@ static void outputBoundsTests()
     CHECK(r.t.r.streamBytes == r.t.streamCap && r.stream.back() == 0xa5);
   }
   for (auto mode : {OutputReply::Empty, OutputReply::WrongIova, OutputReply::BadCapacity,
-                    OutputReply::BadOffset, OutputReply::BadLength, OutputReply::Wraparound}) {
+                    OutputReply::BadOffset, OutputReply::BadLength, OutputReply::Wraparound, OutputReply::BadTimestamp}) {
     Run r(320, 240);
     r.peer.firstOutput = mode;
     CHECK(r.go() == kErrHfi && r.t.r.failedStage == Frames && !r.t.r.pass());
     CHECK(r.t.r.closed && !r.t.r.last && r.t.r.etb == 1 && r.t.r.ebd == 1);
-    CHECK(r.t.r.fbd == 0 && r.t.r.ftb == 2 && r.t.r.streamBytes == 0 && r.stream[0] == 0xa5);
+    CHECK(r.t.r.fbd == 0 && r.t.r.ftb == 4 && r.t.r.streamBytes == 0 && r.stream[0] == 0xa5);
   }
 }
 
@@ -574,31 +666,70 @@ static void patternTests()
   CHECK(outside == 0);   // nothing written past the UV plane
 }
 
+static void capabilityWireTests(const Peer &p, unsigned first, Stage stage)
+{
+  const struct { uint32_t id, port, payload, value; } expected[] = {
+      {0x03000107, 1, 9, 4}, {0x03000108, 1, 9, 14}, {0x03000123, 2, 1, 64}, {0x03000123, 1, 1, 64},
+      {0x0300010a, 0, 1, 2}, {0x03000149, 1, 9, 2}, {0x0300013b, 2, 1, 2000000}, {0x0300012a, 1, 9, 0},
+      {0x03000146, 2, 1, 9}, {0x03000121, 1, 1, 1}, {0x03000129, 1, 10, 0x00060600}, {0x0300014c, 2, 9, 0},
+      {0x03000131, 1, 1, 0}, {0x03000147, 1, 1, 0}, {0x03000145, 2, 9, 1}, {0x0300012b, 1, 1, 0},
+  };
+  for (const auto &want : expected) {
+    CHECK(first < p.sent.size());
+    if (first >= p.sent.size()) return;
+    const auto &got = p.sent[first++];
+    CHECK(got.type == want.id && got.port == want.port && got.payload == want.payload && got.v0 == want.value);
+    CHECK(got.stage == int(stage) && got.flags == 0 && got.words == 1);
+  }
+}
+
 static void sessionTests()
 {
   {  // success, 640x480 (no VPSS)
     Run r(640, 480);
+    r.peer.rawBatch = 4;
+    r.peer.reorderFirstBatch = true;
     CHECK(r.go() == 0 && r.t.r.pass());
     const auto &p = r.peer;
     CHECK(p.patternOk == 10 && !p.patternBad);
     CHECK(r.t.r.etb == 10 && r.t.r.ebd == 10 && r.t.r.fbd == 10 && r.t.r.idr == 1 && r.t.r.sps == 1 && r.t.r.slices == 9);
     CHECK(r.t.r.drainAck && r.t.r.last && r.t.r.stopBitstream && r.t.r.stopRaw && r.t.r.closed && !r.t.r.truncated);
     CHECK(r.t.frames[0].picture == PictureIdr && r.t.frames[1].picture == PictureP);
-    // The order: OPEN, CODEC, raw config (5), caps (14), START raw, bitstream config (3), caps (14), COMV count before COMV,
-    // BIN..DPB, START bitstream, two empty bitstream buffers, then frames; DRAIN; STOP 1, STOP 2, CLOSE.
+    CHECK(p.rawSlots == 0xf && p.bitstreamSlots == 0xf && p.peakRaw == 4 && p.peakBitstream == 4);
+    CHECK(r.t.r.ftb == 14 && r.t.r.empty == 4);
+    for (unsigned f = 0; f < 10; ++f)
+      CHECK(r.t.frames[f].ebdUs > r.t.frames[f].etbUs && r.t.frames[f].fbdUs > r.t.frames[f].etbUs);
+    CHECK(r.t.frames[2].ebdUs < r.t.frames[1].ebdUs && r.t.frames[2].fbdUs < r.t.frames[1].fbdUs);
+    CHECK(r.t.frames[2].offset == r.t.frames[0].bytes && r.t.frames[1].offset == r.t.frames[2].offset + r.t.frames[2].bytes);
     const auto t = types(p);
     CHECK(t.size() > 50 && t[0] == Open && t[1] == PropCodec && p.sent[1].v0 == CodecEncodeAvc && p.sent[1].payload == PayloadEnum);
-    CHECK(t[2] == PropColorFormat && t[6] == PropColorInfo && t[7] == PropProfile && t[20] == PropRequestSyncFrame);
-    const unsigned startRaw = indexOf(p, Start, PortRaw), startBits = indexOf(p, Start, PortBitstream);
-    CHECK(startRaw == 21 && t[22] == PropBitstreamResolution && t[25] == PropProfile && startBits != ~0u && startBits > startRaw);
+    CHECK(t[2] == PropColorFormat && t[6] == PropColorInfo);
+    capabilityWireTests(p, 7, InputConfig);
+    capabilityWireTests(p, 28, OutputConfig);
+    const unsigned startRaw = indexOf(p, 0x01000005, 2), startBits = indexOf(p, 0x01000005, 1);
+    CHECK(startRaw == 24 && t[25] == PropBitstreamResolution && startBits == 50);
+    const auto *arp = r.layout.find(9, 0);
+    const unsigned arpAt = bufferIndex(p, 9);
+    CHECK(arp && !arp->queued && p.arp.empty() && p.internals.empty());
+    CHECK(arpAt == 23 && p.arpPackets.size() == 1 && p.sent[arpAt].stage == InputConfig);
+    if (arp && !p.arpPackets.empty()) {
+      const std::vector<uint32_t> expected = {
+          128, r.t.sessionId, 23, 0, 0, 0, 0, 1,
+          96, 0x01000009, 1, 5, 0, 23, 0, 0,
+          9, 0, arp->iova(), 0, 0, 204800, 0, 0, 0, 0, 0x00000200, 0, 0, 0, 0, 0,
+      };
+      CHECK(p.arpPackets[0] == expected && !(arp->iova() & 16383));
+    }
     CHECK(bufferIndex(p, BufVpss) == ~0u);
     const unsigned bin = bufferIndex(p, BufBin), comv = bufferIndex(p, BufComv), dpb = bufferIndex(p, BufDpb);
     CHECK(bin > startRaw && bin < comv && comv < dpb && dpb < startBits && p.sent[comv - 1].type == PropComvCount);
+    const auto &count = p.sent[comv - 1];
+    CHECK(count.type == 0x03000193 && count.port == 1 && count.flags == 0 && count.payload == 1 && count.words == 1 && count.v0 == 4);
     CHECK(bufferIndex(p, BufBitstream) == startBits + 1 && bufferIndex(p, BufRaw) > startBits);
     const unsigned drain = indexOf(p, Drain, PortRaw), stop1 = indexOf(p, Stop, PortBitstream), stop2 = indexOf(p, Stop, PortRaw);
     CHECK(drain != ~0u && drain < stop1 && stop1 < stop2 && t.back() == Close);
     // The export is the whole stream in output order and starts with the SPS.
-    CHECK(r.t.r.streamBytes > 3000 && r.stream[4] == 0x67 && r.t.frames[1].offset == r.t.frames[0].bytes);
+    CHECK(r.t.r.streamBytes > 3000 && r.stream[4] == 0x67);
     CHECK(r.peer.hw.log.find("E1 result PASS") != std::string::npos);
   }
   for (const auto &size : {kInternal[0], kInternal[2], kInternal[3]}) {
@@ -606,7 +737,26 @@ static void sessionTests()
     r.t.set.frames = 2;
     CHECK(r.go() == 0 && r.t.r.pass());
     const unsigned vpss = bufferIndex(r.peer, BufVpss);
-    CHECK(vpss != ~0u && r.peer.sent[vpss].port == PortRaw && vpss < indexOf(r.peer, Start, PortRaw));
+    if (size.vpss)
+      CHECK(vpss != ~0u && r.peer.sent[vpss].port == PortRaw && bufferIndex(r.peer, 9) < vpss &&
+            vpss < indexOf(r.peer, Start, PortRaw));
+    else
+      CHECK(vpss == ~0u);
+  }
+  {  // a failed ring write leaves ARP host-owned and no port started
+    Run r(640, 480);
+    r.peer.rejectArp = true;
+    CHECK(r.go() == kErrHfi && r.t.r.failedStage == InputConfig && r.t.r.closed);
+    CHECK(r.peer.arpPackets.empty() && !r.layout.find(9, 0)->queued);
+    CHECK(indexOf(r.peer, Start, PortRaw) == ~0u && indexOf(r.peer, Stop, PortRaw) == ~0u);
+  }
+  {  // match the stage-5 failure trace: both STOPs return scratch and CLOSE fences ARP
+    Run r(640, 480);
+    r.peer.errorBitstreamStart = true;
+    r.peer.reportArpOnStop = true;
+    CHECK(r.go() == kErrHfi && r.t.r.failedStage == OutputStart && r.t.r.errorPort == 1);
+    CHECK(r.t.r.stopBitstream && r.t.r.stopRaw && r.t.r.closed && !r.t.r.close && !r.t.r.etb);
+    CHECK(r.peer.arpPackets.size() == 1 && !r.layout.find(9, 0)->queued && r.peer.arp.empty());
   }
   {  // a session error on a property stops at that stage; cleanup still STOPs/CLOSEs
     Run r(640, 480);
@@ -620,10 +770,12 @@ static void sessionTests()
     r.peer.dropLast = true;
     CHECK(r.go() == kErrHfiTimeout && r.t.r.failedStage == Draining && r.t.r.fbd == 10 && !r.t.r.last);
   }
-  {  // no CLOSE ack: the run reports it
+  for (bool errorAck : {false, true}) {
     Run r(640, 480);
-    r.peer.dropCloseAck = true;
+    r.peer.dropCloseAck = !errorAck;
+    r.peer.errorCloseAck = errorAck;
     CHECK(r.go() != 0 && !r.t.r.closed && r.t.r.close == kErrHfiTimeout && !r.t.r.pass());
+    CHECK(r.t.r.stopBitstream && r.t.r.stopRaw && r.layout.find(9, 0)->queued && !r.peer.arp.empty());
   }
   {  // a system error is fatal at once
     Run r(640, 480);
@@ -637,12 +789,20 @@ static void sessionTests()
     r.go();
     CHECK(r.t.r.badNal > 0 && !r.t.r.pass());
   }
+  {  // a timestamp for a different RAW frame cannot return this input credit
+    Run r(640, 480);
+    r.peer.rawBatch = 4;
+    r.peer.wrongRawTimestamp = true;
+    CHECK(r.go() == kErrHfi && r.t.r.failedStage == Frames && r.t.r.closed);
+    CHECK(r.t.r.etb == 4 && r.t.r.ebd == 3 && !r.t.frames[0].ebdUs && r.t.frames[1].ebdUs);
+  }
   {  // an SMMU fault during frame submission leaves the DMA state held for quarantine
     Run r(640, 480);
     r.peer.faultOnRaw = true;
     CHECK(r.go() == kErrFault && !r.t.r.pass());
     CHECK(r.t.r.etb == 1 && r.t.r.fbd == 0 && r.peer.sent.back().v0 == BufRaw);
     CHECK(indexOf(r.peer, Stop, PortBitstream) == ~0u && indexOf(r.peer, Close, PortNone) == ~0u);
+    CHECK(r.layout.find(9, 0)->queued && !r.peer.arp.empty());
   }
   {  // a watchdog during shutdown prevents the second STOP and CLOSE
     Run r(640, 480);
@@ -650,6 +810,7 @@ static void sessionTests()
     CHECK(r.go() == kErrWatchdog && !r.t.r.pass());
     CHECK(r.peer.sent.back().type == Stop && r.peer.sent.back().port == PortBitstream);
     CHECK(!r.t.r.stopRaw && !r.t.r.closed);
+    CHECK(r.layout.find(9, 0)->queued && !r.peer.arp.empty());
   }
 }
 
@@ -688,6 +849,7 @@ int main(int argc, char **argv)
   residentArenaTests();
   scanTests();
   patternTests();
+  timestampTests();
   settingsAndReopenTests();
   outputBoundsTests();
   sessionTests();

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026 Leo Zhang.
 // PianoVideo E1 (piano-video-enc=1): one bounded H.264 encode session over the verified V3 owner, on synthetic NV12 frames.
-// The order is Linux iris_venc's (VideoEncode.h names the pin): OPEN, CODEC; streamon raw (input config, capabilities, VPSS,
+// The order is Linux iris_venc's (VideoEncode.h names the pin): OPEN, CODEC; streamon raw (input config, capabilities, ARP, VPSS,
 // START raw); streamon bitstream (output config, capabilities, COMV count, BIN/COMV/NON_COMV/LINE/DPB, START bitstream); queue the
-// bitstream buffers; ETB the frames (two raw buffers in turn); DRAIN raw -> LAST; STOP bitstream, STOP raw, CLOSE.
+// bitstream buffers; ETB the frames across four RAW slots; DRAIN raw -> LAST; STOP bitstream, STOP raw, CLOSE.
 // The Owner is the decoder's (session::SelfTest's duck type: hw, ops, plan, mem, ids, tx, rx, dma.arena, rep, watchdog words,
 // send, packetTrace, drainDebug). Nothing here frees memory: the arena belongs to the V3 owner, as for the decoder.
 #pragma once
@@ -43,6 +43,7 @@ public:
   Result r;
   int deviceError = 0;
   FrameRecord frames[kMaxFrames] = {};
+  unsigned rawFrame[kRaws] = {};
   uint32_t sessionId = 0x56340e01;
   uint8_t *stream = nullptr;   // the export buffer (owner's), the whole Annex B stream in output order
   uint32_t streamCap = 0;
@@ -92,7 +93,7 @@ public:
                             kHostNonSecure, 0, 0, 0, 0, 0};
     b.queued = true;
     b.released = false;
-    const int rc = tx(Buffers, 1, b.port, 5, v, 16);
+    const int rc = tx(Buffers, kHfiHostIntr, b.port, PayloadStructure, v, 16);
     if (rc) b.queued = false;
     return rc;
   }
@@ -124,16 +125,25 @@ public:
       if (!cleanup) fail(kErrHfi, Buffers, p[2], p[4]);
       return;
     }
-    b->queued = false;
+    // ARP lives outside both port buffer tables. A buffer reply does not
+    // release its session backing. Keep ownership until a successful CLOSE.
+    if (b->type == BufArp) return;
+
     const uint64_t now = o.hw.nowUs();
+    const uint64_t ts = uint64_t(v[8]) | uint64_t(v[9]) << 32;
     if (b->type == BufRaw) {
-      const uint64_t ts = uint64_t(v[8]) | uint64_t(v[9]) << 32;
-      const unsigned f = unsigned(ts / frameUs());
-      if (f < kMaxFrames) frames[f].ebdUs = now;
+      const unsigned f = frameIndex(ts, set.fps);
+      if (b->index >= kRaws || f >= r.etb || rawFrame[b->index] != f) {
+        fail(kErrHfi, Buffers, p[2], p[4]);
+        return;
+      }
+      b->queued = false;
+      frames[f].ebdUs = now;
       ++r.ebd;
       return;
     }
     if (b->type != BufBitstream) {
+      b->queued = false;
       if (!cleanup) fail(kErrHfi, Buffers, p[2], p[4]);
       return;
     }
@@ -142,14 +152,21 @@ public:
       r.last = true;
     }
     if (!v[7]) {
+      b->queued = false;
       ++r.empty;
       if (!(v[10] & kFlagLast) && !cleanup) fail(kErrHfi, Buffers, v[10], p[4]);
       return;
     }
+    const unsigned f = frameIndex(ts, set.fps);
+    if (f >= r.etb || frames[f].bytes) {
+      fail(kErrHfi, Buffers, p[2], p[4]);
+      return;
+    }
+    b->queued = false;
+    ++r.fbd;
+    FrameRecord &rec = frames[f];
     o.hw.barrier();
     const volatile uint8_t *data = o.dma.arena + b->off + v[6];
-    const unsigned f = r.fbd++;
-    FrameRecord *rec = f < kMaxFrames ? &frames[f] : nullptr;
     // Copy out first (the buffer goes back to the firmware below), then classify the copy.
     const uint32_t at = r.streamBytes;
     uint32_t kept = 0;
@@ -159,26 +176,21 @@ public:
       r.streamBytes += kept;
     }
     if (kept != v[7]) r.truncated = true;
-    if (rec) {
-      rec->bytes = v[7];
-      rec->picture = picture;
-      rec->offset = at;
-      rec->fbdUs = now;
-      if (kept == v[7] && stream) rec->nals = classify(stream + at, kept);
-      r.sps += rec->nals.sps;
-      r.pps += rec->nals.pps;
-      r.idr += rec->nals.idr;
-      r.slices += rec->nals.slice;
-      r.badNal += rec->nals.bad;
-      o.hw.note("E1 FBD frame %u bytes %u picture %08x NAL sps %u pps %u idr %u slice %u other %u bad %u etb-to-fbd-us %llu", f,
-                v[7], picture, rec->nals.sps, rec->nals.pps, rec->nals.idr, rec->nals.slice, rec->nals.other, unsigned(rec->nals.bad),
-                (unsigned long long)(f < r.etb ? now - frames[f].etbUs : 0));
-    }
+    rec.bytes = v[7];
+    rec.picture = picture;
+    rec.offset = at;
+    rec.fbdUs = now;
+    if (kept == v[7] && stream) rec.nals = classify(stream + at, kept);
+    r.sps += rec.nals.sps;
+    r.pps += rec.nals.pps;
+    r.idr += rec.nals.idr;
+    r.slices += rec.nals.slice;
+    r.badNal += rec.nals.bad;
+    o.hw.note("E1 FBD frame %u bytes %u picture %08x NAL sps %u pps %u idr %u slice %u other %u bad %u etb-to-fbd-us %llu", f,
+              v[7], picture, rec.nals.sps, rec.nals.pps, rec.nals.idr, rec.nals.slice, rec.nals.other, unsigned(rec.nals.bad),
+              (unsigned long long)(now - rec.etbUs));
     picture = 0;
-    if (!r.last && !cleanup) {
-      ++r.ftb;
-      (void)buffer(*b);
-    }
+    if (!r.last && !cleanup && !r.error && !buffer(*b)) ++r.ftb;
   }
   int receive(const uint32_t *b, uint32_t bytes)
   {
@@ -229,7 +241,7 @@ public:
             stopPending = 0;
           }
         } else if (type == Close) {
-          if (!closeSent || port || !(flags & 1)) fail(kErrHfi, type, flags, port);
+          if (!closeSent || port || !(flags & kHfiFwSuccess) || (flags & kHfiFwSessionError)) fail(kErrHfi, type, flags, port);
           else r.closed = true;
         }
       }
@@ -275,11 +287,10 @@ public:
     const uint32_t target = o.mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQWrite);
     return wait([this, target] { return o.mem.ld(hfi::qhdr(hfi::kCmdq) + hfi::kQRead) == target; });
   }
-  uint64_t frameUs() const { return 1000000ull / set.fps; }
-  session::Buffer *freeRaw()
+  session::Buffer *freeRaw(unsigned first)
   {
     for (unsigned i = 0; i < kRaws; ++i) {
-      session::Buffer *b = layout.find(BufRaw, i);
+      session::Buffer *b = layout.find(BufRaw, (first + i) % kRaws);
       if (b && !b->queued) return b;
     }
     return nullptr;
@@ -314,30 +325,38 @@ public:
     const uint32_t codec = CodecEncodeAvc;
     if (consumed() || tx(PropCodec, 0, PortNone, PayloadEnum, &codec, 1)) return r.error;
     stage(InputConfig);
-    if (props(inputConfig(g)) || props(capabilities(set)) || internals(true)) return r.error;
+    if (props(inputConfig(g)) || props(capabilities(set))) return r.error;
+    session::Buffer *arp = layout.find(BufArp, 0);
+    if (!arp) return fail(kErrNoMemory);
+    if (buffer(*arp) || internals(true)) return r.error;
     stage(InputStart);
+    if (tx(Start, 3, PortRaw, 0)) return r.error;
     inputStarted = true;
-    if (tx(Start, 3, PortRaw, 0) || consumed()) return r.error;
+    if (consumed()) return r.error;
     stage(OutputConfig);
     if (props(outputConfig(g, set)) || props(capabilities(set)) || internals(false)) return r.error;
     stage(OutputStart);
+    if (tx(Start, 3, PortBitstream, 0)) return r.error;
     outputStarted = true;
-    if (tx(Start, 3, PortBitstream, 0) || consumed()) return r.error;
+    if (consumed()) return r.error;
     for (unsigned i = 0; i < kBitstreams; ++i) {
+      session::Buffer *b = layout.find(BufBitstream, i);
+      if (!b) return fail(kErrNoMemory);
+      if (buffer(*b)) return r.error;
       ++r.ftb;
-      if (buffer(*layout.find(BufBitstream, i))) return r.error;
     }
     stage(Frames);
     for (unsigned f = 0; f < set.frames; ++f) {
       session::Buffer *raw = nullptr;
-      if (wait([this, &raw] { return (raw = freeRaw()) != nullptr; }, 2000)) return r.error;
+      if (wait([this, f, &raw] { return (raw = freeRaw(f % kRaws)) != nullptr; }, 2000)) return r.error;
       volatile uint8_t *base = o.dma.arena + raw->off;
       pattern(g, f, [base](uint32_t at, uint8_t v) { base[at] = v; });
       o.hw.barrier();
       frames[f].etbUs = o.hw.nowUs();
-      ++r.etb;
       deadline = o.hw.nowUs() + 5000000;
-      if (buffer(*raw, g.rawBytes, uint64_t(f) * frameUs())) return r.error;
+      if (buffer(*raw, g.rawBytes, frameNs(f, set.fps))) return r.error;
+      rawFrame[raw->index] = f;
+      ++r.etb;
       if (pump() && r.error) return r.error;
     }
     stage(Draining);
@@ -374,6 +393,10 @@ public:
     }
     if (const int late = pump(); late && !rc) rc = late;
     r.close = rc;
+    // CLOSE acknowledges session-wide DMA quiescence, including ARP. The owner
+    // keeps its arena mapped and quarantines it on any error.
+    if (r.closed && !deviceError)
+      for (unsigned i = 0; i < layout.used; ++i) layout.buf[i].queued = false;
     unsigned queued = 0;
     for (unsigned i = 0; i < layout.used; ++i) queued += layout.buf[i].queued;
     o.hw.note("E1 session end closed %u close-error %d stop %u/%u queued-at-close %u arena-retained 1 unknown-props %u last-prop %08x",
@@ -385,9 +408,10 @@ public:
   {
     const int rc = transaction();
     shutdown();
-    for (unsigned f = 0; f < r.fbd && f < kMaxFrames; ++f)
-      o.hw.note("E1 frame %u bytes %u picture %08x encode-us %llu", f, frames[f].bytes, frames[f].picture,
-                (unsigned long long)(frames[f].fbdUs > frames[f].etbUs ? frames[f].fbdUs - frames[f].etbUs : 0));
+    for (unsigned f = 0; f < r.etb; ++f)
+      if (frames[f].bytes)
+        o.hw.note("E1 frame %u bytes %u picture %08x encode-us %llu", f, frames[f].bytes, frames[f].picture,
+                  (unsigned long long)(frames[f].fbdUs - frames[f].etbUs));
     o.hw.note("E1 result %s error %d stage %u failed-stage %u close %d ETB %u EBD %u FBD %u IDR %u SPS %u PPS %u slices %u bad-nal %u "
               "bytes %u truncated %u", r.pass() ? "PASS" : "FAIL", r.error, r.stage, r.failedStage, r.close, r.etb, r.ebd, r.fbd, r.idr,
               r.sps, r.pps, r.slices, r.badNal, r.streamBytes, unsigned(r.truncated));
