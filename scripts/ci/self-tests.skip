@@ -10,8 +10,6 @@ tooling/native/tests/test_mic_diag.py                  # ARGS: takes a recorded 
 tooling/native/piano-mic-check/test-mic-check.py       # ARGS: tooling/native/piano-mic-check/run-tests.sh builds the app and WAV via make test
 package/PianoCamera/tests/camera_host.cpp              # HEADER: -I<gen>, the sensor tables generated from data/camera by the build
 package/PianoVideo/tests/bringup_host.cpp              # HEADER: links QcomMdt.o from the kext build
-package/PianoUsbHost/tests/ucsi_host.cpp               # HEADER: needs PianoUsbHw.h's include path from build-native-piano-usbhost.sh
-package/PianoWifi/tests/qmi_host.cpp                   # HEADER: its build line compiles a .c file as C++ (-Werror,-Wdeprecated)
 tooling/persist/test-data-store.py                     # INPUT: imports the UniXNU checkout's unixnu.bootimg (fetch-pins.py UniXNU)
 tooling/persist/test-persist.py                        # INPUT: reads the maintainer's partition-table backup
 tooling/persist/test-switch-pair.py                    # INPUT: reads the maintainer's partition-table backup

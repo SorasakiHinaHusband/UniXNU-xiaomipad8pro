@@ -6,7 +6,7 @@
 // PPM: a reset clears the notification enable and latches RESET_COMPLETE, every command completes in CCI (with the MESSAGE_IN length),
 // ACK_CC_CI clears the command completion and, with the connector-change bit, the connector's pending change; a change is shown in the
 // CCI's connector field until it is acknowledged; notifications go out only for enabled events.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. ucsi_host.cpp -o /tmp/ucsi_host && /tmp/ucsi_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 ucsi_host.cpp -o /tmp/ucsi_host && /tmp/ucsi_host
 #include "UcsiClient.h"
 #include "PortRole.h"
 #include "ControllerLoan.h"
