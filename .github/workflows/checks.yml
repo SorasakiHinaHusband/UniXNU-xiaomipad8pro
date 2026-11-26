@@ -60,9 +60,14 @@ jobs:
           persist-credentials: false
       - name: Host tools the tests call (mtools for the FAT images, llvm for the freestanding selector build)
         run: brew install mtools llvm
+      - name: Fetch the pinned DarwinBoot source for the bootloader host tests
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/self-test-sources
+        run: python3 scripts/fetch-pins.py --only DarwinBoot
       - name: Host tests (including Adreno830 with pinned public kits)
         # the charge integration test takes ~270 s and test-k273-only ~150 s on an M-series Mac; the hosted runner is slower
         env:
+          DARWINBOOT: ${{ runner.temp }}/self-test-sources/DarwinBoot
           SELFTEST_TIMEOUT: "1500"
         run: python3 scripts/ci/self-tests.py --junit "$RUNNER_TEMP/self-tests.xml"
       - uses: actions/upload-artifact@v7
