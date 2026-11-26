@@ -227,9 +227,9 @@ Frames readFrames(Io &io)
 template <class Io, class Poll = PlainPoll>
 bool waitFrameEdge(Io &io, uint32_t timeoutUs, Frames *edge, const Poll &poll = {})
 {
+  if (!edge || !timeoutUs) return false;
   const uint32_t f0 = io.rd(intfReg(1, kIntfFrameCount));
   const uint64_t start = io.nowUs();
-  if (!timeoutUs) return false;
   io.delayUs(50);
   for (;;) {
     const Frames r = readFrames(io);
@@ -303,15 +303,16 @@ bool waitLines(Io &io, unsigned lo, unsigned hi, unsigned vtotal, uint32_t timeo
 template <class Io, class Poll = PlainPoll>
 int32_t waitFlush(Io &io, unsigned ctl, uint32_t mask, uint32_t timeoutUs, const Poll &poll = {})
 {
+  if (ctl >= kCtlCount) return -1;
   const uint64_t t0 = io.nowUs();
   for (;;) {
-    const uint64_t now = io.nowUs();
+    const uint64_t elapsed = io.nowUs() - t0;
     const uint64_t pa = ctlReg(ctl, kCtlFlush);
     const uint32_t flush = io.rd(pa);
     const bool latched = !(flush & mask);
-    if (latched || now - t0 >= timeoutUs) {
+    if (latched || elapsed >= timeoutUs) {
       poll.sample(io, {pa, flush});
-      return latched ? int32_t(now - t0) : -1;
+      return latched && elapsed <= INT32_MAX ? int32_t(elapsed) : -1;
     }
     poll.pause(io, 1000, true, {pa, flush});
   }

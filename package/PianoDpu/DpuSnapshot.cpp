@@ -78,7 +78,7 @@ uintptr_t pageVa(uint64_t pa)
 
 uint32_t load(uint64_t pa)
 {
-  const uintptr_t va = pageVa(pa);
+  const uintptr_t va = pa & 3u ? 0 : pageVa(pa);
   if (!va) {
     ++gMapFailures;
     return 0xffffffffu;   // the survey's convention: an unmapped word reads all ones (no geometry, no mode)

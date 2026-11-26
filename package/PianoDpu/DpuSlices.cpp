@@ -137,7 +137,10 @@ void readSliceArgs()
       if (*c >= '0' && *c <= '9') {
         v = v * 10 + unsigned(*c - '0');
         digit = true;
-        ok &= v <= 4000;
+        if (v > 4000) {
+          ok = false;
+          break;
+        }
       } else if (*c == ',' || !*c) {
         ok &= digit && k < 3;
         if (ok) gA.pccTestMilli[k++] = int32_t(v);
@@ -281,7 +284,7 @@ struct KernelIo {
   bool voteModeBandwidth(const Mode &mode) { return voteDisplayBandwidth(mode); }
   uint32_t rd(uint64_t pa)
   {
-    const uintptr_t va = pageVa(pa);
+    const uintptr_t va = pa & 3u ? 0 : pageVa(pa);
     if (!va) {
       ++gMapFailures;
       return 0xffffffffu;

@@ -7,7 +7,7 @@
 //     never latches, a direct TOTAL write, a store the guard refuses;
 //   - the policy: idle -> 60, bursts -> 120, a blinking cursor stays at 60, the dwell, disabled after a failure; and the policy
 //     driving the model through a session of swaps.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_refresh_host.cpp -o /tmp/dpu_refresh_host && /tmp/dpu_refresh_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. dpu_refresh_host.cpp -o /tmp/dpu_refresh_host && /tmp/dpu_refresh_host
 #include "DpuRefresh.h"
 #include "dpu_model.h"
 #include <cstdio>
@@ -159,7 +159,11 @@ static void testPollBounds()
     void sleepMs(uint32_t ms) { now += uint64_t(ms) * 1000; }
   } io;
   Frames edge;
+  CHECK(!waitFrameEdge(io, 150, nullptr) && !waitFrameEdge(io, 0, &edge) && io.now == io.start);
   CHECK(waitFrameEdge(io, 150, &edge) && edge.f[0] == 0 && edge.us - io.start == 100);
+  io.now = io.start;
+  CHECK(waitFlush(io, kCtlCount, UINT32_MAX, 2000) == -1 && io.now == io.start);
+  CHECK(waitFlush(io, 0, UINT32_MAX, 2000) == 1000 && io.now - io.start == 1000);
   io.now = io.start;
   CHECK(!waitLines(io, 1900, 2000, 2310, 1200) && io.now - io.start == 1200);
   CHECK(!waitLines(io, 0, 2310, 2310, 1));

@@ -13,7 +13,7 @@
 // a bank the boot loader translates, the four ladder steps, the flip service (windows, LRU, TLB invalidation, refusals, the clean
 // policy, the alpha bit, multirect), the safety reverts (missed latch, fault, underrun, the watch), the interrupt (service, misses),
 // the rate-limited summary.
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_flip_host.cpp -o /tmp/dpu_flip_host && /tmp/dpu_flip_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. dpu_flip_host.cpp -o /tmp/dpu_flip_host && /tmp/dpu_flip_host
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>

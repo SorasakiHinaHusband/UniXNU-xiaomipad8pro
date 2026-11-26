@@ -57,6 +57,7 @@ static_assert(kM5PllStatus % sizeof(uint32_t) == 0 && kM5PllStatus <= kDsiPllByt
 template <uint32_t Bytes, const auto &Offsets, class Io, unsigned N>
 void readM5Words(Io &io, uint64_t base, uint32_t (&words)[N])
 {
+  static_assert(Bytes >= sizeof(uint32_t));
   static_assert(N == sizeof Offsets / sizeof Offsets[0]);
   static_assert([] {
     for (uint32_t offset : Offsets)

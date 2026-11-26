@@ -169,11 +169,11 @@ Sent sendDcs(Io &io, uint8_t command, const Options &o, bool commandOnly = false
     else if ((k.trig & kTrigDmaMask) != kTrigDmaSw) s.why = "a DSI controller's command DMA is not software-triggered (TRIG_CTRL)";
     if (*s.why) return s;
   }
-  const uint64_t busyEnd = io.nowUs() + kDmaBusyTimeoutUs;
+  const uint64_t busyStart = io.nowUs();
   const uint32_t busy = kStatusDmaBusy | (commandOnly ? kStatusVideoBusy : 0);
   for (unsigned l = 0; l < 2; ++l)
     while ((s.before[l].status = io.rd(dsiReg(l, kDsiStatus0))) & busy) {
-      if (io.nowUs() >= busyEnd) {
+      if (io.nowUs() - busyStart >= kDmaBusyTimeoutUs) {
         s.why = "a DSI host stayed busy for 20 ms (nothing written)";
         return s;
       }
@@ -279,6 +279,7 @@ bool programFetch(Io &io, const Fetch &fetch, bool enable, Engines &e)
 template <class Io>
 int32_t stopEngine(Io &io, unsigned intf, Engines &e, const Trace &trace)
 {
+  if (intf < 1 || intf > 2) return -1;
   ++e.stores;
   if (!io.wr(intfReg(intf, kIntfEn), 0)) {
     ++e.refused;
@@ -294,7 +295,7 @@ int32_t stopEngine(Io &io, unsigned intf, Engines &e, const Trace &trace)
     const uint64_t elapsed = io.nowUs() - t0;
     if (stopped || elapsed >= kEngineStopUs) {
       trace.sample(io, {pa, st}, slave);
-      return stopped ? int32_t(elapsed) : -1;
+      return stopped && elapsed <= INT32_MAX ? int32_t(elapsed) : -1;
     }
     trace.pause(io, 1000, true, {pa, st}, slave);
   }
@@ -335,14 +336,14 @@ bool resetPanelCtl(Io &io, const LivePath &p, Engines &e, Trace &trace)
   trace.boundary(io, TraceStep::ctlReset);
   if (io.rd(ctlReg(ctl, kCtlFlush)) || (io.rd(reset) & 1u) || !timingQuiescent(io) ||
       !panelStore(io, p, kCtlSwReset, 1, e)) return false;
-  const uint64_t end = io.nowUs() + 2000;  // the reference CTL soft reset bound
+  const uint64_t start = io.nowUs();
   do {
     if (!(io.rd(reset) & 1u)) {
       trace.sample(io);
       return io.rd(ctlReg(ctl, kCtlTop)) == p.ctlTop && (io.rd(ctlReg(ctl, kCtlLayerActive)) & 0xffu) == p.lms;
     }
     trace.pause(io, 50, false);
-  } while (io.nowUs() < end);
+  } while (io.nowUs() - start < 2000);  // the reference CTL soft reset bound
   trace.sample(io);
   return false;
 }
@@ -415,8 +416,9 @@ Engines startEngines(Io &io, const LivePath &p, const Fetch &fetch, Trace &trace
   const char *phase = nullptr;
   if (on1 && !on2) {
     const unsigned vt = p.link[0].vtotal ? p.link[0].vtotal : kVtotal120;
+    const uint64_t alignTimeoutUs = 3ull * vt * kLineNs / 1000;
     trace.step = TraceStep::align;
-    if (!waitLines(io, 0, 2, vt, 3 * vt * kLineNs / 1000, kLineNs, trace))
+    if (alignTimeoutUs > UINT32_MAX || !waitLines(io, 0, 2, vt, uint32_t(alignTimeoutUs), kLineNs, trace))
       phase = "INTF1's line counter did not wrap: INTF2 started out of phase";
     const uintptr_t irq = io.irqOff();
     wr(intfReg(2, kIntfEn), 1);

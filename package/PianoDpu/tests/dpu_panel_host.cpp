@@ -10,7 +10,7 @@
 //   - the failures: a DMA that never finishes (the link left alone, nothing after it), an engine that does not stop (the panel
 //     brought back), an engine that does not start; DCS only; high speed;
 //   - nothing written outside the guard's registers: never TLMM (the panel's reset and supply pins).
-//   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_panel_host.cpp -o /tmp/dpu_panel_host && /tmp/dpu_panel_host
+//   c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. dpu_panel_host.cpp -o /tmp/dpu_panel_host && /tmp/dpu_panel_host
 #include "DpuPanel.h"
 #include "dpu_model.h"
 #include "../../NativeGopDisplay/GopCompose.h"
@@ -115,11 +115,21 @@ static void testRefusals()
     CHECK(!sendDcs(m, 0x51, Options()).ok && m.stores.empty());   // brightness: not this slice's
   }
   {
-    model::Dpu m;
+    struct WrappingClock : model::Dpu {
+      uint64_t nowUs() { return model::Dpu::nowUs() - 500; }
+    } m;
     m.dsi[0].dmaPending = true;   // a DMA of someone else's that never ends
     m.dsi[0].dmaAt = UINT64_MAX;
+    const uint64_t start = m.nowUs();
     const Sent s = sendDcs(m, kDcsDisplayOff, Options());
     CHECK(!s.ok && std::strstr(s.why, "busy") && m.stores.empty());
+    CHECK(m.nowUs() - start >= kDmaBusyTimeoutUs && m.nowUs() - start < kDmaBusyTimeoutUs + 200);
+  }
+  {
+    model::Dpu m;
+    Engines e;
+    CHECK(stopEngine(m, 0, e, {}) == -1 && stopEngine(m, 3, e, {}) == -1);
+    CHECK(e.stores == 0 && m.stores.empty() && m.refused.empty());
   }
   {
     model::Dpu m;
