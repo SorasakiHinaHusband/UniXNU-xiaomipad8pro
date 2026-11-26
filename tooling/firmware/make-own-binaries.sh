@@ -32,7 +32,15 @@ mkdir -p "$W/root/deps/Mu-Silicium/Binaries"
 ln -s "$PU/tools" "$W/root/tools"
 ln -s "$DODGE" "$W/root/deps/Mu-Silicium/Binaries/dodge"
 "$W/venv/bin/python" "$PU/tools/extract-qcom-dxe.py" "$W/uefi_a.img" "$W/root/deps/Mu-Silicium/Binaries/piano"
-(cd "$W/root" && PATH="$W/venv/bin:$PATH" bash tools/patch-qcom-dxe.sh) || echo "patch-qcom-dxe.sh stopped (expected at UFSDxe for this build)"
+status=0
+(cd "$W/root" && PATH="$W/venv/bin:$PATH" bash tools/patch-qcom-dxe.sh) > "$W/patch.log" 2>&1 || status=$?
+cat "$W/patch.log"
+if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 1 ] || ! grep -Fxq 'UFSDxe: unexpected code at the patch sites' "$W/patch.log"; then
+    exit "$status"
+  fi
+  echo "patch-qcom-dxe.sh stopped (expected at UFSDxe for this build)"
+fi
 PAYLOAD=$W/root/deps/Mu-Silicium/Binaries/piano
 shasum -a 256 "$W/uefi_a.img" | sed 's|  .*|  uefi_a.img|' > "$PAYLOAD/SOURCE.sha256"
 mkdir -p -- "$(dirname -- "$OUT")"
