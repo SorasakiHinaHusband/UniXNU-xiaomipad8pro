@@ -165,7 +165,8 @@ void readArgs()
   gArgs.gauge = bootArg("piano-power-gauge", 1);
   gArgs.write = bootArg("piano-power-write", 1);
   gArgs.hv = bootArg("piano-power-hv", 0);
-  gArgs.b4pd = bootArg("piano-power-b4pd", 0);
+  if (gArgs.hv > 2) gArgs.hv = 0;
+  gArgs.b4pd = bootArg("piano-power-b4pd", 0) == 1;
   gArgs.policy = bootArg("piano-power-policy", 0);
   if (gArgs.b4pd) { gArgs.policy = 1; gArgs.hv = 2; }
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
@@ -637,7 +638,7 @@ bool PianoPower::start(IOService *provider)
                         "(-resume, 75 %), the higher pack's, with a charging hold against idle sleep below the stop"
                       : (gArgs.kick && gArgs.write ? " (battery health off: 0x2003 = 0 only within a charging restart)"
                                                    : " (battery health off: 0x2003 is never written 0)"),
-         gArgs.hv > 2 ? 2u : gArgs.hv, gArgs.hv ? " (9 V asked from a PD source 15 s after the attach)" : "");
+         gArgs.hv, gArgs.hv ? " (9 V asked from a PD source 15 s after the attach)" : "");
     if (gArgs.unsuspend) note("piano-power-unsuspend=1 is the built-in policy's: not used with piano-power-policy=1");
     note("piano-power-pdo-mca=%u: %s [PianoPdoFirmwareV1]", gArgs.pdoMca && gArgs.ucsi ? 1u : 0u,
          gArgs.pdoMca && gArgs.ucsi
@@ -780,7 +781,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   n("Generation", c.generation); n("LinkGeneration", fMca.links); n("ContractSeq", c.seq);
   n("RawType", uint32_t(piano_mca_has(&fMca, McaType) ? fMca.value[McaType] : -1));
   n("EffectiveType", uint32_t(x.type)); n("Connector", c.connector); n("Connected", c.connected);
-  n("Sink", c.sink); n("PD", c.pd); n("ContractValid", piano_contract_fresh(&c, now));
+  n("Sink", c.sink); n("PD", c.pd); n("ContractValid", piano_contract_fresh(&c, now) != 0);
   n("ContractStatusValid", c.status_valid); n("RDO", c.rdo); n("Protocol", c.protocol); n("ContractMV", c.mv); n("ContractMA", c.ma);
   n("PackSampleMs", fPackMs); n("PackAgeMs", now >= fPackMs ? now - fPackMs : ~0u);
   n("SourceMA", c.source_ma); n("SourcePDOCount", c.pdos); n("UCSIVersion", c.version); n("CCI", c.cci);
@@ -804,6 +805,8 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
   }
   n("RequestedVoltageProperty", s.volt_want_prop); n("RequestedVoltageValue", s.volt_want_value);
   n("AcknowledgedVoltageProperty", s.volt_set_prop); n("AcknowledgedVoltageValue", s.volt_set_value);
+  n("PPSAckPlanMs", s.pps_acked ? s.hv_asked_ms : 0); n("VirtualSkinValid", (x.valid & PIANO_CHG_IN_SKIN) != 0);
+  n("VirtualSkinDeciC", uint32_t(x.t_skin_dc));
   n("VoltagePending", s.contract_transition || (s.pending & (1u << PIANO_CHG_S_VOLT)));
   n("ModePending", s.contract_mode_change); n("RestoreRequired", s.volt_want_prop == PIANO_CHG_PD_FIXED && s.volt_want_value == 5000 && x.bus_mv >= 6000);
   n("ContractError", uint32_t(c.last_error)); n("ContractAgeMs", c.updated_ms && now >= c.updated_ms ? now - c.updated_ms : ~0u);
@@ -876,7 +879,7 @@ void PianoPower::publishCharge(uint64_t now, const piano_board_temps *board)
     n("CPFaults", gCpFaults); n("CPBusOCP", cp->busOcpMa());
     n("CPKickAgeMs", cp->lastKickMs() && now >= cp->lastKickMs() ? now - cp->lastKickMs() : ~0u);
   }
-  n("LPDValid", piano_mca_has(&fMca, McaLpd)); n("LPD", uint32_t(fMca.value[McaLpd]));
+  n("LPDValid", piano_mca_has(&fMca, McaLpd) != 0); n("LPD", uint32_t(fMca.value[McaLpd]));
   n("DTPT", fAlerts.active()); n("SafetyAlarmMask", fAlerts.alarms);
   n("SafetyReobserved", fAlerts.retried); n("SafetyReobserveValid", fAlerts.retryValid); n("SafetyRereads", fAlerts.rereads);
   n("VBUS", uint32_t(x.bus_mv)); n("IBUS", uint32_t(x.ibus_ma));
@@ -1901,8 +1904,8 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
   AdapterReal real;
   if (fPolicyOn && piano_contract_fresh(&fContract, nowMs())) {
     real.ok = real.pd = true;
-    real.mv = fContract.mv;
-    real.ma = fContract.ma;
+    real.mv = int32_t(fContract.mv);
+    real.ma = int32_t(fContract.ma);
   } else if (fPolicyOn && fLink.st.hv_qc && fLink.st.hv == PIANO_CHG_HV_ON && fLink.st.icl_set) {
     real.ok = true;   // cfg.qc at 9 V: the source's 9 V at the input limit in force (QC has no contract to show)
     real.mv = 9000;
@@ -2280,6 +2283,11 @@ void PianoPower::pumpMca(uint64_t now)
     fContractSeenGeneration = fContract.generation;
   }
   if (!fRequestDue) {
+    const uint64_t sendNow = nowMs();
+    if (fPolicyOn && piano_charge_pps_expired(&fLink.st, sendNow)) {
+      fLink.requestDecision();
+      stepPolicy(sendNow);
+    }
     const uint32_t n = piano_mca_next(&fMca, out);
     if (n) {
       if (piano_adsp_send(fChannel, out, n)) note("mca: send queue full");
@@ -2377,7 +2385,7 @@ void PianoPower::serviceMca(uint64_t now)
       note("mca: write %s (%#x) = %u: %s (%d)", piano_mca_property_name(fMca.last_property), fMca.last_property, fMca.last_value,
            fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result);
       fMca.events &= ~uint32_t(McaEvWrite);
-      fLink.answered(fMca);
+      fLink.answered(fMca, now);
       cpAnswered();
     }
     if (r == McaLateWritten) {
@@ -2386,7 +2394,7 @@ void PianoPower::serviceMca(uint64_t now)
            piano_mca_property_name(fMca.last_property), fMca.last_property, fMca.last_value,
            fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result, gArgs.writeMs, fMca.late_answers,
            fPolicyOn ? ": handed to the policy" : "");
-      if (fPolicyOn) {fLink.answered(fMca); cpAnswered();}
+      if (fPolicyOn) {fLink.answered(fMca, now, true); cpAnswered();}
     }
     if (r == McaIgnored && fMca.ignored_answers > fIgnoredSeen) {
       fIgnoredSeen = fMca.ignored_answers;
@@ -2812,6 +2820,7 @@ void PianoPower::stepPolicy(uint64_t now)
                    mippsEligibleNow();
   PortState port;
   piano_board_temps board;
+  piano_skin_temps skin{};
   if (reachable && fLink.due(fMca, v)) {
     if (!fHandover && !fShutdownSeen) sampleSafety(now);
     v.safetyFresh = fSafetyMs && now >= fSafetyMs && now - fSafetyMs <= 10000;
@@ -2824,6 +2833,11 @@ void PianoPower::stepPolicy(uint64_t now)
       v.port = &port;
     }
     if (boardTemps(board, now)) v.board = &board;
+    if (fThermal && fLink.cfg.hv) {
+      skin.version = PIANO_SKIN_TEMPS_VERSION;
+      if (fThermal->callPlatformFunction("piano-thermal-skin-temps", false, &skin, nullptr, nullptr, nullptr) == kIOReturnSuccess)
+        v.skin = &skin;
+    }
     if (v.board && (board.valid & (1u << PIANO_BOARD_TEMP_CHARGER)) && v.chargerPdUp && !ChargeLink::chargerReadingCounts(v) &&
         fPdUpMs != fChargerEarlyNotedMs) {
       fChargerEarlyNotedMs = fPdUpMs;
@@ -2836,6 +2850,10 @@ void PianoPower::stepPolicy(uint64_t now)
   if (reachable) fLink.step(fMca, v, o);
   else o.handoverReady = !fLink.st.disabled && !fLink.st.pending;
   if (o.decided) {
+    if ((o.events & PIANO_CHG_EV_DETACH) && v.port && v.port->ok && !v.port->sourceSeen &&
+        piano_contract_recover_detach(&fContract)) {
+      fContractRefresh = now;
+    }
     publishCharge(now, v.board);
     if (gArgs.ps) publishBattery((now - fStartMs) / 1000, v.port);
   }

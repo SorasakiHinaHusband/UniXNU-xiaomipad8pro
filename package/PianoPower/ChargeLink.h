@@ -60,6 +60,7 @@ struct LinkView {
   uint64_t packsMs = 0;                       // when it was taken (nowMs's clock; 0: not known)
   const PortState *port = nullptr;            // the charger PMIC's Type-C block, or not readable
   const piano_board_temps *board = nullptr;   // PianoThermal's last round, or PianoThermal not there
+  const piano_skin_temps *skin = nullptr;     // virtual skin reading for the PPS buck
   uint32_t wakes = 0;                         // system wakes so far
   bool willSleep = false, shutdown = false;   // a handover is asked for
   bool mippsBusy = false;                     // MiPPS runs or owes its 0x21002 = 0: no voltage step (an authentication)
@@ -121,7 +122,7 @@ class ChargeLink {
     piano_charge_config_default(&cfg);
     cfg.strict_contract = o.strictContract ? 1 : 0;
     cfg.writes = o.writes && m.policy ? 1 : 0;
-    cfg.hv = uint8_t(o.hv > 2 ? 2 : o.hv);
+    cfg.hv = uint8_t(o.hv <= 2 ? o.hv : 0);
     cfg.qc3 = o.qc3 ? 1 : 0;
     cfg.rp = o.rp ? 1 : 0;
     cfg.ramp = o.rp && o.ramp ? 1 : 0;
@@ -134,12 +135,14 @@ class ChargeLink {
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
     // 0x2003 = 0 through the codec only for battery health's stop and the charging restart's
-    piano_mca_use_external_policy(&m, cfg.strict_contract || cfg.limit || cfg.kick, cfg.strict_contract || cfg.hv >= 2,
+    piano_mca_use_external_policy(&m, cfg.strict_contract || cfg.limit || cfg.kick, ppsEnabled(),
                                   cfg.qc3 || cfg.qc);
     piano_mca_allow_icl(&m, piano_charge_icl_max(&cfg));   // the codec's bound follows the policy's (1600 unless stepped higher)
     // charge/pd1: the charge current up to the stock 9 V rows (3500) and the warm float (0x2007 = 4400 / 4060) only with their options
     piano_mca_allow_fast(&m, cfg.hv_caps, cfg.fv_hot);
   }
+
+  void syncPpsOption(PianoMca &m) const {m.pps_allowed = m.policy && ppsEnabled();}
 
   // The charger thermistor's reading was taken while charger_pd was up (at or after it came up this time).
   static bool chargerReadingCounts(const LinkView &v)
@@ -218,8 +221,20 @@ class ChargeLink {
           if (mv == 9000 && ma >= 100 && ma <= 5000) x.fixed9_ma = ma;
         } else if ((raw >> 28) == 12) {
           const uint32_t lo = ((raw >> 8) & 255) * 100, hi = ((raw >> 17) & 255) * 100, ma = (raw & 127) * 50;
-          if (lo >= 3000 && lo <= 9000 && hi >= 9000 && hi <= 21000 && ma >= 500 && ma <= 5000)
-            x.pps9_ma = ma > 3000 ? 3000 : ma;
+          if (lo < hi && lo <= 9000 && hi >= 9000 && lo >= 3000 && hi <= 21000 && ma >= 500 && ma <= 5000) {
+            // With firmware PDOs, check the selected slot against this cycle's list too. An older UCSI snapshot can
+            // outlive a new firmware offer until the next agreeing GET_CONNECTOR_STATUS pair.
+            const bool matches = c.pdo_origin != PIANO_CONTRACT_PDO_FIRMWARE ||
+                                 (i < c.offer_n && piano_contract_firmware_pdo_word(c.offer_pdo[i][0],
+                                      c.offer_pdo[i][1], c.offer_pdo[i][2]) == raw);
+            if ((x.valid & PIANO_CHG_IN_PDOS) &&
+                (i >= x.pdos || piano_contract_firmware_pdo_word(x.pdo[i][0], x.pdo[i][1], x.pdo[i][2]) !=
+                  piano_contract_firmware_pdo_word(lo, hi, ma))) continue;
+            if (matches && ma > x.pps9_ma) {
+              x.pps9_ma = ma;
+              x.pps9_object = uint8_t(i + 1);
+            }
+          }
         }
       }
       if (fixed5 && has(McaPdState) && m.value[McaPdState] == 2 &&
@@ -268,14 +283,22 @@ class ChargeLink {
         *dst[i] = milliToDeci(v.board->milli_c[kMap[i].index]);
       }
     }
+    if (v.skin && v.skin->version == PIANO_SKIN_TEMPS_VERSION && v.skin->virtual_valid) {
+      const int32_t dc = milliToDeci(v.skin->virtual_milli_c);
+      if (dc > -400 && dc < 1250) {
+        x.valid |= PIANO_CHG_IN_SKIN;
+        x.t_skin_dc = int16_t(dc);
+      }
+    }
   }
 
   // A decision is due: a codec cycle ended since the last one, or (handing over) the first time and after each write answer.
   bool due(const PianoMca &m, const LinkView &v) const
   {
     if (!m.external) return false;
-    if (force_ || m.cycles != lastCycles_) return true;
+    if (force_ || m.cycles != lastCycles_ || v.wakes != st.wakes) return true;
     const bool handover = v.willSleep || v.shutdown;
+    if (!handover && v.nowMs != in.now_ms && piano_charge_pps_due(&st, v.nowMs)) return true;
     return handover && (!lastHandover_ || answers != answersAtDecision_);
   }
 
@@ -285,6 +308,7 @@ class ChargeLink {
     if (!m.external) return;
     const bool handover = v.willSleep || v.shutdown;
     if (!v.chargerPdUp) {
+      if (st.volt_want_prop == PIANO_CHG_PPS) cancelQueued(m);
       if (!pdNoted_) {pdNoted_ = true; o.waitingPd = true;}
       if (handover) o.handoverReady = !st.disabled && !st.pending;
       hold = false;
@@ -306,9 +330,13 @@ class ChargeLink {
     lastCycles_ = m.cycles;
     lastHandover_ = handover;
     answersAtDecision_ = answers;
+    const bool buckPps = st.volt_want_prop == PIANO_CHG_PPS;
+    syncPpsOption(m);
     fill(in, m, v);
     if (v.shutdown) piano_charge_shutdown(&cfg, &in, &st, &plan);
     else piano_charge_decide(&cfg, &in, &st, &plan);
+    if (buckPps && (handover || st.volt_want_prop != PIANO_CHG_PPS ||
+                    !(in.valid & PIANO_CHG_IN_CONTRACT))) cancelQueued(m);
     decisions++;
     o.decided = true;
     o.events = plan.events;
@@ -361,6 +389,7 @@ class ChargeLink {
         // Cancellation is not a firmware refusal. An unsent stop alone
         // creates no right to lift a firmware-owned disable afterwards.
         if (prop == PIANO_CHG_ENABLE && !m.queue[i].value && !disableObligation_) st.disabled = 0;
+        force_ = true;
       }
     }
     m.queued = uint8_t(dst);
@@ -374,12 +403,14 @@ class ChargeLink {
   }
 
   // The codec answered a write (McaWritten): the policy learns the result; a taken limit, enable or voltage is read back next cycle.
-  void answered(const PianoMca &m)
+  void answered(const PianoMca &m, uint64_t now = 0, bool late = false)
   {
     if (!m.external) return;
+    if (m.last_property == PIANO_MCA_PPS && late) return;   // a timed-out renew cannot extend the PPS deadline
     answers++;
-    piano_charge_ack(&st, m.last_property, m.last_value, m.last_result);
-    if (m.last_result) return;
+    const int32_t result = m.last_property == PIANO_MCA_PPS && piano_charge_pps_expired(&st, now) ? -60 : m.last_result;
+    piano_charge_ack(&st, m.last_property, m.last_value, result);
+    if (result) return;
     if (m.last_property == PIANO_CHG_ENABLE) disableObligation_ = m.last_value == 0;
     const int slot = m.last_property == PIANO_MCA_ICL ? 0 : m.last_property == PIANO_MCA_CHARGE_ENABLE ? 1
                      : m.last_property == PIANO_MCA_PD_FIXED || m.last_property == PIANO_MCA_PPS ? 2 : -1;
@@ -395,6 +426,7 @@ class ChargeLink {
   }
 
  private:
+  bool ppsEnabled() const {return piano_charge_pps_enabled(&cfg);}
   struct Pending {uint32_t property = 0, value = 0, cycle = 0; bool armed = false;};
   struct Shown {uint8_t cls = 0xff, hv = 0xff, charge = 0xff, why = 0xff, hold = 0xff; uint32_t icl = 0, fcc = 0;};
   uint32_t lastCycles_ = 0, answersAtDecision_ = 0, boardLinks_ = 0;

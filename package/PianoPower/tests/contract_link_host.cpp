@@ -14,7 +14,7 @@ using namespace pianopower;
 static uint32_t fixedPdo(unsigned mv,unsigned ma) {return mv/50<<10 | ma/10;}
 static uint32_t fixedRdo(unsigned object,unsigned ma) {return object<<28 | ma/10<<10 | ma/10;}
 static uint32_t ppsPdo() {return 3u<<30 | 110u<<17 | 33u<<8 | 60u;}
-static uint32_t ppsRdo() {return 3u<<28 | 450u<<9 | 60u;}
+static uint32_t ppsRdo(uint32_t word) {return 3u<<28 | 450u<<9 | (word & 0xffff); }
 
 struct Integration {
   PianoChargeContract contract{};
@@ -56,7 +56,7 @@ struct Integration {
     for(unsigned i=0;i<link.plan.writes;++i) {
       const auto w=link.plan.write[i];
       assert(piano_charge_write_allowed(&link.cfg,w.property,w.value,w.bytes));
-      if(w.property==PIANO_CHG_PD_FIXED || w.property==PIANO_CHG_PPS) {
+      if(w.property==PIANO_CHG_PD_FIXED || (w.property==PIANO_CHG_PPS && link.st.hv==PIANO_CHG_HV_ASKED)) {
         if (!(link.st.icl_set && link.st.icl_set<=link.st.transition_ma)) std::fprintf(stderr,"barrier now=%llu prop=%x value=%u hv=%u set=%u transition=%u read=%u pending=%u valid=%u observing=%u bus=%u rdo=%x\n",(unsigned long long)now,w.property,w.value,link.st.hv,link.st.icl_set,link.st.transition_ma,icl,link.st.pending,contract.valid,contract.notify_pending,bus,rdo);
         assert(link.st.icl_set && link.st.icl_set<=link.st.transition_ma);
         assert(link.st.fcc_set && link.st.fcc_set<=500);
@@ -70,7 +70,7 @@ struct Integration {
       case PIANO_CHG_FCC:fcc=w.value;break;
       case PIANO_CHG_ENABLE:enable=w.value;for(auto &g:packs)g.currentMa=enable?300:0;break;
       case PIANO_CHG_PD_FIXED:bus=w.value;rdo=fixedRdo(bus==9000?2:1,bus==9000?1600:3000);break;
-      case PIANO_CHG_PPS:bus=(w.value>>16)*20;rdo=ppsRdo();break;
+      case PIANO_CHG_PPS:bus=(w.value>>16)*20;rdo=ppsRdo(w.value);break;
       default:assert(false);
       }
       piano_charge_ack(&link.st,w.property,w.value,0);

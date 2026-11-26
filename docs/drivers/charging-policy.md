@@ -12,9 +12,10 @@
   November 27 opt-in **BH-2** check on RAM `v131y12t-qual1` published `AppleSmartBatteryPack`, and `powerd` returned
   `0xe00002ca` (`kIOReturnIOError`) writing `BHPersistentStorage`. The gate is **HOLD** pending the owner's decision on
   27.3 `powerd` analysis. [November 26 battery results](../results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM results](../results-2026-11-27.md#ram-qualification)
-- **PPS and direct charging.** The **9 V PPS buck** path up to 2.5 A is built and awaits a tablet run. **Charge Pump / MiPPS
-  stays off by default.** The November 24 attended attempt stayed at a 100 mA input limit because of an unmapped vendor
-  power object. The fix is built and awaits an owner-present test. [Hardware backlog, B4](../BACKLOG-hardware.md#2-backlog-b1b15)
+- **PPS and direct charging.** The **9 V PPS buck** path up to 2.5 A has a host safety audit and awaits RAM qualification.
+  **Charge Pump / MiPPS stays off by default.** The November 24 attended attempt stayed at a 100 mA input limit because of an
+  unmapped vendor power object. The fix is built and awaits an owner-present test.
+  [Audit and RAM qualification checklist](#25-b4-9-v-pps-buck-host-audit-and-ram-qualification) · [Hardware backlog, B4](../BACKLOG-hardware.md#2-backlog-b1b15)
 
 ## Historical charging-policy bring-up
 
@@ -1239,3 +1240,70 @@ Registry keys that survive the dmesg ring and the swap back: `McaPDO1-7` / `McaP
 1 empty slot, 2 another object there, 4 no vSafe5V at slot 1, 5 no vSafe5V at all), `PDUnmappedMs`, `PDUnmappedChanges`; `MiPPSRuns`,
 `MiPPSResults`, `MiPPSResultError`, `MiPPSResultVerified`, `MiPPSResultAdapter`, `MiPPSResultMs`, `MiPPSVersion`, `MiPPSCleared`.
 Test: `tests/pdo_firmware_host.cpp` cpFirst2Replay (fails on a8ff8e74 with ICL 100 / FCC 500, as on the tablet).
+
+### 25. B4 9 V PPS buck host audit and RAM qualification
+
+**Host-verified. RAM qualification pending.** PianoPower defaults to `piano-power-hv=0` and `piano-power-hv-order=0`.
+The shipped profile sets `piano-power-hv=1 piano-power-hv-order=1`. It prefers fixed 9 V and already allows PPS at 9 V
+when a source offers a suitable APDO and lacks a fixed 9 V PDO. Mode 2 explicitly prefers PPS when both are offered.
+The shipped boot arguments, fixed 9 V preference and 80/75% policy are unchanged.
+
+| Audit area | Host-verified behavior |
+|---|---|
+| Source and RDO | `ChargeContract.h` checks the RDO against the selected raw PDO, preserving source positions. On this tablet's PPM the firmware's `0x21011` list supplies the PDOs after two agreeing UCSI status reads. `ChargeLink.h` selects the strongest usable 9 V APDO from that validated list and checks it against the current firmware offer. The PPS word encodes exactly 9000 mV and requests at most the APDO, 2500 mA and the thermal cap, rounded down in 50 mA units. Both the buck policy and MCA codec reject words above 2500 mA. The reduced-current barrier requires FCC and ICL acknowledgements and ICL readback at or below 500 mA before the initial request. The selected APDO, a 9000 mV RDO within the requested current and measured VBUS 8.0–9.6 V must agree before the buck raises its load. |
+| Refresh and withdrawal | The stock host planner suppressed identical writes. It now schedules a repeat MCA `0x21017` write 4 s after the previous acknowledged write's plan time, independently of the 5 s charger read cycle. The 8 s watchdog covers queued, late and missed work. A refusal, missing completion or expired deadline removes queued PPS work, lowers the current through the barrier and requests fixed 5 V with `0x21018 = 5000`. A late ACK cannot renew the session. PPS timeouts and rejection block PPS until detach. A withdrawal still measured above the 5 V band stays behind the barrier and gets up to two additional fixed-5 V writes after an ACK. [USB-IF PPS timing and source timeout tests](https://www.usb.org/sites/default/files/Power%20Delivery%203%200%20Tests%20v1p14%20r2.pdf) |
+| Battery health and sleep | PPS requires an enabled 80/75% health vote. The higher pack's 80% reading plans `0x2003 = 0` first, cancels unsent PPS work and withdraws to fixed 5 V. The hold persists through 76–79% and missing SOC. At 75% the buck resumes through the fresh-contract and reduced-current gates. Sleep cancels queued PPS, attempts withdrawal and stops charging under the health policy. If the 2 s PM handover runs out, PianoPower publishes `PianoChargeHandoverFault`; that is a qualification failure. Wake clears PPS timing and relinks for fresh charger and contract evidence. |
+| Thermals | PPS requires valid pack telemetry, a coolest battery reading of at least 15 °C and a warmest reading of at most 45 °C in the driver's whole-degree conversion. The warmest and coolest combine both packs, firmware battery temperature and the battery NTC when valid. With fast caps enabled, more than 1600 mA requires a readable connector below 50 °C with all readable connectors below 50 °C, a valid charger reading below 75 °C and a valid virtual skin reading below 42 °C. Missing board or skin evidence for that higher cap gives at most 1600 mA. An active contract above a newly lowered cap withdraws through 5 V and waits at least 15 s before requesting again under the lower cap. At 44 °C virtual skin, PPS stops until the proxy reads below 42 °C. The proxy is PianoThermal's board-derived virtual temperature. |
+| Hot holds | Either connector at 60 °C caps input at 100 mA, with release after both read below 50 °C. Charger at 85 °C caps input at 500 mA until below 75 °C. These holds withdraw PPS. At 5 V, battery FCC derates by 300 mA per whole degree above 48 °C, with upward steps limited to one per 30 s for a steady charge row. The battery hot stop trips at 55 °C and clears below 53 °C. A battery reading below 0 °C stops charging and clears at 2 °C. |
+| Cable and service changes | A confirmed detach drops the old request, object, current limits and timing. A detach while a request is pending imposes a 60 s backoff. A hard reset returning an active PPS session to 5 V blocks its retry on the same attachment. A timeout quarantine can reinitialize UCSI after the measured detach is corroborated by the PMIC Type-C state. A changed or lost offer or an invalid/mismatched RDO revokes the old budget. Fixed-only PD can select fixed 9 V in mode 2 with ordering enabled. USB sources use their 5 V row. |
+| Charge pump isolation | PPS buck writes only the charger firmware's PPS property. SC8541 probing and the pump session require the independent `piano-power-cp=1` gate, and pump writes also require the per-boot root arm. The ordinary policy's SC8541 control-register read verifies the pump is off. MiPPS additionally needs `piano-power-mipps=1`, loaded keys and an allocated pump session. Both boot defaults are zero. The buck codec tests reject pump-range PPS words and MiPPS verify writes with those paths off. |
+
+The host cases in `tests/fastcharge_host.cpp`, `tests/pdo_firmware_host.cpp`, `tests/contract_link_host.cpp` and
+`tests/policy_host.cpp` exercise the APDO/RDO path, live cap changes, refresh scheduling and queue revocation, 80/75%,
+temperature boundaries, resets and fallback. The same synthetic PPS source on the starting revision negotiated 3000 mA and
+received one MCA PPS write. The audited build passes both the request limit and repeat-write assertions.
+The host can check what goes to MCA and what the simulated UCSI observer reads.
+The ADSP owns the wire protocol. An MCA ACK or an unchanged UCSI RDO cannot establish that the ADSP emitted a fresh
+USB PD Request. The attended capture must establish PPS cadence before any deployment decision.
+
+#### Future attended RAM checklist
+
+1. Use a RAM image based on the audited build. Replace any conflicting charging arguments in that image with the following
+   values. Start with a cool, dry port, both packs between 40% and 70%, and a PD analyzer that records packets, VBUS and IBUS.
+   Use a known PPS source advertising 9 V within an APDO, a fixed-9 V-only PD source and a USB 5 V source for controls.
+
+   ```text
+   piano-power=2 piano-power-policy=1 piano-power-write=1 piano-power-gauge=1 piano-power-period=5
+   piano-power-ucsi=1 piano-power-pdo-mca=1 piano-power-hv=2 piano-power-hv-order=1 piano-power-hv-caps=1
+   piano-power-health=1 piano-power-health-stop=80 piano-power-health-resume=75
+   piano-power-b4pd=0 piano-power-qc=0 piano-power-cp=0 piano-power-mipps=0
+   piano-thermal=1 piano-thermal-adc=1 piano-thermal-adc-s=5
+   ```
+
+2. Check `PianoCharge` in IORegistry. Require `HealthEnabled=1`, `HealthStop=80`, `HealthResume=75`, a clear
+   `CPControl` switching bit (0x10), `MiPPSActive=0`, `MiPPSRuns=0`, dry/no gauge alerts and valid thermal and
+   pack telemetry. Record `SourcePDO*`, `LadderObject`, `RDO`, `ContractMV`, `ContractMA`, `VBUS`, `IBUS`,
+   `AppliedICL`, `ICLReadback`, `AppliedFCC`, `PPSAckPlanMs`, `VirtualSkinValid`, `VirtualSkinDeciC` and pack current.
+   Capture the initial fixed 5 V and current barrier.
+3. Run 10 minutes at a steady moderate load. Pass when every PPS Request selects the advertised APDO at exactly 9000 mV
+   and within its budget, thermal cap and 2500 mA. Verify steady VBUS 8.0–9.6 V and no draw above the active limit. Measure
+   every successive PPS Request interval on the wire and require at most 10 s. Any source Hard Reset, rejected PPS Request
+   or repeated renegotiation in this steady-state segment fails it.
+4. Observe a normal charge to 80%. Pass when the first decision with the higher pack at 80% requests charge disable and
+   return to fixed 5 V, the wire stops sending PPS Requests, and enable readback is 0 with pack current near zero or
+   discharging within two settled samples. Verify the hold at 76–79%, then observe resume at 75% with a fresh 5 V contract
+   and the current barrier before renewed PPS. Zero charge-enable readback with more than +100 mA after 60 s is a failure.
+5. Disconnect and replug, then test the fixed-only PD and USB controls. Require fresh source evidence before PPS on replug,
+   fixed 9 V for the fixed-only PD control and 5 V for USB. With a PD test source able to reject or reset, verify withdrawal to
+   fixed 5 V and no stale PPS words. With cool hardware and the analyzer attached, exercise sleep/wake. Pass when fixed 5 V
+   and charge disable are observed before PM acknowledgement, the sleeping capture has no PPS Requests, and a fresh contract
+   and barrier precede any new PPS Request after wake. Any handover fault fails the run.
+6. Abort by disconnecting the source if a steady 9 V session leaves 8.0–9.6 V, a Request exceeds its voltage or current
+   budget, the bus stays above the 5 V band after withdrawal, the pump switches, or SOC disable fails. Also abort on liquid
+   or gauge alerts, telemetry loss, either pack or battery NTC outside 15–45 °C, connector at 50 °C, charger at 75 °C,
+   virtual skin at 42 °C, or measured case surface at 42 °C. These attended gates sit ahead of the driver's hard holds.
+   Thermal trips and missing sensor behavior are exercised in the host fixtures. Record the first failing sample and the
+   preceding analyzer trace. Leave the installed profile as-is after the RAM session.
+
+Charge Pump / MiPPS remains a separate B4 item, blocked on the owner-present session. A successful PPS buck RAM run
+qualifies only the attended buck configuration. Daily mode stays fixed-first.

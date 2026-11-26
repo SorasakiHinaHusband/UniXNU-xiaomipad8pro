@@ -274,7 +274,7 @@ static void testTables()
   const uint32_t b[][3] = {{5000, 5000, 3000}, {3300, 11000, 3250}};
   CHECK(piano_charge_pdo_5v_ma(b, 2) == 3000);
   CHECK(piano_charge_pdo_9v_ma(b, 2, 0, &pps) == 0);                   // hv=1: fixed only
-  CHECK(piano_charge_pdo_9v_ma(b, 2, 1, &pps) == 3000 && pps);         // capped at 3 A
+  CHECK(piano_charge_pdo_9v_ma(b, 2, 1, &pps) == 2500 && pps);         // capped at 2.5 A
   const uint32_t c[][3] = {{3300, 5900, 2000}, {5000, 5000, 3000}};
   CHECK(piano_charge_pdo_5v_ma(c, 2) == 2000);                         // the lowest covering 5 V
   const uint32_t d[][3] = {{5000, 5000, 3000}, {9000, 9000, 50}, {3300, 11000, 400}};
@@ -325,7 +325,11 @@ static void testTables()
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4540, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_FV, 4500, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 9000, 4) && !piano_charge_write_allowed(&cfg, PIANO_CHG_PD_FIXED, 12000, 4));
   CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_QC_VOLT, 9000, 4) && piano_charge_write_allowed(&cfg, PIANO_CHG_QC_VOLT, 5000, 4));
-  CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 3000), 4));
+  CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 2500), 4));
+  cfg.strict_contract = cfg.limit = 1;
+  CHECK(piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 2500), 4));
+  CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 2550), 4));
+  cfg.strict_contract = cfg.limit = 0;
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 3050), 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(8000, 3000), 4));
   CHECK(!piano_charge_write_allowed(&cfg, PIANO_CHG_PPS, piano_charge_pps_word(9000, 450), 4));
@@ -632,7 +636,7 @@ static void testNineVolt()
     s.step();
     CHECK(s.wrote(PIANO_CHG_PD_FIXED, 9000));
   }
-  // a PPS APDO covering 9 V (hv=2 only): the PPS request at its current (3 A at most), the PD_PPS row
+  // Legacy policy never requests PPS, even with hv=2. The strict policy validates the RDO.
   {
     Sim s;
     s.cfg.hv = 1;
@@ -641,14 +645,7 @@ static void testNineVolt()
     Sim t;
     t.cfg.hv = 2; t.cfg.icl_cap_ma = 2500; t.cfg.fcc_cap_ma = 3500;
     t.pd({{5000, 5000, 3000}, {3300, 11000, 3250}}, PIANO_CHG_T_PPS);
-    for (int i = 0; i < 4; ++i) t.step();
-    CHECK(t.wrote(PIANO_CHG_PPS, 450u << 16 | 60u));
-    t.step();
-    CHECK(t.wrote(PIANO_CHG_ICL, 2500) && t.wrote(PIANO_CHG_FCC, 3500));
-    // thermal derating applies at 9 V too
-    t.temp(49);
-    t.step();
-    CHECK(t.wrote(PIANO_CHG_FCC, 3200));
+    for (int i = 0; i < 8; ++i) {t.step(); CHECK(!t.wrote(PIANO_CHG_PPS) && t.busMv == 5000);}
   }
   // hv off at 9 V without a request of ours (a wake without a handover): taken as on when allowed
   {
@@ -1619,13 +1616,14 @@ struct StrictSim : Sim {
       if (!a9) in.pps9_ma = 0;
     }
     in.safety = safe; in.faults = faults;
+    in.valid |= PIANO_CHG_IN_SKIN; in.t_skin_dc = 300;
     in.mipps_pending = mippsPending;
     piano_charge_decide(&cfg, &in, &st, &plan); check();
     if (!ackWrites) return;
     for (unsigned i = 0; i < plan.writes; ++i) {
       const auto &w = plan.write[i];
       // A request must only cross the voltage boundary behind both current ACKs and ICL readback.
-      if (w.property == PIANO_CHG_PD_FIXED || w.property == PIANO_CHG_PPS) {
+      if (w.property == PIANO_CHG_PD_FIXED || (w.property == PIANO_CHG_PPS && st.hv == PIANO_CHG_HV_ASKED)) {
         CHECK(st.icl_set && st.icl_set <= st.transition_ma && st.fcc_set && st.fcc_set <= 500);
         CHECK((in.valid & PIANO_CHG_IN_ICL) && uint32_t(in.icl_ma) <= st.transition_ma);
         CHECK(!(st.pending & ((1u << PIANO_CHG_S_ICL) | (1u << PIANO_CHG_S_FCC))));
@@ -1636,7 +1634,7 @@ struct StrictSim : Sim {
       apply(w);
       if (contractFollows) {
         if (w.property == PIANO_CHG_PD_FIXED) {protocol = 1; contractMv = busMv;}
-        if (w.property == PIANO_CHG_PPS) {protocol = 2; contractMv = busMv;}
+        if (w.property == PIANO_CHG_PPS) {protocol = 2; contractMv = busMv; contractMa = (w.value & 0xffff) * 50;}
       }
     }
   }
@@ -2306,6 +2304,7 @@ static void testT14NineVolt()
   // charge/pd2: PPS 9 V (mode 2) takes in_pps 2500 only with a cool connector reading, like the fixed rule; the row 1600 otherwise
   auto pps9 = [&](StrictSim &s, uint32_t apdoMa) {
     daily(s); s.cfg.hv = 2;
+    s.boardValid |= PIANO_CHG_IN_CHGR;
     s.pd({{5000, 5000, 3000}, {9000, 9000, 3000}, {3300, 11000, apdoMa}}); s.fixed9 = 3000; s.pps9 = apdoMa;
     s.contractMa = std::min<uint32_t>(apdoMa, 3000);
     for (unsigned i = 0; i < 40 && s.busMv != 9000; ++i) s.step();
@@ -2316,12 +2315,12 @@ static void testT14NineVolt()
     CHECK(s.busMv == 9000 && s.protocol == 2 && s.st.hv_pps && s.icl == 2500 && s.fcc == 3500 && s.plan.icl_why == PIANO_CHG_ICL_9V);
   }
   {   // no connector reading: the row 1600 (was 2500 before charge/pd2)
-    StrictSim s; s.boardValid = 0; pps9(s, 5000); s.boardValid = 0; s.run(4);
+    StrictSim s; pps9(s, 5000); s.boardValid = 0; s.run(10);
     CHECK(s.busMv == 9000 && s.protocol == 2 && s.icl == 1600 && s.fcc <= 3200);
   }
   {   // a connector at 51 C -> the row; 60 C -> 100 mA; cool -> 2500 again
     StrictSim s; pps9(s, 5000); CHECK(s.icl == 2500);
-    s.conn2Dc = 515; s.run(2); CHECK(s.icl == 1600 && s.fcc <= 3200);
+    s.conn2Dc = 515; s.run(10); CHECK(s.icl == 1600 && s.fcc <= 3200);
     s.conn2Dc = 600; s.run(2); CHECK(s.icl == 100);
     s.conn2Dc = 300; s.run(20); CHECK(s.busMv == 9000 && s.icl == 2500);
   }
