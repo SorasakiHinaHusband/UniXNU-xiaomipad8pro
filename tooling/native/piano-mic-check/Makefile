@@ -12,7 +12,7 @@ CONTENTS = $(APP)/Contents
 BINARY = $(CONTENTS)/MacOS/piano-mic-check
 TONE = $(CONTENTS)/Resources/mic-check-tone.wav
 
-.PHONY: all
+.PHONY: all test
 all: $(OUT)/.signed
 
 $(CONTENTS)/Info.plist: Info.plist
@@ -33,3 +33,6 @@ $(OUT)/.signed: $(BINARY) $(CONTENTS)/Info.plist $(TONE)
 	/usr/bin/codesign --force --sign - "$(APP)"
 	/usr/bin/codesign --verify --strict "$(APP)"
 	touch "$@"
+
+test: all
+	$(PYTHON) test-mic-check.py "$(BINARY)" "$(TONE)"

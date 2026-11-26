@@ -158,7 +158,7 @@ static Tone find_tone(const float *samples, size_t count, double rate, double me
     return best;
 }
 
-static int analyze(NSURL *url, BOOL expectTone, long seconds)
+static int analyze_file(NSURL *url, BOOL expectTone, long seconds)
 {
     NSError *error = nil;
     AVAudioFile *file = [[AVAudioFile alloc] initForReading:url commonFormat:AVAudioPCMFormatFloat32
@@ -190,11 +190,11 @@ static int analyze(NSURL *url, BOOL expectTone, long seconds)
         return Error;
     BOOL hasInput = NO, detected = NO;
     unsigned consecutive = 0;
-    Tone best = { .snr = -200.0 };
+    Tone best = { .snr = -200.0 }, previous = best;
     // Best qualifying window, or the strongest candidate for diagnosis on a failed tone run.
     Tone candidate = best;
-    for (unsigned index = 0; file.framePosition < frames; ++index) {
-        AVAudioFrameCount count = (AVAudioFrameCount)MIN((AVAudioFramePosition)second, frames - file.framePosition);
+    for (AVAudioFramePosition offset = 0; offset < frames; offset += second) {
+        AVAudioFrameCount count = (AVAudioFrameCount)MIN((AVAudioFramePosition)second, frames - offset);
         if (![file readIntoBuffer:buffer frameCount:count error:&error] || buffer.frameLength != count) {
             fprintf(stderr, "decode: incomplete PCM read%s%s\n", error ? ": " : "",
                     error.localizedDescription.UTF8String ?: "");
@@ -206,7 +206,7 @@ static int analyze(NSURL *url, BOOL expectTone, long seconds)
             sumSquares += (double)samples[i] * samples[i];
             peak = fmax(peak, fabs(samples[i]));
         }
-        printf("second=%u rms_dbfs=%.2f peak_dbfs=%.2f\n", index,
+        printf("second=%lld rms_dbfs=%.2f peak_dbfs=%.2f\n", (long long)(offset / second),
                power_db(sumSquares / count), power_db(peak * peak));
 
         for (size_t start = 0; start + window <= count; start += window) {
@@ -223,10 +223,13 @@ static int analyze(NSURL *url, BOOL expectTone, long seconds)
             if (tone.power > candidate.power)
                 candidate = tone;
             if (power_db(tone.power) >= kMinToneDBFS && tone.snr >= kMinToneSNR) {
-                ++consecutive;
-                detected |= consecutive >= 2;
-                if (tone.snr > best.snr)
-                    best = tone;
+                if (++consecutive >= 2) {
+                    detected = YES;
+                    Tone stronger = tone.snr >= previous.snr ? tone : previous;
+                    if (stronger.snr > best.snr)
+                        best = stronger;
+                }
+                previous = tone;
             } else {
                 consecutive = 0;
             }
@@ -237,12 +240,23 @@ static int analyze(NSURL *url, BOOL expectTone, long seconds)
         Tone tone = detected ? best : candidate;
         printf("tone_detected=%s\n", detected ? "yes" : "no");
         if (tone.frequency)
-            printf("tone_candidate_hz=%d tone_snr_db=%.2f tone_dbfs=%.2f\n",
+            printf("%s=%d tone_snr_db=%.2f tone_dbfs=%.2f\n",
+                   detected ? "tone_frequency_hz" : "tone_candidate_hz",
                    tone.frequency, tone.snr, power_db(tone.power));
     }
     if (!hasInput)
         return Silence;
     return expectTone && !detected ? ToneMissing : OK;
+}
+
+static int analyze(NSURL *url, BOOL expectTone, long seconds)
+{
+    @try {
+        return analyze_file(url, expectTone, seconds);
+    } @catch (NSException *exception) {
+        fprintf(stderr, "decode: %s\n", exception.reason.UTF8String ?: "audio framework exception");
+        return Error;
+    }
 }
 
 static BOOL play_recording(NSURL *url)
@@ -266,8 +280,9 @@ static BOOL play_recording(NSURL *url)
 static int record_to(NSURL *url, long seconds, BOOL tone)
 {
     NSDictionary *settings = @{
-        AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @48000.0,
-        AVNumberOfChannelsKey: @1, AVEncoderBitRateKey: @96000
+        AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @48000.0,
+        AVNumberOfChannelsKey: @1, AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsFloatKey: @NO, AVLinearPCMIsBigEndianKey: @NO
     };
     NSError *error = nil;
     AVAudioRecorder *recorder = [[AVAudioRecorder alloc] initWithURL:url settings:settings error:&error];
