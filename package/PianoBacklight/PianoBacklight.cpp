@@ -1146,7 +1146,7 @@ IOReturn PianoBacklight::enqueueNative(OSDictionary &properties, OSObject *value
   const uint64_t fixed = asked <= 0 ? 0 : asked < int64_t(min) ? min : asked > int64_t(max) ? max : uint64_t(asked);
   const IOReturn result = !authorized ? kIOReturnNotPrivileged : !valid ? kIOReturnBadArgument
       : !gNativeReady ? kIOReturnNotReady : kIOReturnSuccess;
-  uint32_t dropped;
+  uint32_t dropped = 0;
   const bool logRefusal = result != kIOReturnSuccess && gNativeRejectionLog.allow(nowMs(), &dropped);
   if (result == kIOReturnSuccess && !fixed) {
     ++gNativeDark;   // a dark ramp's value: nothing to apply (the display's power takes the backlight down)
