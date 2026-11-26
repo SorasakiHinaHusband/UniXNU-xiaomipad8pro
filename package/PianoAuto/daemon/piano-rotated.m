@@ -35,6 +35,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <math.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -157,7 +158,9 @@ static CGDirectDisplayID panelDisplay(void)
 static int degreesShown(CGDirectDisplayID d)
 {
     if (!d) return -1;
-    const int deg = ((int)(CGDisplayRotation(d) + 0.5) % 360 + 360) % 360;
+    const double rotation = CGDisplayRotation(d);
+    if (!isfinite(rotation)) return -1;
+    const int deg = ((int)lround(fmod(rotation, 360.0)) + 360) % 360;
     return par_valid_degrees(deg) ? deg : -1;
 }
 

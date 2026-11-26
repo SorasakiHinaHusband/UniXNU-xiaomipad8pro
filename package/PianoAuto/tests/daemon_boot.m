@@ -6,14 +6,17 @@
 #define CGGetOnlineDisplayList fixture_display_list
 #define CGDisplayVendorNumber fixture_display_vendor
 #define CGDisplayModelNumber fixture_display_model
+#define CGDisplayRotation fixture_display_rotation
 #include "../daemon/piano-rotated.m"
 #undef main
+#include <math.h>
 #include "check.h"
 
 static char merged[PIANO_BOOT_ARGS_MAX];
 static const char *legacy;
 static int merged_error, legacy_reads;
 static int panel_online;
+static double panel_angle;
 
 int fixture_sysctlbyname(const char *name, void *out, size_t *size, void *new_value, size_t new_size)
 {
@@ -55,6 +58,7 @@ CGError fixture_display_list(uint32_t max, CGDirectDisplayID *ids, uint32_t *cou
 
 uint32_t fixture_display_vendor(CGDirectDisplayID display) { return display == 2 ? kPanelVendor : 0; }
 uint32_t fixture_display_model(CGDirectDisplayID display) { return display == 2 ? kPanelModel : 0; }
+double fixture_display_rotation(CGDirectDisplayID display) { CHECK(display == 2); return panel_angle; }
 
 static void expect_off(void)
 {
@@ -99,8 +103,16 @@ int main(void)
     CHECK(!applyRotation(panelDisplay(), 90, why, sizeof why) && strstr(why, "panel display is unavailable"));
     panel_online = 1;
     CHECK(panelDisplay() == 2);
+    panel_angle = -90;
+    CHECK(degreesShown(panelDisplay()) == 270);
+    panel_angle = 360;
+    CHECK(degreesShown(panelDisplay()) == 0);
+    panel_angle = 45;
+    CHECK(degreesShown(panelDisplay()) == -1);
+    panel_angle = NAN;
+    CHECK(degreesShown(panelDisplay()) == -1);
     gDisplayOverride = 1;
     CHECK(panelDisplay() == 1);
-    printf("PASS daemon: default-off before backend setup, exact late arguments, legacy fallback, and panel selection\n");
+    printf("PASS daemon: default-off before backend setup, exact late arguments, legacy fallback, panel selection and read-back\n");
     return 0;
 }

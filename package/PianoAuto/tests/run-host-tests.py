@@ -44,7 +44,7 @@ def run(exe):
     result = subprocess.run([str(exe)], capture_output=True, text=True)
     text = (result.stdout + result.stderr).strip()
     print(text)
-    if result.returncode or not text.splitlines()[-1].startswith('PASS'):
+    if result.returncode or not text or not text.splitlines()[-1].startswith('PASS'):
         sys.exit(f'FAIL: {exe.name}')
 
 

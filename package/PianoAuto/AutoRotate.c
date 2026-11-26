@@ -84,6 +84,7 @@ void par_edge(ParAgent *a, int edge, uint64_t now_ms)
 {
     (void)now_ms;
     if (edge < PS_EDGE_TOP || edge > PS_EDGE_RIGHT) edge = PS_EDGE_NONE;
+    if (edge != a->edge) a->rot.edge = PS_EDGE_NONE;
     a->edge = edge;
     if (a->manual && edge != PS_EDGE_NONE && edge != a->manual_edge) a->manual = 0;   /* turned to another edge: automatic again */
 }
@@ -107,6 +108,7 @@ void par_observed(ParAgent *a, int degrees, uint64_t now_ms)
 {
     if (!par_valid_degrees(degrees)) {
         a->shown = a->rot.rotation = -1;
+        a->rot.edge = PS_EDGE_NONE;
         a->touch = -1;
         return;
     }
@@ -227,16 +229,19 @@ uint64_t par_deadline(const ParAgent *a, uint64_t now_ms, int can_apply)
     } else if (!a->gave_up && a->shown >= 0) {
         const int cover = cover_now(a, now_ms);
         uint64_t at = 0;
+        int want = 0;
         if (cover == 1) {
-            if (a->force && a->shown != 0) at = a->rot.changed_ms + a->cfg.rot.min_interval_ms;
+            want = a->force && a->shown != 0;
+            at = a->rot.changed_ms + a->cfg.rot.min_interval_ms;
         } else if (cover == 2) {
             TAKE(a->hold_until);
         } else if (!a->locked && !a->manual && a->edge != PS_EDGE_NONE && a->cfg.rot.degrees[a->edge] != a->shown) {
+            want = 1;
             const uint64_t settle = a->rot.edge == a->edge ? a->rot.edge_since + a->cfg.rot.settle_ms : now_ms;
             const uint64_t interval = a->rot.rotation >= 0 ? a->rot.changed_ms + a->cfg.rot.min_interval_ms : 0;
             at = settle > interval ? settle : interval;
         }
-        if (at && (can_apply || at > now_ms)) TAKE(at > a->retry_at ? at : a->retry_at);
+        if (want && (can_apply || at > now_ms)) TAKE(at > a->retry_at ? at : a->retry_at);
     }
 #undef TAKE
     return best && best < now_ms ? now_ms : best;

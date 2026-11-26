@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Copyright (c) 2026, Leo Zhang. All rights reserved.
+// cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -I.. -I../../PianoSensors -I../../PianoSensors/tests -I../../include auto_host.c ../AutoRotate.c ../AutoStream.c ../AutoLight.c ../../PianoSensors/SensorsPolicy.c ../../PianoSensors/SensorsOrient.c ../../PianoSensors/SensorsFixed.c -o /tmp/piano-auto-host && /tmp/piano-auto-host
 // Host tests of PianoAuto's portable C (docs/drivers/sensors.md section 5a), synthetic inputs only, ASan/UBSan:
 //   touch    TouchRotation.h: the four rotations against CGDisplayRotation's definition (corners), round trips, clamping, the HID scale,
 //            the latch at touch-down
@@ -367,6 +368,40 @@ static void test_rotation_transitions(void)
     printf("PASS rotation transitions: cover during a request, touch follows read-back, detach in portrait, panel loss\n");
 }
 
+static void test_interrupted_rotation(void)
+{
+    ParConfig c;
+    par_defaults(&c);
+    start(&c);
+    par_edge(&a, PS_EDGE_LEFT, 1000);
+    CHECK(at(1000).apply == -1);
+    par_edge(&a, PS_EDGE_NONE, 1599);
+    par_edge(&a, PS_EDGE_LEFT, 1600);
+    CHECK(at(1600).apply == -1 && at(2199).apply == -1 && at(2200).apply == 90);
+
+    start(&c);
+    par_edge(&a, PS_EDGE_LEFT, 1000);
+    CHECK(at(1000).apply == -1);
+    par_observed(&a, -1, 1400);
+    CHECK(at(1600).apply == -1);
+    par_observed(&a, 0, 1700);
+    CHECK(at(1700).apply == -1 && at(2299).apply == -1 && at(2300).apply == 90);
+
+    c.rot.min_interval_ms = 0;
+    par_init(&a, &c);
+    par_observed(&a, 90, 1000);
+    par_touch_done(&a, 90, 1, 1000);
+    par_cover(&a, PAR_COVER_ATTACHED, 1000);
+    CHECK(at(1000).apply == 0);
+    par_applied(&a, 0, 0, 1000);
+    par_cover(&a, PAR_COVER_DETACHED, 1100);
+    CHECK(par_deadline(&a, 1100, 1) == 1100 + c.detach_hold_ms);
+    par_cover(&a, PAR_COVER_ATTACHED, 1200);
+    CHECK(at(1200).apply == -1 && par_deadline(&a, 1200, 1) == 1000 + c.retry_first_ms);
+    CHECK(at(1000 + c.retry_first_ms).apply == 0);
+    puts("PASS rotation interruptions: fresh dwell after edge or panel loss, cover reattach schedules its retry");
+}
+
 static void test_android_als(void)
 {
     const uint32_t lux[] = {2, 4, 6, 8, 10, 15, 20, 25, 30, 82, 771, 1202, 2058, 5100, 8900, 11165};
@@ -410,6 +445,7 @@ int main(void)
     test_rotate();
     test_orientation();
     test_rotation_transitions();
+    test_interrupted_rotation();
     stream_tests();
     printf("PASS PianoAuto C host tests (%u checks)\n", checks);
     return 0;
