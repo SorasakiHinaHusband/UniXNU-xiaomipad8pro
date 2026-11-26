@@ -713,18 +713,18 @@ void checkCallerThreads(std::vector<uint8_t> reference)
   checkDurable(reference);
 }
 
-void checkFault(Fault fault, const std::vector<uint8_t> &reference)
+void checkFault(Fault fault, bool writeBack, const std::vector<uint8_t> &reference)
 {
   controller.boot();
   const auto baseline = controller.durable;
   {
-    Disk disk(persist::Open::Resumed);
+    Disk disk(persist::Open::Resumed, writeBack);
     auto ops = burst(0);
     const auto accepted = fillQueue(disk, ops, false);
     const auto commands = controller.submissions;
     releaseData(fault);
     disk.drain();
-    assert(gHost.poisoned && !gHost.ready && disk.state.failed());
+    assert(gHost.poisoned && !gHost.ready && disk.state.failed() && disk.state.dirty() == writeBack);
     assert(disk.admission.quarantined == kStageMask && !disk.admission.modeChangeAllowed(true, true));
     assert(controller.submissions == commands && controller.durable == baseline);
     assert(std::popcount(gOutstanding) == kStages && gOutstanding == controller.doorbells);
@@ -848,8 +848,8 @@ int main()
   checkWindow();
   checkCallerThreads(stress(false));
   const auto reference = stress(true);
-  checkFault(Fault::Timeout, reference);
-  checkFault(Fault::Fatal, reference);
+  checkFault(Fault::Timeout, true, reference);
+  checkFault(Fault::Fatal, false, reference);
   checkVolatileBoot();
   puts("PASS timeout/fatal DMA quarantine, fresh-boot recovery, partition edges and volatile budget");
 }
