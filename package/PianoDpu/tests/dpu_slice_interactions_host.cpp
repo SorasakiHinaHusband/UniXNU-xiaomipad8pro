@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Startup policy and serialized M2/M3/M4 transactions on the timed DPU model.
+// Startup policy and serialized M2/M3/M4/M5 transactions on the timed DPU model.
 // Build: c++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I.. dpu_slice_interactions_host.cpp -o /tmp/dpu_slice_interactions_host && /tmp/dpu_slice_interactions_host
 #include "DpuClockRead.h"
 #include "DpuFlip.h"
 #include "DpuModeSwitch.h"
 #include "DpuNightShift.h"
+#include "DpuPanel.h"
 #include "DpuSliceArgs.h"
 #include "DpuSnapshot.h"
 #include "dpu_model.h"
@@ -84,6 +85,7 @@ void testStartup()
         const auto args = boot.slices();
         CHECK(args.level == level && args.refresh == kRefreshOff && !args.nightShift);
         CHECK(args.panel == row.panel && args.panelTrace == row.panel && args.pcc == row.pcc);
+        CHECK(!args.panelVideoOnly);
         CHECK(args.modeHz == (row.modes ? 60u : 0u) && args.modesEnabled() == row.modes);
         CHECK(args.wanted() == (row.panel || row.pcc || row.modes));
         const unsigned expectedVote = explicitVote >= 0 ? unsigned(explicitVote) : level >= 2 ? row.ahbVote : 0;
@@ -257,19 +259,64 @@ void checkTiming(const snapshot::Snapshot &s, unsigned hz, unsigned htotal, unsi
 
 void testDailyMode()
 {
-  const BootArgs boot{{{"piano-dpu", 2}}};
-  const auto args = boot.slices();
-  CHECK(!args.wanted() && !args.panel && !args.nightShift && !boot.cleanSkip(4));
   auto io = model::modeSwitchFixture();
   CHECK(!modes::switchTiming(io, 60, {}).why);  // Model the 60 Hz scanout already in use.
   const auto before = io.stores.size();
   const auto unexpected = [] { CHECK(false); };
-  for (unsigned hz : {60u, 90u, 120u, 144u}) {
-    const auto result = modes::switchTo(io, hz, {.fixedHz = args.modeHz}, unexpected, unexpected);
-    CHECK(result.why && !result.timingTouched);
+  const auto checkDaily = [&](const BootArgs &boot, bool videoOnly) {
+    const auto args = boot.slices();
+    CHECK(!args.wanted() && !args.panel && !args.panelTrace && args.panelVideoOnly == videoOnly && !args.nightShift);
+    CHECK(args.ahbVote == 0 && args.refresh == kRefreshOff && !boot.cleanSkip(4));
+    for (unsigned hz : {60u, 90u, 120u, 144u}) {
+      const auto result = modes::switchTo(io, hz, {.fixedHz = args.modeHz}, unexpected, unexpected);
+      CHECK(result.why && !result.timingTouched);
+    }
+  };
+  checkDaily(BootArgs{{{"piano-dpu", 2}}}, false);
+  for (unsigned value : {0u, 1u, 2u, UINT32_MAX}) {
+    checkDaily(BootArgs{{{"piano-dpu", 2}, {"piano-dpu-panel", 0}, {"piano-dpu-panel-video-only", value}}}, value == 1);
   }
   checkTiming(takeReadOnlySnapshot(io, false).state, 60, 576, 4620);
   CHECK(io.stores.size() == before && io.dcs.empty());
+}
+
+void testPanelVideoOnlyCycles()
+{
+  for (unsigned value : {0u, 1u, 2u, UINT32_MAX}) {
+    const BootArgs boot{{{"piano-dpu", 2}, {"piano-dpu-panel", 1}, {"piano-dpu-panel-video-only", value}}};
+    const auto args = boot.slices();
+    CHECK(args.wanted() && args.panel && args.panelTrace && args.panelVideoOnly == (value == 1));
+    const panel::Options options{.engines = args.panelEngines != 0, .videoOnly = args.panelVideoOnly};
+    auto io = model::modeSwitchFixture();
+    CHECK(!modes::switchTiming(io, 60, {}).why);
+    for (unsigned l = 0; l < 2; ++l) io.regs[dsiReg(l, kDsiCtrl)] = 0x1f7;
+    auto path = readPath(io);
+    CHECK(path.ok);
+    const uint32_t videoCtrl = value == 1 ? 0x1f3 : 0x1f7;
+    panel::TraceRing ring;
+    for (unsigned cycle = 0; cycle < 3; ++cycle) {
+      const size_t begin = io.stores.size();
+      const auto off = panel::panelOff(io, path, options);
+      CHECK(off.ok && off.enginesStopped && off.dcs[0].dmaDoneMask() == 3 && off.dcs[1].dmaDoneMask() == 3);
+      for (unsigned l = 0; l < 2; ++l) {
+        const uint32_t ctrl = cycle ? videoCtrl : 0x1f7;
+        std::vector<uint32_t> writes;
+        for (size_t i = begin; i < io.stores.size(); ++i)
+          if (io.stores[i].pa == dsiReg(l, kDsiCtrl)) writes.push_back(io.stores[i].v);
+        const std::vector<uint32_t> expected{ctrl | 4u, ctrl, ctrl | 4u, ctrl};
+        CHECK(writes == expected && io.rd(dsiReg(l, kDsiCtrl)) == ctrl);
+      }
+      ring.reset();
+      const auto on = panel::panelOn(io, path, options, off.enginesStopped, off.fetch, &ring);
+      CHECK(on.ok && on.engines.rate.lockstep && on.dcs[0].dmaDoneMask() == 3 && on.dcs[1].dmaDoneMask() == 3);
+      CHECK(ring.total == ring.size() && ring.size() > 4);
+      path = readPath(io);   // panelWake rereads the path for the next cycle
+      CHECK(path.ok && path.link[0].dsiCtrl == videoCtrl && path.link[1].dsiCtrl == videoCtrl);
+      CHECK(io.half[0].displayOn && io.half[1].displayOn);
+    }
+    checkTiming(takeReadOnlySnapshot(io, false).state, 60, 576, 4620);
+    CHECK(io.refused.empty() && io.glitches == 0 && io.desync == 0 && io.commandsInFrame == 0);
+  }
 }
 
 void testInterleavedSlices()
@@ -396,6 +443,7 @@ int main()
   testStartup();
   testSnapshotGates();
   testDailyMode();
+  testPanelVideoOnlyCycles();
   testInterleavedSlices();
   std::puts("PianoDpu startup and slice interactions: all passed");
 }

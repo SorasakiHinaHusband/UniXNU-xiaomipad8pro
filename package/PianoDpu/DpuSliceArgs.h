@@ -19,7 +19,7 @@ struct SliceArgs {
   bool pccTest = false;
   int32_t pccTestMilli[3] = {1000, 1000, 1000};
   unsigned panel = 0, panelEngines = 1, panelHs = 0, panelTest = 0;
-  bool panelTrace = false;
+  bool panelTrace = false, panelVideoOnly = false;
   unsigned ahbVote = 0;   // piano-dpu-ahb-vote: 1 = the gate's Linux rule for GCC's display AHB (DpuAhbVote.h)
 
   bool modesEnabled() const { return modeHz && !refresh && refreshDb; }
@@ -58,6 +58,7 @@ SliceArgs readStartupArgs(ReadNumber readNumber, ReadString readString)
   const unsigned panelArg = argNumber("piano-dpu-panel", 0, 0, UINT32_MAX);
   args.panel = panelArg != 0;
   args.panelTrace = panelArg == 1;
+  args.panelVideoOnly = argNumber("piano-dpu-panel-video-only", 0, 0, UINT32_MAX) == 1;
   args.ahbVote = argNumber("piano-dpu-ahb-vote", (args.nightShift || args.modesEnabled() || args.panel) && args.level >= 2 ? 1 : 0, 0, 2);
   args.pccEncode = argNumber("piano-dpu-pcc-encode", 1, 0, 1);
   args.pccNegative = argNumber("piano-dpu-pcc-negative", 0, 0, 1);

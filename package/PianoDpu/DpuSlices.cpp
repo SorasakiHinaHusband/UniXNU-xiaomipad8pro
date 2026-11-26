@@ -20,6 +20,7 @@
 //   piano-dpu-panel=1                    the panel's light sleep with display sleep (NativeGopDisplay calls PianoDpuPanel)
 //   piano-dpu-panel-engines=0            DCS only: the timing engines keep running
 //   piano-dpu-panel-hs=1                 DCS in high speed (default: low power, the panel's MIPI_DSI_MODE_LPM)
+//   piano-dpu-panel-video-only=1         clear CMD_MODE_EN when restoring video after a successful stopped-host wake
 //   piano-dpu-panel-test=N               standalone level-1 DCS test, 5 s asleep and 5 s awake each
 // Platform functions (IOService::callPlatformFunction on the PianoDpu service, registered when a slice is on; no link dependency):
 //   "PianoDpuSwap"          no parameters: a frame was shown
@@ -697,7 +698,8 @@ void publishPanelTrace()
            count, gPanelTrace->total - count);
   emit();
   if (report.on) {
-    snprintf(line, sizeof line, "m5 %u pre-reset status=%08x/%08x", report.serial, report.dsiBeforeReset[0], report.dsiBeforeReset[1]);
+    snprintf(line, sizeof line, "m5 %u pre-reset status=%08x/%08x video-only=%u", report.serial, report.dsiBeforeReset[0],
+             report.dsiBeforeReset[1], unsigned(gPanelOptions.videoOnly));
     emit();
   }
   for (const panel::Sent &s : report.dcs) {
@@ -716,10 +718,21 @@ void publishPanelTrace()
   }
   for (unsigned i = 0; i < count; ++i) {
     const panel::TraceSample &s = gPanelTrace->at(i);
-    const panel::TraceLink &a = s.link[0], &b = s.link[1];
-    snprintf(line, sizeof line, "m5 %u %u %llu %s %c %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x",
-             report.serial, gPanelTrace->total - count + i, (unsigned long long)s.us, panel::traceStepName(s.step), s.boundary ? 'B' : 'P',
-             a.en, a.status, a.frame, a.line, b.en, b.status, b.frame, b.line, s.top, s.active, s.flush, s.intfFlush);
+    const unsigned row = gPanelTrace->total - count + i;
+    const char *step = panel::traceStepName(s.step);
+    if (panel::isHostTraceStep(s.step)) {
+      const panel::TraceHost &a = s.host[0], &b = s.host[1];
+      snprintf(line, sizeof line,
+               "m5 %u host %s row=%u us=%llu ctrl=%08x/%08x status=%08x/%08x fifo=%08x/%08x lane=%08x/%08x clk=%08x/%08x",
+               report.serial, step, row, (unsigned long long)s.us,
+               a.ctrl, b.ctrl, a.status, b.status, a.fifo, b.fifo, a.lane, b.lane, a.clk, b.clk);
+    } else {
+      const panel::TraceTiming &t = s.timing;
+      const panel::TraceLink &a = t.link[0], &b = t.link[1];
+      snprintf(line, sizeof line, "m5 %u %u %llu %s %c %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x %08x/%08x/%08x/%08x",
+               report.serial, row, (unsigned long long)s.us, step, s.boundary ? 'B' : 'P',
+               a.en, a.status, a.frame, a.line, b.en, b.status, b.frame, b.line, t.top, t.active, t.flush, t.intfFlush);
+    }
     emit();
   }
   if (!complete || !gService->setProperty("piano-dpu-panel-trace", dump))
@@ -791,6 +804,7 @@ void panelStart()
 {
   gPanelOptions.lowPower = !gA.panelHs;
   gPanelOptions.engines = gA.panelEngines != 0;
+  gPanelOptions.videoOnly = gA.panelVideoOnly;
   for (unsigned l = 0; l < 2; ++l) {
     const uint32_t trig = gIo.rd(dsiReg(l, kDsiTrigCtrl));
     note("panel: dsi%u command path: ctrl %08x status %08x fifo %08x cmd-dma %08x dma1 %08x length %08x trig %08x (dma trigger %u%s, %s) "
