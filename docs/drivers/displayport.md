@@ -3,8 +3,9 @@
 ## Status as of 2026-11-27
 
 **External DisplayPort remains design-only (B8).** The tracked `PianoDp` level 1 is a read-only survey and port-event decoder.
-D6 is a RAM-backed second display for testing the macOS display path. The QMP PHY tuning tables are extracted with provenance
-and host-checked under `data/dp/`. AUX and link training, external scanout and hot-plug, and tablet qualification remain open.
+D6 is a RAM-backed second display for testing the macOS display path. D0 now includes host-tested EDID/CTA mode selection,
+callback-driven AUX/DPCD link training, and MSA/TU arithmetic with the extracted QMP PHY tables. Controller AUX transactions,
+hardware link training, external scanout, hot-plug and tablet qualification remain open.
 B8 depends on B1's DPU path and B7's Type-C host work. [PHY tables](../../data/dp/README.md) · [Support status](../STATUS.md) · [Hardware backlog, B8](../BACKLOG-hardware.md#2-backlog-b1b15) · [PianoDp source](../../package/PianoDp/PianoDp.cpp)
 
 **Built-in panel.** Installed v13.1y12q uses PianoDpu flips at 60 Hz, with native screenshots and neutral colours. Night Shift
@@ -160,15 +161,16 @@ import check: PianoPower's `piano_port_*` / `piano_adsp_health` come from PianoP
 `NativeGopDisplay.json`, the vtable check unchanged). Linked 2026-11-11: PianoDp ≈ 30 KB of code and strings, 2.7 KB `__DATA,__const`
 (its vtable), 1.2 KB `__bss` (the page table).
 
-Later levels add host tests for the AUX transaction encoder, an EDID parser (base block + CTA-861 + DisplayID tiles), the training
-state machine against a DPCD model, MSA/TU arithmetic and mode fitting from EDID against the link budget (the standard-mode budget is
-there already).
+The offline D0 headers validate up to four EDID blocks, select RGB 8 bpc modes against piano's HBR2 and pin lane budgets,
+train against a scripted AUX/DPCD sink, and calculate MSA and a 64-symbol TU for progressive SST. The PianoDp host runner checks
+both suites under ASan/UBSan and verifies the training drive indices against generated QMP tables. Controller AUX encoding
+(including I2C-over-AUX transfers) and DisplayID tiles are later work. [EDID model](../../package/PianoDp/DpEdid.h) · [Training and stream model](../../package/PianoDp/DpLinkTrain.h) · [Host runner](../../package/PianoDp/tests/run-dp-host.sh)
 
 ### 8. Ladder and effort (RAM boots, owner present with a monitor and a USB-C/DP cable or dock)
 
 | Step | What | Pass | Effort |
 |---|---|---|---|
-| D0 | offline: register map, decoders, EDID, training model, timings, host tests | host tests | 1–1.5 weeks (D1/D2/D6's parts built 2026-11-11) |
+| D0 | offline register map, decoders, EDID/CTA, link budget, AUX/DPCD training model, MSA/TU | both host suites pass under ASan/UBSan | completed offline |
 | D1 | survey (`piano-dp=1`, read only, **unattended**): the DP gates, the controller and PHY when clocked, the DPU's DP side | the survey lines through `survey done`, no stall or reset; the gates and the DPU verdict as found | built; 1 boot |
 | D2 | port events (`piano-dp=1`, PianoPower level 2, read only, **attended**): plug a monitor both ways, with a dock | orientation/mux/pin/HPD per plug match Ubuntu's | built; 1 session |
 | D3 | DIO4485 + DP_COM + AUX: DPCD caps, EDID; then link training RBR → HBR2, both orientations, 2 and 4 lanes | DPCD rev/rate/lanes, the monitor's EDID name; CR + EQ done, the monitor leaves "no signal" | 2–2.5 weeks + 3 sessions |
