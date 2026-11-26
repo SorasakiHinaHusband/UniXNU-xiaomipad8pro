@@ -114,6 +114,10 @@ section /usr/sbin/sysctl machdep.piano_wifi_ps
 REMOTE
 )
 snapshot=$(cat <<'REMOTE'
+section /usr/bin/sw_vers
+args=$(/usr/sbin/sysctl -n kern.piano_bootargs 2>/dev/null || /usr/sbin/sysctl -n kern.bootargs)
+printf '\n== Bluetooth and radio boot arguments ==\n'
+printf '%s\n' "$args" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -E '^piano-(bt(=|-)|usb-net=|wifi(=|-ps=))'
 section /usr/sbin/sysctl machdep.piano_bt_boot
 if /usr/sbin/sysctl -N machdep.piano_bt_uptime_ms >/dev/null 2>&1; then
     section /usr/sbin/sysctl machdep.piano_bt_uptime_ms
@@ -123,6 +127,8 @@ section /usr/sbin/ioreg -r -n bluetooth -d 1 -l -w0
 section /usr/sbin/ioreg -p IODeviceTree -r -n bluetooth -d 1 -l -w0
 section /bin/ls -l /dev/cu.BLTH
 section /usr/sbin/system_profiler -timeout 12 SPBluetoothDataType
+section /usr/bin/hidutil list --matching '{"Transport":"Bluetooth"}'
+section /usr/bin/hidutil list --matching '{"Transport":"Bluetooth Low Energy"}'
 REMOTE
 )
 
