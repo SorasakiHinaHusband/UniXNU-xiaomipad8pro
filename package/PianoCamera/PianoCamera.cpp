@@ -546,11 +546,17 @@ class Lines {
     char item[120];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(item, sizeof item, fmt, ap);
+    const int written = vsnprintf(item, sizeof item, fmt, ap);
     va_end(ap);
+    if (written < 0) return;
     const size_t len = strlen(item);
     if (n_ && n_ + 2 + len > kWidth) flush();
-    n_ += snprintf(line_ + n_, sizeof line_ - n_, "%s%s", n_ ? ", " : "", item);
+    if (n_) {
+      line_[n_++] = ',';
+      line_[n_++] = ' ';
+    }
+    memcpy(line_ + n_, item, len + 1);
+    n_ += len;
   }
   void flush()
   {
@@ -731,11 +737,17 @@ class Ops {
     VrmResult res;
     const int rc = vrmSend(gRsc, gRscIo, base, cmds, n, res);
     lockRelease(&sm8750_rpmh_drv2_owner);
-    char line[120];
-    int at = 0;
-    for (unsigned i = 0; i < n && at < int(sizeof line) - 24; ++i)
-      at += snprintf(line + at, sizeof line - at, "%s%s %u", i ? ", " : "",
-                     cmds[i].reg == kVrmVoltage ? "mV" : cmds[i].reg == kVrmEnable ? "enable" : "mode", cmds[i].value);
+    char line[120] = {};
+    size_t at = 0;
+    for (unsigned i = 0; i < n && at < sizeof line - 24; ++i) {
+      const int written = snprintf(line + at, sizeof line - at, "%s%s %u", i ? ", " : "",
+                                   cmds[i].reg == kVrmVoltage ? "mV" : cmds[i].reg == kVrmEnable ? "enable" : "mode", cmds[i].value);
+      if (written < 0) {
+        line[at] = 0;
+        break;
+      }
+      at += size_t(written);
+    }
     note("rsc: %s (%#x): %s through TCS %d %s after %u ms", kRails[rail].cmdDb, base, line, res.tcs,
          res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" : "NOT completed (left in flight, not used again)", res.waited);
     return rc;
@@ -1465,7 +1477,7 @@ void PianoCamera::serveLive(uint32_t sensor)
   }
   IOLockLock(gServeLock);
   gLiveStatus.cleanOff = !result || result->cleanOff;
-  gLiveStatus.failedStep = result ? result->failedStep : 0;
+  gLiveStatus.failedStep = result ? uint32_t(result->failedStep) : 0;
   gLiveStatus.guardFault = result && result->failure == StreamFailure::guard;
   gLiveStatus.smmuFault = result ? result->fault.fsr & iova::kFsrFaults : 0;
   gLiveStatus.aeSamples = result ? result->aeCount : 0;
