@@ -2299,6 +2299,7 @@ static void testSoundAge(void)
 // spk-probe1: the protection pair up without sound for a while, amplifiers down (or up muted),
 // the monitor read, the path down at the end; refused without the configuration's switch or without protection; real sound takes over.
 static uint32_t g_probe_req, g_probe_at, g_probe_mute_at, g_probe_snd_from, g_probe_snd_to, g_probe_dev_at;
+static uint32_t g_probe_sleep_at;
 static int g_probe_rc, g_probe_text_ok, g_probe_down_after;
 static char g_probe_text[480];
 static void probe_setup(AudioLiveConfig *c) {c->spk_probe = 1;}
@@ -2306,6 +2307,7 @@ static void probe_hook(uint32_t t)
 {
     if (g_probe_mute_at && t == g_probe_mute_at) audio_live_control(&sh, -1, 1);
     if (g_probe_dev_at && t == g_probe_dev_at && !w.out_running) device(1, 0);
+    if (g_probe_sleep_at && t == g_probe_sleep_at) audio_live_sleep(&live, 1);
     w.amplitude = 20000;
     w.sound_on = g_probe_snd_to && t >= g_probe_snd_from && t < g_probe_snd_to;
     if (t == g_probe_at) g_probe_rc = audio_live_spk_probe(&sh, g_probe_req);
@@ -2319,6 +2321,7 @@ static void probe_hook(uint32_t t)
 static void probe_reset(void)
 {
     g_probe_req = 6; g_probe_at = 1000; g_probe_mute_at = g_probe_snd_from = g_probe_snd_to = g_probe_dev_at = 0;
+    g_probe_sleep_at = 0;
     g_probe_rc = -2; g_probe_text_ok = g_probe_down_after = 0; g_probe_text[0] = 0;
 }
 static void testSpkProbe(void)
@@ -2359,9 +2362,12 @@ static void testSpkProbe(void)
     spk_reset(); spk_files(); g_spk = 0; probe_reset(); g_setup = probe_setup;
     run(&sc);
     CHECK(!w.violations && live.spk_starts == 0 && logged("refused: protection not asked for"));
-    // D: the master muted, amplifiers up and held muted (S + 100): powered, never unmuted, gain 243 under the pair
-    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_req = 106; g_probe_mute_at = 500; g_setup = probe_setup;
-    run(&sc);
+    // D: a muted device offers PCM throughout a probe with amps powered. The deadline overrides the 30 s playback idle timer.
+    struct Scenario slow_idle = sc;
+    slow_idle.idle_ms = 30000;
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_probe_req = 106; g_setup = probe_setup;
+    g_probe_mute_at = 100; g_probe_dev_at = 200; g_probe_snd_from = 300; g_probe_snd_to = 12000;
+    run(&slow_idle);
     CHECK(!w.violations && live.prot_starts == 1 && live.spk_starts == 1 && power_ups_after_session() == 4 && w.unmutes == 0);
     CHECK(w.sound_periods == 0 && live.probe_reads >= 2 && logged("amplifiers powered up and held MUTED") && g_probe_down_after);
     // E: real sound during the amplifier-less probe: that start ends, the path comes back with the amplifiers and plays
@@ -2371,6 +2377,27 @@ static void testSpkProbe(void)
     CHECK(!w.violations && live.spk_starts == 2 && live.prot_starts == 2 && !live.prot_fallbacks && power_ups_after_session() == 4);
     CHECK(w.unmutes == 4 && w.sound_periods > 50 && logged("spk-probe1: probe 1 over: ended: real sound took over"));
     CHECK(logged("spk-probe1: sound during the amplifier-less probe"));
+    // F: an existing playback run keeps ownership of the path.
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+    g_probe_dev_at = 500; g_probe_snd_from = 800; g_probe_snd_to = 6000; g_probe_at = 2500;
+    run(&sc);
+    CHECK(!w.violations && live.probe_refused == 1 && live.probe_runs == 0 && live.spk_starts == 1);
+    CHECK(w.sound_periods > 300 && logged("refused: the speaker path is busy"));
+    // G: a failed probe unwinds. A normal playback start owns any passthrough fallback.
+    const char *failures[] = {"OPEN 0xb0000002", "GET 0x4046 0x10001fab"};
+    for (unsigned i = 0; i < N(failures); ++i) {
+        spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+        g_fail = failures[i];
+        run(&sc);
+        CHECK(!w.violations && live.prot_fallbacks == 1 && live.spk_starts == 1 && !live.probing);
+        CHECK(find_cmd("OPEN 0x4005", live_from()) == w.ncmd && g_probe_down_after && logged("ended: protection unavailable"));
+    }
+    // H: sleep cancels an active probe and the path parks.
+    spk_reset(); spk_files(); g_spk = 1; probe_reset(); g_setup = probe_setup;
+    g_probe_sleep_at = 3000;
+    run(&sc);
+    CHECK(!w.violations && live.parked && !live.probing && g_probe_down_after);
+    CHECK(logged("cancelled: the system sleeps"));
     spk_reset(); g_setup = 0;
 }
 

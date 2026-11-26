@@ -26,6 +26,28 @@ struct PianoAudioLevelArgs {
   uint32_t spkProbe;                  // piano-audio-spk-probe=1: machdep.piano_audio_spk_probe may start spk-probe1 (AudioLive.h audio_live_spk_probe)
   uint32_t tap;                       // piano-audio-tap: the microphone tap for "Mic (noise reduced)" at level 10 (AudioTap.h; default 1)
 };
+
+// Require an explicit =1 token. The last mention of the switch wins.
+inline bool piano_audio_spk_probe_enabled(const char *args)
+{
+  if (!args) return false;
+  constexpr char key[] = "piano-audio-spk-probe";
+  constexpr size_t keyLength = sizeof key - 1;
+  bool enabled = false;
+  while (*args) {
+    while (*args == ' ' || *args == '\t') ++args;
+    const char *end = args;
+    while (*end && *end != ' ' && *end != '\t') ++end;
+    const size_t length = end - args;
+    if (length >= keyLength && __builtin_memcmp(args, key, keyLength) == 0 &&
+        (length == keyLength || args[keyLength] == '=')) {
+      enabled = length == keyLength + 2 && args[keyLength + 1] == '1';
+    }
+    args = end;
+  }
+  return enabled;
+}
+
 // PianoAudioTap.cpp: the microphone tap (AudioTap.h) on sh: its shared memory and the service "piano-mic-tap" whose user client the
 // "Mic (noise reduced)" plug-in opens (shared: AudioLive.h's AudioLiveShared); wake() runs the live thread at an open or close.
 // 0, or -1 (no memory; no tap this boot).

@@ -107,8 +107,7 @@ typedef struct {
     int miplay;                           /* MIPLAY asked for (spk_miplay_valid: the boot argument, then the sysctl); taken at a start */
     uint32_t miplay_gen;                  /* every request: a new one clears a MIPLAY fallback of this boot */
     /* spk-probe1: a silent protection probe asked for (audio_live_spk_probe), taken by the worker */
-    uint32_t spk_probe;                   /* the request: seconds (1..AUDIO_SPK_PROBE_MAX_S), + AUDIO_SPK_PROBE_AMPS: amplifiers up, muted */
-    uint32_t spk_probe_gen;               /* every request */
+    uint32_t spk_probe;                   /* pending request, or 0 when consumed; a newer write can replace it before the tick */
     /* The microphone tap (AudioTap.h): its shared header and ring (null: no tap), and how many tap clients are open; while one is,
      * the capture plan runs as if the Mic device did, and every capture period also goes into the tap. */
     PianoTapHeader *tap;
@@ -276,9 +275,10 @@ typedef struct {
     uint32_t live_reads, vbat_sends, vbat_uv;
     uint32_t live_at;                    /* the worker's time of the last live data (live_reads > 0) */
     /* ---- spk-probe1 (audio_live_spk_probe): the silent protection probe */
-    uint32_t probe_gen, probe_until, probe_requests, probe_runs, probe_refused, probe_reads_from, probe_reads, probe_up;
+    uint32_t probe_until, probe_requests, probe_runs, probe_refused, probe_reads_from, probe_reads, probe_up;
     int probing;                         /* a probe was taken and has not ended */
     int probe_amps;                      /* this probe powers the amplifiers up (muted) */
+    int probe_only;                      /* the current plan was started for the probe and has had no playback takeover */
     int probe_noamps;                    /* this start of the speaker path is the probe's alone with the amplifiers left powered down */
     const char *probe_why;               /* the last probe's outcome or refusal (a static string) */
     /* ---- MIPLAY (AudioSpkProt.h), inside the protection pair */

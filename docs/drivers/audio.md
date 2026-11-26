@@ -175,7 +175,7 @@ is selectable. The Mic still receives mono with the first 100 ms silenced.
 | `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
 | `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
 | `piano-audio-spk=1` | 0 | levels 8-10: the speaker path opens the stock speaker-protection pair (FSADSP SP_RX/SP_TX with V/I feedback) instead of the passthrough device graph, with the two private files (section 12); missing or mismatched files, or any FSADSP error, keep or bring the speaker back on the passthrough graph in the same boot. `machdep.piano_audio_spk` (root, 0, or odd: 1 + the round-2 variant bits of section 12) changes it from the next start of the speaker path; `machdep.piano_audio_spk_state` reads the state |
-| `piano-audio-spk-probe=1` | 0 | levels 9-10: enables `machdep.piano_audio_spk_probe` (root writes) and `machdep.piano_audio_spk_live` (read only). With speaker protection requested and ready, writing S (1..30) starts a silent probe with the amplifiers powered down. S+100 powers them up muted. The monitor reads battery voltage and live data. Sleep cancels the probe. Writes return ENOENT while protection is unavailable. Reading the control gives the remaining milliseconds. See section 14. |
+| `piano-audio-spk-probe=1` | 0 | At levels 9-10, this exact token registers `machdep.piano_audio_spk_probe` (root writes) and `machdep.piano_audio_spk_live` (read only). With speaker protection requested and ready, writing S (1..30) starts a silent probe with the amplifiers powered down. S+100 powers them up muted. The monitor sends battery voltage when available and reads live data. Sleep cancels the probe. Writes return ENOENT when the protection files are missing or invalid. Reading the control gives the remaining milliseconds. See section 14. |
 | `piano-audio-miplay=R` | 0 | levels 8-10, inside speaker protection only: the stock Dolby/MiSound MIPLAY subgraph between the stream and the speaker graph's MFC, with its private file (section 12.1). R: 0 off; 1 perf mode 1 (Android's), 2 perf mode 2; +4 the Dolby pregain follows the master volume (else fixed 0 dB); +16 x (r + 1) the rotation r (0..3; else Android's 1). Any MIPLAY error brings the speaker back on the protection plan without it. `machdep.piano_audio_miplay` (root) changes it from the next start of the protection plan; its state is in `machdep.piano_audio_spk_state` |
 | `piano-audio-duplex-hold=0\|1\|3` | 0 | level 10, an A/B switch for the duplex stutter (section 13): 1 holds the LPASS macro and digital codec votes, 3 also the VA (TX core) mclk, in a plan of their own from before the first path (speaker or Mic) starts until both are down; the Mic's plan then skips them. `machdep.piano_audio_duplex_hold` (root) changes it, taken when both paths are down and one starts. 0: unchanged |
 | `piano-audio-mic-gain=G` | 124 | level 10: the VA decimators' gain, Ubuntu's UCM control (0..124, 84 = 0 dB, 124 = +40 dB) |
@@ -976,20 +976,19 @@ flags a second owner of a vote and counts PRM commands while the speaker stream 
 
 The probe has been host-tested and built for arm64e. It has yet to run on the tablet.
 
-The speaker path, and with it the protection pair and its V/I monitor, starts only on a non-zero sample with the master unmuted, and
-the per-amp live data were console lines only: a silent install could not check that protection still comes up. spk-probe1 adds:
+The probe brings up speaker protection and its V/I monitor in silence. Both sysctls require the exact
+`piano-audio-spk-probe=1` boot argument at levels 9-10.
 
-- `piano-audio-spk-probe=1` and `machdep.piano_audio_spk_probe` (section 6): the protection pair up for S seconds without sound. The
-  start is the normal one (the same plan, order, clock ownership, Re25, MIPLAY when asked for); the stream sends silent periods and
-  stays in its quiet state until the deadline; the amplifiers stay powered down (log `spk-probe1: amplifiers left powered down`), or
-  with S+100 are powered up muted at the protection cap and never unmuted by the probe. Sound arriving during an amplifier-less
-  probe ends that start first (`spk-probe1: sound during the amplifier-less probe ...`); the path comes back with the amplifiers and
-  plays as usual. The outcome is logged: `spk-probe1: probe N over: done: the pair came up and the monitor read (live reads K, ...)`.
-- With the same boot argument, `machdep.piano_audio_spk_live` shows the probe's state and, in TDM slot order,
-  the last live data as relative values: `r0-permille` (r0 / that amplifier's Re25), `f0` (Hz), `q`, `t-dC` (coil temperature in
-  0.1 C), the read's `age-ms`, and `ok` (700..1500 permille and f0 200..2000 Hz) or `check`. Observe-only: no fallback follows from
-  it. The calibration value itself is never published.
+- `machdep.piano_audio_spk_probe` queues a request for the worker, which accepts it when the speaker path
+  is down and protection is requested and ready. It starts the normal protection plan with the same clock ownership, Re25, and optional MIPLAY. The stream sends silent
+  periods until the deadline and drains. The amplifiers stay powered down or power up muted at the protection cap with S+100.
+  Playback takes over using the normal speaker prefill and unmute rules. If the amplifiers are down, the probe first unwinds and
+  playback starts the path with the amplifiers. A protection failure ends the probe and leaves any passthrough start to normal
+  playback demand. The log records the probe outcome and the number of live reads.
+- `machdep.piano_audio_spk_live` shows the probe's state, the last read's `age-ms`, and each amplifier's data in TDM slot order.
+  The fields are `r0-permille` (r0 relative to that amplifier's Re25), `f0` (Hz), `q`, `t-dC` (coil temperature in 0.1 C),
+  and `ok` (700..1500 permille and f0 200..2000 Hz) or `check`. The plausibility result is for observation only.
 
-What the DSP reports while no current flows (amplifiers down or muted) is not known yet; the first probe run reads it. Host tests:
-`tests/live_host.c` testSpkProbe (the request's range; amplifiers down: the protection plan and monitor as with sound, nothing
-powered or played, down at the end; the switch off and protection off refused; muted master with S+100; real sound taking over).
+The DSP's live readings with the amplifiers down or muted still need hardware validation. The `testSpkProbe` host test in
+`tests/live_host.c` covers the request range, default-off and protection-off refusal, both amplifier modes, the deadline
+with a muted device offering PCM, playback takeover, a busy speaker path, protection failures, and sleep cancellation.

@@ -356,8 +356,8 @@ struct sysctl_oid gSpkProbeOid, gSpkLiveOid;
 int spkProbeControl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req)
 {
     if (!gLive || !gShared) return ENXIO;
-    const uint32_t now = nowMs();
-    int value = gLive->probing && int32_t(gLive->probe_until - now) > 0 ? int(gLive->probe_until - now) : 0;
+    const int32_t left = int32_t(gLive->probe_until - nowMs());
+    int value = gLive->probing && left > 0 ? left : 0;
     const int err = sysctl_handle_int(oidp, &value, 0, req);
     if (err || !req->newptr) return err;
     if (!gLive->cfg.spk_probe) return EPERM;
