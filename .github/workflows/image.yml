@@ -264,7 +264,7 @@ jobs:
           K273_TREE=out/k273/k27-tree bash tooling/k273/build-k273-image.sh \
             || echo "::warning::build-k273-image.sh did not finish: the KC and the ADT it wrote before the root/seed gates are kept and uploaded"
           ls -la out/k27 out/adt out/ram 2>/dev/null || true
-      - name: Publish the image outputs as a prerelease
+      - name: Publish the image outputs as a prerelease (root.img compressed and split under the 2 GB asset limit)
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -274,9 +274,19 @@ jobs:
           if gh release view "$tag" > /dev/null 2>&1; then echo "release $tag already exists"; exit 0; fi
           files=$(ls out/ram/* out/k27/kc-k27-native.bin out/adt/* out/fd/*.fd out/fd/*.sha256 out/inputs/k273/root/root.json 2>/dev/null | head -40)
           [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
+          EXTRA=
+          # root.img is 19.5 GiB: zstd, then 1900 MiB parts, each a legal release asset, plus the reassembly note
+          if [ -f out/inputs/k273/root/root.img ]; then
+            echo "compressing root.img"; zstd -19 -T0 -q -f -o "$RUNNER_TEMP/root.img.zst" out/inputs/k273/root/root.img \
+              && { split -b 1900m -d -a 3 "$RUNNER_TEMP/root.img.zst" "$RUNNER_TEMP/root.img.zst.part-";
+                   shasum -a 256 "$RUNNER_TEMP"/root.img.zst.part-* > "$RUNNER_TEMP/root.img.zst.parts.sha256";
+                   printf "%s\n" "root.img in parts" "" "cat root.img.zst.part-* > root.img.zst" "shasum -a 256 -c root.img.zst.parts.sha256" "unzstd root.img.zst" > "$RUNNER_TEMP/REASSEMBLE.txt";
+                   EXTRA="$(ls "$RUNNER_TEMP"/root.img.zst.part-* "$RUNNER_TEMP"/root.img.zst.parts.sha256 "$RUNNER_TEMP"/REASSEMBLE.txt)"; } \
+              || echo "::warning::root.img could not be compressed"
+          fi
           gh release create "$tag" --prerelease --title "piano image $tag" \
-            --notes "Whatever the image chain produced in run $GITHUB_RUN_ID (commit $GITHUB_SHA): the kernel collection, the ADT, the FD and the RAM images when the root image could be built. See the run log for which steps were completed." \
-            $files 2>&1 | tail -3 || echo "::warning::gh release create failed"
+            --notes "Whatever the image chain produced in run $GITHUB_RUN_ID (commit $GITHUB_SHA): the kernel collection, the ADT, the FD, the RAM images when the root image could be built, and root.img as zstd parts (see REASSEMBLE.txt)." \
+            $files $EXTRA 2>&1 | tail -3 || echo "::warning::gh release create failed"
       - name: Logs
         if: always()
         run: |
