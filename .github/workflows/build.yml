@@ -104,7 +104,14 @@ jobs:
           echo "=== TAIL 80 ==="
           tail -n 80 "${{ runner.temp }}/ci/kernel-pass1.log" || true
       - name: Kexts (the kernelcache member only, deleted afterwards)
-        run: bash tooling/ci/build-kexts.sh
+        run: |
+          SDK_KH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers"
+          for base in "$WORK/k27-tree/out/x12377/fakeroot" "$WORK/k27-tree/out/k27/kdk-notb"; do
+            mkdir -p "$base/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/IOKit"
+            ln -sfn Versions/A/Headers "$base/System/Library/Frameworks/Kernel.framework/Headers"
+            cp -Rn "$SDK_KH/IOKit/storage" "$base/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/IOKit/" 2>/dev/null || true
+          done
+          bash tooling/ci/build-kexts.sh
       - name: Nothing of Apple's in the outputs
         run: |
           cd "$OUT"
