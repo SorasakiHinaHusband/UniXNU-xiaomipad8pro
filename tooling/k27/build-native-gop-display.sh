@@ -61,6 +61,7 @@ if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ] || [ ! -f "$CACHE/abi" ]; then
         "committed declarations do not verify against it (tooling/k27/check-iomfb-abi-header.py)" >&2
       exit 1
     fi
+  fi
 fi
 python3 "$D/tooling/k27/build-native-kext.py" NativeGopDisplay "$D/package/NativeGopDisplay/NativeGopDisplay.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   -I "$CACHE" -D "NATIVE_GOP_IOMFB_ABI=$(cat "$CACHE/abi")" --obj "${K27_OBJ:-k27-native-obj}"
