@@ -1,0 +1,15 @@
+name: probe-ubuntu
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Where and when
+        run: |
+          date -u; uname -a; nproc; df -h / | tail -1
+          echo "runner started at $(date -u +%H:%M:%S)"
