@@ -175,6 +175,29 @@ jobs:
           bash tooling/repro/fetch-and-build.sh systemos
         timeout-minutes: 90
 
+      - name: Trust bundle from the IPSW trust caches, no own modules (G2 second option)
+        run: |
+          set -uo pipefail
+          M=out/inputs/k273/26C5035r
+          mkdir -p out/inputs
+          if [ -f "$M/141-22233-021.dmg.aea.trustcache" ]; then
+            python3 tooling/k273/make-trust.py "out/inputs/base-absent.bundle" \
+              "$M/141-22233-021.dmg.aea.trustcache" "$M/141-22145-021.dmg.aea.trustcache" "$M/141-22106-021.dmg.trustcache" \
+              out/inputs/kernel.macho.trustcache
+          else
+            echo "::warning::no IPSW trust caches, the trust bundle cannot be made"
+          fi
+
+      - name: Data seed from the IPSW Data template (the G3 fresh recipe, on macOS)
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
+        run: |
+          set -uo pipefail
+          if [ -f out/inputs/scratch-data.img ]; then echo "seed present"; exit 0; fi
+          python3 scripts/fetch-pins.py --only DarwinBoot || { echo "::warning::no DarwinBoot checkout"; exit 0; }
+          PACKED_RAMDISK="$UNIXNU_RESEARCH/DarwinBoot/Test/packed_ramdisk.py" bash tooling/ci/make-data-seed-macos.sh \
+            out/inputs/k273/26C5035r/141-22233-021.dmg out/inputs 1024 \
+            || echo "::warning::the fresh Data seed recipe failed (G3 is unverified upstream too), the root step will stop at its seed gate"
       - name: Root image (needs the owner's G2 trust bundle and G3 Data seed)
         continue-on-error: true
         env:
