@@ -38,6 +38,19 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   cp "$K" "$OUT/kernel-k273-native.macho"
   mkdir -p "$T/out/kc"
   ln -sfn "$K273_KC" "$T/out/kc/kc27.bin"
+  # A hosted-runner gap, said out loud: NativeGopDisplay’s declarations are generated from a collection whose IOMobileFramebufferLegacy
+  # subclass (AppleParavirtDisplay) names the pure virtual slots. 27.3’s mac17j kernelcache has no such subclass (docs/ci.md,
+  # tooling/k273/check-family-abi.py), so the generator needs a paravirt reference collection (IOMFB_ABI_REFERENCE_KC). None is
+  # available on a GitHub runner: leave that one kext out with a warning instead of failing the whole job, and build it again
+  # whenever a reference collection is supplied.
+  REF_KC=${IOMFB_ABI_REFERENCE_KC:-$T/out/kc/kc27.bin}
+  KEXT_LIST=configs/k27-native-kexts.txt
+  if ! python3 "$T/scripts/kc-vtable.py" "$REF_KC" AppleParavirtDisplay > /dev/null 2>&1; then
+    grep -v -E "^[[:space:]]*NativeGopDisplay([[:space:]]|$)" "$KEXT_LIST" > "$WORK/kexts-ci.txt"
+    echo "::warning::NativeGopDisplay left out of this CI build: $REF_KC has no AppleParavirtDisplay, so its IOMobileFramebufferABI.h cannot be generated (set IOMFB_ABI_REFERENCE_KC to a paravirt collection to build it)"
+    KEXT_LIST=$WORK/kexts-ci.txt
+  fi
+  PIANO_KEXT_LIST=$KEXT_LIST \
   PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml \
     CPATH="$EXTRA_INC:$SOC_DIR/kits" \
     PIANO_STOP_AFTER=kexts bash tooling/k27/build-native-image.sh
