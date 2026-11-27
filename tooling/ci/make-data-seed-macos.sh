@@ -75,9 +75,16 @@ for container in data.get("Containers", []):
 DATA_VOL=$(printf "%s\n" "$DATA_VOL_IDS" | awk 'NF {print "/dev/" $1; exit}')
 [ -n "$DATA_VOL" ] || { echo "no APFS volume on the container of $DATA_DEV (physical stores: $(diskutil apfs list | head -20 | tr "\n" " "))" >&2; exit 1; }
 echo "container on $DATA_DEV, volume $DATA_VOL"
-mkdir -p "$DATA_MNT"
-diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
-mounted "$DATA_MNT" || { echo "the new APFS volume did not mount at $DATA_MNT" >&2; exit 1; }
+# macOS usually auto-mounts the new volume (often at /Volumes/Data); use that mount point when it did
+if mount | grep -q "^$DATA_VOL "; then
+  DATA_MNT=$(mount | awk -v d="$DATA_VOL" '$1 == d {line = $0; sub(/^.* on /, "", line); sub(/ \\(.*/, "", line); print line; exit}')
+  echo "already mounted at $DATA_MNT"
+else
+  mkdir -p "$DATA_MNT"
+  diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
+  mounted "$DATA_MNT" || { echo "the new APFS volume did not mount at $DATA_MNT" >&2; exit 1; }
+fi
+mounted "$DATA_MNT" || { echo "no mount point for $DATA_VOL" >&2; exit 1; }
 
 echo "the template's /private/var skeleton"
 sudo mkdir -p "$DATA_MNT/private/var"
