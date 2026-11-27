@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """T-16 switcher, phase 1 (private/host-checks/20261123-switcher/DESIGN.md 3.1): maint-session.py accepts Android's slot-A pair
 (vendor_boot 99ef425b + init_boot dce4a752 Magisk or ae0b5153 stock) as well as the Ubuntu-era pair of macos-set-v5, refuses an
-unknown pair, and refuses map / boot-a / check while boot_a holds stock Android (17e89056). A fake tablet (test-persist.py's)."""
+unknown pair, and refuses map / boot-a / check while boot_a holds stock Android (17e89056). It uses test-persist.py's fake tablet
+with file-backed transfers and optional PIANO_TEST_PERSIST_OUT pointing to the read-only reference/GPT fixture directory."""
 import contextlib
 import hashlib
 import importlib.util
@@ -110,8 +111,11 @@ def session(tmp):
     put('init_boot_a', CB / 'android-set-root/init_boot-magisk-shellgrant.img')
     log = run('map', 'backup')
     tp.check('Android\'s pair with the Magisk init_boot (macos-set-v5a)' in log, 'map: Android + Magisk pair accepted and named')
+    before = region('boot_a')
     run('boot-a')        # check needs the new GPT tables (test-persist's session writes them first): not this test's subject
     tp.check(region('boot_a') == common.sha(out / 'boot-test-signed.img'), 'boot-a writes boot_a with the Android pair in place')
+    run('rollback', 'boot-a')
+    tp.check(region('boot_a') == before, 'rollback boot-a restores the exact verified backup')
     put('init_boot_a', CB / 'android-set/init_boot.img')
     log = run('map')
     tp.check('Android\'s stock pair (android-set)' in log, 'map: Android stock pair accepted and named')

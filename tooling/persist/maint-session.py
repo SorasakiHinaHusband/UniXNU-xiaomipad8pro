@@ -108,7 +108,8 @@ LUN0_BYTES = common.LUN0_BLOCKS * B
 TAIL_LBA = common.LUN0_BLOCKS - 5
 UFS_LUN0_VENDOR = '860845C1-BE09-4355-8BC1-30D64FF8E63A'
 RAM_PAYLOAD_VENDOR = 'A9C6827C-1BD8-410C-885A-C46500F7D836'
-ABL_EXPECT = {'product': 'piano', 'unlocked': 'yes', 'current-slot': 'a', 'slot-successful:a': 'yes', 'slot-unbootable:a': 'no',
+ABL_EXPECT = {'product': 'piano', 'is-userspace': 'no', 'unlocked': 'yes', 'current-slot': 'a',
+              'slot-successful:a': 'yes', 'slot-unbootable:a': 'no',
               'battery-soc-ok': 'yes', 'partition-size:boot_a': '0x6000000'}
 ABL_SHOW = ('slot-retry-count:a', 'battery-voltage')
 SELECTOR_TAG = b'PIANO-SW-SEL-V1\0'
@@ -318,8 +319,14 @@ class Session:
                 window = common.adt_ram_window(adt['path'])
             elif (OUT / record['image']).is_file():
                 try:
-                    data = common.fat32_read(OUT / record['image'])['files'].get('EFI/UniXNU/Payloads/kernel.macho.adt')
-                    window = common.adt_ram_window(data) if data else None
+                    files = common.fat32_read(OUT / record['image'])['files']
+                    config = common.toml_loads(files['EFI/UniXNU/unixnu.toml'].decode())
+                    default = config['boot']['default']
+                    for entry in config.get('entry', []):
+                        if entry.get('id') == default and entry.get('type') == 'xnu':
+                            data = files.get(f'EFI/UniXNU/{entry["path"]}.adt')
+                            window = common.adt_ram_window(data) if data else None
+                            break
                 except (ValueError, IndexError, KeyError, struct.error):
                     window = None   # not a FAT image (the tests' stand-ins): no payload, no window
             self.windows[key] = window
@@ -467,8 +474,8 @@ class Session:
             size = common.BOOT_PARTITION_BYTES if key == 'boot_a' else common.ESP_BLOCKS * B
             self.need(entry.get('bytes') == size, f'{key} backup covers the entire region')
             if key == 'boot_a':
-                count, bs = entry.get('count'), entry.get('bs')
-                self.need(entry.get('skip') == 0 and type(count) is int and type(bs) is int and
+                skip, count, bs = (entry.get(field) for field in ('skip', 'count', 'bs'))
+                self.need(type(skip) is int and skip == 0 and type(count) is int and type(bs) is int and
                           count > 0 and bs > 0 and count * bs == size, 'boot_a backup covers the partition from offset zero')
             try:
                 manifest = json.loads(path.with_name('manifest.json').read_text())
@@ -2242,11 +2249,18 @@ def boot_a_step(s):
     if selector and s.execute:
         s.need(got_pair[0] == common.ANDROID_VENDOR_BOOT_SHA256,
                'selector boot-a requires the existing Android vendor_boot_a and a known Android init_boot_a')
+        for key, digest in zip(('vendor_boot_a', 'init_boot_a'), got_pair):
+            saved = s.state.get('backups', {}).get(key, {})
+            s.need(saved.get('verified') is True and saved.get('sha256') == digest,
+                   f'{key} matches the verified companion SHA-256 recorded with the boot_a backup')
         s.need(any(e.get('sha256') == now for e in s.boot['signed'].values()), 'selector replaces a known signed macOS boot_a')
         s.pair(now, esp, 'the boot_a being replaced remains compatible for rollback')
     s.require_backup('boot_a', now if s.execute else None)
     s.require_backup('boot_b')
     s.fetch('boot.img', image, signed or '<signed sha256>')
+    if selector and s.execute:
+        # Keep the selector recovery gate even if the partition write or read-back is interrupted.
+        s.save(selector_write_sha256=signed)
     if s.write(f'{image.name} -> /dev/{boot_a} ({common.BOOT_PARTITION_BYTES} bytes)'):
         s.t('write', 'boot.img', boot_a, 0, MiB, timeout=600)
     got = s.region_sha(boot_a, 0, s.sizes['boot_a'] // MiB, MiB, name='boot_a-check')
@@ -2263,15 +2277,23 @@ def boot_a_back(s):
     """boot_a as backed up (the verified backup boot_a of this backup set: Ubuntu's 389d4271 when the install started, the
     image of before in a later set), read back. Refused while the ESP on the tablet asks for a RAM window the backup's DarwinBoot
     does not take: rollback esp-final first (the pair rule)."""
+    selector = bool(s.state.get('selector_write_sha256'))
+    if selector:
+        require_abl_check(s)
     boot_a = map_boot_a(s)
     entry = s.state.get('backups', {}).get('boot_a') or {}
     if entry.get('sha256'):
         check_boot_image_pair(s, entry['sha256'], f'the boot_a backup ({s.boot_identity(entry["sha256"])[0]}) with the ESP on the tablet',
-                              require_esp=s.execute and bool(s.ledger_esp()[1]))
+                              require_esp=selector)
+    if selector and s.execute:
+        for key in ('vendor_boot_a', 'init_boot_a'):
+            got = s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}')
+            saved = s.state['backups'].get(key, {}).get('sha256')
+            s.need(got == saved and saved is not None, f'{key} still matches the companion image backed up with boot_a')
     s.restore('boot_a', boot_a, 0, MiB)
     s.sim['boot_a'] = entry.get('sha256')
     if s.execute:
-        s.save(boot_a_written=None, boot_a_sha256=entry['sha256'])
+        s.save(boot_a_written=None, boot_a_sha256=entry['sha256'], selector_write_sha256=None)
 
 
 @step('esp-final', 'maintenance, WRITE partition 37 (daily-use ESP)', writes='LUN 0 LBA 71527424-71789567')
@@ -2532,7 +2554,8 @@ def slot_crc_back(s):
 @step('abl-final', 'ABL fastboot, read only')
 def abl_final(s):
     """Before the first boot from boot_a: slot A current, successful and bootable."""
-    for var, want in (('unlocked', 'yes'), ('current-slot', 'a'), ('slot-successful:a', 'yes'), ('slot-unbootable:a', 'no')):
+    for var, want in (('is-userspace', 'no'), ('unlocked', 'yes'), ('current-slot', 'a'),
+                      ('slot-successful:a', 'yes'), ('slot-unbootable:a', 'no')):
         out = s.fastboot('getvar', var, check=False)
         m = re.search(rf'{re.escape(var)}:\s*(\S+)', out or '')
         s.need((m and m.group(1)) == want if s.execute else None, f'{var} = {want}')

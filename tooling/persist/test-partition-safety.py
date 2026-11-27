@@ -12,7 +12,7 @@ import uuid
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import common
 import installed_boot_identity as identity
@@ -41,6 +41,19 @@ class BootMenuCompatibility(unittest.TestCase):
                   'unixnu_toml': '[[entry]]\nid = "test"\ntype = "action"\naction = "reset"\n'}
         with tempfile.TemporaryDirectory() as tmp, patch.object(maint, 'OUT', Path(tmp)):
             self.assertEqual(maint.entries_using_rootfs(SimpleNamespace(execute=False), record), {})
+
+    def test_maintenance_uses_adt_from_default_xnu_entry_in_fat_image(self):
+        session = maint.Session.__new__(maint.Session)
+        session.windows = {}
+        files = {'EFI/UniXNU/unixnu.toml': b'[boot]\ndefault = "daily"\n[[entry]]\nid = "daily"\n'
+                 b'type = "xnu"\npath = "Payloads/k273/kernel.macho"\n',
+                 'EFI/UniXNU/Payloads/k273/kernel.macho.adt': b'daily ADT', 'EFI/UniXNU/Payloads/kernel.macho.adt': b'legacy ADT'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(maint, 'OUT', Path(tmp)):
+            (Path(tmp) / 'fixture.img').touch()
+            with (patch.object(common, 'fat32_read', return_value={'files': files}),
+                  patch.object(common, 'adt_ram_window', return_value=13956546560) as window):
+                self.assertEqual(session.esp_window({'image': 'fixture.img', 'sha256': 'fixture'}), 13956546560)
+                window.assert_called_once_with(b'daily ADT')
 
 
 def sha(data):
@@ -224,6 +237,9 @@ class SelectorWriteSafety(unittest.TestCase):
         self.addCleanup(mapped.stop)
         self.record_backup('boot_a', self.old, 0)
         self.record_backup('boot_b', bytes(4096), 0)
+        for key, digest in (('vendor_boot_a', common.ANDROID_VENDOR_BOOT_SHA256),
+                            ('init_boot_a', common.ANDROID_INIT_BOOT_MAGISK_SHA256)):
+            self.s.state['backups'][key] = {'file': key + '.img', 'sha256': digest, 'verified': True}
         self.s.write_manifest(self.nas, self.s.state['backups'])
         self.s.region_sha.side_effect = [sha(self.old), common.ANDROID_VENDOR_BOOT_SHA256, common.ANDROID_INIT_BOOT_MAGISK_SHA256,
                                          self.digest]
@@ -257,12 +273,14 @@ class SelectorWriteSafety(unittest.TestCase):
         maint.boot_a_step(self.s)
         self.s.t.assert_any_call('write', 'boot.img', 'sde13', 0, maint.MiB, timeout=600)
         self.assertEqual([c.args[0] for c in self.s.t.call_args_list], ['write', 'peek'])
-        self.s.save.assert_called_once_with(boot_a_written=self.digest)
+        self.assertEqual(self.s.save.call_args_list, [call(selector_write_sha256=self.digest),
+                                                     call(boot_a_written=self.digest)])
         self.s.save.reset_mock()
-        self.s.region_sha.side_effect = [sha(self.old), common.ANDROID_VENDOR_BOOT_SHA256, common.ANDROID_INIT_BOOT_SHA256, sha(b'bad')]
+        self.s.region_sha.side_effect = [sha(self.old), common.ANDROID_VENDOR_BOOT_SHA256,
+                                         common.ANDROID_INIT_BOOT_MAGISK_SHA256, sha(b'bad')]
         with self.assertRaisesRegex(maint.Stop, 'boot_a read back'):
             maint.boot_a_step(self.s)
-        self.s.save.assert_not_called()
+        self.s.save.assert_called_once_with(selector_write_sha256=self.digest)
 
     def test_rollback_refuses_wrong_or_mounted_partition(self):
         for mapped in ({'boot_a': 'sde13 618800 196607', 'mounted': '0'}, {'boot_a': 'sde13 618800 196608', 'mounted': '1'}):
