@@ -38,15 +38,24 @@ jobs:
       - name: Disk space before
         run: df -h / /System/Volumes/Data | sed -n '1,4p'
 
-      - name: Free disk space (hosted image extras; keeps the selected Xcode and its SDKs)
+      - name: Free disk space (simulator runtimes only: Xcode, its SDKs and the toolchains stay)
         run: |
           set -u
-          sudo rm -rf /Applications/Xcode_16*.app /Users/runner/Library/Android /Users/runner/Library/Developer/CoreSimulator/Devices \
-            /Library/Developer/CoreSimulator/Profiles/Runtimes /usr/local/share/dotnet /opt/hostedtoolcache \
-            /Users/runner/hostedtoolcache /usr/local/lib/node_modules 2>/dev/null || true
+          before=$(df -k /System/Volumes/Data | awk 'NR == 2 {print $4}')
+          # Simulators: the runtime images (many GB each), the device sets and caches. The iPhoneOS/macOS SDKs under
+          # Xcode.app/Contents/Developer/Platforms/*/Developer/SDKs and every Xcode install are NOT touched.
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes \
+            /Library/Developer/CoreSimulator/Volumes /Library/Developer/CoreSimulator/Caches /Library/Developer/CoreSimulator/Devices \
+            /Users/runner/Library/Developer/CoreSimulator/Devices /Users/runner/Library/Developer/CoreSimulator/Caches \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/*.platform/Library/Developer/CoreSimulator/Profiles/Runtimes \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/*.platform/Developer/Library/CoreSimulator/Profiles/Runtimes \
+            /Users/runner/Library/Android /usr/local/share/dotnet /opt/hostedtoolcache /Users/runner/hostedtoolcache 2>/dev/null || true
+          # keep every Xcode and its SDKs; report what is left
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          ls "$(xcrun --sdk iphoneos --show-sdk-path)" > /dev/null 2>&1 && echo "iphoneos SDK ok" || echo "::error::iphoneos SDK missing"
+          after=$(df -k /System/Volumes/Data | awk 'NR == 2 {print $4}')
+          echo "free before: $((before / 1048576)) GiB, after: $((after / 1048576)) GiB"
           df -h / /System/Volumes/Data | sed -n '1,4p'
-          xcodebuild -version
-
       - name: Host tools
         run: |
           brew install gnu-sed mtools dtc zstd nasm mtoc acpica 2>&1 | tail -2
