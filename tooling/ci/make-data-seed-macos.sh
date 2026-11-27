@@ -57,7 +57,7 @@ newfs_apfs -v Data "$DATA_DEV" > /dev/null
 # physical store we just formatted, instead of guessing <device>s1 (guessing mounted the runner root disk in smoke run 4).
 DATA_VOL_IDS=$(diskutil apfs list -plist | plutil -convert json -o - - | python3 -c '
 import json, sys
-want = sys.argv[1]
+want = sys.argv[1].replace("/dev/", "")   # diskutil names devices without the /dev/ prefix
 data = json.load(sys.stdin)
 for container in data.get("Containers", []):
     stores = [s.get("DeviceIdentifier", "") for s in container.get("PhysicalStores", [])]
