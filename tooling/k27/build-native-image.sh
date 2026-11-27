@@ -61,7 +61,11 @@ for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
   case $k in PianoUsbHostStack|PianoUsbHostStackA2) continue ;; esac   # codeless (a plist entry only): nothing to build
   case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoIR) b=piano-ir ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; PianoXhciHost) b=piano-xhcihost ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
-  tooling/k27/build-native-$b.sh > "out/k27/build-native-$b.log" 2>&1 || { tail -20 "out/k27/build-native-$b.log" >&2; exit 1; }
+  if [ "${PIANO_OBJECTS_ONLY:-0}" = 1 ] && ls out/native-kexts/"$k"/*.o > /dev/null 2>&1; then
+    echo "$k: objects already there (PIANO_OBJECTS_ONLY=1)" >&2   # a host without the Xcode toolchain (CI split)
+  else
+    tooling/k27/build-native-$b.sh > "out/k27/build-native-$b.log" 2>&1 || { tail -20 "out/k27/build-native-$b.log" >&2; exit 1; }
+  fi
 done
 # PIANO_STOP_AFTER=kexts: the kexts' objects only (out/native-kexts; CI's tooling/ci/build-kexts.sh), no collection, ADT or image.
 if [ "${PIANO_STOP_AFTER:-}" = kexts ]; then echo "kexts built (out/native-kexts), PIANO_STOP_AFTER=kexts"; exit 0; fi
