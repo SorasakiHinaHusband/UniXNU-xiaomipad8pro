@@ -169,6 +169,25 @@ jobs:
         run: bash tooling/repro/fetch-and-build.sh inputs
         timeout-minutes: 120
 
+      - name: Probe the display sources (a VM kernelcache in the IPSW, AppleParavirtDisplay on the OS volume)
+        run: |
+          set -uo pipefail
+          I=out/inputs/k273/26C5035r
+          echo "== IPSW members that look like another kernelcache"
+          python3 tooling/k273/ipsw-members.py list 2>&1 | grep -i kernelcache || echo "none listed"
+          echo "== OS volume: paravirt kexts"
+          ATT=$(hdiutil attach -nobrowse -readonly "$I/141-22233-021.dmg" 2>&1) || { echo "attach failed: $ATT"; exit 0; }
+          echo "$ATT"
+          MP=$(printf "%s\n" "$ATT" | awk '/Apple_APFS/ {print $NF; exit}')
+          if [ -n "$MP" ] && [ -d "$MP/System/Library/Extensions" ]; then
+            ls "$MP/System/Library/Extensions" | grep -i paravirt || echo "no paravirt kext under Extensions"
+            ls -la "$MP/System/Library/Extensions/AppleParavirtDisplay.kext/Contents/MacOS" 2>/dev/null || true
+            find "$MP/System/Library" -maxdepth 3 -iname "*Paravirt*" 2>/dev/null | head -20 || true
+          else
+            echo "no System/Library/Extensions on the mounted volume"
+          fi
+          [ -n "$MP" ] && hdiutil detach "$MP" -force > /dev/null 2>&1 || true
+          true
       - name: SystemOS (sudo; the SystemOS and App cryptexes, the boot shims)
         env:
           PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
