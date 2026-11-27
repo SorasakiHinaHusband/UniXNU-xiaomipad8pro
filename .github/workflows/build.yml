@@ -106,10 +106,13 @@ jobs:
       - name: Kexts (the kernelcache member only, deleted afterwards)
         run: |
           SDK_KH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers"
+          echo "=== SDK check ==="
+          ls -la "$SDK_KH/IOKit/storage/IOBlockStorageDevice.h" || true
           for base in "$WORK/k27-tree/out/x12377/fakeroot" "$WORK/k27-tree/out/k27/kdk-notb"; do
-            mkdir -p "$base/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/IOKit"
-            ln -sfn Versions/A/Headers "$base/System/Library/Frameworks/Kernel.framework/Headers"
-            cp -Rn "$SDK_KH/IOKit/storage" "$base/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/IOKit/" 2>/dev/null || true
+            for hdir in "Headers" "Versions/A/Headers"; do
+              mkdir -p "$base/System/Library/Frameworks/Kernel.framework/$hdir/IOKit"
+              cp -RLn "$SDK_KH/IOKit/storage" "$base/System/Library/Frameworks/Kernel.framework/$hdir/IOKit/" 2>/dev/null || true
+            done
           done
           bash tooling/ci/build-kexts.sh
       - name: Nothing of Apple's in the outputs
