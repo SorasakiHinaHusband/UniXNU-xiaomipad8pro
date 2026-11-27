@@ -170,6 +170,8 @@ jobs:
         timeout-minutes: 120
 
       - name: SystemOS (sudo; the SystemOS and App cryptexes, the boot shims)
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
         run: |
           df -h /
           bash tooling/repro/fetch-and-build.sh systemos
