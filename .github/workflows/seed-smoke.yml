@@ -1,0 +1,59 @@
+# A 6-minute smoke test of tooling/ci/make-data-seed-macos.sh without the 14 GiB IPSW fetch: the APFS image, the template copy, the
+# macOS firmlink skeleton and DarwinBoot's packed_ramdisk.py on a synthetic /System/Library/Templates/Data. It says nothing about a
+# real boot; the image workflow runs the same script against the real OS volume.
+name: seed-smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: Data seed recipe
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: DarwinBoot (packed_ramdisk.py, pinned)
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
+        run: python3 scripts/fetch-pins.py --only DarwinBoot
+
+      - name: A synthetic template and the recipe
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
+        run: |
+          set -uo pipefail
+          T=$RUNNER_TEMP/fake-template
+          rm -rf "$T"; mkdir -p "$T/private/var/log" "$T/private/var/db" "$T/Library/Apple" "$T/Users" "$T/Applications"
+          echo "log" > "$T/private/var/log/seed-smoke.log"
+          echo "apple" > "$T/Library/Apple/probe.txt"
+          echo "user" > "$T/Users/probe.txt"
+          df -h /
+          PACKED_RAMDISK="$UNIXNU_RESEARCH/DarwinBoot/Test/packed_ramdisk.py" SEED_TEMPLATE_DIR="$T" \
+            bash tooling/ci/make-data-seed-macos.sh /dev/null "$RUNNER_TEMP/seed-out" 256 2>&1 | tee "$RUNNER_TEMP/seed.log"
+          echo "== result"
+          ls -la "$RUNNER_TEMP/seed-out" || true
+          head -c 16 "$RUNNER_TEMP/seed-out/scratch-data.img" | od -c | head -2 || true
+          df -h /
+
+      - name: The seed is a packed RAM disk
+        run: |
+          f="$RUNNER_TEMP/seed-out/scratch-data.img"
+          [ -f "$f" ] || { echo "::error::no seed"; exit 1; }
+          magic=$(head -c 8 "$f")
+          echo "magic: $magic  bytes: $(wc -c < "$f")"
+          [ "$magic" = "DBRDISK1" ] || { echo "::error::not a DBRDISK1 container"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: seed-smoke
+          path: |
+            ${{ runner.temp }}/seed.log
+            ${{ runner.temp }}/seed-out
+          if-no-files-found: warn
+          retention-days: 7
