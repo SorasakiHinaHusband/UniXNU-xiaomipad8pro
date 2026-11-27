@@ -47,8 +47,9 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes \
             /Library/Developer/CoreSimulator/Volumes /Library/Developer/CoreSimulator/Caches /Library/Developer/CoreSimulator/Devices \
             /Users/runner/Library/Developer/CoreSimulator/Devices /Users/runner/Library/Developer/CoreSimulator/Caches \
-            /Applications/Xcode*.app/Contents/Developer/Platforms/*.platform/Library/Developer/CoreSimulator/Profiles/Runtimes \
-            /Applications/Xcode*.app/Contents/Developer/Platforms/*.platform/Developer/Library/CoreSimulator/Profiles/Runtimes \
+            # Xcode's own platform runtime profiles stay: removing them wedges xcodebuild on this image (the fakeroot
+            # stage's libdispatch build stopped responding for 29 minutes in run 3), and the space they hold is small
+            # next to /Library/Developer/CoreSimulator.
             /Users/runner/Library/Android /usr/local/share/dotnet /opt/hostedtoolcache /Users/runner/hostedtoolcache 2>/dev/null || true
           # keep every Xcode and its SDKs; report what is left
           ls -d /Applications/Xcode*.app 2>/dev/null || true
@@ -93,8 +94,14 @@ jobs:
           OUT: ${{ runner.temp }}/ci/out
         run: |
           set -eo pipefail
+          sudo xcodebuild -license accept 2>/dev/null || true
+          sudo xcodebuild -runFirstLaunch 2>/dev/null || true
+          xcodebuild -version; xcrun --sdk iphoneos --show-sdk-path
           date -u
-          bash tooling/ci/k27-kernel.sh fakeroot
+          # bash -x into a log: if this stage ever stalls again, the last line names the command that stalled
+          bash -x tooling/ci/k27-kernel.sh fakeroot > "$RUNNER_TEMP/fakeroot.log" 2>&1 \
+            || { echo "::error::fakeroot failed"; tail -60 "$RUNNER_TEMP/fakeroot.log"; exit 1; }
+          tail -5 "$RUNNER_TEMP/fakeroot.log"
           date -u
           bash tooling/ci/k27-kernel.sh platform kernel
           date -u; df -h /
