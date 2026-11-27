@@ -52,10 +52,13 @@ def modules_of(bundle):
 def main():
     if len(sys.argv) != 6:
         sys.exit(__doc__)
-    base = modules_of(Path(sys.argv[1]).read_bytes())
-    if len(base) < 3:
+    # BASE_BUNDLE may be absent: a build host that never had the 27.0.1 line then starts with no own modules and the bundle is
+    # the 27.3 IPSW's three trust caches alone (docs/k273-line.md, G2's second option). The staging tools still put theirs in front.
+    base_path = Path(sys.argv[1])
+    base = modules_of(base_path.read_bytes()) if base_path.is_file() else []
+    if base and len(base) < 3:
         sys.exit('the base bundle has fewer than three modules')
-    own = base[:-3]
+    own = base[:-3] if base else []
     ipsw = [im4p_module(p) for p in sys.argv[2:5]]
     modules = own + ipsw
     offsets, cursor = [], 4 + 4 * len(modules)
