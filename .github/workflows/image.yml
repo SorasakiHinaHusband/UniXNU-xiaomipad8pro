@@ -1,0 +1,150 @@
+# The 27.3 line's RAM images from a GitHub-hosted runner: tooling/repro/fetch-and-build.sh's chain (host, inputs, systemos,
+# root, kernel, fd, image), with the kernel/tree built by tooling/ci/k27-kernel.sh first (Known gap G1) and the kexts by
+# tooling/ci/build-kexts.sh. What a hosted runner cannot supply is said per step and never silently skipped: the two the
+# install skill calls G2 (the 27.0.1 base trust bundle) and G3 (a Data seed) are private to the owner, so the root step is
+# allowed to fail (continue-on-error) and the image step is attempted only if the root image exists.
+#
+# Artifacts: out/ram (the RAM images and their build record), out/fd (the UEFI FD and its hash), out/inputs/k273/root/root.json
+# and the logs. Nothing of Apple's but the IPSW's members' hashes is uploaded: no IPSW member, no Apple payload, no seed.
+name: image
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: fetch-and-build.sh steps to run (default the whole chain)
+        type: string
+        default: host inputs systemos root kernel fd image
+
+permissions:
+  contents: read
+
+env:
+  JOBS: '6'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  KDK_URL: ${{ vars.PIANO_KDK_URL }}
+  SUDO: sudo
+  REMOVE_AEA: '1'
+
+jobs:
+  image:
+    name: RAM images
+    runs-on: macos-26
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disk space before
+        run: df -h / /System/Volumes/Data | sed -n '1,4p'
+
+      - name: Free disk space (hosted image extras; keeps the selected Xcode and its SDKs)
+        run: |
+          set -u
+          sudo rm -rf /Applications/Xcode_16*.app /Users/runner/Library/Android /Users/runner/Library/Developer/CoreSimulator/Devices \
+            /Library/Developer/CoreSimulator/Profiles/Runtimes /usr/local/share/dotnet /opt/hostedtoolcache \
+            /Users/runner/hostedtoolcache /usr/local/lib/node_modules 2>/dev/null || true
+          df -h / /System/Volumes/Data | sed -n '1,4p'
+          xcodebuild -version
+
+      - name: Host tools
+        run: |
+          brew install gnu-sed mtools dtc zstd nasm mtoc acpica 2>&1 | tail -2
+          brew install blacktop/tap/ipsw 2>&1 | tail -2 || true
+          echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
+          command -v ipsw aea dtc mtools || true
+
+      - name: Kernel, its collection base and our kexts (the k27 tree; Known gap G1)
+        env:
+          WORK: ${{ runner.temp }}/ci
+          OUT: ${{ runner.temp }}/ci/out
+        run: |
+          set -eo pipefail
+          mkdir -p "$WORK" "$OUT"
+          bash tooling/ci/k27-kernel.sh tree xnu ld
+          [ -n "$KDK_URL" ] && { curl -fL --retry 3 -o "$RUNNER_TEMP/kdk.dmg" "$KDK_URL"; KDK_DMG="$RUNNER_TEMP/kdk.dmg" bash tooling/ci/k27-kernel.sh kdk; rm -f "$RUNNER_TEMP/kdk.dmg"; } \
+            || echo "::warning::no KDK (vars.PIANO_KDK_URL): the kernel build will stop at fakeroot's installhdrs"
+          bash tooling/ci/k27-kernel.sh fakeroot platform kernel
+          df -h /
+
+      - name: Kexts (per-kext; the status file names what a hosted runner cannot build)
+        env:
+          WORK: ${{ runner.temp }}/ci
+          OUT: ${{ runner.temp }}/ci/out
+        continue-on-error: true
+        run: bash tooling/ci/build-kexts.sh
+
+      - name: The Ubuntu v1.1.0 maintenance image (the boot DT's source; pinned)
+        run: |
+          set -eo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/boot.zip" \
+            https://github.com/yzddmr6/xiaomipad-8pro-mainline/releases/download/v1.1.0/piano-ubuntu-v1.1.0-boot.zip
+          mkdir -p "$RUNNER_TEMP/maint" && unzip -o -q "$RUNNER_TEMP/boot.zip" -d "$RUNNER_TEMP/maint"
+          find "$RUNNER_TEMP/maint" -name 'boot-ram-maintenance.img' -print -exec ls -l {} \;
+          echo "MAINT_IMG=$(find "$RUNNER_TEMP/maint" -name 'boot-ram-maintenance.img' | head -1)" >> "$GITHUB_ENV"
+
+      - name: Inputs (the IPSW's members from Apple's CDN, the boot DT)
+        env:
+          PIANO_V110: ${{ runner.temp }}/maint
+        run: bash tooling/repro/fetch-and-build.sh inputs
+        timeout-minutes: 120
+
+      - name: SystemOS (sudo; the SystemOS and App cryptexes, the boot shims)
+        run: |
+          df -h /
+          bash tooling/repro/fetch-and-build.sh systemos
+        timeout-minutes: 90
+
+      - name: Root image (needs the owner's G2 trust bundle and G3 Data seed)
+        continue-on-error: true
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
+        run: bash tooling/repro/fetch-and-build.sh root
+        timeout-minutes: 90
+
+      - name: Kernel relinked at the 27.3 collection's addresses
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
+        run: bash tooling/repro/fetch-and-build.sh kernel
+
+      - name: FD (UEFI)
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
+        run: |
+          python3 scripts/fetch-pins.py --only UniXNU,UniXNU-sm8750-common,Mu-Silicium,Device-Binaries,piano-uefi,uefi-sheng,DarwinBoot,ArmCpu,ArmDTPlatform,GopFramebuffer,RamBlock,XnuPrelink,AppleKeyStoreState
+          bash tooling/firmware/build-fd.sh
+
+      - name: RAM images (only when the root image exists)
+        id: image
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
+        run: |
+          if [ -f out/inputs/k273/root/root.json ]; then
+            bash tooling/repro/fetch-and-build.sh image
+            python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
+          else
+            echo "::error::no root image (out/inputs/k273/root/root.json): the Root image step above needs G2/G3, see docs/ci.md"
+            exit 1
+          fi
+
+      - name: Logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          find out -name '*.log' -size -8M -exec cp --parents {} "$RUNNER_TEMP/logs/" \; 2>/dev/null || \
+            find out -name '*.log' -size -8M | while read -r f; do mkdir -p "$RUNNER_TEMP/logs/$(dirname "$f")"; cp "$f" "$RUNNER_TEMP/logs/$f"; done
+          cp "${{ runner.temp }}/ci/kexts-status.txt" "$RUNNER_TEMP/logs/" 2>/dev/null || true
+          df -h / > "$RUNNER_TEMP/logs/df.txt"
+          ls -la out out/ram out/fd 2>/dev/null >> "$RUNNER_TEMP/logs/df.txt" || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: piano-image
+          path: |
+            ${{ runner.temp }}/logs
+            out/ram
+            out/fd
+            out/inputs/k273/root/root.json
+          if-no-files-found: warn
+          retention-days: 14
