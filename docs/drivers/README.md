@@ -58,7 +58,8 @@ with Night Shift routing and native panel sleep off. Display, EFI memory, batter
   [WCN7860 Wi-Fi / Bluetooth coexistence](wifi-bt-coex.md), [USB debug network TX flow control](usb-net-reset.md)
   and [USB host2 integration and Phase U qualification](usb-host2-qualification.md).
 - **Sensors and power.** [Auto-rotate](auto-rotate.md), [charging over the buck path](charging-buck-session.md),
-  [Android-reference brightness and CPU ceiling](android-reference-controls.md) and [PMK8550 power-on history](pon-history.md).
+  [Android-reference brightness and CPU ceiling](android-reference-controls.md), [PMK8550 power-on history](pon-history.md) and
+  [27.3 BH-2 powerd storage analysis](power-bh2-powerd-analysis.md) (storage fix-image gate HOLD).
 
 ## Common template
 

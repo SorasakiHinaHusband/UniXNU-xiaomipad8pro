@@ -1,0 +1,239 @@
+# BH-2: macOS 27.3 powerd storage contract
+
+**OWNER-0748(b), 2026-11-27. Host analysis and opt-in publisher port only;
+storage fix and fix-image gate HOLD.** The saved `v131y12t-qual1` capture proves
+a persistent-write failure after pack discovery. It does **not** preserve the
+selected-backend log or the underlying IOKit property-write result. The exact
+error-producing conditions in powerd are identified below; choosing one kernel
+root cause or claiming a persistence fix from this evidence would be unjustified.
+
+Both `piano-power-ps-fields` and `piano-power-ps-health` remain default **0**.
+The latter requires `piano-power-ps=1 piano-power-ps-fields=1`. The 80/75% charge
+hold, fixed-PD policy and Charge Pump / MiPPS defaults are unchanged. No device
+operation, image build, installation or remote push was performed for this work.
+
+## Sources and address convention
+
+These are independently written engineering notes, without copied instruction
+bytes, binary payloads or runtime identity data. The local read-only inputs are
+the supplied powerd disassembly, strings, symbol table and executable; the decoded
+27.3 shared cache; the prior `batt-fields2` commits; and the saved qualification
+logs. Input locations and extracted artifacts stay outside this repository.
+
+`ipsw macho info --arch arm64e` reports minimum OS/SDK **27.3**, source version
+**2043.60.6**, Mach-O UUID `29CB19CD-F120-31A5-A527-31D9529512E9` for powerd.
+The supplied universal executable SHA-256 is
+`045e9090396eeebb64e37b71f220c74d51d661fef3f072a14264519856685105`.
+The shared cache is the supplied `26C5035r` input. These identifiers establish
+the local analysis inputs, not an independent hash of the running tablet's file.
+
+Powerd addresses below are **unslid arm64e virtual addresses**; subtract
+`0x100000000` for image-relative offsets. Thus `0x100001ef0` is offset `+0x1ef0`.
+Shared-cache IOKit addresses are unslid cache VAs. Reporter addresses are offsets
+in the previously extracted 27.3 `SPPowerReporter` arm64e image. Its SHA-256 is
+`c3f95a2ffb187599494fb9ae42d2bc585bc74ec0e0c8af1de98bd5bccbf144f7`.
+
+The prior changes inspected were `96545f31`, `01a2606e`, `ad563440`, `3aa4cfbc`,
+`6fa1e3fd`, `bb30ebb4` and `211e9e98`, together with their field-publisher
+prerequisites `387747d1` and `429e8e67`. Only the relevant source and tests were
+ported; previous analysis documents containing local paths were not copied.
+
+## Saved failure evidence
+
+| Saved reference | Sanitized observation | Consequence |
+|---|---|---|
+| `bf-grade.txt`, `bf-pack.txt` | Exactly one registered `AppleSmartBatteryPack`, ID 0, FeatureFlags 1024; nested identity present; full/raw/nominal 8781 mAh, design 9200 mAh, cycles 122 | The earlier missing class/dictionary explanation no longer explains this failure. |
+| `bf-grade.txt`, `bf-ioreg.txt` | Source MaxCapacity 100, CurrentCapacity 56; charge stop/resume 80/75, limit enabled | Pack absolute capacity and source normalized percentage have distinct contracts. |
+| `bf-spp.txt` | Cycle Count 122; Condition Service Recommended; Maximum Capacity absent | Complete input telemetry did not establish healthy IOPS output. |
+| `bh-powerd.txt` | Validation of absent stored identity returns status 0; new pack health data created; write then fails with `0xe00002ca`; update/evaluation report the same status repeatedly | Cold initialization reaches the persistent writer. A null **stored** identity is not evidence that BatteryData identity is missing. |
+| `console.out:44–48` | NVRAM bank size 8192; CHRP common partition size `0x800`; no system partition | Finite proxy capacity is relevant, but the failing JSON's serialized size and remaining capacity were not captured. |
+| `console.out:1130–1138` | No NVRAM controller; synchronization returns `0xe00002d8` | Durable NVRAM storage is missing. This sync failure alone cannot explain the observed write error, because powerd ignores sync's return. |
+
+The saved health log has no `batteryHealthStoragePersistent` messages naming
+the selected storage type and no raw `IORegistryEntrySetCFProperty` result.
+The kernel console does not identify the failed battery-health write's size,
+permission decision, or return code. These absences bound the diagnosis.
+
+## End-to-end path table
+
+`ours-OK` means implemented in the carried opt-in publisher, established by saved
+evidence, or covered by the explicitly bounded host replay. It does not mean a
+new RAM qualification passed. `ours-missing` identifies a demonstrated missing
+capability. `unknown` identifies a missing observation or an unqualified path.
+
+| Stage / check | Address or implementation | Status | Contract / evidence |
+|---|---|---|---|
+| Opt-in prerequisites | `PianoPower.cpp`, `readArgs` / `publishBattery` | ours-OK | Both arguments default 0; health requires fields and power source. No settings in a daily profile are enabled. |
+| Measured fields | `Gauge.h`, `BatteryMap.h`, `BatteryHealthData.h` | ours-OK | Both gauges, valid cycles and design/full; partial/sentinel input withholds a new pack and retains the last complete health sample. |
+| Singleton construction | `BatteryHealthSingleton shared` `0x10000f888`; `sharedSet:` `0x10000f900` | ours-OK | Associated-object singleton; sharedSet requires a non-null object and no previous instance. This is a userspace helper, not a required kernel service. |
+| Persistent protocol | `BHPersistentStorageProtocol` Objective-C metadata | ours-OK | Required selectors are `dataCopyForPack:outData:` and `dataWrite:forPack:`. The published pack is not an implementation of this Objective-C protocol. |
+| Persistent singleton | `sharedStorage` `0x100001b90`; `init` `0x100001c14` | ours-OK | Dispatch-once allocation, persistent log category; Mac storage initialization constructs the namespaced NVRAM key. |
+| Pack count | `0x1000169a0–0x1000169c4` | ours-OK | Missing BatteryPackCount defaults to one logical pack. |
+| Pack matching | `0x100016e40–0x100017050` | ours-OK | Match service **class** AppleSmartBatteryPack; numeric ID must equal pack index. Saved run has one, ID 0. |
+| Pack telemetry | `0x1000170c0–0x10001724c` | ours-OK | BatteryData dictionary; string Serial inside it; RemainingCapacity, MaxCapacity, DesignCapacity, Voltage, AverageCurrent, CycleCount, NominalChargeCapacity. Capacities are absolute mAh. |
+| Metric selection | `0x100017928–0x100017a18`, `0x10001a00c–0x10001a190` | ours-OK | Service-level FeatureFlags bit 10 selects nominal/design on Mac. A similarly named nested flag does not. |
+| Update inputs | `0x100019104–0x1000191c4` | ours-OK | Positive AppleRawMaxCapacity and DesignCapacity, ratio in range; CycleCount present and not -1. MaxCapacity alone cannot supply the separate raw-full check. |
+| Authentication | `0x10001dfa8`; `PackAuthManager` `0x10002ab70–0x10002ac94` | unknown | Unsupported auth result 2 is accepted; supported failed auth has its own flags. Saved creation implies this initialization gate passed then; full auth behavior is not qualified. No Apple auth data is fabricated. |
+| Permanent failure | `0x1000176d4–0x1000176fc`, `0x10001e89c` | ours-OK | Read BatteryData PermanentFailureStatus; absent input clears cached value. A measured nonzero value sets flag `0x40000000`. Gauge fully-discharged is not PF. |
+| History validation/init | `0x10001e43c–0x10001e8d0`; init `0x10001eaa0` | ours-OK | Read per-pack stored identity; absent/mismatched history needs initialization, valid telemetry and accepted auth. Saved log reaches new-data creation. |
+| Internal write caller | `0x100015fd0–0x10001611c` | ours-OK | Validate pack dictionary and look up existing pack; call persistent singleton `dataWrite:forPack:`. Failure is logged and propagated, without a successful history publication. |
+| Per-pack root shape | `dataCopyForPack:outData:` `0x100002934`; `dataWrite:forPack:` `0x100002b74` | ours-OK | Root `BatteryPacks` dictionary indexed by decimal ID string; per-pack dictionary. Read accepts legacy flat root. Write replaces one record and preserves other packs. Host replay covers this contract. |
+| Backend selection | `storageTypeGet` `0x1000026dc`; predicate `0x10002a2c8` | unknown | Return `isMac XOR 1`; isMac compares MGCopyAnswer(DeviceClass) to Mac. Mac gives type 0 NVRAM; other/missing class gives type 1 CFPreferences. Runtime DeviceClass/type was not saved. |
+| Root dispatch | write `0x1000026f8`; copy `0x1000027e8` | ours-OK | Type 0 NVRAM, type 1 CFPreferences, type 2 Unsupported (`0xe00002c9`). No retry on the other backend after failure. |
+| NVRAM encoding | `rootDictNVRAMWrite:` `0x100001f6c`; copy `0x100002034` | ours-OK | Foundation JSON bytes in NSData; decoded root must be a dictionary. Successful writes/copies cache the root in process memory. Invalid JSON and wrong types have separate errors. |
+| NVRAM target | `init` `0x100001d0c–0x100001d58`; raw copy `0x100001de4`; raw write `0x100001e9c` | unknown | `IODeviceTree:/options`, key `40A0DDD2-77F8-4392-B4A3-1E7304206516:battery-health`. Existing proxy is proven; this operation's raw result is not. The UUID is a public variable namespace, not a unit identity. |
+| IOKit wrapper | cache `_IORegistryEntrySetCFProperty` `0x184eca620`; plural `0x184eca6a8` | ours-OK | Wrap one key/value in CFDictionary, IOCFSerialize, issue registry-set-properties MIG call; choose transport error if nonzero, otherwise return the kernel method's result. Does not itself map every error to IOError. |
+| Kernel property method | local XNU `IOUserClient.cpp`, `is_io_registry_entry_set_properties`; `IONVRAM.cpp`, `IODTNVRAM::setProperties` | unknown | Unserialize, MAC policy / allowable-property checks, then setProperties and per-key setter. The failed call's actual result was not captured. |
+| Kernel variable validation | `IODTNVRAM::setPropertyWithGUIDAndName` | unknown | Require initialized format; enforce variable permission, type, size; translate GUID, call format setVariable. Static candidates include NotPermitted/NotPrivileged/BadArgument/NoSpace/NotReady. The executable carries system-NVRAM allowance; runtime entitlement recognition was not measured. |
+| CHRP bounds | local XNU `IONVRAMCHRPHandler::setVariableInternal` | unknown | Encoded new variable size + used − old size must fit its partition. The observed 2048-byte common partition is a bound, not proof that this health record exceeded it. |
+| NVRAM synchronization | `0x100001f30–0x100001f4c`; CHRP `serializeVariables` | ours-missing | After successful property write, set string-valued IONVRAM-SYNCNOW-PROPERTY. Powerd ignores that return and reports success. Saved controller absence prevents durable sync. |
+| File-backed alternative | CFPreferences methods `0x1000021fc–0x1000026d8` | unknown | Domain com.apple.batteryhealthdata; current user/current host; explicit current container `/var/MobileSoftwareUpdate/Hardware/Battery/`; fallback legacy read and successful-write legacy cleanup. Selected only for type 1, not as a Mac NVRAM fallback. |
+| Volatile session | `BHStorageSession init` `0x100002f74`, get `0x1000030fc`, set `0x100003224` | ours-OK | batteryHealthStorageVolatile is a log category for an in-memory, locked dictionary keyed by pack/key. Session reset is not a durable backend or a persistent-write fallback. |
+| Persistent tester read | handler `0x100015430`; worker `0x1000155d8`; pack read `0x100015770` | ours-OK | Require batteryTester entitlement, use power-management queue, iterate actual packs, return XPC data / returnCode. Not called in these host tests. |
+| Persistent tester set/entries | handler `0x100016120`; worker `0x10001638c`; dispatch `0x100062cf4` | ours-OK | setBatteryHealthPersistentData dispatch reads setBatteryHealthPersistentDataEntries; require entitled caller and dictionary; merge entries into existing record, then use internal writer. Absent record returns NotReady. |
+| Persistent tester delete | handler `0x100015b10`; worker `0x100015db4`; dispatch `0x100062cb0` | ours-OK | deleteBatteryHealthPersistentData reads nonempty deleteBatteryHealthPersistentDataKeys array; validate every string/key before mutation; remove requested fields and rewrite through the same writer. Does not delete the NVRAM variable. |
+| Health/service evaluation | `0x100023ff8`, `0x10002441c` | ours-OK | Service state 0 is healthy, PF maps to state 8; invalid capacity flags can map to state 5. Private health normal is 0, distinct from legacy kernel IOPM Good=3. |
+| IOPS public/private output | `0x1000189dc–0x100018b64`; cache `_IOPSGetBatteryHealthState` `0x184ef9ff8` | ours-OK | Per-pack IOPSBatteryHealthState and Battery Service State; XPC getBatteryHealthState returns IOPSPrivateBatteryHealthState. These are outputs, not invented registry inputs. |
+| IOPS power-source health merge | `0x10001bf8c–0x10001c450` | unknown | Entitled power-source description merges persistent per-pack history into BatteryPacks[*].BatteryHealth. The saved failed writer never established the expected output. |
+| System Information | reporter `+0x1608–+0x1738` | unknown | First active pack's BatteryHealth; service state exactly 0 => Normal; missing/nonzero => Service Recommended. Nonnegative Maximum Capacity Percent => clamped percentage; missing/negative or service state 8 => em dash. Candidate runtime remains unqualified. |
+| Cross-boot persistence / UI / replacement | saved logs plus synthetic aggregate identity | ours-missing | No durable backend qualified; no successful UI result; synthetic logical identity cannot detect physical pack replacement. No previous history is cleared to hide this. |
+
+SMC is involved in other power/pack-management work, but neither branch of
+this persistent writer sends an SMC key write, opens AppleSmartBatteryPack as
+a storage user client, or calls pack `setProperties`. Adding storage-looking
+properties to the pack service cannot satisfy this writer. The actual Mac
+storage receiver is the options node.
+
+## Exact error conditions and root-cause boundary
+
+On the **NVRAM branch**, the failing path is:
+
+1. `0x10001e6d0` (new initialization) or `0x10001e8d0` (updated history)
+   calls `0x100015fd0`.
+2. `0x100016040` calls `dataWrite:forPack:`; `0x100002d9c` calls
+   `rootDictWrite:`; type 0 dispatches at `0x100002744` to rootDictNVRAMWrite.
+3. JSON encoding succeeds; `0x100001fbc` calls nvramRawDataWrite.
+4. The raw writer initializes its result to **`0xe00002ca` at
+   `0x100001eb4–0x100001eb8`**. It finds options and calls
+   **IORegistryEntrySetCFProperty at `0x100001ef0`**.
+5. **At `0x100001ef4`, a nonzero result takes the failure path and leaves
+   `0xe00002ca` unchanged.** The original result is discarded. It returns at
+   `0x100001f58`; wrappers propagate it to the saved Failed to write pack health
+   data log at `0x1000160bc–0x100016104`.
+
+If options lookup instead returns zero at `0x100001ee0`, the error is changed
+to **`0xe00002f0` (NotFound)** at `0x100001f04`. If the property write succeeds,
+the later sync call at `0x100001f40` is ignored and the result is zeroed at
+`0x100001f4c`. Therefore **controller absence cannot directly cause the saved
+`0xe00002ca` through this raw writer**. It is a separate, demonstrated durability
+gap. A controller alone is not an evidence-backed fix for the observed failure.
+
+On the **CFPreferences branch**, `0x100002774` selects rootDictCFPrefsWrite.
+At `0x10000253c`, `_CFPreferencesSynchronizeWithContainer` returning false
+selects `0xe00002bd + 0xd = 0xe00002ca` at `0x100002540–0x100002548`.
+This branch can produce **the identical saved code** without a NVRAM property
+write. The current log does not distinguish it. Assuming that an Apple-looking
+model name proves MG DeviceClass=Mac is insufficient.
+
+**Root cause established:** the new telemetry passes discovery/initial creation,
+but persistent-write success is a required dependency and fails. **Exact kernel
+leaf / backend: unknown.** The strongest conditional location is the masked
+NVRAM property failure above; the alternative CFPreferences synchronization
+failure must remain open until the backend is identified. No existing log proves
+partition exhaustion, missing entitlement, an immutable-variable policy, failed
+serialization, or a particular kernel setter return.
+
+The minimal additional evidence is the runtime DeviceClass/storage type and
+the failed operation's **raw** return (plus serialized length and partition usage
+if it is NoSpace), captured before powerd normalizes it. It could come from an
+existing more complete capture or a separately qualified diagnostic build.
+This task performs no new capture on the tablet. Do not disable entitlement
+checks, expand global NVRAM permissions, patch the daemon, select a false device
+class or fabricate UI fields to work around an unidentified error.
+
+## What Normal and Maximum Capacity require
+
+The source's numeric BatteryHealth=3 is the kernel IOPM quality enum. It is not
+the private health enum and does not select Normal in the 27.3 reporter. The
+reporter reads IOPS output, not a similarly named top-level registry property.
+
+For the saved healthy 122-cycle fixture, the Mac nominal metric path computes
+`ceil(100 * 8781 / 9200) = 96`. The initializer uses 104 below 21 cycles; later
+history can differ from the instantaneous ratio, and the UI clamps at 100.
+Updates require the separate raw-full field and can lower nominal history by
+one point after five further cycles. Authentication, service flags, valid
+identity, persistent write/readback and successful IOPS merge must also pass.
+PF status must remain truthful; it deliberately produces Service Recommended
+and hides maximum capacity. Absence of a measured PF value is not a fabricated
+Apple authentication or diagnostic result.
+
+The carried [publisher](../../package/PianoPower/BatteryHealthData.h) supplies
+measured pack inputs and FeatureFlags, and the
+[IOService adapter](../../package/PianoPower/PianoBattery.cpp) registers the pack
+before the source's discovery/update. It supplies no precomputed maximum or
+condition. This repairs the earlier input gap and reproduces the failed run's
+pack shape; **it does not repair the persistent backend**.
+
+## Host regression scope and validation
+
+[run-battery-health-host.sh](../../package/PianoPower/tests/run-battery-health-host.sh)
+runs both replays with **ASan and UBSan**:
+
+- [battery_health_host.cpp](../../package/PianoPower/tests/battery_health_host.cpp)
+  serializes the actual shared publisher schema through CF property lists;
+  checks class/ID, metric placement, all required capacities, cycles, PF,
+  signed current, transient invalid telemetry, numeric allocation failures and
+  off gates. Its healthy UI calculation explicitly assumes working storage.
+- [battery_storage_host.mm](../../package/PianoPower/tests/battery_storage_host.mm)
+  uses real Foundation JSON and disposable file storage with injected provider
+  errors. It checks cold reads, legacy shape, malformed JSON/type rejection,
+  full replacement, entry merge, other-pack preservation, decimal ID boundaries,
+  delete validation before mutation, empty records, exact size-boundary behavior,
+  failed-write cache preservation, new-instance reads and simulated reboot.
+  Permission/space/not-ready/unsupported/allocation failures all reproduce the
+  same normalized IOError. It also proves that an ignored sync failure can
+  return success while losing data on reboot, and that a CFPreferences sync
+  failure can yield the same error as the NVRAM branch.
+
+The provider limit is a test parameter, not an invented powerd JSON bound.
+The decimal ID boundary test covers internal key formatting; it does not claim
+UINT32_MAX is a real pack. The actual caller looks up a known pack before using
+its pointer, and the kernel independently bounds its serialized IOKit message.
+Delete removes fields inside stored JSON; generic deletion of the battery-health
+NVRAM variable is forbidden by XNU's variable policy. Tester XPC calls require
+`com.apple.private.iokit.batteryTester` and are not executed by these tests.
+
+These are clean-room **contract models**, not execution of Apple powerd,
+IODTNVRAM, MAC policy, the real CFPreferences container, or System Information.
+Temporary files prove the replay provider can persist, not that the product
+has a persistent backend. No test success is a RAM/UI qualification.
+
+Required validation results are recorded after the final host run below.
+
+## Fix-image gate
+
+**Status: HOLD — no root-cause storage fix or fix image.**
+
+**Path:** Measured gauges → opt-in source/pack ID 0 → powerd history init/update
+→ dataWrite:forPack → rootDictWrite → selected persistent backend → readback
+→ BatteryPacks[0].BatteryHealth → System Information.
+
+**Checks:** Pack shape passed in the saved run; host schema/JSON/error regressions
+are available. Storage backend selection, raw failed-operation return, actual
+successful write/readback, durable reboot history, Normal condition and populated
+maximum are **not qualified**. Preserve MaxCapacity=100, percentage, charging/AC
+state, 80/75 hold and unknown time on AC idle/full/hold. Recheck transient partial
+telemetry and truthful faults. Do not clear history to obtain 96%.
+
+**Root cause:** Persistent write dependency fails with normalized `0xe00002ca`.
+Exact NVRAM setter failure versus CFPreferences synchronize failure remains
+unknown because the saved log lacks backend/raw-result evidence. NVRAM
+controller absence is independently proven, but its ignored sync error does
+not explain this code. A unique production fix cannot yet be selected.
+
+**ONE change:** **Not selected; HOLD.** The carried default-off publisher is a
+prerequisite port, not a new fix for this failure. No speculative storage change
+is committed. Identify the backend and raw failure first, then specify exactly
+one corresponding storage repair and its bounds/error/durability checks before
+building a fix image. Both opt-ins remain 0 until a later RAM-qualified result;
+rollback is omission/0. This analysis authorizes no new device operation.

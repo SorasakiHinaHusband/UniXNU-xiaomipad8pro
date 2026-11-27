@@ -12,7 +12,9 @@
   November 27 opt-in **BH-2** check on RAM `v131y12t-qual1` published `AppleSmartBatteryPack`, and `powerd` returned
   `0xe00002ca` (`kIOReturnIOError`) writing `BHPersistentStorage`. **Owner decision (2026-11-27, `OWNER-0748`):**
   host-side disassembly analysis of Apple 27.3 `powerd` is APPROVED (analysis only; never commit Apple binaries) to
-  fix the battery health storage write. [November 26 battery results](../results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM results](../results-2026-11-27.md#ram-qualification)
+  fix the battery health storage write. The [27.3 storage trace](power-bh2-powerd-analysis.md) identifies error normalization and
+  the separate missing durable NVRAM backend; the raw failed operation is still unknown and the fix-image gate stays HOLD.
+  Both reporting opt-ins remain default 0. [November 26 battery results](../results-2026-11-26.md#efi-memory-battery-and-video) · [November 27 RAM results](../results-2026-11-27.md#ram-qualification)
 - **PPS and direct charging.** The **9 V PPS buck** path up to 2.5 A has a host safety audit and awaits RAM qualification.
   **Charge Pump / MiPPS stays off by default.** The November 24 attended attempt stayed at a 100 mA input limit because of an
   unmapped vendor power object. The fix is built and awaits an owner-present test.
