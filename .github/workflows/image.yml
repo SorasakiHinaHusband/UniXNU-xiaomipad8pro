@@ -38,7 +38,7 @@ jobs:
       - name: Disk space before
         run: df -h / /System/Volumes/Data | sed -n '1,4p'
 
-      - name: Free disk space (simulator runtimes only: Xcode, its SDKs and the toolchains stay)
+      - name: "Free disk space (simulator runtimes only: Xcode, its SDKs and the toolchains stay)"
         run: |
           set -u
           before=$(df -k /System/Volumes/Data | awk 'NR == 2 {print $4}')
