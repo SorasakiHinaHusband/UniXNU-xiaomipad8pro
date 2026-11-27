@@ -32,7 +32,7 @@ static inline bool parse_arguments(int argc, char *const argv[], struct argument
   if (argc == 1) return true;
   if (strcmp(argv[1], "on") == 0) {
     args->command = ON;
-    return argc <= 4 && (argc < 3 || (decimal(argv[2], 100, &args->ma) && args->ma > 0)) &&
+    return argc <= 4 && (argc < 3 || (decimal(argv[2], 400, &args->ma) && args->ma > 0)) &&
            (argc < 4 || decimal(argv[3], 1800, &args->seconds));
   }
   if (argc != 2) return false;

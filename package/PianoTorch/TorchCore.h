@@ -196,8 +196,9 @@ inline void formatFaults(const Faults &f, char *out, unsigned size)
 }
 
 constexpr unsigned kDefaultLevel = 0;
-constexpr unsigned kDefaultMaxMa = kUbuntuTorchMaxMa;
-constexpr unsigned kHardMaxMa = kFactoryTorchMaxMa;   // 2 x 200 mA, ITARGET and TORCH_CLAMP 39
+constexpr unsigned kDefaultOnMa = kFactoryTorchMaxMa;   // 2 x 200 mA, configured lit setting (OWNER-0801)
+constexpr unsigned kDefaultMaxMa = kFactoryTorchMaxMa;  // 2 x 200 mA, ITARGET and TORCH_CLAMP 39 (OWNER-0801)
+constexpr unsigned kHardMaxMa = kFactoryTorchMaxMa;     // 2 x 200 mA, ITARGET and TORCH_CLAMP 39
 constexpr unsigned kLadderLevelsMa[] = {100, 200, 300, 400};
 constexpr unsigned kLadderWindowSeconds = 10, kLadderWindowMs = kLadderWindowSeconds * 1000;
 constexpr uint8_t kProbeFlashItarget = 1, kProbeFlashTicks = 8;

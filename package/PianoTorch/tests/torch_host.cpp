@@ -189,7 +189,7 @@ static void testConstants()
   CHECK(kPpid == 0x1ee);
   CHECK(itargetForMa(50) == 4 && itargetForMa(100) == 9 && itargetForMa(400) == 39 && itargetForMa(10) == 0 && itargetForMa(5) == 0);
   CHECK(itargetForMa(45) == 3 && maForItarget(3) == 40);   // rounds down, never up
-  CHECK(kDefaultLevel == 0 && kDefaultMaxMa == 100 && kHardMaxMa == 400);
+  CHECK(kDefaultLevel == 0 && kDefaultOnMa == 400 && kDefaultMaxMa == 400 && kHardMaxMa == 400);
   CHECK(clampMa(500, 100) == 100 && clampMa(1, 100) == 10 && clampMa(80, 500) == 80 && clampMa(500, 500) == 400);
   CHECK(boundedRequest(0, 100) == 0 && boundedRequest(50, 100) == 50 && boundedRequest(1ull << 32, 100) == 100);
   CHECK(boundedRequest(UINT64_MAX, 1800) == 1800);
@@ -240,16 +240,16 @@ static void testRequestBoundaries()
   Port p(true);
   Torch t(p.bus, GuardConfig(), kDefaultMaxMa);
   const struct { uint64_t request; unsigned current; } cases[] = {
-    {0, 0}, {1, 10}, {9, 10}, {10, 10}, {11, 10}, {99, 90}, {100, 100}, {101, 100},
-    {UINT32_MAX, 100}, {1ull << 32, 100}, {(1ull << 32) + 1, 100}, {UINT64_MAX, 100},
+    {0, 0}, {1, 10}, {9, 10}, {10, 10}, {11, 10}, {99, 90}, {100, 100}, {200, 200}, {399, 390}, {400, 400}, {401, 400},
+    {UINT32_MAX, 400}, {1ull << 32, 400}, {(1ull << 32) + 1, 400}, {UINT64_MAX, 400},
   };
   for (const auto &[raw, current] : cases) {
     const auto o = t.request(0, boundedRequest(raw, kHardMaxMa), boundedRequest(1ull << 32, t.config().maxS), {});
     CHECK(o.steps.ok && o.lit == (current != 0) && t.ma() == current);
-    CHECK(t.maxMa() == 100 && !(a.flash(kRegChanEn) & ~kPianoChannelMask));
+    CHECK(t.maxMa() == 400 && !(a.flash(kRegChanEn) & ~kPianoChannelMask));
     if (current) {
       const uint8_t target = uint8_t(current / 10 - 1);
-      CHECK(a.flash(kRegItarget0) == target && a.flash(kRegItarget0 + 1) == target && a.flash(kRegTorchClamp) == 9);
+      CHECK(a.flash(kRegItarget0) == target && a.flash(kRegItarget0 + 1) == target && a.flash(kRegTorchClamp) == 39);
       CHECK(a.flash(kRegChanEn) == kPianoChannelMask && (a.flash(kRegModuleEn) & kModuleEnBit));
       CHECK(t.deadlineMs() == 1800000 && t.turnOff(1, Reason::user).steps.ok);
     }
@@ -330,15 +330,15 @@ static void testOnOff()
   char line[120];
   t.describe(0, line, sizeof line);
   CHECK(std::strcmp(line, "off") == 0);
-  Torch::Outcome o = t.request(1000, 50, 0, temps);
-  CHECK(o.lit && o.steps.ok && o.steps.writes == 12 && o.steps.readbacks == 12 && t.ma() == 50 && t.itarget() == 4);
+  Torch::Outcome o = t.request(1000, kDefaultOnMa, 0, temps);
+  CHECK(o.lit && o.steps.ok && o.steps.writes == 12 && o.steps.readbacks == 12 && t.ma() == 400 && t.itarget() == 39);
   CHECK(a.flash(kRegModuleEn) == 0x81 && a.flash(kRegChanEn) == 0x03 && a.flash(kRegIres) == 0x07);
-  CHECK(a.flash(kRegItarget0) == 0x84 && a.flash(kRegItarget0 + 1) == 0x04 && a.flash(kRegTorchClamp) == 9);
+  CHECK(a.flash(kRegItarget0) == 0xa7 && a.flash(kRegItarget0 + 1) == 39 && a.flash(kRegTorchClamp) == 39);
   CHECK(a.flash(kRegStrobe0) == 0x01 && a.flash(kRegStrobe0 + 1) == 0x01 && a.flash(kRegTimer0) == 0 && a.flash(kRegTimer0 + 1) == 0);
   CHECK(onlyFlash(a));
   CHECK(t.deadlineMs() == 1000 + 300 * 1000);
   t.describe(1000, line, sizeof line);
-  CHECK(std::strcmp(line, "on 50 mA (2 x 25 mA, itarget 4), off in 300 s") == 0);
+  CHECK(std::strcmp(line, "on 400 mA (2 x 200 mA, itarget 39), off in 300 s") == 0);
 
   a.writes.clear();
   o = t.request(2000, 0, 0, temps);
@@ -347,9 +347,13 @@ static void testOnOff()
   t.describe(2000, line, sizeof line);
   CHECK(std::strcmp(line, "off (asked)") == 0);
 
-  // clamped to the limit and to the hard cap; the seconds to maxS
+  // clamped to the configured default cap (400 mA) and lower custom caps; the seconds to maxS
   o = t.request(3000, 900, 99999, temps);
-  CHECK(o.lit && t.ma() == 100 && t.itarget() == 9 && t.deadlineMs() == 3000 + 1800 * 1000);
+  CHECK(o.lit && t.ma() == 400 && t.itarget() == 39 && t.deadlineMs() == 3000 + 1800 * 1000);
+  Torch ubuntuCap(p.bus, g, kUbuntuTorchMaxMa);
+  o = ubuntuCap.request(3500, 400, 10, temps);
+  CHECK(o.lit && ubuntuCap.ma() == 100 && a.flash(kRegItarget0 + 1) == 9 && a.flash(kRegTorchClamp) == 9);
+  ubuntuCap.request(3600, 0, 0, temps);
   Torch low(p.bus, g, 60);
   o = low.request(4000, 100, 10, temps);
   CHECK(o.lit && low.ma() == 60 && a.flash(kRegItarget0 + 1) == 5 && a.flash(kRegTorchClamp) == 5);
@@ -430,7 +434,7 @@ static void testOnOff()
 
 static void testLadder()
 {
-  for (const unsigned cap : {kDefaultMaxMa, 400u}) {
+  for (const unsigned cap : {kUbuntuTorchMaxMa, kDefaultMaxMa}) {
     Arbiter a;
     piano(a);
     Port p(true);

@@ -13,8 +13,9 @@ using namespace pianotorch;
 
 constexpr unsigned kSafetyCeilingMa = 400;
 constexpr unsigned kSafetyCeilingUa = kSafetyCeilingMa * 1000;
-constexpr unsigned kDefaultCurrentUa = 100000;
-static_assert(kDefaultLevel == 0 && kDefaultMaxMa == 100 && kHardMaxMa == kSafetyCeilingMa);
+constexpr unsigned kDefaultCurrentUa = kDefaultOnMa * 1000;
+static_assert(kDefaultLevel == 0 && kDefaultOnMa == kSafetyCeilingMa && kDefaultMaxMa == kSafetyCeilingMa &&
+              kHardMaxMa == kSafetyCeilingMa);
 
 int failures = 0;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "%s:%d: %s\n", __func__, __LINE__, #expr); ++failures; } } while (0)
@@ -152,7 +153,7 @@ void checkCurrent(uint64_t rawMa, unsigned configuredMaxMa)
 void testCurrentBounds()
 {
   // Include a non-quantized configured ceiling and an oversized boot argument.
-  for (const unsigned limit : {0u, 9u, 10u, 95u, kDefaultMaxMa, 101u, 199u, 399u, 400u, 401u, 500u, UINT32_MAX}) {
+  for (const unsigned limit : {0u, 9u, 10u, 95u, kUbuntuTorchMaxMa, 101u, 199u, 399u, kDefaultMaxMa, 401u, 500u, UINT32_MAX}) {
     for (unsigned ma = 0; ma <= 500; ++ma) checkCurrent(ma, limit);
     for (const uint64_t ma : {uint64_t(UINT32_MAX), uint64_t(uint32_t(INT32_MIN)), uint64_t(uint32_t(-2)),
                               uint64_t(INT64_MIN), uint64_t(-2), UINT64_MAX})
@@ -178,10 +179,10 @@ void testCurrentBounds()
 void checkSoftwareDeadline(unsigned seconds, unsigned expectedSeconds)
 {
   FlashPmic pmic;
-  Torch torch(pmic.bus(), {}, 100);
+  Torch torch(pmic.bus(), {}, kDefaultMaxMa);
   constexpr uint64_t start = uint64_t(1) << 32;
   const uint64_t end = start + expectedSeconds * 1000;
-  const auto on = torch.request(start, 100, seconds, {});
+  const auto on = torch.request(start, kDefaultOnMa, seconds, {});
   CHECK(on.lit && torch.deadlineMs() == end);
   CHECK(pmic.reg[kRegTimer0] == 0 && pmic.reg[kRegTimer0 + 1] == 0);
   CHECK(torch.poll(end - 1, {}).lit && pmic.currentUa() == kDefaultCurrentUa);

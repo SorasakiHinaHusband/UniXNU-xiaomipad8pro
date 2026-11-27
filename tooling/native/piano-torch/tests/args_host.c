@@ -21,16 +21,20 @@ int main(void)
          args.ma == 99 && args.seconds == 1799);
   assert(parse_arguments(4, (char *[]){"piano-torch", "on", "100", "1800"}, &args) &&
          args.ma == 100 && args.seconds == 1800);
-  assert(parse_arguments(4, (char *[]){"piano-torch", "on", "101", "1801"}, &args) &&
-         args.ma == 100 && args.seconds == 1800);
+  assert(parse_arguments(4, (char *[]){"piano-torch", "on", "200", "60"}, &args) &&
+         args.ma == 200 && args.seconds == 60);
+  assert(parse_arguments(4, (char *[]){"piano-torch", "on", "400", "1800"}, &args) &&
+         args.ma == 400 && args.seconds == 1800);
+  assert(parse_arguments(4, (char *[]){"piano-torch", "on", "401", "1801"}, &args) &&
+         args.ma == 400 && args.seconds == 1800);
   char oversized[] = "184467440737095516160";
   assert(parse_arguments(4, (char *[]){"piano-torch", "on", oversized, oversized}, &args) &&
-         args.ma == 100 && args.seconds == 1800);
+         args.ma == 400 && args.seconds == 1800);
   char digits[4097];
   memset(digits, '9', sizeof digits - 1);
   digits[sizeof digits - 1] = '\0';
   assert(parse_arguments(4, (char *[]){"piano-torch", "on", digits, digits}, &args) &&
-         args.ma == 100 && args.seconds == 1800);
+         args.ma == 400 && args.seconds == 1800);
   digits[sizeof digits - 2] = 'x';
   assert(!parse_arguments(3, (char *[]){"piano-torch", "on", digits}, &args));
   assert(!parse_arguments(4, (char *[]){"piano-torch", "on", "50", digits}, &args));

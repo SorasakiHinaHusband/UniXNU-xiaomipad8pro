@@ -2,12 +2,14 @@
 
 ## Status (2026-11-27)
 
-- **Owner decision `OWNER-0717`.** The cap can be set up to **400 mA total** (2 x 200 mA, ITARGET 39, TORCH_CLAMP 39).
-  The cap defaults to **100 mA total** when `piano-torch-max-ma` is omitted. PianoTorch defaults to off (`piano-torch=0`).
-  The T4 fault/status probe and opt-in `piano-torch-ladder=1` are host-verified. The ladder runs 100/200/300/400 mA total
-  within the configured cap, with 10 s lit and 10 s dark per step. Both diagnostics retain the temperature and PMIC guards,
-  write allowlist, activation and explicit OFF read-backs, and synchronous OFF on sleep or shutdown. T4's optional FLASH
-  pulse stays at 50 mA total for 80 ms. [Driver](../../package/PianoTorch/PianoTorch.cpp)
+- **Owner decisions `OWNER-0717` & `OWNER-0801`.** The configured torch-on current and default cap are **400 mA total**
+  (2 x 200 mA per channel, ITARGET 39, TORCH_CLAMP 39) — both `piano-torch-ma` and `piano-torch-max-ma` default to 400 mA
+  total (with CLI numeric requests clamped at 400 mA), not only the top step of the ladder. PianoTorch still defaults to off
+  (`piano-torch=0`, opt-in boot arg only). The T4 fault/status probe and opt-in `piano-torch-ladder=1` are host-verified.
+  The ladder runs 100/200/300/400 mA total within the configured cap, with 10 s lit and 10 s dark per step. Ordinary torch-on
+  and both diagnostics retain all temperature and PMIC guards, the write allowlist, activation and explicit OFF read-backs,
+  and synchronous OFF on sleep or shutdown. T4's optional FLASH pulse stays at 50 mA total for 80 ms.
+  [Driver](../../package/PianoTorch/PianoTorch.cpp)
 - **Attended lit RAM boot pending.** Both November 15 T2 RAM runs read back all 12 register writes and the rear LED stayed dark.
   The lit test waits until the owner is beside the tablet to watch the LED and match visible light to the register evidence.
   [Hardware backlog, B12](../BACKLOG-hardware.md#2-backlog-b1b15)
@@ -160,9 +162,9 @@ no channel outside the driver's set on (else "someone else drives this module").
   allowlisted **for the probe only** (`piano-torch-probe`, the one-boot test of which pair the LED really sits on); a normal boot
   never writes them. `Controller::put` refuses anything else. Masked writes read first, merge under the mask, write, and compare read-back. Activation stops on a read or write failure.
   OFF tries every step and can use the last known value during an observer failure.
-- **Current** (`piano-torch-ma`): 50 mA (2 × 25 mA, ITARGET 4) unless a request names a current. `piano-torch-max-ma` defaults
-  to 100 mA total (Ubuntu's DT limit, TORCH_CLAMP 9) and can be set up to 400 mA total (2 × 200 mA, TORCH_CLAMP 39).
-  Requests respect the configured clamp and round down to 5 mA steps per channel.
+- **Current** (`piano-torch-ma`): defaults to **400 mA total (2 × 200 mA, ITARGET 39)** per `OWNER-0801` unless a boot arg or
+  request names a lower current. `piano-torch-max-ma` defaults to **400 mA total (2 × 200 mA, TORCH_CLAMP 39)** and accepts
+  10..400 mA total (hard-capped at 400 mA). Requests respect the configured clamp and round down to 5 mA steps per channel.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
   1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, INT_RT_STS fault, STATUS1 short **or open** (the open bit is the
   module's own word for a lit register state with no LED current path — since 2026-11-15 it is a fault reason, not an unknown) →
@@ -186,7 +188,7 @@ boolean) and `piano-torch-seconds` from an administrator only (`IOUserClient::cl
 `tooling/native/piano-torch/piano-torch.c` (IOKit.framework, built on the Mac like `pianousb-shell`; installed as
 `/usr/local/bin/piano-torch` by `configs/userland.toml`, `docs/userland.md`): `sudo piano-torch on [MA [S]]`,
 `off`, `toggle`, `status`; exit 0 when the state after the request is the one asked for. Usable from the root shell over USB too.
-The CLI clamps its numeric `MA` argument to 100 mA. With no numeric argument, `on` uses the boot's configured `piano-torch-ma`.
+The CLI clamps its numeric `MA` argument to 400 mA (`OWNER-0801`). With no numeric argument, `on` uses the boot's configured `piano-torch-ma` (default 400 mA total, 2 × 200 mA).
 
 **From other drivers**: `callPlatformFunction` `PianoTorchSet` (mA, seconds, caller), `PianoTorchToggle` (caller),
 `PianoTorchStatus` (buffer, size); queued, never blocking on the PMIC (`PianoTorchClient.h`).
@@ -203,8 +205,8 @@ tool is user-space work for later.
 | Argument | Default | Meaning |
 |---|---|---|
 | `piano-torch` | 0 | 0 off, 1 survey (read only), 2 survey and control |
-| `piano-torch-ma` | 50 | lamp current of an on without its own (10..max, 5 mA a channel steps) |
-| `piano-torch-max-ma` | 100 | 10..400 mA total, with larger values clamped to 400 mA |
+| `piano-torch-ma` | 400 | configured lit current of an on without its own (2 × 200 mA per `OWNER-0801`; 10..max, 5 mA a channel steps) |
+| `piano-torch-max-ma` | 400 | 10..400 mA total (default 400 mA = 2 × 200 mA per `OWNER-0801`; larger values clamped to 400 mA) |
 | `piano-torch-timeout` | 300 | auto-off of a request without its own time (10..1800 s) |
 | `piano-torch-test` | 0 | level 2: light once at boot for S s (1..60), then off |
 | `piano-torch-soc-max`, `piano-torch-batt-max` | 85, 45 | the guard's temperatures (°C) |
@@ -301,8 +303,10 @@ Without `piano-torch` nothing is mapped. Level 2 refusing leaves level 1's surve
    (*inferred*, not verified for this block); ABL/Ubuntu boot next. Check once in T3 (`reset` from the console while lit).
 5. The flash thermistor (ADC 0x145) as a direct guard → with B6's ADC conversions.
 6. Camera flash (400 mA, 300 ms strobe) is B11's, not this driver's; it would need the derating sequence and a hardware strobe.
-7. **Decided 2026-11-27 (`OWNER-0717`).** The owner approved a hard cap of 400 mA total (2 × 200 mA) and a guarded
-   100/200/300/400 mA ladder for an attended RAM boot. The default cap is 100 mA and the driver defaults to off.
+7. **Decided 2026-11-27 (`OWNER-0717`, updated `OWNER-0801`).** The owner approved the 400 mA total (2 × 200 mA) factory-safe
+   range, set **200 mA per channel (400 mA total, ITARGET 39, TORCH_CLAMP 39)** as the configured torch-on setting (`piano-torch-ma`
+   and `piano-torch-max-ma` defaults, CLI clamp 400 mA, not only the ladder top step), and enabled the guarded 100/200/300/400 mA
+   ladder for an attended RAM boot. The driver stays default-off (`piano-torch=0`) with all temperature guards and read-back checks on.
    The lit test waits until the owner is beside the tablet watching the LED.
 
 ### 11. Licence note

@@ -10,8 +10,8 @@
 //                  an administrator's IORegistry property (tooling/native/piano-torch) or another driver's callPlatformFunction
 //                  (PianoTorchClient.h); piano-torch-test=S lights it once for S seconds at boot (the attended first test).
 // With piano-torch omitted or set to 0, the driver declines in probe() and maps nothing.
-// Other arguments: piano-torch-ma (default 50, the lamp current of an on without its own),
-// piano-torch-max-ma (default 100 mA total, hard cap 400 mA total, 2 x 200 mA),
+// Other arguments: piano-torch-ma (default 400 mA total, 2 x 200 mA, the lamp current of an on without its own),
+// piano-torch-max-ma (default 400 mA total, hard cap 400 mA total, 2 x 200 mA),
 // piano-torch-timeout=S (default 300, 10..1800), piano-torch-soc-max=C (default 85), piano-torch-batt-max=C (default 45),
 // piano-torch-delay=S (default 0), and piano-torch-probe=1 to replace the boot test with T4. The probe can add a spare-pair
 // window (piano-torch-probe-spare=1) or a timed FLASH pulse (piano-torch-flash=1). The separate piano-torch-ladder=1 mode
@@ -58,7 +58,7 @@ void readArgs()
 {
   gArgs.level = bootArg("piano-torch", kDefaultLevel);
   gArgs.maxMa = clampMa(bootArg("piano-torch-max-ma", kDefaultMaxMa), kHardMaxMa);
-  gArgs.ma = clampMa(bootArg("piano-torch-ma", 50), gArgs.maxMa);
+  gArgs.ma = clampMa(bootArg("piano-torch-ma", kDefaultOnMa), gArgs.maxMa);
   gArgs.timeout = clampArg(bootArg("piano-torch-timeout", 300), 10, 1800);
   gArgs.test = clampArg(bootArg("piano-torch-test", 0), 0, kProbeMaxSeconds);
   gArgs.delay = clampArg(bootArg("piano-torch-delay", 0), 0, 600);

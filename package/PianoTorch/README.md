@@ -10,9 +10,10 @@ FLASH pulse for photos and a shared green privacy LED; those are provenance fact
 - `piano-torch=2`: the survey, then torch control. Writes go only to that peripheral, only to the registers of
   `TorchCore.h`'s allowlist, each read-modify-write under its mask and read back. Off after `piano-torch-timeout` (300 s),
   on the module's own fault/over-temperature bits, at SoC >= `piano-torch-soc-max` (85 C, PianoThermal) or battery >=
-  `piano-torch-batt-max` (45 C, PianoPower), when the enables read off, on system sleep and on shutdown. 50 mA by default
-  (`piano-torch-ma`). With `piano-torch-max-ma` omitted, the cap is 100 mA total. The owner approved an opt-in cap up to
-  400 mA total (2 x 200 mA, ITARGET and TORCH_CLAMP 39) on 2026-11-27. Higher values clamp to 400 mA.
+  `piano-torch-batt-max` (45 C, PianoPower), when the enables read off, on system sleep and on shutdown. Configured torch-on
+  current (`piano-torch-ma`) and default cap (`piano-torch-max-ma`) are both **400 mA total (2 x 200 mA, ITARGET and TORCH_CLAMP 39)**
+  per owner decisions `OWNER-0717` and `OWNER-0801` (2026-11-27); lower values remain selectable down to 10 mA and higher values
+  clamp to 400 mA. The driver stays default-off (`piano-torch=0`, opt-in only) with all temperature guards and read-backs enabled.
   `piano-torch-test=S` lights it once at boot for S seconds. `piano-torch-ladder=1` runs the 100/200/300/400 mA steps within
   the configured cap, with 10 s lit and 10 s dark per step. It samples PMIC status and flash, SoC and battery temperatures
   every 500 ms and stops with explicit OFF on a fault, an unreadable status sample or a SoC/battery thermal trip.
