@@ -144,7 +144,9 @@ stage_kdk() {
   mkdir -p "$mnt"; hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$KDK_DMG"
   trap 'hdiutil detach -quiet "$mnt" || true' RETURN
   rm -rf "$pkgx"; pkgutil --expand-full "$mnt"/*.pkg "$pkgx"
-  local payload; payload=$(find "$pkgx" -type d -path '*Payload/Library/Developer/KDKs/*.kdk' | head -1)
+  local kf payload=""
+  kf=$(find "$pkgx" -type d -path '*/System/Library/Frameworks/Kernel.framework' 2>/dev/null | head -1 || true)
+  [ -n "$kf" ] && payload="${kf%/System/Library/Frameworks/Kernel.framework}"
   [ -n "$payload" ] || { echo "no KDK payload in $KDK_DMG" >&2; exit 1; }
   mkdir -p "$K"
   # headers and the kernel-support headers only: no kernels, no libraries are kept (nothing Apple-built is linked into ours)
