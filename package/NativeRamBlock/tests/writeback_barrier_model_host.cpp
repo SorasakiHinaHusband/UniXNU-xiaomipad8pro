@@ -194,17 +194,22 @@ struct Disk {
   DirectAdmission admission;
   DirectCommitQueue commits;
   Schedule schedule;
-  bool writeBack;
+  const bool requestWriteBack;
+  bool writeBack = false;
 
-  Disk(Medium &device, Window window, bool cache = false)
-    : medium(device), store{window, Persist::Ufs}, writeBack(cache) {}
+  Disk(Medium &device, Window window, bool cache = false, Persist mode = Persist::Ufs)
+    : medium(device), store{window, mode}, requestWriteBack(cache) {}
 
-  persist::Open open() {
-    assert(store.open(medium));
+  persist::Open open(bool startParallel = true) {
+    if (!store.open(medium)) return persist::Open::Failed;
     assert(store.window.blocks == persist::windowBlocks(kPages));
     const uint8_t digest[32] = {0x35};
-    admission.configure(2, true);
-    return overlay.open(store, kPages, digest, false, bits.data(), false, 0, store.window.first);
+    const auto result = overlay.open(store, kPages, digest, false, bits.data(), false, 0, store.window.first);
+    if (result == persist::Open::Fresh || result == persist::Open::Resumed) {
+      admission.configure(2, startParallel);
+      writeBack = requestWriteBack;
+    }
+    return result;
   }
 
   bool transfer(DirectAdmission::Request &request, Buffer &buffer) {
@@ -215,9 +220,13 @@ struct Disk {
     CachedOverwrite<Store> cached{overlay, store};
     ConcurrentDirect<Schedule, Store> fua{overlay, commits, schedule, store, stage.data()};
     // A single stage is enough for these one-block commands.
-    const auto actual = writeBack && cached.eligible(request)
-      ? directDiskIOWithPolicy(seed, overlay, store, stage.data(), 1, request.write, offset, length, buffer, &error, cached)
-      : directDiskIOWithPolicy(seed, overlay, store, stage.data(), 1, request.write, offset, length, buffer, &error, fua);
+    const auto serve = [&](auto &policy) {
+      return directDiskIOWithPolicy(seed, overlay, store, stage.data(), 1, request.write, offset, length, buffer, &error, policy);
+    };
+    uint64_t actual;
+    if (writeBack && cached.eligible(request)) actual = serve(cached);
+    else if (admission.parallel) actual = serve(fua);
+    else actual = directDiskIO(seed, overlay, store, stage.data(), 1, request.write, offset, length, buffer, &error);
     return !error && actual == length;
   }
 
@@ -236,6 +245,15 @@ struct Disk {
 
   bool synchronize(Sync kind) {
     return admission.beginFence(schedule) && finishFence(kind);
+  }
+
+  bool enableConcurrent() {
+    if (!admission.beginFence(schedule)) return false;
+    const bool ok = !store.state.failed() && admission.modeChangeAllowed(true, false) &&
+                    (admission.parallel || !writeBack || !store.state.dirty() || store.state.flush(store));
+    if (ok) admission.parallel = true;
+    admission.endFence(schedule);
+    return ok;
   }
 
   bool finishFence(Sync kind) {
@@ -361,6 +379,50 @@ void checkSyncFailure(Sync kind)
   assert(!recovered.overlay.has(2) && recovered.read(2) == block(0));
 }
 
+void checkDailyModeSwitch(bool failSync)
+{
+  Medium medium;
+  medium.reboot();
+  Disk initial(medium, kOwner);
+  assert(initial.open() == persist::Open::Fresh && initial.write(0, 0x10));
+  medium.reboot();
+  Disk daily(medium, kOwner, true);
+  assert(daily.open(false) == persist::Open::Resumed && !daily.admission.parallel && daily.writeBack);
+  const uint64_t lba = kOwner.first + persist::pageBlock(kPages, 0);
+  DirectAdmission::Request overwrite(0, kBlock, true);
+  assert(daily.admission.take(daily.schedule, overwrite) == DirectAdmission::kSerial);
+  Buffer beforeMount{block(0x20)};
+  assert(daily.transfer(overwrite, beforeMount) && daily.store.state.dirty());
+  assert(medium.stable.at(lba) == block(0x10) && medium.pending.at(lba) == beforeMount.bytes);
+
+  if (failSync) {
+    m.fault = Fault::SyncCheck;
+    medium.flushLimit = 0;
+  }
+  const auto syncs = m.syncs;
+  assert(daily.enableConcurrent() == !failSync);
+  assert(m.syncs == syncs + 1 && !daily.admission.fenced && daily.admission.parallel == !failSync);
+  if (failSync) {
+    assert(daily.store.state.failed() && daily.store.state.dirty());
+    assert(medium.stable.at(lba) == block(0x10));
+    assert(!daily.enableConcurrent() && !daily.write(1, 0x30) && m.syncs == syncs + 1);
+    return;
+  }
+
+  assert(!daily.store.state.dirty() && medium.pending.empty() && medium.stable.at(lba) == beforeMount.bytes);
+  const int slot = daily.admission.take(daily.schedule, overwrite);
+  assert(slot >= 0 && daily.admission.inflight == 1);
+  Buffer afterMount{block(0x30)};
+  assert(daily.transfer(overwrite, afterMount) && daily.store.state.dirty());
+  daily.admission.give(daily.schedule, slot, false);
+  assert(daily.read(0) == afterMount.bytes && medium.stable.at(lba) == beforeMount.bytes);
+  assert(daily.enableConcurrent() && daily.store.state.dirty() && m.syncs == syncs + 1);
+  assert(daily.synchronize(Sync::Barrier) && !daily.store.state.dirty());
+  medium.reboot();
+  Disk resumed(medium, kOwner);
+  assert(resumed.open() == persist::Open::Resumed && resumed.read(0) == afterMount.bytes);
+}
+
 void checkWindow(Window window, Window other)
 {
   Medium medium;
@@ -484,10 +546,11 @@ void checkVolatileAndPersistent()
   const auto ownerImage = medium.stable;
 
   medium.reboot();
-  Store disabled{kOwner, Persist::Ram};
-  assert(!disabled.open(medium) && !gStoreOpen);
+  Disk ram(medium, kOwner, true, Persist::Ram);  // Carry the disk flags into data-persist=0.
+  assert(ram.open(false) == persist::Open::Failed && !gStoreOpen);
+  assert(!ram.writeBack && !ram.enableConcurrent() && !ram.admission.parallel && !ram.admission.depth);
   const auto readBack = block(0x90);
-  assert(!disabled.write(0, 1, readBack.data()) && !disabled.writeCached(0, 1, readBack.data()) && !disabled.sync());
+  assert(!ram.store.write(0, 1, readBack.data()) && !ram.store.writeCached(0, 1, readBack.data()) && !ram.store.sync());
   auto ramBoot = [&](bool afterReset) {
     // Three budgeted pages, only two ready on boot. The first write takes
     // one leaf and one data page. Its seed is shared with the persistent boot.
@@ -636,6 +699,8 @@ void checkBootDefaults()
   const auto end = ram.find("voidNativeRamBlock::configureAsync(){", start);
   assert(start != std::string::npos && end != std::string::npos);
   const auto setup = ram.substr(start, end - start);
+  assert(setup.find("voidNativeRamBlock::configureDirect(){if(!direct)return;") == 0);
+  assert(ram.find("if(commitGate)install(modeOid,") != std::string::npos);
   assert(setup.find("cache=0;") != std::string::npos);
   assert(setup.find(R"(PE_parse_boot_argn("data-store-write-back",&cache,sizeofcache);)") != std::string::npos);
   assert(setup.find("writeBack=cache==1;") != std::string::npos);
@@ -654,6 +719,8 @@ int main()
     checkSyncFailure(sync);
   }
   checkQueue();
+  checkDailyModeSwitch(false);
+  checkDailyModeSwitch(true);
   checkWindow(kOwner, kScratch);
   checkWindow(kScratch, kOwner);
   checkVolatileAndPersistent();

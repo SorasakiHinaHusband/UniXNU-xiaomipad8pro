@@ -111,7 +111,10 @@ def split_line(line, *, force=False):
     long_layout = limit == boot_args.LONG_LINE_MAX
     if not (long_layout or force or len(line.encode()) > limit):
         return line, None
-    kept, tail = boot_args.fit(words, 'macos', force=force or not long_layout)
+    # Both keys are read by kexts through the merged PE boot arguments. Keep
+    # the y12q USB helpers' existing words inside the legacy sysctl clip.
+    kept, tail = boot_args.fit(words, 'macos', force=force or not long_layout,
+                               extra_tail_keys=('native-gop-display-night-shift', 'data-store-write-back'))
     return ' '.join(kept), tail or None
 
 

@@ -8,6 +8,7 @@
 #include "DpuPanel.h"
 #include "DpuSliceArgs.h"
 #include "DpuSnapshot.h"
+#include "../../NativeGopDisplay/GopRefresh.h"
 #include "dpu_model.h"
 
 #include <cstdarg>
@@ -436,6 +437,233 @@ void testInterleavedSlices()
   CHECK(io.refused.empty() && io.irqDepth == 0);
 }
 
+// Flips use the same timed CTL as the slices. Model a wired backing and the
+// VIG shadows here. The flip suite covers physical fetch and SMMU fault handling.
+enum class FlipEvent { tableClean, backingClean, scanoutClean, barrier, flush };
+
+struct DailyFlipIo {
+  model::Dpu &io;
+  std::map<uint64_t, uint32_t> shadow, active;
+  std::vector<FlipEvent> events;
+  unsigned tlbSyncs = 0;
+  static constexpr uint64_t kBackingBytes = 28 * 1024 * 1024;
+
+  explicit DailyFlipIo(model::Dpu &model) : io(model) {}
+
+  uint64_t nowUs() { return io.nowUs(); }
+  uint32_t rd(uint64_t pa) { return io.rd(pa); }
+  void wr(uint64_t pa, uint32_t value)
+  {
+    if (pa == ctlReg(0, kCtlFlush)) {
+      CHECK(!io.ctlFlush && io.wr(pa, value));
+      events.push_back(FlipEvent::flush);
+    } else if (pa != kMdp + kTopIntrEn && pa != kMdp + kTopIntrClear) {
+      shadow[pa] = value;
+    }
+  }
+  void barrier() { events.push_back(FlipEvent::barrier); }
+  void vsyncArm() {}
+  bool irqLive() { return false; }
+  uint64_t irqCount() { return 0; }
+  uint32_t takeIrqBits() { return 0; }
+  void irqDelivered() { CHECK(false); }
+  void irqMiss() { CHECK(false); }
+  bool waitVsync(uint32_t us)
+  {
+    io.delayUs(us < 1000 ? us : 1000);
+    if (!io.ctlFlush) active = shadow;
+    return false;
+  }
+  void delayUs(uint32_t us) { io.delayUs(us); }
+  void clean(const void *, size_t) { events.push_back(FlipEvent::tableClean); }
+  void smmuWr(uint32_t off, uint32_t) { if (off == smmu::kTlbSync) ++tlbSyncs; }
+  uint32_t smmuRd(uint32_t) { return 0; }
+  uint64_t surfaceLength(const PianoDpuFlipRequest &) { return kBackingBytes; }
+  bool surfaceMap(const PianoDpuFlipRequest &r, uint64_t *pages, unsigned max, unsigned *count, void **cookie, const char **)
+  {
+    *count = kBackingBytes / 4096;
+    CHECK(*count <= max);
+    const auto base = *static_cast<const uint64_t *>(r.surface);
+    for (unsigned i = 0; i < *count; ++i) pages[i] = base + i * 4096ull;
+    *cookie = r.surface;
+    return true;
+  }
+  void surfaceRelease(void *) {}
+  uint32_t surfaceCacheMode(void *) { return flip::kSurfaceWriteCombined; }
+  flip::CleanPages surfaceAttributes(const uint64_t *, unsigned count) { return {count, 0, 0}; }
+  bool surfaceClean(void *, uint64_t, uint64_t) { CHECK(false); return false; }
+  bool surfaceCleanPhysical(const uint64_t *, uint64_t offset, uint64_t bytes)
+  {
+    CHECK(offset + bytes <= kBackingBytes);
+    events.push_back(bytes == kBackingBytes ? FlipEvent::backingClean : FlipEvent::scanoutClean);
+    barrier();
+    return true;
+  }
+  void note(const char *, ...) {}
+};
+
+void testDailyCombo(unsigned hz, bool switchFrom60, bool failReadback)
+{
+  const BootArgs boot{{{"piano-dpu", 2}, {"piano-dpu-flip", 4}, {"piano-dpu-panel", 0}, {"piano-dpu-clean-skip", 1},
+                       {"piano-dpu-modes", hz}, {"native-gop-display-night-shift", 1}}};
+  const auto args = boot.slices();
+  CHECK(args.nightShift && args.modesEnabled() && args.ahbVote == 1 && !args.panel && !args.pcc && !args.refresh);
+  auto io = model::modeSwitchFixture();
+  if (switchFrom60) CHECK(!modes::switchTiming(io, 60, {}).why);
+  io.resetPccOnTimingChange = true;
+  DailyFlipIo hw(io);
+  flip::Flipper flipper(hw);
+  flipper.cfg.level = boot.number("piano-dpu-flip", 1);
+  flipper.cfg.cleanSkip = boot.cleanSkip(flipper.cfg.level);
+  CHECK(flipper.cfg.cleanSkip);
+  flipper.path.ctl = 0;
+  flipper.path.flushMask = 3;  // VIG0 and VIG1 on the two halves
+  flipper.path.count = 2;
+  flipper.path.pipe[1].pipe = 1;
+  flipper.path.pipe[1].offset[0] = kPanelWidth * 2;
+  std::vector<uint64_t> tables(smmu::kTablePages * 512), pages(smmu::kSlotPages);
+  flipper.tables.cpu = tables.data();
+  flipper.tables.pa = 0x8c1000000;
+  flipper.guardPa = 0x8c2000000;
+  flipper.pages = pages.data();
+  smmu::buildTables(flipper.tables, [&](const void *p, size_t n) { hw.clean(p, n); });
+  flipper.state = flip::State::ready;
+
+  bool displayOff = false;
+  pcc::PanelPcc base;
+  const bool ahb = args.ahbVote == 1;
+  CHECK(pcc::capturePanelPcc(io, readPath(io, ahb), base));
+  auto last = base;
+  pcc::NightShift state;
+  constexpr uint64_t neutral[9] = {1ull << 32, 0, 0, 0, 1ull << 31, 0, 0, 0, 1ull << 31};
+  CHECK(state.setMatrix(neutral) == pcc::NightShift::Input::accepted && state.neutral());
+  const auto apply = [&](bool replay) {
+    if (displayOff) return;
+    auto update = pcc::updateNightShift(io, readPath(io, ahb), pcc::nightShiftPrograms(base, state), last, replay);
+    CHECK(update.attempted && update.result.ok && update.result.dspps == 3);
+    for (unsigned d = 0; d < 2; ++d) {
+      CHECK(io.pccActive[d][0] == unsigned(last.dspp[d].enabled));
+      for (unsigned o = 0; o < 3; ++o)
+        for (unsigned i = 0; i < 3; ++i)
+          CHECK(io.pccActive[d][kPccCoef[o][i] / 4] == last.dspp[d].words.w[o][i]);
+    }
+  };
+  const auto timingFor = [&](unsigned rate) {
+    checkTiming(takeReadOnlySnapshot(io, ahb, false).state, rate, rate == 144 ? 480 : 576, rate == 60 ? 4620 : 2310);
+  };
+
+  uint64_t backing[] = {0x8d0000000, 0x8e0000000};
+  const auto show = [&](unsigned index, uint32_t row, uint32_t offset, bool producerComplete) {
+    PianoDpuFlipRequest r{.size = sizeof r, .version = kPianoDpuFlipVersion, .surface = &backing[index], .memory = &backing[index],
+                          .offset = offset, .rowBytes = row, .width = kPanelWidth, .height = kPanelHeight, .format = flip::kFourccBgra};
+    hw.events.clear();
+    CHECK(flipper.request(r, producerComplete) == kPianoDpuFlipShown && !io.ctlFlush);
+    const uint32_t baseIova = smmu::slotIova(unsigned(flipper.slots.shown)) + offset;
+    CHECK(flipper.current.base == baseIova && flipper.current.stride == row);
+    for (unsigned p = 0; p < flipper.path.count; ++p) {
+      const auto &pipe = flipper.path.pipe[p];
+      const auto reg = kMdp + kPipes[pipe.pipe].base;
+      CHECK(hw.active.at(reg + kSrc0Addr) == baseIova + pipe.offset[0]);
+      CHECK(hw.active.at(reg + kYStride0) == row);
+    }
+  };
+  show(0, kSplashStride, 0, true);  // Eligible epoch on the source timing.
+  CHECK(flipper.st.cleanInits == 1 && hw.tlbSyncs == 1);
+  CHECK(!hw.events.empty() && hw.events.front() == FlipEvent::tableClean);
+  const auto originalTarget = flipper.current;
+  const auto originalPipes = hw.active;
+  const auto beforeDcs = io.dcs.size();
+  if (failReadback) {
+    state.setCorrection(pcc::kOne / 2);
+    apply(false);
+    io.dropStore = intfReg(2, kIntfProgFetch);
+    io.dropValue = (2310 - 67) * (hz == 144 ? 480 : 576) + 1;
+    io.dropCount = 1;
+  }
+  unsigned invalidations = 0, replays = 0;
+  const auto switched = modes::switchTo(io, hz, {.hwGatedAhb = ahb, .fixedHz = args.modeHz}, [&] {
+    ++invalidations;
+    flipper.invalidateCleanEpochs();
+  }, [&] {
+    ++replays;
+    CHECK(invalidations == 1 && !flipper.cleanEpochs[flipper.slots.shown].initialized);
+    apply(true);
+  });
+  CHECK(switched.timingTouched == (switchFrom60 || hz == 144));
+  CHECK(invalidations == unsigned(switched.timingTouched) && replays == invalidations);
+  CHECK(hz == 144 ? io.bandwidthVotes.size() == 1 : io.bandwidthVotes.empty());
+  CHECK(flip::sameTarget(flipper.current, originalTarget) && hw.active == originalPipes);
+  CHECK(bool(switched.why) == failReadback && switched.reverted == failReadback && !switched.restoreWhy);
+  const unsigned verifiedHz = failReadback ? switched.from : hz;
+  timingFor(verifiedHz);
+  uint64_t attributes[goprefresh::kWords];
+  const auto period = 1000000000ull / verifiedHz;
+  CHECK(goprefresh::fixedAttributes(verifiedHz, [](uint64_t ns) { return ns; }, attributes));
+  CHECK(attributes[goprefresh::kMinAbs] == period && attributes[goprefresh::kMaxAbs] == period && !attributes[goprefresh::kStepAbs]);
+  CHECK(goprefresh::nextDeadline(period, 2 * period + 10, period) == 3 * period);
+  show(0, kSplashStride, 0, true);  // A re-show after timing writes must initialize again.
+  using Event = FlipEvent;
+  const std::vector<Event> cleanedBacking{Event::backingClean, Event::barrier}, skippedReshow{Event::barrier};
+  CHECK(hw.events == (invalidations ? cleanedBacking : skippedReshow) && hw.tlbSyncs == 1);
+  if (failReadback) {
+    CHECK(io.pccActive[0][kPccCoef[0][0] / 4] == 0x4000);
+    CHECK(io.pccActive[1][kPccCoef[0][0] / 4] == 0x4000);
+    CHECK(io.refused.empty() && !io.desync && !io.modeUnderruns());
+    return;
+  }
+
+  show(1, kSplashStride, 0, true);
+  const std::vector<Event> skippedLatch{Event::barrier, Event::barrier, Event::barrier, Event::flush,
+                                       Event::barrier, Event::barrier, Event::barrier};
+  for (unsigned divisor : {2u, 4u, 2u, 1u}) {
+    const uint64_t matrix[9] = {1ull << 32, 0, 0, 0, (1ull << 31) / divisor, 0, 0, 0, (1ull << 31) / divisor};
+    CHECK(state.setMatrix(matrix) == pcc::NightShift::Input::accepted);
+    apply(false);
+    const auto blue = io.pccActive[0][kPccCoef[2][2] / 4];
+    if (divisor == 1) {
+      CHECK(!io.pccActive[0][0] && blue == base.dspp[0].words.w[2][2]);
+    } else {
+      CHECK(io.pccActive[0][0] && blue == 0x8000 / divisor);
+    }
+    CHECK(pcc::same(last, base) == (divisor == 1));
+    show(0, kSplashStride, 0, true);
+    CHECK(hw.events == skippedLatch);
+    show(1, kSplashStride, 0, true);
+    CHECK(hw.events == skippedLatch);
+    CHECK(io.pccActive[0][kPccCoef[2][2] / 4] == blue && io.pccActive[1][kPccCoef[2][2] / 4] == blue);
+  }
+  // WC eligibility covers the allocation. A new stride/offset on the same slot still latches.
+  show(1, kSplashStride + 64, 64, true);
+  CHECK(hw.events == skippedLatch && flipper.st.cleanSkips >= 9);
+  show(1, kSplashStride + 64, 64, true);
+  CHECK(hw.events == skippedReshow);
+  show(1, kSplashStride + 64, 64, false);
+  CHECK((hw.events == std::vector<Event>{Event::scanoutClean, Event::barrier}) && flipper.st.cleanFull == 1);
+  show(1, kSplashStride + 64, 64, true);
+  CHECK(hw.events == cleanedBacking);
+
+  state.setCorrection(pcc::kOne / 2);
+  apply(false);
+  displayOff = true;
+  constexpr uint64_t blank[9] = {};
+  CHECK(state.setMatrix(blank) == pcc::NightShift::Input::blank);
+  const auto beforeOff = io.stores.size(), dcsBeforeWake = io.dcs.size();
+  apply(true);
+  CHECK(io.stores.size() == beforeOff && io.intf[1].on && io.intf[2].on);
+  CHECK(flipper.cleanEpochs[flipper.slots.shown].initialized);
+  for (unsigned d = 0; d < 2; ++d) io.pccActive[d][0] = io.pccShadow[d][0] = 0;
+  displayOff = false;
+  apply(true);
+  CHECK(io.pccActive[0][kPccCoef[0][0] / 4] == 0x4000);
+  show(1, kSplashStride + 64, 64, true);
+  CHECK(hw.events == skippedReshow);
+  CHECK(io.dcs.size() == dcsBeforeWake && (hz == 144 || io.dcs.size() == beforeDcs));
+  CHECK(hw.tlbSyncs == 2 && !flipper.st.toBoot && !flipper.st.cleanFailures && !flipper.st.cleanUnderruns);
+  CHECK(flipper.st.cleanInits + flipper.st.cleanSkips + flipper.st.cleanFull == flipper.st.flips + flipper.st.reshows);
+  timingFor(hz);
+  CHECK(io.refused.empty() && !io.glitches && !io.desync && !io.modeUnderruns());
+}
+
 }  // namespace
 
 int main()
@@ -445,5 +673,10 @@ int main()
   testDailyMode();
   testPanelVideoOnlyCycles();
   testInterleavedSlices();
+  testDailyCombo(120, false, false);
+  for (unsigned hz : {120u, 144u}) {
+    testDailyCombo(hz, true, false);
+    testDailyCombo(hz, true, true);
+  }
   std::puts("PianoDpu startup and slice interactions: all passed");
 }

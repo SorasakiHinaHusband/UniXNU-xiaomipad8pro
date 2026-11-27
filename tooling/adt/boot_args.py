@@ -104,10 +104,10 @@ def prop_name(set_name):
     return f'{PROP}-{set_name}'
 
 
-def fit(args, set_name, reserve=0, force=False):
+def fit(args, set_name, reserve=0, force=False, *, extra_tail_keys=()):
     """(line args, tail args) for ARGS: unchanged with an empty tail when the line plus RESERVE fits (and
-    not FORCE). Otherwise movable arguments go in the tail with piano-boot-args=SET_NAME in the line. SystemExit when the line still
-    does not fit, or the merged boot-args would not fit the kernel's buffer."""
+    not FORCE). Otherwise movable arguments and the caller's extra kernel-only keys go in the tail with
+    piano-boot-args=SET_NAME in the line. SystemExit when either the loader or merged line would exceed its budget."""
     args = list(args)
     if any(name_of(x) == PROP for x in args):
         raise SystemExit(f'the arguments already have {PROP}=: give the whole (merged) arguments, the tools make the selector')
@@ -124,7 +124,7 @@ def fit(args, set_name, reserve=0, force=False):
     moves = movable_long if long_layout else movable
     kept, tail = [], []
     for word in args:
-        (tail if moves(word) else kept).append(word)
+        (tail if moves(word) or name_of(word) in extra_tail_keys else kept).append(word)
     if not tail:
         if line_bytes > limit:
             if long_layout:

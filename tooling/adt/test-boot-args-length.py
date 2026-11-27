@@ -195,6 +195,36 @@ def test_daily(record):
     print(f'PASS {record.stem} legacy replay, opt-in {len(line)}/{len(diag)} loader, {size} merged, {clipped} clipped')
 
 
+def test_daily_combo():
+    # Recreate the installed prefix size and USB argument positions without
+    # needing an installed image or a staged userland manifest.
+    base = ['test-prefix=' + 'x' * 770, 'sheng-smp=1', 'piano-test-pad=' + 'y' * 107, 'piano-usb-net=1', 'piano-usb-shell=1']
+    baseline, _ = esp.split_line(' '.join(base), force=True)
+    assert len(baseline) == 816
+    with tempfile.TemporaryDirectory() as tmp:
+        kc = Path(tmp) / 'kc'
+        kc.write_bytes(ba.KC_MARKER + ba.MERGED_SYSCTL_MARKER)
+        for hz in (120, 144):
+            delta = ['native-gop-display-night-shift=1', 'piano-dpu-clean-skip=1', f'piano-dpu-modes={hz}', 'data-store-write-back=1']
+            words = base + delta
+            # The previous split kept Night Shift and write-back in the
+            # loader, moving USB shell beyond the legacy clip.
+            before, tail = ba.fit(words, 'macos', force=True)
+            refused('pianousb-shell', ba.check_userland, {'main': ' '.join(before)},
+                    ba.with_set(ba.tiny_adt(), 'macos', tail), kc, live=True)
+            line, tail = esp.split_line(' '.join(words), force=True)
+            assert line == baseline and tail[-4:] == delta
+            adt = ba.with_set(ba.tiny_adt(), 'macos', tail)
+            diag = esp.diag_line(line, 240)
+            assert esp.diag_budget(diag, len(' '.join(tail)))['included']
+            ba.check_userland({'main': line, 'diag': diag}, adt, kc, live=True)
+            for prefix in (line, diag):
+                full, status = ba.merged(prefix, adt)
+                assert status == 'appended' and set(delta) <= set(full.split())
+                assert set(base[-2:]) <= set(ba.legacy_clip(full.encode()).decode().split())
+    print('PASS y12u fixed 120/144 ESP replay keeps the installed USB arguments visible')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--qual-record', type=Path, help='record from an existing RAM qualification image')
@@ -205,6 +235,7 @@ def main():
     test_adt_bounds()
     ba.test_userland_visibility()
     test_identity_overlay()
+    test_daily_combo()
     if args.qual_record:
         test_qual(args.qual_record)
     if args.daily_record:
