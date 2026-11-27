@@ -53,12 +53,22 @@ mkfile -n "${SIZE_MIB}m" "$IMG"
 DATA_DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk '/^\/dev\/disk/ {print $1; exit}')
 [ -n "$DATA_DEV" ] || { echo "hdiutil did not attach $IMG" >&2; exit 1; }
 newfs_apfs -v Data "$DATA_DEV" > /dev/null
-# newfs_apfs leaves an APFS container: the mountable object is its first APFS volume (diskNsM), not the container device
-# newfs_apfs on a whole raw image makes the container ON that device: its single volume is <device>s1
-DATA_VOL=${DATA_DEV}s1
-[ -e "$DATA_VOL" ] || { VOL=$(diskutil list | awk '/APFS Volume/ {print $NF; exit}'); [ -n "$VOL" ] && DATA_VOL=/dev/${VOL#/dev/}; }
-[ -e "$DATA_VOL" ] || { echo "no APFS volume for $DATA_DEV ($(diskutil list | tr "\n" " "))" >&2; exit 1; }
-echo "container $DATA_DEV, volume $DATA_VOL"
+# newfs_apfs leaves an APFS container that may live on a synthesized device: ask diskutil which volume belongs to the
+# physical store we just formatted, instead of guessing <device>s1 (guessing mounted the runner root disk in smoke run 4).
+DATA_VOL_IDS=$(diskutil apfs list -plist | plutil -convert json -o - - | python3 -c '
+import json, sys
+want = sys.argv[1]
+data = json.load(sys.stdin)
+for container in data.get("Containers", []):
+    stores = [s.get("DeviceIdentifier", "") for s in container.get("PhysicalStores", [])]
+    if any(s == want or s.startswith(want) for s in stores):
+        for volume in container.get("Volumes", []):
+            print(volume.get("DeviceIdentifier", ""))
+        break
+' "$DATA_DEV")
+DATA_VOL=$(printf "%s\n" "$DATA_VOL_IDS" | awk 'NF {print "/dev/" $1; exit}')
+[ -n "$DATA_VOL" ] || { echo "no APFS volume on the container of $DATA_DEV (physical stores: $(diskutil apfs list | head -20 | tr "\n" " "))" >&2; exit 1; }
+echo "container on $DATA_DEV, volume $DATA_VOL"
 mkdir -p "$DATA_MNT"
 diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
 mounted "$DATA_MNT" || { echo "the new APFS volume did not mount at $DATA_MNT" >&2; exit 1; }
