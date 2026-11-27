@@ -131,6 +131,7 @@ jobs:
             ${{ runner.temp }}/ci/out/piano-kexts.tar.gz
             ${{ runner.temp }}/ci/out/SHA256SUMS
             ${{ runner.temp }}/ci/out/BUILD-INFO.txt
+            ${{ runner.temp }}/ci/kexts-status.txt
           retention-days: 14
       - name: Remove the KDK copy and every leftover input
         if: always()
