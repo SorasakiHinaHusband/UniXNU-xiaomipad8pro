@@ -39,7 +39,10 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Host tools
-        run: brew install nasm mtoc acpica 2>&1 | tail -3 || true
+        run: |
+          brew install nasm mtoc acpica llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
       - name: UEFI checkouts of unixnu.lock
         env:
           UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
