@@ -23,6 +23,10 @@ fi
 ln -sfn "$SOC_DIR" "$D/UniXNU-sm8750-common"
 ln -sfn "$SOC_DIR" "$(dirname "$D")/UniXNU-sm8750-common"
 export SOC_DIR
+EXTRA_INC="$WORK/extra-inc"
+mkdir -p "$EXTRA_INC/IOKit"
+ln -sfn "$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers/IOKit/storage" "$EXTRA_INC/IOKit/storage"
+export EXTRA_INC
 bash tooling/ci/with-kernelcache.sh bash -c '
   set -euo pipefail
   T=$WORK/k273-tree
@@ -30,7 +34,7 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   [ -f "$K" ] || { echo "prepare-k27-tree.sh gave no kernel" >&2; exit 1; }
   cp "$K" "$OUT/kernel-k273-native.macho"
   PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml \
-    CPATH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers:$SOC_DIR/kits" \
+    CPATH="$EXTRA_INC:$SOC_DIR/kits" \
     PIANO_STOP_AFTER=kexts bash tooling/k27/build-native-image.sh
 '
 # our objects only (out/native-kexts/NAME/*.o, no generated headers or host-test outputs) and the descriptors; nothing of the
