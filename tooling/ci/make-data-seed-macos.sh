@@ -39,9 +39,15 @@ if [ -z "$TEMPLATE" ]; then
   echo "attaching $OS_IMAGE (read only)"
   ATTACH=$(hdiutil attach -nobrowse -readonly "$OS_IMAGE")
   echo "$ATTACH"
-  OS_MNT=$(printf '%s\n' "$ATTACH" | awk '/Apple_APFS/ {print $NF; exit}')
-  [ -n "$OS_MNT" ] && [ -d "$OS_MNT/System/Library/Templates/Data" ] \
-    || { echo "no /System/Library/Templates/Data under $OS_IMAGE (mount points: $ATTACH)" >&2; exit 1; }
+  # the volume is the one that carries the Data template; hdiutil's output names no "Apple_APFS" line on this image
+  OS_MNT=
+  for m in /Volumes/*; do [ -d "$m/System/Library/Templates/Data" ] && { OS_MNT=$m; break; }; done
+  if [ -z "$OS_MNT" ]; then
+    echo "no /System/Library/Templates/Data among /Volumes/* (attach output: $ATTACH)" >&2
+    for m in /Volumes/*; do [ -d "$m/System/Library" ] && ls "$m/System/Library/Templates" 2>/dev/null; done
+    exit 1
+  fi
+  echo "template volume: $OS_MNT"
   TEMPLATE="$OS_MNT/System/Library/Templates/Data"
 fi
 [ -d "$TEMPLATE" ] || { echo "no template directory $TEMPLATE" >&2; exit 1; }
