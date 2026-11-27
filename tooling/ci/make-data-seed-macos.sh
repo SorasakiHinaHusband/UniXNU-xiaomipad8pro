@@ -32,17 +32,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "attaching $OS_IMAGE (read only)"
-ATTACH=$(hdiutil attach -nobrowse -readonly "$OS_IMAGE")
-echo "$ATTACH"
-OS_MNT=$(printf '%s\n' "$ATTACH" | awk '$3 == "/System/Library/Templates/Data" || NF >= 3 {print $NF}' | while read -r mp; do
-  [ -d "$mp/System/Library/Templates/Data" ] && { echo "$mp"; break; }; done)
-if [ -z "$OS_MNT" ]; then
+# SEED_TEMPLATE_DIR: a template tree to use instead of the OS image (the smoke test of this script, tools/ci/seed-smoke.yml)
+TEMPLATE=${SEED_TEMPLATE_DIR:-}
+if [ -z "$TEMPLATE" ]; then
+  echo "attaching $OS_IMAGE (read only)"
+  ATTACH=$(hdiutil attach -nobrowse -readonly "$OS_IMAGE")
+  echo "$ATTACH"
   OS_MNT=$(printf '%s\n' "$ATTACH" | awk '/Apple_APFS/ {print $NF; exit}')
+  [ -n "$OS_MNT" ] && [ -d "$OS_MNT/System/Library/Templates/Data" ] \
+    || { echo "no /System/Library/Templates/Data under $OS_IMAGE (mount points: $ATTACH)" >&2; exit 1; }
+  TEMPLATE="$OS_MNT/System/Library/Templates/Data"
 fi
-[ -n "$OS_MNT" ] && [ -d "$OS_MNT/System/Library/Templates/Data" ] \
-  || { echo "no /System/Library/Templates/Data under the attached $OS_IMAGE (mount points: $ATTACH)" >&2; exit 1; }
-TEMPLATE="$OS_MNT/System/Library/Templates/Data"
+[ -d "$TEMPLATE" ] || { echo "no template directory $TEMPLATE" >&2; exit 1; }
 
 echo "a $SIZE_MIB MiB APFS image, volume Data"
 IMG=$OUT/data.img
