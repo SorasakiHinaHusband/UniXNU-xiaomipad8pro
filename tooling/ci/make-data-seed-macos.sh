@@ -18,7 +18,7 @@ OUT=${2:?the output directory}
 SIZE_MIB=${3:-1024}
 PACKER=${PACKED_RAMDISK:-${DARWINBOOT:-}/Test/packed_ramdisk.py}
 [ -f "$PACKER" ] || { echo "no packed_ramdisk.py: set PACKED_RAMDISK or DARWINBOOT (the DarwinBoot checkout)" >&2; exit 1; }
-[ -f "$OS_IMAGE" ] || { echo "no $OS_IMAGE" >&2; exit 1; }
+[ -n "${SEED_TEMPLATE_DIR:-}" ] || [ -f "$OS_IMAGE" ] || { echo "no $OS_IMAGE" >&2; exit 1; }   # /dev/null and friends only make sense with SEED_TEMPLATE_DIR
 mkdir -p "$OUT"
 W=$(mktemp -d "${TMPDIR:-/tmp}/piano-seed.XXXXXX")
 OS_MNT=
