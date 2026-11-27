@@ -1,0 +1,111 @@
+# Part 1 of the split image build: only what cannot run anywhere but macOS.
+#   - the AEA images of the 27.3 IPSW (Apple's /usr/bin/aea),
+#   - the SystemOS window (newfs_apfs + ditto),
+#   - the Data seed (newfs_apfs + the IPSW's Templates/Data + DarwinBoot's packed_ramdisk.py),
+#   - root.img (its two windows come from the steps above).
+# It uploads those to the image-apfs artifact; image-linux.yml (ubuntu, free and plentiful) does the KC, the ADT and the
+# RAM images from them. Queueing for a macOS runner is expected: it is one short job instead of a two hour chain.
+name: image-apfs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  SUDO: sudo
+  REMOVE_AEA: '1'
+
+jobs:
+  apfs:
+    name: macOS-only inputs
+    runs-on: macos-26
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disk space and host tools
+        run: |
+          df -h / | tail -1
+          brew install gnu-sed mtools dtc zstd nasm mtoc acpica blacktop/tap/ipsw 2>&1 | tail -2 || true
+          xcodebuild -version
+
+      - name: The k27 tree (the SystemOS boot shims live in it)
+        run: |
+          set -uo pipefail
+          bash tooling/k27/fetch-k27-tree.sh "$RUNNER_TEMP/k27-tree" || { echo "::error::no k27 tree"; exit 1; }
+          echo "PIANO_K27_TREE=$RUNNER_TEMP/k27-tree" >> "$GITHUB_ENV"
+          ls "$RUNNER_TEMP/k27-tree/overlay/systemos-shims/sbin"
+
+      - name: IPSW inputs (AEA decrypted, pinned)
+        run: python3 tooling/repro/fetch-ipsw.py --inputs out/inputs/k273
+        timeout-minutes: 120
+
+      - name: Trust bundle (the three IPSW trust caches, no own modules)
+        run: |
+          set -uo pipefail
+          M=out/inputs/k273/26C5035r
+          mkdir -p out/inputs
+          python3 tooling/k273/make-trust.py out/inputs/base-absent.bundle \
+            "$M/141-22233-021.dmg.aea.trustcache" "$M/141-22145-021.dmg.aea.trustcache" "$M/141-22106-021.dmg.trustcache" \
+            out/inputs/kernel.macho.trustcache
+
+      - name: SystemOS window (newfs_apfs + ditto, 6 GiB)
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/k27-tree
+        run: |
+          df -h /
+          bash tooling/k273/make-systemos.sh out/inputs/k273/26C5035r/141-22233-021.dmg \
+            out/inputs/k273/26C5035r/141-22145-021.dmg out/inputs/k273/26C5035r/141-22106-021.dmg \
+            out/inputs/k273/root/systemos.img
+          sudo python3 -I tooling/repro/volume-manifest.py --image out/inputs/k273/root/systemos.img \
+            --json out/inputs/k273/root/systemos.manifest.json \
+            --compare tooling/repro/pins.json
+        timeout-minutes: 60
+
+      - name: Data seed (the IPSW Data template, APFS image, DBRDISK1)
+        env:
+          UNIXNU_RESEARCH: ${{ runner.temp }}/unixnu-research
+        run: |
+          set -uo pipefail
+          python3 scripts/fetch-pins.py --only DarwinBoot
+          PACKED_RAMDISK="$UNIXNU_RESEARCH/DarwinBoot/Test/packed_ramdisk.py" \
+            bash tooling/ci/make-data-seed-macos.sh out/inputs/k273/26C5035r/141-22233-021.dmg out/inputs 1024
+          ls -la out/inputs/scratch-data.img
+        timeout-minutes: 40
+
+      - name: root.img (the two windows, pinned layout)
+        env:
+          PIANO_K27_TREE: ${{ runner.temp }}/k27-tree
+          K273_INPUTS: out/inputs/k273
+        run: |
+          set -uo pipefail
+          K273_SEED=out/inputs/scratch-data.img bash tooling/k273/make-root-image.sh out/inputs/k273/root
+          ls -la out/inputs/k273/root/
+          python3 tooling/repro/verify-root.py out/inputs/k273/root --quick || true
+        timeout-minutes: 40
+
+      - name: Compress and split root.img (2 GB asset rule, ~10 GB artifact rule)
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/apfs"
+          cp out/inputs/scratch-data.img "$RUNNER_TEMP/apfs/" || true
+          cp out/inputs/kernel.macho.trustcache "$RUNNER_TEMP/apfs/" || true
+          cp out/inputs/k273/root/root.json "$RUNNER_TEMP/apfs/" || true
+          if [ -f out/inputs/k273/root/root.img ]; then
+            zstd -19 -T0 -q -f -o "$RUNNER_TEMP/apfs/root.img.zst" out/inputs/k273/root/root.img
+            ls -la "$RUNNER_TEMP/apfs/root.img.zst"
+            shasum -a 256 "$RUNNER_TEMP/apfs/root.img.zst" | cut -d" " -f1 > "$RUNNER_TEMP/apfs/root.img.zst.sha256"
+          fi
+          ls -la "$RUNNER_TEMP/apfs"
+        timeout-minutes: 60
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: image-apfs
+          path: ${{ runner.temp }}/apfs
+          if-no-files-found: warn
+          retention-days: 14
