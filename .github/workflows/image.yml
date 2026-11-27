@@ -64,6 +64,35 @@ jobs:
           echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
           command -v ipsw aea dtc mtools || true
 
+      - name: Owner inputs (private release assets, when configured)
+        env:
+          INPUTS_REPO: ${{ vars.PIANO_INPUTS_REPO }}
+          TOKEN: ${{ secrets.PIANO_INPUTS_TOKEN }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/owner-inputs"
+          if [ -z "${INPUTS_REPO:-}" ] || [ -z "${TOKEN:-}" ]; then
+            echo "::warning::no owner inputs: vars.PIANO_INPUTS_REPO / secrets.PIANO_INPUTS_TOKEN are not set (root and NativeGopDisplay stay unbuildable)"
+            exit 0
+          fi
+          curl -fsSL -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$INPUTS_REPO/releases/latest" \
+            | python3 -c 'import json,sys; [print(a["name"], a["id"]) for a in json.load(sys.stdin).get("assets", [])]' > "$RUNNER_TEMP/assets.txt"
+          cat "$RUNNER_TEMP/assets.txt"
+          fetch() { # NAME DEST
+            local id; id=$(awk -v n="$1" '$1 == n {print $2}' "$RUNNER_TEMP/assets.txt")
+            [ -n "$id" ] || { echo "::warning::owner input $1 is not in the latest release of $INPUTS_REPO"; return 1; }
+            curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" \
+              -o "$2" "https://api.github.com/repos/$INPUTS_REPO/releases/assets/$id" && ls -l "$2"
+          }
+          fetch kernel.macho.trustcache "$RUNNER_TEMP/owner-inputs/kernel.macho.trustcache" || true
+          fetch scratch-data.img "$RUNNER_TEMP/owner-inputs/scratch-data.img" || true
+          fetch inc-hid.tar.gz "$RUNNER_TEMP/owner-inputs/inc-hid.tar.gz" || true
+          fetch inc-net-piano.tar.gz "$RUNNER_TEMP/owner-inputs/inc-net-piano.tar.gz" || true
+          fetch kc27.bin "$RUNNER_TEMP/owner-inputs/kc27.bin" || true
+          mkdir -p out/inputs
+          for f in kernel.macho.trustcache scratch-data.img; do
+            [ -f "$RUNNER_TEMP/owner-inputs/$f" ] && cp "$RUNNER_TEMP/owner-inputs/$f" "out/inputs/$f" && echo "placed out/inputs/$f"
+          done
       - name: k27 tree, xnu source and ld-classic
         env:
           WORK: ${{ runner.temp }}/ci
@@ -75,6 +104,19 @@ jobs:
           bash tooling/ci/k27-kernel.sh tree xnu ld
           date -u
 
+      - name: Place the owner inputs in the tree (generated headers, reference collection)
+        env:
+          WORK: ${{ runner.temp }}/ci
+        run: |
+          set -uo pipefail
+          T="$WORK/k27-tree/out/x12377"
+          mkdir -p "$T" "$WORK/k27-tree/out/kc"
+          for tarball in inc-hid inc-net-piano; do
+            f="$RUNNER_TEMP/owner-inputs/$tarball.tar.gz"
+            [ -f "$f" ] && { tar -xzf "$f" -C "$T" && echo "placed $T/$tarball"; } || true
+          done
+          f="$RUNNER_TEMP/owner-inputs/kc27.bin"
+          [ -f "$f" ] && { cp "$f" "$WORK/k27-tree/out/kc/kc27.bin" && echo "placed the paravirt reference collection"; } || true
       - name: KDK headers (download bounded, expanded, removed again)
         env:
           WORK: ${{ runner.temp }}/ci
