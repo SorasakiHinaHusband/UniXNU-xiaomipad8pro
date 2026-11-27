@@ -306,6 +306,8 @@ jobs:
           name: piano-image
           path: |
             ${{ runner.temp }}/logs
+            ${{ runner.temp }}/ci/kext-*.log
+            ${{ runner.temp }}/ci/kexts-status.txt
             out/ram
             out/fd
             out/k27/kc-k27-native.bin
