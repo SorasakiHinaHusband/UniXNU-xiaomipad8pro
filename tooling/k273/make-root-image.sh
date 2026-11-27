@@ -36,7 +36,7 @@ else
 python3 tooling/native/make-root-manifest.py "$O/manifest" "OS=$OS" "SystemOS=$SYS"
 IMAGE_BYTES=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_bytes"])' "$O/manifest/layout.json")
 rm -f "$O/root.img" "$O/root.img.sha256"
-mkfile -n "$IMAGE_BYTES" "$O/root.img"
+if command -v mkfile > /dev/null; then mkfile -n "$IMAGE_BYTES" "$O/root.img"; else truncate -s "$IMAGE_BYTES" "$O/root.img"; fi   # mkfile is macOS, truncate Linux
 dd if="$O/manifest/manifest.bin" of="$O/root.img" bs=4096 count=1 conv=notrunc 2> /dev/null
 python3 - "$O/manifest/layout.json" "$O/root.img" <<'EOF'
 import json, sys
