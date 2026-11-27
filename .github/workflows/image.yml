@@ -241,11 +241,20 @@ jobs:
       - name: KC, ADT and (when the root image exists) the RAM images
         continue-on-error: true
         env:
+          WORK: ${{ runner.temp }}/ci
           PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
         run: |
           set -uo pipefail
           df -h /
-          bash tooling/k273/build-k273-image.sh || echo "::warning::build-k273-image.sh did not finish: the KC and ADT it wrote before the root/seed gates are kept and uploaded"
+          # build-k273-image.sh rebuilds the kexts itself and stops at the first one that cannot build here; give it exactly
+          # the set this job built, so the KC and the ADT are made from everything that exists instead of nothing at all.
+          if [ -f "$WORK/kexts-status.txt" ]; then
+            awk '$1 == "ok" {print $2}' "$WORK/kexts-status.txt" > "$RUNNER_TEMP/kexts-ok.txt"
+            echo "kexts for the collection: $(wc -l < "$RUNNER_TEMP/kexts-ok.txt")"
+            export PIANO_KEXT_LIST=$RUNNER_TEMP/kexts-ok.txt
+          fi
+          K273_TREE=out/k273/k27-tree bash tooling/k273/build-k273-image.sh \
+            || echo "::warning::build-k273-image.sh did not finish: the KC and the ADT it wrote before the root/seed gates are kept and uploaded"
           ls -la out/k27 out/adt out/ram 2>/dev/null || true
       - name: Logs
         if: always()
