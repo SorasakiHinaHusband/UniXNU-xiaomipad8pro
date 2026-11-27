@@ -2,12 +2,10 @@
 # tablet, and nothing is uploaded but the test report. docs/ci.md.
 name: checks
 
+# Disabled on this fork: every push spawned this workflow (privacy scan, self-tests, ~40 min on macos-26) and the
+# account runs one macOS job at a time, so it starved the build/image runs. Run it by hand when it matters.
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: read
 
