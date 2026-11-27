@@ -82,7 +82,9 @@ jobs:
           # work and outputs outside the workspace (and outside every cache and artifact path but the explicit uploads below)
           { echo "WORK=$RUNNER_TEMP/ci"; echo "OUT=$RUNNER_TEMP/ci/out"; } >> "$GITHUB_ENV"
       - name: Host tools
-        run: brew install gnu-sed ffmpeg 2>&1 | tail -2
+        run: |
+          brew install gnu-sed ffmpeg llvm 2>&1 | tail -2
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
       - name: k27 tree, xnu source, ld-classic
         run: bash tooling/ci/k27-kernel.sh tree xnu ld
       - name: KDK headers
@@ -111,7 +113,8 @@ jobs:
           for f in *; do
             case $f in kernel-k27-native.macho|kernel-k273-native.macho|piano-kexts.tar.gz|*.sha256) ;; *) echo "::error::unexpected output $f"; exit 1 ;; esac
           done
-          if tar -tzf piano-kexts.tar.gz | grep -viE '^(native-kexts/.*\.o|tooling/k27/kext(/.*\.json)?/?)$'; then
+          # Directory entries are fine; every FILE inside the tarball must be one of ours: the kexts' objects or the descriptors.
+          if tar -tzf piano-kexts.tar.gz | grep -v '/$' | grep -viE '^(native-kexts/.*\.o|tooling/k27/kext(/.*\.json)?)$'; then
             echo "::error::piano-kexts.tar.gz holds more than our kext objects and descriptors"; exit 1
           fi
           ls -la
@@ -135,6 +138,7 @@ jobs:
             ${{ runner.temp }}/ci/out/BUILD-INFO.txt
             ${{ runner.temp }}/ci/kexts-status.txt
             ${{ runner.temp }}/ci/kext-*.log
+            out/native-kexts/*/host-tests/*.log
           retention-days: 14
       - name: Remove the KDK copy and every leftover input
         if: always()
