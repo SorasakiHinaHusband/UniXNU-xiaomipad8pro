@@ -50,10 +50,29 @@ bash tooling/ci/with-kernelcache.sh bash -c '
     echo "::warning::NativeGopDisplay left out of this CI build: $REF_KC has no AppleParavirtDisplay, so its IOMobileFramebufferABI.h cannot be generated (set IOMFB_ABI_REFERENCE_KC to a paravirt collection to build it)"
     KEXT_LIST=$WORK/kexts-ci.txt
   fi
-  PIANO_KEXT_LIST=$KEXT_LIST \
-  PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml \
-    CPATH="$EXTRA_INC:$SOC_DIR/kits" \
-    PIANO_STOP_AFTER=kexts bash tooling/k27/build-native-image.sh
+  export PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml
+  export CPATH="$EXTRA_INC:$SOC_DIR/kits" PIANO_STOP_AFTER=kexts
+  # A hosted runner has no device-local inputs: the pinned boot DT, and the vendor firmware images (GPU zap, VPU, MCU, audio
+  # preset). Those stay off a public CI artifact anyway (docs/ci.md: Apple and vendor payloads never leave the runner), so build
+  # the kexts without them, one at a time, and let kexts-status.txt say per kext what this job could build and what it could not:
+  # one kext that needs a local input must not take the whole build down.
+  export PIANO_GPU_NO_FIRMWARE=1 PIANO_KEYBOARD_NO_FIRMWARE=1
+  : > "$WORK/kexts-status.txt"
+  built=0; left=
+  while read -r name rest; do
+    case $name in ""|\#*) continue ;; esac
+    printf "%s\n" "$name" > "$WORK/one-kext.txt"
+    if PIANO_KEXT_LIST=$WORK/one-kext.txt bash tooling/k27/build-native-image.sh > "$WORK/kext-$name.log" 2>&1; then
+      echo "ok   $name" | tee -a "$WORK/kexts-status.txt"
+      built=$((built + 1))
+    else
+      echo "FAIL $name  $(tail -1 "$WORK/kext-$name.log")" | tee -a "$WORK/kexts-status.txt"
+      echo "::warning::kext $name did not build on this runner: $(tail -2 "$WORK/kext-$name.log" | tr "\n" " ")"
+      left="$left $name"
+    fi
+  done < "$KEXT_LIST"
+  echo "kexts built: $built; left out:${left:- none}"
+  [ "$built" -gt 0 ] || { echo "no kext built at all" >&2; exit 1; }
 '
 # our objects only (out/native-kexts/NAME/*.o, no generated headers or host-test outputs) and the descriptors; nothing of the
 # kernelcache is in there
