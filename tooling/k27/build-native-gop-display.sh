@@ -23,6 +23,12 @@ CACHE=$D/out/k27/iomfb-abi/$(shasum -a 256 "$KC_BASE" | cut -c1-16)
 # A collection without AppleParavirtDisplay (a Mac's: no IOMobileFramebufferLegacy subclass names the pure virtual slots) takes the
 # declarations generated from IOMFB_ABI_REFERENCE_KC (default the k27 tree's kc27.bin) once tooling/k273/check-family-abi.py has
 # found the classes' vtables the same there, with the target's instance size.
+#
+# A hosted runner has neither the paravirt collection nor a Mac VM to make one, so there is a third path: the declarations the k27
+# tree commits for 26.5's vma2 collection (overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h), accepted only after
+# tooling/k27/check-iomfb-abi-header.py has found EVERY slot's PAC diversity and the slot count identical in this collection
+# (the diversities are the mangled names' discriminators, so they pin the ABI); the committed instance size is replaced with the
+# one this collection's OSMetaClass constructor passes. A header that does not verify is refused, never patched into place.
 if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ] || [ ! -f "$CACHE/abi" ]; then
   mkdir -p "$CACHE"
   if python3 "$K/scripts/kc-vtable.py" "$KC_BASE" AppleParavirtDisplay > /dev/null 2>&1; then
@@ -30,22 +36,31 @@ if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ] || [ ! -f "$CACHE/abi" ]; then
     echo 1 > "$CACHE/abi"
   else
     REF=${IOMFB_ABI_REFERENCE_KC:-$K/out/kc/kc27.bin}
-    python3 "$D/tooling/k273/check-family-abi.py" --vtables-only "$REF" "$KC_BASE" IOMobileFramebuffer@com.apple.iokit.IOMobileGraphicsFamily \
-      IOMobileFramebufferLegacy@com.apple.iokit.IOMobileGraphicsFamily IOMFBSwapIORequest@com.apple.iokit.IOMobileGraphicsFamily > "$CACHE/abi-check.txt" \
-      || { cat "$CACHE/abi-check.txt" >&2; echo "Error: the IOMobileFramebuffer vtables of $KC_BASE are not $REF's" >&2; exit 1; }
-    SIZES=$(awk '$1 == "size" {printf "%s:%s:%s ", $2, $3, $4}' "$CACHE/abi-check.txt")
-    case " $SIZES " in
-      # the local tree: the 27.0.1 vma2 reference against the 27.3 target
-      *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:7640:9120 IOMFBSwapIORequest:3400:4056 "*) ABI=2 ;;
-      # CI: the reference IS the target collection (the 27.3 mac17j kernelcache), so the sizes agree; the layout is the same 27.3 one
-      *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:9120:9120 IOMFBSwapIORequest:4056:4056 "*) ABI=2 ;;
-      *) echo "Error: no NativeGopDisplay offsets for this IOMobileGraphicsFamily layout ($SIZES)" >&2; exit 1 ;;
-    esac
-    python3 "$K/scripts/gen-iomfb-abi.py" "$REF" "$CACHE/IOMobileFramebufferABI.h.ref"
-    sed -e 's/0x1dd8/0x23a0/g' "$CACHE/IOMobileFramebufferABI.h.ref" > "$CACHE/IOMobileFramebufferABI.h"
-    grep -q 'sizeof(IOMobileFramebufferLegacy) == 0x23a0' "$CACHE/IOMobileFramebufferABI.h" || { echo "Error: instance size not replaced" >&2; exit 1; }
-    echo $ABI > "$CACHE/abi"
-  fi
+    if [ -f "$REF" ] && python3 "$K/scripts/kc-vtable.py" "$REF" AppleParavirtDisplay > /dev/null 2>&1; then
+      python3 "$D/tooling/k273/check-family-abi.py" --vtables-only "$REF" "$KC_BASE" IOMobileFramebuffer@com.apple.iokit.IOMobileGraphicsFamily \
+        IOMobileFramebufferLegacy@com.apple.iokit.IOMobileGraphicsFamily IOMFBSwapIORequest@com.apple.iokit.IOMobileGraphicsFamily > "$CACHE/abi-check.txt" \
+        || { cat "$CACHE/abi-check.txt" >&2; echo "Error: the IOMobileFramebuffer vtables of $KC_BASE are not $REF's" >&2; exit 1; }
+      SIZES=$(awk '$1 == "size" {printf "%s:%s:%s ", $2, $3, $4}' "$CACHE/abi-check.txt")
+      case " $SIZES " in
+        # the local tree: the 27.0.1 vma2 reference against the 27.3 target
+        *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:7640:9120 IOMFBSwapIORequest:3400:4056 "*) ABI=2 ;;
+        # a reference that is the target collection itself: the sizes agree, the layout is the target's
+        *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:9120:9120 IOMFBSwapIORequest:4056:4056 "*) ABI=2 ;;
+        *) echo "Error: no NativeGopDisplay offsets for this IOMobileGraphicsFamily layout ($SIZES)" >&2; exit 1 ;;
+      esac
+      python3 "$K/scripts/gen-iomfb-abi.py" "$REF" "$CACHE/IOMobileFramebufferABI.h.ref"
+      sed -e 's/0x1dd8/0x23a0/g' "$CACHE/IOMobileFramebufferABI.h.ref" > "$CACHE/IOMobileFramebufferABI.h"
+      grep -q 'sizeof(IOMobileFramebufferLegacy) == 0x23a0' "$CACHE/IOMobileFramebufferABI.h" || { echo "Error: instance size not replaced" >&2; exit 1; }
+      echo $ABI > "$CACHE/abi"
+    elif python3 "$D/tooling/k27/check-iomfb-abi-header.py" --header "$K/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h" \
+           --kc "$KC_BASE" --tree "$K" --out "$CACHE/IOMobileFramebufferABI.h.tmp"; then
+      mv "$CACHE/IOMobileFramebufferABI.h.tmp" "$CACHE/IOMobileFramebufferABI.h"
+      echo 2 > "$CACHE/abi"
+    else
+      echo "Error: no IOMobileFramebuffer declarations for $KC_BASE: no paravirt reference collection (IOMFB_ABI_REFERENCE_KC), and the" \
+        "committed declarations do not verify against it (tooling/k27/check-iomfb-abi-header.py)" >&2
+      exit 1
+    fi
 fi
 python3 "$D/tooling/k27/build-native-kext.py" NativeGopDisplay "$D/package/NativeGopDisplay/NativeGopDisplay.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   -I "$CACHE" -D "NATIVE_GOP_IOMFB_ABI=$(cat "$CACHE/abi")" --obj "${K27_OBJ:-k27-native-obj}"
