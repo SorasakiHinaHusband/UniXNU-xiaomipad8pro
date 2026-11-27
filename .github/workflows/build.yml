@@ -82,7 +82,7 @@ jobs:
           # work and outputs outside the workspace (and outside every cache and artifact path but the explicit uploads below)
           { echo "WORK=$RUNNER_TEMP/ci"; echo "OUT=$RUNNER_TEMP/ci/out"; } >> "$GITHUB_ENV"
       - name: Host tools
-        run: brew install gnu-sed 2>&1 | tail -1
+        run: brew install gnu-sed ffmpeg 2>&1 | tail -2
       - name: k27 tree, xnu source, ld-classic
         run: bash tooling/ci/k27-kernel.sh tree xnu ld
       - name: KDK headers
@@ -134,6 +134,7 @@ jobs:
             ${{ runner.temp }}/ci/out/SHA256SUMS
             ${{ runner.temp }}/ci/out/BUILD-INFO.txt
             ${{ runner.temp }}/ci/kexts-status.txt
+            ${{ runner.temp }}/ci/kext-*.log
           retention-days: 14
       - name: Remove the KDK copy and every leftover input
         if: always()
