@@ -54,8 +54,9 @@ jobs:
       - name: Hash
         run: |
           mkdir -p "$RUNNER_TEMP/fd"
-          shasum -a 256 out/fd/piano-uefi-A-bundled.fd | tee "$RUNNER_TEMP/fd/fd.sha256"
-          cp out/fd/build-A-bundled.log "$RUNNER_TEMP/fd/" || true
+          shasum -a 256 out/fd/piano-uefi-A-bundled.fd > "$RUNNER_TEMP/fd/sha256.txt"
+          cp out/fd/build-A-bundled.log "$RUNNER_TEMP/fd/"
+          cp out/fd/piano-uefi-A-bundled.fd "$RUNNER_TEMP/fd/"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
