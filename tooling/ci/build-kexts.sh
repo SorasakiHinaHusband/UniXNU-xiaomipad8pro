@@ -71,5 +71,7 @@ bash tooling/ci/with-kernelcache.sh bash -c '
 # kernelcache is in there
 ( cd out && find native-kexts -type f -name '*.o' | sort > "$WORK/kext-objects.txt" )
 [ -s "$WORK/kext-objects.txt" ] || { echo "no kext objects under out/native-kexts" >&2; exit 1; }
-tar -C out -czf "$OUT/piano-kexts.tar.gz" -T "$WORK/kext-objects.txt" -C "$D" tooling/k27/kext
+# bsdtar (macOS) resolves a -T list against the LAST -C, GNU tar against the one in force when -T is read: name the
+# descriptors first, then put -C out immediately before -T so both implementations read the list under out/.
+tar -czf "$OUT/piano-kexts.tar.gz" -C "$D" tooling/k27/kext -C out -T "$WORK/kext-objects.txt"
 ( cd "$OUT" && shasum -a 256 piano-kexts.tar.gz kernel-k273-native.macho > kexts.sha256 && cat kexts.sha256 )
