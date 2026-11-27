@@ -87,6 +87,15 @@ jobs:
           python3 tooling/repro/verify-root.py out/inputs/k273/root --quick || true
         timeout-minutes: 40
 
+      - name: The KC base (decompressed here because only macOS has Apple compression_tool)
+        run: |
+          set -uo pipefail
+          mkdir -p out/inputs/k273/kc
+          python3 tooling/k273/ipsw-members.py fetch --out out/inputs/k273/26C5035r KernelCache
+          python3 tooling/k273/decompress-kernelcache.py out/inputs/k273/26C5035r/kernelcache.release.mac17j out/inputs/k273/kc/kc273-mac17j.bin
+          ls -la out/inputs/k273/kc/
+        timeout-minutes: 30
+
       - name: Compress and split root.img (2 GB asset rule, ~10 GB artifact rule)
         run: |
           set -uo pipefail
@@ -94,6 +103,7 @@ jobs:
           cp out/inputs/scratch-data.img "$RUNNER_TEMP/apfs/" || true
           cp out/inputs/kernel.macho.trustcache "$RUNNER_TEMP/apfs/" || true
           cp out/inputs/k273/root/root.json "$RUNNER_TEMP/apfs/" || true
+          cp out/inputs/k273/kc/kc273-mac17j.bin "$RUNNER_TEMP/apfs/" || true
           if [ -f out/inputs/k273/root/root.img ]; then
             zstd -19 -T0 -q -f -o "$RUNNER_TEMP/apfs/root.img.zst" out/inputs/k273/root/root.img
             ls -la "$RUNNER_TEMP/apfs/root.img.zst"
