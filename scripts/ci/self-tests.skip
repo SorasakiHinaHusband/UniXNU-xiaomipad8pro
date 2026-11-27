@@ -53,3 +53,4 @@ tooling/k27/run-a830-host-tests.py                     # SUITE: scripts/ci/adren
 package/PianoA830/adreno830/tests/test_tier_boalloc.cpp # SUITE: package/PianoA830/adreno830/tests/run-host-tests.py
 tooling/metal/turnip-a830/test-cache-fallback-host.sh   # ARGS: needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
 tooling/metal/turnip-a830/test-family-host.sh           # ARGS: needs a built NativeAdrenoMetal.bundle argument (run by hand after tooling/metal/build-turnip-a830.sh)
+package/PianoPower/tests/battery_health_host.cpp      # SUITE: package/PianoPower/tests/run-battery-health-host.sh (CoreFoundation, ASan/UBSan)

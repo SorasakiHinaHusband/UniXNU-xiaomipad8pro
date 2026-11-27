@@ -17,6 +17,7 @@
 #include "Gauge.h"
 #include "gauge_model.h"
 #include "GaugeAlerts.h"
+#include "BatteryMap.h"
 #include "RtcReadout.h"
 #include <algorithm>
 #include <ctime>
@@ -1209,6 +1210,104 @@ static void testChgFix()
 // --------------------------------------------------------------------------------------------------------- I2C gauge model
 using pianopower::test::Gauge;
 using pianopower::test::fillGauge;
+
+static void testGaugeBatteryFields()
+{
+  // 2026-11-11 level-1 capture, charging.md and 20261111-045251-loop/xnu-console.txt.
+  // Replay the measured per-pack data. The design split uses equal halves of the recorded
+  // 9200 mAh aggregate. The time words are fixtures for registers the old collection did not read.
+  Gauge a, b;
+  fillGauge(a, 4480, 0, 99, 4287, 4344, 293, 0x60);
+  fillGauge(b, 4479, 0, 99, 4235, 4290, 281, 0x60);
+  a.regs[0x2a] = 113;
+  b.regs[0x2a] = 114;
+  a.regs[0x3c] = b.regs[0x3c] = 4600;
+  a.regs[0x16] = b.regs[0x16] = 0xffff;
+  a.regs[0x18] = b.regs[0x18] = 0xffff;
+  I2cBus busA(a.io()), busB(b.io());
+  GaugeReading packs[] = {readGauge(busA), readGauge(busB)};
+  CHECK(a.reads == 10 && b.reads == 10);
+  CHECK(packs[0].timeToEmpty == 0xffff && packs[1].timeToFull == 0xffff);
+
+  PortState ac;
+  ac.ok = ac.sourceSeen = true;
+  const BatteryValues baseline = mapBattery(packs, 2, combinePacks(packs, 2), &ac, 0);
+  CHECK(!baseline.gaugeFields && baseline.systemTimeRemaining() == 65535);
+  packs[0] = readGauge(busA, true);
+  packs[1] = readGauge(busB, true);
+  CHECK(a.reads == 22 && b.reads == 22);
+  BatteryValues v = mapBattery(packs, 2, combinePacks(packs, 2), &ac, 0);
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.gaugeFields && v.cycles == 114 && v.designMah == 9200);
+  CHECK(v.rawMah == 8522 && v.fullMah == 8634 && v.percent == 99 && v.maxCapacity == 100);
+  CHECK(v.full && !v.charging && v.gaugeStatusValid && !v.gaugeFullyDischarged && !v.lowCapacity);
+  CHECK(v.timeToEmpty == kTimeUnknown && v.timeToFull == kTimeUnknown && v.systemTimeRemaining() == -1);
+
+  a.regs[0x16] = 0x012c;
+  b.regs[0x16] = 0x0102;
+  a.regs[0x18] = 0;
+  b.regs[0x18] = 62;
+  packs[0] = readGauge(busA, true);
+  packs[1] = readGauge(busB, true);
+  CHECK(packs[0].timeToEmpty == 300 && packs[1].timeToEmpty == 258);
+  CHECK(packs[0].timeToFull == 0 && packs[1].timeToFull == 62);
+
+  // The policy may clear the time before the gauge fields are applied. A battery-only report
+  // must still expose time to empty, while a charge hold must hide time to full.
+  v = mapBattery(packs, 2, combinePacks(packs, 2), nullptr, 0);
+  v.timeRemaining = kTimeUnknown;
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.timeToEmpty == 258 && v.systemTimeRemaining() == 258 && v.timeToFull == kTimeUnknown);
+  v = baseline;
+  v.full = false;
+  v.charging = true;
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.timeToFull == 62 && v.systemTimeRemaining() == 62 && v.timeToEmpty == kTimeUnknown);
+  v.charging = false;
+  v.healthHold = true;
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.external && v.healthHold && !v.charging && v.timeToFull == kTimeUnknown && v.systemTimeRemaining() == -1);
+
+  // A failed optional transaction leaves core readings and the other time intact.
+  a.nackReadNumber = a.reads + 12;
+  packs[0] = readGauge(busA, true);
+  CHECK(packs[0].ok && packs[0].error == I2cResult::ok && packs[0].cycles == 113);
+  CHECK(packs[0].timeToEmpty == 300 && packs[0].timeToFull == kTimeUnknown);
+  v = baseline;
+  v.full = false;
+  v.charging = true;
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.systemTimeRemaining() == -1 && v.timeToFull == kTimeUnknown);
+
+  // A valid zero means the endpoint has been reached. FD is a charge state even with healthy capacity.
+  packs[0].timeToEmpty = 0;
+  packs[0].status |= kGaugeFd;
+  v = mapBattery(packs, 2, combinePacks(packs, 2), nullptr, 0);
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.systemTimeRemaining() == 0 && v.gaugeFullyDischarged && !v.lowCapacity);
+
+  packs[0].fullMah = packs[1].fullMah = 3500;
+  packs[0].remainingMah = packs[1].remainingMah = 3200;
+  packs[0].cycles = 0;
+  packs[1].cycles = 0;
+  v = mapBattery(packs, 2, combinePacks(packs, 2), nullptr, 0);
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.cycles == 0 && v.designMah == 9200 && v.fullMah == 7000 && v.lowCapacity);
+
+  packs[1].cycles = 0xffff;
+  packs[1].designMah = 0;
+  packs[1].status = 0xffff;
+  v = mapBattery(packs, 2, combinePacks(packs, 2), nullptr, 0);
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.cycles == kCycleCountUnknown && v.designMah == 0 && !v.gaugeStatusValid);
+  CHECK(v.known && v.rawMah == 6400 && v.fullMah == 7000 && v.systemTimeRemaining() == 0);
+
+  packs[1].ok = false;
+  v = mapBattery(packs, 2, combinePacks(packs, 2), nullptr, 0);
+  mapGaugeBatteryFields(v, packs);
+  CHECK(v.known && v.cycles == kCycleCountUnknown && v.designMah == 0 && !v.gaugeStatusValid);
+  CHECK(v.rawMah == 3200 && v.fullMah == 3500 && v.systemTimeRemaining() == -1);
+}
 
 static void testGauge()
 {
@@ -3101,6 +3200,7 @@ int main()
   testChgEn();
   testChgFix();
   testGauge();
+  testGaugeBatteryFields();
   testGaugeAlertRestore();
   testGaugeReobserve();
   testBuckQueueCancellation();

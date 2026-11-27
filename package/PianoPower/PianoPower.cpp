@@ -113,7 +113,7 @@ namespace {
 
 struct Args {
   uint32_t level, period, gauge, write, hv, b4pd, unsuspend, ps, psFloor, psInject, board, ucsi, pdoMca;
-  bool psGuard;
+  bool psGuard, psFields, psHealth;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick, ownBus;
   uint32_t wdog, chgen, chgfix, chgwatch;
@@ -184,6 +184,8 @@ void readArgs()
   gArgs.cp = bootArg("piano-power-cp", 0) == 1;     // the SC8541 pump: off by default; writes also need machdep.piano_power_cp_arm=1
   gArgs.mipps = bootArg("piano-power-mipps", 0) == 1;   // MiPPS: load the private key file (the engine runs only with it)
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
+  gArgs.psFields = gArgs.ps && bootArg("piano-power-ps-fields", 0) == 1;  // read-only cycle, health and time reporting
+  gArgs.psHealth = gArgs.psFields && bootArg("piano-power-ps-health", 0) == 1; // 27.3 logical-pack health input
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
   gArgs.psInject = bootArg("piano-power-ps-inject", 0); // deterministic bad first publisher cycles for CHGUI A/B
@@ -402,7 +404,7 @@ struct CpSession {
 };
 CpSession *gCpSess = nullptr;
 
-GaugeReading readBus(GaugeBus &b)
+GaugeReading readBus(GaugeBus &b, bool readTimes = false)
 {
   takePin(b.scl);
   takePin(b.sda);
@@ -410,7 +412,7 @@ GaugeReading readBus(GaugeBus &b)
   const I2cIo io = {&b, busSda, busScl, busReadSda, busReadScl, busDelay};
   I2cBus bus(io);
   if (&b == &gBuses[0] && gCpHook) bus.setHook(cpHookFn, gCpHook);
-  GaugeReading g = readGauge(bus);
+  GaugeReading g = readGauge(bus, readTimes);
   givePin(b.sda);
   givePin(b.scl);
   if (g.wordRereads)
@@ -519,7 +521,7 @@ class PianoPower : public IOService {
   void readRtcLine(char *line, size_t size);
   void surveyAdsp();
   void probeGauges();
-  void sampleGauges();
+  void sampleGauges(bool readTimes = false);
   void report();
   void startCharger();
   void serviceMca(uint64_t now);
@@ -1810,10 +1812,11 @@ void PianoPower::probeGauges()
   stage(3, "gauges");
 }
 
-void PianoPower::sampleGauges()
+void PianoPower::sampleGauges(bool readTimes)
 {
   if (!fGauges) return;
-  for (unsigned i = 0; i < 2; ++i) fPack[i] = gBuses[i].sda.page.va && gBuses[i].scl.page.va ? readBus(gBuses[i]) : GaugeReading();
+  for (unsigned i = 0; i < 2; ++i)
+    fPack[i] = gBuses[i].sda.page.va && gBuses[i].scl.page.va ? readBus(gBuses[i], readTimes) : GaugeReading();
   fPackMs = nowMs();
   fBattery = combinePacks(fPack, 2);
   piano_mca_battery_temperature(&fMca, fBattery.ok, fBattery.tempDeciC / 10);
@@ -1962,6 +1965,8 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
     note("[%llus] ps: no gauge reading: the power source is %s", t, pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
     return;
   }
+  if (gArgs.psFields) mapGaugeBatteryFields(v, fPack);
+  v.packHealth = gArgs.psHealth;
   pianoBatteryUpdate(this, v);
   note("[%llus] ps: %u %%%s, %s, %u mV, %d mA (instant %d), %u/%u mAh (design %u), %u cycles, time remaining %u min%s%s", t,
        v.percent, v.clamped ? " (floor)" : "",
@@ -1974,7 +1979,7 @@ void PianoPower::publishBattery(uint64_t t, const PortState *port)
 void PianoPower::report()
 {
   const uint64_t t = (nowMs() - fStartMs) / 1000;
-  sampleGauges();
+  sampleGauges(gArgs.psFields);
   if (fGauges) {
     const PackReading &b = fBattery;
     if (b.ok)
@@ -1987,6 +1992,13 @@ void PianoPower::report()
     else
       note("[%llus] battery: no usable gauge sample (A: %s at %#x, B: %s at %#x)", t, i2cName(fPack[0].error),
            fPack[0].failedCommand, i2cName(fPack[1].error), fPack[1].failedCommand);
+    if (gArgs.psFields) {
+      const GaugeReading &a = fPack[0], &b = fPack[1];
+      note("[%llus] ps-fields: A ok=%u cycles=%d full/design=%d/%d status=%#x tte/ttf=%u/%u | "
+           "B ok=%u cycles=%d full/design=%d/%d status=%#x tte/ttf=%u/%u", t,
+           unsigned(a.ok), a.cycles, a.fullMah, a.designMah, unsigned(a.status), unsigned(a.timeToEmpty), unsigned(a.timeToFull),
+           unsigned(b.ok), b.cycles, b.fullMah, b.designMah, unsigned(b.status), unsigned(b.timeToEmpty), unsigned(b.timeToFull));
+    }
   }
   // The RTC from the first report after IOBSD is published: the kernel's calendar (k27 0060, IOKitInitializeTime) reads the same
   // observer channels earlier in bsd_init, and IOKitBSDInit publishes IOBSD after it, so the two never share a channel.
