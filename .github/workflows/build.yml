@@ -100,8 +100,9 @@ jobs:
       - name: Dump kernel build error
         if: failure()
         run: |
-          find "${{ runner.temp }}/ci" out/ -name "*.log" -print 2>/dev/null || true
-          find "${{ runner.temp }}/ci" out/ -name "*.log" -exec grep -Hn -C 5 ": error:" {} + 2>/dev/null | head -n 100 || true
+          grep -n -C 5 "error:" "${{ runner.temp }}/ci/kernel-pass1.log" | head -n 100 || true
+          echo "=== TAIL 80 ==="
+          tail -n 80 "${{ runner.temp }}/ci/kernel-pass1.log" || true
       - name: Kexts (the kernelcache member only, deleted afterwards)
         run: bash tooling/ci/build-kexts.sh
       - name: Nothing of Apple's in the outputs
