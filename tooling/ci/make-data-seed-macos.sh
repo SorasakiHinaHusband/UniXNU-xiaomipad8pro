@@ -54,9 +54,10 @@ DATA_DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk '/^\/dev\/disk/ {print
 [ -n "$DATA_DEV" ] || { echo "hdiutil did not attach $IMG" >&2; exit 1; }
 newfs_apfs -v Data "$DATA_DEV" > /dev/null
 # newfs_apfs leaves an APFS container: the mountable object is its first APFS volume (diskNsM), not the container device
-VOL_ID=$(diskutil list "$DATA_DEV" | awk '/APFS Volume/ {print $NF; exit}')
-[ -n "$VOL_ID" ] || { echo "no APFS volume on $DATA_DEV ($(diskutil list "$DATA_DEV" | tr "\n" " "))" >&2; exit 1; }
-DATA_VOL=/dev/${VOL_ID#/dev/}
+# newfs_apfs on a whole raw image makes the container ON that device: its single volume is <device>s1
+DATA_VOL=${DATA_DEV}s1
+[ -e "$DATA_VOL" ] || { VOL=$(diskutil list | awk '/APFS Volume/ {print $NF; exit}'); [ -n "$VOL" ] && DATA_VOL=/dev/${VOL#/dev/}; }
+[ -e "$DATA_VOL" ] || { echo "no APFS volume for $DATA_DEV ($(diskutil list | tr "\n" " "))" >&2; exit 1; }
 echo "container $DATA_DEV, volume $DATA_VOL"
 mkdir -p "$DATA_MNT"
 diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
