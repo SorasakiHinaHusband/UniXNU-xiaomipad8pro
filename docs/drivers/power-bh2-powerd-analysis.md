@@ -104,6 +104,17 @@ a storage user client, or calls pack `setProperties`. Adding storage-looking
 properties to the pack service cannot satisfy this writer. The actual Mac
 storage receiver is the options node.
 
+The arm64e Objective-C caller ABI for `dataCopyForPack:outData:` is x0=self,
+x1=selector, x2=pack pointer, x3=output dictionary pointer; for
+`dataWrite:forPack:` x2 is the dictionary and x3 the pack pointer. Both return
+IOReturn in w0 and assert the power-management dispatch queue. Pack ID is read
+from the pack structure at `+4` by `packIdForPack:` (`0x1000028fc`). The plain
+internal writer at `0x100015fd0` receives logical ID in w0 and dictionary in x1.
+It looks up a real pack through `0x1000123f4`, which rejects ID >= pack count
+and also requires a matching stored ID, before calling the Objective-C writer.
+Missing history is success with a nil output; it is distinct from a failed
+read. Public tester endpoints do not expose a generic unrestricted storage API.
+
 ## Exact error conditions and root-cause boundary
 
 On the **NVRAM branch**, the failing path is:
@@ -208,7 +219,19 @@ IODTNVRAM, MAC policy, the real CFPreferences container, or System Information.
 Temporary files prove the replay provider can persist, not that the product
 has a persistent backend. No test success is a RAM/UI qualification.
 
-Required validation results are recorded after the final host run below.
+Validation on this branch (2026-11-27):
+
+| Command | Result |
+|---|---|
+| `python3 scripts/ci/self-tests.py --only package/PianoPower/tests/` | **PASS:** 8 passed, 0 failed, 2 suite-owned skips. The runner also reports 19 existing C/C++ sources without standalone build lines; enclosing charge/platform suites and the native build run their host tests. |
+| `bash tooling/k27/build-native-piano-power.sh` | **PASS:** host tests including both ASan/UBSan health replays; 23 native arm64e objects; import check passes (404 kernel imports, 7 library imports). No image built. |
+| `python3 scripts/ci/test-doc-links.py` | **PASS:** 173 Markdown files, 61/61 driver index entries, 0 errors. |
+| `python3 scripts/ci/privacy-scan.py` | **PASS:** 0 hits, 0 refused files. Staged additions and the full branch diff also pass with 0/0. |
+| `git diff --check` | **PASS.** |
+
+The opt-in publisher, contract replays and analysis are committed. **No
+production storage repair is claimed:** the raw failed-operation evidence
+required to select that change remains missing.
 
 ## Fix-image gate
 
