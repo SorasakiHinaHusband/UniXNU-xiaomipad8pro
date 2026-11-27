@@ -63,19 +63,41 @@ jobs:
           echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
           command -v ipsw aea dtc mtools || true
 
-      - name: Kernel, its collection base and our kexts (the k27 tree; Known gap G1)
+      - name: k27 tree, xnu source and ld-classic
         env:
           WORK: ${{ runner.temp }}/ci
           OUT: ${{ runner.temp }}/ci/out
         run: |
           set -eo pipefail
           mkdir -p "$WORK" "$OUT"
+          date -u; df -h /
           bash tooling/ci/k27-kernel.sh tree xnu ld
-          [ -n "$KDK_URL" ] && { curl -fL --retry 3 -o "$RUNNER_TEMP/kdk.dmg" "$KDK_URL"; KDK_DMG="$RUNNER_TEMP/kdk.dmg" bash tooling/ci/k27-kernel.sh kdk; rm -f "$RUNNER_TEMP/kdk.dmg"; } \
-            || echo "::warning::no KDK (vars.PIANO_KDK_URL): the kernel build will stop at fakeroot's installhdrs"
-          bash tooling/ci/k27-kernel.sh fakeroot platform kernel
-          df -h /
+          date -u
 
+      - name: KDK headers (download bounded, expanded, removed again)
+        env:
+          WORK: ${{ runner.temp }}/ci
+          OUT: ${{ runner.temp }}/ci/out
+        run: |
+          set -eo pipefail
+          [ -n "$KDK_URL" ] || { echo "::error::vars.PIANO_KDK_URL is not set"; exit 1; }
+          echo "downloading $KDK_URL"; date -u
+          curl -fL --retry 3 --max-time 1800 --connect-timeout 30 --progress-bar -o "$RUNNER_TEMP/kdk.dmg" "$KDK_URL"
+          ls -l "$RUNNER_TEMP/kdk.dmg"; df -h /; date -u
+          KDK_DMG="$RUNNER_TEMP/kdk.dmg" bash tooling/ci/k27-kernel.sh kdk
+          rm -f "$RUNNER_TEMP/kdk.dmg"; df -h /; date -u
+
+      - name: Fakeroot, platform libraries and the kernel
+        env:
+          WORK: ${{ runner.temp }}/ci
+          OUT: ${{ runner.temp }}/ci/out
+        run: |
+          set -eo pipefail
+          date -u
+          bash tooling/ci/k27-kernel.sh fakeroot
+          date -u
+          bash tooling/ci/k27-kernel.sh platform kernel
+          date -u; df -h /
       - name: Kexts (per-kext; the status file names what a hosted runner cannot build)
         env:
           WORK: ${{ runner.temp }}/ci
