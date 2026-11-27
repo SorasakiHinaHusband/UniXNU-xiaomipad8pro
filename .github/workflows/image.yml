@@ -59,8 +59,9 @@ jobs:
           df -h / /System/Volumes/Data | sed -n '1,4p'
       - name: Host tools
         run: |
-          brew install gnu-sed mtools dtc zstd nasm mtoc acpica 2>&1 | tail -2
+          brew install gnu-sed mtools dtc zstd nasm mtoc acpica ffmpeg llvm 2>&1 | tail -2
           brew install blacktop/tap/ipsw 2>&1 | tail -2 || true
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
           command -v ipsw aea dtc mtools || true
 
