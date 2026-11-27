@@ -14,6 +14,15 @@ WORK=${WORK:-$PWD/out/ci}; OUT=${OUT:-$WORK/out}; M=${K27_DIR:-$WORK/k27-tree}; 
 [ -f "$M/out/k27/kernel-k27-$TOP-native.macho" ] || { echo "no $M/out/k27/kernel-k27-$TOP-native.macho: tooling/ci/k27-kernel.sh first" >&2; exit 1; }
 mkdir -p "$OUT" out/k27 out/k273
 export WORK OUT M TOP
+SOC_DIR="$WORK/UniXNU-sm8750-common"
+if [ ! -d "$SOC_DIR/kits/Sm8750Platform" ]; then
+  read -r SOC_URL SOC_REV < <(python3 -c 'import tomllib; d=tomllib.load(open("unixnu.lock","rb"))["pin"]["UniXNU-sm8750-common"]; print(d["git"], d["commit"])')
+  git clone "$SOC_URL" "$SOC_DIR"
+  git -C "$SOC_DIR" checkout "$SOC_REV"
+fi
+ln -sfn "$SOC_DIR" "$D/UniXNU-sm8750-common"
+ln -sfn "$SOC_DIR" "$(dirname "$D")/UniXNU-sm8750-common"
+export SOC_DIR
 bash tooling/ci/with-kernelcache.sh bash -c '
   set -euo pipefail
   T=$WORK/k273-tree
@@ -21,7 +30,7 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   [ -f "$K" ] || { echo "prepare-k27-tree.sh gave no kernel" >&2; exit 1; }
   cp "$K" "$OUT/kernel-k273-native.macho"
   PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml \
-    CPATH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers" \
+    CPATH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers:$SOC_DIR/kits" \
     PIANO_STOP_AFTER=kexts bash tooling/k27/build-native-image.sh
 '
 # our objects only (out/native-kexts/NAME/*.o, no generated headers or host-test outputs) and the descriptors; nothing of the
