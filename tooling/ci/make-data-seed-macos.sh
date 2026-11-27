@@ -24,8 +24,9 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/piano-seed.XXXXXX")
 OS_MNT=
 DATA_DEV=
 DATA_MNT="$W/data-mnt"
+mounted() { mount | grep -q " on $1 "; }   # macOS has no mountpoint(1)
 cleanup() {
-  [ -n "$DATA_MNT" ] && mountpoint -q "$DATA_MNT" && diskutil unmount force "$DATA_MNT" > /dev/null 2>&1 || true
+  [ -n "$DATA_MNT" ] && mounted "$DATA_MNT" && diskutil unmount force "$DATA_MNT" > /dev/null 2>&1 || true
   [ -n "$DATA_DEV" ] && hdiutil detach "$DATA_DEV" -force > /dev/null 2>&1 || true
   [ -n "$OS_MNT" ] && hdiutil detach "$OS_MNT" -force > /dev/null 2>&1 || true
   rm -rf "$W"
@@ -52,10 +53,14 @@ mkfile -n "${SIZE_MIB}m" "$IMG"
 DATA_DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk '/^\/dev\/disk/ {print $1; exit}')
 [ -n "$DATA_DEV" ] || { echo "hdiutil did not attach $IMG" >&2; exit 1; }
 newfs_apfs -v Data "$DATA_DEV" > /dev/null
-# the volume device is the container plus a slice; diskutil mount finds it
+# newfs_apfs leaves an APFS container: the mountable object is its first APFS volume (diskNsM), not the container device
+VOL_ID=$(diskutil list "$DATA_DEV" | awk '/APFS Volume/ {print $NF; exit}')
+[ -n "$VOL_ID" ] || { echo "no APFS volume on $DATA_DEV ($(diskutil list "$DATA_DEV" | tr "\n" " "))" >&2; exit 1; }
+DATA_VOL=/dev/${VOL_ID#/dev/}
+echo "container $DATA_DEV, volume $DATA_VOL"
 mkdir -p "$DATA_MNT"
-diskutil mount -mountPoint "$DATA_MNT" "$DATA_DEV" > /dev/null || diskutil mount "$DATA_DEV" > /dev/null
-mountpoint -q "$DATA_MNT" || { echo "the new APFS image did not mount at $DATA_MNT" >&2; exit 1; }
+diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
+mounted "$DATA_MNT" || { echo "the new APFS volume did not mount at $DATA_MNT" >&2; exit 1; }
 
 echo "the template's /private/var skeleton"
 sudo mkdir -p "$DATA_MNT/private/var"
