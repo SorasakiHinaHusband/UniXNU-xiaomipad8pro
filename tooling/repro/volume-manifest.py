@@ -142,7 +142,12 @@ def main():
         a.json.write_text(json.dumps(s, indent=1) + '\n')
     print(f'manifest: {s["entries"]} entries {s["counts"]}, {s["file_bytes"]} file bytes, digest {s["digest"]}')
     if a.compare:
-        pin = json.loads(a.compare.read_text())['systemos']['file_manifest']
+        pins = json.loads(a.compare.read_text())
+    # pins.json keeps it at root.systemos (verify-root.py reads it there); accept a top-level systemos too.
+    systemos = pins.get('systemos') or (pins.get('root') or {}).get('systemos') or {}
+    pin = systemos.get('file_manifest')
+    if not pin:
+        sys.exit(f'{a.compare}: no systemos.file_manifest (nor root.systemos.file_manifest)')
         if s['digest'] != pin['digest']:
             bad = sorted(k for k in set(pin['groups']) | set(s['groups']) if pin['groups'].get(k) != s['groups'].get(k))
             print(f'MISMATCH: digest {s["digest"]}, the pin is {pin["digest"]}; groups that differ: {", ".join(bad[:20])}')
