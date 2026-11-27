@@ -144,13 +144,20 @@ stage_kdk() {
   mkdir -p "$mnt"; hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$KDK_DMG"
   trap 'hdiutil detach -quiet "$mnt" || true' RETURN
   rm -rf "$pkgx"; pkgutil --expand-full "$mnt"/*.pkg "$pkgx"
-  local kf payload=""
-  kf=$(find "$pkgx" -type d -path '*/System/Library/Frameworks/Kernel.framework' 2>/dev/null | head -1 || true)
-  [ -n "$kf" ] && payload="${kf%/System/Library/Frameworks/Kernel.framework}"
-  [ -n "$payload" ] || { echo "no KDK payload in $KDK_DMG" >&2; exit 1; }
   mkdir -p "$K"
-  # headers and the kernel-support headers only: no kernels, no libraries are kept (nothing Apple-built is linked into ours)
-  rsync -a --include='*/' --include='*.h' --include='*.modulemap' --include='*.plist' --exclude='*' "$payload/System" "$payload/usr" "$K/"
+  local found=0 p
+  while IFS= read -r p; do
+    if [ -d "$p/System" ]; then
+      rsync -a --include='*/' --include='*.h' --include='*.modulemap' --include='*.plist' --exclude='*' "$p/System" "$K/"
+      found=1
+    fi
+    if [ -d "$p/usr" ]; then
+      rsync -a --include='*/' --include='*.h' --include='*.modulemap' --include='*.plist' --exclude='*' "$p/usr" "$K/"
+      found=1
+    fi
+  done < <(find "$pkgx" -type d \( -name "Payload" -o -name "*.kdk" \) | sort -u)
+  [ "$found" -eq 1 ] || { echo "no KDK payload in $KDK_DMG" >&2; exit 1; }
+  echo "=== KDK check
   find "$K" -iname '*Tightbeam*' -prune -exec rm -rf {} +
   rm -rf "$pkgx"
 }
