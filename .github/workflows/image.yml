@@ -17,7 +17,7 @@ on:
         default: host inputs systemos root kernel fd image
 
 permissions:
-  contents: read
+  contents: write   # the run publishes its own prerelease
 
 env:
   JOBS: '6'
@@ -257,6 +257,19 @@ jobs:
           K273_TREE=out/k273/k27-tree bash tooling/k273/build-k273-image.sh \
             || echo "::warning::build-k273-image.sh did not finish: the KC and the ADT it wrote before the root/seed gates are kept and uploaded"
           ls -la out/k27 out/adt out/ram 2>/dev/null || true
+      - name: Publish the image outputs as a prerelease
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          tag="image-$(echo "$GITHUB_SHA" | cut -c1-8)"
+          if gh release view "$tag" > /dev/null 2>&1; then echo "release $tag already exists"; exit 0; fi
+          files=$(ls out/ram/* out/k27/kc-k27-native.bin out/adt/* out/fd/*.fd out/fd/*.sha256 out/inputs/k273/root/root.json 2>/dev/null | head -40)
+          [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
+          gh release create "$tag" --prerelease --title "piano image $tag" \
+            --notes "Whatever the image chain produced in run $GITHUB_RUN_ID (commit $GITHUB_SHA): the kernel collection, the ADT, the FD and the RAM images when the root image could be built. See the run log for which steps were completed." \
+            $files 2>&1 | tail -3 || echo "::warning::gh release create failed"
       - name: Logs
         if: always()
         run: |
