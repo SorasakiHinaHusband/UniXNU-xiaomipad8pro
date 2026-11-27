@@ -38,6 +38,12 @@ If any active reader needs an argument in an earlier view, keep its complete tok
 | ADT tail, including past byte 1023 | Kext `piano-*` knobs such as `piano-gpu`, `piano-dpu`, `piano-wifi`, `piano-audio`, `piano-touch`, `piano-camera` and `piano-video`; audited display keys `native-gop-display-{builtin,flip-lossless,shot,night-shift}` | Their argument wrappers call the post-merge PE parser. Examples are `PianoDwc3.cpp:150–175`, `PianoA830/board/PianoA830.cpp:226–232`, `PianoBacklight.cpp:115–116`, `NativeGopDisplay.cpp:842,949,999,1090`, and `PianoDpu/DpuSlices.cpp:125` under `package/`. The four display keys have no early or fixed-width reader in this checkout. |
 | ADT tail, including past byte 1023, with 0076 and matching helpers | `piano-usb-shell`, `piano-usb-net`, `piano-rotate` and the rotation helper's variants, `piano-backlight-{native,auto}` | The kernel consumers use the merged PE parser. `pianousb-shell.c:35–39`, `piano-bootargs.sh:3–18`, `piano-rotated.m:84–87` and `piano-brightness-sync.m:75–81` read the full view. The builder checks the staged reader ABI against the KC when a helper's argument is beyond the clip. |
 
+The 27.3 ESP builder includes `native-gop-display-night-shift` and
+`data-store-write-back` in the ADT whenever it splits a line. Both are
+post-merge kext arguments. This placement keeps the installed USB helper
+arguments in the legacy view for the v13.1y12u daily and diagnostic entries.
+[Actual ESP replay](y12u-daily-combo-audit.md#exact-daily-profile-delta)
+
 ## Opt in and verify
 
 Add `piano-long-boot-args=1` to `PIANO_EXTRA_ARGS` for RAM or pass `--arg piano-long-boot-args=1` to `build-k273-esp.py` for the current daily ESP. The default layout and its 999-byte budget still apply when the option is absent or `=0`. The opt-in fits the required loader words, selector and per-entry suffix in 1008 bytes and uses the 0066 tail for the rest, up to 4095 merged bytes. The builders preserve the relative order of repeated arguments. DarwinBoot, the kernel and the kexts use the existing ABI. The optional ESP diagnostic entry is included when its reset arguments fit both budgets.

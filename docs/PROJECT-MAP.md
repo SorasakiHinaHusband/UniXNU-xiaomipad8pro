@@ -116,6 +116,7 @@ requires verified backups and read-back of changed regions. [Install design and 
 - **Installed daily system.** v13.1y12q booted from disk on 2026-11-26. The native 27.3 line runs as Mac17,11 at EL1 with
   Gunyah at EL2. The k273 build uses k27 patches 0053–0076 and the 27.3 kernel patches. The installed 13 GiB memory window
   measured 13310 MiB on v13.1y12l. [27.3 line](k273-line.md) · [November 26 results](results-2026-11-26.md)
+  [v13.1y12u daily combination audit](y12u-daily-combo-audit.md)
 - **Disk and USB.** The v5 BootShim and FD are on `boot_a`, with the UniXNU payload on the ESP. The 27.3 root is on
   `linux_rootfs` and the 200 GiB Data store is on `linux_data`. Data switches to concurrent mode after mount, with write-back
   and queue modes off. The USB debug network enables TX flow control by default (66/66 exact transfers in qualification).
