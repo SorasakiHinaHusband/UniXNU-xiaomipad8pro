@@ -211,7 +211,13 @@ jobs:
       - name: Kernel relinked at the 27.3 collection's addresses
         env:
           PIANO_K27_TREE: ${{ runner.temp }}/ci/k27-tree
-        run: bash tooling/repro/fetch-and-build.sh kernel
+        run: |
+          set -uo pipefail
+          # tooling/ci/k27-kernel.sh builds with K27_TREE_TOP=0066 and names the kernel after it; prepare-k27-tree.sh
+          # defaults to 0065, so pass the tag explicitly (fetch-and-build.sh passes none).
+          TOP=${K27_TREE_TOP:-0066}
+          ls "$PIANO_K27_TREE/out/k27/" | head -5
+          bash tooling/k273/prepare-k27-tree.sh "$TOP"
 
       - name: FD (UEFI)
         env:
@@ -290,6 +296,7 @@ jobs:
           gh release create "$tag" --prerelease --title "piano image $tag" \
             --notes "Whatever the image chain produced in run $GITHUB_RUN_ID (commit $GITHUB_SHA): the kernel collection, the ADT, the FD, the RAM images when the root image could be built, and root.img as zstd parts (see REASSEMBLE.txt)." \
             $files $EXTRA 2>&1 | tail -3 || echo "::warning::gh release create failed"
+          exit 0
       - name: Logs
         if: always()
         run: |
