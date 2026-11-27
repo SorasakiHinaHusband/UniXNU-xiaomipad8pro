@@ -182,7 +182,14 @@ jobs:
           MP=$(printf "%s\n" "$ATT" | awk '/Apple_APFS/ {print $NF; exit}')
           if [ -n "$MP" ] && [ -d "$MP/System/Library/Extensions" ]; then
             ls "$MP/System/Library/Extensions" | grep -i paravirt || echo "no paravirt kext under Extensions"
-            ls -la "$MP/System/Library/Extensions/AppleParavirtDisplay.kext/Contents/MacOS" 2>/dev/null || true
+            K="$MP/System/Library/Extensions/AppleParavirtDisplay.kext/Contents/MacOS/AppleParavirtDisplay"
+            if [ -f "$K" ]; then
+              ls -la "$K"; lipo -info "$K" || true
+              echo "== its vtable symbol"; xcrun nm -arch arm64e "$K" 2>/dev/null | grep -i "ZTV.*AppleParavirtDisplay" | head -5 || true
+              echo "== chained fixups around the vtable (diversity is what the ABI needs)"; xcrun dyld_info -fixups "$K" 2>&1 | grep -A3 -B3 -i "vtable\|ZTV" | head -40 || true
+            else
+              echo "no AppleParavirtDisplay binary at $K"
+            fi
             find "$MP/System/Library" -maxdepth 3 -iname "*Paravirt*" 2>/dev/null | head -20 || true
           else
             echo "no System/Library/Extensions on the mounted volume"
