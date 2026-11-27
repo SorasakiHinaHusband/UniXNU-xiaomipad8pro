@@ -157,7 +157,7 @@ stage_kdk() {
     fi
   done < <(find "$pkgx" -type d \( -name "Payload" -o -name "*.kdk" \) | sort -u)
   [ "$found" -eq 1 ] || { echo "no KDK payload in $KDK_DMG" >&2; exit 1; }
-  echo "=== KDK check
+  echo "=== KDK check==="
   find "$K" -iname '*Tightbeam*' -prune -exec rm -rf {} +
   rm -rf "$pkgx"
 }
