@@ -37,7 +37,9 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   [ -f "$K" ] || { echo "prepare-k27-tree.sh gave no kernel" >&2; exit 1; }
   cp "$K" "$OUT/kernel-k273-native.macho"
   mkdir -p "$T/out/kc"
-  ln -sfn "$K273_KC" "$T/out/kc/kc27.bin"
+  # kc27.bin is the paravirt reference collection when the owner supplied one (it names the pure virtual slots the
+  # IOMobileFramebuffer declarations need); otherwise the target collection stands in for it.
+  [ -e "$T/out/kc/kc27.bin" ] || ln -sfn "$K273_KC" "$T/out/kc/kc27.bin"
   # NativeGopDisplay needs IOMobileFramebuffer declarations: from a paravirt reference collection when the caller supplies one
   # (IOMFB_ABI_REFERENCE_KC), else from the declarations the k27 tree commits, and only if tooling/k27/check-iomfb-abi-header.py
   # finds every slot and PAC diversity identical in this collection. The kext script decides that itself; a failure there is one
