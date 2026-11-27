@@ -71,7 +71,10 @@ bash tooling/ci/with-kernelcache.sh bash -c '
 # kernelcache is in there
 ( cd out && find native-kexts -type f -name '*.o' | sort > "$WORK/kext-objects.txt" )
 [ -s "$WORK/kext-objects.txt" ] || { echo "no kext objects under out/native-kexts" >&2; exit 1; }
-# bsdtar (macOS) resolves a -T list against the LAST -C, GNU tar against the one in force when -T is read: name the
-# descriptors first, then put -C out immediately before -T so both implementations read the list under out/.
-tar -czf "$OUT/piano-kexts.tar.gz" -C "$D" tooling/k27/kext -C out -T "$WORK/kext-objects.txt"
+# A staging tree, so the archive has exactly two roots (native-kexts/, tooling/) and no -C/-T ordering that bsdtar and GNU tar
+# read differently: operands may not follow options, and a -T list is resolved against the -C in force when it is read.
+STAGE=$WORK/kexts-stage; rm -rf "$STAGE"; mkdir -p "$STAGE"
+( cd out && tar -cf - -T "$WORK/kext-objects.txt" ) | tar -xf - -C "$STAGE"
+mkdir -p "$STAGE/tooling/k27"; cp -R "$D/tooling/k27/kext" "$STAGE/tooling/k27/kext"
+tar -czf "$OUT/piano-kexts.tar.gz" -C "$STAGE" native-kexts tooling
 ( cd "$OUT" && shasum -a 256 piano-kexts.tar.gz kernel-k273-native.macho > kexts.sha256 && cat kexts.sha256 )
