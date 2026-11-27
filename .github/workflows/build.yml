@@ -123,8 +123,10 @@ jobs:
             echo "xnu source $(git -C "$WORK/k27-tree/out/k27/xnu" rev-parse 'HEAD^{tree}')"; xcodebuild -version | tr '\n' ' '; echo; } > BUILD-INFO.txt
           cat SHA256SUMS BUILD-INFO.txt
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: kernel-kexts
+          if-no-files-found: warn
           path: |
             ${{ runner.temp }}/ci/out/kernel-k27-native.macho
             ${{ runner.temp }}/ci/out/kernel-k273-native.macho
