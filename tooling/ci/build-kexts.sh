@@ -51,17 +51,17 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   # preset). Those stay off a public CI artifact anyway (docs/ci.md: Apple and vendor payloads never leave the runner), so build
   # the kexts without them, one at a time, and let kexts-status.txt say per kext what this job could build and what it could not:
   # one kext that needs a local input must not take the whole build down.
-  # A hosted runner has no bootstrap that generated out/x12377/inc-hid and inc-net-piano (Known gap G1: those come from the
-  # owner's non-public xnu-linux workspace). The headers themselves are Apple's: seed the two include trees from the macOS SDK's
-  # Kernel.framework when they are missing, so the kexts that need them can at least be compiled and checked here. This is NOT the
-  # owner's generated set: tools/ci labels the result as built against SDK headers.
+  # A hosted runner has no bootstrap that generated out/x12377/inc-hid and inc-net-piano (Known gap G1: those came from a
+  # non-public xnu-linux workspace). The headers themselves are Apple-owned: seed the two include trees from the macOS SDK
+  # Kernel.framework when they are missing, so the kexts that need them compile and get checked here. This is not the
+  # maintainer set, and the artifacts say so.
   SDK_KH="$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers"
   for pair in "inc-hid:IOKit/hid" "inc-net-piano:IOKit/network"; do
     d=${pair%%:*}; sub=${pair#*:}
     if [ ! -d "$T/out/x12377/$d/$sub" ] && [ -d "$SDK_KH/$sub" ]; then
       mkdir -p "$T/out/x12377/$d/$sub"
       cp -R "$SDK_KH/$sub/." "$T/out/x12377/$d/$sub/"
-      echo "inc: $d seeded from the SDK's $sub ($(ls "$T/out/x12377/$d/$sub" | wc -l | tr -d " ") headers)"
+      echo "inc: $d seeded from the SDK $sub"
     fi
   done
   export PIANO_GPU_NO_FIRMWARE=1 PIANO_KEYBOARD_NO_FIRMWARE=1
