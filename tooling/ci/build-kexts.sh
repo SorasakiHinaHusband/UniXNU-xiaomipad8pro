@@ -24,8 +24,11 @@ ln -sfn "$SOC_DIR" "$D/UniXNU-sm8750-common"
 ln -sfn "$SOC_DIR" "$(dirname "$D")/UniXNU-sm8750-common"
 export SOC_DIR
 EXTRA_INC="$WORK/extra-inc"
+SDK_KH="$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers"
 mkdir -p "$EXTRA_INC/IOKit"
-ln -sfn "$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers/IOKit/storage" "$EXTRA_INC/IOKit/storage"
+ln -sfn "$SDK_KH/IOKit/storage" "$EXTRA_INC/IOKit/storage"
+ln -sfn "$SDK_KH/TargetConditionals.h" "$EXTRA_INC/TargetConditionals.h"
+for f in "$SDK_KH"/Availability*.h; do [ -e "$f" ] && ln -sfn "$f" "$EXTRA_INC/"; done
 export EXTRA_INC
 bash tooling/ci/with-kernelcache.sh bash -c '
   set -euo pipefail
