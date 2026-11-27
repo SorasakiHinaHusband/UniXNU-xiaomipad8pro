@@ -24,7 +24,7 @@ on:
         value: ${{ jobs.kernel-kexts.outputs.commit }}
 
 permissions:
-  contents: read
+  contents: write   # the run publishes its own prerelease
 
 env:
   JOBS: '6'
@@ -140,6 +140,20 @@ jobs:
             ${{ runner.temp }}/ci/kext-*.log
             out/native-kexts/*/host-tests/*.log
           retention-days: 14
+      - name: Publish the binaries as a prerelease
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          cd "$OUT" 2>/dev/null || { echo "no $OUT"; exit 0; }
+          tag="build-$(echo "$GITHUB_SHA" | cut -c1-8)"
+          if gh release view "$tag" > /dev/null 2>&1; then echo "release $tag already exists"; exit 0; fi
+          files=$(ls kernel-k27-native.macho kernel-k273-native.macho piano-kexts.tar.gz SHA256SUMS BUILD-INFO.txt 2>/dev/null)
+          [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
+          gh release create "$tag" --prerelease --title "piano build $tag" \
+            --notes "Kernels, kext objects and the FD from build.yml run $GITHUB_RUN_ID (commit $GITHUB_SHA). The kernel collection, the ADT, the root image and the RAM images are the image workflow." \
+            $files "$WORK/kexts-status.txt" 2>&1 | tail -3 || echo "::warning::gh release create failed"
       - name: Remove the KDK copy and every leftover input
         if: always()
         run: rm -rf "$RUNNER_TEMP/kdk.dmg" "$WORK/k27-tree/out/k27/kdk-notb" "$RUNNER_TEMP"/piano-kc.* "$WORK/kdk-mnt" "$WORK/kdk-pkg"
