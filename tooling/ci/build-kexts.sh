@@ -36,6 +36,8 @@ bash tooling/ci/with-kernelcache.sh bash -c '
   K=$(K273_TREE=$T PIANO_K27_TREE=$M bash tooling/k273/prepare-k27-tree.sh "$TOP" | tail -1)
   [ -f "$K" ] || { echo "prepare-k27-tree.sh gave no kernel" >&2; exit 1; }
   cp "$K" "$OUT/kernel-k273-native.macho"
+  mkdir -p "$T/out/kc"
+  ln -sfn "$K273_KC" "$T/out/kc/kc27.bin"
   PIANO_K27_TREE=$T K27_KERNEL=$K KC_BASE=$K273_KC KC_BUILDER=k27/kc-build273-piano.py PIANO_ADT_IDENTITY=configs/k273-adt.toml \
     CPATH="$EXTRA_INC:$SOC_DIR/kits" \
     PIANO_STOP_AFTER=kexts bash tooling/k27/build-native-image.sh
