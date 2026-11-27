@@ -20,7 +20,13 @@ P=$D/package/PianoA830; A=$P/adreno830; B=$P/board; K=$P/kits
 O=$D/out/native-kexts/PianoA830
 . "$D/tooling/k27/k27-tree.sh"; K27=$PIANO_K27_TREE
 mkdir -p "$O" "$D/out/k27/kext"
-python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
+# The pinned boot DT (out/inputs/piano-boot.dtb) is a device-local input. Without it the committed PianoGpuInputs.h is what the
+# driver uses, so the staleness check is skipped instead of taking the build down (a CI runner has no piano DT).
+if [ -f "$D/out/inputs/piano-boot.dtb" ]; then
+  python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
+else
+  echo "::warning::no pinned boot DT (out/inputs/piano-boot.dtb): PianoGpuInputs.h DT check skipped, the committed header is used"
+fi
 "$D/package/include/tests/run.sh" >&2   # PianoScmLock.h: the secure-call lock the board takes (docs/scm-lock.md)
 python3 "$D/tooling/k27/stage-piano-gpu-firmware.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware}
 # PIANO_A830_HOST_TESTS: 1 always, 0 never, auto (default) when the driver sources, the kits or the test runner changed since the last
