@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+# The 27.3 line's Data seed on a macOS host: the port of the k27 tree's scripts/make-macos-data-seed.sh, which builds it on a Linux
+# host with apfsprogs, an apfs kernel module, losetup and chroot-free mounting. Here: the OS volume's /System/Library/Templates/Data
+# into a fresh APFS image, macOS's firmlink skeleton, then DarwinBoot's packed_ramdisk.py to DBRDISK1 (the packed RAM disk the entry
+# hands XNU as the Data device).
+#
+#   tooling/ci/make-data-seed-macos.sh OS_IMAGE OUT_DIR [SIZE_MIB]
+#     OS_IMAGE  the decrypted 27.3 OS disk image (out/inputs/k273/26C5035r/141-22233-021.dmg)
+#     OUT_DIR   receives scratch-data.img (the packed seed) and data.img (the APFS image, for inspection)
+#
+# KNOWN GAP G3 in the install skill: the reference seeds are the owner's, every other host has to make its own, and the maintainer's
+# own note says the fresh recipe still needs a build and a RAM test. This script is that recipe on macOS. Sizes: the packed seed
+# holds at most 256 MiB of nonzero pages, so the image is sparse and mostly zero.
+set -euo pipefail
+OS_IMAGE=${1:?the decrypted OS image}
+OUT=${2:?the output directory}
+SIZE_MIB=${3:-1024}
+PACKER=${PACKED_RAMDISK:-${DARWINBOOT:-}/Test/packed_ramdisk.py}
+[ -f "$PACKER" ] || { echo "no packed_ramdisk.py: set PACKED_RAMDISK or DARWINBOOT (the DarwinBoot checkout)" >&2; exit 1; }
+[ -f "$OS_IMAGE" ] || { echo "no $OS_IMAGE" >&2; exit 1; }
+mkdir -p "$OUT"
+W=$(mktemp -d "${TMPDIR:-/tmp}/piano-seed.XXXXXX")
+OS_MNT=
+DATA_DEV=
+DATA_MNT="$W/data-mnt"
+cleanup() {
+  [ -n "$DATA_MNT" ] && mountpoint -q "$DATA_MNT" && diskutil unmount force "$DATA_MNT" > /dev/null 2>&1 || true
+  [ -n "$DATA_DEV" ] && hdiutil detach "$DATA_DEV" -force > /dev/null 2>&1 || true
+  [ -n "$OS_MNT" ] && hdiutil detach "$OS_MNT" -force > /dev/null 2>&1 || true
+  rm -rf "$W"
+}
+trap cleanup EXIT
+
+echo "attaching $OS_IMAGE (read only)"
+ATTACH=$(hdiutil attach -nobrowse -readonly "$OS_IMAGE")
+echo "$ATTACH"
+OS_MNT=$(printf '%s\n' "$ATTACH" | awk '$3 == "/System/Library/Templates/Data" || NF >= 3 {print $NF}' | while read -r mp; do
+  [ -d "$mp/System/Library/Templates/Data" ] && { echo "$mp"; break; }; done)
+if [ -z "$OS_MNT" ]; then
+  OS_MNT=$(printf '%s\n' "$ATTACH" | awk '/Apple_APFS/ {print $NF; exit}')
+fi
+[ -n "$OS_MNT" ] && [ -d "$OS_MNT/System/Library/Templates/Data" ] \
+  || { echo "no /System/Library/Templates/Data under the attached $OS_IMAGE (mount points: $ATTACH)" >&2; exit 1; }
+TEMPLATE="$OS_MNT/System/Library/Templates/Data"
+
+echo "a $SIZE_MIB MiB APFS image, volume Data"
+IMG=$OUT/data.img
+rm -f "$IMG"
+mkfile -n "${SIZE_MIB}m" "$IMG"
+DATA_DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk '/^\/dev\/disk/ {print $1; exit}')
+[ -n "$DATA_DEV" ] || { echo "hdiutil did not attach $IMG" >&2; exit 1; }
+newfs_apfs -v Data "$DATA_DEV" > /dev/null
+# the volume device is the container plus a slice; diskutil mount finds it
+mkdir -p "$DATA_MNT"
+diskutil mount -mountPoint "$DATA_MNT" "$DATA_DEV" > /dev/null || diskutil mount "$DATA_DEV" > /dev/null
+mountpoint -q "$DATA_MNT" || { echo "the new APFS image did not mount at $DATA_MNT" >&2; exit 1; }
+
+echo "the template's /private/var skeleton"
+sudo mkdir -p "$DATA_MNT/private/var"
+sudo rsync -aH "$TEMPLATE/private/var/" "$DATA_MNT/private/var/"
+for directory in tmp log run vm folders db/dslocal/nodes/Default; do
+  sudo mkdir -p "$DATA_MNT/private/var/$directory"
+done
+sudo chmod 1777 "$DATA_MNT/private/var/tmp"
+sudo mkdir -p -m 1777 "$DATA_MNT/private/tmp"
+# The bulky read-only parts stay on the SystemOS disk; the same exclusions as the Linux recipe.
+READONLY=(Library/Apple "Library/Application Support/Apple" Library/Documentation Library/WebServer)
+for path in Library Users Applications Volumes cores opt usr/local System/Library/Caches System/Volumes/Hardware private/etc; do
+  sudo mkdir -p "$DATA_MNT/$(dirname "$path")"
+  if [ -e "$TEMPLATE/$path" ]; then
+    EX=()
+    for r in "${READONLY[@]}"; do EX+=("--exclude=/$r"); done
+    sudo rsync -aH ${EX[@]+"${EX[@]}"} "$TEMPLATE/$path" "$DATA_MNT/$(dirname "$path")/"
+  else
+    sudo mkdir -p "$DATA_MNT/$path"
+  fi
+done
+for path in "${READONLY[@]}"; do
+  sudo ln -sfn "/System/Library/DroidVMData/$path" "$DATA_MNT/$path"
+done
+sudo ln -sfn /System/Cryptexes "$DATA_MNT/System/Cryptexes"
+sudo chmod 1777 "$DATA_MNT/Volumes" 2>/dev/null || true
+sudo find "$DATA_MNT" -maxdepth 2 | sort | head -40
+sync
+diskutil unmount force "$DATA_MNT" > /dev/null
+hdiutil detach "$DATA_DEV" -force > /dev/null
+DATA_DEV=
+
+echo "packing to DBRDISK1 with $PACKER"
+python3 "$PACKER" "$IMG" "$OUT/scratch-data.img"
+ls -la "$OUT"
+echo "Data seed: $OUT/scratch-data.img from $OS_IMAGE"
