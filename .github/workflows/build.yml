@@ -97,6 +97,10 @@ jobs:
         run: bash tooling/ci/k27-kernel.sh fakeroot
       - name: Platform libraries and the kernel
         run: bash tooling/ci/k27-kernel.sh platform kernel
+      - name: Dump kernel build error
+        if: failure()
+        run: |
+             grep -rn -C 5 ": error:" "${{ runner.temp }}/ci" out/ 2>/dev/null | head -n 100 || true
       - name: Kexts (the kernelcache member only, deleted afterwards)
         run: bash tooling/ci/build-kexts.sh
       - name: Nothing of Apple's in the outputs
