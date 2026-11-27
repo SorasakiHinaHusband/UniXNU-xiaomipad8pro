@@ -7,7 +7,8 @@ grows so ABL reserves the room. The layout and undo check follow piano-uefi's to
 firmware/selector/NOTICE.md).
 
   pack-selector.py ANDROID_BOOT SELECTOR_BIN UEFI_BOOT -o OUT.img     -> OUT.img (unsigned) + OUT.img.avb.json (the stock props)
-  pack-selector.py --check-signed OUT-signed.img ANDROID_BOOT         -> footer, props and rollback equal to the stock image's
+  pack-selector.py --check-signed OUT-signed.img ANDROID_BOOT [--unsigned OUT.img]
+                      -> footer, props and rollback equal to the stock image's, optionally bind the exact packed payload
 
 Both output paths must be new host files. Signing is tooling/bootimg/sign-on-remote.sh's job (the private key stays on the
 signing host), with the props and rollback of OUT.img.avb.json. The boot patch level lives only in the stock footer."""
@@ -300,6 +301,8 @@ def check_signed(a):
                 errs.append(f'{k}: {si[k]} != stock {oi[k]}')
         if si['algorithm'] != 2:
             errs.append(f"algorithm {si['algorithm']} (want SHA256_RSA4096)")
+        if a.unsigned and s[:si['original_size']] != read_input(a.unsigned, UNSIGNED_LIMIT):
+            errs.append('signed payload differs from the packed unsigned image')
         body = read_boot(s[:si['original_size']])['kernel']
         m = body.find(META_MAGIC)
         if m < 0 or body[m + 80:m + 96] != SEL_TAG:
@@ -317,10 +320,13 @@ def main():
     ap.add_argument('uefi', nargs='?')
     ap.add_argument('-o', '--output')
     ap.add_argument('--check-signed', metavar='SIGNED')
+    ap.add_argument('--unsigned', metavar='PACKED', help='with --check-signed, compare the full payload with the packed image')
     a = ap.parse_args()
     try:
         if a.check_signed:
             check_signed(a)
+        if a.unsigned:
+            ap.error('--unsigned requires --check-signed')
         if not (a.selector and a.uefi and a.output):
             fail('need ANDROID_BOOT SELECTOR_BIN UEFI_BOOT -o OUT')
         pack(a)

@@ -111,6 +111,7 @@ RAM_PAYLOAD_VENDOR = 'A9C6827C-1BD8-410C-885A-C46500F7D836'
 ABL_EXPECT = {'product': 'piano', 'unlocked': 'yes', 'current-slot': 'a', 'slot-successful:a': 'yes', 'slot-unbootable:a': 'no',
               'battery-soc-ok': 'yes', 'partition-size:boot_a': '0x6000000'}
 ABL_SHOW = ('slot-retry-count:a', 'battery-voltage')
+SELECTOR_TAG = b'PIANO-SW-SEL-V1\0'
 SMALL = 128 * MiB            # backups up to this size are also kept in out/persistent/session/
 # A slow USB link (the big regions: rootfs-backup, rootfs-clear and its rollback): the slowest rate the time limits allow for, and how
 # long a stream may stall before its piece counts as failed (then retried).
@@ -462,8 +463,13 @@ class Session:
         if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
             raise Stop(f'invalid NAS backup hash for {key}')
         path = self.backup_root() / name / file
-        if key == ESP_BACKUP:
-            self.need(entry.get('bytes') == common.ESP_BLOCKS * B, 'ESP backup covers the entire ESP region')
+        if key in (ESP_BACKUP, 'boot_a'):
+            size = common.BOOT_PARTITION_BYTES if key == 'boot_a' else common.ESP_BLOCKS * B
+            self.need(entry.get('bytes') == size, f'{key} backup covers the entire region')
+            if key == 'boot_a':
+                count, bs = entry.get('count'), entry.get('bs')
+                self.need(entry.get('skip') == 0 and type(count) is int and type(bs) is int and
+                          count > 0 and bs > 0 and count * bs == size, 'boot_a backup covers the partition from offset zero')
             try:
                 manifest = json.loads(path.with_name('manifest.json').read_text())
                 checksums = path.with_name('SHA256SUMS').read_text()
@@ -471,7 +477,8 @@ class Session:
                 complete = checksums.endswith('\n') and manifest['backups'][key] == entry and matches == [f'{digest}  {file}']
             except (OSError, ValueError, KeyError, TypeError):
                 complete = False
-            self.need(complete, 'ESP backup manifest.json and SHA256SUMS match the verified receipt')
+            label = 'ESP' if key == ESP_BACKUP else key
+            self.need(complete, f'{label} backup manifest.json and SHA256SUMS match the verified receipt')
         try:
             valid = path.is_file() and path.stat().st_size == entry.get('bytes') and self.sha_nocache(path) == digest
         except OSError as exc:
@@ -1371,19 +1378,23 @@ def k273_store_grow_back(s):
 @step('abl-check', 'ABL fastboot, read only')
 def abl_check(s):
     """fastboot getvar from ABL (read only): identity, unlock, slot A state, battery, boot_a size."""
+    if s.execute:
+        s.save(abl=None)
     values = {}
     for var in list(ABL_EXPECT) + list(ABL_SHOW):
         out = s.fastboot('getvar', var, check=False)
         m = re.search(rf'{re.escape(var)}:\s*(\S+)', out or '')
         values[var] = m.group(1) if m else None
-        if var in ABL_EXPECT and var != 'slot-successful:a':
+        if var == 'slot-successful:a':
+            s.need(values[var] in ('yes', 'no') if s.execute else None, f'valid {var} (got {values[var]})')
+        elif var in ABL_EXPECT:
             s.need(values[var] == ABL_EXPECT[var] if s.execute else None, f'{var} = {ABL_EXPECT[var]} (got {values[var]})')
         else:
             s.log(f'  info  {var}: {values[var]}')
     if s.execute:
         s.save(abl=values)
         if values.get('slot-successful:a') != 'yes':
-            s.log('  NOTE  slot A is not marked successful: run step slot-success in session 3 (never set_active)')
+            s.log('  NOTE  slot A is not marked successful: use slot-success-crc in maintenance')
 
 
 @step('maint-boot', 'ABL fastboot -> maintenance RAM image (fastboot boot)')
@@ -1395,6 +1406,7 @@ def maint_boot(s):
            (str(image) if image else 'none of ' + ', '.join(str(t) for t in tried) + ' (set PIANO_V110)'))
     if not s.wait(s.serial, True, 120):
         raise Stop('ABL fastboot not found (power + volume-down 15-20 s)')
+    abl_check(s)
     s.fastboot('boot', str(image or MAINT_IMAGE), timeout=180)
     s.wait_shell()
     s.shell('piano-maint idle 3600')
@@ -2118,19 +2130,26 @@ def ram_boot_a(s):
     normal boot (the owner's Data, data-persist=2), judged on the USB console (usb-console.py --capture), and left with the
     console's 'reset fastboot'. Host-side: the image is a signed one of boot.json/boot-v*.json, and its DarwinBoot takes the RAM
     window of the ESP on the tablet (the state's)."""
-    image = OUT / s.a.boot_image
-    entry = s.boot['signed'].get(s.a.boot_image)
-    s.need(bool(entry) and image.is_file() and common.sha(image) == entry['sha256'],
-           f'{image.name} is a signed image of {entry["record"] if entry else "no boot record"}' +
-           (f' (sha256 {entry["sha256"][:16]}, DarwinBoot window up to {entry["fd_bound"] >> 20} MiB)' if entry else ''))
-    esp = s.esp_by_sha(s.esp_state()[1] or s.ledger_esp()[1]) or s.esp_record(s.esp_state()[0] or s.a.esp)
+    image, entry, selector = signed_boot_image(s)
+    esp_sha = s.esp_state()[1] or s.ledger_esp()[1]
+    esp = s.esp_by_sha(esp_sha) if esp_sha else None
+    if selector:
+        s.need(bool(esp and s.esp_window(esp) is not None), 'the installed ESP has a build record and known window for selector R1')
+    else:
+        esp = esp or s.esp_record(s.esp_state()[0] or s.a.esp)
     window = s.esp_window(esp)
     s.need(bool(entry) and (window or 0) <= entry['fd_bound'],
            f'the ESP on the tablet ({esp["image"] if esp else "unknown"}, RAM window {window >> 20 if window else "-"} MiB) boots with this FD')
     guid = s.gpt['esp_guid'] if s.gpt else '<esp guid>'
     if not s.wait(s.serial, True, 240):
         raise Stop('no ABL fastboot (from the installed system: usb-console.py --send "reset fastboot" --capture 5)')
+    abl_check(s)
+    if selector:
+        s.log(f'  R1 inputs: boot SHA-256 {entry["sha256"]}, installed ESP SHA-256 {esp_sha}')
+        s.log('  R1: stop the UEFI countdown before launching XNU, or hold volume-down for the return-to-ABL case')
     s.fastboot('boot', str(image), timeout=180)
+    if selector:
+        return   # the operator observes the menu or return to ABL and records the R1 result
     if not s.wait('piano-uefi', True, 40):
         raise Stop('our UEFI did not appear: ABL refused the image? (fastboot reboot bootloader)')
     lines = uefi_log(s, image.stem, f'config: volume VenHw({UFS_LUN0_VENDOR})/HD(37,GPT,{guid}')
@@ -2152,19 +2171,52 @@ def need_known_pair(s, vendor_boot, init_boot, what):
     return name
 
 
-def check_boot_image_pair(s, sha, what):
+def signed_boot_image(s):
+    image = OUT / s.a.boot_image
+    entry = s.boot['signed'].get(s.a.boot_image) or {}
+    digest = entry.get('sha256')
+    data = image.read_bytes() if image.is_file() and image.stat().st_size == common.BOOT_PARTITION_BYTES else b''
+    s.need(bool(data and digest and hashlib.sha256(data).hexdigest() == digest),
+           f'{image.name} is a partition-sized signed image matching its boot.json/boot-v*.json SHA-256')
+    return image, entry, SELECTOR_TAG in data
+
+
+def require_abl_check(s):
+    values = s.state.get('abl') or {}
+    s.need(all(values.get(k) == v for k, v in ABL_EXPECT.items() if k != 'slot-successful:a') and
+           values.get('slot-successful:a') in ('yes', 'no') if s.execute else None,
+           'run abl-check before maintenance to verify unlocked ABL, slot A, battery and boot_a size')
+    return values.get('slot-successful:a')
+
+
+def map_boot_a(s):
+    mapped = map_nodes(s)
+    if s.execute:
+        node = (mapped or {}).get('boot_a', '').split()
+        s.need(len(node) == 3 and re.fullmatch(r'sd[a-z]+[1-9][0-9]*', node[0]) and
+               node[1:] == [str(common.BOOT_A_START_512), str(common.BOOT_A_SIZE_512)] and mapped.get('mounted') == '0',
+               'boot_a has the expected partition geometry and UFS is unmounted')
+    return s.nodes['boot_a']
+
+
+def check_boot_image_pair(s, sha, what, *, require_esp=False):
     """Before boot_a gets the contents SHA: the ESP on the tablet (read from it) must boot with their DarwinBoot (the pair rule).
     An FD whose DarwinBoot takes every window needs no read; Ubuntu's boot_a boots no ESP."""
     name, bound = s.boot_identity(sha)
-    if sha == common.BOOT_A_SHA256 or (bound and bound >= common.DARWIN_WINDOW_MAX):
+    if not require_esp and (sha == common.BOOT_A_SHA256 or (bound and bound >= common.DARWIN_WINDOW_MAX)):
         s.log(f'  info  {what}: {name} (DarwinBoot window up to {bound >> 20 if bound else "-"} MiB): every ESP\'s window boots')
         return
     esp_sha = s.tablet_esp()
     record = s.esp_by_sha(esp_sha) if esp_sha else None
     if record is None:
+        if require_esp:
+            s.need(False, f'{what}: the live ESP has no matching build record')
         s.log(f'  info  {what}: the ESP region ({esp_sha and esp_sha[:16]}) is no ESP of a build record here: nothing to compare')
         return
+    if require_esp:
+        s.need(s.esp_window(record) is not None, f'{what}: the ESP RAM window is known')
     s.pair(sha, record, what)
+    return record
 
 
 @step('boot-a', 'maintenance, WRITE boot_a by dd (slot bits untouched)', writes='boot_a (LUN 4)')
@@ -2172,24 +2224,26 @@ def boot_a_step(s):
     """boot_a = the signed image (--boot-image: a signed image of boot.json or boot-v*.json; the signed v2 test image is the
     fallback), written by dd from the maintenance image so slot A's successful bit and retry count stay as they are. Read back
     whole. Refused when the ESP on the tablet asks for a RAM window this image's DarwinBoot does not take (the pair rule)."""
-    image = OUT / s.a.boot_image
-    signed = ((s.boot or {}).get('signed') or {}).get(s.a.boot_image, {}).get('sha256')
-    if not signed:
-        what = f'{s.a.boot_image} is not in boot.json/boot-v*.json "signed" (tooling/persist/sign.sh OUT SERIES: signs and verifies)'
-        if s.execute:
-            raise Stop(what)
-        s.need(False, what)
-    s.need(image.is_file() and common.sha(image) == signed if signed else None, f'{image.name} hashes to its record\'s {signed and signed[:16]}')
-    r = map_nodes(s)
-    if r:
-        s.need(r['boot_a'].split()[1:] == [str(common.BOOT_A_START_512), str(common.BOOT_A_SIZE_512)], f'boot_a is {r["boot_a"]}')
-    check_boot_image_pair(s, signed or f'planned:{s.a.boot_image}', f'{image.name} with the ESP on the tablet')
-    boot_a = s.nodes['boot_a']
+    image, entry, selector = signed_boot_image(s)
+    signed = entry.get('sha256')
+    if selector:
+        require_abl_check(s)
+    boot_a = map_boot_a(s)
+    esp = check_boot_image_pair(s, signed or f'planned:{s.a.boot_image}', f'{image.name} with the ESP on the tablet',
+                                require_esp=selector)
+    if selector:
+        s.need(s.a.selector_r1 == [signed, esp['sha256']] if esp else False,
+               'operator R1 pass names the exact signed selector and live ESP SHA-256 values (--selector-r1)')
     now = s.region_sha(boot_a, 0, s.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
     if s.execute and now == common.ANDROID_BOOT_A_SHA256:
         s.need(False, f'boot_a holds stock Android ({now[:16]}): switch to macOS first (piano-switch), then run boot-a')
     got_pair = [s.region_sha(s.nodes[key], 0, s.sizes[key] // MiB, MiB, name=f'sha-{key}') for key in ('vendor_boot_a', 'init_boot_a')]
     need_known_pair(s, got_pair[0], got_pair[1], 'boot-a (ABL pairs it with boot_a)')
+    if selector and s.execute:
+        s.need(got_pair[0] == common.ANDROID_VENDOR_BOOT_SHA256,
+               'selector boot-a requires the existing Android vendor_boot_a and a known Android init_boot_a')
+        s.need(any(e.get('sha256') == now for e in s.boot['signed'].values()), 'selector replaces a known signed macOS boot_a')
+        s.pair(now, esp, 'the boot_a being replaced remains compatible for rollback')
     s.require_backup('boot_a', now if s.execute else None)
     s.require_backup('boot_b')
     s.fetch('boot.img', image, signed or '<signed sha256>')
@@ -2209,14 +2263,15 @@ def boot_a_back(s):
     """boot_a as backed up (the verified backup boot_a of this backup set: Ubuntu's 389d4271 when the install started, the
     image of before in a later set), read back. Refused while the ESP on the tablet asks for a RAM window the backup's DarwinBoot
     does not take: rollback esp-final first (the pair rule)."""
-    map_nodes(s)
+    boot_a = map_boot_a(s)
     entry = s.state.get('backups', {}).get('boot_a') or {}
     if entry.get('sha256'):
-        check_boot_image_pair(s, entry['sha256'], f'the boot_a backup ({s.boot_identity(entry["sha256"])[0]}) with the ESP on the tablet')
-    s.restore('boot_a', s.nodes['boot_a'], 0, MiB)
+        check_boot_image_pair(s, entry['sha256'], f'the boot_a backup ({s.boot_identity(entry["sha256"])[0]}) with the ESP on the tablet',
+                              require_esp=s.execute and bool(s.ledger_esp()[1]))
+    s.restore('boot_a', boot_a, 0, MiB)
     s.sim['boot_a'] = entry.get('sha256')
     if s.execute:
-        s.save(boot_a_written=None)
+        s.save(boot_a_written=None, boot_a_sha256=entry['sha256'])
 
 
 @step('esp-final', 'maintenance, WRITE partition 37 (daily-use ESP)', writes='LUN 0 LBA 71527424-71789567')
@@ -2274,6 +2329,36 @@ def lun4_layout(s, number):
     return old_p, old_b, bh, (pe, pc, ps), (my, alt), (be, bc, bs_)
 
 
+def slot_crc_layout(primary, backup, total, number):
+    """Validate both GPT headers and locate the exact boot_a attribute and backup entry array."""
+    if len(primary) != 6 * B or len(backup) != 5 * B:
+        raise Stop('LUN 4 GPT backups have the wrong size')
+    ph, bh = primary[B:2 * B], backup[-B:]
+    for header, at, other in ((ph, 1, total - 1), (bh, total - 1, 1)):
+        sig, rev, size, crc, reserved, current, alternate = struct.unpack_from('<8sIIIIQQ', header)
+        if ((sig, rev, size, reserved, current, alternate) != (b'EFI PART', 0x10000, 92, 0, at, other) or
+                zlib.crc32(header[:16] + bytes(4) + header[20:92]) != crc):
+            raise Stop('LUN 4 GPT header geometry or CRC is invalid')
+    pe, count, size, crc = struct.unpack_from('<QIII', ph, 72)
+    be, backup_count, backup_size, backup_crc = struct.unpack_from('<QIII', bh, 72)
+    first, last = struct.unpack_from('<QQ', ph, 40)
+    nblk = (count * size + B - 1) // B
+    if (ph[40:72] != bh[40:72] or (pe, size) != (2, 128) or (count, size, crc) != (backup_count, backup_size, backup_crc) or
+            not (0 < number <= count and 1 <= nblk <= 4 and pe + nblk <= first <= last < be <= total - 1 - nblk)):
+        raise Stop('LUN 4 GPT copies disagree or the entry arrays are outside their reserved regions')
+    entries = primary[2 * B:2 * B + count * size]
+    if zlib.crc32(entries) != crc:
+        raise Stop('LUN 4 primary entry array CRC is invalid')
+    entry = entries[(number - 1) * size:number * size]
+    start, end = struct.unpack_from('<QQ', entry, 32)
+    name = 'boot_a'.encode('utf-16-le').ljust(72, b'\0')
+    if (not any(entry[:16]) or entry[56:] != name or
+            start * (B // 512) != common.BOOT_A_START_512 or (end - start + 1) * (B // 512) != common.BOOT_A_SIZE_512 or
+            not first <= start <= end <= last):
+        raise Stop('LUN 4 GPT entry does not describe the exact boot_a partition')
+    return bh, entries, be, nblk
+
+
 @step('slot-success-crc', 'maintenance, WRITE LUN 4 GPT (boot_a attribute bit 54 and the two CRCs only, both copies)',
       writes='LUN 4 GPT: backup entry array + backup header, then primary header + entries (bit 54 of boot_a and CRCs only)')
 def slot_success_crc(s):
@@ -2282,35 +2367,48 @@ def slot_success_crc(s):
     primary entry array, its CRC and the primary header CRC recomputed; the backup entry array = the new primary entries, the backup
     header's two CRCs recomputed. Written backup entries, backup header, then primary (LBA 1-5), each read back against the computed
     bytes; the protective MBR (LBA 0) is never written. Never set_active."""
-    if s.execute and (s.state.get('abl') or {}).get('slot-successful:a') == 'yes':
+    if require_abl_check(s) == 'yes' and s.execute:
         s.log('  info  slot A is already marked successful: nothing to do')
         return
-    boot_a = s.nodes['boot_a']
+    boot_a = map_boot_a(s)
+    if s.execute:
+        now = s.tablet_boot_a()
+        written = s.state.get('boot_a_written')
+        original = s.state.get('boot_a_sha256')
+        s.need(bool(original) and now is not None and now in (original, written),
+               'slot-success-crc: boot_a still matches the mapped or verified written image')
+        s.require_backup('boot_a', None if now == written else now)
     disk = re.sub(r'\d+$', '', boot_a)
     part = s.shell(f'cat /sys/class/block/{boot_a}/partition')
     number = int(part.strip().splitlines()[-1]) if part else 0
     s.shell(f'sgdisk -i {number or "<n>"} /dev/{disk}')
-    s.backup('lun4-gpt-primary', disk, 0, 6, B, f'{disk} LBA 0-5 (boot_a\'s LUN, primary GPT)')
+    head_sha = s.backup('lun4-gpt-primary', disk, 0, 6, B, f'{disk} LBA 0-5 (boot_a\'s LUN, primary GPT)')
     blocks = s.shell(f'blockdev --getsize64 /dev/{disk}')
     total = int(blocks.strip().splitlines()[-1]) // B if blocks else 0
-    s.backup('lun4-gpt-backup', disk, total - 5 if total else '<last-5>', 5, B, f'{disk} last 5 LBAs (backup GPT)')
+    tail_sha = s.backup('lun4-gpt-backup', disk, total - 5 if total else '<last-5>', 5, B, f'{disk} last 5 LBAs (backup GPT)')
     if not s.execute:
         s.log(f'  WRITE computed: backup entries (from its header), backup header (last LBA), primary LBA 1-5; bit 54 of entry <n> + CRCs')
         return
-    old_p, old_b, bh, (pe, pc, ps), (my, alt), (be, bc, bs_) = lun4_layout(s, number)
-    nblk = (pc * ps + B - 1) // B
-    s.need(pe == 2 and (pc, ps) == (bc, bs_) and my == total - 1 and alt == 1 and be + nblk <= total - 1 and 0 < number <= pc,
-           f'LUN 4 GPT layout: primary entries LBA {pe}, backup header LBA {my} of {total}, backup entries LBA {be} ({nblk} blocks)')
-    s.backup('lun4-gpt-backup-entries', disk, be, nblk, B, f'{disk} LBA {be}+{nblk} (backup entry array, as found)')
+    old_p, old_b = ((s.dir / f'lun4-gpt-{name}.img').read_bytes() for name in ('primary', 'backup'))
+    for name, data, digest in (('primary', old_p, head_sha), ('backup', old_b, tail_sha)):
+        s.need(hashlib.sha256(data).hexdigest() == digest, f'local LUN 4 {name} GPT copy matches the verified backup')
+    bh, entries, be, nblk = slot_crc_layout(old_p, old_b, total, number)
+    entries_sha = s.backup('lun4-gpt-backup-entries', disk, be, nblk, B, f'{disk} LBA {be}+{nblk} (backup entry array, as found)')
+    old_entries = (s.dir / 'lun4-gpt-backup-entries.img').read_bytes()
+    s.need(hashlib.sha256(old_entries).hexdigest() == entries_sha and old_entries[:len(entries)] == entries,
+           'LUN 4 primary and backup GPT entry arrays match their verified backups')
     new_p = gpt_set_attr_bit(old_p, 0, 1, number, 54)
-    entries = new_p[pe * B:pe * B + pc * ps]
+    if new_p == old_p:
+        s.log('  info  boot_a GPT bit 54 is already set in both copies')
+        return
+    new_entries = new_p[2 * B:2 * B + len(entries)]
     index = number - 1
     allowed_p = set(range(B + 16, B + 20)) | set(range(B + 88, B + 92)) | set(range(2 * B + index * 128 + 48, 2 * B + index * 128 + 56))
     diff_p = {i for i in range(len(old_p)) if old_p[i] != new_p[i]}
     s.need(diff_p and diff_p <= allowed_p, f'computed primary: {len(diff_p)} bytes differ, all in entry {number}\'s attributes and the '
            f'two CRCs (protective MBR untouched)')
-    new_bh = gpt_backup_header_with(bh, entries)
-    new_be = new_p[pe * B:(pe + nblk) * B]
+    new_bh = gpt_backup_header_with(bh, new_entries)
+    new_be = new_entries + old_entries[len(entries):]  # keep the backup array's own sector padding
     pieces = (('lun4-gpt-backup-entries-bit54', new_be, be), ('lun4-gpt-backup-header-bit54', new_bh, total - 1),
               ('lun4-gpt-primary-bit54', new_p[B:], 1))
     for key, data, seek in pieces:
@@ -2322,12 +2420,12 @@ def slot_success_crc(s):
             s.job(f'restore-{key}', 'restore', f'{key}.img', disk, seek, B, s.a.http_port, timeout=3600)
         got = s.region_sha(disk, seek, len(data) // B, B, name=f'check-{key}')
         s.need(got == digest, f'{key} written: read back {got[:16]} = computed {digest[:16]}')
-    s.save(slot_success_written=True)
     v = s.shell(f'partx -u /dev/{disk}; sgdisk -A {number}:show /dev/{disk}; sgdisk -v /dev/{disk}')
     s.need('No problems found' in (v or '') and 'ERROR' not in (v or '') and "don't match" not in (v or ''),
            'sgdisk -v: both headers and both partition tables OK')
     attrs = int.from_bytes(new_p[2 * B + index * 128 + 48:2 * B + index * 128 + 56], 'little')
     s.need(attrs >> 54 & 1 == 1, f'boot_a attributes {attrs:#x}: bit 54 set')
+    s.save(slot_success_written=True)
 
 
 @step('lun4-backup-entries-repair', 'maintenance, WRITE LUN 4 backup GPT entry array (= the verified primary entries)',
@@ -2434,7 +2532,7 @@ def slot_crc_back(s):
 @step('abl-final', 'ABL fastboot, read only')
 def abl_final(s):
     """Before the first boot from boot_a: slot A current, successful and bootable."""
-    for var, want in (('current-slot', 'a'), ('slot-successful:a', 'yes'), ('slot-unbootable:a', 'no')):
+    for var, want in (('unlocked', 'yes'), ('current-slot', 'a'), ('slot-successful:a', 'yes'), ('slot-unbootable:a', 'no')):
         out = s.fastboot('getvar', var, check=False)
         m = re.search(rf'{re.escape(var)}:\s*(\S+)', out or '')
         s.need((m and m.group(1)) == want if s.execute else None, f'{var} = {want}')
@@ -2990,6 +3088,8 @@ def main():
                    'whole-disk layout after rootfs-clear)')
     p.add_argument('--esp-final', default='esp-base-macos.img', help='the ESP image of step esp-final')
     p.add_argument('--boot-image', default='boot-piano-macos-persistent-v4-signed.img', help='the boot_a image (out/persistent)')
+    p.add_argument('--selector-r1', nargs=2, metavar=('BOOT_SHA256', 'ESP_SHA256'),
+                   help='attest an observed write-free selector R1 pass for the signed boot image and live ESP')
     p.add_argument('--dump-image', default=str(D / 'out/ram-dump/boot-piano-macos-ram-A-bundled.img'))
     # ram-precedence's image: patched FD, data-persist=0 (another seed must not reset the installed system's store), reset 45 s
     p.add_argument('--dev-image', default=str(D / 'out/ram-precedence/boot-piano-macos-ram-A-bundled.img'))

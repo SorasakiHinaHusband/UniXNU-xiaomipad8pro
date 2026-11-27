@@ -182,6 +182,113 @@ class PartitionSafety(unittest.TestCase):
             self.s.require_backup(key)
 
 
+class SelectorWriteSafety(unittest.TestCase):
+    record_backup = PartitionSafety.record_backup
+
+    def setUp(self):
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(temp)
+        self.nas = self.root / 'backups' / 'set'
+        self.nas.mkdir(parents=True)
+        self.s = maint.Session.__new__(maint.Session)
+        self.s.execute = True
+        self.s.a = SimpleNamespace()
+        self.s.dir = self.root
+        self.s.env = {'PIANO_BACKUP_DIR': str(self.nas.parent)}
+        self.s.state = {'backup_name': self.nas.name, 'backups': {}}
+        self.s.log = Mock()
+        self.s.serve = Mock()
+        self.s.fetch = Mock()
+        self.s.t = Mock()
+        self.s.region_sha = Mock()
+        self.s.save = Mock()
+        self.enterContext(patch.object(maint, 'OUT', self.root))
+        self.enterContext(patch.object(common, 'BOOT_PARTITION_BYTES', maint.MiB))
+        self.s.a.boot_image = 'boot-selector-signed.img'
+        self.s.state['abl'] = dict(maint.ABL_EXPECT)
+        self.s.nodes = dict(boot_a='sde13', vendor_boot_a='sde23', init_boot_a='sde28')
+        self.s.sizes = dict.fromkeys(('boot_a', 'vendor_boot_a', 'init_boot_a'), maint.MiB)
+        self.s.sim = {}
+        self.image = (b'ANDROID!' + maint.SELECTOR_TAG).ljust(maint.MiB, b'\0')
+        self.digest = sha(self.image)
+        self.esp = {'image': 'esp-test.img', 'sha256': sha(b'esp'), 'ram_window': common.DARWIN_WINDOW_MAX - 2 * maint.MiB}
+        self.s.a.selector_r1 = [self.digest, self.esp['sha256']]
+        self.s.tablet_esp = Mock(return_value=self.esp['sha256'])
+        self.s.esp_by_sha = Mock(return_value=self.esp)
+        self.old = b'ANDROID!'.ljust(maint.MiB, b'x')
+        self.s.boot = {'signed': {self.s.a.boot_image: {'sha256': self.digest, 'fd_bound': common.DARWIN_WINDOW_MAX},
+                                  'old-signed.img': {'sha256': sha(self.old), 'fd_bound': common.DARWIN_WINDOW_MAX}}}
+        (self.root / self.s.a.boot_image).write_bytes(self.image)
+        mapped = patch.object(maint, 'map_nodes', return_value={'boot_a': 'sde13 618800 196608', 'mounted': '0'})
+        self.map = mapped.start()
+        self.addCleanup(mapped.stop)
+        self.record_backup('boot_a', self.old, 0)
+        self.record_backup('boot_b', bytes(4096), 0)
+        self.s.write_manifest(self.nas, self.s.state['backups'])
+        self.s.region_sha.side_effect = [sha(self.old), common.ANDROID_VENDOR_BOOT_SHA256, common.ANDROID_INIT_BOOT_MAGISK_SHA256,
+                                         self.digest]
+        self.s.t.return_value = {'hex': b'ANDROID!'.hex()}
+
+    def assert_refused_before_write(self, message):
+        with self.assertRaisesRegex(maint.Stop, message):
+            maint.boot_a_step(self.s)
+        self.s.fetch.assert_not_called()
+        self.s.t.assert_not_called()
+
+    def test_selector_requires_exact_r1_and_known_live_esp(self):
+        for receipt in (None, [self.digest, sha(b'equal-sized different esp')], [sha(b'different boot'), self.esp['sha256']]):
+            self.s.a.selector_r1 = receipt
+            self.assert_refused_before_write('operator R1 pass')
+        self.s.esp_by_sha.return_value = None
+        self.assert_refused_before_write('live ESP has no matching build record')
+
+    def test_selector_requires_unlocked_abl_and_compatible_rollback(self):
+        self.s.state['abl']['unlocked'] = 'no'
+        self.assert_refused_before_write('verify unlocked ABL')
+        self.s.state['abl']['unlocked'] = 'yes'
+        self.s.boot['signed']['old-signed.img']['fd_bound'] = common.OLD_DARWINBOOT_WINDOW_MAX
+        self.assert_refused_before_write('remains compatible for rollback')
+
+    def test_selector_requires_untampered_backup_manifest(self):
+        (self.nas / 'SHA256SUMS').unlink()
+        self.assert_refused_before_write('boot_a backup manifest.json and SHA256SUMS')
+
+    def test_exact_partition_is_the_only_write_and_readback_must_match(self):
+        maint.boot_a_step(self.s)
+        self.s.t.assert_any_call('write', 'boot.img', 'sde13', 0, maint.MiB, timeout=600)
+        self.assertEqual([c.args[0] for c in self.s.t.call_args_list], ['write', 'peek'])
+        self.s.save.assert_called_once_with(boot_a_written=self.digest)
+        self.s.save.reset_mock()
+        self.s.region_sha.side_effect = [sha(self.old), common.ANDROID_VENDOR_BOOT_SHA256, common.ANDROID_INIT_BOOT_SHA256, sha(b'bad')]
+        with self.assertRaisesRegex(maint.Stop, 'boot_a read back'):
+            maint.boot_a_step(self.s)
+        self.s.save.assert_not_called()
+
+    def test_rollback_refuses_wrong_or_mounted_partition(self):
+        for mapped in ({'boot_a': 'sde13 618800 196607', 'mounted': '0'}, {'boot_a': 'sde13 618800 196608', 'mounted': '1'}):
+            self.map.return_value = mapped
+            with self.assertRaisesRegex(maint.Stop, 'expected partition geometry'):
+                maint.boot_a_back(self.s)
+        self.s.serve.assert_not_called()
+
+    def test_selector_ram_boot_only_checks_abl_and_boots_exact_file(self):
+        self.s.esp_state = Mock(return_value=(self.esp['image'], self.esp['sha256']))
+        self.s.gpt = {'esp_guid': 'fixture'}
+        self.s.serial = 'fixture'
+        self.s.wait = Mock(return_value=True)
+        values = dict(maint.ABL_EXPECT)
+        self.s.fastboot = Mock(side_effect=lambda cmd, *args, **kwargs: f'{args[0]}: {values.get(args[0])}'
+                               if cmd == 'getvar' else None)
+        maint.ram_boot_a(self.s)
+        self.assertEqual(self.s.fastboot.call_args.args, ('boot', str(self.root / self.s.a.boot_image)))
+        self.assertTrue(all(c.args[0] == 'getvar' for c in self.s.fastboot.call_args_list[:-1]))
+        self.s.fastboot.reset_mock()
+        values['unlocked'] = 'no'
+        with self.assertRaisesRegex(maint.Stop, 'unlocked = yes'):
+            maint.ram_boot_a(self.s)
+        self.assertTrue(all(c.args[0] == 'getvar' for c in self.s.fastboot.call_args_list))
+
+
 class InstalledIdentity(unittest.TestCase):
     def test_conflicting_arguments_across_adt_tail_are_refused(self):
         profile = identity.argument_profile('data-persist=0 piano-boot-args=ram',

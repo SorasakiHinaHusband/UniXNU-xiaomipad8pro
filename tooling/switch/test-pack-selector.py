@@ -130,6 +130,14 @@ def main(t):
     # check-signed: a footer with the stock props passes, a wrong patch level / rollback / no footer fails
     open(p('good.img'), 'wb').write(with_footer(out, PROPS))
     check(run('--check-signed', p('good.img'), p('android.img')).returncode == 0, 'check-signed accepts the stock props')
+    check(run('--check-signed', p('good.img'), p('android.img'), '--unsigned', p('out.img')).returncode == 0,
+          'check-signed accepts the exact packed payload')
+    other = bytearray(out)
+    other[PAGE + 128] ^= 1
+    open(p('other-signed.img'), 'wb').write(with_footer(other, PROPS))
+    r = run('--check-signed', p('other-signed.img'), p('android.img'), '--unsigned', p('out.img'))
+    check(r.returncode != 0 and 'differs from the packed unsigned image' in r.stdout,
+          'check-signed refuses a different payload even with matching AVB properties and digest')
     bad = dict(PROPS, **{'com.android.build.boot.security_patch': '2025-01-01'})
     open(p('bad1.img'), 'wb').write(with_footer(out, bad))
     check(run('--check-signed', p('bad1.img'), p('android.img')).returncode != 0, 'check-signed refuses another patch level')
