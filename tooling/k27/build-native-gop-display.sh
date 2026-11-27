@@ -35,7 +35,10 @@ if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ] || [ ! -f "$CACHE/abi" ]; then
       || { cat "$CACHE/abi-check.txt" >&2; echo "Error: the IOMobileFramebuffer vtables of $KC_BASE are not $REF's" >&2; exit 1; }
     SIZES=$(awk '$1 == "size" {printf "%s:%s:%s ", $2, $3, $4}' "$CACHE/abi-check.txt")
     case " $SIZES " in
+      # the local tree: the 27.0.1 vma2 reference against the 27.3 target
       *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:7640:9120 IOMFBSwapIORequest:3400:4056 "*) ABI=2 ;;
+      # CI: the reference IS the target collection (the 27.3 mac17j kernelcache), so the sizes agree; the layout is the same 27.3 one
+      *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:9120:9120 IOMFBSwapIORequest:4056:4056 "*) ABI=2 ;;
       *) echo "Error: no NativeGopDisplay offsets for this IOMobileGraphicsFamily layout ($SIZES)" >&2; exit 1 ;;
     esac
     python3 "$K/scripts/gen-iomfb-abi.py" "$REF" "$CACHE/IOMobileFramebufferABI.h.ref"
