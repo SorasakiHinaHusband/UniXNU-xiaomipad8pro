@@ -31,7 +31,8 @@ jobs:
       - name: Extract the kernelcache
         run: |
           mkdir -p kc
-          unzip -o -j ipsw.zip 'KernelCache*' -d kc || true
+          unzip -l ipsw.zip | grep -iE "\.kernelcache|kernelcache" | head -20 || true
+          unzip -o -j ipsw.zip '*ernel*' -d kc || true
           ls -l kc | head
           mv kc/* kc.bin 2>/dev/null || true
           ls -l kc.bin || true
