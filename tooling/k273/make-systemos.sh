@@ -54,7 +54,10 @@ mount_ro "$APP" "$WORK/app"
 TEMPLATE=$WORK/os/System/Library/Templates/Data
 [ -d "$TEMPLATE/private/var" ] || { echo "$OS: no Data template" >&2; exit 1; }
 
-mkfile -n "${SIZE_MIB}m" "$OUT"
+# mkfile lives in /usr/sbin, which a hosted runner step may not have on PATH
+MKFILE=$(command -v mkfile || echo /usr/sbin/mkfile)
+[ -x "$MKFILE" ] || { echo "no mkfile (looked on PATH and /usr/sbin/mkfile)" >&2; exit 1; }
+"$MKFILE" -n "${SIZE_MIB}m" "$OUT"
 attach "$OUT"
 # newfs_apfs only on the disk hdiutil attached OUT as, a disk image of exactly OUT's size
 [ "$(diskutil info -plist "$WHOLE" | plutil -extract TotalSize raw -o - -)" = "$(stat -f %z "$OUT")" ] \
