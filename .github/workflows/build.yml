@@ -149,7 +149,7 @@ jobs:
           cd "$OUT" 2>/dev/null || { echo "no $OUT"; exit 0; }
           tag="build-$(echo "$GITHUB_SHA" | cut -c1-8)"
           if gh release view "$tag" > /dev/null 2>&1; then echo "release $tag already exists"; exit 0; fi
-          files=$(ls kernel-k27-native.macho kernel-k273-native.macho piano-kexts.tar.gz SHA256SUMS BUILD-INFO.txt 2>/dev/null)
+          files=$( (ls kernel-k27-native.macho kernel-k273-native.macho piano-kexts.tar.gz SHA256SUMS BUILD-INFO.txt 2>/dev/null || true) )
           [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
           gh release create "$tag" --prerelease --title "piano build $tag" \
             --notes "Kernels, kext objects and the FD from build.yml run $GITHUB_RUN_ID (commit $GITHUB_SHA). The kernel collection, the ADT, the root image and the RAM images are the image workflow." \
