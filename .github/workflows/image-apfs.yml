@@ -56,6 +56,7 @@ jobs:
         env:
           PIANO_K27_TREE: ${{ runner.temp }}/k27-tree
         run: |
+          export PATH="/usr/sbin:/sbin:$PATH"
           df -h /
           bash tooling/k273/make-systemos.sh out/inputs/k273/26C5035r/141-22233-021.dmg \
             out/inputs/k273/26C5035r/141-22145-021.dmg out/inputs/k273/26C5035r/141-22106-021.dmg \
