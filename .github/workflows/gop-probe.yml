@@ -17,7 +17,8 @@ jobs:
 
       - name: Tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq unzip xz-utils p7zip-full python3-pip
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip xz-utils p7zip-full python3-pip cmake build-essential
+          git clone --depth 1 https://github.com/lzfse/lzfse.git /tmp/lzfse && cmake -S /tmp/lzfse -B /tmp/lzfse/build >/dev/null && cmake --build /tmp/lzfse/build -j4 >/dev/null && /tmp/lzfse/build/lzfse -h 2>&1 | head -3
           python3 -m pip install --quiet --break-system-packages pyimg4 || pip3 install --quiet pyimg4
           python3 -c "import pyimg4; print('pyimg4', pyimg4.__version__ if hasattr(pyimg4,'__version__') else 'ok')"
 
@@ -42,20 +43,22 @@ jobs:
         run: |
           set -x
           python3 - <<'PY'
-          # the IPSW's kernelcache carries a small iOS container header; the IM4P starts later
+          # the kernelcache is an IM4P whose data is an LZFSE block; skip both wrappers by finding the block magic
           data = open('kc.bin','rb').read()
-          i = data.find(b'IM4P')
-          print("IM4P at", i, "of", len(data))
-          assert i > 0
-          open('kc.im4p','wb').write(data[i:])
-          from pyimg4 import IM4P
-          im4p = IM4P('kc.im4p')
-          payload = im4p.payload.data
-          open('kc.payload','wb').write(payload)
-          print("payload bytes", len(payload))
+          for m in (b'bvx2', b'bvxn', b'bvx1', b'complzss'):
+              i = data.find(m)
+              print(m.decode(), 'at', i)
+              if i > 0:
+                  open('kc.payload','wb').write(data[i:])
+                  print('payload from magic:', len(data) - i, 'bytes')
+                  break
+          else:
+              raise SystemExit('no LZFSE/LZSS magic found')
           PY
-          ls -l kc.payload || true
-          head -c 32 kc.payload | od -An -c | head -3 || true
+          ls -l kc.raw
+          /tmp/lzfse/build/lzfse -decode -i kc.payload -o kc.raw || echo "lzfse decode failed"
+          ls -l kc.raw 2>/dev/null || true
+          head -c 32 kc.raw 2>/dev/null | od -An -c | head -3 || true
           ls -l kc.payload 2>/dev/null || true
           file kc.payload 2>/dev/null || true
 
@@ -64,7 +67,7 @@ jobs:
           set -uo pipefail
           echo "--- strings scan ---"
           for s in AppleParavirtDisplay IOMobileFramebufferLegacy IOMobileGraphicsFamily; do
-            n=$(grep -a -c "$s" kc.payload 2>/dev/null || echo 0)
+            n=$(grep -a -c "$s" kc.raw 2>/dev/null || echo 0)
             echo "$s: $n occurrences"
           done
           echo "--- first hits (context) ---"
@@ -76,6 +79,6 @@ jobs:
         with:
           name: gop-probe-report
           path: |
-            kc.payload
+            kc.raw
           if-no-files-found: warn
           retention-days: 3
