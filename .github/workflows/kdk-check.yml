@@ -1,0 +1,65 @@
+# Probe: does the macOS runner itself carry AppleParavirtDisplay with its vtable symbol?
+name: kdk-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Uname and system extensions
+        run: |
+          uname -a
+          ls /System/Library/Extensions | grep -i -E "paravirt|IOMobileGraphics" || echo "none in /S/L/E"
+
+      - name: Kernel collections
+        run: |
+          ls -l /System/Library/KernelCollections/ 2>/dev/null || true
+          for kc in /System/Library/KernelCollections/*.kc; do
+            echo "== $kc"
+            strings -a "$kc" 2>/dev/null | grep -c -i "AppleParavirtDisplay" || true
+          done
+
+      - name: The k27 tree
+        run: bash tooling/k27/fetch-k27-tree.sh "$RUNNER_TEMP/k27-tree" || echo "::warning::tree fetch failed"
+
+      - name: kc-vtable against the kext and the collections
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/k27-tree"
+          K=/System/Library/Extensions/AppleParavirtDisplay.kext
+          if [ -d "$K" ]; then
+            echo "== kext binary"
+            python3 "$T/scripts/kc-vtable.py" "$K/Contents/MacOS/AppleParavirtDisplay" AppleParavirtDisplay 2>&1 | head -30
+            echo "exit=$?"
+          fi
+          for kc in /System/Library/KernelCollections/*.kc; do
+            echo "== $kc"
+            python3 "$T/scripts/kc-vtable.py" "$kc" AppleParavirtDisplay 2>&1 | head -12
+            echo "exit=$?"
+          done
+
+      - name: Generate the header from whatever worked
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/k27-tree"
+          K=/System/Library/Extensions/AppleParavirtDisplay.kext/Contents/MacOS/AppleParavirtDisplay
+          [ -f "$K" ] || { echo "::warning::no paravirt kext on the runner"; exit 0; }
+          python3 "$T/scripts/gen-iomfb-abi.py" "$K" "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>&1 | tail -10
+          ls -l "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>/dev/null || echo "::warning::no header"
+          head -40 "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: kdk-check
+          path: ${{ runner.temp }}/IOMobileFramebufferABI.h
+          if-no-files-found: warn
+          retention-days: 7
