@@ -82,3 +82,48 @@ jobs:
             kc.raw
           if-no-files-found: warn
           retention-days: 3
+
+  parse:
+    name: Does the k27 tree parse it (kc-vtable, gen-iomfb-abi)?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Python and git
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3 git curl
+
+      - name: The reference collection
+        run: |
+          curl -sSL --max-time 900 -o "$RUNNER_TEMP/kc.raw" "https://github.com/SorasakiHinaHusband/UniXNU-xiaomipad8pro/releases/download/abi-refs/kc.raw"
+          ls -l "$RUNNER_TEMP/kc.raw"
+          sha256sum "$RUNNER_TEMP/kc.raw" | cut -c1-32
+
+      - name: The k27 tree
+        run: |
+          bash tooling/k27/fetch-k27-tree.sh "$RUNNER_TEMP/k27-tree" || echo "::warning::tree fetch failed"
+          ls "$RUNNER_TEMP/k27-tree/scripts" | head -20 || true
+
+      - name: kc-vtable on the reference
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/k27-tree"
+          python3 "$T/scripts/kc-vtable.py" "$RUNNER_TEMP/kc.raw" AppleParavirtDisplay 2>&1 | head -40
+          echo "exit=$?"
+
+      - name: Generate the ABI header
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/k27-tree"
+          python3 "$T/scripts/gen-iomfb-abi.py" "$RUNNER_TEMP/kc.raw" "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>&1 | tail -20
+          echo "exit=$?"
+          ls -l "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>/dev/null || echo "::warning::no header"
+          head -30 "$RUNNER_TEMP/IOMobileFramebufferABI.h" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: iomfb-abi
+          path: ${{ runner.temp }}/IOMobileFramebufferABI.h
+          if-no-files-found: warn
+          retention-days: 7
