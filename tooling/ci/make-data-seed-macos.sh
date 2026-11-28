@@ -89,7 +89,19 @@ else
     REAL=$(mount | awk -v d="$DATA_VOL" '$1 == d {line = $0; sub(/^.* on /, "", line); sub(/ \(.*/, "", line); print line; exit}')
     if [ "$REAL" != "$DATA_MNT" ]; then echo "mounted at $REAL"; DATA_MNT=$REAL; fi
   else
-    echo "the new APFS volume did not mount:" >&2; diskutil info "$DATA_VOL" 2>&1 | head -8 >&2; exit 1
+    # last resort: mount the whole container, then look again
+    diskutil mountDisk "$DATA_DEV" > /dev/null 2>&1 || true
+    sleep 2
+    if mount | grep -q "^$DATA_VOL "; then
+      DATA_MNT=$(mount | awk -v d="$DATA_VOL" '$1 == d {line = $0; sub(/^.* on /, "", line); sub(/ \(.*/, "", line); print line; exit}')
+      echo "mounted at $DATA_MNT (mountDisk)"
+    else
+      echo "the new APFS volume did not mount:" >&2
+      diskutil info "$DATA_VOL" 2>&1 | head -12 >&2
+      echo "--- diskutil list ---" >&2; diskutil list 2>&1 | head -20 >&2
+      echo "--- mount ---" >&2; mount 2>&1 | tail -10 >&2
+      exit 1
+    fi
   fi
 fi
 mounted "$DATA_MNT" || { echo "no mount point for $DATA_VOL" >&2; exit 1; }
