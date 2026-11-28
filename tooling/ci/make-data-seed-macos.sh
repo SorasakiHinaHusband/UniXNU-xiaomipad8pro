@@ -84,7 +84,13 @@ if mount | grep -q "^$DATA_VOL "; then
 else
   mkdir -p "$DATA_MNT"
   diskutil mount -mountPoint "$DATA_MNT" "$DATA_VOL" > /dev/null || diskutil mount "$DATA_VOL" > /dev/null
-  mounted "$DATA_MNT" || { echo "the new APFS volume did not mount at $DATA_MNT" >&2; exit 1; }
+  # diskutil mount without a mount point puts the volume under /Volumes: take wherever it really landed
+  if mount | grep -q "^$DATA_VOL "; then
+    REAL=$(mount | awk -v d="$DATA_VOL" '$1 == d {line = $0; sub(/^.* on /, "", line); sub(/ \(.*/, "", line); print line; exit}')
+    if [ "$REAL" != "$DATA_MNT" ]; then echo "mounted at $REAL"; DATA_MNT=$REAL; fi
+  else
+    echo "the new APFS volume did not mount:" >&2; diskutil info "$DATA_VOL" 2>&1 | head -8 >&2; exit 1
+  fi
 fi
 mounted "$DATA_MNT" || { echo "no mount point for $DATA_VOL" >&2; exit 1; }
 
