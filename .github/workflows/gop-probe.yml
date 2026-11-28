@@ -1,0 +1,74 @@
+# Probe: does an iPadOS kernelcache carry AppleParavirtDisplay (the IOMobileFramebuffer ABI reference)?
+# Cheap: ubuntu, one download, one grep. Nothing of value changes here.
+name: gop-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip xz-utils p7zip-full python3-pip
+          python3 -m pip install --quiet --break-system-packages pyimg4 || pip3 install --quiet pyimg4
+          python3 -c "import pyimg4; print('pyimg4', pyimg4.__version__ if hasattr(pyimg4,'__version__') else 'ok')"
+
+      - name: Download the iPadOS IPSW (bounded)
+        run: |
+          URL="https://updates.cdn-apple.com/2026FallFCS/3817acb0-03ca-45b0-9e74-e37622c5d7a6/iPad_Fall_2021_27.2.1_24B156_Restore.ipsw"
+          curl -sSL --max-time 1500 -o ipsw.zip "$URL"
+          ls -l ipsw.zip
+          df -h / | tail -1
+
+      - name: Extract the kernelcache
+        run: |
+          mkdir -p kc
+          unzip -o -j ipsw.zip 'KernelCache*' -d kc || true
+          ls -l kc | head
+          mv kc/* kc.bin 2>/dev/null || true
+          ls -l kc.bin || true
+          head -c 16 kc.bin | od -An -c | head -2 || true
+
+      - name: Decompress it (IM4P payload, lzfse)
+        run: |
+          set -x
+          python3 - <<'PY' || true
+          import glob, sys
+          from pyimg4 import IM4P
+          f = glob.glob('kc.bin')
+          if not f: sys.exit("no kernelcache")
+          im4p = IM4P(f[0])
+          open('kc.payload','wb').write(im4p.payload.data)
+          print("payload bytes", len(im4p.payload.data))
+          PY
+          ls -l kc.payload 2>/dev/null || true
+          file kc.payload 2>/dev/null || true
+
+      - name: Does it carry AppleParavirtDisplay / IOMobileGraphicsFamily?
+        run: |
+          set -uo pipefail
+          echo "--- strings scan ---"
+          for s in AppleParavirtDisplay IOMobileFramebufferLegacy IOMobileGraphicsFamily; do
+            n=$(grep -a -c "$s" kc.payload 2>/dev/null || echo 0)
+            echo "$s: $n occurrences"
+          done
+          echo "--- first hits (context) ---"
+          grep -a -o -m5 '.\{0,40\}AppleParavirtDisplay.\{0,40\}' kc.payload 2>/dev/null | head -5 || true
+          ls -l kc.payload
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gop-probe-report
+          path: |
+            kc.payload
+          if-no-files-found: warn
+          retention-days: 3
