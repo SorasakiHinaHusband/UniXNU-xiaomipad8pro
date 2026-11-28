@@ -41,15 +41,21 @@ jobs:
       - name: Decompress it (IM4P payload, lzfse)
         run: |
           set -x
-          python3 - <<'PY' || true
-          import glob, sys
+          python3 - <<'PY'
+          # the IPSW's kernelcache carries a small iOS container header; the IM4P starts later
+          data = open('kc.bin','rb').read()
+          i = data.find(b'IM4P')
+          print("IM4P at", i, "of", len(data))
+          assert i > 0
+          open('kc.im4p','wb').write(data[i:])
           from pyimg4 import IM4P
-          f = glob.glob('kc.bin')
-          if not f: sys.exit("no kernelcache")
-          im4p = IM4P(f[0])
-          open('kc.payload','wb').write(im4p.payload.data)
-          print("payload bytes", len(im4p.payload.data))
+          im4p = IM4P('kc.im4p')
+          payload = im4p.payload.data
+          open('kc.payload','wb').write(payload)
+          print("payload bytes", len(payload))
           PY
+          ls -l kc.payload || true
+          head -c 32 kc.payload | od -An -c | head -3 || true
           ls -l kc.payload 2>/dev/null || true
           file kc.payload 2>/dev/null || true
 
