@@ -25,7 +25,7 @@ jobs:
       - name: The 27.3 kernel cache member (HTTP ranges, ~124 MB)
         run: |
           set -uo pipefail
-          python3 tooling/k273/ipsw-members.py fetch --out out/inputs/k273/26C5035r KernelCache || true
+          python3 tooling/k273/ipsw-members.py --out out/inputs/k273/26C5035r fetch KernelCache || true
           ls -l out/inputs/k273/26C5035r/ 2>/dev/null | head -10
 
       - name: Decode it (IM4P + LZFSE + arm64 slice) without macOS tools
