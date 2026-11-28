@@ -55,9 +55,9 @@ jobs:
           else:
               raise SystemExit('no LZFSE/LZSS magic found')
           PY
-          ls -l kc.raw
           /tmp/lzfse/build/lzfse -decode -i kc.payload -o kc.raw || echo "lzfse decode failed"
           ls -l kc.raw 2>/dev/null || true
+          wc -c kc.raw 2>/dev/null || true
           head -c 32 kc.raw 2>/dev/null | od -An -c | head -3 || true
           ls -l kc.payload 2>/dev/null || true
           file kc.payload 2>/dev/null || true
