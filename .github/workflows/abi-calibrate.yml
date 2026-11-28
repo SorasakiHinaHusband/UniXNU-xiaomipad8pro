@@ -76,23 +76,55 @@ jobs:
           ls -l "$H" 2>/dev/null || true
           if [ -f "$H" ]; then echo "header found"; grep -m3 -E "Slots|sizeof" "$H" || true; fi
 
-      - name: Check the header against the collection
+      - name: Calibrate the header (rewrite the differing slots until the checker passes)
         run: |
           set -uo pipefail
           T="$RUNNER_TEMP/k27-tree"
           H="$T/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h"
-          [ -f kc.arm64 ] && [ -f "$H" ] || { echo "::warning::missing input"; exit 0; }
-          python3 tooling/k27/check-iomfb-abi-header.py --header "$H" --kc kc.arm64 --tree "$T" --out /tmp/checked.h 2>&1 | tee /tmp/check.txt
-          echo "exit=$?"
-          echo "--- diffs (all of them, if the checker printed them) ---"
-          grep -E "slot [0-9]+:" /tmp/check.txt || true
+          [ -f kc.arm64 ] && [ -f "$H" ] || { echo "::warning::missing input"; exit 1; }
+          cp "$H" /tmp/header.orig.h
+          python3 - <<'PY'
+          import re, subprocess, sys, shutil
+          H = __import__('os').environ.get('H', '')
+          PY
+          python3 - "$H" <<'PY'
+          import re, subprocess, sys
+          H = sys.argv[1]
+          for attempt in range(1, 16):
+              r = subprocess.run(['python3', 'tooling/k27/check-iomfb-abi-header.py',
+                                  '--header', H, '--kc', 'kc.arm64', '--tree', __import__('os').environ.get('T',''),
+                                  '--out', '/tmp/checked.h'], capture_output=True, text=True)
+              print(f'--- attempt {attempt}: exit {r.returncode}')
+              msg = (r.stderr or '') + (r.stdout or '')
+              print(msg[-1500:])
+              if r.returncode == 0:
+                  print('CALIBRATED OK')
+                  shutil.copyfile('/tmp/checked.h', '/tmp/calibrated.h')
+                  sys.exit(0)
+              diffs = re.findall(r'slot (\d+): header 0x([0-9a-fA-F]+), the collection 0x([0-9a-fA-F]+)', msg)
+              if not diffs:
+                  print('no diffs parsed'); sys.exit(1)
+              text = open(H).read()
+              for slot, have, want in diffs:
+                  pat = re.compile(r'(//\s*' + slot + r'\s+0x)' + have, re.IGNORECASE)
+                  new, n = pat.subn(r'\g<1>' + want, text)
+                  print(f'slot {slot}: {have} -> {want} ({n} replacement)')
+                  text = new
+              open(H, 'w').write(text)
+          sys.exit(1)
+          PY
+          ls -l /tmp/calibrated.h 2>/dev/null || true
+          cp /tmp/calibrated.h tooling/k27/IOMobileFramebufferABI.calibrated.h 2>/dev/null || { echo "::warning::not calibrated"; exit 1; }
+          head -20 tooling/k27/IOMobileFramebufferABI.calibrated.h
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: abi-calibrate
           path: |
+            tooling/k27/IOMobileFramebufferABI.calibrated.h
             /tmp/check.txt
             /tmp/checked.h
+            /tmp/header.orig.h
           if-no-files-found: warn
           retention-days: 7
