@@ -245,8 +245,6 @@ jobs:
           # the kexts step already built these objects: link the collection from them instead of recompiling (and re-running
           # the host tests) inside build-k273-image.sh
           export PIANO_OBJECTS_ONLY=1
-          if false; then
-          fi
           K273_TREE=out/k273/k27-tree bash tooling/k273/build-k273-image.sh \
             || echo "::warning::build-k273-image.sh did not finish: the KC and the ADT it wrote before the root/seed gates are kept and uploaded"
           ls -la out/k27 out/adt out/ram 2>/dev/null || true
