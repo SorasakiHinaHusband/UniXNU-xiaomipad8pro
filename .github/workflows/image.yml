@@ -280,6 +280,23 @@ jobs:
           # detach by device, never by mount point, and always, so nothing is held afterwards
           printf "%s\n" "$ATT" | awk '/^\/dev\/disk/ {print $1}' | sort -r | while read -r d; do hdiutil detach "$d" -force > /dev/null 2>&1 || true; done
           true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: piano-image
+          path: |
+            ${{ runner.temp }}/logs
+            ${{ runner.temp }}/ci/kext-*.log
+            ${{ runner.temp }}/ci/kexts-status.txt
+            out/ram
+            out/fd
+            out/k27/kc-k27-native.bin
+            out/k27/kc-k27-native.bin.link-log
+            out/adt
+            out/inputs/k273/root/root.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Publish the image outputs as a prerelease (root.img compressed and split under the 2 GB asset limit)
         if: always()
         env:
@@ -291,9 +308,15 @@ jobs:
           files=$( (ls out/ram/* out/k27/kc-k27-native.bin out/adt/* out/fd/*.fd out/fd/*.sha256 out/inputs/k273/root/root.json 2>/dev/null || true) | head -40 )
           [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
           EXTRA=
+          # the runner has ~66 GiB: root.img (19.5 GiB) plus its sources (IPSW 20 GiB, SystemOS 6 GiB) plus the zstd file
+          # and the parts do not fit. The sources are not needed any more: root.img holds both windows and the RAM images
+          # were built in the KC step.
+          sudo rm -f out/inputs/k273/26C5035r/*.dmg out/inputs/k273/root/systemos.img out/inputs/data.img out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache 2>/dev/null || true
+          df -h / || true
+
           # root.img is 19.5 GiB: zstd, then 1900 MiB parts, each a legal release asset, plus the reassembly note
           if [ -f out/inputs/k273/root/root.img ]; then
-            echo "compressing root.img"; zstd -19 -T0 -q -f -o "$RUNNER_TEMP/root.img.zst" out/inputs/k273/root/root.img \
+            echo "compressing root.img"; zstd -6 -T0 -q -f -o "$RUNNER_TEMP/root.img.zst" out/inputs/k273/root/root.img \
               && { split -b 1900m -d -a 3 "$RUNNER_TEMP/root.img.zst" "$RUNNER_TEMP/root.img.zst.part-";
                    shasum -a 256 "$RUNNER_TEMP"/root.img.zst.part-* > "$RUNNER_TEMP/root.img.zst.parts.sha256";
                    printf "%s\n" "root.img in parts" "" "cat root.img.zst.part-* > root.img.zst" "shasum -a 256 -c root.img.zst.parts.sha256" "unzstd root.img.zst" > "$RUNNER_TEMP/REASSEMBLE.txt";
@@ -314,19 +337,3 @@ jobs:
           df -h / > "$RUNNER_TEMP/logs/df.txt"
           ls -la out out/ram out/fd 2>/dev/null >> "$RUNNER_TEMP/logs/df.txt" || true
 
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: piano-image
-          path: |
-            ${{ runner.temp }}/logs
-            ${{ runner.temp }}/ci/kext-*.log
-            ${{ runner.temp }}/ci/kexts-status.txt
-            out/ram
-            out/fd
-            out/k27/kc-k27-native.bin
-            out/k27/kc-k27-native.bin.link-log
-            out/adt
-            out/inputs/k273/root/root.json
-          if-no-files-found: warn
-          retention-days: 14
