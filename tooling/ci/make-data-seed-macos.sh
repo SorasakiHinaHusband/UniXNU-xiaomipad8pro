@@ -13,6 +13,8 @@
 # own note says the fresh recipe still needs a build and a RAM test. This script is that recipe on macOS. Sizes: the packed seed
 # holds at most 256 MiB of nonzero pages, so the image is sparse and mostly zero.
 set -euo pipefail
+# newfs_apfs, diskutil and mkfile live in /usr/sbin: a hosted runner step may not have it on PATH
+export PATH="/usr/sbin:/sbin:$PATH"
 OS_IMAGE=${1:?the decrypted OS image}
 OUT=${2:?the output directory}
 SIZE_MIB=${3:-1024}
