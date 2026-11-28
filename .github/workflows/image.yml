@@ -202,7 +202,7 @@ jobs:
           python3 scripts/fetch-pins.py --only DarwinBoot || { echo "::warning::no DarwinBoot checkout"; exit 0; }
           PACKED_RAMDISK="$UNIXNU_RESEARCH/DarwinBoot/Test/packed_ramdisk.py" bash tooling/ci/make-data-seed-macos.sh \
             out/inputs/k273/26C5035r/141-22233-021.dmg out/inputs 1024 \
-            || echo "::warning::the fresh Data seed recipe failed (G3 is unverified upstream too), the root step will stop at its seed gate"
+           
       - name: Root image (needs the owner's G2 trust bundle and G3 Data seed)
         continue-on-error: true
         env:
