@@ -59,9 +59,10 @@ jobs:
           df -h / /System/Volumes/Data | sed -n '1,4p'
       - name: Host tools
         run: |
-          brew install gnu-sed mtools dtc zstd nasm mtoc acpica ffmpeg llvm 2>&1 | tail -2
+          brew install gnu-sed mtools dtc zstd nasm mtoc acpica ffmpeg llvm lld 2>&1 | tail -2
           brew install blacktop/tap/ipsw 2>&1 | tail -2 || true
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
           command -v ipsw aea dtc mtools || true
 
@@ -285,7 +286,7 @@ jobs:
           set -uo pipefail
           tag="image-$(echo "$GITHUB_SHA" | cut -c1-8)"
           if gh release view "$tag" > /dev/null 2>&1; then echo "release $tag already exists"; exit 0; fi
-          files=$(ls out/ram/* out/k27/kc-k27-native.bin out/adt/* out/fd/*.fd out/fd/*.sha256 out/inputs/k273/root/root.json 2>/dev/null | head -40)
+          files=$( (ls out/ram/* out/k27/kc-k27-native.bin out/adt/* out/fd/*.fd out/fd/*.sha256 out/inputs/k273/root/root.json 2>/dev/null || true) | head -40 )
           [ -n "$files" ] || { echo "nothing to publish"; exit 0; }
           EXTRA=
           # root.img is 19.5 GiB: zstd, then 1900 MiB parts, each a legal release asset, plus the reassembly note
