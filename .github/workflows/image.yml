@@ -229,6 +229,7 @@ jobs:
           bash tooling/firmware/build-fd.sh
 
       - name: KC, ADT and (when the root image exists) the RAM images
+        if: always()
         continue-on-error: true
         env:
           WORK: ${{ runner.temp }}/ci
@@ -250,6 +251,7 @@ jobs:
             || echo "::warning::build-k273-image.sh did not finish: the KC and the ADT it wrote before the root/seed gates are kept and uploaded"
           ls -la out/k27 out/adt out/ram 2>/dev/null || true
       - name: Probe the display sources at the end, so it never holds the OS image while systemos runs
+        if: always()
         continue-on-error: true
         run: |
           set -uo pipefail
