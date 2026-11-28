@@ -31,7 +31,7 @@ jobs:
       - name: Decode it (IM4P + LZFSE + arm64 slice) without macOS tools
         run: |
           set -uo pipefail
-          K=$(ls out/inputs/k273/26C5035r/KernelCache* 2>/dev/null | head -1)
+          K=$(ls out/inputs/k273/26C5035r/kernelcache.release.* 2>/dev/null | head -1)
           echo "member: $K"
           [ -n "$K" ] || { echo "::warning::no kernelcache member"; exit 0; }
           python3 - "$K" <<'PY'
