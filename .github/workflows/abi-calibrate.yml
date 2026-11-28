@@ -1,0 +1,98 @@
+# Calibrate the committed IOMobileFramebufferABI.h against the 27.3 kernel cache, slot by slot, on a Linux runner.
+# The checker reports every slot whose PAC diversity differs; this job prints them so the header can be fixed.
+name: abi-calibrate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3 git curl cmake build-essential
+          git clone --depth 1 https://github.com/lzfse/lzfse.git /tmp/lzfse >/dev/null 2>&1
+          cmake -S /tmp/lzfse -B /tmp/lzfse/build >/dev/null && cmake --build /tmp/lzfse/build -j4 >/dev/null
+          /tmp/lzfse/build/lzfse -h 2>&1 | head -2
+
+      - name: The 27.3 kernel cache member (HTTP ranges, ~124 MB)
+        run: |
+          set -uo pipefail
+          python3 tooling/k273/ipsw-members.py fetch --out out/inputs/k273/26C5035r KernelCache || true
+          ls -l out/inputs/k273/26C5035r/ 2>/dev/null | head -10
+
+      - name: Decode it (IM4P + LZFSE + arm64 slice) without macOS tools
+        run: |
+          set -uo pipefail
+          K=$(ls out/inputs/k273/26C5035r/KernelCache* 2>/dev/null | head -1)
+          echo "member: $K"
+          [ -n "$K" ] || { echo "::warning::no kernelcache member"; exit 0; }
+          python3 - "$K" <<'PY'
+          import sys, struct
+          data = open(sys.argv[1], 'rb').read()
+          i = data.find(b'bvx2')
+          print('bvx2 at', i, 'of', len(data))
+          if i > 0:
+              open('kc.payload', 'wb').write(data[i:])
+          else:
+              open('kc.payload', 'wb').write(data)
+          PY
+          /tmp/lzfse/build/lzfse -decode -i kc.payload -o kc.raw || cp kc.payload kc.raw
+          ls -l kc.raw
+          python3 - <<'PY'
+          import struct, sys
+          d = open('kc.raw', 'rb').read()
+          magic = struct.unpack('>I', d[:4])[0]
+          print('magic', hex(magic), 'size', len(d))
+          if magic in (0xcafebabe, 0xbebafeca):
+              n = struct.unpack('>I', d[4:8])[0] if magic == 0xcafebabe else None
+              print('fat, slices', n)
+              endian = '>' if magic == 0xbebafeca else '<'
+              # fat_arch entries follow: cputype, cpusubtype, offset, size, align
+              for k in range(n):
+                  off = 8 + 20 * k
+                  cputype, cpusub, o, sz, al = struct.unpack(endian + '5I', d[off:off+20])
+                  print('  cputype', hex(cputype), 'offset', o, 'size', sz)
+                  if cputype == 0x0100000c:
+                      open('kc.arm64', 'wb').write(d[o:o+sz]); print('  -> arm64 slice written')
+              import os
+              sys.exit(0 if os.path.exists('kc.arm64') else 1)
+          open('kc.arm64', 'wb').write(d)
+          print('thin, written as is')
+          PY
+          ls -l kc.arm64 2>/dev/null || { echo "::warning::no arm64 slice"; exit 0; }
+
+      - name: The k27 tree (its committed header)
+        run: |
+          bash tooling/k27/fetch-k27-tree.sh "$RUNNER_TEMP/k27-tree" || echo "::warning::tree fetch failed"
+          H="$RUNNER_TEMP/k27-tree/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h"
+          ls -l "$H" 2>/dev/null || true
+          if [ -f "$H" ]; then echo "header found"; grep -m3 -E "Slots|sizeof" "$H" || true; fi
+
+      - name: Check the header against the collection
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/k27-tree"
+          H="$T/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h"
+          [ -f kc.arm64 ] && [ -f "$H" ] || { echo "::warning::missing input"; exit 0; }
+          python3 tooling/k27/check-iomfb-abi-header.py --header "$H" --kc kc.arm64 --tree "$T" --out /tmp/checked.h 2>&1 | tee /tmp/check.txt
+          echo "exit=$?"
+          echo "--- diffs (all of them, if the checker printed them) ---"
+          grep -E "slot [0-9]+:" /tmp/check.txt || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: abi-calibrate
+          path: |
+            /tmp/check.txt
+            /tmp/checked.h
+          if-no-files-found: warn
+          retention-days: 7
